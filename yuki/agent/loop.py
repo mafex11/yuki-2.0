@@ -73,10 +73,13 @@ class Agent:
             then Y", nothing that decides behaviour on the model's behalf. Behind
             its own cache breakpoint so wording differences between instances
             cannot cost the shared prompt its cache.
-        prewarm: Open the persistent PowerShell session in a background thread
-            now, so the first ``run_powershell`` does not pay its 2-4.7 s cold
-            start. Harmless when there is no real desktop backend; pass ``False``
-            to keep construction from touching the machine at all.
+        prewarm: Do the two slow first-time things in a background thread at
+            construction instead of in front of the user: open the persistent
+            PowerShell session (2-4.7 s of cold start), and send one throwaway
+            request that builds the Bedrock client and writes the prompt cache,
+            so the first real request reads a warm cache. Harmless when there is
+            no real desktop backend; pass ``False`` to keep construction from
+            touching the machine or the network at all.
 
     Raises:
         ValueError: If ``tool_names`` contains a name that is not a tool.
@@ -105,6 +108,7 @@ class Agent:
         self.tool_names = resolve_tool_names(tool_names)
         self.extra_instructions = (extra_instructions or "").strip() or None
         self._client = client
+        self._client_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._pending_answer: str | None = None
         self._awaiting_answer = False
@@ -122,44 +126,84 @@ class Agent:
 
     @property
     def client(self) -> Any:
-        """The Bedrock client, constructed on first use."""
-        if self._client is None:
-            import anthropic
+        """The Bedrock client, constructed on first use.
 
-            region = self.settings.aws_region or os.environ["AWS_REGION"]
-            self._client = anthropic.AnthropicBedrock(aws_region=region)
-        return self._client
+        Guarded by a lock because the pre-warm thread and the first real request
+        can both reach for it at once, and importing ``anthropic`` plus resolving
+        credentials is not something to do twice.
+        """
+        with self._client_lock:
+            if self._client is None:
+                import anthropic
+
+                region = self.settings.aws_region or os.environ["AWS_REGION"]
+                self._client = anthropic.AnthropicBedrock(aws_region=region)
+            return self._client
 
     # -- warm-up -----------------------------------------------------------
 
     def _start_prewarm(self) -> threading.Thread:
-        """Kick the persistent PowerShell session awake off the main thread.
+        """Do both first-time warm-ups off the main thread.
 
-        A daemon thread, so a process that exits before the shell finishes
-        starting is not held open by it. Every failure is swallowed and logged:
-        pre-warming is an optimisation, and a machine that cannot start
-        PowerShell must still get a working Yuki that finds that out when it
-        actually tries to run something.
+        The model warm-up goes first because it is the one the user always pays
+        for -- every request needs the model, only some need a shell.
+
+        A daemon thread, so a process that exits before the warm-up finishes is
+        not held open by it. Every failure is swallowed and logged: pre-warming is
+        an optimisation, and a machine that cannot start PowerShell (or reach
+        Bedrock) must still get a working Yuki that finds that out when it
+        actually tries to use them.
         """
 
         def warm() -> None:
-            started = time.perf_counter()
-            try:
-                live = self.dispatcher.prewarm_shell()
-            except Exception as exc:
-                self.logger.error(
-                    f"powershell prewarm failed: {type(exc).__name__}: {exc}", exc=exc
-                )
-                return
-            self.logger.log(
-                "shell_prewarm",
-                live=live,
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
-            )
+            self._warm_model()
+            self._warm_shell()
 
-        thread = threading.Thread(target=warm, name="yuki-shell-prewarm", daemon=True)
+        thread = threading.Thread(target=warm, name="yuki-prewarm", daemon=True)
         thread.start()
         return thread
+
+    def _warm_shell(self) -> None:
+        """Open the persistent PowerShell session now. Never raises."""
+        started = time.perf_counter()
+        try:
+            live = self.dispatcher.prewarm_shell()
+        except Exception as exc:
+            self.logger.error(f"powershell prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
+            return
+        self.logger.log(
+            "shell_prewarm",
+            live=live,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+
+    def _warm_model(self) -> None:
+        """Build the client and write the prompt cache before the user asks.
+
+        The first request of a process pays for three things nobody wants to wait
+        for: importing ``anthropic``/``boto3``, resolving credentials, and having
+        the API read a few thousand tokens of system prompt and tool schemas for
+        the first time. This sends one deliberately pointless request with the
+        *same* system blocks and tool definitions -- so the cached prefix is
+        byte-identical -- and ``max_tokens`` of 1, so the model is cut off
+        immediately and nothing is spent on output.
+
+        Never raises, and never touches :attr:`~yuki.log.events.SessionLogger.usage`:
+        this request is overhead, not part of any user request's accounting.
+        """
+        started = time.perf_counter()
+        try:
+            response = self.client.messages.create(**self._request_params(warmup=True))
+        except Exception as exc:
+            self.logger.error(f"model prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
+            return
+        self.logger.log(
+            "model_prewarm",
+            model=self.settings.model,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            stop_reason=getattr(response, "stop_reason", None),
+            usage=getattr(response, "usage", None),
+        )
 
     def wait_for_prewarm(self, timeout_s: float | None = None) -> bool:
         """Block until the pre-warm thread has finished (tests and diagnostics).
@@ -397,6 +441,14 @@ class Agent:
     ) -> Any:
         """Execute every ``tool_use`` block in order, stopping at the first failure.
 
+        A response may carry ``done`` alongside real work -- "press mute, and with
+        that I am finished" -- which is how a one-step request costs one round trip
+        instead of two. ``done`` is therefore always executed last, whatever
+        position the model put it in, and only if everything before it succeeded:
+        a failure stops dispatch, so the ``done`` is dropped with an explanation
+        and the model gets the results back to react to. It never gets to announce
+        an outcome that did not happen.
+
         Args:
             tool_uses: The blocks from one assistant response, in model order.
             finished: Out-parameter; the ``done`` message is appended to it if the
@@ -406,29 +458,33 @@ class Agent:
             Events for each call and result, and :class:`AskUser` when paused.
 
         Returns:
-            ``(tool_result_blocks, tool_use_id -> name)``. Every block carries a
-            result even when execution stopped early: the API requires one
-            ``tool_result`` per ``tool_use``, so skipped tools get an error block
-            explaining they never ran.
+            ``(tool_result_blocks, tool_use_id -> name)``. The blocks are in the
+            model's original order, because that is the order the API pairs them
+            with the calls. Every block carries a result even when execution
+            stopped early: the API requires one ``tool_result`` per ``tool_use``,
+            so skipped tools get an error block explaining they never ran.
         """
-        blocks: list[dict[str, Any]] = []
+        results: dict[str, dict[str, Any]] = {}
         names: dict[str, str] = {}
         stop_after = False
+        order = [str(getattr(b, "id", "")) for b in tool_uses]
+        work = [b for b in tool_uses if str(getattr(b, "name", "")) != "done"]
+        closing = [b for b in tool_uses if str(getattr(b, "name", "")) == "done"]
 
-        for block in tool_uses:
+        for block in work + closing:
             tool_id = str(getattr(block, "id", ""))
             name = str(getattr(block, "name", ""))
             tool_input = dict(getattr(block, "input", {}) or {})
             names[tool_id] = name
 
             if stop_after:
-                self._skip(
-                    blocks, tool_id, name, "Not run: an earlier tool in this turn failed."
+                results[tool_id] = self._skip(
+                    tool_id, name, "Not run: an earlier tool in this turn failed."
                 )
                 continue
 
             if self._cancelled.is_set():
-                self._skip(blocks, tool_id, name, "Not run: the user cancelled.")
+                results[tool_id] = self._skip(tool_id, name, "Not run: the user cancelled.")
                 stop_after = True
                 continue
 
@@ -442,7 +498,7 @@ class Agent:
             # not wait forever for one.
             if self._cancelled.is_set():
                 text = "Not run: the user cancelled."
-                self._skip(blocks, tool_id, name, text)
+                results[tool_id] = self._skip(tool_id, name, text)
                 yield ToolResult(name, False, text)
                 stop_after = True
                 continue
@@ -465,8 +521,8 @@ class Agent:
                         elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
                     )
                     yield ToolResult(name, False, text)
-                    blocks.append(
-                        self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True)
+                    results[tool_id] = self._result_block(
+                        tool_id, [{"type": "text", "text": text}], is_error=True
                     )
                     stop_after = True
                     continue
@@ -476,7 +532,9 @@ class Agent:
                     elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
                 )
                 yield ToolResult(name, True, f"answered: {answer}")
-                blocks.append(self._result_block(tool_id, [{"type": "text", "text": answer}]))
+                results[tool_id] = self._result_block(
+                    tool_id, [{"type": "text", "text": answer}]
+                )
                 continue
 
             if outcome.kind == "note":
@@ -491,14 +549,12 @@ class Agent:
             content = outcome.content or [
                 {"type": "text", "text": outcome.summary or "Done."}
             ]
-            blocks.append(self._result_block(tool_id, content, is_error=not outcome.ok))
+            results[tool_id] = self._result_block(tool_id, content, is_error=not outcome.ok)
 
-            if not outcome.ok:
-                stop_after = True
-            if outcome.kind == "done":
+            if not outcome.ok or outcome.kind == "done":
                 stop_after = True
 
-        return blocks, names
+        return [results[tool_id] for tool_id in order], names
 
     def _dispatch(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
         """Run one tool, refusing anything outside this agent's subset.
@@ -511,9 +567,7 @@ class Agent:
             return unavailable_tool(name, self.tool_names)
         return self.dispatcher.dispatch(name, tool_input)
 
-    def _skip(
-        self, blocks: list[dict[str, Any]], tool_use_id: str, name: str, text: str
-    ) -> None:
+    def _skip(self, tool_use_id: str, name: str, text: str) -> dict[str, Any]:
         """Answer a tool that never ran, and record that in the transcript.
 
         The API wants one ``tool_result`` per ``tool_use``, so a turn that stops
@@ -521,10 +575,10 @@ class Agent:
         answers are real content sent to the model, so they belong in the JSONL
         too -- otherwise a cancelled turn reads, in the log, as if the model was
         told nothing.
+
+        Returns:
+            The ``tool_result`` block to send for that call.
         """
-        blocks.append(
-            self._result_block(tool_use_id, [{"type": "text", "text": text}], is_error=True)
-        )
         self.logger.tool_result(
             name,
             ok=False,
@@ -533,6 +587,7 @@ class Agent:
             elapsed_ms=0.0,
             tool_use_id=tool_use_id,
         )
+        return self._result_block(tool_use_id, [{"type": "text", "text": text}], is_error=True)
 
     def _log_outcome(self, outcome: ToolOutcome, *, tool_use_id: str) -> None:
         """Write the screenshot file, the perception record, and the tool result."""
@@ -591,35 +646,42 @@ class Agent:
 
     # -- model request -----------------------------------------------------
 
-    def _request(self) -> Any:
-        """Send one request and return the response, logging both sides in full."""
-        params: dict[str, Any] = {
+    def _request_params(self, *, warmup: bool = False) -> dict[str, Any]:
+        """Build the request parameters.
+
+        Args:
+            warmup: Build the throwaway pre-warm request instead of a real one:
+                the same system blocks and tools (so the cached prefix matches
+                byte for byte), one token of output, and a message that is never
+                meant to be answered.
+
+        Returns:
+            Keyword arguments for ``messages.create`` / ``messages.stream``.
+        """
+        return {
             "model": self.settings.model,
-            "max_tokens": self.settings.max_tokens,
+            "max_tokens": 1 if warmup else self.settings.max_tokens,
             "system": system_blocks(extra=self.extra_instructions),
-            "messages": self.context.messages,
+            "messages": [{"role": "user", "content": "warming up"}]
+            if warmup
+            else self.context.messages,
             "tools": tool_params(names=self.tool_names),
             "thinking": {"type": "adaptive", "display": self.settings.thinking_display},
             "output_config": {"effort": self.settings.effort},
         }
-        # The typed llm_request record carries the bulk (system, messages, tools)
-        # and dereferences screenshot payloads to files; this one carries the
-        # knobs that are not in its signature, so the transcript still shows
-        # every parameter the request was actually sent with.
-        self.logger.log(
-            "llm_request_config",
-            model=params["model"],
-            max_tokens=params["max_tokens"],
-            thinking=params["thinking"],
-            output_config=params["output_config"],
-            stream=self.settings.stream,
-            tools=[t["name"] for t in params["tools"]],
-        )
+
+    def _request(self) -> Any:
+        """Send one request and return the response, logging both sides in full."""
+        params = self._request_params()
         self.logger.llm_request(
             model=params["model"],
             system=params["system"],
             messages=params["messages"],
             tools=params["tools"],
+            max_tokens=params["max_tokens"],
+            thinking=params["thinking"],
+            output_config=params["output_config"],
+            stream=self.settings.stream,
         )
         started = time.perf_counter()
         try:

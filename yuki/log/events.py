@@ -89,9 +89,12 @@ class ErrorEvent:
 
 AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Final | ErrorEvent
 
-#: Every event type name that may appear in a session JSONL file.
+#: Every event type name that may appear in a session JSONL file. Anything
+#: :meth:`SessionLogger.log` is called with should be in here, so a reader can
+#: enumerate the schema instead of discovering it from real logs.
 EVENT_TYPES: frozenset[str] = frozenset(
     {
+        # the conversation
         "session_start",
         "user_message",
         "llm_request",
@@ -106,6 +109,16 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "usage_total",
         "final",
         "error",
+        # how this agent instance was set up and what it was told to be
+        "agent_scope",
+        # warm-ups done at construction, off the critical path
+        "shell_prewarm",
+        "model_prewarm",
+        # the caller changed a knob mid-session
+        "model_switch",
+        "effort_switch",
+        # the desktop shell's own decisions (:class:`yuki.ui.uilog.UiLog`)
+        "ui",
     }
 )
 
@@ -298,11 +311,41 @@ class SessionLogger:
         """Log (and show) a new request from the user."""
         self.log("user_message", text=text)
 
-    def llm_request(self, *, model: str, system: Any, messages: Any, tools: Any) -> None:
-        """Log the complete outgoing request."""
+    def llm_request(
+        self,
+        *,
+        model: str,
+        system: Any,
+        messages: Any,
+        tools: Any,
+        max_tokens: int | None = None,
+        thinking: Any = None,
+        output_config: Any = None,
+        stream: bool | None = None,
+    ) -> None:
+        """Log the complete outgoing request: the bulk *and* every knob.
+
+        One record per request, so a reader never has to join two lines to know
+        what was actually sent. Screenshot payloads inside ``messages`` are
+        swapped for the file they were written to.
+
+        Args:
+            model: Model id.
+            system: The ``system`` blocks.
+            messages: The ``messages`` list.
+            tools: The tool definitions.
+            max_tokens: Output ceiling, when the caller sets one.
+            thinking: The ``thinking`` parameter.
+            output_config: The ``output_config`` parameter (effort, format).
+            stream: Whether the streaming endpoint was used.
+        """
         self.log(
             "llm_request",
             model=model,
+            max_tokens=max_tokens,
+            thinking=_as_plain(thinking),
+            output_config=_as_plain(output_config),
+            stream=stream,
             system=_as_plain(system),
             messages=self._dereference_images(_as_plain(messages)),
             tools=_as_plain(tools),

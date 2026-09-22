@@ -23,14 +23,19 @@ MODEL_ALIASES: dict[str, str] = {
 
 DEFAULT_MODEL = MODEL_ALIASES["sonnet"]
 
-#: Effort levels accepted by ``output_config.effort``. Widening this tuple is all
-#: it takes to expose more of the API's range; the loop passes the value through
-#: untouched.
-EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+#: Every effort level ``output_config.effort`` accepts, cheapest first. The loop
+#: passes the value through untouched, so this tuple is only here to catch a typo
+#: before the API does.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
-#: Provisional default. Nothing here has been measured on this machine yet, so
-#: treat it as a starting point to tune, not a finding.
-DEFAULT_EFFORT = "medium"
+#: Measured with ``scripts/bench.py`` on this machine on 2026-09-22 (Sonnet 5,
+#: the same five requests, one run each): ``low`` took 16 model calls and 53 s of
+#: wall time against ``medium``'s 15 calls and 70 s, at 3.2 s versus 4.4 s per
+#: call and 75 versus 419 thinking tokens, with the same 4/5 requests succeeding.
+#: Low effort is also the level that reliably finishes a one-step request in a
+#: single round trip. Raise it per request with ``/effort`` when a task genuinely
+#: needs more thinking; a harder task set may well want ``medium`` back.
+DEFAULT_EFFORT = "low"
 
 
 @dataclass
@@ -60,7 +65,9 @@ class Settings:
             :data:`EFFORT_LEVELS`. Lower effort means less thinking and fewer,
             more-consolidated tool calls. Mutable so the CLI's ``/effort``
             command (and :meth:`yuki.agent.loop.Agent.set_effort`) can change it
-            mid-conversation. The default is provisional and unmeasured.
+            mid-conversation.
+        ui_hotkey: Global combo that opens and closes the overlay.
+        ui_cancel_hotkey: Global combo that cancels whatever the worker is doing.
     """
 
     model: str = DEFAULT_MODEL
@@ -75,6 +82,8 @@ class Settings:
     keep_perception_turns: int = 2
     tool_timeout_s: float = 20.0
     effort: str = DEFAULT_EFFORT
+    ui_hotkey: str = "alt+space"
+    ui_cancel_hotkey: str = "ctrl+alt+space"
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)

@@ -47,9 +47,20 @@ def _obj(
     }
 
 
+#: The input guard, shared by every tool that sends keys or mouse events. One
+#: object rather than five copies of the same paragraph: it is the same promise in
+#: each of them, and the tool block is a cached prefix, so wording that drifted
+#: between tools would be both misleading and dead weight.
+_GUARD: dict[str, Any] = {
+    "type": "integer",
+    "description": "Send only while this window is still in front. If focus has "
+    "moved, nothing is sent and you are told what has it instead.",
+}
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "look_at_desktop",
+        "label": "Looking at the desktop",
         "description": (
             "List every visible top-level window with its hwnd, title, process, "
             "bounds and which one is in the foreground, plus cursor position and "
@@ -60,6 +71,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "look_at_window",
+        "label": "Reading a window",
         "description": (
             "Read the UI Automation element tree of one window: roles, names, text "
             "field values, click points, keyboard shortcuts and whether each element "
@@ -75,11 +87,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "take_screenshot",
+        "label": "Taking a look at the screen",
         "description": (
             "Capture pixels: one window if you pass an hwnd, otherwise the whole "
             "screen. Downscaled. Use it when the element tree is empty, truncated or "
             "does not explain what you are looking at, or when you need to read "
-            "something only rendering shows."
+            "something only rendering shows. A window's image is relative to that "
+            "window and scaled down, so the result tells you the rectangle it covers "
+            "and the arithmetic for turning image pixels into screen coordinates."
         ),
         "input_schema": _obj(
             {
@@ -92,6 +107,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "system_facts",
+        "label": "Reading system facts",
         "description": (
             "Current local date and time, uptime, CPU load, memory totals and the "
             "processes using the most memory."
@@ -100,6 +116,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "launch_app",
+        "label": "Opening an app",
         "description": (
             "Start an installed application by name and wait for its window. If the "
             "name matches several apps it returns the candidates instead of guessing, "
@@ -112,6 +129,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "focus_window",
+        "label": "Switching window",
         "description": (
             "Bring a window to the foreground, restoring it first if minimised. Do "
             "this before typing or using keyboard shortcuts aimed at that window."
@@ -120,6 +138,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "click",
+        "label": "Clicking",
         "description": "Click at a screen coordinate, usually an element's centre point.",
         "input_schema": _obj(
             {
@@ -127,18 +146,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "y": {"type": "integer"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"]},
                 "clicks": {"type": "integer", "description": "2 for a double click."},
-                "expect_hwnd": {
-                    "type": "integer",
-                    "description": "Only send if this window is still in front; "
-                    "if something else has taken focus nothing is sent and you are "
-                    "told which window has it.",
-                },
+                "expect_hwnd": _GUARD,
             },
             ["x", "y"],
         ),
     },
     {
         "name": "type_text",
+        "label": "Typing",
         "description": (
             "Type text into whatever currently has keyboard focus, optionally pressing "
             "Enter afterwards. Make sure the right field is focused first."
@@ -147,18 +162,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             {
                 "text": {"type": "string"},
                 "press_enter": {"type": "boolean"},
-                "expect_hwnd": {
-                    "type": "integer",
-                    "description": "Only send if this window is still in front; "
-                    "if something else has taken focus nothing is sent and you are "
-                    "told which window has it.",
-                },
+                "expect_hwnd": _GUARD,
             },
             ["text"],
         ),
     },
     {
         "name": "hotkey",
+        "label": "Pressing a shortcut",
         "description": (
             "Press a key combination, given as the keys held together, e.g. "
             "['ctrl','t'] or ['win','r'] or ['volume_mute']."
@@ -166,35 +177,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _obj(
             {
                 "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                "expect_hwnd": {
-                    "type": "integer",
-                    "description": "Only send if this window is still in front; "
-                    "if something else has taken focus nothing is sent and you are "
-                    "told which window has it.",
-                },
+                "expect_hwnd": _GUARD,
             },
             ["keys"],
         ),
     },
     {
         "name": "press",
+        "label": "Pressing a key",
         "description": "Press a single key, optionally several times, e.g. 'enter', 'tab', 'down'.",
         "input_schema": _obj(
             {
                 "key": {"type": "string"},
                 "times": {"type": "integer", "minimum": 1},
-                "expect_hwnd": {
-                    "type": "integer",
-                    "description": "Only send if this window is still in front; "
-                    "if something else has taken focus nothing is sent and you are "
-                    "told which window has it.",
-                },
+                "expect_hwnd": _GUARD,
             },
             ["key"],
         ),
     },
     {
         "name": "scroll",
+        "label": "Scrolling",
         "description": "Scroll at a point by wheel notches; positive dy scrolls up.",
         "input_schema": _obj(
             {
@@ -202,18 +205,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "y": {"type": "integer"},
                 "dy": {"type": "integer"},
                 "dx": {"type": "integer"},
-                "expect_hwnd": {
-                    "type": "integer",
-                    "description": "Only send if this window is still in front; "
-                    "if something else has taken focus nothing is sent and you are "
-                    "told which window has it.",
-                },
+                "expect_hwnd": _GUARD,
             },
             ["x", "y"],
         ),
     },
     {
         "name": "run_powershell",
+        "label": "Running a command",
         "description": (
             "Run a PowerShell command on this PC and get stdout, stderr and the exit "
             "code back. Often the fastest and most reliable way to inspect or change "
@@ -223,11 +222,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "open_url",
+        "label": "Opening a link",
         "description": "Open a URL in the default browser.",
         "input_schema": _obj({"url": {"type": "string"}}, ["url"]),
     },
     {
         "name": "note_to_self",
+        "label": "Making a note",
         "description": (
             "Replace your short working note for this conversation. You get it back at "
             "the start of every turn. Use it to carry forward what you learned and what "
@@ -238,6 +239,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "ask_user",
+        "label": "Asking you something",
         "description": (
             "Put one question to the user and wait for their answer. Their reply comes "
             "back as this tool's result."
@@ -246,9 +248,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "done",
+        "label": "Wrapping up",
         "description": (
-            "End your turn with what you want to say to the user. Call this exactly "
-            "once, as your last action."
+            "What to tell the user once this turn's work has succeeded. Call it "
+            "exactly once. It is evaluated last, after every other tool in the turn, "
+            "and only if all of them succeeded -- so calling it alongside the actions "
+            "that finish the job is the normal thing to do, not a gamble: if one of "
+            "them fails your message is discarded and you get the results back to "
+            "react to instead. You can never end up having claimed something that "
+            "did not happen."
         ),
         "input_schema": _obj({"message": {"type": "string"}}, ["message"]),
     },
@@ -321,13 +329,34 @@ def tool_params(
             resolved by :func:`resolve_tool_names`. ``None`` sends all of them.
 
     Returns:
-        A fresh list of tool dicts; the caller may not mutate the module copy.
+        A fresh list of tool dicts, carrying only what the API accepts -- the
+        human ``label`` is dropped here, since it exists for the UI and an
+        unexpected key would be rejected. The caller may not mutate the module
+        copy.
     """
     allowed = resolve_tool_names(names)
-    tools = [dict(t) for t in TOOL_SCHEMAS if allowed is None or t["name"] in allowed]
+    tools = [
+        {k: v for k, v in t.items() if k != "label"}
+        for t in TOOL_SCHEMAS
+        if allowed is None or t["name"] in allowed
+    ]
     if cacheable and tools:
         tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
+
+
+def tool_label(name: str) -> str:
+    """The one-line human phrase for a tool, for the UI to show while it runs.
+
+    Args:
+        name: Tool name as the model called it.
+
+    Returns:
+        The tool's ``label``, or an empty string for a name that is not a tool --
+        the UI is not the place to raise over an unknown tool.
+    """
+    schema = TOOLS_BY_NAME.get(name)
+    return str(schema.get("label") or "") if schema else ""
 
 
 def unavailable_tool(name: str, available: Iterable[str]) -> "ToolOutcome":
@@ -372,6 +401,7 @@ class Backend(Protocol):
     ) -> Any: ...
     def format_window_tree(self, tree: Any) -> str: ...
     def screenshot(self, hwnd: int | None = None, *, max_width: int = 1280) -> bytes: ...
+    def capture_bounds(self, hwnd: int | None) -> tuple[int, int, int, int]: ...
     def system_facts(self) -> dict[str, Any]: ...
     def launch_app(self, query: str, *, timeout_s: float = 8.0) -> Any: ...
     def focus_window(self, hwnd: int, *, timeout_s: float = 2.0) -> Any: ...
@@ -422,6 +452,7 @@ class _LazyRealBackend:
         "get_window_tree",
         "format_window_tree",
         "screenshot",
+        "capture_bounds",
         "system_facts",
     }
     _ACTIONS = {
@@ -713,20 +744,69 @@ class Dispatcher:
             raise ToolError(f"screenshot() returned {type(png).__name__}, expected PNG bytes")
         png = bytes(png)
         b64 = base64.standard_b64encode(png).decode("ascii")
-        target = "screen" if hwnd is None else f"window {hwnd}"
+        target = "the screen" if hwnd is None else f"window {hwnd}"
+        geometry = self._capture_geometry(hwnd, png)
         return ToolOutcome(
             name="take_screenshot",
             ok=True,
             summary=f"{target}, {len(png)} bytes",
             content=[
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                {"type": "text", "text": f"Screenshot of {target}."},
+                {"type": "text", "text": f"Screenshot of {target}. {geometry['text']}"},
             ],
-            payload={"target": target, "bytes": len(png)},
+            payload={"target": target, "bytes": len(png), **geometry["payload"]},
             elapsed_ms=(time.perf_counter() - started) * 1000,
             screenshot_png=png,
             screenshot_b64=b64,
         )
+
+    def _capture_geometry(self, hwnd: int | None, png: bytes) -> dict[str, Any]:
+        """Say where a screenshot's pixels are, in screen coordinates.
+
+        Without this a window shot is a trap: it is rendered by the window, so its
+        top-left is the window's top-left and not the screen's, and it is then
+        downscaled. A model that reads a coordinate off the image and clicks it
+        lands somewhere else entirely -- which is exactly what happened on
+        2026-09-22, six clicks in a row into another app's window while the
+        dialog it was aiming at sat untouched.
+
+        Facts only: the rectangle captured, the size sent, the scale between them,
+        and the arithmetic. It says nothing about what to do with them.
+
+        Returns:
+            ``{"text": str, "payload": dict}``; the text is empty-safe -- if the
+            geometry cannot be read, the caller still gets a usable result.
+        """
+        size = _png_size(png)
+        bounds: tuple[int, int, int, int] | None = None
+        reader = getattr(self.backend, "capture_bounds", None)
+        if callable(reader):
+            try:
+                left, top, right, bottom = reader(hwnd)
+                bounds = (int(left), int(top), int(right), int(bottom))
+            except Exception:
+                bounds = None
+        if size is None or bounds is None:
+            return {"text": "", "payload": {"image_size": size, "capture_bounds": bounds}}
+        width, height = size
+        left, top, right, bottom = bounds
+        source_width = max(1, right - left)
+        scale = width / source_width
+        text = (
+            f"The image is {width}x{height} and covers the screen rectangle "
+            f"({left},{top})-({right},{bottom}), which is {source_width}x{bottom - top} "
+            f"real pixels, so it is at {scale:.3f} scale. To act on something you see "
+            f"here: screen_x = {left} + image_x / {scale:.3f}, "
+            f"screen_y = {top} + image_y / {scale:.3f}."
+        )
+        return {
+            "text": text,
+            "payload": {
+                "image_size": [width, height],
+                "capture_bounds": [left, top, right, bottom],
+                "scale": round(scale, 4),
+            },
+        }
 
     def _do_system_facts(self, tool_input: dict[str, Any]) -> ToolOutcome:
         started = time.perf_counter()
@@ -863,6 +943,19 @@ class Dispatcher:
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
+
+
+def _png_size(png: bytes) -> tuple[int, int] | None:
+    """Pixel size from a PNG's IHDR chunk, or ``None`` if it is not a PNG.
+
+    Reading eight bytes of header beats decoding the image just to learn how big
+    it is, and keeps this module free of Pillow.
+    """
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    width = int.from_bytes(png[16:20], "big")
+    height = int.from_bytes(png[20:24], "big")
+    return (width, height) if width and height else None
 
 
 def _plain(value: Any) -> Any:

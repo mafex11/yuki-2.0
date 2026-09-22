@@ -208,29 +208,32 @@ def get_desktop_overview() -> DesktopOverview:
 def format_overview(o: DesktopOverview) -> str:
     """Compact text rendering of an overview, one line per window.
 
+    The model is handed this every turn, so it is kept to facts it cannot get
+    anywhere else and nothing is said twice.  The window count and the foreground
+    handle are not in the header: the lines are the count, and the foreground one
+    is flagged (the header only mentions it when the foreground window is *not*
+    one of the listed ones -- a shell surface, say -- because that is information
+    the list cannot carry).  A minimised window's rectangle is the off-screen
+    parking spot Windows gives it, which is worse than useless to act on, so it
+    is left out rather than printed as if it meant something.
+
     Handles are printed in decimal because the model passes them straight back
-    as JSON integers.
+    as JSON integers, and geometry as origin plus size because that is what a
+    reader wants to know about a window.
     """
     width, height = o.screen_size
-    header = (
-        f"screen {width}x{height} | cursor ({o.cursor[0]},{o.cursor[1]}) | "
-        f"{len(o.windows)} window(s) | foreground hwnd "
-        f"{o.foreground_hwnd if o.foreground_hwnd else 'none'}"
-    )
-    lines = [header]
+    lines = [f"screen {width}x{height} | cursor ({o.cursor[0]},{o.cursor[1]})"]
+    if o.foreground_hwnd and not any(w.is_foreground for w in o.windows):
+        lines[0] += f" | foreground hwnd {o.foreground_hwnd} (not a user window)"
     if not o.windows:
         lines.append("(no user windows)")
     for w in o.windows:
         left, top, right, bottom = w.bounds
-        flags = []
-        if w.is_foreground:
-            flags.append("FOREGROUND")
-        if w.is_minimized:
-            flags.append("minimized")
-        suffix = f" [{' '.join(flags)}]" if flags else ""
-        process = w.process_name or "unknown"
-        lines.append(
-            f'[{w.hwnd}] {process} "{w.title}" '
-            f"@({left},{top})-({right},{bottom}){suffix}"
+        where = (
+            "minimized"
+            if w.is_minimized
+            else f"@{left},{top} {right - left}x{bottom - top}"
         )
+        flags = " FOREGROUND" if w.is_foreground else ""
+        lines.append(f'[{w.hwnd}] {w.process_name or "unknown"} "{w.title}" {where}{flags}')
     return "\n".join(lines)

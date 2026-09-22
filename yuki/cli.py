@@ -16,13 +16,14 @@ from yuki.agent.loop import Agent
 from yuki.config import EFFORT_LEVELS, MODEL_ALIASES, Settings
 from yuki.log.events import AgentEvent, AskUser, ErrorEvent, Final, SessionLogger
 
-HELP = """\
+HELP = f"""\
 Type a request and press enter. Commands:
-  /model sonnet|opus       switch model for the next request
-  /effort low|medium|high  how hard the model works on the next request
-  /cancel                  cancel the current question and drop the request
-  /help                    this text
-  /quit                    exit (Ctrl-D also works)"""
+  /model sonnet|opus    switch model for the next request
+  /effort {"|".join(EFFORT_LEVELS)}
+                        how hard the model works on the next request
+  /cancel               cancel the current question and drop the request
+  /help                 this text
+  /quit                 exit (Ctrl-D also works)"""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
