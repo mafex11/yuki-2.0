@@ -10,6 +10,7 @@ dependencies = [
     "pillow>=12.3.0",
     "psutil>=7.2.2",
     "pyautogui>=0.9.54",
+    "pyside6>=6.11.2",
     "pywin32>=312",
     "rich>=15.0.0",
     "uiautomation>=2.0.29",
@@ -22,6 +23,7 @@ dev = [
 
 [project.scripts]
 yuki = "yuki.cli:main"
+yuki-ui = "yuki.ui.app:main"
 
 [build-system]
 requires = ["uv_build>=0.9.9,<0.10.0"]

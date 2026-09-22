@@ -4,6 +4,8 @@ from yuki.agent.context import ContextManager
 from yuki.agent.loop import Agent
 from yuki.agent.prompt import SYSTEM_PROMPT, system_blocks
 from yuki.agent.tools import (
+    ACTION_TOOL_NAMES,
+    ALL_TOOL_NAMES,
     CONTROL_TOOLS,
     PERCEPTION_TOOLS,
     TOOL_SCHEMAS,
@@ -13,10 +15,14 @@ from yuki.agent.tools import (
     ToolError,
     ToolOutcome,
     default_backend,
+    resolve_tool_names,
     tool_params,
+    unavailable_tool,
 )
 
 __all__ = [
+    "ACTION_TOOL_NAMES",
+    "ALL_TOOL_NAMES",
     "CONTROL_TOOLS",
     "PERCEPTION_TOOLS",
     "SYSTEM_PROMPT",
@@ -29,6 +35,8 @@ __all__ = [
     "ToolError",
     "ToolOutcome",
     "default_backend",
+    "resolve_tool_names",
     "system_blocks",
     "tool_params",
+    "unavailable_tool",
 ]

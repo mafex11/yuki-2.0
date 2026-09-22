@@ -58,7 +58,9 @@ sentences: what happened, or the answer, or what you need. No preamble, no recap
 your steps, no bullet lists."""
 
 
-def system_blocks(*, cacheable: bool = True) -> list[dict[str, Any]]:
+def system_blocks(
+    *, cacheable: bool = True, extra: str | None = None
+) -> list[dict[str, Any]]:
     """Return the ``system`` parameter for a request.
 
     Args:
@@ -66,11 +68,19 @@ def system_blocks(*, cacheable: bool = True) -> list[dict[str, Any]]:
             every turn after the first. The prompt is a frozen constant, so the
             cached prefix stays byte-stable; per-turn volatile context (the
             desktop overview and the running note) goes into ``messages``.
+        extra: Per-instance role framing, appended as a *second* text block. It
+            gets its own ``cache_control`` breakpoint, so the frozen first block
+            remains a byte-identical prefix that every Yuki instance in the
+            process shares a cache entry for, while this block is cached
+            separately per wording. Blank or whitespace-only values are ignored.
 
     Returns:
-        A one-element list of text blocks.
+        One text block, or two when ``extra`` is given.
     """
-    block: dict[str, Any] = {"type": "text", "text": SYSTEM_PROMPT}
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": SYSTEM_PROMPT}]
+    if extra and extra.strip():
+        blocks.append({"type": "text", "text": extra.strip()})
     if cacheable:
-        block["cache_control"] = {"type": "ephemeral"}
-    return [block]
+        for block in blocks:
+            block["cache_control"] = {"type": "ephemeral"}
+    return blocks

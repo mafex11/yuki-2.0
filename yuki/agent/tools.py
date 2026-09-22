@@ -18,7 +18,7 @@ import base64
 import dataclasses
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -257,21 +257,99 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 #: Name -> schema, for validation and lookups.
 TOOLS_BY_NAME: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOL_SCHEMAS}
 
+#: Every tool name, in registry order. Immutable on purpose: the order is part of
+#: the cached prefix, so a caller that reordered it would silently cost cache hits.
+ALL_TOOL_NAMES: tuple[str, ...] = tuple(TOOLS_BY_NAME)
 
-def tool_params(*, cacheable: bool = True) -> list[dict[str, Any]]:
+#: The tools that reach out and change something on the machine, as opposed to the
+#: ones that only look. Handy as a ready-made argument for a look-but-do-not-touch
+#: Yuki (``tool_names=[n for n in ALL_TOOL_NAMES if n not in ACTION_TOOL_NAMES]``).
+#: It is a list of names, not a rule: nothing here decides what the model does.
+ACTION_TOOL_NAMES: tuple[str, ...] = (
+    "launch_app",
+    "focus_window",
+    "click",
+    "type_text",
+    "hotkey",
+    "press",
+    "scroll",
+    "run_powershell",
+    "open_url",
+)
+
+
+def resolve_tool_names(names: Iterable[str] | None) -> tuple[str, ...] | None:
+    """Validate a requested tool subset and return it in registry order.
+
+    The three control tools are always added: without ``done`` a turn can never
+    end, without ``ask_user`` the agent cannot pause, and without
+    ``note_to_self`` it loses its memory as older context ages out.
+
+    Args:
+        names: The tools to expose, or ``None`` for all of them.
+
+    Returns:
+        ``None`` when ``names`` is ``None``, otherwise the resolved names in
+        :data:`ALL_TOOL_NAMES` order, so the cached tool block stays byte-stable
+        for a given subset however the caller happened to order it.
+
+    Raises:
+        ValueError: If any name is not in the registry.
+    """
+    if names is None:
+        return None
+    requested = list(names)
+    unknown = [name for name in requested if name not in TOOLS_BY_NAME]
+    if unknown:
+        raise ValueError(
+            f"unknown tool name(s): {', '.join(sorted(set(unknown)))}; "
+            f"available: {', '.join(ALL_TOOL_NAMES)}"
+        )
+    wanted = set(requested) | set(CONTROL_TOOLS)
+    return tuple(name for name in ALL_TOOL_NAMES if name in wanted)
+
+
+def tool_params(
+    *, cacheable: bool = True, names: Iterable[str] | None = None
+) -> list[dict[str, Any]]:
     """Return the tool definitions for a request.
 
     Args:
         cacheable: Mark the last tool definition with ``cache_control`` so the
             whole (byte-stable) tool block is cached by the API.
+        names: Restrict the list to these tools (plus the control tools), as
+            resolved by :func:`resolve_tool_names`. ``None`` sends all of them.
 
     Returns:
         A fresh list of tool dicts; the caller may not mutate the module copy.
     """
-    tools = [dict(t) for t in TOOL_SCHEMAS]
+    allowed = resolve_tool_names(names)
+    tools = [dict(t) for t in TOOL_SCHEMAS if allowed is None or t["name"] in allowed]
     if cacheable and tools:
         tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
+
+
+def unavailable_tool(name: str, available: Iterable[str]) -> "ToolOutcome":
+    """The outcome for a tool the model asked for but cannot have.
+
+    Covers both "there is no such tool" and "that tool is not in this instance's
+    subset": from the model's side they are the same situation, and the way out is
+    the same -- pick something from the list it is given.
+    """
+    return ToolOutcome(
+        name=name,
+        ok=False,
+        summary=f"tool {name!r} is not available",
+        content=[
+            {
+                "type": "text",
+                "text": f"There is no tool named {name!r} available to you. "
+                "Available: " + ", ".join(sorted(available)),
+            }
+        ],
+        payload={"error": "unknown_tool", "name": name},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +403,10 @@ class Backend(Protocol):
     def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any: ...
     def open_url(self, url: str) -> Any: ...
 
+    # Optional, and not part of the architecture contract: a backend without it
+    # simply never gets pre-warmed. See :meth:`Dispatcher.prewarm_shell`.
+    def prewarm_shell(self) -> bool: ...  # pragma: no cover - protocol only
+
 
 class _LazyRealBackend:
     """Backend that resolves attributes from the real perception/action modules.
@@ -353,6 +435,18 @@ class _LazyRealBackend:
         "run_powershell",
         "open_url",
     }
+
+    def prewarm_shell(self) -> bool:
+        """Open the persistent PowerShell session now, before anything needs it.
+
+        A real method rather than something resolved through ``__getattr__``: it
+        is not one of the contract's action functions and is not re-exported from
+        :mod:`yuki.actions`, so it reaches straight into
+        :mod:`yuki.actions.shell`, which owns the session.
+        """
+        import importlib
+
+        return bool(importlib.import_module("yuki.actions.shell").prewarm())
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
         import importlib
@@ -448,6 +542,26 @@ class Dispatcher:
         self.tool_timeout_s = tool_timeout_s
         self.max_tree_elements = max_tree_elements
 
+    # -- warm-up -----------------------------------------------------------
+
+    def prewarm_shell(self) -> bool:
+        """Ask the backend to start its persistent PowerShell session now.
+
+        The audit measured 2-4.7 s of cold start for that session, which the
+        first ``run_powershell`` of a session would otherwise pay in front of the
+        user. Safe to call on any backend: one with no ``prewarm_shell`` (every
+        test double, and any backend without a real shell) returns ``False``
+        instead of raising. Blocks, so callers run it off the main thread --
+        :class:`yuki.agent.loop.Agent` does exactly that at construction.
+
+        Returns:
+            True if the backend reported a live session.
+        """
+        prewarm = getattr(self.backend, "prewarm_shell", None)
+        if not callable(prewarm):
+            return False
+        return bool(prewarm())
+
     # -- entry point -------------------------------------------------------
 
     def dispatch(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -460,20 +574,9 @@ class Dispatcher:
         started = time.perf_counter()
         handler = getattr(self, f"_do_{name}", None)
         if handler is None:
-            return ToolOutcome(
-                name=name,
-                ok=False,
-                summary=f"unknown tool {name!r}",
-                content=[
-                    {
-                        "type": "text",
-                        "text": f"There is no tool named {name!r}. Available: "
-                        + ", ".join(sorted(TOOLS_BY_NAME)),
-                    }
-                ],
-                payload={"error": "unknown_tool"},
-                elapsed_ms=(time.perf_counter() - started) * 1000,
-            )
+            outcome = unavailable_tool(name, TOOLS_BY_NAME)
+            outcome.elapsed_ms = (time.perf_counter() - started) * 1000
+            return outcome
         try:
             outcome = handler(tool_input)
         except ToolError as exc:
