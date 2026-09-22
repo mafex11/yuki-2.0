@@ -3,8 +3,10 @@
 Two paths, same contract:
 
 * **Persistent session** (default).  ``powershell.exe`` costs ~1.3 s to start on
-  a normal desktop, which is unacceptable for an assistant that prefers shell
-  commands over clicking.  One long-lived ``-Command -`` process is kept alive
+  a normal desktop (2-4.7 s measured to first usable command on this one), which
+  is unacceptable for an assistant that prefers shell commands over clicking, so
+  :func:`prewarm` pays that cost at start-up instead of in front of the user.
+  One long-lived ``-Command -`` process is kept alive
   and each script is handed to it as base64 (so multi-line scripts, quotes and
   pipes survive untouched), framed by unique sentinels on stdout and stderr so
   output can be attributed to exactly one command.  Working directory,
@@ -266,6 +268,39 @@ def _run_in_session(command: str, timeout_s: float) -> _RunOutcome | None:
             _session.kill()
             _session = None
             return None
+
+
+def prewarm(*, timeout_s: float = 30.0) -> bool:
+    """Start the persistent session now, so the first real command is fast.
+
+    Starting ``powershell.exe`` and getting it to the point where it will run a
+    script measured 2-4.7 s on this machine, and whoever asks for the first
+    command of a session pays all of it. Calling this at start-up moves that cost
+    off the critical path.
+
+    It runs one trivial script rather than only spawning the process: the
+    ``_Session`` constructor returns as soon as ``Popen`` does, while the shell is
+    still loading, so a session that has never round-tripped is not actually warm.
+
+    Blocks for as long as the shell takes, so call it from a background thread.
+    Never raises: a machine where PowerShell cannot start still gets a working
+    Yuki, it just finds out when something really needs the shell.
+
+    Args:
+        timeout_s: Budget for the warm-up round-trip. Generous, because a cold
+            shell on a busy machine is exactly the case being waited on.
+
+    Returns:
+        True when the session answered and is live.
+    """
+    try:
+        outcome = _run_in_session("$null", timeout_s)
+    except Exception:
+        return False
+    if outcome is None or outcome.timed_out:
+        return False
+    with _session_lock:
+        return _session is not None and _session.alive
 
 
 def _run_one_shot(command: str, timeout_s: float) -> _RunOutcome:

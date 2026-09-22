@@ -14,6 +14,11 @@ Every input function takes an optional ``expect_hwnd``: when given, the
 foreground window is checked immediately before anything is sent, and nothing is
 sent if another window has taken focus.
 
+Long or non-ASCII text is pasted rather than typed, which means borrowing the
+user's clipboard.  It is borrowed, not spent: every format on it is snapshotted
+byte-for-byte first and put back afterwards, so an image or a set of copied files
+survives Yuki pasting a sentence.
+
 Nothing here sleeps: no glide, no per-control delay tables, no settle time.
 """
 
@@ -34,6 +39,7 @@ pyautogui.FAILSAFE = False  # a corner-of-screen cursor must not abort Yuki
 pyautogui.PAUSE = 0  # we wait on conditions, never on the clock
 
 _user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
 
 _MOUSEEVENTF = {
     "left": (0x0002, 0x0004),  # down, up
@@ -102,6 +108,34 @@ _user32.MapVirtualKeyW.argtypes = [ctypes.c_uint, ctypes.c_uint]
 _user32.MapVirtualKeyW.restype = ctypes.c_uint
 _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_int]
 _user32.SendInput.restype = ctypes.c_uint
+
+# The clipboard and global-memory calls, likewise explicit: GetClipboardData and
+# GlobalLock return pointers, and without a restype ctypes truncates them to a
+# 32-bit int, which on a 64-bit process silently corrupts every handle.
+_user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+_user32.OpenClipboard.restype = ctypes.c_int
+_user32.CloseClipboard.argtypes = []
+_user32.CloseClipboard.restype = ctypes.c_int
+_user32.EmptyClipboard.argtypes = []
+_user32.EmptyClipboard.restype = ctypes.c_int
+_user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
+_user32.EnumClipboardFormats.restype = ctypes.c_uint
+_user32.GetClipboardData.argtypes = [ctypes.c_uint]
+_user32.GetClipboardData.restype = ctypes.c_void_p
+_user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+_user32.SetClipboardData.restype = ctypes.c_void_p
+_user32.GetClipboardFormatNameW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetClipboardFormatNameW.restype = ctypes.c_int
+_kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+_kernel32.GlobalAlloc.restype = ctypes.c_void_p
+_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalLock.restype = ctypes.c_void_p
+_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalUnlock.restype = ctypes.c_int
+_kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalSize.restype = ctypes.c_size_t
+_kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalFree.restype = ctypes.c_void_p
 
 
 def _key_event(vk: int, scan: int, *, up: bool, unicode: bool = False) -> _Input:
@@ -336,26 +370,202 @@ def click(
     return _result(True, f"{label} {button} at ({x},{y})", details, started)
 
 
-def _get_clipboard_text() -> str | None:
-    """Current clipboard text, or ``None`` when it holds something else."""
-    for _ in range(20):  # the clipboard is a shared lock; retry briefly
-        try:
-            win32clipboard.OpenClipboard()
-        except Exception:
-            time.sleep(0.005)  # another process holds the clipboard lock
-            continue
-        try:
-            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                return win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-            return None
-        except Exception:
-            return None
-        finally:
+_GMEM_MOVEABLE = 0x0002
+
+#: Total bytes we are willing to hold in Python while the clipboard is borrowed.
+#: A 4K screenshot arrives as ~33 MB of CF_DIB plus a CF_DIBV5 copy plus a PNG, so
+#: the budget has to be roomy; it exists only to stop something pathological from
+#: turning "type a sentence" into a memory spike.
+_CLIPBOARD_SNAPSHOT_BUDGET = 128 * 1024 * 1024
+
+#: Formats whose clipboard "data" is not a block of global memory but a GDI or
+#: application handle (or nothing at all, for owner-rendered data).  Copying the
+#: bytes behind those handles is not what duplicating them means, and handing the
+#: same handle back would give two owners the right to free it, so they are read
+#: past and reported instead.  This is a Win32 fact about handle types, not a
+#: judgement about content.
+_UNDUPLICABLE_FORMATS: frozenset[int] = frozenset(
+    {
+        2,  # CF_BITMAP        - HBITMAP
+        3,  # CF_METAFILEPICT  - METAFILEPICT wrapping an HMETAFILE
+        9,  # CF_PALETTE       - HPALETTE
+        14,  # CF_ENHMETAFILE  - HENHMETAFILE
+        0x0080,  # CF_OWNERDISPLAY     - no data; the owner paints it
+        0x0083,  # CF_DSPMETAFILEPICT
+        0x008E,  # CF_DSPENHMETAFILE
+    }
+)
+
+#: Names for the built-in formats, for the log only.  Registered formats
+#: (``>= 0xC000``, e.g. "PNG", "HTML Format") carry their own name in Windows.
+_CLIPBOARD_FORMAT_NAMES: dict[int, str] = {
+    1: "CF_TEXT",
+    2: "CF_BITMAP",
+    3: "CF_METAFILEPICT",
+    4: "CF_SYLK",
+    5: "CF_DIF",
+    6: "CF_TIFF",
+    7: "CF_OEMTEXT",
+    8: "CF_DIB",
+    9: "CF_PALETTE",
+    10: "CF_PENDATA",
+    11: "CF_RIFF",
+    12: "CF_WAVE",
+    13: "CF_UNICODETEXT",
+    14: "CF_ENHMETAFILE",
+    15: "CF_HDROP",
+    16: "CF_LOCALE",
+    17: "CF_DIBV5",
+    0x0080: "CF_OWNERDISPLAY",
+    0x0081: "CF_DSPTEXT",
+    0x0082: "CF_DSPBITMAP",
+    0x0083: "CF_DSPMETAFILEPICT",
+    0x008E: "CF_DSPENHMETAFILE",
+}
+
+
+def _format_name(fmt: int) -> str:
+    """Readable name for a clipboard format id, for logging."""
+    known = _CLIPBOARD_FORMAT_NAMES.get(fmt)
+    if known:
+        return known
+    buffer = ctypes.create_unicode_buffer(256)
+    if _user32.GetClipboardFormatNameW(fmt, buffer, len(buffer)) > 0:
+        return buffer.value
+    if 0x0200 <= fmt <= 0x02FF:
+        return f"CF_PRIVATE+{fmt - 0x0200}"
+    if 0x0300 <= fmt <= 0x03FF:
+        return f"CF_GDIOBJ+{fmt - 0x0300}"
+    return f"format {fmt}"
+
+
+def _open_clipboard(attempts: int = 20) -> bool:
+    """Take the clipboard lock, retrying briefly while someone else holds it."""
+    for _ in range(attempts):
+        if _user32.OpenClipboard(None):
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class _ClipboardSnapshot:
+    """Every duplicable format that was on the clipboard, and what was not.
+
+    Attributes:
+        items: ``(format id, bytes)`` in the order Windows enumerated them, which
+            is the owner's own priority order - most-descriptive first - and the
+            order they are put back in.
+        kept: Names of the formats captured.
+        skipped: Names of the formats that could not be captured, with why.
+        empty: True when the clipboard held nothing at all.
+    """
+
+    __slots__ = ("items", "kept", "skipped", "empty")
+
+    def __init__(self) -> None:
+        self.items: list[tuple[int, bytes]] = []
+        self.kept: list[str] = []
+        self.skipped: list[str] = []
+        self.empty = False
+
+
+def _snapshot_clipboard() -> _ClipboardSnapshot | None:
+    """Copy the whole clipboard out, format by format.
+
+    Restoring only the text (which is all a paste needs to put *in*) silently
+    destroys anything else the user had copied: an image, a group of files, a
+    spreadsheet range.  So every format is enumerated and the bytes behind each
+    global-memory handle are copied into Python.
+
+    Returns:
+        The snapshot, or ``None`` if the clipboard could not even be opened - in
+        which case the caller should leave it alone rather than guess.
+    """
+    if not _open_clipboard():
+        return None
+    snapshot = _ClipboardSnapshot()
+    total = 0
+    try:
+        fmt = _user32.EnumClipboardFormats(0)
+        if fmt == 0:
+            snapshot.empty = True
+            return snapshot
+        while fmt:
+            name = _format_name(fmt)
+            if fmt in _UNDUPLICABLE_FORMATS or 0x0200 <= fmt <= 0x03FF:
+                snapshot.skipped.append(f"{name} (handle, not copyable)")
+            else:
+                try:
+                    handle = _user32.GetClipboardData(fmt)
+                    size = _kernel32.GlobalSize(handle) if handle else 0
+                    if not handle:
+                        snapshot.skipped.append(f"{name} (no data)")
+                    elif not size:
+                        snapshot.skipped.append(f"{name} (not global memory)")
+                    elif total + size > _CLIPBOARD_SNAPSHOT_BUDGET:
+                        snapshot.skipped.append(f"{name} ({size} bytes, over budget)")
+                    else:
+                        pointer = _kernel32.GlobalLock(handle)
+                        if not pointer:
+                            snapshot.skipped.append(f"{name} (could not be locked)")
+                        else:
+                            try:
+                                data = ctypes.string_at(pointer, size)
+                            finally:
+                                _kernel32.GlobalUnlock(handle)
+                            snapshot.items.append((fmt, data))
+                            snapshot.kept.append(name)
+                            total += size
+                except Exception as exc:  # one awkward format must not lose the rest
+                    snapshot.skipped.append(f"{name} ({type(exc).__name__})")
+            fmt = _user32.EnumClipboardFormats(fmt)
+    finally:
+        _user32.CloseClipboard()
+    return snapshot
+
+
+def _restore_clipboard(snapshot: _ClipboardSnapshot | None) -> tuple[bool, list[str]]:
+    """Put a snapshot back, best effort.
+
+    Each format gets a fresh ``GMEM_MOVEABLE`` block holding the same bytes.
+    Ownership of a block passes to the system the moment ``SetClipboardData``
+    accepts it, so an accepted block is never freed here and a rejected one always
+    is.
+
+    Returns:
+        ``(everything restored, names that failed)``.  ``snapshot`` of ``None``
+        means there was nothing to restore and the clipboard is left untouched.
+    """
+    if snapshot is None:
+        return False, []
+    if not _open_clipboard():
+        return False, ["clipboard busy"]
+    failed: list[str] = []
+    try:
+        _user32.EmptyClipboard()
+        for fmt, data in snapshot.items:
+            handle = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, max(len(data), 1))
+            if not handle:
+                failed.append(f"{_format_name(fmt)} (out of memory)")
+                continue
+            pointer = _kernel32.GlobalLock(handle)
+            if not pointer:
+                _kernel32.GlobalFree(handle)
+                failed.append(f"{_format_name(fmt)} (could not be locked)")
+                continue
             try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
-    return None
+                if data:
+                    ctypes.memmove(pointer, data, len(data))
+            finally:
+                _kernel32.GlobalUnlock(handle)
+            if not _user32.SetClipboardData(fmt, handle):
+                _kernel32.GlobalFree(handle)  # still ours: the clipboard refused it
+                failed.append(f"{_format_name(fmt)} (rejected)")
+    except Exception as exc:  # pragma: no cover - needs a live clipboard to fail
+        failed.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        _user32.CloseClipboard()
+    return not failed, failed
 
 
 def _set_clipboard_text(text: str | None) -> bool:
@@ -409,6 +619,11 @@ def type_text(
     or non-ASCII is pasted instead: the clipboard is swapped, Ctrl+V is sent, and
     the previous contents are restored once the target app has read it.
 
+    "The previous contents" means all of them, not just the text.  Every clipboard
+    format is snapshotted and put back, so an image or a set of copied files is
+    still there afterwards; ``details`` records exactly which formats came back
+    and which could not (see :func:`_snapshot_clipboard`).
+
     Args:
         text: what to type.
         press_enter: press Enter after the text.
@@ -434,16 +649,20 @@ def type_text(
         return _result(True, "nothing to type", details, started)
 
     if needs_clipboard:
-        previous = _get_clipboard_text()
+        previous = _snapshot_clipboard()
         if not _set_clipboard_text(text):
             return _result(False, "could not write to the clipboard", details, started)
         pyautogui.hotkey("ctrl", "v")
         consumed = _wait_clipboard_released(
             time.monotonic() + _CLIPBOARD_HANDOFF_S
         )
-        restored = _set_clipboard_text(previous)
+        restored, failed = _restore_clipboard(previous)
         details["clipboard_consumed"] = consumed
         details["clipboard_restored"] = restored
+        details["clipboard_kept"] = previous.kept if previous else None
+        details["clipboard_skipped"] = previous.skipped if previous else None
+        if failed:
+            details["clipboard_restore_failed"] = failed
     else:
         sent, expected = _send_text(text)
         details["events_sent"] = sent

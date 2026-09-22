@@ -13,15 +13,16 @@ from typing import Iterator, Sequence
 from rich.console import Console
 
 from yuki.agent.loop import Agent
-from yuki.config import MODEL_ALIASES, Settings, resolve_model
+from yuki.config import EFFORT_LEVELS, MODEL_ALIASES, Settings
 from yuki.log.events import AgentEvent, AskUser, ErrorEvent, Final, SessionLogger
 
 HELP = """\
 Type a request and press enter. Commands:
-  /model sonnet|opus   switch model for the next request
-  /cancel              cancel the current question and drop the request
-  /help                this text
-  /quit                exit (Ctrl-D also works)"""
+  /model sonnet|opus       switch model for the next request
+  /effort low|medium|high  how hard the model works on the next request
+  /cancel                  cancel the current question and drop the request
+  /help                    this text
+  /quit                    exit (Ctrl-D also works)"""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -39,7 +40,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger = SessionLogger(settings.sessions_dir, console=console)
     agent = Agent(settings, logger)
 
-    console.print(f"[bold]yuki[/bold] [dim]{settings.model} | session {logger.session_id}[/dim]")
+    console.print(
+        f"[bold]yuki[/bold] [dim]{settings.model} | effort {settings.effort} | "
+        f"session {logger.session_id}[/dim]"
+    )
     console.print(f"[dim]{HELP}[/dim]")
 
     try:
@@ -52,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not line:
                 continue
             if line.startswith("/"):
-                if _command(line, settings, console):
+                if _command(line, agent, console):
                     continue
                 break
             _run_request(agent, line, console)
@@ -62,14 +66,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _command(line: str, settings: Settings, console: Console) -> bool:
+def _command(line: str, agent: Agent, console: Console) -> bool:
     """Handle a slash command.
+
+    Both switches go through the agent rather than poking ``settings`` directly,
+    so each one lands in the transcript as a ``model_switch`` / ``effort_switch``
+    record and a later reader can see what the session was running at each turn.
 
     Returns:
         True to keep looping, False to exit.
     """
     parts = line.split()
     name = parts[0].lower()
+    settings = agent.settings
     if name in {"/quit", "/exit"}:
         return False
     if name == "/help":
@@ -85,8 +94,19 @@ def _command(line: str, settings: Settings, console: Console) -> bool:
                 f"choices: {', '.join(sorted(MODEL_ALIASES))}[/dim]"
             )
             return True
-        settings.model = resolve_model(parts[1])
-        console.print(f"[dim]model -> {settings.model}[/dim]")
+        console.print(f"[dim]model -> {agent.set_model(parts[1])}[/dim]")
+        return True
+    if name == "/effort":
+        if len(parts) < 2:
+            console.print(
+                f"[dim]effort is {settings.effort}; "
+                f"choices: {', '.join(EFFORT_LEVELS)}[/dim]"
+            )
+            return True
+        try:
+            console.print(f"[dim]effort -> {agent.set_effort(parts[1])}[/dim]")
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
         return True
     console.print(f"[red]unknown command {name}[/red]")
     return True
