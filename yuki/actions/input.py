@@ -22,7 +22,18 @@ user's clipboard.  It is borrowed, not spent: every format on it is snapshotted
 byte-for-byte first and put back afterwards, so an image or a set of copied files
 survives Yuki pasting a sentence.
 
-Nothing here sleeps: no glide, no per-control delay tables, no settle time.
+After a click, the result says what the click *did*: the window that is in front
+now and the control that has keyboard focus, named by role and text, and whether
+that control takes typing.  Without it a missed click is indistinguishable from a
+hit - on 2026-09-22 three clicks 30-100 px apart all "succeeded" while Spotify's
+search field sat untouched - and the only way to find out was to take a
+screenshot and look.  The facts come from ``GetForegroundWindow``,
+``GetGUIThreadInfo`` and one UIA focused-element read, which together cost a few
+milliseconds.
+
+Nothing here sleeps: no glide, no per-control delay tables, no settle time.  The
+one wait after a click is a condition poll for the focus to move, abandoned at a
+deadline, because "focus did not move" is a real answer and not worth waiting out.
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ from yuki.actions import ActionResult
 from yuki.perception.windows import (
     accepts_input,
     cursor_position,
+    focused_control_hwnd,
     virtual_screen_bounds,
     window_info,
 )
@@ -381,6 +393,147 @@ def _move(x: int, y: int) -> None:
     _user32.SetCursorPos(int(x), int(y))
 
 
+#: How long the focus is watched for a change after a click.  A condition poll
+#: with a deadline, not a settle sleep: a click that lands on a text field moves
+#: the focus within a few milliseconds and the poll ends there, while a click that
+#: hit nothing costs this much and is reported honestly as having moved nothing.
+_FOCUS_WATCH_S = 0.2
+
+#: How often that watch re-asks.  One read is ~5 ms, so this is as tight as it is
+#: worth being.
+_FOCUS_POLL_S = 0.01
+
+
+def _read_focus():  # -> yuki.perception.tree.FocusInfo | None
+    """What UIA says has focus, or ``None`` when UIA is unavailable.
+
+    Imported here rather than at module scope: :mod:`yuki.perception.tree` builds a
+    comtypes wrapper for UIAutomationCore at import, and sending a keystroke should
+    not depend on that having happened.
+    """
+    try:
+        from yuki.perception.tree import focused_element
+    except Exception:
+        return None
+    try:
+        return focused_element()
+    except Exception:
+        return None
+
+
+def _focus_state() -> dict:
+    """Everything cheap about where input would go right now.
+
+    Three layers, coarsest first: which top-level window is in front, which of its
+    controls its own GUI thread reports focus on, and - the only one that can see
+    inside a window that keeps its whole UI in one HWND - what UIA says the focused
+    element actually is.
+    """
+    foreground = int(_user32.GetForegroundWindow())
+    info = window_info(foreground) if foreground else None
+    return {
+        "foreground_hwnd": foreground,
+        "foreground_title": info.title if info else "",
+        "foreground_process": info.process_name if info else "",
+        "focused_control_hwnd": focused_control_hwnd(foreground) if foreground else 0,
+        "focus": _read_focus(),
+    }
+
+
+def _watch_focus(before: dict, *, timeout_s: float = _FOCUS_WATCH_S) -> dict:
+    """Poll until the focus differs from ``before``, or the deadline passes.
+
+    A click's effect on focus is not instantaneous, so reading it back straight
+    away would report the old state as often as the new one.  This waits for the
+    condition - any of the three layers changed - and returns the moment it holds.
+    """
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    state = _focus_state()
+    while _focus_unmoved(before, state) and time.monotonic() < deadline:
+        time.sleep(_FOCUS_POLL_S)
+        state = _focus_state()
+    return state
+
+
+def _focus_unmoved(before: dict, after: dict) -> bool:
+    """Whether focus is on the same thing it was before."""
+    if before["foreground_hwnd"] != after["foreground_hwnd"]:
+        return False
+    if before["focused_control_hwnd"] != after["focused_control_hwnd"]:
+        return False
+    old, new = before.get("focus"), after.get("focus")
+    if old is None or new is None:
+        return True  # no UIA to tell us otherwise; the Win32 layers agreed
+    return new.same_as(old)
+
+
+def _describe_outcome(before: dict, after: dict) -> tuple[str, dict]:
+    """A phrase for ``summary`` and the flat facts for ``details``.
+
+    The phrase is what a person would say about the click - "focus now Edit
+    'What do you want to play?'", "focus unchanged" - and the dict is the same
+    thing without the prose, so the log keeps the handles and the model reading the
+    summary does not have to.
+    """
+    focus = after.get("focus")
+    facts: dict = {
+        "foreground_hwnd": after["foreground_hwnd"],
+        "foreground_title": after["foreground_title"],
+        "foreground_process": after["foreground_process"],
+        "focused_control_hwnd": after["focused_control_hwnd"],
+        "foreground_changed": before["foreground_hwnd"] != after["foreground_hwnd"],
+        "focus_changed": not _focus_unmoved(before, after),
+    }
+    if focus is not None and focus.ok:
+        facts.update(
+            {
+                "focus_role": focus.role,
+                "focus_name": focus.name,
+                "focus_value": focus.value,
+                "focus_accepts_text": focus.accepts_text,
+                "focus_shortcut": focus.shortcut,
+            }
+        )
+    parts: list[str] = []
+    who = (
+        f'{after["foreground_process"] or "unknown"} "{after["foreground_title"]}" '
+        f'(hwnd {after["foreground_hwnd"]})'
+        if after["foreground_hwnd"]
+        else "no window"
+    )
+    if facts["foreground_changed"]:
+        parts.append(f"foreground now {who}")
+    else:
+        parts.append(f"foreground still {who}")
+    described = focus.describe() if focus is not None else "unknown"
+    if facts["focus_changed"]:
+        parts.append(f"focus now {described}")
+    elif described in ("unknown", "nothing"):
+        parts.append(f"focus unchanged ({described})")
+    else:
+        parts.append(f"focus unchanged, still {described}")
+    return "; ".join(parts), facts
+
+
+def _where_focus_is() -> tuple[str, dict]:
+    """Where keyboard input would go right now: a phrase and the flat facts.
+
+    For ``type_text``, which reports a single moment rather than a before/after,
+    so the ``*_changed`` flags :func:`_describe_outcome` adds are left out.
+    """
+    state = _focus_state()
+    facts = _describe_outcome(state, state)[1]
+    facts.pop("foreground_changed", None)
+    facts.pop("focus_changed", None)
+    focus = state["focus"]
+    described = focus.describe() if focus is not None else "unknown"
+    phrase = (
+        f"keyboard focus is on {described} in "
+        f"{state['foreground_process'] or 'no window'}"
+    )
+    return phrase, facts
+
+
 def click(
     x: int,
     y: int,
@@ -398,6 +551,16 @@ def click(
         expect_hwnd: only send if this window is still in the foreground; when
             it is not, nothing is sent and the result is a failure naming the
             window that took focus instead.
+
+    Returns:
+        ActionResult whose ``summary`` says what the click did, not just that it
+        happened - which window is in front now and what has keyboard focus - and
+        whose ``details`` carry ``foreground_hwnd``, ``focused_control_hwnd``, the
+        focused control's ``focus_role``/``focus_name``/``focus_value``,
+        ``focus_accepts_text``, and the ``focus_changed`` /
+        ``foreground_changed`` flags.  A click that hit nothing says "focus
+        unchanged", which is the signal that the coordinate was wrong; retrying the
+        same point is then pointless.
     """
     started = time.perf_counter()
     details = {
@@ -426,6 +589,7 @@ def click(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    before = _focus_state()
     down, up = _MOUSEEVENTF[button]
     _move(x, y)
     for _ in range(clicks):
@@ -435,7 +599,9 @@ def click(
     label = {1: "clicked", 2: "double-clicked", 3: "triple-clicked"}.get(
         clicks, f"clicked {clicks}x"
     )
-    return _result(True, f"{label} {button} at ({x},{y})", details, started)
+    outcome, facts = _describe_outcome(before, _watch_focus(before))
+    details.update(facts)
+    return _result(True, f"{label} {button} at ({x},{y}); {outcome}", details, started)
 
 
 _GMEM_MOVEABLE = 0x0002
@@ -699,11 +865,21 @@ def type_text(
     into that gap are dropped while ``SendInput`` reports success.
     ``details["ready_ms"]`` records the wait.
 
+    When typing does not happen, or only partly happens, the result names what
+    actually has keyboard focus (role, text, and whether it takes text at all).
+    "Nothing was typed" plus "focus is on a Button" is a diagnosis; "nothing was
+    typed" on its own is a shrug.
+
     Args:
         text: what to type.
         press_enter: press Enter after the text.
         expect_hwnd: only send if this window is still in the foreground *and*
             ready to receive input.
+
+    Returns:
+        ActionResult.  ``details`` always carries where the text went or would have
+        gone: ``foreground_hwnd``, ``focused_control_hwnd`` and the focused
+        control's ``focus_role``/``focus_name``/``focus_accepts_text``.
     """
     started = time.perf_counter()
     if not isinstance(text, str):
@@ -730,11 +906,13 @@ def type_text(
             who = f"hwnd {int(expect_hwnd)}"
             if info:
                 who += f' ({info.process_name} "{info.title}")'
+            where, facts = _where_focus_is()
+            details.update(facts)
             return _result(
                 False,
                 f"{who} is not accepting keyboard input yet: no focused control "
                 f"after {waited_ms:.0f} ms, so nothing was typed (typing now would "
-                f"lose characters). Focus it again and retry.",
+                f"lose characters); {where}. Focus it again and retry.",
                 details,
                 started,
             )
@@ -773,18 +951,22 @@ def type_text(
         details["events_expected"] = expected
         if refusal:
             details["interrupted"] = refusal
+            where, facts = _where_focus_is()
+            details.update(facts)
             return _result(
                 False,
-                f"{refusal}; only the first part of the text reached the window. "
-                f"Focus it again and retype the whole thing.",
+                f"{refusal}; only the first part of the text reached the window; "
+                f"{where}. Focus it again and retype the whole thing.",
                 details,
                 started,
             )
         if sent != expected:
+            where, facts = _where_focus_is()
+            details.update(facts)
             return _result(
                 False,
                 f"Windows accepted only {sent} of {expected} key events; the text "
-                f"in the window is incomplete",
+                f"in the window is incomplete; {where}",
                 details,
                 started,
             )
@@ -792,6 +974,9 @@ def type_text(
     if press_enter:
         pyautogui.press("enter")
     preview = text if len(text) <= 60 else text[:60] + "…"
+    # Where it landed, for the log and for a caller checking its work.  Read after
+    # the keystrokes, not before: Enter may well have moved the focus on.
+    details.update(_where_focus_is()[1])
     return _result(
         True,
         f"typed {len(text)} chars via {details['method']}"

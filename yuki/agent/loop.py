@@ -665,7 +665,15 @@ class Agent:
             "messages": [{"role": "user", "content": "warming up"}]
             if warmup
             else self.context.messages,
-            "tools": tool_params(names=self.tool_names),
+            "tools": tool_params(
+                names=self.tool_names,
+                # The dispatcher's policy is the one that gates dispatch, so the
+                # block the model sees must agree with it (never -> no
+                # take_screenshot at all; the dispatcher's refusal is the backstop).
+                screenshot_policy=getattr(
+                    self.dispatcher, "screenshot_policy", self.settings.screenshot_policy
+                ),
+            ),
             "thinking": {"type": "adaptive", "display": self.settings.thinking_display},
             "output_config": {"effort": self.settings.effort},
         }

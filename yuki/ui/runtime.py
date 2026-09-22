@@ -74,7 +74,7 @@ FRONT_DESK_INSTRUCTIONS = (
     "A task is already running on this PC and owns the mouse and keyboard, so for "
     "now you are the one who talks to the user while the other you works. Answer "
     "this if you can without acting on the desktop -- you can still look at the "
-    "desktop, read windows, take screenshots and query system facts. If it needs "
+    "desktop, read windows and query system facts. If it needs "
     "hands, say in one line exactly what you would do and call done: the caller "
     "queues it for the task lane the moment you finish."
 )

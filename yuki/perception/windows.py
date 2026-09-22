@@ -1,8 +1,18 @@
-"""Desktop overview: what windows exist right now.
+"""Desktop overview: what windows exist right now, on which monitors.
 
-Pure Win32 (``EnumWindows`` + DWM cloak state + ``psutil`` for process names).
-No UI Automation is involved, which keeps a full overview in the low
-milliseconds so the agent can be handed a fresh one every turn.
+Pure Win32 (``EnumWindows`` + DWM cloak state + ``EnumDisplayMonitors`` +
+``psutil`` for process names).  No UI Automation is involved, which keeps a full
+overview in the low milliseconds so the agent can be handed a fresh one every
+turn.
+
+Every coordinate in here - window rectangles, element centres, the cursor - is in
+**virtual-desktop** pixels: one coordinate space spanning every monitor, with the
+primary monitor's top-left at (0, 0) and other monitors at whatever offset the
+user arranged them, which can be negative.  ``GetWindowRect`` and ``GetCursorPos``
+already speak it, and :mod:`yuki.actions.input` validates against it, so nothing
+needs converting - but the space is only trustworthy in a per-monitor DPI aware
+process, which :mod:`yuki` arranges at import.  Without that, Windows lies to the
+process about rectangles on any display whose scaling differs from the primary's.
 """
 
 from __future__ import annotations
@@ -42,6 +52,37 @@ class _GUIThreadInfo(ctypes.Structure):
         ("rcCaret", wintypes.RECT),
     ]
 
+
+class _MonitorInfoEx(ctypes.Structure):
+    """``MONITORINFOEXW``: one display's rectangles, flags and device name."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+#: ``MONITORINFOF_PRIMARY``.
+_MONITORINFOF_PRIMARY = 1
+
+#: ``MDT_EFFECTIVE_DPI``: the DPI the user's scaling setting asks for, which is
+#: the one window coordinates are laid out against.
+_MDT_EFFECTIVE_DPI = 0
+
+#: A display at 100% scaling reports 96 dots per inch; every scale factor here is
+#: a monitor's DPI divided by this.
+_DEFAULT_DPI = 96
+
+_MONITOR_ENUM_PROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HMONITOR if hasattr(wintypes, "HMONITOR") else wintypes.HANDLE,
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT),
+    wintypes.LPARAM,
+)
 
 _user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUIThreadInfo)]
 _user32.GetGUIThreadInfo.restype = wintypes.BOOL
@@ -94,14 +135,55 @@ class WindowInfo:
 
 
 @dataclass
+class MonitorInfo:
+    """One display, in virtual-desktop coordinates.
+
+    Attributes:
+        index: position in :func:`list_monitors`, which is the order Windows
+            enumerates displays in.  Stable for as long as the arrangement is.
+        name: the display device name Windows uses (``\\.\\DISPLAY1``).
+        bounds: the whole monitor: ``(left, top, right, bottom)``.
+        work_area: ``bounds`` minus the taskbar and any other docked appbar -
+            where a maximised window actually ends up.
+        is_primary: the monitor whose top-left corner is the origin (0, 0).
+        dpi_scale: display scaling as a factor, 1.0 at 100% and 1.5 at 150%.
+            Informational only: this process is per-monitor DPI aware, so every
+            coordinate here (bounds, window rectangles, element centres, the
+            cursor) is already in physical pixels and needs no scaling.  It tells
+            a reader why text on that display looks bigger for the same pixels.
+        dpi: the raw effective DPI ``dpi_scale`` was derived from.
+    """
+
+    index: int
+    name: str
+    bounds: tuple[int, int, int, int]
+    work_area: tuple[int, int, int, int]
+    is_primary: bool
+    dpi_scale: float
+    dpi: int
+
+
+@dataclass
 class DesktopOverview:
-    """Everything cheap that can be known about the desktop at one instant."""
+    """Everything cheap that can be known about the desktop at one instant.
+
+    ``screen_size`` is the size of the **virtual desktop** - the box around every
+    monitor - not of the primary display.  It used to be the primary display's
+    size, which on this desktop meant reporting 1920x1080 while windows sat at
+    x=2480: every coordinate the model reasoned about was measured against a
+    picture that was missing two thirds of the screen space it was allowed to
+    click in.  ``virtual_bounds`` gives the same box with its origin, which is
+    what matters when a monitor is placed left of or above the primary one and the
+    coordinates there are negative.
+    """
 
     windows: list[WindowInfo] = field(default_factory=list)
     foreground_hwnd: int | None = None
     cursor: tuple[int, int] = (0, 0)
     screen_size: tuple[int, int] = (0, 0)
     captured_at: float = 0.0
+    monitors: list[MonitorInfo] = field(default_factory=list)
+    virtual_bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 def is_cloaked(hwnd: int) -> bool:
@@ -256,7 +338,109 @@ def window_info(hwnd: int) -> WindowInfo | None:
         return None
 
 
+def _monitor_dpi(handle: int) -> int:
+    """Effective DPI of one monitor, or 96 when Windows will not say.
+
+    ``GetDpiForMonitor`` lives in shcore and only answers usefully in a
+    per-monitor DPI aware process; in one that is not, it reports the primary
+    monitor's DPI for every display, which is exactly the lie that makes
+    coordinates on a differently-scaled monitor wrong.
+    """
+    dpi_x = ctypes.c_uint(0)
+    dpi_y = ctypes.c_uint(0)
+    try:
+        result = ctypes.windll.shcore.GetDpiForMonitor(
+            ctypes.c_void_p(handle),
+            ctypes.c_int(_MDT_EFFECTIVE_DPI),
+            ctypes.byref(dpi_x),
+            ctypes.byref(dpi_y),
+        )
+    except Exception:  # pragma: no cover - shcore missing on very old Windows
+        return _DEFAULT_DPI
+    if result != 0 or not dpi_x.value:
+        return _DEFAULT_DPI
+    return int(dpi_x.value)
+
+
+def list_monitors() -> list[MonitorInfo]:
+    """Every display attached right now, in the order Windows enumerates them.
+
+    Returns:
+        One :class:`MonitorInfo` per monitor.  Never empty in practice; a session
+        with no display at all (an RDP session that has dropped) returns ``[]``
+        rather than raising, because an overview is still useful without it.
+    """
+    handles: list[int] = []
+
+    def _collect(handle: int, _hdc: int, _rect: object, _data: int) -> int:
+        handles.append(int(handle))
+        return 1
+
+    try:
+        _user32.EnumDisplayMonitors(None, None, _MONITOR_ENUM_PROC(_collect), 0)
+    except Exception:
+        return []
+
+    monitors: list[MonitorInfo] = []
+    for index, handle in enumerate(handles):
+        info = _MonitorInfoEx()
+        info.cbSize = ctypes.sizeof(_MonitorInfoEx)
+        if not _user32.GetMonitorInfoW(ctypes.c_void_p(handle), ctypes.byref(info)):
+            continue
+        dpi = _monitor_dpi(handle)
+        monitors.append(
+            MonitorInfo(
+                index=index,
+                name=str(info.szDevice),
+                bounds=(
+                    int(info.rcMonitor.left),
+                    int(info.rcMonitor.top),
+                    int(info.rcMonitor.right),
+                    int(info.rcMonitor.bottom),
+                ),
+                work_area=(
+                    int(info.rcWork.left),
+                    int(info.rcWork.top),
+                    int(info.rcWork.right),
+                    int(info.rcWork.bottom),
+                ),
+                is_primary=bool(info.dwFlags & _MONITORINFOF_PRIMARY),
+                dpi_scale=round(dpi / _DEFAULT_DPI, 4),
+                dpi=dpi,
+            )
+        )
+    return monitors
+
+
+def monitor_at(x: int, y: int, monitors: list[MonitorInfo] | None = None) -> MonitorInfo | None:
+    """The monitor a point falls on, or ``None`` when it falls off every one.
+
+    Args:
+        x, y: a point in virtual-desktop coordinates.
+        monitors: a list already read by :func:`list_monitors`, to avoid asking
+            Windows again; omitted means read it now.
+    """
+    for monitor in monitors if monitors is not None else list_monitors():
+        left, top, right, bottom = monitor.bounds
+        if left <= x < right and top <= y < bottom:
+            return monitor
+    return None
+
+
 def screen_size() -> tuple[int, int]:
+    """Size of the whole virtual desktop in physical pixels.
+
+    Deliberately *not* the primary monitor's size, which is what
+    ``SM_CXSCREEN``/``SM_CYSCREEN`` report and what this used to return: a caller
+    asking "how big is the screen" is asking where it is allowed to point, and on
+    a multi-monitor desktop the primary display's size is a smaller box than the
+    truth.  :func:`virtual_screen_bounds` adds the origin.
+    """
+    left, top, right, bottom = virtual_screen_bounds()
+    return (right - left, bottom - top)
+
+
+def primary_screen_size() -> tuple[int, int]:
     """Primary monitor size in physical pixels."""
     return (
         _user32.GetSystemMetrics(win32con.SM_CXSCREEN),
@@ -286,15 +470,19 @@ def cursor_position() -> tuple[int, int]:
 
 
 def get_desktop_overview() -> DesktopOverview:
-    """Snapshot every user window, the foreground window and the cursor."""
+    """Snapshot every user window, every monitor, the foreground window, the cursor."""
     windows = list_windows()
     foreground = _user32.GetForegroundWindow()
+    virtual_bounds = virtual_screen_bounds()
+    left, top, right, bottom = virtual_bounds
     return DesktopOverview(
         windows=windows,
         foreground_hwnd=foreground or None,
         cursor=cursor_position(),
-        screen_size=screen_size(),
+        screen_size=(right - left, bottom - top),
         captured_at=time.time(),
+        monitors=list_monitors(),
+        virtual_bounds=virtual_bounds,
     )
 
 
@@ -313,11 +501,41 @@ def format_overview(o: DesktopOverview) -> str:
     Handles are printed in decimal because the model passes them straight back
     as JSON integers, and geometry as origin plus size because that is what a
     reader wants to know about a window.
+
+    The monitor layout is printed whenever there is more than one display,
+    because without it every window rectangle outside the primary monitor looks
+    like a mistake.  One line per monitor: which one it is, the rectangle it
+    occupies in the same coordinates as the windows below it, its work area when
+    that differs (a docked taskbar), and its scaling when it is not 100%.
     """
     width, height = o.screen_size
-    lines = [f"screen {width}x{height} | cursor ({o.cursor[0]},{o.cursor[1]})"]
+    v_left, v_top = o.virtual_bounds[0], o.virtual_bounds[1]
+    span = "all screens" if len(o.monitors) > 1 else "one screen"
+    lines = [
+        f"screen space {width}x{height} @{v_left},{v_top} ({span}) | "
+        f"cursor ({o.cursor[0]},{o.cursor[1]})"
+    ]
     if o.foreground_hwnd and not any(w.is_foreground for w in o.windows):
         lines[0] += f" | foreground hwnd {o.foreground_hwnd} (not a user window)"
+    if len(o.monitors) > 1:
+        cursor_monitor = monitor_at(o.cursor[0], o.cursor[1], o.monitors)
+        for monitor in o.monitors:
+            left, top, right, bottom = monitor.bounds
+            parts = [
+                f"monitor {monitor.index}"
+                f"{' PRIMARY' if monitor.is_primary else ''}:"
+                f" @{left},{top} {right - left}x{bottom - top}"
+            ]
+            if monitor.work_area != monitor.bounds:
+                w_left, w_top, w_right, w_bottom = monitor.work_area
+                parts.append(
+                    f"work @{w_left},{w_top} {w_right - w_left}x{w_bottom - w_top}"
+                )
+            if monitor.dpi_scale != 1.0:
+                parts.append(f"{monitor.dpi_scale:g}x scaling")
+            if cursor_monitor is not None and cursor_monitor.index == monitor.index:
+                parts.append("cursor here")
+            lines.append(" | ".join(parts))
     if not o.windows:
         lines.append("(no user windows)")
     for w in o.windows:

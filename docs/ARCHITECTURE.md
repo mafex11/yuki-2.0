@@ -12,7 +12,8 @@ The old project at `C:\Users\esska\LLM-OS` is REFERENCE ONLY. Salvage low-level 
 4. **Log everything.** Every model request (full system, messages, tools), every response (full content blocks, usage, latency), every tool call and result, every perception snapshot, every question to the user and their answer, every error. JSONL, one file per session, never truncated. Plus a human-readable pretty stream on the console.
 5. **No LangChain/LangGraph.** Plain Python + `anthropic` SDK (`AnthropicBedrock`) + boto3 + Windows libs.
 6. **Keyboard/mouse input is guarded.** Every input action (`click`, `type_text`, `hotkey`, `press`, `scroll`) accepts `expect_hwnd`; when set, input is sent only if that window is still in the foreground, otherwise the action fails without sending. Tests and scripts must never send Alt+F4 or any key without `expect_hwnd`, and must close windows they opened by terminating the PID. (On 2026-09-22 an unguarded Alt+F4 closed the user's terminal and killed the build session.)
-7. **Windows-only, Python 3.13, `uv`.** Project root `C:\Users\esska\yuki`. Package `yuki/`. Run with `uv run ...`.
+7. **Builders never touch the live desktop.** No sub-agent or script written by one may launch apps, send input, take screenshots, run smoke tests, benchmarks or end-to-end agent runs. Verify by import, compile and stub-driven offline checks only. The user does live testing. (Two terminal-closing incidents on 2026-09-22.)
+8. **Windows-only, Python 3.13, `uv`.** Project root `C:\Users\esska\yuki`. Package `yuki/`. Run with `uv run ...`.
 
 ## Model access
 
@@ -25,13 +26,13 @@ The old project at `C:\Users\esska\LLM-OS` is REFERENCE ONLY. Salvage low-level 
 
 ```
 yuki/
-  config.py          # dataclass Settings: model ids, log dir, screenshot policy (never|ask|auto, default auto)
+  config.py          # dataclass Settings: model ids, log dir, screenshot policy (never|ask|auto, default never (test phase))
   log/
     events.py        # event schema (TypedDicts/dataclasses) + SessionLogger (JSONL + pretty console)
   perception/        # "eyes"
     windows.py       # desktop overview
     tree.py          # UIA tree for one window
-    screenshot.py    # screenshot of screen or one window, downscaled
+    screenshot.py    # screenshot of a window, region, monitor or the desktop; native resolution, origin + scale reported
     system.py        # system facts (processes, memory, cpu, time)
   actions/           # "hands"
     launch.py        # launch app via shell:AppsFolder / Start-Process; focus by hwnd
@@ -43,7 +44,7 @@ yuki/
     loop.py          # Agent: run(request) -> yields events; supports ask_user pause/resume, cancel
     context.py       # context hygiene: replace stale large perception results with stubs; running summary
   cli.py             # terminal REPL
-tests/               # smoke tests; perception/actions tests may require a live desktop
+tests/               # (none) — the user tests live; builders verify offline only
 docs/
 logs/                # gitignored; sessions/<timestamp>.jsonl
 ```
@@ -61,15 +62,27 @@ class WindowInfo:
     pid: int
     is_foreground: bool
     is_minimized: bool
-    bounds: tuple[int, int, int, int]   # left, top, right, bottom (screen px)
+    bounds: tuple[int, int, int, int]   # left, top, right, bottom (virtual-desktop px)
+
+@dataclass
+class MonitorInfo:
+    index: int                     # EnumDisplayMonitors order
+    name: str                      # e.g. "\\.\DISPLAY1"
+    bounds: tuple[int, int, int, int]      # virtual-desktop px
+    work_area: tuple[int, int, int, int]   # bounds minus taskbar/appbars
+    is_primary: bool
+    dpi_scale: float               # 1.0 at 100%, 1.5 at 150% (informational: coordinates are physical px)
+    dpi: int                       # effective DPI
 
 @dataclass
 class DesktopOverview:
     windows: list[WindowInfo]     # all top-level, visible, non-tool windows (Explorer shell windows excluded, taskbar excluded)
     foreground_hwnd: int | None
     cursor: tuple[int, int]
-    screen_size: tuple[int, int]
+    screen_size: tuple[int, int]   # size of the whole virtual desktop (all monitors), not the primary display
     captured_at: float             # time.time()
+    monitors: list[MonitorInfo]
+    virtual_bounds: tuple[int, int, int, int]  # left, top, right, bottom of the virtual desktop (may be negative)
 
 def get_desktop_overview() -> DesktopOverview: ...
 
@@ -93,19 +106,35 @@ class WindowTree:
     title: str
     process_name: str
     elements: list[UIElement]      # depth-first order, capped (see below)
-    truncated: bool                # True if cap hit
+    truncated: bool                # True if cap or timeout hit
     captured_at: float
     elapsed_ms: float
+    passes: int                    # walks made (>1 when the first pass was thin and re-polled)
+    child_windows: int             # descendant HWNDs walked alongside the top-level one
+    first_pass_elements: int       # element count of the first walk (-1 unknown)
 
 def get_window_tree(hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0) -> WindowTree: ...
 def format_window_tree(tree: WindowTree) -> str: ...   # compact text for the model, one line per element:  [id] role "name" value=... @(x,y) [kb: shortcut]
 def format_overview(o: DesktopOverview) -> str: ...
 
-def screenshot(hwnd: int | None = None, *, max_width: int = 1280) -> bytes: ...  # PNG bytes, downscaled preserving aspect
+@dataclass
+class Capture:
+    png: bytes
+    origin: tuple[int, int]        # top-left of the captured rectangle, virtual-desktop px
+    source_size: tuple[int, int]   # screen px captured
+    image_size: tuple[int, int]    # PNG size (== source_size unless scaled)
+    scale: float                   # image px per screen px; 1.0 = 1:1.  screen = origin + image / scale
+    target: str                    # "window <hwnd>", "monitor <i>", "region", "desktop"
+    rendered_by_window: bool       # PrintWindow (True) vs desktop crop (False)
+
+def screenshot(hwnd: int | None = None, *, region: tuple[int, int, int, int] | None = None,
+               monitor: int | None = None, max_width: int = 2560) -> Capture: ...
+    # at most one target; none = whole virtual desktop. Native resolution unless the longest edge exceeds
+    # max_width, in which case it is scaled down and the exact scale reported. `capture` is the same function.
 def system_facts() -> dict: ...                # time, uptime, cpu %, memory total/used, top processes by memory with pid/name/rss
 ```
 
-Notes for the tree: walk via `uiautomation` from the window's control, depth-first, skipping offscreen elements, include every element that has a name/value or is interactive/scrollable. For Chromium/Electron windows (Chrome, Edge, Spotify, VS Code, Discord) the UIA tree exposes web content only if the accessibility bridge is on; do not special-case by app name — just walk what UIA gives you, and report `truncated`/element counts honestly so the model can decide to fall back to a screenshot. Walk in a worker thread with COM initialised (`comtypes.CoInitializeEx` / `pythoncom`) and enforce `timeout_s`.
+Notes for the tree: walk via UIA cached subtrees from the window's element, depth-first, skipping offscreen elements, include every element that has a name/value or is interactive/scrollable. Child HWNDs are walked too: `EnumChildWindows` lists the visible descendants, each gets its own `ElementFromHandle` (its own WM_GETOBJECT, which is what makes Chromium/Electron/CEF build their lazily built tree), and its subtree is spliced in after the element that owns it, de-duplicated by RuntimeId (else role+name+bounds); ids are positions within the returned pass. If the first pass is thin, the walk is re-polled with a deadline until the count has grown and stopped growing, or has not grown within a short grace (longer for a process launched moments ago) — never a fixed sleep. No special-casing by app or class name; report `truncated`/element counts/`passes` honestly. Walk in a worker thread with COM initialised (`comtypes.CoInitializeEx` / `pythoncom`) and enforce `timeout_s`.
 
 ## Actions contract (module `yuki.actions`)
 
@@ -127,7 +156,10 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult
     # Waits until a new window from the launched process appears, or timeout.
 def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult   # restore if minimized, SetForegroundWindow, verify foreground
 def click(x: int, y: int, *, button: str = "left", clicks: int = 1) -> ActionResult   # instant move, no glide
+    # summary + details report the outcome: foreground window after the click (foreground_hwnd/title/process,
+    # foreground_changed), focused_control_hwnd, focus_role/focus_name/focus_value/focus_accepts_text, focus_changed.
 def type_text(text: str, *, press_enter: bool = False) -> ActionResult  # types into current focus; use clipboard paste for long/unicode text
+    # details carry foreground_hwnd, focused_control_hwnd, focus_role/name/accepts_text; failures name the focus in the summary.
 def hotkey(*keys: str) -> ActionResult                                  # e.g. ("ctrl","t"), ("win","r"), ("volume_mute",)
 def press(key: str, *, times: int = 1) -> ActionResult
 def scroll(x: int, y: int, *, dy: int = 0, dx: int = 0) -> ActionResult  # wheel notches at a point
@@ -141,9 +173,9 @@ def open_url(url: str) -> ActionResult                                  # defaul
 - `Agent.run(request: str) -> Iterator[AgentEvent]`. Events: `thinking(text)`, `tool_call(name, input)`, `tool_result(name, ok, summary)`, `ask_user(question)`, `final(text)`, `error(text)`. When `ask_user` is yielded the generator pauses; the caller sends the answer with `agent.answer(text)` and continues iterating. State (messages, running summary) survives the pause.
 - Messages are append-only. Tool results from perception that are older than the last 2 turns are replaced in-place with a one-line stub like `[desktop overview from step 3 — superseded]` before the next request (this is context hygiene, not behavior steering).
 - One model call may return several `tool_use` blocks; execute in order, stop at the first failure, return all results in one user message.
-- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?)`, `system_facts`, `launch_app(query)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url)`, `ask_user(question)`, `note_to_self(text)` (updates the running summary the model sees each turn), `done(message)`.
+- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?, region?, monitor?)` (omitted from the tool list entirely when `screenshot_policy` is `never`; the dispatcher still refuses it as a backstop), `system_facts`, `launch_app(query)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url)`, `ask_user(question)`, `note_to_self(text)` (updates the running summary the model sees each turn), `done(message)`.
 - Every turn the model automatically gets a fresh `look_at_desktop` result appended (cheap), never a tree or screenshot unless it asks.
-- System prompt: short, behavioral. Describe who Yuki is, what it can see, how to prefer fast paths (shell/shortcuts > tree clicks > screenshot), when to ask the user (ambiguity, risk, or genuinely stuck — not as a first move), and to confirm before irreversible actions. Do not include keyword-based rule lists.
+- System prompt: short, behavioral. Describe who Yuki is, what it can see, how to prefer fast paths (shell/shortcuts > tree clicks; the prompt does not mention screenshots), when to ask the user (ambiguity, risk, or genuinely stuck — not as a first move), and to confirm before irreversible actions. Do not include keyword-based rule lists.
 
 ## Logging contract (module `yuki.log`)
 
