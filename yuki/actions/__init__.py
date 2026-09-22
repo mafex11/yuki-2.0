@@ -32,6 +32,7 @@ from yuki.actions.input import (  # noqa: E402  (ActionResult must exist first)
     press,
     scroll,
     type_text,
+    wait_for_input_ready,
 )
 from yuki.actions.launch import (  # noqa: E402
     focus_window,
@@ -54,4 +55,5 @@ __all__ = [
     "run_powershell",
     "scroll",
     "type_text",
+    "wait_for_input_ready",
 ]

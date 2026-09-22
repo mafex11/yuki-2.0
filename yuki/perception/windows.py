@@ -24,9 +24,45 @@ _dwmapi = ctypes.windll.dwmapi
 
 _DWMWA_CLOAKED = 14
 
-#: Shell surfaces owned by explorer.exe (desktop, taskbars, task view) plus the
-#: alt-tab / notification hosts.  These are never user windows, so they are
-#: dropped from the overview.  Window-class plumbing, not app matching.
+#: ``GetAncestor(hwnd, GA_ROOT)``: the top-level window a control belongs to.
+_GA_ROOT = 2
+
+class _GUIThreadInfo(ctypes.Structure):
+    """``GUITHREADINFO``: what one GUI thread thinks it is doing right now."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+_user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUIThreadInfo)]
+_user32.GetGUIThreadInfo.restype = wintypes.BOOL
+_user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+_user32.GetAncestor.restype = wintypes.HWND
+
+#: Window classes registered by Windows itself: the explorer.exe shell surfaces
+#: (desktop, taskbars, task view), the alt-tab / notification hosts, and the XAML
+#: framework's own windowed-popup host.  A window of one of these classes belongs
+#: to the OS, not to an app the user opened, so it is dropped from the overview.
+#: Window-class plumbing, not app matching - nothing here names an application.
+#:
+#: ``Xaml_WindowedPopupClass`` is the class Microsoft's XAML framework registers
+#: for the light-dismiss surfaces it has to give their own HWND (flyouts, menus,
+#: combo drop-downs, tooltips).  The framework creates and titles them
+#: ("PopupHost"), keeps one alive per popup site whether or not anything is shown,
+#: and marks them ``WS_EX_NOACTIVATE`` so the user can never switch to one: a
+#: single Windows 11 Notepad contributed fourteen of the nineteen lines in one
+#: real snapshot.  Dialogs are untouched by this - a "Save as" dialog is a
+#: ``#32770`` and an in-window WinUI dialog ("Save changes?") lives in its
+#: parent's UIA tree rather than in a popup host.
 _SHELL_WINDOW_CLASSES = frozenset(
     {
         "Progman",
@@ -39,6 +75,7 @@ _SHELL_WINDOW_CLASSES = frozenset(
         "ForegroundStaging",
         "MultitaskingViewFrame",
         "XamlExplorerHostIslandWindow",
+        "Xaml_WindowedPopupClass",
     }
 )
 
@@ -89,17 +126,26 @@ def is_cloaked(hwnd: int) -> bool:
 def is_user_window(hwnd: int) -> bool:
     """Filter shared by the overview and the launch watcher.
 
-    A user window is visible, not cloaked, not a tool window, carries a title
-    and has a real rectangle.  Minimised windows keep their off-screen
-    rectangle and are still reported (flagged as minimised).
+    Answers one question - could the user see this window and point at it? - and
+    answers it only from OS facts.  A user window is visible and not DWM-cloaked,
+    is not a tool window, is not one of the OS's own window classes, carries a
+    title, and occupies a rectangle that overlaps the desktop.
+    Minimised windows keep the off-screen rectangle Windows parks them at, so the
+    geometry rules are skipped for them and they are still reported (flagged as
+    minimised).
+
+    Nothing here looks at the process or reads the title: every rule is a window
+    style, a cloak state, a rectangle, or a system window class.
     """
     if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
         return False
-    if win32gui.GetWindowText(hwnd) == "":
+    title = win32gui.GetWindowText(hwnd)
+    if title.strip() == "":
         return False
     if win32gui.GetClassName(hwnd) in _SHELL_WINDOW_CLASSES:
         return False
-    if win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOOLWINDOW:
+    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    if ex_style & win32con.WS_EX_TOOLWINDOW:
         return False
     if is_cloaked(hwnd):
         return False
@@ -107,7 +153,54 @@ def is_user_window(hwnd: int) -> bool:
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         if right - left <= 1 or bottom - top <= 1:
             return False
+        # Parked off the side of every monitor: it exists, but not on screen.
+        v_left, v_top, v_right, v_bottom = virtual_screen_bounds()
+        if right <= v_left or left >= v_right or bottom <= v_top or top >= v_bottom:
+            return False
     return True
+
+
+def focused_control_hwnd(hwnd: int) -> int:
+    """The control ``hwnd``'s own GUI thread reports keyboard focus on, or 0.
+
+    ``GetGUIThreadInfo`` asks the window's thread what *it* thinks is focused,
+    which is the only signal that a freshly created or freshly activated window
+    has finished wiring up its input: until the thread names a focused control,
+    ``SendInput`` reports success and the characters go nowhere.
+    """
+    try:
+        thread_id, _ = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception:
+        return 0  # the window died between the caller's check and this call
+    if not thread_id:
+        return 0
+    info = _GUIThreadInfo()
+    info.cbSize = ctypes.sizeof(_GUIThreadInfo)
+    if not _user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+        return 0
+    return int(info.hwndFocus or 0)
+
+
+def accepts_input(hwnd: int) -> bool:
+    """True when keystrokes sent right now would land in ``hwnd``.
+
+    Two OS facts have to agree: the window is the foreground window (so synthetic
+    input is delivered to its thread at all), and that thread reports keyboard
+    focus on a control belonging to this top-level window (so there is something
+    ready to receive it).  In the gap right after a launch or an activation the
+    first is true while the second is not, and characters typed in that gap are
+    lost silently - on this desktop Windows 11 Notepad turned "hello world" into
+    "ld" while ``SendInput`` reported every event accepted.
+    """
+    hwnd = int(hwnd)
+    if int(_user32.GetForegroundWindow()) != hwnd:
+        return False
+    focus = focused_control_hwnd(hwnd)
+    if not focus:
+        return False
+    # The focused control must belong to this window, not to another top-level
+    # window the same thread owns (a popup, a second document).
+    return int(_user32.GetAncestor(wintypes.HWND(focus), _GA_ROOT) or 0) == hwnd
 
 
 def _process_name(pid: int) -> str:

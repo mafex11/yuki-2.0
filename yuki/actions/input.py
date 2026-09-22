@@ -12,7 +12,10 @@ pyautogui's, which are the contract.
 
 Every input function takes an optional ``expect_hwnd``: when given, the
 foreground window is checked immediately before anything is sent, and nothing is
-sent if another window has taken focus.
+sent if another window has taken focus.  Being in the foreground is necessary but
+not sufficient, so ``type_text`` additionally waits (see
+:func:`wait_for_input_ready`) for the window's own GUI thread to report a focused
+control, and refuses rather than typing into a window that is not listening yet.
 
 Long or non-ASCII text is pasted rather than typed, which means borrowing the
 user's clipboard.  It is borrowed, not spent: every format on it is snapshotted
@@ -33,7 +36,12 @@ import win32clipboard
 import win32con
 
 from yuki.actions import ActionResult
-from yuki.perception.windows import cursor_position, virtual_screen_bounds, window_info
+from yuki.perception.windows import (
+    accepts_input,
+    cursor_position,
+    virtual_screen_bounds,
+    window_info,
+)
 
 pyautogui.FAILSAFE = False  # a corner-of-screen cursor must not abort Yuki
 pyautogui.PAUSE = 0  # we wait on conditions, never on the clock
@@ -260,6 +268,46 @@ def _foreground_mismatch(expect_hwnd: int | None) -> str | None:
         f"Foreground window changed; input not sent "
         f"(expected hwnd {int(expect_hwnd)}, got {actual} {title!r})"
     )
+
+
+#: How long an activated window is given to report a focused control before we
+#: stop waiting for it.  Measured on this desktop: Windows 11 Notepad needs about
+#: 50 ms after ``SetForegroundWindow``, so a second is generous without being a
+#: delay anyone notices when it is not needed.
+_READY_S = 1.0
+
+#: How often :func:`wait_for_input_ready` re-asks.  Finer than the launch/focus
+#: watchers, because the whole wait is usually over inside a few polls.
+_READY_POLL_S = 0.005
+
+
+def wait_for_input_ready(hwnd: int, *, timeout_s: float = _READY_S) -> tuple[bool, float]:
+    """Wait until ``hwnd`` would actually receive keystrokes.
+
+    This is the condition, not a sleep: it polls
+    :func:`yuki.perception.windows.accepts_input` - the window is in the
+    foreground *and* its own GUI thread reports keyboard focus on one of its
+    controls - and returns the moment both are true.
+
+    A window that has just been launched or activated is in the foreground before
+    it is listening.  ``SendInput`` cheerfully accepts every event sent into that
+    gap and reports success while the characters are dropped on the floor, which
+    on this desktop turned a typed ``"hello world"`` into ``"ld"``.  Waiting for
+    the window's own thread to name a focused control closes it.
+
+    Returns:
+        ``(ready, waited_ms)``.  ``ready`` is False only if the condition never
+        held within ``timeout_s``; ``waited_ms`` is how long the wait took either
+        way, for the caller to report.
+    """
+    started = time.perf_counter()
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while True:
+        if accepts_input(hwnd):
+            return True, (time.perf_counter() - started) * 1000.0
+        if time.monotonic() >= deadline:
+            return False, (time.perf_counter() - started) * 1000.0
+        time.sleep(_READY_POLL_S)
 
 
 #: How long we are willing to wait for the target app to read the clipboard
@@ -644,10 +692,18 @@ def type_text(
     still there afterwards; ``details`` records exactly which formats came back
     and which could not (see :func:`_snapshot_clipboard`).
 
+    With ``expect_hwnd`` the window is not only checked for being in the
+    foreground but given up to a second to report a focused control before the
+    first character goes out (:func:`wait_for_input_ready`); a window that never
+    does gets no keystrokes at all and the caller is told, because characters sent
+    into that gap are dropped while ``SendInput`` reports success.
+    ``details["ready_ms"]`` records the wait.
+
     Args:
         text: what to type.
         press_enter: press Enter after the text.
-        expect_hwnd: only send if this window is still in the foreground.
+        expect_hwnd: only send if this window is still in the foreground *and*
+            ready to receive input.
     """
     started = time.perf_counter()
     if not isinstance(text, str):
@@ -662,6 +718,26 @@ def type_text(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    # Foreground is not the same thing as listening.  Before the first character
+    # goes out, give the window a bounded chance to report a focused control; if
+    # it never does, say so instead of typing into the void and reporting success.
+    if expect_hwnd and (text or press_enter):
+        ready, waited_ms = wait_for_input_ready(expect_hwnd)
+        details["ready_ms"] = round(waited_ms, 1)
+        details["ready"] = ready
+        if not ready:
+            info = window_info(int(expect_hwnd))
+            who = f"hwnd {int(expect_hwnd)}"
+            if info:
+                who += f' ({info.process_name} "{info.title}")'
+            return _result(
+                False,
+                f"{who} is not accepting keyboard input yet: no focused control "
+                f"after {waited_ms:.0f} ms, so nothing was typed (typing now would "
+                f"lose characters). Focus it again and retry.",
+                details,
+                started,
+            )
     if not text:
         if press_enter:
             pyautogui.press("enter")

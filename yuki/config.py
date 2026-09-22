@@ -82,7 +82,7 @@ class Settings:
     keep_perception_turns: int = 2
     tool_timeout_s: float = 20.0
     effort: str = DEFAULT_EFFORT
-    ui_hotkey: str = "alt+space"
+    ui_hotkey: str = "alt+shift"
     ui_cancel_hotkey: str = "ctrl+alt+space"
 
     def __post_init__(self) -> None:
