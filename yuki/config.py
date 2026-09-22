@@ -28,14 +28,30 @@ DEFAULT_MODEL = MODEL_ALIASES["sonnet"]
 #: before the API does.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
-#: Measured with ``scripts/bench.py`` on this machine on 2026-09-22 (Sonnet 5,
-#: the same five requests, one run each): ``low`` took 16 model calls and 53 s of
-#: wall time against ``medium``'s 15 calls and 70 s, at 3.2 s versus 4.4 s per
-#: call and 75 versus 419 thinking tokens, with the same 4/5 requests succeeding.
-#: Low effort is also the level that reliably finishes a one-step request in a
-#: single round trip. Raise it per request with ``/effort`` when a task genuinely
-#: needs more thinking; a harder task set may well want ``medium`` back.
-DEFAULT_EFFORT = "low"
+#: Default raised from ``low`` to ``high`` on 2026-09-22 after watching what low
+#: effort actually costs on a real request. Asked to "play my Japanese playlist
+#: on Spotify", Yuki typed the word "japanese" into Spotify's global search three
+#: times, never formed the thought that "my Japanese playlist" means the playlist
+#: in the user's own library whose *name* is written in Japanese, and gave up
+#: after 1m41s. A human did it in four steps by looking at the library and
+#: picking the playlist with the Japanese name. That is not a speed problem, it
+#: is a thinking problem: interpreting what a request refers to, and noticing
+#: that a repeated action is not working, is exactly the work that gets skipped
+#: when there is no budget to do it in.
+#:
+#: The earlier ``low`` default came from a bench on five short, single-step
+#: requests (``scripts/bench.py``, Sonnet 5, 2026-09-22), where ``low`` finished
+#: in 53 s against ``medium``'s 70 s with the same 4/5 succeeding. That
+#: measurement stands, but it measured the wrong thing: those tasks needed no
+#: reasoning, so it only ever showed that thinking costs seconds, never that not
+#: thinking costs the whole task. Seconds are cheap next to a failed request that
+#: the user then has to do by hand.
+#:
+#: No new timings have been taken for ``high``; expect it to be slower per turn
+#: and to be re-benchmarked on a task set that actually requires reasoning. All
+#: five levels stay available and ``/effort`` still switches mid-conversation, so
+#: dropping back for a session of trivial requests is one command away.
+DEFAULT_EFFORT = "high"
 
 
 @dataclass
@@ -51,7 +67,14 @@ class Settings:
             per session.
         screenshot_policy: ``never`` refuses screenshots, ``ask`` requires the
             user to approve one, ``auto`` takes them whenever the model asks.
-            This is a safety/consent gate, not behaviour steering.
+            This is a safety/consent gate, not behaviour steering. Defaults to
+            ``never`` for now, deliberately and temporarily: with the tree-waking
+            fix in place the UIA tree is usable even on the Chromium/Electron
+            apps that used to come back empty, and the point of the current
+            testing phase is to find out where the tree really is not enough
+            rather than let a screenshot paper over it. Screenshots are not going
+            away -- expect this back at ``auto`` once the tree path has been
+            exercised properly.
         max_tokens: ``max_tokens`` for every request.
         thinking_display: ``summarized`` returns readable reasoning; ``omitted``
             (the API default on Sonnet 5 / Opus 5) returns empty thinking text.
@@ -63,8 +86,11 @@ class Settings:
         tool_timeout_s: Ceiling handed to PowerShell and other slow actions.
         effort: ``output_config.effort`` sent on every request, one of
             :data:`EFFORT_LEVELS`. Lower effort means less thinking and fewer,
-            more-consolidated tool calls. Mutable so the CLI's ``/effort``
-            command (and :meth:`yuki.agent.loop.Agent.set_effort`) can change it
+            more-consolidated tool calls; it also means less of the
+            interpretation and self-correction that hard requests live on, which
+            is why the default is ``high`` (see :data:`DEFAULT_EFFORT`). Mutable
+            so the CLI's ``/effort`` command (and
+            :meth:`yuki.agent.loop.Agent.set_effort`) can change it
             mid-conversation.
         ui_hotkey: Global combo that opens and closes the overlay.
         ui_cancel_hotkey: Global combo that cancels whatever the worker is doing.
@@ -74,7 +100,7 @@ class Settings:
     aws_region: str = field(default_factory=lambda: os.environ.get("AWS_REGION", "us-east-1"))
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
     log_dir: Path = Path("logs/sessions")
-    screenshot_policy: ScreenshotPolicy = "auto"
+    screenshot_policy: ScreenshotPolicy = "never"
     max_tokens: int = 8000
     thinking_display: Literal["summarized", "omitted"] = "summarized"
     stream: bool = False
