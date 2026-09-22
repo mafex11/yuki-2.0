@@ -11,7 +11,8 @@ The old project at `C:\Users\esska\LLM-OS` is REFERENCE ONLY. Salvage low-level 
 3. **No fixed sleeps.** Wait for a condition (window appeared, focus changed, tree stable, process exited) with a timeout. Never `time.sleep(0.8)` to "let things settle".
 4. **Log everything.** Every model request (full system, messages, tools), every response (full content blocks, usage, latency), every tool call and result, every perception snapshot, every question to the user and their answer, every error. JSONL, one file per session, never truncated. Plus a human-readable pretty stream on the console.
 5. **No LangChain/LangGraph.** Plain Python + `anthropic` SDK (`AnthropicBedrock`) + boto3 + Windows libs.
-6. **Windows-only, Python 3.13, `uv`.** Project root `C:\Users\esska\yuki`. Package `yuki/`. Run with `uv run ...`.
+6. **Keyboard/mouse input is guarded.** Every input action (`click`, `type_text`, `hotkey`, `press`, `scroll`) accepts `expect_hwnd`; when set, input is sent only if that window is still in the foreground, otherwise the action fails without sending. Tests and scripts must never send Alt+F4 or any key without `expect_hwnd`, and must close windows they opened by terminating the PID. (On 2026-09-22 an unguarded Alt+F4 closed the user's terminal and killed the build session.)
+7. **Windows-only, Python 3.13, `uv`.** Project root `C:\Users\esska\yuki`. Package `yuki/`. Run with `uv run ...`.
 
 ## Model access
 
@@ -140,7 +141,7 @@ def open_url(url: str) -> ActionResult                                  # defaul
 - `Agent.run(request: str) -> Iterator[AgentEvent]`. Events: `thinking(text)`, `tool_call(name, input)`, `tool_result(name, ok, summary)`, `ask_user(question)`, `final(text)`, `error(text)`. When `ask_user` is yielded the generator pauses; the caller sends the answer with `agent.answer(text)` and continues iterating. State (messages, running summary) survives the pause.
 - Messages are append-only. Tool results from perception that are older than the last 2 turns are replaced in-place with a one-line stub like `[desktop overview from step 3 — superseded]` before the next request (this is context hygiene, not behavior steering).
 - One model call may return several `tool_use` blocks; execute in order, stop at the first failure, return all results in one user message.
-- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?)`, `system_facts`, `launch_app(query)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url)`, `ask_user(question)`, `done(message)`.
+- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?)`, `system_facts`, `launch_app(query)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url)`, `ask_user(question)`, `note_to_self(text)` (updates the running summary the model sees each turn), `done(message)`.
 - Every turn the model automatically gets a fresh `look_at_desktop` result appended (cheap), never a tree or screenshot unless it asks.
 - System prompt: short, behavioral. Describe who Yuki is, what it can see, how to prefer fast paths (shell/shortcuts > tree clicks > screenshot), when to ask the user (ambiguity, risk, or genuinely stuck — not as a first move), and to confirm before irreversible actions. Do not include keyword-based rule lists.
 
