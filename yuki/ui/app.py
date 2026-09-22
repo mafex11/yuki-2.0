@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from yuki.config import MODEL_ALIASES, Settings
 from yuki.ui.glass import ACCENT
-from yuki.ui.hotkey import HotkeyThread, hotkey_bindings
+from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_tool
@@ -113,7 +113,7 @@ class YukiUi(QObject):
         runtime_signals.queued.connect(self._on_queued)
 
         self.bindings = hotkey_bindings(settings)
-        self.hotkeys = HotkeyThread(self.bindings)
+        self.hotkeys = HotkeyListener(self.bindings)
         self.hotkeys.pressed.connect(self._on_hotkey)
         self.hotkeys.failed.connect(
             lambda action, reason: self.ui_log.event("hotkey_failed", action=action, reason=reason)

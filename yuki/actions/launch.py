@@ -19,6 +19,7 @@ import win32con
 import win32gui
 
 from yuki.actions import ActionResult
+from yuki.actions.input import wait_for_input_ready
 from yuki.actions.shell import run_powershell
 from yuki.perception.windows import is_user_window, list_windows, window_info
 
@@ -156,7 +157,10 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
 
     Returns:
         ActionResult with ``details = {"launched", "hwnd", "candidates",
-        "new_windows", "name", "appid"}``.  When the query matches 0 or >1 apps
+        "new_windows", "name", "appid", "ready", "ready_ms"}``.  ``ready_ms`` is
+        how long the new window took to start accepting keyboard input, and
+        ``ready`` whether it got there at all (a window that opened in the
+        background never will until it is focused).  When the query matches 0 or >1 apps
         and none matches exactly, ``ok`` is False and ``candidates`` lists the
         options - the model chooses, this function never guesses.  Likewise
         ``new_windows`` lists every window that appeared, so a launch that
@@ -233,11 +237,20 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
     info = window_info(hwnd)
     details["title"] = info.title if info else ""
     details["process_name"] = info.process_name if info else ""
+    # A window that exists is not yet a window that listens.  Wait for the app's
+    # own GUI thread to report a focused control, so the caller's first keystroke
+    # is not swallowed by a half-built window - and report the wait either way.
+    ready, ready_ms = wait_for_input_ready(hwnd)
+    details["ready"] = ready
+    details["ready_ms"] = round(ready_ms, 1)
     extra = len(details["new_windows"]) - 1
     return finish(
         True,
         f"launched {chosen['name']!r}: hwnd {hwnd} "
         f"({details['process_name']}) \"{details['title']}\" - {reason}"
+        + (f"; ready for input after {ready_ms:.0f} ms" if ready else
+           f"; it is not in the foreground / not accepting input yet after "
+           f"{ready_ms:.0f} ms, so focus it before typing")
         + (f"; {extra} other new window(s) appeared, see new_windows" if extra > 0 else ""),
         details,
     )
@@ -273,7 +286,12 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
 
     Tries progressively stronger activation paths and polls
     ``GetForegroundWindow`` after each, so it returns as soon as the window is
-    actually focused.
+    actually focused - and then waits, inside the same ``timeout_s`` budget, for
+    the window to be ready to *receive* input (see
+    :func:`yuki.actions.input.wait_for_input_ready`).  ``details["ready_ms"]``
+    reports that wait and ``details["ready"]`` whether it ever came true; a window
+    can be in the foreground a good 50 ms before it is listening, and keystrokes
+    sent in between are dropped without any error.
     """
     started = time.perf_counter()
     deadline = time.monotonic() + timeout_s
@@ -350,9 +368,26 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
         wait(deadline)
 
     if focused():
+        # Foreground is only half of "focused": until the window's own GUI thread
+        # names a focused control it is not listening, and keystrokes sent into
+        # that gap vanish although SendInput reports them accepted.  Wait for the
+        # condition with what is left of the budget instead of returning early and
+        # letting the caller type into nothing.
+        ready, ready_ms = wait_for_input_ready(
+            hwnd, timeout_s=max(deadline - time.monotonic(), 0.0)
+        )
+        details["ready"] = ready
+        details["ready_ms"] = round(ready_ms, 1)
+        note = (
+            f"; ready for input after {ready_ms:.0f} ms"
+            if ready
+            else f"; still no focused control after {ready_ms:.0f} ms, so typing "
+            f"into it may lose characters"
+        )
         return finish(
             True,
-            f"focused hwnd {hwnd} ({details['process_name']}) \"{details['title']}\"",
+            f"focused hwnd {hwnd} ({details['process_name']}) \"{details['title']}\""
+            + note,
             details,
         )
     details["foreground_hwnd"] = _user32.GetForegroundWindow()
