@@ -190,7 +190,7 @@ def _char_events(char: str) -> list[_Input]:
     return events
 
 
-def _send_text(text: str) -> tuple[int, int]:
+def _send_text(text: str, expect_hwnd: int | None = None) -> tuple[int, int, str]:
     """Send ``text`` as key events, one ``SendInput`` call per character.
 
     Per character, not per string: batching a whole string into one call is
@@ -203,20 +203,40 @@ def _send_text(text: str) -> tuple[int, int]:
     drains the queue, not the state each event was sent with.  One call per
     character keeps each character atomic with its own modifiers.
 
+    Typing a string is not instantaneous, so ``expect_hwnd`` is re-checked before
+    every character rather than only once before the first.  Checking once is
+    barely a guard: on 2026-09-22 Discord took the foreground part-way through
+    ``"hello from yuki 215715"`` and the rest of the string was typed into the
+    user's chat box, while the action still reported "typed 22 chars".  A
+    foreground change now stops the typing there, and the caller is told how far
+    it got, so it can say what the window really contains.
+
+    Args:
+        text: Characters to send.
+        expect_hwnd: Window that must stay in the foreground.  ``None`` disables
+            the check, which is only safe when the caller genuinely does not care
+            where the text lands.
+
     Returns:
-        ``(events_sent, events_expected)``; a short count means Windows (or a
-        lower-level hook, such as an anti-cheat driver) refused part of the
-        input.
+        ``(events_sent, events_expected, refusal)``.  ``expected`` counts only the
+        characters actually attempted, so ``sent != expected`` still means Windows
+        (or a lower-level hook, such as an anti-cheat driver) refused part of the
+        input.  ``refusal`` is empty unless the foreground changed mid-string, in
+        which case it says so and typing stopped at that character.
     """
     sent = expected = 0
-    for char in text.replace("\r\n", "\r").replace("\n", "\r"):
+    body = text.replace("\r\n", "\r").replace("\n", "\r")
+    for index, char in enumerate(body):
+        refusal = _foreground_mismatch(expect_hwnd)
+        if refusal:
+            return sent, expected, f"{refusal} after {index} of {len(body)} characters"
         events = _char_events(char)
         array = (_Input * len(events))(*events)
         expected += len(events)
         sent += int(
             _user32.SendInput(len(events), ctypes.byref(array), ctypes.sizeof(_Input))
         )
-    return sent, expected
+    return sent, expected, ""
 
 
 def _foreground_mismatch(expect_hwnd: int | None) -> str | None:
@@ -652,6 +672,14 @@ def type_text(
         previous = _snapshot_clipboard()
         if not _set_clipboard_text(text):
             return _result(False, "could not write to the clipboard", details, started)
+        # Snapshotting and rewriting the clipboard takes long enough for the
+        # foreground to change, so the guard is asked again immediately before the
+        # paste -- and the clipboard is put back before refusing, so a refusal
+        # leaves nothing of the user's behind.
+        refusal = _foreground_mismatch(expect_hwnd)
+        if refusal:
+            _restore_clipboard(previous)
+            return _result(False, refusal, details, started)
         pyautogui.hotkey("ctrl", "v")
         consumed = _wait_clipboard_released(
             time.monotonic() + _CLIPBOARD_HANDOFF_S
@@ -664,9 +692,18 @@ def type_text(
         if failed:
             details["clipboard_restore_failed"] = failed
     else:
-        sent, expected = _send_text(text)
+        sent, expected, refusal = _send_text(text, expect_hwnd)
         details["events_sent"] = sent
         details["events_expected"] = expected
+        if refusal:
+            details["interrupted"] = refusal
+            return _result(
+                False,
+                f"{refusal}; only the first part of the text reached the window. "
+                f"Focus it again and retype the whole thing.",
+                details,
+                started,
+            )
         if sent != expected:
             return _result(
                 False,

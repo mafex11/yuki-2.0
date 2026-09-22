@@ -1,10 +1,11 @@
 """The status strip: what Yuki is doing, bottom-right, while it has the hands.
 
 While a task runs the overlay gets out of the way and this strip takes over: a
-spinner and one line of text. The line is built from the tool call the agent just
-made -- generically, by reshaping the tool's own name and its most telling
-argument. There is no table of per-tool phrases anywhere: a new tool gets a
-sensible line for free, and the UI never claims to know what a tool means.
+spinner and one line of text. The line is the tool's own one-line ``label`` from
+the registry (:func:`yuki.agent.tools.tool_label`) plus its most telling argument,
+so the phrase a user reads is written next to the tool it describes rather than
+re-derived here from its identifier. A tool with no label still gets a readable
+line: its name is reshaped into one.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
+from yuki.agent.tools import tool_label
 from yuki.ui.glass import ACCENT, TEXT_PRIMARY, GlassWindow, ui_font
 
 #: Size of the panel (excluding the shadow margin), in logical pixels.
@@ -75,10 +77,12 @@ def _participle(word: str) -> str:
 def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit: int = 44) -> str:
     """One line of present-tense status text for a tool call.
 
-    The tool's snake_case name becomes a phrase (``launch_app`` ->
-    ``Launching app``) and its most descriptive argument is appended when there is
-    one (``Launching app — spotify``). Purely presentational: nothing here changes
-    what runs.
+    The phrase is the tool's own ``label`` (``hotkey`` -> ``Pressing a shortcut``),
+    with its most descriptive argument appended when there is one
+    (``Opening an app — spotify``). A tool the registry has never heard of falls
+    back to its name reshaped into a phrase, so an unlabelled tool still reads as
+    English instead of as an identifier. Purely presentational: nothing here
+    changes what runs.
 
     Args:
         name: Tool name exactly as the model called it.
@@ -88,12 +92,19 @@ def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit:
     Returns:
         A single line, no trailing punctuation except an ellipsis.
     """
-    words = [word for word in name.split("_") if word]
-    if not words:
+    phrase = tool_label(name) or _phrase_from_name(name)
+    if not phrase:
         return "Working…"
-    phrase = " ".join([_participle(words[0])] + words[1:]).capitalize()
     detail = _detail(tool_input or {}, limit=limit)
     return f"{phrase} — {detail}" if detail else f"{phrase}…"
+
+
+def _phrase_from_name(name: str) -> str:
+    """Last resort: turn ``launch_app`` into ``Launching app``."""
+    words = [word for word in name.split("_") if word]
+    if not words:
+        return ""
+    return " ".join([_participle(words[0])] + words[1:]).capitalize()
 
 
 def _detail(tool_input: dict[str, Any], *, limit: int) -> str:

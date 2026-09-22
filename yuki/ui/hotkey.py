@@ -18,7 +18,12 @@ import ctypes
 import os
 from ctypes import wintypes
 
+from typing import TYPE_CHECKING
+
 from PySide6.QtCore import QThread, Signal
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
+    from yuki.config import Settings
 
 #: ``fsModifiers`` flags for ``RegisterHotKey``.
 MOD_ALT = 0x0001
@@ -70,10 +75,12 @@ _VK_NAMES: dict[str, int] = {
     **{f"f{n}": 0x6F + n for n in range(1, 25)},
 }
 
-#: Environment variables holding the combo for each action, and their defaults.
-HOTKEY_ENV: dict[str, tuple[str, str]] = {
-    "toggle": ("YUKI_HOTKEY", "alt+space"),
-    "cancel": ("YUKI_CANCEL_HOTKEY", "ctrl+alt+space"),
+#: Environment variable that may override each action's combo. The defaults live
+#: in :class:`yuki.config.Settings` (``ui_hotkey`` / ``ui_cancel_hotkey``); these
+#: are the escape hatch for trying a different combo without editing anything.
+HOTKEY_ENV: dict[str, str] = {
+    "toggle": "YUKI_HOTKEY",
+    "cancel": "YUKI_CANCEL_HOTKEY",
 }
 
 
@@ -126,23 +133,28 @@ def _virtual_key(key: str) -> int | None:
     return None
 
 
-def hotkeys_from_env(env: dict[str, str] | None = None) -> dict[str, str]:
-    """Read the configured combo for every action from the environment.
+def hotkey_bindings(
+    settings: "Settings", env: dict[str, str] | None = None
+) -> dict[str, str]:
+    """The combo to register for every action.
 
-    Yuki's :class:`~yuki.config.Settings` has no UI fields yet, so the overlay
-    reads ``YUKI_HOTKEY`` / ``YUKI_CANCEL_HOTKEY`` instead of inventing a config
-    field it cannot add. Empty or unset falls back to the default.
+    Configuration first: the combos are :class:`~yuki.config.Settings` fields, so
+    a caller that wants different ones just passes different settings. The
+    environment stays as an override for trying a combo out without touching
+    anything -- unset or blank falls straight through to the setting.
 
     Args:
-        env: Mapping to read; :data:`os.environ` by default.
+        settings: Where ``ui_hotkey`` and ``ui_cancel_hotkey`` come from.
+        env: Mapping to read the overrides from; :data:`os.environ` by default.
 
     Returns:
         ``action -> combo`` for every action in :data:`HOTKEY_ENV`.
     """
     source = os.environ if env is None else env
+    defaults = {"toggle": settings.ui_hotkey, "cancel": settings.ui_cancel_hotkey}
     return {
-        action: (source.get(var) or default).strip()
-        for action, (var, default) in HOTKEY_ENV.items()
+        action: ((source.get(HOTKEY_ENV[action]) or defaults[action]) or "").strip()
+        for action in HOTKEY_ENV
     }
 
 

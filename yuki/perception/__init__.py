@@ -13,7 +13,7 @@ Everything returns plain dataclasses (or dicts) that survive
 
 from __future__ import annotations
 
-from yuki.perception.screenshot import screenshot
+from yuki.perception.screenshot import capture_bounds, screenshot
 from yuki.perception.system import format_system_facts, system_facts
 from yuki.perception.tree import UIElement, WindowTree, format_window_tree, get_window_tree
 from yuki.perception.windows import (
@@ -34,6 +34,7 @@ __all__ = [
     "UIElement",
     "WindowInfo",
     "WindowTree",
+    "capture_bounds",
     "cursor_position",
     "format_overview",
     "format_system_facts",

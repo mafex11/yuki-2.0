@@ -46,6 +46,30 @@ def _frame_bounds(hwnd: int) -> tuple[int, int, int, int]:
     return tuple(win32gui.GetWindowRect(hwnd))  # type: ignore[return-value]
 
 
+def capture_bounds(hwnd: int | None) -> tuple[int, int, int, int]:
+    """Screen rectangle a :func:`screenshot` of this target covers.
+
+    The point of it is coordinate arithmetic: a window shot is rendered by the
+    window itself, so its pixels are offsets inside this rectangle, not screen
+    coordinates.  Anything wanting to click what it can see in the image has to
+    add this origin back, and guessing the origin from ``GetWindowRect`` is wrong
+    by the width of the invisible resize border.
+
+    Args:
+        hwnd: Window handle, or ``None`` for the primary screen.
+
+    Returns:
+        ``(left, top, right, bottom)`` in screen pixels.
+    """
+    if hwnd is None:
+        width, height = (
+            _user32.GetSystemMetrics(0),  # SM_CXSCREEN
+            _user32.GetSystemMetrics(1),  # SM_CYSCREEN
+        )
+        return (0, 0, width, height)
+    return _frame_bounds(hwnd)
+
+
 def _print_window(hwnd: int, width: int, height: int) -> Image.Image | None:
     """Ask the window to render itself into a bitmap.  ``None`` on failure."""
     window_dc = None
