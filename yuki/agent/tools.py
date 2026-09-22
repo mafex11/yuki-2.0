@@ -34,6 +34,14 @@ PERCEPTION_TOOLS: frozenset[str] = frozenset(
 #: Tools handled by the agent loop rather than a backend function.
 CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
 
+#: The tool the screenshot policy governs. When the policy is ``never`` this name
+#: is dropped from the definitions sent to the model (see :func:`tool_params`)
+#: rather than only refused on arrival: a tool the model can see is a tool it will
+#: eventually try, and every attempt costs a full round trip to be told no.
+#: Dropping a name never reorders the rest, so the tool block stays byte-stable
+#: for prompt caching.
+POLICY_GATED_TOOLS: dict[str, str] = {"take_screenshot": "screenshot_policy"}
+
 
 def _obj(
     properties: dict[str, Any], required: list[str] | None = None
@@ -63,9 +71,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Looking at the desktop",
         "description": (
             "List every visible top-level window with its hwnd, title, process, "
-            "bounds and which one is in the foreground, plus cursor position and "
-            "screen size. Cheap and fast. You already receive this at the start of "
-            "every turn, so call it only to re-check after you have acted."
+            "bounds and which one is in the foreground, plus the cursor, the size of "
+            "the whole desktop and, when there is more than one display, each "
+            "monitor's index and rectangle. All coordinates are in one space "
+            "spanning every monitor, which is the same space click, scroll and "
+            "element centres use. Cheap and fast. You already receive this at the "
+            "start of every turn, so call it only to re-check after you have acted."
         ),
         "input_schema": _obj({}),
     },
@@ -76,9 +87,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "Read the UI Automation element tree of one window: roles, names, text "
             "field values, click points, keyboard shortcuts and whether each element "
             "is interactive. This is how you find things to click or type into. The "
-            "result reports how many elements it found and whether it was truncated; "
-            "some windows (especially browser-based apps) expose little or nothing, "
-            "in which case take a screenshot instead."
+            "result reports how many elements it found, whether it was truncated, and "
+            "whether the window was still building its tree while it was read, in "
+            "which case reading it again can show more."
         ),
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
@@ -89,19 +100,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "take_screenshot",
         "label": "Taking a look at the screen",
         "description": (
-            "Capture pixels: one window if you pass an hwnd, otherwise the whole "
-            "screen. Downscaled. Use it when the element tree is empty, truncated or "
-            "does not explain what you are looking at, or when you need to read "
-            "something only rendering shows. A window's image is relative to that "
-            "window and scaled down, so the result tells you the rectangle it covers "
-            "and the arithmetic for turning image pixels into screen coordinates."
+            "Capture pixels. Name at most one target: a window (hwnd), a screen "
+            "rectangle (region), or one display (monitor). With none you get the "
+            "whole desktop across all monitors, which is the only shot that is "
+            "scaled down. Use it when the element tree is empty, truncated or does "
+            "not explain what you are looking at, or when you need to read something "
+            "only rendering shows. Every shot tells you where its top-left corner is "
+            "on screen and whether it is 1:1; prefer a window, a monitor or a region "
+            "so that it is, and zoom in on a small region when you need to read or "
+            "aim at something precisely."
         ),
         "input_schema": _obj(
             {
                 "hwnd": {
                     "type": "integer",
-                    "description": "Window to capture; omit for the full screen.",
-                }
+                    "description": "Window to capture.",
+                },
+                "region": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "Screen rectangle [left, top, right, bottom] in the "
+                    "same coordinates as window bounds and element centres.",
+                },
+                "monitor": {
+                    "type": "integer",
+                    "description": "Index of one display, as listed by look_at_desktop.",
+                },
             }
         ),
     },
@@ -286,6 +312,59 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
 )
 
 
+def effective_screenshot_policy(policy: str | None = None) -> str:
+    """The screenshot policy in force, resolving ``None`` from :class:`Settings`.
+
+    :func:`tool_params` has to know the policy in order to leave
+    ``take_screenshot`` out of the block it builds, and its caller in
+    :mod:`yuki.agent.loop` passes only a tool subset. Rather than have every
+    caller thread the value through, ``None`` means "whatever a default
+    :class:`yuki.config.Settings` says", which is the process-wide configured
+    answer. A caller holding a modified ``Settings`` should pass its value
+    explicitly.
+
+    Args:
+        policy: an explicit policy, or ``None`` to read the configured default.
+
+    Returns:
+        One of ``"never"``, ``"ask"``, ``"auto"``; anything unrecognised is
+        returned unchanged so a typo surfaces rather than silently meaning
+        ``auto``.
+    """
+    if policy is not None:
+        return policy
+    try:
+        from yuki.config import Settings
+
+        return str(Settings().screenshot_policy)
+    except Exception:  # pragma: no cover - config must never break tool building
+        return "never"
+
+
+def available_tool_names(
+    names: Iterable[str] | None = None, *, screenshot_policy: str | None = None
+) -> tuple[str, ...]:
+    """Every tool the model may be shown, in registry order.
+
+    Args:
+        names: a requested subset, as understood by :func:`resolve_tool_names`.
+        screenshot_policy: the policy in force; ``None`` reads the configured
+            default.
+
+    Returns:
+        The names, minus any whose policy switches them off entirely.
+    """
+    allowed = resolve_tool_names(names)
+    dropped = set()
+    if effective_screenshot_policy(screenshot_policy) == "never":
+        dropped = set(POLICY_GATED_TOOLS)
+    return tuple(
+        name
+        for name in ALL_TOOL_NAMES
+        if (allowed is None or name in allowed) and name not in dropped
+    )
+
+
 def resolve_tool_names(names: Iterable[str] | None) -> tuple[str, ...] | None:
     """Validate a requested tool subset and return it in registry order.
 
@@ -318,7 +397,10 @@ def resolve_tool_names(names: Iterable[str] | None) -> tuple[str, ...] | None:
 
 
 def tool_params(
-    *, cacheable: bool = True, names: Iterable[str] | None = None
+    *,
+    cacheable: bool = True,
+    names: Iterable[str] | None = None,
+    screenshot_policy: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the tool definitions for a request.
 
@@ -327,18 +409,22 @@ def tool_params(
             whole (byte-stable) tool block is cached by the API.
         names: Restrict the list to these tools (plus the control tools), as
             resolved by :func:`resolve_tool_names`. ``None`` sends all of them.
+        screenshot_policy: The screenshot policy in force. Under ``never``,
+            ``take_screenshot`` is left out of the block entirely instead of being
+            offered and then refused -- a refusal the model has to spend a whole
+            round trip discovering. ``None`` reads the configured default.
 
     Returns:
-        A fresh list of tool dicts, carrying only what the API accepts -- the
-        human ``label`` is dropped here, since it exists for the UI and an
-        unexpected key would be rejected. The caller may not mutate the module
-        copy.
+        A fresh list of tool dicts in registry order, carrying only what the API
+        accepts -- the human ``label`` is dropped here, since it exists for the UI
+        and an unexpected key would be rejected. The caller may not mutate the
+        module copy.
     """
-    allowed = resolve_tool_names(names)
+    allowed = set(available_tool_names(names, screenshot_policy=screenshot_policy))
     tools = [
         {k: v for k, v in t.items() if k != "label"}
         for t in TOOL_SCHEMAS
-        if allowed is None or t["name"] in allowed
+        if t["name"] in allowed
     ]
     if cacheable and tools:
         tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
@@ -400,8 +486,32 @@ class Backend(Protocol):
         self, hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0
     ) -> Any: ...
     def format_window_tree(self, tree: Any) -> str: ...
-    def screenshot(self, hwnd: int | None = None, *, max_width: int = 1280) -> bytes: ...
-    def capture_bounds(self, hwnd: int | None) -> tuple[int, int, int, int]: ...
+    def screenshot(
+        self,
+        hwnd: int | None = None,
+        *,
+        region: tuple[int, int, int, int] | None = None,
+        monitor: int | None = None,
+        max_width: int = 2560,
+    ) -> Any: ...  # a Capture (png, origin, scale, ...); bare PNG bytes also accepted
+    def capture_bounds(
+        self,
+        hwnd: int | None = None,
+        *,
+        region: tuple[int, int, int, int] | None = None,
+        monitor: int | None = None,
+    ) -> tuple[int, int, int, int]: ...
+    # Optional: a backend that has it reports the image's origin and scale itself
+    # instead of the dispatcher reconstructing them. See
+    # :meth:`Dispatcher._do_take_screenshot`.
+    def capture(
+        self,
+        hwnd: int | None = None,
+        *,
+        region: tuple[int, int, int, int] | None = None,
+        monitor: int | None = None,
+        max_width: int = 2560,
+    ) -> Any: ...  # pragma: no cover - protocol only
     def system_facts(self) -> dict[str, Any]: ...
     def launch_app(self, query: str, *, timeout_s: float = 8.0) -> Any: ...
     def focus_window(self, hwnd: int, *, timeout_s: float = 2.0) -> Any: ...
@@ -452,6 +562,7 @@ class _LazyRealBackend:
         "get_window_tree",
         "format_window_tree",
         "screenshot",
+        "capture",
         "capture_bounds",
         "system_facts",
     }
@@ -553,25 +664,37 @@ class Dispatcher:
     Args:
         backend: Object providing the contract functions. Defaults to the real
             desktop backend.
-        screenshot_policy: ``never`` refuses screenshots outright, ``ask`` returns
-            a failure telling the model to ask the user first, ``auto`` allows
-            them. This is the consent gate, not behaviour steering.
+        screenshot_policy: ``never`` (the default, matching
+            :class:`yuki.config.Settings`) refuses screenshots outright -- a
+            backstop, since :func:`tool_params` already leaves ``take_screenshot``
+            out of the block under ``never`` -- ``ask`` returns a failure telling
+            the model to ask the user first, ``auto`` allows them. This is the
+            consent gate, not behaviour steering.
         tool_timeout_s: Timeout handed to :func:`run_powershell`.
         max_tree_elements: Cap for :func:`get_window_tree`.
+        tree_timeout_s: Budget handed to :func:`get_window_tree`. Deliberately
+            larger than that function's own default: a window whose tree is built
+            lazily is thin for the first few seconds of its life and the walk
+            spends the budget polling for it, and ``look_at_window`` is exactly the
+            call that follows ``launch_app``. Measured on this desktop, a cold
+            Spotify goes from 7 usable elements to 137 by spending 4.9 s of it, and
+            a window that is already built still answers in one pass.
     """
 
     def __init__(
         self,
         backend: Backend | None = None,
         *,
-        screenshot_policy: str = "auto",
+        screenshot_policy: str = "never",
         tool_timeout_s: float = 20.0,
         max_tree_elements: int = 400,
+        tree_timeout_s: float = 6.0,
     ) -> None:
         self.backend = backend if backend is not None else default_backend()
         self.screenshot_policy = screenshot_policy
         self.tool_timeout_s = tool_timeout_s
         self.max_tree_elements = max_tree_elements
+        self.tree_timeout_s = tree_timeout_s
 
     # -- warm-up -----------------------------------------------------------
 
@@ -710,7 +833,9 @@ class Dispatcher:
     def _do_look_at_window(self, tool_input: dict[str, Any]) -> ToolOutcome:
         hwnd = self._need_int(tool_input, "hwnd")
         started = time.perf_counter()
-        tree = self.backend.get_window_tree(hwnd, max_elements=self.max_tree_elements)
+        tree = self.backend.get_window_tree(
+            hwnd, max_elements=self.max_tree_elements, timeout_s=self.tree_timeout_s
+        )
         text = self.backend.format_window_tree(tree)
         payload = _plain(tree)
         elements = payload.get("elements") or [] if isinstance(payload, dict) else []
@@ -738,21 +863,32 @@ class Dispatcher:
             )
         hwnd = tool_input.get("hwnd")
         hwnd = None if hwnd is None else self._need_int(tool_input, "hwnd")
+        monitor = tool_input.get("monitor")
+        monitor = None if monitor is None else self._need_int(tool_input, "monitor")
+        region = self._opt_region(tool_input)
+        named = [
+            label
+            for label, value in (("hwnd", hwnd), ("region", region), ("monitor", monitor))
+            if value is not None
+        ]
+        if len(named) > 1:
+            raise ToolError(
+                f"name at most one target, got {', '.join(named)}. One shot covers one "
+                f"thing: a window, a rectangle, or a display."
+            )
+
         started = time.perf_counter()
-        png = self.backend.screenshot(hwnd)
-        if not isinstance(png, (bytes, bytearray)):
-            raise ToolError(f"screenshot() returned {type(png).__name__}, expected PNG bytes")
-        png = bytes(png)
+        shot = self._capture(hwnd, region, monitor)
+        png, geometry = shot["png"], shot["geometry"]
         b64 = base64.standard_b64encode(png).decode("ascii")
-        target = "the screen" if hwnd is None else f"window {hwnd}"
-        geometry = self._capture_geometry(hwnd, png)
+        target = shot["target"]
         return ToolOutcome(
             name="take_screenshot",
             ok=True,
             summary=f"{target}, {len(png)} bytes",
             content=[
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                {"type": "text", "text": f"Screenshot of {target}. {geometry['text']}"},
+                {"type": "text", "text": f"Screenshot of {target}. {geometry['text']}".strip()},
             ],
             payload={"target": target, "bytes": len(png), **geometry["payload"]},
             elapsed_ms=(time.perf_counter() - started) * 1000,
@@ -760,7 +896,100 @@ class Dispatcher:
             screenshot_b64=b64,
         )
 
-    def _capture_geometry(self, hwnd: int | None, png: bytes) -> dict[str, Any]:
+    def _opt_region(
+        self, tool_input: dict[str, Any]
+    ) -> tuple[int, int, int, int] | None:
+        """Validate the optional ``region`` argument, or ``None`` when omitted."""
+        region = tool_input.get("region")
+        if region is None:
+            return None
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            raise ToolError(
+                f"'region' must be [left, top, right, bottom], got {region!r}"
+            )
+        values = []
+        for value in region:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ToolError(f"'region' must be four integers, got {region!r}")
+            values.append(int(value))
+        left, top, right, bottom = values
+        if right <= left or bottom <= top:
+            raise ToolError(
+                f"region {values} is empty; it is [left, top, right, bottom] and needs "
+                f"right > left and bottom > top"
+            )
+        return (left, top, right, bottom)
+
+    def _capture(
+        self,
+        hwnd: int | None,
+        region: tuple[int, int, int, int] | None,
+        monitor: int | None,
+    ) -> dict[str, Any]:
+        """Take the shot and work out what to say about its coordinates.
+
+        Prefers the backend's ``capture``, which reports the image's origin and
+        scale as facts it measured rather than numbers reconstructed afterwards.
+        Falls back to ``screenshot``, which in the contract returns the same
+        ``Capture``; a backend whose ``screenshot`` returns bare PNG bytes (older
+        test doubles) gets its geometry reconstructed from ``capture_bounds``.
+        """
+        capture = getattr(self.backend, "capture", None)
+        if not callable(capture):
+            capture = self.backend.screenshot
+        shot = capture(hwnd, region=region, monitor=monitor)
+        if not isinstance(shot, (bytes, bytearray)):
+            png = getattr(shot, "png", None)
+            if not isinstance(png, (bytes, bytearray)):
+                raise ToolError(
+                    f"capture returned {type(shot).__name__} without PNG bytes in .png"
+                )
+            mapping = getattr(shot, "mapping_text", None)
+            left, top = getattr(shot, "origin", (0, 0))
+            scale = float(getattr(shot, "scale", 1.0) or 1.0)
+            return {
+                "png": bytes(png),
+                "target": str(getattr(shot, "target", "") or "the screen"),
+                "geometry": {
+                    "text": mapping() if callable(mapping) else "",
+                    "payload": {
+                        "image_size": list(getattr(shot, "image_size", ()) or []),
+                        "capture_bounds": list(getattr(shot, "bounds", ()) or []),
+                        "origin": [int(left), int(top)],
+                        "scale": scale,
+                        "one_to_one": scale == 1.0,
+                        "rendered_by_window": bool(
+                            getattr(shot, "rendered_by_window", False)
+                        ),
+                    },
+                },
+            }
+        # A backend written to the older bytes-only contract: reconstruct the
+        # geometry from capture_bounds.
+        png = shot
+        png = bytes(png)
+        if hwnd is not None:
+            target = f"window {hwnd}"
+        elif monitor is not None:
+            target = f"monitor {monitor}"
+        elif region is not None:
+            target = "region"
+        else:
+            target = "the screen"
+        return {
+            "png": png,
+            "target": target,
+            "geometry": self._capture_geometry(hwnd, png, region=region, monitor=monitor),
+        }
+
+    def _capture_geometry(
+        self,
+        hwnd: int | None,
+        png: bytes,
+        *,
+        region: tuple[int, int, int, int] | None = None,
+        monitor: int | None = None,
+    ) -> dict[str, Any]:
         """Say where a screenshot's pixels are, in screen coordinates.
 
         Without this a window shot is a trap: it is rendered by the window, so its
@@ -782,8 +1011,14 @@ class Dispatcher:
         reader = getattr(self.backend, "capture_bounds", None)
         if callable(reader):
             try:
-                left, top, right, bottom = reader(hwnd)
+                left, top, right, bottom = reader(hwnd, region=region, monitor=monitor)
                 bounds = (int(left), int(top), int(right), int(bottom))
+            except TypeError:  # a backend written before region/monitor existed
+                try:
+                    left, top, right, bottom = reader(hwnd)
+                    bounds = (int(left), int(top), int(right), int(bottom))
+                except Exception:
+                    bounds = None
             except Exception:
                 bounds = None
         if size is None or bounds is None:
@@ -792,19 +1027,34 @@ class Dispatcher:
         left, top, right, bottom = bounds
         source_width = max(1, right - left)
         scale = width / source_width
-        text = (
-            f"The image is {width}x{height} and covers the screen rectangle "
-            f"({left},{top})-({right},{bottom}), which is {source_width}x{bottom - top} "
-            f"real pixels, so it is at {scale:.3f} scale. To act on something you see "
-            f"here: screen_x = {left} + image_x / {scale:.3f}, "
-            f"screen_y = {top} + image_y / {scale:.3f}."
-        )
+        if scale == 1.0 and (left, top) == (0, 0):
+            text = (
+                f"The image is {width}x{height} at 1:1 with the screen and starts at "
+                f"the screen origin, so a point in this image IS the screen point - "
+                f"click it as you read it, no conversion."
+            )
+        elif scale == 1.0:
+            text = (
+                f"The image is {width}x{height} at 1:1 with the screen, covering "
+                f"({left},{top}) to ({right},{bottom}). To click something here: "
+                f"screen_x = {left} + image_x, screen_y = {top} + image_y."
+            )
+        else:
+            text = (
+                f"The image is {width}x{height}, a {scale:.4g}x scaling of the "
+                f"{source_width}x{bottom - top} screen rectangle ({left},{top}) to "
+                f"({right},{bottom}). To click something here: "
+                f"screen_x = {left} + image_x / {scale:.4g}, "
+                f"screen_y = {top} + image_y / {scale:.4g}."
+            )
         return {
             "text": text,
             "payload": {
                 "image_size": [width, height],
                 "capture_bounds": [left, top, right, bottom],
-                "scale": round(scale, 4),
+                "origin": [left, top],
+                "scale": round(scale, 6),
+                "one_to_one": scale == 1.0,
             },
         }
 

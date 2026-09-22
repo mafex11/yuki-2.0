@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -48,18 +49,37 @@ def get_start_apps(*, refresh: bool = False) -> list[dict[str, str]]:
     ``Get-StartApps`` costs a PowerShell start-up (~0.4 s), so the list is
     cached for the lifetime of the process; pass ``refresh=True`` after
     installing something.
+
+    The JSON goes via a temp file rather than stdout.  ``run_powershell``'s
+    stdout is what the *model* reads, so it is clipped (head + tail, middle
+    announced) above :data:`yuki.actions.shell.MAX_STREAM_CHARS`; this desktop's
+    Start menu serialises to ~18 kB today and would cross that line with a
+    handful more apps, at which point the JSON arrives with a human-readable
+    marker spliced into the middle of it and ``json.loads`` fails.  A machine
+    reader must not depend on a channel shaped for a reader, so PowerShell writes
+    the file and prints nothing.
     """
     global _start_apps_cache
     with _start_apps_lock:
         if _start_apps_cache is not None and not refresh:
             return _start_apps_cache
-        result = run_powershell(
-            "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress",
-            timeout_s=20.0,
-        )
-        if not result.ok:
-            raise RuntimeError(f"Get-StartApps failed: {result.summary}")
-        raw = result.details["stdout"].strip()
+        handle, path = tempfile.mkstemp(prefix="yuki-startapps-", suffix=".json")
+        os.close(handle)
+        try:
+            result = run_powershell(
+                "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress "
+                f"| Set-Content -LiteralPath {_quote(path)} -Encoding UTF8",
+                timeout_s=20.0,
+            )
+            if not result.ok:
+                raise RuntimeError(f"Get-StartApps failed: {result.summary}")
+            with open(path, encoding="utf-8-sig") as stream:
+                raw = stream.read().strip()
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         parsed = json.loads(raw) if raw else []
         if isinstance(parsed, dict):  # a single app comes back as an object
             parsed = [parsed]
