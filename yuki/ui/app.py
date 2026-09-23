@@ -13,7 +13,7 @@ import sys
 from typing import Sequence
 
 from PySide6.QtCore import QObject, QUrl, Qt
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from yuki.config import MODEL_ALIASES, Settings
@@ -21,8 +21,12 @@ from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import WORKER, AgentRuntime
-from yuki.ui.status import StatusStrip, describe_tool
+from yuki.ui.status import StatusStrip, describe_summary, describe_tool
 from yuki.ui.uilog import UiLog
+
+#: The effort levels offered in the tray menu (all five stay reachable from the
+#: CLI's ``/effort``); a level outside these simply shows nothing ticked.
+TRAY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
 #: Name of the mutex that keeps one Yuki UI per session.
 MUTEX_NAME = "Local\\YukiUiSingleInstance"
@@ -100,6 +104,9 @@ class YukiUi(QObject):
         self._acting: set[int] = set()
         #: Which lane is waiting for an answer, and for which request.
         self._question: tuple[str, int] | None = None
+        #: Where each request's closing message landed (a card, or ``None`` for
+        #: the strip), until its time/steps/cost suffix arrives.
+        self._settled: dict[int, ReplyCard | None] = {}
 
         self.overlay.submitted.connect(self._on_submitted)
         self.overlay.dismissed.connect(lambda: self.ui_log.event("overlay", state="hidden"))
@@ -114,6 +121,7 @@ class YukiUi(QObject):
         runtime_signals.finished.connect(self._on_finished)
         runtime_signals.failed.connect(self._on_failed)
         runtime_signals.queued.connect(self._on_queued)
+        runtime_signals.summarized.connect(self._on_summarized)
 
         self.bindings = hotkey_bindings(settings)
         self.hotkeys = HotkeyListener(self.bindings)
@@ -220,11 +228,33 @@ class YukiUi(QObject):
             card.set_body(text, tone="error" if tone == "error" else "reply")
         if self.overlay.isVisible() and not self.overlay.closing:
             if card is None:
-                self.overlay.add_card("", text, tone="error" if tone == "error" else "reply")
+                card = self.overlay.add_card("", text, tone="error" if tone == "error" else "reply")
             self.overlay.expand_input()
+            self._settled[request_id] = card
         else:
             self.strip.show_final(text, tone=tone)
+            self._settled[request_id] = None
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text)
+
+    def _on_summarized(self, lane_name: str, request_id: int, summary: dict) -> None:
+        """Put the dim ``52 s · 10 steps · 8¢`` suffix under the closing message."""
+        if request_id not in self._settled:
+            return
+        target = self._settled.pop(request_id)
+        text = describe_summary(summary)
+        self.ui_log.event(
+            "request_cost", id=request_id, lane=lane_name, suffix=text,
+            cost_usd=summary.get("cost_usd"), wall_s=summary.get("wall_s"),
+        )
+        if not text:
+            return
+        if target is None:
+            self.strip.set_meta(text)
+            return
+        try:
+            target.set_meta(text)
+        except RuntimeError:  # the card was trimmed away and deleted meanwhile
+            pass
 
     def _on_queued(self, request_id: int, request: str, waiting: int) -> None:
         """A front-desk request turned out to need hands and went to the worker."""
@@ -235,18 +265,21 @@ class YukiUi(QObject):
 
     # -- tray --------------------------------------------------------------
 
-    def toggle_model(self) -> str:
-        """Switch between the two configured models.
+    def set_model(self, alias_or_id: str) -> str:
+        """Switch both lanes to a model from the next request (logs ``model_switch``).
 
         Returns:
             The model id now in force.
         """
-        aliases = list(MODEL_ALIASES)
-        current = next(
-            (alias for alias in aliases if MODEL_ALIASES[alias] == self.settings.model), aliases[0]
-        )
-        nxt = aliases[(aliases.index(current) + 1) % len(aliases)]
-        return self.runtime.set_model(nxt)
+        return self.runtime.set_model(alias_or_id)
+
+    def set_effort(self, level: str) -> str:
+        """Switch both lanes to an effort level (logs ``effort_switch`` per lane).
+
+        Returns:
+            The level now in force.
+        """
+        return self.runtime.set_effort(level)
 
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
@@ -271,19 +304,54 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     show.triggered.connect(ui.show_overlay)
     menu.addAction(show)
 
-    model = QAction("", menu)
+    # Model and effort: one checkable item per choice, the current one ticked.
+    # Both go through the runtime, so both lanes switch and each agent logs it.
+    menu.addSeparator()
+    model_group = QActionGroup(menu)
+    model_group.setExclusive(True)
+    model_items: dict[str, QAction] = {}
+    for alias, model_id in MODEL_ALIASES.items():
+        item = QAction(f"Model: {alias.capitalize()}", menu, checkable=True)
+        item.triggered.connect(lambda _checked=False, a=alias: switch_model(a))
+        model_group.addAction(item)
+        menu.addAction(item)
+        model_items[model_id] = item
 
-    def refresh_model_label() -> None:
-        model.setText(f"Model: {ui.settings.model.split('.')[-1]}  (click to switch)")
+    menu.addSeparator()
+    effort_group = QActionGroup(menu)
+    effort_group.setExclusive(True)
+    effort_items: dict[str, QAction] = {}
+    for level in TRAY_EFFORTS:
+        item = QAction(f"Effort: {level.capitalize()}", menu, checkable=True)
+        item.triggered.connect(lambda _checked=False, lv=level: switch_effort(lv))
+        effort_group.addAction(item)
+        menu.addAction(item)
+        effort_items[level] = item
 
-    def switch_model() -> None:
-        ui.toggle_model()
-        refresh_model_label()
-        tray.setToolTip(f"Yuki — {ui.settings.model}")
+    def refresh_ticks() -> None:
+        # Exclusive groups cannot be emptied by unchecking one item, so drop
+        # exclusivity while syncing (a model or effort outside the menu, e.g.
+        # xhigh from settings, shows nothing ticked).
+        for group, items, current in (
+            (model_group, model_items, ui.settings.model),
+            (effort_group, effort_items, ui.settings.effort),
+        ):
+            group.setExclusive(False)
+            for key, item in items.items():
+                item.setChecked(key == current)
+            group.setExclusive(True)
+        tray.setToolTip(f"Yuki — {ui.settings.model} · effort {ui.settings.effort}")
 
-    refresh_model_label()
-    model.triggered.connect(switch_model)
-    menu.addAction(model)
+    def switch_model(alias: str) -> None:
+        ui.set_model(alias)
+        refresh_ticks()
+
+    def switch_effort(level: str) -> None:
+        ui.set_effort(level)
+        refresh_ticks()
+
+    menu.aboutToShow.connect(refresh_ticks)
+    menu.addSeparator()
 
     logs = QAction("Open logs folder", menu)
     logs.triggered.connect(ui.open_logs)
@@ -295,7 +363,7 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     menu.addAction(quit_action)
 
     tray.setContextMenu(menu)
-    tray.setToolTip(f"Yuki — {ui.settings.model}")
+    refresh_ticks()
     tray.activated.connect(
         lambda reason: ui.show_overlay()
         if reason == QSystemTrayIcon.ActivationReason.Trigger

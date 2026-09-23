@@ -167,6 +167,14 @@ class ReplyCard(QWidget):
         self._body.setStyleSheet("color: rgba(238,240,245,255);")
         layout.addWidget(self._body)
 
+        #: Dim time/steps/cost line under a finished reply; hidden until set.
+        self._meta = QLabel("", self)
+        self._meta.setFont(ui_font(9))
+        self._meta.setTextFormat(Qt.TextFormat.PlainText)
+        self._meta.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
+        self._meta.setVisible(False)
+        layout.addWidget(self._meta)
+
         self._effect = QGraphicsOpacityEffect(self)
         self._effect.setOpacity(0.0)
         self.setGraphicsEffect(self._effect)
@@ -191,6 +199,16 @@ class ReplyCard(QWidget):
             self.tone = tone
         self._body.setText(text)
         self.update()
+        self.grow_to_fit()
+
+    def set_meta(self, text: str) -> None:
+        """Show a dim footer line (``52 s · 10 steps · 8¢``) and grow to fit.
+
+        Args:
+            text: The line; empty hides it.
+        """
+        self._meta.setText(text)
+        self._meta.setVisible(bool(text))
         self.grow_to_fit()
 
     def wanted_height(self) -> int:

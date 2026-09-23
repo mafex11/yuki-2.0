@@ -54,6 +54,29 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "high"
 
 
+#: Anthropic list prices in US dollars per million tokens, keyed by the Bedrock
+#: model id. ``cache_write`` is the 5-minute cache write (1.25x input) and
+#: ``cache_read`` a cache hit (0.1x input). Bedrock bills separately and its
+#: rates may differ from these (regional or cross-region inference profiles,
+#: negotiated pricing); override ``Settings.pricing`` to match your bill. The
+#: numbers only feed the cost *estimate* in the logs -- nothing decides anything
+#: on them.
+DEFAULT_PRICING: dict[str, dict[str, float]] = {
+    MODEL_ALIASES["sonnet"]: {
+        "input": 2.00,
+        "output": 10.00,
+        "cache_write": 2.50,
+        "cache_read": 0.20,
+    },
+    MODEL_ALIASES["opus"]: {
+        "input": 5.00,
+        "output": 25.00,
+        "cache_write": 6.25,
+        "cache_read": 0.50,
+    },
+}
+
+
 @dataclass
 class Settings:
     """All knobs for one Yuki process.
@@ -94,6 +117,14 @@ class Settings:
             mid-conversation.
         ui_hotkey: Global combo that opens and closes the overlay.
         ui_cancel_hotkey: Global combo that cancels whatever the worker is doing.
+        pricing: US dollars per million tokens per model id, each entry with
+            ``input``, ``output``, ``cache_write`` and ``cache_read``. Defaults
+            to Anthropic's list prices (:data:`DEFAULT_PRICING`). Bedrock rates
+            may differ -- override this dict (or single entries) to match what
+            AWS actually bills. A model with no entry is logged with
+            ``cost_usd`` of ``None`` rather than a guess.
+        requests_csv: Append-only CSV with one line per finished request,
+            resolved against ``project_root`` like ``log_dir``.
     """
 
     model: str = DEFAULT_MODEL
@@ -110,6 +141,10 @@ class Settings:
     effort: str = DEFAULT_EFFORT
     ui_hotkey: str = "alt+shift"
     ui_cancel_hotkey: str = "ctrl+alt+space"
+    pricing: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {model: dict(rates) for model, rates in DEFAULT_PRICING.items()}
+    )
+    requests_csv: Path = Path("logs/requests.csv")
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)
@@ -120,6 +155,38 @@ class Settings:
         """Absolute directory for session logs."""
         log_dir = Path(self.log_dir)
         return log_dir if log_dir.is_absolute() else self.project_root / log_dir
+
+    @property
+    def requests_csv_path(self) -> Path:
+        """Absolute path of the per-request CSV."""
+        path = Path(self.requests_csv)
+        return path if path.is_absolute() else self.project_root / path
+
+    def price_for(self, model: str) -> dict[str, float] | None:
+        """The ``$/1M tokens`` rates for ``model`` (alias or id), or ``None``."""
+        return self.pricing.get(resolve_model(model))
+
+    def estimate_cost(self, model: str, usage: dict[str, int]) -> float | None:
+        """Estimated US dollars for ``usage`` on ``model``.
+
+        Args:
+            model: Alias or model id.
+            usage: Token counts keyed ``input_tokens`` (uncached input),
+                ``cache_write_tokens``, ``cache_read_tokens`` and
+                ``output_tokens`` (thinking included, as the API bills it).
+
+        Returns:
+            The estimate, or ``None`` when there is no price for the model.
+        """
+        rates = self.price_for(model)
+        if rates is None:
+            return None
+        return (
+            int(usage.get("input_tokens") or 0) * float(rates.get("input", 0.0))
+            + int(usage.get("cache_write_tokens") or 0) * float(rates.get("cache_write", 0.0))
+            + int(usage.get("cache_read_tokens") or 0) * float(rates.get("cache_read", 0.0))
+            + int(usage.get("output_tokens") or 0) * float(rates.get("output", 0.0))
+        ) / 1_000_000
 
     def with_model(self, name: str) -> "Settings":
         """Return a copy pointing at ``name`` (alias or full model id)."""
