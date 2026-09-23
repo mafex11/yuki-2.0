@@ -2,15 +2,37 @@
 
 Reading UIA properties one at a time is a cross-process COM call each
 (~3 ms/element for the dozen properties we need - a Chrome window measured
-~1 s for 300 elements).  Instead we ask UIA for a **cached subtree**
-(``BuildUpdatedCache`` with ``TreeScope_Subtree``): one cross-process call per
-top-level child, after which every property read is in-process
-(~0.2 ms/element for 22 properties).
+~1 s for 300 elements).  Instead every read is a **cache request**
+(``BuildUpdatedCache``) that brings back a batch of elements with all the
+properties we need in one cross-process call, after which every property read
+is in-process.
+
+**Viewport first.**  One cached subtree per top-level child is not enough: a
+web page is one child holding the whole document, thousands of nodes, almost
+all of them scrolled out of view, and a single ``TreeScope_Subtree`` request
+for it has to visit every one of them before it returns anything.  On
+2026-09-23 such a request on a browser window showing a YouTube channel had not
+returned after 6 s, eleven times in a row, while the same content read through
+the renderer's own window handle took 42 ms.  So a pass decides, element by
+element, how much to ask for in one call (see :class:`_ViewportPass`):
+
+* an element that lies wholly inside the visible part of the window, is not a
+  scroll container and does not host a descendant HWND gets its whole subtree
+  in one request, filtered to elements that are not off-screen;
+* an element that reaches beyond the visible area, scrolls, or hosts a
+  descendant window gets only its children in one request, so off-screen
+  branches are dropped without ever being visited;
+* an element that owns a descendant HWND is read through that HWND's own UIA
+  root, which asks the provider behind the handle directly instead of routing
+  every node through the parent's.
+
+That is a few dozen calls per window whatever the size of the page behind it,
+and each is bounded by what is on screen.
 
 The walk runs in a worker thread that initialises COM for itself, so a hung or
 pathologically large provider can be abandoned: the caller gives up at
-``timeout_s`` and returns whatever the worker had already collected, marked
-``truncated``.
+``timeout_s`` and returns everything the worker had collected up to then, in
+tree order, marked ``truncated`` - never an older, smaller pass in its place.
 
 **Lazily built trees.**  Some providers do not have a tree until something asks
 for one, and do not have it *immediately* even then.  A window whose content is
@@ -40,6 +62,14 @@ screen and its process alive, the result comes back at once with
 ``status="busy"`` and a note saying so.  A window that does answer keeps the
 full budget and the lazy-wake polling above; one that answered with a small tree
 is ``status="ok"``, and one that answered with nothing is ``status="empty"``.
+
+**A frame is not the content.**  A browser that has not built its page tree
+yet still answers with its own frame - title bar, toolbar, a sidebar full of
+tab names - which is far more than :data:`_THIN_TREE_ELEMENTS`.  So a pass is
+also treated as thin when a large descendant HWND has no element inside it, or
+when the elements found cover only a small part of the window
+(:func:`_surface_gaps`): both are facts about rectangles, not about which
+program drew them.
 """
 
 from __future__ import annotations
@@ -51,9 +81,10 @@ from dataclasses import dataclass, field
 import comtypes
 import comtypes.client
 import psutil
+import win32con
 import win32gui
 
-from yuki.perception.windows import is_cloaked, window_info
+from yuki.perception.windows import is_cloaked, virtual_screen_bounds, window_info
 
 # ---------------------------------------------------------------------------
 # UIA property ids we cache.  Names come from IUIAutomation's propid list.
@@ -82,6 +113,9 @@ _P_LEGACY_DEFAULT_ACTION = 30100
 _P_IS_TEXT_AVAILABLE = 30040
 _P_NATIVE_WINDOW_HANDLE = 30020
 _P_IS_PASSWORD = 30019
+_P_SELECTION_ITEM_IS_SELECTED = 30079
+_P_TOGGLE_STATE = 30086
+_P_EXPAND_COLLAPSE_STATE = 30070
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -110,11 +144,23 @@ _CACHED_PROPERTIES = (
     _P_IS_SCROLL_AVAILABLE,
     _P_LEGACY_DEFAULT_ACTION,
     _P_NATIVE_WINDOW_HANDLE,
+    _P_SELECTION_ITEM_IS_SELECTED,
+    _P_TOGGLE_STATE,
+    _P_EXPAND_COLLAPSE_STATE,
 )
 
 _TREE_SCOPE_ELEMENT = 1
+_TREE_SCOPE_CHILDREN = 2
+_TREE_SCOPE_DESCENDANTS = 4
 _TREE_SCOPE_SUBTREE = 7
 _AUTOMATION_ELEMENT_MODE_NONE = 0  # cached properties only: fastest
+#: Cached properties *and* a live reference, so the element can be asked for
+#: its own children in a later request.
+_AUTOMATION_ELEMENT_MODE_FULL = 1
+
+#: State values, per the documented ToggleState / ExpandCollapseState enums.
+_TOGGLE_STATES = {0: "off", 1: "on", 2: "mixed"}
+_EXPAND_STATES = {0: "collapsed", 1: "expanded", 2: "partly expanded"}  # 3 = leaf: no state
 
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
 
@@ -239,6 +285,29 @@ _HANDOFF_S = 0.15
 #: 211 elements once it had settled - time the model spent waiting, not looking.
 _BUSY_S = 1.5
 
+#: A descendant HWND this large a share of the window's visible area is a
+#: *surface*: if no element at all is found inside it, whatever it draws has not
+#: been exposed yet (a Chromium renderer woken moments ago answers with an empty
+#: root; measured on 2026-09-23, Discord's content window had no elements for
+#: several seconds after the first query, then 1191).  Small children - a
+#: caption button host, an input sink - are not held to that.
+_SURFACE_MIN_SHARE = 0.10
+
+#: Below this share of the visible window covered by leaf elements, a pass is
+#: treated as thin even though it has plenty of elements.  Measured from the
+#: 2026-09-23 logs on a 1920x1080 browser window: frame and sidebar only (27
+#: elements, the page not yet exposed) covered 8%; the same window with its page
+#: read covered 95%; Notepad and Spotify with content 95-100%.
+_MIN_COVERAGE = 0.25
+
+#: Grid cell (px) used to measure coverage: coarse enough to cost nothing for
+#: 400 rectangles, fine enough that a sidebar is not mistaken for the page.
+_COVERAGE_CELL = 32
+
+#: Slack (px) when comparing an element's rectangle against the viewport or a
+#: window rectangle - providers round differently from ``GetWindowRect``.
+_EDGE_SLACK = 2
+
 #: What ``WindowTree.status`` can say.  ``ok``: UIA answered (however small the
 #: tree).  ``busy``: the window is on screen and its process alive, but nothing
 #: came back in time.  ``empty``: UIA answered with nothing usable, or the window
@@ -267,6 +336,12 @@ class UIElement:
     #: (ExpandCollapse) and ``value`` (a writable Value).  Empty for elements
     #: that are not interactive.
     patterns: tuple[str, ...] = ()
+    #: What the element's patterns say about its current state, for elements
+    #: that expose one: ``selected`` (SelectionItem.IsSelected - e.g. the tab
+    #: that is on screen), ``on``/``off``/``mixed`` (Toggle) and
+    #: ``expanded``/``collapsed``/``partly expanded`` (ExpandCollapse).  Keyboard
+    #: focus stays in :attr:`is_focused`.
+    states: tuple[str, ...] = ()
 
 
 #: The pattern flags :class:`UIElement` reports, in the order they are listed:
@@ -307,6 +382,12 @@ class WindowTree:
     #: One sentence for the reader when ``status`` is not ``ok`` or the tree is
     #: partial; empty otherwise.
     note: str = ""
+    #: Off-screen branches the returned pass dropped without reading them (only
+    #: counted where they were seen: branches under an element that was read as
+    #: a whole subtree are filtered by UIA itself and not counted).
+    offscreen_skipped: int = 0
+    #: Cross-process cache requests the returned pass made (diagnostic).
+    fetches: int = 0
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -438,6 +519,91 @@ def child_window_handles(hwnd: int, *, limit: int = _MAX_CHILD_WINDOWS) -> list[
     return handles
 
 
+def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    """``GetWindowRect`` as (l, t, r, b), or ``None`` if empty or gone."""
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return (int(left), int(top), int(right), int(bottom))
+
+
+def _owned_window_handles(hwnd: int, *, limit: int = _MAX_CHILD_WINDOWS) -> list[int]:
+    """Visible top-level windows owned by ``hwnd`` that overlap it.
+
+    Not every surface drawn over a window is a descendant of it: popups, menus,
+    drop-downs and some hosted content views are separate top-level windows
+    *owned* by it.  They are part of what the user sees in that window, and
+    ``EnumChildWindows`` never lists them.  Ownership, visibility, cloaking and
+    rectangles are window-manager facts; nothing here looks at a class name.
+    """
+    frame = _window_rect(hwnd)
+    if frame is None:
+        return []
+    handles: list[int] = []
+
+    def _collect(candidate: int, _: object) -> bool:
+        if len(handles) >= limit:
+            return False
+        try:
+            if candidate == hwnd or win32gui.GetWindow(candidate, win32con.GW_OWNER) != hwnd:
+                return True
+            if not win32gui.IsWindowVisible(candidate) or is_cloaked(candidate):
+                return True
+        except Exception:
+            return True
+        rect = _window_rect(candidate)
+        if rect is not None and _overlap(rect, frame) is not None:
+            handles.append(int(candidate))
+        return True
+
+    try:
+        win32gui.EnumWindows(_collect, None)
+    except Exception:
+        pass
+    return handles
+
+
+def _surface_handles(hwnd: int) -> list[int]:
+    """Every window a pass reads alongside ``hwnd``: descendants, then owned."""
+    handles = child_window_handles(hwnd)
+    for owned in _owned_window_handles(hwnd, limit=max(_MAX_CHILD_WINDOWS - len(handles), 0)):
+        if owned not in handles:
+            handles.append(owned)
+    return handles
+
+
+def _overlap(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int]
+) -> tuple[int, int, int, int] | None:
+    """Intersection of two (l, t, r, b) rectangles, or ``None``."""
+    left, top = max(a[0], b[0]), max(a[1], b[1])
+    right, bottom = min(a[2], b[2]), min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def _area(rect: tuple[int, int, int, int] | None) -> int:
+    if rect is None:
+        return 0
+    return max(rect[2] - rect[0], 0) * max(rect[3] - rect[1], 0)
+
+
+def _contains(
+    outer: tuple[int, int, int, int], inner: tuple[int, int, int, int], slack: int = _EDGE_SLACK
+) -> bool:
+    """Whether ``inner`` lies within ``outer`` (give or take ``slack`` px)."""
+    return (
+        outer[0] <= inner[0] + slack
+        and outer[1] <= inner[1] + slack
+        and outer[2] >= inner[2] - slack
+        and outer[3] >= inner[3] - slack
+    )
+
+
 def _rect(value: object) -> tuple[int, int, int, int] | None:
     """Convert a cached BoundingRectangle variant to (l, t, r, b).
 
@@ -454,6 +620,32 @@ def _rect(value: object) -> tuple[int, int, int, int] | None:
     if width <= 0 or height <= 0:
         return None
     return (left, top, left + width, top + height)
+
+
+def _states(get: object) -> tuple[str, ...]:
+    """Current state from the cached SelectionItem/Toggle/ExpandCollapse values.
+
+    A state is only read when its pattern is available: for an element without
+    the pattern UIA returns its "not supported" sentinel, which is a COM object
+    and must not be mistaken for a value.
+    """
+    states: list[str] = []
+    try:
+        if _as_bool(get(_P_IS_SELECTION_ITEM_AVAILABLE)):  # type: ignore[operator]
+            selected = get(_P_SELECTION_ITEM_IS_SELECTED)  # type: ignore[operator]
+            if isinstance(selected, bool) and selected:
+                states.append("selected")
+        if _as_bool(get(_P_IS_TOGGLE_AVAILABLE)):  # type: ignore[operator]
+            toggle = get(_P_TOGGLE_STATE)  # type: ignore[operator]
+            if isinstance(toggle, int) and toggle in _TOGGLE_STATES:
+                states.append(_TOGGLE_STATES[toggle])
+        if _as_bool(get(_P_IS_EXPAND_COLLAPSE_AVAILABLE)):  # type: ignore[operator]
+            expand = get(_P_EXPAND_COLLAPSE_STATE)  # type: ignore[operator]
+            if isinstance(expand, int) and expand in _EXPAND_STATES:
+                states.append(_EXPAND_STATES[expand])
+    except Exception:
+        pass  # a state is a nicety; never lose the element over it
+    return tuple(states)
 
 
 class _CachedWalker:
@@ -484,6 +676,17 @@ class _CachedWalker:
         self.passes = 1
         self.child_windows = 0
         self.first_pass_elements = -1
+        #: Off-screen branches dropped unread, and cache requests made.
+        self.offscreen_skipped = 0
+        self.fetches = 0
+        #: Set once the pass has walked everything it meant to (as opposed to
+        #: being stopped by the cap, the deadline or ``cancel``).
+        self.complete = False
+        #: Window handles the pass read, with their rectangles, for
+        #: :func:`_surface_gaps`.
+        self.surfaces: dict[int, tuple[int, int, int, int]] = {}
+        #: Visible part of the window (window rect clipped to the desktop).
+        self.viewport: tuple[int, int, int, int] | None = None
         #: Called as ``on_window(native_hwnd, depth)`` after an element that owns
         #: a window handle has been walked, so the pass can splice that HWND's own
         #: subtree in right there - keeping depth-first order and real depths -
@@ -560,6 +763,7 @@ class _CachedWalker:
         self.seen.add(identity)
         self._shapes.add(shape)
         shortcut = _as_text(get(_P_ACCELERATOR_KEY)) or _as_text(get(_P_ACCESS_KEY))
+        states = _states(get)
         left, top, right, bottom = bounds
         self.elements.append(
             UIElement(
@@ -575,6 +779,7 @@ class _CachedWalker:
                 shortcut=shortcut or None,
                 depth=depth,
                 patterns=patterns if is_interactive else (),
+                states=states,
             )
         )
 
@@ -647,13 +852,31 @@ class _CachedWalker:
         return False
 
 
-def _build_cache_request(automation: object, scope: int) -> object:
+def _build_cache_request(
+    automation: object,
+    scope: int,
+    *,
+    tree_filter: object | None = None,
+    mode: int = _AUTOMATION_ELEMENT_MODE_NONE,
+) -> object:
+    """A cache request for every property :class:`UIElement` needs.
+
+    Args:
+        scope: ``TreeScope`` flags - which elements come back in the one call.
+        tree_filter: view the request walks (default: the control view).
+        mode: ``_AUTOMATION_ELEMENT_MODE_FULL`` when the returned elements will
+            be asked for their own children later.
+    """
     request = automation.CreateCacheRequest()  # type: ignore[attr-defined]
     for prop in _CACHED_PROPERTIES:
         request.AddProperty(prop)
     request.TreeScope = scope
-    request.TreeFilter = automation.ControlViewCondition  # type: ignore[attr-defined]
-    request.AutomationElementMode = _AUTOMATION_ELEMENT_MODE_NONE
+    request.TreeFilter = (
+        tree_filter
+        if tree_filter is not None
+        else automation.ControlViewCondition  # type: ignore[attr-defined]
+    )
+    request.AutomationElementMode = mode
     return request
 
 
@@ -689,7 +912,7 @@ def _element_from_handle(
             time.sleep(0.04)
 
 
-def _collect_pass(
+def _collect_pass_whole(
     automation: object,
     hwnd: int,
     child_handles: list[int],
@@ -699,7 +922,14 @@ def _collect_pass(
     cancel: threading.Event | None = None,
     on_start: object | None = None,
 ) -> _CachedWalker:
-    """One full pass: the window's own subtree plus every child HWND's subtree.
+    """Fallback pass: one unfiltered cached subtree per top-level child.
+
+    This is the walker from before :class:`_ViewportPass`; it is only used when
+    that one fails outright (a provider that rejects its requests), because on
+    a large document a single one of its requests can take longer than the
+    whole budget.
+
+    The window's own subtree plus every child HWND's subtree.
 
     The top-level element comes first (so the window frame keeps element id 0),
     then its UIA children one cached subtree at a time, then each descendant
@@ -801,6 +1031,414 @@ def _collect_pass(
     return walker
 
 
+class _ViewportPass:
+    """One pass over a window, reading only what is on screen, in batches.
+
+    Every element the walk keeps comes from a cache request; the question per
+    element is only how big a request to make for what lies below it:
+
+    * **whole subtree** (``TreeScope_Descendants`` filtered to
+      ``IsOffscreen == False``, one call) when the element lies entirely inside
+      the viewport, is not a scroll container and contains no descendant HWND:
+      everything under it is on screen or clipped away inside it, so the batch
+      is bounded by what the user can see;
+    * **one level** (``TreeScope_Children``, one call, live references) when it
+      reaches past the viewport, scrolls, or hosts a descendant HWND: its
+      off-screen children are dropped here and their subtrees never visited,
+      which is what keeps a 10,000-node page to a few hundred elements;
+    * **its own window** when the element *is* a descendant HWND we listed: that
+      handle's UIA root is asked directly (its own ``WM_GETOBJECT`` - what wakes
+      a lazily built provider - and no routing of each node through the
+      parent's provider), and walked by the same rules at the element's depth.
+
+    Elements are appended depth-first as they arrive, so whatever has been
+    collected when the deadline or cap stops the walk is a true prefix of the
+    window's tree - never thrown away.
+    """
+
+    def __init__(
+        self,
+        automation: object,
+        hwnd: int,
+        handles: list[int],
+        max_elements: int,
+        deadline: float,
+        *,
+        cancel: threading.Event | None = None,
+        on_start: object | None = None,
+    ) -> None:
+        self.automation = automation
+        self.hwnd = hwnd
+        self.deadline = deadline
+        self.cancel = cancel
+        self.walker = _CachedWalker(max_elements=max_elements, deadline=deadline, cancel=cancel)
+        if on_start is not None:
+            on_start(self.walker)  # type: ignore[operator]
+        onscreen = automation.CreateAndCondition(  # type: ignore[attr-defined]
+            automation.ControlViewCondition,  # type: ignore[attr-defined]
+            automation.CreatePropertyCondition(_P_IS_OFFSCREEN, False),  # type: ignore[attr-defined]
+        )
+        self.root_request = _build_cache_request(
+            automation,
+            _TREE_SCOPE_ELEMENT | _TREE_SCOPE_CHILDREN,
+            mode=_AUTOMATION_ELEMENT_MODE_FULL,
+        )
+        self.level_request = _build_cache_request(
+            automation, _TREE_SCOPE_CHILDREN, mode=_AUTOMATION_ELEMENT_MODE_FULL
+        )
+        self.subtree_request = _build_cache_request(
+            automation, _TREE_SCOPE_DESCENDANTS, tree_filter=onscreen
+        )
+        frame = _window_rect(hwnd)
+        self.viewport = _overlap(frame, virtual_screen_bounds()) if frame else None
+        self.walker.viewport = self.viewport
+        self.rects: dict[int, tuple[int, int, int, int]] = {}
+        for handle in handles:
+            rect = _window_rect(handle)
+            if rect is not None:
+                self.rects[handle] = rect
+        self.walker.surfaces = dict(self.rects)
+        #: Descendant/owned HWNDs not yet read, in enumeration order.
+        self.pending: dict[int, None] = dict.fromkeys(handles)
+        #: HWNDs already read through their own root: meeting their element
+        #: again must not walk the same content a second time the slow way.
+        self.read_windows: set[int] = set()
+        #: RuntimeIds of every element visited this pass, kept or not.  The same
+        #: element is often reachable twice - through the parent's provider and
+        #: through its own window's root - and its subtree only needs reading
+        #: once.
+        self.visited: set[tuple[int, ...]] = set()
+
+    # -- calls --------------------------------------------------------------
+    def _fetch(self, element: object, request: object) -> object | None:
+        """One cache request; ``None`` (and ``truncated``) if it failed."""
+        if self.walker.out_of_budget():
+            return None
+        try:
+            holder = element.BuildUpdatedCache(request)  # type: ignore[attr-defined]
+        except Exception:
+            # The element went away (a page re-rendering), or the provider
+            # refused: that branch is missing, and the tree says so.
+            self.walker.truncated = True
+            return None
+        self.walker.fetches += 1
+        return holder
+
+    def _whole_subtree(self, get: object) -> bool:
+        """Whether one filtered subtree request is safe for this element."""
+        if self.viewport is None:
+            return False
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        if bounds is None or not _contains(self.viewport, bounds):
+            return False
+        if _as_bool(get(_P_IS_SCROLL_AVAILABLE)):  # type: ignore[operator]
+            return False  # its content can run far beyond its own rectangle
+        return not any(_contains(bounds, rect) for rect in self.rects.values())
+
+    # -- traversal ----------------------------------------------------------
+    def _walk_children(self, holder: object, depth: int, *, live: bool) -> None:
+        for child in _CachedWalker._cached_children(holder):
+            if self.walker.out_of_budget():
+                return
+            self._visit(child, depth + 1, live=live)
+
+    def _visit(self, element: object, depth: int, *, live: bool) -> None:
+        """Keep ``element`` (if it is worth keeping) and walk what is below it.
+
+        ``live``: the element came from a one-level request, so it can be asked
+        for its own children; otherwise its whole subtree is already cached.
+        """
+        walker = self.walker
+        if walker.out_of_budget():
+            return
+        if depth > _MAX_DEPTH:
+            walker.truncated = True
+            return
+        get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+        if _as_bool(get(_P_IS_OFFSCREEN)):
+            walker.offscreen_skipped += 1
+            return
+        runtime_id = _runtime_id(get)
+        if runtime_id is not None:
+            if runtime_id in self.visited:
+                return  # already read, subtree and all, by another route
+            self.visited.add(runtime_id)
+        native = _native_handle(get)
+        if native and native != self.hwnd:
+            if native in self.pending and self._window(
+                native, depth, host=runtime_id, host_depth=depth
+            ):
+                return
+            if native in self.read_windows:
+                walker._add(element, depth)  # dropped as a duplicate if seen
+                return
+        walker._add(element, depth)
+        if not live:
+            self._walk_children(element, depth, live=False)
+            return
+        if not native:
+            # An element exactly the size of a window we have not read yet,
+            # without saying it owns it: most likely it hosts that window.
+            # Reading the window through its own root first means its content
+            # comes from the provider behind the handle, and the same content
+            # met below through this element is then skipped as visited.
+            hosted = self._hosted_window(get)
+            if hosted is not None:
+                self._window(hosted, depth + 1, host=runtime_id, host_depth=depth)
+        if self._whole_subtree(get):
+            holder = self._fetch(element, self.subtree_request)
+            if holder is not None:
+                self._walk_children(holder, depth, live=False)
+        else:
+            holder = self._fetch(element, self.level_request)
+            if holder is not None:
+                self._walk_children(holder, depth, live=True)
+
+    def _hosted_window(self, get: object) -> int | None:
+        """A pending window whose rectangle is this element's, if any."""
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        if bounds is None:
+            return None
+        for handle in self.pending:
+            rect = self.rects.get(handle)
+            if rect is not None and _contains(bounds, rect) and _contains(rect, bounds):
+                return handle
+        return None
+
+    def _window(
+        self,
+        handle: int,
+        depth: int,
+        *,
+        host: tuple[int, ...] | None = None,
+        host_depth: int = 0,
+    ) -> bool:
+        """Read a descendant/owned HWND through its own UIA root at ``depth``.
+
+        ``host``: RuntimeId of the element that led here (it owns the handle,
+        or has its exact rectangle), at ``host_depth``; if the window's root
+        turns out to be that very element, it stays at ``host_depth`` and its
+        children go directly below it.
+
+        Returns False when the handle gave no element in time, so the caller
+        can fall back to reading the element it met through the parent.
+        """
+        self.pending.pop(handle, None)
+        walker = self.walker
+        if walker.out_of_budget():
+            return True
+        live = _element_from_handle(
+            self.automation,
+            handle,
+            min(self.deadline, time.monotonic() + _CHILD_PATIENCE_S),
+            self.cancel,
+        )
+        if live is None:
+            return False
+        root = self._fetch(live, self.root_request)
+        if root is None:
+            return False
+        self.read_windows.add(handle)
+        get = root.GetCachedPropertyValue  # type: ignore[attr-defined]
+        if _as_bool(get(_P_IS_OFFSCREEN)):
+            walker.offscreen_skipped += 1
+            return True
+        runtime_id = _runtime_id(get)
+        if host is not None and runtime_id == host:
+            # The window's root *is* the element that led here: one element,
+            # now read through its own provider.
+            walker._add(root, host_depth)  # dropped as a duplicate if already kept
+            self._walk_children(root, host_depth, live=True)
+            return True
+        if runtime_id is not None:
+            if runtime_id in self.visited:
+                return True  # its content was already read through the parent
+            self.visited.add(runtime_id)
+        walker._add(root, depth)
+        self._walk_children(root, depth, live=True)
+        return True
+
+    def run(self) -> _CachedWalker:
+        """Walk the window; raises if its own handle gives no UIA element."""
+        walker = self.walker
+        live_root = _element_from_handle(self.automation, self.hwnd, self.deadline, self.cancel)
+        if live_root is None:
+            raise RuntimeError(f"UIA would not give an element for hwnd={self.hwnd}")
+        # Not through _fetch: if the root itself refuses this request, the
+        # caller falls back to the older whole-subtree walk.
+        root = live_root.BuildUpdatedCache(self.root_request)  # type: ignore[attr-defined]
+        walker.fetches += 1
+        root_id = _runtime_id(root.GetCachedPropertyValue)
+        if root_id is not None:
+            self.visited.add(root_id)
+        walker._add(root, 0)  # the frame keeps id 0, even if UIA calls it off-screen
+        self._walk_children(root, 0, live=True)
+        # Handles the walk never met (their owner was off-screen, padding, or
+        # not exposed by the parent's provider) are asked regardless - that is
+        # what wakes a lazily built provider - at depth 1, the honest floor.
+        for handle in list(self.pending):
+            if walker.out_of_budget():
+                break
+            self._window(handle, 1)
+        stopped = (
+            len(walker.elements) >= walker.max_elements
+            or (self.cancel is not None and self.cancel.is_set())
+            or time.monotonic() >= self.deadline
+        )
+        walker.complete = not stopped
+        return walker
+
+
+def _runtime_id(get: object) -> tuple[int, ...] | None:
+    """The cached RuntimeId as a tuple, or ``None`` if the provider gave none."""
+    try:
+        raw = get(_P_RUNTIME_ID)  # type: ignore[operator]
+        runtime_id = tuple(int(part) for part in raw) if raw is not None else ()
+    except Exception:
+        return None
+    return runtime_id or None
+
+
+def _native_handle(get: object) -> int:
+    try:
+        return int(get(_P_NATIVE_WINDOW_HANDLE) or 0)  # type: ignore[operator]
+    except Exception:
+        return 0
+
+
+def _collect_pass(
+    automation: object,
+    hwnd: int,
+    child_handles: list[int],
+    max_elements: int,
+    deadline: float,
+    *,
+    cancel: threading.Event | None = None,
+    on_start: object | None = None,
+) -> _CachedWalker:
+    """One pass over the window (see :class:`_ViewportPass`).
+
+    Falls back to :func:`_collect_pass_whole` only if the viewport pass cannot
+    even read the window's root element with its requests.
+
+    Raises:
+        RuntimeError: UIA never produced an element for ``hwnd`` itself.
+    """
+    viewport_pass = _ViewportPass(
+        automation,
+        hwnd,
+        child_handles,
+        max_elements,
+        deadline,
+        cancel=cancel,
+        on_start=on_start,
+    )
+    try:
+        return viewport_pass.run()
+    except RuntimeError:
+        raise
+    except Exception:
+        if viewport_pass.walker.elements:
+            viewport_pass.walker.truncated = True
+            return viewport_pass.walker  # it was reading: keep what it read
+    walker = _collect_pass_whole(
+        automation,
+        hwnd,
+        child_handles,
+        max_elements,
+        deadline,
+        cancel=cancel,
+        on_start=on_start,
+    )
+    walker.surfaces = viewport_pass.walker.surfaces
+    walker.viewport = viewport_pass.viewport
+    walker.complete = not (
+        len(walker.elements) >= max_elements
+        or (cancel is not None and cancel.is_set())
+        or time.monotonic() >= deadline
+    )
+    return walker
+
+
+def _leaf_coverage(
+    elements: list[UIElement], viewport: tuple[int, int, int, int]
+) -> float:
+    """Share of ``viewport`` covered by leaf elements (0..1), on a coarse grid.
+
+    A leaf is an element with no kept descendant (the next element is not
+    deeper).  Containers are left out on purpose: a frame or a page wrapper
+    covers everything and says nothing about whether anything is inside it.
+    """
+    left, top, right, bottom = viewport
+    cols = max((right - left + _COVERAGE_CELL - 1) // _COVERAGE_CELL, 1)
+    rows = max((bottom - top + _COVERAGE_CELL - 1) // _COVERAGE_CELL, 1)
+    grid = bytearray(cols * rows)
+    for index, element in enumerate(elements):
+        if index + 1 < len(elements) and elements[index + 1].depth > element.depth:
+            continue  # has something below it: not a leaf
+        clipped = _overlap(element.bounds, viewport)
+        if clipped is None:
+            continue
+        c0 = (clipped[0] - left) // _COVERAGE_CELL
+        c1 = min((clipped[2] - left - 1) // _COVERAGE_CELL + 1, cols)
+        r0 = (clipped[1] - top) // _COVERAGE_CELL
+        r1 = min((clipped[3] - top - 1) // _COVERAGE_CELL + 1, rows)
+        if c1 <= c0:
+            continue
+        run = b"\x01" * (c1 - c0)
+        for row in range(r0, r1):
+            grid[row * cols + c0 : row * cols + c1] = run
+    return grid.count(1) / len(grid)
+
+
+@dataclass
+class _Gaps:
+    """What a pass left unexplained (see :func:`_surface_gaps`)."""
+
+    #: Large descendant/owned HWNDs with no element inside them.
+    empty_surfaces: list[int] = field(default_factory=list)
+    #: Share of the visible window covered by leaf elements, ``None`` if unknown.
+    coverage: float | None = None
+
+    @property
+    def any(self) -> bool:
+        return bool(self.empty_surfaces) or (
+            self.coverage is not None and self.coverage < _MIN_COVERAGE
+        )
+
+
+def _surface_gaps(walker: _CachedWalker) -> _Gaps:
+    """Parts of the window a pass found nothing in.
+
+    Two facts about rectangles, neither about which program drew them:
+
+    * a descendant or owned HWND covering at least :data:`_SURFACE_MIN_SHARE`
+      of the visible window with no element inside it (containers the size of
+      the handle itself do not count - a root with nothing below it is exactly
+      what an unbuilt provider returns);
+    * leaf elements covering less than :data:`_MIN_COVERAGE` of the visible
+      window, which is what a browser frame looks like around a page that has
+      not been exposed yet.
+    """
+    viewport = walker.viewport
+    if viewport is None:
+        return _Gaps()
+    elements = list(walker.elements)
+    view_area = _area(viewport)
+    empty: list[int] = []
+    for handle, rect in walker.surfaces.items():
+        visible = _overlap(rect, viewport)
+        if visible is None or _area(visible) < _SURFACE_MIN_SHARE * view_area:
+            continue
+        limit = 0.9 * _area(rect)
+        if not any(
+            _contains(rect, element.bounds) and _area(element.bounds) < limit
+            for element in elements
+        ):
+            empty.append(handle)
+    return _Gaps(empty_surfaces=empty, coverage=_leaf_coverage(elements, viewport))
+
+
 def _walk_window(
     hwnd: int,
     max_elements: int,
@@ -816,8 +1454,10 @@ def _walk_window(
     Runs on the worker thread.  The first pass - the top-level subtree plus every
     descendant HWND's, which is itself what wakes a lazily built provider - is
     usually the whole story.  When it comes back thin (fewer than
-    :data:`_THIN_TREE_ELEMENTS`, or no more elements than there are descendant
-    HWNDs to host content), the pass is repeated as a condition poll with a
+    :data:`_THIN_TREE_ELEMENTS`, no more elements than there are descendant
+    HWNDs to host content, or - however many elements it has - a large child
+    window with nothing in it or most of the window uncovered, see
+    :func:`_surface_gaps`), the pass is repeated as a condition poll with a
     deadline, never a settle sleep:
 
     * the count grew past the first pass and then stood still for
@@ -829,8 +1469,9 @@ def _walk_window(
       thin, a pause in growth does not count as settled.)
     * ``deadline``.
 
-    Two facts drive that decision - an element count and a list of window
-    handles - and nothing here knows the name of an application.
+    Facts about a snapshot drive that decision - an element count, a list of
+    window handles, rectangles - and nothing here knows the name of an
+    application.
 
     Args:
         publish: called with every pass that becomes the best so far, so the
@@ -846,7 +1487,7 @@ def _walk_window(
     automation = comtypes.client.CreateObject(
         _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
     )
-    child_handles = child_window_handles(hwnd)
+    child_handles = _surface_handles(hwnd)
     passes = 1
 
     def adopt(walker: _CachedWalker) -> _CachedWalker:
@@ -869,8 +1510,12 @@ def _walk_window(
     first_count = len(best.elements)
     best = adopt(best)
 
-    thin = first_count < _THIN_TREE_ELEMENTS or (
-        bool(child_handles) and first_count <= len(child_handles)
+    thin = (
+        first_count < _THIN_TREE_ELEMENTS
+        or (bool(child_handles) and first_count <= len(child_handles))
+        # A populated frame around content that has not been exposed yet: a
+        # large child window with nothing in it, or most of the window blank.
+        or _surface_gaps(best).any
     )
     if not thin or len(best.elements) >= max_elements or time.monotonic() >= deadline:
         return best
@@ -886,7 +1531,7 @@ def _walk_window(
         grown = len(best.elements) > first_count
         if not grown and not young and now >= grace_deadline:
             break  # woken and re-read: it did not grow, so this is the window
-        child_handles = child_window_handles(hwnd)
+        child_handles = _surface_handles(hwnd)
         if not child_handles and not grown and now >= grace_deadline:
             break  # nothing to wake, and nothing arrived to wake
         try:
@@ -1073,7 +1718,7 @@ def get_window_tree(
             captured_at=time.time(),
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             passes=0,
-            child_windows=len(child_window_handles(hwnd)),
+            child_windows=len(_surface_handles(hwnd)),
             status=status,
             note=note,
         )
@@ -1089,57 +1734,84 @@ def get_window_tree(
     if thread.is_alive():
         cancel.set()  # stop the abandoned walk at its next check
 
-    walker = result.get("walker")
-    note = ""
-    if walker is None and result.get("best") is not None:
-        # Overran mid-poll: the best complete pass so far is still a true answer.
-        walker = result["best"]
-        assert isinstance(walker, _CachedWalker)
-        walker.truncated = True
-    if walker is None:
-        error = result.get("error")
-        if error is not None:
-            raise RuntimeError(f"UIA walk of hwnd={hwnd} failed: {error}") from error
-        live = result.get("live")
-        if live is None or not _has_content(live):
+    finished = result.get("walker")
+    best = result.get("best")
+    live = result.get("live")
+    partial = False
+    if isinstance(finished, _CachedWalker):
+        chosen = finished
+    else:
+        # Overran.  Everything collected so far is a true answer: the pass that
+        # was in flight is a depth-first prefix of the window's tree, so it is
+        # used whenever it holds more than the last complete pass - a pass cut
+        # off 90% of the way through a large page beats a small earlier one.
+        candidates = [w for w in (best, live) if isinstance(w, _CachedWalker)]
+        chosen = max(candidates, key=lambda w: len(w.elements)) if candidates else None
+        if chosen is None or not (chosen is best or _has_content(chosen)):
+            error = result.get("error")
+            if error is not None:
+                raise RuntimeError(f"UIA walk of hwnd={hwnd} failed: {error}") from error
             # Still running and nothing below the root: abandon the thread.
             return _silent(timeout_s)
-        # The first pass was answering but did not finish in time: what it had
-        # collected is a true, partial answer, and better than nothing.
-        assert isinstance(live, _CachedWalker)
-        partial = list(live.elements)
-        return WindowTree(
-            hwnd=hwnd,
-            title=info.title if info else "",
-            process_name=info.process_name if info else "",
-            elements=partial,
-            truncated=True,
-            captured_at=time.time(),
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
-            passes=1,
-            child_windows=len(child_window_handles(hwnd)),
-            first_pass_elements=len(partial),
-            status="ok",
-            note=f"the window answered but its first read did not finish within "
-            f"{timeout_s:g} s; this is the part collected so far",
+        partial = True
+    elements = list(chosen.elements)
+    if not chosen.complete and chosen.truncated and len(elements) < max_elements:
+        partial = True  # the worker returned, but only because its deadline stopped it
+    note = ""
+    if partial and elements:
+        last = elements[-1]
+        where = f"[{last.id}] {last.role}"
+        if last.name:
+            where += f' "{_one_line(last.name, 40)}"'
+        note = (
+            f"reading stopped at the {timeout_s:g} s limit; these {len(elements)} "
+            f"elements are everything read until then, in tree order from the window "
+            f"frame down to {where} - what comes after that in the tree was not read"
         )
-    assert isinstance(walker, _CachedWalker)
-    status = "ok" if walker.elements else "empty"
+    status = "ok" if elements else "empty"
     if status == "empty":
         note = "the window answered but exposes no elements with a size on screen"
+    elif not partial:
+        gaps = _surface_gaps(chosen)
+        if gaps.any:
+            parts = []
+            if gaps.coverage is not None:
+                parts.append(
+                    f"only {gaps.coverage:.0%} of the window's visible area holds "
+                    f"accessible elements"
+                )
+            if gaps.empty_surfaces:
+                parts.append(
+                    f"{len(gaps.empty_surfaces)} large child window(s) exposed nothing"
+                )
+            note = (
+                "; ".join(parts)
+                + " - the rest is drawn without accessibility (video, canvas) or has "
+                "not been exposed yet; look again shortly if you expected content there"
+            )
+    passes = max(
+        chosen.passes, best.passes if isinstance(best, _CachedWalker) else 1
+    )
+    reference = best if isinstance(best, _CachedWalker) else chosen
     return WindowTree(
         hwnd=hwnd,
         title=info.title if info else "",
         process_name=info.process_name if info else "",
-        elements=walker.elements,
-        truncated=walker.truncated,
+        elements=elements,
+        truncated=chosen.truncated or partial,
         captured_at=time.time(),
         elapsed_ms=(time.perf_counter() - started) * 1000.0,
-        passes=walker.passes,
-        child_windows=walker.child_windows,
-        first_pass_elements=walker.first_pass_elements,
+        passes=passes,
+        child_windows=reference.child_windows or len(_surface_handles(hwnd)),
+        first_pass_elements=(
+            reference.first_pass_elements
+            if reference.first_pass_elements >= 0
+            else len(elements)
+        ),
         status=status,
         note=note,
+        offscreen_skipped=chosen.offscreen_skipped,
+        fetches=chosen.fetches,
     )
 
 
@@ -1403,7 +2075,10 @@ def format_window_tree(tree: WindowTree) -> str:
     layout scaffolding the model cannot use.  Indentation carries ``depth``.  An
     interactive element's supported patterns follow its position in braces,
     ``{invoke,expand}``, so an element a click activates (``invoke``/``toggle``)
-    can be told from one a click only selects (``select``).
+    can be told from one a click only selects (``select``).  Current state
+    follows in brackets with the other flags - ``selected`` (the tab or item that
+    is chosen), ``on``/``off``/``mixed``, ``expanded``/``collapsed``,
+    ``focused``, ``scrollable``: ``[selected focused]``.
     """
     header = (
         f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'}) - "
@@ -1423,6 +2098,11 @@ def format_window_tree(tree: WindowTree) -> str:
         header += f" [status: {status}]"
     if tree.truncated:
         header += " [TRUNCATED: partial tree]"
+    skipped = getattr(tree, "offscreen_skipped", 0) or 0
+    if skipped:
+        # Said so the reader knows the list is the visible part on purpose:
+        # scrolling brings the rest into view (and into the next read).
+        header += f" [on-screen only: {skipped} off-screen branch(es) not read]"
     lines = [header]
     if note:
         lines.append(f"note: {note}")
@@ -1443,7 +2123,7 @@ def format_window_tree(tree: WindowTree) -> str:
             parts.append("{" + ",".join(patterns) + "}")
         if element.shortcut:
             parts.append(f"[kb: {element.shortcut}]")
-        flags = []
+        flags = list(getattr(element, "states", ()) or ())
         if element.is_focused:
             flags.append("focused")
         if element.is_scrollable:
