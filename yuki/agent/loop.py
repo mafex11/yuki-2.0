@@ -13,6 +13,7 @@ conversation.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -21,6 +22,8 @@ from typing import Any, Iterable, Iterator
 from yuki.agent.context import ContextManager
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
+    CONTROL_TOOLS,
+    PERCEPTION_TOOLS,
     Backend,
     Dispatcher,
     ToolOutcome,
@@ -113,6 +116,12 @@ class Agent:
         self._pending_answer: str | None = None
         self._awaiting_answer = False
         self._prewarm_thread: threading.Thread | None = None
+        # Per-request self-awareness facts (reset by run()): reported to the
+        # model as plain facts, never used to steer the loop.
+        self._request_started = time.monotonic()
+        self._waited_s = 0.0
+        self._model_calls = 0
+        self._call_history: dict[str, list[tuple[str, str]]] = {}
         if self.tool_names is not None or self.extra_instructions:
             self.logger.log(
                 "agent_scope",
@@ -315,11 +324,15 @@ class Agent:
         self._cancelled.clear()
         self._pending_answer = None
         self._awaiting_answer = False
+        self._request_started = time.monotonic()
+        self._waited_s = 0.0
+        self._model_calls = 0
+        self._call_history = {}
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.user_message(request)
         try:
-            overview = self._capture_overview()
+            overview, _ = self._capture_overview()
             self._close_dangling_tools(overview)
             self.context.add_request(request, overview)
             yield from self._drive()
@@ -399,7 +412,10 @@ class Agent:
             if tool_uses:
                 finished: list[str] = []
                 blocks, names = yield from self._run_tools(tool_uses, finished)
-                self.context.add_tool_results(blocks, self._capture_overview(), tool_names=names)
+                overview, facts = self._capture_overview()
+                self.context.add_tool_results(
+                    blocks, overview, tool_names=names, self_facts=facts
+                )
                 if finished:
                     self.logger.final(finished[0])
                     yield Final(finished[0])
@@ -510,7 +526,9 @@ class Agent:
                 self.logger.ask_user(question)
                 self._awaiting_answer = True
                 self._pending_answer = None
+                asked_at = time.monotonic()
                 yield AskUser(question)  # generator pauses here
+                self._waited_s += time.monotonic() - asked_at
                 self._awaiting_answer = False
                 answer = self._pending_answer
                 self._pending_answer = None
@@ -543,12 +561,24 @@ class Agent:
             if outcome.kind == "done":
                 finished.append(outcome.control_input["message"])
 
+            repeat_note = None
+            if name not in PERCEPTION_TOOLS and name not in CONTROL_TOOLS:
+                repeats = self._record_call(name, tool_input, outcome.summary)
+                repeat_note = _repeat_text(name, repeats)
+                outcome.payload = (
+                    {**outcome.payload, "self_facts": repeats}
+                    if isinstance(outcome.payload, dict)
+                    else {"result": outcome.payload, "self_facts": repeats}
+                )
+
             self._log_outcome(outcome, tool_use_id=tool_id)
             yield ToolResult(outcome.name, outcome.ok, outcome.summary)
 
-            content = outcome.content or [
+            content = list(outcome.content) or [
                 {"type": "text", "text": outcome.summary or "Done."}
             ]
+            if repeat_note:
+                content.append({"type": "text", "text": repeat_note})
             results[tool_id] = self._result_block(tool_id, content, is_error=not outcome.ok)
 
             if not outcome.ok or outcome.kind == "done":
@@ -626,23 +656,71 @@ class Agent:
 
     # -- perception --------------------------------------------------------
 
-    def _capture_overview(self) -> str:
+    def _capture_overview(self) -> tuple[str, str | None]:
         """Grab the desktop overview handed to the model at the start of each turn.
 
         A failure here is reported to the model as text rather than raised: not
         being able to see the desktop is something Yuki should know about and work
         around, not a crash.
+
+        Returns:
+            ``(overview_text, self_facts_text)``. The second is the one-line
+            request facts for the same situation block, ``None`` before the
+            first model call of a request. Both are also written to the
+            ``perception`` record (``payload.self_facts``).
         """
+        facts = self._turn_facts()
+        facts_text = _turn_facts_text(facts)
         try:
             text, payload, elapsed = self.dispatcher.overview_text()
         except Exception as exc:
             message = f"(could not read the desktop: {type(exc).__name__}: {exc})"
             self.logger.error(message, exc=exc)
-            return message
+            self.logger.log("self_facts", **facts)
+            return message, facts_text
+        if isinstance(payload, dict):
+            payload = {**payload, "self_facts": facts}
         self.logger.perception(
             "look_at_desktop", size_chars=len(text), elapsed_ms=elapsed, payload=payload
         )
-        return text
+        return text, facts_text
+
+    # -- self-awareness facts ----------------------------------------------
+
+    def _turn_facts(self) -> dict[str, Any]:
+        """Facts about the running request itself: wall time and model calls."""
+        return {
+            "request_elapsed_s": round(time.monotonic() - self._request_started, 1),
+            "waiting_for_user_s": round(self._waited_s, 1),
+            "model_calls": self._model_calls,
+        }
+
+    def _record_call(self, name: str, tool_input: dict[str, Any], summary: str) -> dict[str, int]:
+        """Record one action call this request and count its repeats.
+
+        Returns:
+            ``exact_calls``: calls of this tool with this exact input (canonical
+            JSON) this request, this one included. ``exact_same_result``: how many
+            of the earlier exact calls returned this same summary.
+            ``other_input_same_result``: earlier calls of this tool with a
+            different input that returned this same summary. ``tool_calls``:
+            calls of this tool this request, this one included.
+        """
+        canonical = json.dumps(
+            tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        )
+        history = self._call_history.setdefault(name, [])
+        exact = [previous for key, previous in history if key == canonical]
+        facts = {
+            "exact_calls": len(exact) + 1,
+            "exact_same_result": sum(previous == summary for previous in exact),
+            "other_input_same_result": sum(
+                key != canonical and previous == summary for key, previous in history
+            ),
+            "tool_calls": len(history) + 1,
+        }
+        history.append((canonical, summary))
+        return facts
 
     # -- model request -----------------------------------------------------
 
@@ -681,6 +759,7 @@ class Agent:
     def _request(self) -> Any:
         """Send one request and return the response, logging both sides in full."""
         params = self._request_params()
+        self._model_calls += 1
         self.logger.llm_request(
             model=params["model"],
             system=params["system"],
@@ -713,6 +792,50 @@ class Agent:
             stop_details=getattr(response, "stop_details", None),
         )
         return response
+
+
+def _turn_facts_text(facts: dict[str, Any]) -> str | None:
+    """One line for the situation block, or ``None`` before any model call."""
+    calls = int(facts.get("model_calls") or 0)
+    if calls <= 0:
+        return None
+    waited = float(facts.get("waiting_for_user_s") or 0.0)
+    waiting = f" ({waited:.0f} s of it waiting for the user's answer)" if waited >= 1 else ""
+    return (
+        f"Request running {float(facts['request_elapsed_s']):.0f} s{waiting}, "
+        f"{calls} model call{'' if calls == 1 else 's'} so far."
+    )
+
+
+def _repeat_text(name: str, facts: dict[str, int]) -> str | None:
+    """The repetition fact appended to a tool result, or ``None`` when there is none."""
+    count = facts["exact_calls"]
+    same = facts["exact_same_result"]
+    others = facts["other_input_same_result"]
+    other_calls = f"{others} {name} call{'' if others == 1 else 's'} with different input"
+    if count > 1:
+        previous = count - 1
+        if same == previous:
+            tail = (
+                "the previous one returned the same result"
+                if previous == 1
+                else f"the previous {previous} returned the same result"
+            )
+        elif same == 0:
+            tail = (
+                "the previous one returned a different result"
+                if previous == 1
+                else f"none of the previous {previous} returned this result"
+            )
+        else:
+            tail = f"{same} of the previous {previous} returned the same result"
+        text = f"(this exact call has now been made {count} times this request; {tail}"
+        if others:
+            text += f"; {other_calls} also returned it"
+        return text + ")"
+    if others:
+        return f"(earlier this request, {other_calls} returned this same result)"
+    return None
 
 
 def _content_chars(content: list[dict[str, Any]]) -> int:

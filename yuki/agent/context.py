@@ -74,23 +74,30 @@ class ContextManager:
 
     # -- composing messages ------------------------------------------------
 
-    def situation_text(self, overview_text: str) -> str:
-        """Build the per-turn context block: fresh desktop plus the running note.
+    def situation_text(self, overview_text: str, self_facts: str | None = None) -> str:
+        """Build the per-turn context block: fresh desktop, request facts, note.
 
         The architecture contract says the model gets a fresh ``look_at_desktop``
-        every turn without asking; this is that text. The running note rides along
-        here rather than in the system prompt so the cached prefix stays stable.
+        every turn without asking; this is that text. The running note and the
+        facts about the request itself (``self_facts``: how long it has been
+        running, how many model calls) ride along here rather than in the system
+        prompt so the cached prefix stays stable. All of it lives in one block,
+        so pruning stubs it as one unit once it is stale.
         """
         parts = [f"Desktop right now:\n{overview_text}"]
+        if self_facts:
+            parts.append(self_facts)
         if self.running_summary:
             parts.append(f"Your working note:\n{self.running_summary}")
         return "\n\n".join(parts)
 
-    def add_request(self, text: str, overview_text: str) -> None:
+    def add_request(
+        self, text: str, overview_text: str, *, self_facts: str | None = None
+    ) -> None:
         """Append a new user request together with the current situation."""
         content = [
             {"type": "text", "text": text},
-            {"type": "text", "text": self.situation_text(overview_text)},
+            {"type": "text", "text": self.situation_text(overview_text, self_facts)},
         ]
         self._slots.append(
             _Slot(role="user", content=content, turn=self.logger.turn, situation_pos=1)
@@ -106,6 +113,7 @@ class ContextManager:
         overview_text: str,
         *,
         tool_names: dict[str, str] | None = None,
+        self_facts: str | None = None,
     ) -> None:
         """Append one user message holding every tool result plus the situation.
 
@@ -114,9 +122,13 @@ class ContextManager:
             overview_text: Formatted fresh desktop overview for this turn.
             tool_names: ``tool_use_id`` -> tool name, so pruning knows which
                 results are perception snapshots.
+            self_facts: One line of facts about the running request, placed in
+                the situation block next to the overview.
         """
         content: list[Any] = list(results)
-        content.append({"type": "text", "text": self.situation_text(overview_text)})
+        content.append(
+            {"type": "text", "text": self.situation_text(overview_text, self_facts)}
+        )
         self._slots.append(
             _Slot(
                 role="user",
