@@ -17,6 +17,14 @@ every turn -- the same text from the same function), a later ``system_facts``,
 or a later ``take_screenshot`` of the same target. The most recent look of each
 window, and of each other kind, always stays in full however old it is. A
 failed look (``is_error``) supersedes nothing: it says nothing about the window.
+
+The window view Yuki attaches after a turn of successful actions ("Window after
+your actions") is a look like any other: keyed as ``look_at_window`` of its hwnd,
+it supersedes older looks of that window (explicit or attached) and is
+superseded by newer ones. It travels as its own attached block right *after*
+the situation block rather than inside it, because the situation block is
+stubbed every round by the next overview while the view must live exactly as
+long as nothing newer has looked at its window.
 This is housekeeping about payload size, never about behaviour: the stub says
 what was there and that something newer exists, so the model can look again if
 it still cares.
@@ -42,7 +50,9 @@ perception payload older than two turns) rewrote something two turns back on
   thing guaranteed to be superseded next round -- by the next turn's overview.
   Leaving it after the breakpoint means stubbing it next round touches only
   content *after* the previous breakpoint, which costs no cache. The price: each
-  turn's overview (~1-2k tokens) is always sent uncached, once.
+  turn's overview (~1-2k tokens) is always sent uncached, once. The window view
+  after actions sits after the situation block for the same reason: stubbing
+  it one round later touches only content after the previous breakpoint.
 * A superseded ``look_at_window``/``system_facts``/``take_screenshot`` result is
   usually one or two turns back, i.e. at or just before the previous
   breakpoint. That rewrite is accepted: that one request misses from the old
@@ -119,6 +129,9 @@ class _Slot:
             tool results.
         situation_pos: Index within ``content`` of the per-turn desktop overview
             block, if this message has one.
+        view_pos: Index within ``content`` of the window view attached after
+            actions, if this message has one.
+        view_hwnd: The window that view shows.
         stubbed: Keys already replaced, so each edit is logged exactly once.
     """
 
@@ -127,6 +140,8 @@ class _Slot:
     turn: int
     tool_names: dict[str, str] = field(default_factory=dict)
     situation_pos: int | None = None
+    view_pos: int | None = None
+    view_hwnd: int | None = None
     stubbed: set[str] = field(default_factory=set)
 
 
@@ -142,6 +157,7 @@ class _Look:
     is_situation: bool
     stubbed: bool
     failed: bool
+    is_view: bool = False
 
 
 class ContextManager:
@@ -318,6 +334,7 @@ class ContextManager:
         *,
         tool_names: dict[str, str] | None = None,
         self_facts: str | None = None,
+        window_view: tuple[int, str] | None = None,
     ) -> None:
         """Append one user message holding every tool result plus the situation.
 
@@ -328,18 +345,30 @@ class ContextManager:
                 results are perception snapshots.
             self_facts: One line of facts about the running request, placed in
                 the situation block next to the overview.
+            window_view: ``(hwnd, text)`` of the window read after this turn's
+                actions, attached as its own block right after the situation
+                block and tracked as a look at ``hwnd`` for stubbing.
         """
         content: list[Any] = list(results)
         content.append(
             {"type": "text", "text": self.situation_text(overview_text, self_facts)}
         )
+        situation_pos = len(content) - 1
+        view_pos: int | None = None
+        view_hwnd: int | None = None
+        if window_view is not None:
+            view_hwnd, view_text = int(window_view[0]), window_view[1]
+            content.append({"type": "text", "text": attached_text(view_text)})
+            view_pos = len(content) - 1
         self._slots.append(
             _Slot(
                 role="user",
                 content=content,
                 turn=self.logger.turn,
                 tool_names=dict(tool_names or {}),
-                situation_pos=len(content) - 1,
+                situation_pos=situation_pos,
+                view_pos=view_pos,
+                view_hwnd=view_hwnd,
             )
         )
 
@@ -430,6 +459,21 @@ class ContextManager:
                         )
                     )
                     continue
+                if position == slot.view_pos:
+                    looks.append(
+                        _Look(
+                            key=("look_at_window", str(slot.view_hwnd)),
+                            slot_index=slot_index,
+                            position=position,
+                            tool_use_id="",
+                            name="look_at_window",
+                            is_situation=False,
+                            stubbed=f"view@{position}" in slot.stubbed,
+                            failed=False,
+                            is_view=True,
+                        )
+                    )
+                    continue
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 tool_use_id = str(block.get("tool_use_id") or "")
@@ -472,17 +516,28 @@ class ContextManager:
         newer_turn = self._slots[latest.slot_index].turn
         block = slot.content[look.position]
         if latest.slot_index == look.slot_index:
-            by = (
-                "the desktop overview attached at the end of this message"
-                if latest.is_situation
-                else "a later result in this same message"
-            )
+            if latest.is_situation:
+                by = "the desktop overview attached at the end of this message"
+            elif latest.is_view:
+                by = "the window view attached after your actions, at the end of this message"
+            else:
+                by = "a later result in this same message"
+        elif latest.is_view:
+            by = f"the window view attached after your actions on turn {newer_turn}"
         else:
             by = f"a newer one on turn {newer_turn}"
         what = look.name
         if look.key[0] == "look_at_window" and len(look.key) > 1:
             what = f"look_at_window hwnd={look.key[1]}"
-        if look.is_situation:
+        if look.is_view:
+            original = _chars(block)
+            stub = (
+                f"\n\n[window view of hwnd={look.key[1]} attached by Yuki after your "
+                f"actions on turn {slot.turn} - superseded by {by}]"
+            )
+            slot.content[look.position] = {"type": "text", "text": stub}
+            slot.stubbed.add(f"view@{look.position}")
+        elif look.is_situation:
             original = _chars(block)
             # Same leading break as the block it replaces: in the first message
             # it sits right after the user's own words.

@@ -76,7 +76,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "monitor's index and rectangle. All coordinates are in one space "
             "spanning every monitor, which is the same space click, scroll and "
             "element centres use. Cheap and fast. You already receive this at the "
-            "start of every turn, so call it only to re-check after you have acted."
+            "start of every turn, already fresh, so you rarely need to call it."
         ),
         "input_schema": _obj({}),
     },
@@ -93,7 +93,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "window answered (however small the tree), busy when the window is on "
             "screen but did not answer in time, which usually means it is loading or "
             "rendering and can be read again shortly, and empty when it answered "
-            "with nothing usable."
+            "with nothing usable. After a turn whose actions all succeeded, the window "
+            "you acted on is read for you and attached to your next turn as 'Window "
+            "after your actions', so there is no need to call this just to see what "
+            "an action did; call it for other windows, or when that attached view is "
+            "not enough."
         ),
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
@@ -371,6 +375,32 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "run_powershell",
     "open_url",
 )
+
+#: Actions after which the loop attaches a fresh read of the window acted on to
+#: the next turn (see :meth:`Dispatcher.window_view`), so the model does not
+#: spend a whole round trip calling ``look_at_window`` only to see the result.
+#: ``run_powershell`` is not here: it acts on the system, not on a window. A list
+#: of names for plumbing, not a rule about what the model should do.
+AUTO_VIEW_TOOLS: frozenset[str] = frozenset(
+    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll"}
+)
+
+#: How long a window's element count and covered area must hold still before the
+#: automatic view after an action is taken as settled.
+AUTO_VIEW_QUIET_S = 0.3
+
+#: Ceiling on the whole automatic view, reads included: a window still changing
+#: after this is attached as it is, and says so.
+AUTO_VIEW_CAP_S = 1.5
+
+#: Gap between re-reads while waiting for the window to settle. Each read is a
+#: full tree walk (tens of milliseconds on a built window), so this only keeps
+#: the poll from spinning; the wait itself ends on the condition, not the clock.
+_AUTO_VIEW_POLL_S = 0.1
+
+#: Grid cell (px) for the covered-area part of the settle signature, the same
+#: coarse measure the tree module uses for coverage.
+_VIEW_CELL = 32
 
 
 def effective_screenshot_policy(policy: str | None = None) -> str:
@@ -722,6 +752,31 @@ class ToolOutcome:
         return self.name in PERCEPTION_TOOLS
 
 
+@dataclass
+class WindowView:
+    """One settled read of a window, for the view attached after actions.
+
+    Attributes:
+        hwnd: The window read.
+        text: Header plus formatted tree, the same text ``look_at_window`` gives.
+        summary: The one-line summary ``look_at_window`` would report.
+        payload: The tree as plain data, for the log.
+        reads: Tree reads made while waiting for it to settle.
+        settled: The signature held still for the quiet period.
+        reason: Why the wait ended, in words.
+        elapsed_ms: Wall time of the whole view.
+    """
+
+    hwnd: int
+    text: str
+    summary: str
+    payload: dict[str, Any]
+    reads: int
+    settled: bool
+    reason: str
+    elapsed_ms: float
+
+
 class ToolError(Exception):
     """Raised inside a handler to report a clean, model-readable failure."""
 
@@ -904,6 +959,16 @@ class Dispatcher:
         tree = self.backend.get_window_tree(
             hwnd, max_elements=self.max_tree_elements, timeout_s=self.tree_timeout_s
         )
+        return self._tree_outcome(hwnd, tree, started)
+
+    def _tree_outcome(self, hwnd: int, tree: Any, started: float) -> ToolOutcome:
+        """Format one tree read exactly as ``look_at_window`` returns it.
+
+        The text is the backend's own :func:`format_window_tree` behind a
+        one-line header, so whatever that formatter reports (page title and
+        address, selected tab, status and notes) reaches the model unchanged,
+        for explicit looks and the automatic view after actions alike.
+        """
         text = self.backend.format_window_tree(tree)
         payload = _plain(tree)
         elements = payload.get("elements") or [] if isinstance(payload, dict) else []
@@ -925,6 +990,110 @@ class Dispatcher:
             summary=summary,
             content=[{"type": "text", "text": f"{header}\n{text}"}],
             payload=payload,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def foreground_hwnd(self) -> int | None:
+        """The foreground window right now, from a (cheap) desktop overview."""
+        overview = self.backend.get_desktop_overview()
+        value = (
+            overview.get("foreground_hwnd")
+            if isinstance(overview, dict)
+            else getattr(overview, "foreground_hwnd", None)
+        )
+        try:
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def window_view(
+        self,
+        hwnd: int,
+        *,
+        settle: bool = True,
+        quiet_s: float = AUTO_VIEW_QUIET_S,
+        cap_s: float = AUTO_VIEW_CAP_S,
+    ) -> "WindowView":
+        """Read a window the way ``look_at_window`` does, once it has settled.
+
+        Used by the loop for the view it attaches after a turn of actions. Every
+        read is the backend's own :func:`get_window_tree`, patience included (a
+        thin tree of a young or freshly opened window is re-polled inside it,
+        and a window that does not answer comes back ``busy``). On top of that
+        the window is re-read until its element count and the area its leaf
+        elements cover have not changed for ``quiet_s``, bounded by ``cap_s``
+        for the whole view. A condition poll, never a fixed wait: a window that
+        is already still returns after two equal reads ``quiet_s`` apart.
+
+        Args:
+            hwnd: Window to read.
+            settle: ``False`` takes one read and returns it -- for when the
+                action already reported the window's content ready.
+            quiet_s: How long the signature must hold still.
+            cap_s: Bound on the whole view.
+
+        Returns:
+            A :class:`WindowView` holding the newest good read.
+
+        Raises:
+            Whatever the first read raises (``ValueError`` for a handle that is
+            no longer a window); a later read that fails just ends the wait.
+        """
+        started = time.perf_counter()
+        deadline = started + max(cap_s, 0.0)
+        tree = self.backend.get_window_tree(
+            hwnd, max_elements=self.max_tree_elements, timeout_s=max(cap_s, 0.1)
+        )
+        reads = 1
+        signature = _tree_signature(tree)
+        changed_at = time.perf_counter()
+        settled = False
+        if not settle:
+            reason = "one read: the action had already reported the content ready"
+        elif signature[0] != "ok":
+            reason = f"one read: the window's status is {signature[0]}"
+        else:
+            reason = f"still changing when the {cap_s:g} s limit was reached"
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                time.sleep(min(_AUTO_VIEW_POLL_S, remaining))  # poll gap, not a settle sleep
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    newer = self.backend.get_window_tree(
+                        hwnd,
+                        max_elements=self.max_tree_elements,
+                        timeout_s=max(remaining, quiet_s),
+                    )
+                except Exception as exc:  # gone or wedged: keep the last good read
+                    reason = f"re-reading stopped: {type(exc).__name__}: {exc}"
+                    break
+                reads += 1
+                newer_signature = _tree_signature(newer)
+                if newer_signature[0] != "ok":
+                    reason = f"re-reading stopped: the window turned {newer_signature[0]}"
+                    break
+                tree = newer
+                now = time.perf_counter()
+                if newer_signature != signature:
+                    signature, changed_at = newer_signature, now
+                    continue
+                if now - changed_at >= quiet_s:
+                    settled = True
+                    reason = f"unchanged for {(now - changed_at) * 1000:.0f} ms"
+                    break
+        outcome = self._tree_outcome(hwnd, tree, started)
+        return WindowView(
+            hwnd=hwnd,
+            text=str(outcome.content[0]["text"]) if outcome.content else "",
+            summary=outcome.summary,
+            payload=outcome.payload if isinstance(outcome.payload, dict) else {},
+            reads=reads,
+            settled=settled,
+            reason=reason,
             elapsed_ms=(time.perf_counter() - started) * 1000,
         )
 
@@ -1292,6 +1461,59 @@ class Dispatcher:
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
+
+
+def _tree_signature(tree: Any) -> tuple[str, int, bool, int]:
+    """What has to hold still for a window to count as settled.
+
+    ``(status, element count, truncated, covered cells)``. The covered cells are
+    the :data:`_VIEW_CELL` grid cells under leaf elements (elements with nothing
+    kept below them) -- the same coarse measure as the tree module's coverage --
+    so a page that fills in without adding elements, or swaps its content at the
+    element cap, still reads as changing.
+    """
+    payload = _plain(tree)
+    if not isinstance(payload, dict):
+        return ("ok", 0, False, 0)
+    elements = [e for e in payload.get("elements") or [] if isinstance(e, dict)]
+    return (
+        str(payload.get("status") or "ok"),
+        len(elements),
+        bool(payload.get("truncated")),
+        _leaf_cells(elements),
+    )
+
+
+def _leaf_cells(elements: list[dict[str, Any]]) -> int:
+    """Number of :data:`_VIEW_CELL` grid cells covered by leaf elements."""
+    rects: list[tuple[int, int, int, int]] = []
+    for index, element in enumerate(elements):
+        depth = int(element.get("depth") or 0)
+        if index + 1 < len(elements) and int(elements[index + 1].get("depth") or 0) > depth:
+            continue  # has something below it: not a leaf
+        bounds = element.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            continue
+        try:
+            left, top, right, bottom = (int(v) for v in bounds)
+        except (TypeError, ValueError):
+            continue
+        if right > left and bottom > top:
+            rects.append((left, top, right, bottom))
+    if not rects:
+        return 0
+    x0 = min(r[0] for r in rects)
+    y0 = min(r[1] for r in rects)
+    cols = max((max(r[2] for r in rects) - x0 + _VIEW_CELL - 1) // _VIEW_CELL, 1)
+    rows = max((max(r[3] for r in rects) - y0 + _VIEW_CELL - 1) // _VIEW_CELL, 1)
+    grid = bytearray(cols * rows)
+    for left, top, right, bottom in rects:
+        c0, c1 = (left - x0) // _VIEW_CELL, (right - x0 - 1) // _VIEW_CELL + 1
+        r0, r1 = (top - y0) // _VIEW_CELL, (bottom - y0 - 1) // _VIEW_CELL + 1
+        run = b"\x01" * (c1 - c0)
+        for row in range(r0, r1):
+            grid[row * cols + c0 : row * cols + c1] = run
+    return grid.count(1)
 
 
 def _png_size(png: bytes) -> tuple[int, int] | None:
