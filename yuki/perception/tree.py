@@ -70,12 +70,26 @@ also treated as thin when a large descendant HWND has no element inside it, or
 when the elements found cover only a small part of the window
 (:func:`_surface_gaps`): both are facts about rectangles, not about which
 program drew them.
+
+**Only the page in front.**  A browser keeps the page of every open tab
+exposed and reported on screen, each in a child window of its own, so a walk
+that reads every child window mixes all tabs' content (on 2026-09-23 a 400-element
+read of a Chrome window was mostly other tabs').  A page Document whose window
+is not the one on top at its centre - another page's window is - is left out,
+subtree and all, and counted (:meth:`_ViewportPass._background_page`; the tree
+header says "N background tab page(s) skipped").  The page that is shown leads
+the header as ``page: "<title>" <url>`` (its Document's Name and Value), which
+is the fact about what the window shows: a browser's window title can stay the
+same whatever the page, and its tab names lag behind.  :func:`wait_for_page`
+reads only that (a page-only pass, nothing inside the pages) and
+:func:`page_text` reads a page's whole text in one Text-pattern call.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import comtypes
@@ -163,6 +177,11 @@ _TOGGLE_STATES = {0: "off", 1: "on", 2: "mixed"}
 _EXPAND_STATES = {0: "collapsed", 1: "expanded", 2: "partly expanded"}  # 3 = leaf: no state
 
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
+
+#: ``UIA_DocumentControlTypeId``: a page (browser, PDF, rich document).
+_DOCUMENT_CONTROL_TYPE = 50030
+#: ``UIA_HyperlinkControlTypeId``.
+_HYPERLINK_CONTROL_TYPE = 50005
 
 #: UIA ControlType id -> role name, per the documented control-type ids.  Kept
 #: local so the tree walk needs nothing but comtypes.
@@ -426,6 +445,10 @@ class WindowTree:
     offscreen_skipped: int = 0
     #: Cross-process cache requests the returned pass made (diagnostic).
     fetches: int = 0
+    #: Page Documents left out of the tree, subtree and all, because another
+    #: page's window is on top of them: a browser's background tabs (see
+    #: :meth:`_ViewportPass._background_page`).
+    background_pages: int = 0
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -531,7 +554,11 @@ def child_window_handles(hwnd: int, *, limit: int = _MAX_CHILD_WINDOWS) -> list[
 
     Invisible children are dropped: the user cannot see them, their UIA elements
     come back off-screen and would be skipped by the walk anyway, and a single
-    Chromium window can carry several of them.
+    Chromium window can carry several of them.  DWM cloaking is *not* a reason
+    to drop a child: measured on this desktop, the child window a WinUI
+    browser draws its page in reports ``DWMWA_CLOAKED`` 1 (and its own child 5)
+    while that page is on screen - cloaking only means something for top-level
+    windows.
 
     Args:
         hwnd: window whose descendants to list.
@@ -711,10 +738,14 @@ class _CachedWalker:
         self.truncated = False
         self.seen: set[tuple] = set()
         self._shapes: set[tuple] = set()
-        #: ``[depth, kept id or -1]`` of every element on the path from the root
-        #: to the one being added, kept or not, so each kept element can name its
-        #: nearest kept ancestor exactly (see :attr:`UIElement.parent`).
+        #: ``[depth, kept id or -1, window handle]`` of every element on the
+        #: path from the root to the one being added, kept or not, so each kept
+        #: element can name its nearest kept ancestor exactly (see
+        #: :attr:`UIElement.parent`) and the window it was drawn in.
         self._lineage: list[list[int]] = []
+        #: Page Documents left out, subtree and all, because another page's
+        #: window is on top of them (see :meth:`_ViewportPass._background_page`).
+        self.background_pages = 0
         self.passes = 1
         self.child_windows = 0
         self.first_pass_elements = -1
@@ -758,15 +789,18 @@ class _CachedWalker:
         return ("shape", role, name, bounds)
 
     # -- element decoding ---------------------------------------------------
-    def _add(self, element: object, depth: int) -> None:
+    def _add(self, element: object, depth: int, *, window: int = 0) -> None:
         # Every element met, kept or not, closes the branches at its depth and
         # below: the walk is depth-first, so whatever sits deeper on the path
         # belongs to a sibling's subtree that is finished.
         lineage = self._lineage
         while lineage and lineage[-1][0] >= depth:
             lineage.pop()
-        lineage.append([depth, -1])
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+        # The window it is drawn in: its own handle, else the handle it was read
+        # through (a window root that reports none), else its parent's.
+        native = _native_handle(get) or window or (lineage[-1][2] if lineage else 0)
+        lineage.append([depth, -1, native])
         bounds = _rect(get(_P_BOUNDING_RECT))
         if bounds is None:
             return
@@ -829,10 +863,18 @@ class _CachedWalker:
                 depth=depth,
                 patterns=patterns if is_interactive else (),
                 states=states,
-                parent=next((kept for _, kept in reversed(lineage[:-1]) if kept >= 0), -1),
+                parent=next((entry[1] for entry in reversed(lineage[:-1]) if entry[1] >= 0), -1),
             )
         )
         lineage[-1][1] = len(self.elements) - 1
+
+    def window_at(self, depth: int) -> int:
+        """The window an element about to be added at ``depth`` inherits: that of
+        its nearest ancestor on the current path (0 when none is known)."""
+        for entry in reversed(self._lineage):
+            if entry[0] < depth:
+                return entry[2]
+        return 0
 
     # -- traversal ----------------------------------------------------------
     @staticmethod
@@ -1117,11 +1159,16 @@ class _ViewportPass:
         *,
         cancel: threading.Event | None = None,
         on_start: object | None = None,
+        stop_at_documents: bool = False,
     ) -> None:
         self.automation = automation
         self.hwnd = hwnd
         self.deadline = deadline
         self.cancel = cancel
+        #: Keep a Document element but read nothing below it: the frame of
+        #: the window plus the identity of every page on screen, without the
+        #: pages themselves (see :func:`wait_for_page`).
+        self.stop_at_documents = stop_at_documents
         self.walker = _CachedWalker(max_elements=max_elements, deadline=deadline, cancel=cancel)
         if on_start is not None:
             on_start(self.walker)  # type: ignore[operator]
@@ -1138,8 +1185,16 @@ class _ViewportPass:
             automation, _TREE_SCOPE_CHILDREN, mode=_AUTOMATION_ELEMENT_MODE_FULL
         )
         self.subtree_request = _build_cache_request(
-            automation, _TREE_SCOPE_DESCENDANTS, tree_filter=onscreen
+            automation,
+            _TREE_SCOPE_DESCENDANTS,
+            tree_filter=onscreen,
+            # A page-only pass keeps live references to what it reads, so a
+            # page Document found in a batch can be asked for its text.
+            mode=_AUTOMATION_ELEMENT_MODE_FULL if stop_at_documents else _AUTOMATION_ELEMENT_MODE_NONE,
         )
+        #: Live UIA elements of the page Documents kept by a page-only pass,
+        #: by element id (see :func:`page_text`).
+        self.page_elements: dict[int, object] = {}
         frame = _window_rect(hwnd)
         self.viewport = _overlap(frame, virtual_screen_bounds()) if frame else None
         self.walker.viewport = self.viewport
@@ -1159,6 +1214,10 @@ class _ViewportPass:
         #: through its own window's root - and its subtree only needs reading
         #: once.
         self.visited: set[tuple[int, ...]] = set()
+        #: Window handle -> the page Documents its own UIA root is or directly
+        #: holds, as ``(RuntimeId, name, value)`` (see :meth:`_pages_in_window`),
+        #: asked once per pass.
+        self.page_hosts: dict[int, list[tuple]] = {}
 
     # -- calls --------------------------------------------------------------
     def _fetch(self, element: object, request: object) -> object | None:
@@ -1223,7 +1282,13 @@ class _ViewportPass:
             if native in self.read_windows:
                 walker._add(element, depth)  # dropped as a duplicate if seen
                 return
+        if self._background_page(get, native or walker.window_at(depth)):
+            walker.background_pages += 1
+            return
         walker._add(element, depth)
+        if self._stops_here(get):
+            self._keep_page(element)
+            return
         if not live:
             self._walk_children(element, depth, live=False)
             return
@@ -1244,6 +1309,111 @@ class _ViewportPass:
             holder = self._fetch(element, self.level_request)
             if holder is not None:
                 self._walk_children(holder, depth, live=True)
+
+    def _stops_here(self, get: object) -> bool:
+        """Whether the walk ends at this element (a Document, in a page-only pass)."""
+        if not self.stop_at_documents:
+            return False
+        try:
+            return get(_P_CONTROL_TYPE) == _DOCUMENT_CONTROL_TYPE  # type: ignore[operator]
+        except Exception:
+            return False
+
+    def _keep_page(self, element: object) -> None:
+        """Remember the live element of a page Document just kept."""
+        walker = self.walker
+        if walker.elements and walker.elements[-1].role == "Document":
+            self.page_elements.setdefault(walker.elements[-1].id, element)
+
+    def _background_page(self, get: object, own: int) -> bool:
+        """Whether this element is the page of a tab that is not in front.
+
+        A browser keeps the page of every open tab exposed, reported on screen,
+        each drawn in a child window of its own; only the tab in front has its
+        window on top.  So a Document whose Value is an address (a page, not an
+        editor's text) is a background page when
+
+        * its own window (``own``: the handle it was read through, else its
+          nearest ancestor's) is a child window that is hidden, or its
+          rectangle does not reach into the window at all; or
+        * at the centre of its visible part, the child window on top in the
+          window's own stacking order (``ChildWindowFromPointEx``) is not its
+          own window (nor inside it, nor containing it) and holds a page that
+          is a *different* Document (:meth:`_pages_in_window`; compared by
+          RuntimeId, else by title and address).  That comparison is what
+          settles a page the window's frame exposes without saying which child
+          window draws it.
+
+        A window on top that holds no page (a frame composited over the page)
+        says nothing, and neither does a page drawn in the top-level window
+        itself with nothing over it.  Window and UIA facts only - nothing here
+        knows which program drew them.
+        """
+        try:
+            if get(_P_CONTROL_TYPE) != _DOCUMENT_CONTROL_TYPE:  # type: ignore[operator]
+                return False
+            raw = get(_P_VALUE_VALUE) if _as_bool(get(_P_IS_VALUE_AVAILABLE)) else None  # type: ignore[operator]
+            if not is_address(raw if isinstance(raw, str) else None):
+                return False
+            bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        except Exception:
+            return False
+        visible = _overlap(bounds, self.viewport) if bounds and self.viewport else None
+        if visible is None:
+            return bounds is not None and self.viewport is not None
+        child = bool(own) and own != self.hwnd
+        try:
+            # Hidden, not cloaked: a child window's cloak state does not say
+            # whether it is on screen (see :func:`child_window_handles`).
+            if child and not win32gui.IsWindowVisible(own):
+                return True
+        except Exception:
+            return True  # its window is gone
+        on_top = _child_window_at(
+            self.hwnd, (visible[0] + visible[2]) // 2, (visible[1] + visible[3]) // 2
+        )
+        if on_top == self.hwnd or (child and _related(on_top, own)):
+            return False
+        on_top_pages = self._pages_in_window(on_top)
+        if not on_top_pages:
+            return False
+        runtime_id = _runtime_id(get)
+        name = _as_text(get(_P_NAME))  # type: ignore[operator]
+        for other_id, other_name, other_value in on_top_pages:
+            if runtime_id is not None and other_id is not None:
+                if other_id == runtime_id:
+                    return False  # the page on top is this very Document
+            elif (other_name, other_value) == (name, raw):
+                return False
+        return True
+
+    def _pages_in_window(self, handle: int) -> list[tuple]:
+        """The page Documents ``handle``'s own UIA root is or directly holds,
+        as ``(RuntimeId or None, name, value)``."""
+        if handle in self.page_hosts:
+            return self.page_hosts[handle]
+        pages: list[tuple] = []
+        live = _element_from_handle(
+            self.automation,
+            handle,
+            min(self.deadline, time.monotonic() + _CHILD_PATIENCE_S),
+            self.cancel,
+        )
+        if live is not None:
+            try:
+                root = live.BuildUpdatedCache(self.root_request)  # type: ignore[attr-defined]
+                self.walker.fetches += 1
+                for candidate in [root, *_CachedWalker._cached_children(root)]:
+                    get = candidate.GetCachedPropertyValue
+                    if get(_P_CONTROL_TYPE) != _DOCUMENT_CONTROL_TYPE:
+                        continue
+                    raw = get(_P_VALUE_VALUE) if _as_bool(get(_P_IS_VALUE_AVAILABLE)) else None
+                    if is_address(raw if isinstance(raw, str) else None):
+                        pages.append((_runtime_id(get), _as_text(get(_P_NAME)), raw))
+            except Exception:
+                pages = []
+        self.page_hosts[handle] = pages
+        return pages
 
     def _hosted_window(self, get: object) -> int | None:
         """A pending window whose rectangle is this element's, if any."""
@@ -1295,18 +1465,27 @@ class _ViewportPass:
             walker.offscreen_skipped += 1
             return True
         runtime_id = _runtime_id(get)
+        if self._background_page(get, handle):
+            walker.background_pages += 1
+            return True
         if host is not None and runtime_id == host:
             # The window's root *is* the element that led here: one element,
             # now read through its own provider.
-            walker._add(root, host_depth)  # dropped as a duplicate if already kept
-            self._walk_children(root, host_depth, live=True)
+            walker._add(root, host_depth, window=handle)  # dropped as a duplicate if already kept
+            if self._stops_here(get):
+                self._keep_page(live)
+            else:
+                self._walk_children(root, host_depth, live=True)
             return True
         if runtime_id is not None:
             if runtime_id in self.visited:
                 return True  # its content was already read through the parent
             self.visited.add(runtime_id)
-        walker._add(root, depth)
-        self._walk_children(root, depth, live=True)
+        walker._add(root, depth, window=handle)
+        if self._stops_here(get):
+            self._keep_page(live)
+        else:
+            self._walk_children(root, depth, live=True)
         return True
 
     def run(self) -> _CachedWalker:
@@ -1885,6 +2064,7 @@ def get_window_tree(
         note=note,
         offscreen_skipped=chosen.offscreen_skipped,
         fetches=chosen.fetches,
+        background_pages=chosen.background_pages,
     )
 
 
@@ -2137,6 +2317,576 @@ def wait_for_content(
         result.error = str(shared["error"])
     result.waited_ms = (time.perf_counter() - started) * 1000.0
     return result
+
+
+# ---------------------------------------------------------------------------
+# Which page a window is showing
+# ---------------------------------------------------------------------------
+def is_address(value: str | None) -> bool:
+    """Whether a Document's Value is an address (``https://...``, ``file:///...``,
+    ``about:blank``) rather than document text.
+
+    Browsers (Chromium, Edge, Firefox) expose the page URL as the Value of the
+    page's Document element; an editor's Document holds its text instead.  An
+    address is one token with a scheme of two or more letters (a single letter
+    is a drive: ``C:\\...``).  Parsing the value's shape, not naming any app.
+    """
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return len(parts.scheme) > 1 and len(value) > len(parts.scheme) + 1
+
+
+@dataclass
+class PageIdentity:
+    """The page a window shows, read from its Document element.
+
+    Attributes:
+        title: the Document's Name (the page title; may still be the address,
+            or empty, while the page loads).
+        url: the Document's Value.
+        element_id: the Document's element id in the snapshot (-1: not from one).
+        bounds: the Document's rectangle.
+        other_pages: further top-level pages on screen (a split view, an
+            owned pop-up window with a page of its own).
+        selected_tab: Name of the selected TabItem (else ListItem) outside any
+            page - the browser's own tab strip or sidebar.  It can lag behind
+            the page; the page is the fact.
+    """
+
+    title: str
+    url: str
+    element_id: int = -1
+    bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
+    other_pages: int = 0
+    selected_tab: str = ""
+
+    def phrase(self) -> str:
+        """``"MrBeast - YouTube" https://www.youtube.com/@MrBeast/videos``."""
+        if self.title and self.title != self.url:
+            return f'"{_one_line(self.title, 90)}" {_one_line(self.url, 200)}'
+        return f"{_one_line(self.url, 200)} (no title yet)"
+
+
+def _inside_document(element: UIElement, by_id: dict[int, UIElement]) -> bool:
+    parent = getattr(element, "parent", -1)
+    hops = 0
+    while parent >= 0 and hops <= _MAX_DEPTH:
+        above = by_id.get(parent)
+        if above is None:
+            return False
+        if above.role == "Document":
+            return True
+        parent = getattr(above, "parent", -1)
+        hops += 1
+    return False
+
+
+def _page_documents(elements: list[UIElement]) -> list[UIElement]:
+    """Documents whose Value is an address and that are not inside another one."""
+    by_id = {element.id: element for element in elements}
+    return [
+        element
+        for element in elements
+        if element.role == "Document"
+        and is_address(element.value)
+        and not _inside_document(element, by_id)
+    ]
+
+
+def pages_on_screen(elements: list[UIElement]) -> list[PageIdentity]:
+    """Every top-level page in a snapshot, the visible main one first.
+
+    A page is a Document whose Value is an address (:func:`is_address`) and
+    that is not inside another Document (an embedded frame is part of its
+    page).  Background tabs' pages never get into a snapshot (the walk leaves
+    them out, see :meth:`_ViewportPass._background_page`).  The main page is
+    the one the selected tab names, when a selected tab outside the pages
+    names one of them; else a titled page before an untitled one (an app's
+    own shell page, drawn under the page it hosts, has no title), then the
+    largest (ties: tree order).  The selected tab is carried on the first.
+    """
+    by_id = {element.id: element for element in elements}
+    documents = _page_documents(elements)
+    if not documents:
+        return []
+
+    def area(element: UIElement) -> int:
+        left, top, right, bottom = element.bounds
+        return max(right - left, 0) * max(bottom - top, 0)
+
+    def titled(element: UIElement) -> bool:
+        return bool(element.name) and element.name != element.value
+
+    # A page with a title before one without (an app's own shell page under
+    # the page it hosts has none), then the largest; ties keep tree order.
+    ordered = sorted(documents, key=lambda e: (titled(e), area(e)), reverse=True)
+    selected = [
+        element
+        for element in elements
+        if element.role in ("TabItem", "ListItem")
+        and "selected" in (getattr(element, "states", ()) or ())
+        and element.name
+        and not _inside_document(element, by_id)
+    ]
+    tab = next((e for e in selected if e.role == "TabItem"), None) or (
+        selected[0] if selected else None
+    )
+    if tab is not None and len(ordered) > 1:
+        # A tab's name is its page's title, sometimes with more after it
+        # ("Title - Memory usage - 98 MB"); the page it names goes first.
+        named = [e for e in ordered if e.name and tab.name.startswith(e.name)]
+        if named:
+            ordered = [named[0], *[e for e in ordered if e is not named[0]]]
+    pages = [
+        PageIdentity(
+            title=element.name,
+            url=element.value or "",
+            element_id=element.id,
+            bounds=element.bounds,
+        )
+        for element in ordered
+    ]
+    pages[0].other_pages = len(pages) - 1
+    pages[0].selected_tab = tab.name if tab is not None else ""
+    return pages
+
+
+def page_identity(elements: list[UIElement]) -> PageIdentity | None:
+    """The main page of a snapshot (see :func:`pages_on_screen`), or ``None``."""
+    pages = pages_on_screen(elements)
+    return pages[0] if pages else None
+
+
+#: ``CWP_SKIPINVISIBLE`` for ``ChildWindowFromPointEx``.  Transparent children
+#: are *not* skipped: a browser's page windows are ``WS_EX_TRANSPARENT``.
+_CWP_SKIPINVISIBLE = 0x1
+
+
+def _child_window_at(hwnd: int, x: int, y: int) -> int:
+    """The deepest visible descendant of ``hwnd`` at screen point (x, y), in
+    the window's own stacking order (other top-level windows do not matter),
+    or ``hwnd`` itself when no child is there."""
+    current = hwnd
+    for _ in range(_MAX_DEPTH):
+        try:
+            point = win32gui.ScreenToClient(current, (x, y))
+            child = win32gui.ChildWindowFromPointEx(current, point, _CWP_SKIPINVISIBLE)
+        except Exception:
+            break
+        if not child or child == current:
+            break
+        current = int(child)
+    return current
+
+
+def _related(a: int, b: int) -> bool:
+    """``a`` and ``b`` are the same window, or one contains the other."""
+    if a == b:
+        return True
+    try:
+        return bool(win32gui.IsChild(a, b) or win32gui.IsChild(b, a))
+    except Exception:
+        return False
+
+
+@dataclass
+class PageSeen:
+    """One page seen by :func:`wait_for_page`: which window, which page."""
+
+    hwnd: int
+    title: str
+    url: str
+    #: The window's main (largest) page, as opposed to a second one beside it.
+    main: bool = True
+    selected_tab: str = ""
+
+
+@dataclass
+class PageWait:
+    """What :func:`wait_for_page` found.
+
+    Attributes:
+        matched: the first page whose address the caller accepted, or ``None``.
+        seen: every page on screen in the windows read by the last poll, each
+            window's main page first, windows in the order given.
+        windows: the windows the last poll read.
+        polls: polls made.
+        answered: some window answered at all (False: none was read).
+        waited_ms: time from the call to the answer.
+        error: the last failure, when nothing answered.
+    """
+
+    matched: PageSeen | None = None
+    seen: list[PageSeen] = field(default_factory=list)
+    windows: list[int] = field(default_factory=list)
+    polls: int = 0
+    answered: bool = False
+    waited_ms: float = 0.0
+    error: str = ""
+
+
+#: Per-window cap on one page-only read: the window's own frame (toolbars,
+#: tabs, a sidebar) plus its Document elements, never the pages' content.
+_PAGE_READ_ELEMENTS = 300
+
+#: Longest one window's page-only read may take inside a :func:`wait_for_page`
+#: poll, so a window that does not answer cannot starve the others.
+_PAGE_READ_S = 1.5
+
+
+def _read_pages(automation: object, hwnd: int, deadline: float, cancel: threading.Event) -> list[PageSeen]:
+    """Page-only pass over one window (runs on the worker thread)."""
+    viewport_pass = _ViewportPass(
+        automation,
+        hwnd,
+        _surface_handles(hwnd),
+        _PAGE_READ_ELEMENTS,
+        min(deadline, time.monotonic() + _PAGE_READ_S),
+        cancel=cancel,
+        stop_at_documents=True,
+    )
+    walker = viewport_pass.run()
+    return [
+        PageSeen(
+            hwnd=hwnd,
+            title=page.title,
+            url=page.url,
+            main=index == 0,
+            selected_tab=page.selected_tab,
+        )
+        for index, page in enumerate(pages_on_screen(list(walker.elements)))
+    ]
+
+
+def wait_for_page(
+    windows: Callable[[], list[int]],
+    accept: Callable[[str], bool],
+    *,
+    timeout_s: float = CONTENT_WAIT_S,
+) -> PageWait:
+    """Wait until one of ``windows()`` shows a page whose address ``accept`` takes.
+
+    Each poll calls ``windows()`` again (so a window that appears meanwhile is
+    read too) and reads each window with a page-only pass: the on-screen walk of
+    :func:`get_window_tree` that keeps Document elements but reads nothing
+    inside them, a few dozen milliseconds for a browser window however large its
+    page.  Every top-level page on screen counts, not only the main one.  A
+    condition poll bounded by ``timeout_s``, on its own worker thread with its
+    own COM apartment; a provider that blocks past the budget is abandoned.
+
+    Returns:
+        A :class:`PageWait`; never raises.
+    """
+    started = time.perf_counter()
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    shared: dict[str, object] = {}
+    cancel = threading.Event()
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(
+                _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
+            )
+            polls = 0
+            answered = False
+            while not cancel.is_set():
+                try:
+                    handles = [int(h) for h in windows()]
+                except Exception as exc:  # noqa: BLE001 - reported, never raised
+                    shared["error"] = f"listing windows failed: {type(exc).__name__}: {exc}"
+                    handles = []
+                seen: list[PageSeen] = []
+                for handle in handles:
+                    if cancel.is_set() or time.monotonic() >= deadline:
+                        break
+                    try:
+                        pages = _read_pages(automation, handle, deadline, cancel)
+                    except Exception as exc:  # noqa: BLE001 - not answering, or gone
+                        shared["error"] = f"{type(exc).__name__}: {exc}"
+                        continue
+                    answered = True
+                    seen.extend(pages)
+                    hit = next((page for page in pages if accept(page.url)), None)
+                    if hit is not None:
+                        shared["result"] = PageWait(
+                            matched=hit, seen=seen, windows=handles, polls=polls + 1,
+                            answered=True,
+                        )
+                        return
+                polls += 1
+                shared["result"] = PageWait(
+                    seen=seen, windows=handles, polls=polls, answered=answered
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(_WAKE_POLL_S, remaining))
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            shared["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name="yuki-uia-page", daemon=True)
+    thread.start()
+    thread.join(max(timeout_s, 0.0) + _HANDOFF_S)
+    if thread.is_alive():
+        cancel.set()  # a read blocked in a provider: stop it at its next check
+    found = shared.get("result")
+    result = (
+        PageWait(
+            matched=found.matched,
+            seen=list(found.seen),
+            windows=list(found.windows),
+            polls=found.polls,
+            answered=found.answered,
+        )
+        if isinstance(found, PageWait)
+        else PageWait()
+    )
+    if not result.answered and shared.get("error"):
+        result.error = str(shared["error"])
+    result.waited_ms = (time.perf_counter() - started) * 1000.0
+    return result
+
+
+@dataclass
+class PageText:
+    """The text of the page a window is showing (see :func:`page_text`).
+
+    Attributes:
+        hwnd: the window read.
+        title: the page's title (its Document's Name).
+        url: the page's address (its Document's Value).
+        text: the page's text, at most ``max_chars``.
+        chars: ``len(text)``.
+        truncated: the page holds more than ``max_chars`` characters.
+        source: ``"text pattern"`` (the Document's whole text in one call,
+            parts scrolled out of view included), ``"elements"`` (names and
+            values of the Document's descendants, when it has no Text pattern),
+            or ``""`` when nothing was read.
+        background_pages: background tabs' pages left out while finding it.
+        found: a page was found in the window at all.
+        elapsed_ms: time from the call to the answer.
+        note: one sentence when the result is partial or empty.
+        error: set when reading failed outright.
+    """
+
+    hwnd: int
+    title: str = ""
+    url: str = ""
+    text: str = ""
+    chars: int = 0
+    truncated: bool = False
+    source: str = ""
+    background_pages: int = 0
+    found: bool = False
+    elapsed_ms: float = 0.0
+    note: str = ""
+    error: str = ""
+
+
+#: Budget for :func:`page_text`: finding the page is a page-only pass (tens of
+#: milliseconds), reading its text one call that grows with the page.
+PAGE_TEXT_TIMEOUT_S = 6.0
+
+#: Elements a descendant read may collect when a page has no Text pattern.
+_PAGE_TEXT_ELEMENTS = 5000
+
+
+def _text_from_elements(automation: object, element: object, max_chars: int) -> tuple[str, bool]:
+    """Names and values of a Document's descendants, in tree order, one per line.
+
+    One cache request for the whole subtree, off-screen parts included.  Only
+    leaves contribute their name (a link's name repeats the text inside it),
+    plus every non-empty Value except a link's (its address).  Returns
+    ``(text, truncated)``.
+    """
+    request = automation.CreateCacheRequest()  # type: ignore[attr-defined]
+    for prop in (_P_NAME, _P_VALUE_VALUE, _P_IS_VALUE_AVAILABLE, _P_CONTROL_TYPE):
+        request.AddProperty(prop)
+    request.TreeScope = _TREE_SCOPE_SUBTREE
+    request.TreeFilter = automation.ControlViewCondition  # type: ignore[attr-defined]
+    request.AutomationElementMode = _AUTOMATION_ELEMENT_MODE_NONE
+    root = element.BuildUpdatedCache(request)  # type: ignore[attr-defined]
+    lines: list[str] = []
+    size = 0
+    count = 0
+    stack = [root]
+    while stack and size <= max_chars and count < _PAGE_TEXT_ELEMENTS:
+        node = stack.pop()
+        count += 1
+        get = node.GetCachedPropertyValue
+        children = _CachedWalker._cached_children(node)
+        parts = []
+        name = _as_text(get(_P_NAME))
+        if name and not children and node is not root:
+            parts.append(name)
+        # A link's Value is its address, not text on the page.
+        if _as_bool(get(_P_IS_VALUE_AVAILABLE)) and get(_P_CONTROL_TYPE) != _HYPERLINK_CONTROL_TYPE:
+            value = get(_P_VALUE_VALUE)
+            if isinstance(value, str) and value.strip() and value.strip() != name and node is not root:
+                parts.append(value.strip())
+        for part in parts:
+            lines.append(part)
+            size += len(part) + 1
+        stack.extend(reversed(children))
+    text = "\n".join(lines)
+    return text[:max_chars], len(text) > max_chars or bool(stack)
+
+
+#: U+FFFC OBJECT REPLACEMENT CHARACTER: what a Text pattern puts where an
+#: embedded object (an image, a button, a frame) sits in the text.
+_OBJECT_REPLACEMENT = "\ufffc"
+
+
+def _clean_page_text(text: str) -> str:
+    """Drop object placeholders and the blank lines they leave behind."""
+    lines = (line.replace(_OBJECT_REPLACEMENT, "").rstrip() for line in text.splitlines())
+    return "\n".join(line for line in lines if line.strip())
+
+
+def page_text(
+    hwnd: int, *, max_chars: int = 30000, timeout_s: float = PAGE_TEXT_TIMEOUT_S
+) -> PageText:
+    """Read the whole text of the page ``hwnd`` is showing, with its title and address.
+
+    The page is found exactly as the tree header's ``page:`` is: a page-only
+    pass (Document elements kept, nothing inside them read; background tabs'
+    pages left out), then the main visible page.  Its text comes from the
+    Document's UIA Text pattern (``DocumentRange.GetText``) in one call, which
+    covers the parts of the page scrolled out of view; a Document with no Text
+    pattern falls back to the names and values of its descendants, read in one
+    cache request, off-screen ones included.  At most ``max_chars`` characters
+    are returned; ``truncated`` says when the page holds more.
+
+    Runs on its own worker thread with its own COM apartment, bounded by
+    ``timeout_s``; never raises.
+    """
+    started = time.perf_counter()
+    result = PageText(hwnd=int(hwnd))
+    if not win32gui.IsWindow(hwnd):
+        result.error = "not a window (it may have closed)"
+        return result
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    shared: dict[str, object] = {}
+    cancel = threading.Event()
+    limit = max(int(max_chars), 1)
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(
+                _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
+            )
+            viewport_pass = _ViewportPass(
+                automation,
+                hwnd,
+                _surface_handles(hwnd),
+                _PAGE_READ_ELEMENTS,
+                min(deadline, time.monotonic() + _PAGE_READ_S),
+                cancel=cancel,
+                stop_at_documents=True,
+            )
+            walker = viewport_pass.run()
+            found = PageText(hwnd=int(hwnd), background_pages=walker.background_pages)
+            pages = pages_on_screen(list(walker.elements))
+            if not pages:
+                shared["result"] = found
+                return
+            page = pages[0]
+            found.found = True
+            found.title, found.url = page.title, page.url
+            shared["result"] = found
+            element = viewport_pass.page_elements.get(page.element_id)
+            if element is None:
+                found.note = "the page was found but could not be asked for its text"
+                return
+            text = ""
+            try:
+                pattern = element.GetCurrentPattern(_PATTERN_TEXT)  # type: ignore[attr-defined]
+                if pattern:
+                    text_pattern = pattern.QueryInterface(module.IUIAutomationTextPattern)  # type: ignore[attr-defined]
+                    text = str(text_pattern.DocumentRange.GetText(limit + 1) or "")
+                    found.source = "text pattern"
+            except Exception:
+                found.source = ""
+            if not found.source:
+                text, more = _text_from_elements(automation, element, limit + 1)
+                found.source = "elements"
+                if more:
+                    text = text + " "  # force the truncation flag below
+            found.truncated = len(text) > limit
+            found.text = _clean_page_text(text[:limit])
+            found.chars = len(found.text)
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            shared["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name=f"yuki-uia-page-text-{hwnd}", daemon=True)
+    thread.start()
+    thread.join(max(timeout_s, 0.0) + _HANDOFF_S)
+    if thread.is_alive():
+        cancel.set()
+    found = shared.get("result")
+    if isinstance(found, PageText):
+        result = PageText(**found.__dict__)
+    if shared.get("error"):
+        result.error = str(shared["error"])
+    if thread.is_alive() and not result.text:
+        result.note = (
+            f"the window did not hand over the page text within {timeout_s:g} s "
+            f"(probably still loading); try again shortly"
+        )
+    elif not result.found and not result.error:
+        result.note = "no page is showing in this window (no Document with an address on screen)"
+    elif result.found and not result.text and not result.note:
+        result.note = "the page exposes no text"
+    elif result.truncated:
+        result.note = f"clipped at {limit} characters; the page holds more"
+    result.elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return result
+
+
+def format_page_text(result: PageText) -> str:
+    """Text rendering for the model: one header line, then the page text."""
+    facts = []
+    if result.found:
+        page = PageIdentity(title=result.title, url=result.url)
+        facts.append(f"page: {page.phrase()}")
+    facts.append(f"window {result.hwnd}")
+    if result.found:
+        via = f" via {result.source}" if result.source else ""
+        facts.append(f"{result.chars} chars{via} in {result.elapsed_ms:.0f} ms")
+    if result.background_pages:
+        facts.append(f"{result.background_pages} background tab page(s) skipped")
+    if result.note:
+        facts.append(f"note: {result.note}")
+    if result.error:
+        facts.append(f"error: {result.error}")
+    header = " | ".join(facts)
+    return header + ("\n" + result.text if result.text else "")
 
 
 #: Budget for :func:`focused_element`.  It is a handful of cross-process property
@@ -2585,9 +3335,12 @@ def _origin(address: str) -> str:
 def format_window_tree(tree: WindowTree) -> str:
     """Compact text rendering of a window tree, one line per element.
 
-    The header is one line: the window, the element count, how long the read
-    took, and - when there are any - how the tree was built, its status, that it
-    is partial, what was left off screen, and the note.
+    The header is one line.  When the window shows a page (a Document whose
+    Value is an address, see :func:`page_identity`) it starts with
+    ``page: "<title>" <url>`` and, when there is one outside the page, the
+    selected tab (``selected tab: "..."``); then the window, the element count,
+    how long the read took, and - when there are any - how the tree was built,
+    its status, that it is partial, what was left off screen, and the note.
 
     Element lines: ``[id] Role "name" value="..." @(x,y) {patterns} [kb: key]
     [flags]``.  Indentation is nesting among the listed elements (layout
@@ -2616,7 +3369,19 @@ def format_window_tree(tree: WindowTree) -> str:
     """
     status = getattr(tree, "status", "ok") or "ok"
     note = getattr(tree, "note", "") or ""
-    facts = [
+    facts: list[str] = []
+    page = page_identity(tree.elements)
+    if page is not None:
+        # The page is the fact about what the window shows: a browser's own
+        # window title can stay the same whatever page is on screen, and its
+        # tab names can lag behind the page.
+        facts.append(
+            f"page: {page.phrase()}"
+            + (f" (+{page.other_pages} other page(s) on screen)" if page.other_pages else "")
+        )
+        if page.selected_tab:
+            facts.append(f'selected tab: "{_one_line(page.selected_tab, _FORMAT_NAME_CHARS)}"')
+    facts += [
         f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'})",
         f"{len(tree.elements)} elements in {tree.elapsed_ms:.0f} ms",
     ]
@@ -2637,6 +3402,9 @@ def format_window_tree(tree: WindowTree) -> str:
         # Said so the reader knows the list is the visible part on purpose:
         # scrolling brings the rest into view (and into the next read).
         facts.append(f"on-screen only: {skipped} off-screen branch(es) not read")
+    background = getattr(tree, "background_pages", 0) or 0
+    if background:
+        facts.append(f"{background} background tab page(s) skipped")
     if note:
         facts.append(f"note: {note}")
     lines = [" | ".join(facts)]

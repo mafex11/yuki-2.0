@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: hygiene (:mod:`yuki.agent.context`) to decide what may be stubbed once stale.
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
-    {"look_at_desktop", "look_at_window", "take_screenshot", "system_facts"}
+    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -65,6 +65,23 @@ _GUARD: dict[str, Any] = {
     "moved, nothing is sent and you are told what has it instead.",
 }
 
+#: An element of the latest tree read of a window, as an input target. Shared by
+#: click, type_text and scroll for the same reason as :data:`_GUARD`.
+_ELEMENT: dict[str, Any] = {
+    "type": "integer",
+    "description": "Id of an element in the latest read of the window (the [id] in "
+    "its tree, from look_at_window or the view attached after your actions). It is "
+    "resolved to that element's centre and input is guarded to that window: "
+    "expect_hwnd names the window, or else the window read most recently is used.",
+}
+
+#: The read an element id comes from.
+_READ: dict[str, Any] = {
+    "type": "integer",
+    "description": "The read number of the tree the element id comes from (read #N "
+    "in its header). If that window has been read again since, nothing is sent.",
+}
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "look_at_desktop",
@@ -98,6 +115,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "after your actions', so there is no need to call this just to see what "
             "an action did; call it for other windows, or when that attached view is "
             "not enough."
+        ),
+        "input_schema": _obj(
+            {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
+            ["hwnd"],
+        ),
+    },
+    {
+        "name": "read_page",
+        "label": "Reading a page",
+        "description": (
+            "Read the full text of the page currently showing in a browser or "
+            "web-based app window, including parts scrolled out of view, with its "
+            "title and address. Use it to read, summarise or find information on a "
+            "page; use look_at_window when you need elements to click or type into."
         ),
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
@@ -192,16 +223,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "click",
         "label": "Clicking",
-        "description": "Click at a screen coordinate, usually an element's centre point.",
+        "description": (
+            "Click an element or a screen coordinate. Prefer an element id from the "
+            "latest tree read of the window; give x and y only when no element "
+            "describes the target."
+        ),
         "input_schema": _obj(
             {
+                "element": _ELEMENT,
+                "read": _READ,
                 "x": {"type": "integer"},
                 "y": {"type": "integer"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"]},
                 "clicks": {"type": "integer", "description": "2 for a double click."},
                 "expect_hwnd": _GUARD,
             },
-            ["x", "y"],
         ),
     },
     {
@@ -216,11 +252,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "not pressed. With clear, the field's existing contents are selected and "
             "deleted first, and the result says whether it read empty. The result "
             "also names any new window the application showed meanwhile, such as a "
-            "suggestion list or menu."
+            "suggestion list or menu. With element, that element is clicked first "
+            "to focus it."
         ),
         "input_schema": _obj(
             {
                 "text": {"type": "string"},
+                "element": _ELEMENT,
+                "read": _READ,
                 "press_enter": {"type": "boolean"},
                 "clear": {
                     "type": "boolean",
@@ -269,16 +308,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "scroll",
         "label": "Scrolling",
-        "description": "Scroll at a point by wheel notches; positive dy scrolls up.",
+        "description": (
+            "Scroll by wheel notches over an element (preferred) or a point; "
+            "positive dy scrolls up."
+        ),
         "input_schema": _obj(
             {
+                "element": _ELEMENT,
+                "read": _READ,
                 "x": {"type": "integer"},
                 "y": {"type": "integer"},
                 "dy": {"type": "integer"},
                 "dx": {"type": "integer"},
                 "expect_hwnd": _GUARD,
             },
-            ["x", "y"],
         ),
     },
     {
@@ -577,6 +620,12 @@ class Backend(Protocol):
         self, hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0
     ) -> Any: ...
     def format_window_tree(self, tree: Any) -> str: ...
+    # The text of the page a window shows (a PageText: hwnd, title, url, text,
+    # chars, truncated, source, found, note, error) and its rendering.
+    def page_text(
+        self, hwnd: int, *, max_chars: int = 30000, timeout_s: float = 6.0
+    ) -> Any: ...
+    def format_page_text(self, result: Any) -> str: ...
     def screenshot(
         self,
         hwnd: int | None = None,
@@ -659,6 +708,8 @@ class _LazyRealBackend:
         "format_overview",
         "get_window_tree",
         "format_window_tree",
+        "page_text",
+        "format_page_text",
         "screenshot",
         "capture",
         "capture_bounds",
@@ -818,6 +869,13 @@ class Dispatcher:
         self.tool_timeout_s = tool_timeout_s
         self.max_tree_elements = max_tree_elements
         self.tree_timeout_s = tree_timeout_s
+        #: Reads handed to the model so far (``read #N`` in a tree's header).
+        self._reads = 0
+        #: hwnd -> ``(read number, {element id: element})`` of the latest tree
+        #: of that window the model was given, for element-id input targets.
+        self._latest_trees: dict[int, tuple[int, dict[int, dict[str, Any]]]] = {}
+        #: The window of the most recent tree read, the default for an element id.
+        self._latest_tree_hwnd: int | None = None
 
     # -- warm-up -----------------------------------------------------------
 
@@ -975,9 +1033,20 @@ class Dispatcher:
         truncated = bool(payload.get("truncated")) if isinstance(payload, dict) else False
         status = str(payload.get("status") or "ok") if isinstance(payload, dict) else "ok"
         note = str(payload.get("note") or "") if isinstance(payload, dict) else ""
+        self._reads += 1
+        self._latest_trees[int(hwnd)] = (
+            self._reads,
+            {
+                int(element["id"]): element
+                for element in elements
+                if isinstance(element, dict) and isinstance(element.get("id"), int)
+            },
+        )
+        self._latest_tree_hwnd = int(hwnd)
         header = (
             f"window {hwnd} \"{payload.get('title', '')}\" ({payload.get('process_name', '')}): "
-            f"{len(elements)} elements{', truncated' if truncated else ''}, status {status}"
+            f"{len(elements)} elements{', truncated' if truncated else ''}, status {status}, "
+            f"read #{self._reads}"
         )
         summary = f"{len(elements)} elements{' (truncated)' if truncated else ''}"
         if status != "ok":
@@ -989,6 +1058,44 @@ class Dispatcher:
             ok=True,
             summary=summary,
             content=[{"type": "text", "text": f"{header}\n{text}"}],
+            payload=payload,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _do_read_page(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """The whole text of the page a window shows, with its title and address.
+
+        ``ok`` is False when the window shows no page (no Document with an
+        address on screen) or the read failed: the result then says why, and the
+        element tree is the way to look at that window instead.
+        """
+        hwnd = self._need_int(tool_input, "hwnd")
+        read = getattr(self.backend, "page_text", None)
+        if not callable(read):
+            raise ToolError("this backend cannot read page text")
+        started = time.perf_counter()
+        result = read(hwnd)
+        formatter = getattr(self.backend, "format_page_text", None)
+        payload = _plain(result)
+        if not isinstance(payload, dict):
+            payload = {"result": payload}
+        text = formatter(result) if callable(formatter) else _render(payload)
+        found = bool(payload.get("found"))
+        error = str(payload.get("error") or "")
+        note = str(payload.get("note") or "")
+        chars = int(payload.get("chars") or 0)
+        if found and not error:
+            title = str(payload.get("title") or payload.get("url") or "")
+            summary = f'{chars} chars of "{title}"'
+            if payload.get("truncated"):
+                summary += " (clipped)"
+        else:
+            summary = error or note or "no page read"
+        return ToolOutcome(
+            name="read_page",
+            ok=found and not error,
+            summary=summary,
+            content=[{"type": "text", "text": text}],
             payload=payload,
             elapsed_ms=(time.perf_counter() - started) * 1000,
         )
@@ -1344,34 +1451,124 @@ class Dispatcher:
             "focus_window", self.backend.focus_window(self._need_int(tool_input, "hwnd"))
         )
 
+    def _element_target(self, tool_input: dict[str, Any]) -> tuple[int, int, int, str] | None:
+        """``(x, y, hwnd, label)`` of the ``element`` an input names, or ``None``.
+
+        The element comes from the latest tree of its window the model was given
+        (``expect_hwnd``, else the window read most recently). Plumbing that
+        turns an id into the coordinates it stood for, with the guard set to its
+        window; every way it could point at the wrong thing is refused instead.
+
+        Raises:
+            ToolError: no such element, no read of that window, or ``read`` names
+                an older read than the latest.
+        """
+        if tool_input.get("element") is None:
+            return None
+        element_id = self._need_int(tool_input, "element")
+        hwnd = self._opt_hwnd(tool_input)
+        if hwnd is None:
+            hwnd = self._latest_tree_hwnd
+        if hwnd is None or hwnd not in self._latest_trees:
+            raise ToolError(
+                f"element {element_id} refers to no tree: "
+                + (f"window {hwnd} has not been read" if hwnd is not None else "no window has been read yet")
+                + " - look at the window first, or give x and y"
+            )
+        read, elements = self._latest_trees[hwnd]
+        if tool_input.get("read") is not None:
+            asked = self._need_int(tool_input, "read")
+            if asked != read:
+                raise ToolError(
+                    f"element ids from read #{asked} are out of date: the latest read of "
+                    f"window {hwnd} is #{read}; nothing was sent. Use an id from read "
+                    f"#{read}, or look at the window again"
+                )
+        element = elements.get(element_id)
+        if element is None:
+            raise ToolError(
+                f"read #{read} of window {hwnd} has no element [{element_id}] (its ids "
+                f"run 0-{max(elements) if elements else 0}); nothing was sent"
+            )
+        center = element.get("center") or ()
+        try:
+            x, y = int(center[0]), int(center[1])
+        except (TypeError, ValueError, IndexError):
+            raise ToolError(f"element [{element_id}] of read #{read} has no position") from None
+        label = f"[{element_id}] {element.get('role') or 'element'}"
+        if element.get("name"):
+            label += f" \"{str(element['name'])[:60]}\""
+        return x, y, hwnd, f"{label} of read #{read} at ({x},{y})"
+
+    def _point(self, tool_input: dict[str, Any]) -> tuple[int, int, int | None, str]:
+        """``(x, y, expect_hwnd, label)``: an element id's centre, else x and y."""
+        target = self._element_target(tool_input)
+        if target is not None:
+            return target
+        if tool_input.get("x") is None or tool_input.get("y") is None:
+            raise ToolError("give an element id from the latest tree, or both x and y")
+        return (
+            self._need_int(tool_input, "x"),
+            self._need_int(tool_input, "y"),
+            self._opt_hwnd(tool_input),
+            "",
+        )
+
+    @staticmethod
+    def _labelled(outcome: ToolOutcome, label: str) -> ToolOutcome:
+        """Say which element an element-id input went to, ahead of the result."""
+        if label:
+            outcome.summary = f"on {label}: {outcome.summary}"
+            if outcome.content and outcome.content[0].get("type") == "text":
+                outcome.content[0]["text"] = f"on {label}: {outcome.content[0]['text']}"
+            if isinstance(outcome.payload, dict):
+                outcome.payload = {**outcome.payload, "element_target": label}
+        return outcome
+
     def _do_click(self, tool_input: dict[str, Any]) -> ToolOutcome:
         button = tool_input.get("button") or "left"
         if button not in {"left", "right", "middle"}:
             raise ToolError(f"button must be left, right or middle, got {button!r}")
-        return self._from_action(
-            "click",
-            self.backend.click(
-                self._need_int(tool_input, "x"),
-                self._need_int(tool_input, "y"),
-                button=button,
-                clicks=self._opt_int(tool_input, "clicks", 1),
-                expect_hwnd=self._opt_hwnd(tool_input),
+        x, y, guard, label = self._point(tool_input)
+        return self._labelled(
+            self._from_action(
+                "click",
+                self.backend.click(
+                    x,
+                    y,
+                    button=button,
+                    clicks=self._opt_int(tool_input, "clicks", 1),
+                    expect_hwnd=guard,
+                ),
             ),
+            label,
         )
 
     def _do_type_text(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = tool_input.get("text")
         if not isinstance(text, str):
             raise ToolError(f"'text' must be a string, got {text!r}")
+        target = self._element_target(tool_input)
         options: dict[str, Any] = {
             "press_enter": bool(tool_input.get("press_enter")),
-            "expect_hwnd": self._opt_hwnd(tool_input),
+            "expect_hwnd": target[2] if target is not None else self._opt_hwnd(tool_input),
         }
         if tool_input.get("clear"):
             # Only when asked, so a backend written before the option existed
             # keeps working for plain typing.
             options["clear"] = True
-        return self._from_action("type_text", self.backend.type_text(text, **options))
+        if target is None:
+            return self._from_action("type_text", self.backend.type_text(text, **options))
+        # Focus the element first by clicking it, guarded to its window; type
+        # only if that click went through.
+        x, y, guard, label = target
+        focus = self._from_action("type_text", self.backend.click(x, y, expect_hwnd=guard))
+        if not focus.ok:
+            return self._labelled(focus, f"{label} (clicked to focus it; nothing typed)")
+        typed = self._from_action("type_text", self.backend.type_text(text, **options))
+        typed.payload = {"focus_click": focus.payload, "type_text": typed.payload}
+        typed.elapsed_ms += focus.elapsed_ms
+        return self._labelled(typed, f"{label} (clicked to focus it)")
 
     def _do_hotkey(self, tool_input: dict[str, Any]) -> ToolOutcome:
         keys = tool_input.get("keys")
@@ -1392,15 +1589,19 @@ class Dispatcher:
         )
 
     def _do_scroll(self, tool_input: dict[str, Any]) -> ToolOutcome:
-        return self._from_action(
-            "scroll",
-            self.backend.scroll(
-                self._need_int(tool_input, "x"),
-                self._need_int(tool_input, "y"),
-                dy=self._opt_int(tool_input, "dy", 0),
-                dx=self._opt_int(tool_input, "dx", 0),
-                expect_hwnd=self._opt_hwnd(tool_input),
+        x, y, guard, label = self._point(tool_input)
+        return self._labelled(
+            self._from_action(
+                "scroll",
+                self.backend.scroll(
+                    x,
+                    y,
+                    dy=self._opt_int(tool_input, "dy", 0),
+                    dx=self._opt_int(tool_input, "dx", 0),
+                    expect_hwnd=guard,
+                ),
             ),
+            label,
         )
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:

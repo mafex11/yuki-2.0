@@ -49,6 +49,28 @@ hand-off within :data:`_RUNNING_REACT_S` if it reacts at all, so that is how
 long the call waits for it (counted from when the hand-off finished), and a
 result where nothing changed says the app may have ignored the arguments.
 
+**Handed a web address, success is the page, not the window.**  When an
+argument is a web address (:func:`_page_address`), the launch - and
+``open_url`` with the default handler - waits, within the content deadline,
+until one of the app's windows shows a page at that address
+(:func:`yuki.perception.tree.wait_for_page`: a page-only read of each window,
+the Document element's Value being the page URL), with redirects that keep the
+host and path prefix accepted (:func:`_same_page`).  The summary states the
+fact: "Arc is now showing https://... (page "...")", or "handed Arc ..., but
+after N s no page in Arc is at that address; the visible page is ...", which
+is ``ok=False``.  A browser's window title is not evidence: on 2026-09-23 Arc
+opened the URL every time while its title stayed "Arc", and the old "nothing
+visibly changed" report cost the model rounds re-doing work that had worked.
+The window-title and foreground signals remain for arguments that are not
+pages.
+
+**An app running with no window** (closed to the background or the tray) is
+brought back when launched without arguments: its own hidden main window is
+shown, or, when it has none, a new window is asked for the way the Start menu
+would start it (``ActivateApplication`` for a packaged app, its program run
+again for a desktop app), and the summary says "Arc was running in the
+background with no window; opened a new window".
+
 **After the window shows up** it is brought to the foreground exactly as
 :func:`focus_window` does and waited on until it accepts input: launching an app
 is asking to use it, and on 2026-09-23 a launch that returned "not in the
@@ -82,7 +104,15 @@ import win32process
 from yuki.actions import ActionResult
 from yuki.actions.input import wait_for_input_ready
 from yuki.actions.shell import run_powershell
-from yuki.perception.windows import is_user_window, list_windows, owner_of, window_info
+from yuki.perception.windows import (
+    cloak_state,
+    could_be_main_window,
+    hidden_main_window,
+    is_user_window,
+    list_windows,
+    process_package_ids,
+    window_info,
+)
 
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
@@ -237,25 +267,8 @@ for _fn in ("GetApplicationUserModelId", "GetPackageFamilyName"):
     getattr(_pkg_api, _fn).restype = ctypes.c_long
 
 
-def _process_package_ids(pid: int) -> tuple[str, str]:
-    """``(AppUserModelID, package family name)`` of a packaged process.
-
-    Both ``""`` for a process without package identity or one that cannot be
-    opened.  Read from the process itself (``GetApplicationUserModelId``,
-    ``GetPackageFamilyName``): the identity Windows gave it, whatever its image.
-    """
-    handle = _pkg_api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    if not handle:
-        return "", ""
-    try:
-        values = []
-        for fn in (_pkg_api.GetApplicationUserModelId, _pkg_api.GetPackageFamilyName):
-            length = ctypes.c_uint32(_APPMODEL_BUFFER)
-            buffer = ctypes.create_unicode_buffer(_APPMODEL_BUFFER)
-            values.append(buffer.value if fn(handle, ctypes.byref(length), buffer) == 0 else "")
-        return values[0], values[1]
-    finally:
-        _pkg_api.CloseHandle(handle)
+#: Moved to :mod:`yuki.perception.windows` (the overview needs it too).
+_process_package_ids = process_package_ids
 
 
 def _is_within(path: str, folder: str) -> bool:
@@ -422,54 +435,39 @@ def _top_level_windows(pids: set[int]) -> list[int]:
     return found
 
 
-#: ``WS_EX_NOACTIVATE``: a window the user can never switch to.
-_WS_EX_NOACTIVATE = 0x08000000
-
-
-def _could_be_main_window(hwnd: int) -> bool:
-    """Whether a window that is not on screen is one a user could switch to.
-
-    Window-style facts only: top level and unowned, not a tool or no-activate
-    window, titled, with a caption *and* a system menu (the frame a user can
-    move, switch to and close).  Helper windows an app keeps hidden (tray-icon
-    hosts, message sinks, IME windows) lack that frame or a title.
-    """
-    try:
-        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        title = win32gui.GetWindowText(hwnd)
-    except Exception:
-        return False
-    if style & win32con.WS_CHILD or owner_of(hwnd):
-        return False
-    if ex_style & (win32con.WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE):
-        return False
-    if not title.strip():
-        return False
-    return (style & win32con.WS_CAPTION) == win32con.WS_CAPTION and bool(
-        style & win32con.WS_SYSMENU
-    )
+#: Moved to :mod:`yuki.perception.windows` (the overview needs it too).
+_could_be_main_window = could_be_main_window
 
 
 def _find_app_window(identity: _AppIdentity, pids: set[int]) -> tuple[int | None, str]:
     """The app's own window, for when launching it changed nothing.
 
     Returns:
-        ``(hwnd, state)`` with state ``"open"`` (on screen), ``"minimized"`` or
-        ``"hidden"`` (exists but not shown - an app sitting in the tray), or
-        ``(None, "")`` when the app has no window a user could switch to.
-        Visible ones win, topmost first; among hidden ones the largest.
+        ``(hwnd, state)`` with state ``"open"`` (on screen, or on another
+        virtual desktop - cloaked by the shell, which activating it switches
+        to), ``"minimized"`` or ``"hidden"`` (exists but not shown, or cloaked
+        by the app itself - an app sitting in the tray or the background; see
+        :func:`yuki.perception.windows.hidden_main_window`), or ``(None, "")``
+        when the app has no window a user could switch to.  Visible ones win,
+        topmost first; among hidden ones the largest.
     """
     windows = _top_level_windows(pids)
     shown = [h for h in windows if is_user_window(h) and identity.owns_window(h)]
     if shown:
         restored = [h for h in shown if not win32gui.IsIconic(h)]
         return (restored or shown)[0], ("open" if restored else "minimized")
-    hidden = [
+    elsewhere = [
         h
         for h in windows
-        if not is_user_window(h) and _could_be_main_window(h) and identity.owns_window(h)
+        if win32gui.IsWindowVisible(h)
+        and cloak_state(h)
+        and not hidden_main_window(h)
+        and _could_be_main_window(h)
+        and identity.owns_window(h)
     ]
+    if elsewhere:
+        return elsewhere[0], "open"
+    hidden = [h for h in windows if hidden_main_window(h) and identity.owns_window(h)]
     if not hidden:
         return None, ""
 
@@ -1324,6 +1322,369 @@ def _activate_packaged(
     return None, result.get("error") or f"activation did not return within {timeout_s:g}s"
 
 
+# ---------------------------------------------------------------------------
+# Verifying that a page opened: the address, not the window title
+# ---------------------------------------------------------------------------
+def _page_address(arg: str) -> str | None:
+    """The web address an argument asks an app to open, or ``None``.
+
+    Parsing the argument's shape: one token that is a URL with a host
+    (``https://...``, ``ftp://...``), a ``file:`` URL, or a bare
+    ``host.tld/path`` / ``www.host.tld`` / ``host:port`` - which a browser
+    handed it opens as ``https://`` - and not a path to something on disk.  A
+    bare ``name.ext`` is not taken for a page (it is as likely a file), nor is
+    a URI of a scheme with no host (``mailto:``, ``spotify:track:...``).
+    """
+    text = (arg or "").strip()
+    if not text or any(ch.isspace() for ch in text) or "\\" in text:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if len(scheme) > 1:
+        if parts.netloc or scheme == "file":
+            return text
+        # "localhost:3000/x" parses as scheme "localhost": a port, not a scheme.
+        if not text[len(scheme) + 1 :].split("/", 1)[0].isdigit():
+            return None
+    if len(scheme) == 1 or os.path.exists(text):
+        return None  # a drive letter, or a file or folder on disk
+    host, slash, _ = text.partition("/")
+    host = host.split("?", 1)[0].split("#", 1)[0]
+    name, _, port = host.partition(":")
+    if port and not port.isdigit():
+        return None
+    labels = name.split(".")
+    # A bare "name.ext" is as likely a file name as a host, so the bare form
+    # counts only with a path after the host or a "www." in front of it.
+    dotted = len(labels) > 1 and all(labels)
+    if (dotted or name == "localhost") and (slash or port or name.startswith("www.")):
+        return "https://" + text
+    return None
+
+
+def _address_parts(url: str) -> tuple[str, str, int | None, str, list[tuple[str, str]]] | None:
+    """``(scheme, host, port, path, query pairs)`` of an address, normalised.
+
+    Scheme and host lowercased, ``http`` and ``https`` counted as one (a site
+    upgrades one to the other), a leading ``www.`` and a default port dropped,
+    the path unquoted, case-folded and without a trailing ``/``, the fragment
+    ignored.  ``None`` when it cannot be parsed.
+    """
+    from urllib.parse import parse_qsl, unquote
+
+    try:
+        parts = urlsplit(url if "://" in url or url.lower().startswith("file:") else "https://" + url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme in ("http", "https"):
+        if port in (80, 443):
+            port = None
+        scheme = "http"
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = unquote(parts.path).casefold().rstrip("/")
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    return scheme, host, port, path, query
+
+
+def _same_page(requested: str, actual: str) -> bool:
+    """Whether the page at ``actual`` is the one ``requested`` asked for.
+
+    After normalisation (:func:`_address_parts`): the same scheme and port,
+    the same host or a subdomain of it (``youtube.com`` -> ``m.youtube.com``),
+    a path that is the requested one or continues it
+    (``/@mrbeast`` -> ``/@mrbeast/videos``), and every query parameter asked
+    for still present with the same value (a redirect may add more).  So a
+    redirect that keeps the host and the path prefix counts, and one to a
+    login or consent page elsewhere does not.
+    """
+    want = _address_parts(requested)
+    got = _address_parts(actual)
+    if want is None or got is None:
+        return False
+    w_scheme, w_host, w_port, w_path, w_query = want
+    g_scheme, g_host, g_port, g_path, g_query = got
+    if w_scheme != g_scheme or w_port != g_port:
+        return False
+    if not (g_host == w_host or g_host.endswith("." + w_host)):
+        return False
+    if w_path and not (g_path == w_path or g_path.startswith(w_path + "/")):
+        return False
+    return all(pair in g_query for pair in w_query)
+
+
+def _app_windows(identity: _AppIdentity, before: dict[int, int]):
+    """A callable listing, topmost first, the on-screen windows to look for the
+    page in: the app's own (restored) windows, or - when nothing is known to
+    recognise them by - windows that appeared since ``before`` and the
+    foreground window."""
+    owned: dict[int, bool] = {}
+
+    def windows() -> list[int]:
+        found: list[int] = []
+        for window in list_windows():
+            if window.is_minimized:
+                continue
+            if identity.confirmable:
+                if window.hwnd not in owned:
+                    owned[window.hwnd] = bool(identity.owns_window(window.hwnd))
+                if owned[window.hwnd]:
+                    found.append(window.hwnd)
+            elif window.hwnd not in before or window.is_foreground:
+                found.append(window.hwnd)
+        return found
+
+    return windows
+
+
+def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, int], timeout_s: float):
+    """Wait (bounded) until one of the app's windows shows a page at one of
+    ``targets`` (see :func:`yuki.perception.tree.wait_for_page`); ``None`` when
+    the accessibility reader cannot be loaded."""
+    try:
+        from yuki.perception.tree import wait_for_page
+    except Exception:
+        return None
+    return wait_for_page(
+        _app_windows(identity, before),
+        lambda url: any(_same_page(target, url) for target in targets),
+        timeout_s=timeout_s,
+    )
+
+
+def _page_details(wait) -> dict:
+    """The page check, as plain data for ``details``."""
+    if wait is None:
+        return {"checked": False, "reason": "accessibility unavailable"}
+    return {
+        "checked": True,
+        "matched": asdict(wait.matched) if wait.matched else None,
+        "seen": [asdict(page) for page in wait.seen],
+        "windows": list(wait.windows),
+        "polls": wait.polls,
+        "answered": wait.answered,
+        "waited_ms": round(wait.waited_ms, 1),
+        "error": wait.error,
+    }
+
+
+def _page_phrase(title: str, url: str) -> str:
+    if title and title != url:
+        return f'{url} (page "{title}")'
+    return f"{url} (page still loading, no title yet)"
+
+
+def _page_miss(name: str, targets: list[str], wait) -> tuple[bool, str]:
+    """``(ok, clause)`` for a hand-off after which no window showed the page.
+
+    ``ok`` is False only when the app's windows do show pages and none is at
+    the address - the effect provably did not happen.  When no page could be
+    read at all, the clause says the address could not be checked.
+    """
+    target = targets[0] + (f" (+{len(targets) - 1} more)" if len(targets) > 1 else "")
+    if wait is None:
+        return True, f"handed {name} {target}; whether it opened could not be checked (accessibility unavailable)"
+    secs = wait.waited_ms / 1000.0
+    visible = [page for page in wait.seen if page.main]
+    if visible:
+        shown = visible[0]
+        others = f" (+{len(visible) - 1} other window(s) with a page)" if len(visible) > 1 else ""
+        return False, (
+            f"handed {name} {target}, but after {secs:.1f} s no page in {name} is at that "
+            f"address; the visible page is {_page_phrase(shown.title, shown.url)}{others}"
+        )
+    if wait.windows:
+        return True, (
+            f"handed {name} {target}; after {secs:.1f} s none of its windows shows a page "
+            f"whose address can be read, so whether it opened is not known"
+        )
+    return True, f"handed {name} {target}; after {secs:.1f} s it has no window on screen showing it"
+
+
+def _page_opened(
+    name: str,
+    wait,
+    before: dict[int, int],
+    details: dict,
+    content_deadline: float,
+    targets: list[str],
+    identity: _AppIdentity | None = None,
+) -> str:
+    """Bring the window showing the requested page forward, wait out the rest of
+    its content (within ``content_deadline``) and say so, fact first."""
+    seen = wait.matched
+    hwnd = seen.hwnd
+    info = window_info(hwnd)
+    details.update(
+        hwnd=hwnd,
+        window_reason="a window of it is showing the requested page",
+        title=info.title if info else "",
+        process_name=info.process_name if info else "",
+        page_verified=True,
+        page={"title": seen.title, "url": seen.url},
+    )
+    appeared = [h for h in _window_snapshot()[0] if h not in before]
+    details["new_windows"] = [
+        {
+            "hwnd": other,
+            "title": (w.title if (w := window_info(other)) else ""),
+            "process_name": w.process_name if w else "",
+            "is_app_window": bool(identity.owns_window(other)) if identity else None,
+        }
+        for other in appeared
+    ]
+    _note_fresh(hwnd)
+    forward = _bring_forward(hwnd, time.monotonic(), details)
+    content_note = ""
+    remaining = content_deadline - time.monotonic()
+    if remaining > 0.05:
+        content_note = _wait_for_opened_content(hwnd, remaining, details)
+        for document in (details.get("content") or {}).get("documents") or []:
+            value = str(document.get("value") or "")
+            if value and any(_same_page(target, value) for target in targets):
+                seen.url, seen.title = value, str(document.get("name") or "") or seen.title
+                details["page"] = {"title": seen.title, "url": seen.url}
+                break
+    if (fresh := window_info(hwnd)) is not None:
+        details["title"] = fresh.title
+    new_window = hwnd in appeared
+    return (
+        f"{name} is now showing {_page_phrase(seen.title, seen.url)}"
+        f"{' in a new window' if new_window else ''}: hwnd {hwnd} "
+        f"({details['process_name']}) \"{details['title']}\"; {forward}"
+        + (f"; {content_note}" if content_note else "")
+    )
+
+
+# ---------------------------------------------------------------------------
+# An app running in the background with no window
+# ---------------------------------------------------------------------------
+def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: float) -> tuple[int | None, str, str]:
+    """Ask a running app for a new window, the way the Start menu starts it.
+
+    A packaged app is activated (``IApplicationActivationManager::
+    ActivateApplication``, no arguments); a desktop app has the program its
+    Start menu entry points at run again (``Start-Process``), which a running
+    single-instance app answers by opening a window; with no program file
+    known, the Start menu entry itself is started (``shell:AppsFolder``).
+
+    Returns:
+        ``(pid or None, via, error)``.
+    """
+    appid = chosen["appid"]
+    if _is_packaged(appid):
+        pid, error = _activate_packaged(appid, "", budget_s)
+        return pid, "ActivateApplication", error
+    exe = next((path for path in sorted(identity.exe_paths) if _is_program_file(path)), "")
+    if exe:
+        result = run_powershell(
+            _start_process_command(exe, "", os.path.dirname(exe)), timeout_s=budget_s
+        )
+        stdout = str(result.details.get("stdout") or "").strip()
+        last = stdout.splitlines()[-1].strip() if stdout else ""
+        error = "" if result.ok else str(result.details.get("stderr") or result.summary)
+        return (int(last) if last.isdigit() else None), f"Start-Process {exe}", error
+    result = run_powershell(
+        f"Start-Process -FilePath {_quote('shell:AppsFolder\\' + appid)}", timeout_s=budget_s
+    )
+    error = "" if result.ok else str(result.details.get("stderr") or result.summary)
+    return None, "shell:AppsFolder", error
+
+
+def _restore_background_app(
+    chosen: dict[str, str],
+    identity: _AppIdentity,
+    hidden_hwnd: int | None,
+    running: set[int],
+    details: dict,
+    timeout_s: float,
+) -> tuple[bool, str]:
+    """Bring up an app that is running with no window on screen.
+
+    Its own hidden main window is shown when it has one (and it comes on
+    screen); otherwise, or when showing it did nothing, a new window is asked
+    for (:func:`_open_new_window`) and waited for (bounded by ``timeout_s``).
+
+    Returns:
+        ``(ok, summary)``.
+    """
+    name = chosen["name"]
+    details["background"] = True
+    details["window_state_before"] = "hidden" if hidden_hwnd else "none"
+    deadline = time.monotonic() + timeout_s
+    lead = f"{name} was running in the background with no window"
+    if hidden_hwnd:
+        shown = _show_window(hidden_hwnd)
+        details["shown_hidden_window"] = shown
+        if shown:
+            info = window_info(hidden_hwnd)
+            details.update(
+                launched=True,
+                hwnd=hidden_hwnd,
+                window_reason="its hidden window was shown",
+                title=info.title if info else "",
+                process_name=info.process_name if info else "",
+            )
+            forward = _bring_forward(hidden_hwnd, deadline, details)
+            return True, (
+                f"{lead}; its hidden window was shown: hwnd {hidden_hwnd} "
+                f"({details['process_name']}) \"{details['title']}\"; {forward}"
+            )
+    before, before_pids, before_titles = _window_snapshot()
+    before_foreground = _user32.GetForegroundWindow()
+    hidden_before = {h for h in _top_level_windows(running) if not is_user_window(h)}
+    pid, via, error = _open_new_window(chosen, identity, max(2.0, min(timeout_s, 15.0)))
+    details.update(via=via, pid=pid, launched=not error or pid is not None)
+    if error:
+        details["launch_error"] = error
+    if error and pid is None:
+        return False, f"{lead}, and asking it for a new window ({via}) failed: {error}"
+    if pid and pid not in running:
+        identity.add_launched(pid)
+    hwnd, reason, appeared = _wait_for_new_window(
+        identity,
+        before,
+        before_pids,
+        before_foreground,
+        deadline,
+        before_titles=before_titles,
+        hidden_before=hidden_before,
+    )
+    details["new_windows"] = [
+        {
+            "hwnd": other,
+            "title": (info.title if (info := window_info(other)) else ""),
+            "process_name": info.process_name if info else "",
+            "is_app_window": bool(identity.owns_window(other)),
+        }
+        for other in appeared
+    ]
+    if hwnd is None:
+        return False, (
+            f"{lead}; asked it for a new window ({via}) but none appeared within "
+            f"{timeout_s:g}s - it is still running with no window"
+        )
+    info = window_info(hwnd)
+    details.update(
+        hwnd=hwnd,
+        window_reason=reason,
+        title=info.title if info else "",
+        process_name=info.process_name if info else "",
+    )
+    _note_fresh(hwnd)
+    forward = _bring_forward(hwnd, deadline, details)
+    return True, (
+        f"{lead}; opened a new window ({via}): hwnd {hwnd} ({details['process_name']}) "
+        f"\"{details['title']}\"; {forward}"
+    )
+
+
 def launch_app(
     query: str,
     *,
@@ -1465,6 +1826,19 @@ def launch_app(
         hwnd for hwnd in _top_level_windows(running_before) if not is_user_window(hwnd)
     }
 
+    if not arg_list and already_running:
+        # Running, but with no window on screen (closed to the background or the
+        # tray): show its own hidden window, or ask it for a new one.  Starting
+        # its Start menu entry again is not enough - a running instance may
+        # just stay in the background.
+        app_hwnd, state = _find_app_window(identity, running_before)
+        if state in ("hidden", ""):
+            ok, summary = _restore_background_app(
+                chosen, identity, app_hwnd, running_before, details, timeout_s
+            )
+            details["identity"] = identity.describe()
+            return finish(ok, summary, details)
+
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
     launched_pid: int | None = None
@@ -1518,6 +1892,33 @@ def launch_app(
             except Exception:
                 carrier = None
     react = _ReactClock(handed_off, window_deadline, carrier) if already_running else None
+    # Handed a web address: success is a window of the app showing a page at
+    # that address - not its window title changing, which for some browsers
+    # never happens whatever page they show.
+    page_targets = [address for address in (_page_address(arg) for arg in arg_list) if address]
+    page_miss: tuple[bool, str] | None = None
+    if page_targets:
+        details["page_targets"] = page_targets
+        content_deadline = handed_off + content_timeout_s + (0.0 if already_running else timeout_s)
+        page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic())
+        details["page_check"] = _page_details(page_wait)
+        details["identity"] = identity.describe()
+        if page_wait is not None and page_wait.matched is not None:
+            details["waited_ms"] = round((time.monotonic() - handed_off) * 1000.0, 1)
+            return finish(
+                True,
+                _page_opened(
+                    chosen["name"], page_wait, before, details, content_deadline,
+                    page_targets, identity,
+                ),
+                details,
+            )
+        details["page_verified"] = False if page_wait is not None and page_wait.seen else None
+        page_miss = _page_miss(chosen["name"], page_targets, page_wait)
+        # The address is not on screen.  What did change, if anything, is
+        # looked up once, without waiting any longer.
+        window_deadline = time.monotonic() + 2 * _POLL_S
+        react = None
     hwnd, reason, appeared = _wait_for_new_window(
         identity,
         before,
@@ -1545,9 +1946,16 @@ def launch_app(
     ]
     if hwnd is None:
         return finish(
-            True,
+            page_miss[0] if page_miss else True,
             _no_window_outcome(
-                chosen, identity, details, arg_list, already_running, waited_s, window_deadline
+                chosen,
+                identity,
+                details,
+                arg_list,
+                already_running,
+                waited_s,
+                window_deadline,
+                lead=page_miss[1] if page_miss else None,
             ),
             details,
         )
@@ -1560,7 +1968,7 @@ def launch_app(
     # does not have to spend a round on focusing it.
     forward = _bring_forward(hwnd, window_deadline, details)
     content_note = ""
-    if arg_list:
+    if arg_list and not page_miss:
         # It was handed something to open: wait (bounded) until that is on
         # screen and readable, so the next look sees it rather than the frame.
         content_note = _wait_for_opened_content(hwnd, content_timeout_s, details)
@@ -1573,6 +1981,15 @@ def launch_app(
     if arg_list:
         shown = details["arguments"]
         with_args = f" with arguments {shown if len(shown) <= 160 else shown[:160] + '…'}"
+    if page_miss:
+        # The page check is the fact that matters; the window that changed is
+        # reported after it.
+        return finish(
+            page_miss[0],
+            f"{page_miss[1]}; hwnd {hwnd} ({details['process_name']}) \"{details['title']}\" "
+            f"- {reason}; {forward}",
+            details,
+        )
     return finish(
         True,
         f"launched {chosen['name']!r}{with_args}: hwnd {hwnd} "
@@ -1596,17 +2013,23 @@ def _no_window_outcome(
     already_running: bool,
     waited_s: float,
     window_deadline: float,
+    *,
+    lead: str | None = None,
 ) -> str:
     """The summary (and ``details``) for a launch after which no window of the
     app appeared, changed or came forward by itself.
 
     The app's own window is looked up: one on screen or minimized is brought to
     the front, a hidden one (an app sitting in the tray) is shown first.  Only
-    ever a window of the app - when it has none, the summary says so.
+    ever a window of the app - when it has none, the summary says so.  ``lead``
+    replaces the opening clause (the page check's verdict, when the app was
+    handed a web address).
     """
     name = repr(chosen["name"])
     via = details.get("via")
-    if arg_list and already_running:
+    if lead:
+        pass  # the caller's verdict (the page check) opens the summary
+    elif arg_list and already_running:
         details["args_effect"] = "nothing visible"
         lead = (
             f"{name} was already running and nothing visibly changed within "
@@ -2003,6 +2426,29 @@ def open_url(
     # that newly appears does (said so in its reason), never an old one that
     # merely came to the front.
     identity = _AppIdentity(handler or "the default handler", image_names=[handler] if handler else [])
+    # A web address: success is a page at that address in the handler's windows
+    # (or, with no handler known, in a window that appeared or is in front).
+    address = _page_address(target)
+    page_miss: tuple[bool, str] | None = None
+    if address:
+        details["page_targets"] = [address]
+        content_deadline = time.monotonic() + _HANDLER_WINDOW_S + content_timeout_s
+        page_wait = _await_page(identity, [address], before, content_deadline - time.monotonic())
+        details["page_check"] = _page_details(page_wait)
+        who = os.path.splitext(handler)[0] if handler else "the default browser"
+        if page_wait is not None and page_wait.matched is not None:
+            matched = page_wait.matched
+            process = getattr(window_info(matched.hwnd), "process_name", "")
+            who = os.path.splitext(process)[0] if process else who
+            return finish(
+                True,
+                f"{opened}; "
+                + _page_opened(who, page_wait, before, details, content_deadline, [address]),
+                details,
+            )
+        details["page_verified"] = False if page_wait is not None and page_wait.seen else None
+        page_miss = _page_miss(who, [address], page_wait)
+        window_deadline = time.monotonic() + 2 * _POLL_S
     hwnd, reason, appeared = _wait_for_new_window(
         identity,
         before,
@@ -2027,6 +2473,8 @@ def open_url(
         for other in appeared
     ]
     if hwnd is None:
+        if page_miss:
+            return finish(page_miss[0], f"{opened}; {page_miss[1]}", details)
         return finish(
             True,
             f"{opened}; no window of it appeared, came to the front or changed within "
@@ -2038,6 +2486,13 @@ def open_url(
     details["process_name"] = info.process_name if info else ""
     _note_fresh(hwnd)
     forward = _bring_forward(hwnd, window_deadline, details)
+    if page_miss:
+        return finish(
+            page_miss[0],
+            f"{opened}; {page_miss[1]}; hwnd {hwnd} ({details['process_name']}) "
+            f"\"{details['title']}\" - {reason}; {forward}",
+            details,
+        )
     content_note = _wait_for_opened_content(
         hwnd, content_timeout_s, details, require_document=True
     )

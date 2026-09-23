@@ -13,11 +13,19 @@ already speak it, and :mod:`yuki.actions.input` validates against it, so nothing
 needs converting - but the space is only trustworthy in a per-monitor DPI aware
 process, which :mod:`yuki` arranges at import.  Without that, Windows lies to the
 process about rectangles on any display whose scaling differs from the primary's.
+
+The overview also names the Start menu apps that are running with no window on
+screen (:func:`background_apps`), so "running in the background" can be told
+from "not running": a browser whose window was closed keeps running, and an
+overview of visible windows alone cannot say so.  That join goes through the
+Start menu, read once in the background at import (:func:`warm_start_menu_index`).
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -214,6 +222,30 @@ class DesktopOverview:
     ui_language: str = ""
     user_locale: str = ""
     keyboard_layout: str = ""
+    #: Start menu apps that are running but have no window on screen (closed to
+    #: the background or the tray) - see :func:`background_apps`.  Empty until
+    #: the Start menu index has been read (a second or so after import).
+    background_apps: list["BackgroundApp"] = field(default_factory=list)
+
+
+@dataclass
+class BackgroundApp:
+    """A Start menu app that is running with no window on screen.
+
+    Attributes:
+        name: its Start menu display name (what ``launch_app`` takes).
+        appid: its Start menu AppID (an AppUserModelID or a program path).
+        pids: its running processes that were seen (at most a few).
+        process_name: image name of the first of them.
+        hidden_hwnd: a main-style window it keeps hidden (or cloaks itself),
+            when it has one; ``None`` when it runs with no such window at all.
+    """
+
+    name: str
+    appid: str
+    pids: list[int] = field(default_factory=list)
+    process_name: str = ""
+    hidden_hwnd: int | None = None
 
 
 def is_cloaked(hwnd: int) -> bool:
@@ -398,6 +430,457 @@ def window_info(hwnd: int) -> WindowInfo | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Main-style windows, process identity, and apps running with no window
+# ---------------------------------------------------------------------------
+#: ``DWM_CLOAKED_APP``: the app cloaked the window itself (it is hiding it).
+#: The other cloak reasons - ``DWM_CLOAKED_SHELL`` (another virtual desktop, a
+#: suspended UWP frame) and ``DWM_CLOAKED_INHERITED`` - are the shell's doing.
+_DWM_CLOAKED_APP = 0x1
+
+
+def cloak_state(hwnd: int) -> int:
+    """The raw ``DWMWA_CLOAKED`` flags of a window (0: not cloaked, or unknown)."""
+    value = ctypes.c_int(0)
+    result = _dwmapi.DwmGetWindowAttribute(
+        wintypes.HWND(hwnd),
+        ctypes.c_uint(_DWMWA_CLOAKED),
+        ctypes.byref(value),
+        ctypes.sizeof(value),
+    )
+    return int(value.value) if result == 0 else 0
+
+
+def could_be_main_window(hwnd: int) -> bool:
+    """Whether a window that is not on screen is one a user could switch to.
+
+    Window-style facts only: top level and unowned, not a tool or no-activate
+    window, titled, with a caption *and* a system menu (the frame a user can
+    move, switch to and close).  Helper windows an app keeps hidden (tray-icon
+    hosts, message sinks, IME windows) usually lack that frame or a title.
+    Cheapest checks first: it runs on every hidden top-level window of the
+    desktop for each overview.
+    """
+    try:
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        if (style & win32con.WS_CAPTION) != win32con.WS_CAPTION or not (
+            style & win32con.WS_SYSMENU
+        ):
+            return False
+        if style & win32con.WS_CHILD:
+            return False
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if ex_style & (win32con.WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE):
+            return False
+        if owner_of(hwnd):
+            return False
+        return win32gui.GetWindowText(hwnd).strip() != ""
+    except Exception:
+        return False
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_APPMODEL_BUFFER = 512
+
+_proc_api = ctypes.WinDLL("kernel32")  # private: its argtypes leak nowhere
+_proc_api.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+_proc_api.OpenProcess.restype = ctypes.c_void_p
+_proc_api.CloseHandle.argtypes = [ctypes.c_void_p]
+_proc_api.CloseHandle.restype = ctypes.c_int
+for _fn in ("GetApplicationUserModelId", "GetPackageFamilyName"):
+    getattr(_proc_api, _fn).argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_wchar_p,
+    ]
+    getattr(_proc_api, _fn).restype = ctypes.c_long
+_proc_api.QueryFullProcessImageNameW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_wchar_p,
+    ctypes.POINTER(ctypes.c_uint32),
+]
+_proc_api.QueryFullProcessImageNameW.restype = ctypes.c_int
+
+
+def process_package_ids(pid: int) -> tuple[str, str]:
+    """``(AppUserModelID, package family name)`` of a packaged process.
+
+    Both ``""`` for a process without package identity or one that cannot be
+    opened.  Read from the process itself (``GetApplicationUserModelId``,
+    ``GetPackageFamilyName``): the identity Windows gave it, whatever its image.
+    """
+    handle = _proc_api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    if not handle:
+        return "", ""
+    try:
+        values = []
+        for fn in (_proc_api.GetApplicationUserModelId, _proc_api.GetPackageFamilyName):
+            length = ctypes.c_uint32(_APPMODEL_BUFFER)
+            buffer = ctypes.create_unicode_buffer(_APPMODEL_BUFFER)
+            values.append(buffer.value if fn(handle, ctypes.byref(length), buffer) == 0 else "")
+        return values[0], values[1]
+    finally:
+        _proc_api.CloseHandle(handle)
+
+
+#: pid -> ``(AppUserModelID lowercased, image path normcased)``, both ``""``
+#: when unreadable.  A process's identity and image never change while it
+#: lives, so each pid is asked once; pids that have exited are dropped on the
+#: next :func:`background_apps` call.
+_pid_facts: dict[int, tuple[str, str]] = {}
+_pid_facts_lock = threading.Lock()
+
+
+def _read_pid_facts(pid: int) -> tuple[str, str]:
+    handle = _proc_api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    if not handle:
+        return "", ""
+    try:
+        length = ctypes.c_uint32(_APPMODEL_BUFFER)
+        buffer = ctypes.create_unicode_buffer(_APPMODEL_BUFFER)
+        aumid = (
+            buffer.value
+            if _proc_api.GetApplicationUserModelId(handle, ctypes.byref(length), buffer) == 0
+            else ""
+        )
+        size = ctypes.c_uint32(1024)
+        path = ctypes.create_unicode_buffer(size.value)
+        exe = (
+            path.value
+            if _proc_api.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size))
+            else ""
+        )
+    finally:
+        _proc_api.CloseHandle(handle)
+    return aumid.lower(), os.path.normcase(exe) if exe else ""
+
+
+def _facts_for(pid: int) -> tuple[str, str]:
+    with _pid_facts_lock:
+        known = _pid_facts.get(pid)
+    if known is not None:
+        return known
+    facts = _read_pid_facts(pid)
+    with _pid_facts_lock:
+        _pid_facts[pid] = facts
+    return facts
+
+
+@dataclass(frozen=True)
+class StartEntry:
+    """One Start menu entry: display name, AppID, and the program it starts."""
+
+    name: str
+    appid: str
+    #: ``PKEY_Link_TargetParsingPath``: the program file a desktop entry's
+    #: shortcut points at (normcased); ``""`` for packaged apps.
+    target: str = ""
+
+
+#: ``PKEY_Link_TargetParsingPath``.
+_PKEY_LINK_TARGET = ("{B9B4B3FC-2B51-4A42-B5D8-324146AFCF25}", 2)
+
+
+def _is_within(path: str, folder: str) -> bool:
+    """Whether normcased ``path`` lies inside normcased ``folder``."""
+    folder = folder.rstrip("\\/")
+    return bool(folder) and (path == folder or path.startswith(folder + os.sep))
+
+
+class _StartIndex:
+    """The Start menu, indexed for "which entry does this process belong to".
+
+    A process belongs to an entry when its AppUserModelID is the entry's AppID
+    (packaged apps), when its image is the program the entry's shortcut starts,
+    or when its image is installed under that program's folder (a launcher stub
+    that runs the real program from a versioned subfolder).  A program started
+    by several differently named entries (a shell, an installer) names none of
+    them, and neither does a folder shared by several: the entry would be a
+    guess.  Folders inside the Windows directory and the bare per-machine /
+    per-user install roots never count as an app's folder - they hold
+    everybody's programs.
+    """
+
+    def __init__(self, entries: list[StartEntry]) -> None:
+        self.entries = entries
+        self.by_appid = {entry.appid.lower(): entry for entry in entries}
+        by_target: dict[str, dict[str, StartEntry]] = {}
+        for entry in entries:
+            if entry.target:
+                by_target.setdefault(entry.target, {})[entry.name] = entry
+        self.by_target = {
+            target: next(iter(named.values()))
+            for target, named in by_target.items()
+            if len(named) == 1
+        }
+        roots = {
+            os.path.normcase(os.path.abspath(path)).rstrip("\\/")
+            for path in (
+                os.environ.get("ProgramFiles") or "",
+                os.environ.get("ProgramFiles(x86)") or "",
+                os.environ.get("ProgramW6432") or "",
+                os.environ.get("ProgramData") or "",
+                os.environ.get("LOCALAPPDATA") or "",
+                os.environ.get("APPDATA") or "",
+                os.path.join(os.environ.get("LOCALAPPDATA") or "", "Programs"),
+                os.environ.get("USERPROFILE") or "",
+            )
+            if path
+        }
+        windows_dir = os.path.normcase(os.environ.get("SystemRoot") or r"C:\Windows")
+        by_dir: dict[str, dict[str, StartEntry]] = {}
+        for target, entry in self.by_target.items():
+            folder = os.path.dirname(target)
+            if not folder or folder in roots or _is_within(folder, windows_dir):
+                continue
+            by_dir.setdefault(folder, {})[entry.name] = entry
+        #: Longest folder first, so the most specific one wins.
+        self.dirs = sorted(
+            (
+                (folder, next(iter(named.values())))
+                for folder, named in by_dir.items()
+                if len(named) == 1
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+    def entry_for(self, aumid: str, exe: str) -> StartEntry | None:
+        """The entry a process with this (lowercased) AUMID and (normcased) image is."""
+        if aumid:
+            return self.by_appid.get(aumid)
+        if not exe:
+            return None
+        entry = self.by_target.get(exe)
+        if entry is not None:
+            return entry
+        for folder, entry in self.dirs:
+            if _is_within(exe, folder):
+                return entry
+        return None
+
+
+_start_index: _StartIndex | None = None
+_start_index_lock = threading.Lock()
+_start_index_thread: threading.Thread | None = None
+
+
+def _read_start_menu() -> list[StartEntry]:
+    """Every ``shell:AppsFolder`` item - the list the Start menu shows.
+
+    Runs on its own thread with its own COM apartment (see
+    :func:`warm_start_menu_index`).  Measured on this desktop: 293 entries in
+    about 1.2 s, which is why it is read once, in the background, and cached.
+    """
+    import pythoncom
+    import pywintypes
+    from win32com.shell import shell, shellcon
+
+    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+    try:
+        folder = shell.SHCreateItemFromParsingName("shell:AppsFolder", None, shell.IID_IShellItem)
+        items = folder.BindToHandler(None, shell.BHID_EnumItems, shell.IID_IEnumShellItems)
+        key = (pywintypes.IID(_PKEY_LINK_TARGET[0]), _PKEY_LINK_TARGET[1])
+        entries: list[StartEntry] = []
+        while True:
+            batch = items.Next(64)
+            if not batch:
+                break
+            for item in batch:
+                try:
+                    name = item.GetDisplayName(shellcon.SIGDN_NORMALDISPLAY)
+                    appid = item.GetDisplayName(shellcon.SIGDN_PARENTRELATIVEPARSING)
+                except Exception:
+                    continue
+                target = ""
+                try:
+                    target = item.QueryInterface(shell.IID_IShellItem2).GetString(key) or ""
+                except Exception:
+                    pass
+                if name and appid:
+                    entries.append(
+                        StartEntry(
+                            name=str(name),
+                            appid=str(appid),
+                            target=os.path.normcase(str(target)) if target else "",
+                        )
+                    )
+        return entries
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def warm_start_menu_index(*, refresh: bool = False) -> None:
+    """Start reading the Start menu in the background (once; ``refresh`` re-reads).
+
+    Returns at once.  Until the read has finished, :func:`start_menu_index` is
+    ``None`` and :func:`background_apps` reports nothing - it never guesses
+    without it.  Started at import, so it is normally ready before the first
+    request is typed.
+    """
+    global _start_index_thread
+
+    def build() -> None:
+        global _start_index
+        try:
+            index = _StartIndex(_read_start_menu())
+        except Exception:
+            return  # no Start menu to read: background apps stay unreported
+        with _start_index_lock:
+            _start_index = index
+
+    with _start_index_lock:
+        running = _start_index_thread is not None and _start_index_thread.is_alive()
+        if running or (_start_index is not None and not refresh):
+            return
+        _start_index_thread = threading.Thread(
+            target=build, name="yuki-start-menu-index", daemon=True
+        )
+        _start_index_thread.start()
+
+
+def start_menu_index(*, wait_s: float = 0.0) -> _StartIndex | None:
+    """The Start menu index if it has been read, else ``None`` (and a read is started).
+
+    ``wait_s``: wait up to this long for a read in progress (a caller that is
+    about to act on the answer, not the per-turn overview).
+    """
+    with _start_index_lock:
+        index = _start_index
+        thread = _start_index_thread
+    if index is None:
+        warm_start_menu_index()
+        if wait_s > 0:
+            with _start_index_lock:
+                thread = _start_index_thread
+            if thread is not None:
+                thread.join(wait_s)
+            with _start_index_lock:
+                index = _start_index
+    return index
+
+
+#: The console host's window class.  A hidden one belongs to a console program
+#: that was started without a window of its own (a script, a build step, this
+#: program's own shell) - OS plumbing, never an app the user closed.
+_CONSOLE_WINDOW_CLASS = "ConsoleWindowClass"
+
+#: At most this many background apps are reported (the line says how many more).
+MAX_BACKGROUND_APPS = 10
+
+
+def hidden_main_window(hwnd: int, visible: bool | None = None) -> bool:
+    """A top-level window that is not on screen but has a main window's frame.
+
+    Hidden (``IsWindowVisible`` false), or visible but cloaked by its own app
+    (``DWM_CLOAKED_APP``: the app is hiding it), with the frame of
+    :func:`could_be_main_window`; never the console host's window.
+    """
+    try:
+        if visible is None:
+            visible = bool(win32gui.IsWindowVisible(hwnd))
+        if visible and not cloak_state(hwnd) & _DWM_CLOAKED_APP:
+            return False
+        if not could_be_main_window(hwnd):
+            return False
+        return win32gui.GetClassName(hwnd) != _CONSOLE_WINDOW_CLASS
+    except Exception:
+        return False
+
+
+def background_apps(
+    windows: list[WindowInfo],
+    hidden: list[tuple[int, int]],
+    *,
+    others: set[int] | frozenset[int] = frozenset(),
+) -> list[BackgroundApp]:
+    """Start menu apps that are running with no window on screen.
+
+    OS facts only, joined through the Start menu (see :class:`_StartIndex`):
+
+    * a process that keeps a main-style window hidden (:func:`hidden_main_window`)
+      - an app closed to the tray or the background;
+    * a packaged process (it has an AppUserModelID) whose AUMID is a Start
+      menu entry - a packaged app can keep running like that with no window;
+
+    never a process whose image lies in the Windows directory (the shell, or
+    ``dllhost.exe`` serving a package's shell extension: the OS, not an app);
+
+    and no process of the same entry has a window in ``windows`` (or on another
+    virtual desktop, ``others``).  Processes that belong to no Start menu entry
+    - services, helpers, drivers' tray hosts - are left out, whatever windows
+    they keep.  Sorted by name; at most :data:`MAX_BACKGROUND_APPS` + 1 are
+    returned (the extra one tells the formatter there are more).
+
+    Args:
+        windows: the user windows on screen right now.
+        hidden: ``(hwnd, pid)`` of the hidden main-style windows found in the
+            same enumeration.
+        others: pids owning a main-style window cloaked by the shell (on
+            another virtual desktop): such an app has a window, just elsewhere.
+    """
+    index = start_menu_index()
+    if index is None:
+        return []
+    pids = psutil.pids()
+    live = set(pids)
+    with _pid_facts_lock:
+        for gone in [pid for pid in _pid_facts if pid not in live]:
+            del _pid_facts[gone]
+
+    def entry_of(pid: int) -> StartEntry | None:
+        aumid, exe = _facts_for(pid)
+        return index.entry_for(aumid, exe)
+
+    shown: set[str] = set()
+    for pid in {w.pid for w in windows} | set(others):
+        entry = entry_of(pid)
+        if entry is not None:
+            shown.add(entry.appid)
+
+    found: dict[str, BackgroundApp] = {}
+
+    def add(entry: StartEntry, pid: int, hwnd: int | None) -> None:
+        if entry.appid in shown:
+            return
+        app = found.get(entry.appid)
+        if app is None:
+            app = found[entry.appid] = BackgroundApp(name=entry.name, appid=entry.appid)
+        if pid not in app.pids and len(app.pids) < 4:
+            app.pids.append(pid)
+        if hwnd and app.hidden_hwnd is None:
+            app.hidden_hwnd = hwnd
+
+    # A process whose image is a Windows program is part of the OS, never an
+    # app running in the background: the shell (a Start entry can be a
+    # shortcut that runs explorer.exe on a folder), or a host a package
+    # borrowed (dllhost.exe serving its shell extension, a background-task
+    # host).
+    windows_dir = os.path.normcase(os.environ.get("SystemRoot") or r"C:\Windows")
+
+    def os_program(pid: int) -> bool:
+        exe = _facts_for(pid)[1]
+        return bool(exe) and _is_within(exe, windows_dir)
+
+    for hwnd, pid in hidden:
+        entry = entry_of(pid)
+        if entry is not None and not os_program(pid):
+            add(entry, pid, hwnd)
+    for pid in pids:
+        aumid, _ = _facts_for(pid)
+        if not aumid or (entry := index.by_appid.get(aumid)) is None or os_program(pid):
+            continue
+        add(entry, pid, None)
+    apps = sorted(found.values(), key=lambda app: app.name.lower())[: MAX_BACKGROUND_APPS + 1]
+    for app in apps:
+        app.process_name = _process_name(app.pids[0]) if app.pids else ""
+    return apps
+
+
 def _monitor_dpi(handle: int) -> int:
     """Effective DPI of one monitor, or 96 when Windows will not say.
 
@@ -529,10 +1012,51 @@ def cursor_position() -> tuple[int, int]:
     return (point.x, point.y)
 
 
+def _enumerate_desktop() -> tuple[list[int], list[tuple[int, int]], set[int]]:
+    """One ``EnumWindows`` pass: user windows, hidden main windows, windows elsewhere.
+
+    Returns:
+        ``(user_handles, hidden, elsewhere_pids)``: the handles
+        :func:`is_user_window` accepts, in Z-order; ``(hwnd, pid)`` of every
+        :func:`hidden_main_window`; and the pids owning a main-style window that
+        the shell has cloaked (one on another virtual desktop).
+    """
+    user: list[int] = []
+    hidden: list[tuple[int, int]] = []
+    elsewhere: set[int] = set()
+
+    def _collect(hwnd: int, _: object) -> bool:
+        try:
+            visible = bool(win32gui.IsWindowVisible(hwnd))
+            if visible and is_user_window(hwnd):
+                user.append(hwnd)
+            elif hidden_main_window(hwnd, visible):
+                hidden.append((hwnd, int(win32process.GetWindowThreadProcessId(hwnd)[1])))
+            elif visible and cloak_state(hwnd) and could_be_main_window(hwnd):
+                elsewhere.add(int(win32process.GetWindowThreadProcessId(hwnd)[1]))
+        except Exception:
+            pass  # the window died mid-enumeration
+        return True
+
+    win32gui.EnumWindows(_collect, None)
+    return user, hidden, elsewhere
+
+
 def get_desktop_overview() -> DesktopOverview:
-    """Snapshot every user window, every monitor, the foreground window, the cursor."""
-    windows = list_windows()
+    """Snapshot every user window, every monitor, the foreground window, the cursor,
+    and the Start menu apps running with no window on screen."""
     foreground = int(_user32.GetForegroundWindow() or 0)
+    handles, hidden, elsewhere = _enumerate_desktop()
+    windows: list[WindowInfo] = []
+    for hwnd in handles:
+        try:
+            windows.append(_window_info(hwnd, foreground))
+        except Exception:
+            continue  # the window died between enumeration and inspection
+    try:
+        background = background_apps(windows, hidden, others=elsewhere)
+    except Exception:  # an overview without them is still an overview
+        background = []
     virtual_bounds = virtual_screen_bounds()
     left, top, right, bottom = virtual_bounds
     try:
@@ -553,6 +1077,7 @@ def get_desktop_overview() -> DesktopOverview:
         ui_language=str(locale.get("ui_language") or ""),
         user_locale=str(locale.get("user_locale") or ""),
         keyboard_layout=str(keyboard.get("summary") or ""),
+        background_apps=background,
     )
 
 
@@ -613,6 +1138,11 @@ def format_overview(o: DesktopOverview) -> str:
     a disabled window with no such window in sight reads ``DISABLED``.  The
     header ends with the locale: Windows display language, regional formats,
     and the keyboard layout of the foreground window's thread.
+
+    Last, one line naming the Start menu apps that are running with no window
+    on screen (``running with no open window: Arc, WhatsApp``), so "running in
+    the background" can be told from "not running"; left out when there are
+    none (or the Start menu has not been read yet).
     """
     width, height = o.screen_size
     v_left, v_top = o.virtual_bounds[0], o.virtual_bounds[1]
@@ -673,4 +1203,16 @@ def format_overview(o: DesktopOverview) -> str:
         if w.hwnd in dialogs:
             flags += f" DIALOG for [{dialogs[w.hwnd]}]"
         lines.append(f'[{w.hwnd}] {w.process_name or "unknown"} "{w.title}" {where}{flags}')
+    background = list(getattr(o, "background_apps", None) or [])
+    if background:
+        names = [app.name for app in background[:MAX_BACKGROUND_APPS]]
+        more = len(background) > len(names)
+        lines.append(
+            "running with no open window: " + ", ".join(names) + (" and more" if more else "")
+        )
     return "\n".join(lines)
+
+
+# Read the Start menu in the background now, so the first overview can already
+# say which apps run with no window (the read takes about a second).
+warm_start_menu_index()
