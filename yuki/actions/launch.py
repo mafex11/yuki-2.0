@@ -12,18 +12,42 @@ resolved as usual and then started another way, chosen from the *kind* of Start
 menu entry it is - facts about the entry, never about which app it is:
 
 * a packaged app (its AppID is an AppUserModelID, ``<PackageFamilyName>!<App>``)
-  is activated through ``IApplicationActivationManager::ActivateApplication``,
-  which hands the arguments over and keeps the app's package identity.  Running
-  the executable inside its package folder directly would start it *without*
-  that identity, and so with a different data folder (a fresh browser profile);
+  is looked up in its package manifest (``AppxManifest.xml`` in the package's
+  install folder) and started, in this order, through
+  1. its **App Execution Alias** (``uap3``/``uap5:ExecutionAlias``, the
+     ``%LOCALAPPDATA%\\Microsoft\\WindowsApps`` link verified to point at this
+     very app), with ``Start-Process``: exactly what typing the alias in a
+     terminal does.  It creates a process *with* package identity, and that
+     process hands its command line to an instance that is already running the
+     way the app itself does it;
+  2. ``IApplicationActivationManager::ActivateForProtocol``, when every argument
+     is a URI whose scheme the manifest declares under ``windows.protocol``:
+     protocol activation is what a running instance is built to receive;
+  3. ``IApplicationActivationManager::ActivateApplication`` otherwise.  It keeps
+     package identity too, but when the app is already running Windows may
+     only activate that instance and drop the arguments (on 2026-09-23 a
+     running Arc was "started" with a URL and showed nothing).
+  Running the executable inside its package folder directly would start it
+  *without* package identity, and so with a different data folder (a fresh
+  browser profile), which is why none of these does that;
 * a desktop app is started with ``Start-Process -FilePath <exe> -ArgumentList
   ...``, the executable being the target of its Start menu shortcut (whose own
   arguments and working folder are kept), else the file its AppID names, else
   the image of a running process whose window carries that AppID.
 
-An app that is already running usually hands the arguments to its existing
-window instead of opening a new one; the watcher therefore also accepts a
-title change of a window of the process that was started.
+**Which window is the app's.**  Only a window that belongs to the app that was
+asked for is ever reported (:class:`_AppIdentity`): same AppUserModelID (the
+window's own ``PKEY_AppUserModel_ID``, or the packaged process's), same package
+family, same program file (or one installed under its folder), or a process the
+launch itself started.  On 2026-09-23 "launch WhatsApp" reported Arc's window
+because the foreground happened to change to it.  An app that is already
+running usually hands the arguments to the window it has, so a title change or
+foreground change of *its* window counts; if nothing of it changes, its own
+window is looked up - a window hidden in the tray is shown - and when it has
+none the summary says so.  An app that was already running reacts to a
+hand-off within :data:`_RUNNING_REACT_S` if it reacts at all, so that is how
+long the call waits for it (counted from when the hand-off finished), and a
+result where nothing changed says the app may have ignored the arguments.
 
 **After the window shows up** it is brought to the foreground exactly as
 :func:`focus_window` does and waited on until it accepts input: launching an app
@@ -47,15 +71,18 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict
+from urllib.parse import urlsplit
+from xml.etree import ElementTree
 
 import psutil
 import win32con
 import win32gui
+import win32process
 
 from yuki.actions import ActionResult
 from yuki.actions.input import wait_for_input_ready
 from yuki.actions.shell import run_powershell
-from yuki.perception.windows import is_user_window, list_windows, window_info
+from yuki.perception.windows import is_user_window, list_windows, owner_of, window_info
 
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
@@ -80,6 +107,27 @@ _AO_NOERRORUI = 0x2
 
 _CLSID_APPLICATION_ACTIVATION_MANAGER = "{45BA127D-10A8-46EA-8AB7-56EA9078943C}"
 _IID_APPLICATION_ACTIVATION_MANAGER = "{2E941141-7F97-4756-BA1D-9DECDE894A3D}"
+_IID_ISHELLITEM = "{43826D1E-E718-42EE-BC55-A1E261C37BFE}"
+_IID_ISHELLITEMARRAY = "{B63EA76D-1F85-456F-A19C-48159EFA858B}"
+
+#: ``PKEY_AppUserModel_PackageInstallPath`` (propkey.h): the install folder of a
+#: packaged Start menu entry, read from its ``shell:AppsFolder`` item.
+_PKEY_PACKAGE_INSTALL_PATH = ("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}", 15)
+
+#: ``IO_REPARSE_TAG_APPEXECLINK``: the reparse point an App Execution Alias is.
+_IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
+_FSCTL_GET_REPARSE_POINT = 0x000900A8
+
+#: How long an app that was *already running* is given to react to a hand-off
+#: (arguments, or just "come forward"), counted from when the hand-off finished
+#: - the activation call returned, or the process that carried the command line
+#: to the running instance exited.  A running instance that is going to open
+#: something does so well inside this; the wait ends the moment it does.
+_RUNNING_REACT_S = 2.0
+
+#: Bound on the wait for a hidden (tray) window to become visible after it has
+#: been shown.
+_SHOW_S = 1.0
 
 _start_apps_lock = threading.Lock()
 _start_apps_cache: list[dict[str, str]] | None = None
@@ -170,6 +218,289 @@ def _match_apps(query: str, apps: list[dict[str, str]]) -> tuple[dict | None, li
 
 
 # ---------------------------------------------------------------------------
+# Whose window is it
+# ---------------------------------------------------------------------------
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_APPMODEL_BUFFER = 512
+
+_pkg_api = ctypes.WinDLL("kernel32")  # private: its argtypes leak nowhere
+_pkg_api.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+_pkg_api.OpenProcess.restype = ctypes.c_void_p
+_pkg_api.CloseHandle.argtypes = [ctypes.c_void_p]
+_pkg_api.CloseHandle.restype = ctypes.c_int
+for _fn in ("GetApplicationUserModelId", "GetPackageFamilyName"):
+    getattr(_pkg_api, _fn).argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_wchar_p,
+    ]
+    getattr(_pkg_api, _fn).restype = ctypes.c_long
+
+
+def _process_package_ids(pid: int) -> tuple[str, str]:
+    """``(AppUserModelID, package family name)`` of a packaged process.
+
+    Both ``""`` for a process without package identity or one that cannot be
+    opened.  Read from the process itself (``GetApplicationUserModelId``,
+    ``GetPackageFamilyName``): the identity Windows gave it, whatever its image.
+    """
+    handle = _pkg_api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    if not handle:
+        return "", ""
+    try:
+        values = []
+        for fn in (_pkg_api.GetApplicationUserModelId, _pkg_api.GetPackageFamilyName):
+            length = ctypes.c_uint32(_APPMODEL_BUFFER)
+            buffer = ctypes.create_unicode_buffer(_APPMODEL_BUFFER)
+            values.append(buffer.value if fn(handle, ctypes.byref(length), buffer) == 0 else "")
+        return values[0], values[1]
+    finally:
+        _pkg_api.CloseHandle(handle)
+
+
+def _is_within(path: str, folder: str) -> bool:
+    """Whether normcased ``path`` lies inside normcased ``folder``."""
+    folder = folder.rstrip("\\/")
+    return bool(folder) and (path == folder or path.startswith(folder + os.sep))
+
+
+def _window_pid(hwnd: int) -> int:
+    try:
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:
+        return 0
+
+
+class _AppIdentity:
+    """What makes a process or a window "the app that was asked for".
+
+    Facts, in the order they are checked:
+
+    * the window's own AppUserModelID (``PKEY_AppUserModel_ID``) - the id the
+      taskbar groups it under - equal to the Start menu entry's AppID.  Most
+      windows declare none (a packaged app's identity is its process's), so a
+      window that does not match here is judged by its process;
+    * for a packaged app, the process's AppUserModelID, else its package family;
+    * the process's program file: one of ``exe_paths``, or a program installed
+      under the folder of one of them (a launcher stub that starts the real
+      program from a versioned subfolder).  A folder inside the Windows
+      directory is never used that way - it holds everybody's programs;
+    * the process's image name, when that is all that is known (``open_url``'s
+      default handler);
+    * the process, or one of its ancestors, is one the launch itself started.
+
+    ``confirmable`` is False when none of these is known (a Start menu entry
+    that is a URL, a shell folder, an unresolvable shortcut): then nothing can
+    be recognised as the app's, and the caller says so.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        aumid: str = "",
+        exe_paths: tuple[str, ...] | list[str] = (),
+        image_names: tuple[str, ...] | list[str] | frozenset[str] = (),
+    ) -> None:
+        self.name = name
+        self.aumid = (aumid or "").lower()
+        self.packaged = _is_packaged(self.aumid)
+        self.family = self.aumid.split("!", 1)[0] if self.packaged else ""
+        self.exe_paths = {
+            os.path.normcase(os.path.abspath(path)) for path in exe_paths if path
+        }
+        windows_dir = os.path.normcase(os.environ.get("SystemRoot") or r"C:\Windows")
+        self.exe_dirs = {
+            os.path.dirname(path)
+            for path in self.exe_paths
+            if not _is_within(path, windows_dir)
+        }
+        self.image_names = {image.lower() for image in image_names if image}
+        self.launched_pids: set[int] = set()
+        self._pid_cache: dict[int, str] = {}
+
+    @property
+    def confirmable(self) -> bool:
+        return bool(self.packaged or self.exe_paths or self.image_names or self.launched_pids)
+
+    def describe(self) -> dict:
+        return {
+            "aumid": self.aumid,
+            "package_family": self.family,
+            "exe_paths": sorted(self.exe_paths),
+            "image_names": sorted(self.image_names),
+            "launched_pids": sorted(self.launched_pids),
+            "confirmable": self.confirmable,
+        }
+
+    def add_launched(self, pid: int | None) -> None:
+        """Count ``pid`` (and what it starts) as the app's from now on."""
+        if pid:
+            self.launched_pids.add(int(pid))
+            # A "no" cached before may now be a child of the launched process.
+            self._pid_cache = {k: v for k, v in self._pid_cache.items() if v}
+
+    def owns_pid(self, pid: int) -> str:
+        """How ``pid`` is known to be the app's (``""``: it is not)."""
+        if not pid:
+            return ""
+        if pid in self._pid_cache:
+            return self._pid_cache[pid]
+        how = self._check_pid(pid)
+        self._pid_cache[pid] = how
+        return how
+
+    def _check_pid(self, pid: int) -> str:
+        if self.packaged:
+            process_aumid, family = _process_package_ids(pid)
+            if process_aumid:
+                if process_aumid.lower() == self.aumid:
+                    return "same AppUserModelID"
+            elif family and family.lower() == self.family:
+                return "same package"
+        try:
+            process = psutil.Process(pid)
+        except Exception:
+            return ""
+        if self.exe_paths or self.image_names:
+            try:
+                exe = os.path.normcase(process.exe() or "")
+            except Exception:
+                exe = ""
+            if exe and exe in self.exe_paths:
+                return "same program file"
+            if exe and any(_is_within(exe, folder) for folder in self.exe_dirs):
+                return "program installed under the app's folder"
+            if self.image_names:
+                try:
+                    image = (process.name() or "").lower()
+                except Exception:
+                    image = os.path.basename(exe)
+                if image in self.image_names:
+                    return "same program name"
+        if self.launched_pids:
+            current: psutil.Process | None = process
+            for _ in range(8):  # a launcher, its child, a grandchild - never a loop
+                if current is None:
+                    break
+                if current.pid in self.launched_pids:
+                    return "started by this launch"
+                try:
+                    current = current.parent()
+                except Exception:
+                    break
+        return ""
+
+    def owns_window(self, hwnd: int) -> str:
+        """How ``hwnd`` is known to be the app's (``""``: it is not, or unknown)."""
+        if self.aumid and _window_appid(hwnd).lower() == self.aumid:
+            return "window AppUserModelID"
+        return self.owns_pid(_window_pid(hwnd))
+
+    def running_pids(self) -> set[int]:
+        """Processes of the app that exist right now."""
+        if not self.confirmable:
+            return set()
+        return {pid for pid in psutil.pids() if self.owns_pid(pid)}
+
+
+def _top_level_windows(pids: set[int]) -> list[int]:
+    """Every top-level window of ``pids`` (visible or not), in Z-order."""
+    if not pids:
+        return []
+    found: list[int] = []
+
+    def collect(hwnd: int, _: object) -> bool:
+        if _window_pid(hwnd) in pids:
+            found.append(hwnd)
+        return True
+
+    try:
+        win32gui.EnumWindows(collect, None)
+    except Exception:
+        pass
+    return found
+
+
+#: ``WS_EX_NOACTIVATE``: a window the user can never switch to.
+_WS_EX_NOACTIVATE = 0x08000000
+
+
+def _could_be_main_window(hwnd: int) -> bool:
+    """Whether a window that is not on screen is one a user could switch to.
+
+    Window-style facts only: top level and unowned, not a tool or no-activate
+    window, titled, with a caption *and* a system menu (the frame a user can
+    move, switch to and close).  Helper windows an app keeps hidden (tray-icon
+    hosts, message sinks, IME windows) lack that frame or a title.
+    """
+    try:
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        title = win32gui.GetWindowText(hwnd)
+    except Exception:
+        return False
+    if style & win32con.WS_CHILD or owner_of(hwnd):
+        return False
+    if ex_style & (win32con.WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE):
+        return False
+    if not title.strip():
+        return False
+    return (style & win32con.WS_CAPTION) == win32con.WS_CAPTION and bool(
+        style & win32con.WS_SYSMENU
+    )
+
+
+def _find_app_window(identity: _AppIdentity, pids: set[int]) -> tuple[int | None, str]:
+    """The app's own window, for when launching it changed nothing.
+
+    Returns:
+        ``(hwnd, state)`` with state ``"open"`` (on screen), ``"minimized"`` or
+        ``"hidden"`` (exists but not shown - an app sitting in the tray), or
+        ``(None, "")`` when the app has no window a user could switch to.
+        Visible ones win, topmost first; among hidden ones the largest.
+    """
+    windows = _top_level_windows(pids)
+    shown = [h for h in windows if is_user_window(h) and identity.owns_window(h)]
+    if shown:
+        restored = [h for h in shown if not win32gui.IsIconic(h)]
+        return (restored or shown)[0], ("open" if restored else "minimized")
+    hidden = [
+        h
+        for h in windows
+        if not is_user_window(h) and _could_be_main_window(h) and identity.owns_window(h)
+    ]
+    if not hidden:
+        return None, ""
+
+    def area(hwnd: int) -> int:
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return 0
+        return max(right - left, 0) * max(bottom - top, 0)
+
+    hidden.sort(key=area, reverse=True)
+    return hidden[0], "hidden"
+
+
+def _show_window(hwnd: int, timeout_s: float = _SHOW_S) -> bool:
+    """Show a hidden window and wait (bounded) until it is on screen."""
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    except Exception:
+        return False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if is_user_window(hwnd):
+            return True
+        time.sleep(_POLL_S)
+    return is_user_window(hwnd)
+
+
+# ---------------------------------------------------------------------------
 # Waiting for windows
 # ---------------------------------------------------------------------------
 def _window_snapshot() -> tuple[dict[int, int], set[int], dict[int, tuple[str, str]]]:
@@ -183,60 +514,126 @@ def _window_snapshot() -> tuple[dict[int, int], set[int], dict[int, tuple[str, s
     )
 
 
+class _ReactClock:
+    """The shorter deadline for an app that was already running.
+
+    Counts :data:`_RUNNING_REACT_S` from ``handed_off`` (when the activation
+    call returned), and slides along while ``carrier`` - the process that
+    carries the command line over to the running instance - is still alive, so
+    the clock runs from when the hand-off actually finished.  Never later than
+    ``hard_deadline``.
+    """
+
+    def __init__(
+        self, handed_off: float, hard_deadline: float, carrier: psutil.Process | None = None
+    ) -> None:
+        self.handed_off = handed_off
+        self.hard_deadline = hard_deadline
+        self.carrier = carrier
+
+    def deadline(self) -> float:
+        if self.carrier is not None:
+            try:
+                alive = self.carrier.is_running() and (
+                    self.carrier.status() != psutil.STATUS_ZOMBIE
+                )
+            except Exception:
+                alive = False
+            if alive:
+                return min(time.monotonic() + _RUNNING_REACT_S, self.hard_deadline)
+            self.carrier = None
+            self.handed_off = max(self.handed_off, time.monotonic())
+        return min(self.handed_off + _RUNNING_REACT_S, self.hard_deadline)
+
+
 def _wait_for_new_window(
+    identity: _AppIdentity,
     before: dict[int, int],
     before_pids: set[int],
     before_foreground: int,
     deadline: float,
     *,
     before_titles: dict[int, tuple[str, str]] | None = None,
-    target_processes: frozenset[str] = frozenset(),
+    hidden_before: set[int] | frozenset[int] = frozenset(),
+    react: _ReactClock | None = None,
 ) -> tuple[int | None, str, list[int]]:
     """Wait for the launched app to show itself, and return as soon as it has.
 
-    Accepts, in order of confidence: a new window belonging to a process that
-    did not exist before; a new window of an already running process (an app
-    opening a second window); the foreground window changing to something that
-    was not focused before (single-instance apps that just activate the window
-    they already had).  With ``target_processes`` (lowercased image names of
-    what was just started) a window of one of those processes that was already
-    open and has changed its title also counts: an app that is handed a URL or a
-    file while running typically opens it in the window it has, and the new title
-    is the first visible sign that it did.
+    Only windows that belong to the app (``identity``) count.  Accepted, in
+    order of confidence: a new window of the app from a process that did not
+    exist before; a new window of an already running process of the app (a
+    second window, or one that was hidden and is now shown); an already open
+    window of the app that changed its title (an app handed a URL or a file
+    while running typically opens it in the window it has); the foreground
+    changing to an already open window of the app.  A window of any other
+    process is never reported, however it got the foreground.
+
+    When the identity is not ``confirmable`` (nothing is known to recognise the
+    app's windows by) a newly appeared window is accepted with that said in the
+    reason, and a foreground change to an old window is not.
 
     Every window that appeared is returned alongside the chosen one.  When more
     than one did, the caller hands the whole list to the model rather than
     waiting on a timer to see whether a "better" window turns up -- guessing on
     a stopwatch is exactly what the contract forbids.
 
+    ``react`` (an app that was already running) ends the wait earlier: see
+    :class:`_ReactClock`.
+
     Returns:
         ``(hwnd | None, reason, appeared)``.
     """
-    while time.monotonic() < deadline:
+
+    ownership: dict[int, str] = {}
+
+    def owns(hwnd: int) -> str:
+        if hwnd not in ownership:
+            ownership[hwnd] = identity.owns_window(hwnd)
+        return ownership[hwnd]
+
+    def shown_reason(hwnd: int, default: str) -> str:
+        if hwnd in hidden_before:
+            return "its window, hidden before (running in the background), was shown"
+        return default
+
+    while time.monotonic() < (react.deadline() if react else deadline):
         current, _, titles = _window_snapshot()
         fresh = [hwnd for hwnd in current if hwnd not in before]
-        from_new_process = [
-            hwnd for hwnd in fresh if current[hwnd] not in before_pids
-        ]
+        owned = [hwnd for hwnd in fresh if owns(hwnd)]
+        from_new_process = [hwnd for hwnd in owned if current[hwnd] not in before_pids]
         for hwnd in reversed(from_new_process):
             if is_user_window(hwnd):  # re-check: splash windows come and go
-                return hwnd, "new window from a new process", fresh
-        if fresh:
-            return fresh[-1], "new window from an already running process", fresh
-        if target_processes and before_titles:
+                return hwnd, shown_reason(hwnd, "new window from a new process"), fresh
+        if owned:
+            return (
+                owned[-1],
+                shown_reason(owned[-1], "new window from an already running process"),
+                fresh,
+            )
+        if fresh and not identity.confirmable:
+            return (
+                fresh[-1],
+                (
+                    f"new window (not confirmed as {identity.name!r}'s: nothing is known "
+                    f"to recognise its windows by)"
+                ),
+                fresh,
+            )
+        if before_titles:
             for hwnd, (title, process) in titles.items():
                 old = before_titles.get(hwnd)
-                if old is not None and process in target_processes and title != old[0]:
-                    return hwnd, f"existing {process} window changed its title", fresh
+                if old is not None and title != old[0] and owns(hwnd):
+                    return hwnd, f"its already open {process} window changed its title", fresh
         foreground = _user32.GetForegroundWindow()
         if (
             foreground
             and foreground != before_foreground
             and is_user_window(foreground)
+            and owns(foreground)
         ):
-            return foreground, "foreground changed to an already open window", fresh
+            return foreground, "foreground changed to its already open window", fresh
         time.sleep(_POLL_S)
-    return None, "no new or newly focused window appeared", []
+    return None, "no new, changed or newly focused window of it appeared", []
 
 
 # ---------------------------------------------------------------------------
@@ -374,21 +771,359 @@ def _start_process_command(exe: str, arguments: str, workdir: str = "") -> str:
     return " ".join(parts) + "; if ($p) { $p.Id }"
 
 
+#: ``PKEY_Link_TargetParsingPath``: what a desktop Start menu entry points at.
+_PKEY_LINK_TARGET_PARSING_PATH = ("{B9B4B3FC-2B51-4A42-B5D8-324146AFCF25}", 2)
+
+
+def _run_in_com_thread(fn, timeout_s: float = 3.0):
+    """Run ``fn()`` on a short-lived thread with its own COM apartment.
+
+    Shell items need COM; initialising it on the caller's thread would leave
+    that thread in an apartment it did not choose.
+
+    Returns:
+        ``(value, error)``.
+    """
+    result: dict = {}
+
+    def worker() -> None:
+        import pythoncom
+
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        except Exception:
+            pass
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=worker, name="yuki-shell-item", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if "value" in result:
+        return result["value"], ""
+    return None, result.get("error") or f"no answer within {timeout_s:g}s"
+
+
+def _apps_folder_strings(appid: str, keys: dict[str, tuple[str, int]]) -> dict[str, str]:
+    """String properties of the ``shell:AppsFolder\\<appid>`` item (``""`` if absent)."""
+
+    def read() -> dict[str, str]:
+        import pywintypes
+        from win32com.shell import shell
+
+        item = shell.SHCreateItemFromParsingName(
+            "shell:AppsFolder\\" + appid, None, shell.IID_IShellItem2
+        )
+        values: dict[str, str] = {}
+        for name, (fmtid, pid) in keys.items():
+            try:
+                values[name] = str(item.GetString((pywintypes.IID(fmtid), pid)) or "")
+            except Exception:
+                values[name] = ""
+        return values
+
+    values, _ = _run_in_com_thread(read)
+    return values or {name: "" for name in keys}
+
+
+def _is_program_file(path: str) -> bool:
+    """An existing ``.exe`` - a file a process can have as its image."""
+    return bool(path) and path.lower().endswith(".exe") and os.path.isfile(path)
+
+
+def _identity_for(chosen: dict[str, str], plan: dict | None) -> _AppIdentity:
+    """The :class:`_AppIdentity` of a Start menu entry (and how it is started)."""
+    appid = chosen["appid"]
+    if _is_packaged(appid):
+        return _AppIdentity(chosen["name"], aumid=appid)
+    exe_paths: list[str] = []
+    if plan is not None and _is_program_file(plan.get("exe") or ""):
+        exe_paths.append(plan["exe"])
+    path = _appid_path(appid)
+    if path and _is_program_file(path):
+        exe_paths.append(path)
+    target = _apps_folder_strings(appid, {"target": _PKEY_LINK_TARGET_PARSING_PATH})["target"]
+    if _is_program_file(target):
+        exe_paths.append(target)
+    return _AppIdentity(chosen["name"], aumid=appid, exe_paths=exe_paths)
+
+
+def _package_install_dir(aumid: str) -> tuple[str, str]:
+    """``(install folder, error)`` of the package a packaged AppID belongs to.
+
+    Read from the Start menu item itself (``PKEY_AppUserModel_PackageInstallPath``),
+    else from ``Get-AppxPackage``.
+    """
+    install_dir = _apps_folder_strings(aumid, {"dir": _PKEY_PACKAGE_INSTALL_PATH})["dir"]
+    if install_dir and os.path.isdir(install_dir):
+        return install_dir, ""
+    family = aumid.split("!", 1)[0]
+    # A package family name is "<Name>_<PublisherId>"; package names hold no "_".
+    try:
+        found = _powershell_json(
+            f"Get-AppxPackage -Name {_quote(family.rsplit('_', 1)[0])} "
+            f"| Where-Object {{ $_.PackageFamilyName -eq {_quote(family)} }} "
+            "| Select-Object -First 1 InstallLocation | ConvertTo-Json -Compress "
+            "| Set-Content -LiteralPath {path} -Encoding UTF8",
+            what="Get-AppxPackage",
+        )
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        return "", f"package lookup failed: {exc}"
+    for item in found:
+        location = str(item.get("InstallLocation") or "") if isinstance(item, dict) else ""
+        if location and os.path.isdir(location):
+            return location, ""
+    return "", f"no installed package with family {family!r} was found"
+
+
+def _package_app_facts(aumid: str) -> dict:
+    """What a packaged app's own manifest declares for it.
+
+    Reads ``AppxManifest.xml`` in the package's install folder and, under the
+    ``<Application Id=...>`` the AppID names, collects the App Execution Aliases
+    (``*:ExecutionAlias Alias=``) and the URI schemes of its
+    ``windows.protocol`` extensions.  Namespaces vary with the manifest schema
+    version (uap3, uap5, ...), so elements are matched by local name.
+
+    Returns:
+        ``{"install_dir", "manifest", "aliases", "protocols", "error"}``.
+    """
+    facts: dict = {"install_dir": "", "manifest": "", "aliases": [], "protocols": [], "error": ""}
+    app_id = aumid.split("!", 1)[1] if "!" in aumid else ""
+    install_dir, error = _package_install_dir(aumid)
+    if not install_dir:
+        facts["error"] = error
+        return facts
+    manifest = os.path.join(install_dir, "AppxManifest.xml")
+    facts.update(install_dir=install_dir, manifest=manifest)
+    try:
+        root = ElementTree.parse(manifest).getroot()
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        facts["error"] = f"could not read {manifest}: {exc}"
+        return facts
+
+    def local(tag: object) -> str:
+        return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+    application = next(
+        (
+            element
+            for element in root.iter()
+            if local(element.tag) == "Application"
+            and (element.get("Id") or "").lower() == app_id.lower()
+        ),
+        None,
+    )
+    if application is None:
+        facts["error"] = f"{manifest} declares no Application Id={app_id!r}"
+        return facts
+    aliases: list[str] = []
+    protocols: list[str] = []
+    for element in application.iter():
+        name = local(element.tag)
+        if name == "ExecutionAlias" and element.get("Alias"):
+            aliases.append(element.get("Alias"))
+        elif name == "Extension" and element.get("Category") == "windows.protocol":
+            for inner in element.iter():
+                if local(inner.tag) == "Protocol" and inner.get("Name"):
+                    protocols.append(inner.get("Name").lower())
+    facts["aliases"] = list(dict.fromkeys(aliases))
+    facts["protocols"] = list(dict.fromkeys(protocols))
+    return facts
+
+
+_pkg_api.CreateFileW.argtypes = [
+    ctypes.c_wchar_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+]
+_pkg_api.CreateFileW.restype = ctypes.c_void_p
+_pkg_api.DeviceIoControl.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32),
+    ctypes.c_void_p,
+]
+_pkg_api.DeviceIoControl.restype = ctypes.c_int
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+def _read_app_exec_link(path: str) -> dict | None:
+    """Read an App Execution Alias: ``{"path", "family", "aumid", "target"}``.
+
+    ``None`` when ``path`` is not an alias at all.  The reparse data of an
+    ``IO_REPARSE_TAG_APPEXECLINK`` (version 3) holds NUL-separated UTF-16
+    strings: package family name, AppUserModelID, target executable.  Fields
+    that cannot be read stay ``""``.  Read-only: the link is opened for its
+    attributes, never followed.
+    """
+    try:
+        if getattr(os.lstat(path), "st_reparse_tag", 0) != _IO_REPARSE_TAG_APPEXECLINK:
+            return None
+    except OSError:
+        return None
+    link = {"path": path, "family": "", "aumid": "", "target": ""}
+    handle = _pkg_api.CreateFileW(
+        path,
+        0x80,  # FILE_READ_ATTRIBUTES
+        0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000 | 0x02000000,  # FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+        None,
+    )
+    if not handle or handle == _INVALID_HANDLE:
+        return link
+    try:
+        buffer = ctypes.create_string_buffer(16 * 1024)
+        returned = ctypes.c_uint32(0)
+        if not _pkg_api.DeviceIoControl(
+            handle, _FSCTL_GET_REPARSE_POINT, None, 0, buffer, len(buffer),
+            ctypes.byref(returned), None,
+        ):
+            return link
+    finally:
+        _pkg_api.CloseHandle(handle)
+    raw = buffer.raw[: returned.value]
+    length = int.from_bytes(raw[4:6], "little")
+    data = raw[8 : 8 + length]
+    if int.from_bytes(data[:4], "little") != 3:
+        return link
+    parts = data[4:].decode("utf-16-le", errors="replace").split("\0")
+    link.update(
+        family=parts[0] if len(parts) > 0 else "",
+        aumid=parts[1] if len(parts) > 1 else "",
+        target=parts[2] if len(parts) > 2 else "",
+    )
+    return link
+
+
+def _find_alias(aumid: str, aliases: list[str]) -> tuple[dict | None, list[str]]:
+    """The App Execution Alias link of ``aumid``, verified, and notes on the search.
+
+    Looks in the package's own alias folder
+    (``%LOCALAPPDATA%\\Microsoft\\WindowsApps\\<PackageFamilyName>``) first, then
+    in the folder on ``PATH``.  A link counts only when its reparse data names
+    this very AppUserModelID (the ``PATH`` one may belong to another package
+    that declared the same alias); in the package's own folder an unreadable
+    one is accepted, since the folder is the package's.
+    """
+    notes: list[str] = []
+    base = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"),
+        "Microsoft",
+        "WindowsApps",
+    )
+    family = aumid.split("!", 1)[0]
+    for alias in aliases:
+        own = os.path.join(base, family, alias)
+        for path in (own, os.path.join(base, alias)):
+            link = _read_app_exec_link(path)
+            if link is None:
+                continue
+            if link["aumid"]:
+                if link["aumid"].lower() == aumid.lower():
+                    return {**link, "alias": alias}, notes
+                notes.append(f"alias link {path} belongs to {link['aumid']}, not to {aumid}")
+                continue
+            if path == own:
+                return {**link, "alias": alias}, notes
+            notes.append(f"alias link {path} could not be read to confirm whose it is")
+        notes.append(f"the manifest declares alias {alias!r}, but no link for it points at this app")
+    return None, notes
+
+
+def _uri_schemes(args: list[str]) -> list[str] | None:
+    """Lowercased schemes of ``args`` when every one is a URI, else ``None``.
+
+    A single letter before ``:`` is a drive, not a scheme.
+    """
+    schemes: list[str] = []
+    for arg in args:
+        try:
+            scheme = urlsplit(arg).scheme.lower()
+        except ValueError:
+            return None
+        if len(scheme) <= 1:
+            return None
+        schemes.append(scheme)
+    return schemes or None
+
+
 def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict | None, list[str]]:
     """How to start ``chosen`` with ``args``, or why it cannot be.
 
+    For a packaged app, in order (see the module docstring): its App Execution
+    Alias, protocol activation when every argument is a URI of a scheme it
+    declares, ``ActivateApplication``.  For a desktop app, ``Start-Process`` on
+    its program file.
+
     Returns:
-        ``(plan, notes)``.  ``plan`` is ``{"via": "ActivateApplication", "aumid",
-        "arguments"}`` for a packaged app, or ``{"via": "Start-Process", "exe",
-        "arguments", "workdir", "source", "command"}`` for a desktop app; ``None``
-        when no executable could be found, in which case ``notes`` says what was
-        tried.
+        ``(plan, notes)``.  ``plan["via"]`` is ``"AppExecutionAlias"`` or
+        ``"Start-Process"`` (both with ``"exe", "arguments", "workdir",
+        "source", "command"``), ``"ActivateForProtocol"`` (with ``"aumid",
+        "uris", "arguments"``) or ``"ActivateApplication"`` (with ``"aumid",
+        "arguments"``); packaged plans also carry ``"manifest"``,
+        ``"manifest_aliases"`` and ``"manifest_protocols"``.  ``None`` when no
+        executable could be found, in which case ``notes`` says what was tried.
     """
     arguments = _command_line(args)
     appid = chosen["appid"]
     notes: list[str] = []
     if _is_packaged(appid):
-        return {"via": "ActivateApplication", "aumid": appid, "arguments": arguments}, notes
+        facts = _package_app_facts(appid)
+        base = {
+            "aumid": appid,
+            "arguments": arguments,
+            "manifest": facts["manifest"],
+            "manifest_aliases": facts["aliases"],
+            "manifest_protocols": facts["protocols"],
+        }
+        if facts["error"]:
+            notes.append(facts["error"])
+        link, alias_notes = _find_alias(appid, facts["aliases"])
+        notes.extend(alias_notes)
+        if link is not None:
+            return {
+                **base,
+                "via": "AppExecutionAlias",
+                "exe": link["path"],
+                "workdir": "",
+                "source": (
+                    f"App Execution Alias {link['alias']!r} declared in {facts['manifest']} "
+                    f"(-> {link['target'] or 'target unreadable'})"
+                ),
+                "command": _start_process_command(link["path"], arguments),
+            }, notes
+        if not facts["error"] and not facts["aliases"]:
+            notes.append("its package manifest declares no App Execution Alias")
+        schemes = _uri_schemes(args)
+        if schemes and all(scheme in facts["protocols"] for scheme in schemes):
+            return {**base, "via": "ActivateForProtocol", "uris": list(args)}, notes
+        if facts["protocols"]:
+            notes.append(
+                "not every argument is a URI of a scheme its manifest declares "
+                f"({', '.join(facts['protocols'])})"
+            )
+        elif not facts["error"]:
+            notes.append("its package manifest declares no URI scheme it handles")
+        notes.append("using ActivateApplication, which an already running instance may ignore")
+        return {**base, "via": "ActivateApplication"}, notes
 
     def plan(exe: str, source: str, prefix: str = "", workdir: str = "") -> dict:
         line = " ".join(part for part in (prefix.strip(), arguments) if part)
@@ -437,8 +1172,9 @@ def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict
 def _activation_manager_interface():  # -> type[comtypes.IUnknown]
     """``IApplicationActivationManager``, declared once on first use.
 
-    Only ``ActivateApplication`` is declared: it is the first method of the
-    interface, so the vtable is right without the two after it.
+    All three methods are declared, in vtable order, because the one used for
+    protocols is the last.  The item array is passed as a plain ``IUnknown``
+    pointer: nothing here calls into it.
     """
     global _ACTIVATION_INTERFACE
     if _ACTIVATION_INTERFACE is None:
@@ -457,6 +1193,23 @@ def _activation_manager_interface():  # -> type[comtypes.IUnknown]
                     (["in"], ctypes.c_int, "options"),
                     (["out"], ctypes.POINTER(wintypes.DWORD), "processId"),
                 ),
+                comtypes.COMMETHOD(
+                    [],
+                    comtypes.HRESULT,
+                    "ActivateForFile",
+                    (["in"], wintypes.LPCWSTR, "appUserModelId"),
+                    (["in"], ctypes.POINTER(comtypes.IUnknown), "itemArray"),
+                    (["in"], wintypes.LPCWSTR, "verb"),
+                    (["out"], ctypes.POINTER(wintypes.DWORD), "processId"),
+                ),
+                comtypes.COMMETHOD(
+                    [],
+                    comtypes.HRESULT,
+                    "ActivateForProtocol",
+                    (["in"], wintypes.LPCWSTR, "appUserModelId"),
+                    (["in"], ctypes.POINTER(comtypes.IUnknown), "itemArray"),
+                    (["out"], ctypes.POINTER(wintypes.DWORD), "processId"),
+                ),
             ]
 
         _ACTIVATION_INTERFACE = IApplicationActivationManager
@@ -465,14 +1218,65 @@ def _activation_manager_interface():  # -> type[comtypes.IUnknown]
 
 _ACTIVATION_INTERFACE = None
 
+_shell_api = ctypes.WinDLL("shell32")  # private: its argtypes leak nowhere
 
-def _activate_packaged(aumid: str, arguments: str, timeout_s: float) -> tuple[int | None, str]:
-    """Activate a packaged app with a command line, as the Start menu would.
 
-    Runs on its own thread with its own COM apartment, bounded by ``timeout_s``.
+def _uri_item_array(uri: str):  # -> ctypes.POINTER(comtypes.IUnknown)
+    """A one-item ``IShellItemArray`` holding ``uri`` (COM must be initialised).
+
+    ``SHCreateItemFromParsingName`` parses a URL into a shell item without
+    touching the network or any handler; the array is what
+    ``ActivateForProtocol`` takes.
+
+    Raises:
+        OSError: the shell could not make an item of it.
+    """
+    import comtypes
+
+    unknown_out = ctypes.POINTER(ctypes.POINTER(comtypes.IUnknown))
+    _shell_api.SHCreateItemFromParsingName.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(comtypes.GUID),
+        unknown_out,
+    ]
+    _shell_api.SHCreateItemFromParsingName.restype = ctypes.c_long
+    _shell_api.SHCreateShellItemArrayFromShellItem.argtypes = [
+        ctypes.POINTER(comtypes.IUnknown),
+        ctypes.POINTER(comtypes.GUID),
+        unknown_out,
+    ]
+    _shell_api.SHCreateShellItemArrayFromShellItem.restype = ctypes.c_long
+    item = ctypes.POINTER(comtypes.IUnknown)()
+    hr = _shell_api.SHCreateItemFromParsingName(
+        uri, None, ctypes.byref(comtypes.GUID(_IID_ISHELLITEM)), ctypes.byref(item)
+    )
+    if hr < 0 or not item:
+        raise OSError(f"SHCreateItemFromParsingName({uri!r}) failed: HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+    array = ctypes.POINTER(comtypes.IUnknown)()
+    hr = _shell_api.SHCreateShellItemArrayFromShellItem(
+        item, ctypes.byref(comtypes.GUID(_IID_ISHELLITEMARRAY)), ctypes.byref(array)
+    )
+    if hr < 0 or not array:
+        raise OSError(
+            f"SHCreateShellItemArrayFromShellItem({uri!r}) failed: HRESULT 0x{hr & 0xFFFFFFFF:08X}"
+        )
+    return array
+
+
+def _activate_packaged(
+    aumid: str, arguments: str, timeout_s: float, *, uris: list[str] | None = None
+) -> tuple[int | None, str]:
+    """Activate a packaged app, as the Start menu or the shell would.
+
+    With ``uris``, each is handed over by protocol activation
+    (``ActivateForProtocol``), one call per URI; otherwise the app is activated
+    with ``arguments`` as its command line (``ActivateApplication``).  Runs on
+    its own thread with its own COM apartment, bounded by ``timeout_s``.
 
     Returns:
-        ``(pid, error)``: the activated process id, or ``None`` and why not.
+        ``(pid, error)``: the activated process id (the first, with several
+        URIs), or ``None`` and why not.
     """
     result: dict = {}
 
@@ -484,15 +1288,26 @@ def _activate_packaged(aumid: str, arguments: str, timeout_s: float) -> tuple[in
             comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
         except Exception:
             pass
-        try:
+        def activate() -> None:
+            # Its own frame, so every COM reference is released on return,
+            # before the apartment is torn down.
             manager = comtypes.client.CreateObject(
                 _CLSID_APPLICATION_ACTIVATION_MANAGER,
                 clsctx=comtypes.CLSCTX_LOCAL_SERVER,
                 interface=_activation_manager_interface(),
             )
-            result["pid"] = int(
-                manager.ActivateApplication(aumid, arguments or None, _AO_NOERRORUI)
-            )
+            if uris:
+                for uri in uris:
+                    array = _uri_item_array(uri)
+                    result.setdefault("pid", int(manager.ActivateForProtocol(aumid, array)))
+                    del array
+            else:
+                result["pid"] = int(
+                    manager.ActivateApplication(aumid, arguments or None, _AO_NOERRORUI)
+                )
+
+        try:
+            activate()
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             result["error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -505,18 +1320,8 @@ def _activate_packaged(aumid: str, arguments: str, timeout_s: float) -> tuple[in
     thread.start()
     thread.join(timeout_s)
     if "pid" in result:
-        return result["pid"], ""
+        return result["pid"], result.get("error", "")
     return None, result.get("error") or f"activation did not return within {timeout_s:g}s"
-
-
-def _process_name(pid: int | None) -> str:
-    """Lowercased image name of ``pid``, or ``""``."""
-    if not pid:
-        return ""
-    try:
-        return psutil.Process(pid).name().lower()
-    except Exception:
-        return ""
 
 
 def launch_app(
@@ -538,7 +1343,9 @@ def launch_app(
             reason, not launched without them.
         timeout_s: how long to wait for a window to appear after the launch;
             bringing it to the front then uses what is left of it (at least
-            :data:`_FOCUS_FLOOR_S`).
+            :data:`_FOCUS_FLOOR_S`).  When the app was already running the
+            wait ends :data:`_RUNNING_REACT_S` after the hand-off finished
+            (see :class:`_ReactClock`), still within ``timeout_s``.
         content_timeout_s: with ``args``, how much longer to wait for the window
             to expose what it was handed (see
             :func:`yuki.perception.tree.wait_for_content`).
@@ -561,12 +1368,23 @@ def launch_app(
         :class:`yuki.perception.tree.ContentCheck`).  When the query matches 0 or >1 apps
         and none matches exactly, ``ok`` is False and ``candidates`` lists the
         options - the model chooses, this function never guesses.  Likewise
-        ``new_windows`` lists every window that appeared, so a launch that
-        produced more than one is reported rather than resolved by guesswork.
+        ``new_windows`` lists every window that appeared (``is_app_window``
+        says whether it is the app's), so a launch that produced more than one
+        is reported rather than resolved by guesswork.  ``identity`` says what
+        the app's windows were recognised by, ``already_running`` /
+        ``running_pids`` whether it ran before the call, ``waited_ms`` how long
+        the watch lasted; when no window of it changed and its own window was
+        brought up instead, ``window_state_before`` is ``open``, ``minimized``
+        or ``hidden`` (``shown_hidden_window`` then says whether showing it
+        worked), and ``args_effect`` is ``"nothing visible"`` when a running
+        instance showed no reaction to the arguments.
         With ``args``, ``details`` also carries ``args``, ``arguments`` (the
-        command line handed over), ``via`` (``ActivateApplication`` or
-        ``Start-Process``), ``exe``/``exe_source``/``start_command`` for a desktop
-        app, and ``pid`` when the start reported one.
+        command line handed over), ``via`` (``AppExecutionAlias``,
+        ``ActivateForProtocol``, ``ActivateApplication`` or ``Start-Process``),
+        ``exe``/``exe_source``/``start_command`` when a program file or alias
+        was started, ``uris`` for protocol activation, ``manifest`` /
+        ``manifest_aliases`` / ``manifest_protocols`` for a packaged app,
+        ``resolution_notes``, and ``pid`` when the start reported one.
     """
     started = time.perf_counter()
 
@@ -625,14 +1443,31 @@ def launch_app(
             )
         details["via"] = plan["via"]
         details["arguments"] = plan["arguments"]
-        if plan["via"] == "Start-Process":
+        if "command" in plan:
             details["exe"] = plan["exe"]
             details["exe_source"] = plan["source"]
             details["start_command"] = plan["command"]
+        if "uris" in plan:
+            details["uris"] = plan["uris"]
+        if "manifest" in plan:
+            details["manifest"] = plan["manifest"]
+            details["manifest_aliases"] = plan["manifest_aliases"]
+            details["manifest_protocols"] = plan["manifest_protocols"]
+
+    # Who the app is, and whether it is running already: only its windows are
+    # ever reported, and a running instance gets a short wait to react.
+    identity = _identity_for(chosen, plan)
+    running_before = identity.running_pids()
+    already_running = bool(running_before)
+    details["already_running"] = already_running
+    details["running_pids"] = sorted(running_before)
+    hidden_before = {
+        hwnd for hwnd in _top_level_windows(running_before) if not is_user_window(hwnd)
+    }
 
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
-    target_processes: frozenset[str] = frozenset()
+    launched_pid: int | None = None
     if plan is None:
         # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
         # for both packaged apps (AppUserModelID) and desktop shortcuts.
@@ -643,57 +1478,77 @@ def launch_app(
         details["launched"] = result.ok
         details["launch_stderr"] = result.details.get("stderr", "")
         failure = result.details.get("stderr") or result.summary
-    elif plan["via"] == "ActivateApplication":
-        pid, error = _activate_packaged(plan["aumid"], plan["arguments"], start_budget)
-        details["launched"] = pid is not None
-        details["pid"] = pid
-        if error:
-            details["launch_error"] = error
-        failure = (
-            f"activating the packaged app {plan['aumid']!r} with arguments failed: "
-            f"{error}"
-        )
-        if pid is not None and (name := _process_name(pid)):
-            target_processes = frozenset({name})
-    else:
+    elif "command" in plan:
+        # Start-Process on a desktop program file or on an App Execution Alias.
         result = run_powershell(plan["command"], timeout_s=start_budget)
         details["launched"] = result.ok
         details["launch_stderr"] = result.details.get("stderr", "")
         stdout = str(result.details.get("stdout") or "").strip()
         last_line = stdout.splitlines()[-1].strip() if stdout else ""
         details["pid"] = int(last_line) if last_line.isdigit() else None
+        launched_pid = details["pid"]
         failure = result.details.get("stderr") or result.summary
-        target_processes = frozenset({os.path.basename(plan["exe"]).lower()})
+    else:
+        pid, error = _activate_packaged(
+            plan["aumid"], plan["arguments"], start_budget, uris=plan.get("uris")
+        )
+        details["launched"] = pid is not None
+        details["pid"] = pid
+        launched_pid = pid
+        if error:
+            details["launch_error"] = error
+        failure = (
+            f"activating the packaged app {plan['aumid']!r} with arguments "
+            f"({plan['via']}) failed: {error}"
+        )
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
 
-    window_deadline = time.monotonic() + timeout_s
+    handed_off = time.monotonic()
+    window_deadline = handed_off + timeout_s
+    carrier: psutil.Process | None = None
+    if launched_pid and launched_pid not in running_before:
+        identity.add_launched(launched_pid)
+        if already_running:
+            # A new process started while the app runs is most likely carrying
+            # the command line over to the running instance: the short wait
+            # counts from when it is done.
+            try:
+                carrier = psutil.Process(launched_pid)
+            except Exception:
+                carrier = None
+    react = _ReactClock(handed_off, window_deadline, carrier) if already_running else None
     hwnd, reason, appeared = _wait_for_new_window(
+        identity,
         before,
         before_pids,
         before_foreground,
         window_deadline,
         before_titles=before_titles,
-        target_processes=target_processes,
+        hidden_before=hidden_before,
+        react=react,
     )
+    waited_s = time.monotonic() - handed_off
     details["hwnd"] = hwnd
     details["window_reason"] = reason
+    details["waited_ms"] = round(waited_s * 1000.0, 1)
+    details["identity"] = identity.describe()
     # More than one window showed up: say so instead of silently picking.
     details["new_windows"] = [
         {
             "hwnd": other,
             "title": (info.title if (info := window_info(other)) else ""),
             "process_name": info.process_name if info else "",
+            "is_app_window": bool(identity.owns_window(other)),
         }
         for other in appeared
     ]
     if hwnd is None:
         return finish(
             True,
-            f"started {chosen['name']!r}"
-            + (" with arguments" if arg_list else "")
-            + f" but no window appeared or changed within {timeout_s:g}s "
-            f"(it may be a background app, still loading, or already showing that)",
+            _no_window_outcome(
+                chosen, identity, details, arg_list, already_running, waited_s, window_deadline
+            ),
             details,
         )
     info = window_info(hwnd)
@@ -711,7 +1566,9 @@ def launch_app(
         content_note = _wait_for_opened_content(hwnd, content_timeout_s, details)
         if (fresh := window_info(hwnd)) is not None:
             details["title"] = fresh.title
-    extra = len(details["new_windows"]) - 1
+    same_app = [w for w in details["new_windows"] if w["is_app_window"]]
+    extra = len(same_app) - 1
+    unrelated = len(details["new_windows"]) - len(same_app)
     with_args = ""
     if arg_list:
         shown = details["arguments"]
@@ -721,8 +1578,89 @@ def launch_app(
         f"launched {chosen['name']!r}{with_args}: hwnd {hwnd} "
         f"({details['process_name']}) \"{details['title']}\" - {reason}; {forward}"
         + (f"; {content_note}" if content_note else "")
-        + (f"; {extra} other new window(s) appeared, see new_windows" if extra > 0 else ""),
+        + (f"; {extra} other new window(s) of it appeared, see new_windows" if extra > 0 else "")
+        + (
+            f"; {unrelated} window(s) of other apps also appeared meanwhile (not it)"
+            if unrelated > 0 and identity.confirmable
+            else ""
+        ),
         details,
+    )
+
+
+def _no_window_outcome(
+    chosen: dict[str, str],
+    identity: _AppIdentity,
+    details: dict,
+    arg_list: list[str],
+    already_running: bool,
+    waited_s: float,
+    window_deadline: float,
+) -> str:
+    """The summary (and ``details``) for a launch after which no window of the
+    app appeared, changed or came forward by itself.
+
+    The app's own window is looked up: one on screen or minimized is brought to
+    the front, a hidden one (an app sitting in the tray) is shown first.  Only
+    ever a window of the app - when it has none, the summary says so.
+    """
+    name = repr(chosen["name"])
+    via = details.get("via")
+    if arg_list and already_running:
+        details["args_effect"] = "nothing visible"
+        lead = (
+            f"{name} was already running and nothing visibly changed within "
+            f"{waited_s:.1f}s of handing it the arguments ({via}); it may have ignored them"
+        )
+    elif already_running:
+        lead = (
+            f"{name} was already running and showed no window of its own within "
+            f"{waited_s:.1f}s of being activated"
+        )
+    else:
+        lead = (
+            f"started {name}" + (" with arguments" if arg_list else "")
+            + f" but no window of it appeared within {waited_s:.1f}s (it may still be "
+            f"loading, or run without a window)"
+        )
+    if not identity.confirmable:
+        return (
+            f"{lead}; nothing is known to recognise an already open window of it by "
+            f"(its Start menu entry is {chosen['appid']!r}), so none is reported"
+        )
+    pids = identity.running_pids()
+    details["running_pids_after"] = sorted(pids)
+    app_hwnd, state = _find_app_window(identity, pids)
+    if app_hwnd is None:
+        if pids:
+            return (
+                f"{lead}; it is running (pid {', '.join(str(p) for p in sorted(pids)[:6])}) "
+                f"but has no window a user could switch to, shown or hidden"
+            )
+        return f"{lead}; no process of it is running now"
+    if state == "hidden":
+        shown = _show_window(app_hwnd)
+        details["shown_hidden_window"] = shown
+        how = (
+            "its window was hidden (running in the background or the tray), so it was shown"
+            if shown
+            else "its window is hidden (running in the background or the tray) and did "
+            "not come on screen when shown"
+        )
+    elif state == "minimized":
+        how = "its window was minimized, so it was restored"
+    else:
+        how = "its already open window"
+    details["hwnd"] = app_hwnd
+    details["window_reason"] = how
+    details["window_state_before"] = state
+    info = window_info(app_hwnd)
+    details["title"] = info.title if info else ""
+    details["process_name"] = info.process_name if info else ""
+    forward = _bring_forward(app_hwnd, window_deadline, details)
+    return (
+        f"{lead}; {how}: hwnd {app_hwnd} ({details['process_name']}) "
+        f"\"{details['title']}\"; {forward}"
     )
 
 
@@ -1061,13 +1999,17 @@ def open_url(
         opened += f" ({handler})"
 
     window_deadline = time.monotonic() + _HANDLER_WINDOW_S
+    # Only the handler's windows count; with no handler known, only a window
+    # that newly appears does (said so in its reason), never an old one that
+    # merely came to the front.
+    identity = _AppIdentity(handler or "the default handler", image_names=[handler] if handler else [])
     hwnd, reason, appeared = _wait_for_new_window(
+        identity,
         before,
         before_pids,
         before_foreground,
         window_deadline,
         before_titles=before_titles,
-        target_processes=frozenset({handler}) if handler else frozenset(),
     )
     if hwnd is None and handler:
         front = _user32.GetForegroundWindow()
