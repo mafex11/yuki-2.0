@@ -11,7 +11,9 @@ the GUI thread (Qt owns that queue) and hands each press over as a Qt signal.
 virtual key to pass it -- so a modifier-only combo such as the default
 ``"alt+shift"`` goes to :class:`ChordHookThread` instead. That watches the keyboard
 through a ``WH_KEYBOARD_LL`` hook and fires when the held modifiers were exactly
-the chord and nothing else was typed. It reads keys; it never swallows one.
+the chord and nothing else was typed. It never swallows a key; the one thing it
+adds is a "menu mask" tap of an unassigned key while Alt (or Win) is held for a
+chord, so that releasing the chord is not a lone Alt tap to the app underneath.
 
 :class:`HotkeyListener` is what callers use: it sorts the bindings into whichever
 mechanism can serve them and re-emits both as one ``pressed(action)`` signal.
@@ -30,6 +32,8 @@ from ctypes import wintypes
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, Signal
+
+from yuki.ui.focus import INJECT_MARK, send_mask_key
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
     from yuki.config import Settings
@@ -55,6 +59,11 @@ WM_SYSKEYUP = 0x0105
 _KEY_DOWN = (WM_KEYDOWN, WM_SYSKEYDOWN)
 _KEY_UP = (WM_KEYUP, WM_SYSKEYUP)
 _KEY_HELD = 0x8000
+
+#: Modifiers whose lone tap means something to Windows or to the app in front:
+#: Alt puts the focused window's menu bar into keyboard mode, Win opens Start. A
+#: chord containing one of them gets the menu-mask tap (see ChordHookThread).
+_MASKED_MODS = frozenset({MOD_ALT, MOD_WIN})
 
 #: Modifier spellings a user might reasonably type.
 _MODIFIERS: dict[str, int] = {
@@ -352,9 +361,29 @@ class ChordHookThread(_MessageLoopThread):
     keys has come back up. So Alt+Shift toggles the overlay as it is released,
     while Alt+Shift+Tab and Alt+Shift+P are left to whoever wanted them.
 
-    Alt+Shift is also Windows' own input-language switch when more than one
-    keyboard layout is installed. That is deliberately not suppressed (see
-    ``docs/UI.md``): swallowing a system chord is worse than sharing it.
+    Firing on release (not on the key-down that completes the chord) is what
+    keeps that rule: at key-down time there is no telling whether a Tab is about
+    to follow. The cost of firing on release is that the window underneath sees
+    the Alt go up, and an Alt press and release with no key between them is the
+    "activate the menu bar" gesture -- that window then sits in menu mode and
+    competes with the overlay for the keyboard. So, like AutoHotkey's menu mask
+    key, the hook taps an unassigned virtual key (:data:`~yuki.ui.focus.MASK_VK`,
+    stamped :data:`~yuki.ui.focus.INJECT_MARK`) while Alt is still held, once per
+    press, and only for a chord that contains Alt or Win and is armed and clean:
+
+    - when the chord is completed by a non-Alt/Win key (Alt already down), at
+      that key-down -- the tap lands after Alt-down whatever the injection order;
+    - otherwise at the first chord key-up: if that is Shift (Alt still held),
+      the tap again lands before Alt-up; if it is the Alt/Win key-up itself, the
+      tap is sent before that key-up is passed on -- input injected from inside
+      a low-level hook is delivered ahead of the event the hook is holding,
+      which is the behaviour AutoHotkey's mask relies on.
+
+    The user's keys are all passed on untouched; the tap is extra, and the hook
+    ignores its own injected events. Side effect: Windows' own Alt+Shift
+    input-language switch requires the chord with no key in between, so with the
+    mask it no longer cycles the layout on the same press. That is deliberately
+    not suppressed by eating keys (see ``docs/UI.md``); Win+Space still switches.
 
     Args:
         bindings: ``action -> combo``, e.g. ``{"toggle": "alt+shift"}``. Every combo
@@ -373,6 +402,11 @@ class ChordHookThread(_MessageLoopThread):
         self._armed: tuple[frozenset[int], str] | None = None
         #: Something other than a modifier was pressed: this press is not ours.
         self._tainted = False
+        #: The menu mask has been tapped during this press (reset when all
+        #: modifiers are up), so autorepeat does not tap it again.
+        self._masked = False
+        #: Set by :meth:`_observe` when the callback should tap the mask now.
+        self._mask_now = False
         self._user32: ctypes.WinDLL | None = None
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
@@ -422,13 +456,21 @@ class ChordHookThread(_MessageLoopThread):
         self._held.clear()
         self._armed = None
         self._tainted = False
+        self._masked = False
+        self._mask_now = False
 
         def on_key(n_code: int, w_param: int, l_param: int) -> int:
             action: str | None = None
             try:
                 if n_code == HC_ACTION:
                     event = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    action = self._observe(int(event.vkCode), int(w_param))
+                    # Our own injected keys (the mask tap, the focus unlock) are
+                    # not the user's typing: they must not taint or end a chord.
+                    if (event.dwExtraInfo or 0) != INJECT_MARK:
+                        action = self._observe(int(event.vkCode), int(w_param))
+                        if self._mask_now:
+                            self._mask_now = False
+                            send_mask_key()
             except Exception:  # noqa: BLE001 - a raising callback takes the hook down
                 action = None
             result = user32.CallNextHookEx(None, n_code, w_param, l_param)
@@ -488,6 +530,16 @@ class ChordHookThread(_MessageLoopThread):
             action = self._chords.get(current)
             if action is not None:
                 self._armed = (current, action)
+                if (
+                    not self._masked
+                    and not self._tainted
+                    and current & _MASKED_MODS
+                    and mod not in _MASKED_MODS
+                ):
+                    # Alt/Win went down earlier, so a tap now sits between its
+                    # down and its eventual up.
+                    self._masked = True
+                    self._mask_now = True
             return None
 
         if message not in _KEY_UP or mod is None:
@@ -497,12 +549,25 @@ class ChordHookThread(_MessageLoopThread):
         fired: str | None = None
         if self._armed is not None:
             chord, action = self._armed
+            if (
+                not self._masked
+                and not self._tainted
+                and mod in chord
+                and (mod in _MASKED_MODS or current & chord & _MASKED_MODS)
+            ):
+                # A key of the armed chord is coming up with no tap yet. If Alt/Win
+                # is still held, the tap lands before its up whatever the order;
+                # if this *is* the Alt/Win up, the hook is still holding it, and
+                # input injected here is delivered ahead of it.
+                self._masked = True
+                self._mask_now = True
             if not current & chord:  # the last of the chord's keys just came up
                 if not self._tainted:
                     fired = action
                 self._armed = None
         if not self._held:
             self._tainted = False
+            self._masked = False
         return fired
 
     def _canonical(self) -> frozenset[int]:

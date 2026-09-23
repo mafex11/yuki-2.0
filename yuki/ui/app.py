@@ -103,6 +103,9 @@ class YukiUi(QObject):
 
         self.overlay.submitted.connect(self._on_submitted)
         self.overlay.dismissed.connect(lambda: self.ui_log.event("overlay", state="hidden"))
+        # How each activation got (or failed to get) the keyboard: which step of
+        # the foreground hand-over worked, and what Windows reported.
+        self.overlay.focus_path.connect(lambda record: self.ui_log.event("focus_path", **record))
 
         runtime_signals = self.runtime
         runtime_signals.started.connect(self._on_started)
