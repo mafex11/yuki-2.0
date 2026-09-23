@@ -13,9 +13,10 @@ pyautogui's, which are the contract.
 Every input function takes an optional ``expect_hwnd``: when given, the
 foreground window is checked immediately before anything is sent, and nothing is
 sent if another window has taken focus.  Being in the foreground is necessary but
-not sufficient, so ``type_text`` additionally waits (see
-:func:`wait_for_input_ready`) for the window's own GUI thread to report a focused
-control, and refuses rather than typing into a window that is not listening yet.
+not sufficient, so ``type_text``, ``hotkey`` and ``press`` additionally wait
+(see :func:`wait_for_input_ready`) for the window's own GUI thread to report a
+focused control, and refuse rather than sending into a window that is not
+listening yet.
 
 Long or non-ASCII text is pasted rather than typed, which means borrowing the
 user's clipboard.  It is borrowed, not spent: every format on it is snapshotted
@@ -31,9 +32,17 @@ screenshot and look.  The facts come from ``GetForegroundWindow``,
 ``GetGUIThreadInfo`` and one UIA focused-element read, which together cost a few
 milliseconds.
 
+Keyboard actions report what they caused as well: ``hotkey``/``press`` say where
+focus went, ``type_text`` names the control that had focus when typing began,
+and all three name any *new* top-level window the same process showed while
+they ran (a suggestion list, a menu, a popup), from a before/after snapshot of
+that process's visible top-level windows.
+
 Nothing here sleeps: no glide, no per-control delay tables, no settle time.  The
 one wait after a click is a condition poll for the focus to move, abandoned at a
 deadline, because "focus did not move" is a real answer and not worth waiting out.
+The waits after keyboard input (focus moving, a new window showing, a cleared
+field reading empty) are condition polls with deadlines in the same way.
 """
 
 from __future__ import annotations
@@ -45,12 +54,15 @@ import time
 import pyautogui
 import win32clipboard
 import win32con
+import win32gui
+import win32process
 
 from yuki.actions import ActionResult
 from yuki.perception.windows import (
     accepts_input,
     cursor_position,
     focused_control_hwnd,
+    is_cloaked,
     virtual_screen_bounds,
     window_info,
 )
@@ -399,9 +411,51 @@ def _move(x: int, y: int) -> None:
 #: hit nothing costs this much and is reported honestly as having moved nothing.
 _FOCUS_WATCH_S = 0.2
 
+#: The same watch after a hotkey or key press.  Longer than after a click, because
+#: what a shortcut opens (a command bar, a find box, a dialog) has to be built
+#: before it can take focus, where a click lands on a control that already
+#: exists.  Still a condition poll: it ends the moment focus moves.
+_KEY_FOCUS_WATCH_S = 0.4
+
 #: How often that watch re-asks.  One read is ~5 ms, so this is as tight as it is
 #: worth being.
 _FOCUS_POLL_S = 0.01
+
+#: After typing, how long to watch for a new window of the target process (a
+#: suggestion list opens a moment after the characters are processed, not when
+#: ``SendInput`` returns).  A condition poll: it ends the moment one shows.
+#: ``hotkey``/``press`` need no extra watch of their own - they read the windows
+#: once their focus watch has ended.
+_POPUP_WATCH_S = 0.15
+
+#: How long ``type_text(clear=True)`` watches the focused control's value for
+#: becoming empty after select-all + delete.  Ends the moment it reads empty.
+_CLEAR_VERIFY_S = 0.3
+
+#: New windows named individually in a summary; the rest are counted.
+_MAX_NEW_WINDOWS_SHOWN = 3
+
+#: Text at least this long goes in by paste rather than keystrokes when the
+#: focused control is a writable Value field, or the window was slow to accept
+#: input.  A paste is one input event; a burst of keystrokes into a control that
+#: is busy redrawing (a suggestion list rebuilding after each character) can be
+#: dropped by the application after ``SendInput`` has accepted every one.
+_PASTE_INTO_FIELD_CHARS = 12
+
+#: A readiness wait at least this long says the window is busy right now - the
+#: condition under which keystrokes get dropped.
+_SLOW_READY_MS = 100.0
+
+#: After typing, how long the read-back may wait for the typed text to show up
+#: in the control, at most.  The watch ends the moment it does, and also once
+#: the contents have stopped changing for :data:`_READBACK_SETTLE_S` without it:
+#: characters that were going to arrive have arrived by then.
+_READBACK_MAX_S = 2.0
+_READBACK_SETTLE_S = 0.35
+
+#: How often the read-back re-reads.  One read is a UIA round trip on its own
+#: thread (~5-20 ms), so there is no point asking faster.
+_READBACK_POLL_S = 0.03
 
 
 def _read_focus():  # -> yuki.perception.tree.FocusInfo | None
@@ -532,6 +586,364 @@ def _where_focus_is() -> tuple[str, dict]:
         f"{state['foreground_process'] or 'no window'}"
     )
     return phrase, facts
+
+
+def _input_target(state: dict) -> tuple[str, dict]:
+    """What input is about to go into: a phrase and ``typed_into_*`` facts.
+
+    Read *before* the first character, so the result can say truthfully where
+    the text went even when that is not where it was meant to go - a page under
+    a command bar that had not opened yet, say.  Reported, never enforced.
+    """
+    focus = state.get("focus")
+    described = focus.describe() if focus is not None else "unknown"
+    facts: dict = {
+        "typed_into_hwnd": state["foreground_hwnd"],
+        "typed_into_process": state["foreground_process"],
+        "typed_into_control_hwnd": state["focused_control_hwnd"],
+    }
+    if focus is not None and focus.ok:
+        facts.update(
+            {
+                "typed_into_role": focus.role,
+                "typed_into_name": focus.name,
+                "typed_into_accepts_text": focus.accepts_text,
+            }
+        )
+    return f"{described} in {state['foreground_process'] or 'no window'}", facts
+
+
+def _window_pid(hwnd: int) -> int:
+    """Process id owning ``hwnd``, or 0."""
+    if not hwnd:
+        return 0
+    try:
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:
+        return 0
+
+
+def _process_top_windows(pid: int) -> dict[int, tuple[str, str, tuple[int, int, int, int]]]:
+    """Visible, uncloaked, non-empty top-level windows of ``pid``.
+
+    Returns:
+        ``{hwnd: (title, class_name, (left, top, right, bottom))}``.  Hidden
+        windows are left out on purpose: a popup a process keeps around hidden
+        and shows when needed has "appeared" when it is shown.
+    """
+    found: dict[int, tuple[str, str, tuple[int, int, int, int]]] = {}
+    if not pid:
+        return found
+
+    def collect(hwnd: int, _: object) -> bool:
+        try:
+            if _window_pid(hwnd) != pid or not win32gui.IsWindowVisible(hwnd):
+                return True
+            if is_cloaked(hwnd):
+                return True
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            if right <= left or bottom <= top:
+                return True
+            found[hwnd] = (
+                win32gui.GetWindowText(hwnd),
+                win32gui.GetClassName(hwnd),
+                (left, top, right, bottom),
+            )
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(collect, None)
+    except Exception:
+        pass
+    return found
+
+
+def _windows_before(expect_hwnd: int | None) -> tuple[int, dict]:
+    """``(pid, windows)`` of the process input is going to: the before-snapshot.
+
+    The process is ``expect_hwnd``'s when given, otherwise the foreground
+    window's - whichever the keystrokes are aimed at.
+    """
+    hwnd = int(expect_hwnd) if expect_hwnd else int(_user32.GetForegroundWindow())
+    pid = _window_pid(hwnd)
+    return pid, _process_top_windows(pid)
+
+
+def _windows_appeared(pid: int, before: dict, *, timeout_s: float = 0.0) -> list[dict]:
+    """Top-level windows of ``pid`` that are showing now and were not before.
+
+    Polls until at least one has appeared or ``timeout_s`` has passed (0: look
+    once).  Returns ``[{"hwnd", "title", "class_name", "bounds"}, ...]``.
+    """
+    if not pid:
+        return []
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while True:
+        now = _process_top_windows(pid)
+        fresh = [hwnd for hwnd in now if hwnd not in before]
+        if fresh or time.monotonic() >= deadline:
+            break
+        time.sleep(_FOCUS_POLL_S)
+    return [
+        {
+            "hwnd": hwnd,
+            "title": now[hwnd][0],
+            "class_name": now[hwnd][1],
+            "bounds": list(now[hwnd][2]),
+        }
+        for hwnd in fresh
+    ]
+
+
+def _describe_appeared(windows: list[dict]) -> str:
+    """``"a new window appeared (class X) at (l,t) WxH"``, or ``""`` for none."""
+    if not windows:
+        return ""
+    described = []
+    for window in windows[:_MAX_NEW_WINDOWS_SHOWN]:
+        left, top, right, bottom = window["bounds"]
+        title = f' "{window["title"][:60]}"' if window["title"] else ""
+        described.append(
+            f"(class {window['class_name']}){title} at ({left},{top}) "
+            f"{right - left}x{bottom - top}"
+        )
+    more = len(windows) - _MAX_NEW_WINDOWS_SHOWN
+    head = (
+        "a new window of the same process appeared"
+        if len(windows) == 1
+        else f"{len(windows)} new windows of the same process appeared"
+    )
+    return f"{head} " + "; ".join(described) + (f"; and {more} more" if more > 0 else "")
+
+
+def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, str]:
+    """Select all and delete in the focused control, then check it reads empty.
+
+    Refuses when UIA names a focused control that does not take text: select-all
+    + delete aimed at "the field" but landing on a list, a page or a canvas
+    could remove something else.  When the control exposes a Value pattern the
+    result is verified (a condition poll, :data:`_CLEAR_VERIFY_S`); when it does
+    not, the keys are sent and the result says the clear could not be checked.
+
+    Returns:
+        ``(failure, phrase)``: ``failure`` is ``None`` when it is safe to type
+        next, otherwise why not; ``phrase`` describes what the clear did.
+        ``details`` gets ``cleared`` (True / False / None for unverifiable) and
+        the value before and after.
+    """
+    focus = _read_focus()
+    known = focus is not None and focus.ok
+    details["clear_target"] = focus.describe() if focus is not None else "unknown"
+    if known:
+        details["clear_value_before"] = focus.value
+    if known and not focus.accepts_text:
+        details["cleared"] = False
+        return (
+            f"did not clear: keyboard focus is on {focus.describe()}, which does not "
+            f"take text, so select-all + delete there could remove something else",
+            "",
+        )
+    refusal = _foreground_mismatch(expect_hwnd)
+    if refusal:
+        details["cleared"] = False
+        return refusal, ""
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("delete")
+    if not known or not getattr(focus, "has_value", False):
+        details["cleared"] = None
+        return None, (
+            "sent select-all + delete (the control exposes no value, so the clear "
+            "could not be checked)"
+        )
+    deadline = time.monotonic() + _CLEAR_VERIFY_S
+    after = _read_focus()
+    while (
+        after is None or not after.ok or (after.same_as(focus) and after.value)
+    ) and time.monotonic() < deadline:
+        time.sleep(_FOCUS_POLL_S)
+        after = _read_focus()
+    if after is None or not after.ok:
+        details["cleared"] = None
+        return None, "sent select-all + delete (UIA did not answer, so the clear could not be checked)"
+    details["clear_value_after"] = after.value
+    if not after.same_as(focus):
+        details["cleared"] = False
+        return f"focus moved to {after.describe()} during select-all + delete", ""
+    if after.value:
+        details["cleared"] = False
+        return (
+            f"select-all + delete did not empty {focus.describe()}: its value is "
+            f"still {after.value[:80]!r}",
+            "",
+        )
+    details["cleared"] = True
+    return None, f"cleared {focus.describe()} (value now empty)"
+
+
+def _choose_method(text: str, target: object, ready_ms: float | None) -> tuple[bool, str]:
+    """``(paste, reason)``: whether to paste ``text`` rather than type it, and why.
+
+    Decided on the text and on facts about the target, never on which app it is:
+    non-ASCII or long text is always pasted (see :data:`_PASTE_THRESHOLD_CHARS`);
+    text of :data:`_PASTE_INTO_FIELD_CHARS` or more is pasted when the focused
+    control reports a writable Value pattern, or when the window took
+    :data:`_SLOW_READY_MS` or more to accept input.
+    """
+    if not text.isascii():
+        return True, "the text is not plain ASCII"
+    if len(text) > _PASTE_THRESHOLD_CHARS:
+        return True, f"the text is longer than {_PASTE_THRESHOLD_CHARS} characters"
+    if len(text) >= _PASTE_INTO_FIELD_CHARS:
+        if (
+            target is not None
+            and getattr(target, "ok", False)
+            and getattr(target, "has_value", False)
+            and getattr(target, "accepts_text", False)
+        ):
+            return True, (
+                "the focused control is a text field with a Value pattern, and one "
+                "paste cannot be partly dropped the way a burst of keystrokes can"
+            )
+        if ready_ms is not None and ready_ms >= _SLOW_READY_MS:
+            return True, (
+                f"the window took {ready_ms:.0f} ms to accept input, so it is busy "
+                f"and a burst of keystrokes could be dropped"
+            )
+    return False, "short text"
+
+
+def _read_text(caret_chars: int):  # -> yuki.perception.tree.FocusText | None
+    """What the focused control holds, or ``None`` when UIA is unavailable."""
+    try:
+        from yuki.perception.tree import focused_text
+    except Exception:
+        return None
+    try:
+        return focused_text(caret_chars=caret_chars)
+    except Exception:
+        return None
+
+
+def _squash(text: str) -> str:
+    """Text for "did it arrive" comparison: no whitespace, case-folded.
+
+    A single-line field turns a newline into nothing or a space and some fields
+    change case as they go; neither is a dropped character.
+    """
+    return "".join(text.split()).casefold()
+
+
+def _shown(text: str, limit: int = 80) -> str:
+    """``text`` quoted for a summary, keeping its end when it is long."""
+    flat = " ".join(text.split())
+    return repr(flat if len(flat) <= limit else "…" + flat[-limit:])
+
+
+def _read_back(text: str, target: object) -> tuple[bool | None, str, dict]:
+    """Check that ``text`` is now in the focused control.
+
+    Polls :func:`_read_text` until the control's contents contain ``text``,
+    until they have stopped changing for :data:`_READBACK_SETTLE_S`, or until
+    :data:`_READBACK_MAX_S`.
+
+    Returns:
+        ``(verdict, phrase, facts)``: ``verdict`` is True when the text is there,
+        False when the control was read and it is not, and None when the
+        contents could not be read or checked (no Value/Text pattern, a
+        password field, focus moved to another control meanwhile).
+    """
+    want = _squash(text)
+    caret_chars = len(text) + 32
+    started = time.monotonic()
+    deadline = started + _READBACK_MAX_S
+    last: str | None = None
+    changed_at = started
+    while True:
+        seen = _read_text(caret_chars)
+        now = time.monotonic()
+        waited_ms = round((now - started) * 1000.0, 1)
+        if seen is None or not seen.ok or not seen.readable:
+            reason = getattr(seen, "reason", "") or "UIA is unavailable"
+            return None, f"field contents not readable ({reason})", {
+                "readback": "unreadable",
+                "readback_reason": reason,
+                "readback_ms": waited_ms,
+            }
+        if (
+            target is not None
+            and getattr(target, "ok", False)
+            and not seen.same_control(target)
+        ):
+            moved_to = " ".join(
+                part for part in (seen.role or "element", f'"{seen.name}"' if seen.name else "") if part
+            )
+            return None, (
+                f"field contents not checked: focus moved to {moved_to} while typing"
+            ), {"readback": "moved", "readback_ms": waited_ms}
+        facts = {
+            "readback_source": seen.source,
+            "readback_text": seen.text[:500],
+            "readback_complete": seen.complete,
+            "readback_ms": waited_ms,
+        }
+        if want in _squash(seen.text):
+            facts["readback"] = "arrived"
+            where = "the text before the caret is" if seen.source == "caret" else "field now contains"
+            return True, f"{where} {_shown(seen.text)}", facts
+        if seen.text != last:
+            last, changed_at = seen.text, now
+        elif now - changed_at >= _READBACK_SETTLE_S or now >= deadline:
+            if seen.source == "document" and not seen.complete:
+                facts["readback"] = "unreadable"
+                return None, "field contents too long to check", facts
+            facts["readback"] = "missing"
+            return False, _shown(seen.text, 120), facts
+        if now >= deadline:
+            facts["readback"] = "missing"
+            return False, _shown(seen.text, 120), facts
+        time.sleep(_READBACK_POLL_S)
+
+
+def _refuse_unless_ready(
+    expect_hwnd: int | None, details: dict, started: float, *, withheld: str
+) -> ActionResult | None:
+    """Wait for ``expect_hwnd`` to be listening; a failure result if it never is.
+
+    Being in the foreground is not the same as listening: until the window's own
+    GUI thread names a focused control, keystrokes are dropped while
+    ``SendInput`` reports them accepted.  Bounded by
+    :func:`wait_for_input_ready`'s own timeout (about a second), and skipped
+    entirely without ``expect_hwnd``.
+
+    Args:
+        withheld: what did not happen, for the summary ("nothing was typed").
+
+    Returns:
+        ``None`` when it is safe to send; otherwise the failure to return, naming
+        where keyboard focus actually is.
+    """
+    if not expect_hwnd:
+        return None
+    ready, waited_ms = wait_for_input_ready(expect_hwnd)
+    details["ready_ms"] = round(waited_ms, 1)
+    details["ready"] = ready
+    if ready:
+        return None
+    info = window_info(int(expect_hwnd))
+    who = f"hwnd {int(expect_hwnd)}"
+    if info:
+        who += f' ({info.process_name} "{info.title}")'
+    where, facts = _where_focus_is()
+    details.update(facts)
+    return _result(
+        False,
+        f"{who} is not accepting keyboard input yet: no focused control "
+        f"after {waited_ms:.0f} ms, so {withheld}; {where}. Focus it again and retry.",
+        details,
+        started,
+    )
 
 
 def click(
@@ -844,7 +1256,11 @@ def _wait_clipboard_released(deadline: float) -> bool:
 
 
 def type_text(
-    text: str, *, press_enter: bool = False, expect_hwnd: int | None = None
+    text: str,
+    *,
+    press_enter: bool = False,
+    clear: bool = False,
+    expect_hwnd: int | None = None,
 ) -> ActionResult:
     """Type into whatever has keyboard focus.
 
@@ -870,25 +1286,48 @@ def type_text(
     "Nothing was typed" plus "focus is on a Button" is a diagnosis; "nothing was
     typed" on its own is a shrug.
 
+    With ``clear`` the focused control is emptied first, with select-all +
+    delete, as part of the same action (see :func:`_clear_focused`): refused when
+    the focused control does not take text, and checked to read empty afterwards
+    when it exposes a Value pattern.  A clear that did not work means nothing is
+    typed.
+
+    Afterwards the result names any new top-level window of the target process
+    that showed while typing (``details["new_windows"]``) - a suggestion list,
+    say, that the next Enter would pick from.
+
+    ``SendInput`` accepting every key event is not the application keeping every
+    character, so once the text is sent the focused control is read back through
+    UIA (see :func:`_read_back`), *before* Enter: the summary says what it holds
+    ("field now contains ..."), and if it does not contain the typed text the
+    action fails, Enter is not pressed, and the summary says what the field holds
+    instead.  A control whose contents cannot be read is reported as such and
+    the action goes on as before.  Which path the text took - keystrokes or one
+    paste - is chosen by :func:`_choose_method` and reported in
+    ``details["method"]``/``details["method_reason"]``.
+
     Args:
-        text: what to type.
+        text: what to type (may be empty with ``clear`` to only clear).
         press_enter: press Enter after the text.
+        clear: select all and delete in the focused control first.
         expect_hwnd: only send if this window is still in the foreground *and*
             ready to receive input.
 
     Returns:
         ActionResult.  ``details`` always carries where the text went or would have
         gone: ``foreground_hwnd``, ``focused_control_hwnd`` and the focused
-        control's ``focus_role``/``focus_name``/``focus_accepts_text``.
+        control's ``focus_role``/``focus_name``/``focus_accepts_text``.  On
+        success the summary also names what had focus just *before* the first
+        character (``typed_into_*`` in ``details``): "typed 43 chars into Document
+        "(1515) YouTube"" is how text that went into the wrong control shows up.
     """
     started = time.perf_counter()
     if not isinstance(text, str):
         return _result(False, "text must be a string", {"text": text}, started)
-    needs_clipboard = len(text) > _PASTE_THRESHOLD_CHARS or not text.isascii()
     details: dict = {
         "chars": len(text),
-        "method": "clipboard" if needs_clipboard else "keystrokes",
         "press_enter": press_enter,
+        "clear": bool(clear),
         "expect_hwnd": expect_hwnd,
     }
     refusal = _foreground_mismatch(expect_hwnd)
@@ -897,30 +1336,65 @@ def type_text(
     # Foreground is not the same thing as listening.  Before the first character
     # goes out, give the window a bounded chance to report a focused control; if
     # it never does, say so instead of typing into the void and reporting success.
-    if expect_hwnd and (text or press_enter):
-        ready, waited_ms = wait_for_input_ready(expect_hwnd)
-        details["ready_ms"] = round(waited_ms, 1)
-        details["ready"] = ready
-        if not ready:
-            info = window_info(int(expect_hwnd))
-            who = f"hwnd {int(expect_hwnd)}"
-            if info:
-                who += f' ({info.process_name} "{info.title}")'
+    if text or press_enter or clear:
+        not_ready = _refuse_unless_ready(
+            expect_hwnd,
+            details,
+            started,
+            withheld="nothing was typed (typing now would lose characters)",
+        )
+        if not_ready is not None:
+            return not_ready
+    if not text and not press_enter and not clear:
+        return _result(True, "nothing to type", details, started)
+
+    # Which windows the target process is showing, so anything the typing opens
+    # (a suggestion list, a menu) can be named afterwards.
+    watched_pid, windows_before = _windows_before(expect_hwnd)
+
+    def appeared(timeout_s: float) -> str:
+        windows = _windows_appeared(watched_pid, windows_before, timeout_s=timeout_s)
+        details["new_windows"] = windows
+        return _describe_appeared(windows)
+
+    def summary(*parts: str) -> str:
+        return "; ".join(part for part in parts if part)
+
+    cleared = ""
+    if clear:
+        failure, cleared = _clear_focused(expect_hwnd, details)
+        if failure:
             where, facts = _where_focus_is()
             details.update(facts)
             return _result(
                 False,
-                f"{who} is not accepting keyboard input yet: no focused control "
-                f"after {waited_ms:.0f} ms, so nothing was typed (typing now would "
-                f"lose characters); {where}. Focus it again and retry.",
+                summary(f"{failure}; nothing was typed", where, appeared(0.0)),
                 details,
                 started,
             )
     if not text:
         if press_enter:
+            into, facts = _input_target(_focus_state())
+            details.update(facts)
             pyautogui.press("enter")
-            return _result(True, "pressed enter (no text)", details, started)
-        return _result(True, "nothing to type", details, started)
+            return _result(
+                True,
+                summary(cleared, f"pressed enter (no text) in {into}", appeared(_POPUP_WATCH_S)),
+                details,
+                started,
+            )
+        return _result(True, summary(cleared, appeared(0.0)), details, started)
+
+    # Where the text is about to go, read before the first character.  Reported
+    # on success as well as failure: a field that had not taken focus yet leaves
+    # the text in whatever did have it, and "typed 43 chars" alone hides that.
+    target_state = _focus_state()
+    target = target_state.get("focus")
+    into, facts = _input_target(target_state)
+    details.update(facts)
+    needs_clipboard, method_reason = _choose_method(text, target, details.get("ready_ms"))
+    details["method"] = "clipboard" if needs_clipboard else "keystrokes"
+    details["method_reason"] = method_reason
 
     if needs_clipboard:
         previous = _snapshot_clipboard()
@@ -971,16 +1445,52 @@ def type_text(
                 started,
             )
 
-    if press_enter:
-        pyautogui.press("enter")
     preview = text if len(text) <= 60 else text[:60] + "…"
+    # SendInput accepting every event is not the app keeping every character: an
+    # app busy redrawing can drop them.  Read the control back - before Enter, so
+    # a half-arrived text is never submitted.
+    verdict, contents, facts = _read_back(text, target)
+    details.update(facts)
+    if verdict is False:
+        where, facts = _where_focus_is()
+        details.update(facts)
+        return _result(
+            False,
+            summary(
+                cleared,
+                f"Windows accepted all {len(text)} characters (sent via "
+                f"{details['method']}), but the application did not keep them: "
+                f"{into} now holds {contents}, not the text that was typed"
+                + ("; Enter was not pressed" if press_enter else ""),
+                "select all and delete in the field, then type it again",
+                appeared(0.0),
+            ),
+            details,
+            started,
+        )
+    if press_enter:
+        # The read-back took time; check the guard again before submitting.
+        refusal = _foreground_mismatch(expect_hwnd)
+        if refusal:
+            return _result(
+                False,
+                summary(f"typed {len(text)} chars into {into}, then {refusal}; Enter was not pressed", contents),
+                details,
+                started,
+            )
+        pyautogui.press("enter")
     # Where it landed, for the log and for a caller checking its work.  Read after
     # the keystrokes, not before: Enter may well have moved the focus on.
     details.update(_where_focus_is()[1])
     return _result(
         True,
-        f"typed {len(text)} chars via {details['method']}"
-        f"{' + enter' if press_enter else ''}: {preview!r}",
+        summary(
+            cleared,
+            f"typed {len(text)} chars via {details['method']} into {into}: {preview!r}",
+            contents + (" (before Enter)" if press_enter and verdict else ""),
+            "then pressed Enter" if press_enter else "",
+            appeared(_POPUP_WATCH_S),
+        ),
         details,
         started,
     )
@@ -992,6 +1502,16 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     Modifiers are held in order and released in reverse, exactly like a human
     chord.  Media keys (``volume_mute``, ``volume_up``, ``volume_down``,
     ``playpause``) work as single-key "chords".
+
+    With ``expect_hwnd`` the window must also be ready for input (see
+    :func:`_refuse_unless_ready`), or nothing is sent.  Afterwards the focus is
+    watched for up to :data:`_KEY_FOCUS_WATCH_S` and the result says where it is
+    now - "focus now Edit ... (takes text)" or "focus unchanged, still Document
+    ..." - with the same ``focus_*``/``*_changed`` details as :func:`click`.  A
+    shortcut meant to open a text field that reports "focus unchanged" did not
+    open it (yet), and typing next would go into whatever still has focus.  Any
+    new top-level window of the target process that showed meanwhile is named
+    too (``details["new_windows"]``).
     """
     started = time.perf_counter()
     details: dict = {"keys": list(keys), "expect_hwnd": expect_hwnd}
@@ -1013,14 +1533,36 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    not_ready = _refuse_unless_ready(
+        expect_hwnd, details, started, withheld="the keys were not sent"
+    )
+    if not_ready is not None:
+        return not_ready
+    watched_pid, windows_before = _windows_before(expect_hwnd)
+    before = _focus_state()
     pyautogui.hotkey(*resolved)
-    return _result(True, f"pressed {'+'.join(resolved)}", details, started)
+    outcome, facts = _describe_outcome(
+        before, _watch_focus(before, timeout_s=_KEY_FOCUS_WATCH_S)
+    )
+    details.update(facts)
+    details["new_windows"] = _windows_appeared(watched_pid, windows_before)
+    popup = _describe_appeared(details["new_windows"])
+    return _result(
+        True,
+        f"pressed {'+'.join(resolved)}; {outcome}" + (f"; {popup}" if popup else ""),
+        details,
+        started,
+    )
 
 
 def press(
     key: str, *, times: int = 1, expect_hwnd: int | None = None
 ) -> ActionResult:
-    """Press a single key ``times`` times with no delay between presses."""
+    """Press a single key ``times`` times with no delay between presses.
+
+    Guarded, readiness-checked and reported exactly like :func:`hotkey`: the
+    result says where keyboard focus is after the presses.
+    """
     started = time.perf_counter()
     details: dict = {"key": key, "times": times, "expect_hwnd": expect_hwnd}
     normalized = normalize_key(key)
@@ -1032,9 +1574,27 @@ def press(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    not_ready = _refuse_unless_ready(
+        expect_hwnd, details, started, withheld="the key was not sent"
+    )
+    if not_ready is not None:
+        return not_ready
+    watched_pid, windows_before = _windows_before(expect_hwnd)
+    before = _focus_state()
     pyautogui.press(normalized, presses=times, interval=0)
+    outcome, facts = _describe_outcome(
+        before, _watch_focus(before, timeout_s=_KEY_FOCUS_WATCH_S)
+    )
+    details.update(facts)
+    details["new_windows"] = _windows_appeared(watched_pid, windows_before)
+    popup = _describe_appeared(details["new_windows"])
     suffix = f" x{times}" if times > 1 else ""
-    return _result(True, f"pressed {normalized}{suffix}", details, started)
+    return _result(
+        True,
+        f"pressed {normalized}{suffix}; {outcome}" + (f"; {popup}" if popup else ""),
+        details,
+        started,
+    )
 
 
 def scroll(

@@ -30,6 +30,16 @@ back thin, the walk is repeated until the count has grown and stopped growing,
 it has failed to grow within a short grace, or the budget runs out.  This is a condition poll,
 not a settle sleep, and it is keyed on window handles and element counts only:
 nothing here knows the name of an application.
+
+**Windows that do not answer.**  A provider that is busy (a page loading, a
+renderer mid-layout) can leave UIA's calls blocked for seconds.  Waiting out the
+whole budget for that and then reporting "0 elements, truncated" is
+indistinguishable from a window that has nothing in it, so the walk is given
+:data:`_BUSY_S` to produce *any* content; if it has not, and the window is on
+screen and its process alive, the result comes back at once with
+``status="busy"`` and a note saying so.  A window that does answer keeps the
+full budget and the lazy-wake polling above; one that answered with a small tree
+is ``status="ok"``, and one that answered with nothing is ``status="empty"``.
 """
 
 from __future__ import annotations
@@ -43,7 +53,7 @@ import comtypes.client
 import psutil
 import win32gui
 
-from yuki.perception.windows import window_info
+from yuki.perception.windows import is_cloaked, window_info
 
 # ---------------------------------------------------------------------------
 # UIA property ids we cache.  Names come from IUIAutomation's propid list.
@@ -71,6 +81,11 @@ _P_IS_SCROLL_AVAILABLE = 30034
 _P_LEGACY_DEFAULT_ACTION = 30100
 _P_IS_TEXT_AVAILABLE = 30040
 _P_NATIVE_WINDOW_HANDLE = 30020
+_P_IS_PASSWORD = 30019
+_PATTERN_TEXT = 10014
+_TEXT_ENDPOINT_START = 0
+_TEXT_ENDPOINT_END = 1
+_TEXT_UNIT_CHARACTER = 0
 
 _CACHED_PROPERTIES = (
     _P_RUNTIME_ID,
@@ -214,6 +229,22 @@ _YOUNG_PROCESS_S = 10.0
 #: the deadline returns its partial tree instead of nothing.
 _HANDOFF_S = 0.15
 
+#: How long a walk gets to produce its first content before a window that is on
+#: screen, with a live process, is reported as busy instead of being waited on.
+#: "Content" means a finished pass or any element below the window's own root
+#: element: the root alone says the handle exists, not that the provider behind
+#: it is answering.  A window that answers at all does so in tens of
+#: milliseconds (a cold Spotify's first thin pass included), while on 2026-09-23
+#: a loading browser window gave nothing for three full 6 s budgets in a row and
+#: 211 elements once it had settled - time the model spent waiting, not looking.
+_BUSY_S = 1.5
+
+#: What ``WindowTree.status`` can say.  ``ok``: UIA answered (however small the
+#: tree).  ``busy``: the window is on screen and its process alive, but nothing
+#: came back in time.  ``empty``: UIA answered with nothing usable, or the window
+#: is minimised, hidden or gone and nothing came back.
+TREE_STATUSES = ("ok", "busy", "empty")
+
 
 @dataclass
 class UIElement:
@@ -230,6 +261,23 @@ class UIElement:
     is_focused: bool
     shortcut: str | None
     depth: int
+    #: Which action patterns the element supports, in :data:`_PATTERN_ORDER`:
+    #: ``invoke`` (a click activates it), ``toggle``, ``select`` (SelectionItem:
+    #: a click selects it, which is not the same as activating it), ``expand``
+    #: (ExpandCollapse) and ``value`` (a writable Value).  Empty for elements
+    #: that are not interactive.
+    patterns: tuple[str, ...] = ()
+
+
+#: The pattern flags :class:`UIElement` reports, in the order they are listed:
+#: ``(label, IsXxxPatternAvailable property id)``.  ``value`` is handled apart,
+#: because only a Value that is not read-only says "this takes text".
+_PATTERN_ORDER = (
+    ("invoke", _P_IS_INVOKE_AVAILABLE),
+    ("toggle", _P_IS_TOGGLE_AVAILABLE),
+    ("select", _P_IS_SELECTION_ITEM_AVAILABLE),
+    ("expand", _P_IS_EXPAND_COLLAPSE_AVAILABLE),
+)
 
 
 @dataclass
@@ -254,6 +302,11 @@ class WindowTree:
     passes: int = 1
     child_windows: int = 0
     first_pass_elements: int = -1
+    #: ``"ok" | "busy" | "empty"`` - see :data:`TREE_STATUSES`.
+    status: str = "ok"
+    #: One sentence for the reader when ``status`` is not ``ok`` or the tree is
+    #: partial; empty otherwise.
+    note: str = ""
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -279,6 +332,8 @@ class FocusInfo:
         shortcut: AcceleratorKey/AccessKey if exposed.
         ok: False when UIA would not answer at all, in which case every other
             field is empty and the caller should say "unknown" rather than "none".
+        has_value: whether the element exposes a Value pattern at all, so that
+            ``value is None`` can be read as "empty" rather than "not known".
     """
 
     role: str = ""
@@ -288,6 +343,7 @@ class FocusInfo:
     accepts_text: bool = False
     shortcut: str | None = None
     ok: bool = False
+    has_value: bool = False
 
     def describe(self) -> str:
         """One short phrase: ``Edit "What do you want to play?"``."""
@@ -410,9 +466,17 @@ class _CachedWalker:
     which keeps the depth-first order of the walk that found it.
     """
 
-    def __init__(self, max_elements: int, deadline: float) -> None:
+    def __init__(
+        self,
+        max_elements: int,
+        deadline: float,
+        cancel: threading.Event | None = None,
+    ) -> None:
         self.max_elements = max_elements
         self.deadline = deadline
+        #: Set by the caller once it has stopped waiting, so an abandoned walk
+        #: stops at its next check instead of running on to its deadline.
+        self.cancel = cancel
         self.elements: list[UIElement] = []
         self.truncated = False
         self.seen: set[tuple] = set()
@@ -468,12 +532,11 @@ class _CachedWalker:
                     else text
                 )
         editable = value_available and not _as_bool(get(_P_VALUE_IS_READONLY))
+        patterns = tuple(
+            label for label, property_id in _PATTERN_ORDER if _as_bool(get(property_id))
+        ) + (("value",) if editable else ())
         is_interactive = enabled and (
-            _as_bool(get(_P_IS_INVOKE_AVAILABLE))
-            or _as_bool(get(_P_IS_TOGGLE_AVAILABLE))
-            or _as_bool(get(_P_IS_SELECTION_ITEM_AVAILABLE))
-            or _as_bool(get(_P_IS_EXPAND_COLLAPSE_AVAILABLE))
-            or editable
+            bool(patterns)
             or _as_bool(get(_P_IS_KEYBOARD_FOCUSABLE))
             or bool(_as_text(get(_P_LEGACY_DEFAULT_ACTION)))
         )
@@ -511,6 +574,7 @@ class _CachedWalker:
                 is_focused=_as_bool(get(_P_HAS_KEYBOARD_FOCUS)),
                 shortcut=shortcut or None,
                 depth=depth,
+                patterns=patterns if is_interactive else (),
             )
         )
 
@@ -574,6 +638,9 @@ class _CachedWalker:
         if len(self.elements) >= self.max_elements:
             self.truncated = True
             return True
+        if self.cancel is not None and self.cancel.is_set():
+            self.truncated = True
+            return True
         if time.monotonic() >= self.deadline:
             self.truncated = True
             return True
@@ -597,7 +664,10 @@ _CHILD_PATIENCE_S = 0.15
 
 
 def _element_from_handle(
-    automation: object, hwnd: int, deadline: float
+    automation: object,
+    hwnd: int,
+    deadline: float,
+    cancel: threading.Event | None = None,
 ) -> object | None:
     """UIA element for a window handle, retried inside ``deadline``.
 
@@ -614,6 +684,8 @@ def _element_from_handle(
         except Exception:
             if time.monotonic() + 0.05 >= deadline or not win32gui.IsWindow(hwnd):
                 return None
+            if cancel is not None and cancel.is_set():
+                return None
             time.sleep(0.04)
 
 
@@ -623,6 +695,9 @@ def _collect_pass(
     child_handles: list[int],
     max_elements: int,
     deadline: float,
+    *,
+    cancel: threading.Event | None = None,
+    on_start: object | None = None,
 ) -> _CachedWalker:
     """One full pass: the window's own subtree plus every child HWND's subtree.
 
@@ -637,10 +712,18 @@ def _collect_pass(
     top-level element costs one cache build and adds nothing - measured at 6 ms
     for Spotify's render-widget window.
 
+    Args:
+        cancel: stop early once set (the caller has stopped waiting).
+        on_start: called with the walker before anything is collected, so the
+            caller can see whether a pass that has not finished is producing
+            anything at all (see :data:`_BUSY_S`).
+
     Raises:
         RuntimeError: UIA never produced an element for ``hwnd`` itself.
     """
-    walker = _CachedWalker(max_elements=max_elements, deadline=deadline)
+    walker = _CachedWalker(max_elements=max_elements, deadline=deadline, cancel=cancel)
+    if on_start is not None:
+        on_start(walker)  # type: ignore[operator]
     root_request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
     subtree_request = _build_cache_request(automation, _TREE_SCOPE_SUBTREE)
     tree_walker = automation.ControlViewWalker  # type: ignore[attr-defined]
@@ -659,7 +742,10 @@ def _collect_pass(
             return
         del pending[child_hwnd]
         child_root = _element_from_handle(
-            automation, child_hwnd, min(deadline, time.monotonic() + _CHILD_PATIENCE_S)
+            automation,
+            child_hwnd,
+            min(deadline, time.monotonic() + _CHILD_PATIENCE_S),
+            cancel,
         )
         if child_root is None:
             return
@@ -692,7 +778,7 @@ def _collect_pass(
             except Exception:
                 return
 
-    live_root = _element_from_handle(automation, hwnd, deadline)
+    live_root = _element_from_handle(automation, hwnd, deadline, cancel)
     if live_root is None:
         raise RuntimeError(f"UIA would not give an element for hwnd={hwnd}")
     try:
@@ -722,6 +808,8 @@ def _walk_window(
     *,
     young: bool = False,
     publish: object | None = None,
+    on_pass: object | None = None,
+    cancel: threading.Event | None = None,
 ) -> _CachedWalker:
     """Collect the window's elements, waiting out a tree that is still building.
 
@@ -748,6 +836,8 @@ def _walk_window(
         publish: called with every pass that becomes the best so far, so the
             caller can return it even if a later pass is abandoned at the
             deadline.
+        on_pass: handed to :func:`_collect_pass` as ``on_start`` for every pass.
+        cancel: once set, stop at the next check and return what there is.
     """
     # A fresh IUIAutomation for this thread's apartment: COM interface pointers
     # cannot be shared across apartments, and an abandoned thread must not
@@ -767,7 +857,15 @@ def _walk_window(
             publish(walker)  # type: ignore[operator]
         return walker
 
-    best = _collect_pass(automation, hwnd, child_handles, max_elements, deadline)
+    best = _collect_pass(
+        automation,
+        hwnd,
+        child_handles,
+        max_elements,
+        deadline,
+        cancel=cancel,
+        on_start=on_pass,
+    )
     first_count = len(best.elements)
     best = adopt(best)
 
@@ -783,7 +881,7 @@ def _walk_window(
     while time.monotonic() < deadline:
         time.sleep(min(_WAKE_POLL_S, max(deadline - time.monotonic(), 0.0)))
         now = time.monotonic()
-        if now >= deadline:
+        if now >= deadline or (cancel is not None and cancel.is_set()):
             break
         grown = len(best.elements) > first_count
         if not grown and not young and now >= grace_deadline:
@@ -793,7 +891,13 @@ def _walk_window(
             break  # nothing to wake, and nothing arrived to wake
         try:
             attempt = _collect_pass(
-                automation, hwnd, child_handles, max_elements, deadline
+                automation,
+                hwnd,
+                child_handles,
+                max_elements,
+                deadline,
+                cancel=cancel,
+                on_start=on_pass,
             )
         except Exception:
             break  # the window went away mid-poll: keep what we have
@@ -814,6 +918,61 @@ def _walk_window(
     return best
 
 
+def _has_content(walker: object) -> bool:
+    """Whether an unfinished pass has collected anything below the root element.
+
+    The root is the window handle's own element; everything at depth 1 and below
+    came from the provider actually answering.  The list is copied first because
+    the worker thread may still be appending to it.
+    """
+    elements = list(getattr(walker, "elements", None) or [])
+    return any(element.depth > 0 for element in elements)
+
+
+def _answered(result: dict) -> bool:
+    """Whether the worker has produced anything worth waiting on."""
+    if any(key in result for key in ("walker", "best", "error")):
+        return True
+    live = result.get("live")
+    return live is not None and _has_content(live)
+
+
+def _on_screen(hwnd: int, pid: int | None) -> bool:
+    """Visible, not minimised, not cloaked, and its process still running.
+
+    The conditions under which silence from UIA means "busy" rather than "there
+    is nothing here to see".  Window-state facts only.
+    """
+    try:
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return False
+        if win32gui.IsIconic(hwnd) or is_cloaked(hwnd):
+            return False
+    except Exception:
+        return False
+    if pid:
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return True
+    return True
+
+
+def _silent_note(waited_s: float, on_screen: bool) -> tuple[str, str]:
+    """``(status, note)`` for a window from which nothing came back in time."""
+    if on_screen:
+        return (
+            "busy",
+            f"window did not answer accessibility queries within {waited_s:.1f} s "
+            f"(probably loading or rendering); look again shortly",
+        )
+    return (
+        "empty",
+        f"window did not answer accessibility queries within {waited_s:.1f} s, and "
+        f"it is minimised, hidden or gone",
+    )
+
+
 def get_window_tree(
     hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0
 ) -> WindowTree:
@@ -825,6 +984,13 @@ def get_window_tree(
     ``timeout_s`` runs out, because a Chromium/Electron/CEF window does not build
     its tree until its renderer window is asked and does not finish building it
     straight away.  ``passes`` says how many walks it took.
+
+    A window that produces no content at all within :data:`_BUSY_S` while it is
+    on screen and its process is alive is not waited on further: the result is
+    returned then, with no elements, ``truncated`` set, ``status="busy"`` and a
+    ``note`` saying the window did not answer.  ``status`` is ``"ok"`` whenever
+    UIA answered, however small the tree, and ``"empty"`` when it answered with
+    nothing usable (or the window is not on screen and never answered).
 
     Args:
         hwnd: top-level window handle.
@@ -857,9 +1023,13 @@ def get_window_tree(
             young = False
 
     result: dict[str, object] = {}
+    cancel = threading.Event()
 
     def _publish(walker: _CachedWalker) -> None:
         result["best"] = walker
+
+    def _pass_started(walker: _CachedWalker) -> None:
+        result["live"] = walker
 
     def _worker() -> None:
         try:
@@ -868,7 +1038,13 @@ def get_window_tree(
             pass  # already initialised for this thread
         try:
             result["walker"] = _walk_window(
-                hwnd, max_elements, deadline, young=young, publish=_publish
+                hwnd,
+                max_elements,
+                deadline,
+                young=young,
+                publish=_publish,
+                on_pass=_pass_started,
+                cancel=cancel,
             )
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             result["error"] = exc
@@ -882,19 +1058,12 @@ def get_window_tree(
         target=_worker, name=f"yuki-uia-{hwnd}", daemon=True
     )
     thread.start()
-    thread.join(timeout_s)
+    pid = info.pid if info is not None else None
 
-    walker = result.get("walker")
-    if walker is None and result.get("best") is not None:
-        # Overran mid-poll: the best complete pass so far is still a true answer.
-        walker = result["best"]
-        assert isinstance(walker, _CachedWalker)
-        walker.truncated = True
-    if walker is None:
-        error = result.get("error")
-        if error is not None:
-            raise RuntimeError(f"UIA walk of hwnd={hwnd} failed: {error}") from error
-        # Still running: abandon the thread and report an empty, truncated tree.
+    def _silent(waited_s: float) -> WindowTree:
+        """Nothing came back: abandon the worker and say why there is no tree."""
+        cancel.set()
+        status, note = _silent_note(waited_s, _on_screen(hwnd, pid))
         return WindowTree(
             hwnd=hwnd,
             title=info.title if info else "",
@@ -905,8 +1074,59 @@ def get_window_tree(
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             passes=0,
             child_windows=len(child_window_handles(hwnd)),
+            status=status,
+            note=note,
+        )
+
+    # First, a short wait for *any* content.  A window that answers keeps the
+    # whole budget below; one that is on screen and silent is reported busy now
+    # rather than after the full timeout, which it would only have spent silent.
+    busy_after = min(_BUSY_S, timeout_s)
+    thread.join(busy_after)
+    if thread.is_alive() and not _answered(result) and _on_screen(hwnd, pid):
+        return _silent(busy_after)
+    thread.join(max(timeout_s - (time.perf_counter() - started), 0.0))
+    if thread.is_alive():
+        cancel.set()  # stop the abandoned walk at its next check
+
+    walker = result.get("walker")
+    note = ""
+    if walker is None and result.get("best") is not None:
+        # Overran mid-poll: the best complete pass so far is still a true answer.
+        walker = result["best"]
+        assert isinstance(walker, _CachedWalker)
+        walker.truncated = True
+    if walker is None:
+        error = result.get("error")
+        if error is not None:
+            raise RuntimeError(f"UIA walk of hwnd={hwnd} failed: {error}") from error
+        live = result.get("live")
+        if live is None or not _has_content(live):
+            # Still running and nothing below the root: abandon the thread.
+            return _silent(timeout_s)
+        # The first pass was answering but did not finish in time: what it had
+        # collected is a true, partial answer, and better than nothing.
+        assert isinstance(live, _CachedWalker)
+        partial = list(live.elements)
+        return WindowTree(
+            hwnd=hwnd,
+            title=info.title if info else "",
+            process_name=info.process_name if info else "",
+            elements=partial,
+            truncated=True,
+            captured_at=time.time(),
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            passes=1,
+            child_windows=len(child_window_handles(hwnd)),
+            first_pass_elements=len(partial),
+            status="ok",
+            note=f"the window answered but its first read did not finish within "
+            f"{timeout_s:g} s; this is the part collected so far",
         )
     assert isinstance(walker, _CachedWalker)
+    status = "ok" if walker.elements else "empty"
+    if status == "empty":
+        note = "the window answered but exposes no elements with a size on screen"
     return WindowTree(
         hwnd=hwnd,
         title=info.title if info else "",
@@ -918,6 +1138,8 @@ def get_window_tree(
         passes=walker.passes,
         child_windows=walker.child_windows,
         first_pass_elements=walker.first_pass_elements,
+        status=status,
+        note=note,
     )
 
 
@@ -939,7 +1161,8 @@ def _read_focus(automation: object) -> FocusInfo:
     role = _role_name(get(_P_CONTROL_TYPE))
     name = _as_text(get(_P_NAME))
     value: str | None = None
-    if _as_bool(get(_P_IS_VALUE_AVAILABLE)):
+    has_value = _as_bool(get(_P_IS_VALUE_AVAILABLE))
+    if has_value:
         raw = get(_P_VALUE_VALUE)
         if isinstance(raw, str) and raw:
             value = raw[:_MAX_VALUE_CHARS] + "…" if len(raw) > _MAX_VALUE_CHARS else raw
@@ -962,6 +1185,7 @@ def _read_focus(automation: object) -> FocusInfo:
         shortcut=(_as_text(get(_P_ACCELERATOR_KEY)) or _as_text(get(_P_ACCESS_KEY)))
         or None,
         ok=True,
+        has_value=has_value,
     )
 
 
@@ -1011,6 +1235,150 @@ def focused_element(*, timeout_s: float = _FOCUS_TIMEOUT_S) -> FocusInfo:
     return focus if isinstance(focus, FocusInfo) else FocusInfo()
 
 
+@dataclass
+class FocusText:
+    """What the focused control holds, read back through UIA.
+
+    Attributes:
+        ok: UIA answered at all.
+        readable: ``text`` is the control's contents (or the part just before
+            its caret); False when there is no Value or Text pattern, it is a
+            password field, or reading failed - ``reason`` says which.
+        source: ``"value"`` (ValuePattern, the whole value), ``"caret"``
+            (TextPattern, the characters just before the caret or selection) or
+            ``"document"`` (TextPattern document range); ``""`` when unreadable.
+        text: what was read.
+        complete: ``text`` is all of it (not clipped, not just a caret window).
+        role, name, hwnd: which control was read, to compare with the one input
+            was aimed at.
+        reason: why it is not readable, when it is not.
+    """
+
+    ok: bool = False
+    readable: bool = False
+    source: str = ""
+    text: str = ""
+    complete: bool = False
+    role: str = ""
+    name: str = ""
+    hwnd: int = 0
+    reason: str = ""
+
+    def same_control(self, focus: "FocusInfo | None") -> bool:
+        """Whether this was read from the control ``focus`` describes."""
+        if focus is None or not (self.ok and focus.ok):
+            return False
+        return (self.role, self.name, self.hwnd) == (focus.role, focus.name, focus.hwnd)
+
+
+def _read_focused_text(automation: object, caret_chars: int, max_chars: int) -> FocusText:
+    """Read the focused control's contents.  Runs on the worker thread."""
+    element = automation.GetFocusedElement()  # type: ignore[attr-defined]
+    if not element:
+        return FocusText(ok=True, reason="nothing has keyboard focus")
+    request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
+    request.AddProperty(_P_IS_TEXT_AVAILABLE)
+    request.AddProperty(_P_IS_PASSWORD)
+    cached = element.BuildUpdatedCache(request)
+    get = cached.GetCachedPropertyValue
+    try:
+        hwnd = int(get(_P_NATIVE_WINDOW_HANDLE) or 0)
+    except Exception:
+        hwnd = 0
+    who = {"role": _role_name(get(_P_CONTROL_TYPE)), "name": _as_text(get(_P_NAME)), "hwnd": hwnd}
+    if _as_bool(get(_P_IS_PASSWORD)):
+        return FocusText(ok=True, reason="it is a password field", **who)
+    if _as_bool(get(_P_IS_VALUE_AVAILABLE)):
+        raw = get(_P_VALUE_VALUE)
+        text = raw if isinstance(raw, str) else ""
+        return FocusText(
+            ok=True,
+            readable=True,
+            source="value",
+            text=text[:max_chars],
+            complete=len(text) <= max_chars,
+            **who,
+        )
+    if not _as_bool(get(_P_IS_TEXT_AVAILABLE)):
+        return FocusText(ok=True, reason="it exposes neither a Value nor a Text pattern", **who)
+    module = _uia_core()
+    pattern = element.GetCurrentPattern(_PATTERN_TEXT).QueryInterface(
+        module.IUIAutomationTextPattern  # type: ignore[attr-defined]
+    )
+    # The characters just before the caret (or before the start of a selection,
+    # which is where an inline completion begins): exactly where typed text
+    # lands, and bounded however large the document is.
+    try:
+        selection = pattern.GetSelection()
+        if selection is not None and selection.Length > 0:
+            caret = selection.GetElement(0)
+            window = caret.Clone()
+            window.MoveEndpointByRange(_TEXT_ENDPOINT_END, caret, _TEXT_ENDPOINT_START)
+            window.MoveEndpointByUnit(
+                _TEXT_ENDPOINT_START, _TEXT_UNIT_CHARACTER, -max(int(caret_chars), 1)
+            )
+            text = window.GetText(max(int(caret_chars), 1) + 1)
+            return FocusText(
+                ok=True, readable=True, source="caret", text=str(text or ""), **who
+            )
+    except Exception:
+        pass  # no caret to read from: fall back to the whole document
+    text = str(pattern.DocumentRange.GetText(max_chars + 1) or "")
+    return FocusText(
+        ok=True,
+        readable=True,
+        source="document",
+        text=text[:max_chars],
+        complete=len(text) <= max_chars,
+        **who,
+    )
+
+
+def focused_text(
+    *, caret_chars: int = 200, max_chars: int = 20000, timeout_s: float = _FOCUS_TIMEOUT_S
+) -> FocusText:
+    """What the control with keyboard focus holds, read back through UIA.
+
+    ``SendInput`` accepting a keystroke says nothing about whether the app kept
+    it; this is how the text that actually arrived is checked.  A Value pattern
+    gives the whole value; failing that a Text pattern gives the
+    ``caret_chars`` characters before the caret (where typing lands), or the
+    document's first ``max_chars``.
+
+    Same worker-thread shape as :func:`focused_element`, and like it never raises.
+    """
+    result: dict[str, object] = {}
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(
+                _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
+            )
+            result["text"] = _read_focused_text(automation, caret_chars, max_chars)
+        except BaseException as exc:  # noqa: BLE001 - reported as unreadable
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name="yuki-uia-text", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    read = result.get("text")
+    if isinstance(read, FocusText):
+        return read
+    return FocusText(
+        reason=str(result.get("error") or f"UIA did not answer within {timeout_s:g} s")
+    )
+
+
 try:  # pay the one-off wrapper-generation cost on the importing thread
     _uia_core()
 except Exception:  # pragma: no cover - retried lazily inside the worker
@@ -1032,7 +1400,10 @@ def format_window_tree(tree: WindowTree) -> str:
     """Compact text rendering of a window tree, one line per element.
 
     Elements with no name, no value and no interactivity are skipped - they are
-    layout scaffolding the model cannot use.  Indentation carries ``depth``.
+    layout scaffolding the model cannot use.  Indentation carries ``depth``.  An
+    interactive element's supported patterns follow its position in braces,
+    ``{invoke,expand}``, so an element a click activates (``invoke``/``toggle``)
+    can be told from one a click only selects (``select``).
     """
     header = (
         f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'}) - "
@@ -1046,9 +1417,15 @@ def format_window_tree(tree: WindowTree) -> str:
             f" [built lazily: grew from {tree.first_pass_elements} over "
             f"{tree.passes} passes - read it again if something you expect is missing]"
         )
+    status = getattr(tree, "status", "ok") or "ok"
+    note = getattr(tree, "note", "") or ""
+    if status != "ok":
+        header += f" [status: {status}]"
     if tree.truncated:
         header += " [TRUNCATED: partial tree]"
     lines = [header]
+    if note:
+        lines.append(f"note: {note}")
     shown = 0
     for element in tree.elements:
         if not element.name and element.value is None and not element.is_interactive:
@@ -1061,6 +1438,9 @@ def format_window_tree(tree: WindowTree) -> str:
         if element.value is not None:
             parts.append(f'value="{_one_line(element.value, _FORMAT_VALUE_CHARS)}"')
         parts.append(f"@({element.center[0]},{element.center[1]})")
+        patterns = getattr(element, "patterns", ())
+        if patterns:
+            parts.append("{" + ",".join(patterns) + "}")
         if element.shortcut:
             parts.append(f"[kb: {element.shortcut}]")
         flags = []
@@ -1071,6 +1451,6 @@ def format_window_tree(tree: WindowTree) -> str:
         if flags:
             parts.append(f"[{' '.join(flags)}]")
         lines.append(" ".join(parts))
-    if shown == 0:
+    if shown == 0 and status != "busy":  # a busy window's note already says why
         lines.append("(no named or interactive elements - UIA exposes nothing usable here)")
     return "\n".join(lines)

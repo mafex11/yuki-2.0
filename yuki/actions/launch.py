@@ -5,6 +5,25 @@ shows - and matches case-insensitively on the display name: exact first, then
 substring.  Nothing is guessed: when the query is ambiguous the candidates are
 handed back so the model can pick.  There is no fuzzy matching and no
 app-name allowlist anywhere in this module.
+
+**Starting an app with arguments** (a URL, a file, a folder for it to open) cannot
+go through ``shell:AppsFolder\\<AppID>``, which drops them.  So the app is
+resolved as usual and then started another way, chosen from the *kind* of Start
+menu entry it is - facts about the entry, never about which app it is:
+
+* a packaged app (its AppID is an AppUserModelID, ``<PackageFamilyName>!<App>``)
+  is activated through ``IApplicationActivationManager::ActivateApplication``,
+  which hands the arguments over and keeps the app's package identity.  Running
+  the executable inside its package folder directly would start it *without*
+  that identity, and so with a different data folder (a fresh browser profile);
+* a desktop app is started with ``Start-Process -FilePath <exe> -ArgumentList
+  ...``, the executable being the target of its Start menu shortcut (whose own
+  arguments and working folder are kept), else the file its AppID names, else
+  the image of a running process whose window carries that AppID.
+
+An app that is already running usually hands the arguments to its existing
+window instead of opening a new one; the watcher therefore also accepts a
+title change of a window of the process that was started.
 """
 
 from __future__ import annotations
@@ -12,10 +31,12 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
 
+import psutil
 import win32con
 import win32gui
 
@@ -35,6 +56,13 @@ _POLL_S = 0.02
 _ACTIVATION_S = 0.25
 
 _MAX_CANDIDATES = 25
+
+#: ``ACTIVATEOPTIONS.AO_NOERRORUI``: a failed activation reports an HRESULT to us
+#: instead of putting an error dialog in front of the user.
+_AO_NOERRORUI = 0x2
+
+_CLSID_APPLICATION_ACTIVATION_MANAGER = "{45BA127D-10A8-46EA-8AB7-56EA9078943C}"
+_IID_APPLICATION_ACTIVATION_MANAGER = "{2E941141-7F97-4756-BA1D-9DECDE894A3D}"
 
 _start_apps_lock = threading.Lock()
 _start_apps_cache: list[dict[str, str]] | None = None
@@ -63,26 +91,11 @@ def get_start_apps(*, refresh: bool = False) -> list[dict[str, str]]:
     with _start_apps_lock:
         if _start_apps_cache is not None and not refresh:
             return _start_apps_cache
-        handle, path = tempfile.mkstemp(prefix="yuki-startapps-", suffix=".json")
-        os.close(handle)
-        try:
-            result = run_powershell(
-                "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress "
-                f"| Set-Content -LiteralPath {_quote(path)} -Encoding UTF8",
-                timeout_s=20.0,
-            )
-            if not result.ok:
-                raise RuntimeError(f"Get-StartApps failed: {result.summary}")
-            with open(path, encoding="utf-8-sig") as stream:
-                raw = stream.read().strip()
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        parsed = json.loads(raw) if raw else []
-        if isinstance(parsed, dict):  # a single app comes back as an object
-            parsed = [parsed]
+        parsed = _powershell_json(
+            "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress "
+            "| Set-Content -LiteralPath {path} -Encoding UTF8",
+            what="Get-StartApps",
+        )
         apps = [
             {"name": str(item.get("Name") or ""), "appid": str(item.get("AppID") or "")}
             for item in parsed
@@ -90,6 +103,36 @@ def get_start_apps(*, refresh: bool = False) -> list[dict[str, str]]:
         ]
         _start_apps_cache = apps
         return apps
+
+
+def _powershell_json(script: str, *, what: str, timeout_s: float = 20.0) -> list:
+    """Run ``script`` and parse the JSON it writes to ``{path}`` (a temp file).
+
+    ``{path}`` in ``script`` is replaced by the quoted temp-file path.  A file,
+    not stdout: stdout is shaped for the model to read and is clipped when long
+    (see :func:`get_start_apps`).  A single object is returned as a one-item list
+    and an empty file as an empty list.
+
+    Raises:
+        RuntimeError: the script failed.
+    """
+    handle, path = tempfile.mkstemp(prefix="yuki-ps-", suffix=".json")
+    os.close(handle)
+    try:
+        result = run_powershell(script.replace("{path}", _quote(path)), timeout_s=timeout_s)
+        if not result.ok:
+            raise RuntimeError(f"{what} failed: {result.summary}")
+        with open(path, encoding="utf-8-sig") as stream:
+            raw = stream.read().strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    parsed = json.loads(raw) if raw else []
+    if isinstance(parsed, dict):  # a single item comes back as an object
+        parsed = [parsed]
+    return parsed if isinstance(parsed, list) else []
 
 
 def _match_apps(query: str, apps: list[dict[str, str]]) -> tuple[dict | None, list[dict]]:
@@ -112,14 +155,25 @@ def _match_apps(query: str, apps: list[dict[str, str]]) -> tuple[dict | None, li
 # ---------------------------------------------------------------------------
 # Waiting for windows
 # ---------------------------------------------------------------------------
-def _window_snapshot() -> tuple[dict[int, int], set[int]]:
-    """Current user windows as ``{hwnd: pid}`` plus the set of their pids."""
+def _window_snapshot() -> tuple[dict[int, int], set[int], dict[int, tuple[str, str]]]:
+    """Current user windows as ``{hwnd: pid}``, the set of their pids, and
+    ``{hwnd: (title, process name lowercased)}``."""
     windows = list_windows()
-    return ({w.hwnd: w.pid for w in windows}, {w.pid for w in windows})
+    return (
+        {w.hwnd: w.pid for w in windows},
+        {w.pid for w in windows},
+        {w.hwnd: (w.title, (w.process_name or "").lower()) for w in windows},
+    )
 
 
 def _wait_for_new_window(
-    before: dict[int, int], before_pids: set[int], before_foreground: int, deadline: float
+    before: dict[int, int],
+    before_pids: set[int],
+    before_foreground: int,
+    deadline: float,
+    *,
+    before_titles: dict[int, tuple[str, str]] | None = None,
+    target_processes: frozenset[str] = frozenset(),
 ) -> tuple[int | None, str, list[int]]:
     """Wait for the launched app to show itself, and return as soon as it has.
 
@@ -127,7 +181,11 @@ def _wait_for_new_window(
     did not exist before; a new window of an already running process (an app
     opening a second window); the foreground window changing to something that
     was not focused before (single-instance apps that just activate the window
-    they already had).
+    they already had).  With ``target_processes`` (lowercased image names of
+    what was just started) a window of one of those processes that was already
+    open and has changed its title also counts: an app that is handed a URL or a
+    file while running typically opens it in the window it has, and the new title
+    is the first visible sign that it did.
 
     Every window that appeared is returned alongside the chosen one.  When more
     than one did, the caller hands the whole list to the model rather than
@@ -138,7 +196,7 @@ def _wait_for_new_window(
         ``(hwnd | None, reason, appeared)``.
     """
     while time.monotonic() < deadline:
-        current, _ = _window_snapshot()
+        current, _, titles = _window_snapshot()
         fresh = [hwnd for hwnd in current if hwnd not in before]
         from_new_process = [
             hwnd for hwnd in fresh if current[hwnd] not in before_pids
@@ -148,6 +206,11 @@ def _wait_for_new_window(
                 return hwnd, "new window from a new process", fresh
         if fresh:
             return fresh[-1], "new window from an already running process", fresh
+        if target_processes and before_titles:
+            for hwnd, (title, process) in titles.items():
+                old = before_titles.get(hwnd)
+                if old is not None and process in target_processes and title != old[0]:
+                    return hwnd, f"existing {process} window changed its title", fresh
         foreground = _user32.GetForegroundWindow()
         if (
             foreground
@@ -167,12 +230,291 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
+def _is_packaged(appid: str) -> bool:
+    """Whether a Start menu AppID is a packaged app's AppUserModelID.
+
+    Packaged AUMIDs have the documented shape ``<PackageFamilyName>!<AppId>``;
+    desktop entries are file paths (``{KNOWNFOLDERID}\\dir\\app.exe``) or an
+    explicit AUMID the app chose, neither of which contains ``!``.  Parsing a
+    structured id, not matching an app.
+    """
+    return "!" in appid
+
+
+def _appid_path(appid: str) -> str | None:
+    """The file a desktop AppID names, when it is a path to an existing file.
+
+    ``Get-StartApps`` reports a shortcut with no explicit AUMID by its target,
+    written as ``{KNOWNFOLDERID}\\relative\\path`` or as a plain absolute path.
+    """
+    path: str | None = None
+    if appid.startswith("{") and "}\\" in appid:
+        folder_id, rest = appid.split("\\", 1)
+        try:
+            import pywintypes
+            from win32com.shell import shell
+
+            base = shell.SHGetKnownFolderPath(pywintypes.IID(folder_id), 0, None)
+        except Exception:
+            return None
+        path = os.path.join(base, rest)
+    elif os.path.isabs(appid):
+        path = appid
+    return path if path and os.path.isfile(path) else None
+
+
+def _start_menu_shortcuts(name: str) -> list[dict]:
+    """Start menu ``.lnk`` files whose name is ``name``, with their targets.
+
+    The Start menu's display name for a shortcut is the shortcut's file name, so
+    this looks the chosen entry back up under the per-user and all-users
+    Programs folders and reads each match with ``WScript.Shell``.
+
+    Returns:
+        ``[{"lnk", "target", "arguments", "workdir"}, ...]`` (possibly empty).
+    """
+    script = (
+        f"$name = {_quote(name)}\n"
+        "$shell = New-Object -ComObject WScript.Shell\n"
+        "$roots = @([Environment]::GetFolderPath('Programs'), "
+        "[Environment]::GetFolderPath('CommonPrograms'))\n"
+        "$found = foreach ($root in $roots) {\n"
+        "  if ($root -and (Test-Path -LiteralPath $root)) {\n"
+        "    Get-ChildItem -LiteralPath $root -Recurse -Filter *.lnk -File "
+        "-ErrorAction SilentlyContinue | Where-Object { $_.BaseName -eq $name } | "
+        "ForEach-Object {\n"
+        "      $s = $shell.CreateShortcut($_.FullName)\n"
+        "      [pscustomobject]@{ lnk = $_.FullName; target = $s.TargetPath; "
+        "arguments = $s.Arguments; workdir = $s.WorkingDirectory }\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+        "ConvertTo-Json -InputObject @($found) -Compress "
+        "| Set-Content -LiteralPath {path} -Encoding UTF8"
+    )
+    items = _powershell_json(script, what="Start menu shortcut lookup")
+    return [
+        {
+            "lnk": str(item.get("lnk") or ""),
+            "target": str(item.get("target") or ""),
+            "arguments": str(item.get("arguments") or ""),
+            "workdir": str(item.get("workdir") or ""),
+        }
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _window_appid(hwnd: int) -> str:
+    """The AppUserModelID a window declares for itself (``""`` when none)."""
+    try:
+        from win32com.propsys import propsys, pscon
+
+        store = propsys.SHGetPropertyStoreForWindow(hwnd, propsys.IID_IPropertyStore)
+        value = store.GetValue(pscon.PKEY_AppUserModel_ID).GetValue()
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _running_image(appid: str) -> dict | None:
+    """The executable of a running process whose window carries ``appid``.
+
+    Identity by AppUserModelID - the id the taskbar groups windows by - so this
+    only ever finds the app that was asked for, never a lookalike.
+    """
+    wanted = appid.lower()
+    for window in list_windows():
+        if _window_appid(window.hwnd).lower() != wanted:
+            continue
+        try:
+            exe = psutil.Process(window.pid).exe()
+        except Exception:
+            continue
+        if exe and os.path.isfile(exe):
+            return {"exe": exe, "hwnd": window.hwnd, "pid": window.pid}
+    return None
+
+
+def _command_line(args: list[str]) -> str:
+    """Arguments as one Windows command line (quoted where needed)."""
+    return subprocess.list2cmdline([str(arg) for arg in args])
+
+
+def _start_process_command(exe: str, arguments: str, workdir: str = "") -> str:
+    """The ``Start-Process`` script that starts ``exe`` with ``arguments``.
+
+    ``-ArgumentList`` gets one pre-quoted string: Windows PowerShell joins an
+    array with bare spaces, which would split a path that contains one.
+    ``-PassThru`` prints the new process id.
+    """
+    parts = [f"$p = Start-Process -FilePath {_quote(exe)}"]
+    if arguments:
+        parts.append(f"-ArgumentList {_quote(arguments)}")
+    if workdir:
+        parts.append(f"-WorkingDirectory {_quote(workdir)}")
+    parts.append("-PassThru")
+    return " ".join(parts) + "; if ($p) { $p.Id }"
+
+
+def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict | None, list[str]]:
+    """How to start ``chosen`` with ``args``, or why it cannot be.
+
+    Returns:
+        ``(plan, notes)``.  ``plan`` is ``{"via": "ActivateApplication", "aumid",
+        "arguments"}`` for a packaged app, or ``{"via": "Start-Process", "exe",
+        "arguments", "workdir", "source", "command"}`` for a desktop app; ``None``
+        when no executable could be found, in which case ``notes`` says what was
+        tried.
+    """
+    arguments = _command_line(args)
+    appid = chosen["appid"]
+    notes: list[str] = []
+    if _is_packaged(appid):
+        return {"via": "ActivateApplication", "aumid": appid, "arguments": arguments}, notes
+
+    def plan(exe: str, source: str, prefix: str = "", workdir: str = "") -> dict:
+        line = " ".join(part for part in (prefix.strip(), arguments) if part)
+        return {
+            "via": "Start-Process",
+            "exe": exe,
+            "arguments": line,
+            "workdir": workdir,
+            "source": source,
+            "command": _start_process_command(exe, line, workdir),
+        }
+
+    try:
+        shortcuts = _start_menu_shortcuts(chosen["name"])
+    except Exception as exc:  # noqa: BLE001 - try the other sources
+        shortcuts = []
+        notes.append(f"shortcut lookup failed: {exc}")
+    for shortcut in shortcuts:
+        target = shortcut["target"]
+        if target and os.path.isfile(target):
+            return plan(
+                target,
+                f"Start menu shortcut {shortcut['lnk']}",
+                shortcut["arguments"],
+                shortcut["workdir"],
+            ), notes
+        notes.append(
+            f"shortcut {shortcut['lnk']} does not point at a program file "
+            f"({target or 'no target'})"
+        )
+    if not shortcuts:
+        notes.append(f"no Start menu shortcut named {chosen['name']!r}")
+    path = _appid_path(appid)
+    if path:
+        return plan(path, f"AppID path {appid}"), notes
+    notes.append(f"AppID {appid!r} is not a path to a program file")
+    running = _running_image(appid)
+    if running:
+        return plan(
+            running["exe"], f"running process {running['pid']} (hwnd {running['hwnd']})"
+        ), notes
+    notes.append("no running window carries that AppID")
+    return None, notes
+
+
+def _activation_manager_interface():  # -> type[comtypes.IUnknown]
+    """``IApplicationActivationManager``, declared once on first use.
+
+    Only ``ActivateApplication`` is declared: it is the first method of the
+    interface, so the vtable is right without the two after it.
+    """
+    global _ACTIVATION_INTERFACE
+    if _ACTIVATION_INTERFACE is None:
+        import comtypes
+        from ctypes import wintypes
+
+        class IApplicationActivationManager(comtypes.IUnknown):
+            _iid_ = comtypes.GUID(_IID_APPLICATION_ACTIVATION_MANAGER)
+            _methods_ = [
+                comtypes.COMMETHOD(
+                    [],
+                    comtypes.HRESULT,
+                    "ActivateApplication",
+                    (["in"], wintypes.LPCWSTR, "appUserModelId"),
+                    (["in"], wintypes.LPCWSTR, "arguments"),
+                    (["in"], ctypes.c_int, "options"),
+                    (["out"], ctypes.POINTER(wintypes.DWORD), "processId"),
+                ),
+            ]
+
+        _ACTIVATION_INTERFACE = IApplicationActivationManager
+    return _ACTIVATION_INTERFACE
+
+
+_ACTIVATION_INTERFACE = None
+
+
+def _activate_packaged(aumid: str, arguments: str, timeout_s: float) -> tuple[int | None, str]:
+    """Activate a packaged app with a command line, as the Start menu would.
+
+    Runs on its own thread with its own COM apartment, bounded by ``timeout_s``.
+
+    Returns:
+        ``(pid, error)``: the activated process id, or ``None`` and why not.
+    """
+    result: dict = {}
+
+    def worker() -> None:
+        import comtypes
+        import comtypes.client
+
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
+        except Exception:
+            pass
+        try:
+            manager = comtypes.client.CreateObject(
+                _CLSID_APPLICATION_ACTIVATION_MANAGER,
+                clsctx=comtypes.CLSCTX_LOCAL_SERVER,
+                interface=_activation_manager_interface(),
+            )
+            result["pid"] = int(
+                manager.ActivateApplication(aumid, arguments or None, _AO_NOERRORUI)
+            )
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=worker, name="yuki-activate", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if "pid" in result:
+        return result["pid"], ""
+    return None, result.get("error") or f"activation did not return within {timeout_s:g}s"
+
+
+def _process_name(pid: int | None) -> str:
+    """Lowercased image name of ``pid``, or ``""``."""
+    if not pid:
+        return ""
+    try:
+        return psutil.Process(pid).name().lower()
+    except Exception:
+        return ""
+
+
+def launch_app(
+    query: str, *, args: list[str] | None = None, timeout_s: float = 8.0
+) -> ActionResult:
     """Launch a Start menu app by display name and wait for its window.
 
     Args:
         query: what the user called the app; matched against Start menu display
             names (exact, then substring).
+        args: command-line arguments for the app (a URL, a file, a folder).  The
+            app is resolved exactly as without them and then started so that it
+            receives them - see the module docstring for how.  An app that
+            cannot be given arguments is reported as ``ok=False`` with the
+            reason, not launched without them.
         timeout_s: how long to wait for a window to appear after the launch.
 
     Returns:
@@ -185,6 +527,10 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
         options - the model chooses, this function never guesses.  Likewise
         ``new_windows`` lists every window that appeared, so a launch that
         produced more than one is reported rather than resolved by guesswork.
+        With ``args``, ``details`` also carries ``args``, ``arguments`` (the
+        command line handed over), ``via`` (``ActivateApplication`` or
+        ``Start-Process``), ``exe``/``exe_source``/``start_command`` for a desktop
+        app, and ``pid`` when the start reported one.
     """
     started = time.perf_counter()
 
@@ -198,6 +544,15 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
 
     if not query or not query.strip():
         return finish(False, "no app name given", {"launched": False, "hwnd": None, "candidates": []})
+    if args is not None and (
+        not isinstance(args, (list, tuple)) or not all(isinstance(a, str) for a in args)
+    ):
+        return finish(
+            False,
+            f"args must be a list of strings, got {args!r}",
+            {"launched": False, "hwnd": None, "candidates": []},
+        )
+    arg_list = [a for a in (args or []) if a != ""]
 
     apps = get_start_apps()
     chosen, candidates = _match_apps(query, apps)
@@ -210,31 +565,79 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
             {"launched": False, "hwnd": None, "candidates": candidates},
         )
 
-    before, before_pids = _window_snapshot()
-    before_foreground = _user32.GetForegroundWindow()
-    # shell:AppsFolder\<AppID> is the Start menu's own launch path and works for
-    # both packaged apps (AppUserModelID) and desktop shortcuts.
-    result = run_powershell(
-        f"Start-Process -FilePath {_quote('shell:AppsFolder\\' + chosen['appid'])}",
-        timeout_s=max(2.0, min(timeout_s, 15.0)),
-    )
     details: dict = {
-        "launched": result.ok,
+        "launched": False,
         "hwnd": None,
         "candidates": [],
         "name": chosen["name"],
         "appid": chosen["appid"],
-        "launch_stderr": result.details.get("stderr", ""),
     }
-    if not result.ok:
-        return finish(
-            False,
-            f"could not start {chosen['name']!r}: {result.details.get('stderr') or result.summary}",
-            details,
+    start_budget = max(2.0, min(timeout_s, 15.0))
+    plan: dict | None = None
+    if arg_list:
+        details["args"] = arg_list
+        plan, notes = _plan_start_with_args(chosen, arg_list)
+        if notes:
+            details["resolution_notes"] = notes
+        if plan is None:
+            return finish(
+                False,
+                f"cannot pass arguments to {chosen['name']!r}: its Start menu entry "
+                f"(AppID {chosen['appid']!r}) is not a packaged app and no program "
+                f"file was found for it ({'; '.join(notes)}). Nothing was started.",
+                details,
+            )
+        details["via"] = plan["via"]
+        details["arguments"] = plan["arguments"]
+        if plan["via"] == "Start-Process":
+            details["exe"] = plan["exe"]
+            details["exe_source"] = plan["source"]
+            details["start_command"] = plan["command"]
+
+    before, before_pids, before_titles = _window_snapshot()
+    before_foreground = _user32.GetForegroundWindow()
+    target_processes: frozenset[str] = frozenset()
+    if plan is None:
+        # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
+        # for both packaged apps (AppUserModelID) and desktop shortcuts.
+        result = run_powershell(
+            f"Start-Process -FilePath {_quote('shell:AppsFolder\\' + chosen['appid'])}",
+            timeout_s=start_budget,
         )
+        details["launched"] = result.ok
+        details["launch_stderr"] = result.details.get("stderr", "")
+        failure = result.details.get("stderr") or result.summary
+    elif plan["via"] == "ActivateApplication":
+        pid, error = _activate_packaged(plan["aumid"], plan["arguments"], start_budget)
+        details["launched"] = pid is not None
+        details["pid"] = pid
+        if error:
+            details["launch_error"] = error
+        failure = (
+            f"activating the packaged app {plan['aumid']!r} with arguments failed: "
+            f"{error}"
+        )
+        if pid is not None and (name := _process_name(pid)):
+            target_processes = frozenset({name})
+    else:
+        result = run_powershell(plan["command"], timeout_s=start_budget)
+        details["launched"] = result.ok
+        details["launch_stderr"] = result.details.get("stderr", "")
+        stdout = str(result.details.get("stdout") or "").strip()
+        last_line = stdout.splitlines()[-1].strip() if stdout else ""
+        details["pid"] = int(last_line) if last_line.isdigit() else None
+        failure = result.details.get("stderr") or result.summary
+        target_processes = frozenset({os.path.basename(plan["exe"]).lower()})
+    if not details["launched"]:
+        return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
 
     hwnd, reason, appeared = _wait_for_new_window(
-        before, before_pids, before_foreground, time.monotonic() + timeout_s
+        before,
+        before_pids,
+        before_foreground,
+        time.monotonic() + timeout_s,
+        before_titles=before_titles,
+        target_processes=target_processes,
     )
     details["hwnd"] = hwnd
     details["window_reason"] = reason
@@ -250,8 +653,10 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
     if hwnd is None:
         return finish(
             True,
-            f"started {chosen['name']!r} but no window appeared within {timeout_s:g}s "
-            f"(it may be a background app or still loading)",
+            f"started {chosen['name']!r}"
+            + (" with arguments" if arg_list else "")
+            + f" but no window appeared or changed within {timeout_s:g}s "
+            f"(it may be a background app, still loading, or already showing that)",
             details,
         )
     info = window_info(hwnd)
@@ -264,9 +669,13 @@ def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult:
     details["ready"] = ready
     details["ready_ms"] = round(ready_ms, 1)
     extra = len(details["new_windows"]) - 1
+    with_args = ""
+    if arg_list:
+        shown = details["arguments"]
+        with_args = f" with arguments {shown if len(shown) <= 160 else shown[:160] + '…'}"
     return finish(
         True,
-        f"launched {chosen['name']!r}: hwnd {hwnd} "
+        f"launched {chosen['name']!r}{with_args}: hwnd {hwnd} "
         f"({details['process_name']}) \"{details['title']}\" - {reason}"
         + (f"; ready for input after {ready_ms:.0f} ms" if ready else
            f"; it is not in the foreground / not accepting input yet after "
@@ -419,8 +828,16 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
     )
 
 
-def open_url(url: str) -> ActionResult:
-    """Open a URL (or any shell target) with the user's default handler."""
+def open_url(url: str, *, app: str | None = None) -> ActionResult:
+    """Open a URL (or any shell target: a file, a folder).
+
+    Args:
+        url: the target.
+        app: ``None`` opens it with the user's default handler.  Otherwise the
+            Start menu app to open it with, which is exactly
+            ``launch_app(app, args=[url])`` - the target is handed to the app as
+            an argument, so nothing is typed anywhere.
+    """
     started = time.perf_counter()
 
     def finish(ok: bool, summary: str, details: dict) -> ActionResult:
@@ -434,6 +851,10 @@ def open_url(url: str) -> ActionResult:
     if not url or not url.strip():
         return finish(False, "no url given", {"url": url})
     target = url.strip()
+    if app is not None and app.strip():
+        launched = launch_app(app, args=[target])
+        launched.details["url"] = target
+        return launched
     try:
         os.startfile(target)  # noqa: S606 - opening a user-provided target is the point
         return finish(True, f"opened {target} with the default handler", {"url": target, "via": "startfile"})

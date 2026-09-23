@@ -17,10 +17,12 @@ from yuki.perception.screenshot import Capture, capture, capture_bounds, screens
 from yuki.perception.system import format_system_facts, system_facts
 from yuki.perception.tree import (
     FocusInfo,
+    FocusText,
     UIElement,
     WindowTree,
     child_window_handles,
     focused_element,
+    focused_text,
     format_window_tree,
     get_window_tree,
 )
@@ -47,6 +49,7 @@ __all__ = [
     "Capture",
     "DesktopOverview",
     "FocusInfo",
+    "FocusText",
     "MonitorInfo",
     "UIElement",
     "WindowInfo",
@@ -60,6 +63,7 @@ __all__ = [
     "format_system_facts",
     "focused_control_hwnd",
     "focused_element",
+    "focused_text",
     "format_window_tree",
     "get_desktop_overview",
     "get_window_tree",

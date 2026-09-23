@@ -89,7 +89,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "is interactive. This is how you find things to click or type into. The "
             "result reports how many elements it found, whether it was truncated, and "
             "whether the window was still building its tree while it was read, in "
-            "which case reading it again can show more."
+            "which case reading it again can show more. Its status is ok when the "
+            "window answered (however small the tree), busy when the window is on "
+            "screen but did not answer in time, which usually means it is loading or "
+            "rendering and can be read again shortly, and empty when it answered "
+            "with nothing usable."
         ),
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
@@ -146,10 +150,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Start an installed application by name and wait for its window. If the "
             "name matches several apps it returns the candidates instead of guessing, "
-            "so you can pick one or ask the user."
+            "so you can pick one or ask the user. With args the application is "
+            "started with those command-line arguments, such as a URL, a file or a "
+            "folder for it to open; passing a URL as an argument to a browser opens "
+            "it there without using the address bar. An application that is already "
+            "running usually opens the arguments in the window it has, and the result "
+            "names the window that appeared or changed. If the application cannot be "
+            "given arguments, nothing is started and the result says why."
         ),
         "input_schema": _obj(
-            {"query": {"type": "string", "description": "Application name, e.g. 'spotify'."}},
+            {
+                "query": {"type": "string", "description": "Application name, e.g. 'spotify'."},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command-line arguments, one item per argument, "
+                    "e.g. a URL or a file path. Omit to start the application plainly.",
+                },
+            },
             ["query"],
         ),
     },
@@ -182,12 +200,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Typing",
         "description": (
             "Type text into whatever currently has keyboard focus, optionally pressing "
-            "Enter afterwards. Make sure the right field is focused first."
+            "Enter afterwards. Make sure the right field is focused first. The result "
+            "says which control had keyboard focus when typing began. When the "
+            "control's contents can be read, the result says what it holds after "
+            "typing; if the typed text is not in it, the action fails and Enter is "
+            "not pressed. With clear, the field's existing contents are selected and "
+            "deleted first, and the result says whether it read empty. The result "
+            "also names any new window the application showed meanwhile, such as a "
+            "suggestion list or menu."
         ),
         "input_schema": _obj(
             {
                 "text": {"type": "string"},
                 "press_enter": {"type": "boolean"},
+                "clear": {
+                    "type": "boolean",
+                    "description": "Select all and delete in the focused field before "
+                    "typing. Text may be empty to only clear.",
+                },
                 "expect_hwnd": _GUARD,
             },
             ["text"],
@@ -198,7 +228,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Pressing a shortcut",
         "description": (
             "Press a key combination, given as the keys held together, e.g. "
-            "['ctrl','t'] or ['win','r'] or ['volume_mute']."
+            "['ctrl','t'] or ['win','r'] or ['volume_mute']. The result says where "
+            "keyboard focus is afterwards and whether it moved, and names any new "
+            "window the application showed."
         ),
         "input_schema": _obj(
             {
@@ -211,7 +243,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "press",
         "label": "Pressing a key",
-        "description": "Press a single key, optionally several times, e.g. 'enter', 'tab', 'down'.",
+        "description": (
+            "Press a single key, optionally several times, e.g. 'enter', 'tab', "
+            "'down'. The result says where keyboard focus is afterwards and whether "
+            "it moved, and names any new window the application showed."
+        ),
         "input_schema": _obj(
             {
                 "key": {"type": "string"},
@@ -249,8 +285,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "open_url",
         "label": "Opening a link",
-        "description": "Open a URL in the default browser.",
-        "input_schema": _obj({"url": {"type": "string"}}, ["url"]),
+        "description": (
+            "Open a URL, file or folder. Without app it opens with the default "
+            "handler for that kind of target. With app it is handed to that installed "
+            "application as an argument instead, the same as launch_app with args; "
+            "for a browser that loads the page there directly, without using the "
+            "address bar."
+        ),
+        "input_schema": _obj(
+            {
+                "url": {"type": "string", "description": "URL, file path or folder path."},
+                "app": {
+                    "type": "string",
+                    "description": "Installed application name, as launch_app takes "
+                    "it, to open the target with.",
+                },
+            },
+            ["url"],
+        ),
     },
     {
         "name": "note_to_self",
@@ -513,7 +565,9 @@ class Backend(Protocol):
         max_width: int = 2560,
     ) -> Any: ...  # pragma: no cover - protocol only
     def system_facts(self) -> dict[str, Any]: ...
-    def launch_app(self, query: str, *, timeout_s: float = 8.0) -> Any: ...
+    def launch_app(
+        self, query: str, *, args: list[str] | None = None, timeout_s: float = 8.0
+    ) -> Any: ...
     def focus_window(self, hwnd: int, *, timeout_s: float = 2.0) -> Any: ...
     def click(
         self,
@@ -525,7 +579,12 @@ class Backend(Protocol):
         expect_hwnd: int | None = None,
     ) -> Any: ...
     def type_text(
-        self, text: str, *, press_enter: bool = False, expect_hwnd: int | None = None
+        self,
+        text: str,
+        *,
+        press_enter: bool = False,
+        clear: bool = False,
+        expect_hwnd: int | None = None,
     ) -> Any: ...
     def hotkey(self, *keys: str, expect_hwnd: int | None = None) -> Any: ...
     def press(
@@ -541,7 +600,7 @@ class Backend(Protocol):
         expect_hwnd: int | None = None,
     ) -> Any: ...
     def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any: ...
-    def open_url(self, url: str) -> Any: ...
+    def open_url(self, url: str, *, app: str | None = None) -> Any: ...
 
     # Optional, and not part of the architecture contract: a backend without it
     # simply never gets pre-warmed. See :meth:`Dispatcher.prewarm_shell`.
@@ -840,14 +899,21 @@ class Dispatcher:
         payload = _plain(tree)
         elements = payload.get("elements") or [] if isinstance(payload, dict) else []
         truncated = bool(payload.get("truncated")) if isinstance(payload, dict) else False
+        status = str(payload.get("status") or "ok") if isinstance(payload, dict) else "ok"
+        note = str(payload.get("note") or "") if isinstance(payload, dict) else ""
         header = (
             f"window {hwnd} \"{payload.get('title', '')}\" ({payload.get('process_name', '')}): "
-            f"{len(elements)} elements{', truncated' if truncated else ''}"
+            f"{len(elements)} elements{', truncated' if truncated else ''}, status {status}"
         )
+        summary = f"{len(elements)} elements{' (truncated)' if truncated else ''}"
+        if status != "ok":
+            summary += f", {status}"
+        if note:
+            summary += f": {note}"
         return ToolOutcome(
             name="look_at_window",
             ok=True,
-            summary=f"{len(elements)} elements{' (truncated)' if truncated else ''}",
+            summary=summary,
             content=[{"type": "text", "text": f"{header}\n{text}"}],
             payload=payload,
             elapsed_ms=(time.perf_counter() - started) * 1000,
@@ -1073,10 +1139,27 @@ class Dispatcher:
 
     # -- actions -----------------------------------------------------------
 
+    @staticmethod
+    def _opt_str_list(tool_input: dict[str, Any], key: str) -> list[str] | None:
+        """An optional list of strings, or ``None`` when omitted."""
+        value = tool_input.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ToolError(f"{key!r} must be a list of strings, got {value!r}")
+        return value
+
     def _do_launch_app(self, tool_input: dict[str, Any]) -> ToolOutcome:
-        return self._from_action(
-            "launch_app", self.backend.launch_app(self._need_str(tool_input, "query"))
+        query = self._need_str(tool_input, "query")
+        args = self._opt_str_list(tool_input, "args")
+        # Only pass args when there are some, so a backend written before the
+        # parameter existed keeps working for plain launches.
+        result = (
+            self.backend.launch_app(query, args=args)
+            if args
+            else self.backend.launch_app(query)
         )
+        return self._from_action("launch_app", result)
 
     def _do_focus_window(self, tool_input: dict[str, Any]) -> ToolOutcome:
         return self._from_action(
@@ -1102,14 +1185,15 @@ class Dispatcher:
         text = tool_input.get("text")
         if not isinstance(text, str):
             raise ToolError(f"'text' must be a string, got {text!r}")
-        return self._from_action(
-            "type_text",
-            self.backend.type_text(
-                text,
-                press_enter=bool(tool_input.get("press_enter")),
-                expect_hwnd=self._opt_hwnd(tool_input),
-            ),
-        )
+        options: dict[str, Any] = {
+            "press_enter": bool(tool_input.get("press_enter")),
+            "expect_hwnd": self._opt_hwnd(tool_input),
+        }
+        if tool_input.get("clear"):
+            # Only when asked, so a backend written before the option existed
+            # keeps working for plain typing.
+            options["clear"] = True
+        return self._from_action("type_text", self.backend.type_text(text, **options))
 
     def _do_hotkey(self, tool_input: dict[str, Any]) -> ToolOutcome:
         keys = tool_input.get("keys")
@@ -1150,7 +1234,13 @@ class Dispatcher:
         )
 
     def _do_open_url(self, tool_input: dict[str, Any]) -> ToolOutcome:
-        return self._from_action("open_url", self.backend.open_url(self._need_str(tool_input, "url")))
+        url = self._need_str(tool_input, "url")
+        app = tool_input.get("app")
+        if app is not None and not isinstance(app, str):
+            raise ToolError(f"'app' must be a string, got {app!r}")
+        if app and app.strip():
+            return self._from_action("open_url", self.backend.open_url(url, app=app))
+        return self._from_action("open_url", self.backend.open_url(url))
 
     # -- control tools -----------------------------------------------------
 
