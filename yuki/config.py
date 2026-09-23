@@ -51,7 +51,21 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 #: and to be re-benchmarked on a task set that actually requires reasoning. All
 #: five levels stay available and ``/effort`` still switches mid-conversation, so
 #: dropping back for a session of trivial requests is one command away.
-DEFAULT_EFFORT = "high"
+#:
+#: Default lowered from ``high`` to ``medium`` on 2026-09-23, for round latency.
+#: 107 real rounds measured each round at about 3.5 s fixed plus 13.8 ms per
+#: output token (thinking included), and the fixed part cannot be reduced, so
+#: output tokens are the part of a round Yuki controls. Now that perception is
+#: reliable (tree waking, coverage, content-ready checks, the window view
+#: attached after actions), less of each round goes on working out what the
+#: screen shows, and the extra thinking ``high`` buys is paid on every round of
+#: every task. The Spotify case above remains the warning sign to watch for.
+#: This is a default, not a verdict: the tray menu switches low/medium/high for
+#: both lanes at once, and ``logs/requests.csv`` records effort, wall time,
+#: model time, calls and tokens for every request, so the levels can be
+#: compared on real tasks (``scripts/costs.py`` summarises it) and this changed
+#: back if ``medium`` starts losing tasks ``high`` would have finished.
+DEFAULT_EFFORT = "medium"
 
 
 #: Anthropic list prices in US dollars per million tokens, keyed by the Bedrock
@@ -101,7 +115,11 @@ class Settings:
         max_tokens: ``max_tokens`` for every request.
         thinking_display: ``summarized`` returns readable reasoning; ``omitted``
             (the API default on Sonnet 5 / Opus 5) returns empty thinking text.
-        stream: Use the streaming endpoint and ``get_final_message()``.
+        stream: Use the streaming endpoint (on by default). Tools then start
+            while the response is still being generated, as soon as their
+            ``tool_use`` block is complete, and the stored turn is
+            ``get_final_message()``. ``False`` falls back to ``messages.create``
+            with every tool run after the response.
         max_steps: Hard ceiling on model round-trips per user request, so a
             confused loop cannot burn tokens forever.
         keep_perception_turns: How many recent assistant turns keep their full
@@ -110,9 +128,11 @@ class Settings:
         effort: ``output_config.effort`` sent on every request, one of
             :data:`EFFORT_LEVELS`. Lower effort means less thinking and fewer,
             more-consolidated tool calls; it also means less of the
-            interpretation and self-correction that hard requests live on, which
-            is why the default is ``high`` (see :data:`DEFAULT_EFFORT`). Mutable
-            so the CLI's ``/effort`` command (and
+            interpretation and self-correction that hard requests live on. The
+            default is ``medium``, chosen for round latency now that perception
+            is reliable (see :data:`DEFAULT_EFFORT`); the tray's effort switch
+            and ``logs/requests.csv`` exist to compare levels on real tasks.
+            Mutable so the CLI's ``/effort`` command (and
             :meth:`yuki.agent.loop.Agent.set_effort`) can change it
             mid-conversation.
         ui_hotkey: Global combo that opens and closes the overlay.
@@ -134,7 +154,7 @@ class Settings:
     screenshot_policy: ScreenshotPolicy = "never"
     max_tokens: int = 8000
     thinking_display: Literal["summarized", "omitted"] = "summarized"
-    stream: bool = False
+    stream: bool = True
     max_steps: int = 40
     keep_perception_turns: int = 2
     tool_timeout_s: float = 20.0

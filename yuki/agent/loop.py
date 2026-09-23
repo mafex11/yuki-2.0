@@ -9,6 +9,20 @@ not in the generator's locals.
 
 One :class:`Agent` spans the whole session: every new request appends to the same
 conversation.
+
+Two things keep the number and length of rounds down:
+
+* Tools run while the response is still streaming. As soon as a ``tool_use``
+  block is complete (and the stream has moved past it, so it was not cut off by
+  the output limit) it is dispatched, provided it is an action or perception
+  tool and everything before it in the response has already run and succeeded.
+  ``ask_user`` waits for the end of the stream (and holds back everything after
+  it), and ``done`` is still evaluated last. The stored assistant turn is always
+  the SDK's complete final message.
+* After a turn whose actions all succeeded, the window acted on is read once it
+  has settled and attached to the next turn ("Window after your actions"), so
+  the model does not spend a round calling ``look_at_window`` only to see what
+  its action did.
 """
 
 from __future__ import annotations
@@ -18,12 +32,14 @@ import os
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 from yuki.agent.context import ContextManager
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
+    AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
     PERCEPTION_TOOLS,
     Backend,
@@ -43,12 +59,61 @@ from yuki.log.events import (
     Thinking,
     ToolCall,
     ToolResult,
+    _as_plain,
 )
 from yuki.log.requests import TOKEN_KEYS, append_request_row, usage_tokens
 
 
 #: The API's limit on ``cache_control`` breakpoints in one request.
 MAX_CACHE_BREAKPOINTS = 4
+
+#: Tools never dispatched while the response is still streaming. ``done`` is
+#: evaluated last, after everything else in the turn; ``ask_user`` pauses the
+#: generator for the user's answer, and whatever the model wrote after it must
+#: not run before that answer exists.
+_DEFERRED_TOOLS: frozenset[str] = frozenset({"done", "ask_user"})
+
+#: Stop reasons after which a just-finished ``tool_use`` block may be cut off or
+#: disowned, so it is not run early.
+_UNSAFE_STOPS: frozenset[str] = frozenset({"max_tokens", "refusal"})
+
+
+@dataclass
+class _Turn:
+    """The tool calls of one assistant response, shared by in-stream and later dispatch.
+
+    Attributes:
+        results: ``tool_use_id`` -> the ``tool_result`` block to send.
+        names: ``tool_use_id`` -> tool name.
+        handled: Ids that already have a result (ran, failed or skipped).
+        stop_after: A failure (or ``done``) happened; everything later is skipped.
+        failed: Some result in this turn is an error (a failure or a skip).
+        finished: The ``done`` message, if the model ended the request.
+        actions: ``(name, input, outcome)`` of every successful state-changing
+            action, in dispatch order (:data:`AUTO_VIEW_TOOLS`).
+        looked: hwnds read by an explicit successful ``look_at_window`` after
+            the last of those actions.
+        early: Tools dispatched while the response was still streaming.
+        first_early_at: ``perf_counter`` of the first of them.
+    """
+
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    names: dict[str, str] = field(default_factory=dict)
+    handled: set[str] = field(default_factory=set)
+    stop_after: bool = False
+    failed: bool = False
+    finished: list[str] = field(default_factory=list)
+    actions: list[tuple[str, dict[str, Any], ToolOutcome]] = field(default_factory=list)
+    looked: set[int] = field(default_factory=set)
+    early: int = 0
+    first_early_at: float | None = None
+
+    def record(self, tool_use_id: str, block: dict[str, Any]) -> None:
+        """Store one result block, noting whether it is an error."""
+        self.results[tool_use_id] = block
+        self.handled.add(tool_use_id)
+        if block.get("is_error"):
+            self.failed = True
 
 
 class Agent:
@@ -408,6 +473,7 @@ class Agent:
         self._model_s = 0.0
         self._tool_s = 0.0
         self._overview_s = 0.0
+        self._auto_view_s = 0.0
         self._tool_counts: Counter[str] = Counter()
         self._tokens: dict[str, int] = dict.fromkeys(TOKEN_KEYS, 0)
         self._cost_usd = 0.0
@@ -438,8 +504,10 @@ class Agent:
 
         Wall time includes the time spent waiting for the user's answers, which
         is also reported on its own. Model time is every round trip (failed ones
-        included); tool time is dispatching the tools the model called; the
-        per-turn desktop overview is ``overview_s``. Whatever is left of the
+        included) minus the time tools ran while its response was still
+        streaming; tool time is dispatching the tools the model called, in the
+        stream or after it; the per-turn desktop overview is ``overview_s`` and
+        the window view attached after actions ``auto_view_s``. Whatever is left of the
         wall time is the loop's own overhead. Pre-warm calls are not in here:
         they are the separate ``startup_cost`` record.
         """
@@ -459,6 +527,7 @@ class Agent:
                 "model_s": round(self._model_s, 2),
                 "tool_s": round(self._tool_s, 2),
                 "overview_s": round(self._overview_s, 2),
+                "auto_view_s": round(self._auto_view_s, 2),
                 "model_calls": self._model_calls,
                 "tool_calls": dict(self._tool_counts),
                 "tokens": dict(self._tokens),
@@ -528,17 +597,14 @@ class Agent:
                 self.logger.begin_turn()
 
             self.context.prune()
-            response = self._request()
+            # Thinking and the tools that can run early are yielded while the
+            # response streams; what comes back is the complete final message.
+            turn = _Turn()
+            response = yield from self._request(turn)
             self.context.add_assistant(response.content)
 
-            for block in response.content:
-                if getattr(block, "type", None) == "thinking":
-                    text = getattr(block, "thinking", "") or ""
-                    if text.strip():
-                        self.logger.thinking(text)
-                        yield Thinking(text)
-
             stop_reason = getattr(response, "stop_reason", None)
+            tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
 
             if stop_reason == "refusal":
                 details = getattr(response, "stop_details", None)
@@ -546,11 +612,20 @@ class Agent:
                 category = getattr(details, "category", None)
                 if category:
                     message += f" ({category})"
+                if turn.handled:
+                    # Some tools already ran while the response streamed: close
+                    # the turn with what they did, so the transcript matches the
+                    # machine, and run nothing more.
+                    blocks, names = yield from self._run_tools(
+                        tool_uses, turn, skip_text="Not run: the model stopped this response."
+                    )
+                    overview, facts = self._capture_overview()
+                    self.context.add_tool_results(
+                        blocks, overview, tool_names=names, self_facts=facts
+                    )
                 self.logger.error(message)
                 yield ErrorEvent(message)
                 return
-
-            tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
 
             if stop_reason == "max_tokens" and not tool_uses:
                 message = "The model hit the output limit before finishing."
@@ -559,15 +634,17 @@ class Agent:
                 return
 
             if tool_uses:
-                finished: list[str] = []
-                blocks, names = yield from self._run_tools(tool_uses, finished)
+                if stop_reason == "max_tokens":
+                    self._skip_truncated(response, turn)
+                blocks, names = yield from self._run_tools(tool_uses, turn)
+                view = None if turn.finished else self._auto_view(turn)
                 overview, facts = self._capture_overview()
                 self.context.add_tool_results(
-                    blocks, overview, tool_names=names, self_facts=facts
+                    blocks, overview, tool_names=names, self_facts=facts, window_view=view
                 )
-                if finished:
-                    self.logger.final(finished[0])
-                    yield Final(finished[0])
+                if turn.finished:
+                    self.logger.final(turn.finished[0])
+                    yield Final(turn.finished[0])
                     return
                 continue
 
@@ -602,9 +679,9 @@ class Agent:
     # -- tools -------------------------------------------------------------
 
     def _run_tools(
-        self, tool_uses: list[Any], finished: list[str]
+        self, tool_uses: list[Any], turn: _Turn, *, skip_text: str | None = None
     ) -> Any:
-        """Execute every ``tool_use`` block in order, stopping at the first failure.
+        """Execute every ``tool_use`` block not yet handled, stopping at the first failure.
 
         A response may carry ``done`` alongside real work -- "press mute, and with
         that I am finished" -- which is how a one-step request costs one round trip
@@ -614,10 +691,15 @@ class Agent:
         and the model gets the results back to react to. It never gets to announce
         an outcome that did not happen.
 
+        Blocks already run while the response streamed (see :meth:`_request`)
+        keep their results; this runs the rest in the same order and under the
+        same stop-on-first-failure rule.
+
         Args:
             tool_uses: The blocks from one assistant response, in model order.
-            finished: Out-parameter; the ``done`` message is appended to it if the
-                model ended its turn.
+            turn: This response's tool state; ``turn.finished`` gets the ``done``
+                message if the model ended its turn.
+            skip_text: Run nothing more: answer every unhandled call with this.
 
         Yields:
             Events for each call and result, and :class:`AskUser` when paused.
@@ -629,120 +711,226 @@ class Agent:
             stopped early: the API requires one ``tool_result`` per ``tool_use``,
             so skipped tools get an error block explaining they never ran.
         """
-        results: dict[str, dict[str, Any]] = {}
-        names: dict[str, str] = {}
-        stop_after = False
         order = [str(getattr(b, "id", "")) for b in tool_uses]
         work = [b for b in tool_uses if str(getattr(b, "name", "")) != "done"]
         closing = [b for b in tool_uses if str(getattr(b, "name", "")) == "done"]
 
         for block in work + closing:
             tool_id = str(getattr(block, "id", ""))
-            name = str(getattr(block, "name", ""))
-            tool_input = dict(getattr(block, "input", {}) or {})
-            names[tool_id] = name
-
-            if stop_after:
-                results[tool_id] = self._skip(
-                    tool_id, name, "Not run: an earlier tool in this turn failed."
-                )
+            if tool_id in turn.handled:
                 continue
-
-            if self._cancelled.is_set():
-                results[tool_id] = self._skip(tool_id, name, "Not run: the user cancelled.")
-                stop_after = True
+            if skip_text is not None:
+                name = str(getattr(block, "name", ""))
+                turn.names[tool_id] = name
+                turn.record(tool_id, self._skip(tool_id, name, skip_text))
                 continue
+            yield from self._run_one(turn, block)
 
-            self.logger.tool_call(name, tool_input, tool_use_id=tool_id)
-            yield ToolCall(name, tool_input)
+        return [turn.results[tool_id] for tool_id in order], dict(turn.names)
 
-            # The generator was suspended on that yield, which is exactly where a
-            # cancel from the UI thread tends to land. The tool has not started,
-            # so refuse it rather than touch the machine on the way out -- and
-            # still emit a result, so a caller pairing calls with results does
-            # not wait forever for one.
-            if self._cancelled.is_set():
-                text = "Not run: the user cancelled."
-                results[tool_id] = self._skip(tool_id, name, text)
-                yield ToolResult(name, False, text)
-                stop_after = True
-                continue
+    def _run_one(self, turn: _Turn, block: Any, *, early: bool = False) -> Iterator[AgentEvent]:
+        """Run one ``tool_use`` block and record its result in ``turn``.
 
-            dispatched = time.perf_counter()
-            outcome = self._dispatch(name, tool_input)
-            self._tool_s += time.perf_counter() - dispatched
-            self._tool_counts[name] += 1
+        Args:
+            turn: This response's tool state.
+            block: The ``tool_use`` block.
+            early: The response is still streaming (counted for ``first_tool_ms``).
 
-            if outcome.kind == "ask_user":
-                question = outcome.control_input["question"]
-                self.logger.ask_user(question)
-                self._awaiting_answer = True
-                self._pending_answer = None
-                asked_at = time.monotonic()
-                yield AskUser(question)  # generator pauses here
-                self._waited_s += time.monotonic() - asked_at
-                self._awaiting_answer = False
-                answer = self._pending_answer
-                self._pending_answer = None
-                if answer is None:
-                    text = "The user did not answer."
-                    self.logger.tool_result(
-                        name, ok=False, summary=text, result={"answer": None},
-                        elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
-                    )
-                    yield ToolResult(name, False, text)
-                    results[tool_id] = self._result_block(
-                        tool_id, [{"type": "text", "text": text}], is_error=True
-                    )
-                    stop_after = True
-                    continue
-                self.logger.user_answer(answer)
+        Yields:
+            ``tool_call`` / ``tool_result`` events, and :class:`AskUser` when paused.
+        """
+        tool_id = str(getattr(block, "id", ""))
+        name = str(getattr(block, "name", ""))
+        tool_input = dict(getattr(block, "input", {}) or {})
+        turn.names[tool_id] = name
+
+        # done is honoured only when everything before it succeeded -- which
+        # includes a call skipped for being cut off at the output limit.
+        if turn.stop_after or (name == "done" and turn.failed):
+            turn.record(
+                tool_id, self._skip(tool_id, name, "Not run: an earlier tool in this turn failed.")
+            )
+            return
+
+        if self._cancelled.is_set():
+            turn.record(tool_id, self._skip(tool_id, name, "Not run: the user cancelled."))
+            turn.stop_after = True
+            return
+
+        self.logger.tool_call(name, tool_input, tool_use_id=tool_id)
+        yield ToolCall(name, tool_input)
+
+        # The generator was suspended on that yield, which is exactly where a
+        # cancel from the UI thread tends to land. The tool has not started,
+        # so refuse it rather than touch the machine on the way out -- and
+        # still emit a result, so a caller pairing calls with results does
+        # not wait forever for one.
+        if self._cancelled.is_set():
+            text = "Not run: the user cancelled."
+            turn.record(tool_id, self._skip(tool_id, name, text))
+            yield ToolResult(name, False, text)
+            turn.stop_after = True
+            return
+
+        dispatched = time.perf_counter()
+        if early:
+            turn.early += 1
+            if turn.first_early_at is None:
+                turn.first_early_at = dispatched
+        outcome = self._dispatch(name, tool_input)
+        self._tool_s += time.perf_counter() - dispatched
+        self._tool_counts[name] += 1
+
+        if outcome.kind == "ask_user":
+            question = outcome.control_input["question"]
+            self.logger.ask_user(question)
+            self._awaiting_answer = True
+            self._pending_answer = None
+            asked_at = time.monotonic()
+            yield AskUser(question)  # generator pauses here
+            self._waited_s += time.monotonic() - asked_at
+            self._awaiting_answer = False
+            answer = self._pending_answer
+            self._pending_answer = None
+            if answer is None:
+                text = "The user did not answer."
                 self.logger.tool_result(
-                    name, ok=True, summary=f"answered: {answer}", result={"answer": answer},
+                    name, ok=False, summary=text, result={"answer": None},
                     elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
                 )
-                yield ToolResult(name, True, f"answered: {answer}")
-                results[tool_id] = self._result_block(
-                    tool_id, [{"type": "text", "text": answer}]
+                yield ToolResult(name, False, text)
+                turn.record(
+                    tool_id,
+                    self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True),
                 )
+                turn.stop_after = True
+                return
+            self.logger.user_answer(answer)
+            self.logger.tool_result(
+                name, ok=True, summary=f"answered: {answer}", result={"answer": answer},
+                elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
+            )
+            yield ToolResult(name, True, f"answered: {answer}")
+            turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": answer}]))
+            return
+
+        if outcome.kind == "note":
+            self.context.set_note(outcome.control_input["text"])
+
+        if outcome.kind == "done":
+            turn.finished.append(outcome.control_input["message"])
+
+        # What the view after this turn's actions should show, and whether an
+        # explicit read after the last action already shows it.
+        if outcome.ok and name in AUTO_VIEW_TOOLS:
+            turn.actions.append((name, tool_input, outcome))
+            turn.looked.clear()
+        elif outcome.ok and name == "look_at_window" and turn.actions:
+            hwnd = _as_hwnd(tool_input.get("hwnd"))
+            if hwnd is not None:
+                turn.looked.add(hwnd)
+
+        # Repetition facts for every real tool call the model made, looks
+        # included (eleven identical look_at_window calls went unremarked
+        # while only actions were counted). The per-turn automatic overview
+        # and the view after actions never come through here, so only
+        # explicit calls are counted.
+        repeat_note = None
+        if name not in CONTROL_TOOLS:
+            repeats = self._record_call(name, tool_input, outcome.summary)
+            repeat_note = _repeat_text(
+                name, repeats, perception=name in PERCEPTION_TOOLS, summary=outcome.summary
+            )
+            outcome.payload = (
+                {**outcome.payload, "self_facts": repeats}
+                if isinstance(outcome.payload, dict)
+                else {"result": outcome.payload, "self_facts": repeats}
+            )
+
+        self._log_outcome(outcome, tool_use_id=tool_id)
+        yield ToolResult(outcome.name, outcome.ok, outcome.summary)
+
+        content = list(outcome.content) or [
+            {"type": "text", "text": outcome.summary or "Done."}
+        ]
+        if repeat_note:
+            content.append({"type": "text", "text": repeat_note})
+        turn.record(tool_id, self._result_block(tool_id, content, is_error=not outcome.ok))
+
+        if not outcome.ok or outcome.kind == "done":
+            turn.stop_after = True
+
+    def _can_run_early(self, turn: _Turn, block: Any, seen: list[Any]) -> bool:
+        """Whether a just-completed block may run while the response still streams.
+
+        Only action and perception tools (and ``note_to_self``, which only
+        replaces the note), only while nothing in this response has failed,
+        and only when every earlier call in the response has already run --
+        so an ``ask_user`` holds back everything the model wrote after it, and
+        model order is kept exactly as :meth:`_run_tools` would keep it.
+        ``done`` never counts as earlier: it is evaluated last anyway.
+        """
+        if str(getattr(block, "name", "")) in _DEFERRED_TOOLS:
+            return False
+        if turn.stop_after or turn.failed or self._cancelled.is_set():
+            return False
+        for earlier in seen:
+            if earlier is block:
+                break
+            if str(getattr(earlier, "name", "")) == "done":
                 continue
+            if str(getattr(earlier, "id", "")) not in turn.handled:
+                return False
+        return True
 
-            if outcome.kind == "note":
-                self.context.set_note(outcome.control_input["text"])
+    def _skip_truncated(self, response: Any, turn: _Turn) -> None:
+        """Refuse the call the output limit cut off, so its partial input never runs.
 
-            if outcome.kind == "done":
-                finished.append(outcome.control_input["message"])
+        At ``max_tokens`` the last content block, if it is a ``tool_use``, was
+        still being written; the SDK parses whatever arrived, which can be a
+        plausible-looking half of the input. Everything before it ran (or runs)
+        as usual; ``done`` is then dropped like after any failure.
+        """
+        content = list(getattr(response, "content", []) or [])
+        if not content or getattr(content[-1], "type", None) != "tool_use":
+            return
+        block = content[-1]
+        tool_id = str(getattr(block, "id", ""))
+        if tool_id in turn.handled:
+            return
+        name = str(getattr(block, "name", ""))
+        turn.names[tool_id] = name
+        turn.record(
+            tool_id,
+            self._skip(
+                tool_id,
+                name,
+                "Not run: your response reached the output limit while this call was "
+                "being written, so its input may be cut off.",
+            ),
+        )
 
-            # Repetition facts for every real tool call the model made, looks
-            # included (eleven identical look_at_window calls went unremarked
-            # while only actions were counted). The per-turn automatic overview
-            # never comes through here, so only explicit calls are counted.
-            repeat_note = None
-            if name not in CONTROL_TOOLS:
-                repeats = self._record_call(name, tool_input, outcome.summary)
-                repeat_note = _repeat_text(
-                    name, repeats, perception=name in PERCEPTION_TOOLS, summary=outcome.summary
-                )
-                outcome.payload = (
-                    {**outcome.payload, "self_facts": repeats}
-                    if isinstance(outcome.payload, dict)
-                    else {"result": outcome.payload, "self_facts": repeats}
-                )
+    def _note_orphaned_tools(self, turn: _Turn) -> None:
+        """Tell the model which tools ran before its response broke off.
 
-            self._log_outcome(outcome, tool_use_id=tool_id)
-            yield ToolResult(outcome.name, outcome.ok, outcome.summary)
-
-            content = list(outcome.content) or [
-                {"type": "text", "text": outcome.summary or "Done."}
-            ]
-            if repeat_note:
-                content.append({"type": "text", "text": repeat_note})
-            results[tool_id] = self._result_block(tool_id, content, is_error=not outcome.ok)
-
-            if not outcome.ok or outcome.kind == "done":
-                stop_after = True
-
-        return [results[tool_id] for tool_id in order], names
+        When a stream fails after some tools already ran, there is no final
+        message to store, so the transcript would otherwise not show that
+        anything happened on the machine.
+        """
+        ran = [
+            f"{turn.names.get(tool_id, '?')}: "
+            + " ".join(
+                str(part.get("text") or "")
+                for part in block.get("content") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()[:300]
+            for tool_id, block in turn.results.items()
+        ]
+        self.logger.log("context_edit", reason="orphaned_tool_results", tools=ran)
+        self.context.add_note(
+            "Your last response broke off with an error after these tools had already "
+            "run:\n" + "\n".join(f"- {line}" for line in ran)
+        )
 
     def _dispatch(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
         """Run one tool, refusing anything outside this agent's subset.
@@ -933,8 +1121,31 @@ class Agent:
             "output_config": {"effort": self.settings.effort},
         }
 
-    def _request(self) -> Any:
-        """Send one request and return the response, logging both sides in full."""
+    def _request(self, turn: _Turn) -> Iterator[AgentEvent]:
+        """Send one request, running tools as their blocks complete; return the response.
+
+        A generator: it yields :class:`Thinking` as each thinking block
+        completes and the ``tool_call``/``tool_result`` events of every tool it
+        runs early, and returns the complete final message (``yield from``).
+
+        With ``settings.stream`` (the default) the request goes through
+        ``messages.stream``. A ``tool_use`` block whose input is complete is run
+        as soon as the stream shows it was not cut off -- the next block
+        starting, or the stop reason arriving and not being ``max_tokens`` or
+        ``refusal`` -- if :meth:`_can_run_early` allows it; one token of delay
+        buys never running a truncated input. While a tool runs the stream is
+        simply not read; the rest of the response waits in the connection.
+        The stored response is the SDK's ``get_final_message()``, the same
+        accumulated message a non-streamed call returns, thinking blocks and
+        signatures untouched. Without ``stream``, ``messages.create`` is used
+        and every tool runs after the response, as before.
+
+        Logs the request and the response in full. ``llm_response`` also has
+        ``first_tool_ms`` (request start to the first tool dispatched while
+        streaming; ``None`` when none was), ``tools_in_stream`` and
+        ``in_stream_tool_ms``; its ``latency_ms`` is the whole request,
+        in-stream tool time included.
+        """
         params = self._request_params()
         self._model_calls += 1
         self.logger.log(
@@ -955,33 +1166,254 @@ class Agent:
             stream=self.settings.stream,
         )
         started = time.perf_counter()
+        in_stream_s = 0.0
         try:
             if self.settings.stream:
                 with self.client.messages.stream(**params) as stream:
+                    seen: list[Any] = []
+                    pending: Any = None
+                    for event in stream:
+                        kind = getattr(event, "type", None)
+                        if pending is not None and kind in (
+                            "content_block_start",
+                            "message_delta",
+                            "message_stop",
+                        ):
+                            block, pending = pending, None
+                            if _block_confirmed(event) and self._can_run_early(turn, block, seen):
+                                ran = time.perf_counter()
+                                yield from self._run_one(turn, block, early=True)
+                                in_stream_s += time.perf_counter() - ran
+                        if kind == "content_block_stop":
+                            block = getattr(event, "content_block", None)
+                            block_type = getattr(block, "type", None)
+                            if block_type == "thinking":
+                                yield from self._emit_thinking(block)
+                            elif block_type == "tool_use":
+                                seen.append(block)
+                                pending = block
                     response = stream.get_final_message()
             else:
                 response = self.client.messages.create(**params)
+                for block in getattr(response, "content", []) or []:
+                    if getattr(block, "type", None) == "thinking":
+                        yield from self._emit_thinking(block)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
-            self._model_s += latency_ms / 1000
+            self._model_s += max(latency_ms / 1000 - in_stream_s, 0.0)
             self.logger.error(
                 f"request failed after {latency_ms:.0f}ms: {type(exc).__name__}: {exc}", exc=exc
             )
+            if turn.results:
+                self._note_orphaned_tools(turn)
             raise
         latency_ms = (time.perf_counter() - started) * 1000
-        self._model_s += latency_ms / 1000
+        self._model_s += max(latency_ms / 1000 - in_stream_s, 0.0)
         self._account_response(params["model"], getattr(response, "usage", None))
         # The request went through, so its cache entry exists: the next prune
         # measures "before the breakpoint" against this one.
         self.context.commit_breakpoint()
-        self.logger.llm_response(
-            content=getattr(response, "content", []),
-            stop_reason=getattr(response, "stop_reason", None),
-            usage=getattr(response, "usage", None),
+        self._log_llm_response(
+            response,
             latency_ms=latency_ms,
-            stop_details=getattr(response, "stop_details", None),
+            first_tool_ms=(
+                None
+                if turn.first_early_at is None
+                else round((turn.first_early_at - started) * 1000, 1)
+            ),
+            tools_in_stream=turn.early,
+            in_stream_tool_ms=round(in_stream_s * 1000, 1),
         )
         return response
+
+    def _emit_thinking(self, block: Any) -> Iterator[AgentEvent]:
+        """Log and yield one thinking block, if it has any text."""
+        text = getattr(block, "thinking", "") or ""
+        if text.strip():
+            self.logger.thinking(text)
+            yield Thinking(text)
+
+    def _log_llm_response(self, response: Any, *, latency_ms: float, **extra: Any) -> None:
+        """Write the ``llm_response`` record, with this loop's extra timing fields.
+
+        The same record :meth:`SessionLogger.llm_response` writes (full content,
+        stop reason and details, usage, latency; usage folded into the running
+        total; one console line), plus ``extra`` -- which that method has no
+        parameter for.
+        """
+        log = self.logger
+        usage = getattr(response, "usage", None)
+        stop_reason = getattr(response, "stop_reason", None)
+        log.usage.add(usage, latency_ms=latency_ms)
+        dereference = getattr(log, "_dereference_images", None)
+        content = _as_plain(getattr(response, "content", []))
+        log.log(
+            "llm_response",
+            content=dereference(content) if callable(dereference) else content,
+            stop_reason=stop_reason,
+            stop_details=_as_plain(getattr(response, "stop_details", None)),
+            usage=_as_plain(usage),
+            latency_ms=round(latency_ms, 1),
+            **extra,
+        )
+        plain = _as_plain(usage)
+        if not isinstance(plain, dict):
+            plain = {}
+        printer = getattr(log, "_print", None)
+        if callable(printer):
+            first = extra.get("first_tool_ms")
+            printer(
+                f"[dim]<- {stop_reason} {latency_ms / 1000:.1f}s "
+                f"in={plain.get('input_tokens', 0)} "
+                f"cached={plain.get('cache_read_input_tokens', 0)} "
+                f"out={plain.get('output_tokens', 0)}"
+                + (f" first_tool={first / 1000:.1f}s" if first is not None else "")
+                + "[/dim]"
+            )
+
+    # -- the view after actions ----------------------------------------------
+
+    def _auto_view(self, turn: _Turn) -> tuple[int, str] | None:
+        """Read the window this turn's actions acted on, for the next turn.
+
+        Attached only when at least one state-changing action succeeded and
+        nothing in the turn failed or was skipped (a failure's own text is what
+        the model needs then), and not when an explicit ``look_at_window`` of
+        that same window already ran after the last action. The window is the
+        last action's ``expect_hwnd``, else the window it reported (the one it
+        focused, launched or opened, or the foreground after the input), else
+        the foreground window. It is read once it has settled
+        (:meth:`Dispatcher.window_view`), or read once when ``launch_app`` /
+        ``open_url`` already reported its content ready.
+
+        Returns:
+            ``(hwnd, text)`` for :meth:`ContextManager.add_tool_results`, or
+            ``None``. Every attempt is logged: a ``perception`` record of kind
+            ``auto_view`` when attached, ``auto_view_skipped`` otherwise.
+        """
+        if not turn.actions:
+            return None
+        if turn.failed or self._cancelled.is_set():
+            self.logger.log(
+                "auto_view_skipped",
+                reason="cancelled" if self._cancelled.is_set() else "a tool in this turn failed",
+            )
+            return None
+        name, tool_input, outcome = turn.actions[-1]
+        details = outcome.payload.get("details") if isinstance(outcome.payload, dict) else None
+        details = details if isinstance(details, dict) else {}
+        hwnd, source = _view_target(name, tool_input, details)
+        started = time.perf_counter()
+        try:
+            if hwnd is None:
+                hwnd, source = self.dispatcher.foreground_hwnd(), "the foreground window"
+            if hwnd is None:
+                self.logger.log("auto_view_skipped", reason="no window to read", after=name)
+                return None
+            if hwnd in turn.looked:
+                self.logger.log(
+                    "auto_view_skipped",
+                    reason="look_at_window of this window already ran after the action",
+                    hwnd=hwnd,
+                )
+                return None
+            content_ready = name in ("launch_app", "open_url") and details.get("content_ready") is True
+            try:
+                view = self.dispatcher.window_view(hwnd, settle=not content_ready)
+            except Exception as exc:
+                # The window acted on may have closed (Escape on a dialog, say):
+                # show what is in front instead, and say so.
+                foreground = self.dispatcher.foreground_hwnd()
+                if foreground is None or foreground == hwnd:
+                    raise
+                source = (
+                    f"the foreground window; hwnd {hwnd}, the window acted on, could not be "
+                    f"read ({type(exc).__name__}: {exc})"
+                )
+                hwnd = foreground
+                view = self.dispatcher.window_view(hwnd)
+        except Exception as exc:
+            self.logger.error(f"auto view failed: {type(exc).__name__}: {exc}", exc=exc)
+            return None
+        finally:
+            self._auto_view_s += time.perf_counter() - started
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        reads = f"{view.reads} read{'' if view.reads == 1 else 's'}"
+        text = (
+            f"Window after your actions: {source}, read automatically after {name} "
+            f"({reads} in {view.elapsed_ms:.0f} ms; {view.reason}).\n{view.text}"
+        )
+        self.logger.perception(
+            "auto_view",
+            size_chars=len(text),
+            elapsed_ms=elapsed_ms,
+            payload={
+                **view.payload,
+                "auto_view": {
+                    "hwnd": hwnd,
+                    "source": source,
+                    "after_tool": name,
+                    "reads": view.reads,
+                    "settled": view.settled,
+                    "reason": view.reason,
+                    "content_ready_reported": name in ("launch_app", "open_url")
+                    and details.get("content_ready") is True,
+                    "summary": view.summary,
+                },
+            },
+        )
+        return hwnd, text
+
+
+def _as_hwnd(value: Any) -> int | None:
+    """A window handle from a tool input or result field, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        hwnd = int(value)
+    except (TypeError, ValueError):
+        return None
+    return hwnd or None
+
+
+def _view_target(
+    name: str, tool_input: dict[str, Any], details: dict[str, Any]
+) -> tuple[int | None, str]:
+    """``(hwnd, how it was chosen)`` for the view after an action.
+
+    The guard the model put on the action, else the window the action says it
+    acted on, else ``None`` (the caller then reads the foreground window).
+    """
+    hwnd = _as_hwnd(tool_input.get("expect_hwnd"))
+    if hwnd is not None:
+        return hwnd, "the window the action was aimed at (expect_hwnd)"
+    if name == "focus_window":
+        hwnd = _as_hwnd(tool_input.get("hwnd"))
+        if hwnd is not None:
+            return hwnd, "the window you focused"
+    hwnd = _as_hwnd(details.get("hwnd"))
+    if hwnd is not None:
+        return hwnd, "the window the action reported"
+    hwnd = _as_hwnd(details.get("foreground_hwnd"))
+    if hwnd is not None:
+        return hwnd, "the window in front after the action"
+    return None, "the foreground window"
+
+
+def _block_confirmed(event: Any) -> bool:
+    """Whether the stream event after a finished ``tool_use`` block shows it complete.
+
+    A new block starting means generation went on past it. A stop reason of
+    ``max_tokens`` or ``refusal`` means it may have been cut off or disowned.
+    """
+    kind = getattr(event, "type", None)
+    if kind == "content_block_start":
+        return True
+    if kind == "message_delta":
+        reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+    else:  # message_stop carries the accumulated message
+        reason = getattr(getattr(event, "message", None), "stop_reason", None)
+    return reason not in _UNSAFE_STOPS
 
 
 def _turn_facts_text(facts: dict[str, Any]) -> str | None:
