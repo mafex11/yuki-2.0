@@ -150,13 +150,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Start an installed application by name and wait for its window. If the "
             "name matches several apps it returns the candidates instead of guessing, "
-            "so you can pick one or ask the user. With args the application is "
-            "started with those command-line arguments, such as a URL, a file or a "
-            "folder for it to open; passing a URL as an argument to a browser opens "
-            "it there without using the address bar. An application that is already "
-            "running usually opens the arguments in the window it has, and the result "
-            "names the window that appeared or changed. If the application cannot be "
-            "given arguments, nothing is started and the result says why."
+            "so you can pick one or ask the user. The window that appeared or changed "
+            "is brought to the front and waited on until it accepts input, so there "
+            "is no need to focus it afterwards; the result says whether that worked. "
+            "With args the application is started with those command-line arguments, "
+            "such as a URL, a file or a folder for it to open; passing a URL as an "
+            "argument to a browser opens it there without using the address bar. "
+            "With args it also returns only once the content is ready - the result "
+            "says 'content ready' with the page or document now shown, or 'content "
+            "still not ready' after a few seconds' wait. An application that is "
+            "already running usually opens the arguments in the window it has, and "
+            "the result names the window that appeared or changed. If the application "
+            "cannot be given arguments, nothing is started and the result says why."
         ),
         "input_schema": _obj(
             {
@@ -290,7 +295,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "handler for that kind of target. With app it is handed to that installed "
             "application as an argument instead, the same as launch_app with args; "
             "for a browser that loads the page there directly, without using the "
-            "address bar."
+            "address bar. Either way the window showing it is brought to the front "
+            "and, when it shows a page or document, the call returns once that "
+            "content is ready: the result says "
+            "'content ready' with the page or document now shown, or 'content still "
+            "not ready' after a few seconds' wait."
         ),
         "input_schema": _obj(
             {

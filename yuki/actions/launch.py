@@ -24,6 +24,17 @@ menu entry it is - facts about the entry, never about which app it is:
 An app that is already running usually hands the arguments to its existing
 window instead of opening a new one; the watcher therefore also accepts a
 title change of a window of the process that was started.
+
+**After the window shows up** it is brought to the foreground exactly as
+:func:`focus_window` does and waited on until it accepts input: launching an app
+is asking to use it, and on 2026-09-23 a launch that returned "not in the
+foreground" cost the model a whole round just to focus it.  When the app was
+handed something to open (``args``, or :func:`open_url`), the call then waits -
+bounded, a condition poll - until the window has exposed that content
+(:func:`yuki.perception.tree.wait_for_content`), and says which: "content ready
+after N ms (Document ...)" or "content still not ready after N ms (...)".  The
+window is also noted as fresh, so the next tree read of it waits out a
+half-built page instead of returning the frame around it.
 """
 
 from __future__ import annotations
@@ -35,6 +46,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import asdict
 
 import psutil
 import win32con
@@ -56,6 +68,11 @@ _POLL_S = 0.02
 _ACTIVATION_S = 0.25
 
 _MAX_CANDIDATES = 25
+
+#: Default bound on the wait for opened content - the value of
+#: :data:`yuki.perception.tree.CONTENT_WAIT_S`, repeated here so that importing
+#: this module does not build the UIA wrapper (see :func:`_note_fresh`).
+CONTENT_WAIT_S = 6.0
 
 #: ``ACTIVATEOPTIONS.AO_NOERRORUI``: a failed activation reports an HRESULT to us
 #: instead of putting an error dialog in front of the user.
@@ -503,7 +520,11 @@ def _process_name(pid: int | None) -> str:
 
 
 def launch_app(
-    query: str, *, args: list[str] | None = None, timeout_s: float = 8.0
+    query: str,
+    *,
+    args: list[str] | None = None,
+    timeout_s: float = 8.0,
+    content_timeout_s: float = CONTENT_WAIT_S,
 ) -> ActionResult:
     """Launch a Start menu app by display name and wait for its window.
 
@@ -515,14 +536,29 @@ def launch_app(
             receives them - see the module docstring for how.  An app that
             cannot be given arguments is reported as ``ok=False`` with the
             reason, not launched without them.
-        timeout_s: how long to wait for a window to appear after the launch.
+        timeout_s: how long to wait for a window to appear after the launch;
+            bringing it to the front then uses what is left of it (at least
+            :data:`_FOCUS_FLOOR_S`).
+        content_timeout_s: with ``args``, how much longer to wait for the window
+            to expose what it was handed (see
+            :func:`yuki.perception.tree.wait_for_content`).
+
+    The window that appeared (or changed) is brought to the foreground exactly as
+    :func:`focus_window` does and waited on until it accepts input, so the caller
+    can type into it straight away.  With ``args`` the call then waits, up to
+    ``content_timeout_s``, until the window's content is on screen and readable -
+    its visible area covered by accessible elements, or a newly titled Document -
+    and the summary says either "content ready after N ms (Document ...)" or
+    "content still not ready after N ms (...)".
 
     Returns:
         ActionResult with ``details = {"launched", "hwnd", "candidates",
-        "new_windows", "name", "appid", "ready", "ready_ms"}``.  ``ready_ms`` is
-        how long the new window took to start accepting keyboard input, and
-        ``ready`` whether it got there at all (a window that opened in the
-        background never will until it is focused).  When the query matches 0 or >1 apps
+        "new_windows", "name", "appid", "foreground", "ready", "ready_ms",
+        "focus", "focus_ms"}``.  ``foreground`` says whether the window was
+        brought to the front, ``ready`` whether it then accepted keyboard input
+        and ``ready_ms`` how long that took.  With ``args`` also
+        ``content_ready``, ``content_ms`` and ``content`` (the whole
+        :class:`yuki.perception.tree.ContentCheck`).  When the query matches 0 or >1 apps
         and none matches exactly, ``ok`` is False and ``candidates`` lists the
         options - the model chooses, this function never guesses.  Likewise
         ``new_windows`` lists every window that appeared, so a launch that
@@ -631,11 +667,12 @@ def launch_app(
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
 
+    window_deadline = time.monotonic() + timeout_s
     hwnd, reason, appeared = _wait_for_new_window(
         before,
         before_pids,
         before_foreground,
-        time.monotonic() + timeout_s,
+        window_deadline,
         before_titles=before_titles,
         target_processes=target_processes,
     )
@@ -662,12 +699,18 @@ def launch_app(
     info = window_info(hwnd)
     details["title"] = info.title if info else ""
     details["process_name"] = info.process_name if info else ""
-    # A window that exists is not yet a window that listens.  Wait for the app's
-    # own GUI thread to report a focused control, so the caller's first keystroke
-    # is not swallowed by a half-built window - and report the wait either way.
-    ready, ready_ms = wait_for_input_ready(hwnd)
-    details["ready"] = ready
-    details["ready_ms"] = round(ready_ms, 1)
+    _note_fresh(hwnd)
+    # Launching something is asking to use it: bring the window to the front and
+    # wait for it to listen, within what is left of the budget, so the next step
+    # does not have to spend a round on focusing it.
+    forward = _bring_forward(hwnd, window_deadline, details)
+    content_note = ""
+    if arg_list:
+        # It was handed something to open: wait (bounded) until that is on
+        # screen and readable, so the next look sees it rather than the frame.
+        content_note = _wait_for_opened_content(hwnd, content_timeout_s, details)
+        if (fresh := window_info(hwnd)) is not None:
+            details["title"] = fresh.title
     extra = len(details["new_windows"]) - 1
     with_args = ""
     if arg_list:
@@ -676,13 +719,88 @@ def launch_app(
     return finish(
         True,
         f"launched {chosen['name']!r}{with_args}: hwnd {hwnd} "
-        f"({details['process_name']}) \"{details['title']}\" - {reason}"
-        + (f"; ready for input after {ready_ms:.0f} ms" if ready else
-           f"; it is not in the foreground / not accepting input yet after "
-           f"{ready_ms:.0f} ms, so focus it before typing")
+        f"({details['process_name']}) \"{details['title']}\" - {reason}; {forward}"
+        + (f"; {content_note}" if content_note else "")
         + (f"; {extra} other new window(s) appeared, see new_windows" if extra > 0 else ""),
         details,
     )
+
+
+#: Least time :func:`_bring_forward` gets, however little of the launch budget
+#: the window's appearance left: :func:`focus_window`'s own default.
+_FOCUS_FLOOR_S = 2.0
+
+
+def _bring_forward(hwnd: int, deadline: float, details: dict) -> str:
+    """Activate ``hwnd`` as :func:`focus_window` does and say how that went.
+
+    Budget: what is left until ``deadline``, but at least :data:`_FOCUS_FLOOR_S`.
+    Fills ``details`` with ``foreground``, ``ready``, ``ready_ms`` and ``focus``
+    (the focus attempt's own details).
+
+    Returns:
+        A clause for the summary.
+    """
+    budget = max(deadline - time.monotonic(), _FOCUS_FLOOR_S)
+    focus = focus_window(hwnd, timeout_s=budget)
+    details["foreground"] = focus.ok
+    details["focus"] = focus.details
+    details["focus_ms"] = round(focus.elapsed_ms, 1)
+    details["ready"] = bool(focus.details.get("ready"))
+    details["ready_ms"] = focus.details.get("ready_ms")
+    if focus.ok and details["ready"]:
+        return f"in the foreground and ready for input after {focus.elapsed_ms:.0f} ms"
+    if focus.ok:
+        return (
+            f"in the foreground, but no control in it had keyboard focus after "
+            f"{focus.elapsed_ms:.0f} ms, so typing into it may lose characters"
+        )
+    other = focus.details.get("foreground_hwnd")
+    who = ""
+    if other and (front := window_info(other)) is not None:
+        who = f" ({front.process_name} \"{front.title}\" is)"
+    return (
+        f"could not bring it to the foreground within {budget:g}s{who}, so focus "
+        f"it before typing"
+    )
+
+
+def _note_fresh(hwnd: int) -> None:
+    """Tell the tree reader this window has just been opened or handed a target.
+
+    Imported here, as :mod:`yuki.actions.input` does, so that launching never
+    depends on the UIA wrapper having been built.
+    """
+    try:
+        from yuki.perception.tree import note_window_fresh
+    except Exception:
+        return
+    note_window_fresh(hwnd)
+
+
+def _wait_for_opened_content(
+    hwnd: int, timeout_s: float, details: dict, *, require_document: bool = False
+) -> str:
+    """Wait (bounded) for ``hwnd`` to expose what it was just asked to open.
+
+    See :func:`yuki.perception.tree.wait_for_content`.  Fills ``details`` with
+    ``content_ready``, ``content_ms`` and ``content`` (the whole check).
+
+    Returns:
+        A clause for the summary ("content ready after N ms (...)" or
+        "content still not ready after N ms (...)").
+    """
+    try:
+        from yuki.perception.tree import wait_for_content
+    except Exception as exc:  # noqa: BLE001 - UIA unavailable: say so, do not fail
+        details["content_ready"] = None
+        details["content_error"] = f"{type(exc).__name__}: {exc}"
+        return f"content not checked (accessibility unavailable: {exc})"
+    check = wait_for_content(hwnd, timeout_s=timeout_s, require_document=require_document)
+    details["content_ready"] = check.ready
+    details["content_ms"] = round(check.waited_ms, 1)
+    details["content"] = asdict(check)
+    return check.describe()
 
 
 def _try_activate(hwnd: int) -> bool:
@@ -828,7 +946,65 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
     )
 
 
-def open_url(url: str, *, app: str | None = None) -> ActionResult:
+#: ``ASSOCSTR_EXECUTABLE``, ``ASSOCF_NOTRUNCATE`` and ``ASSOCF_IS_PROTOCOL`` for
+#: ``AssocQueryStringW``.
+_ASSOCSTR_EXECUTABLE = 2
+_ASSOCF_NOTRUNCATE = 0x20
+_ASSOCF_IS_PROTOCOL = 0x1000
+
+#: How long :func:`open_url` watches for the default handler's window to appear,
+#: come to the front or change its title.  A bound on a condition: the watch
+#: ends as soon as one of those happens, which is the common case.
+_HANDLER_WINDOW_S = 3.0
+
+
+def _default_handler(target: str) -> str:
+    """Lowercased image name of the program Windows opens ``target`` with, or ``""``.
+
+    Read from the shell's own association (``AssocQueryStringW``): the URL's
+    scheme, ``Folder`` for a directory, else the file's extension.  A registry
+    fact, not a guess about which program it is.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        scheme = urlsplit(target).scheme
+    except ValueError:
+        scheme = ""
+    flags = _ASSOCF_NOTRUNCATE
+    if len(scheme) > 1:  # "c:" is a drive letter, not a scheme
+        assoc, flags = scheme, flags | _ASSOCF_IS_PROTOCOL
+    elif os.path.isdir(target):
+        assoc = "Folder"
+    else:
+        assoc = os.path.splitext(target)[1]
+    if not assoc:
+        return ""
+    try:
+        from ctypes import wintypes
+
+        query = ctypes.windll.shlwapi.AssocQueryStringW
+        query.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        query.restype = ctypes.c_long
+        size = wintypes.DWORD(1024)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if query(flags, _ASSOCSTR_EXECUTABLE, assoc, "open", buffer, ctypes.byref(size)) != 0:
+            return ""
+    except Exception:
+        return ""
+    return os.path.basename(buffer.value).lower()
+
+
+def open_url(
+    url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S
+) -> ActionResult:
     """Open a URL (or any shell target: a file, a folder).
 
     Args:
@@ -836,7 +1012,16 @@ def open_url(url: str, *, app: str | None = None) -> ActionResult:
         app: ``None`` opens it with the user's default handler.  Otherwise the
             Start menu app to open it with, which is exactly
             ``launch_app(app, args=[url])`` - the target is handed to the app as
-            an argument, so nothing is typed anywhere.
+            an argument, so nothing is typed anywhere - including bringing the
+            window to the front and waiting for the content.
+        content_timeout_s: bound on the wait for the content to be on screen.
+
+    With the default handler, the handler's window is watched for (a new window,
+    the foreground changing, or a window of the handler's program changing its
+    title, up to :data:`_HANDLER_WINDOW_S`; failing those, the foreground window
+    if it belongs to the handler).  That window is brought to the front as
+    :func:`focus_window` does, and if it shows a document (or a content area that
+    is still empty) the call waits for the content as ``launch_app`` does.
     """
     started = time.perf_counter()
 
@@ -852,20 +1037,73 @@ def open_url(url: str, *, app: str | None = None) -> ActionResult:
         return finish(False, "no url given", {"url": url})
     target = url.strip()
     if app is not None and app.strip():
-        launched = launch_app(app, args=[target])
+        launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s)
         launched.details["url"] = target
         return launched
+
+    handler = _default_handler(target)
+    details: dict = {"url": target, "handler": handler}
+    before, before_pids, before_titles = _window_snapshot()
+    before_foreground = _user32.GetForegroundWindow()
     try:
         os.startfile(target)  # noqa: S606 - opening a user-provided target is the point
-        return finish(True, f"opened {target} with the default handler", {"url": target, "via": "startfile"})
+        details["via"] = "startfile"
+        opened = f"opened {target} with the default handler"
     except Exception as exc:
         result = run_powershell(f"Start-Process {_quote(target)}", timeout_s=10.0)
-        details = {
-            "url": target,
-            "via": "Start-Process",
-            "startfile_error": str(exc),
-            "stderr": result.details.get("stderr", ""),
+        details.update(
+            via="Start-Process", startfile_error=str(exc), stderr=result.details.get("stderr", "")
+        )
+        if not result.ok:
+            return finish(False, f"could not open {target}: {result.summary}", details)
+        opened = f"opened {target} via Start-Process"
+    if handler:
+        opened += f" ({handler})"
+
+    window_deadline = time.monotonic() + _HANDLER_WINDOW_S
+    hwnd, reason, appeared = _wait_for_new_window(
+        before,
+        before_pids,
+        before_foreground,
+        window_deadline,
+        before_titles=before_titles,
+        target_processes=frozenset({handler}) if handler else frozenset(),
+    )
+    if hwnd is None and handler:
+        front = _user32.GetForegroundWindow()
+        info = window_info(front) if front else None
+        if info is not None and (info.process_name or "").lower() == handler:
+            hwnd, reason = front, f"the foreground window is {info.process_name}'s"
+    details["hwnd"] = hwnd
+    details["window_reason"] = reason
+    details["new_windows"] = [
+        {
+            "hwnd": other,
+            "title": (info.title if (info := window_info(other)) else ""),
+            "process_name": info.process_name if info else "",
         }
-        if result.ok:
-            return finish(True, f"opened {target} via Start-Process", details)
-        return finish(False, f"could not open {target}: {result.summary}", details)
+        for other in appeared
+    ]
+    if hwnd is None:
+        return finish(
+            True,
+            f"{opened}; no window of it appeared, came to the front or changed within "
+            f"{_HANDLER_WINDOW_S:g}s",
+            details,
+        )
+    info = window_info(hwnd)
+    details["title"] = info.title if info else ""
+    details["process_name"] = info.process_name if info else ""
+    _note_fresh(hwnd)
+    forward = _bring_forward(hwnd, window_deadline, details)
+    content_note = _wait_for_opened_content(
+        hwnd, content_timeout_s, details, require_document=True
+    )
+    if (fresh := window_info(hwnd)) is not None:
+        details["title"] = fresh.title
+    return finish(
+        True,
+        f"{opened}: hwnd {hwnd} ({details['process_name']}) \"{details['title']}\" - "
+        f"{reason}; {forward}; {content_note}",
+        details,
+    )
