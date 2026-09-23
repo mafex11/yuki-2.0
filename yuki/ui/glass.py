@@ -9,9 +9,20 @@ translucent top-level window are unreliable and force the whole widget tree
 through an offscreen pixmap. So the window keeps a transparent margin
 (:data:`GlassWindow.SHADOW`) around a "panel" rectangle, and ``paintEvent`` draws
 the falloff into that margin itself.
+
+Focus is the other half of the difference between the two surfaces. The overlay
+must own the keyboard the instant it appears; the strip must never take it. A
+``Qt.Tool`` window is shown with ``SW_SHOWNOACTIVATE`` and Qt's
+``activateWindow()`` is a bare ``SetForegroundWindow``, which the foreground lock
+refuses to a background tray app -- so an activating window goes through
+:func:`yuki.ui.focus.force_foreground` (see :meth:`GlassWindow.take_focus`), and a
+non-activating one is pinned ``WS_EX_NOACTIVATE`` so not even a click on it
+activates it.
 """
 
 from __future__ import annotations
+
+from dataclasses import asdict
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -25,6 +36,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
+
+from yuki.ui.focus import FocusResult, force_foreground, set_no_activate
 
 #: Duration of the show/hide transition, in milliseconds.
 ANIM_MS = 150
@@ -72,12 +85,15 @@ class GlassWindow(QWidget):
     Signals:
         faded_out: Emitted once the hide animation has finished and the window is
             actually hidden.
+        focus_path: After every :meth:`take_focus`, a dict describing how (and
+            whether) the window got the foreground -- the ``focus_path`` UI event.
     """
 
     #: Transparent padding reserved for the painted shadow, in logical pixels.
     SHADOW = 16
 
     faded_out = Signal()
+    focus_path = Signal(dict)
 
     def __init__(self, *, activates: bool = True, radius: int = 16) -> None:
         flags = (
@@ -86,6 +102,8 @@ class GlassWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.NoDropShadowWindowHint
         )
+        if not activates:
+            flags |= Qt.WindowType.WindowDoesNotAcceptFocus
         super().__init__(None, flags)
         self.radius = radius
         self._activates = activates
@@ -171,10 +189,16 @@ class GlassWindow(QWidget):
         if not self.isVisible():
             self.setWindowOpacity(0.0)
             self.move(target + QPoint(0, SLIDE_PX))
+            # winId() creates the native window if needed; pin the activation
+            # style before it is ever shown.
+            set_no_activate(int(self.winId()), not self._activates)
             self.show()
-            if self._activates:
-                self.raise_()
-                self.activateWindow()
+        if self._activates:
+            # Now, at show time -- not when the fade ends -- because the user starts
+            # typing the moment the hotkey is released. Also when already visible:
+            # a re-open during the fade-out, or a question arriving while the user
+            # is in another window, must take the keyboard back too.
+            self.take_focus(reason="show")
         self._opacity.setStartValue(start_opacity)
         self._opacity.setEndValue(1.0)
         self._opacity.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -196,6 +220,36 @@ class GlassWindow(QWidget):
         self._move.setEndValue(self.pos() + QPoint(0, SLIDE_PX))
         self._move.setEasingCurve(QEasingCurve.Type.InCubic)
         self._anim.start()
+
+    def focus_target(self) -> QWidget | None:
+        """The child that should hold the keyboard once the window is active."""
+        return None
+
+    def take_focus(self, *, reason: str, allow_unlock: bool = True) -> FocusResult:
+        """Make this window the foreground window and focus :meth:`focus_target`.
+
+        The native sequence first (:func:`~yuki.ui.focus.force_foreground`:
+        attach input to the foreground thread, bring to top, set foreground,
+        activate, focus, detach; one injected key-up if that was refused), then
+        the Qt side so Qt's own idea of the active window and focus widget agrees:
+        ``raise_()``, ``activateWindow()``, ``setFocus(ActiveWindowFocusReason)``.
+        The result goes out on :attr:`focus_path`.
+
+        Args:
+            reason: Why focus was taken, for the log (``show``, ``grace_end``...).
+            allow_unlock: Permit the injected key-up fallback.
+
+        Returns:
+            What the native sequence achieved.
+        """
+        result = force_foreground(int(self.winId()), allow_unlock=allow_unlock)
+        self.raise_()
+        self.activateWindow()
+        target = self.focus_target()
+        if target is not None:
+            target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self.focus_path.emit({"window": self.objectName(), "reason": reason, **asdict(result)})
+        return result
 
     @property
     def closing(self) -> bool:

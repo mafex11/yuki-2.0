@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QRectF,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPen
@@ -50,6 +51,12 @@ PAD = 14
 
 #: How many reply cards stay on screen.
 MAX_CARDS = 3
+
+#: After the overlay is shown, how long losing activation does not count as the
+#: user clicking away. Covers the transient activate/deactivate messages of the
+#: foreground hand-over (:func:`yuki.ui.focus.force_foreground`). A UI timer, not
+#: a wait: nothing blocks on it.
+FOCUS_GRACE_MS = 200
 
 CardTone = Literal["reply", "question", "error"]
 
@@ -292,6 +299,14 @@ class Overlay(GlassWindow):
         self.input.setMaximumHeight(self.input.preferred_height())
         self.resize(PANEL_WIDTH + 2 * self.SHADOW, self.layout().sizeHint().height())
 
+        #: True for :data:`FOCUS_GRACE_MS` after :meth:`open`: a deactivation then
+        #: is the focus hand-over settling, not the user leaving.
+        self._focus_grace = False
+        self._grace_timer = QTimer(self)
+        self._grace_timer.setSingleShot(True)
+        self._grace_timer.setInterval(FOCUS_GRACE_MS)
+        self._grace_timer.timeout.connect(self._end_focus_grace)
+
     # -- geometry ----------------------------------------------------------
 
     def anchor(self) -> QPoint:
@@ -320,12 +335,23 @@ class Overlay(GlassWindow):
 
     # -- show / hide -------------------------------------------------------
 
+    def focus_target(self) -> QWidget:  # noqa: D102 - GlassWindow hook
+        return self.input
+
     def open(self) -> None:
-        """Show the overlay (or just refocus it) with the input ready."""
+        """Show the overlay (or just refocus it) with the input ready to type in.
+
+        The grace period is armed before anything is shown, so the activation
+        messages of the hand-over cannot reach :meth:`changeEvent` as a "user
+        clicked away". :meth:`fade_in` then shows the window and takes the
+        foreground at once (:meth:`GlassWindow.take_focus`), focusing the input
+        before the first animation frame.
+        """
+        self._focus_grace = True
+        self._grace_timer.start()
         self.expand_input()
         self.fit()
         self.fade_in(self.anchor())
-        self.input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def dismiss(self) -> None:
         """Hide the overlay and tell the controller it is gone."""
@@ -347,8 +373,21 @@ class Overlay(GlassWindow):
             event.type() == QEvent.Type.ActivationChange
             and self.isVisible()
             and not self.isActiveWindow()
+            and not self._focus_grace
         ):
             self.dismiss()
+
+    def _end_focus_grace(self) -> None:
+        """Close the grace window; if the hand-over did not stick, try once more.
+
+        Losing activation from here on is a real focus-out again. If the overlay
+        is showing but not active right now, the activation lost a race (for
+        example to the window behind it); take it back once, without the
+        injected-key fallback, which :meth:`open` has already spent.
+        """
+        self._focus_grace = False
+        if self.isVisible() and not self.closing and not self.isActiveWindow():
+            self.take_focus(reason="grace_end", allow_unlock=False)
 
     # -- cards -------------------------------------------------------------
 
