@@ -28,6 +28,7 @@ import win32gui
 import win32process
 
 import yuki  # noqa: F401  (imported for the DPI-awareness side effect)
+from yuki.perception.system import locale_facts
 
 _user32 = ctypes.windll.user32
 _dwmapi = ctypes.windll.dwmapi
@@ -88,6 +89,18 @@ _user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUIThreadIn
 _user32.GetGUIThreadInfo.restype = wintypes.BOOL
 _user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
 _user32.GetAncestor.restype = wintypes.HWND
+_owner_api = ctypes.WinDLL("user32")  # private: its argtypes leak nowhere
+_owner_api.IsWindowEnabled.argtypes = [wintypes.HWND]
+_owner_api.IsWindowEnabled.restype = wintypes.BOOL
+_owner_api.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+_owner_api.GetWindow.restype = wintypes.HWND
+
+#: ``GetWindow(hwnd, GW_OWNER)``: the window that owns a popup or dialog.
+_GW_OWNER = 4
+
+#: ``WS_EX_NOACTIVATE``: a window the user can never switch to (popup hosts,
+#: tooltips) - never a dialog waiting for an answer.
+_WS_EX_NOACTIVATE = 0x08000000
 
 #: Window classes registered by Windows itself: the explorer.exe shell surfaces
 #: (desktop, taskbars, task view), the alt-tab / notification hosts, and the XAML
@@ -132,6 +145,12 @@ class WindowInfo:
     is_foreground: bool
     is_minimized: bool
     bounds: tuple[int, int, int, int]  # left, top, right, bottom (screen px)
+    #: ``IsWindowEnabled``. False while a modal dialog it owns holds it (clicks
+    #: and keys sent to it are then ignored), or when the app disabled it.
+    is_enabled: bool = True
+    #: ``GetWindow(GW_OWNER)``: the window that owns this one (a dialog's
+    #: parent window), or None for an unowned top-level window.
+    owner_hwnd: int | None = None
 
 
 @dataclass
@@ -184,6 +203,17 @@ class DesktopOverview:
     captured_at: float = 0.0
     monitors: list[MonitorInfo] = field(default_factory=list)
     virtual_bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
+    #: Owner of the foreground window (``GW_OWNER``), which may be a listed
+    #: window even when the foreground one itself is not listed.
+    foreground_owner_hwnd: int | None = None
+    #: Title of the foreground window, for when it is not one of ``windows``.
+    foreground_title: str = ""
+    #: Locale facts (see :func:`yuki.perception.system.locale_facts`): Windows
+    #: display language, regional-format culture, and the keyboard layout the
+    #: foreground window's thread is typing with.  "" when unknown.
+    ui_language: str = ""
+    user_locale: str = ""
+    keyboard_layout: str = ""
 
 
 def is_cloaked(hwnd: int) -> bool:
@@ -216,18 +246,18 @@ def is_user_window(hwnd: int) -> bool:
     geometry rules are skipped for them and they are still reported (flagged as
     minimised).
 
-    Nothing here looks at the process or reads the title: every rule is a window
-    style, a cloak state, a rectangle, or a system window class.
+    One exception to the title and tool-window rules: a window whose owner is
+    disabled is kept anyway, because that is the OS shape of a modal dialog
+    holding its owner (an untitled or tool-styled "Save changes?" box is still
+    the thing the user has to answer before the owner takes input again).
+
+    Nothing here looks at the process or reads the title's content: every rule
+    is a window style, a cloak state, an enabled state, a rectangle, or a system
+    window class.
     """
     if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
         return False
-    title = win32gui.GetWindowText(hwnd)
-    if title.strip() == "":
-        return False
     if win32gui.GetClassName(hwnd) in _SHELL_WINDOW_CLASSES:
-        return False
-    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-    if ex_style & win32con.WS_EX_TOOLWINDOW:
         return False
     if is_cloaked(hwnd):
         return False
@@ -239,7 +269,35 @@ def is_user_window(hwnd: int) -> bool:
         v_left, v_top, v_right, v_bottom = virtual_screen_bounds()
         if right <= v_left or left >= v_right or bottom <= v_top or top >= v_bottom:
             return False
-    return True
+    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    titled = win32gui.GetWindowText(hwnd).strip() != ""
+    if titled and not ex_style & win32con.WS_EX_TOOLWINDOW:
+        return True
+    return _holds_owner_disabled(hwnd, ex_style)
+
+
+def owner_of(hwnd: int) -> int:
+    """``GetWindow(hwnd, GW_OWNER)``: the window owning ``hwnd``, or 0."""
+    return int(_owner_api.GetWindow(wintypes.HWND(hwnd), _GW_OWNER) or 0)
+
+
+def is_enabled(hwnd: int) -> bool:
+    """``IsWindowEnabled``: False while the window refuses mouse and keyboard input."""
+    return bool(_owner_api.IsWindowEnabled(wintypes.HWND(hwnd)))
+
+
+def _holds_owner_disabled(hwnd: int, ex_style: int) -> bool:
+    """True when ``hwnd`` can be activated and its owner is disabled.
+
+    Windows' own dialog manager (``DialogBox``, ``MessageBox``, the common
+    dialogs) disables the owner for as long as a modal dialog is up, so this is
+    an OS fact, not a guess about what the window is.  A window that can never
+    be activated (``WS_EX_NOACTIVATE``) cannot be that dialog.
+    """
+    if ex_style & _WS_EX_NOACTIVATE:
+        return False
+    owner = owner_of(hwnd)
+    return bool(owner) and not is_enabled(owner)
 
 
 def focused_control_hwnd(hwnd: int) -> int:
@@ -304,6 +362,8 @@ def _window_info(hwnd: int, foreground: int) -> WindowInfo:
         is_foreground=hwnd == foreground,
         is_minimized=bool(win32gui.IsIconic(hwnd)),
         bounds=(left, top, right, bottom),
+        is_enabled=is_enabled(hwnd),
+        owner_hwnd=owner_of(hwnd) or None,
     )
 
 
@@ -472,9 +532,14 @@ def cursor_position() -> tuple[int, int]:
 def get_desktop_overview() -> DesktopOverview:
     """Snapshot every user window, every monitor, the foreground window, the cursor."""
     windows = list_windows()
-    foreground = _user32.GetForegroundWindow()
+    foreground = int(_user32.GetForegroundWindow() or 0)
     virtual_bounds = virtual_screen_bounds()
     left, top, right, bottom = virtual_bounds
+    try:
+        locale = locale_facts(foreground or None)
+    except Exception:  # an overview without locale is still an overview
+        locale = {}
+    keyboard = locale.get("keyboard") or {}
     return DesktopOverview(
         windows=windows,
         foreground_hwnd=foreground or None,
@@ -483,7 +548,41 @@ def get_desktop_overview() -> DesktopOverview:
         captured_at=time.time(),
         monitors=list_monitors(),
         virtual_bounds=virtual_bounds,
+        foreground_owner_hwnd=(owner_of(foreground) or None) if foreground else None,
+        foreground_title=win32gui.GetWindowText(foreground) if foreground else "",
+        ui_language=str(locale.get("ui_language") or ""),
+        user_locale=str(locale.get("user_locale") or ""),
+        keyboard_layout=str(keyboard.get("summary") or ""),
     )
+
+
+def _blockers(o: DesktopOverview) -> dict[int, tuple[int, str]]:
+    """Disabled listed window -> ``(hwnd, title)`` of the window it is held by.
+
+    OS facts only: the window is disabled, and a listed window it owns is
+    enabled and not minimised, or is itself disabled while owning a listed
+    window (a dialog that opened a dialog), or the foreground window is owned by
+    it.
+    """
+    listed = {w.hwnd: w for w in o.windows}
+    owned: dict[int, list[WindowInfo]] = {}
+    for w in o.windows:
+        if w.owner_hwnd:
+            owned.setdefault(w.owner_hwnd, []).append(w)
+    blockers: dict[int, tuple[int, str]] = {}
+    for w in o.windows:
+        if w.is_enabled:
+            continue
+        children = owned.get(w.hwnd, [])
+        pick = next((c for c in children if c.is_enabled and not c.is_minimized), None)
+        if pick is None:
+            pick = next((c for c in children if not c.is_enabled and c.hwnd in owned), None)
+        if pick is not None:
+            blockers[w.hwnd] = (pick.hwnd, pick.title)
+        elif o.foreground_hwnd and o.foreground_owner_hwnd == w.hwnd:
+            fg = listed.get(o.foreground_hwnd)
+            blockers[w.hwnd] = (o.foreground_hwnd, fg.title if fg else o.foreground_title)
+    return blockers
 
 
 def format_overview(o: DesktopOverview) -> str:
@@ -507,6 +606,13 @@ def format_overview(o: DesktopOverview) -> str:
     like a mistake.  One line per monitor: which one it is, the rectangle it
     occupies in the same coordinates as the windows below it, its work area when
     that differs (a docked taskbar), and its scaling when it is not 100%.
+
+    Input-blocking facts ride on the window lines: a disabled window with an
+    owned window up (or owning the foreground window) reads
+    ``BLOCKED by [hwnd] "title"`` and that window reads ``DIALOG for [owner]``;
+    a disabled window with no such window in sight reads ``DISABLED``.  The
+    header ends with the locale: Windows display language, regional formats,
+    and the keyboard layout of the foreground window's thread.
     """
     width, height = o.screen_size
     v_left, v_top = o.virtual_bounds[0], o.virtual_bounds[1]
@@ -517,6 +623,17 @@ def format_overview(o: DesktopOverview) -> str:
     ]
     if o.foreground_hwnd and not any(w.is_foreground for w in o.windows):
         lines[0] += f" | foreground hwnd {o.foreground_hwnd} (not a user window)"
+    locale = [
+        part
+        for part in (
+            f"ui {o.ui_language}" if o.ui_language else "",
+            f"formats {o.user_locale}" if o.user_locale else "",
+            f"keyboard {o.keyboard_layout}" if o.keyboard_layout else "",
+        )
+        if part
+    ]
+    if locale:
+        lines[0] += " | " + ", ".join(locale)
     if len(o.monitors) > 1:
         cursor_monitor = monitor_at(o.cursor[0], o.cursor[1], o.monitors)
         for monitor in o.monitors:
@@ -538,6 +655,8 @@ def format_overview(o: DesktopOverview) -> str:
             lines.append(" | ".join(parts))
     if not o.windows:
         lines.append("(no user windows)")
+    blockers = _blockers(o)
+    dialogs = {dialog: owner for owner, (dialog, _) in blockers.items()}
     for w in o.windows:
         left, top, right, bottom = w.bounds
         where = (
@@ -546,5 +665,12 @@ def format_overview(o: DesktopOverview) -> str:
             else f"@{left},{top} {right - left}x{bottom - top}"
         )
         flags = " FOREGROUND" if w.is_foreground else ""
+        if w.hwnd in blockers:
+            dialog, title = blockers[w.hwnd]
+            flags += f' BLOCKED by [{dialog}] "{title}"'
+        elif not w.is_enabled:
+            flags += " DISABLED"
+        if w.hwnd in dialogs:
+            flags += f" DIALOG for [{dialogs[w.hwnd]}]"
         lines.append(f'[{w.hwnd}] {w.process_name or "unknown"} "{w.title}" {where}{flags}')
     return "\n".join(lines)
