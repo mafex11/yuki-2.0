@@ -99,6 +99,7 @@ class UIElement:
     is_focused: bool
     shortcut: str | None           # AcceleratorKey/AccessKey if exposed
     depth: int                     # tree depth (for the model to understand grouping)
+    patterns: tuple[str, ...]      # interactive elements only: subset of invoke, toggle, select (SelectionItem), expand (ExpandCollapse), value (writable Value)
 
 @dataclass
 class WindowTree:
@@ -112,9 +113,11 @@ class WindowTree:
     passes: int                    # walks made (>1 when the first pass was thin and re-polled)
     child_windows: int             # descendant HWNDs walked alongside the top-level one
     first_pass_elements: int       # element count of the first walk (-1 unknown)
+    status: str                    # "ok" UIA answered (however small) | "busy" on screen, process alive, no answer within ~1.5 s (returned then, elements=[], truncated) | "empty" answered with nothing usable, or not on screen and silent
+    note: str                      # one sentence when status is not ok or the tree is partial, e.g. "window did not answer accessibility queries within 1.5 s (probably loading or rendering); look again shortly"
 
 def get_window_tree(hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0) -> WindowTree: ...
-def format_window_tree(tree: WindowTree) -> str: ...   # compact text for the model, one line per element:  [id] role "name" value=... @(x,y) [kb: shortcut]
+def format_window_tree(tree: WindowTree) -> str: ...   # compact text for the model, one line per element:  [id] role "name" value=... @(x,y) {invoke,expand} [kb: shortcut]; header carries [status: busy|empty] and a note: line when set
 def format_overview(o: DesktopOverview) -> str: ...
 
 @dataclass
@@ -150,22 +153,39 @@ class ActionResult:
 ```
 
 ```python
-def launch_app(query: str, *, timeout_s: float = 8.0) -> ActionResult
+def launch_app(query: str, *, args: list[str] | None = None, timeout_s: float = 8.0) -> ActionResult
     # Resolve via Get-StartApps (AppsFolder). Return candidates when ambiguous instead of guessing:
     # details = {"launched": bool, "hwnd": int|None, "candidates": [{"name","appid"}]}.
-    # Waits until a new window from the launched process appears, or timeout.
+    # Waits until a new window from the launched process appears (or an existing window of it changes title), or timeout.
+    # With args: shell:AppsFolder cannot pass arguments, so a packaged app (AUMID "Family!App") is activated with its
+    # arguments through IApplicationActivationManager (keeps package identity, so the app's own profile/data), and a
+    # desktop app is started with Start-Process -FilePath <exe> -ArgumentList <args>, the exe coming from its Start-menu
+    # .lnk target, a known-folder/absolute AppID path, or the image of a running window with that AppUserModelID.
+    # No way to pass arguments -> ok=False, nothing started, reason in the summary.
 def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult   # restore if minimized, SetForegroundWindow, verify foreground
 def click(x: int, y: int, *, button: str = "left", clicks: int = 1) -> ActionResult   # instant move, no glide
     # summary + details report the outcome: foreground window after the click (foreground_hwnd/title/process,
     # foreground_changed), focused_control_hwnd, focus_role/focus_name/focus_value/focus_accepts_text, focus_changed.
-def type_text(text: str, *, press_enter: bool = False) -> ActionResult  # types into current focus; use clipboard paste for long/unicode text
+def type_text(text: str, *, press_enter: bool = False, clear: bool = False) -> ActionResult  # types into current focus
     # details carry foreground_hwnd, focused_control_hwnd, focus_role/name/accepts_text; failures name the focus in the summary.
+    # Path: paste for non-ASCII or >50 chars, and for >=12 chars when the focused control is a writable Value field or the window
+    #   took >=100 ms to become ready; keystrokes otherwise. details["method"]/["method_reason"] say which and why.
+    # clear: select-all + delete first, refused if the focused control does not take text, verified empty when it has a Value pattern.
+    # Read-back: after sending (before Enter) the focused control is read via UIA (ValuePattern, else TextPattern before the caret);
+    #   summary "field now contains '...'"; if the typed text is not there: ok=False, Enter NOT pressed, summary says what it holds.
+    #   Unreadable -> "field contents not readable (...)" and it proceeds. Condition poll: ends when the text shows or the
+    #   contents stop changing for 0.35 s, cap 2 s.
+    # type_text/hotkey/press: details["new_windows"] lists top-level windows of the target process that showed during the action
+    #   (before/after snapshot); the summary names them with class and bounds.
 def hotkey(*keys: str) -> ActionResult                                  # e.g. ("ctrl","t"), ("win","r"), ("volume_mute",)
 def press(key: str, *, times: int = 1) -> ActionResult
+    # hotkey/press: with expect_hwnd, wait_for_input_ready first (~1 s, fail naming the focus); after sending, watch focus
+    # for up to ~400 ms (condition poll) and report it like click: "pressed ctrl+l; focus now Edit '...' (takes text)".
+    # type_text records the focused control before the first character and names it on success: "typed N chars ... into <control>".
 def scroll(x: int, y: int, *, dy: int = 0, dx: int = 0) -> ActionResult  # wheel notches at a point
 def run_powershell(command: str, *, timeout_s: float = 20.0) -> ActionResult
     # Pass the script via -EncodedCommand (UTF-16LE base64) or stdin; NEVER split on whitespace. Capture stdout/stderr/exit code (UTF-8).
-def open_url(url: str) -> ActionResult                                  # default browser via os.startfile / Start-Process
+def open_url(url: str, *, app: str | None = None) -> ActionResult     # default handler via os.startfile / Start-Process; with app: launch_app(app, args=[url])
 ```
 
 ## Agent contract (module `yuki.agent`)
@@ -173,7 +193,7 @@ def open_url(url: str) -> ActionResult                                  # defaul
 - `Agent.run(request: str) -> Iterator[AgentEvent]`. Events: `thinking(text)`, `tool_call(name, input)`, `tool_result(name, ok, summary)`, `ask_user(question)`, `final(text)`, `error(text)`. When `ask_user` is yielded the generator pauses; the caller sends the answer with `agent.answer(text)` and continues iterating. State (messages, running summary) survives the pause.
 - Messages are append-only. Tool results from perception that are older than the last 2 turns are replaced in-place with a one-line stub like `[desktop overview from step 3 — superseded]` before the next request (this is context hygiene, not behavior steering).
 - One model call may return several `tool_use` blocks; execute in order, stop at the first failure, return all results in one user message.
-- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?, region?, monitor?)` (omitted from the tool list entirely when `screenshot_policy` is `never`; the dispatcher still refuses it as a backstop), `system_facts`, `launch_app(query)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url)`, `ask_user(question)`, `note_to_self(text)` (updates the running summary the model sees each turn), `done(message)`.
+- Tools exposed to the model (names are final): `look_at_desktop`, `look_at_window(hwnd)`, `take_screenshot(hwnd?, region?, monitor?)` (omitted from the tool list entirely when `screenshot_policy` is `never`; the dispatcher still refuses it as a backstop), `system_facts`, `launch_app(query, args?)`, `focus_window(hwnd)`, `click(x,y,button,clicks)`, `type_text(text,press_enter,clear?)`, `hotkey(keys[])`, `press(key,times)`, `scroll(x,y,dy,dx)`, `run_powershell(command)`, `open_url(url, app?)`, `ask_user(question)`, `note_to_self(text)` (updates the running summary the model sees each turn), `done(message)`.
 - Every turn the model automatically gets a fresh `look_at_desktop` result appended (cheap), never a tree or screenshot unless it asks.
 - System prompt: short, behavioral. Describe who Yuki is, what it can see, how to prefer fast paths (shell/shortcuts > tree clicks; the prompt does not mention screenshots), when to ask the user (ambiguity, risk, or genuinely stuck — not as a first move), and to confirm before irreversible actions. Do not include keyword-based rule lists.
 
