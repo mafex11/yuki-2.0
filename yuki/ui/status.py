@@ -26,7 +26,7 @@ from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
 from yuki.agent.tools import tool_label
-from yuki.ui.glass import ACCENT, TEXT_PRIMARY, GlassWindow, ui_font
+from yuki.ui.glass import ACCENT, TEXT_DIM, TEXT_PRIMARY, GlassWindow, ui_font
 
 #: Size of the panel (excluding the shadow margin), in logical pixels.
 STRIP_WIDTH = 360
@@ -126,6 +126,42 @@ def _detail(tool_input: dict[str, Any], *, limit: int) -> str:
     return _shorten(", ".join(numbers[:3]), limit) if numbers else ""
 
 
+def describe_summary(summary: dict[str, Any]) -> str:
+    """The short dim suffix for a finished request: ``52 s · 10 steps · 8¢``.
+
+    Steps are model round trips. Cost is the estimate from ``Settings.pricing``,
+    left out when the model has no price. Purely presentational.
+
+    Args:
+        summary: A ``request_summary`` record (:meth:`yuki.agent.loop.Agent._summarize`).
+
+    Returns:
+        One short line, or ``""`` when there is nothing worth showing.
+    """
+    parts: list[str] = []
+    wall = summary.get("wall_s")
+    if isinstance(wall, (int, float)):
+        seconds = round(float(wall))
+        parts.append(f"{seconds // 60} min {seconds % 60} s" if seconds >= 60 else f"{seconds} s")
+    steps = summary.get("model_calls")
+    if isinstance(steps, int) and steps > 0:
+        parts.append(f"{steps} step{'' if steps == 1 else 's'}")
+    cost = summary.get("cost_usd")
+    if isinstance(cost, (int, float)):
+        parts.append(_money(float(cost)))
+    return " · ".join(parts)
+
+
+def _money(usd: float) -> str:
+    """``$1.23`` from a dollar up, whole cents below, one decimal under a cent."""
+    if usd >= 1.0:
+        return f"${usd:.2f}"
+    cents = usd * 100
+    if cents >= 0.95:
+        return f"{cents:.0f}¢"
+    return f"{cents:.1f}¢"
+
+
 def _shorten(text: str, limit: int) -> str:
     """Truncate with an ellipsis."""
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -223,6 +259,14 @@ class StatusStrip(GlassWindow):
         )
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
 
+        #: Dim time/steps/cost suffix, shown only with a final message.
+        self.meta = QLabel(self)
+        self.meta.setFont(ui_font(9))
+        self.meta.setTextFormat(Qt.TextFormat.PlainText)
+        self.meta.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
+        self.meta.setVisible(False)
+        row.addWidget(self.meta, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self._linger = QTimer(self)
         self._linger.setSingleShot(True)
         self._linger.timeout.connect(self.fade_out)
@@ -244,6 +288,7 @@ class StatusStrip(GlassWindow):
             text: The line to display.
         """
         self._linger.stop()
+        self.meta.setVisible(False)
         self.label.setText(text)
         self.spinner.start()
         self.spinner.setVisible(True)
@@ -256,6 +301,7 @@ class StatusStrip(GlassWindow):
             text: The message.
             tone: ``final`` or ``error``; errors are tinted red.
         """
+        self.meta.setVisible(False)
         self.label.setText(text)
         self.spinner.stop()
         self.spinner.setVisible(False)
@@ -263,6 +309,16 @@ class StatusStrip(GlassWindow):
         self.label.setStyleSheet(f"color: rgba({colour},235);")
         self.fade_in(self.anchor())
         self._linger.start(FINAL_LINGER_MS)
+
+    def set_meta(self, text: str) -> None:
+        """Add the dim suffix to the final message on show (no timer restart).
+
+        Args:
+            text: e.g. ``52 s · 10 steps · 8¢``; empty hides it.
+        """
+        self.meta.setText(text)
+        # The message label gives up the width; its resizeEvent re-elides it.
+        self.meta.setVisible(bool(text))
 
     def dismiss(self) -> None:
         """Hide the strip now."""

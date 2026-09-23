@@ -17,6 +17,8 @@ import json
 import os
 import threading
 import time
+from collections import Counter
+from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 from yuki.agent.context import ContextManager
@@ -42,6 +44,7 @@ from yuki.log.events import (
     ToolCall,
     ToolResult,
 )
+from yuki.log.requests import TOKEN_KEYS, append_request_row, usage_tokens
 
 
 #: The API's limit on ``cache_control`` breakpoints in one request.
@@ -86,7 +89,13 @@ class Agent:
             request that builds the Bedrock client and writes the prompt cache,
             so the first real request reads a warm cache. Harmless when there is
             no real desktop backend; pass ``False`` to keep construction from
-            touching the machine or the network at all.
+            touching the machine or the network at all. Its tokens and cost go
+            to a ``startup_cost`` record, never into a request's totals.
+        lane: Which lane this agent is (``worker``, ``front_desk``, ``cli``),
+            written into every ``request_summary`` and ``requests.csv`` line.
+        record_requests: Append one line per finished request to
+            ``settings.requests_csv_path``. The ``request_summary`` JSONL record
+            is written either way.
 
     Raises:
         ValueError: If ``tool_names`` contains a name that is not a tool.
@@ -103,8 +112,12 @@ class Agent:
         tool_names: Iterable[str] | None = None,
         extra_instructions: str | None = None,
         prewarm: bool = True,
+        lane: str = "main",
+        record_requests: bool = True,
     ) -> None:
         self.settings = settings or Settings()
+        self.lane = lane
+        self.record_requests = record_requests
         self.logger = logger or SessionLogger(self.settings.sessions_dir)
         self.dispatcher = dispatcher or Dispatcher(
             backend,
@@ -126,6 +139,10 @@ class Agent:
         self._waited_s = 0.0
         self._model_calls = 0
         self._call_history: dict[str, list[tuple[str, str]]] = {}
+        self._reset_accounting()
+        #: The ``request_summary`` of the last request that ended (``None``
+        #: while one is running). Read by the UI to label the finished card.
+        self.last_summary: dict[str, Any] | None = None
         if self.tool_names is not None or self.extra_instructions:
             self.logger.log(
                 "agent_scope",
@@ -210,12 +227,26 @@ class Agent:
         except Exception as exc:
             self.logger.error(f"model prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
             return
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        model = self.settings.model
+        usage = getattr(response, "usage", None)
         self.logger.log(
             "model_prewarm",
-            model=self.settings.model,
-            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            model=model,
+            elapsed_ms=elapsed_ms,
             stop_reason=getattr(response, "stop_reason", None),
-            usage=getattr(response, "usage", None),
+            usage=usage,
+        )
+        tokens = usage_tokens(usage)
+        cost = self.settings.estimate_cost(model, tokens)
+        self.logger.log(
+            "startup_cost",
+            kind="model_prewarm",
+            lane=self.lane,
+            model=model,
+            elapsed_s=round(elapsed_ms / 1000, 2),
+            tokens=tokens,
+            cost_usd=None if cost is None else round(cost, 6),
         )
 
     def wait_for_prewarm(self, timeout_s: float | None = None) -> bool:
@@ -332,20 +363,134 @@ class Agent:
         self._waited_s = 0.0
         self._model_calls = 0
         self._call_history = {}
+        self._reset_accounting()
+        self.last_summary = None
+        started_at = datetime.now()
+        model, effort = self.settings.model, self.settings.effort
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.user_message(request)
+        # How the request ended, for the summary. "abandoned" survives only when
+        # the caller stopped iterating before a final or an error arrived.
+        outcome = "abandoned"
+        drive: Iterator[AgentEvent] | None = None
         try:
             overview, _ = self._capture_overview()
             self._close_dangling_tools(overview)
             self.context.add_request(request, overview)
-            yield from self._drive()
+            drive = self._drive()
+            for event in drive:
+                if isinstance(event, Final):
+                    outcome = "final"
+                elif isinstance(event, ErrorEvent):
+                    outcome = "cancelled" if self._cancelled.is_set() else "error"
+                yield event
+        except KeyboardInterrupt:
+            outcome = "cancelled"
+            raise
         except Exception as exc:  # never let a crash escape into the REPL
             message = f"{type(exc).__name__}: {exc}"
             self.logger.error(message, exc=exc)
+            outcome = "cancelled" if self._cancelled.is_set() else "error"
             yield ErrorEvent(message)
         finally:
+            if drive is not None:
+                drive.close()
             self.logger.usage_total()
+            self._summarize(
+                request, outcome=outcome, started_at=started_at, model=model, effort=effort
+            )
+
+    # -- per-request accounting --------------------------------------------
+
+    def _reset_accounting(self) -> None:
+        """Zero the time/token/cost accumulators for a new request."""
+        self._model_s = 0.0
+        self._tool_s = 0.0
+        self._overview_s = 0.0
+        self._tool_counts: Counter[str] = Counter()
+        self._tokens: dict[str, int] = dict.fromkeys(TOKEN_KEYS, 0)
+        self._cost_usd = 0.0
+        self._unpriced: set[str] = set()
+        self._models_used: list[str] = []
+
+    def _account_response(self, model: str, usage: Any) -> None:
+        """Fold one real (non-warm-up) response into this request's totals.
+
+        Priced per call with the model that call actually used, so a model
+        switch that lands mid-request is still costed correctly.
+        """
+        tokens = usage_tokens(usage)
+        for key in TOKEN_KEYS:
+            self._tokens[key] += tokens[key]
+        if model not in self._models_used:
+            self._models_used.append(model)
+        cost = self.settings.estimate_cost(model, tokens)
+        if cost is None:
+            self._unpriced.add(model)
+        else:
+            self._cost_usd += cost
+
+    def _summarize(
+        self, request: str, *, outcome: str, started_at: datetime, model: str, effort: str
+    ) -> None:
+        """Write ``request_summary`` and the ``requests.csv`` line. Never raises.
+
+        Wall time includes the time spent waiting for the user's answers, which
+        is also reported on its own. Model time is every round trip (failed ones
+        included); tool time is dispatching the tools the model called; the
+        per-turn desktop overview is ``overview_s``. Whatever is left of the
+        wall time is the loop's own overhead. Pre-warm calls are not in here:
+        they are the separate ``startup_cost`` record.
+        """
+        try:
+            wall_s = time.monotonic() - self._request_started
+            models = self._models_used or [model]
+            cost = None if self._unpriced else round(self._cost_usd, 6)
+            summary: dict[str, Any] = {
+                "request": request,
+                "lane": self.lane,
+                "outcome": outcome,
+                "model": models[0] if len(models) == 1 else "+".join(models),
+                "effort": effort,
+                "started_at": started_at.isoformat(timespec="seconds"),
+                "wall_s": round(wall_s, 2),
+                "waiting_for_user_s": round(self._waited_s, 2),
+                "model_s": round(self._model_s, 2),
+                "tool_s": round(self._tool_s, 2),
+                "overview_s": round(self._overview_s, 2),
+                "model_calls": self._model_calls,
+                "tool_calls": dict(self._tool_counts),
+                "tokens": dict(self._tokens),
+                "thinking_tokens": self.logger.usage.thinking_tokens,
+                "cost_usd": cost,
+                "unpriced_models": sorted(self._unpriced),
+            }
+            self.last_summary = summary
+            self.logger.request_summary(summary)
+            if self.record_requests:
+                append_request_row(
+                    self.settings.requests_csv_path,
+                    {
+                        "timestamp": summary["started_at"],
+                        "session": self.logger.session_id,
+                        "lane": self.lane,
+                        "request": request,
+                        "model": summary["model"],
+                        "effort": effort,
+                        "wall_s": summary["wall_s"],
+                        "wait_s": summary["waiting_for_user_s"],
+                        "model_s": summary["model_s"],
+                        "tool_s": summary["tool_s"],
+                        "calls": self._model_calls,
+                        "tool_calls": summary["tool_calls"],
+                        **self._tokens,
+                        "cost_usd": cost,
+                        "outcome": outcome,
+                    },
+                )
+        except Exception as exc:  # accounting must never break a request
+            self.logger.error(f"request summary failed: {type(exc).__name__}: {exc}", exc=exc)
 
     def _close_dangling_tools(self, overview: str) -> None:
         """Answer tool calls left hanging by a cancelled or interrupted run.
@@ -523,7 +668,10 @@ class Agent:
                 stop_after = True
                 continue
 
+            dispatched = time.perf_counter()
             outcome = self._dispatch(name, tool_input)
+            self._tool_s += time.perf_counter() - dispatched
+            self._tool_counts[name] += 1
 
             if outcome.kind == "ask_user":
                 question = outcome.control_input["question"]
@@ -681,13 +829,16 @@ class Agent:
         """
         facts = self._turn_facts()
         facts_text = _turn_facts_text(facts)
+        looked = time.perf_counter()
         try:
             text, payload, elapsed = self.dispatcher.overview_text()
         except Exception as exc:
+            self._overview_s += time.perf_counter() - looked
             message = f"(could not read the desktop: {type(exc).__name__}: {exc})"
             self.logger.error(message, exc=exc)
             self.logger.log("self_facts", **facts)
             return message, facts_text
+        self._overview_s += time.perf_counter() - looked
         if isinstance(payload, dict):
             payload = {**payload, "self_facts": facts}
         self.logger.perception(
@@ -812,11 +963,14 @@ class Agent:
                 response = self.client.messages.create(**params)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
+            self._model_s += latency_ms / 1000
             self.logger.error(
                 f"request failed after {latency_ms:.0f}ms: {type(exc).__name__}: {exc}", exc=exc
             )
             raise
         latency_ms = (time.perf_counter() - started) * 1000
+        self._model_s += latency_ms / 1000
+        self._account_response(params["model"], getattr(response, "usage", None))
         # The request went through, so its cache entry exists: the next prune
         # measures "before the breakpoint" against this one.
         self.context.commit_breakpoint()

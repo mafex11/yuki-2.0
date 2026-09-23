@@ -107,6 +107,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "user_answer",
         "context_edit",
         "usage_total",
+        # per-request time, tokens and estimated cost (also a line in requests.csv)
+        "request_summary",
         "final",
         "error",
         # how this agent instance was set up and what it was told to be
@@ -114,6 +116,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # warm-ups done at construction, off the critical path
         "shell_prewarm",
         "model_prewarm",
+        "startup_cost",
         # the caller changed a knob mid-session
         "model_switch",
         "effort_switch",
@@ -487,6 +490,28 @@ class SessionLogger:
             f"- {totals.wall_ms / 1000:.1f}s[/dim]"
         )
         return totals
+
+    def request_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Log the end-of-request time/token/cost record and one console line.
+
+        Args:
+            summary: Built by :meth:`yuki.agent.loop.Agent._summarize`.
+
+        Returns:
+            The written record.
+        """
+        record = self.log("request_summary", **summary)
+        cost = summary.get("cost_usd")
+        cost_text = "cost unknown" if cost is None else f"${cost:.4f}"
+        waited = float(summary.get("waiting_for_user_s") or 0.0)
+        waiting = f" (waited {waited:.1f}s for user)" if waited >= 0.05 else ""
+        self._print(
+            f"[dim]== {summary.get('outcome')} - {float(summary.get('wall_s') or 0):.1f}s{waiting} "
+            f"- model {float(summary.get('model_s') or 0):.1f}s "
+            f"- tools {float(summary.get('tool_s') or 0):.1f}s "
+            f"- {summary.get('model_calls', 0)} call(s) - {cost_text}[/dim]"
+        )
+        return record
 
     # -- console -----------------------------------------------------------
 

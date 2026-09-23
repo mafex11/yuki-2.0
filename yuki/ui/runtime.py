@@ -211,6 +211,12 @@ class Lane(QThread):
             reached_for_hands: list[str] = []
             try:
                 reached_for_hands = self._drive(job)
+                # The agent writes its summary in the generator's finally, which
+                # has run by now: the final/failed signal went out first, so the
+                # UI can label the message that is already on screen.
+                summary = self.agent.last_summary
+                if summary is not None:
+                    self.runtime.summarized.emit(self.name, job.id, dict(summary))
             finally:
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
@@ -302,6 +308,8 @@ class AgentRuntime(QObject):
         finished: ``(lane, id, text)`` -- the closing message.
         failed: ``(lane, id, text)`` -- error or cancellation.
         queued: ``(id, request, waiting)`` -- request parked for the worker.
+        summarized: ``(lane, id, summary)`` -- the request's ``request_summary``
+            (time, steps, tokens, estimated cost), right after finished/failed.
         lane_done: ``(lane, id, request, needed_hands, refused_tools)`` -- the lane
             is free again.
     """
@@ -314,6 +322,7 @@ class AgentRuntime(QObject):
     finished = Signal(str, int, str)
     failed = Signal(str, int, str)
     queued = Signal(int, str, int)
+    summarized = Signal(str, int, dict)
     lane_done = Signal(str, int, str, bool, list)
 
     def __init__(
@@ -339,6 +348,7 @@ class AgentRuntime(QObject):
                 SessionLogger(
                     settings.sessions_dir, console=console, session_id=f"{session}-worker"
                 ),
+                lane=WORKER,
             )
         if front_desk_agent is None:
             front_desk_blocked = front_desk_blocked or HandsBlockedBackend()
@@ -355,6 +365,7 @@ class AgentRuntime(QObject):
                 tool_names=LOOK_ONLY_TOOLS,
                 extra_instructions=FRONT_DESK_INSTRUCTIONS,
                 prewarm=False,  # it cannot run a shell, so there is nothing to warm
+                lane=FRONT_DESK,
             )
 
         self.worker = Lane(WORKER, worker_agent, self)

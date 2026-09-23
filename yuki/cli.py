@@ -39,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     console = Console(soft_wrap=True)
     settings = Settings()
     logger = SessionLogger(settings.sessions_dir, console=console)
-    agent = Agent(settings, logger)
+    agent = Agent(settings, logger, lane="cli")
 
     console.print(
         f"[bold]yuki[/bold] [dim]{settings.model} | effort {settings.effort} | "
