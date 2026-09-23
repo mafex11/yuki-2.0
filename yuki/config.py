@@ -88,6 +88,13 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
         "cache_write": 6.25,
         "cache_read": 0.50,
     },
+    # Claude Haiku 4.5: the memory journal worker (yuki.memory.journal).
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input": 1.00,
+        "output": 5.00,
+        "cache_write": 1.25,
+        "cache_read": 0.10,
+    },
 }
 
 
