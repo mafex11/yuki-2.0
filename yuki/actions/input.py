@@ -32,6 +32,19 @@ screenshot and look.  The facts come from ``GetForegroundWindow``,
 ``GetGUIThreadInfo`` and one UIA focused-element read, which together cost a few
 milliseconds.
 
+A click also says what it *hit* and what that *caused*.  Before the button goes
+down, the element under the point is named through UIA - role, name, and the
+nearest named container ("clicked Button "Magic UI" in ToolBar "Bookmarks"") -
+on a ~150 ms budget ("target element unknown" past it).  And the page the
+foreground window shows (its Document element: title and address) is read
+before and watched after, so "the page changed from "(25) Messaging |
+LinkedIn" (linkedin.com/messaging) to "Magic UI" (magicui.design)" is a fact in
+the result.  On 2026-09-23 a guessed coordinate hit a bookmark and navigated
+the tab away; the result said only "focus unchanged", and the model spent three
+minutes hunting for a LinkedIn tab that had merely navigated, where Back would
+have done.  ``hotkey`` and ``press`` report the page the same way, because keys
+navigate too.
+
 Keyboard actions report what they caused as well: ``hotkey``/``press`` say where
 focus went, ``type_text`` names the control that had focus when typing began,
 and all three name any *new* top-level window the same process showed while
@@ -42,14 +55,17 @@ Nothing here sleeps: no glide, no per-control delay tables, no settle time.  The
 one wait after a click is a condition poll for the focus to move, abandoned at a
 deadline, because "focus did not move" is a real answer and not worth waiting out.
 The waits after keyboard input (focus moving, a new window showing, a cleared
-field reading empty) are condition polls with deadlines in the same way.
+field reading empty) and the page watch after any input (the page differing from
+before and titled) are condition polls with deadlines in the same way.
 """
 
 from __future__ import annotations
 
 import ctypes
 import struct
+import threading
 import time
+from collections.abc import Callable
 
 import pyautogui
 import win32clipboard
@@ -521,23 +537,38 @@ def _focus_unmoved(before: dict, after: dict) -> bool:
     return new.same_as(old)
 
 
-def _describe_outcome(before: dict, after: dict) -> tuple[str, dict]:
+def _describe_outcome(
+    before: dict, after: dict, *, page_phrase: str = "", page_changed: bool = False
+) -> tuple[str, dict]:
     """A phrase for ``summary`` and the flat facts for ``details``.
 
     The phrase is what a person would say about the click - "focus now Edit
     'What do you want to play?'", "focus unchanged" - and the dict is the same
     thing without the prose, so the log keeps the handles and the model reading the
     summary does not have to.
+
+    A foreground window that stayed but was retitled says so, before -> after;
+    when ``page_phrase`` (see :func:`_describe_page_change`) already tells the
+    same story (``page_changed``), only the new title is given.  ``page_phrase``
+    goes between the window and the focus.
     """
     focus = after.get("focus")
+    title_before = before.get("foreground_title", "")
     facts: dict = {
         "foreground_hwnd": after["foreground_hwnd"],
         "foreground_title": after["foreground_title"],
+        "foreground_title_before": title_before,
         "foreground_process": after["foreground_process"],
         "focused_control_hwnd": after["focused_control_hwnd"],
         "foreground_changed": before["foreground_hwnd"] != after["foreground_hwnd"],
         "focus_changed": not _focus_unmoved(before, after),
     }
+    retitled = (
+        not facts["foreground_changed"]
+        and bool(after["foreground_hwnd"])
+        and title_before != after["foreground_title"]
+    )
+    facts["foreground_title_changed"] = retitled
     if focus is not None and focus.ok:
         facts.update(
             {
@@ -557,8 +588,22 @@ def _describe_outcome(before: dict, after: dict) -> tuple[str, dict]:
     )
     if facts["foreground_changed"]:
         parts.append(f"foreground now {who}")
+    elif retitled:
+        still = (
+            f'foreground still {after["foreground_process"] or "unknown"} '
+            f'(hwnd {after["foreground_hwnd"]})'
+        )
+        if page_changed:
+            parts.append(f"{still}, title now {_quoted(after['foreground_title'], 90)}")
+        else:
+            parts.append(
+                f"{still}, title changed from {_quoted(title_before, 90)} to "
+                f"{_quoted(after['foreground_title'], 90)}"
+            )
     else:
         parts.append(f"foreground still {who}")
+    if page_phrase:
+        parts.append(page_phrase)
     described = focus.describe() if focus is not None else "unknown"
     if facts["focus_changed"]:
         parts.append(f"focus now {described}")
@@ -577,8 +622,8 @@ def _where_focus_is() -> tuple[str, dict]:
     """
     state = _focus_state()
     facts = _describe_outcome(state, state)[1]
-    facts.pop("foreground_changed", None)
-    facts.pop("focus_changed", None)
+    for flag in ("foreground_changed", "focus_changed", "foreground_title_before", "foreground_title_changed"):
+        facts.pop(flag, None)
     focus = state["focus"]
     described = focus.describe() if focus is not None else "unknown"
     phrase = (
@@ -716,6 +761,732 @@ def _describe_appeared(windows: list[dict]) -> str:
         else f"{len(windows)} new windows of the same process appeared"
     )
     return f"{head} " + "; ".join(described) + (f"; and {more} more" if more > 0 else "")
+
+
+# ---------------------------------------------------------------------------
+# What a click is about to hit, and what the input changed
+# ---------------------------------------------------------------------------
+#: Budget for naming the element under a click before it is sent.  A UIA
+#: ``ElementFromPoint`` is a few milliseconds; the frame descent it sometimes
+#: needs (see :func:`_start_hit_test`) measured 30-55 ms on a browser window.
+#: Past this the click goes out anyway and the result says "target element
+#: unknown": naming the target must never be why a click is slow or fails.
+_HIT_TEST_S = 0.15
+
+#: The worker stops starting new UIA calls this long before the caller gives up
+#: on it, so what it found so far is published in time to be used.
+_HIT_MARGIN_S = 0.015
+
+#: Ancestors looked at for a named container ("in ToolBar "Bookmarks"").
+_HIT_CONTEXT_LEVELS = 3
+
+#: Deepest the frame descent goes (a browser's bookmark button is 7 levels down).
+_HIT_DESCENT_LEVELS = 40
+
+#: Budget for one read of the page a window shows (see :func:`_page_at`):
+#: typically one ``ElementFromHandle`` plus one cached ``FindFirst``, 2-20 ms.
+_PAGE_READ_S = 0.3
+
+#: After input, how long the page is watched for changing.  A condition poll: it
+#: ends the moment the page differs from before and has its title, or when the
+#: foreground window changed and its page (if any) has been read.  Navigation
+#: commits a few hundred milliseconds after the click that starts it, so input
+#: that changes nothing in a window showing a page costs this much - the price
+#: of "page unchanged" being a fact rather than a guess.  A window without a
+#: page is read once and not watched.
+_PAGE_WATCH_S = 0.8
+
+#: How often the page watch re-reads.
+_PAGE_POLL_S = 0.04
+
+#: Levels climbed from the element at a window's centre to the page containing
+#: it, when no child window holds the page (see :func:`_page_at`).
+_PAGE_CLIMB_LEVELS = 40
+
+#: How much of a name / an address a summary shows (details keep them whole).
+_NAME_CHARS = 70
+_URL_CHARS = 70
+
+_CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
+_UIA_BOUNDING_RECT = 30001
+_UIA_CONTROL_TYPE = 30003
+_UIA_NAME = 30005
+_UIA_AUTOMATION_ID = 30011
+_UIA_NATIVE_WINDOW_HANDLE = 30020
+_UIA_IS_VALUE_AVAILABLE = 30043
+_UIA_VALUE = 30045
+_UIA_DOCUMENT = 50030  # UIA_DocumentControlTypeId: a page / rich document
+_TREE_SCOPE_ELEMENT = 1
+_TREE_SCOPE_CHILDREN = 2
+_GA_ROOT = 2
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` on one line, cut to ``limit`` characters with an ellipsis."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _quoted(text: str, limit: int = _NAME_CHARS) -> str:
+    return f'"{_clip(text, limit)}"'
+
+
+def _role(control_type: object) -> str:
+    """UIA ControlType id -> role name, the same names the window tree uses."""
+    try:
+        from yuki.perception.tree import _role_name
+
+        return _role_name(control_type)
+    except Exception:
+        return f"ControlType{control_type}"
+
+
+def _is_address(value: str | None) -> bool:
+    """Whether a UIA Value is an address (``https://...``), not document text."""
+    try:
+        from yuki.perception.tree import is_address
+    except Exception:
+        return bool(value) and "://" in value and not any(c.isspace() for c in value)
+    return is_address(value)
+
+
+def _contains(bounds: tuple[int, int, int, int], x: int, y: int) -> bool:
+    left, top, right, bottom = bounds
+    return left <= x < right and top <= y < bottom
+
+
+def _area(bounds: tuple[int, int, int, int]) -> int:
+    left, top, right, bottom = bounds
+    return max(right - left, 0) * max(bottom - top, 0)
+
+
+def _is_window_root(hwnd: int) -> bool:
+    """Whether a UIA element's own handle is a top-level window or the desktop:
+    the element *is* the window, which names nothing the summary does not."""
+    if not hwnd:
+        return False
+    try:
+        return hwnd == int(win32gui.GetDesktopWindow()) or int(
+            win32gui.GetAncestor(hwnd, _GA_ROOT)
+        ) == hwnd
+    except Exception:
+        return False
+
+
+def _new_automation() -> object:
+    """A CUIAutomation object for the calling (worker) thread.
+
+    The comtypes wrapper is the one :mod:`yuki.perception.tree` generated at
+    import; imported here, not at module scope, so that sending input never
+    depends on UIA having loaded.
+    """
+    import comtypes.client
+
+    try:
+        from yuki.perception.tree import _uia_core
+
+        module = _uia_core()
+    except Exception:
+        module = comtypes.client.GetModule("UIAutomationCore.dll")
+    return comtypes.client.CreateObject(
+        _CUIAUTOMATION_CLSID, interface=module.IUIAutomation  # type: ignore[attr-defined]
+    )
+
+
+def _cache_request(automation: object) -> object:
+    """One cache request for every property the hit test and page read use."""
+    request = automation.CreateCacheRequest()  # type: ignore[attr-defined]
+    for prop in (
+        _UIA_CONTROL_TYPE,
+        _UIA_NAME,
+        _UIA_AUTOMATION_ID,
+        _UIA_NATIVE_WINDOW_HANDLE,
+        _UIA_BOUNDING_RECT,
+        _UIA_IS_VALUE_AVAILABLE,
+        _UIA_VALUE,
+    ):
+        request.AddProperty(prop)
+    request.TreeScope = _TREE_SCOPE_ELEMENT
+    return request
+
+
+def _element_facts(element: object) -> dict:
+    """The cached facts of one element, as plain data."""
+    get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+    control_type = get(_UIA_CONTROL_TYPE)
+    try:
+        rect = element.CachedBoundingRectangle  # type: ignore[attr-defined]
+        bounds = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:
+        bounds = (0, 0, 0, 0)
+    value = None
+    if get(_UIA_IS_VALUE_AVAILABLE):
+        raw = get(_UIA_VALUE)
+        if isinstance(raw, str) and raw:
+            value = raw[:500]
+    try:
+        native = int(get(_UIA_NATIVE_WINDOW_HANDLE) or 0)
+    except Exception:
+        native = 0
+    name = get(_UIA_NAME)
+    automation_id = get(_UIA_AUTOMATION_ID)
+    return {
+        "role": _role(control_type),
+        "control_type": control_type if isinstance(control_type, int) else 0,
+        "name": name.strip() if isinstance(name, str) else "",
+        "automation_id": automation_id.strip() if isinstance(automation_id, str) else "",
+        "value": value,
+        "bounds": bounds,
+        "native_hwnd": native,
+    }
+
+
+def _context_facts(facts: dict) -> dict:
+    return {key: facts[key] for key in ("role", "name", "automation_id")}
+
+
+class _Pending:
+    """A UIA read running on its own thread with its own COM apartment.
+
+    ``job(automation, shared)`` writes what it finds into ``shared`` as it goes,
+    so a caller that stops waiting at the budget still gets everything found up
+    to then; a provider that blocks costs the budget, never the calling thread.
+    """
+
+    def __init__(self, job: Callable[[object, dict], None], name: str, budget_s: float):
+        self.shared: dict = {}
+        self.budget_s = budget_s
+        self._started = time.perf_counter()
+        self._thread = threading.Thread(target=self._run, args=(job,), name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self, job: Callable[[object, dict], None]) -> None:
+        try:
+            import comtypes
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            self.shared["error"] = f"{type(exc).__name__}: {exc}"
+            return
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass  # already initialised for this thread
+        try:
+            job(_new_automation(), self.shared)
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            self.shared["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    def wait(self) -> dict:
+        """Wait for the job, at most until its budget is spent; ``shared`` then."""
+        remaining = self.budget_s - (time.perf_counter() - self._started)
+        self._thread.join(max(remaining, 0.0))
+        return self.shared
+
+    @property
+    def timed_out(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def elapsed_ms(self) -> float:
+        return round((time.perf_counter() - self._started) * 1000.0, 1)
+
+
+def _start_hit_test(x: int, y: int) -> _Pending:
+    """Start naming the element at (x, y): what a click there would hit.
+
+    ``ElementFromPoint`` first.  Its answer is trusted only when its rectangle
+    contains the point: a browser keeps each tab's page in a child window whose
+    rectangle can reach over the browser's own toolbars (measured on this
+    desktop: a page window starting at y=0 behind toolbars ending at y=120), and
+    for a point in that overlap ``ElementFromPoint`` answers with the page, well
+    away from the point, while the real click lands on the toolbar.  In that case
+    the element is found by descending the point's top-level window from its UIA
+    root, child by child, into the smallest element containing the point -
+    leaving out Document elements, because a page's content is what
+    ``ElementFromPoint`` answers for, and the frame's tree also carries every
+    background tab's page, reported on screen with a stale rectangle that would
+    swallow the point.  Rectangles and control types only; nothing here knows
+    which program drew the window.  Nothing is clicked, focused or hovered.
+    """
+    try:
+        window = int(win32gui.GetAncestor(win32gui.WindowFromPoint((int(x), int(y))), _GA_ROOT))
+    except Exception:
+        window = 0
+    stop_at = time.monotonic() + _HIT_TEST_S - _HIT_MARGIN_S
+
+    def job(automation: object, shared: dict) -> None:
+        from ctypes import wintypes
+
+        shared["window_hwnd"] = window
+        request = _cache_request(automation)
+        element = automation.ElementFromPointBuildCache(  # type: ignore[attr-defined]
+            wintypes.POINT(int(x), int(y)), request
+        )
+        facts = _element_facts(element) if element else None
+        if facts is not None and (
+            _contains(facts["bounds"], x, y) or not _area(facts["bounds"])
+        ):
+            target = {**facts, "via": "point", "context": None}
+            shared["target"] = target
+            walker = automation.ControlViewWalker  # type: ignore[attr-defined]
+            current = element
+            for _ in range(_HIT_CONTEXT_LEVELS):
+                if time.monotonic() >= stop_at:
+                    return
+                current = walker.GetParentElementBuildCache(current, request)
+                if not current:
+                    return
+                above = _element_facts(current)
+                if _is_window_root(above["native_hwnd"]):
+                    return
+                if above["name"]:
+                    target["context"] = _context_facts(above)
+                    return
+            return
+        if not window:
+            shared["error"] = "no window at the point"
+            return
+        root = automation.ElementFromHandleBuildCache(window, request)  # type: ignore[attr-defined]
+        if not root:
+            shared["error"] = "the window at the point did not answer"
+            return
+        path = [_element_facts(root)]
+        condition = automation.ControlViewCondition  # type: ignore[attr-defined]
+        current = root
+        for _ in range(_HIT_DESCENT_LEVELS):
+            if time.monotonic() >= stop_at:
+                break
+            children = current.FindAllBuildCache(_TREE_SCOPE_CHILDREN, condition, request)
+            best, best_facts = None, None
+            for index in range(children.Length if children else 0):
+                child = children.GetElement(index)
+                child_facts = _element_facts(child)
+                if child_facts["control_type"] == _UIA_DOCUMENT or not _contains(
+                    child_facts["bounds"], x, y
+                ):
+                    continue
+                if best_facts is None or _area(child_facts["bounds"]) <= _area(
+                    best_facts["bounds"]
+                ):
+                    best, best_facts = child, child_facts
+            if best is None:
+                break
+            current = best
+            path.append(best_facts)
+            context = next(
+                (
+                    _context_facts(above)
+                    for above in path[-2:0:-1][:_HIT_CONTEXT_LEVELS]
+                    if above["name"] and not _is_window_root(above["native_hwnd"])
+                ),
+                None,
+            )
+            shared["target"] = {**best_facts, "via": "frame", "context": context}
+        if "target" not in shared:
+            shared["error"] = (
+                "the element UIA reported at the point does not contain it, and "
+                "no element of the window's frame does"
+            )
+
+    return _Pending(job, "yuki-uia-hit", _HIT_TEST_S)
+
+
+def _finish_hit_test(pending: _Pending) -> tuple[dict | None, str]:
+    """``(target, "")``, or ``(None, why the target is unknown)``."""
+    shared = pending.wait()
+    target = shared.get("target")
+    if not isinstance(target, dict):
+        if shared.get("error"):
+            reason = str(shared["error"])
+        elif pending.timed_out:
+            reason = f"UIA did not answer within {_HIT_TEST_S * 1000:.0f} ms"
+        else:
+            reason = "UIA named no element at the point"
+        return None, reason
+    target = dict(target)
+    target["context"] = dict(target["context"]) if target.get("context") else None
+    target["partial"] = pending.timed_out
+    target["hit_ms"] = pending.elapsed_ms
+    window = int(shared.get("window_hwnd") or 0)
+    info = window_info(window) if window else None
+    target["window_hwnd"] = window
+    target["window_process"] = info.process_name if info else ""
+    target["window_title"] = info.title if info else ""
+    return target, ""
+
+
+def _describe_target(target: dict | None, foreground_hwnd: int) -> str:
+    """``Button "Magic UI" in ToolBar "Bookmarks"``, or ``""`` when unknown."""
+    if not target:
+        return ""
+    parts = [target.get("role") or "element"]
+    if target.get("name"):
+        parts.append(_quoted(target["name"]))
+    elif target.get("automation_id"):
+        parts.append(f"(id {_quoted(target['automation_id'], 40)})")
+    value = target.get("value")
+    if target.get("control_type") != _UIA_DOCUMENT and _is_address(value):
+        parts.append(f"(url {_short_url(value)})")
+    context = target.get("context")
+    if context:
+        parts.append(f"in {context.get('role') or 'element'} {_quoted(context['name'])}")
+    window = target.get("window_hwnd")
+    if window and foreground_hwnd and window != foreground_hwnd:
+        parts.append(
+            f"in another window, {target.get('window_process') or 'unknown'} "
+            f"{_quoted(target.get('window_title') or '', 60)} (hwnd {window})"
+        )
+    return " ".join(parts)
+
+
+def _client_centre(hwnd: int) -> tuple[int, int] | None:
+    """Screen coordinates of the middle of ``hwnd``'s client area."""
+    try:
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        if right - left <= 0 or bottom - top <= 0:
+            return None
+        x, y = win32gui.ClientToScreen(hwnd, ((left + right) // 2, (top + bottom) // 2))
+        return int(x), int(y)
+    except Exception:
+        return None
+
+
+#: Child windows at a window's centre asked for a page, at most.
+_PAGE_CANDIDATE_WINDOWS = 12
+
+
+def _child_windows_at(hwnd: int, x: int, y: int) -> list[int]:
+    """Visible descendant windows of ``hwnd`` whose rectangle holds (x, y).
+
+    In ``EnumChildWindows`` order: each parent's children top of the stacking
+    order first, each followed by its own descendants.  Transparent children
+    are kept - a browser's page windows are ``WS_EX_TRANSPARENT`` - and so are
+    windows under another child, because a frame can lay a transparent input
+    layer over the window that draws the page (measured on this desktop: a
+    WinUI bridge window over a Chromium page window).  The first of these that
+    holds a Document is the page (see :func:`_page_at`); a browser's background
+    tabs' page windows are below the front tab's, so the front tab's comes first.
+    """
+    found: list[int] = []
+
+    def collect(child: int, _: object) -> bool:
+        try:
+            if win32gui.IsWindowVisible(child) and _contains(
+                tuple(win32gui.GetWindowRect(child)), x, y
+            ):
+                found.append(int(child))
+        except Exception:
+            pass
+        return len(found) < _PAGE_CANDIDATE_WINDOWS
+
+    try:
+        win32gui.EnumChildWindows(hwnd, collect, None)
+    except Exception:
+        pass  # pywin32 reports a callback that stopped the enumeration as an error
+    return found
+
+
+def _page_facts(facts: dict, hwnd: int, via: str) -> dict:
+    value = facts.get("value")
+    return {
+        "hwnd": hwnd,
+        "title": facts.get("name", ""),
+        "url": value if _is_address(value) else "",
+        "via": via,
+    }
+
+
+def _page_at(automation: object, hwnd: int, deadline: float) -> dict | None:
+    """The page ``hwnd`` visibly shows: ``{"hwnd", "title", "url", "via"}``.
+
+    Only the Document element is read, never its content.  "Visibly" is decided
+    at the centre of the window's client area.  The child windows there (a
+    browser draws each tab's page in a child window of its own, the front tab's
+    on top; see :func:`_child_windows_at`) are asked in turn, each for its UIA
+    root and that root's children, in one cached call, until one holds a
+    Document - measured 1-16 ms on a browser window, where the first Document of
+    the whole window's tree was a background tab's.  A window with no such
+    child has the element at its centre climbed until a Document, giving up on
+    reaching the window itself or an element of another window, and not tried
+    at all when another window covers the centre.  The Document's Name is the page title and, when its Value is an
+    address, the Value is the URL.  ``None``: no page.  Raises
+    ``TimeoutError`` when ``deadline`` passes first, so that running out of
+    time is never mistaken for "this window shows no page".
+    """
+    if not hwnd:
+        return None
+    try:
+        if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd):
+            return None
+    except Exception:
+        return None
+    centre = _client_centre(hwnd)
+    if centre is None:
+        return None
+    request = _cache_request(automation)
+    condition = automation.CreatePropertyCondition(  # type: ignore[attr-defined]
+        _UIA_CONTROL_TYPE, _UIA_DOCUMENT
+    )
+    for child in _child_windows_at(hwnd, *centre):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("the page read ran out of time")
+        try:
+            element = automation.ElementFromHandle(child)  # type: ignore[attr-defined]
+        except Exception:
+            continue  # closed meanwhile, or its provider would not answer
+        if not element:
+            continue
+        document = element.FindFirstBuildCache(
+            _TREE_SCOPE_ELEMENT | _TREE_SCOPE_CHILDREN, condition, request
+        )
+        if document:
+            return _page_facts(_element_facts(document), hwnd, "child window")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("the page read ran out of time")
+    try:
+        on_top = int(win32gui.GetAncestor(win32gui.WindowFromPoint(centre), _GA_ROOT))
+    except Exception:
+        on_top = 0
+    if on_top != hwnd:
+        return None  # another window covers the centre: its page is not this one's
+    from ctypes import wintypes
+
+    element = automation.ElementFromPointBuildCache(  # type: ignore[attr-defined]
+        wintypes.POINT(*centre), request
+    )
+    walker = automation.ControlViewWalker  # type: ignore[attr-defined]
+    for _ in range(_PAGE_CLIMB_LEVELS):
+        if not element:
+            return None
+        facts = _element_facts(element)
+        if facts["control_type"] == _UIA_DOCUMENT:
+            return _page_facts(facts, hwnd, "centre")
+        native = facts["native_hwnd"]
+        if native:
+            try:
+                root = int(win32gui.GetAncestor(native, _GA_ROOT))
+            except Exception:
+                root = 0
+            if native == hwnd or root != hwnd:
+                return None  # reached the window itself, or not this window at all
+        if time.monotonic() >= deadline:
+            raise TimeoutError("the page read ran out of time")
+        element = walker.GetParentElementBuildCache(element, request)
+    return None
+
+
+def _start_page_read(hwnd: int) -> _Pending:
+    """Start reading the page ``hwnd`` shows (the before-snapshot)."""
+
+    def job(automation: object, shared: dict) -> None:
+        shared["page"] = _page_at(automation, hwnd, time.monotonic() + _PAGE_READ_S)
+
+    return _Pending(job, "yuki-uia-page-before", _PAGE_READ_S)
+
+
+def _finish_page_read(pending: _Pending) -> tuple[bool, dict | None, dict]:
+    """``(known, page, facts)``: ``known`` is False when the read did not finish."""
+    shared = pending.wait()
+    facts: dict = {"page_read_ms": pending.elapsed_ms}
+    if "page" not in shared:
+        facts["page_read_error"] = str(
+            shared.get("error") or f"no answer within {_PAGE_READ_S * 1000:.0f} ms"
+        )
+        return False, None, facts
+    return True, shared["page"], facts
+
+
+def _same_page(a: dict | None, b: dict | None) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return (a.get("title"), a.get("url")) == (b.get("title"), b.get("url"))
+
+
+def _titled(page: dict) -> bool:
+    """Whether a page has its title yet (a loading page is named by its address)."""
+    return bool(page.get("title")) and page.get("title") != page.get("url")
+
+
+def _page_settled(
+    before_hwnd: int, before: dict | None, before_known: bool, hwnd: int, page: dict | None
+) -> bool:
+    """Whether the page watch has its answer (see :data:`_PAGE_WATCH_S`)."""
+    if hwnd != before_hwnd:
+        return page is None or _titled(page)  # another window: one answer is enough
+    if not before_known or before is None:
+        return True  # nothing to compare with: one read
+    if page is None:
+        return False  # the page is gone for now (mid-navigation): keep looking
+    return not _same_page(before, page) and _titled(page)
+
+
+def _start_page_watch(before_hwnd: int, before: dict | None, before_known: bool) -> _Pending:
+    """Start watching the foreground window's page for changing after input."""
+
+    def job(automation: object, shared: dict) -> None:
+        deadline = time.monotonic() + _PAGE_WATCH_S
+        polls = 0
+        while True:
+            hwnd = int(_user32.GetForegroundWindow())
+            polls += 1
+            shared["polls"] = polls
+            try:
+                # Each read gets its own budget, not what is left of the watch:
+                # a read cut short says nothing, and must not replace the last
+                # one that finished (the caller takes the latest finished read).
+                page = _page_at(automation, hwnd, time.monotonic() + _PAGE_READ_S)
+            except TimeoutError:
+                shared["timeouts"] = shared.get("timeouts", 0) + 1
+            else:
+                shared["after"] = (hwnd, page)
+                if _page_settled(before_hwnd, before, before_known, hwnd, page):
+                    return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(_PAGE_POLL_S)
+
+    return _Pending(job, "yuki-uia-page-watch", _PAGE_WATCH_S + _PAGE_POLL_S)
+
+
+def _finish_page_watch(pending: _Pending) -> tuple[bool, int, dict | None, dict]:
+    """``(known, hwnd, page, facts)`` from the last poll the watch finished."""
+    shared = pending.wait()
+    facts: dict = {"page_watch_ms": pending.elapsed_ms, "page_polls": shared.get("polls", 0)}
+    if shared.get("timeouts"):
+        facts["page_read_timeouts"] = shared["timeouts"]
+    after = shared.get("after")
+    if not isinstance(after, tuple):
+        facts["page_watch_error"] = str(
+            shared.get("error") or f"no answer within {_PAGE_WATCH_S * 1000:.0f} ms"
+        )
+        return False, 0, None, facts
+    hwnd, page = after
+    return True, int(hwnd), page, facts
+
+
+def _short_url(url: str, other: str | None = None) -> str:
+    """``linkedin.com/messaging`` for ``https://www.linkedin.com/messaging/``.
+
+    Scheme, ``www.``, query and fragment are left out of http(s) addresses,
+    unless that would make ``url`` read the same as a different ``other``.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _clip(url, _URL_CHARS)
+    if parts.scheme not in ("http", "https"):
+        return _clip(url, _URL_CHARS)
+    host = parts.netloc[4:] if parts.netloc.startswith("www.") else parts.netloc
+    short = host + parts.path.rstrip("/")
+    if other and other != url and _short_url(other) == short:
+        tail = (f"?{parts.query}" if parts.query else "") + (
+            f"#{parts.fragment}" if parts.fragment else ""
+        )
+        short = short + tail if tail else url
+    return _clip(short, _URL_CHARS)
+
+
+def _page_phrase(page: dict, other: dict | None = None) -> str:
+    """``"Magic UI" (magicui.design)``; ``magicui.design (no title yet)``."""
+    url = page.get("url") or ""
+    short = _short_url(url, (other or {}).get("url")) if url else ""
+    if not _titled(page):
+        return f"{short} (no title yet)" if short else "(untitled)"
+    return f"{_quoted(page['title'])} ({short})" if short else _quoted(page["title"])
+
+
+def _describe_page_change(
+    before_hwnd: int,
+    before: dict | None,
+    after_hwnd: int,
+    after: dict | None,
+    *,
+    before_known: bool = True,
+    after_known: bool = True,
+) -> tuple[str, dict]:
+    """A phrase for ``summary`` and the before/after facts for ``details``.
+
+    ``page_changed`` is True / False, or ``None`` when one side was not read.
+    """
+    facts: dict = {"page_before": before, "page_after": after}
+    if not after_known or not before_known:
+        facts["page_changed"] = None
+        if after_known and after is not None:
+            return f"page now {_page_phrase(after)}", facts
+        return "", facts
+    facts["page_changed"] = not _same_page(before, after)
+    if after_hwnd != before_hwnd:
+        if after is None:
+            return "", facts
+        return f"the new foreground window shows {_page_phrase(after)}", facts
+    if before is None and after is None:
+        return "", facts
+    if before is None:
+        return f"a page is showing now: {_page_phrase(after)}", facts
+    if after is None:
+        return f"the page {_page_phrase(before)} could not be read afterwards", facts
+    if _same_page(before, after):
+        return f"page unchanged: {_page_phrase(before)}", facts
+    if before.get("url") == after.get("url") and _titled(before) and _titled(after):
+        if not after.get("url"):  # a document that is not a web page
+            return (
+                f"the document changed from {_quoted(before['title'])} to "
+                f"{_quoted(after['title'])}"
+            ), facts
+        return (
+            f"the page title changed from {_quoted(before['title'])} to "
+            f"{_quoted(after['title'])} (same url)"
+        ), facts
+    return (
+        f"the page changed from {_page_phrase(before, after)} to "
+        f"{_page_phrase(after, before)}"
+    ), facts
+
+
+def _report_effects(
+    before: dict,
+    page_hwnd: int,
+    page_before: dict | None,
+    page_known: bool,
+    watch: _Pending,
+    *,
+    focus_timeout_s: float,
+    details: dict,
+) -> str:
+    """After input: watch focus and the page, and say what changed.
+
+    The focus watch runs here while the page watch runs on its own thread, so
+    the two waits overlap.  The window title is read again at the end: the page
+    watch can outlast the focus watch, and a navigation retitles the window
+    when it commits.
+    """
+    after = _watch_focus(before, timeout_s=focus_timeout_s)
+    after_known, after_hwnd, page_after, watch_facts = _finish_page_watch(watch)
+    if after["foreground_hwnd"] and int(_user32.GetForegroundWindow()) == after["foreground_hwnd"]:
+        info = window_info(after["foreground_hwnd"])
+        if info:
+            after = {**after, "foreground_title": info.title}
+    page_phrase, page_facts = _describe_page_change(
+        page_hwnd,
+        page_before,
+        after_hwnd,
+        page_after,
+        before_known=page_known,
+        after_known=after_known,
+    )
+    outcome, facts = _describe_outcome(
+        before, after, page_phrase=page_phrase, page_changed=bool(page_facts["page_changed"])
+    )
+    details.update(facts)
+    details.update(page_facts)
+    details.update(watch_facts)
+    return outcome
 
 
 def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, str]:
@@ -965,14 +1736,26 @@ def click(
             window that took focus instead.
 
     Returns:
-        ActionResult whose ``summary`` says what the click did, not just that it
-        happened - which window is in front now and what has keyboard focus - and
-        whose ``details`` carry ``foreground_hwnd``, ``focused_control_hwnd``, the
-        focused control's ``focus_role``/``focus_name``/``focus_value``,
+        ActionResult whose ``summary`` says what the click hit and what it did,
+        not just that it happened: the element under the point, named before the
+        click (:func:`_start_hit_test`, ~150 ms budget; "target element unknown"
+        past it), then which window is in front now (retitled: before -> after),
+        which page it shows (before -> after, see :func:`_describe_page_change`)
+        and what has keyboard focus.  On 2026-09-23 a guessed coordinate hit a
+        bookmark and navigated the tab away, and a result that said only "focus
+        unchanged" sent the model hunting three minutes for a tab that had
+        merely navigated.  ``details`` carry ``target`` (role, name,
+        automation_id, value, bounds, context, window, via) or
+        ``target_unknown_reason``; ``page_before``/``page_after``
+        (``{hwnd, title, url, via}`` or ``None``) and ``page_changed``
+        (``None``: not known); ``foreground_hwnd``/``foreground_title``/
+        ``foreground_title_before``, ``focused_control_hwnd``, the focused
+        control's ``focus_role``/``focus_name``/``focus_value``,
         ``focus_accepts_text``, and the ``focus_changed`` /
-        ``foreground_changed`` flags.  A click that hit nothing says "focus
-        unchanged", which is the signal that the coordinate was wrong; retrying the
-        same point is then pointless.
+        ``foreground_changed`` / ``foreground_title_changed`` flags.  A click
+        that hit nothing says "focus unchanged" and "page unchanged", which is
+        the signal that the coordinate was wrong; retrying the same point is
+        then pointless.
     """
     started = time.perf_counter()
     details = {
@@ -1001,19 +1784,62 @@ def click(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    # Before anything is sent: what is under the point, and which page the
+    # foreground window shows - read concurrently, each on a budget, neither
+    # able to stop the click.
+    page_hwnd = int(_user32.GetForegroundWindow())
+    hit = _start_hit_test(x, y)
+    page_read = _start_page_read(page_hwnd)
+    target, unknown_reason = _finish_hit_test(hit)
+    page_known, page_before, page_facts = _finish_page_read(page_read)
+    details["target"] = target
+    if target is None:
+        details["target_unknown_reason"] = unknown_reason
+    details.update(page_facts)
+    # The reads took time; the guard is asked again right before sending.
+    refusal = _foreground_mismatch(expect_hwnd)
+    if refusal:
+        return _result(False, refusal, details, started)
     before = _focus_state()
     down, up = _MOUSEEVENTF[button]
     _move(x, y)
     for _ in range(clicks):
         _user32.mouse_event(down, 0, 0, 0, 0)
         _user32.mouse_event(up, 0, 0, 0, 0)
+    watch = _start_page_watch(page_hwnd, page_before, page_known)
     details["cursor"] = cursor_position()
-    label = {1: "clicked", 2: "double-clicked", 3: "triple-clicked"}.get(
+    outcome = _report_effects(
+        before,
+        page_hwnd,
+        page_before,
+        page_known,
+        watch,
+        focus_timeout_s=_FOCUS_WATCH_S,
+        details=details,
+    )
+    return _result(
+        True,
+        _click_summary(button, clicks, x, y, _describe_target(target, page_hwnd), outcome),
+        details,
+        started,
+    )
+
+
+def _click_summary(button: str, clicks: int, x: int, y: int, target: str, outcome: str) -> str:
+    """``clicked Button "Magic UI" in ToolBar "Bookmarks" at (3200,100); <outcome>``.
+
+    ``target`` is :func:`_describe_target`'s phrase; empty means the hit test
+    found nothing, which the summary says rather than hiding.
+    """
+    verb = {1: "clicked", 2: "double-clicked", 3: "triple-clicked"}.get(
         clicks, f"clicked {clicks}x"
     )
-    outcome, facts = _describe_outcome(before, _watch_focus(before))
-    details.update(facts)
-    return _result(True, f"{label} {button} at ({x},{y}); {outcome}", details, started)
+    if button != "left":
+        verb = f"{button}-{verb}"
+    head = f"{verb} {target} at ({x},{y})" if target else (
+        f"{verb} at ({x},{y}), target element unknown"
+    )
+    return f"{head}; {outcome}" if outcome else head
 
 
 _GMEM_MOVEABLE = 0x0002
@@ -1496,6 +2322,19 @@ def type_text(
     )
 
 
+def _page_before_keys(details: dict) -> tuple[int, dict | None, bool]:
+    """``(hwnd, page, known)``: the foreground window's page before keys go out.
+
+    Keyboard navigation (Enter on a link, Alt+Left, Ctrl+L + Enter) changes the
+    page just as a click does, so ``hotkey`` and ``press`` take the same
+    before-snapshot and run the same watch afterwards.
+    """
+    hwnd = int(_user32.GetForegroundWindow())
+    known, page, facts = _finish_page_read(_start_page_read(hwnd))
+    details.update(facts)
+    return hwnd, page, known
+
+
 def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     """Press a key combination, e.g. ``("ctrl","t")``, ``("volume_mute",)``.
 
@@ -1511,7 +2350,10 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     shortcut meant to open a text field that reports "focus unchanged" did not
     open it (yet), and typing next would go into whatever still has focus.  Any
     new top-level window of the target process that showed meanwhile is named
-    too (``details["new_windows"]``).
+    too (``details["new_windows"]``), and so is what happened to the page the
+    foreground window shows (before -> after, watched for up to
+    :data:`_PAGE_WATCH_S`; ``page_before``/``page_after``/``page_changed`` in
+    ``details``), so a key that navigates says where it went.
     """
     started = time.perf_counter()
     details: dict = {"keys": list(keys), "expect_hwnd": expect_hwnd}
@@ -1539,12 +2381,22 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     if not_ready is not None:
         return not_ready
     watched_pid, windows_before = _windows_before(expect_hwnd)
+    page_hwnd, page_before, page_known = _page_before_keys(details)
+    refusal = _foreground_mismatch(expect_hwnd)  # the page read took time
+    if refusal:
+        return _result(False, refusal, details, started)
     before = _focus_state()
     pyautogui.hotkey(*resolved)
-    outcome, facts = _describe_outcome(
-        before, _watch_focus(before, timeout_s=_KEY_FOCUS_WATCH_S)
+    watch = _start_page_watch(page_hwnd, page_before, page_known)
+    outcome = _report_effects(
+        before,
+        page_hwnd,
+        page_before,
+        page_known,
+        watch,
+        focus_timeout_s=_KEY_FOCUS_WATCH_S,
+        details=details,
     )
-    details.update(facts)
     details["new_windows"] = _windows_appeared(watched_pid, windows_before)
     popup = _describe_appeared(details["new_windows"])
     return _result(
@@ -1561,7 +2413,8 @@ def press(
     """Press a single key ``times`` times with no delay between presses.
 
     Guarded, readiness-checked and reported exactly like :func:`hotkey`: the
-    result says where keyboard focus is after the presses.
+    result says where keyboard focus is after the presses and what happened to
+    the foreground window's page ("the page changed from ... to ...").
     """
     started = time.perf_counter()
     details: dict = {"key": key, "times": times, "expect_hwnd": expect_hwnd}
@@ -1580,12 +2433,22 @@ def press(
     if not_ready is not None:
         return not_ready
     watched_pid, windows_before = _windows_before(expect_hwnd)
+    page_hwnd, page_before, page_known = _page_before_keys(details)
+    refusal = _foreground_mismatch(expect_hwnd)  # the page read took time
+    if refusal:
+        return _result(False, refusal, details, started)
     before = _focus_state()
     pyautogui.press(normalized, presses=times, interval=0)
-    outcome, facts = _describe_outcome(
-        before, _watch_focus(before, timeout_s=_KEY_FOCUS_WATCH_S)
+    watch = _start_page_watch(page_hwnd, page_before, page_known)
+    outcome = _report_effects(
+        before,
+        page_hwnd,
+        page_before,
+        page_known,
+        watch,
+        focus_timeout_s=_KEY_FOCUS_WATCH_S,
+        details=details,
     )
-    details.update(facts)
     details["new_windows"] = _windows_appeared(watched_pid, windows_before)
     popup = _describe_appeared(details["new_windows"])
     suffix = f" x{times}" if times > 1 else ""
