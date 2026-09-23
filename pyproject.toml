@@ -7,6 +7,9 @@ dependencies = [
     "anthropic[bedrock]>=1.7.0",
     "boto3>=1.43.99",
     "comtypes>=1.4.17",
+    "cryptography>=50.0.1",
+    "fastembed>=0.8.1",
+    "numpy>=2.5.3",
     "pillow>=12.3.0",
     "psutil>=7.2.2",
     "pyautogui>=0.9.54",
@@ -24,6 +27,7 @@ dev = [
 [project.scripts]
 yuki = "yuki.cli:main"
 yuki-ui = "yuki.ui.app:main"
+yuki-memory = "yuki.memory.service:main"
 
 [build-system]
 requires = ["uv_build>=0.9.9,<0.10.0"]
