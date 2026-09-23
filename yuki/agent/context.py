@@ -19,6 +19,25 @@ from typing import Any
 from yuki.agent.tools import PERCEPTION_TOOLS
 from yuki.log.events import SessionLogger
 
+#: First line of every text block Yuki writes into a ``user`` message itself.
+#: The API joins adjacent text blocks with no separator, so without it the
+#: model reads the user's "... on yt" and the next block's "Desktop right now:"
+#: as one run of text ("ytDesktop") and cannot tell which part the user wrote.
+ATTACHED_LABEL = "[Attached automatically by Yuki, not written by the user]"
+
+#: Last line of the same blocks, so whatever follows (a new request after a
+#: cancelled run, say) is just as clearly separated at the other end.
+ATTACHED_END = "[End of attached context]"
+
+
+def attached_text(body: str) -> str:
+    """Frame text Yuki attaches to a ``user`` message so it cannot pass as the user's.
+
+    The leading blank line keeps the label off the end of whatever block comes
+    before it once the API has joined them.
+    """
+    return f"\n\n{ATTACHED_LABEL}\n{body.strip()}\n{ATTACHED_END}"
+
 
 @dataclass
 class _Slot:
@@ -83,18 +102,26 @@ class ContextManager:
         running, how many model calls) ride along here rather than in the system
         prompt so the cached prefix stays stable. All of it lives in one block,
         so pruning stubs it as one unit once it is stale.
+
+        The block is framed by :func:`attached_text`: it always travels as its
+        own content block, never inside the user's words, and its first line
+        says Yuki attached it and the user did not write it.
         """
         parts = [f"Desktop right now:\n{overview_text}"]
         if self_facts:
             parts.append(self_facts)
         if self.running_summary:
             parts.append(f"Your working note:\n{self.running_summary}")
-        return "\n\n".join(parts)
+        return attached_text("\n\n".join(parts))
 
     def add_request(
         self, text: str, overview_text: str, *, self_facts: str | None = None
     ) -> None:
-        """Append a new user request together with the current situation."""
+        """Append a new user request together with the current situation.
+
+        The request is the first block, verbatim and alone; the situation is a
+        second, separately labelled block (see :meth:`situation_text`).
+        """
         content = [
             {"type": "text", "text": text},
             {"type": "text", "text": self.situation_text(overview_text, self_facts)},
@@ -140,9 +167,17 @@ class ContextManager:
         )
 
     def add_note(self, text: str) -> None:
-        """Append a plain user text message (used for cancellations and notices)."""
+        """Append a notice from Yuki (cancellations and the like) as a user message.
+
+        Framed like the situation block: the next request may land right after
+        it, and the two must not read as one piece of the user's writing.
+        """
         self._slots.append(
-            _Slot(role="user", content=[{"type": "text", "text": text}], turn=self.logger.turn)
+            _Slot(
+                role="user",
+                content=[{"type": "text", "text": attached_text(text)}],
+                turn=self.logger.turn,
+            )
         )
 
     def dangling_tool_uses(self) -> list[tuple[str, str]]:
@@ -197,7 +232,9 @@ class ContextManager:
                 if key in slot.stubbed:
                     continue
                 original = _chars(block)
-                stub = f"[desktop overview from turn {slot.turn} - superseded]"
+                # Same leading break as the block it replaces: in the first
+                # message it sits right after the user's own words.
+                stub = f"\n\n[desktop overview attached by Yuki on turn {slot.turn} - superseded]"
                 slot.content[position] = {"type": "text", "text": stub}
                 slot.stubbed.add(key)
                 self.logger.context_edit(

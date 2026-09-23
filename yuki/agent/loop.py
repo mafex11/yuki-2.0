@@ -561,10 +561,16 @@ class Agent:
             if outcome.kind == "done":
                 finished.append(outcome.control_input["message"])
 
+            # Repetition facts for every real tool call the model made, looks
+            # included (eleven identical look_at_window calls went unremarked
+            # while only actions were counted). The per-turn automatic overview
+            # never comes through here, so only explicit calls are counted.
             repeat_note = None
-            if name not in PERCEPTION_TOOLS and name not in CONTROL_TOOLS:
+            if name not in CONTROL_TOOLS:
                 repeats = self._record_call(name, tool_input, outcome.summary)
-                repeat_note = _repeat_text(name, repeats)
+                repeat_note = _repeat_text(
+                    name, repeats, perception=name in PERCEPTION_TOOLS, summary=outcome.summary
+                )
                 outcome.payload = (
                     {**outcome.payload, "self_facts": repeats}
                     if isinstance(outcome.payload, dict)
@@ -696,7 +702,10 @@ class Agent:
         }
 
     def _record_call(self, name: str, tool_input: dict[str, Any], summary: str) -> dict[str, int]:
-        """Record one action call this request and count its repeats.
+        """Record one explicit tool call this request and count its repeats.
+
+        Actions and perception tools alike, keyed on tool name plus canonical
+        input; control tools are not recorded.
 
         Returns:
             ``exact_calls``: calls of this tool with this exact input (canonical
@@ -807,19 +816,36 @@ def _turn_facts_text(facts: dict[str, Any]) -> str | None:
     )
 
 
-def _repeat_text(name: str, facts: dict[str, int]) -> str | None:
-    """The repetition fact appended to a tool result, or ``None`` when there is none."""
+def _repeat_text(
+    name: str, facts: dict[str, int], *, perception: bool = False, summary: str = ""
+) -> str | None:
+    """The repetition fact appended to a tool result, or ``None`` when there is none.
+
+    Args:
+        name: Tool name.
+        facts: From :meth:`Agent._record_call`.
+        perception: The tool only looks. What is compared is the one-line summary
+            (a tree's full text differs on every read, if only in its timing), so
+            the fact names that summary rather than claiming identical content,
+            and the "different input, same result" fact is left out: two
+            different windows both having six elements says nothing.
+        summary: This call's summary, quoted for perception tools.
+
+    The text starts with a line break because the API joins it straight onto
+    the end of the tool's own text block.
+    """
     count = facts["exact_calls"]
     same = facts["exact_same_result"]
-    others = facts["other_input_same_result"]
+    others = 0 if perception else facts["other_input_same_result"]
     other_calls = f"{others} {name} call{'' if others == 1 else 's'} with different input"
+    same_result = f'the same summary, "{summary}"' if perception and summary else "the same result"
     if count > 1:
         previous = count - 1
         if same == previous:
             tail = (
-                "the previous one returned the same result"
+                f"the previous one returned {same_result}"
                 if previous == 1
-                else f"the previous {previous} returned the same result"
+                else f"the previous {previous} returned {same_result}"
             )
         elif same == 0:
             tail = (
@@ -828,13 +854,13 @@ def _repeat_text(name: str, facts: dict[str, int]) -> str | None:
                 else f"none of the previous {previous} returned this result"
             )
         else:
-            tail = f"{same} of the previous {previous} returned the same result"
-        text = f"(this exact call has now been made {count} times this request; {tail}"
+            tail = f"{same} of the previous {previous} returned {same_result}"
+        text = f"\n(this exact call has now been made {count} times this request; {tail}"
         if others:
             text += f"; {other_calls} also returned it"
         return text + ")"
     if others:
-        return f"(earlier this request, {other_calls} returned this same result)"
+        return f"\n(earlier this request, {other_calls} returned this same result)"
     return None
 
 
