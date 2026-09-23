@@ -1,0 +1,148 @@
+# Yuki memory - privacy rules (defaults).
+#
+# On first run this file is copied to %LOCALAPPDATA%\Yuki\memory\privacy.toml.
+# Edit THAT copy; the watcher re-reads it whenever it changes (no restart).
+# Every rule here is data about what must never be recorded.  Nothing in this
+# file tells Yuki how to behave; it only says what the watcher may not read.
+#
+# Matching:
+#   * process names are Windows image names ("chrome.exe"), case-insensitive;
+#   * hosts match exactly or as a parent domain ("chase.com" also blocks
+#     "secure.chase.com"), case-insensitive;
+#   * path fragments and query terms are case-insensitive substrings.
+# Seeded from MaxMi's Denylist.swift, mapped to Windows.
+
+version = 1
+
+[pause]
+# Stop capturing entirely while the session is locked.
+when_locked = true
+# Stop capturing entirely while a full-screen window is in front (a game,
+# a full-screen video, a presentation).
+when_fullscreen = true
+
+[fields]
+# Never read the value of a UIA element whose IsPassword is true.
+drop_password_values = true
+# Skip the whole capture while the focused control is a password field.
+skip_when_password_focused = true
+# A value or line made only of these characters is a masked secret: dropped.
+mask_characters = "•●∙·*◦⦁⚫"
+
+[own]
+# Never read Yuki's own windows (the tray app, its overlay, its dialogs).
+skip_own_windows = true
+
+[apps]
+# Never read windows of these processes.
+blocked_processes = [
+    # password managers and authenticators
+    "1Password.exe",
+    "Bitwarden.exe",
+    "KeePass.exe",
+    "KeePassXC.exe",
+    "LastPass.exe",
+    "Dashlane.exe",
+    "Enpass.exe",
+    "RoboForm.exe",
+    "NordPass.exe",
+    "ProtonPass.exe",
+    "Proton Pass.exe",
+    "Keeper Password Manager.exe",
+    "KeeperPasswordManager.exe",
+    "Authy Desktop.exe",
+    "WinAuth.exe",
+    # Windows credential and sign-in surfaces
+    "CredentialUIBroker.exe",
+    "LogonUI.exe",
+    "LockApp.exe",
+    "consent.exe",
+    # Settings (Wi-Fi keys, accounts, sign-in options)
+    "SystemSettings.exe",
+]
+# Product-name fragments of password-manager families (process name contains).
+blocked_process_substrings = ["1password", "bitwarden", "lastpass", "dashlane", "keepass"]
+# Window titles (exact, case-insensitive) never read, whatever the process:
+# Control Panel applets that live inside explorer.exe.
+blocked_window_titles = ["Credential Manager"]
+
+# Private / incognito browser windows.  Browsers mark these in the window title;
+# each rule is one browser's mark.  process = "*" means any process.
+[[private_windows]]
+process = "msedge.exe"
+title_contains = "InPrivate"
+
+[[private_windows]]
+process = "*"
+title_endswith = "(Incognito)"
+
+[[private_windows]]
+process = "*"
+title_endswith = "(Private)"
+
+[[private_windows]]
+process = "*"
+title_endswith = "(Private with Tor)"
+
+[[private_windows]]
+process = "*"
+title_endswith = "Private Browsing"
+
+[web]
+# Pages with these URL schemes are never read (browser settings / password /
+# wallet pages, extension pages, raw data).  "file" is not listed: many desktop
+# apps draw their own UI from file:// pages.  Add it to block local files
+# opened in a browser.
+blocked_schemes = [
+    "chrome", "edge", "about", "arc", "brave", "vivaldi", "opera",
+    "view-source", "devtools", "chrome-extension", "moz-extension",
+    "extension", "chrome-untrusted", "chrome-search", "edge-extension",
+    "data", "blob", "javascript",
+]
+# http(s) pages without a host are not read (fail closed).
+block_hostless_web = true
+# A URL carrying a user name or password is not read.
+block_credentials_in_url = true
+
+# Sign-in, password-manager, banking, payment and meeting sites.
+blocked_host_suffixes = [
+    "accounts.google.com", "passwords.google.com",
+    "login.microsoftonline.com", "login.live.com", "account.live.com",
+    "account.microsoft.com", "appleid.apple.com", "idmsa.apple.com",
+    "bitwarden.com", "1password.com", "okta.com", "lastpass.com",
+    "dashlane.com", "authy.com", "auth0.com",
+    "netbanking.hdfcbank.com", "onlinesbi.sbi", "icicibank.com", "axisbank.com",
+    "chase.com", "bankofamerica.com", "wellsfargo.com",
+    "paypal.com",
+    "meet.google.com", "zoom.us",
+]
+# Any site: a page whose path contains one of these is not read.
+blocked_path_fragments = [
+    "/login", "/signin", "/sign-in", "/sign_in", "/auth/", "/oauth/",
+    "/reset-password", "/forgot-password", "/change-password",
+    "/2fa", "/mfa", "/otp",
+]
+
+# Per-site path rules: host (and its subdomains) -> path fragments.
+[web.blocked_host_paths]
+"stripe.com" = ["/login"]
+"teams.microsoft.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
+"teams.live.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
+
+[adult]
+host_suffixes = [
+    "pornhub.com", "pornhub.org", "xvideos.com", "xnxx.com", "redtube.com",
+    "youporn.com", "xhamster.com", "spankbang.com", "jav.guru", "hanime.tv",
+    "onlyfans.com", "chaturbate.com", "stripchat.com",
+]
+host_substrings = ["porn", "xvideos", "xhamster", "hentai", "javhd"]
+# A search whose query contains one of these is not read.
+query_terms = ["porn", "hentai", "xxx", "nsfw", "jav ", "sex video"]
+# URL query parameters that carry a search query.
+query_params = ["q", "search_query", "query", "p"]
+
+[user]
+# Your own blocklist.  Apps: process name ("discord.exe") or app name
+# ("Discord").  Domains: "example.com" also blocks its subdomains.
+blocked_apps = []
+blocked_domains = []

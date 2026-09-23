@@ -1,0 +1,324 @@
+"""``yuki-memory``: the background memory process (docs/MEMORY.md, "Processes").
+
+Runs the watcher (:mod:`yuki.memory.watcher`) and the journal worker
+(:mod:`yuki.memory.journal`) against one shared :class:`~yuki.memory.store.Store`
+(the journal worker waits on the store's own "new capture" condition, which only
+fires within one Store instance).  It is its own process so that nothing here
+can take Yuki down, runs at below-normal priority, and keeps one instance per
+session and database (named mutex).
+
+Stopping: Ctrl+C / Ctrl+Break / closing the console, ``WM_CLOSE`` to the
+watcher's hidden window (class :data:`yuki.memory.watcher.WINDOW_CLASS`; this is
+how the tray app stops it), end of the Windows session, or ``--duration``.
+
+Logs: ``logs/memory-<YYYYMMDD-HHMMSS>.jsonl``, content-free - apps, triggers,
+outcomes, sizes, timings, process CPU and memory - never captured text, window
+titles or URLs.  The journal worker keeps its own log (``logs/memory/``).
+
+Usage::
+
+    uv run yuki-memory                     # the real store, journal on
+    uv run yuki-memory --verbose           # one console line per capture
+    uv run yuki-memory --db %TEMP%\\m\\memory.db --no-journal --duration 90
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import signal
+import sys
+import threading
+import time
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import psutil
+
+from yuki.log.events import SessionLogger
+from yuki.memory.privacy import PrivacyConfig
+from yuki.memory.watcher import Watcher, WatcherSettings
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MUTEX_PREFIX = "Local\\YukiMemorySingleInstance"
+_ERROR_ALREADY_EXISTS = 183
+#: Captures older than this are deleted (docs/MEMORY.md: captures TTL 30 days).
+CAPTURE_TTL_DAYS = 30.0
+_PRUNE_EVERY_S = 6 * 3600.0
+
+
+class _Log:
+    """Thread-safe front for :class:`SessionLogger` plus an optional console line."""
+
+    def __init__(self, logger: SessionLogger, *, verbose: bool) -> None:
+        self._logger = logger
+        self._lock = threading.Lock()
+        self.verbose = verbose
+
+    def __call__(self, type: str, **fields: Any) -> None:
+        with self._lock:
+            self._logger.log(type, **fields)
+            if self.verbose:
+                print(_console_line(type, fields), flush=True)
+
+    def close(self) -> None:
+        with self._lock:
+            self._logger.close()
+
+    @property
+    def path(self) -> Path:
+        return self._logger.path
+
+
+def _console_line(type: str, f: dict[str, Any]) -> str:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    if type == "capture":
+        extra = f" +{f.get('delta_chars', 0)}" if f.get("outcome") == "captured" else ""
+        reason = f" ({f['reason']})" if f.get("reason") else ""
+        return (
+            f"{stamp} {f.get('trigger', ''):<10} {f.get('app', '') or '-':<22.22} "
+            f"{f.get('outcome', ''):<12}{reason} {f.get('chars', 0)} chars{extra} "
+            f"{f.get('ms', 0):.0f} ms [{f.get('source', '')}]"
+        )
+    if type == "stats":
+        lat = f.get("watcher", {}).get("latency_ms", {})
+        return (
+            f"{stamp} stats  cpu {f.get('cpu_percent_total')}% (one core {f.get('cpu_percent_one_core')}%)"
+            f"  rss {f.get('rss_mb')} MB  attempts/min {f.get('watcher', {}).get('attempts_per_min')}"
+            f"  p50 {lat.get('p50')} ms  p90 {lat.get('p90')} ms"
+        )
+    if type == "error":
+        return f"{stamp} error  {f.get('where', '')}: {f.get('error', '')}"
+    brief = {k: v for k, v in f.items() if k not in ("traceback", "settings", "stats")}
+    return f"{stamp} {type}  {brief}"
+
+
+def _claim_mutex(db_path: Path) -> int | None:
+    """One service per session and database; returns the handle to hold, or None."""
+    digest = hashlib.sha1(str(db_path.resolve()).lower().encode()).hexdigest()[:12]
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, f"{MUTEX_PREFIX}-{digest}")
+    if not handle:
+        return None
+    if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return None
+    return int(handle)
+
+
+class _ProcessMeter:
+    """CPU and memory of this process, between successive readings."""
+
+    def __init__(self) -> None:
+        self._proc = psutil.Process()
+        self._cpus = psutil.cpu_count() or 1
+        self._t0 = time.perf_counter()
+        self._c0 = self._cpu()
+        self._start_t, self._start_c = self._t0, self._c0
+
+    def _cpu(self) -> float:
+        times = self._proc.cpu_times()
+        return times.user + times.system
+
+    def reading(self, *, since_start: bool = False) -> dict[str, Any]:
+        now, cpu = time.perf_counter(), self._cpu()
+        t0, c0 = (self._start_t, self._start_c) if since_start else (self._t0, self._c0)
+        if not since_start:
+            self._t0, self._c0 = now, cpu
+        wall = max(now - t0, 1e-9)
+        one_core = 100.0 * (cpu - c0) / wall
+        mem = self._proc.memory_info()
+        return {
+            "window_s": round(wall, 1),
+            "cpu_s": round(cpu - c0, 3),
+            "cpu_percent_one_core": round(one_core, 2),
+            "cpu_percent_total": round(one_core / self._cpus, 2),
+            "rss_mb": round(mem.rss / 2**20, 1),
+            "peak_mb": round(getattr(mem, "peak_wset", mem.rss) / 2**20, 1),
+            "threads": self._proc.num_threads(),
+        }
+
+
+def _set_below_normal() -> None:
+    try:
+        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    except (psutil.Error, OSError):
+        pass
+
+
+def _install_stop_handlers(stop: threading.Event) -> Callable[[], None]:
+    """Ctrl+C, Ctrl+Break and console close all set ``stop``."""
+
+    def on_signal(signum: int, frame: object) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGINT, on_signal)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, on_signal)
+
+    handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+    def on_console(event: int) -> int:
+        # CTRL_CLOSE_EVENT(2), LOGOFF(5), SHUTDOWN(6): the console is going away.
+        if event in (2, 5, 6):
+            stop.set()
+            return 1
+        return 0  # Ctrl+C / Ctrl+Break: let Python's signal handlers run
+
+    callback = handler_type(on_console)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(callback, True)
+    return lambda: callback  # keeps the callback alive for the process lifetime
+
+
+def _parse(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="yuki-memory", description="Yuki's memory process.")
+    parser.add_argument("--db", type=Path, default=None, help="database path (default: %%LOCALAPPDATA%%\\Yuki\\memory\\memory.db)")
+    parser.add_argument("--privacy", type=Path, default=None, help="privacy rules file (default: %%LOCALAPPDATA%%\\Yuki\\memory\\privacy.toml)")
+    parser.add_argument("--no-journal", action="store_true", help="capture only; do not run the journal worker")
+    parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
+    parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
+    parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
+    return parser.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    from yuki.memory.store import Store, default_db_path
+
+    db_path = Path(args.db) if args.db else default_db_path()
+    mutex = _claim_mutex(db_path)
+    if mutex is None:
+        print(f"yuki-memory is already running for {db_path}", file=sys.stderr)
+        return 1
+    _set_below_normal()
+
+    stop = threading.Event()
+    keep_alive = _install_stop_handlers(stop)
+    session_id = "memory-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = _Log(SessionLogger(PROJECT_ROOT / "logs", session_id=session_id, quiet=True), verbose=args.verbose)
+    meter = _ProcessMeter()
+    started = time.monotonic()
+    watcher: Watcher | None = None
+    journal = None
+    journal_thread: threading.Thread | None = None
+    store = None
+    code = 0
+    try:
+        store = Store.open(db_path)
+        privacy = PrivacyConfig(args.privacy)
+        log(
+            "service_start",
+            pid=psutil.Process().pid,
+            db=str(db_path),
+            privacy=str(privacy.path),
+            privacy_error=privacy.last_error,
+            journal=not args.no_journal,
+            duration_s=args.duration,
+        )
+        try:
+            removed = store.prune(CAPTURE_TTL_DAYS)
+            log("prune", captures_deleted=removed, older_than_days=CAPTURE_TTL_DAYS)
+        except Exception as exc:
+            log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
+        last_prune = time.monotonic()
+
+        shared = store
+        watcher = Watcher(lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(), on_close=stop.set)
+        watcher.start()
+
+        if not args.no_journal:
+            try:
+                from yuki.memory.journal import JournalWorker
+
+                journal = JournalWorker(store)
+                journal_thread = threading.Thread(
+                    target=_guarded(journal.run, log, "journal"), args=(stop,), name="yuki-memory-journal", daemon=True
+                )
+                journal_thread.start()
+            except Exception as exc:  # the watcher runs on without it
+                log("error", where="journal_start", error=f"{type(exc).__name__}: {exc}")
+                journal = None
+
+        if not args.verbose:
+            print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
+        next_stats = time.monotonic() + args.stats_every
+        privacy_error = privacy.last_error
+        while not stop.is_set():
+            now = time.monotonic()
+            deadline = next_stats
+            if args.duration is not None:
+                deadline = min(deadline, started + args.duration)
+            # Bounded so Ctrl+C is seen promptly (signals run between waits).
+            stop.wait(min(max(deadline - now, 0.0), 1.0))
+            now = time.monotonic()
+            if args.duration is not None and now >= started + args.duration:
+                log("service_stop_requested", via="duration")
+                break
+            if not watcher.alive:
+                log("error", where="watcher", error="hook thread exited")
+                code = 2
+                break
+            if privacy.last_error != privacy_error:
+                privacy_error = privacy.last_error
+                log("privacy_config", error=privacy_error, reloads=privacy.reloads)
+            if now >= next_stats:
+                next_stats = now + args.stats_every
+                log("stats", **meter.reading(), watcher=watcher.stats())
+            if now - last_prune >= _PRUNE_EVERY_S:
+                last_prune = now
+                try:
+                    log("prune", captures_deleted=store.prune(CAPTURE_TTL_DAYS), older_than_days=CAPTURE_TTL_DAYS)
+                except Exception as exc:
+                    log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        import traceback
+
+        log("error", where="service", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+        code = 2
+    finally:
+        stop.set()
+        if journal is not None:
+            try:
+                journal.stop()
+            except Exception:
+                pass
+        if watcher is not None:
+            watcher.stop()
+        if journal_thread is not None:
+            journal_thread.join(10.0)
+        totals = meter.reading(since_start=True)
+        log("service_stop", **totals, watcher=watcher.stats() if watcher else None, exit_code=code)
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        log.close()
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(mutex))
+        keep_alive()
+    return code
+
+
+def _guarded(fn: Callable[..., Any], log: _Log, where: str) -> Callable[..., None]:
+    def runner(*args: Any) -> None:
+        try:
+            fn(*args)
+        except BaseException as exc:
+            import traceback
+
+            log("error", where=where, error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+
+    return runner
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run(_parse(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
