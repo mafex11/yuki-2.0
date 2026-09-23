@@ -270,6 +270,40 @@ _SETTLE_S = 0.6
 #: about which application it is.
 _YOUNG_PROCESS_S = 10.0
 
+#: Windows an action has just opened or handed something to open (a URL, a
+#: file), with when (``time.monotonic``).  Process age alone misses the common
+#: case where an app keeps a background process alive: on 2026-09-23 a browser
+#: window created seconds earlier belonged to a process far older than
+#: :data:`_YOUNG_PROCESS_S`, so its half-loaded frame (7% of the window covered)
+#: was returned after 0.6 s as if it were the page.  A window noted here is read
+#: with the same patience as a young process for :data:`_YOUNG_PROCESS_S`.
+_fresh_windows: dict[int, float] = {}
+_fresh_lock = threading.Lock()
+
+
+def note_window_fresh(hwnd: int) -> None:
+    """Record that ``hwnd`` was just opened, or just handed a target to open.
+
+    Called by the actions that do that (``launch_app``, ``open_url``).  For the
+    next :data:`_YOUNG_PROCESS_S` a thin or mostly blank read of that window is
+    re-polled until its content is exposed or the budget ends, exactly as for a
+    window of a process that has only just started.  A fact about what this
+    program did to the window, not about which application it is.
+    """
+    if not hwnd:
+        return
+    now = time.monotonic()
+    with _fresh_lock:
+        for stale in [h for h, at in _fresh_windows.items() if now - at >= _YOUNG_PROCESS_S]:
+            del _fresh_windows[stale]
+        _fresh_windows[int(hwnd)] = now
+
+
+def _window_is_fresh(hwnd: int) -> bool:
+    with _fresh_lock:
+        at = _fresh_windows.get(int(hwnd))
+    return at is not None and time.monotonic() - at < _YOUNG_PROCESS_S
+
 #: Slice of ``timeout_s`` reserved for handing the result back: the worker aims
 #: to finish this much before the caller stops waiting, so a walk that runs to
 #: the deadline returns its partial tree instead of nothing.
@@ -342,6 +376,10 @@ class UIElement:
     #: ``expanded``/``collapsed``/``partly expanded`` (ExpandCollapse).  Keyboard
     #: focus stays in :attr:`is_focused`.
     states: tuple[str, ...] = ()
+    #: ``id`` of the nearest kept ancestor in the UIA tree, ``-1`` for the root
+    #: (or when not known).  Depth alone cannot say this: an ancestor that was
+    #: not kept (layout padding) leaves two unrelated branches at the same depths.
+    parent: int = -1
 
 
 #: The pattern flags :class:`UIElement` reports, in the order they are listed:
@@ -673,6 +711,10 @@ class _CachedWalker:
         self.truncated = False
         self.seen: set[tuple] = set()
         self._shapes: set[tuple] = set()
+        #: ``[depth, kept id or -1]`` of every element on the path from the root
+        #: to the one being added, kept or not, so each kept element can name its
+        #: nearest kept ancestor exactly (see :attr:`UIElement.parent`).
+        self._lineage: list[list[int]] = []
         self.passes = 1
         self.child_windows = 0
         self.first_pass_elements = -1
@@ -717,6 +759,13 @@ class _CachedWalker:
 
     # -- element decoding ---------------------------------------------------
     def _add(self, element: object, depth: int) -> None:
+        # Every element met, kept or not, closes the branches at its depth and
+        # below: the walk is depth-first, so whatever sits deeper on the path
+        # belongs to a sibling's subtree that is finished.
+        lineage = self._lineage
+        while lineage and lineage[-1][0] >= depth:
+            lineage.pop()
+        lineage.append([depth, -1])
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
         bounds = _rect(get(_P_BOUNDING_RECT))
         if bounds is None:
@@ -780,8 +829,10 @@ class _CachedWalker:
                 depth=depth,
                 patterns=patterns if is_interactive else (),
                 states=states,
+                parent=next((kept for _, kept in reversed(lineage[:-1]) if kept >= 0), -1),
             )
         )
+        lineage[-1][1] = len(self.elements) - 1
 
     # -- traversal ----------------------------------------------------------
     @staticmethod
@@ -1467,6 +1518,12 @@ def _walk_window(
       ``young`` process, whose first tree can take seconds to start growing: it
       is watched until it grows or ``deadline``, and while it is still below
       thin, a pause in growth does not count as settled.)
+    * for a ``young`` window, a pass that still leaves most of the window
+      uncovered or a large child window empty (:func:`_surface_gaps`) does not
+      count as settled either, however many elements it has: a page that has
+      just been opened is exposed in pieces, and its frame alone is not the
+      answer.  An old window keeps the short behaviour above, since a video or
+      canvas that never exposes anything must not cost every read the budget.
     * ``deadline``.
 
     Facts about a snapshot drive that decision - an element count, a list of
@@ -1523,12 +1580,15 @@ def _walk_window(
     poll_started = time.monotonic()
     grace_deadline = min(deadline, poll_started + _WAKE_GRACE_S)
     last_growth = poll_started
+    #: A later pass has replaced the first (it grew, or closed a young
+    #: window's gaps): the tree is changing, so it can settle.
+    changed = False
     while time.monotonic() < deadline:
         time.sleep(min(_WAKE_POLL_S, max(deadline - time.monotonic(), 0.0)))
         now = time.monotonic()
         if now >= deadline or (cancel is not None and cancel.is_set()):
             break
-        grown = len(best.elements) > first_count
+        grown = changed
         if not grown and not young and now >= grace_deadline:
             break  # woken and re-read: it did not grow, so this is the window
         child_handles = _surface_handles(hwnd)
@@ -1548,14 +1608,19 @@ def _walk_window(
             break  # the window went away mid-poll: keep what we have
         passes += 1
         best.passes = passes
-        if len(attempt.elements) > len(best.elements):
+        # A young window's page can replace its frame with fewer, larger
+        # elements; a pass that closes the gaps beats a bigger one that does not.
+        closes_gaps = young and _surface_gaps(best).any and not _surface_gaps(attempt).any
+        if len(attempt.elements) > len(best.elements) or closes_gaps:
             best = adopt(attempt)
             last_growth = time.monotonic()
+            changed = True
             if len(best.elements) >= max_elements:
                 break  # hit the cap: more passes cannot show more
         elif (
-            len(best.elements) > first_count
+            changed
             and (not young or len(best.elements) >= _THIN_TREE_ELEMENTS)
+            and not (young and _surface_gaps(best).any)
             and time.monotonic() - last_growth >= _SETTLE_S
         ):
             break  # populated, and has stopped growing
@@ -1660,8 +1725,8 @@ def get_window_tree(
     # The worker aims a little short of the caller's own wait so that a walk
     # which runs to the deadline still hands back what it collected.
     deadline = time.monotonic() + max(timeout_s - min(_HANDOFF_S, timeout_s * 0.1), 0.0)
-    young = False
-    if info is not None and info.pid:
+    young = _window_is_fresh(hwnd)
+    if not young and info is not None and info.pid:
         try:
             young = time.time() - psutil.Process(info.pid).create_time() < _YOUNG_PROCESS_S
         except Exception:
@@ -1784,6 +1849,14 @@ def get_window_tree(
                 parts.append(
                     f"{len(gaps.empty_surfaces)} large child window(s) exposed nothing"
                 )
+            waited_s = time.perf_counter() - started
+            if young and chosen.passes > 1:
+                # It was watched for most of the budget: say so, so that "look
+                # again" is weighed against a wait that has already happened.
+                parts.append(
+                    f"still so after re-reading it for {waited_s:.1f} s since it was "
+                    f"opened moments ago"
+                )
             note = (
                 "; ".join(parts)
                 + " - the rest is drawn without accessibility (video, canvas) or has "
@@ -1813,6 +1886,257 @@ def get_window_tree(
         offscreen_skipped=chosen.offscreen_skipped,
         fetches=chosen.fetches,
     )
+
+
+#: How long :func:`wait_for_content` waits by default for a window to expose
+#: the content it was just handed (a page, a file, a folder).  On 2026-09-23 the
+#: model spent two rounds looking at a browser frame whose page was not exposed
+#: yet, then navigated again by hand; a page needs a second or two once its
+#: window exists.  A bound on a condition, not a settle time.
+CONTENT_WAIT_S = 6.0
+
+#: How many Document elements a :class:`ContentCheck` keeps (a split view or an
+#: embedded frame can show several).
+_MAX_DOCUMENTS = 3
+
+
+@dataclass
+class ContentCheck:
+    """Whether a window has exposed its content, per :func:`wait_for_content`.
+
+    Attributes:
+        ready: the content is there (see ``why``).
+        why: ``"coverage"`` - leaf elements cover at least :data:`_MIN_COVERAGE`
+            of the visible window and no large child window is empty (the same
+            test that makes :func:`get_window_tree` call a read mostly blank);
+            ``"document"`` - a Document with a title appeared that was not there
+            on the first look (the page has committed, even if its body is still
+            being exposed); ``""`` when not ready.
+        waited_ms: time from the call to the answer.
+        polls: passes read.
+        answered: at least one pass came back; False means the window never
+            answered accessibility queries within the budget.
+        coverage: share of the visible window covered by leaf elements on the
+            last pass, ``None`` when unknown.
+        elements: element count of the last pass.
+        empty_surfaces: large descendant/owned windows with nothing in them.
+        documents: ``[{"name", "value"}]`` of the Document elements on screen in
+            the last pass (value is usually the address), at most
+            :data:`_MAX_DOCUMENTS`.
+        skipped: set when the caller only wanted a wait for a window that shows
+            a document and this one shows none: why nothing was waited for.
+        error: set when the reader failed outright.
+    """
+
+    ready: bool = False
+    why: str = ""
+    waited_ms: float = 0.0
+    polls: int = 0
+    answered: bool = False
+    coverage: float | None = None
+    elements: int = 0
+    empty_surfaces: int = 0
+    documents: list[dict] = field(default_factory=list)
+    skipped: str = ""
+    error: str = ""
+
+    def _document_phrase(self) -> str:
+        if not self.documents:
+            return "no Document exposed"
+        first = self.documents[0]
+        phrase = "Document"
+        if first.get("name"):
+            phrase += f' "{_one_line(first["name"], 80)}"'
+        if first.get("value"):
+            phrase += f" at {_one_line(first['value'], 120)}"
+        if len(self.documents) > 1:
+            phrase += f" (+{len(self.documents) - 1} more)"
+        return phrase
+
+    def _coverage_phrase(self) -> str:
+        if self.coverage is None:
+            return "coverage of the window unknown"
+        return f"{self.coverage:.0%} of the window's visible area holds accessible elements"
+
+    def describe(self) -> str:
+        """One clause for an action summary."""
+        waited = f"{self.waited_ms:.0f} ms"
+        if self.error and not self.answered:
+            return f"content not checked: reading the window failed ({self.error})"
+        if not self.answered:
+            return (
+                f"content still not ready after {waited}: the window did not answer "
+                f"accessibility queries (probably still loading)"
+            )
+        if self.skipped:
+            return f"did not wait for content: {self.skipped}"
+        if self.ready and self.why == "coverage":
+            return (
+                f"content ready after {waited} ({self._document_phrase()}; "
+                f"{self._coverage_phrase()}, {self.elements} elements)"
+            )
+        if self.ready:
+            if self.empty_surfaces or self.coverage is None:
+                so_far = "its body is not exposed yet"
+            else:
+                so_far = f"{self._coverage_phrase()} so far, the rest may still be loading"
+            return f"content ready after {waited} ({self._document_phrase()} appeared; {so_far})"
+        parts = [self._document_phrase()]
+        if self.coverage is not None and self.coverage < _MIN_COVERAGE:
+            parts.append(f"only {self._coverage_phrase()}")
+        if self.empty_surfaces:
+            parts.append(f"{self.empty_surfaces} large child window(s) exposed nothing")
+        return f"content still not ready after {waited} ({'; '.join(parts)})"
+
+
+def _documents(elements: list[UIElement]) -> list[tuple[str, str]]:
+    """``(name, value)`` of the Document elements, in tree order."""
+    return [
+        (element.name, element.value or "")
+        for element in elements
+        if element.role == "Document"
+    ][:_MAX_DOCUMENTS]
+
+
+def _content_verdict(
+    walker: _CachedWalker, baseline: set[tuple[str, str]] | None
+) -> tuple[str, _Gaps, list[tuple[str, str]]]:
+    """``(why, gaps, documents)`` for one pass; ``why`` is ``""`` when not ready.
+
+    Rectangles and UIA control types only - nothing about which application.
+    A titled Document counts when it was not there on the first look
+    (``baseline``); a title that is just the address - what a page reports
+    before its own title arrives - does not.
+    """
+    elements = list(walker.elements)
+    gaps = _surface_gaps(walker)
+    documents = _documents(elements)
+    if elements and not gaps.any:
+        return "coverage", gaps, documents
+    if baseline is not None:
+        for name, value in documents:
+            if name and name != value and (name, value) not in baseline:
+                return "document", gaps, documents
+    return "", gaps, documents
+
+
+def wait_for_content(
+    hwnd: int,
+    *,
+    timeout_s: float = CONTENT_WAIT_S,
+    max_elements: int = 400,
+    require_document: bool = False,
+) -> ContentCheck:
+    """Wait until a window has exposed the content it was just handed.
+
+    Re-reads the window with the same on-screen pass as :func:`get_window_tree`
+    (one pass per look, no lazy-wake polling inside it) until either the visible
+    area is covered by accessible elements (at least :data:`_MIN_COVERAGE`, and
+    no large child window empty - the test behind the "only N% of the window"
+    note), or a titled Document appears that the first look did not have.  A
+    condition poll bounded by ``timeout_s``.  Runs on its own worker thread with
+    its own COM apartment; a provider that blocks past the budget is abandoned.
+
+    Args:
+        hwnd: top-level window.
+        timeout_s: bound on the whole wait.
+        max_elements: cap per pass.
+        require_document: only wait for a window that shows a document: if the
+            first pass has no Document element and no empty large child window,
+            return at once with ``skipped`` set (used after opening a target
+            with whatever handles it, which may be an app with no page at all).
+
+    Returns:
+        A :class:`ContentCheck`; never raises.
+    """
+    started = time.perf_counter()
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    shared: dict[str, object] = {}
+    cancel = threading.Event()
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(
+                _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
+            )
+            baseline: set[tuple[str, str]] | None = None
+            polls = 0
+            while not cancel.is_set():
+                try:
+                    walker = _collect_pass(
+                        automation,
+                        hwnd,
+                        _surface_handles(hwnd),
+                        max_elements,
+                        deadline,
+                        cancel=cancel,
+                    )
+                except Exception as exc:  # noqa: BLE001 - not answering, or gone
+                    if not win32gui.IsWindow(hwnd):
+                        shared["error"] = "the window closed"
+                        return
+                    shared["error"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    polls += 1
+                    why, gaps, documents = _content_verdict(walker, baseline)
+                    if baseline is None:
+                        baseline = set(documents)
+                    check = ContentCheck(
+                        ready=bool(why),
+                        why=why,
+                        polls=polls,
+                        answered=True,
+                        coverage=gaps.coverage,
+                        elements=len(walker.elements),
+                        empty_surfaces=len(gaps.empty_surfaces),
+                        documents=[{"name": n, "value": v} for n, v in documents],
+                    )
+                    if (
+                        not why
+                        and require_document
+                        and polls == 1
+                        and not documents
+                        and not gaps.empty_surfaces
+                    ):
+                        check.skipped = (
+                            "the window shows no Document and no empty content area, "
+                            "so there is no page to wait for"
+                        )
+                    shared["check"] = check
+                    if why or check.skipped:
+                        return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(_WAKE_POLL_S, remaining))
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            shared["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name=f"yuki-uia-content-{hwnd}", daemon=True)
+    thread.start()
+    thread.join(max(timeout_s, 0.0) + _HANDOFF_S)
+    if thread.is_alive():
+        cancel.set()  # a pass blocked in the provider: stop it at its next check
+    found = shared.get("check")
+    result = (
+        ContentCheck(**{**found.__dict__, "documents": list(found.documents)})
+        if isinstance(found, ContentCheck)
+        else ContentCheck()
+    )
+    if not result.answered and shared.get("error"):
+        result.error = str(shared["error"])
+    result.waited_ms = (time.perf_counter() - started) * 1000.0
+    return result
 
 
 #: Budget for :func:`focused_element`.  It is a handful of cross-process property
@@ -2060,6 +2384,14 @@ except Exception:  # pragma: no cover - retried lazily inside the worker
 _FORMAT_NAME_CHARS = 90
 _FORMAT_VALUE_CHARS = 160
 
+#: Deepest indentation :func:`format_window_tree` draws.
+_FORMAT_MAX_INDENT = 12
+
+#: Shorter spellings for role names in the text the model reads.  Only where the
+#: short form cannot be mistaken for another UIA control type; the structured
+#: :class:`UIElement` keeps the full name.
+_FORMAT_ROLE = {"Hyperlink": "Link"}
+
 
 def _one_line(text: str, limit: int) -> str:
     """Flatten newlines/tabs and clip, so one element stays one line."""
@@ -2068,56 +2400,298 @@ def _one_line(text: str, limit: int) -> str:
     return flat[:limit] + "…" if len(flat) > limit else flat
 
 
+def _listed(element: UIElement) -> bool:
+    """Whether the text rendering shows ``element`` at all."""
+    return bool(element.name) or element.value is not None or element.is_interactive
+
+
+def _has_marks(element: UIElement) -> bool:
+    """Whether the element says more than a role, a name and a position.
+
+    ``is_interactive`` alone does not count: Chromium gives almost every element
+    under a clickable one a default action, so a list item or a table cell that
+    wraps a link reads as interactive while the link is what a click would use.
+    """
+    return bool(
+        element.value is not None
+        or getattr(element, "patterns", ())
+        or element.is_scrollable
+        or element.is_focused
+        or element.shortcut
+        or getattr(element, "states", ())
+    )
+
+
+def _parents(
+    elements: list[UIElement], everything: list[UIElement] | None = None
+) -> list[int]:
+    """Index (into ``elements``) of each element's nearest ancestor among them, or -1.
+
+    Uses :attr:`UIElement.parent` when the snapshot has it (``everything`` is the
+    whole snapshot, so a parent that is not in ``elements`` is looked through to
+    its own parent).  A snapshot without it (read from an older log) falls back
+    to depth order, which cannot tell a child from the first element of a
+    neighbouring branch whose container was not kept.
+    """
+    everything = everything if everything is not None else elements
+    if any(getattr(element, "parent", -1) >= 0 for element in everything):
+        by_id = {element.id: element for element in everything}
+        position = {element.id: index for index, element in enumerate(elements)}
+        parents: list[int] = []
+        for element in elements:
+            parent = getattr(element, "parent", -1)
+            hops = 0
+            while parent >= 0 and parent not in position and hops <= _MAX_DEPTH:
+                above = by_id.get(parent)
+                parent = getattr(above, "parent", -1) if above is not None else -1
+                hops += 1
+            parents.append(position.get(parent, -1))
+        return parents
+    parents = []
+    stack: list[int] = []
+    for index, element in enumerate(elements):
+        while stack and elements[stack[-1]].depth >= element.depth:
+            stack.pop()
+        parents.append(stack[-1] if stack else -1)
+        stack.append(index)
+    return parents
+
+
+#: Two click points this close (px) are the same place for :func:`_drop_redundant`.
+_SAME_SPOT_PX = 4
+
+
+def _same_spot(a: UIElement, b: UIElement) -> bool:
+    return (
+        abs(a.center[0] - b.center[0]) <= _SAME_SPOT_PX
+        and abs(a.center[1] - b.center[1]) <= _SAME_SPOT_PX
+    )
+
+
+def _mark_set(element: UIElement) -> set[str]:
+    """Patterns, states and flags of an element, as one set to compare."""
+    marks = set(getattr(element, "patterns", ()) or ()) | set(getattr(element, "states", ()) or ())
+    if element.is_focused:
+        marks.add("focused")
+    if element.is_scrollable:
+        marks.add("scrollable")
+    if element.shortcut:
+        marks.add("kb:" + element.shortcut)
+    return marks
+
+
+def _drop_redundant(
+    elements: list[UIElement], everything: list[UIElement] | None = None
+) -> list[UIElement]:
+    """Leave out elements whose line would only repeat a neighbour's.
+
+    Three shapes, all judged on names, values, patterns and click points - never
+    on which application drew them:
+
+    * **an echo of a name**: a plain element (no patterns, value, state or
+      shortcut - see :func:`_has_marks`) with the same name as the element
+      right after it, when that one is its child or next sibling and carries
+      more (a list item or table cell wrapping a link of the same name), or as
+      the element kept just before it, when that is its parent or previous
+      sibling (a label repeating the pane it is in);
+    * **a duplicate on the same spot**: an element with the same name and click
+      point as its parent or previous sibling, whose value, patterns and state
+      add nothing to that element's (a link wrapped in a link of the same name);
+    * **an unnamed wrapper**: an element with no name, value, state or
+      shortcut whose first child can be acted on at the same click point (the
+      clickable group around a button).
+
+    The element that stays has the name and the click point, and one that can
+    be acted on only gives way to another that can, at the same place or
+    carrying the same name.
+    """
+    parents = _parents(elements, everything)
+    dropped = [False] * len(elements)
+    kept_index: list[int] = []
+
+    def related(index: int, other: int) -> bool:
+        """``other`` is ``index``'s parent or sibling, looking through elements
+        already left out between them."""
+        parent = parents[index]
+        while parent >= 0 and dropped[parent] and parent != other:
+            parent = parents[parent]
+        if parent == other:
+            return True
+        other_parent = parents[other]
+        while other_parent >= 0 and dropped[other_parent]:
+            other_parent = parents[other_parent]
+        return other_parent == parent
+
+    for index, element in enumerate(elements):
+        following = elements[index + 1] if index + 1 < len(elements) else None
+        follows_inside = following is not None and (
+            parents[index + 1] == index or parents[index + 1] == parents[index]
+        )
+        last = kept_index[-1] if kept_index else -1
+        previous = elements[last] if last >= 0 else None
+        drop = False
+        if element.name and not _has_marks(element):
+            if follows_inside and following.name == element.name and _has_marks(following):
+                drop = True
+            elif (
+                previous is not None
+                and previous.name == element.name
+                and related(index, last)
+                and (not element.is_interactive or previous.is_interactive)
+            ):
+                drop = True
+        if (
+            not drop
+            and element.name
+            and previous is not None
+            and previous.name == element.name
+            and _same_spot(element, previous)
+            and element.value in (None, previous.value)
+            and _mark_set(element) <= _mark_set(previous)
+            and (not element.is_interactive or previous.is_interactive)
+            and related(index, last)
+        ):
+            drop = True
+        if (
+            not drop
+            and not element.name
+            and element.value is None
+            and not (_mark_set(element) - set(getattr(element, "patterns", ()) or ()))
+            and following is not None
+            and parents[index + 1] == index
+            and (following.is_interactive or getattr(following, "patterns", ()))
+            and set(getattr(element, "patterns", ()) or ()) <= _mark_set(following)
+            and _same_spot(element, following)
+        ):
+            drop = True
+        if drop:
+            dropped[index] = True
+            continue
+        kept_index.append(index)
+    return [elements[index] for index in kept_index]
+
+
+def _origin(address: str) -> str:
+    """``scheme://host`` of an address, or ``""`` when it has no host."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(address)
+    except ValueError:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
+
 def format_window_tree(tree: WindowTree) -> str:
     """Compact text rendering of a window tree, one line per element.
 
-    Elements with no name, no value and no interactivity are skipped - they are
-    layout scaffolding the model cannot use.  Indentation carries ``depth``.  An
-    interactive element's supported patterns follow its position in braces,
-    ``{invoke,expand}``, so an element a click activates (``invoke``/``toggle``)
-    can be told from one a click only selects (``select``).  Current state
-    follows in brackets with the other flags - ``selected`` (the tab or item that
-    is chosen), ``on``/``off``/``mixed``, ``expanded``/``collapsed``,
-    ``focused``, ``scrollable``: ``[selected focused]``.
+    The header is one line: the window, the element count, how long the read
+    took, and - when there are any - how the tree was built, its status, that it
+    is partial, what was left off screen, and the note.
+
+    Element lines: ``[id] Role "name" value="..." @(x,y) {patterns} [kb: key]
+    [flags]``.  Indentation is nesting among the listed elements (layout
+    padding that is not listed does not indent).  An interactive element's
+    supported patterns follow its position in braces, ``{invoke,expand}``, so
+    one a click activates (``invoke``/``toggle``) can be told from one a click
+    only selects (``select``).  State follows in brackets: ``selected``,
+    ``on``/``off``/``mixed``, ``expanded``/``collapsed``, ``focused``,
+    ``scrollable``.
+
+    To keep it short without losing what can be used:
+
+    * elements with no name, no value and nothing to do are skipped (layout);
+    * a plain element that only repeats the name of the element next to it is
+      left out (see :func:`_drop_redundant`);
+    * a value that equals the name is not repeated, and an address on the same
+      host as the page it is in is written from its path (``/watch?v=...``);
+    * the click point ``@(x,y)`` is given for everything that can be acted on
+      or carries a value or state, and for every leaf of its own; it is left
+      off a plain container (aim at what is inside it) and off a plain label
+      whose parent is a control that can be acted on and smaller than half the
+      window each way (aim at the control);
+    * consecutive unnamed siblings that are identical but for position are one
+      line: ``Button ×3 {invoke}: [9]@(242,17) [10]@(892,17) [11]@(966,17)``;
+    * ``Hyperlink`` is written ``Link``.
     """
-    header = (
-        f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'}) - "
-        f"{len(tree.elements)} element(s), {tree.elapsed_ms:.0f} ms"
-    )
+    status = getattr(tree, "status", "ok") or "ok"
+    note = getattr(tree, "note", "") or ""
+    facts = [
+        f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'})",
+        f"{len(tree.elements)} elements in {tree.elapsed_ms:.0f} ms",
+    ]
     if tree.passes > 1 and 0 <= tree.first_pass_elements < len(tree.elements):
         # The tree was being built while it was read, which is worth saying: the
         # app had only just been opened or navigated, and a second look may show
         # more than this one did.
-        header += (
-            f" [built lazily: grew from {tree.first_pass_elements} over "
-            f"{tree.passes} passes - read it again if something you expect is missing]"
+        facts.append(
+            f"built lazily: grew from {tree.first_pass_elements} over {tree.passes} "
+            f"passes, read again if something you expect is missing"
         )
-    status = getattr(tree, "status", "ok") or "ok"
-    note = getattr(tree, "note", "") or ""
     if status != "ok":
-        header += f" [status: {status}]"
+        facts.append(f"status: {status}")
     if tree.truncated:
-        header += " [TRUNCATED: partial tree]"
+        facts.append("TRUNCATED: partial tree")
     skipped = getattr(tree, "offscreen_skipped", 0) or 0
     if skipped:
         # Said so the reader knows the list is the visible part on purpose:
         # scrolling brings the rest into view (and into the next read).
-        header += f" [on-screen only: {skipped} off-screen branch(es) not read]"
-    lines = [header]
+        facts.append(f"on-screen only: {skipped} off-screen branch(es) not read")
     if note:
-        lines.append(f"note: {note}")
-    shown = 0
-    for element in tree.elements:
-        if not element.name and element.value is None and not element.is_interactive:
-            continue
-        shown += 1
-        indent = " " * min(element.depth, 12)
-        parts = [f"{indent}[{element.id}] {element.role}"]
-        if element.name:
-            parts.append(f'"{_one_line(element.name, _FORMAT_NAME_CHARS)}"')
-        if element.value is not None:
-            parts.append(f'value="{_one_line(element.value, _FORMAT_VALUE_CHARS)}"')
-        parts.append(f"@({element.center[0]},{element.center[1]})")
+        facts.append(f"note: {note}")
+    lines = [" | ".join(facts)]
+
+    listed = _drop_redundant(
+        [element for element in tree.elements if _listed(element)], tree.elements
+    )
+    parents = _parents(listed, tree.elements)
+    has_child = [False] * len(listed)
+    for parent in parents:
+        if parent >= 0:
+            has_child[parent] = True
+
+    # Per element: listed nesting depth, and the origin of the page (Document)
+    # it is in.
+    levels: list[int] = []
+    origins: list[str] = []
+    relative_used = False
+    for index, element in enumerate(listed):
+        parent = parents[index]
+        levels.append(levels[parent] + 1 if parent >= 0 else 0)
+        if element.role == "Document" and element.value:
+            origins.append(_origin(element.value))
+        else:
+            origins.append(origins[parent] if parent >= 0 else "")
+
+    def point(element: UIElement) -> str:
+        return f"@({element.center[0]},{element.center[1]})"
+
+    frame = tree.elements[0].bounds if tree.elements else None
+
+    def small_target(element: UIElement) -> bool:
+        """Less than half the window each way: a control, not a page region."""
+        if frame is None:
+            return False
+        left, top, right, bottom = element.bounds
+        return (right - left) * 2 < frame[2] - frame[0] and (bottom - top) * 2 < frame[3] - frame[1]
+
+    def wants_point(index: int) -> bool:
+        element = listed[index]
+        if element.is_interactive or _has_marks(element):
+            return True
+        if has_child[index]:
+            return False  # a plain container: aim at what is inside it
+        parent = parents[index]
+        # A label inside a control that can be acted on: the control's own
+        # click point is the one to use.
+        return not (
+            parent >= 0
+            and getattr(listed[parent], "patterns", ())
+            and small_target(listed[parent])
+        )
+
+    def marks(element: UIElement) -> list[str]:
+        parts: list[str] = []
         patterns = getattr(element, "patterns", ())
         if patterns:
             parts.append("{" + ",".join(patterns) + "}")
@@ -2130,7 +2704,60 @@ def format_window_tree(tree: WindowTree) -> str:
             flags.append("scrollable")
         if flags:
             parts.append(f"[{' '.join(flags)}]")
+        return parts
+
+    def run_key(index: int) -> tuple | None:
+        """What an unnamed leaf looks like apart from its id and position."""
+        element = listed[index]
+        if element.name or element.value is not None or has_child[index]:
+            return None
+        return (parents[index], element.role, tuple(marks(element)), wants_point(index))
+
+    index = 0
+    while index < len(listed):
+        element = listed[index]
+        indent = " " * min(levels[index], _FORMAT_MAX_INDENT)
+        role = _FORMAT_ROLE.get(element.role, element.role)
+        key = run_key(index)
+        end = index + 1
+        if key is not None:
+            while end < len(listed) and run_key(end) == key:
+                end += 1
+        if end - index > 1:
+            members = listed[index:end]
+            parts = [f"{indent}{role} ×{len(members)}", *marks(element)]
+            where = " ".join(
+                f"[{member.id}]{point(member)}" if key[3] else f"[{member.id}]"
+                for member in members
+            )
+            lines.append(" ".join(parts) + ": " + where)
+            index = end
+            continue
+        parts = [f"{indent}[{element.id}] {role}"]
+        if element.name:
+            parts.append(f'"{_one_line(element.name, _FORMAT_NAME_CHARS)}"')
+        if element.value is not None and element.value != element.name:
+            value = element.value
+            origin = origins[parents[index]] if parents[index] >= 0 else ""
+            if (
+                element.role != "Document"
+                and origin
+                and value.startswith(origin)
+                and value[len(origin) : len(origin) + 1] in ("/", "?", "#")
+            ):
+                value = value[len(origin) :]
+                relative_used = True
+            parts.append(f'value="{_one_line(value, _FORMAT_VALUE_CHARS)}"')
+        if wants_point(index):
+            parts.append(point(element))
+        parts.extend(marks(element))
         lines.append(" ".join(parts))
-    if shown == 0 and status != "busy":  # a busy window's note already says why
+        index += 1
+    if relative_used:
+        lines[0] += (
+            " | values starting with / are addresses on the same host as the "
+            "Document they are in"
+        )
+    if not listed and status != "busy":  # a busy window's note already says why
         lines.append("(no named or interactive elements - UIA exposes nothing usable here)")
     return "\n".join(lines)
