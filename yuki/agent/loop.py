@@ -44,6 +44,10 @@ from yuki.log.events import (
 )
 
 
+#: The API's limit on ``cache_control`` breakpoints in one request.
+MAX_CACHE_BREAKPOINTS = 4
+
+
 class Agent:
     """Yuki's brain: drives the model, runs tools, and talks to the caller.
 
@@ -742,25 +746,38 @@ class Agent:
                 byte for byte), one token of output, and a message that is never
                 meant to be answered.
 
+        Side effect (real requests only): the context places the moving
+        conversation cache breakpoint, committed once the request succeeds.
+
         Returns:
             Keyword arguments for ``messages.create`` / ``messages.stream``.
         """
+        system = system_blocks(extra=self.extra_instructions)
+        tools = tool_params(
+            names=self.tool_names,
+            # The dispatcher's policy is the one that gates dispatch, so the
+            # block the model sees must agree with it (never -> no
+            # take_screenshot at all; the dispatcher's refusal is the backstop).
+            screenshot_policy=getattr(
+                self.dispatcher, "screenshot_policy", self.settings.screenshot_policy
+            ),
+        )
+        if warmup:
+            # No conversation breakpoint: the placeholder must never be cached.
+            messages: list[dict[str, Any]] = [{"role": "user", "content": "warming up"}]
+        else:
+            # The moving conversation breakpoint takes whatever is left of the
+            # API's 4 after the system blocks and the tools (see context.py).
+            used = _count_breakpoints(system) + _count_breakpoints(tools)
+            messages = self.context.request_messages(
+                max_breakpoints=MAX_CACHE_BREAKPOINTS - used
+            )
         return {
             "model": self.settings.model,
             "max_tokens": 1 if warmup else self.settings.max_tokens,
-            "system": system_blocks(extra=self.extra_instructions),
-            "messages": [{"role": "user", "content": "warming up"}]
-            if warmup
-            else self.context.messages,
-            "tools": tool_params(
-                names=self.tool_names,
-                # The dispatcher's policy is the one that gates dispatch, so the
-                # block the model sees must agree with it (never -> no
-                # take_screenshot at all; the dispatcher's refusal is the backstop).
-                screenshot_policy=getattr(
-                    self.dispatcher, "screenshot_policy", self.settings.screenshot_policy
-                ),
-            ),
+            "system": system,
+            "messages": messages,
+            "tools": tools,
             "thinking": {"type": "adaptive", "display": self.settings.thinking_display},
             "output_config": {"effort": self.settings.effort},
         }
@@ -769,6 +786,13 @@ class Agent:
         """Send one request and return the response, logging both sides in full."""
         params = self._request_params()
         self._model_calls += 1
+        self.logger.log(
+            "cache_breakpoints",
+            system_tools=_count_breakpoints(params["system"])
+            + _count_breakpoints(params["tools"]),
+            messages=_count_breakpoints(params["messages"]),
+            conversation=self.context.breakpoint_info(),
+        )
         self.logger.llm_request(
             model=params["model"],
             system=params["system"],
@@ -793,6 +817,9 @@ class Agent:
             )
             raise
         latency_ms = (time.perf_counter() - started) * 1000
+        # The request went through, so its cache entry exists: the next prune
+        # measures "before the breakpoint" against this one.
+        self.context.commit_breakpoint()
         self.logger.llm_response(
             content=getattr(response, "content", []),
             stop_reason=getattr(response, "stop_reason", None),
@@ -862,6 +889,22 @@ def _repeat_text(
     if others:
         return f"\n(earlier this request, {other_calls} returned this same result)"
     return None
+
+
+def _count_breakpoints(value: Any) -> int:
+    """Number of ``cache_control`` markers anywhere in a request part.
+
+    Walks dicts and lists (system blocks, tool definitions, messages); SDK
+    content objects in assistant turns never carry one, so they are skipped.
+    """
+    if isinstance(value, dict):
+        own = 1 if value.get("cache_control") else 0
+        return own + sum(
+            _count_breakpoints(v) for k, v in value.items() if k != "cache_control"
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_count_breakpoints(item) for item in value)
+    return 0
 
 
 def _content_chars(content: list[dict[str, Any]]) -> int:
