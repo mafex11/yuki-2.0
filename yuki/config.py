@@ -160,7 +160,7 @@ class Settings:
     tool_timeout_s: float = 20.0
     effort: str = DEFAULT_EFFORT
     ui_hotkey: str = "alt+shift"
-    ui_cancel_hotkey: str = "ctrl+alt+space"
+    ui_cancel_hotkey: str = "alt+shift+x"
     pricing: dict[str, dict[str, float]] = field(
         default_factory=lambda: {model: dict(rates) for model, rates in DEFAULT_PRICING.items()}
     )
