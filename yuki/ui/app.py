@@ -323,8 +323,14 @@ class YukiUi(QObject):
             return None, None
         newest = max(shown, key=lambda n: nudge_moment(n) or 0.0)
         seen = nudge_moment(newest)
+        # An implicit link is offered once, with the first message after the
+        # nudge; after that the conversation has moved on and it is noise.
+        used: set = self.__dict__.setdefault("_implicit_nudge_ids", set())
+        if newest.get("id") in used:
+            return None, None
         if nudge_answered(newest) or seen is None or time.time() - seen > IMPLICIT_REPLY_S:
             return None, None
+        used.add(newest.get("id"))
         return newest, "implicit"
 
     # -- runtime events ----------------------------------------------------
