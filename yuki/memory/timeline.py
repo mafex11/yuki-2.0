@@ -1023,6 +1023,17 @@ class TimelineRecorder:
     def alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def current_meeting(self) -> dict[str, Any] | None:
+        """The meeting row in front now, content-free: ``{"process", "app", "service"}``, or None.
+
+        Read by the call memory (:mod:`yuki.memory.calls`) to tell a call; safe
+        from any thread (one attribute read of the open stretch).
+        """
+        st = self._current
+        if st is None or not st.meeting or self._blocked:
+            return None
+        return {"process": st.process, "app": st.app, "service": st.meeting}
+
     def stats(self) -> dict[str, Any]:
         """Counters (content-free)."""
         probe = self._probe

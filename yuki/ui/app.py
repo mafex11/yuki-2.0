@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiA
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from yuki.config import MODEL_ALIASES, Settings
+from yuki.ui.calls import CallController
 from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 from yuki.ui.memory import (
@@ -143,6 +144,15 @@ class YukiUi(QObject):
         self.nudges.reply_requested.connect(self._on_nudge_reply)
         self.nudges.in_overlay.connect(self._on_nudge_in_overlay)
         self.nudges.recent_ready.connect(self._on_recent_nudges)
+        #: Calls, just the user's side: the consent card, the indicator and Stop.
+        self.calls = CallController(
+            self.runtime.memory, ui_log, covered=lambda: self.nudges.showing is not None,
+            strip_up=self.strip.isVisible,
+        )
+        # The consent card has the corner: a nudge card up makes way (it goes back in the queue).
+        self.calls.changed.connect(lambda _status: self.nudges.make_way() if self.calls.card_up else None)
+        self.calls.card.faded_out.connect(self.nudges.try_show)
+        self.nudges.card.faded_out.connect(self.calls.place_indicator)
         #: The nudge the user is writing a reply to (its card is in the overlay),
         #: and where Reply was pressed: ``card`` (the corner) or ``overlay``.
         self._nudge_reply: dict | None = None
@@ -202,6 +212,7 @@ class YukiUi(QObject):
         self._memory_watchdog.timeout.connect(lambda: self.memory.ensure_service(quiet=True))
         self._memory_watchdog.start()
         self.nudges.start()
+        self.calls.start()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -217,6 +228,7 @@ class YukiUi(QObject):
         """
         self.ui_log.event("stop")
         self.nudges.stop()
+        self.calls.stop()
         self.hotkeys.stop()
         self.runtime.stop()
         self.overlay.hide()
@@ -432,6 +444,8 @@ class YukiUi(QObject):
         """
         if self.strip.isVisible():
             return "status_strip"
+        if self.calls.card_up:
+            return "call_consent"
         if self._nudge_reply is not None:
             return "replying_to_nudge"
         if self.runtime.worker_busy:
@@ -651,6 +665,13 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     nudges_on = QAction("Nudges on", menu)
     nudges_on.triggered.connect(lambda _checked=False: ui.snooze_nudges(0))
     menu.addAction(nudges_on)
+    # Calls: only while memory is remembering the user's side of one (or waiting for headphones).
+    stop_call = QAction("Stop remembering this call", menu)
+    stop_call.triggered.connect(lambda _checked=False: ui.calls.stop_call())
+    stop_call.setVisible(False)
+    menu.addAction(stop_call)
+    ui.calls.changed.connect(lambda _status: stop_call.setVisible(ui.calls.recording))
+    menu.aboutToShow.connect(lambda: stop_call.setVisible(ui.calls.recording))
 
     def show_memory_status(status: object, error: object) -> None:
         del error

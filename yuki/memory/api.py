@@ -43,6 +43,13 @@ The weekly review (written by the service, yuki.memory.review)::
     memory.weekly_review(which="latest") -> dict | None   # "latest", an ISO week "2026-W39" or a date in it
     memory.run_weekly_review()                             # flag file; the service writes one now (non-blocking)
     memory.recall(...)                                     # also kind "review"
+
+Calls, just the user's side (the service's call worker, yuki.memory.calls)::
+
+    memory.call_status() -> {"call": {...} | None, "recording": bool}   # wait on Local\\YukiCallReady
+    memory.answer_call(call_id, "yes" | "no" | "always" | "never" | "none") -> bool
+    memory.stop_call() -> int | None                     # "Stop remembering this call"
+    memory.call_prefs() -> list[dict];  memory.set_call_pref(app, "always" | "never" | None)
 """
 
 from __future__ import annotations
@@ -570,7 +577,8 @@ class MemoryClient:
             if text is None:
                 return None
             due = f"due {datetime.fromtimestamp(f.due_at):%Y-%m-%d %H:%M}".replace(" 00:00", "") if f.due_at else ""
-            dates = ", ".join(x for x in (due, f"asked {_day(f.valid_from)}") if x)
+            said = "said in a call" if f.origin == "call" else "asked"
+            dates = ", ".join(x for x in (due, f"{said} {_day(f.valid_from)}") if x)
             return f"- {text} ({dates})"
         if text is None and quote is None:
             return None
@@ -599,12 +607,16 @@ class MemoryClient:
             "rule": "Rules the user set for Yuki:",
             "preference": "The user's preferences about how Yuki talks or works:",
             "commitment": "Open commitments (what Yuki is to do later):",
+            "call": "What the user said they would do, in calls (their own words):",
         }
+
+        def group(f: ConversationFact) -> str:
+            return "call" if f.kind == "commitment" and f.origin == "call" else f.kind
 
         def render(chosen: list[tuple[ConversationFact, str]]) -> str:
             lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
-            for kind in ("rule", "preference", "commitment"):
-                rows = [line for f, line in chosen if f.kind == kind]
+            for kind in ("rule", "preference", "commitment", "call"):
+                rows = [line for f, line in chosen if group(f) == kind]
                 if rows:
                     lines += [headings[kind], *rows]
             return "\n".join(lines)
@@ -1100,6 +1112,81 @@ class MemoryClient:
         path = self._flag(REVIEW_FLAG)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+
+    # -- calls: the user's own side (yuki.memory.calls) ----------------------
+
+    def call_status(self) -> dict:
+        """The call going on now, for the UI's consent card and "remembering your side" indicator.
+
+        ``{"call": {...} | None, "recording": bool}``; the call is
+        ``{"id", "app", "status", "asking", "consent", "headphones",
+        "form_factor", "output_device", "detected_at", "recording_since",
+        "ask_timeout_s", "can_remember_choice"}``. ``asking`` is True while the
+        card should be up (no answer yet); ``status`` is ``asking`` |
+        ``recording`` | ``waiting_headphones`` (said yes, output is not
+        headphones: the microphone stays closed) | ``declined`` |
+        ``unanswered`` | ``not_asked`` (nudges were snoozed) | ``stopped``.
+        Content-free. The service sets ``Local\\YukiCallReady`` whenever it
+        changes. Never raises.
+        """
+        try:
+            from yuki.memory.calls import CallConfig
+            from yuki.memory.store import CALL_OPEN_STATUSES
+
+            rows = self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1)
+            if not rows:
+                return {"call": None, "recording": False}
+            c = rows[0]
+            timeout = CallConfig().ask_timeout_s
+            try:
+                from types import SimpleNamespace
+
+                from yuki.memory.privacy import user_config_path
+                from yuki.memory.timeline import PrivacySection
+
+                timeout = PrivacySection(SimpleNamespace(path=user_config_path()), "calls",
+                                         CallConfig.from_dict).get().ask_timeout_s
+            except Exception:
+                pass
+            call = {
+                "id": c.id, "app": c.app, "status": c.status, "consent": c.consent,
+                "asking": c.status == "asking" and c.consent is None,
+                "headphones": c.headphones, "form_factor": c.output_form_factor, "output_device": c.output_device,
+                "detected_at": _iso(c.detected_at), "recording_since": _iso(c.recording_started_at),
+                "ask_timeout_s": timeout, "can_remember_choice": bool(c.process),
+            }
+            return {"call": call, "recording": c.status == "recording"}
+        except Exception:
+            return {"call": None, "recording": False}
+
+    def answer_call(self, call_id: int, answer: str) -> bool:
+        """The user's answer on the consent card: ``yes`` | ``no`` | ``always`` | ``never`` | ``none``
+        (the card went away unanswered). ``always``/``never`` also hold for later calls of that app.
+        False when the call no longer waits for an answer. Wakes the service at once."""
+        from yuki.memory.store import call_event_name, signal_event
+
+        ok = self.store.answer_call(int(call_id), str(answer), by="card" if answer != "none" else "ui_timeout")
+        signal_event(call_event_name(self.store.path))
+        return ok
+
+    def stop_call(self) -> int | None:
+        """Stop remembering the call going on now (the tray's "Stop remembering this call"); its id or None."""
+        from yuki.memory.store import call_event_name, signal_event
+
+        call_id = self.store.request_call_stop()
+        signal_event(call_event_name(self.store.path))
+        return call_id
+
+    def call_prefs(self) -> list[dict]:
+        """The user's standing call answers: ``[{"app", "decision": "always"|"never", "name", "updated_at"}]``."""
+        try:
+            return self.store.call_prefs()
+        except Exception:
+            return []
+
+    def set_call_pref(self, app: str, decision: str | None) -> None:
+        """Keep ``always``/``never`` for a call app, or forget it (``None``: ask again every call)."""
+        self.store.set_call_pref(app, decision)
 
     # -- status and control ------------------------------------------------
 

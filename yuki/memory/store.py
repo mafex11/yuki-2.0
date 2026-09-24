@@ -182,6 +182,19 @@ The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
     store.reviews_without_vectors() / add_review_vectors(items, model)
     store.episodes_by_ids(ids);  store.turn_times(since, until) -> [(at, session_id)]
 
+Calls, just the user's side (yuki.memory.calls; MemoryClient.call_status / answer_call / stop_call)::
+
+    store.start_call(app=, process=, via=, service=None, at=None, status="asking", consent=None, ...) -> int
+    store.update_call(id, **plumbing columns);  store.call_record(id);  store.calls(statuses=, since=, limit=)
+    store.answer_call(id, "yes"|"no"|"always"|"never"|"none", by="card") -> bool   # always/never kept per app
+    store.request_call_stop(id=None) -> int | None
+    store.call_pref(app) / set_call_pref(app, "always"|"never"|None, name=) / call_prefs()
+    store.add_call_side(call_id, app=, process=, started_at=, ended_at=, utterances=, final=) -> capture_id
+        # kind my_call_side, one thread per call; text only (JSON, encrypted), never audio
+    store.commit_call_batch(call, capture_ids, facts, commitments) -> (batch_id, commitment ids)
+        # journal facts + the user's own commitments (conversation facts, origin "call") in one transaction
+    call_event_name(db_path);  CALL_READY_EVENT;  signal_event(name)
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
@@ -270,6 +283,40 @@ def turns_event_name(db_path: str | Path | None) -> str:
     db = Path(db_path) if db_path is not None else default_db_path()
     digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
     return f"{TURNS_EVENT_PREFIX}-{digest}"
+
+
+#: Prefix of the named auto-reset event the UI sets after answering a call's consent card
+#: or asking to stop remembering a call (the service's call worker creates it).
+CALL_EVENT_PREFIX = "Local\\YukiMemoryCall"
+#: Named auto-reset event the service sets when a call's consent card or recording state changed
+#: (the UI's call watcher creates or opens it, like ``Local\\YukiNudgeReady``).
+CALL_READY_EVENT = "Local\\YukiCallReady"
+
+
+def call_event_name(db_path: str | Path | None) -> str:
+    """Name of the event that wakes the service's call worker for ``db_path``."""
+    db = Path(db_path) if db_path is not None else default_db_path()
+    digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
+    return f"{CALL_EVENT_PREFIX}-{digest}"
+
+
+def signal_event(name: str) -> bool:
+    """Set an existing named event; False when nobody created it (or on any error)."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.restype = ctypes.c_void_p
+        kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+        handle = kernel32.OpenEventW(0x0002, False, name)   # EVENT_MODIFY_STATE
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.SetEvent(ctypes.c_void_p(handle)))
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:
+        return False
 
 
 def signal_turns(db_path: str | Path | None) -> bool:
@@ -866,6 +913,58 @@ class EpisodeRunStats:
     error: str | None = None
 
 
+#: Capture / thread kind of the user's own side of a call (yuki.memory.calls):
+#: only the user's microphone, transcribed on this PC; never the call audio.
+CALL_SIDE_KIND = "my_call_side"
+#: ``calls.status`` values of a call that is still going on.
+CALL_OPEN_STATUSES: tuple[str, ...] = ("asking", "recording", "waiting_headphones", "declined", "unanswered",
+                                       "not_asked", "stopped")
+#: Answers the user can give on the consent card (``always``/``never`` are also kept per app).
+CALL_ANSWERS: tuple[str, ...] = ("yes", "no", "always", "never", "none")
+#: ``calls`` columns :meth:`Store.update_call` may set (plumbing whitelist).
+_CALL_COLUMNS: frozenset[str] = frozenset({
+    "status", "consent", "consent_by", "consent_at", "output_form_factor", "output_device", "headphones",
+    "recording_started_at", "recording_stopped_at", "stop_requested", "stop_reason", "ended_at", "thread_id",
+    "chunks", "chunks_silent", "speech_s", "audio_s", "utterances", "transcribe_ms", "stt_model", "stt_device",
+    "captures",
+})
+
+
+@dataclass
+class CallRecord:
+    """One call the user was in (content-free: no audio, no words; see ``calls``)."""
+
+    id: int
+    app: str                          # display name ("Zoom", "Discord")
+    process: str | None               # app_key of the process holding the microphone
+    service: str | None               # meeting service when a timeline meeting row named it
+    via: str                          # mic | meeting
+    detected_at: float
+    ended_at: float | None
+    status: str                       # asking | recording | waiting_headphones | declined | unanswered | not_asked | stopped | ended
+    consent: str | None               # yes | no | always | never | none
+    consent_by: str | None            # card | pref | quiet | ui_timeout | call_ended
+    consent_at: float | None
+    output_form_factor: str | None    # headphones | headset | speakers | ...
+    output_device: str | None
+    headphones: bool | None
+    recording_started_at: float | None
+    recording_stopped_at: float | None
+    stop_requested: bool
+    stop_reason: str | None
+    thread_id: int | None
+    chunks: int
+    chunks_silent: int
+    speech_s: float
+    audio_s: float
+    utterances: int
+    transcribe_ms: float
+    stt_model: str | None
+    stt_device: str | None
+    captures: int
+    updated_at: float
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1415,6 +1514,53 @@ MIGRATIONS: tuple[str, ...] = (
         model           TEXT NOT NULL,
         dim             INTEGER NOT NULL,
         vec_ciphertext  BLOB NOT NULL
+    );
+    """,
+    # 10: the user's own side of calls (yuki.memory.calls) - one content-free
+    # row per call (app, times, consent and who gave it, the output device's
+    # form factor, chunk and timing counts), and the user's standing
+    # "always"/"never" per app. The words themselves are captures of kind
+    # my_call_side (encrypted, capture TTL); audio is never stored anywhere.
+    # Additive only, like 2-9.
+    """
+    CREATE TABLE calls (
+        id                   INTEGER PRIMARY KEY,
+        app                  TEXT NOT NULL,
+        process              TEXT,
+        service              TEXT,
+        via                  TEXT NOT NULL,          -- mic | meeting
+        detected_at          REAL NOT NULL,
+        ended_at             REAL,
+        status               TEXT NOT NULL,          -- asking | recording | waiting_headphones | declined | unanswered | not_asked | stopped | ended
+        consent              TEXT,                   -- yes | no | always | never | none
+        consent_by           TEXT,                   -- card | pref | quiet | ui_timeout | call_ended
+        consent_at           REAL,
+        output_form_factor   TEXT,
+        output_device        TEXT,
+        headphones           INTEGER,
+        recording_started_at REAL,
+        recording_stopped_at REAL,
+        stop_requested       INTEGER NOT NULL DEFAULT 0,
+        stop_reason          TEXT,
+        thread_id            INTEGER,
+        chunks               INTEGER NOT NULL DEFAULT 0,
+        chunks_silent        INTEGER NOT NULL DEFAULT 0,
+        speech_s             REAL NOT NULL DEFAULT 0,
+        audio_s              REAL NOT NULL DEFAULT 0,
+        utterances           INTEGER NOT NULL DEFAULT 0,
+        transcribe_ms        REAL NOT NULL DEFAULT 0,
+        stt_model            TEXT,
+        stt_device           TEXT,
+        captures             INTEGER NOT NULL DEFAULT 0,
+        updated_at           REAL NOT NULL
+    );
+    CREATE INDEX calls_status ON calls(status, detected_at);
+
+    CREATE TABLE call_prefs (
+        app        TEXT PRIMARY KEY,                 -- app_key of the call app
+        decision   TEXT NOT NULL,                    -- always | never
+        name       TEXT,                             -- display name, for the UI
+        updated_at REAL NOT NULL
     );
     """,
 )
@@ -3999,6 +4145,206 @@ class Store:
             return len(items)
 
         return self._write(op) if items else 0
+
+    # -- calls: the user's own side (yuki.memory.calls) ------------------------
+
+    def _call(self, r: sqlite3.Row) -> CallRecord:
+        return CallRecord(
+            id=r["id"], app=r["app"], process=r["process"], service=r["service"], via=r["via"],
+            detected_at=r["detected_at"], ended_at=r["ended_at"], status=r["status"], consent=r["consent"],
+            consent_by=r["consent_by"], consent_at=r["consent_at"], output_form_factor=r["output_form_factor"],
+            output_device=r["output_device"], headphones=None if r["headphones"] is None else bool(r["headphones"]),
+            recording_started_at=r["recording_started_at"], recording_stopped_at=r["recording_stopped_at"],
+            stop_requested=bool(r["stop_requested"]), stop_reason=r["stop_reason"], thread_id=r["thread_id"],
+            chunks=r["chunks"], chunks_silent=r["chunks_silent"], speech_s=r["speech_s"], audio_s=r["audio_s"],
+            utterances=r["utterances"], transcribe_ms=r["transcribe_ms"], stt_model=r["stt_model"],
+            stt_device=r["stt_device"], captures=r["captures"], updated_at=r["updated_at"],
+        )
+
+    def start_call(
+        self, *, app: str, process: str | None, via: str, service: str | None = None, at: float | None = None,
+        status: str = "asking", consent: str | None = None, consent_by: str | None = None,
+        output_form_factor: str | None = None, output_device: str | None = None, headphones: bool | None = None,
+    ) -> int:
+        """A call was detected: one content-free ``calls`` row; returns its id."""
+        now = time.time()
+        when = float(at) if at is not None else now
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO calls(app, process, service, via, detected_at, status, consent, consent_by, consent_at,"
+            " output_form_factor, output_device, headphones, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (app or "", app_key(process), service, via, when, status, consent, consent_by,
+             when if consent else None, output_form_factor, output_device,
+             None if headphones is None else int(bool(headphones)), now),
+        ).lastrowid))
+
+    def update_call(self, call_id: int, **fields: Any) -> None:
+        """Set columns of one call (only the plumbing columns in ``_CALL_COLUMNS``)."""
+        bad = set(fields) - _CALL_COLUMNS
+        if bad:
+            raise ValueError(f"not call columns: {sorted(bad)}")
+        if not fields:
+            return
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self._write(lambda conn: conn.execute(
+            f"UPDATE calls SET {sets}, updated_at=? WHERE id=?", (*values, time.time(), int(call_id))))
+
+    def call_record(self, call_id: int) -> CallRecord | None:
+        rows = self._query("SELECT * FROM calls WHERE id=?", (int(call_id),))
+        return self._call(rows[0]) if rows else None
+
+    def calls(self, *, statuses: Sequence[str] | None = None, since: TimeArg = None,
+              limit: int | None = None) -> list[CallRecord]:
+        """Calls, newest first; ``statuses`` filters (e.g. :data:`CALL_OPEN_STATUSES`)."""
+        clauses, params = [], []
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' * len(statuses))})")
+            params += list(statuses)
+        if (s := _ts(since)) is not None:
+            clauses.append("detected_at >= ?")
+            params.append(s)
+        sql = "SELECT * FROM calls" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY detected_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._call(r) for r in self._query(sql, params)]
+
+    def answer_call(self, call_id: int, answer: str, *, by: str = "card", at: float | None = None) -> bool:
+        """Record the user's answer to a call's consent card; False when the call is no longer asking.
+
+        ``yes``/``always`` leave the call to the worker (it starts, or waits for
+        headphones); ``no``/``never`` decline it now; ``none`` (the card went
+        away unanswered) marks it ``unanswered``. ``always``/``never`` are also
+        kept for the call's app (:meth:`call_pref`), in the same transaction.
+        """
+        if answer not in CALL_ANSWERS:
+            raise ValueError(f"unknown answer {answer!r}")
+        now = time.time()
+        when = float(at) if at is not None else now
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT * FROM calls WHERE id=?", (int(call_id),)).fetchone()
+            if row is None or row["status"] != "asking" or row["consent"] is not None:
+                return False
+            status = {"no": "declined", "never": "declined", "none": "unanswered"}.get(answer, "asking")
+            conn.execute("UPDATE calls SET consent=?, consent_by=?, consent_at=?, status=?, updated_at=? WHERE id=?",
+                         (answer, by, when, status, now, int(call_id)))
+            if answer in ("always", "never") and row["process"]:
+                self._set_call_pref(conn, row["process"], answer, row["app"], now)
+            return True
+
+        return self._write(op)
+
+    def request_call_stop(self, call_id: int | None = None) -> int | None:
+        """Ask the worker to stop remembering a call (the open one when ``call_id`` is None); its id or None."""
+        def op(conn: sqlite3.Connection) -> int | None:
+            if call_id is None:
+                row = conn.execute(
+                    "SELECT id FROM calls WHERE status IN ('recording','waiting_headphones')"
+                    " OR (status='asking' AND consent IN ('yes','always')) ORDER BY detected_at DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT id FROM calls WHERE id=?", (int(call_id),)).fetchone()
+            if row is None:
+                return None
+            conn.execute("UPDATE calls SET stop_requested=1, updated_at=? WHERE id=?", (time.time(), row["id"]))
+            return int(row["id"])
+
+        return self._write(op)
+
+    @staticmethod
+    def _set_call_pref(conn: sqlite3.Connection, app: str, decision: str | None, name: str | None,
+                       now: float) -> None:
+        if decision is None:
+            conn.execute("DELETE FROM call_prefs WHERE app=?", (app,))
+            return
+        conn.execute(
+            "INSERT INTO call_prefs(app, decision, name, updated_at) VALUES (?,?,?,?)"
+            " ON CONFLICT(app) DO UPDATE SET decision=excluded.decision, name=coalesce(excluded.name, name),"
+            " updated_at=excluded.updated_at", (app, decision, name, now))
+
+    def call_pref(self, app: str | None) -> str | None:
+        """``always`` / ``never`` for a call app (any spelling of its process name), or None."""
+        key = app_key(app)
+        if not key:
+            return None
+        rows = self._query("SELECT decision FROM call_prefs WHERE app=?", (key,))
+        return rows[0]["decision"] if rows else None
+
+    def set_call_pref(self, app: str, decision: str | None, *, name: str | None = None) -> None:
+        """Keep (``always``/``never``) or forget (``None``) the user's standing answer for a call app."""
+        if decision not in (None, "always", "never"):
+            raise ValueError(f"unknown call preference {decision!r}")
+        key = app_key(app)
+        if not key:
+            raise ValueError("no app")
+        self._write(lambda conn: self._set_call_pref(conn, key, decision, name, time.time()))
+
+    def call_prefs(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._query("SELECT app, decision, name, updated_at FROM call_prefs ORDER BY app")]
+
+    def add_call_side(
+        self, call_id: int, *, app: str, process: str | None, started_at: float, ended_at: float,
+        utterances: Sequence[dict[str, Any]], final: bool = False,
+    ) -> int | None:
+        """Store a stretch of what the user said in a call, for the journal; the capture id (None if empty).
+
+        One thread per call (``kind`` :data:`CALL_SIDE_KIND`, scope ``call:<id>``);
+        each capture's delta is ``{"call_id", "app", "start", "end", "final",
+        "utterances": [{"at", "end", "text", "lang"}]}`` as JSON, encrypted like
+        every capture (capture TTL). The call row's counters move in the same
+        transaction. Text only: audio never reaches the store.
+        """
+        items = [dict(u) for u in utterances if str(u.get("text") or "").strip()]
+        if not items:
+            return None
+        delta = json.dumps({"call_id": int(call_id), "app": app, "start": float(started_at), "end": float(ended_at),
+                            "final": bool(final), "utterances": items}, ensure_ascii=False)
+
+        def op(conn: sqlite3.Connection) -> int:
+            thread_id = self._upsert_thread(conn, app or "", f"{app} call", None, process=process,
+                                            scope=f"call:{int(call_id)}", kind=CALL_SIDE_KIND)
+            first = min(float(u.get("at") or started_at) for u in items)
+            cur = conn.execute(
+                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (thread_id, first, "call", self.cipher.encrypt(delta), len(delta),
+                 self.cipher.digest(CALL_SIDE_KIND, str(call_id), str(first), str(len(items))), CALL_SIDE_KIND,
+                 "callside"),
+            )
+            conn.execute("UPDATE threads SET last_seen=max(last_seen, ?) WHERE id=?", (float(ended_at), thread_id))
+            conn.execute("UPDATE calls SET thread_id=?, captures=captures+1, updated_at=? WHERE id=?",
+                         (thread_id, time.time(), int(call_id)))
+            return int(cur.lastrowid)
+
+        capture_id = self._write(op)
+        with self._cond:
+            self._cond.notify_all()
+        return capture_id
+
+    def commit_call_batch(
+        self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
+        commitments: Sequence[ConversationChange] = (),
+    ) -> tuple[int, list[int]]:
+        """:meth:`commit_batch` for a call's side, plus the user's commitments from it, in one transaction.
+
+        Commitments are conversation facts of kind ``commitment``, origin
+        ``call`` (so they reach the to-do list and reminders like any other),
+        each already checked to quote the user's own words. Returns the batch
+        id and the new commitment ids.
+        """
+        ids = list(capture_ids)
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> tuple[int, list[int]]:
+            batch_id = self._insert_batch(conn, call, len(ids), len(facts))
+            for fact in facts:
+                self._insert_journal(conn, fact, batch_id)
+            new_ids = [self._insert_cfact(conn, ch, now, None) for ch in commitments]
+            conn.executemany("UPDATE captures SET journal_batch_id=? WHERE id=?", [(batch_id, i) for i in ids])
+            return batch_id, new_ids
+
+        return self._write(op)
 
     # -- maintenance -------------------------------------------------------
 

@@ -283,3 +283,81 @@ present_s = 120
 deliver_within_h = 72
 # A failed run is retried no sooner than this many minutes later.
 retry_min = 30
+
+[calls]
+# "Just my side" of calls (yuki.memory.calls): during a call Yuki may, if you
+# say yes on the card, transcribe ONLY your own microphone - never the call's
+# sound, never the other people - on this PC (no audio leaves it, no audio is
+# ever written to disk), and remember what you said: facts, decisions and
+# what you said you would do.  It asks every call unless you chose "Always"
+# or "Never" for that app; no answer means nothing is recorded.
+enabled = true
+# Communication apps: one of these holding the microphone is a call.  (A
+# meeting row of the timeline - [meetings] - is a call too, whatever the app.)
+# Process names of desktop apps, or package family names of Store apps.
+apps = [
+    "Zoom.exe", "Discord.exe", "ms-teams.exe", "Teams.exe", "Slack.exe", "Telegram.exe",
+    "Signal.exe", "Skype.exe", "Webex.exe", "CiscoCollabHost.exe",
+    "5319275A.WhatsAppDesktop", "MSTeams", "Microsoft.SkypeApp",
+]
+# How often the microphone's users are read (a registry read, ~30 ms), and how
+# long a call may go quiet (app off the microphone, meeting not in front)
+# before it counts as ended.
+poll_s = 5
+end_grace_s = 30
+# The card goes away unanswered after this long (= no recording for this call).
+ask_timeout_s = 120
+# Headphones only, so the other people's voices coming out of speakers are
+# never picked up.  The default output device's form factor must be one of
+# these (Windows' own values: headphones, headset, handset, speakers,
+# line_level, digital_display, spdif, network, unknown).
+headphone_form_factors = ["headphones", "headset", "handset"]
+# Output devices you know are headphones although Windows does not say so -
+# e.g. headphones plugged into an audio interface whose output Windows calls
+# "Speakers".  Exact device names as Windows shows them (Sound settings).
+headphone_devices = []
+# The microphone recorded: the input device the call app itself is recording
+# from (Windows' audio sessions tell), else the default communications input.
+# Set a device name here to always use that one instead.  Capture is shared
+# mode only, so it never takes the microphone away from the call app, Handy
+# or anything else.
+capture_device = ""
+# Speech to text, on this PC only.  "faster-whisper:<model>": a Whisper model
+# (tried on the GPU with CUDA, int8), with call_stt_fallback on the CPU when
+# CUDA is not there or fails.  large-v3 is the default because it gets
+# Kannada and Telugu right where large-v3-turbo (faster, 1.2 GB less VRAM)
+# mistakes them for Tamil (measured 2026-09-24); use turbo if you only speak
+# English and Hindi.
+call_stt_model = "faster-whisper:large-v3"
+call_stt_fallback = "faster-whisper:small"
+# Where models are kept; empty = %LOCALAPPDATA%\Yuki\models\whisper.
+model_dir = ""
+# Languages you speak in calls (Whisper codes).  Each chunk is transcribed in
+# the most likely of these; code-mixed speech ("Hinglish") comes out in the
+# chunk's main language.  Empty = any language.
+languages = ["en", "hi", "kn", "ta", "te"]
+# Energy gate: 30 ms frames under this level are silence; a chunk with less
+# speech than min_speech_s is dropped, never transcribed.  Chunks are cut at a
+# pause once they are chunk_min_s long, and at chunk_max_s at the latest.
+gate_dbfs = -45.0
+min_speech_s = 0.5
+chunk_min_s = 6
+chunk_max_s = 25
+pause_s = 0.7
+# What was said is handed to the journal this often during a long call (and at its end).
+flush_every_s = 300
+# Display names for the card ("Remember what you say in this call?" ... "Always for Zoom").
+[calls.names]
+"Zoom.exe" = "Zoom"
+"Discord.exe" = "Discord"
+"ms-teams.exe" = "Microsoft Teams"
+"Teams.exe" = "Microsoft Teams"
+"MSTeams" = "Microsoft Teams"
+"Slack.exe" = "Slack"
+"Telegram.exe" = "Telegram"
+"Signal.exe" = "Signal"
+"Skype.exe" = "Skype"
+"Microsoft.SkypeApp" = "Skype"
+"Webex.exe" = "Webex"
+"CiscoCollabHost.exe" = "Webex"
+"5319275A.WhatsAppDesktop" = "WhatsApp"

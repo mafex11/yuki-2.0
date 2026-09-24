@@ -51,6 +51,14 @@ Usage::
     uv run yuki-memory --no-conversations   # do not extract memory from Yuki's own conversations
     uv run yuki-memory --no-nudges          # no coach: no check-ins, no reminders
     uv run yuki-memory --no-review          # no weekly review
+    uv run yuki-memory --no-calls           # never detect calls, never ask, never transcribe
+
+Calls (:mod:`yuki.memory.calls`, thread ``yuki-memory-calls``): a
+communication app holding the microphone, or a meeting row in front, is a
+call; the UI is asked (``Local\\YukiCallReady``) to show a consent card, and
+only with a yes (or "always" for the app) and headphones as the output is the
+user's own microphone transcribed here, in memory, as text of kind
+``my_call_side``. The ``paused`` flag stops it at once.
 """
 
 from __future__ import annotations
@@ -226,6 +234,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-nudges", action="store_true",
                         help="no coach: no check-ins and no reminders (to-dos are still kept)")
     parser.add_argument("--no-review", action="store_true", help="no weekly review (scheduled or requested)")
+    parser.add_argument("--no-calls", action="store_true",
+                        help="never detect calls, ask, or transcribe the user's side of one")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -266,6 +276,8 @@ def run(args: argparse.Namespace) -> int:
     nudges_thread: threading.Thread | None = None
     review = None
     review_thread: threading.Thread | None = None
+    calls = None
+    calls_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     review_path = flag_path(db_path, REVIEW_FLAG)
@@ -288,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
             conversations=not (args.no_journal or args.no_conversations),
             nudges=not (args.no_journal or args.no_timeline or args.no_nudges),
             review=not (args.no_journal or args.no_review),
+            calls=not args.no_calls,
             duration_s=args.duration,
         )
         try:
@@ -451,6 +464,24 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="review_start", error=f"{type(exc).__name__}: {exc}")
                 review = None
 
+        if not args.no_calls:
+            try:
+                from yuki.memory.calls import CallWorker
+
+                def meeting_now() -> dict[str, Any] | None:
+                    tl = timeline
+                    return tl.current_meeting() if tl is not None and tl.alive else None
+
+                calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now)
+                calls_thread = threading.Thread(
+                    target=_guarded(calls.run, log, "calls"), args=(stop, pause_path),
+                    name="yuki-memory-calls", daemon=True,
+                )
+                calls_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="calls_start", error=f"{type(exc).__name__}: {exc}")
+                calls = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
@@ -528,6 +559,8 @@ def run(args: argparse.Namespace) -> int:
             conversations.stop()
         if nudges is not None:
             nudges.stop()
+        if calls is not None:
+            calls.stop()   # closes the microphone, transcribes what is left, hands the text to the store
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
@@ -550,6 +583,8 @@ def run(args: argparse.Namespace) -> int:
             portrait_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if review_thread is not None:
             review_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
+        if calls_thread is not None:
+            calls_thread.join(30.0)  # the last chunks of a call being transcribed; audio is never kept
         totals = meter.reading(since_start=True)
         log("service_stop", **totals, watcher=watcher.stats() if watcher else None,
             timeline=timeline.stats() if timeline is not None else None, exit_code=code)

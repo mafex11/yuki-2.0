@@ -411,7 +411,9 @@ def todo_items(store: Store, *, include_done: bool = False, now: float | None = 
         if f.status == "done" and (f.valid_to or 0.0) < done_since:
             continue
         evidence = None
-        if f.quote:
+        if f.quote and f.origin == "call":   # the user's own words in a call (yuki.memory.calls)
+            evidence = f"the user said in a call on {datetime.fromtimestamp(f.valid_from):%Y-%m-%d}: \"{f.quote}\""
+        elif f.quote:
             evidence = f"the user asked on {datetime.fromtimestamp(f.valid_from):%Y-%m-%d}: \"{f.quote}\""
         items.append(Item(
             f"commit:{f.id}", f.text, "commitment", f.due_at, f.due_at is not None and _is_midnight(f.due_at),
