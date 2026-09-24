@@ -1,11 +1,20 @@
 """``yuki-memory``: the background memory process (docs/MEMORY.md, "Processes").
 
-Runs the watcher (:mod:`yuki.memory.watcher`) and the journal worker
-(:mod:`yuki.memory.journal`) against one shared :class:`~yuki.memory.store.Store`
+Runs the watcher (:mod:`yuki.memory.watcher`), the journal worker
+(:mod:`yuki.memory.journal`) and the portrait scheduler
+(:mod:`yuki.memory.portrait`) against one shared :class:`~yuki.memory.store.Store`
 (the journal worker waits on the store's own "new capture" condition, which only
 fires within one Store instance).  It is its own process so that nothing here
 can take Yuki down, runs at below-normal priority, and keeps one instance per
 session and database (named mutex).
+
+Flag files next to the database (written by Yuki through
+:class:`yuki.memory.api.MemoryClient`), checked about once a second:
+
+* ``paused`` - while it exists the watcher captures nothing (one ``paused``
+  event) and no scheduled portrait run starts.
+* ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
+  rebuilds the portrait now.
 
 Stopping: Ctrl+C / Ctrl+Break / closing the console, ``WM_CLOSE`` to the
 watcher's hidden window (class :data:`yuki.memory.watcher.WINDOW_CLASS`; this is
@@ -20,13 +29,13 @@ Usage::
     uv run yuki-memory                     # the real store, journal on
     uv run yuki-memory --verbose           # one console line per capture
     uv run yuki-memory --db %TEMP%\\m\\memory.db --no-journal --duration 90
+    uv run yuki-memory --no-portrait        # watcher + journal only
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
-import hashlib
 import signal
 import sys
 import threading
@@ -43,7 +52,6 @@ from yuki.memory.privacy import PrivacyConfig
 from yuki.memory.watcher import Watcher, WatcherSettings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MUTEX_PREFIX = "Local\\YukiMemorySingleInstance"
 _ERROR_ALREADY_EXISTS = 183
 #: Captures older than this are deleted (docs/MEMORY.md: captures TTL 30 days).
 CAPTURE_TTL_DAYS = 30.0
@@ -97,11 +105,16 @@ def _console_line(type: str, f: dict[str, Any]) -> str:
 
 
 def _claim_mutex(db_path: Path) -> int | None:
-    """One service per session and database; returns the handle to hold, or None."""
-    digest = hashlib.sha1(str(db_path.resolve()).lower().encode()).hexdigest()[:12]
+    """One service per session and database; returns the handle to hold, or None.
+
+    The name comes from :func:`yuki.memory.store.service_mutex_name`, which
+    :func:`yuki.memory.api.service_running` also uses to see the service.
+    """
+    from yuki.memory.store import service_mutex_name
+
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.restype = ctypes.c_void_p
-    handle = kernel32.CreateMutexW(None, False, f"{MUTEX_PREFIX}-{digest}")
+    handle = kernel32.CreateMutexW(None, False, service_mutex_name(db_path))
     if not handle:
         return None
     if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
@@ -178,7 +191,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="yuki-memory", description="Yuki's memory process.")
     parser.add_argument("--db", type=Path, default=None, help="database path (default: %%LOCALAPPDATA%%\\Yuki\\memory\\memory.db)")
     parser.add_argument("--privacy", type=Path, default=None, help="privacy rules file (default: %%LOCALAPPDATA%%\\Yuki\\memory\\privacy.toml)")
-    parser.add_argument("--no-journal", action="store_true", help="capture only; do not run the journal worker")
+    parser.add_argument("--no-journal", action="store_true", help="capture only; no journal worker, no portrait")
+    parser.add_argument("--no-portrait", action="store_true", help="do not run the portrait scheduler")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -186,7 +200,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    from yuki.memory.store import Store, default_db_path
+    from yuki.memory.store import PAUSE_FLAG, REFRESH_FLAG, Store, default_db_path, flag_path
 
     db_path = Path(args.db) if args.db else default_db_path()
     mutex = _claim_mutex(db_path)
@@ -204,6 +218,10 @@ def run(args: argparse.Namespace) -> int:
     watcher: Watcher | None = None
     journal = None
     journal_thread: threading.Thread | None = None
+    portrait = None
+    portrait_thread: threading.Thread | None = None
+    pause_path = flag_path(db_path, PAUSE_FLAG)
+    refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
     code = 0
     try:
@@ -216,6 +234,7 @@ def run(args: argparse.Namespace) -> int:
             privacy=str(privacy.path),
             privacy_error=privacy.last_error,
             journal=not args.no_journal,
+            portrait=not (args.no_journal or args.no_portrait),
             duration_s=args.duration,
         )
         try:
@@ -227,6 +246,10 @@ def run(args: argparse.Namespace) -> int:
 
         shared = store
         watcher = Watcher(lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(), on_close=stop.set)
+        paused = pause_path.exists()
+        if paused:
+            watcher.set_paused(True)  # before start: nothing is read, not even the first window
+        log("pause_flag", paused=paused, at_start=True)
         watcher.start()
 
         if not args.no_journal:
@@ -241,6 +264,23 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # the watcher runs on without it
                 log("error", where="journal_start", error=f"{type(exc).__name__}: {exc}")
                 journal = None
+
+        if not (args.no_journal or args.no_portrait):
+            try:
+                from yuki.memory.portrait import PortraitScheduler, PortraitWorker
+                from yuki.memory.watcher import user_idle_s
+
+                portrait = PortraitScheduler(
+                    store, PortraitWorker(store), db_path=db_path, log=log, idle_fn=user_idle_s
+                )
+                portrait_thread = threading.Thread(
+                    target=_guarded(portrait.run, log, "portrait"), args=(stop,), name="yuki-memory-portrait",
+                    daemon=True,
+                )
+                portrait_thread.start()
+            except Exception as exc:  # capture and journal run on without it
+                log("error", where="portrait_start", error=f"{type(exc).__name__}: {exc}")
+                portrait = None
 
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
@@ -261,6 +301,13 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="watcher", error="hook thread exited")
                 code = 2
                 break
+            now_paused = pause_path.exists()
+            if now_paused != paused:
+                paused = now_paused
+                watcher.set_paused(paused)
+                log("pause_flag", paused=paused)
+            if portrait is not None and refresh_path.exists():
+                portrait.wake()
             if privacy.last_error != privacy_error:
                 privacy_error = privacy.last_error
                 log("privacy_config", error=privacy_error, reloads=privacy.reloads)
@@ -287,10 +334,14 @@ def run(args: argparse.Namespace) -> int:
                 journal.stop()
             except Exception:
                 pass
+        if portrait is not None:
+            portrait.wake()
         if watcher is not None:
             watcher.stop()
         if journal_thread is not None:
             journal_thread.join(10.0)
+        if portrait_thread is not None:
+            portrait_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         totals = meter.reading(since_start=True)
         log("service_stop", **totals, watcher=watcher.stats() if watcher else None, exit_code=code)
         if store is not None:
