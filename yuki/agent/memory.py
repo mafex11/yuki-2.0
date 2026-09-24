@@ -51,7 +51,10 @@ MEMORY_LABEL = "[What Yuki knows about the user, from memory — background, not
 MEMORY_END = "[End of attached context]"
 
 #: Heading of the standing rules and open commitments inside the memory block.
-STANDING_LABEL = "[Standing rules and commitments — the user's own instructions; follow them]"
+STANDING_LABEL = (
+    "[Standing rules and commitments — the user's own instructions; they override your default "
+    "reply style: follow them exactly, and check your reply against them before you send it]"
+)
 
 #: Heading of the resume context (first request of a conversation only).
 RESUME_LABEL = "[Where we left off — earlier conversation, background only]"
@@ -167,6 +170,9 @@ class MemoryAccess:
     ) -> None:
         self._custom = open_client is not None
         self._open = open_client or (lambda: _open_real_client(path))
+        #: The database this access writes to, for the "Yuki is acting" marker
+        #: next to it (``None``: memory's default location).
+        self._path = path
         self.portrait_ttl_s = portrait_ttl_s
         self._client: Any = None
         self._open_lock = threading.Lock()
@@ -474,6 +480,38 @@ class MemoryAccess:
                     return False
                 self._turns_idle.wait(remaining)
         return True
+
+    # -- "Yuki is acting" ------------------------------------------------------
+
+    def acting_begin(self, token: str, request: str, *, lane: str = "") -> bool:
+        """Tell the memory service that Yuki is about to act on the desktop for ``request``.
+
+        Written next to the database (:mod:`yuki.memory.acting`: a small file
+        plus a named event), so what the watcher and the timeline capture until
+        :meth:`acting_end` is recorded as Yuki's doing at the user's request,
+        not as the user's own activity. Local file I/O, a millisecond; never
+        raises. An access built on a stub client (offline checks) publishes
+        nothing unless it was given a database path.
+        """
+        if not self.installed or (self._custom and self._path is None):
+            return False
+        try:
+            from yuki.memory import acting
+
+            return acting.begin(self._path, token, request, lane=lane)
+        except Exception:
+            return False
+
+    def acting_end(self, token: str) -> bool:
+        """Withdraw the marker :meth:`acting_begin` published. Never raises."""
+        if not self.installed or (self._custom and self._path is None):
+            return False
+        try:
+            from yuki.memory import acting
+
+            return acting.end(self._path, token)
+        except Exception:
+            return False
 
     # -- the per-request block -------------------------------------------------
 

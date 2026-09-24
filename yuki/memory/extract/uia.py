@@ -577,10 +577,22 @@ def _title_rank(name: str, window_title: str) -> int:
     return 1 if name in title else 0
 
 
-def _choose(candidates: list[_PageCandidate], window_title: str) -> tuple[_PageCandidate | None, int]:
+def _choose(
+    candidates: list[_PageCandidate], window_title: str, selected_tab: str = ""
+) -> tuple[_PageCandidate | None, int]:
     visible = [c for c in candidates if c.bounds is not None]
     if not visible:
         return None, 0
+    if (
+        selected_tab and window_title
+        and not any(c.name and selected_tab.startswith(c.name) for c in visible)
+        and not any(_title_rank(c.name, window_title) for c in visible)
+    ):
+        # The window's selected tab and its title name none of the pages found:
+        # they are tabs behind the one in front, whose own page is not in the
+        # snapshot yet (a tab loading). Seen live 2026-09-24 night 2: a new tab
+        # opening Instagram, then YouTube, was read as another tab's billing page.
+        return None, len(visible)
 
     def area(c: _PageCandidate) -> int:
         b = c.bounds or (0, 0, 0, 0)
@@ -727,8 +739,25 @@ def _read(
                     f"{len(scanned)} page(s) found by a scan that ignores IsOffscreen"
                     + (" (all reported off-screen)" if all(c.offscreen for c in scanned) else "")
                 )
-    chosen, others = _choose(candidates, snap.title)
+    selected = next(
+        (
+            e.name for e in frame
+            if e.role == "TabItem" and e.name and "selected" in (e.states or ())
+            and not _tree._inside_document(e, by_id)
+        ),
+        "",
+    )
+    chosen, others = _choose(candidates, snap.title, selected)
     snap.other_pages = others
+    if chosen is None and any(c.bounds is not None for c in candidates):
+        # Every page found is a tab behind the one in front (see _choose): the
+        # front page is loading or did not answer. Reading the whole window now
+        # would read those hidden tabs' pages as if they were on screen (seen
+        # live 2026-09-24 night 2: a Soba tab behind a YouTube tab). Nothing is
+        # read; the page's own events or the backstop bring the next attempt.
+        snap.truncated = True
+        snap.notes.append("the page in front is not in the tree yet (only background tabs' pages): not read")
+        return
     snap.frame_chars = sum(
         len(e.name) + len(e.value or "") for e in frame if e.role != "Document"
     )

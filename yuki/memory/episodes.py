@@ -68,6 +68,7 @@ from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted
 from yuki.memory.store import EpisodeRunStats, JournalEntry, NewEpisode, Store
 from yuki.memory.timeline import (
     BREAK_S,
+    RUN_GAP_S,
     aggregate,
     breaks,
     describe,
@@ -90,8 +91,8 @@ their time.
 
 Each request covers one window of time and gives you, measured on the PC rather than guessed:
 - TIME USE: time per app, per site and per page. "Active" means the user was giving input \
-(typing, scrolling, clicking); "watching" means no input while that app was playing media (a \
-video, music). Away time is counted separately and is in neither. A visit is one uninterrupted \
+(typing, scrolling, clicking); "watching" means that app was playing media while it was in \
+front (a video, music). Away time is counted separately and is in neither. A visit is one uninterrupted \
 run of an activity; "longest" is its longest run. Switches count one activity directly \
 followed by another; "back and forth" names pairs the user alternated between and how often.
   "Full screen" is time with a full-screen window in front (a game, a video in full screen): \
@@ -106,6 +107,11 @@ meeting line's span.
 marked.
 - JOURNAL: facts already extracted from what was on screen during the window (what the pages, \
 videos and conversations were about).
+- YUKI ACTING: spans when Yuki itself, the assistant, was working on the desktop for the user, \
+each with the user's request. What was in front then was Yuki's doing, not the user's: it is \
+left out of the time use above. Mention it only as "Yuki, at the user's request '...', \
+opened X", never as the user browsing, watching or reading it; journal facts marked \
+[by Yuki] are the same.
 
 Write 1 to 3 episodes with the record_episodes tool. An episode is one stretch of the window \
 with a coherent activity or mix of activities: what the user was doing, how it flowed (long \
@@ -206,10 +212,34 @@ class EpisodeResult:
 
 
 def window_facts(store: Store, since: float, until: float) -> dict[str, Any]:
-    """Everything computed for one window (content: labels and titles; stored encrypted)."""
-    rows = store.timeline_between(since, until)
+    """Everything computed for one window (content: labels and titles; stored encrypted).
+
+    Stretches Yuki spent acting for the user (``by_yuki``) are not the user's
+    time: they are left out of the aggregates and listed on their own
+    (``yuki``: span, app, site, the request).
+    """
+    all_rows = store.timeline_between(since, until)
+    rows = [r for r in all_rows if not getattr(r, "by_yuki", False)]
+    yuki: list[dict[str, Any]] = []
+    for r in all_rows:
+        if not getattr(r, "by_yuki", False):
+            continue
+        start, end = max(r.started_at, since), min(r.ended_at, until)
+        if end <= start:
+            continue
+        last = yuki[-1] if yuki else None
+        if last is not None and last["request"] == (r.yuki_request or "") and start - last["end"] <= RUN_GAP_S:
+            last["end"] = max(last["end"], end)
+            if r.host and r.host not in last["sites"]:
+                last["sites"].append(r.host)
+            if r.app and r.app not in last["apps"]:
+                last["apps"].append(r.app)
+            continue
+        yuki.append({"start": start, "end": end, "request": r.yuki_request or "",
+                     "apps": [r.app] if r.app else [], "sites": [r.host] if r.host else []})
     return {
         "rows": len(rows),
+        "yuki": yuki,
         "site": aggregate(rows, since, until, "site", limit=12),
         "app": aggregate(rows, since, until, "app", limit=8, titles=0),
         "page": aggregate(rows, since, until, "page", limit=10, titles=0),
@@ -290,12 +320,19 @@ def build_user_message(
     parts += [safe(x, 300) for x in describe(page, max_items=10, titles=False)[1:] if x.startswith("- ")]
     parts.append("SEQUENCE:")
     parts += _sequence_lines(facts["sequence"], safe) or ["(nothing)"]
+    parts.append("YUKI ACTING (Yuki working on the desktop at the user's request; not the user's time):")
+    parts += [
+        f"- {_local(y['start'], '%H:%M')}-{_local(y['end'], '%H:%M')} request \"{safe(y['request'], 200)}\": "
+        f"{safe(', '.join(y['apps'] + y['sites']), 200) or 'the desktop'}"
+        for y in facts.get("yuki", [])[:20]
+    ] or ["(none)"]
     parts.append("JOURNAL (facts from the screen in this window, oldest first):")
     used = 0
     journal_lines = []
     for j in journal:
         where = j.app + (f" / {j.host}" if j.host else "")
-        line = f"- {_local(j.at, '%H:%M')} [{safe(where, 100)}] {safe(j.fact, 600)}"
+        mark = " [by Yuki]" if getattr(j, "by_yuki", False) else ""
+        line = f"- {_local(j.at, '%H:%M')} [{safe(where, 100)}]{mark} {safe(j.fact, 600)}"
         if used + len(line) > JOURNAL_CHARS:
             journal_lines.append(f"- ... {len(journal) - len(journal_lines)} more facts not shown")
             break

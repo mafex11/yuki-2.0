@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import threading
 import time
 import traceback
@@ -93,7 +94,7 @@ invited Kenji to #design".
 
 Each request shows what newly appeared in one window, web page or terminal folder (a "thread") as \
 numbered SOURCES [1], [2], ..., each with the local date and time it is dated by. There \
-are three kinds:
+are four kinds:
 - MESSAGES of a conversation or an email thread, one source per message, with its sender \
 ("the user" marks the user's own messages) and when it was sent. Each is marked:
   NEW - sent or received since Yuki last looked at this conversation;
@@ -103,13 +104,28 @@ are three kinds:
 a commitment, a deadline. Record those, cite the message they come from and write them \
 in the past tense, as what was said then. Never record HISTORY as something happening \
 now or something the user just did: rereading an old conversation is not news.
-- CAPTURES of a page, document or list: the text that newly appeared on screen at that \
+- CAPTURES of a page or document: the text that newly appeared on screen at that \
 moment (a delta against what the window showed before).
+- LIST ITEMS: one row each of a list that was on screen - an inbox, a folder, a playlist, \
+search results - dated by the row's own date when it shows one (an email's date, a file's \
+modified time), else by when the list was seen. A list is what was VISIBLE, not what the user \
+did: an email in an inbox was received on its own date, a file in a folder was saved or \
+changed on its date. Never write that the user read, opened, watched, downloaded or chose an \
+item because it was listed - only what the row itself says. A fact from a row cites that row, \
+so it is stored with the row's date, never the day the list was looked at.
 - COMMANDS the user ran in their terminal (Warp), one source per command in the order \
 they ran: the command line, the folder it ran in, the git branch, the exit code (0 = it \
 succeeded, anything else = it failed; "not recorded" = unknown) and when it started. A \
 command marked "run by Warp's AI agent" was not typed by the user. The output of \
 commands is never given.
+
+Sources marked BY YUKI were put on screen by Yuki itself, the assistant, while it carried out \
+a request the user gave it (the request is quoted). Record them as Yuki's doing at the user's \
+request, with Yuki as the subject of the sentence - "Yuki, at the user's request 'play the \
+latest MrBeast video', opened and played 'X' by MrBeast on YouTube." - never as something the \
+user browsed, watched, read, looked up or searched for, and never as a sign of the user's \
+interests or habits. What such a page or message says \
+is still what it says (who wrote what, when); only bringing it up was Yuki's doing.
 
 For COMMANDS, summarise; do not transcribe. Write one fact per coherent piece of work: a \
 sequence of related commands becomes one fact that says what the user was doing, in which \
@@ -248,6 +264,24 @@ def _local(at: float) -> str:
 MESSAGE_KINDS = ("conversation", "email")
 #: Capture kind of terminal commands (yuki.memory.warp, Store.add_terminal_commands).
 TERMINAL_KIND = "terminal"
+#: Capture kind of lists (inbox views, folders): one source per row.
+LIST_KIND = "list"
+
+#: The date the extractor put in front of a list row that shows one
+#: (yuki.memory.extract: "[dated 2026-09-09 14:03] ..."): our own format.
+_ROW_DATE = _re.compile(r"^\[dated (\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\] ")
+
+
+def list_row(line: str) -> tuple[float | None, str]:
+    """``(epoch of the row's own date or None, the row's text)`` for one line of a list capture."""
+    m = _ROW_DATE.match(line)
+    if not m:
+        return None, line
+    try:
+        at = datetime.strptime(f"{m.group(1)} {m.group(2) or '00:00'}", "%Y-%m-%d %H:%M").timestamp()
+    except ValueError:
+        return None, line[m.end():]
+    return at, line[m.end():]
 
 
 @dataclass
@@ -261,6 +295,10 @@ class Source:
     at_estimated: bool = False
     #: A terminal command (``Store.add_terminal_commands`` dict: command, pwd, branch, exit_code, ...).
     command: dict[str, Any] | None = None
+    #: One row of a list capture (its text, without the date prefix).
+    item: str | None = None
+    #: The row showed its own date (``at`` is that date, not the capture time).
+    item_dated: bool = False
 
 
 def terminal_commands(cap: PendingCapture) -> list[dict[str, Any]]:
@@ -294,6 +332,14 @@ def build_sources(
                     at = cap.at
                 out.append(Source(at=at, capture=cap, command=c))
             continue
+        if cap.kind == LIST_KIND:
+            rows = [line for line in (cap.delta or "").splitlines() if line.strip()]
+            for line in rows:
+                at, text = list_row(line)
+                out.append(Source(at=at if at is not None else cap.at, capture=cap, item=text,
+                                  item_dated=at is not None))
+            if rows:
+                continue
         msgs = (messages or {}).get(cap.id) or []
         if cap.kind not in MESSAGE_KINDS or not msgs:
             out.append(Source(at=cap.at, capture=cap))
@@ -346,6 +392,13 @@ def build_user_message(
         safe(previous, PREVIOUS_FACTS_CHARS) or "(none)",
         "SOURCES (the only fact source):",
     ]
+    def by_yuki(src: Source) -> str:
+        cap = src.capture
+        if not getattr(cap, "by_yuki", False):
+            return ""
+        request = safe(getattr(cap, "yuki_request", "") or "", 300).replace("\n", " ")
+        return f" BY YUKI (at the user's request \"{request}\")" if request else " BY YUKI (at the user's request)"
+
     for number, src in enumerate(sources, start=1):
         c = src.command
         if c is not None:
@@ -362,10 +415,16 @@ def build_user_message(
             command = safe(str(c.get("command") or ""), 1_000).replace("\n", "\n      ")
             parts.append(f"[{number}] COMMAND {_local(src.at)} {where}, {', '.join(how)}:\n    $ {command}")
             continue
+        if src.item is not None:
+            cap = src.capture
+            when = (f"dated {_local(src.at)}, seen in the list {_local(cap.at)[:16]}" if src.item_dated
+                    else f"no date shown, seen in the list {_local(cap.at)}")
+            parts.append(f"[{number}] LIST ITEM ({when}){by_yuki(src)}: {safe(src.item, 1_000)}")
+            continue
         m = src.message
         if m is None:
             cap = src.capture
-            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}")
+            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}{by_yuki(src)}")
             parts.append(safe(cap.delta, max_capture_chars))
             continue
         mark = "NEW" if m.status == "new" else "HISTORY"
@@ -374,7 +433,7 @@ def build_user_message(
             shown = f", shown as '{safe(m.time_label, 60)}'" if m.time_label else ""
             when = f"time not shown{shown}; on or after {when}"
         text = safe(m.text, max_capture_chars).replace("\n", "\n    ")
-        parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}:\n    {text}")
+        parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}:\n    {text}")
     data = "\n".join(parts)
     return (
         f"CALENDAR: {_calendar([s.at for s in sources])}\n\n"
@@ -625,7 +684,8 @@ class JournalWorker:
                 index = len(sources) - 1
             facts.append(
                 NewFact(at=sources[index].at, thread_id=thread.id, app=thread.app, host=thread.host,
-                        fact=text, importance=importance)
+                        fact=text, importance=importance,
+                        by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)))
             )
         return facts
 

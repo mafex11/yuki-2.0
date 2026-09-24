@@ -71,7 +71,8 @@ class CaptureStore(Protocol):
     def latest_text(self, thread_id: int) -> str | None: ...
     def add_capture(
         self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str,
-        *, kind: str | None = None, profile: str | None = None,
+        *, kind: str | None = None, profile: str | None = None, by_yuki: bool = False,
+        yuki_request: str | None = None,
     ) -> int | None: ...
     def add_conversation(self, thread_id: int, at: float, trigger: str, messages: list, **kwargs: Any) -> Any: ...
     def add_me_names(self, app: str | None, names: list[str]) -> int: ...
@@ -114,7 +115,18 @@ class WatcherSettings:
     #: Minimum gap per window between captures from one trigger kind, so a
     #: title that ticks every second or a user tabbing through fields cannot
     #: turn into a capture per second.  The capture is delayed, not dropped.
-    min_gap_s: dict[str, float] = field(default_factory=lambda: {"title": 5.0, "focus": 10.0})
+    min_gap_s: dict[str, float] = field(default_factory=lambda: {"title": 5.0, "focus": 10.0, "page": 2.0})
+    #: A read of a window that had just come to the front (or changed page)
+    #: that found nothing, or less than this many characters, or no answer,
+    #: is retried once, after the window settles: on its next content event,
+    #: or when the process behind a UWP frame appears, or at the latest
+    #: ``retry_wait_s`` later. Settings pages and lazily built trees (CEF)
+    #: gave an empty first read, and nothing followed (seen live 2026-09-24).
+    retry_below_chars: int = 24
+    retry_wait_s: float = 5.0
+    #: Captures whose triggering event came this soon after Yuki stopped
+    #: acting are still Yuki's doing (the page it opened finishing its load).
+    acting_tail_s: float = 3.0
     #: UIA reads still running from earlier timed-out captures; above this the
     #: next capture is skipped instead of piling up threads on a hung provider.
     uia_backlog: int = 3
@@ -126,7 +138,10 @@ class WatcherSettings:
 #: with ``PostMessage(FindWindow(WINDOW_CLASS, None), WM_CLOSE)``.
 WINDOW_CLASS = "YukiMemoryWatcher"
 
-TRIGGER_RANK = {"backstop": 0, "focus": 1, "title": 2, "resume": 3, "foreground": 3, "start": 3}
+TRIGGER_RANK = {"backstop": 0, "focus": 1, "title": 2, "page": 2, "retry": 2, "resume": 3, "foreground": 3, "start": 3}
+#: Triggers that mean the window in front just changed: an empty read after
+#: one of them is retried once (``WatcherSettings.retry_wait_s``).
+FRESH_TRIGGERS = frozenset({"foreground", "start", "resume", "page"})
 
 # ---------------------------------------------------------------------------
 # Win32
@@ -243,6 +258,12 @@ NOTIFY_FOR_THIS_SESSION = 0
 WM_APP_STOP = win32con.WM_APP + 1
 WM_APP_REFRESH = win32con.WM_APP + 2
 WM_APP_PAUSE = win32con.WM_APP + 3
+#: From the timeline (same process, another thread): the page in front changed
+#: address without a title change (a reel, a feed); wParam = the window.
+WM_APP_PAGE = win32con.WM_APP + 4
+#: From the capture worker: the last read of this window (wParam) was empty
+#: right after it changed; retry it once it settles.
+WM_APP_RETRY = win32con.WM_APP + 5
 MONITOR_DEFAULTTONEAREST = 2
 QUNS_BUSY = 2
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
@@ -617,6 +638,9 @@ class _Request:
     trigger: str
     title: str = ""
     requested_at: float = 0.0
+    #: Yuki was acting for the user when this capture was triggered
+    #: (:class:`yuki.memory.acting.Acting`), else None.
+    acting: Any = None
 
 
 @dataclass
@@ -728,6 +752,13 @@ class Watcher:
         self._last_capture: dict[int, float] = {}
         self._last_backstop_captured: bool | None = None
         self._probe: _PasswordProbe | None = None
+        #: What Yuki is acting on now (yuki.memory.acting.Acting), set by the
+        #: service from any thread; and the last one with when it ended.
+        self._acting: Any = None
+        self._acting_last: tuple[Any, float] = (None, 0.0)
+        #: A retry waiting for the window to settle (hook thread):
+        #: ``(hwnd, deadline, content pid when armed)``.
+        self._retry: tuple[int, float, int] | None = None
 
         # stats
         self._started_at = 0.0
@@ -782,6 +813,37 @@ class Watcher:
         else:
             self._set_paused(paused)
 
+    def set_acting(self, acting: Any) -> None:
+        """Yuki started (an :class:`~yuki.memory.acting.Acting`) or stopped (``None``)
+        acting on the desktop for the user; safe from any thread.
+
+        Captures triggered meanwhile (and within ``acting_tail_s`` after) are
+        stored ``by_yuki`` with the request's text.
+        """
+        previous = self._acting
+        if acting is None and previous is not None:
+            self._acting_last = (previous, time.monotonic())
+        self._acting = acting
+        if (acting is None) != (previous is None):
+            self._log("watcher_state", acting=acting is not None)
+
+    def acting_now(self) -> Any:
+        """The request Yuki is acting on, or the one it finished within ``acting_tail_s``."""
+        acting = self._acting
+        if acting is not None:
+            return acting
+        last, ended = self._acting_last
+        if last is not None and time.monotonic() - ended <= self.settings.acting_tail_s:
+            return last
+        return None
+
+    def request_capture(self, hwnd: int, trigger: str = "page") -> None:
+        """Ask for a capture of ``hwnd`` if it is still in front (another thread of
+        the service, e.g. the timeline seeing the page's address change);
+        rate-limited per window by ``min_gap_s[trigger]``."""
+        if self._hwnd and trigger == "page":
+            _user32.PostMessageW(self._hwnd, WM_APP_PAGE, int(hwnd), 0)
+
     @property
     def paused(self) -> bool:
         return self._paused
@@ -827,6 +889,7 @@ class Watcher:
             "fullscreen": self._fullscreen,
             "paused": self._paused,
             "idle": self._idle,
+            "acting": self._acting is not None,
             "backstop_interval_s": self._backstop_interval,
         }
 
@@ -947,6 +1010,20 @@ class Watcher:
             if msg == WM_APP_REFRESH:
                 self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
                 return 0
+            if msg == WM_APP_PAGE:
+                target = int(wparam or 0)
+                if target and target == self._fg and not (self._locked or self._fullscreen or self._paused):
+                    self._events["page"] += 1
+                    now = time.monotonic()
+                    self._activity_at = now
+                    self._arm("page", now)
+                return 0
+            if msg == WM_APP_RETRY:
+                target = int(wparam or 0)
+                if target and target == self._fg and not (self._locked or self._fullscreen or self._paused):
+                    self._events["retry_armed"] += 1
+                    self._retry = (target, time.monotonic() + self.settings.retry_wait_s, _window_pid(target))
+                return 0
             if msg == WM_APP_STOP:
                 win32gui.DestroyWindow(hwnd)
                 return 0
@@ -1038,6 +1115,12 @@ class Watcher:
                 return
             now = time.monotonic()
             self._activity_at = now
+            if self._retry is not None and self._retry[0] == fg:
+                # The window that read empty is doing something: read it again
+                # once this burst settles.
+                self._retry = None
+                self._events["retry"] += 1
+                self._arm("retry", now)
             if event == EVENT_OBJECT_NAMECHANGE:
                 if hwnd == fg and id_object == OBJID_WINDOW and id_child == CHILDID_SELF:
                     self._events["title"] += 1
@@ -1054,6 +1137,7 @@ class Watcher:
         if hwnd:
             hwnd = int(_user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
         self._fg = hwnd
+        self._retry = None
         if self._locked or self._paused or not hwnd:
             self._unhook_pid()
             self._pending = None
@@ -1111,6 +1195,9 @@ class Watcher:
 
     def _next_timeout_ms(self, now: float) -> int:
         deadlines = [self._next_backstop]
+        if self._retry is not None:
+            # a condition poll (the hosted app's window appearing), bounded by the retry's deadline
+            deadlines.append(min(self._retry[1], now + 0.25))
         pending = self._pending
         if pending is not None:
             if pending.not_before:
@@ -1122,6 +1209,20 @@ class Watcher:
         return max(int(wait * 1000) + 1, 0)
 
     def _tick(self, now: float) -> None:
+        retry = self._retry
+        if retry is not None:
+            hwnd, deadline, pid = retry
+            if hwnd != self._fg:
+                self._retry = None
+            else:
+                moved = _window_pid(hwnd) != pid
+                if moved or now >= deadline:
+                    # The frame's app appeared (its own focus/name events need its
+                    # own hooks), or nothing happened within the bound: read again.
+                    self._retry = None
+                    self._events["retry"] += 1
+                    self._hook_pid(hwnd)
+                    self._arm("retry", now)
         pending = self._pending
         if pending is not None and pending.hwnd != self._fg:
             self._pending = pending = None
@@ -1174,7 +1275,8 @@ class Watcher:
     def _submit(self, hwnd: int, trigger: str, now: float) -> None:
         self._pending = None
         self._next_backstop = max(self._next_backstop, now + self._backstop_interval)
-        request = _Request(hwnd=hwnd, trigger=trigger, title=_window_title(hwnd), requested_at=now)
+        request = _Request(hwnd=hwnd, trigger=trigger, title=_window_title(hwnd), requested_at=now,
+                           acting=self.acting_now())
         with self._cond:
             self._request = request  # latest wins
             self._cond.notify()
@@ -1225,6 +1327,15 @@ class Watcher:
             if request.trigger == "backstop":
                 self._last_backstop_captured = result.outcome == "captured"
         self._log("capture", **result.__dict__)
+        if self._hwnd and (
+            (request.trigger in FRESH_TRIGGERS or request.trigger == "title") and result.reason == "window_busy"
+            or request.trigger in FRESH_TRIGGERS and (
+                result.outcome == "empty"
+                or (result.outcome in ("captured", "unchanged", "no_new_text", "deduplicated")
+                    and result.chars < self.settings.retry_below_chars))
+        ):
+            # Once per change: the retry's own result never asks again.
+            _user32.PostMessageW(self._hwnd, WM_APP_RETRY, int(request.hwnd), 0)
         if store is not None:
             try:
                 store.add_health(
@@ -1309,7 +1420,9 @@ class Watcher:
             timeout_s=self.settings.capture_budget_s,
         )
         result.read_ms = (time.perf_counter() - t0) * 1000.0
-        outcome, reason = self.ingest(store, extraction, request.trigger, process=facts.process_name, result=result)
+        acting = request.acting or self._acting
+        outcome, reason = self.ingest(store, extraction, request.trigger, process=facts.process_name, result=result,
+                                      acting=acting)
         return done(outcome, reason)
 
     # -- extraction -> store (worker thread; also usable offline) -----------
@@ -1335,12 +1448,15 @@ class Watcher:
         process: str | None = None,
         at: float | None = None,
         result: CaptureResult | None = None,
+        acting: Any = None,
     ) -> tuple[str, str]:
         """Privacy-gate and store one extraction; returns ``(outcome, reason)``.
 
         Conversations and mail (``kind`` conversation/email) are stored message
         by message against the thread's fingerprints; everything else keeps a
         line delta of its main text.  The thread is ``(app, thread_scope)``.
+        ``acting``: Yuki was acting for the user (:class:`yuki.memory.acting.Acting`):
+        the capture is stored ``by_yuki`` with the request's text.
         """
         rules = self.privacy.rules()
         result = result if result is not None else CaptureResult(trigger=trigger)
@@ -1359,10 +1475,11 @@ class Watcher:
         self._learn_names(store, extraction)
 
         s0 = time.perf_counter()
+        yuki = {"by_yuki": True, "yuki_request": getattr(acting, "request", "") or ""} if acting is not None else {}
         try:
             if extraction.kind in ("conversation", "email"):
-                return self._ingest_messages(store, extraction, trigger, process, at, rules, result)
-            return self._ingest_text(store, extraction, trigger, process, at, rules, result)
+                return self._ingest_messages(store, extraction, trigger, process, at, rules, result, yuki)
+            return self._ingest_text(store, extraction, trigger, process, at, rules, result, yuki)
         except Exception as exc:
             self._log_error("store", exc)
             return "failed", "store_error"
@@ -1383,7 +1500,7 @@ class Watcher:
 
     def _ingest_messages(
         self, store: CaptureStore, ex: Extraction, trigger: str, process: str | None, at: float,
-        rules: PrivacyRules, result: CaptureResult,
+        rules: PrivacyRules, result: CaptureResult, yuki: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         messages = []
         for message in ex.messages:
@@ -1400,6 +1517,7 @@ class Watcher:
         written = store.add_conversation(
             thread_id, at, trigger, messages, kind=ex.kind, profile=ex.profile,
             first_visit_new_s=self.settings.first_visit_new_s, label_tolerance_s=self.settings.label_tolerance_s,
+            **(yuki or {}),
         )
         result.new_messages, result.history_messages = written.new, written.history
         if written.capture_id is None:
@@ -1409,7 +1527,7 @@ class Watcher:
 
     def _ingest_text(
         self, store: CaptureStore, ex: Extraction, trigger: str, process: str | None, at: float,
-        rules: PrivacyRules, result: CaptureResult,
+        rules: PrivacyRules, result: CaptureResult, yuki: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         text, clipped = normalise_text(ex.body, rules, self.settings.max_chars)
         result.truncated = result.truncated or clipped
@@ -1429,7 +1547,8 @@ class Watcher:
         delta = text_delta(previous, text)
         # An empty delta (lines only went away or moved) writes no capture
         # row, but the store still makes this text the thread's latest.
-        capture_id = store.add_capture(thread_id, at, trigger, text, delta, kind=ex.kind, profile=ex.profile)
+        capture_id = store.add_capture(thread_id, at, trigger, text, delta, kind=ex.kind, profile=ex.profile,
+                                       **(yuki or {}))
         if not delta:
             return "no_new_text", "truncated" if result.truncated else ""
         result.delta_chars = len(delta)

@@ -23,8 +23,13 @@ Two parts:
     worker thread of its own, bounded to :data:`PAGE_PROBE_S`;
   - ``present`` vs ``away``: present while the last keyboard/mouse input
     (``GetLastInputInfo``, system idle time - no hooks, no input monitoring)
-    is under :data:`AWAY_AFTER_S` old, or while the app in front plays media
-    (``passive``: watching); otherwise ``away``;
+    is under :data:`AWAY_AFTER_S` old, or while the app in front plays media;
+    otherwise ``away``. Time while the app in front plays media is
+    ``passive`` (watching or listening) whatever the input says: the idle
+    timer is only as good as the devices behind it (on this PC a mouse whose
+    sensor reports a one-count move every few seconds resets it with nobody
+    there, measured 2026-09-24), so input cannot be what tells watching from
+    doing;
   - media: the Windows media sessions (:func:`yuki.perception.system.media_sessions`,
     the media part of ``activity_facts()``), polled every
     :data:`MEDIA_EVERY_S`; a playing session is joined to the app in front by
@@ -108,6 +113,11 @@ PAGE_WAIT_S = 2.5
 #: A page in front is read again this often (a single-page site changes address
 #: without a title change: reels, feeds).
 PAGE_REPROBE_S = 60.0
+#: ...and this soon when the page's process has changed content since the last
+#: read (name-change events: a reel scrolled, a feed moved on), so an address
+#: that changes without a title change is seen within seconds. Each read is a
+#: page-only pass (tens of ms, on the probe thread).
+PAGE_ACTIVE_REPROBE_S = 2.5
 #: A stretch that settled without a page, in a process that has shown pages
 #: (fewer than NO_PAGE_STREAK empty probes in a row), is read again this often:
 #: its first probe came while the page was loading. Seen live 2026-09-24: Chrome
@@ -731,12 +741,16 @@ _WM_APP = 0x8000
 _WM_QUIT = 0x0012
 WM_APP_PAUSE = _WM_APP + 21
 WM_APP_PAGE = _WM_APP + 22
+WM_APP_ACTING = _WM_APP + 23
 _PM_REMOVE = 0x0001
 _PM_NOREMOVE = 0x0000
 _QS_ALLINPUT = 0x04FF
 _MWMO_INPUTAVAILABLE = 0x0004
 _EVENT_SYSTEM_FOREGROUND = 0x0003
 _EVENT_OBJECT_NAMECHANGE = 0x800C
+#: Hooked together with name changes (one range): an address bar's or a page
+#: Document's value changing is the address changing.
+_EVENT_OBJECT_VALUECHANGE = 0x800E
 _WINEVENT_OUTOFCONTEXT = 0x0000
 _WINEVENT_SKIPOWNPROCESS = 0x0002
 _OBJID_WINDOW = 0
@@ -779,6 +793,9 @@ class _Stretch:
     hidden: bool = False
     meeting: str | None = None
     mic_s: float = 0.0
+    #: Yuki was acting for the user when this stretch began (yuki.memory.acting).
+    by_yuki: bool = False
+    yuki_request: str | None = None
 
 
 def _mic_users() -> frozenset[str]:
@@ -890,7 +907,10 @@ class TimelineRecorder:
         log: ``log(type, **fields)``, content-free.
     """
 
-    def __init__(self, store: Store, *, privacy: Any = None, log: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self, store: Store, *, privacy: Any = None, log: Callable[..., Any] | None = None,
+        on_page_change: Callable[[int], None] | None = None,
+    ) -> None:
         from yuki.memory import watcher as _w
         from yuki.memory.privacy import PrivacyConfig
         from yuki.perception import windows as _windows
@@ -948,7 +968,7 @@ class TimelineRecorder:
         self._title_last: float | None = None
         self._next_flush = time.monotonic() + FLUSH_EVERY_S
         self._next_media = 0.0
-        self._playing: list[tuple[str, str]] = []   # (app id casefolded, display label)
+        self._playing: list[tuple[str, str, str]] = []   # (app id casefolded, display label, media title)
         self._media_errors = 0
         self._no_page: dict[int, tuple[int, float]] = {}   # pid -> (streak, last probe wall time)
         self._page_results: list[tuple] = []
@@ -956,6 +976,15 @@ class TimelineRecorder:
         self._probe: _PageProbe | None = None
         self._due = 0.0
         self.counters: Counter = Counter()
+        #: Called (on this thread) with the window whose page changed address
+        #: under the same title, so the watcher can read it (a reel, a feed).
+        self.on_page_change = on_page_change
+        #: Wall time of the last content (non-window) name change from the
+        #: process in front: the page may have moved on.
+        self._content_at = 0.0
+        #: What Yuki is acting on (yuki.memory.acting.Acting), applied on this thread.
+        self._acting: Any = None
+        self._acting_next: Any = None
 
     # -- public ------------------------------------------------------------
 
@@ -979,6 +1008,16 @@ class TimelineRecorder:
             self._user32.PostThreadMessageW(self._thread_id, WM_APP_PAUSE, int(bool(paused)), 0)
         else:
             self._paused = bool(paused)
+
+    def set_acting(self, acting: Any) -> None:
+        """Yuki started (an :class:`~yuki.memory.acting.Acting`) or stopped (``None``)
+        acting for the user; safe from any thread. The stretch in front is cut
+        there: what follows is recorded ``by_yuki`` (or no longer)."""
+        self._acting_next = acting
+        if self._thread_id and self.alive:
+            self._user32.PostThreadMessageW(self._thread_id, WM_APP_ACTING, 0, 0)
+        else:
+            self._acting = acting
 
     @property
     def alive(self) -> bool:
@@ -1074,6 +1113,12 @@ class TimelineRecorder:
                         continue
                     if not msg.hWnd and msg.message == WM_APP_PAGE:
                         continue  # results are taken in _tick
+                    if not msg.hWnd and msg.message == WM_APP_ACTING:
+                        try:
+                            self._apply_acting(time.time())
+                        except Exception as exc:
+                            self._log_error("acting", exc)
+                        continue
                     u.TranslateMessage(ctypes.byref(msg))
                     u.DispatchMessageW(ctypes.byref(msg))
                 if quit_seen:
@@ -1120,6 +1165,8 @@ class TimelineRecorder:
             delay = min(delay, max(due - mono, 0.0))
         if st is not None and not st.settled:
             delay = min(delay, max(st.probe_at + PAGE_WAIT_S - now, 0.0))
+        elif st is not None and st.host and not st.hidden and self._content_at > st.page_checked_at:
+            delay = min(delay, max(st.page_checked_at + PAGE_ACTIVE_REPROBE_S - now, 0.0))
         delay = max(delay, 0.0)
         self._due = mono + delay
         return max(int(delay * 1000) + 1, 1)
@@ -1138,7 +1185,9 @@ class TimelineRecorder:
                 fg = self._root(int(hwnd or 0) or int(self._user32.GetForegroundWindow() or 0))
                 self._foreground(fg, time.time())
                 return
-            if id_object != _OBJID_WINDOW or id_child != _CHILDID_SELF:
+            if event != _EVENT_OBJECT_NAMECHANGE or id_object != _OBJID_WINDOW or id_child != _CHILDID_SELF:
+                if hwnd and self._fg and not self._blocked:
+                    self._content_at = time.time()  # the page may have moved on (see PAGE_ACTIVE_REPROBE_S)
                 return
             if not hwnd or int(hwnd) != self._fg or self._blocked:
                 return
@@ -1163,7 +1212,7 @@ class TimelineRecorder:
         self._unhook_names()
         for p in pids:
             handle = self._user32.SetWinEventHook(
-                _EVENT_OBJECT_NAMECHANGE, _EVENT_OBJECT_NAMECHANGE, None, self._callback, p, 0,
+                _EVENT_OBJECT_NAMECHANGE, _EVENT_OBJECT_VALUECHANGE, None, self._callback, p, 0,
                 _WINEVENT_OUTOFCONTEXT | _WINEVENT_SKIPOWNPROCESS,
             )
             if handle:
@@ -1216,6 +1265,29 @@ class TimelineRecorder:
             return
         self._paused = paused
         self._gate(time.time())
+
+    def _apply_acting(self, now: float) -> None:
+        """Take the acting state set by :meth:`set_acting`; cut the stretch in front where it changed."""
+        acting = self._acting_next
+        was = self._acting is not None
+        self._acting = acting
+        if (acting is not None) == was:
+            return
+        self.counters["acting_on" if acting is not None else "acting_off"] += 1
+        st = self._current
+        if st is None or self._blocked:
+            return
+        self._advance(now)
+        st = self._current
+        if st is None:
+            return
+        self._close(now)
+        self._open(st.hwnd, now, like=st, state=st.state)
+
+    def _mark_acting(self, st: _Stretch) -> None:
+        acting = self._acting
+        st.by_yuki = acting is not None
+        st.yuki_request = (getattr(acting, "request", "") or None) if acting is not None else None
 
     def _gate(self, now: float) -> bool:
         """Apply pause / lock; True while recording is blocked (full screen is recorded, see :meth:`_open`)."""
@@ -1281,6 +1353,7 @@ class TimelineRecorder:
         if like is not None:
             st = replace(like, start=now, end=now, state=state, settled=False, row_id=None, base=None, segments=1,
                          active_s=0.0, passive_s=0.0, away_s=0.0, media_s=0.0, media_other={}, mic_s=0.0)
+            self._mark_acting(st)
             self._current = st
             self._settle(st)
             return
@@ -1316,6 +1389,7 @@ class TimelineRecorder:
         st = _Stretch(start=now, end=now, hwnd=hwnd, pid=pid, process=facts.process_name if app else "",
                       app=app, title=title, withheld=withheld, host=host, ids=ids, entry=entry,
                       fullscreen=fullscreen, hidden=hidden, meeting=meeting)
+        self._mark_acting(st)
         self._current = st
         if hidden:
             self._unhook_names()
@@ -1413,6 +1487,12 @@ class TimelineRecorder:
                     new = replace(st, host=host, path=path, withheld=withheld, title=title, meeting=meeting)
                     self._open(st.hwnd, now, like=new, state=st.state)
                 self.counters["page_rotations"] += 1
+                if self.on_page_change is not None and host and not withheld and not meeting:
+                    try:
+                        self.on_page_change(st.hwnd)
+                        self.counters["page_change_signals"] += 1
+                    except Exception as exc:
+                        self._log_error("on_page_change", exc)
 
     def _settle(self, st: _Stretch) -> None:
         """Decide the stretch's identity; continue the previous row when it is the same page."""
@@ -1422,6 +1502,7 @@ class TimelineRecorder:
         last = self._last_row
         if (
             last is not None and last.page_key == key and last.state == st.state
+            and bool(last.by_yuki) == st.by_yuki
             and st.start - last.ended_at <= MERGE_GAP_S
         ):
             st.row_id, st.base, st.start = last.id, last, last.started_at
@@ -1442,6 +1523,7 @@ class TimelineRecorder:
             media_s=st.media_s + (base.media_s if base else 0.0),
             media_other=other, withheld=st.withheld, segments=st.segments,
             fullscreen=st.fullscreen, meeting=st.meeting, mic_s=st.mic_s + (base.mic_s if base else 0.0),
+            by_yuki=st.by_yuki, yuki_request=st.yuki_request,
         )
 
     def _write(self, st: _Stretch, end: float) -> TimelineRow | None:
@@ -1481,7 +1563,22 @@ class TimelineRecorder:
         return False
 
     def _fg_media(self, st: _Stretch) -> bool:
-        return any(self._matches(st, app_id) for app_id, _ in self._playing)
+        """The app in front is playing media (any of its windows or tabs)."""
+        return any(self._matches(st, app_id) for app_id, _, _ in self._playing)
+
+    def _watching(self, st: _Stretch) -> bool:
+        """The stretch in front is what plays: its app's media, and for a web page the page naming it."""
+        return any(self._matches(st, app_id) and self._shows(st, title) for app_id, _, title in self._playing)
+
+    @staticmethod
+    def _shows(st: _Stretch, media_title: str) -> bool:
+        """Whether the stretch in front can be the one playing: for a web page, its
+        title names the media when both have one (a browser's other tab playing
+        is not the page in front: Wikipedia read while a YouTube tab plays is not
+        watching). Two titles the OS and the app wrote, compared as text."""
+        if not st.host or not media_title or not st.title:
+            return True
+        return " ".join(media_title.casefold().split()) in " ".join(st.title.casefold().split())
 
     def _mic_on(self, st: _Stretch) -> bool:
         """A meeting's app is using the microphone (by image key, or package family for a packaged app)."""
@@ -1513,7 +1610,7 @@ class TimelineRecorder:
         setattr(st, kind, getattr(st, kind) + d)
         if self._mic_on(st):
             st.mic_s += d
-        for app_id, label in self._playing:
+        for app_id, label, _ in self._playing:
             if self._matches(st, app_id):
                 if kind != "away_s":
                     st.media_s += d
@@ -1548,6 +1645,11 @@ class TimelineRecorder:
             self._open(st.hwnd, now, like=st, state="present" if idle < AWAY_AFTER_S else "away")
             return
         new_input = l1 > l0 + 0.5
+        if st.state == "present" and self._watching(st):
+            # The app in front is playing media: watching or listening, whatever
+            # the idle timer says (see the module docstring).
+            self._credit(st, t0, now, "passive_s")
+            return
         if st.state == "present":
             a = max(t0, l0 + AWAY_AFTER_S)
             b = min(now, l1 if new_input else now)
@@ -1594,7 +1696,7 @@ class TimelineRecorder:
             index = self._windows.start_menu_index()
         except Exception:
             pass
-        playing: list[tuple[str, str]] = []
+        playing: list[tuple[str, str, str]] = []
         for s in sessions:
             if s.get("status") != "playing":
                 continue
@@ -1605,7 +1707,7 @@ class TimelineRecorder:
             label = entry.name if entry is not None else (app_key(app_id) or app_id)
             if rules.check_app(label, label):
                 continue  # a blocked app's media is not recorded either
-            playing.append((app_id, label))
+            playing.append((app_id, label, str(s.get("title") or "")))
         self._playing = playing
 
     # -- tick --------------------------------------------------------------------------
@@ -1640,7 +1742,7 @@ class TimelineRecorder:
             and now - self._input_at < AWAY_AFTER_S
         ):
             if st.host:
-                due = PAGE_REPROBE_S
+                due = PAGE_ACTIVE_REPROBE_S if self._content_at > st.page_checked_at else PAGE_REPROBE_S
             elif not st.withheld and not st.meeting and self._no_page.get(st.pid, (0, 0.0))[0] < NO_PAGE_STREAK:
                 due = PAGE_RETRY_S
             else:
