@@ -23,7 +23,12 @@ is logged under (:meth:`MemoryAccess.log_turn`), and "where we left off"
 Conversation memory (the turn log, standing rules and commitments, the resume
 context) came after the rest of the API, so those client methods are treated
 as optional: a client found without one is remembered as lacking it
-(:meth:`MemoryAccess.call_method`) and that piece is simply left out.
+(:meth:`MemoryAccess.call_method`) and that piece is simply left out. The same
+goes for the to-do list and the nudges (``todos``, ``add_todo``,
+``complete_todo``, ``pending_nudges``, ``ack_nudge``, ``snooze_nudges``,
+``nudge_status``): the ``todo`` tool's results, the to-dos in the memory block,
+the tray's list and quiet controls and the UI's nudge cards all go quiet when
+memory has no such method.
 """
 
 from __future__ import annotations
@@ -64,6 +69,19 @@ RESUME_LABEL = "[Where we left off — earlier conversation, background only]"
 #: and a cut is logged.
 STANDING_MAX_CHARS = 1600
 RESUME_MAX_CHARS = 4500
+
+#: Most open to-dos attached to one request, and the longest line of one.
+TODO_LINES = 5
+TODO_LINE_CHARS = 160
+
+#: Heading of the open to-dos inside the memory block.
+TODO_LABEL = "Open to-dos on the user's list (from memory):"
+
+#: Most to-dos the ``todo`` tool's ``list`` shows.
+TODO_LIST_LIMIT = 30
+
+#: The reactions ``ack_nudge`` takes.
+NUDGE_REACTIONS = ("shown", "dismissed", "replied", "snoozed")
 
 #: How far back ``resume_context`` looks for the last session.
 RESUME_WITHIN_HOURS = 6.0
@@ -118,6 +136,8 @@ class MemoryContext:
             there are none or memory could not say.
         resume: Last session's summary and closing exchanges; only fetched
             when asked for (a conversation's first request).
+        todos: Open to-dos for the block (at most :data:`TODO_LINES`), minus any
+            the standing context already lists.
         truncated: Sections cut to their budget guard.
         source: ``memory`` (fetched now), ``cache`` (portrait from the
             in-process cache), ``stale_cache`` (fetch failed, older portrait
@@ -131,6 +151,7 @@ class MemoryContext:
     knowhow: list[str] = field(default_factory=list)
     standing: str | None = None
     resume: str | None = None
+    todos: list[dict[str, Any]] = field(default_factory=list)
     truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
@@ -566,6 +587,14 @@ class MemoryAccess:
                 except MemoryUnavailable as exc:
                     if "standing_context" not in self._absent:
                         result.error = result.error or str(exc)
+            if "todos" not in self._absent:
+                try:
+                    result.todos = self.block_todos(
+                        result.standing, timeout_s=max(deadline - time.perf_counter(), 0.05)
+                    )
+                except MemoryUnavailable as exc:
+                    if "todos" not in self._absent:
+                        result.error = result.error or str(exc)
             if resume and "resume_context" not in self._absent:
                 try:
                     result.resume = self.resume(
@@ -580,11 +609,82 @@ class MemoryAccess:
                 setattr(result, name, text[: limit - 1].rstrip() + "…")
                 result.truncated.append(name)
         if result.source in ("memory", "cache") and not (
-            result.portrait or result.knowhow or result.standing or result.resume
+            result.portrait or result.knowhow or result.standing or result.resume or result.todos
         ):
             result.source = "empty"
         result.elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         return result
+
+    # -- to-dos and nudges ------------------------------------------------------
+
+    def todos(
+        self, *, include_done: bool = False, timeout_s: float = TRAY_TIMEOUT_S
+    ) -> list[dict[str, Any]]:
+        """``MemoryClient.todos``, rows as dicts. Raises :class:`MemoryUnavailable`."""
+        rows = self.call_method("todos", include_done=include_done, timeout_s=timeout_s)
+        return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+
+    def block_todos(
+        self, standing: str | None, *, timeout_s: float = CONTEXT_TIMEOUT_S
+    ) -> list[dict[str, Any]]:
+        """The open to-dos for the memory block: at most :data:`TODO_LINES`, in memory's order.
+
+        An item the standing context already carries (memory lists Yuki's open
+        commitments there, and may come to list to-dos too) is left out, so
+        nothing is said twice. Matched on the item's own words, whitespace and
+        case aside -- bookkeeping about what text is already attached.
+
+        Raises:
+            MemoryUnavailable: When memory cannot answer or has no ``todos()``.
+        """
+        rows = self.todos(include_done=False, timeout_s=timeout_s)
+        said = _squash(standing or "")
+        chosen: list[dict[str, Any]] = []
+        for row in rows:
+            if todo_done(row):
+                continue
+            text = _squash(str(row.get("text") or ""))
+            if not text or (said and text[:80] in said):
+                continue
+            chosen.append(row)
+            if len(chosen) >= TODO_LINES:
+                break
+        return chosen
+
+    def add_todo(
+        self, text: str, due: str | None = None, *, timeout_s: float = TOOL_TIMEOUT_S
+    ) -> Any:
+        """``MemoryClient.add_todo``: the new item's id. Raises :class:`MemoryUnavailable`."""
+        return self.call_method("add_todo", text, due=due, timeout_s=timeout_s)
+
+    def complete_todo(self, ref: str, *, timeout_s: float = TOOL_TIMEOUT_S) -> Any:
+        """``MemoryClient.complete_todo``: what was completed, or ``None``. Raises :class:`MemoryUnavailable`."""
+        return self.call_method("complete_todo", ref, timeout_s=timeout_s)
+
+    def pending_nudges(self, *, timeout_s: float = TRAY_TIMEOUT_S) -> list[dict[str, Any]]:
+        """``MemoryClient.pending_nudges``, rows as dicts. Raises :class:`MemoryUnavailable`."""
+        rows = self.call_method("pending_nudges", timeout_s=timeout_s)
+        return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+
+    def ack_nudge(self, nudge_id: Any, reaction: str, *, timeout_s: float = TRAY_TIMEOUT_S) -> Any:
+        """``MemoryClient.ack_nudge``.
+
+        Raises:
+            ValueError: ``reaction`` is not one of :data:`NUDGE_REACTIONS`.
+            MemoryUnavailable: When memory cannot answer or has no such method.
+        """
+        if reaction not in NUDGE_REACTIONS:
+            raise ValueError(f"reaction must be one of {', '.join(NUDGE_REACTIONS)}, got {reaction!r}")
+        return self.call_method("ack_nudge", nudge_id, reaction, timeout_s=timeout_s)
+
+    def snooze_nudges(self, minutes: int, *, timeout_s: float = TRAY_TIMEOUT_S) -> Any:
+        """``MemoryClient.snooze_nudges`` (``0``: nudges back on). Raises :class:`MemoryUnavailable`."""
+        return self.call_method("snooze_nudges", int(minutes), timeout_s=timeout_s)
+
+    def nudge_status(self, *, timeout_s: float = TRAY_TIMEOUT_S) -> dict[str, Any]:
+        """``MemoryClient.nudge_status``. Raises :class:`MemoryUnavailable`."""
+        value = self.call_method("nudge_status", timeout_s=timeout_s)
+        return dict(value) if isinstance(value, dict) else {}
 
     # -- tray ------------------------------------------------------------------
 
@@ -639,6 +739,8 @@ class MemoryAccess:
                 outcome = self._forget_rule(tool_input)
             elif name == "activity":
                 outcome = self._activity(tool_input)
+            elif name == "todo":
+                outcome = self._todo(tool_input)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -772,6 +874,64 @@ class MemoryAccess:
             payload={"saved": bool(revoked), "revoked": revoked, "text": text},
         )
 
+    def _todo(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """``list`` is a look (``ok=False`` when it cannot be made); ``add``/``done`` are writes."""
+        action = _opt_text(tool_input, "action")
+        if action not in ("add", "done", "list"):
+            raise _BadInput(
+                f"'action' must be one of add, done, list, got {tool_input.get('action')!r}"
+            )
+        if action == "list":
+            try:
+                rows = self.todos(include_done=False, timeout_s=TOOL_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                text = f"The to-do list could not be read: {exc}"
+                return _fail("todo", text, {"action": action, "error": str(exc)})
+            rows = [row for row in rows if not todo_done(row)][:TODO_LIST_LIMIT]
+            return ToolOutcome(
+                name="todo",
+                ok=True,
+                summary=f"{len(rows)} open to-do{'' if len(rows) == 1 else 's'}",
+                content=[{"type": "text", "text": format_todos(rows)}],
+                payload={"action": action, "todos": rows},
+            )
+        text = _need_text(tool_input, "text")
+        if action == "add":
+            due = _opt_text(tool_input, "due")
+            if due is not None:
+                _parse_when(due, "due", end_of_day=False)  # validated; passed on as written
+            try:
+                row = self.add_todo(text, due)
+            except MemoryUnavailable as exc:
+                return _not_saved("todo", exc, {"action": action, "text": text, "due": due})
+            when = f" (due {due_text(due)})" if due else ""
+            return ToolOutcome(
+                name="todo",
+                ok=True,
+                summary=f"to-do added{when}",
+                content=[{"type": "text", "text": f"Added to the to-do list{when}: {text}"}],
+                payload={"action": action, "saved": True, "id": row, "text": text, "due": due},
+            )
+        try:
+            completed = self.complete_todo(text)
+        except MemoryUnavailable as exc:
+            return _not_saved("todo", exc, {"action": action, "text": text})
+        if completed:
+            reply, summary = f"Marked done: {completed}", "to-do done"
+        else:
+            reply = (
+                f'Nothing open on the to-do list matched "{text}", so nothing was marked '
+                "done; list it to see the exact wording and ids."
+            )
+            summary = "no matching to-do"
+        return ToolOutcome(
+            name="todo",
+            ok=True,
+            summary=summary,
+            content=[{"type": "text", "text": reply}],
+            payload={"action": action, "saved": bool(completed), "completed": completed, "text": text},
+        )
+
     def _correct(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = _need_text(tool_input, "text")
         try:
@@ -822,11 +982,11 @@ def memory_block_text(
             instead of sending the same page again.
 
     Order: the time, the portrait, standing rules and commitments (under
-    :data:`STANDING_LABEL`), know-how, and last the resume context (under
-    :data:`RESUME_LABEL`) when it was fetched.
+    :data:`STANDING_LABEL`), open to-dos (under :data:`TODO_LABEL`), know-how,
+    and last the resume context (under :data:`RESUME_LABEL`) when it was fetched.
     """
     if context.source == "unavailable" or not (
-        context.portrait or context.knowhow or context.standing or context.resume
+        context.portrait or context.knowhow or context.standing or context.resume or context.todos
     ):
         return None
     now = now or datetime.now()
@@ -841,12 +1001,76 @@ def memory_block_text(
             parts.append(context.portrait)
     if context.standing:
         parts.append(f"{STANDING_LABEL}\n{context.standing}")
+    if context.todos:
+        lines = "\n".join(todo_line(row, with_source=False) for row in context.todos)
+        parts.append(f"{TODO_LABEL}\n{lines}")
     if context.knowhow:
         lines = "\n".join(f"- {' '.join(line.split())}" for line in context.knowhow)
         parts.append(f"Know-how saved on this PC that may apply:\n{lines}")
     if context.resume:
         parts.append(f"{RESUME_LABEL}\n{context.resume}")
     return f"\n\n{MEMORY_LABEL}\n" + "\n\n".join(parts) + f"\n{MEMORY_END}"
+
+
+#: How the to-do list's sources read, to the model and in the tray panel.
+TODO_SOURCES = {
+    "loop": "open loop memory noticed",
+    "commitment": "Yuki promised",
+    "user": "the user added",
+}
+
+
+def todo_done(row: dict[str, Any]) -> bool:
+    """Whether memory's ``status`` says a to-do row is done (a missing status is open)."""
+    return str(row.get("status") or "").strip().lower() == "done"
+
+
+def due_text(value: Any) -> str:
+    """``Fri 2026-09-25 17:00``, or ``Fri 2026-09-25`` for a date with no time of day."""
+    text = _when(value)
+    return text[:-6] if text.endswith(" 00:00") else text
+
+
+def todo_line(
+    row: dict[str, Any], *, with_source: bool = True, limit: int = TODO_LINE_CHARS
+) -> str:
+    """One to-do as a line: ``- [id] text (due Fri 2026-09-25 17:00; Yuki promised)``.
+
+    Args:
+        row: A ``MemoryClient.todos`` row.
+        with_source: Add the id and where the item came from (the tool's list
+            does; the per-request block keeps to the text and due date).
+        limit: Longest the item's text may be.
+    """
+    text = " ".join(str(row.get("text") or "").split())
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    notes = []
+    if row.get("due"):
+        notes.append(f"due {due_text(row.get('due'))}")
+    if with_source and row.get("source"):
+        notes.append(TODO_SOURCES.get(str(row["source"]), str(row["source"])))
+    ident = f"[{row['id']}] " if with_source and row.get("id") not in (None, "") else ""
+    return f"- {ident}{text}" + (f" ({'; '.join(notes)})" if notes else "")
+
+
+def format_todos(rows: list[dict[str, Any]]) -> str:
+    """The ``todo`` tool's ``list`` text: one line per open to-do, with its evidence."""
+    if not rows:
+        return "Nothing is open on the to-do list."
+    lines = [f"{len(rows)} open to-do{'' if len(rows) == 1 else 's'}:"]
+    for row in rows:
+        line = todo_line(row)
+        evidence = " ".join(str(row.get("evidence") or "").split())
+        if evidence:
+            line += f" — evidence: {evidence[:200]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _squash(text: str) -> str:
+    """Lower-case and single-spaced, for spotting an item the standing context already says."""
+    return " ".join(text.split()).casefold()
 
 
 def format_recall(

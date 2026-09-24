@@ -3,7 +3,8 @@
 :class:`YukiUi` is the only place that knows how a stream of agent events turns
 into a visible thing. It holds no opinion about what a request *means*: it shows a
 card per request, and when the worker starts using tools it steps aside for the
-status strip. Every decision it makes is about who is busy and what is on screen.
+status strip. Every decision it makes is about who is busy and what is on screen --
+including when memory's nudge cards (:mod:`yuki.ui.nudges`) may show.
 """
 
 from __future__ import annotations
@@ -19,7 +20,23 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from yuki.config import MODEL_ALIASES, Settings
 from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
-from yuki.ui.memory import STATUS_PENDING, KnowsWindow, MemoryControl, describe_memory_status
+from yuki.ui.memory import (
+    STATUS_PENDING,
+    KnowsWindow,
+    MemoryControl,
+    TodayWindow,
+    describe_memory_status,
+    minutes_until_tomorrow,
+    quiet_until,
+)
+from yuki.ui.nudges import (
+    NUDGE_EVENT_NAME,
+    NudgeController,
+    kind_accent,
+    kind_title,
+    nudge_reply_request,
+    when_label,
+)
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_summary, describe_tool
@@ -86,6 +103,7 @@ class YukiUi(QObject):
         runtime: The agent runtime. One is built from ``settings`` if omitted.
         memory_control: The tray's memory controls. Built on the runtime's
             memory if omitted.
+        nudge_event: The named event memory sets when it writes a nudge.
     """
 
     def __init__(
@@ -94,6 +112,7 @@ class YukiUi(QObject):
         ui_log: UiLog,
         runtime: AgentRuntime | None = None,
         memory_control: MemoryControl | None = None,
+        nudge_event: str = NUDGE_EVENT_NAME,
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -105,6 +124,16 @@ class YukiUi(QObject):
         #: The "what Yuki knows" panel, built the first time it is asked for.
         self.knows: KnowsWindow | None = None
         self.memory.knows_ready.connect(self._on_knows_ready)
+        #: The "Today's list" panel, built the first time it is asked for.
+        self.today: TodayWindow | None = None
+        self.memory.today_ready.connect(self._on_today_ready)
+        #: Memory's nudge cards, shown only while nothing else needs the screen.
+        self.nudges = NudgeController(
+            self.runtime.memory, ui_log, blocked=self._nudge_blocker, event_name=nudge_event
+        )
+        self.nudges.reply_requested.connect(self._on_nudge_reply)
+        #: The nudge the user is writing a reply to (its card is in the overlay).
+        self._nudge_reply: dict | None = None
 
         #: request id -> the card showing it.
         self.cards: dict[int, ReplyCard] = {}
@@ -117,7 +146,7 @@ class YukiUi(QObject):
         self._settled: dict[int, ReplyCard | None] = {}
 
         self.overlay.submitted.connect(self._on_submitted)
-        self.overlay.dismissed.connect(lambda: self.ui_log.event("overlay", state="hidden"))
+        self.overlay.dismissed.connect(self._on_overlay_dismissed)
         # How each activation got (or failed to get) the keyboard: which step of
         # the foreground hand-over worked, and what Windows reported.
         self.overlay.focus_path.connect(self._on_focus_path)
@@ -133,6 +162,10 @@ class YukiUi(QObject):
         runtime_signals.failed.connect(self._on_failed)
         runtime_signals.queued.connect(self._on_queued)
         runtime_signals.summarized.connect(self._on_summarized)
+        # Moments the screen may have come free for a queued nudge.
+        runtime_signals.lane_done.connect(self._on_lane_free)
+        self.strip.faded_out.connect(self.nudges.try_show)
+        self.overlay.faded_out.connect(self.nudges.try_show)
 
         self.bindings = hotkey_bindings(settings)
         self.hotkeys = HotkeyListener(self.bindings)
@@ -148,6 +181,7 @@ class YukiUi(QObject):
         self.runtime.start()
         self.hotkeys.start()
         self.memory.ensure_service()
+        self.nudges.start()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -162,12 +196,14 @@ class YukiUi(QObject):
         lifetime, and keeps remembering while Yuki is closed.
         """
         self.ui_log.event("stop")
+        self.nudges.stop()
         self.hotkeys.stop()
         self.runtime.stop()
         self.overlay.hide()
         self.strip.hide()
-        if self.knows is not None:
-            self.knows.hide()
+        for panel in (self.knows, self.today):
+            if panel is not None:
+                panel.hide()
 
     # -- input -------------------------------------------------------------
 
@@ -212,6 +248,18 @@ class YukiUi(QObject):
             self.cards[request_id] = card
             self.overlay.expand_input()
             return
+        if self._nudge_reply is not None:
+            nudge, self._nudge_reply = self._nudge_reply, None
+            lane_name, request_id = self.runtime.submit(
+                nudge_reply_request(nudge, text), origin_hwnd=self._origin_hwnd
+            )
+            self.cards[request_id] = self.overlay.add_card(text)
+            self.overlay.expand_input()
+            self.ui_log.event(
+                "submit", id=request_id, lane=lane_name, text=text, nudge_id=nudge.get("id")
+            )
+            self.nudges.reply_sent(nudge, text, request_id, lane_name)
+            return
         lane_name, request_id = self.runtime.submit(text, origin_hwnd=self._origin_hwnd)
         self.cards[request_id] = self.overlay.add_card(text)
         self.overlay.expand_input()
@@ -233,6 +281,7 @@ class YukiUi(QObject):
                 if self.overlay.isVisible():
                     self.overlay.dismiss()
                 self.ui_log.event("task_mode", id=request_id, tool=name)
+            self.nudges.make_way()
             self.strip.show_step(line)
             return
         card = self.cards.get(request_id)
@@ -271,9 +320,11 @@ class YukiUi(QObject):
             self.overlay.expand_input()
             self._settled[request_id] = card
         else:
+            self.nudges.make_way()
             self.strip.show_final(text, tone=tone)
             self._settled[request_id] = None
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text)
+        self.nudges.try_show()
 
     def _on_summarized(self, lane_name: str, request_id: int, summary: dict) -> None:
         """Put the dim ``52 s · 10 steps · 8¢`` suffix under the closing message."""
@@ -301,6 +352,54 @@ class YukiUi(QObject):
             request, f"Queued — {waiting} ahead of it" if waiting > 1 else "Queued — up next"
         )
         self.cards[request_id] = card
+
+    # -- nudges ------------------------------------------------------------
+
+    def _nudge_blocker(self) -> str | None:
+        """Why a nudge card may not show right now, or ``None`` when the screen is free.
+
+        Busy means: the task strip is up, the worker has a request in hand, the
+        user is writing a reply to a nudge, or the overlay is open with a
+        request still waiting for its answer.
+        """
+        if self.strip.isVisible():
+            return "status_strip"
+        if self._nudge_reply is not None:
+            return "replying_to_nudge"
+        if self.runtime.worker_busy:
+            return "worker_busy"
+        if self.overlay.isVisible() and not self.overlay.closing and (
+            self.cards or self._question is not None
+        ):
+            return "overlay_request"
+        return None
+
+    def _on_lane_free(self, *_: object) -> None:
+        """A lane finished (emitted from its thread; a bound slot, so it runs on the GUI thread)."""
+        self.nudges.try_show()
+
+    def _on_nudge_reply(self, nudge: dict) -> None:
+        """Reply on a nudge card: the overlay opens with the nudge as its context card."""
+        self._nudge_reply = nudge
+        kind = nudge.get("kind")
+        prompt = " · ".join(part for part in (f"Yuki · {kind_title(kind)}", when_label(nudge.get("at"))) if part)
+        self.overlay.add_card(
+            prompt, " ".join(str(nudge.get("text") or "").split()), tone="context",
+            accent=kind_accent(kind),
+        )
+        self.overlay.open()
+        self.ui_log.event("overlay", state="shown", via="nudge_reply", nudge_id=nudge.get("id"))
+
+    def _on_overlay_dismissed(self) -> None:
+        """The overlay closed; a nudge reply that was never sent counts as dismissed."""
+        self.ui_log.event("overlay", state="hidden")
+        if self._nudge_reply is not None:
+            nudge, self._nudge_reply = self._nudge_reply, None
+            self.nudges.reply_abandoned(nudge)
+
+    def snooze_nudges(self, minutes: int) -> None:
+        """Quiet nudges for ``minutes`` (``0``: back on), then re-read the tray's status line."""
+        self.nudges.snooze(minutes, on_done=self.memory.refresh_status)
 
     # -- tray --------------------------------------------------------------
 
@@ -337,6 +436,19 @@ class YukiUi(QObject):
                 meta,
             )
 
+    def show_today(self) -> None:
+        """Open the read-only "Today's list" panel and fill it from memory."""
+        if self.today is None:
+            self.today = TodayWindow()
+        self.today.show_loading()
+        self.today.open()
+        self.ui_log.event("today", state="shown")
+        self.memory.fetch_today()
+
+    def _on_today_ready(self, rows: object, meta: str) -> None:
+        if self.today is not None:
+            self.today.show_today(list(rows) if isinstance(rows, list) else None, meta)
+
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
         self.ui_log.event("open_logs", path=str(self.settings.sessions_dir))
@@ -371,6 +483,18 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     knows = QAction("Show what Yuki knows", menu)
     knows.triggered.connect(lambda _checked=False: ui.show_knows())
     menu.addAction(knows)
+    today = QAction("Today's list", menu)
+    today.triggered.connect(lambda _checked=False: ui.show_today())
+    menu.addAction(today)
+    quiet_hour = QAction("Quiet for 1 hour", menu)
+    quiet_hour.triggered.connect(lambda _checked=False: ui.snooze_nudges(60))
+    menu.addAction(quiet_hour)
+    quiet_tomorrow = QAction("Quiet until tomorrow", menu)
+    quiet_tomorrow.triggered.connect(lambda _checked=False: ui.snooze_nudges(minutes_until_tomorrow()))
+    menu.addAction(quiet_tomorrow)
+    nudges_on = QAction("Nudges on", menu)
+    nudges_on.triggered.connect(lambda _checked=False: ui.snooze_nudges(0))
+    menu.addAction(nudges_on)
 
     def show_memory_status(status: object, error: object) -> None:
         del error
@@ -384,7 +508,10 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
         pause.blockSignals(False)
         pause.setEnabled(running)
         refresh_portrait.setEnabled(current is not None)
-        knows.setEnabled(ui.memory.memory.installed)
+        installed = ui.memory.memory.installed
+        for item in (knows, today, quiet_hour, quiet_tomorrow):
+            item.setEnabled(installed)
+        nudges_on.setEnabled(installed and quiet_until(current) is not None)
 
     ui.memory.status_changed.connect(show_memory_status)
     menu.aboutToShow.connect(lambda: ui.memory.refresh_status())

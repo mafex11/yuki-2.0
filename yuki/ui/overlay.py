@@ -58,7 +58,7 @@ MAX_CARDS = 3
 #: a wait: nothing blocks on it.
 FOCUS_GRACE_MS = 200
 
-CardTone = Literal["reply", "question", "error"]
+CardTone = Literal["reply", "question", "error", "context"]
 
 
 class AskInput(QPlainTextEdit):
@@ -133,7 +133,9 @@ class ReplyCard(QWidget):
         prompt: What the user asked, shown dim above the body. Empty for a card
             that is only a message (a question, or an error with no request).
         body: Initial body text; empty means "still working".
-        tone: Colour treatment.
+        tone: Colour treatment. ``context`` is something Yuki said first (a
+            nudge being replied to), marked with a bar in ``accent``.
+        accent: Colour of the ``context`` bar.
         parent: Qt parent.
     """
 
@@ -145,10 +147,12 @@ class ReplyCard(QWidget):
         body: str = "",
         *,
         tone: CardTone = "reply",
+        accent: QColor | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.tone: CardTone = tone
+        self.accent = accent
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 11)
         layout.setSpacing(4)
@@ -263,8 +267,12 @@ class ReplyCard(QWidget):
         painter.setBrush(ERROR_BG if error else CARD_BG)
         painter.setPen(QPen(ERROR_BORDER if error else CARD_BORDER, 1.0))
         painter.drawRoundedRect(rect, 10, 10)
-        if self.tone == "question":
-            painter.setPen(QPen(QColor(126, 180, 255, 180), 2.0))
+        if self.tone in ("question", "context"):
+            bar = QColor(self.accent or QColor(126, 180, 255)) if self.tone == "context" else (
+                QColor(126, 180, 255)
+            )
+            bar.setAlpha(200 if self.tone == "context" else 180)
+            painter.setPen(QPen(bar, 2.0))
             painter.drawLine(
                 rect.left() + 1.0, rect.top() + 8.0, rect.left() + 1.0, rect.bottom() - 8.0
             )
@@ -416,18 +424,26 @@ class Overlay(GlassWindow):
         )
         return [widget for widget in widgets if isinstance(widget, ReplyCard)]
 
-    def add_card(self, prompt: str, body: str = "", *, tone: CardTone = "reply") -> ReplyCard:
+    def add_card(
+        self,
+        prompt: str,
+        body: str = "",
+        *,
+        tone: CardTone = "reply",
+        accent: QColor | None = None,
+    ) -> ReplyCard:
         """Add a card at the bottom of the stack and animate it in.
 
         Args:
             prompt: Dim prompt line, usually what the user asked.
             body: Body text; empty for a card that is still waiting.
             tone: Colour treatment.
+            accent: Bar colour for a ``context`` card.
 
         Returns:
             The new card, so the caller can fill it in when the answer arrives.
         """
-        card = ReplyCard(prompt, body, tone=tone, parent=self)
+        card = ReplyCard(prompt, body, tone=tone, accent=accent, parent=self)
         self._cards.addWidget(card)
         card.height_animation.valueChanged.connect(lambda *_: self.fit())
         card.show()

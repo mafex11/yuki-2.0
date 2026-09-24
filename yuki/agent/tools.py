@@ -11,8 +11,8 @@ They have no backend function: the dispatcher validates them and hands them back
 to :class:`yuki.agent.loop.Agent`, which owns pausing, finishing and the running
 summary.
 
-The six *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
-``remember_rule``, ``forget_rule``, ``activity``) have no backend function
+The seven *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
+``remember_rule``, ``forget_rule``, ``activity``, ``todo``) have no backend function
 either: the agent runs them against Yuki's memory through
 :mod:`yuki.agent.memory`, and they are only listed when memory is installed.
 """
@@ -43,7 +43,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
 #: desktop backend. Left out of the tool block entirely when the memory API is
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
-    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity"}
+    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -541,6 +541,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "counts as its app), per app, or per page. Default: site.",
                 },
             }
+        ),
+    },
+    {
+        "name": "todo",
+        "label": "Keeping your to-do list",
+        "description": (
+            "Add to, complete or list the user's to-do list (open loops from memory, "
+            "Yuki's promises and things the user added)."
+        ),
+        "input_schema": _obj(
+            {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "done", "list"],
+                    "description": "add a to-do, mark one done, or list the open ones.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "add: the to-do, in one short line. done: the item's id "
+                    "or its words as the list shows them.",
+                },
+                "due": {
+                    "type": "string",
+                    "description": "add only, when it has a deadline: local ISO date or "
+                    "date-time, e.g. 2026-09-25 or 2026-09-25T17:00.",
+                },
+            },
+            ["action"],
         ),
     },
 ]
