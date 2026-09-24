@@ -3,7 +3,9 @@
 Runs the watcher (:mod:`yuki.memory.watcher`), the timeline recorder
 (:mod:`yuki.memory.timeline`), the journal worker (:mod:`yuki.memory.journal`),
 the Warp terminal-history reader (:mod:`yuki.memory.warp`, every 3 minutes),
-the episode worker (:mod:`yuki.memory.episodes`) and the portrait scheduler
+the conversation worker (:mod:`yuki.memory.conversations`: rules, preferences,
+commitments and journal facts from Yuki's own exchanges, and session summaries;
+woken by Yuki's named turn event), the episode worker (:mod:`yuki.memory.episodes`) and the portrait scheduler
 (:mod:`yuki.memory.portrait`) against one shared :class:`~yuki.memory.store.Store`
 (the journal worker waits on the store's own "new capture" condition, which only
 fires within one Store instance).  It is its own process so that nothing here
@@ -36,6 +38,7 @@ Usage::
     uv run yuki-memory --no-portrait        # watcher + journal only (timeline and episodes still run)
     uv run yuki-memory --no-timeline        # no foreground timeline (and so no episodes)
     uv run yuki-memory --no-terminal        # do not read Warp's command history
+    uv run yuki-memory --no-conversations   # do not extract memory from Yuki's own conversations
 """
 
 from __future__ import annotations
@@ -206,6 +209,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-timeline", action="store_true", help="do not record the foreground timeline")
     parser.add_argument("--no-episodes", action="store_true", help="do not write episodes from the timeline")
     parser.add_argument("--no-terminal", action="store_true", help="do not read the Warp terminal's command history")
+    parser.add_argument("--no-conversations", action="store_true",
+                        help="do not extract memory from Yuki's own conversations (turns are still stored)")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -238,6 +243,8 @@ def run(args: argparse.Namespace) -> int:
     episodes_thread: threading.Thread | None = None
     warp = None
     warp_thread: threading.Thread | None = None
+    conversations = None
+    conversations_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
@@ -256,6 +263,7 @@ def run(args: argparse.Namespace) -> int:
             timeline=not args.no_timeline,
             episodes=not (args.no_journal or args.no_timeline or args.no_episodes),
             terminal=not (args.no_journal or args.no_terminal),
+            conversations=not (args.no_journal or args.no_conversations),
             duration_s=args.duration,
         )
         try:
@@ -316,6 +324,20 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # everything else runs on without it
                 log("error", where="warp_start", error=f"{type(exc).__name__}: {exc}")
                 warp = None
+
+        if not (args.no_journal or args.no_conversations):
+            try:
+                from yuki.memory.conversations import ConversationWorker
+
+                conversations = ConversationWorker(store, log=log)
+                conversations_thread = threading.Thread(
+                    target=_guarded(conversations.run, log, "conversations"), args=(stop,),
+                    name="yuki-memory-conversations", daemon=True,
+                )
+                conversations_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="conversations_start", error=f"{type(exc).__name__}: {exc}")
+                conversations = None
 
         if not (args.no_journal or args.no_portrait):
             try:
@@ -415,6 +437,8 @@ def run(args: argparse.Namespace) -> int:
             episodes.stop()
         if warp is not None:
             warp.stop()
+        if conversations is not None:
+            conversations.stop()
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
@@ -423,6 +447,8 @@ def run(args: argparse.Namespace) -> int:
             journal_thread.join(10.0)
         if warp_thread is not None:
             warp_thread.join(5.0)
+        if conversations_thread is not None:
+            conversations_thread.join(10.0)  # a call in flight is abandoned (daemon); its turns stay pending
         if episodes_thread is not None:
             episodes_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if portrait_thread is not None:

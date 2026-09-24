@@ -135,9 +135,31 @@ Outside sources (yuki.memory.warp)::
         # one transaction: a "terminal" thread per folder, one capture per folder (delta = JSON
         # {"commands": [...]}, encrypted), the checkpoint moved; wakes the journal worker
 
+Conversations with Yuki (yuki.memory.conversations; yuki.memory.api.MemoryClient.log_turn)::
+
+    store.add_turn(session_id, request_id, at, user_text, reply_text=None, actions=(), outcome=None,
+                   *, busy_timeout_s=0.008) -> int
+        # encrypted; a dedicated connection that waits at most busy_timeout_s, else a background
+        # writer retries (the id, from a microsecond clock, is returned either way); flush_turns()
+    signal_turns(db_path) -> bool;  turns_event_name(db_path) -> str   # wakes the service's worker
+    store.turns_pending(max_attempts=3) / turns_unsummarized() / turns_for_session(sid, before=, since=, limit=)
+    store.turns_by_ids(ids) / latest_turn() / session_span(sid) / search_turns(vec, since, until, limit)
+    store.keyword_turns(text, since, until, limit)
+    store.conversation_facts(kinds=None, statuses=("active",)) -> list[ConversationFact]
+    store.conversation_facts_ended(since, kinds=None);  conversation_fact(id);  conversation_fact_vectors(ids)
+    store.add_conversation_fact(kind, text, *, quote=, origin="user", source_turn_ids=, supersedes=, vector=) -> int
+    store.end_conversation_fact(fact_id, status, *, at=None, note=None) -> bool
+    store.commit_conversation_batch(call, turn_ids, changes, journal_facts, *, turn_vectors=, embed_model=)
+        # one transaction: batch row + ADD/UPDATE/INVALIDATE + journal facts (thread "Yuki") + turns extracted
+    store.record_failed_conversation_batch(call, *, extract_turn_ids=(), summary_turn_ids=())
+    store.commit_session_summary(call, session_id, started_at, ended_at, text, turn_ids, *, vector=) -> int
+    store.session_summaries(session_id=None, since=None, until=None, limit=None) / search_summaries / keyword_summaries
+    store.turns/summaries/conversation_facts_without_vectors();  add_conversation_vectors(what, items, model)
+    store.conversation_changed_since(at) -> bool;  conversation_batches(limit);  conversation_thread_id()
+
 Status::
 
-    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes)
+    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations)
 
 Maintenance and reporting::
 
@@ -210,6 +232,36 @@ def service_mutex_name(db_path: str | Path | None) -> str:
     db = Path(db_path) if db_path is not None else default_db_path()
     digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
     return f"{SERVICE_MUTEX_PREFIX}-{digest}"
+
+
+#: Prefix of the named auto-reset event Yuki sets after writing a conversation turn.
+TURNS_EVENT_PREFIX = "Local\\YukiMemoryTurns"
+
+
+def turns_event_name(db_path: str | Path | None) -> str:
+    """Name of the event that wakes the service's conversation worker for ``db_path``."""
+    db = Path(db_path) if db_path is not None else default_db_path()
+    digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
+    return f"{TURNS_EVENT_PREFIX}-{digest}"
+
+
+def signal_turns(db_path: str | Path | None) -> bool:
+    """Set the conversation worker's wake-up event (microseconds); False when no service holds it."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.restype = ctypes.c_void_p
+        kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+        handle = kernel32.OpenEventW(0x0002, False, turns_event_name(db_path))   # EVENT_MODIFY_STATE
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.SetEvent(ctypes.c_void_p(handle)))
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +575,126 @@ class EpisodeRecord:
     created_at: float
     superseded_by: int | None = None
     score: float | None = None       # cosine, set by search_episodes
+
+
+#: Kinds of conversation facts (``conversation_facts.kind``). ``rule`` and
+#: ``preference`` are the user's own words about how Yuki should talk or
+#: behave; ``commitment`` is something Yuki is to do later. ``fact`` is reserved:
+#: durable facts about the user from conversations go to the journal instead.
+CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "fact")
+#: The kinds the conversation worker maintains (and ``standing_context`` shows).
+STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment")
+#: ``conversation_facts.status``: active (a rule in force, an open commitment) or how it ended.
+CONVERSATION_FACT_STATUSES: tuple[str, ...] = ("active", "done", "revoked", "superseded")
+
+
+@dataclass
+class ConversationTurn:
+    """One exchange between the user and Yuki (decrypted), see :meth:`Store.add_turn`."""
+
+    id: int
+    session_id: str
+    request_id: int
+    at: float
+    user_text: str
+    reply_text: str | None
+    actions: list[str]
+    outcome: str | None
+    extracted: bool
+    attempts: int
+    summary_id: int | None
+    created_at: float
+    score: float | None = None       # cosine, set by search_turns
+
+
+@dataclass
+class ConversationFact:
+    """One version of a rule, preference or commitment (bi-temporal).
+
+    ``valid_from``/``valid_to``: when it was in force (from the exchanges);
+    ``created_at``/``expired_at``: when the store learned it / learned it ended.
+    ``quote`` is the user's own words for rules and preferences.
+    """
+
+    id: int
+    kind: str
+    subject: str
+    text: str
+    quote: str | None
+    status: str                      # active | done | revoked | superseded
+    valid_from: float
+    valid_to: float | None
+    due_at: float | None
+    source_turn_ids: list[int]
+    origin: str                      # model (conversation worker) | user (remember_rule)
+    created_at: float | None
+    expired_at: float | None
+    superseded_by: int | None
+    end_note: str | None             # the words or reason that ended it
+    score: float | None = None
+
+
+@dataclass
+class ConversationChange:
+    """One validated conversation-fact operation for :meth:`Store.commit_conversation_batch`.
+
+    ``op``: ADD, UPDATE (supersede ``fact_id``), INVALIDATE (end ``fact_id`` as
+    ``end_as`` = done | revoked). ``at`` is the evidence time (the exchange).
+    """
+
+    op: str
+    fact_id: int | None = None
+    kind: str = ""
+    subject: str = ""
+    text: str = ""
+    quote: str | None = None
+    due_at: float | None = None
+    source_turn_ids: list[int] = field(default_factory=list)
+    at: float | None = None
+    end_as: str | None = None
+    end_note: str | None = None
+    origin: str = "model"
+    vector: np.ndarray | None = None
+    embed_model: str | None = None
+
+
+@dataclass
+class SessionSummary:
+    """A summary of one conversation session (a run of exchanges without a 30-minute gap)."""
+
+    id: int
+    session_id: str
+    started_at: float
+    ended_at: float
+    text: str
+    turn_count: int
+    created_at: float
+    score: float | None = None
+
+
+@dataclass
+class ConversationCall:
+    """Content-free accounting for one conversation-worker model call."""
+
+    at: float
+    purpose: str                     # extract | summary
+    model: str
+    session_id: str | None = None
+    turn_count: int = 0
+    input_chars: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float | None = None
+    latency_ms: float = 0.0
+    stop_reason: str | None = None
+    ops_applied: int = 0
+    ops_noop: int = 0
+    ops_rejected: int = 0
+    journal_facts: int = 0
+    outcome: str = "ok"              # ok | error
+    error: str | None = None
 
 
 @dataclass
@@ -875,6 +1047,108 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at REAL NOT NULL
     );
     """,
+    # 6: conversation memory - Yuki's own exchanges with the user, the rules,
+    # preferences and commitments extracted from them (bi-temporal), session
+    # summaries, their vectors and the worker's accounting
+    # (yuki.memory.conversations). Additive only, like 2-5.
+    """
+    CREATE TABLE conversation_batches (
+        id                 INTEGER PRIMARY KEY,
+        at                 REAL NOT NULL,
+        purpose            TEXT NOT NULL,           -- extract | summary
+        session_id         TEXT,
+        model              TEXT NOT NULL,
+        turn_count         INTEGER NOT NULL DEFAULT 0,
+        input_chars        INTEGER NOT NULL DEFAULT 0,
+        input_tokens       INTEGER NOT NULL DEFAULT 0,
+        output_tokens      INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+        cost_usd           REAL,
+        latency_ms         REAL NOT NULL DEFAULT 0,
+        stop_reason        TEXT,
+        ops_applied        INTEGER NOT NULL DEFAULT 0,
+        ops_noop           INTEGER NOT NULL DEFAULT 0,
+        ops_rejected       INTEGER NOT NULL DEFAULT 0,
+        journal_facts      INTEGER NOT NULL DEFAULT 0,
+        outcome            TEXT NOT NULL,           -- ok | error
+        error              TEXT
+    );
+    CREATE INDEX conversation_batches_at ON conversation_batches(at);
+
+    CREATE TABLE conversation_turns (
+        id                 INTEGER PRIMARY KEY,     -- allocated by the writer (microsecond clock)
+        session_id         TEXT NOT NULL,           -- Yuki's session id, cleartext metadata
+        request_id         INTEGER NOT NULL,
+        at                 REAL NOT NULL,
+        user_ciphertext    TEXT NOT NULL,
+        reply_ciphertext   TEXT,
+        actions_ciphertext TEXT,                    -- JSON list of one-line tool summaries
+        outcome            TEXT,                    -- cleartext (done, cancelled, error, ...)
+        extracted          INTEGER NOT NULL DEFAULT 0,
+        extract_attempts   INTEGER NOT NULL DEFAULT 0,
+        extract_batch_id   INTEGER,
+        summary_id         INTEGER,                 -- session_summaries.id once summarised
+        summary_attempts   INTEGER NOT NULL DEFAULT 0,
+        created_at         REAL NOT NULL
+    );
+    CREATE INDEX conversation_turns_session ON conversation_turns(session_id, at);
+    CREATE INDEX conversation_turns_pending ON conversation_turns(extracted, at);
+    CREATE INDEX conversation_turns_at ON conversation_turns(at);
+    CREATE INDEX conversation_turns_summary ON conversation_turns(summary_id);
+
+    CREATE TABLE conversation_facts (
+        id                 INTEGER PRIMARY KEY,
+        kind               TEXT NOT NULL,           -- rule | preference | commitment | fact
+        subject_ciphertext TEXT,
+        text_ciphertext    TEXT NOT NULL,
+        quote_ciphertext   TEXT,                    -- the user's own words (rules, preferences)
+        status             TEXT NOT NULL,           -- active | done | revoked | superseded
+        valid_from         REAL NOT NULL,
+        valid_to           REAL,
+        due_at             REAL,                    -- commitments: when it is due, if known
+        source_turn_ids    TEXT,                    -- JSON list of conversation_turns ids
+        origin             TEXT NOT NULL DEFAULT 'model',   -- model | user
+        created_at         REAL NOT NULL,
+        expired_at         REAL,
+        superseded_by      INTEGER,
+        end_note_ciphertext TEXT,                   -- the words or reason that ended it
+        batch_id           INTEGER
+    );
+    CREATE INDEX conversation_facts_status ON conversation_facts(status, kind);
+
+    CREATE TABLE session_summaries (
+        id              INTEGER PRIMARY KEY,
+        session_id      TEXT NOT NULL,
+        started_at      REAL NOT NULL,
+        ended_at        REAL NOT NULL,
+        turn_count      INTEGER NOT NULL DEFAULT 0,
+        text_ciphertext TEXT NOT NULL,
+        batch_id        INTEGER,
+        created_at      REAL NOT NULL
+    );
+    CREATE INDEX session_summaries_span ON session_summaries(started_at, ended_at);
+    CREATE INDEX session_summaries_session ON session_summaries(session_id, ended_at);
+
+    CREATE TABLE conversation_turn_vec (
+        turn_id         INTEGER PRIMARY KEY REFERENCES conversation_turns(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    CREATE TABLE session_summary_vec (
+        summary_id      INTEGER PRIMARY KEY REFERENCES session_summaries(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    CREATE TABLE conversation_fact_vec (
+        fact_id         INTEGER PRIMARY KEY REFERENCES conversation_facts(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    """,
 )
 
 
@@ -925,6 +1199,19 @@ class Store:
         self._lock = threading.RLock()
         self._cond = threading.Condition(threading.Lock())
         self._wake_seq = 0
+        # conversation turns: a second connection with a short busy timeout, so
+        # writing a turn never waits behind the shared connection's lock or a long
+        # write transaction of another process (see add_turn)
+        self._turn_conn: sqlite3.Connection | None = None
+        self._turn_lock = threading.Lock()
+        self._id_lock = threading.Lock()
+        self._last_turn_id = 0
+        self._deferred_turns: list[list[Any]] = []
+        self._deferred_lock = threading.Lock()
+        self._turn_thread: threading.Thread | None = None
+        #: Turns the background writer had to drop (content-free counters for diagnostics).
+        self.turn_write_errors = 0
+        self.last_turn_error: str | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -947,6 +1234,14 @@ class Store:
     def close(self) -> None:
         """Close the connection and release any waiter."""
         self.wake()
+        try:
+            self.flush_turns(2.0)
+        except Exception:
+            pass
+        with self._turn_lock:
+            if self._turn_conn is not None:
+                self._turn_conn.close()
+                self._turn_conn = None
         with self._lock:
             self._conn.close()
 
@@ -2049,10 +2344,12 @@ class Store:
         journal_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM journal_batches WHERE at >= ?", (s,))[0][0]
         portrait_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM portrait_runs WHERE at >= ?", (s,))[0][0]
         episode_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM episode_runs WHERE at >= ?", (s,))[0][0]
+        conversation_cost = self._query(
+            "SELECT coalesce(sum(cost_usd), 0) FROM conversation_batches WHERE at >= ?", (s,))[0][0]
         return {
             "captures": int(captures), "facts": int(facts), "last_capture_at": last,
             "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
-            "episode_cost_usd": float(episode_cost or 0.0),
+            "episode_cost_usd": float(episode_cost or 0.0), "conversation_cost_usd": float(conversation_cost or 0.0),
         }
 
     # -- timeline ------------------------------------------------------------
@@ -2386,6 +2683,616 @@ class Store:
             return len(items)
 
         return self._write(op)
+
+    # -- conversations with Yuki (yuki.memory.conversations) -----------------
+
+    #: The journal thread that facts learned in conversations with Yuki are filed under.
+    CONVERSATION_APP = "Yuki"
+    CONVERSATION_SCOPE = "yuki:conversation"
+
+    def _put_vec(self, conn: sqlite3.Connection, table: str, id_col: str, item_id: int,
+                 vector: np.ndarray, model: str | None) -> None:
+        vec = np.asarray(vector, dtype=np.float32).ravel()
+        conn.execute(
+            f"INSERT OR REPLACE INTO {table}({id_col}, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
+            (int(item_id), model or "", int(vec.shape[0]), self.cipher.encrypt_bytes(vec.tobytes())),
+        )
+
+    def _rank(self, rows: list[sqlite3.Row], query_vec: np.ndarray, limit: int) -> list[tuple[sqlite3.Row, float]]:
+        """Rows carrying ``vec_ciphertext``/``dim``, best cosine first."""
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(q))
+        keep = [r for r in rows if r["dim"] == q.shape[0]]
+        if not keep or qn == 0.0:
+            return []
+        matrix = np.stack(
+            [np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32) for r in keep]
+        )
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        scores = (matrix @ (q / qn)) / norms
+        order = np.argsort(-scores)[: max(0, int(limit))]
+        return [(keep[i], float(scores[i])) for i in order]
+
+    # turns ------------------------------------------------------------------
+
+    def _next_turn_id(self) -> int:
+        """A turn id known before the write: the microsecond clock, strictly increasing per store."""
+        with self._id_lock:
+            self._last_turn_id = max(time.time_ns() // 1000, self._last_turn_id + 1)
+            return self._last_turn_id
+
+    def _exec_turn_insert(self, conn: sqlite3.Connection, row: list[Any]) -> bool:
+        """INSERT one turn row on ``conn``; False when the database stayed locked past its busy timeout.
+
+        A primary-key clash (another process took the same microsecond) moves
+        the id on by one and retries.
+        """
+        for _ in range(8):
+            try:
+                conn.execute(
+                    "INSERT INTO conversation_turns(id, session_id, request_id, at, user_ciphertext,"
+                    " reply_ciphertext, actions_ciphertext, outcome, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+                return True
+            except sqlite3.IntegrityError:
+                with self._id_lock:
+                    row[0] = int(row[0]) + 1
+                    self._last_turn_id = max(self._last_turn_id, row[0])
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc) or "busy" in str(exc):
+                    return False
+                raise
+        raise sqlite3.IntegrityError("could not allocate a conversation turn id")
+
+    def _insert_turn_row(self, row: list[Any], busy_timeout_s: float) -> bool:
+        """The fast path: the dedicated turn connection, waiting at most ``busy_timeout_s`` for the lock."""
+        with self._turn_lock:
+            if self._turn_conn is None:
+                conn = sqlite3.connect(str(self.path), timeout=0.05, isolation_level=None, check_same_thread=False)
+                conn.execute("PRAGMA synchronous=NORMAL")
+                self._turn_conn = conn
+            self._turn_conn.execute(f"PRAGMA busy_timeout={max(1, int(busy_timeout_s * 1000))}")
+            return self._exec_turn_insert(self._turn_conn, row)
+
+    def _defer_turn(self, row: list[Any]) -> None:
+        """Hand a turn to the background writer (the database was busy, or earlier turns still wait)."""
+        with self._deferred_lock:
+            self._deferred_turns.append(row)
+            if self._turn_thread is None or not self._turn_thread.is_alive():
+                self._turn_thread = threading.Thread(target=self._drain_turns, name="yuki-memory-turns", daemon=True)
+                self._turn_thread.start()
+
+    def _drain_turns(self) -> None:
+        """Write deferred turns in order on the writer's own connection (never the fast path's lock)."""
+        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None, check_same_thread=False)
+        try:
+            while True:
+                with self._deferred_lock:
+                    if not self._deferred_turns:
+                        self._turn_thread = None
+                        return
+                    row = self._deferred_turns[0]
+                try:
+                    ok = self._exec_turn_insert(conn, row)
+                except Exception as exc:
+                    self.turn_write_errors += 1
+                    self.last_turn_error = f"{type(exc).__name__}: {exc}"
+                    ok = True   # dropped: a row that cannot be written never blocks the ones after it
+                if ok:
+                    with self._deferred_lock:
+                        if self._deferred_turns and self._deferred_turns[0] is row:
+                            self._deferred_turns.pop(0)
+        finally:
+            conn.close()
+
+    def add_turn(
+        self, session_id: str, request_id: int, at: float, user_text: str, reply_text: str | None = None,
+        actions: Sequence[str] = (), outcome: str | None = None, *, busy_timeout_s: float = 0.008,
+    ) -> int:
+        """Store one exchange (encrypted) for the conversation worker; returns its id.
+
+        ``actions`` are one-line tool summaries (stored as an encrypted JSON
+        list); ``outcome`` is cleartext metadata ("done", "cancelled", ...).
+        Written through a dedicated connection that waits at most
+        ``busy_timeout_s`` for the write lock: if another writer holds it
+        longer, the row goes to a background thread that retries and the id is
+        returned at once (ids come from a microsecond clock, so they are known
+        before the write lands). Raises only on encryption/argument errors.
+        """
+        now = time.time()
+        acts = [" ".join(str(a).split()) for a in (actions or ()) if str(a).strip()]
+        row: list[Any] = [
+            self._next_turn_id(), str(session_id or ""), int(request_id or 0), float(at),
+            self.cipher.encrypt(user_text or ""), self._enc(reply_text),
+            self.cipher.encrypt(json.dumps(acts, ensure_ascii=False)) if acts else None,
+            outcome or None, now,
+        ]
+        with self._deferred_lock:
+            queued = bool(self._deferred_turns)
+        if queued or not self._insert_turn_row(row, busy_timeout_s):
+            self._defer_turn(row)   # behind the turns already waiting, in order
+        return int(row[0])
+
+    def flush_turns(self, timeout_s: float = 5.0) -> int:
+        """Write turns still waiting in the background writer now; returns how many are left."""
+        with self._deferred_lock:
+            thread = self._turn_thread
+        if thread is not None:
+            thread.join(max(0.0, timeout_s))   # the writer itself drains (no second inserter, no duplicates)
+        with self._deferred_lock:
+            return len(self._deferred_turns)
+
+    def _turn(self, r: sqlite3.Row, score: float | None = None) -> ConversationTurn:
+        try:
+            actions = json.loads(self._dec(r["actions_ciphertext"]) or "[]")
+        except ValueError:
+            actions = []
+        return ConversationTurn(
+            id=r["id"], session_id=r["session_id"], request_id=r["request_id"], at=r["at"],
+            user_text=self.cipher.decrypt(r["user_ciphertext"]), reply_text=self._dec(r["reply_ciphertext"]),
+            actions=[str(a) for a in actions] if isinstance(actions, list) else [], outcome=r["outcome"],
+            extracted=bool(r["extracted"]), attempts=r["extract_attempts"], summary_id=r["summary_id"],
+            created_at=r["created_at"], score=score,
+        )
+
+    def turns_pending(self, max_attempts: int = 3, limit: int | None = None) -> list[ConversationTurn]:
+        """Turns the conversation worker has not extracted yet (nor given up on), oldest first."""
+        sql = ("SELECT * FROM conversation_turns WHERE extracted=0 AND extract_attempts < ?"
+               " ORDER BY at, id")
+        params: list[Any] = [int(max_attempts)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._turn(r) for r in self._query(sql, params)]
+
+    def turns_unsummarized(self, max_attempts: int = 3) -> list[ConversationTurn]:
+        """Turns no session summary covers yet (nor given up on), oldest first."""
+        return [self._turn(r) for r in self._query(
+            "SELECT * FROM conversation_turns WHERE summary_id IS NULL AND summary_attempts < ? ORDER BY at, id",
+            (int(max_attempts),),
+        )]
+
+    def turns_for_session(
+        self, session_id: str, *, before: TimeArg = None, since: TimeArg = None, limit: int | None = None,
+    ) -> list[ConversationTurn]:
+        """A session's turns in ``[since, before)``; with ``limit`` the newest N. Oldest first."""
+        clauses, params = ["session_id = ?"], [str(session_id)]
+        if (b := _ts(before)) is not None:
+            clauses.append("at < ?")
+            params.append(b)
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        sql = "SELECT * FROM conversation_turns WHERE " + " AND ".join(clauses) + " ORDER BY at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._turn(r) for r in reversed(self._query(sql, params))]
+
+    def turns_by_ids(self, ids: Iterable[int]) -> list[ConversationTurn]:
+        """Turns with these ids, oldest first."""
+        wanted = [int(i) for i in ids]
+        if not wanted:
+            return []
+        rows = self._query(
+            "SELECT * FROM conversation_turns WHERE id IN (%s) ORDER BY at, id" % ",".join("?" * len(wanted)), wanted
+        )
+        return [self._turn(r) for r in rows]
+
+    def session_span(self, session_id: str) -> tuple[float | None, float | None, int]:
+        """``(first exchange at, last exchange at, exchanges)`` of one session."""
+        r = self._query("SELECT min(at), max(at), count(*) FROM conversation_turns WHERE session_id=?",
+                        (str(session_id),))[0]
+        return (r[0], r[1], int(r[2] or 0))
+
+    def latest_turn(self) -> ConversationTurn | None:
+        """The newest turn of any session, or ``None``."""
+        rows = self._query("SELECT * FROM conversation_turns ORDER BY at DESC, id DESC LIMIT 1")
+        return self._turn(rows[0]) if rows else None
+
+    @staticmethod
+    def turn_text(turn: ConversationTurn) -> str:
+        """The exchange as one text (what is embedded and keyword-matched)."""
+        parts = [turn.user_text or ""]
+        if turn.reply_text:
+            parts.append(turn.reply_text)
+        if turn.actions:
+            parts.append("; ".join(turn.actions))
+        return "\n".join(parts)
+
+    def _turn_filter(self, since: TimeArg, until: TimeArg) -> tuple[str, list[Any]]:
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("t.at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("t.at < ?")
+            params.append(u)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def search_turns(
+        self, query_vec: np.ndarray, since: TimeArg = None, until: TimeArg = None, limit: int = 10
+    ) -> list[ConversationTurn]:
+        """Turns most similar to ``query_vec`` (cosine) in ``[since, until)``."""
+        where, params = self._turn_filter(since, until)
+        rows = self._query(
+            "SELECT t.*, v.vec_ciphertext, v.dim FROM conversation_turns t"
+            " JOIN conversation_turn_vec v ON v.turn_id = t.id" + where, params,
+        )
+        return [self._turn(r, score) for r, score in self._rank(rows, query_vec, limit)]
+
+    def keyword_turns(
+        self, text: str, since: TimeArg = None, until: TimeArg = None, limit: int = 50, *, max_scan: int = 5000,
+    ) -> list[ConversationTurn]:
+        """Turns whose user text, reply or actions contain every term of ``text`` (casefolded), newest first.
+
+        Decrypted in memory (no plaintext index); at most the ``max_scan``
+        newest turns of the window are read.
+        """
+        terms = [t.casefold() for t in (text or "").split()]
+        if not terms:
+            return []
+        where, params = self._turn_filter(since, until)
+        hits: list[ConversationTurn] = []
+        for r in self._query("SELECT t.* FROM conversation_turns t" + where + " ORDER BY t.at DESC, t.id DESC LIMIT ?",
+                             [*params, int(max_scan)]):
+            turn = self._turn(r)
+            folded = self.turn_text(turn).casefold()
+            if all(t in folded for t in terms):
+                hits.append(turn)
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def turns_without_vectors(self, limit: int = 256) -> list[ConversationTurn]:
+        return [self._turn(r) for r in self._query(
+            "SELECT t.* FROM conversation_turns t LEFT JOIN conversation_turn_vec v ON v.turn_id = t.id"
+            " WHERE v.turn_id IS NULL ORDER BY t.id LIMIT ?", (int(limit),),
+        )]
+
+    # conversation facts (rules, preferences, commitments) ---------------------
+
+    def _cfact(self, r: sqlite3.Row, score: float | None = None) -> ConversationFact:
+        try:
+            sources = [int(i) for i in json.loads(r["source_turn_ids"] or "[]")]
+        except (ValueError, TypeError):
+            sources = []
+        return ConversationFact(
+            id=r["id"], kind=r["kind"], subject=self._dec(r["subject_ciphertext"]) or "",
+            text=self.cipher.decrypt(r["text_ciphertext"]), quote=self._dec(r["quote_ciphertext"]),
+            status=r["status"], valid_from=r["valid_from"], valid_to=r["valid_to"], due_at=r["due_at"],
+            source_turn_ids=sources, origin=r["origin"] or "model", created_at=r["created_at"],
+            expired_at=r["expired_at"], superseded_by=r["superseded_by"],
+            end_note=self._dec(r["end_note_ciphertext"]), score=score,
+        )
+
+    def conversation_facts(
+        self, kinds: Sequence[str] | None = None, statuses: Sequence[str] | None = ("active",),
+    ) -> list[ConversationFact]:
+        """Conversation facts of these kinds and statuses (``None`` = any), oldest first."""
+        clauses, params = [], []
+        if kinds:
+            clauses.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            params.extend(kinds)
+        if statuses:
+            clauses.append("status IN (%s)" % ",".join("?" * len(statuses)))
+            params.extend(statuses)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return [self._cfact(r) for r in self._query(
+            "SELECT * FROM conversation_facts" + where + " ORDER BY valid_from, id", params
+        )]
+
+    def conversation_facts_ended(self, since: TimeArg, kinds: Sequence[str] | None = None) -> list[ConversationFact]:
+        """Facts that ended (done, revoked, superseded) at or after ``since``, oldest first."""
+        sql = "SELECT * FROM conversation_facts WHERE status != 'active' AND coalesce(valid_to, expired_at) >= ?"
+        params: list[Any] = [_ts(since) or 0.0]
+        if kinds:
+            sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            params.extend(kinds)
+        return [self._cfact(r) for r in self._query(sql + " ORDER BY valid_to, id", params)]
+
+    def conversation_fact(self, fact_id: int) -> ConversationFact | None:
+        rows = self._query("SELECT * FROM conversation_facts WHERE id=?", (int(fact_id),))
+        return self._cfact(rows[0]) if rows else None
+
+    def conversation_fact_vectors(self, ids: Sequence[int]) -> dict[int, np.ndarray]:
+        """Stored (decrypted) vectors for these conversation-fact ids."""
+        if not ids:
+            return {}
+        rows = self._query(
+            "SELECT fact_id, vec_ciphertext FROM conversation_fact_vec WHERE fact_id IN (%s)" % ",".join("?" * len(ids)),
+            [int(i) for i in ids],
+        )
+        return {r["fact_id"]: np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+                for r in rows}
+
+    def conversation_facts_without_vectors(self, limit: int = 256) -> list[ConversationFact]:
+        return [self._cfact(r) for r in self._query(
+            "SELECT f.* FROM conversation_facts f LEFT JOIN conversation_fact_vec v ON v.fact_id = f.id"
+            " WHERE v.fact_id IS NULL ORDER BY f.id LIMIT ?", (int(limit),),
+        )]
+
+    def _insert_cfact(self, conn: sqlite3.Connection, ch: ConversationChange, now: float,
+                      batch_id: int | None) -> int:
+        cur = conn.execute(
+            "INSERT INTO conversation_facts(kind, subject_ciphertext, text_ciphertext, quote_ciphertext, status,"
+            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id)"
+            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?)",
+            (
+                ch.kind, self._enc(ch.subject or ""), self.cipher.encrypt(ch.text),
+                self._enc(ch.quote) if ch.quote else None, float(ch.at if ch.at is not None else now),
+                ch.due_at, json.dumps([int(i) for i in ch.source_turn_ids]), ch.origin or "model", now, batch_id,
+            ),
+        )
+        new_id = int(cur.lastrowid)
+        if ch.vector is not None:
+            self._put_vec(conn, "conversation_fact_vec", "fact_id", new_id, ch.vector, ch.embed_model)
+        return new_id
+
+    def _end_cfact(
+        self, conn: sqlite3.Connection, fact_id: int, status: str, valid_to: float, now: float,
+        *, superseded_by: int | None = None, note: str | None = None,
+    ) -> bool:
+        cur = conn.execute(
+            "UPDATE conversation_facts SET status=?, valid_to=?, expired_at=?, superseded_by=?,"
+            " end_note_ciphertext=? WHERE id=? AND status='active'",
+            (status, float(valid_to), now, superseded_by, self._enc(note) if note else None, int(fact_id)),
+        )
+        return cur.rowcount == 1
+
+    def _apply_cchanges(
+        self, conn: sqlite3.Connection, changes: Sequence[ConversationChange], now: float, batch_id: int | None,
+    ) -> list[tuple[bool, int | None]]:
+        out: list[tuple[bool, int | None]] = []
+        for ch in changes:
+            at = float(ch.at) if ch.at is not None else now
+            if ch.op in ("UPDATE", "INVALIDATE"):
+                old = conn.execute(
+                    "SELECT id FROM conversation_facts WHERE id=? AND status='active'", (ch.fact_id,)
+                ).fetchone()
+                if old is None:
+                    out.append((False, None))
+                    continue
+            if ch.op == "ADD":
+                out.append((True, self._insert_cfact(conn, ch, now, batch_id)))
+            elif ch.op == "UPDATE":
+                new_id = self._insert_cfact(conn, ch, now, batch_id)
+                self._end_cfact(conn, int(ch.fact_id), "superseded", at, now, superseded_by=new_id, note=ch.end_note)
+                out.append((True, new_id))
+            elif ch.op == "INVALIDATE":
+                status = ch.end_as if ch.end_as in ("done", "revoked") else "revoked"
+                self._end_cfact(conn, int(ch.fact_id), status, at, now, note=ch.end_note)
+                out.append((True, None))
+            else:
+                out.append((False, None))
+        return out
+
+    def add_conversation_fact(
+        self, kind: str, text: str, *, quote: str | None = None, subject: str = "", origin: str = "user",
+        source_turn_ids: Sequence[int] = (), due_at: float | None = None, at: float | None = None,
+        vector: np.ndarray | None = None, embed_model: str | None = None, supersedes: int | None = None,
+    ) -> int:
+        """Write one active fact now; with ``supersedes``, end that fact (bi-temporal) in the same transaction."""
+        if kind not in CONVERSATION_FACT_KINDS:
+            raise ValueError(f"unknown conversation fact kind {kind!r}")
+        now = time.time()
+        ch = ConversationChange(
+            "UPDATE" if supersedes is not None else "ADD", supersedes, kind, subject, text, quote, due_at,
+            list(source_turn_ids), float(at) if at is not None else now, origin=origin, vector=vector,
+            embed_model=embed_model,
+        )
+
+        def op(conn: sqlite3.Connection) -> int:
+            if supersedes is not None:
+                ok, new_id = self._apply_cchanges(conn, [ch], now, None)[0]
+                if ok and new_id is not None:
+                    return new_id
+                ch.op = "ADD"   # the old fact ended meanwhile: plain add
+            return self._insert_cfact(conn, ch, now, None)
+
+        return self._write(op)
+
+    def end_conversation_fact(self, fact_id: int, status: str, *, at: float | None = None,
+                              note: str | None = None) -> bool:
+        """End an active fact as ``done``/``revoked``/``superseded``; False if it was not active."""
+        if status not in CONVERSATION_FACT_STATUSES or status == "active":
+            raise ValueError(f"cannot end a fact as {status!r}")
+        now = time.time()
+        return self._write(lambda conn: self._end_cfact(
+            conn, fact_id, status, float(at) if at is not None else now, now, note=note))
+
+    # the worker's batches -----------------------------------------------------
+
+    def _insert_cbatch(self, conn: sqlite3.Connection, call: ConversationCall) -> int:
+        cur = conn.execute(
+            "INSERT INTO conversation_batches(at, purpose, session_id, model, turn_count, input_chars, input_tokens,"
+            " output_tokens, cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, ops_applied,"
+            " ops_noop, ops_rejected, journal_facts, outcome, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                call.at, call.purpose, call.session_id, call.model, call.turn_count, call.input_chars,
+                call.input_tokens, call.output_tokens, call.cache_write_tokens, call.cache_read_tokens,
+                call.cost_usd, call.latency_ms, call.stop_reason, call.ops_applied, call.ops_noop,
+                call.ops_rejected, call.journal_facts, call.outcome, call.error,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def conversation_thread_id(self) -> int:
+        """The journal thread for facts learned in conversations with Yuki (created on first use)."""
+        return self._write(lambda conn: self._upsert_thread(
+            conn, self.CONVERSATION_APP, "Conversations with Yuki", None, scope=self.CONVERSATION_SCOPE,
+            kind="yuki_chat"))
+
+    def commit_conversation_batch(
+        self, call: ConversationCall, turn_ids: Iterable[int], changes: Sequence[ConversationChange],
+        journal_facts: Sequence[NewFact], *, turn_vectors: Sequence[tuple[int, np.ndarray]] = (),
+        embed_model: str | None = None,
+    ) -> tuple[int, list[tuple[bool, int | None]]]:
+        """One transaction: the batch row, the fact changes, the journal facts (filed under
+        the Yuki conversation thread), the turns marked extracted and their vectors.
+
+        Returns ``(batch_id, [(applied, new fact id) per change])``; a change
+        whose target is no longer active is skipped (``(False, None)``).
+        """
+        ids = [int(i) for i in turn_ids]
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> tuple[int, list[tuple[bool, int | None]]]:
+            batch_id = self._insert_cbatch(conn, call)
+            results = self._apply_cchanges(conn, changes, now, batch_id)
+            if journal_facts:
+                thread_id = self._upsert_thread(conn, self.CONVERSATION_APP, "Conversations with Yuki", None,
+                                                scope=self.CONVERSATION_SCOPE, kind="yuki_chat")
+                for fact in journal_facts:
+                    if fact.thread_id is None:
+                        fact.thread_id = thread_id
+                    self._insert_journal(conn, fact, None)
+            conn.executemany(
+                "UPDATE conversation_turns SET extracted=1, extract_batch_id=? WHERE id=?", [(batch_id, i) for i in ids]
+            )
+            for turn_id, vec in turn_vectors:
+                self._put_vec(conn, "conversation_turn_vec", "turn_id", turn_id, vec, embed_model)
+            return batch_id, results
+
+        return self._write(op)
+
+    def record_failed_conversation_batch(
+        self, call: ConversationCall, *, extract_turn_ids: Iterable[int] = (), summary_turn_ids: Iterable[int] = (),
+    ) -> int:
+        """Record a failed call; bump the attempt counters of the turns it was for (they stay pending)."""
+        ext = [(int(i),) for i in extract_turn_ids]
+        summ = [(int(i),) for i in summary_turn_ids]
+
+        def op(conn: sqlite3.Connection) -> int:
+            batch_id = self._insert_cbatch(conn, call)
+            conn.executemany("UPDATE conversation_turns SET extract_attempts=extract_attempts+1 WHERE id=?", ext)
+            conn.executemany("UPDATE conversation_turns SET summary_attempts=summary_attempts+1 WHERE id=?", summ)
+            return batch_id
+
+        return self._write(op)
+
+    def conversation_batches(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Latest conversation-worker calls (content-free), newest first."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM conversation_batches ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    # session summaries ----------------------------------------------------------
+
+    def _summary(self, r: sqlite3.Row, score: float | None = None) -> SessionSummary:
+        return SessionSummary(
+            id=r["id"], session_id=r["session_id"], started_at=r["started_at"], ended_at=r["ended_at"],
+            text=self.cipher.decrypt(r["text_ciphertext"]), turn_count=r["turn_count"], created_at=r["created_at"],
+            score=score,
+        )
+
+    def commit_session_summary(
+        self, call: ConversationCall, session_id: str, started_at: float, ended_at: float, text: str,
+        turn_ids: Iterable[int], *, vector: np.ndarray | None = None, embed_model: str | None = None,
+    ) -> int:
+        """One transaction: the batch row, the summary (+vector), its turns linked to it."""
+        ids = [int(i) for i in turn_ids]
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> int:
+            batch_id = self._insert_cbatch(conn, call)
+            cur = conn.execute(
+                "INSERT INTO session_summaries(session_id, started_at, ended_at, turn_count, text_ciphertext,"
+                " batch_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                (str(session_id), float(started_at), float(ended_at), len(ids), self.cipher.encrypt(text),
+                 batch_id, now),
+            )
+            summary_id = int(cur.lastrowid)
+            conn.executemany("UPDATE conversation_turns SET summary_id=? WHERE id=?", [(summary_id, i) for i in ids])
+            if vector is not None:
+                self._put_vec(conn, "session_summary_vec", "summary_id", summary_id, vector, embed_model)
+            return summary_id
+
+        return self._write(op)
+
+    def _summary_filter(self, since: TimeArg, until: TimeArg, session_id: str | None = None) -> tuple[str, list]:
+        clauses, params = [], []
+        if session_id is not None:
+            clauses.append("s.session_id = ?")
+            params.append(str(session_id))
+        if (s := _ts(since)) is not None:
+            clauses.append("s.ended_at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("s.started_at < ?")
+            params.append(u)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def session_summaries(
+        self, session_id: str | None = None, since: TimeArg = None, until: TimeArg = None, limit: int | None = None,
+    ) -> list[SessionSummary]:
+        """Summaries overlapping ``[since, until)`` (of one session if given); with ``limit`` the newest N. Oldest first."""
+        where, params = self._summary_filter(since, until, session_id)
+        sql = "SELECT s.* FROM session_summaries s" + where + " ORDER BY s.ended_at DESC, s.id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._summary(r) for r in reversed(self._query(sql, params))]
+
+    def search_summaries(
+        self, query_vec: np.ndarray, since: TimeArg = None, until: TimeArg = None, limit: int = 10
+    ) -> list[SessionSummary]:
+        where, params = self._summary_filter(since, until)
+        rows = self._query(
+            "SELECT s.*, v.vec_ciphertext, v.dim FROM session_summaries s"
+            " JOIN session_summary_vec v ON v.summary_id = s.id" + where, params,
+        )
+        return [self._summary(r, score) for r, score in self._rank(rows, query_vec, limit)]
+
+    def keyword_summaries(
+        self, text: str, since: TimeArg = None, until: TimeArg = None, limit: int = 50
+    ) -> list[SessionSummary]:
+        terms = [t.casefold() for t in (text or "").split()]
+        if not terms:
+            return []
+        where, params = self._summary_filter(since, until)
+        hits: list[SessionSummary] = []
+        for r in self._query("SELECT s.* FROM session_summaries s" + where + " ORDER BY s.ended_at DESC, s.id DESC",
+                             params):
+            summary = self._summary(r)
+            folded = summary.text.casefold()
+            if all(t in folded for t in terms):
+                hits.append(summary)
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def summaries_without_vectors(self, limit: int = 64) -> list[SessionSummary]:
+        return [self._summary(r) for r in self._query(
+            "SELECT s.* FROM session_summaries s LEFT JOIN session_summary_vec v ON v.summary_id = s.id"
+            " WHERE v.summary_id IS NULL ORDER BY s.id LIMIT ?", (int(limit),),
+        )]
+
+    def add_conversation_vectors(self, what: str, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        """Store embeddings for existing turns (``what="turn"``), summaries (``"summary"``) or facts (``"fact"``)."""
+        table, col = {
+            "turn": ("conversation_turn_vec", "turn_id"),
+            "summary": ("session_summary_vec", "summary_id"),
+            "fact": ("conversation_fact_vec", "fact_id"),
+        }[what]
+
+        def op(conn: sqlite3.Connection) -> int:
+            for item_id, vec in items:
+                self._put_vec(conn, table, col, item_id, vec, model)
+            return len(items)
+
+        return self._write(op) if items else 0
+
+    def conversation_changed_since(self, at: TimeArg) -> bool:
+        """Whether a rule/preference started or ended, or a session summary was written, after ``at``."""
+        t = _ts(at) or 0.0
+        row = self._query(
+            "SELECT (SELECT count(*) FROM conversation_facts WHERE kind IN ('rule','preference')"
+            " AND (created_at > ? OR coalesce(expired_at, 0) > ?))"
+            " + (SELECT count(*) FROM session_summaries WHERE created_at > ?)", (t, t, t),
+        )[0][0]
+        return bool(row)
 
     # -- maintenance -------------------------------------------------------
 
