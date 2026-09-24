@@ -1,0 +1,235 @@
+# Yuki capture extraction profiles (data, not code).
+#
+# Each [[profile]] tells the generic extractors where an app keeps its
+# content, as paths over UI Automation facts (see yuki/memory/extract/query.py):
+#   //*[class~="c-message_list"]      Chromium/Gecko expose the HTML class attribute as UIA ClassName
+#   //ListItem[id^="chat-messages-"]  ...and the HTML id as AutomationId
+#   //List[name^="Messages in"]       aria-label becomes the UIA Name
+# Operators: = exact, ^= prefix, $= suffix, *= contains, ~= class/word token; [!...] negates.
+# `class` compares per token for = ^= $= ~= and case-insensitively.
+#
+# A profile applies when the page URL's host matches `hosts` (optionally
+# narrowed by `paths`), or the window's process matches `processes`.  The
+# first match wins; profiles in the user's override file
+# (%LOCALAPPDATA%\Yuki\memory\extract_profiles.toml, same shape) come first and
+# replace a default profile of the same name.  Every anchor list is tiered:
+# the first path that selects anything is used.  Anything a profile does not
+# say (or that does not match any more after an app update) falls back to the
+# generic structural extractors, so a stale anchor degrades, it does not break.
+#
+# Status of each anchor set:
+#   verified 2026-09-24 = read live (read-only) from the app on this PC
+#   MaxMi              = ported from MaxMi's fixture-verified anchors, not yet seen live here
+
+[defaults]
+# Marks an app puts inside or next to a message that are not the message.
+text_noise = ["(edited)", "(bearbeitet)", "(modifié)", "(editado)"]
+# A sender shown with one of these names is the user.
+me_senders = ["You", "you", "Me"]
+# "Sudhanshu (you)" - the name before the suffix is the user's.
+me_suffixes = ["(you)", "(You)"]
+# Sidebar previews "You: ok" (only used to learn nothing about senders: previews are chrome).
+me_prefixes = ["You:"]
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "slack"                       # verified 2026-09-24 (Slack desktop, Threads view)
+kind = "conversation"
+hosts = ["app.slack.com"]
+processes = ["slack.exe"]
+# Window title "<view> - <workspace> - Slack"
+title_split = " - "
+title_part = 0
+scope_strip = ["#"]
+header = [
+  '//*[class^="p-view_header__channel_title"]',
+  '//*[class~="p-view_contents--primary"]/ToolBar[class^="p-view_header"]//Text',
+]
+list = [
+  '//*[class~="c-message_list"]',
+  '//*[class~="p-view_contents--primary"]//List[class~="c-virtual_list__scroll_container"]',
+]
+row = ['/*[class~="c-virtual_list__item"]', '//*[class^="c-message_kit__background"]']
+sender = ['//*[class^="c-message__sender"]']
+time = ['//*[class~="c-timestamp"]']
+day_separator = ['//*[class^="c-message_list__day_divider"]', '//*[class^="p-message_pane__day_divider"]']
+exclude = [
+  '//*[class^="c-reaction_bar"]',
+  '//*[class^="c-message_actions"]',
+  '//*[class^="c-file__actions"]',
+  '//*[class^="c-message__reply_bar"]',
+  '//*[class^="c-message_kit__thread_replies"]',
+  '//*[class^="p-threads_view_header__permalink"]',
+]
+composer = ['//*[class~="ql-editor"]', '//*[class^="p-message_input"]']
+# Rows are id'd "...-<channel>-<ts>": the message's own id, and ts is epoch seconds.
+id_source = "automation_id"
+id_time = "epoch_seconds"
+self_name = ['//*[class^="p-ia__nav__user__button"]']
+self_name_strip = ["User: "]
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "discord"                     # verified 2026-09-24 (Discord desktop, DM view); hashed class suffixes -> ^= anchors
+kind = "conversation"
+hosts = ["discord.com", "ptb.discord.com", "canary.discord.com"]
+processes = ["discord.exe", "discordptb.exe", "discordcanary.exe"]
+# Window title "#channel | Server - Discord" or "@friend - Discord"
+title_split = " | "
+title_part = 0
+scope_strip = ["#", "@", " - Discord"]
+header = ['//*[class^="title_"]//*[aria="heading"]', '//*[aria="heading"][class^="title_"]']
+list = ['//List[name^="Messages in"]', '//*[id="messages"]', '//*[class^="messagesWrapper_"]//List']
+row = ['/ListItem[id^="chat-messages-"]', '/*[class^="messageListItem_"]']
+# The day divider is a Thumb/separator child of the list ("September 24, 2026").
+sender = ['//*[class^="username_"]', '//*[id^="message-username-"]']
+time = ['//*[aria="time"]', '//*[id^="message-timestamp-"]', '//*[class^="timestamp_"]']
+body = ['//*[id^="message-content-"]', '//*[class^="messageContent_"]']
+day_separator = ['/*[class^="divider_"][aria="separator"]', '/*[aria="separator"]']
+exclude = [
+  '//*[class^="reactions_"]',
+  '//*[class^="buttonContainer_"]',
+  '//*[class^="repliedMessage_"]',
+  '//*[class^="hoverButton_"]',
+  '//*[class^="header_"][aria="heading"]',
+]
+composer = ['//*[class^="slateTextArea_"]', '//*[aria="textbox"][class^="markup_"]']
+# Rows are id'd "chat-messages-<channel>-<message snowflake>".
+id_source = "automation_id"
+id_time = "snowflake"
+id_epoch_ms = 1420070400000
+# The account panel at the bottom left: its first text is the user's display name.
+self_name = ['//*[class^="accountPopoutButtonWrapper_"]//Text', '//*[class^="panelTitleContainer_"]']
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "whatsapp"                    # MaxMi + WhatsApp Web DOM; desktop app is WebView2 of web.whatsapp.com
+kind = "conversation"
+hosts = ["web.whatsapp.com"]
+processes = ["whatsapp.exe", "whatsapp.root.exe"]
+header = ['//*[id="main"]//*[aria="banner"]//*[aria="button"]//Text', '//*[id="main"]//*[aria="banner"]//Text']
+list = ['//*[id="main"]//*[aria="application"]', '//*[id="main"]//*[class~="copyable-area"]']
+row = ['//*[aria="row"]', '//*[class~="message-in"]', '//*[class~="message-out"]']
+me_row = ['//*[class~="message-out"]']
+body = ['//*[class~="copyable-text"]//*[class~="selectable-text"]', '//*[class~="selectable-text"]']
+exclude = ['//*[aria="button"][name^="React"]', '//*[class^="reaction"]']
+composer = ['//*[id="main"]//*[aria="textbox"]', '//*[id="main"]//Edit']
+date_order = "dmy"
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "teams"                       # MaxMi fixture anchors + Fluent UI class names; new Teams is WebView2
+kind = "conversation"
+hosts = ["teams.microsoft.com", "teams.live.com", "teams.cloud.microsoft"]
+processes = ["ms-teams.exe", "teams.exe", "msteams.exe"]
+header = ['//*[class^="fui-ChatHeader"]//*[aria="heading"]']
+list = ['//*[name^="Chat content"]', '//*[class^="fui-Chat"][aria="list"]', '//List[name*="message"]']
+row = ['//*[class^="fui-ChatMessage"][aria="listitem"]', '//*[class~="fui-ChatMessage"]', '//*[class~="fui-ChatMyMessage"]', '/ListItem']
+me_row = ['//*[class^="fui-ChatMyMessage"]']
+sender = ['//*[class^="fui-ChatMessage__author"]', '//*[class~="message-author-name"]']
+time = ['//*[class^="fui-ChatMessage__timestamp"]', '//*[class^="fui-ChatMyMessage__timestamp"]', '//*[class~="message-timestamp"]']
+body = ['//*[class^="fui-ChatMessage__body"]', '//*[class^="fui-ChatMyMessage__body"]']
+exclude = ['//*[class^="fui-ChatMessage__reactions"]', '//*[class^="fui-ChatMyMessage__reactions"]']
+composer = ['//*[class~="ck-editor__editable"]', '//*[id="ckeditor"]']
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "gmail"                       # MaxMi (Gmail DOM classes adn/gD/g3/a3s/zA/hP)
+kind = "email"
+hosts = ["mail.google.com"]
+header = ['//*[class~="hP"]']
+# An open thread: one container per expanded message.
+list = ['//*[aria="main"]', '//*[landmark="main"]']
+row = ['//*[class~="adn"]']
+sender = ['//*[class~="gD"]', '//*[class~="go"]']
+time = ['//*[class~="g3"]']
+body = ['//*[class~="a3s"]']
+composer = ['//*[name="Message Body"]']
+# The inbox/list view: rows become the body of a "list" extraction.
+list_rows = ['//*[class~="zA"]']
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "outlook_web"                 # ARIA names of Outlook on the web (not yet seen live here)
+kind = "email"
+hosts = ["outlook.office.com", "outlook.live.com", "outlook.office365.com", "outlook.cloud.microsoft"]
+header = ['//*[name="Reading Pane"]//*[aria="heading"]', '//*[class~="outlook-subject"]']
+list = ['//*[name="Reading Pane"]']
+row = ['//*[name="Email message"]', '//*[aria="document"][name^="Message"]', '//*[class~="outlook-message-card"]']
+sender = ['//*[class~="outlook-message-header"]//Button', '//*[name^="From: "]']
+body = ['//*[name="Message body"]', '//*[class~="outlook-message-body"]']
+composer = ['//*[name="Message body, press Alt+F10 to exit"]', '//*[id="outlook-compose-body"]']
+list_rows = ['//*[name="Message list"]//*[aria="option"]', '//*[class~="outlook-message-row"]']
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "linkedin_messaging"          # MaxMi (LinkedIn msg-* classes)
+kind = "conversation"
+hosts = ["www.linkedin.com", "linkedin.com"]
+paths = ["/messaging"]
+header = ['//*[class~="msg-entity-lockup__entity-title"]', '//*[class^="msg-title-bar"]//*[aria="heading"]']
+list = ['//*[class~="msg-s-message-list"]', '//*[class^="msg-s-message-list-content"]']
+row = ['//*[class~="msg-s-message-list__event"]']
+sender = ['//*[class~="msg-s-message-group__name"]']
+time = ['//*[class~="msg-s-message-group__timestamp"]']
+body = ['//*[class~="msg-s-event-listitem__body"]']
+day_separator = ['/*[class~="msg-s-message-list__time-heading"]', '//*[class~="msg-s-message-list__time-heading"]']
+composer = ['//*[class~="msg-form__contenteditable"]']
+self_name = ['//*[class~="global-nav__me-photo"]']
+self_name_strip = ["Photo of "]
+# A sender group continues until the next named group (LinkedIn shows the name once).
+sender_carries = true
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "telegram"                    # Telegram Desktop (Qt) exposes little; generic detection does the rest
+kind = "conversation"
+processes = ["telegram.exe"]
+hosts = ["web.telegram.org"]
+list = ['//*[class~="MessageList"]', '//*[class~="bubbles-inner"]']
+row = ['//*[class~="Message"]', '//*[class~="bubble"]']
+me_row = ['//*[class~="own"]', '//*[class~="is-out"]']
+time = ['//*[class~="message-time"]', '//*[class~="time"]']
+body = ['//*[class~="text-content"]', '//*[class~="message"]']
+
+# ---------------------------------------------------------------------------
+[[profile]]
+name = "messenger"                   # messenger.com / facebook.com/messages (atomic CSS: ARIA names only)
+kind = "conversation"
+hosts = ["www.messenger.com", "messenger.com", "www.facebook.com", "facebook.com"]
+paths = ["/messages", "/t/", "/e2ee/"]
+header = ['//*[aria="main"]//*[aria="heading"]']
+list = ['//*[name^="Messages in conversation"]', '//*[aria="grid"][name*="onversation"]']
+row = ['/*[aria="row"]', '//*[aria="row"]']
+
+[[profile]]
+name = "instagram_direct"            # instagram.com/direct (atomic CSS: ARIA names only)
+kind = "conversation"
+hosts = ["www.instagram.com", "instagram.com"]
+paths = ["/direct"]
+header = ['//*[aria="main"]//*[aria="heading"]']
+list = ['//*[name^="Messages in conversation"]', '//*[aria="grid"]']
+row = ['/*[aria="row"]', '//*[aria="row"]']
+
+# ---------------------------------------------------------------------------
+# Terminals: the text is the terminal control's Text pattern (Windows Terminal,
+# conhost).  Warp draws with the GPU and exposes only its title (see notes).
+[[profile]]
+name = "terminal"
+kind = "terminal"
+processes = ["windowsterminal.exe", "openconsole.exe", "conhost.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "warp.exe", "wezterm-gui.exe", "alacritty.exe"]
+main = ['//*[class~="TermControl"]', '//Document', '//Edit']
+
+# Editors whose buffer is a Document/Edit value.
+[[profile]]
+name = "editor"
+kind = "document"
+processes = ["notepad.exe", "notepad++.exe", "code.exe", "cursor.exe", "winword.exe", "sublime_text.exe", "obsidian.exe"]
+main = ['//*[class^="monaco-editor"]//Edit', '//Document[class*="RichEdit"]', '//Document', '//Edit']
+
+# File Explorer: the items view is the content; the navigation tree is chrome.
+[[profile]]
+name = "file_explorer"
+kind = "list"
+processes = ["explorer.exe"]
+main = ['//List[id="ItemsView"]', '//*[class~="UIItemsView"]', '//DataGrid', '//List']
