@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Sequence
 
-from PySide6.QtCore import QObject, QUrl, Qt
+from PySide6.QtCore import QObject, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -195,6 +195,12 @@ class YukiUi(QObject):
         self.runtime.start()
         self.hotkeys.start()
         self.memory.ensure_service()
+        # Watchdog: the memory service runs windowless, so if it ever dies the
+        # user would never see it. Check every two minutes and restart it.
+        self._memory_watchdog = QTimer(self)
+        self._memory_watchdog.setInterval(120_000)
+        self._memory_watchdog.timeout.connect(lambda: self.memory.ensure_service(quiet=True))
+        self._memory_watchdog.start()
         self.nudges.start()
         self.ui_log.event(
             "start",
