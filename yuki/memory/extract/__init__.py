@@ -31,10 +31,11 @@ Usage::
 from __future__ import annotations
 
 import time as _time
+from collections import Counter
 from functools import lru_cache
 
 from yuki.memory.extract import profiles as _profiles
-from yuki.memory.extract import query
+from yuki.memory.extract import query, timeparse
 from yuki.memory.extract.conversation import detect_list, extract_conversation, learn_me
 from yuki.memory.extract.model import Extraction, Message, Node, Snapshot
 from yuki.memory.extract.page import extract_page
@@ -53,10 +54,18 @@ __all__ = [
 ]
 
 #: Generic chat detection (no profile): a list with at least this many timed
-#: rows, covering this share of the content, most rows with a sender.
+#: rows, covering this share of the content, most rows with a sender, most
+#: messages with a time label, some sender speaking twice, and at most this
+#: share of rows carrying a link out of the page (a search result list has a
+#: title link to another site, a date and a site name on every row).
 _CHAT_MIN_ROWS = 3
 _CHAT_MIN_AREA = 0.2
 _CHAT_MIN_SENDERS = 0.5
+_CHAT_MIN_TIMED = 0.5
+_CHAT_MAX_LINK_ROWS = 0.4
+#: Container shapes of a message list: list/grid/log/feed controls or roles.
+_LIST_ROLES = frozenset({"List", "DataGrid", "Table"})
+_LIST_ARIA = frozenset({"list", "log", "feed", "grid", "table", "treegrid", "rowgroup"})
 #: Generic document detection: an editor element's value this long, covering this share.
 _DOC_MIN_CHARS = 200
 _DOC_MIN_AREA = 0.3
@@ -188,6 +197,7 @@ def extract(
                 hwnd,
                 timeout_s=timeout_s,
                 text_pattern=bool(early and early.kind in ("terminal", "document")),
+                hidden_labels=bool(early and early.hidden_labels),
             )
         read_ms = snap.elapsed_ms
         result = extract_snapshot(snap, profiles=profiles, now=now, user_names=user_names, app=app, page=page)
@@ -353,7 +363,51 @@ def _main_text(snap: Snapshot, profile: Profile, base, total_chars: int) -> Extr
     return out
 
 
+def _listy(node: Node, root: Node) -> bool:
+    """A message list's container: a list/grid/log control or role, or a
+    scroll region of its own (itself or an ancestor below the page) - a chat
+    scrolls its messages inside the page, a results page scrolls the page."""
+    if node.role in _LIST_ROLES or node.aria_role in _LIST_ARIA:
+        return True
+    for above in [node, *node.ancestors()]:
+        if above is root or above.role == "Document":
+            return False
+        if above.is_scrollable:
+            return True
+    return False
+
+
+def _host(url: str | None) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _site(host: str) -> str:
+    """The host's last two labels ("layerpath.slack.com" -> "slack.com")."""
+    return ".".join(host.split(".")[-2:])
+
+
+def _links_out(row: Node, page_host: str) -> bool:
+    """The row holds a link to another site (a message's own permalink - a
+    link reading as a time label - aside), or shows an address as text."""
+    for node in row.walk():
+        if node.role == "Hyperlink" and node.value and not timeparse.is_time_label(clean(node.name)):
+            host = _host(node.value)
+            if host and _site(host) != _site(page_host):
+                return True
+        text = node.name.strip()
+        if node.role == "Text" and text.startswith(("http://", "https://", "www.")):
+            return True
+    return False
+
+
 def _generic_chat(snap: Snapshot, profiles: ProfileSet, now: float, user_names: list[str], noise: tuple[str, ...]):
+    """A conversation found from structure alone, or None.  Every test is a
+    fact about the list's structure, never a site: see the ``_CHAT_*`` budgets."""
     root = snap.root
     assert root is not None
     list_node, timed = detect_list(root, None)
@@ -362,15 +416,28 @@ def _generic_chat(snap: Snapshot, profiles: ProfileSet, now: float, user_names: 
     area = root.width() * root.height()
     if area and list_node.width() * list_node.height() < _CHAT_MIN_AREA * area:
         return None
+    if not _listy(list_node, root):
+        return None
     scope = _scope(snap, None, "conversation")
     conv = extract_conversation(
         snap, None, profiles.defaults, now=now, user_names=user_names, noise=noise, scope=scope, detected=list_node,
     )
     conv.notes.append(f"message list found from structure ({timed} timed rows)")
-    if len(conv.messages) < _CHAT_MIN_ROWS:
+    count = len(conv.messages)
+    if count < _CHAT_MIN_ROWS:
         return None
-    with_sender = sum(1 for m in conv.messages if m.sender)
-    if with_sender < _CHAT_MIN_SENDERS * len(conv.messages):
+    if sum(1 for m in conv.messages if m.sender) < _CHAT_MIN_SENDERS * count:
+        return None
+    if sum(1 for m in conv.messages if m.time_label) < _CHAT_MIN_TIMED * count:
+        return None
+    # People speak more than once: a sender shown on two rows, or rows that
+    # continue the sender above them (a message group).
+    shown = Counter(conv.shown_senders)
+    carried = sum(1 for m in conv.messages if m.sender) - len(conv.shown_senders)
+    if carried <= 0 and (not shown or shown.most_common(1)[0][1] < 2):
+        return None
+    page_host = _host(snap.url)
+    if sum(1 for row in conv.rows if _links_out(row, page_host)) > _CHAT_MAX_LINK_ROWS * count:
         return None
     return conv
 

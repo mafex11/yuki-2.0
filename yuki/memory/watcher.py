@@ -489,10 +489,48 @@ _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
 
 
+_UIA_IS_PASSWORD = 30019  # UIA_IsPasswordPropertyId
+_TREE_SCOPE_ELEMENT = 1
+_ELEMENT_MODE_NONE = 0  # cached properties only, no live element reference
+
+#: Longest the capture waits for the password-focus answer.
+PASSWORD_PROBE_S = 0.1
+#: UIA's own timeouts for the probe's client (ms): a hung provider frees the
+#: probe thread within about this long, whatever the capture already decided.
+_PROBE_UIA_TIMEOUT_MS = 300
+
+
 class _PasswordProbe:
-    """A UIA client of the worker's own, bounded by UIA's transaction timeouts."""
+    """Whether the focused element is a password field, answered in ~100 ms.
+
+    One daemon thread with its own UIA client and COM apartment asks
+    ``GetFocusedElementBuildCache`` with a cache request for ``IsPassword``
+    only (one cross-process call; element mode None, so no live element and
+    no second round trip for the property).  :meth:`focused_is_password`
+    waits at most ``timeout_s`` for it: ``True`` / ``False``, or ``None`` =
+    unknown (the focused app did not answer in time, or a previous question
+    is still stuck in it - then no new one is queued).  Unknown is not a skip:
+    the structured read never reads a password field's value either way.
+    Measured 2026-09-24: one capture spent ~4.5 s in the old
+    ``GetFocusedElement`` + ``CurrentIsPassword`` gate.
+    """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._busy = False
+        self._generation = 0
+        self._answer: tuple[int, bool | None] = (0, None)
+        self._answered = threading.Condition(self._lock)
+        self._ready = threading.Event()
+        self._error: str | None = None
+        self._thread = threading.Thread(target=self._main, name="yuki-password-probe", daemon=True)
+        self._thread.start()
+        self._ready.wait(5.0)
+        if self._error:
+            raise RuntimeError(self._error)
+
+    def _main(self) -> None:
         import comtypes
         import comtypes.client
 
@@ -500,26 +538,60 @@ class _PasswordProbe:
             comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
         except OSError:
             pass
-        self._module = comtypes.client.GetModule("UIAutomationCore.dll")
-        automation = None
         try:
-            automation = comtypes.client.CreateObject(
-                _CUIAUTOMATION8_CLSID, interface=self._module.IUIAutomation2
-            )
-            automation.ConnectionTimeout = 800
-            automation.TransactionTimeout = 800
+            module = comtypes.client.GetModule("UIAutomationCore.dll")
+            try:
+                uia = comtypes.client.CreateObject(_CUIAUTOMATION8_CLSID, interface=module.IUIAutomation2)
+                uia.ConnectionTimeout = _PROBE_UIA_TIMEOUT_MS
+                uia.TransactionTimeout = _PROBE_UIA_TIMEOUT_MS
+            except Exception:
+                uia = comtypes.client.CreateObject(_CUIAUTOMATION_CLSID, interface=module.IUIAutomation)
+            request = uia.CreateCacheRequest()
+            request.AddProperty(_UIA_IS_PASSWORD)
+            request.TreeScope = _TREE_SCOPE_ELEMENT
+            request.AutomationElementMode = _ELEMENT_MODE_NONE
+        except Exception as exc:  # noqa: BLE001 - reported by the constructor
+            self._error = f"{type(exc).__name__}: {exc}"
+            self._ready.set()
+            return
+        try:
+            # The client's first call sets up its connection (25-150 ms
+            # measured); pay that here, not inside the first capture's budget.
+            uia.GetFocusedElementBuildCache(request)
         except Exception:
-            automation = comtypes.client.CreateObject(
-                _CUIAUTOMATION_CLSID, interface=self._module.IUIAutomation
-            )
-        self._uia = automation
+            pass
+        self._ready.set()
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                generation = self._generation
+            try:
+                element = uia.GetFocusedElementBuildCache(request)
+                value = element.GetCachedPropertyValue(_UIA_IS_PASSWORD) if element else False
+                answer: bool | None = value is True or (isinstance(value, int) and value != 0)
+            except Exception:
+                answer = None
+            with self._lock:
+                self._busy = False
+                self._answer = (generation, answer)
+                self._answered.notify_all()
 
-    def focused_is_password(self) -> bool | None:
-        try:
-            element = self._uia.GetFocusedElement()
-            return bool(element.CurrentIsPassword) if element else False
-        except Exception:
-            return None
+    def focused_is_password(self, timeout_s: float = PASSWORD_PROBE_S) -> bool | None:
+        deadline = time.monotonic() + timeout_s
+        with self._lock:
+            if self._busy:
+                return None  # the last question is still stuck in some provider
+            self._generation += 1
+            generation = self._generation
+            self._busy = True
+            self._wake.set()
+            while self._answer[0] != generation:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self._answered.wait(left)
+            return self._answer[1]
 
 
 def _uia_threads_alive() -> int:
@@ -574,6 +646,11 @@ class CaptureResult:
     ms: float = 0.0
     #: Pre-read gates (password-focus probe, full-screen check...), the read, the store writes.
     gates_ms: float = 0.0
+    #: The password-focus probe alone, and its answer: "no" | "yes" | "unknown"
+    #: (no answer within PASSWORD_PROBE_S: the capture goes on, the read never
+    #: reads password values) | "off" (disabled or no probe).
+    password_ms: float = 0.0
+    password_check: str = "off"
     read_ms: float = 0.0
     store_ms: float = 0.0
 
@@ -1199,12 +1276,13 @@ class Watcher:
             return done("skipped", "fullscreen")
         if _uia_threads_alive() > self.settings.uia_backlog:
             return done("skipped", "uia_backlog")
-        if (
-            rules.skip_when_password_focused
-            and self._probe is not None
-            and self._probe.focused_is_password()
-        ):
-            return done("skipped", "password_focused")
+        if rules.skip_when_password_focused and self._probe is not None:
+            p0 = time.perf_counter()
+            focused_password = self._probe.focused_is_password()
+            result.password_ms = (time.perf_counter() - p0) * 1000.0
+            result.password_check = {True: "yes", False: "no"}.get(focused_password, "unknown")  # type: ignore[arg-type]
+            if focused_password:
+                return done("skipped", "password_focused")
 
         # The structured read drops the value of every IsPassword element
         # itself; what it returns is messages (chats, mail) or main text.

@@ -154,14 +154,17 @@ def pieces(
                 return True
         children_before = len(out)
         left_out = False
+        # Screen-reader-only leaves (see extract.uia) are for anchors, not text,
+        # and must not count as "something below was left out" either.
+        children = [c for c in node.children if not c.sr_only]
         labels = {
             clean(label)
-            for child in node.children
+            for child in children
             if child.role in ACTION_ROLES
             for label in (child.name, child.description)
             if label
         }
-        for child in node.children:
+        for child in children:
             if labels and not child.children and child.role == "Text" and clean(child.name) in labels:
                 continue  # a control's tooltip text
             left_out = visit(child, False) or left_out

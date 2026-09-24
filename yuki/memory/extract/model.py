@@ -47,6 +47,10 @@ class Node:
     is_selected: bool = False
     is_invokable: bool = False
     offscreen: bool = False
+    #: Reported off-screen although wholly inside the visible area: a
+    #: screen-reader-only element (a visually hidden "Alice:" label on a chat
+    #: bubble).  Kept, without its subtree, for profile anchors; never text.
+    sr_only: bool = False
     item_status: str = ""
     runtime_id: tuple[int, ...] | None = None
     children: list["Node"] = field(default_factory=list)

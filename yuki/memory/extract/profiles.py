@@ -86,6 +86,19 @@ class Profile:
     date_order: str | None = None
     text_noise: tuple[str, ...] = ()
     sender_carries: bool = True
+    #: Affixes cut from a sender as shown ("You:" -> "You").
+    sender_strip: tuple[str, ...] = ()
+    #: "parent": rows sharing a parent element are one sender run (the app
+    #: groups consecutive messages of one sender in a container), so a sender
+    #: carries only to rows of the same parent.  "" : it carries down the list.
+    sender_group: str = ""
+    #: False: when no row matches the ``sender`` anchors, leave senders unknown
+    #: instead of guessing them from structure (apps whose messages have no
+    #: visible name to find, only the anchored label).
+    generic_sender: bool = True
+    #: Read screen-reader-only labels (elements reporting IsOffscreen inside
+    #: the visible area) as ``sr_only`` leaves, for anchors such as ``sender``.
+    hidden_labels: bool = False
 
     def matches(self, *, process: str, url: str | None) -> bool:
         """Host (and path) of the page URL, or the window's process image name."""
@@ -133,6 +146,13 @@ def _profile(raw: dict, problems: list[str]) -> Profile | None:
     values["date_order"] = str(raw["date_order"]) if raw.get("date_order") else None
     values["text_noise"] = _strings(raw.get("text_noise"))
     values["sender_carries"] = bool(raw.get("sender_carries", True))
+    values["sender_strip"] = _strings(raw.get("sender_strip"))
+    values["sender_group"] = str(raw.get("sender_group") or "")
+    if values["sender_group"] not in ("", "parent"):
+        problems.append(f"profile {name}: unknown sender_group {values['sender_group']!r}")
+        return None
+    values["generic_sender"] = bool(raw.get("generic_sender", True))
+    values["hidden_labels"] = bool(raw.get("hidden_labels", False))
     return Profile(**values)  # type: ignore[arg-type]
 
 

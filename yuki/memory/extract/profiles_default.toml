@@ -103,16 +103,30 @@ self_name = ['//*[class^="accountPopoutButtonWrapper_"]//Text', '//*[class^="pan
 
 # ---------------------------------------------------------------------------
 [[profile]]
-name = "whatsapp"                    # MaxMi + WhatsApp Web DOM; desktop app is WebView2 of web.whatsapp.com
+name = "whatsapp"                    # verified 2026-09-24 (WhatsApp for Windows = WebView2 of web.whatsapp.com, 1:1 chat)
 kind = "conversation"
 hosts = ["web.whatsapp.com"]
 processes = ["whatsapp.exe", "whatsapp.root.exe"]
-header = ['//*[id="main"]//*[aria="banner"]//*[aria="button"]//Text', '//*[id="main"]//*[aria="banner"]//Text']
-list = ['//*[id="main"]//*[aria="application"]', '//*[id="main"]//*[class~="copyable-area"]']
-row = ['//*[aria="row"]', '//*[class~="message-in"]', '//*[class~="message-out"]']
-me_row = ['//*[class~="message-out"]']
-body = ['//*[class~="copyable-text"]//*[class~="selectable-text"]', '//*[class~="selectable-text"]']
-exclude = ['//*[aria="button"][name^="React"]', '//*[class^="reaction"]']
+# Classes are atomic CSS ("x1n2onr6"), so the anchors are ids, ARIA roles and
+# icon names.  The open chat is id="main" (the chat list is id="pane-side"):
+# banner (avatar button with a description, then the chat-name button), the
+# message scroller, and the composer footer.
+header = ['//*[id="main"]/*[aria="banner"]/Button[!desc*=""]']
+list = ['//*[id="main"]']
+# One role="row" per message; each run of one sender's messages shares a parent.
+row = ['//*[aria="row"]']
+# Bubbles carry a screen-reader label "You:" / "<name>:"; Chromium reports
+# most of them IsOffscreen, so hidden_labels keeps them for this anchor.
+hidden_labels = true
+sender = ['//Group[name$=":"]']
+sender_strip = [":"]
+sender_group = "parent"
+generic_sender = false
+# Own bubbles: the time sits in a button with the delivery tick ("11:05 Read");
+# incoming bubbles show a bare time text (found structurally).
+time = ['//Button[name*=":"]/Text']
+me_row = ['//Button[name*=":"]//Image[help^="wds-ic-"]']
+exclude = ['//*[aria="button"][name^="React"]']
 composer = ['//*[id="main"]//*[aria="textbox"]', '//*[id="main"]//Edit']
 date_order = "dmy"
 
