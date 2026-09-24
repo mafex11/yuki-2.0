@@ -10,6 +10,10 @@ Three tools are *control* tools -- ``ask_user``, ``done`` and ``note_to_self``.
 They have no backend function: the dispatcher validates them and hands them back
 to :class:`yuki.agent.loop.Agent`, which owns pausing, finishing and the running
 summary.
+
+The three *memory* tools (``recall``, ``remember_how``, ``correct_memory``) have
+no backend function either: the agent runs them against Yuki's memory through
+:mod:`yuki.agent.memory`, and they are only listed when memory is installed.
 """
 
 from __future__ import annotations
@@ -28,11 +32,16 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: hygiene (:mod:`yuki.agent.context`) to decide what may be stubbed once stale.
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
-    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts"}
+    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts", "recall"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
 CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
+
+#: Tools backed by Yuki's memory (:mod:`yuki.agent.memory`) rather than the
+#: desktop backend. Left out of the tool block entirely when the memory API is
+#: not installed (see :func:`tool_params`), like a policy-gated tool.
+MEMORY_TOOLS: frozenset[str] = frozenset({"recall", "remember_how", "correct_memory"})
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
 #: is dropped from the definitions sent to the model (see :func:`tool_params`)
@@ -394,6 +403,69 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
         "input_schema": _obj({"message": {"type": "string"}}, ["message"]),
     },
+    {
+        "name": "recall",
+        "label": "Remembering",
+        "description": (
+            "Search the user's memory journal — dated facts about what they did, "
+            "watched, read, and who said what to them — for anything you need to "
+            "know about their past activity, people or plans. Returns the matching "
+            "facts as dated lines."
+        ),
+        "input_schema": _obj(
+            {
+                "query": {"type": "string", "description": "What to look for, in plain words."},
+                "since": {
+                    "type": "string",
+                    "description": "Earliest local date or date-time to include, ISO "
+                    "format, e.g. 2026-09-20 or 2026-09-20T18:00.",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "Latest local date or date-time to include, same "
+                    "format; a date alone includes that whole day.",
+                },
+                "app": {
+                    "type": "string",
+                    "description": "Only facts from this application, as recall results "
+                    "name it.",
+                },
+            },
+            ["query"],
+        ),
+    },
+    {
+        "name": "remember_how",
+        "label": "Saving how it's done",
+        "description": (
+            "Save a short procedure that worked on this PC, so next time you can do "
+            "it directly — e.g. how an app accepts a URL, where something lives. "
+            "Only record what you actually confirmed."
+        ),
+        "input_schema": _obj(
+            {
+                "app": {
+                    "type": "string",
+                    "description": "The program it applies to, by its process name as "
+                    "the window list shows it. Omit when it is not about one program.",
+                },
+                "text": {"type": "string", "description": "The procedure, in a sentence or two."},
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "correct_memory",
+        "label": "Noting that",
+        "description": (
+            "Record a correction the user gave you about themselves or their "
+            "preferences."
+        ),
+        "input_schema": _obj(
+            {"text": {"type": "string", "description": "The correction, as the user meant it."}},
+            ["text"],
+        ),
+    },
 ]
 
 #: Name -> schema, for validation and lookups.
@@ -476,7 +548,10 @@ def effective_screenshot_policy(policy: str | None = None) -> str:
 
 
 def available_tool_names(
-    names: Iterable[str] | None = None, *, screenshot_policy: str | None = None
+    names: Iterable[str] | None = None,
+    *,
+    screenshot_policy: str | None = None,
+    memory: bool = True,
 ) -> tuple[str, ...]:
     """Every tool the model may be shown, in registry order.
 
@@ -484,14 +559,18 @@ def available_tool_names(
         names: a requested subset, as understood by :func:`resolve_tool_names`.
         screenshot_policy: the policy in force; ``None`` reads the configured
             default.
+        memory: whether Yuki's memory is installed; without it the
+            :data:`MEMORY_TOOLS` are left out.
 
     Returns:
         The names, minus any whose policy switches them off entirely.
     """
     allowed = resolve_tool_names(names)
-    dropped = set()
+    dropped: set[str] = set()
     if effective_screenshot_policy(screenshot_policy) == "never":
-        dropped = set(POLICY_GATED_TOOLS)
+        dropped |= set(POLICY_GATED_TOOLS)
+    if not memory:
+        dropped |= set(MEMORY_TOOLS)
     return tuple(
         name
         for name in ALL_TOOL_NAMES
@@ -535,6 +614,7 @@ def tool_params(
     cacheable: bool = True,
     names: Iterable[str] | None = None,
     screenshot_policy: str | None = None,
+    memory: bool = True,
 ) -> list[dict[str, Any]]:
     """Return the tool definitions for a request.
 
@@ -547,6 +627,9 @@ def tool_params(
             ``take_screenshot`` is left out of the block entirely instead of being
             offered and then refused -- a refusal the model has to spend a whole
             round trip discovering. ``None`` reads the configured default.
+        memory: Whether Yuki's memory is installed. Without it the memory tools
+            are left out the same way. Fixed per process, so the block stays
+            byte-stable.
 
     Returns:
         A fresh list of tool dicts in registry order, carrying only what the API
@@ -554,7 +637,9 @@ def tool_params(
         and an unexpected key would be rejected. The caller may not mutate the
         module copy.
     """
-    allowed = set(available_tool_names(names, screenshot_policy=screenshot_policy))
+    allowed = set(
+        available_tool_names(names, screenshot_policy=screenshot_policy, memory=memory)
+    )
     tools = [
         {k: v for k, v in t.items() if k != "label"}
         for t in TOOL_SCHEMAS

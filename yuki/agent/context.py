@@ -14,7 +14,8 @@ A perception result is replaced by a one-line stub as soon as a newer result of
 the same kind exists: a later successful ``look_at_window`` of the same hwnd, a
 later desktop overview (explicit ``look_at_desktop`` or the one Yuki attaches to
 every turn -- the same text from the same function), a later ``system_facts``,
-or a later ``take_screenshot`` of the same target. The most recent look of each
+a later ``take_screenshot`` of the same target, or a later ``recall`` with the
+same arguments. The most recent look of each
 window, and of each other kind, always stays in full however old it is. A
 failed look (``is_error``) supersedes nothing: it says nothing about the window.
 
@@ -295,19 +296,36 @@ class ContextManager:
         return attached_text("\n\n".join(parts))
 
     def add_request(
-        self, text: str, overview_text: str, *, self_facts: str | None = None
+        self,
+        text: str,
+        overview_text: str,
+        *,
+        self_facts: str | None = None,
+        memory_text: str | None = None,
     ) -> None:
         """Append a new user request together with the current situation.
 
-        The request is the first block, verbatim and alone; the situation is a
-        second, separately labelled block (see :meth:`situation_text`).
+        The request is the first block, verbatim and alone; the situation is the
+        last, separately labelled block (see :meth:`situation_text`). Between
+        them, when there is one, sits the memory block (what Yuki knows about the
+        user, already framed by :func:`yuki.agent.memory.memory_block_text`). It
+        is background for the whole request and is never stubbed; being before
+        the situation block, it is also where this message's cache breakpoint
+        lands, so it is read from cache on every later round.
         """
-        content = [
-            {"type": "text", "text": text},
-            {"type": "text", "text": self.situation_text(overview_text, self_facts)},
-        ]
+        content = [{"type": "text", "text": text}]
+        if memory_text and memory_text.strip():
+            content.append({"type": "text", "text": memory_text})
+        content.append(
+            {"type": "text", "text": self.situation_text(overview_text, self_facts)}
+        )
         self._slots.append(
-            _Slot(role="user", content=content, turn=self.logger.turn, situation_pos=1)
+            _Slot(
+                role="user",
+                content=content,
+                turn=self.logger.turn,
+                situation_pos=len(content) - 1,
+            )
         )
 
     def add_assistant(self, content: Any) -> None:
@@ -506,7 +524,9 @@ class ContextManager:
             except (TypeError, ValueError):
                 pass
             return (name, str(hwnd))
-        if name == "take_screenshot":
+        if name in ("take_screenshot", "recall"):
+            # A newer recall with the same arguments supersedes an older one; a
+            # recall asking anything else is a different look.
             return (name, _canonical(tool_input))
         return (name,)
 

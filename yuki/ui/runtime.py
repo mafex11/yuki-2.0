@@ -40,6 +40,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QThread, Signal
 
 from yuki.agent.loop import Agent
+from yuki.agent.memory import MemoryAccess, default_memory
 from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
     ALL_TOOL_NAMES,
@@ -298,6 +299,9 @@ class AgentRuntime(QObject):
         worker_agent: Override the worker agent.
         front_desk_agent: Override the front-desk agent.
         front_desk_blocked: The backend wrapper for the front desk.
+        memory: Yuki's memory, shared by both lanes and the tray (so the
+            portrait is fetched once for all of them). Defaults to the
+            process-wide one.
 
     Signals:
         started: ``(lane, id, request)`` -- a lane picked the request up.
@@ -333,10 +337,12 @@ class AgentRuntime(QObject):
         worker_agent: Agent | None = None,
         front_desk_agent: Agent | None = None,
         front_desk_blocked: HandsBlockedBackend | None = None,
+        memory: MemoryAccess | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.ui_log = ui_log
+        self.memory = memory if memory is not None else default_memory()
         self._ids = itertools.count(1)
         self._worker_outstanding: list[int] = []
 
@@ -349,6 +355,7 @@ class AgentRuntime(QObject):
                     settings.sessions_dir, console=console, session_id=f"{session}-worker"
                 ),
                 lane=WORKER,
+                memory=self.memory,
             )
         if front_desk_agent is None:
             front_desk_blocked = front_desk_blocked or HandsBlockedBackend()
@@ -366,6 +373,7 @@ class AgentRuntime(QObject):
                 extra_instructions=FRONT_DESK_INSTRUCTIONS,
                 prewarm=False,  # it cannot run a shell, so there is nothing to warm
                 lane=FRONT_DESK,
+                memory=self.memory,
             )
 
         self.worker = Lane(WORKER, worker_agent, self)

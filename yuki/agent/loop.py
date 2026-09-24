@@ -37,10 +37,12 @@ from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 from yuki.agent.context import ContextManager
+from yuki.agent.memory import MemoryAccess, default_memory, memory_block_text
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
     AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
+    MEMORY_TOOLS,
     PERCEPTION_TOOLS,
     Backend,
     Dispatcher,
@@ -161,6 +163,12 @@ class Agent:
         record_requests: Append one line per finished request to
             ``settings.requests_csv_path``. The ``request_summary`` JSONL record
             is written either way.
+        memory: Yuki's memory (:class:`~yuki.agent.memory.MemoryAccess`): the
+            portrait and know-how attached to every request, and what the
+            ``recall`` / ``remember_how`` / ``correct_memory`` tools run
+            against. Defaults to the process-wide one on the real memory
+            database; offline checks pass one built on a stub client. Memory
+            that is missing or failing never fails a request.
 
     Raises:
         ValueError: If ``tool_names`` contains a name that is not a tool.
@@ -179,8 +187,10 @@ class Agent:
         prewarm: bool = True,
         lane: str = "main",
         record_requests: bool = True,
+        memory: MemoryAccess | None = None,
     ) -> None:
         self.settings = settings or Settings()
+        self.memory = memory if memory is not None else default_memory()
         self.lane = lane
         self.record_requests = record_requests
         self.logger = logger or SessionLogger(self.settings.sessions_dir)
@@ -204,6 +214,13 @@ class Agent:
         self._waited_s = 0.0
         self._model_calls = 0
         self._call_history: dict[str, list[tuple[str, str]]] = {}
+        #: The request being handled, handed to ``remember_how`` as its source.
+        self._request_text: str | None = None
+        #: The newest desktop overview as plain data (for the foreground app).
+        self._overview_payload: Any = None
+        #: ``(portrait text, turn)`` of the last portrait attached in full to
+        #: this conversation; an identical one is not sent again.
+        self._portrait_sent: tuple[str, int] | None = None
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None``
         #: while one is running). Read by the UI to label the finished card.
@@ -252,6 +269,7 @@ class Agent:
 
         def warm() -> None:
             self._warm_model()
+            self._warm_memory()
             self._warm_shell()
 
         thread = threading.Thread(target=warm, name="yuki-prewarm", daemon=True)
@@ -270,6 +288,19 @@ class Agent:
             "shell_prewarm",
             live=live,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+
+    def _warm_memory(self) -> None:
+        """Open memory and cache the portrait before the first request. Never raises."""
+        if not self.memory.installed:
+            return
+        result = self.memory.warm()
+        self.logger.log(
+            "memory_prewarm",
+            source=result.source,
+            portrait_chars=len(result.portrait or ""),
+            error=result.error,
+            elapsed_ms=result.elapsed_ms,
         )
 
     def _warm_model(self) -> None:
@@ -428,6 +459,7 @@ class Agent:
         self._waited_s = 0.0
         self._model_calls = 0
         self._call_history = {}
+        self._request_text = request
         self._reset_accounting()
         self.last_summary = None
         started_at = datetime.now()
@@ -442,7 +474,9 @@ class Agent:
         try:
             overview, _ = self._capture_overview()
             self._close_dangling_tools(overview)
-            self.context.add_request(request, overview)
+            self.context.add_request(
+                request, overview, memory_text=self._memory_context(request)
+            )
             drive = self._drive()
             for event in drive:
                 if isinstance(event, Final):
@@ -479,6 +513,8 @@ class Agent:
         self._cost_usd = 0.0
         self._unpriced: set[str] = set()
         self._models_used: list[str] = []
+        #: What the memory block of this request carried (``request_summary``).
+        self._memory_info: dict[str, Any] = {}
 
     def _account_response(self, model: str, usage: Any) -> None:
         """Fold one real (non-warm-up) response into this request's totals.
@@ -534,6 +570,13 @@ class Agent:
                 "thinking_tokens": self.logger.usage.thinking_tokens,
                 "cost_usd": cost,
                 "unpriced_models": sorted(self._unpriced),
+                "memory": {
+                    **self._memory_info,
+                    **{
+                        f"{name}_calls": self._tool_counts.get(name, 0)
+                        for name in sorted(MEMORY_TOOLS)
+                    },
+                },
             }
             self.last_summary = summary
             self.logger.request_summary(summary)
@@ -941,6 +984,10 @@ class Agent:
         """
         if self.tool_names is not None and name not in self.tool_names:
             return unavailable_tool(name, self.tool_names)
+        if name in MEMORY_TOOLS:
+            if not self.memory.installed:
+                return unavailable_tool(name, self.tool_names or ())
+            return self.memory.run_tool(name, tool_input, request=self._request_text)
         return self.dispatcher.dispatch(name, tool_input)
 
     def _skip(self, tool_use_id: str, name: str, text: str) -> dict[str, Any]:
@@ -1027,12 +1074,67 @@ class Agent:
             self.logger.log("self_facts", **facts)
             return message, facts_text
         self._overview_s += time.perf_counter() - looked
+        self._overview_payload = payload
         if isinstance(payload, dict):
             payload = {**payload, "self_facts": facts}
         self.logger.perception(
             "look_at_desktop", size_chars=len(text), elapsed_ms=elapsed, payload=payload
         )
         return text, facts_text
+
+    # -- memory ------------------------------------------------------------
+
+    def _memory_context(self, request: str) -> str | None:
+        """The memory block for this request's first message, or ``None``.
+
+        Portrait (cached in-process by :class:`MemoryAccess`) plus the know-how
+        lines memory finds for the foreground app and the request text. A
+        portrait identical to one already attached in full earlier in this
+        conversation -- still there, never stubbed -- is named rather than sent
+        again. Logs ``memory_context`` every time, whatever happened; never
+        raises.
+        """
+        started = time.perf_counter()
+        app = _foreground_app(self._overview_payload)
+        try:
+            fetched = self.memory.context(app=app, query=request)
+            repeated = None
+            if (
+                fetched.portrait
+                and self._portrait_sent is not None
+                and self._portrait_sent[0] == fetched.portrait
+            ):
+                repeated = self._portrait_sent[1]
+            text = memory_block_text(fetched, repeated_turn=repeated)
+        except Exception as exc:  # memory must never break a request
+            self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
+            self._memory_info = {"source": "error", "context_chars": 0, "portrait_chars": 0}
+            return None
+        portrait_chars = len(fetched.portrait or "") if text and repeated is None else 0
+        if text and fetched.portrait and repeated is None:
+            self._portrait_sent = (fetched.portrait, self.logger.turn)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        self._memory_info = {
+            "source": fetched.source,
+            "context_chars": len(text or ""),
+            "portrait_chars": portrait_chars,
+            "portrait_repeated_from_turn": repeated,
+            "knowhow_lines": len(fetched.knowhow) if text else 0,
+            "lookup_ms": elapsed_ms,
+        }
+        self.logger.log(
+            "memory_context",
+            chars=len(text or ""),
+            source=fetched.source,
+            attached=text is not None,
+            portrait_chars=portrait_chars,
+            portrait_repeated_from_turn=repeated,
+            knowhow_lines=len(fetched.knowhow),
+            app=app,
+            error=fetched.error,
+            elapsed_ms=elapsed_ms,
+        )
+        return text
 
     # -- self-awareness facts ----------------------------------------------
 
@@ -1100,6 +1202,7 @@ class Agent:
             screenshot_policy=getattr(
                 self.dispatcher, "screenshot_policy", self.settings.screenshot_policy
             ),
+            memory=self.memory.installed,
         )
         if warmup:
             # No conversation breakpoint: the placeholder must never be cached.
@@ -1398,6 +1501,24 @@ def _view_target(
     if hwnd is not None:
         return hwnd, "the window in front after the action"
     return None, "the foreground window"
+
+
+def _foreground_app(overview: Any) -> str | None:
+    """Process name of the app the user is in, from a desktop overview's plain data.
+
+    The foreground window when it is a listed window; otherwise (Yuki's own
+    overlay is in front, and it is never listed) the listed window at the top
+    of the Z-order that is not minimised.
+    """
+    if not isinstance(overview, dict):
+        return None
+    windows = [w for w in overview.get("windows") or [] if isinstance(w, dict)]
+    foreground = overview.get("foreground_hwnd")
+    chosen = next((w for w in windows if foreground and w.get("hwnd") == foreground), None)
+    if chosen is None:
+        chosen = next((w for w in windows if not w.get("is_minimized")), None)
+    name = str((chosen or {}).get("process_name") or "").strip()
+    return name or None
 
 
 def _block_confirmed(event: Any) -> bool:
