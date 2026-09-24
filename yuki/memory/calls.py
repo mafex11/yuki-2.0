@@ -28,18 +28,20 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
    unless it is headphones/headset (or a device the user listed as
    headphones), the microphone is not opened (``waiting_headphones``) and the
    card says why.
-4. **Transcribe here.** Shared-mode WASAPI capture of the input device the
-   call app records from, in memory only (never written to disk); a simple
-   energy gate drops silence; speech is cut into rolling chunks at pauses and
-   transcribed by a local backend (:func:`make_backend`, ``call_stt_model``:
-   faster-whisper on CUDA, else the CPU fallback). Only text is kept: every
-   ``flush_every_s`` and at the end, the utterances go to the store as a
-   capture of kind ``my_call_side`` (encrypted), which the journal turns into
-   facts and the user's own commitments (:mod:`yuki.memory.journal`).
+4. **Keep, do not transcribe.** Shared-mode WASAPI capture of the input
+   device the call app records from, into memory; a speech gate (energy
+   floor, then Silero VAD on what is louder) drops everything that is not
+   speech; speech is cut into rolling chunks at pauses, compressed (Opus),
+   encrypted with the store's key (AES-256-GCM, DPAPI-protected) and written
+   to the spool next to the database (:meth:`Store.write_spool`) - never in
+   plaintext. No speech-to-text model runs during a call: the deferred
+   transcriber (:mod:`yuki.memory.transcribe`) does that when the PC is free,
+   deletes each chunk's audio once its words are stored, and hands the call
+   to the journal (``my_call_side``: facts and the user's own commitments).
 
 Logs are content-free: ``call_detected``, ``call_consent``,
 ``call_recording_start``/``call_recording_stop``, ``call_chunk`` (audio and
-speech seconds, ms, device, GPU load), never words.
+speech seconds, bytes spooled, encode ms, VAD CPU), never words or audio.
 """
 
 from __future__ import annotations
@@ -68,7 +70,9 @@ from yuki.memory.store import (
 )
 
 RATE = 16_000
-FRAME_S = 0.03
+#: One gate frame = one Silero VAD window (512 samples at 16 kHz).
+FRAME = 512
+FRAME_S = FRAME / RATE
 
 # ---------------------------------------------------------------------------
 # Configuration: the privacy file's [calls] table (data, not code paths)
@@ -81,6 +85,7 @@ class CallConfig:
     apps: frozenset[str] = frozenset()
     names: tuple[tuple[str, str], ...] = ()
     poll_s: float = 5.0
+    holders_backstop_s: float = 60.0
     end_grace_s: float = 30.0
     ask_timeout_s: float = 120.0
     headphone_form_factors: tuple[str, ...] = ("headphones", "headset", "handset")
@@ -90,12 +95,13 @@ class CallConfig:
     stt_fallback: str = "faster-whisper:small"
     model_dir: str = ""
     languages: tuple[str, ...] = ()
-    gate_dbfs: float = -45.0
+    gate_dbfs: float = -50.0
+    vad: bool = True
+    vad_threshold: float = 0.5
     min_speech_s: float = 0.5
     chunk_min_s: float = 6.0
     chunk_max_s: float = 25.0
     pause_s: float = 0.7
-    flush_every_s: float = 300.0
 
     @classmethod
     def from_dict(cls, table: dict | None) -> CallConfig:
@@ -118,7 +124,8 @@ class CallConfig:
         names = tuple((app_key(k) or "", str(v)) for k, v in (t.get("names") or {}).items() if str(v).strip())
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
-            poll_s=max(1.0, num("poll_s", d.poll_s)), end_grace_s=max(0.0, num("end_grace_s", d.end_grace_s)),
+            poll_s=max(1.0, num("poll_s", d.poll_s)),
+            holders_backstop_s=max(5.0, num("holders_backstop_s", d.holders_backstop_s)), end_grace_s=max(0.0, num("end_grace_s", d.end_grace_s)),
             ask_timeout_s=max(10.0, num("ask_timeout_s", d.ask_timeout_s)),
             headphone_form_factors=tuple(s.casefold() for s in strings("headphone_form_factors",
                                                                         d.headphone_form_factors)),
@@ -128,9 +135,10 @@ class CallConfig:
             stt_fallback=str(t.get("call_stt_fallback") or d.stt_fallback).strip(),
             model_dir=str(t.get("model_dir") or "").strip(),
             languages=tuple(s.casefold() for s in strings("languages", ())),
-            gate_dbfs=num("gate_dbfs", d.gate_dbfs), min_speech_s=num("min_speech_s", d.min_speech_s),
+            gate_dbfs=num("gate_dbfs", d.gate_dbfs), vad=bool(t.get("vad", d.vad)),
+            vad_threshold=num("vad_threshold", d.vad_threshold), min_speech_s=num("min_speech_s", d.min_speech_s),
             chunk_min_s=num("chunk_min_s", d.chunk_min_s), chunk_max_s=max(2.0, num("chunk_max_s", d.chunk_max_s)),
-            pause_s=num("pause_s", d.pause_s), flush_every_s=max(10.0, num("flush_every_s", d.flush_every_s)),
+            pause_s=num("pause_s", d.pause_s),
         )
 
     def name_of(self, key: str | None, fallback: str = "") -> str:
@@ -409,10 +417,68 @@ class Chunk:
         return len(self.audio) / RATE
 
 
-class Chunker:
-    """Energy gate + rolling chunks: speech is cut at pauses, silence never becomes a chunk.
+def silero_path() -> Path | None:
+    """Silero VAD v6 (ONNX, 1.2 MB) as shipped inside faster-whisper, found without importing it."""
+    import importlib.util
 
-    30 ms frames under ``gate_dbfs`` are silence. While nothing voiced has
+    spec = importlib.util.find_spec("faster_whisper")
+    for base in (spec.submodule_search_locations or []) if spec else []:
+        path = Path(base) / "assets" / "silero_vad_v6.onnx"
+        if path.exists():
+            return path
+    return None
+
+
+class SileroVad:
+    """Silero VAD (ONNX, CPU, one thread, no arena), streamed window by window with its state carried over.
+
+    ``probs(windows)`` takes consecutive 512-sample windows ``(n, 512)`` and
+    returns their speech probabilities; the 64-sample context and the LSTM
+    state run on across calls, as in faster-whisper's own use of the model.
+    """
+
+    CONTEXT = 64
+
+    def __init__(self, path: Path | None = None) -> None:
+        import onnxruntime as ort
+
+        path = path or silero_path()
+        if path is None:
+            raise FileNotFoundError("silero_vad_v6.onnx not found (faster-whisper assets)")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False
+        opts.log_severity_level = 4
+        self.session = ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
+        self.reset()
+        self.windows = 0
+        self.cpu_s = 0.0
+
+    def reset(self) -> None:
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._tail = np.zeros(self.CONTEXT, dtype=np.float32)
+
+    def probs(self, windows: np.ndarray) -> np.ndarray:
+        w = np.asarray(windows, dtype=np.float32).reshape(-1, FRAME)
+        ctx = np.concatenate([self._tail[None, :], w[:-1, -self.CONTEXT:]], axis=0)
+        batch = np.concatenate([ctx, w], axis=1)
+        t0 = time.thread_time()
+        out, self._h, self._c = self.session.run(None, {"input": batch, "h": self._h, "c": self._c})
+        self.cpu_s += time.thread_time() - t0
+        self._tail = w[-1, -self.CONTEXT:].copy()
+        self.windows += len(w)
+        return np.asarray(out, dtype=np.float32).reshape(-1)[: len(w)]
+
+
+class Chunker:
+    """Speech gate + rolling chunks: speech is cut at pauses, silence never becomes a chunk.
+
+    32 ms frames under ``gate_dbfs`` are silence (cheap: no model runs on
+    them); the rest are speech only when Silero VAD says so (``vad``, with
+    hysteresis: ``vad_threshold`` to start, 0.15 lower to go on), or, without
+    a VAD, whenever they are loud enough. While nothing voiced has
     come, silence is dropped as it arrives (a short pre-roll is kept). A chunk
     ends at a pause of ``pause_s`` once it is ``chunk_min_s`` long, after a
     pause of ``4 * pause_s`` whatever its length (a short "yes"), or at
@@ -420,9 +486,11 @@ class Chunker:
     is counted and dropped, never transcribed.
     """
 
-    def __init__(self, cfg: CallConfig) -> None:
+    def __init__(self, cfg: CallConfig, vad: SileroVad | None = None) -> None:
         self.cfg = cfg
-        self.frame = int(RATE * FRAME_S)
+        self.vad = vad
+        self._in_speech = False
+        self.frame = FRAME
         self._buf: list[np.ndarray] = []
         self._voiced: list[bool] = []
         self._start_at: float | None = None
@@ -444,9 +512,8 @@ class Chunker:
     def feed(self, at: float, samples: np.ndarray) -> list[Chunk]:
         out: list[Chunk] = []
         preroll = max(1, int(0.3 / FRAME_S))
-        for t, frame in self._frames(at, samples):
-            rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))) + 1e-12
-            voiced = 20.0 * np.log10(rms) >= self.cfg.gate_dbfs
+        frames = self._frames(at, samples)
+        for t, frame, voiced in zip((t for t, _ in frames), (f for _, f in frames), self._voicing(frames)):
             if not self._buf:
                 self._start_at = t
             self._buf.append(frame)
@@ -470,6 +537,24 @@ class Chunker:
                 chunk = self._cut(keep_tail=min(trailing, preroll))
                 if chunk is not None:
                     out.append(chunk)
+        return out
+
+    def _voicing(self, frames: list[tuple[float, np.ndarray]]) -> list[bool]:
+        if not frames:
+            return []
+        block = np.stack([f for _, f in frames]).astype(np.float64)
+        loud = 20.0 * np.log10(np.sqrt(np.mean(block ** 2, axis=1)) + 1e-12) >= self.cfg.gate_dbfs
+        if self.vad is None:
+            return [bool(x) for x in loud]
+        if not loud.any():               # nothing above the floor: the model is not run
+            self._in_speech = False
+            return [False] * len(frames)
+        probs = self.vad.probs(block.astype(np.float32))
+        out = []
+        for is_loud, p in zip(loud, probs):
+            limit = self.cfg.vad_threshold - (0.15 if self._in_speech else 0.0)
+            self._in_speech = bool(is_loud and p >= limit)
+            out.append(self._in_speech)
         return out
 
     def _cut(self, keep_tail: int) -> Chunk | None:
@@ -638,47 +723,88 @@ def load_backend(cfg: CallConfig, log: Callable[..., Any] | None = None) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def encode_speech(audio: np.ndarray, *, bitrate: int = 24_000) -> tuple[bytes, str]:
+    """16 kHz mono float32 -> ``(bytes, codec)``: Opus in Ogg (PyAV's libopus, in memory), else int16 + zlib.
+
+    Never touches the disk: the caller encrypts the bytes before anything is written.
+    """
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767.0).astype(np.int16)
+    try:
+        import io
+
+        import av
+
+        buf = io.BytesIO()
+        with av.open(buf, "w", format="ogg") as out:
+            stream = out.add_stream("libopus", rate=RATE)
+            stream.bit_rate = int(bitrate)
+            stream.layout = "mono"
+            frame = av.AudioFrame.from_ndarray(pcm.reshape(1, -1), format="s16", layout="mono")
+            frame.sample_rate = RATE
+            for packet in stream.encode(frame):
+                out.mux(packet)
+            for packet in stream.encode(None):
+                out.mux(packet)
+        return buf.getvalue(), "opus"
+    except Exception:
+        import zlib
+
+        return zlib.compress(pcm.tobytes(), 6), "pcm16-zlib"
+
+
+def decode_speech(payload: bytes, codec: str) -> np.ndarray:
+    """:func:`encode_speech`'s bytes back to 16 kHz mono float32 (in memory)."""
+    if codec == "pcm16-zlib":
+        import zlib
+
+        return np.frombuffer(zlib.decompress(payload), dtype=np.int16).astype(np.float32) / 32768.0
+    import io
+
+    from faster_whisper.audio import decode_audio
+
+    return np.asarray(decode_audio(io.BytesIO(payload), sampling_rate=RATE), dtype=np.float32)
+
+
 @dataclass
 class RecordingStats:
     chunks: int = 0
     chunks_silent: int = 0
     audio_s: float = 0.0
     speech_s: float = 0.0
-    utterances: int = 0
-    captures: int = 0
-    transcribe_ms: list[float] = field(default_factory=list)
-    rtf: list[float] = field(default_factory=list)
+    bytes: int = 0
+    encode_ms: list[float] = field(default_factory=list)
     cpu_s: float = 0.0
-    gpu_util_max: int | None = None
-    vram_used_mb_max: int | None = None
     errors: int = 0
 
 
 class RecordingSession:
-    """Records one call's user side on its own thread; :meth:`pause` closes the microphone, :meth:`stop` ends it.
+    """Records one call's user side on its own thread: gate, compress, encrypt, spool. No speech-to-text here.
 
-    The backend is loaded at the first chunk with speech (a silent call never
-    loads a model); audio waits in memory meanwhile. Utterances are handed to
-    the store every ``flush_every_s`` and at the end; audio never is.
+    :meth:`pause` closes the microphone (output left headphones), :meth:`stop`
+    ends it. Chunks the gate passes are Opus-compressed in memory, encrypted
+    with the store's key and written to the spool (:meth:`Store.write_spool`);
+    the deferred transcriber (:mod:`yuki.memory.transcribe`) turns them into
+    text later, when the PC is free, and deletes them.
     """
 
     def __init__(self, store: Store, *, call_id: int, app: str, process: str | None, cfg: CallConfig,
-                 source_factory: Callable[[], Any], backend: Callable[[], Any], log: Callable[..., Any],
-                 gpu: Gpu | None = None) -> None:
+                 source_factory: Callable[[], Any], log: Callable[..., Any]) -> None:
         self.store = store
         self.call_id = call_id
         self.app = app
         self.process = process
         self.cfg = cfg
         self._source_factory = source_factory
-        self._backend_fn = backend
-        self.backend: Any = None
         self.log = log
-        self.gpu = gpu
-        self.chunker = Chunker(cfg)
+        vad = None
+        if cfg.vad:
+            try:
+                vad = SileroVad()
+            except Exception as exc:   # the energy gate alone still keeps silence out
+                log("call_vad_unavailable", call_id=call_id, error=f"{type(exc).__name__}: {exc}")
+        self.chunker = Chunker(cfg, vad)
         self.stats = RecordingStats()
-        self._pending: list[dict[str, Any]] = []
-        self._pending_since = time.time()
+        self._seq = 0
         self._source: Any = None
         self._source_lock = threading.Lock()
         self._stop = threading.Event()
@@ -688,6 +814,7 @@ class RecordingSession:
         self.device: str | None = None
         self.opened_as: str | None = None
         self.stop_reason: str | None = None
+        self.backend = None   # no speech-to-text during a call
 
     # -- control -------------------------------------------------------------
 
@@ -710,24 +837,19 @@ class RecordingSession:
                 self._source = source
 
     def pause(self) -> None:
-        """Close the microphone now (output left headphones); what was heard so far is still transcribed."""
+        """Close the microphone now; what was heard so far is still spooled."""
         with self._source_lock:
             source, self._source = self._source, None
         if source is not None:
             source.stop()
 
-    def stop(self, reason: str, *, timeout_s: float = 120.0) -> RecordingStats:
-        """Close the microphone, transcribe what is left, hand the rest to the store; returns the stats."""
+    def stop(self, reason: str, *, timeout_s: float = 30.0) -> RecordingStats:
+        """Close the microphone, spool what is left; returns the stats."""
         self.stop_reason = reason
         self.pause()
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout_s)
-        if self.backend is not None:
-            try:
-                self.backend.close()
-            except Exception:
-                pass
         return self.stats
 
     def wait_drained(self, timeout_s: float) -> bool:
@@ -737,112 +859,79 @@ class RecordingSession:
     # -- thread --------------------------------------------------------------
 
     def _run(self) -> None:
+        c0 = time.thread_time()
         try:
             while not self._stop.is_set():
                 source = self._source
                 if source is None:
                     self._stop.wait(0.25)
-                    self._maybe_flush(final=False)
                     continue
                 got = source.read(0.25)
                 if got is None:
                     if getattr(source, "done", None) is not None and source.done.is_set():
                         for chunk in self.chunker.flush():
-                            self._transcribe(chunk)
+                            self._spool(chunk)
                         self._drain.set()
-                    self._maybe_flush(final=False)
                     continue
                 at, samples = got
                 for chunk in self.chunker.feed(at, samples):
-                    self._transcribe(chunk)
-                self._maybe_flush(final=False)
+                    self._spool(chunk)
             for chunk in self.chunker.flush():
-                self._transcribe(chunk)
+                self._spool(chunk)
         except Exception as exc:
             self.stats.errors += 1
             self.log("error", where="calls.recording", error=f"{type(exc).__name__}: {exc}",
                      traceback=traceback.format_exc())
         finally:
-            self._maybe_flush(final=True)
+            self.stats.cpu_s = time.thread_time() - c0
+            self.stats.chunks_silent = self.chunker.silent_dropped
+            self._update_row()
 
-    def _transcribe(self, chunk: Chunk) -> None:
-        import psutil
-
-        self.stats.chunks_silent = self.chunker.silent_dropped
-        if self.backend is None:
-            self.backend = self._backend_fn()
-            self.log("call_stt_ready", call_id=self.call_id, stt_model=self.backend.name, stt_device=self.backend.device,
-                     load_ms=round(getattr(self.backend, "load_ms", 0.0)))
-            self.store.update_call(self.call_id, stt_model=self.backend.name, stt_device=self.backend.device)
-        proc = psutil.Process()
-        c0 = sum(proc.cpu_times()[:2])
+    def _spool(self, chunk: Chunk) -> None:
         t0 = time.perf_counter()
         try:
-            segments, info = self.backend.transcribe(chunk.audio)
+            payload, codec = encode_speech(chunk.audio)
+            self._seq += 1
+            self.store.write_spool(self.call_id, self._seq, start_at=chunk.start_at, audio_s=chunk.seconds,
+                                   speech_s=chunk.speech_s, payload=payload, codec=codec)
         except Exception as exc:
             self.stats.errors += 1
-            self.log("error", where="calls.transcribe", error=f"{type(exc).__name__}: {exc}")
+            self.log("error", where="calls.spool", error=f"{type(exc).__name__}: {exc}")
             return
         ms = (time.perf_counter() - t0) * 1000.0
-        cpu = sum(proc.cpu_times()[:2]) - c0
-        gpu = self.gpu.snapshot() if self.gpu is not None else None
-        for s in segments:
-            self._pending.append({"at": round(chunk.start_at + s.start, 2), "end": round(chunk.start_at + s.end, 2),
-                                  "text": s.text, "lang": s.lang})
         st = self.stats
         st.chunks += 1
         st.audio_s += chunk.seconds
         st.speech_s += chunk.speech_s
-        st.utterances += len(segments)
-        st.transcribe_ms.append(ms)
-        st.rtf.append(ms / 1000.0 / max(chunk.seconds, 1e-6))
-        st.cpu_s += cpu
-        if gpu:
-            st.gpu_util_max = max(st.gpu_util_max or 0, gpu["gpu_util"])
-            st.vram_used_mb_max = max(st.vram_used_mb_max or 0, gpu["vram_used_mb"])
-        self.log("call_chunk", call_id=self.call_id, audio_s=round(chunk.seconds, 2), speech_s=round(chunk.speech_s, 2),
-                 ms=round(ms, 1), rtf=round(st.rtf[-1], 3), cpu_s=round(cpu, 2), segments=len(segments),
-                 lang=info.get("lang"), stt_device=self.backend.device, gpu=gpu)
-        del chunk   # the audio goes with it
-
-    def _maybe_flush(self, *, final: bool) -> None:
-        due = final or (self._pending and time.time() - self._pending_since >= self.cfg.flush_every_s)
-        if not due:
-            return
-        items, self._pending = self._pending, []
-        self._pending_since = time.time()
-        st = self.stats
+        st.bytes += len(payload)
+        st.encode_ms.append(ms)
         st.chunks_silent = self.chunker.silent_dropped
-        if items:
-            try:
-                cid = self.store.add_call_side(self.call_id, app=self.app, process=self.process,
-                                               started_at=items[0]["at"], ended_at=items[-1]["end"],
-                                               utterances=items, final=final)
-                if cid is not None:
-                    st.captures += 1
-            except Exception as exc:
-                st.errors += 1
-                self.log("error", where="calls.flush", error=f"{type(exc).__name__}: {exc}")
+        vad = self.chunker.vad
+        self.log("call_chunk", call_id=self.call_id, audio_s=round(chunk.seconds, 2), speech_s=round(chunk.speech_s, 2),
+                 bytes=len(payload), codec=codec, ms=round(ms, 1), silent_dropped=st.chunks_silent,
+                 vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None)
+        self._update_row()
+        del chunk   # the audio goes with it; only the encrypted file is left
+
+    def _update_row(self) -> None:
+        st = self.stats
         try:
-            self.store.update_call(
-                self.call_id, chunks=st.chunks, chunks_silent=st.chunks_silent, speech_s=round(st.speech_s, 2),
-                audio_s=round(st.audio_s, 2), utterances=st.utterances, transcribe_ms=round(sum(st.transcribe_ms), 1))
+            self.store.update_call(self.call_id, chunks=st.chunks, chunks_silent=st.chunks_silent,
+                                   speech_s=round(st.speech_s, 2), audio_s=round(st.audio_s, 2))
         except Exception:
             pass
 
 
 def summarize(stats: RecordingStats) -> dict[str, Any]:
-    ms = sorted(stats.transcribe_ms)
+    ms = sorted(stats.encode_ms)
 
     def pct(p: float) -> float | None:
         return round(ms[min(len(ms) - 1, int(p * len(ms)))], 1) if ms else None
 
     return {"chunks": stats.chunks, "chunks_silent": stats.chunks_silent, "audio_s": round(stats.audio_s, 1),
-            "speech_s": round(stats.speech_s, 1), "utterances": stats.utterances, "captures": stats.captures,
-            "chunk_ms": {"p50": pct(0.5), "p90": pct(0.9), "max": pct(1.0)},
-            "rtf_mean": round(sum(stats.rtf) / len(stats.rtf), 3) if stats.rtf else None,
-            "cpu_s": round(stats.cpu_s, 1), "gpu_util_max": stats.gpu_util_max,
-            "vram_used_mb_max": stats.vram_used_mb_max, "errors": stats.errors}
+            "speech_s": round(stats.speech_s, 1), "spooled_bytes": stats.bytes,
+            "encode_ms": {"p50": pct(0.5), "max": pct(1.0)}, "cpu_s": round(stats.cpu_s, 2), "errors": stats.errors}
+
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +968,65 @@ class _NamedEvent:
             self.handle = None
 
 
+class _ConsentStoreWatch:
+    """A change notification on the ConsentStore's microphone key (``RegNotifyChangeKeyValue``, subtree,
+    values): Windows writes it when an app starts or stops using the microphone, so the holders are read
+    only then instead of on every poll."""
+
+    _KEY = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+
+    def __init__(self) -> None:
+        import winreg
+
+        self.ok = False
+        self._evt = None
+        self._k = ctypes.WinDLL("kernel32")
+        self._a = ctypes.WinDLL("advapi32")
+        self._k.CreateEventW.restype = ctypes.c_void_p
+        self._k.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        self._k.WaitForMultipleObjects.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+        self._k.WaitForMultipleObjects.restype = ctypes.c_uint32
+        self._k.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._a.RegNotifyChangeKeyValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p,
+                                                    ctypes.c_int]
+        self._a.RegNotifyChangeKeyValue.restype = ctypes.c_long
+        try:
+            self._key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._KEY, 0, winreg.KEY_NOTIFY | winreg.KEY_READ)
+        except OSError:
+            self._key = None
+            return
+        self._evt = self._k.CreateEventW(None, False, False, None)
+        self.ok = bool(self._evt) and self._arm()
+
+    def _arm(self) -> bool:
+        # REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET over the subtree, asynchronous (sets the event)
+        return self._a.RegNotifyChangeKeyValue(ctypes.c_void_p(int(self._key)), 1, 0x1 | 0x4,
+                                               ctypes.c_void_p(self._evt), 1) == 0
+
+    def wait(self, event: _NamedEvent, timeout_s: float) -> str:
+        ms = int(max(0.0, timeout_s) * 1000)
+        if event.handle:
+            handles = (ctypes.c_void_p * 2)(event.handle, self._evt)
+            r = self._k.WaitForMultipleObjects(2, handles, False, ms)
+            which = {0: "event", 1: "registry"}.get(r, "timeout")
+        else:
+            handles = (ctypes.c_void_p * 1)(self._evt)
+            r = self._k.WaitForMultipleObjects(1, handles, False, ms)
+            which = "registry" if r == 0 else "timeout"
+        if which == "registry":
+            self.ok = self._arm()
+        return which
+
+    def close(self) -> None:
+        try:
+            if self._key is not None:
+                self._key.Close()
+            if self._evt:
+                self._k.CloseHandle(ctypes.c_void_p(self._evt))
+        except Exception:
+            pass
+
+
 @dataclass
 class _Active:
     call_id: int
@@ -906,7 +1054,6 @@ class CallWorker:
         holders_fn: Callable[[], list[dict]] | None = None,
         headphones_fn: Callable[[CallConfig], tuple[bool, dict]] = headphones_now,
         source_factory: Callable[[CallConfig, str | None], Any] | None = None,
-        backend_fn: Callable[[CallConfig], Any] | None = None,
         config: CallConfig | None = None,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
@@ -918,15 +1065,20 @@ class CallWorker:
         self._log_fn = log
         self.meeting_fn = meeting_fn
         own = own_executables()
+        #: Who holds the microphone is read again only when Windows changed the ConsentStore key
+        #: (registry change notification) or every ``holders_backstop_s``; a poll between is a cached read.
+        self._watch_registry = holders_fn is None
         self.holders_fn = holders_fn or (lambda: mic_holders(own))
+        self._holders: list[dict] = []
+        self._holders_at = 0.0
+        self._holders_dirty = True
+        self.holder_reads = 0
         self.headphones_fn = headphones_fn
         self.source_factory = source_factory or (lambda cfg, app: MicSource(capture_device_for(cfg, app)))
-        self.backend_fn = backend_fn or (lambda cfg: load_backend(cfg, self._log))
         self.active: _Active | None = None
         self.paused = False
         self._event: _NamedEvent | None = None
         self._stop = threading.Event()
-        self._gpu: Gpu | None = None
         self._errors = 0
 
     # -- plumbing ------------------------------------------------------------
@@ -966,6 +1118,7 @@ class CallWorker:
         stop = stop or self._stop
         self._stop = stop
         self._event = _NamedEvent(call_event_name(self.db_path))
+        watch = _ConsentStoreWatch() if self._watch_registry else None
         recovered = self.recover()
         self._log("calls_start", recovered=recovered, poll_s=self.cfg.poll_s, enabled=self.cfg.enabled)
         try:
@@ -978,11 +1131,18 @@ class CallWorker:
                     self._errors += 1
                     self._log("error", where="calls.step", error=f"{type(exc).__name__}: {exc}",
                               traceback=traceback.format_exc())
-                self._event.wait(self.cfg.poll_s * (1 if self._errors < 3 else 6))
+                timeout = self.cfg.poll_s * (1 if self._errors < 3 else 6)
+                if watch is not None and watch.ok:
+                    if watch.wait(self._event, timeout) == "registry":
+                        self._holders_dirty = True
+                else:
+                    self._event.wait(timeout)
         finally:
             if self.active is not None:
                 self._end(self.active, "service_stop")
                 self.active = None
+            if watch is not None:
+                watch.close()
             self._event.close()
             self._log("calls_stop")
 
@@ -1002,7 +1162,12 @@ class CallWorker:
             meeting = None
         meeting_key = app_key((meeting or {}).get("process")) if meeting else None
         out: list[tuple[str, str, str | None, str]] = []
-        for h in self.holders_fn():
+        now = time.monotonic()
+        if self._holders_dirty or not self._watch_registry or now - self._holders_at >= cfg.holders_backstop_s:
+            self._holders = self.holders_fn()
+            self._holders_at, self._holders_dirty = now, False
+            self.holder_reads += 1
+        for h in self._holders:
             key = app_key(h.get("app"))
             if key and (key in cfg.apps or key == meeting_key):
                 service = (meeting or {}).get("service") if key == meeting_key else None
@@ -1118,18 +1283,15 @@ class CallWorker:
         self._set_status(act, "recording")
 
     def _start_recording(self, cfg: CallConfig, act: _Active) -> None:
-        if self._gpu is None:
-            self._gpu = Gpu()
         session = RecordingSession(
             self.store, call_id=act.call_id, app=act.app, process=act.key, cfg=cfg,
-            source_factory=lambda: self.source_factory(cfg, act.key), backend=lambda: self.backend_fn(cfg),
-            log=self._log, gpu=self._gpu,
+            source_factory=lambda: self.source_factory(cfg, act.key), log=self._log,
         )
         session.start()
         act.session = session
         self.store.update_call(act.call_id, recording_started_at=time.time())
         self._log("call_recording_start", call_id=act.call_id, app=act.app, device=session.device,
-                  opened_as=session.opened_as, stt_model=cfg.stt_model, gpu=self._gpu.snapshot())
+                  opened_as=session.opened_as, vad=session.chunker.vad is not None, spool="encrypted, deferred")
 
     def _stop_recording(self, act: _Active, reason: str) -> None:
         session, act.session = act.session, None
@@ -1138,10 +1300,11 @@ class CallWorker:
         stats = session.stop(reason)
         info = summarize(stats)
         self.store.update_call(act.call_id, recording_stopped_at=time.time(), stop_reason=reason)
+        vad = session.chunker.vad
         self._log("call_recording_stop", call_id=act.call_id, app=act.app, reason=reason,
-                  stt_model=getattr(session.backend, "name", None) if session.backend else None,
-                  stt_device=getattr(session.backend, "device", None) if session.backend else None,
-                  silence_dropped_s=round(session.chunker.silence_s, 1), **info)
+                  silence_dropped_s=round(session.chunker.silence_s, 1),
+                  vad_windows=vad.windows if vad is not None else None,
+                  vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None, **info)
 
     def _end(self, act: _Active, reason: str) -> None:
         if act.session is not None:

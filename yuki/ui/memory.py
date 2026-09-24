@@ -532,10 +532,9 @@ class TodayWindow(KnowsWindow):
             return
         groups = today_groups(rows, now=now)
         open_count = len(groups["due_soon"]) + len(groups["open"])
-        self.meta.setText(
-            meta
-            or f"{open_count} open · {len(groups['done_today'])} done today · {now.strftime('%a %d %b, %H:%M')}"
-        )
+        line = f"{open_count} open · {len(groups['done_today'])} done today · {now.strftime('%a %d %b, %H:%M')}"
+        note = getattr(self, "waiting_note", "")
+        self.meta.setText(meta or (f"{line} · {note}" if note else line))
         self.body.setHtml(today_html(groups, now=now))
 
 

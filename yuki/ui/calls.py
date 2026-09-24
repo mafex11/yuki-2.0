@@ -16,7 +16,10 @@ waits on it (and looks every :data:`FALLBACK_POLL_S` anyway) and fetches
 * :class:`CallIndicator`, a small pill, while memory records the user's side
   (or waits for headphones), out of the way of cards and full-screen apps.
 
-The tray's "Stop remembering this call" calls :meth:`CallController.stop_call`.
+The tray's "Stop remembering this call" calls :meth:`CallController.stop_call`; while
+call audio waits for the deferred transcriber the tray shows "N calls waiting
+to be remembered" (also on the Today panel) and offers "Erase waiting call
+audio" (:meth:`CallController.erase_waiting`).
 Nothing here reads, sends or shows anything that was said.
 """
 
@@ -55,12 +58,21 @@ HEADPHONES_NOTE = "Only with headphones, so other people's voices aren't picked 
 def consent_text(call: dict[str, Any]) -> tuple[str, str, str]:
     """``(question, detail, headphones note or "")`` for a ``call_status()["call"]``."""
     app = str(call.get("app") or "this app")
-    detail = f"{app} · only your microphone, turned into text on this PC. Nobody else is recorded."
+    detail = (f"{app} · only your microphone, kept encrypted and turned into text on this PC later, "
+              "when it's free. Nobody else is recorded.")
     note = ""
     if call.get("headphones") is False:
         output = call.get("form_factor") or "not headphones"
         note = f"{HEADPHONES_NOTE} Your sound is on {output} now, so I'd wait for headphones."
     return "Remember what you say in this call?", detail, note
+
+
+def waiting_text(waiting: Any) -> str:
+    """``"2 calls waiting to be remembered"`` for ``call_status()["waiting"]``; ``""`` when none."""
+    n = int((waiting or {}).get("calls") or 0) if isinstance(waiting, dict) else 0
+    if n <= 0:
+        return ""
+    return f"{n} call{'' if n == 1 else 's'} waiting to be remembered"
 
 
 def indicator_text(call: dict[str, Any]) -> str:
@@ -430,10 +442,21 @@ class CallController(QObject):
         self.ui_log.event("call_stop_requested", call_id=(self.status.get("call") or {}).get("id"))
         return self._background("call_stop", lambda: self.memory.call_method("stop_call", timeout_s=TRAY_TIMEOUT_S))
 
+    @property
+    def waiting(self) -> str:
+        """"N calls waiting to be remembered", or ``""``."""
+        return waiting_text(self.status.get("waiting"))
+
+    def erase_waiting(self) -> threading.Thread:
+        """The tray's "Erase waiting call audio": the spool's audio is deleted, its words never made."""
+        self.ui_log.event("call_audio_erase_requested", waiting=self.status.get("waiting"))
+        return self._background("call_audio_erase",
+                                lambda: self.memory.call_method("erase_call_audio", timeout_s=TRAY_TIMEOUT_S))
+
     def wait(self, timeout_s: float = 5.0) -> None:
         for thread in list(self._threads):
             thread.join(timeout_s)
 
 
 __all__ = ["CallController", "CallConsentCard", "CallIndicator", "CallWatcher", "CALL_EVENT_NAME",
-           "consent_text", "indicator_text"]
+           "consent_text", "indicator_text", "waiting_text"]

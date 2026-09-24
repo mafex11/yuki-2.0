@@ -57,8 +57,11 @@ Calls (:mod:`yuki.memory.calls`, thread ``yuki-memory-calls``): a
 communication app holding the microphone, or a meeting row in front, is a
 call; the UI is asked (``Local\\YukiCallReady``) to show a consent card, and
 only with a yes (or "always" for the app) and headphones as the output is the
-user's own microphone transcribed here, in memory, as text of kind
-``my_call_side``. The ``paused`` flag stops it at once.
+user's own speech kept - encrypted, in the spool - until the deferred
+transcriber (:mod:`yuki.memory.transcribe`, thread ``yuki-memory-transcribe``)
+finds the PC free and turns it into text of kind ``my_call_side`` in a
+below-normal process of its own. This process never loads a speech model or
+uses the GPU. The ``paused`` flag stops both at once.
 """
 
 from __future__ import annotations
@@ -278,6 +281,8 @@ def run(args: argparse.Namespace) -> int:
     review_thread: threading.Thread | None = None
     calls = None
     calls_thread: threading.Thread | None = None
+    transcriber = None
+    transcriber_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     review_path = flag_path(db_path, REVIEW_FLAG)
@@ -481,6 +486,24 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # everything else runs on without it
                 log("error", where="calls_start", error=f"{type(exc).__name__}: {exc}")
                 calls = None
+            try:   # the deferred transcriber: waits for a free PC, runs its own process
+                from yuki.memory.transcribe import TranscribeScheduler
+
+                def live_fullscreen() -> dict[str, Any]:
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"fullscreen": bool(st.get("fullscreen"))}
+
+                transcriber = TranscribeScheduler(store, db_path=db_path, privacy=privacy, log=log,
+                                                  live_fn=live_fullscreen)
+                transcriber_thread = threading.Thread(
+                    target=_guarded(transcriber.run, log, "transcribe"), args=(stop, pause_path),
+                    name="yuki-memory-transcribe", daemon=True,
+                )
+                transcriber_thread.start()
+            except Exception as exc:
+                log("error", where="transcribe_start", error=f"{type(exc).__name__}: {exc}")
+                transcriber = None
 
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
@@ -560,7 +583,9 @@ def run(args: argparse.Namespace) -> int:
         if nudges is not None:
             nudges.stop()
         if calls is not None:
-            calls.stop()   # closes the microphone, transcribes what is left, hands the text to the store
+            calls.stop()   # closes the microphone, spools what is left (encrypted)
+        if transcriber is not None:
+            transcriber.stop()   # a running batch is asked to stop after its chunk
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
@@ -584,7 +609,9 @@ def run(args: argparse.Namespace) -> int:
         if review_thread is not None:
             review_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if calls_thread is not None:
-            calls_thread.join(30.0)  # the last chunks of a call being transcribed; audio is never kept
+            calls_thread.join(30.0)  # the last chunk of a call being encrypted into the spool
+        if transcriber_thread is not None:
+            transcriber_thread.join(35.0)
         totals = meter.reading(since_start=True)
         log("service_stop", **totals, watcher=watcher.stats() if watcher else None,
             timeline=timeline.stats() if timeline is not None else None, exit_code=code)

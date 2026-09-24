@@ -49,6 +49,8 @@ Calls, just the user's side (the service's call worker, yuki.memory.calls)::
     memory.call_status() -> {"call": {...} | None, "recording": bool}   # wait on Local\\YukiCallReady
     memory.answer_call(call_id, "yes" | "no" | "always" | "never" | "none") -> bool
     memory.stop_call() -> int | None                     # "Stop remembering this call"
+    memory.call_audio_waiting() -> dict | None           # "N calls waiting to be remembered"
+    memory.erase_call_audio() -> int                     # "Erase waiting call audio"
     memory.call_prefs() -> list[dict];  memory.set_call_pref(app, "always" | "never" | None)
 """
 
@@ -1133,9 +1135,10 @@ class MemoryClient:
             from yuki.memory.calls import CallConfig
             from yuki.memory.store import CALL_OPEN_STATUSES
 
+            waiting = self.call_audio_waiting()
             rows = self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1)
             if not rows:
-                return {"call": None, "recording": False}
+                return {"call": None, "recording": False, "waiting": waiting}
             c = rows[0]
             timeout = CallConfig().ask_timeout_s
             try:
@@ -1155,9 +1158,34 @@ class MemoryClient:
                 "detected_at": _iso(c.detected_at), "recording_since": _iso(c.recording_started_at),
                 "ask_timeout_s": timeout, "can_remember_choice": bool(c.process),
             }
-            return {"call": call, "recording": c.status == "recording"}
+            return {"call": call, "recording": c.status == "recording", "waiting": waiting}
         except Exception:
-            return {"call": None, "recording": False}
+            return {"call": None, "recording": False, "waiting": None}
+
+    def call_audio_waiting(self) -> dict | None:
+        """The user's call audio waiting to be transcribed: ``{"calls", "chunks", "minutes", "mb",
+        "oldest_at"}`` (content-free), or None when memory cannot be read. Shown as
+        "N calls waiting to be remembered"."""
+        try:
+            w = self.store.spool_summary()
+            return {"calls": int(w["calls"] or 0), "chunks": int(w["chunks"] or 0),
+                    "minutes": round(float(w["audio_s"] or 0) / 60.0, 1), "mb": round(float(w["bytes"] or 0) / 2**20, 2),
+                    "oldest_at": _iso(w["oldest_at"])}
+        except Exception:
+            return None
+
+    def erase_call_audio(self) -> int:
+        """Delete every piece of call audio still waiting to be transcribed (the tray's "Erase waiting call
+        audio"): the encrypted files go now, their words are never made. Returns the chunks erased. What was
+        already transcribed stays remembered."""
+        rows = self.store.call_chunks()
+        erased, _size = self.store.remove_call_chunks([r["id"] for r in rows], "erased")
+        for call_id in sorted({r["call_id"] for r in rows}):
+            try:   # a call whose other chunks were already transcribed still reaches the journal
+                self.store.journal_call_chunks(call_id)
+            except Exception:
+                pass
+        return erased
 
     def answer_call(self, call_id: int, answer: str) -> bool:
         """The user's answer on the consent card: ``yes`` | ``no`` | ``always`` | ``never`` | ``none``

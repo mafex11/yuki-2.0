@@ -25,6 +25,12 @@ Developer Mode cannot create.
 
 Vectors are float32 and L2-normalised, so cosine similarity is a dot product.
 
+Footprint (2026-09-24): the loaded model costs ~550 MB (the 250k-word
+tokenizer alone ~260 MB, the ONNX session the rest), so it is loaded on first
+use and **unloaded after** :data:`IDLE_UNLOAD_S` without a call (the next call
+loads it again, ~1-2 s). The ONNX session runs :data:`THREADS` threads without
+the CPU memory arena (fewer threads idling, no arena kept at its peak).
+
 Public API::
 
     MODEL_NAME, DIM
@@ -51,6 +57,10 @@ from yuki.memory.store import default_memory_dir
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DIM = 384
+#: The model is dropped after this long without an embed call (it reloads on the next one).
+IDLE_UNLOAD_S = 300.0
+#: ONNX Runtime intra-/inter-op threads (fastembed's default is every core).
+THREADS = 2
 
 
 def _dir_bytes(path: Path) -> int:
@@ -60,8 +70,15 @@ def _dir_bytes(path: Path) -> int:
 class Embedder:
     """Lazily loaded fastembed model; safe to share between threads."""
 
-    def __init__(self, model_name: str = MODEL_NAME, models_dir: Path | None = None) -> None:
+    def __init__(self, model_name: str = MODEL_NAME, models_dir: Path | None = None, *,
+                 idle_unload_s: float | None = IDLE_UNLOAD_S, threads: int | None = THREADS) -> None:
         self.model_name = model_name
+        self.idle_unload_s = idle_unload_s
+        self.threads = threads
+        self._last_use = 0.0
+        self._reaper: threading.Timer | None = None
+        self.loads = 0
+        self.unloads = 0
         self.models_dir = Path(models_dir) if models_dir else default_memory_dir() / "models"
         self._model: Any = None
         self._load_lock = threading.Lock()
@@ -85,6 +102,7 @@ class Embedder:
                 return self._model
             os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
             os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+            os.environ.setdefault("RAYON_NUM_THREADS", str(self.threads or 2))   # the tokenizer's thread pool
             from fastembed import TextEmbedding
 
             desc = next(
@@ -101,8 +119,10 @@ class Embedder:
                 snapshot_download(desc["sources"]["hf"], local_dir=str(target))
                 self.download_ms = (time.perf_counter() - t0) * 1000
             t0 = time.perf_counter()
-            self._model = TextEmbedding(self.model_name, specific_model_path=str(target))
+            self._model = TextEmbedding(self.model_name, specific_model_path=str(target), threads=self.threads,
+                                        enable_cpu_mem_arena=False)
             self.load_ms = (time.perf_counter() - t0) * 1000
+            self.loads += 1
             self.model_bytes = _dir_bytes(target)
             return self._model
 
@@ -111,10 +131,12 @@ class Embedder:
         items = [t or "" for t in texts]
         if not items:
             return np.zeros((0, DIM), dtype=np.float32)
-        model = self._ensure_loaded()
-        t0 = time.perf_counter()
         with self._run_lock:
+            model = self._ensure_loaded()
+            t0 = time.perf_counter()
             vecs = np.asarray(list(model.embed(items)), dtype=np.float32)
+            self._last_use = time.monotonic()
+        self._arm_reaper()
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         vecs = vecs / norms
@@ -122,6 +144,38 @@ class Embedder:
         self.texts += len(items)
         self.total_ms += (time.perf_counter() - t0) * 1000
         return vecs
+
+    def _arm_reaper(self) -> None:
+        if not self.idle_unload_s:
+            return
+        with self._load_lock:
+            if self._reaper is not None and self._reaper.is_alive():
+                return
+            self._reaper = threading.Timer(self.idle_unload_s, self._reap)
+            self._reaper.daemon = True
+            self._reaper.name = "yuki-embed-unload"
+            self._reaper.start()
+
+    def _reap(self) -> None:
+        with self._load_lock:
+            self._reaper = None
+        idle = time.monotonic() - self._last_use
+        if idle < (self.idle_unload_s or 0):
+            self._arm_reaper()   # used meanwhile: look again later
+            return
+        self.unload()
+
+    def unload(self) -> bool:
+        """Drop the model now (its memory goes back to the OS); the next embed loads it again."""
+        with self._run_lock, self._load_lock:
+            if self._model is None:
+                return False
+            self._model = None
+        import gc
+
+        gc.collect()
+        self.unloads += 1
+        return True
 
     def embed_one(self, text: str) -> np.ndarray:
         """Embed one text -> ``(DIM,)``."""
@@ -132,6 +186,8 @@ class Embedder:
         return {
             "model": self.model_name,
             "loaded": self._model is not None,
+            "loads": self.loads,
+            "unloads": self.unloads,
             "download_ms": self.download_ms,
             "load_ms": self.load_ms,
             "model_bytes": self.model_bytes,

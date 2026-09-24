@@ -322,7 +322,13 @@ headphone_devices = []
 # mode only, so it never takes the microphone away from the call app, Handy
 # or anything else.
 capture_device = ""
-# Speech to text, on this PC only.  "faster-whisper:<model>": a Whisper model
+# How often the microphone's users are read again without a change notice
+# from Windows (the ConsentStore key is watched; this is only a backstop).
+holders_backstop_s = 60
+# Speech to text, on this PC only, and never during a call: the user's own
+# speech is kept encrypted in the spool (next to the database) until the PC
+# is free, then transcribed in a below-normal process that exits after the
+# batch (model, RAM and VRAM freed at once).  "faster-whisper:<model>": a Whisper model
 # (tried on the GPU with CUDA, int8), with call_stt_fallback on the CPU when
 # CUDA is not there or fails.  large-v3 is the default because it gets
 # Kannada and Telugu right where large-v3-turbo (faster, 1.2 GB less VRAM)
@@ -336,16 +342,40 @@ model_dir = ""
 # the most likely of these; code-mixed speech ("Hinglish") comes out in the
 # chunk's main language.  Empty = any language.
 languages = ["en", "hi", "kn", "ta", "te"]
-# Energy gate: 30 ms frames under this level are silence; a chunk with less
-# speech than min_speech_s is dropped, never transcribed.  Chunks are cut at a
+# Speech gate: 32 ms frames under gate_dbfs are silence (no model runs on
+# them); louder ones are speech only when Silero VAD (1.2 MB, CPU, one
+# thread; ~0.3% of one core while sound comes in) gives at least
+# vad_threshold.  A chunk with less speech than min_speech_s is dropped,
+# never kept.  vad = false falls back to the energy gate alone.  Chunks are cut at a
 # pause once they are chunk_min_s long, and at chunk_max_s at the latest.
-gate_dbfs = -45.0
+gate_dbfs = -50.0
+vad = true
+vad_threshold = 0.5
 min_speech_s = 0.5
 chunk_min_s = 6
 chunk_max_s = 25
 pause_s = 0.7
-# What was said is handed to the journal this often during a long call (and at its end).
-flush_every_s = 300
+# The deferred transcription runs only when ALL of these hold: no call is
+# going on; nothing full screen in front (the timeline's fact, or Windows
+# saying a game or presentation is up); for defer_gpu_quiet_min minutes the
+# GPU stayed at or under defer_gpu_max_util % and kept defer_vram_free_mb free
+# (VRAM counts: a game left open holds it even when idle), and the CPU stayed
+# under defer_cpu_max_percent; and you are away (no input for defer_idle_min
+# minutes, or the session is locked) or it is night (defer_night, local time).
+# It stops after the chunk in hand when you come back (input within
+# defer_back_idle_s; not at night), a call or a game starts, or memory is paused.
+defer_check_s = 60
+defer_idle_min = 5
+defer_night = ["01:00", "07:00"]
+defer_gpu_max_util = 10
+defer_gpu_quiet_min = 3
+defer_vram_free_mb = 2500
+defer_cpu_max_percent = 40
+defer_back_idle_s = 20
+# Audio never waits longer than this (days), and the spool never grows past
+# this (MB, ~11 MB per hour of speech); past either the oldest is deleted.
+spool_max_age_days = 7
+spool_max_mb = 500
 # Display names for the card ("Remember what you say in this call?" ... "Always for Zoom").
 [calls.names]
 "Zoom.exe" = "Zoom"

@@ -12,6 +12,13 @@ separate subpackages; nothing in them imports the agent layer.
 from __future__ import annotations
 
 import ctypes
+import os
+
+# numpy's OpenBLAS starts one thread per core and commits a ~32 MB buffer for
+# each: on this 16-thread CPU that was ~480 MB of private bytes in every Yuki
+# process, for matrix products of a few hundred rows (measured 2026-09-24).
+# Set before anything imports numpy; a value the user set wins.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 __version__ = "0.1.0"
 

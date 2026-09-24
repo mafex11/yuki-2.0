@@ -601,6 +601,7 @@ class YukiUi(QObject):
 
     def _on_today_ready(self, rows: object, meta: str) -> None:
         if self.today is not None:
+            self.today.waiting_note = self.calls.waiting
             self.today.show_today(list(rows) if isinstance(rows, list) else None, meta)
 
     def show_review(self) -> None:
@@ -670,8 +671,26 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     stop_call.triggered.connect(lambda _checked=False: ui.calls.stop_call())
     stop_call.setVisible(False)
     menu.addAction(stop_call)
-    ui.calls.changed.connect(lambda _status: stop_call.setVisible(ui.calls.recording))
-    menu.aboutToShow.connect(lambda: stop_call.setVisible(ui.calls.recording))
+    # Calls waiting for the deferred transcriber: a count, and a way to throw the audio away.
+    call_waiting = QAction("", menu)
+    call_waiting.setEnabled(False)
+    call_waiting.setVisible(False)
+    menu.addAction(call_waiting)
+    erase_calls = QAction("Erase waiting call audio", menu)
+    erase_calls.triggered.connect(lambda _checked=False: ui.calls.erase_waiting())
+    erase_calls.setVisible(False)
+    menu.addAction(erase_calls)
+
+    def show_calls(_status: object = None) -> None:
+        stop_call.setVisible(ui.calls.recording)
+        text = ui.calls.waiting
+        call_waiting.setText(text)
+        call_waiting.setVisible(bool(text))
+        erase_calls.setVisible(bool(text))
+
+    ui.calls.changed.connect(show_calls)
+    menu.aboutToShow.connect(show_calls)
+    menu.aboutToShow.connect(ui.calls.refresh)
 
     def show_memory_status(status: object, error: object) -> None:
         del error

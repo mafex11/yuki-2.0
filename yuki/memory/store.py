@@ -1520,7 +1520,7 @@ MIGRATIONS: tuple[str, ...] = (
     # row per call (app, times, consent and who gave it, the output device's
     # form factor, chunk and timing counts), and the user's standing
     # "always"/"never" per app. The words themselves are captures of kind
-    # my_call_side (encrypted, capture TTL); audio is never stored anywhere.
+    # my_call_side (encrypted, capture TTL); the audio waits encrypted in the spool (migration 11) until transcribed.
     # Additive only, like 2-9.
     """
     CREATE TABLE calls (
@@ -1562,6 +1562,39 @@ MIGRATIONS: tuple[str, ...] = (
         name       TEXT,                             -- display name, for the UI
         updated_at REAL NOT NULL
     );
+    """,
+    # 11: deferred call transcription (yuki.memory.calls / yuki.memory.transcribe).
+    # During a call only the user's own speech is kept, as encrypted Opus
+    # chunks in the spool folder next to the database; each chunk has a row
+    # here (cleartext metadata only). The deferred transcriber writes the
+    # chunk's words (encrypted) and deletes its audio in the same step; once a
+    # call's chunks are all done its words go to the journal as my_call_side
+    # and the rows keep only their accounting. Additive only, like 2-10.
+    """
+    CREATE TABLE call_chunks (
+        id              INTEGER PRIMARY KEY,
+        call_id         INTEGER NOT NULL,
+        seq             INTEGER NOT NULL,
+        start_at        REAL NOT NULL,
+        audio_s         REAL NOT NULL DEFAULT 0,
+        speech_s        REAL NOT NULL DEFAULT 0,
+        file            TEXT,                        -- spool file name while the audio exists
+        bytes           INTEGER NOT NULL DEFAULT 0,
+        codec           TEXT,                        -- opus | pcm16-zlib
+        status          TEXT NOT NULL,               -- spooled | done | journaled | failed | expired | capped | erased | lost
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        text_ciphertext TEXT,                        -- JSON utterances, until journaled
+        lang            TEXT,
+        transcribe_ms   REAL,
+        stt_model       TEXT,
+        stt_device      TEXT,
+        error           TEXT,
+        created_at      REAL NOT NULL,
+        done_at         REAL,
+        removed_at      REAL
+    );
+    CREATE INDEX call_chunks_status ON call_chunks(status, start_at);
+    CREATE INDEX call_chunks_call ON call_chunks(call_id, seq);
     """,
 )
 
@@ -4293,33 +4326,212 @@ class Store:
         each capture's delta is ``{"call_id", "app", "start", "end", "final",
         "utterances": [{"at", "end", "text", "lang"}]}`` as JSON, encrypted like
         every capture (capture TTL). The call row's counters move in the same
-        transaction. Text only: audio never reaches the store.
+        transaction. Text only (the audio stays in the spool until it is transcribed, then is deleted).
         """
         items = [dict(u) for u in utterances if str(u.get("text") or "").strip()]
         if not items:
             return None
-        delta = json.dumps({"call_id": int(call_id), "app": app, "start": float(started_at), "end": float(ended_at),
-                            "final": bool(final), "utterances": items}, ensure_ascii=False)
-
-        def op(conn: sqlite3.Connection) -> int:
-            thread_id = self._upsert_thread(conn, app or "", f"{app} call", None, process=process,
-                                            scope=f"call:{int(call_id)}", kind=CALL_SIDE_KIND)
-            first = min(float(u.get("at") or started_at) for u in items)
-            cur = conn.execute(
-                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (thread_id, first, "call", self.cipher.encrypt(delta), len(delta),
-                 self.cipher.digest(CALL_SIDE_KIND, str(call_id), str(first), str(len(items))), CALL_SIDE_KIND,
-                 "callside"),
-            )
-            conn.execute("UPDATE threads SET last_seen=max(last_seen, ?) WHERE id=?", (float(ended_at), thread_id))
-            conn.execute("UPDATE calls SET thread_id=?, captures=captures+1, updated_at=? WHERE id=?",
-                         (thread_id, time.time(), int(call_id)))
-            return int(cur.lastrowid)
-
-        capture_id = self._write(op)
+        capture_id = self._write(lambda conn: self._add_call_side(conn, call_id, app, process, started_at, ended_at,
+                                                                  items, final))
         with self._cond:
             self._cond.notify_all()
+        return capture_id
+
+    def _add_call_side(self, conn: sqlite3.Connection, call_id: int, app: str, process: str | None,
+                       started_at: float, ended_at: float, items: list[dict[str, Any]], final: bool) -> int:
+        delta = json.dumps({"call_id": int(call_id), "app": app, "start": float(started_at), "end": float(ended_at),
+                            "final": bool(final), "utterances": items}, ensure_ascii=False)
+        thread_id = self._upsert_thread(conn, app or "", f"{app} call", None, process=process,
+                                        scope=f"call:{int(call_id)}", kind=CALL_SIDE_KIND)
+        first = min(float(u.get("at") or started_at) for u in items)
+        cur = conn.execute(
+            "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (thread_id, first, "call", self.cipher.encrypt(delta), len(delta),
+             self.cipher.digest(CALL_SIDE_KIND, str(call_id), str(first), str(len(items))), CALL_SIDE_KIND,
+             "callside"),
+        )
+        conn.execute("UPDATE threads SET last_seen=max(last_seen, ?) WHERE id=?", (float(ended_at), thread_id))
+        conn.execute("UPDATE calls SET thread_id=?, captures=captures+1, updated_at=? WHERE id=?",
+                     (thread_id, time.time(), int(call_id)))
+        return int(cur.lastrowid)
+
+    # -- the call spool: the user's own speech, encrypted, until transcribed ----
+
+    @property
+    def spool_dir(self) -> Path:
+        """``<database folder>\\spool``: encrypted audio of the user's side of calls, waiting for transcription."""
+        return self.path.parent / "spool"
+
+    def write_spool(self, call_id: int, seq: int, *, start_at: float, audio_s: float, speech_s: float,
+                    payload: bytes, codec: str) -> int:
+        """Encrypt ``payload`` (compressed audio) into a spool file and record it; the chunk id.
+
+        The file holds only ciphertext (AES-256-GCM with the store's
+        DPAPI-protected key): it is written to a temporary name and renamed,
+        and the row is written after it, so a crash leaves at most an orphan
+        file (removed by :meth:`sweep_spool`), never a row without its audio.
+        """
+        folder = self.spool_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"call{int(call_id)}-{int(seq):05d}-{os.urandom(4).hex()}.yspool"
+        blob = b"YSP1" + self.cipher.encrypt_bytes(payload)
+        tmp = folder / (name + ".part")
+        tmp.write_bytes(blob)
+        os.replace(tmp, folder / name)
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO call_chunks(call_id, seq, start_at, audio_s, speech_s, file, bytes, codec, status, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?, 'spooled', ?)",
+            (int(call_id), int(seq), float(start_at), float(audio_s), float(speech_s), name, len(blob), codec,
+             time.time()),
+        ).lastrowid))
+
+    def read_spool(self, name: str) -> bytes:
+        """The decrypted payload of one spool file (raises when it is missing or was tampered with)."""
+        blob = (self.spool_dir / name).read_bytes()
+        if not blob.startswith(b"YSP1"):
+            raise ValueError("not a Yuki spool file")
+        return self.cipher.decrypt_bytes(blob[4:])
+
+    def _unlink_spool(self, name: str | None) -> None:
+        if not name:
+            return
+        try:
+            (self.spool_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+
+    def call_chunks(self, *, statuses: Sequence[str] = ("spooled",), call_id: int | None = None,
+                    limit: int | None = None) -> list[dict[str, Any]]:
+        """Chunk rows (cleartext metadata), oldest first, with their call's status and app."""
+        sql = ("SELECT k.*, c.status AS call_status, c.app AS app, c.process AS process FROM call_chunks k"
+               " LEFT JOIN calls c ON c.id = k.call_id"
+               f" WHERE k.status IN ({','.join('?' * len(statuses))})")
+        params: list[Any] = list(statuses)
+        if call_id is not None:
+            sql += " AND k.call_id=?"
+            params.append(int(call_id))
+        sql += " ORDER BY k.start_at, k.id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in self._query(sql, params)]
+
+    def finish_call_chunk(self, chunk_id: int, utterances: Sequence[dict[str, Any]], *, lang: str | None,
+                          ms: float, model: str | None, device: str | None) -> bool:
+        """The chunk's words are stored (encrypted) and its audio deleted: in that order, so audio is only ever
+        deleted once its text is safe. False when the chunk was erased or expired meanwhile."""
+        rows = self._query("SELECT file, status FROM call_chunks WHERE id=?", (int(chunk_id),))
+        if not rows or rows[0]["status"] != "spooled":
+            return False
+        text = json.dumps(list(utterances), ensure_ascii=False)
+        self._write(lambda conn: conn.execute(
+            "UPDATE call_chunks SET status='done', text_ciphertext=?, lang=?, transcribe_ms=?, stt_model=?,"
+            " stt_device=?, file=NULL, done_at=?, removed_at=? WHERE id=? AND status='spooled'",
+            (self.cipher.encrypt(text), lang, float(ms), model, device, time.time(), time.time(), int(chunk_id))))
+        self._unlink_spool(rows[0]["file"])
+        return True
+
+    def fail_call_chunk(self, chunk_id: int, error: str, *, max_attempts: int = 3) -> None:
+        """One failed attempt; after ``max_attempts`` the chunk is given up and its audio deleted."""
+        rows = self._query("SELECT file, attempts FROM call_chunks WHERE id=?", (int(chunk_id),))
+        if not rows:
+            return
+        give_up = rows[0]["attempts"] + 1 >= max_attempts
+        self._write(lambda conn: conn.execute(
+            "UPDATE call_chunks SET attempts=attempts+1, error=?, status=?, file=?, removed_at=? WHERE id=?",
+            (error[:300], "failed" if give_up else "spooled", None if give_up else rows[0]["file"],
+             time.time() if give_up else None, int(chunk_id))))
+        if give_up:
+            self._unlink_spool(rows[0]["file"])
+
+    def remove_call_chunks(self, chunk_ids: Iterable[int], reason: str) -> tuple[int, int]:
+        """Delete these chunks' audio now (``expired`` | ``capped`` | ``erased`` | ``lost``); ``(chunks, bytes)``."""
+        ids = [int(i) for i in chunk_ids]
+        if not ids:
+            return 0, 0
+        rows = self._query(f"SELECT id, file, bytes FROM call_chunks WHERE status='spooled' AND id IN"
+                           f" ({','.join('?' * len(ids))})", ids)
+        for r in rows:
+            self._unlink_spool(r["file"])
+        now = time.time()
+        self._write(lambda conn: conn.executemany(
+            "UPDATE call_chunks SET status=?, file=NULL, removed_at=? WHERE id=? AND status='spooled'",
+            [(reason, now, r["id"]) for r in rows]))
+        return len(rows), sum(int(r["bytes"] or 0) for r in rows)
+
+    def sweep_spool(self, *, max_age_s: float, max_bytes: int, now: float | None = None) -> list[tuple[str, int, int]]:
+        """Enforce the spool's caps: audio older than ``max_age_s`` is deleted (``expired``), then the oldest
+        until the total is under ``max_bytes`` (``capped``); rows whose file vanished become ``lost`` and files
+        without a row (a crash between writing and recording) are deleted. Returns ``[(reason, chunks, bytes)]``."""
+        now = time.time() if now is None else float(now)
+        out: list[tuple[str, int, int]] = []
+        rows = self.call_chunks()
+        known = {r["file"] for r in rows if r["file"]}
+        folder = self.spool_dir
+        if folder.exists():
+            for f in folder.iterdir():
+                if f.is_file() and f.name not in known and now - f.stat().st_mtime > 120:
+                    size = f.stat().st_size
+                    f.unlink(missing_ok=True)
+                    out.append(("orphan", 1, size))
+        lost = [r["id"] for r in rows if not (folder / r["file"]).exists()] if rows else []
+        if lost:
+            out.append(("lost", *self.remove_call_chunks(lost, "lost")))
+        rows = [r for r in rows if r["id"] not in set(lost)]
+        old = [r["id"] for r in rows if now - float(r["created_at"]) > max_age_s]
+        if old:
+            out.append(("expired", *self.remove_call_chunks(old, "expired")))
+        rows = [r for r in rows if r["id"] not in set(old)]
+        total = sum(int(r["bytes"] or 0) for r in rows)
+        drop = []
+        for r in rows:                      # oldest first
+            if total <= max_bytes:
+                break
+            drop.append(r["id"])
+            total -= int(r["bytes"] or 0)
+        if drop:
+            out.append(("capped", *self.remove_call_chunks(drop, "capped")))
+        return out
+
+    def spool_summary(self) -> dict[str, Any]:
+        """``{"calls", "chunks", "audio_s", "speech_s", "bytes", "oldest_at"}`` of the audio waiting."""
+        r = self._query("SELECT count(DISTINCT call_id) AS calls, count(*) AS chunks, coalesce(sum(audio_s),0) AS audio_s,"
+                        " coalesce(sum(speech_s),0) AS speech_s, coalesce(sum(bytes),0) AS bytes,"
+                        " min(created_at) AS oldest_at FROM call_chunks WHERE status='spooled'")[0]
+        return {k: r[k] for k in r.keys()}
+
+    def journal_call_chunks(self, call_id: int) -> int | None:
+        """A call whose chunks are all transcribed: its words become one ``my_call_side`` capture for the
+        journal, and the chunk rows drop their text (one transaction). The capture id, or None (nothing said,
+        or chunks still waiting)."""
+        def op(conn: sqlite3.Connection) -> int | None:
+            if conn.execute("SELECT 1 FROM call_chunks WHERE call_id=? AND status='spooled' LIMIT 1",
+                            (int(call_id),)).fetchone():
+                return None
+            call = conn.execute("SELECT app, process FROM calls WHERE id=?", (int(call_id),)).fetchone()
+            rows = conn.execute("SELECT id, text_ciphertext FROM call_chunks WHERE call_id=? AND status='done'"
+                                " ORDER BY start_at, id", (int(call_id),)).fetchall()
+            if not rows:
+                return None
+            items: list[dict[str, Any]] = []
+            for r in rows:
+                items += json.loads(self.cipher.decrypt(r["text_ciphertext"]) or "[]")
+            items = [u for u in items if str(u.get("text") or "").strip()]
+            capture_id = None
+            if items and call is not None:
+                capture_id = self._add_call_side(conn, call_id, call["app"], call["process"], items[0]["at"],
+                                                 items[-1]["end"], items, True)
+            conn.executemany("UPDATE call_chunks SET status='journaled', text_ciphertext=NULL WHERE id=?",
+                             [(r["id"],) for r in rows])
+            conn.execute("UPDATE calls SET utterances=utterances+?, updated_at=? WHERE id=?",
+                         (len(items), time.time(), int(call_id)))
+            return capture_id
+
+        capture_id = self._write(op)
+        if capture_id is not None:
+            with self._cond:
+                self._cond.notify_all()
         return capture_id
 
     def commit_call_batch(
