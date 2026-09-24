@@ -120,7 +120,10 @@ class YukiUi(QObject):
         self.overlay.dismissed.connect(lambda: self.ui_log.event("overlay", state="hidden"))
         # How each activation got (or failed to get) the keyboard: which step of
         # the foreground hand-over worked, and what Windows reported.
-        self.overlay.focus_path.connect(lambda record: self.ui_log.event("focus_path", **record))
+        self.overlay.focus_path.connect(self._on_focus_path)
+        #: The window that was in front when the overlay last took the keyboard:
+        #: where the user was before they started typing to Yuki.
+        self._origin_hwnd: int | None = None
 
         runtime_signals = self.runtime
         runtime_signals.started.connect(self._on_started)
@@ -173,6 +176,22 @@ class YukiUi(QObject):
         if self.overlay.isVisible() and not self.overlay.closing:
             self.ui_log.event("overlay", state="shown", via="hotkey")
 
+    def _on_focus_path(self, record: dict) -> None:
+        """Log how the overlay got the keyboard, and remember where the user was.
+
+        ``foreground_before`` is the window in front just before the overlay took
+        focus. When it is the overlay itself (focus re-taken while already open),
+        the earlier origin still stands.
+        """
+        self.ui_log.event("focus_path", **record)
+        before = record.get("foreground_before")
+        try:
+            own = int(self.overlay.winId())
+        except Exception:  # noqa: BLE001 - window not created yet
+            own = None
+        if before and before != own:
+            self._origin_hwnd = int(before)
+
     def show_overlay(self) -> None:
         """Open the overlay (tray menu, or another instance asking for it)."""
         self.overlay.open()
@@ -188,7 +207,7 @@ class YukiUi(QObject):
             self.cards[request_id] = card
             self.overlay.expand_input()
             return
-        lane_name, request_id = self.runtime.submit(text)
+        lane_name, request_id = self.runtime.submit(text, origin_hwnd=self._origin_hwnd)
         self.cards[request_id] = self.overlay.add_card(text)
         self.overlay.expand_input()
         self.ui_log.event("submit", id=request_id, lane=lane_name, text=text)

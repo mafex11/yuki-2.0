@@ -401,7 +401,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "react to instead. You can never end up having claimed something that "
             "did not happen."
         ),
-        "input_schema": _obj({"message": {"type": "string"}}, ["message"]),
+        "input_schema": _obj(
+            {
+                "message": {
+                    "type": "string",
+                    "description": "What you would text back: usually one short "
+                    "sentence, in the user's own register. No restating the request "
+                    "or narrating your steps.",
+                }
+            },
+            ["message"],
+        ),
     },
     {
         "name": "recall",
@@ -778,6 +788,10 @@ class Backend(Protocol):
     # Optional, and not part of the architecture contract: a backend without it
     # simply never gets pre-warmed. See :meth:`Dispatcher.prewarm_shell`.
     def prewarm_shell(self) -> bool: ...  # pragma: no cover - protocol only
+    # Optional too: what the user is engaged in (see
+    # :func:`yuki.perception.system.activity_facts`), and its warm-up.
+    def activity_facts(self) -> dict[str, Any]: ...  # pragma: no cover - protocol only
+    def warm_activity(self) -> None: ...  # pragma: no cover - protocol only
 
 
 class _LazyRealBackend:
@@ -823,6 +837,18 @@ class _LazyRealBackend:
         import importlib
 
         return bool(importlib.import_module("yuki.actions.shell").prewarm())
+
+    def activity_facts(self) -> dict[str, Any]:
+        """:func:`yuki.perception.system.activity_facts` (not a contract function)."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.system").activity_facts()
+
+    def warm_activity(self) -> None:
+        """:func:`yuki.perception.system.warm_activity`: returns at once."""
+        import importlib
+
+        importlib.import_module("yuki.perception.system").warm_activity()
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
         import importlib
@@ -981,6 +1007,27 @@ class Dispatcher:
         if not callable(prewarm):
             return False
         return bool(prewarm())
+
+    def activity_facts(self) -> dict[str, Any]:
+        """What the user is engaged in (media, microphone/camera, foreground).
+
+        Read from the backend's optional ``activity_facts``
+        (:func:`yuki.perception.system.activity_facts`); a backend without one
+        gives ``{}``. Failures inside it are reported in its ``errors``.
+        """
+        read = getattr(self.backend, "activity_facts", None)
+        if not callable(read):
+            return {}
+        facts = read()
+        return facts if isinstance(facts, dict) else {}
+
+    def warm_activity(self) -> bool:
+        """Start the backend's activity-facts warm-up (WinRT import) if it has one."""
+        warm = getattr(self.backend, "warm_activity", None)
+        if not callable(warm):
+            return False
+        warm()
+        return True
 
     # -- entry point -------------------------------------------------------
 

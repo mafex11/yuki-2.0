@@ -138,6 +138,9 @@ class Job:
 
     id: int
     request: str
+    #: The window that was in front before the overlay took the keyboard, so the
+    #: agent knows where the user was (the overlay itself is in front by then).
+    origin_hwnd: int | None = None
 
 
 class Lane(QThread):
@@ -237,7 +240,7 @@ class Lane(QThread):
         runtime = self.runtime
         runtime.started.emit(self.name, job.id, job.request)
 
-        events = self.agent.run(job.request)
+        events = self.agent.run(job.request, origin_hwnd=job.origin_hwnd)
         while True:
             try:
                 event = next(events)
@@ -401,7 +404,7 @@ class AgentRuntime(QObject):
         """True while the worker has a request in hand or waiting."""
         return bool(self._worker_outstanding)
 
-    def submit(self, request: str) -> tuple[str, int]:
+    def submit(self, request: str, *, origin_hwnd: int | None = None) -> tuple[str, int]:
         """Route one request to a lane.
 
         The worker takes it whenever the worker is free. Otherwise the front desk
@@ -420,8 +423,11 @@ class AgentRuntime(QObject):
         lane = self.worker if not self.worker_busy else self.front_desk
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
-        waiting = lane.enqueue(Job(request_id, request))
-        self.ui_log.event("lane", lane=lane.name, id=request_id, waiting=waiting, request=request)
+        waiting = lane.enqueue(Job(request_id, request, origin_hwnd))
+        self.ui_log.event(
+            "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
+            origin_hwnd=origin_hwnd,
+        )
         return lane.name, request_id
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None) -> int:
