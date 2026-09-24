@@ -2,6 +2,7 @@
 
 Runs the watcher (:mod:`yuki.memory.watcher`), the timeline recorder
 (:mod:`yuki.memory.timeline`), the journal worker (:mod:`yuki.memory.journal`),
+the Warp terminal-history reader (:mod:`yuki.memory.warp`, every 3 minutes),
 the episode worker (:mod:`yuki.memory.episodes`) and the portrait scheduler
 (:mod:`yuki.memory.portrait`) against one shared :class:`~yuki.memory.store.Store`
 (the journal worker waits on the store's own "new capture" condition, which only
@@ -13,8 +14,9 @@ Flag files next to the database (written by Yuki through
 :class:`yuki.memory.api.MemoryClient`), checked about once a second:
 
 * ``paused`` - while it exists the watcher captures nothing (one ``paused``
-  event), the timeline records nothing, and no scheduled portrait or episode
-  run starts.
+  event), the timeline records nothing, the Warp reader moves past new
+  commands without reading them, and no scheduled portrait or episode run
+  starts.
 * ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
   rebuilds the portrait now.
 
@@ -33,6 +35,7 @@ Usage::
     uv run yuki-memory --db %TEMP%\\m\\memory.db --no-journal --duration 90
     uv run yuki-memory --no-portrait        # watcher + journal only (timeline and episodes still run)
     uv run yuki-memory --no-timeline        # no foreground timeline (and so no episodes)
+    uv run yuki-memory --no-terminal        # do not read Warp's command history
 """
 
 from __future__ import annotations
@@ -202,6 +205,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-portrait", action="store_true", help="do not run the portrait scheduler")
     parser.add_argument("--no-timeline", action="store_true", help="do not record the foreground timeline")
     parser.add_argument("--no-episodes", action="store_true", help="do not write episodes from the timeline")
+    parser.add_argument("--no-terminal", action="store_true", help="do not read the Warp terminal's command history")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -232,6 +236,8 @@ def run(args: argparse.Namespace) -> int:
     timeline = None
     episodes = None
     episodes_thread: threading.Thread | None = None
+    warp = None
+    warp_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
@@ -249,6 +255,7 @@ def run(args: argparse.Namespace) -> int:
             portrait=not (args.no_journal or args.no_portrait),
             timeline=not args.no_timeline,
             episodes=not (args.no_journal or args.no_timeline or args.no_episodes),
+            terminal=not (args.no_journal or args.no_terminal),
             duration_s=args.duration,
         )
         try:
@@ -294,6 +301,21 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # the watcher runs on without it
                 log("error", where="journal_start", error=f"{type(exc).__name__}: {exc}")
                 journal = None
+
+        if not (args.no_journal or args.no_terminal):
+            try:
+                from yuki.memory.warp import WarpReader
+
+                warp = WarpReader(store, privacy=privacy, log=log)
+                warp.set_paused(paused)
+                warp_thread = threading.Thread(
+                    target=_guarded(warp.run, log, "warp"), args=(stop, pause_path), name="yuki-memory-warp",
+                    daemon=True,
+                )
+                warp_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="warp_start", error=f"{type(exc).__name__}: {exc}")
+                warp = None
 
         if not (args.no_journal or args.no_portrait):
             try:
@@ -354,6 +376,8 @@ def run(args: argparse.Namespace) -> int:
                 watcher.set_paused(paused)
                 if timeline is not None:
                     timeline.set_paused(paused)
+                if warp is not None:
+                    warp.set_paused(paused)
                 log("pause_flag", paused=paused)
             if portrait is not None and refresh_path.exists():
                 portrait.wake()
@@ -363,7 +387,8 @@ def run(args: argparse.Namespace) -> int:
             if now >= next_stats:
                 next_stats = now + args.stats_every
                 log("stats", **meter.reading(), watcher=watcher.stats(),
-                    timeline=timeline.stats() if timeline is not None else None)
+                    timeline=timeline.stats() if timeline is not None else None,
+                    warp=warp.stats() if warp is not None else None)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
@@ -388,12 +413,16 @@ def run(args: argparse.Namespace) -> int:
             portrait.wake()
         if episodes is not None:
             episodes.stop()
+        if warp is not None:
+            warp.stop()
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
             timeline.stop()  # writes the open stretch first
         if journal_thread is not None:
             journal_thread.join(10.0)
+        if warp_thread is not None:
+            warp_thread.join(5.0)
         if episodes_thread is not None:
             episodes_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if portrait_thread is not None:

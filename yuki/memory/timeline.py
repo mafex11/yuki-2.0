@@ -35,9 +35,26 @@ Two parts:
   for a window without a page) in the same state are merged into one row.
   Privacy follows :mod:`yuki.memory.privacy`: a blocked app is recorded
   without app, title or page; a private window or a blocked address keeps the
-  app name only.  Nothing is recorded while the user has paused memory, the
-  session is locked, or a full-screen app (a game) is in front - and then no
-  hooks but the foreground one stay registered.
+  app name only.  Nothing is recorded while the user has paused memory or the
+  session is locked - and then no hooks but the foreground one stay
+  registered.
+
+  - **Full screen** (a game, an F11 video, a presentation) is recorded as
+    ``fullscreen`` rows.  While the privacy file pauses content in full
+    screen (``[pause] when_fullscreen``, the default) such a row carries only
+    the process and app name, start/end, present vs away and media - the
+    window's title and page are not read, no title hook is kept.  When the
+    same window was showing a site just before it went full screen, that
+    host (not the path) is carried over, so "YouTube full screen" is known
+    without reading the page.
+  - **Meetings**: an app or page in the privacy file's ``[meetings]`` table
+    (:class:`MeetingRules`) is recorded as a ``meeting`` row: app, host and
+    service name ("Google Meet"), start/end - no title, no path.  Its content
+    stays blocked by the ``[apps]``/``[web]`` rules.  While a meeting is in
+    front the microphone users (ConsentStore, as
+    :func:`yuki.perception.system.activity_facts`) are read every
+    :data:`MEDIA_EVERY_S`; the app in front using the microphone counts as
+    present without input (``passive_s``) and as ``mic_s``.
 
 Nothing here sends input, changes focus, launches anything or takes pixels.
 Logs are content-free.
@@ -48,12 +65,14 @@ from __future__ import annotations
 import ctypes
 import threading
 import time
+import tomllib
 import traceback
 from collections import Counter
 from collections.abc import Callable, Sequence
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -102,6 +121,133 @@ MAX_TICK_GAP_S = 120.0
 RUN_GAP_S = 60.0
 #: Away (or untracked) this long is a break.
 BREAK_S = 600.0
+#: Aggregation: stretches of one meeting service closer than this are one meeting
+#: (the user looked at another window for a while during the call).
+MEETING_GAP_S = 300.0
+
+
+# ---------------------------------------------------------------------------
+# Privacy-file tables this module and yuki.memory.warp read ([meetings], [terminal])
+# ---------------------------------------------------------------------------
+
+
+class PrivacySection:
+    """One table of the privacy file that :class:`yuki.memory.privacy.PrivacyRules` does not parse.
+
+    Re-read whenever the file's modification time or size moves (a ``stat``
+    per call, like :class:`~yuki.memory.privacy.PrivacyConfig`).  A table the
+    user's file lacks comes from the packaged defaults; a file that fails to
+    parse keeps the last good value (or the defaults) and sets
+    :attr:`last_error`, so a typo never opens a gate.
+
+    Args:
+        config: the service's ``PrivacyConfig`` (its ``path`` is read), or None for defaults only.
+        name: the table name, e.g. ``"meetings"``.
+        parse: ``parse(table: dict) -> value``.
+    """
+
+    def __init__(self, config: Any, name: str, parse: Callable[[dict], Any]) -> None:
+        self._config = config
+        self._name = name
+        self._parse = parse
+        self._lock = threading.Lock()
+        self._stamp: tuple[int, int] | None = None
+        self._value: Any = None
+        self.last_error = ""
+
+    def _default_table(self) -> dict:
+        from yuki.memory.privacy import DEFAULT_PATH
+
+        with DEFAULT_PATH.open("rb") as fh:
+            return tomllib.load(fh).get(self._name) or {}
+
+    def get(self) -> Any:
+        with self._lock:
+            path = getattr(self._config, "path", None)
+            stamp = None
+            if path is not None:
+                try:
+                    st = Path(path).stat()
+                    stamp = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    stamp = None
+            if self._value is not None and stamp == self._stamp:
+                return self._value
+            self._stamp = stamp
+            try:
+                table = None
+                if stamp is not None:
+                    with Path(path).open("rb") as fh:
+                        table = tomllib.load(fh).get(self._name)
+                if not isinstance(table, dict):
+                    table = self._default_table()
+                self._value = self._parse(table)
+                self.last_error = ""
+            except Exception as exc:  # keep the last good value
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                if self._value is None:
+                    self._value = self._parse(self._default_table())
+            return self._value
+
+
+def _host_matches(host: str, suffix: str) -> bool:
+    return host == suffix or host.endswith("." + suffix)
+
+
+def _name_key(value: str) -> str:
+    """A ``[meetings.names]`` key: a process as :func:`app_key`, a host lower-cased."""
+    value = str(value).strip().lower()
+    return (app_key(value) or "") if value.endswith(".exe") else value
+
+
+@dataclass(frozen=True)
+class MeetingRules:
+    """The privacy file's ``[meetings]`` table: apps and pages recorded as meeting hours only."""
+
+    processes: frozenset[str] = frozenset()               # app_key form ("zoom")
+    host_suffixes: tuple[str, ...] = ()
+    host_paths: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    names: tuple[tuple[str, str], ...] = ()               # (process key or host, service name)
+
+    @classmethod
+    def from_dict(cls, table: dict) -> MeetingRules:
+        table = table or {}
+        processes = frozenset(k for k in (app_key(str(p)) for p in table.get("processes", []) or []) if k)
+        hosts = tuple(str(h).strip().lower() for h in table.get("host_suffixes", []) or [] if str(h).strip())
+        paths = tuple(
+            (str(h).strip().lower(), tuple(str(f).lower() for f in (frags or []) if str(f)))
+            for h, frags in (table.get("host_paths", {}) or {}).items()
+        )
+        names = tuple((_name_key(k), str(v)) for k, v in (table.get("names", {}) or {}).items() if str(v).strip())
+        return cls(processes=processes, host_suffixes=hosts, host_paths=paths, names=names)
+
+    def _name(self, key: str) -> str | None:
+        return next((v for k, v in self.names if k == key), None)
+
+    def match_process(self, process_name: str, app_name: str = "") -> str | None:
+        """The meeting service a process is (its name from ``names``, else the app name), or None."""
+        key = app_key(process_name)
+        if not key or key not in self.processes:
+            return None
+        return self._name(key) or (app_name or "").strip() or key
+
+    def match_url(self, url: str) -> str | None:
+        """The meeting service an http(s) page is, or None."""
+        try:
+            parts = urlsplit((url or "").strip())
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return None
+        if parts.scheme.lower() not in ("http", "https") or not host:
+            return None
+        for suffix in self.host_suffixes:
+            if _host_matches(host, suffix):
+                return self._name(suffix) or site_of(host)
+        path = (parts.path or "").lower()
+        for rule_host, fragments in self.host_paths:
+            if _host_matches(host, rule_host) and any(f in path for f in fragments):
+                return self._name(rule_host) or site_of(host)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +306,14 @@ def _app_label(row: TimelineRow) -> str:
 
 
 def group_of(row: TimelineRow, group_by: str) -> tuple[str, str]:
-    """``(key, label)`` of the activity a row belongs to at this grouping."""
+    """``(key, label)`` of the activity a row belongs to at this grouping.
+
+    A meeting is its own activity at every grouping ("in a meeting (Google
+    Meet)"); a full-screen row belongs to its app or site like any other
+    (its full-screen time is counted separately).
+    """
+    if row.meeting:
+        return f"meeting:{row.meeting}", f"in a meeting ({row.meeting})"
     if row.withheld:
         if not row.app:
             return "withheld", "(private)"
@@ -172,6 +325,8 @@ def group_of(row: TimelineRow, group_by: str) -> tuple[str, str]:
             label = (row.title or "").strip() or f"{site_of(row.host) or ''}{row.path or ''}"
         else:
             label = (row.title or "").strip() or _app_label(row)
+        if row.fullscreen and not (row.title or "").strip():
+            label += " (full screen)"
         return f"page:{row.page_key}", label
     site = site_of(row.host)
     if site:
@@ -190,6 +345,8 @@ class Run:
     active_s: float = 0.0
     passive_s: float = 0.0
     media_s: float = 0.0
+    fullscreen_s: float = 0.0
+    mic_s: float = 0.0
     apps: Counter = field(default_factory=Counter)
     hosts: Counter = field(default_factory=Counter)
     titles: Counter = field(default_factory=Counter)
@@ -223,6 +380,9 @@ def _runs(clips: Sequence[_Clip], group_by: str) -> list[tuple[Run, bool]]:
         current.active_s += c.val("active_s")
         current.passive_s += c.val("passive_s")
         current.media_s += c.val("media_s")
+        current.mic_s += c.val("mic_s")
+        if row.fullscreen:
+            current.fullscreen_s += c.present_s
         current.apps[_app_label(row)] += c.present_s
         if row.host:
             current.hosts[site_of(row.host)] += c.present_s
@@ -247,6 +407,14 @@ def aggregate(
     time, switches (one activity directly followed by another) and
     background media.  ``interleaving`` lists pairs of activities the user
     went back and forth between, with the number of switches between them.
+
+    Full screen: ``fullscreen_s`` per activity and in the totals is present
+    time with a full-screen window in front.  Meetings are their own
+    activities ("in a meeting (Zoom)"); ``meetings`` lists each meeting as one
+    span - stretches of one service less than :data:`MEETING_GAP_S` apart
+    are one meeting - with ``in_front_s`` (time it was the window in front),
+    ``present_s`` and ``mic_s`` (the app in front using the microphone);
+    ``totals.meeting_s`` is the present time in meetings.
     """
     if group_by not in ("app", "site", "page"):
         raise ValueError(f"group_by must be app, site or page, not {group_by!r}")
@@ -261,7 +429,8 @@ def aggregate(
         if item is None:
             item = items[run.key] = {
                 "key": run.key, "label": run.label, "apps": Counter(), "hosts": Counter(), "titles": Counter(),
-                "present_s": 0.0, "active_s": 0.0, "passive_s": 0.0, "media_s": 0.0, "visits": 0,
+                "present_s": 0.0, "active_s": 0.0, "passive_s": 0.0, "media_s": 0.0, "fullscreen_s": 0.0,
+                "mic_s": 0.0, "meeting": run.key.startswith("meeting:"), "visits": 0,
                 "longest_s": 0.0, "longest_start": None, "longest_end": None,
                 "first_at": run.start, "last_at": run.end,
             }
@@ -269,6 +438,8 @@ def aggregate(
         item["active_s"] += run.active_s
         item["passive_s"] += run.passive_s
         item["media_s"] += run.media_s
+        item["fullscreen_s"] += run.fullscreen_s
+        item["mic_s"] += run.mic_s
         item["visits"] += 1
         item["apps"].update(run.apps)
         item["hosts"].update(run.hosts)
@@ -295,7 +466,7 @@ def aggregate(
         item["titles"] = [
             {"title": t, "present_s": round(s, 1)} for t, s in top_titles.most_common(titles) if t
         ] if titles else []
-        for k in ("present_s", "active_s", "passive_s", "media_s", "longest_s"):
+        for k in ("present_s", "active_s", "passive_s", "media_s", "fullscreen_s", "mic_s", "longest_s"):
             item[k] = round(item[k], 1)
         out_items.append(item)
     background: Counter = Counter()
@@ -310,6 +481,8 @@ def aggregate(
         "away_s": round(sum(c.val("away_s") for c in clips), 1),
         "media_s": round(sum(c.val("media_s") for c in clips), 1),
         "background_media_s": round(sum(background.values()), 1),
+        "fullscreen_s": round(sum(c.present_s for c in present if c.row.fullscreen), 1),
+        "meeting_s": round(sum(c.present_s for c in present if c.row.meeting), 1),
         "switches": switches,
         "activities": total_items,
         "first_at": clips[0].start if clips else None,
@@ -321,7 +494,43 @@ def aggregate(
             {"a": labels[a], "b": labels[b], "switches": n} for (a, b), n in pairs.most_common(8) if n >= 2
         ],
         "background_media": [{"app": a, "seconds": round(s, 1)} for a, s in background.most_common(8) if s >= 1],
+        "meetings": meetings(clips),
     }
+
+
+def meetings(clips: Sequence[_Clip]) -> list[dict[str, Any]]:
+    """Meetings as spans: stretches of one service closer than :data:`MEETING_GAP_S` joined, oldest first."""
+    spans: list[dict[str, Any]] = []
+    open_by: dict[str, dict[str, Any]] = {}
+    for c in clips:
+        label = c.row.meeting
+        if not label:
+            continue
+        span = open_by.get(label)
+        if span is None or c.start - span["end"] > MEETING_GAP_S:
+            span = {"label": label, "apps": Counter(), "hosts": Counter(), "start": c.start, "end": c.end,
+                    "in_front_s": 0.0, "present_s": 0.0, "mic_s": 0.0, "fullscreen_s": 0.0}
+            open_by[label] = span
+            spans.append(span)
+        span["end"] = max(span["end"], c.end)
+        span["in_front_s"] += c.end - c.start
+        span["present_s"] += c.present_s if c.row.state == "present" else 0.0
+        span["mic_s"] += c.val("mic_s")
+        if c.row.fullscreen:
+            span["fullscreen_s"] += c.end - c.start
+        span["apps"][_app_label(c.row)] += c.end - c.start
+        if c.row.host:
+            span["hosts"][site_of(c.row.host)] += c.end - c.start
+    out = []
+    for span in sorted(spans, key=lambda s: s["start"]):
+        apps, hosts = span.pop("apps"), span.pop("hosts")
+        span["app"] = apps.most_common(1)[0][0] if apps else None
+        span["host"] = hosts.most_common(1)[0][0] if hosts else None
+        span["seconds"] = round(span["end"] - span["start"], 1)
+        for k in ("in_front_s", "present_s", "mic_s", "fullscreen_s"):
+            span[k] = round(span[k], 1)
+        out.append(span)
+    return out
 
 
 def sequence(
@@ -392,6 +601,8 @@ def sequence(
             "kind": "run", "label": run.label, "start": run.start, "end": run.end,
             "present_s": round(run.present_s, 1), "active_s": round(run.active_s, 1),
             "passive_s": round(run.passive_s, 1), "media_s": round(run.media_s, 1),
+            "fullscreen_s": round(run.fullscreen_s, 1), "mic_s": round(run.mic_s, 1),
+            "meeting": run.key.startswith("meeting:"),
             "app": run.apps.most_common(1)[0][0] if run.apps else None,
             "title": run.titles.most_common(1)[0][0] if run.titles else None,
         })
@@ -411,8 +622,8 @@ def breaks(
 
     With ``now``, the time after the last row up to ``now`` counts as a gap
     (the recorder writes the open stretch every :data:`FLUSH_EVERY_S`, so a
-    silence longer than that is time nothing was recorded: paused, locked, a
-    full-screen app, the PC asleep).  Each: ``{"start", "end", "seconds", "ongoing"}``.
+    silence longer than that is time nothing was recorded: paused, locked,
+    the PC asleep; full screen is recorded).  Each: ``{"start", "end", "seconds", "ongoing"}``.
     """
     clips = _clip(rows, since, until)
     spans: list[list[float]] = []
@@ -451,19 +662,27 @@ def _hm(at: float | None) -> str:
 def describe(agg: dict[str, Any], *, max_items: int = 12, titles: bool = True) -> list[str]:
     """Plain lines for an aggregate (the API tool text, prompts)."""
     t = agg["totals"]
+    special = ""
+    if t.get("fullscreen_s", 0) >= 30:
+        special += f", full screen {format_duration(t['fullscreen_s'])}"
+    if t.get("meeting_s", 0) >= 30:
+        special += f", in meetings {format_duration(t['meeting_s'])}"
     lines = [
         f"present {format_duration(t['present_s'])} (active {format_duration(t['active_s'])}, watching or "
         f"listening with no input {format_duration(t['passive_s'])}), away {format_duration(t['away_s'])}, "
-        f"media playing in the app in front {format_duration(t['media_s'])}, {t['switches']} switches between "
-        f"{t['activities']} activities"
+        f"media playing in the app in front {format_duration(t['media_s'])}{special}, {t['switches']} switches "
+        f"between {t['activities']} activities"
     ]
     for item in agg["items"][:max_items]:
         where = f" in {item['app']}" if item.get("app") and item["app"] != item["label"] else ""
         extra = []
         if item["passive_s"] >= 30:
-            extra.append(f"watching {format_duration(item['passive_s'])}")
+            what = "no input, microphone on" if item.get("meeting") else "watching"
+            extra.append(f"{what} {format_duration(item['passive_s'])}")
         if item["media_s"] >= 30:
             extra.append(f"media {format_duration(item['media_s'])}")
+        if item.get("fullscreen_s", 0) >= 30:
+            extra.append(f"full screen {format_duration(item['fullscreen_s'])}")
         longest = (
             f"longest {format_duration(item['longest_s'])} at {_hm(item['longest_start'])}"
             if item["longest_s"] else "longest -"
@@ -483,7 +702,19 @@ def describe(agg: dict[str, Any], *, max_items: int = 12, titles: bool = True) -
         lines.append(f"back and forth: {pair['a']} <-> {pair['b']}, {pair['switches']} switches")
     for media in agg.get("background_media", [])[:4]:
         lines.append(f"background media: {media['app']} {format_duration(media['seconds'])}")
+    for m in agg.get("meetings", [])[:8]:
+        lines.append(describe_meeting(m))
     return lines
+
+
+def describe_meeting(m: dict[str, Any]) -> str:
+    """``meeting: in a meeting 15:00-15:45 (Google Meet in Google Chrome), in front 40m, microphone on 38m``."""
+    where = m["label"] + (f" in {m['app']}" if m.get("app") and m["app"] != m["label"] else "")
+    line = (f"meeting: in a meeting {_hm(m['start'])}-{_hm(m['end'])} ({where}), "
+            f"in front {format_duration(m['in_front_s'])}")
+    if m.get("mic_s", 0) >= 30:
+        line += f", microphone on {format_duration(m['mic_s'])}"
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +768,32 @@ class _Stretch:
     media_s: float = 0.0
     media_other: dict[str, float] = field(default_factory=dict)
     end: float = 0.0
+    fullscreen: bool = False
+    #: Nothing about the window is read but its process and app (full screen
+    #: under the privacy pause, a meeting app): no title, no page, no title hook.
+    hidden: bool = False
+    meeting: str | None = None
+    mic_s: float = 0.0
+
+
+def _mic_users() -> frozenset[str]:
+    """Apps using the microphone now (ConsentStore), as app keys / package families, casefolded.
+
+    The same read-only registry facts as ``activity_facts()["microphone"]``
+    (:func:`yuki.perception.system._device_users`), without its media and
+    foreground parts.
+    """
+    import psutil
+
+    from yuki.perception import system as _system
+
+    processes = _system._process_entries()
+    boot_ft = int(psutil.boot_time() * 1e7) + _system._FILETIME_UNIX_EPOCH
+    try:
+        users = _system._device_users("microphone", processes, boot_ft)
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(k for k in ((app_key(u.get("app")) or "") for u in users) if k)
 
 
 class _PageProbe:
@@ -672,7 +929,11 @@ class TimelineRecorder:
         self._hooked: tuple[int, ...] = ()
         self._fg = 0
         self._paused = False
-        self._blocked: str | None = None     # paused | locked | fullscreen
+        self._blocked: str | None = None     # paused | locked
+        self._meetings = PrivacySection(self.privacy, "meetings", MeetingRules.from_dict)
+        self._mic: frozenset[str] = frozenset()
+        self._mic_at = 0.0
+        self._mic_errors = 0
         self._current: _Stretch | None = None
         self._last_row: TimelineRow | None = None
         self._acc_at = time.time()
@@ -738,6 +999,9 @@ class TimelineRecorder:
             "page_probes": probe.probes if probe else 0, "page_errors": probe.errors if probe else 0,
             "page_ms": {"p50": pct(0.5), "p90": pct(0.9), "max": pct(1.0)},
             "media_errors": self._media_errors, "playing": len(self._playing),
+            "fullscreen": bool(self._current.fullscreen) if self._current else None,
+            "meeting": bool(self._current.meeting) if self._current else None,
+            "meetings_config_error": self._meetings.last_error or None,
         }
 
     # -- logging -------------------------------------------------------------
@@ -914,10 +1178,31 @@ class TimelineRecorder:
         if self._gate(now):
             return
         st = self._current
-        if st is not None and st.hwnd == hwnd and self._w._window_title(hwnd) == st.title:
+        if st is not None and st.hwnd == hwnd and self._fullscreen(hwnd) == st.fullscreen and (
+            st.hidden or self._w._window_title(hwnd) == st.title
+        ):
             return  # the same window came back (a menu or dialog of it closed)
         self._close(now)
-        self._open(hwnd, now)
+        self._open(hwnd, now, carry=st)
+
+    def _fullscreen(self, hwnd: int) -> bool:
+        try:
+            return bool(hwnd) and bool(self._w.is_fullscreen_front(hwnd))
+        except Exception:
+            return False
+
+    def _check_fullscreen(self, now: float) -> None:
+        """The window in front went into or out of full screen (F11, a game's mode switch): a new stretch."""
+        st = self._current
+        if st is None or st.hwnd != self._fg:
+            return
+        fullscreen = self._fullscreen(st.hwnd)
+        if fullscreen == st.fullscreen:
+            return
+        self.counters["fullscreen_on" if fullscreen else "fullscreen_off"] += 1
+        self._log("timeline_fullscreen", fullscreen=fullscreen)
+        self._close(now)
+        self._open(st.hwnd, now, carry=st)
 
     # -- gates ---------------------------------------------------------------------
 
@@ -928,15 +1213,13 @@ class TimelineRecorder:
         self._gate(time.time())
 
     def _gate(self, now: float) -> bool:
-        """Apply pause / lock / full screen; True while recording is blocked."""
+        """Apply pause / lock; True while recording is blocked (full screen is recorded, see :meth:`_open`)."""
         rules = self.privacy.rules()
         reason = None
         if self._paused:
             reason = "paused"
         elif rules.pause_when_locked and self._w.session_locked():
             reason = "locked"
-        elif rules.pause_when_fullscreen and self._fg and self._w.is_fullscreen_front(self._fg):
-            reason = "fullscreen"
         if reason == self._blocked:
             return reason is not None
         previous, self._blocked = self._blocked, reason
@@ -977,14 +1260,22 @@ class TimelineRecorder:
         ids.discard("")
         return frozenset(ids), entry
 
-    def _open(self, hwnd: int, now: float, *, like: _Stretch | None = None, state: str = "present") -> None:
-        """Start a stretch for ``hwnd`` (``like``: same window and page, another state)."""
+    def _open(
+        self, hwnd: int, now: float, *, like: _Stretch | None = None, state: str = "present",
+        carry: _Stretch | None = None,
+    ) -> None:
+        """Start a stretch for ``hwnd`` (``like``: same window and page, another state).
+
+        ``carry``: the stretch that just ended; when it was the same window
+        and this one is full screen under the privacy pause, its host,
+        privacy reason and meeting carry over (nothing new is read).
+        """
         self._current = None
         if self._blocked or not hwnd:
             return
         if like is not None:
             st = replace(like, start=now, end=now, state=state, settled=False, row_id=None, base=None, segments=1,
-                         active_s=0.0, passive_s=0.0, away_s=0.0, media_s=0.0, media_other={})
+                         active_s=0.0, passive_s=0.0, away_s=0.0, media_s=0.0, media_other={}, mic_s=0.0)
             self._current = st
             self._settle(st)
             return
@@ -997,26 +1288,46 @@ class TimelineRecorder:
             return
         pid = self._w._window_pid(hwnd)
         facts = self._procs.get(pid)
-        title = self._w._window_title(hwnd)
         rules = self.privacy.rules()
-        app, withheld = facts.app_name, None
+        fullscreen = self._fullscreen(hwnd)
+        hidden = fullscreen and rules.pause_when_fullscreen
+        app, withheld, title, host = facts.app_name, None, "", None
+        meeting = None
         if facts.is_own and rules.skip_own_windows:
-            app, withheld, title = "Yuki", "own_window", ""
+            app, withheld = "Yuki", "own_window"
+        elif meeting := self._meetings.get().match_process(facts.process_name, facts.app_name):
+            # meeting hours only: the app's name and the time, nothing from its windows
+            withheld, hidden = rules.check_app(facts.process_name, facts.app_name) or "meeting", True
         elif reason := rules.check_app(facts.process_name, facts.app_name):
-            app, withheld, title = "", reason, ""
-        elif reason := rules.check_window(facts.process_name, title):
-            withheld, title = reason, ""
+            app, withheld = "", reason
+        elif hidden:
+            if carry is not None and carry.hwnd == hwnd and carry.pid == pid and not carry.hidden:
+                host, withheld, meeting = carry.host, carry.withheld, carry.meeting
+        else:
+            title = self._w._window_title(hwnd)
+            if reason := rules.check_window(facts.process_name, title):
+                withheld, title = reason, ""
         ids, entry = self._identity(pid, facts.exe, facts.process_name)
         st = _Stretch(start=now, end=now, hwnd=hwnd, pid=pid, process=facts.process_name if app else "",
-                      app=app, title=title, withheld=withheld, ids=ids, entry=entry)
+                      app=app, title=title, withheld=withheld, host=host, ids=ids, entry=entry,
+                      fullscreen=fullscreen, hidden=hidden, meeting=meeting)
         self._current = st
-        self._hook_names(hwnd)
+        if hidden:
+            self._unhook_names()
+        else:
+            self._hook_names(hwnd)
         idle = now - self._input_at
-        if idle >= AWAY_AFTER_S and not self._fg_media(st):
+        if meeting:
+            self._poll_mic()
+        if idle >= AWAY_AFTER_S and not self._engaged(st):
             st.state = "away"
-        if withheld or not self._probe_page(st, now):
+        if withheld or hidden or not self._probe_page(st, now):
             self._settle(st)
         self.counters["stretches"] += 1
+        if fullscreen:
+            self.counters["fullscreen_stretches"] += 1
+        if meeting:
+            self.counters["meeting_stretches"] += 1
 
     def _probe_page(self, st: _Stretch, now: float) -> bool:
         """Ask for the page ``st`` shows; False when no read was queued."""
@@ -1057,13 +1368,17 @@ class TimelineRecorder:
             st.page_checked_at = now
             if st.settled and not page:
                 continue  # a re-read that found nothing (loading, not answering) changes nothing
-            host = path = None
+            host = path = meeting = None
             withheld = st.withheld
             title = st.title
             if page and page[1]:
                 url = page[1]
                 reason = self.privacy.rules().check_url(url)
-                if reason:
+                meeting = self._meetings.get().match_url(url)
+                if meeting:
+                    # meeting hours only: the service and host, never the title or the path
+                    host, withheld, title = url_host(url), reason, ""
+                elif reason:
                     withheld, title = reason, ""
                 else:
                     try:
@@ -1077,21 +1392,28 @@ class TimelineRecorder:
                         if not host:
                             path = f"{parts.scheme}:{path}"
             if not st.settled:
-                st.host, st.path, st.withheld, st.title = host, path, withheld, title
+                st.host, st.path, st.withheld, st.title, st.meeting = host, path, withheld, title, meeting
+                if meeting:
+                    self._poll_mic()
+                    self.counters["meeting_stretches"] += 1
                 self._settle(st)
                 continue
-            if (host, path, withheld) != (st.host, st.path, st.withheld):
+            if (host, path, withheld, meeting) != (st.host, st.path, st.withheld, st.meeting):
                 # the page changed under the same title (a feed, a single-page site)
                 self._advance(now)
                 self._close(now)
-                new = replace(st, host=host, path=path, withheld=withheld, title=title)
-                self._open(st.hwnd, now, like=new, state=st.state)
+                if st.meeting and not meeting:
+                    self._open(st.hwnd, now)  # left the meeting page: read the window afresh
+                else:
+                    new = replace(st, host=host, path=path, withheld=withheld, title=title, meeting=meeting)
+                    self._open(st.hwnd, now, like=new, state=st.state)
                 self.counters["page_rotations"] += 1
 
     def _settle(self, st: _Stretch) -> None:
         """Decide the stretch's identity; continue the previous row when it is the same page."""
         st.settled = True
-        key = self.store.timeline_key(st.process, st.host, st.path, st.title, st.withheld)
+        key = self.store.timeline_key(st.process, st.host, st.path, st.title, st.withheld,
+                                      fullscreen=st.fullscreen, meeting=st.meeting)
         last = self._last_row
         if (
             last is not None and last.page_key == key and last.state == st.state
@@ -1114,6 +1436,7 @@ class TimelineRecorder:
             away_s=st.away_s + (base.away_s if base else 0.0),
             media_s=st.media_s + (base.media_s if base else 0.0),
             media_other=other, withheld=st.withheld, segments=st.segments,
+            fullscreen=st.fullscreen, meeting=st.meeting, mic_s=st.mic_s + (base.mic_s if base else 0.0),
         )
 
     def _write(self, st: _Stretch, end: float) -> TimelineRow | None:
@@ -1155,11 +1478,36 @@ class TimelineRecorder:
     def _fg_media(self, st: _Stretch) -> bool:
         return any(self._matches(st, app_id) for app_id, _ in self._playing)
 
+    def _mic_on(self, st: _Stretch) -> bool:
+        """A meeting's app is using the microphone (by image key, or package family for a packaged app)."""
+        if not st.meeting or not self._mic:
+            return False
+        key = app_key(st.process) or ""
+        return key in self._mic or any(i.startswith(m + "_") or i.startswith(m + "!") for m in self._mic
+                                       for i in st.ids)
+
+    def _engaged(self, st: _Stretch) -> bool:
+        """At the app without input: its media plays, or it is a meeting using the microphone."""
+        return self._fg_media(st) or self._mic_on(st)
+
+    def _poll_mic(self) -> None:
+        self._mic_at = time.monotonic()
+        try:
+            self._mic = _mic_users()
+            self._mic_errors = 0
+        except Exception:
+            self._mic_errors += 1
+            self.counters["mic_errors"] += 1
+            if self._mic_errors >= 3:
+                self._mic = frozenset()
+
     def _credit(self, st: _Stretch, a: float, b: float, kind: str) -> None:
         if b <= a:
             return
         d = b - a
         setattr(st, kind, getattr(st, kind) + d)
+        if self._mic_on(st):
+            st.mic_s += d
         for app_id, label in self._playing:
             if self._matches(st, app_id):
                 if kind != "away_s":
@@ -1202,7 +1550,7 @@ class TimelineRecorder:
                 self._credit(st, t0, now, "active_s")
                 return
             self._credit(st, t0, a, "active_s")
-            if self._fg_media(st):
+            if self._engaged(st):
                 self._credit(st, a, b, "passive_s")
                 self._credit(st, b, now, "active_s")
                 return
@@ -1217,7 +1565,7 @@ class TimelineRecorder:
             self._credit(st, t0, back_at, "away_s")
             back = self._switch(st, back_at, "present")
             self._credit(back, back_at, now, "active_s")
-        elif self._fg_media(st):
+        elif self._engaged(st):
             back = self._switch(st, t0, "present")
             self._credit(back, t0, now, "passive_s")
         else:
@@ -1263,9 +1611,14 @@ class TimelineRecorder:
             return
         mono = time.monotonic()
         self._advance(now)
+        self._check_fullscreen(now)
         if mono >= self._next_media:
             self._next_media = mono + MEDIA_EVERY_S
             self._poll_media()
+            if self._current is not None and self._current.meeting:
+                self._poll_mic()
+            else:
+                self._mic = frozenset()
         self._take_pages(now)
         st = self._current
         if self._title_first is not None:
@@ -1278,19 +1631,27 @@ class TimelineRecorder:
             self.counters["page_timeouts"] += 1
             self._settle(st)
         if (
-            st is not None and st.settled and st.host and st.state == "present"
+            st is not None and st.settled and st.host and not st.hidden and st.state == "present"
             and now - st.page_checked_at >= PAGE_REPROBE_S and now - self._input_at < AWAY_AFTER_S
         ):
             st.page_checked_at = now
             self._probe_page(st, now)
         if mono >= self._next_flush:
             self._next_flush = mono + FLUSH_EVERY_S
-            if st is not None and self._current is st:
+            # an unsettled stretch waits for its page (at most PAGE_WAIT_S): its privacy is not known yet
+            if st is not None and self._current is st and st.settled:
                 self._write(st, now)
 
     def _on_title(self, now: float) -> None:
         st = self._current
         if st is None or st.hwnd != self._fg or st.withheld == "own_window":
+            return
+        if st.hidden:
+            return  # full screen under the privacy pause, or a meeting app: nothing about the window is read
+        if st.meeting:
+            # a meeting page: its title is not read; the page is read again in case the tab was left
+            if st.settled:
+                self._probe_page(st, now)
             return
         title = self._w._window_title(st.hwnd)
         if st.withheld and not st.app:
@@ -1314,6 +1675,7 @@ class TimelineRecorder:
 
 
 __all__ = [
-    "TimelineRecorder", "aggregate", "sequence", "breaks", "describe", "format_duration", "group_of", "site_of",
-    "AWAY_AFTER_S", "BREAK_S", "RUN_GAP_S",
+    "TimelineRecorder", "aggregate", "sequence", "breaks", "describe", "describe_meeting", "meetings",
+    "format_duration", "group_of", "site_of", "MeetingRules", "PrivacySection",
+    "AWAY_AFTER_S", "BREAK_S", "RUN_GAP_S", "MEETING_GAP_S",
 ]

@@ -17,8 +17,10 @@ version = 1
 [pause]
 # Stop capturing entirely while the session is locked.
 when_locked = true
-# Stop capturing entirely while a full-screen window is in front (a game,
-# a full-screen video, a presentation).
+# Stop capturing content while a full-screen window is in front (a game,
+# a full-screen video, a presentation).  The timeline still counts the time:
+# the app's name, start/end, active or away and whether media played - never
+# the window's title or page.
 when_fullscreen = true
 
 [fields]
@@ -57,6 +59,8 @@ blocked_processes = [
     "LogonUI.exe",
     "LockApp.exe",
     "consent.exe",
+    # meeting apps: never read, recorded as meeting hours only (see [meetings])
+    "Zoom.exe",
     # Windows Settings (SystemSettings.exe) is read on purpose (user's choice,
     # 2026-09-24).  Its Wi-Fi key and PIN fields are password fields: their
     # values are never read (see [fields]).
@@ -147,3 +151,82 @@ query_params = ["q", "search_query", "query", "p"]
 # ("Discord").  Domains: "example.com" also blocks its subdomains.
 blocked_apps = []
 blocked_domains = []
+
+[meetings]
+# Meetings are remembered as hours only: the timeline records a "meeting"
+# row with the app or site, the service name below and start/end (plus how
+# long the app used the microphone) - never a window title, a page path, or
+# anything said or shown.  Their content stays blocked by [apps] and [web]
+# above; keep the two lists in step.
+# Apps (process names) that are meetings whenever they are in front.
+processes = ["Zoom.exe"]
+# Sites (and their subdomains) that are meetings.
+host_suffixes = ["meet.google.com", "zoom.us"]
+
+# Sites where only some paths are meetings: host -> path fragments.
+[meetings.host_paths]
+"teams.microsoft.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
+"teams.live.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
+
+# The service name shown in the timeline and episodes (process or host -> name).
+[meetings.names]
+"Zoom.exe" = "Zoom"
+"meet.google.com" = "Google Meet"
+"zoom.us" = "Zoom"
+"teams.microsoft.com" = "Microsoft Teams"
+"teams.live.com" = "Microsoft Teams"
+
+[terminal]
+# The Warp terminal's command history (its own local database, read-only).
+# Every few minutes the new commands are journaled: the command line, its
+# folder, git branch, exit code and time.  Command OUTPUT is never read.
+# A command matching any rule below is dropped entirely (never stored, never
+# sent to the model).  Set enabled = false to stop reading Warp's history.
+enabled = true
+# Path of Warp's database; empty = %LOCALAPPDATA%\warp\Warp\data\warp.sqlite.
+database = ""
+# Commands Warp's own AI agent ran (not typed by you) are journaled too, marked as such.
+include_agent_commands = true
+
+# Secret rules: Python regular expressions, matched case-insensitively against
+# the command line, its folder and its branch.  Literal strings: no escaping.
+secret_patterns = [
+    # an assignment naming a secret: API_KEY=..., $env:GITHUB_TOKEN = ..., export DB_PASSWORD=...
+    '''[a-z0-9_.-]*(key|token|secret|passw|pwd|credential|creds|auth(?!or))[a-z0-9_.-]*\s*=\s*\S''',
+    # setx / SetEnvironmentVariable of such a name
+    '''\bsetx\s+\S*(key|token|secret|passw|credential|auth(?!or))''',
+    '''SetEnvironmentVariable\s*\(\s*['"]?[^,'"]*(key|token|secret|passw|credential|auth(?!or))''',
+    # a tool's config set of such a name: aws configure set aws_secret_access_key ..., npm config set //x/:_authToken ...
+    '''\bconfig(ure)?\s+(set\s+)?\S*(key|token|secret|passw|credential|auth(?!or))\S*\s+\S''',
+    # a flag naming a secret, with a value: --api-key abc, --password=..., -Token x
+    '''(^|\s)--?[a-z0-9-]*(key|token|secret|passw|credential|creds|auth(?!or))[a-z0-9-]*(\s+|=)[^\s-]''',
+    # HTTP headers
+    '''\bauthorization\s*:''',
+    '''\bbearer\s+\S{8,}''',
+    '''\b(x-)?(api|access|auth)[-_]?(key|token)\s*:''',
+    # a URL with a user name and password
+    '''[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@''',
+    # well-known key and token shapes
+    '''\b(sk|pk|rk)-[a-z0-9_-]{16,}''',
+    '''\bgh[pousr]_[a-z0-9]{20,}''',
+    '''\bgithub_pat_\w{20,}''',
+    '''\bxox[abprs]-[a-z0-9-]{10,}''',
+    '''\bAKIA[0-9A-Z]{16}\b''',
+    '''\bAIza[0-9a-z_-]{30,}''',
+    '''\bABSK[a-z0-9+/=]{20,}''',
+    '''\beyJ[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}''',
+    '''-----BEGIN [A-Z ]*PRIVATE KEY''',
+    # passwords handed to a tool on the command line
+    '''ConvertTo-SecureString''',
+    '''-AsPlainText''',
+    '''\bsshpass\b''',
+    '''\bmysql(admin)?\b.*\s-p\S''',
+    '''\bcmdkey\b.*/pass''',
+    '''\bnet\s+user\s+\S+\s+\S+''',
+]
+# Long random-looking words are treated as secrets too: a word (split at
+# spaces, quotes, = : , ; ( ) < > | & / \) at least this long whose characters
+# carry at least this many bits of entropy each, mixing letters and digits.
+# (A git commit hash or a GUID on the command line is dropped by this.)
+entropy_min_length = 24
+entropy_min_bits = 3.5
