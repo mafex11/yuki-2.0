@@ -31,7 +31,7 @@ KINDS = ("conversation", "email", "page", "video", "document", "list", "terminal
 _PATH_KEYS = (
     "header", "list", "row", "sender", "time", "body", "day_separator", "exclude",
     "composer", "me_row", "self_name", "list_rows", "main", "chrome",
-    "title", "author", "description",
+    "title", "author", "description", "sender_parent",
 )
 
 
@@ -102,6 +102,10 @@ class Profile:
     #: groups consecutive messages of one sender in a container), so a sender
     #: carries only to rows of the same parent.  "" : it carries down the list.
     sender_group: str = ""
+    #: With ``sender_group = "parent"``: sender anchors looked for from the
+    #: row's parent (the run's container) when the row itself names nobody -
+    #: an app that names a run's sender once, beside the run's bubbles.
+    sender_parent: tuple[str, ...] = ()
     #: False: when no row matches the ``sender`` anchors, leave senders unknown
     #: instead of guessing them from structure (apps whose messages have no
     #: visible name to find, only the anchored label).

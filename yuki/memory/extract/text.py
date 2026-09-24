@@ -33,7 +33,10 @@ CONTAINER_ROLES = frozenset(
 #: Roles whose Name is computed from their contents (Chromium "name from contents").
 NAME_FROM_CONTENT = frozenset({"ListItem", "TreeItem", "DataItem", "Hyperlink", "Text", "HeaderItem"})
 
-_PRIVATE_USE = re.compile("[\ue000-\uf8ff\ufffc\u200b-\u200f\u2060\ufeff]")
+#: Icon-font glyphs and invisible characters: zero-width marks, the soft hyphen, and the
+#: combining grapheme joiner newsletters pad their preview text with ("\u034f \u034f \u034f", seen in
+#: Gmail's inbox rows 2026-09-24).
+_PRIVATE_USE = re.compile("[\ue000-\uf8ff\ufffc\u200b-\u200f\u2060\ufeff\u00ad\u034f]")
 _SPACES = re.compile("[ \t\u00a0]+")
 
 #: Side-column test (fractions of the content root's rectangle).

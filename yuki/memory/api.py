@@ -483,7 +483,7 @@ class MemoryClient:
     # -- conversation memory (yuki.memory.conversations) ----------------------
 
     def log_turn(
-        self, session_id: str, request_id: int, at: float, user_text: str, reply_text: str | None,
+        self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None,
         actions: list[str], outcome: str,
     ) -> int:
         """Store one exchange between the user and Yuki; returns its turn id (0 if it could not be stored).

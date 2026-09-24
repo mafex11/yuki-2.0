@@ -409,8 +409,26 @@ _media_pending: Future | None = None
 _media_manager: Any = None
 
 
+def _prefer_system_cpp_runtime() -> None:
+    """Load the system's C++ runtime before WinRT's bundled one.
+
+    ``winrt`` ships an old ``msvcp140.dll`` (14.29) next to its extension
+    module. Windows keeps one ``msvcp140.dll`` per process (the first one
+    loaded wins), and onnxruntime (the memory embedder) needs 14.40 or newer
+    for ``std::mutex``: with WinRT's copy loaded first, the first embedding
+    crashes the process with an access violation (the ``yuki-memory`` service
+    died this way on 2026-09-24, 1-60 s after every start). The runtime is
+    backward compatible, so loading System32's copy first serves both.
+    """
+    try:
+        ctypes.WinDLL(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "msvcp140.dll"))
+    except OSError:  # no VC++ redistributable installed: WinRT's copy is all there is
+        pass
+
+
 def _init_media_thread() -> None:
     """Put the media thread in the multithreaded apartment WinRT objects expect."""
+    _prefer_system_cpp_runtime()
     try:
         from winrt import _winrt
 

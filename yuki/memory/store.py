@@ -1189,6 +1189,21 @@ def url_host(url: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _request_key(request_id: object) -> int | str:
+    """A turn's request id as stored: an int as given, else its text.
+
+    Yuki names its requests by lane and number ("worker-1", "front_desk-3"),
+    two lanes sharing one session; until 2026-09-24 this was ``int(...)``,
+    which raised on every such id, so no exchange was ever stored.
+    """
+    if isinstance(request_id, bool) or request_id is None:
+        return 0
+    if isinstance(request_id, int):
+        return request_id
+    text = str(request_id).strip()
+    return int(text) if text.isdigit() else text
+
+
 class Store:
     """The memory database. Construct with :meth:`Store.open`."""
 
@@ -2788,7 +2803,7 @@ class Store:
             conn.close()
 
     def add_turn(
-        self, session_id: str, request_id: int, at: float, user_text: str, reply_text: str | None = None,
+        self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None = None,
         actions: Sequence[str] = (), outcome: str | None = None, *, busy_timeout_s: float = 0.008,
     ) -> int:
         """Store one exchange (encrypted) for the conversation worker; returns its id.
@@ -2804,7 +2819,7 @@ class Store:
         now = time.time()
         acts = [" ".join(str(a).split()) for a in (actions or ()) if str(a).strip()]
         row: list[Any] = [
-            self._next_turn_id(), str(session_id or ""), int(request_id or 0), float(at),
+            self._next_turn_id(), str(session_id or ""), _request_key(request_id), float(at),
             self.cipher.encrypt(user_text or ""), self._enc(reply_text),
             self.cipher.encrypt(json.dumps(acts, ensure_ascii=False)) if acts else None,
             outcome or None, now,

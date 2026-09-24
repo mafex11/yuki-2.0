@@ -136,7 +136,10 @@ def _scope(snap: Snapshot, profile: Profile | None, kind: str) -> str:
             )
             if text:
                 return _strip(text, profile.scope_strip)[:200]
-    title = _stable_title(snap.page_title or snap.title)
+    # A page's title names it only when it is a web page (it has an address);
+    # an editor's Document is named after its control ("Text editor" in
+    # Notepad, seen live 2026-09-24), so the window title names the file.
+    title = _stable_title((snap.page_title if snap.url else "") or snap.title)
     if profile and profile.title_split and title:
         parts = title.split(profile.title_split)
         if len(parts) > profile.title_part:
