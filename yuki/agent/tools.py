@@ -521,7 +521,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Looking at how your time went",
         "description": (
             "How the user spent their time: time per app, site or page, visits, "
-            "longest stretches, and episode summaries of what they were doing."
+            "longest stretches, away time, and episode summaries of what they were "
+            "doing. Use it whenever they ask what they did or how long: the window "
+            "in front says nothing about whether they were actually at the PC."
         ),
         "input_schema": _obj(
             {
