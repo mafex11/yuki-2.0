@@ -17,6 +17,9 @@ dependencies = [
     "pywin32>=312",
     "rich>=15.0.0",
     "uiautomation>=2.0.29",
+    "winrt-windows-foundation>=3.2.1",
+    "winrt-windows-foundation-collections>=3.2.1",
+    "winrt-windows-media-control>=3.2.1",
 ]
 
 [dependency-groups]

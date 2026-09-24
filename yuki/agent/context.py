@@ -302,18 +302,25 @@ class ContextManager:
         *,
         self_facts: str | None = None,
         memory_text: str | None = None,
+        origin_text: str | None = None,
     ) -> None:
         """Append a new user request together with the current situation.
 
         The request is the first block, verbatim and alone; the situation is the
         last, separately labelled block (see :meth:`situation_text`). Between
-        them, when there is one, sits the memory block (what Yuki knows about the
-        user, already framed by :func:`yuki.agent.memory.memory_block_text`). It
-        is background for the whole request and is never stubbed; being before
-        the situation block, it is also where this message's cache breakpoint
-        lands, so it is read from cache on every later round.
+        them, when there are any, sit the request origin (where the user was when
+        they asked: the window in front, media, microphone and camera, framed by
+        :func:`attached_text`) and the memory block (what Yuki knows about the
+        user, already framed by :func:`yuki.agent.memory.memory_block_text`).
+        Both are background for the whole request and are never stubbed -- the
+        origin matters most at the end, when the model decides whether to put
+        the user back; being before the situation block, they are also where this
+        message's cache breakpoint lands, so they are read from cache on every
+        later round.
         """
         content = [{"type": "text", "text": text}]
+        if origin_text and origin_text.strip():
+            content.append({"type": "text", "text": attached_text(origin_text)})
         if memory_text and memory_text.strip():
             content.append({"type": "text", "text": memory_text})
         content.append(

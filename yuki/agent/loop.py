@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from collections import Counter
@@ -268,6 +269,7 @@ class Agent:
         """
 
         def warm() -> None:
+            self._warm_activity()
             self._warm_model()
             self._warm_memory()
             self._warm_shell()
@@ -289,6 +291,15 @@ class Agent:
             live=live,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
+
+    def _warm_activity(self) -> None:
+        """Start the WinRT import behind the media facts (returns at once). Never raises."""
+        try:
+            started = self.dispatcher.warm_activity()
+        except Exception as exc:
+            self.logger.error(f"activity prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
+            return
+        self.logger.log("activity_prewarm", started=started)
 
     def _warm_memory(self) -> None:
         """Open memory and cache the portrait before the first request. Never raises."""
@@ -441,11 +452,16 @@ class Agent:
 
     # -- main entry point --------------------------------------------------
 
-    def run(self, request: str) -> Iterator[AgentEvent]:
+    def run(self, request: str, *, origin_hwnd: int | None = None) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
         Args:
             request: What the user typed.
+            origin_hwnd: The window that was in front when the user summoned
+                Yuki, when the caller knows it (a UI whose own window takes the
+                keyboard to be typed into). Without it, the request origin
+                reports whatever is in front now, and when that is Yuki's own
+                window, the top window beneath it.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -473,9 +489,13 @@ class Agent:
         drive: Iterator[AgentEvent] | None = None
         try:
             overview, _ = self._capture_overview()
+            origin = self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
             self.context.add_request(
-                request, overview, memory_text=self._memory_context(request)
+                request,
+                overview,
+                memory_text=self._memory_context(request),
+                origin_text=origin,
             )
             drive = self._drive()
             for event in drive:
@@ -542,7 +562,8 @@ class Agent:
         is also reported on its own. Model time is every round trip (failed ones
         included) minus the time tools ran while its response was still
         streaming; tool time is dispatching the tools the model called, in the
-        stream or after it; the per-turn desktop overview is ``overview_s`` and
+        stream or after it; the per-turn desktop overview (plus the request
+        origin's activity facts) is ``overview_s`` and
         the window view attached after actions ``auto_view_s``. Whatever is left of the
         wall time is the loop's own overhead. Pre-warm calls are not in here:
         they are the separate ``startup_cost`` record.
@@ -1082,6 +1103,38 @@ class Agent:
         )
         return text, facts_text
 
+    def _request_origin(self, origin_hwnd: int | None) -> str | None:
+        """Where the user was when they asked, as one line of facts, or ``None``.
+
+        The window in front (from the overview just captured, with
+        ``origin_hwnd`` taking precedence) plus :meth:`Dispatcher.activity_facts`:
+        media sessions and microphone/camera use. Attached to the request's
+        first message and never stubbed, so it is still there when the model
+        finishes. What to make of it is the model's call. Logged as
+        ``request_origin``; never raises.
+        """
+        started = time.perf_counter()
+        try:
+            facts = self.dispatcher.activity_facts()
+        except Exception as exc:  # the origin must never break a request
+            self.logger.error(f"activity facts failed: {type(exc).__name__}: {exc}", exc=exc)
+            facts = {"errors": {"activity": f"{type(exc).__name__}: {exc}"}}
+        try:
+            text = _origin_text(self._overview_payload, facts, origin_hwnd=origin_hwnd)
+        except Exception as exc:
+            self.logger.error(f"request origin failed: {type(exc).__name__}: {exc}", exc=exc)
+            text = None
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        self._overview_s += elapsed_ms / 1000
+        self.logger.log(
+            "request_origin",
+            text=text,
+            origin_hwnd=origin_hwnd,
+            facts=facts,
+            elapsed_ms=elapsed_ms,
+        )
+        return text
+
     # -- memory ------------------------------------------------------------
 
     def _memory_context(self, request: str) -> str | None:
@@ -1519,6 +1572,92 @@ def _foreground_app(overview: Any) -> str | None:
         chosen = next((w for w in windows if not w.get("is_minimized")), None)
     name = str((chosen or {}).get("process_name") or "").strip()
     return name or None
+
+
+def _origin_text(
+    overview: Any, facts: dict[str, Any], *, origin_hwnd: int | None = None
+) -> str:
+    """The request-origin line: what was in front, media, microphone and camera.
+
+    Facts only, in plain words; nothing here decides what the model does with
+    them. The window comes from the overview's plain data (the hwnd the model
+    can pass to ``focus_window``); ``facts`` is
+    :func:`yuki.perception.system.activity_facts` (or a stub's equivalent).
+    """
+    overview = overview if isinstance(overview, dict) else {}
+    windows = [w for w in overview.get("windows") or [] if isinstance(w, dict)]
+    by_hwnd = {_as_hwnd(w.get("hwnd")): w for w in windows}
+    foreground = facts.get("foreground") if isinstance(facts.get("foreground"), dict) else {}
+    errors = facts.get("errors") if isinstance(facts.get("errors"), dict) else {}
+
+    def window(w: dict[str, Any]) -> str:
+        text = f'[{w.get("hwnd")}] {w.get("process_name") or "?"} "{w.get("title") or ""}"'
+        return text + (" (minimised)" if w.get("is_minimized") else "")
+
+    front_hwnd = _as_hwnd(overview.get("foreground_hwnd")) or _as_hwnd(foreground.get("hwnd"))
+    hint = _as_hwnd(origin_hwnd)
+    if hint is not None and hint in by_hwnd:
+        front = f"in front, before they called you up, was {window(by_hwnd[hint])}"
+    elif hint is not None:
+        front = f"in front, before they called you up, was no app window (hwnd {hint})"
+    elif front_hwnd is not None and front_hwnd in by_hwnd:
+        front = f"in front was {window(by_hwnd[front_hwnd])}"
+    elif foreground.get("own_process"):
+        beneath = next((w for w in windows if not w.get("is_minimized")), None)
+        front = "your own window was in front (they were typing to you)"
+        if beneath is not None:
+            front += f"; the top window beneath it was {window(beneath)}"
+    elif front_hwnd is not None:
+        details = ", ".join(
+            part
+            for part in (
+                str(foreground.get("process_name") or ""),
+                f'class {foreground["class_name"]}' if foreground.get("class_name") else "",
+                f'"{foreground.get("title") or overview.get("foreground_title") or ""}"',
+            )
+            if part
+        )
+        front = f"in front was no app window (hwnd {front_hwnd}: {details})"
+    else:
+        front = "nothing was in front"
+    parts = [front]
+
+    if "media" in errors:
+        parts.append(f"media: unknown ({errors['media']})")
+    else:
+        sessions = []
+        for session in facts.get("media") or []:
+            if not isinstance(session, dict):
+                continue
+            title = str(session.get("title") or "")
+            artist = str(session.get("artist") or "")
+            what = f'"{title}"' if title else "untitled media"
+            if artist:
+                what += f" by {artist}"
+            sessions.append(
+                f"{what} {session.get('status') or 'unknown'} in {session.get('app_id') or '?'}"
+            )
+        parts.append("media: " + ("; ".join(sessions) if sessions else "none"))
+
+    own_image = os.path.basename(sys.executable).lower()
+    for fact, label in (("microphone", "microphone"), ("camera", "camera")):
+        if fact in errors:
+            parts.append(f"{label}: unknown ({errors[fact]})")
+            continue
+        users = []
+        for user in facts.get(fact) or []:
+            if not isinstance(user, dict):
+                continue
+            app = str(user.get("app") or "?")
+            since = user.get("since")
+            text = app
+            if isinstance(since, (int, float)) and since > 0:
+                text += f" since {datetime.fromtimestamp(since).strftime('%H:%M')}"
+            if app.lower() == own_image:
+                text += " (the program you run as)"
+            users.append(text)
+        parts.append(f"{label} in use by {', '.join(users)}" if users else f"{label} not in use")
+    return "When the user asked: " + "; ".join(parts) + "."
 
 
 def _block_confirmed(event: Any) -> bool:

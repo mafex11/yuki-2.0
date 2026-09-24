@@ -1,4 +1,6 @@
-"""Cheap machine facts: clock, uptime, cpu, memory, heaviest processes.
+"""Cheap machine facts: clock, uptime, cpu, memory, heaviest processes, and
+what the user is engaged in (:func:`activity_facts`: media sessions, microphone
+and camera use, the foreground window).
 
 ``psutil.process_iter(['memory_info'])`` opens a handle per process and takes
 ~1.5 s on a busy desktop, which breaks the "perception is fast" rule.  The
@@ -14,9 +16,14 @@ import datetime as _dt
 import functools
 import getpass
 import platform
+import os
 import socket
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from ctypes import wintypes
+from typing import Any
 
 import psutil
 
@@ -69,6 +76,14 @@ class _SystemProcessInformation(ctypes.Structure):
 
 def _processes_native() -> list[dict]:
     """Every process with pid, image name and working set, in one syscall."""
+    return [
+        {"pid": pid, "name": name, "rss_mb": rss_mb}
+        for pid, name, rss_mb, _ in _process_entries()
+    ]
+
+
+def _process_entries() -> list[tuple[int, str, float, int]]:
+    """``(pid, image name, working set MB, creation FILETIME)`` for every process."""
     ntdll = ctypes.windll.ntdll
     size = 512 * 1024
     for _ in range(8):
@@ -88,7 +103,7 @@ def _processes_native() -> list[dict]:
     else:  # pragma: no cover - the process list kept growing faster than us
         raise OSError("NtQuerySystemInformation: buffer never large enough")
 
-    processes: list[dict] = []
+    processes: list[tuple[int, str, float, int]] = []
     offset = 0
     base = ctypes.addressof(buffer)
     while True:
@@ -96,11 +111,12 @@ def _processes_native() -> list[dict]:
         name = entry.ImageName.Buffer or ""
         pid = entry.UniqueProcessId or 0
         processes.append(
-            {
-                "pid": int(pid),
-                "name": name if name else ("System Idle Process" if pid == 0 else ""),
-                "rss_mb": round(entry.WorkingSetSize / _MB, 1),
-            }
+            (
+                int(pid),
+                name if name else ("System Idle Process" if pid == 0 else ""),
+                round(entry.WorkingSetSize / _MB, 1),
+                int(entry.CreateTime),
+            )
         )
         if entry.NextEntryOffset == 0:
             break
@@ -161,6 +177,10 @@ _user32.GetKeyboardLayout.restype = ctypes.c_void_p
 _user32.GetForegroundWindow.restype = wintypes.HWND
 _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
 
 
 def _lcid_name(lcid: int) -> str:
@@ -354,3 +374,300 @@ def format_system_facts(facts: dict) -> str:
             ),
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# What the user is engaged in: media, microphone / camera, foreground window
+# ---------------------------------------------------------------------------
+
+#: Where Windows records, per app, when it last started and stopped using a
+#: privacy-gated device. Packaged apps are keys named by package family;
+#: desktop apps are under ``NonPackaged``, named by exe path with ``#`` for ``\``.
+_CONSENT_STORE = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
+#: ``(fact name, ConsentStore key)``.
+_DEVICES = (("microphone", "microphone"), ("camera", "webcam"))
+
+#: Longest the media-session read may take before it is reported as unanswered.
+#: Steady state is a few ms; the cap covers a first call (WinRT import plus the
+#: session manager's activation) and a media app that is slow to answer.
+_MEDIA_TIMEOUT_S = 0.2
+
+#: ``GlobalSystemMediaTransportControlsSessionPlaybackStatus``.
+_PLAYBACK_STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
+#: ``AsyncStatus.Completed``.
+_ASYNC_COMPLETED = 1
+
+#: 100 ns ticks between 1601-01-01 (FILETIME) and 1970-01-01 (Unix).
+_FILETIME_UNIX_EPOCH = 116_444_736_000_000_000
+
+#: WinRT calls run on one dedicated thread: a fixed apartment for the cached
+#: session manager, and a hard bound on the caller's wait whatever WinRT does.
+_media_lock = threading.Lock()
+_media_executor: ThreadPoolExecutor | None = None
+_media_pending: Future | None = None
+#: The session manager, created once on the media thread and only used there.
+_media_manager: Any = None
+
+
+def _init_media_thread() -> None:
+    """Put the media thread in the multithreaded apartment WinRT objects expect."""
+    try:
+        from winrt import _winrt
+
+        _winrt.init_apartment(_winrt.MTA)
+    except Exception:  # already initialised, or winrt missing: the read reports it
+        pass
+
+
+def _media_thread() -> ThreadPoolExecutor:
+    """The one media thread, started on first use (call with ``_media_lock`` held)."""
+    global _media_executor
+    if _media_executor is None:
+        _media_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="yuki-media", initializer=_init_media_thread
+        )
+    return _media_executor
+
+
+def _media_session_manager(deadline: float) -> Any:
+    """The session manager, activated once (runs on the media thread).
+
+    The first call imports the WinRT projection, 40-300 ms depending on the
+    disk cache, which is why :func:`warm_activity` does it ahead of time.
+    """
+    global _media_manager
+    if _media_manager is None:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as Manager,
+        )
+
+        operation = Manager.request_async()
+        if operation.wait(max(0.0, deadline - time.monotonic())) != _ASYNC_COMPLETED:
+            raise TimeoutError("the media session manager did not answer in time")
+        _media_manager = operation.get_results()
+    return _media_manager
+
+
+def warm_activity(*, timeout_s: float = 5.0) -> None:
+    """Import WinRT and activate the media session manager in the background.
+
+    Returns at once; the work runs on the media thread, so a
+    :func:`media_sessions` call arriving meanwhile reports "still waiting"
+    rather than blocking. Never raises.
+    """
+    global _media_pending
+    with _media_lock:
+        if _media_manager is not None or (
+            _media_pending is not None and not _media_pending.done()
+        ):
+            return
+        # A first read too: the first get_sessions() pays ~35 ms of its own.
+        _media_pending = _media_thread().submit(
+            _read_media_sessions, time.monotonic() + timeout_s
+        )
+
+
+def _read_media_sessions(deadline: float) -> list[dict]:
+    """Every media session Windows knows about (runs on the media thread)."""
+    manager = _media_session_manager(deadline)
+    current = manager.get_current_session()
+    current_id = str(current.source_app_user_model_id or "") if current else ""
+    sessions: list[dict] = []
+    for session in manager.get_sessions():
+        app_id = str(session.source_app_user_model_id or "")
+        entry: dict = {
+            "app_id": app_id,
+            "status": "unknown",
+            "title": "",
+            "artist": "",
+            "current": bool(current_id) and app_id == current_id,
+        }
+        try:
+            status = int(session.get_playback_info().playback_status)
+            entry["status"] = _PLAYBACK_STATUS.get(status, str(status))
+        except Exception as exc:
+            entry["error"] = f"playback info: {type(exc).__name__}: {exc}"
+        remaining = deadline - time.monotonic()
+        operation = session.try_get_media_properties_async() if remaining > 0 else None
+        if operation is not None and operation.wait(remaining) == _ASYNC_COMPLETED:
+            properties = operation.get_results()
+            entry["title"] = str(properties.title or "")
+            entry["artist"] = str(properties.artist or "")
+        else:
+            entry["error"] = "title and artist not read in time"
+        sessions.append(entry)
+    return sessions
+
+
+def media_sessions(*, timeout_s: float = _MEDIA_TIMEOUT_S) -> list[dict]:
+    """Media sessions (the ones the Windows media flyout shows), bounded in time.
+
+    Each: ``app_id`` (the source app's AppUserModelID), ``status`` (playing,
+    paused, stopped, ...), ``title``, ``artist``, ``current`` (the session the
+    media keys would act on).
+
+    Raises:
+        TimeoutError: The read did not finish within ``timeout_s`` (it goes on
+            in the background; calls made meanwhile raise at once).
+        Exception: Whatever WinRT raised (package missing, service down).
+    """
+    global _media_pending
+    with _media_lock:
+        if _media_pending is not None and not _media_pending.done():
+            raise TimeoutError("an earlier media session read is still waiting for Windows")
+        deadline = time.monotonic() + timeout_s
+        future = _media_thread().submit(_read_media_sessions, deadline)
+        _media_pending = future
+    try:
+        return future.result(timeout=timeout_s + 0.05)
+    except FutureTimeout:
+        raise TimeoutError(
+            f"media sessions did not answer within {timeout_s * 1000:.0f} ms"
+        ) from None
+
+
+def _subkeys(key: Any) -> list[str]:
+    """Names of every subkey of an open registry key."""
+    import winreg
+
+    names: list[str] = []
+    index = 0
+    while True:
+        try:
+            names.append(winreg.EnumKey(key, index))
+        except OSError:
+            return names
+        index += 1
+
+
+def _device_users(
+    key_name: str, processes: list[tuple[int, str, float, int]], boot_ft: int
+) -> list[dict]:
+    """Apps using one device right now, from the ConsentStore.
+
+    An app is using it when its record has a start time and a stop time of 0.
+    Windows leaves records at "stop 0" when an app dies or updates mid-use, so
+    a record counts as live only when it started after the last boot and, for
+    a desktop app, a process with that image name is running that was created
+    before the use started (the process that opened the device still exists).
+    """
+    import winreg
+
+    created: dict[str, list[int]] = {}
+    for _, name, _, create_ft in processes:
+        created.setdefault(name.lower(), []).append(create_ft)
+    users: dict[str, dict] = {}
+
+    def check(parent: Any, name: str, *, packaged: bool) -> None:
+        try:
+            with winreg.OpenKey(parent, name) as record:
+                start, _ = winreg.QueryValueEx(record, "LastUsedTimeStart")
+                stop, _ = winreg.QueryValueEx(record, "LastUsedTimeStop")
+        except OSError:
+            return
+        start, stop = int(start or 0), int(stop or 0)
+        if stop != 0 or start <= boot_ft:
+            return
+        if packaged:
+            app, path = name.split("_", 1)[0], ""
+        else:
+            path = name.replace("#", "\\")
+            app = path.rsplit("\\", 1)[-1]
+            if not any(ft and ft <= start for ft in created.get(app.lower(), [])):
+                return
+        since = round((start - _FILETIME_UNIX_EPOCH) / 1e7, 1)
+        previous = users.get(app.lower())
+        if previous is None or since > previous["since"]:
+            users[app.lower()] = {"app": app, "packaged": packaged, "path": path, "since": since}
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{_CONSENT_STORE}\\{key_name}") as root:
+        for name in _subkeys(root):
+            if name == "NonPackaged":
+                with winreg.OpenKey(root, name) as desktop:
+                    for exe in _subkeys(desktop):
+                        check(desktop, exe, packaged=False)
+            else:
+                check(root, name, packaged=True)
+    return sorted(users.values(), key=lambda user: user["since"])
+
+
+def _foreground_window(processes: list[tuple[int, str, float, int]]) -> dict:
+    """The foreground window: hwnd, pid, process, class, title, and whether it is ours."""
+    hwnd = int(_user32.GetForegroundWindow() or 0)
+    if not hwnd:
+        return {"hwnd": None}
+    pid = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    class_name = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(wintypes.HWND(hwnd), class_name, 256)
+    title = ctypes.create_unicode_buffer(512)
+    _user32.GetWindowTextW(wintypes.HWND(hwnd), title, 512)
+    process = next((name for p, name, _, _ in processes if p == pid.value), "")
+    return {
+        "hwnd": hwnd,
+        "pid": int(pid.value),
+        "process_name": process,
+        "class_name": class_name.value,
+        "title": title.value,
+        "own_process": int(pid.value) == os.getpid(),
+    }
+
+
+def activity_facts(*, media_timeout_s: float = _MEDIA_TIMEOUT_S) -> dict:
+    """What the user is engaged in right now, as plain facts.
+
+    Read-only OS queries, each failure-tolerant (a part that fails is reported
+    under ``errors`` and the rest still comes back):
+
+    * ``media``: every media session (:func:`media_sessions`).
+    * ``microphone`` / ``camera``: apps using the device now, from the
+      CapabilityAccessManager ConsentStore (:func:`_device_users`): ``app``,
+      ``packaged``, ``path``, ``since`` (Unix time the use started).
+    * ``foreground``: the foreground window with its process and class, and
+      ``own_process`` when it is Yuki's own window.
+
+    ``elapsed_ms`` has the time of each part and the total.
+    """
+    started = time.perf_counter()
+    facts: dict = {"foreground": {}, "media": [], "microphone": [], "camera": [], "errors": {}}
+    elapsed: dict[str, float] = {}
+
+    mark = time.perf_counter()
+    try:
+        processes = _process_entries()
+    except Exception as exc:
+        processes = []
+        facts["errors"]["processes"] = f"{type(exc).__name__}: {exc}"
+    elapsed["processes"] = round((time.perf_counter() - mark) * 1000, 1)
+
+    mark = time.perf_counter()
+    try:
+        facts["foreground"] = _foreground_window(processes)
+    except Exception as exc:
+        facts["errors"]["foreground"] = f"{type(exc).__name__}: {exc}"
+    elapsed["foreground"] = round((time.perf_counter() - mark) * 1000, 1)
+
+    mark = time.perf_counter()
+    try:
+        facts["media"] = media_sessions(timeout_s=media_timeout_s)
+    except Exception as exc:
+        facts["errors"]["media"] = f"{type(exc).__name__}: {exc}"
+    elapsed["media"] = round((time.perf_counter() - mark) * 1000, 1)
+
+    boot_ft = int(psutil.boot_time() * 1e7) + _FILETIME_UNIX_EPOCH
+    for fact, key_name in _DEVICES:
+        mark = time.perf_counter()
+        if not processes:
+            facts["errors"][fact] = "process list unavailable, so device use cannot be confirmed"
+        else:
+            try:
+                facts[fact] = _device_users(key_name, processes, boot_ft)
+            except FileNotFoundError:
+                facts[fact] = []  # nothing has ever asked for this device
+            except Exception as exc:
+                facts["errors"][fact] = f"{type(exc).__name__}: {exc}"
+        elapsed[fact] = round((time.perf_counter() - mark) * 1000, 1)
+
+    elapsed["total"] = round((time.perf_counter() - started) * 1000, 1)
+    facts["elapsed_ms"] = elapsed
+    return facts
