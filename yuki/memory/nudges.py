@@ -190,8 +190,9 @@ if there is nothing specific to point at, say none. Generic lines ("good, you're
 light (a chat, music, a quick look at something), or came back from a break after one: that is \
 a natural break, and a moment for praise - the stretch's real length and what it was about, \
 specifically. Do not call them back.
-- The user has been at focused work for about 90 minutes or more without a break of 5 minutes \
-or more: suggest a short break (say nudge), with how long they have been at it. This holds even \
+- The user has been at the PC for about 90 minutes or more without a break of 5 minutes \
+or more: suggest a short break (say nudge, is_break_suggestion true), with how long they have \
+been at it and on what. Under 90 minutes, time alone is never a reason to speak. This holds even \
 in the middle of a stretch.
 - Otherwise, when the user is in the middle of focused work that is still going: say none. Any \
 message then is an interruption, even praise; encouragement belongs at a pause - when they came \
@@ -215,7 +216,9 @@ replied, the same style is welcome.
 about who they are (never lazy, addicted, undisciplined, a procrastinator).
 - say "praise" for encouragement, praise and acknowledgements; "nudge" for a call-back, a \
 call-out or a break suggestion; "none" for nothing.
-- Write like a friend texting: one or two short sentences, in the user's register. Every \
+- Write like a friend texting: one or two short sentences, in the user's register. Name \
+the activity you mean ("an hour and a half of Valorant"), never a bare "it", so the message \
+makes sense on its own. Every \
 message follows their RULES exactly, the shortest praise included: if they asked to be called \
 by a name, address them by it in every message; if they banned a punctuation mark or a style, \
 never use it. Speak to them directly about what they are doing; never mention Yuki's data, \
@@ -238,13 +241,17 @@ COACH_TOOL: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["reason", "say", "text", "mentions"],
+        "required": ["reason", "say", "is_break_suggestion", "text", "mentions"],
         "properties": {
             "reason": {
                 "type": "string",
                 "description": "First, one short sentence for the log: what the user is doing and why you decide so.",
             },
             "say": {"type": "string", "enum": ["none", "praise", "nudge"]},
+            "is_break_suggestion": {
+                "type": "boolean",
+                "description": "True when the nudge suggests a break because of how long they have been at the PC.",
+            },
             "text": {
                 "anyOf": [{"type": "string"}, {"type": "null"}],
                 "description": "What Yuki says: one or two short sentences in the user's register; null for none.",
@@ -323,6 +330,8 @@ class NudgeConfig:
     presence_min: float = 5.0
     lookback_min: float = 120.0
     break_min: float = 5.0
+    #: A break suggestion only after this long at the PC without a break of break_min.
+    break_after_min: float = 90.0
     deliver_within_min: float = 15.0
     reminder_late_max_h: float = 24.0
     all_day_at: str = "09:00"
@@ -660,6 +669,14 @@ def observe(store: Store, now: float, config: NudgeConfig, live: dict[str, Any] 
 # ---------------------------------------------------------------------------
 # The coach's request
 # ---------------------------------------------------------------------------
+
+
+def _since_break_s(view: View, now: float) -> float:
+    """Seconds at the PC since the last break of ``break_min`` (as the coach's message states it)."""
+    if view.last_break_end is not None:
+        return now - view.last_break_end
+    first = view.rows[0].started_at if view.rows else now
+    return now - max(first, now - 4 * 3600)
 
 
 def _hm(at: float) -> str:
@@ -1255,6 +1272,9 @@ class NudgeWorker:
                 checkin.outcome = "suppressed:unknown_mention"   # names an item that is not on the list
             elif trigger.kind == "follow_up" and say == "nudge":
                 checkin.outcome = "suppressed:follow_up_nudge"   # no second call-out inside the budget
+            elif (say == "nudge" and decision.get("is_break_suggestion")
+                  and _since_break_s(view, now) < config.break_after_min * 60.0):
+                checkin.outcome = "suppressed:break_too_soon"    # the break rule is a threshold, not a vibe
             else:
                 checkin.outcome = say
                 cur = view.current

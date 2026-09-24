@@ -530,7 +530,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "since": {
                     "type": "string",
                     "description": "Earliest local date or date-time, ISO format, e.g. "
-                    "2026-09-20 or 2026-09-20T18:00. Default: the start of today.",
+                    "2026-09-20 or 2026-09-20T18:00. Default: the start of today. Set it "
+                    "to cover what they mean: a session still going at 00:30 began "
+                    "yesterday, so a question about it needs a since before midnight.",
                 },
                 "until": {
                     "type": "string",
