@@ -18,10 +18,14 @@ Two threads:
   never on a fixed sleep.  A slow adaptive **backstop** re-reads the foreground
   window every 45-90 s while the user is active (``GetLastInputInfo``), and
   never while they are idle.
-* the **capture worker** does the reading (UIA through
-  :mod:`yuki.perception`), privacy gating (:mod:`yuki.memory.privacy`), the
-  delta against the thread's latest text and the store writes, one capture at a
-  time, latest request wins.
+* the **capture worker** does the reading - a structured UIA read turned into
+  messages (chats, mail) or clean main text by :func:`yuki.memory.extract.extract`
+  - privacy gating (:mod:`yuki.memory.privacy`: the page URL, masked lines and
+  messages), and the store writes, one capture at a time, latest request wins.
+  A thread is ``(app, Extraction.thread_scope)``: a conversation's messages are
+  stored against the thread's fingerprints (only unseen ones are stored,
+  labelled new or history, see :meth:`yuki.memory.store.Store.add_conversation`);
+  any other kind keeps a line delta of its main text, keyed by URL.
 
 Nothing here sends input, changes focus, launches anything or takes pixels:
 the watcher only listens to window events and reads the foreground window's
@@ -40,7 +44,7 @@ import traceback
 from collections import Counter, deque
 from collections.abc import Callable
 from ctypes import wintypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -49,14 +53,8 @@ import win32api
 import win32con
 import win32gui
 
+from yuki.memory.extract import Extraction, extract
 from yuki.memory.privacy import PrivacyConfig, PrivacyRules
-from yuki.perception.tree import (
-    UIElement,
-    get_window_tree,
-    is_address,
-    page_identity,
-    page_text,
-)
 from yuki.perception.windows import is_user_window
 
 # ---------------------------------------------------------------------------
@@ -65,13 +63,21 @@ from yuki.perception.windows import is_user_window
 
 
 class CaptureStore(Protocol):
-    def upsert_thread(self, app: str, title: str, url: str | None, *, process: str | None = None) -> int: ...
+    def upsert_thread(
+        self, app: str, title: str, url: str | None, *, process: str | None = None,
+        scope: str | None = None, kind: str | None = None,
+    ) -> int: ...
     def latest_text(self, thread_id: int) -> str | None: ...
     def add_capture(
-        self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str
+        self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str,
+        *, kind: str | None = None, profile: str | None = None,
     ) -> int | None: ...
+    def add_conversation(self, thread_id: int, at: float, trigger: str, messages: list, **kwargs: Any) -> Any: ...
+    def add_me_names(self, app: str | None, names: list[str]) -> int: ...
+    def me_names(self) -> list[str]: ...
     def add_health(
-        self, at: float, app: str, trigger: str, outcome: str, reason: str, chars: int, ms: float
+        self, at: float, app: str, trigger: str, outcome: str, reason: str, chars: int, ms: float,
+        **extra: Any,
     ) -> None: ...
 
 
@@ -94,14 +100,16 @@ class WatcherSettings:
     backstop_max_s: float = 90.0
     #: No backstop reads once the last keyboard/mouse input is older than this.
     idle_limit_s: float = 120.0
-    #: Wall-clock budget for reading one window (page text, else tree).
-    capture_budget_s: float = 0.6
-    #: Floor for the tree read when the page probe used the budget up.
-    tree_floor_s: float = 0.3
-    #: Characters kept per snapshot; the rest is dropped and noted.
+    #: Wall-clock budget for the structured read of one window (yuki.memory.extract).
+    capture_budget_s: float = 1.3
+    #: Characters of main text kept per page/document snapshot; the rest is dropped and noted.
     max_chars: int = 20000
-    #: Elements read from a window without a page.
-    max_elements: int = 400
+    #: Conversation labelling reference points (see Store.add_conversation):
+    #: on a thread never seen before, a message stamped within this long of the
+    #: capture counts as new; on a known thread, a time label may read this
+    #: much earlier than the last look (labels show minutes only).
+    first_visit_new_s: float = 300.0
+    label_tolerance_s: float = 90.0
     #: Minimum gap per window between captures from one trigger kind, so a
     #: title that ticks every second or a user tabbing through fields cannot
     #: turn into a capture per second.  The capture is delayed, not dropped.
@@ -109,8 +117,6 @@ class WatcherSettings:
     #: UIA reads still running from earlier timed-out captures; above this the
     #: next capture is skipped instead of piling up threads on a hung provider.
     uia_backlog: int = 3
-    #: Edit fields whose IsPassword is checked per tree capture.
-    password_checks: int = 12
     #: Latency samples kept for the stats.
     latency_window: int = 2000
 
@@ -464,25 +470,19 @@ def text_delta(previous: str | None, current: str) -> str:
     return "\n\n".join("\n".join(group) for group in groups)
 
 
-def _tree_text(elements: list[UIElement], hidden: set[int], rules: PrivacyRules) -> str:
-    """Names and values of a window's elements, one element per line."""
-    lines: list[str] = []
-    for element in elements:
-        name = (element.name or "").strip()
-        value = (element.value or "").strip()
-        if element.id in hidden or rules.is_masked(value):
-            value = ""
-        if element.role == "Hyperlink" and is_address(value):
-            value = ""  # a link's address, not text on screen
-        if name and value and value != name:
-            lines.append(f"{name}: {value}")
-        elif name or value:
-            lines.append(name or value)
-    return "\n".join(lines)
+def mask_message_text(text: str, rules: PrivacyRules) -> str:
+    """A message's text without its masked lines (a hidden secret); "" when nothing is left."""
+    return "\n".join(line for line in (text or "").splitlines() if line.strip() and not rules.is_masked(line))
+
+
+def _stats(extraction: Extraction) -> dict[str, Any]:
+    """The extraction's diagnostics, content-free keys only."""
+    keep = ("nodes", "read_ms", "total_ms", "source", "truncated")
+    return {k: extraction.stats[k] for k in keep if k in extraction.stats}
 
 
 # ---------------------------------------------------------------------------
-# UIA helpers for the password gates (worker thread only)
+# UIA helper for the password gate (worker thread only)
 # ---------------------------------------------------------------------------
 
 _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
@@ -521,32 +521,6 @@ class _PasswordProbe:
         except Exception:
             return None
 
-    def password_ids(self, elements: list[UIElement], limit: int) -> set[int]:
-        """Ids of Edit elements with a value that UIA says are password fields.
-
-        Each is hit-tested at its centre; when the element found there is not
-        the same Edit (an overlay, a moved field) its value is dropped too.
-        """
-        hidden: set[int] = set()
-        checked = 0
-        for element in elements:
-            if element.role != "Edit" or not element.value:
-                continue
-            if checked >= limit:
-                hidden.add(element.id)
-                continue
-            checked += 1
-            try:
-                point = self._module.tagPOINT(*element.center)
-                hit = self._uia.ElementFromPoint(point)
-                rect = hit.CurrentBoundingRectangle
-                same = (rect.left, rect.top, rect.right, rect.bottom) == tuple(element.bounds)
-                if not same or bool(hit.CurrentIsPassword):
-                    hidden.add(element.id)
-            except Exception:
-                hidden.add(element.id)
-        return hidden
-
 
 def _uia_threads_alive() -> int:
     return sum(1 for t in threading.enumerate() if t.name.startswith("yuki-uia-"))
@@ -576,18 +550,6 @@ class _Pending:
 
 
 @dataclass
-class _Read:
-    title: str = ""
-    url: str | None = None
-    text: str = ""
-    truncated: bool = False
-    block: str = ""  # privacy reason: nothing of this window is kept
-    failure: str = ""
-    busy: bool = False  # the window did not answer within the budget
-    note: str = ""  # why there is no text
-
-
-@dataclass
 class CaptureResult:
     """What one capture attempt did (content-free)."""
 
@@ -598,10 +560,21 @@ class CaptureResult:
     chars: int = 0
     delta_chars: int = 0
     truncated: bool = False
-    source: str = ""  # page|tree
+    #: The extraction: profile ("slack", "generic_page"), kind ("conversation",
+    #: "page", ...), characters of UI chrome it removed, its diagnostics.
+    profile: str = ""
+    kind: str = ""
+    dropped_chars: int = 0
+    stats: dict[str, Any] = field(default_factory=dict)
+    #: Conversations: messages on screen, and how many were stored as new / history.
+    messages: int = 0
+    new_messages: int = 0
+    history_messages: int = 0
+    source: str = ""  # uia|tree|page_text (the extraction's read)
     ms: float = 0.0
-    page_ms: float = 0.0
-    tree_ms: float = 0.0
+    #: Pre-read gates (password-focus probe, full-screen check...), the read, the store writes.
+    gates_ms: float = 0.0
+    read_ms: float = 0.0
     store_ms: float = 0.0
 
 
@@ -616,6 +589,8 @@ class Watcher:
         settings: timing and size budgets.
         on_close: called (from the hook thread) when the hidden window gets
             ``WM_CLOSE`` / end-of-session, so the service can shut down.
+        user_names: the user's configured names (``Settings.user_names``);
+            merged with the names learned on screen and kept in the store.
     """
 
     def __init__(
@@ -626,6 +601,7 @@ class Watcher:
         log: LogFn | None = None,
         settings: WatcherSettings | None = None,
         on_close: Callable[[], None] | None = None,
+        user_names: list[str] | None = None,
     ) -> None:
         self._store_factory = store_factory
         self.privacy = privacy or PrivacyConfig()
@@ -633,6 +609,9 @@ class Watcher:
         self.settings = settings or WatcherSettings()
         self._on_close = on_close
         self._processes = _ProcessCache()
+        self._config_names = [n.strip() for n in (user_names or []) if n and n.strip()]
+        #: Configured + learned names; loaded from the store by the worker.
+        self._names: list[str] | None = None
 
         # hook-thread state
         self._hwnd = 0
@@ -663,7 +642,6 @@ class Watcher:
         self._results_lock = threading.Lock()
         self._last_capture: dict[int, float] = {}
         self._last_backstop_captured: bool | None = None
-        self._had_page: dict[int, bool] = {}
         self._probe: _PasswordProbe | None = None
 
         # stats
@@ -1159,6 +1137,11 @@ class Watcher:
                 store.add_health(
                     time.time(), result.app, result.trigger, result.outcome, result.reason,
                     result.chars, round(result.ms, 1),
+                    profile=result.profile or None, kind=result.kind or None,
+                    dropped_chars=result.dropped_chars if result.profile else None,
+                    messages=result.messages if result.kind in ("conversation", "email") else None,
+                    new_messages=result.new_messages if result.kind in ("conversation", "email") else None,
+                    stats=result.stats or None,
                 )
             except Exception as exc:
                 self._log_error("add_health", exc)
@@ -1196,7 +1179,12 @@ class Watcher:
         facts = self._processes.get(_window_pid(hwnd))
         result.app = facts.app_name
         if not is_user_window(hwnd):
-            return done("skipped", "not_user_window")
+            try:
+                window_class = win32gui.GetClassName(hwnd)
+            except win32gui.error:
+                window_class = "?"
+            # The class name is OS metadata ("Shell_TrayWnd"), not content.
+            return done("skipped", f"not_user_window:{window_class}")
         if rules.skip_own_windows and facts.is_own:
             return done("skipped", "own_window")
         window_title = _window_title(hwnd)
@@ -1218,127 +1206,141 @@ class Watcher:
         ):
             return done("skipped", "password_focused")
 
-        read = self._read_window(hwnd, window_title, rules, result)
-        if read.block:
-            return done("skipped", read.block)
-        if read.failure:
-            return done("failed", read.failure)
-        if read.busy:
-            return done("skipped", "window_busy")
-        title, url = read.title, read.url
+        # The structured read drops the value of every IsPassword element
+        # itself; what it returns is messages (chats, mail) or main text.
+        t0 = time.perf_counter()
+        result.gates_ms = (t0 - started) * 1000.0
+        extraction = extract(
+            hwnd, now=time.time(), user_names=self.user_names(store), app=facts.app_name,
+            timeout_s=self.settings.capture_budget_s,
+        )
+        result.read_ms = (time.perf_counter() - t0) * 1000.0
+        outcome, reason = self.ingest(store, extraction, request.trigger, process=facts.process_name, result=result)
+        return done(outcome, reason)
 
-        text, clipped = normalise_text(read.text, rules, self.settings.max_chars)
-        result.truncated = read.truncated or clipped
-        result.chars = len(text)
-        if not text:
-            return done("empty", read.note or "no_text")
+    # -- extraction -> store (worker thread; also usable offline) -----------
+
+    def user_names(self, store: CaptureStore | None) -> list[str]:
+        """The configured names plus the names learned on screen (cached)."""
+        if self._names is None:
+            learned: list[str] = []
+            if store is not None:
+                try:
+                    learned = store.me_names()
+                except Exception as exc:
+                    self._log_error("me_names", exc)
+            self._names = list(dict.fromkeys([*self._config_names, *learned]))
+        return self._names
+
+    def ingest(
+        self,
+        store: CaptureStore,
+        extraction: Extraction,
+        trigger: str,
+        *,
+        process: str | None = None,
+        at: float | None = None,
+        result: CaptureResult | None = None,
+    ) -> tuple[str, str]:
+        """Privacy-gate and store one extraction; returns ``(outcome, reason)``.
+
+        Conversations and mail (``kind`` conversation/email) are stored message
+        by message against the thread's fingerprints; everything else keeps a
+        line delta of its main text.  The thread is ``(app, thread_scope)``.
+        """
+        rules = self.privacy.rules()
+        result = result if result is not None else CaptureResult(trigger=trigger)
+        result.app = result.app or extraction.app
+        result.profile, result.kind = extraction.profile, extraction.kind
+        result.dropped_chars = int(extraction.dropped_chars or 0)
+        result.stats = _stats(extraction)
+        result.source = str(extraction.stats.get("source", ""))
+        result.truncated = bool(extraction.stats.get("truncated"))
+        at = time.time() if at is None else at
+        if extraction.profile == "error":
+            return "failed", "extract_error"
+        block = rules.check_url(extraction.url or "")
+        if block:
+            return "skipped", block
+        self._learn_names(store, extraction)
 
         s0 = time.perf_counter()
         try:
-            thread_id = store.upsert_thread(facts.app_name, title, url, process=facts.process_name or None)
-            previous = store.latest_text(thread_id)
-            if previous is not None and _digest(previous) == _digest(text):
-                result.store_ms = (time.perf_counter() - s0) * 1000.0
-                return done("unchanged", "truncated" if result.truncated else "")
-            delta = text_delta(previous, text)
-            # An empty delta (lines only went away or moved) writes no capture
-            # row, but the store still makes this text the thread's latest.
-            capture_id = store.add_capture(thread_id, time.time(), request.trigger, text, delta)
-            if not delta:
-                result.store_ms = (time.perf_counter() - s0) * 1000.0
-                return done("no_new_text", "truncated" if result.truncated else "")
+            if extraction.kind in ("conversation", "email"):
+                return self._ingest_messages(store, extraction, trigger, process, at, rules, result)
+            return self._ingest_text(store, extraction, trigger, process, at, rules, result)
         except Exception as exc:
             self._log_error("store", exc)
+            return "failed", "store_error"
+        finally:
             result.store_ms = (time.perf_counter() - s0) * 1000.0
-            return done("failed", "store_error")
-        result.store_ms = (time.perf_counter() - s0) * 1000.0
+
+    def _learn_names(self, store: CaptureStore, extraction: Extraction) -> None:
+        known = {n.casefold() for n in self.user_names(store)}
+        learned = [n for n in extraction.me_names if n and n.strip() and n.strip().casefold() not in known]
+        if not learned:
+            return
+        try:
+            if store.add_me_names(extraction.app or None, learned):
+                self._log("me_names_learned", app=extraction.app, count=len(learned))
+        except Exception as exc:
+            self._log_error("add_me_names", exc)
+        self._names = None  # reload on next use
+
+    def _ingest_messages(
+        self, store: CaptureStore, ex: Extraction, trigger: str, process: str | None, at: float,
+        rules: PrivacyRules, result: CaptureResult,
+    ) -> tuple[str, str]:
+        messages = []
+        for message in ex.messages:
+            text = mask_message_text(message.text, rules)
+            if text:
+                messages.append(message if text == message.text else replace(message, text=text))
+        result.messages = len(messages)
+        result.chars = sum(len(m.text) for m in messages)
+        if not messages:
+            return "empty", ("masked" if ex.messages else "no_complete_message")
+        thread_id = store.upsert_thread(
+            ex.app, ex.title, ex.url, process=process or None, scope=ex.thread_scope or None, kind=ex.kind,
+        )
+        written = store.add_conversation(
+            thread_id, at, trigger, messages, kind=ex.kind, profile=ex.profile,
+            first_visit_new_s=self.settings.first_visit_new_s, label_tolerance_s=self.settings.label_tolerance_s,
+        )
+        result.new_messages, result.history_messages = written.new, written.history
+        if written.capture_id is None:
+            return "unchanged", ""
+        result.delta_chars = int(getattr(written, "chars", 0) or 0)
+        return "captured", ""
+
+    def _ingest_text(
+        self, store: CaptureStore, ex: Extraction, trigger: str, process: str | None, at: float,
+        rules: PrivacyRules, result: CaptureResult,
+    ) -> tuple[str, str]:
+        text, clipped = normalise_text(ex.body, rules, self.settings.max_chars)
+        result.truncated = result.truncated or clipped
+        result.chars = len(text)
+        if not text:
+            if ex.profile == "none" and result.truncated:
+                # The window did not answer within the budget (a page loading):
+                # the load's own events, or the backstop, bring the next attempt.
+                return "skipped", "window_busy"
+            return "empty", f"no_text:{ex.kind}"
+        thread_id = store.upsert_thread(
+            ex.app, ex.title, ex.url, process=process or None, scope=ex.thread_scope or None, kind=ex.kind,
+        )
+        previous = store.latest_text(thread_id)
+        if previous is not None and _digest(previous) == _digest(text):
+            return "unchanged", "truncated" if result.truncated else ""
+        delta = text_delta(previous, text)
+        # An empty delta (lines only went away or moved) writes no capture
+        # row, but the store still makes this text the thread's latest.
+        capture_id = store.add_capture(thread_id, at, trigger, text, delta, kind=ex.kind, profile=ex.profile)
+        if not delta:
+            return "no_new_text", "truncated" if result.truncated else ""
         result.delta_chars = len(delta)
         outcome = "captured" if capture_id is not None else "deduplicated"
-        return done(outcome, "truncated" if result.truncated else "")
-
-    def _read_window(
-        self, hwnd: int, window_title: str, rules: PrivacyRules, result: CaptureResult
-    ) -> _Read:
-        """Read the foreground window within the capture budget.
-
-        A window that showed a page last time (or has not been seen yet) is
-        asked for its page text first: the page probe is a page-only pass and
-        the page's Text pattern hands over the whole page in one call.
-        Otherwise the visible tree is read, and if it holds a page after all,
-        that page's text is read too.  A page's address is checked against the
-        privacy rules before any of its text is kept.
-        """
-        deadline = time.perf_counter() + self.settings.capture_budget_s
-        read = _Read(title=window_title)
-
-        def from_page() -> bool:
-            t0 = time.perf_counter()
-            timeout_s = max(deadline - t0, 0.2)
-            page = page_text(hwnd, max_chars=self.settings.max_chars, timeout_s=timeout_s)
-            result.page_ms += (time.perf_counter() - t0) * 1000.0
-            if not page.found and page.elapsed_ms >= timeout_s * 1000.0:
-                # The window did not answer within the budget (a page loading):
-                # its frame alone is not worth a capture.  The load's own
-                # events, or the backstop, bring the next attempt.
-                read.busy = True
-                return True
-            if not page.found:
-                return False
-            read.block = rules.check_url(page.url) or ""
-            if read.block:
-                return True
-            read.title, read.url = page.title or window_title, page.url
-            read.text, read.truncated = page.text, page.truncated
-            if not page.text:
-                read.note = "read_error" if page.error else "page_empty"
-            result.source = "page"
-            return True
-
-        page_first = self._had_page.get(hwnd, True)
-        if page_first and from_page():
-            self._remember_page(hwnd, True)
-            return read
-        t0 = time.perf_counter()
-        try:
-            tree = get_window_tree(
-                hwnd,
-                max_elements=self.settings.max_elements,
-                timeout_s=max(deadline - t0, self.settings.tree_floor_s),
-            )
-        except ValueError:
-            read.failure = "window_gone"
-            return read
-        except RuntimeError:
-            read.failure = "read_error"
-            return read
-        finally:
-            result.tree_ms = (time.perf_counter() - t0) * 1000.0
-        identity = page_identity(tree.elements)
-        self._remember_page(hwnd, identity is not None)
-        if identity is not None:
-            read.block = rules.check_url(identity.url) or ""
-            if read.block:
-                return read
-            if not page_first and from_page():
-                return read  # this window has a page after all
-            read.title, read.url = identity.title or window_title, identity.url
-        hidden: set[int] = set()
-        if rules.drop_password_values and self._probe is not None:
-            hidden = self._probe.password_ids(tree.elements, self.settings.password_checks)
-        read.text = _tree_text(tree.elements, hidden, rules)
-        read.truncated = tree.truncated
-        if not tree.elements and tree.status == "busy":
-            read.busy = True
-            return read
-        if not tree.elements and tree.status != "ok":
-            read.note = f"tree_{tree.status}"
-        result.source = "tree"
-        return read
-
-    def _remember_page(self, hwnd: int, has_page: bool) -> None:
-        if len(self._had_page) > 256:
-            self._had_page.clear()
-        self._had_page[hwnd] = has_page
+        return outcome, "truncated" if result.truncated else ""
 
     def _flush_paused_health(self, store: CaptureStore | None) -> None:
         if store is None:

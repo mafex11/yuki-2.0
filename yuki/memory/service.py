@@ -86,10 +86,14 @@ def _console_line(type: str, f: dict[str, Any]) -> str:
     if type == "capture":
         extra = f" +{f.get('delta_chars', 0)}" if f.get("outcome") == "captured" else ""
         reason = f" ({f['reason']})" if f.get("reason") else ""
+        msgs = ""
+        if f.get("kind") in ("conversation", "email"):
+            msgs = f" msgs {f.get('messages', 0)} new {f.get('new_messages', 0)} hist {f.get('history_messages', 0)}"
         return (
             f"{stamp} {f.get('trigger', ''):<10} {f.get('app', '') or '-':<22.22} "
-            f"{f.get('outcome', ''):<12}{reason} {f.get('chars', 0)} chars{extra} "
-            f"{f.get('ms', 0):.0f} ms [{f.get('source', '')}]"
+            f"{f.get('outcome', ''):<12}{reason} {f.get('chars', 0)} chars{extra}{msgs} "
+            f"-{f.get('dropped_chars', 0)} chrome {f.get('ms', 0):.0f} ms "
+            f"[{f.get('profile', '')}/{f.get('kind', '')}]"
         )
     if type == "stats":
         lat = f.get("watcher", {}).get("latency_ms", {})
@@ -245,7 +249,12 @@ def run(args: argparse.Namespace) -> int:
         last_prune = time.monotonic()
 
         shared = store
-        watcher = Watcher(lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(), on_close=stop.set)
+        from yuki.config import Settings
+
+        watcher = Watcher(
+            lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(), on_close=stop.set,
+            user_names=Settings().user_names,
+        )
         paused = pause_path.exists()
         if paused:
             watcher.set_paused(True)  # before start: nothing is read, not even the first window
