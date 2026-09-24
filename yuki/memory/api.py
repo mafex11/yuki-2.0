@@ -18,12 +18,22 @@ Usage::
     memory.recall("what did Kenji ask me", since="2026-09-20")    # facts and episodes
     memory.activity(since="2026-09-24", group_by="site")          # time per site, visits, stretches
     memory.episodes(since="2026-09-24")                           # what the user was doing, told
+
+Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory.conversations)::
+
+    memory.log_turn(session_id, request_id, at, user_text, reply_text, actions, outcome) -> int
+    memory.standing_context() -> str                  # active rules/preferences + open commitments, <= 1,200 chars
+    memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
+    memory.remember_rule(text, source_turn=None) -> int      # immediate, the user's words; supersedes a near-duplicate
+    memory.revoke_rule(text) -> int                          # immediate; id revoked or 0
+    memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
 """
 
 from __future__ import annotations
 
 import ctypes
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -33,19 +43,70 @@ import numpy as np
 from yuki.memory.store import (
     PAUSE_FLAG,
     REFRESH_FLAG,
+    STANDING_KINDS,
+    ConversationFact,
+    ConversationTurn,
     JournalEntry,
     Store,
     app_key,
     flag_path,
     service_mutex_name,
+    signal_turns,
 )
 
 #: Know-how for the same app whose embedding is at least this close to a new
 #: entry is treated as the same procedure restated, and superseded by it.
 KNOWHOW_DUPLICATE_COSINE = 0.85
+#: A rule given with :meth:`MemoryClient.remember_rule` whose embedding is at
+#: least this close to an active rule or preference supersedes it.
+RULE_DUPLICATE_COSINE = 0.85
+#: :meth:`MemoryClient.revoke_rule` without a keyword match revokes the nearest
+#: active rule or preference only when it is at least this close. Measured
+#: 2026-09-24 (multilingual MiniLM): withdrawals of a rule in other words scored
+#: 0.50-0.57 against it, unrelated requests and other rules 0.03-0.29.
+REVOKE_MIN_COSINE = 0.45
+#: Hard budgets (characters, ~4 per token) of the blocks Yuki attaches to requests.
+STANDING_CONTEXT_CHARS = 1_200
+RESUME_CONTEXT_CHARS = 4_000
+RESUME_EXCHANGES = 6
 #: Reciprocal-rank-fusion constant for merging vector and keyword hits.
 _RRF_K = 60.0
 _SYNCHRONIZE = 0x00100000
+_SENTENCE_END = ".!?…。！？"
+_CLOSERS = "\"')]”’」』"
+
+
+def _clip_sentences(text: str | None, limit: int) -> str | None:
+    """``text`` (whitespace collapsed) cut after its last whole sentence within ``limit``.
+
+    Returns the whole text when it fits, ``None`` when even its first sentence
+    does not: callers drop the item instead of cutting a sentence.
+    """
+    t = " ".join((text or "").split())
+    if len(t) <= limit:
+        return t
+    best = 0
+    for i in range(min(len(t), limit)):
+        if t[i] not in _SENTENCE_END:
+            continue
+        end = i + 1
+        while end < len(t) and t[end] in _CLOSERS:
+            end += 1
+        if end <= limit and (end == len(t) or t[end] == " " or t[i] in "。！？"):
+            best = end
+    return t[:best].rstrip() if best else None
+
+
+def _day(at: float) -> str:
+    return datetime.fromtimestamp(at).strftime("%Y-%m-%d")
+
+
+def _ago(seconds: float) -> str:
+    minutes = max(0, int(round(seconds / 60.0)))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
 
 
 def _iso(at: float | None) -> str | None:
@@ -109,6 +170,8 @@ class MemoryClient:
         self._embedder: Any = None
         self._embedder_lock = threading.Lock()
         self._app_names: dict[str, set[str]] = {}
+        #: Why the last :meth:`log_turn` returned 0 (content-free), or ``None``.
+        self.last_turn_error: str | None = None
 
     @classmethod
     def open(cls, path: str | Path | None = None) -> "MemoryClient":
@@ -303,22 +366,28 @@ class MemoryClient:
     def recall(
         self, query: str, since=None, until=None, app: str | None = None, limit: int = 15
     ) -> list[dict]:
-        """Journal facts and episodes relevant to ``query``, best first.
+        """Journal facts, episodes and past conversations with Yuki relevant to ``query``, best first.
 
         Merges vector search (local embedder, loaded on first use) and keyword
         search (every whitespace-separated term present, case-insensitive) over
-        the journal and the episodes, by reciprocal rank fusion. ``since``/``until``
+        the journal, the episodes, the conversation turns (what the user said to
+        Yuki and what Yuki replied and did) and the session summaries, by
+        reciprocal rank fusion. ``since``/``until``
         take epoch seconds, a datetime/date or an ISO string (naive = local time;
-        ``since`` inclusive, ``until`` exclusive; an episode counts when its span
-        overlaps). ``app`` takes either the display name the journal records
+        ``since`` inclusive, ``until`` exclusive; an episode or session counts
+        when its span overlaps). ``app`` takes either the display name the journal records
         ("Google Chrome", "Spotify") or a process name ("chrome.exe",
         "Spotify.exe"), case-insensitively: a fact matches when its app is one
         of the names that app goes by, or when it came from a window of that
-        process; with ``app`` given, episodes (which span apps) are left out.
-        Each hit: ``{"kind": "fact" | "episode", "at": ISO local time, "until":
-        ISO | None (an episode's end), "app": str | None, "host": str | None,
-        "fact": str (the fact or the episode text), "importance": int | None,
-        "score": float}`` (``score`` is the fused rank score; higher is better).
+        process; with ``app`` given, episodes, chats and sessions (not tied to
+        one app) are left out.
+        Each hit: ``{"kind": "fact" | "episode" | "chat" | "session", "at": ISO
+        local time, "until": ISO | None (an episode's or session's end), "app":
+        str | None, "host": str | None, "fact": str, "importance": int | None,
+        "score": float}``. ``fact`` is the journal fact, the episode text, the
+        session summary, or for a chat one exchange: ``The user said: "..." Yuki
+        replied: "..." Yuki did: ...`` (long messages cut after whole
+        sentences). ``score`` is the fused rank score; higher is better.
         """
         query = (query or "").strip()
         limit = max(0, int(limit))
@@ -343,31 +412,309 @@ class MemoryClient:
             if names is None:
                 for rank, ep in enumerate(self.store.search_episodes(vec, s, u, pool)):
                     add("episode", rank, ep)
+                for rank, t in enumerate(self.store.search_turns(vec, s, u, pool)):
+                    add("chat", rank, t)
+                for rank, sm in enumerate(self.store.search_summaries(vec, s, u, pool)):
+                    add("session", rank, sm)
         for rank, e in enumerate(self.store.keyword_journal(query, s, u, names, pool, process=process)):
             add("fact", rank, e)
         if names is None:
             for rank, ep in enumerate(self.store.keyword_episodes(query, s, u, pool)):
                 add("episode", rank, ep)
+            for rank, t in enumerate(self.store.keyword_turns(query, s, u, pool)):
+                add("chat", rank, t)
+            for rank, sm in enumerate(self.store.keyword_summaries(query, s, u, pool)):
+                add("session", rank, sm)
 
         def at(key: tuple[str, int]) -> float:
             item = entries[key]
-            return item.at if key[0] == "fact" else item.started_at
+            return item.at if key[0] in ("fact", "chat") else item.started_at
 
         order = sorted(scores, key=lambda k: (-scores[k], -at(k)))[:limit]
         out = []
         for key in order:
             item = entries[key]
+            score = round(scores[key], 5)
             if key[0] == "fact":
                 out.append({
                     "kind": "fact", "at": _iso(item.at), "until": None, "app": item.app, "host": item.host,
-                    "fact": item.fact, "importance": item.importance, "score": round(scores[key], 5),
+                    "fact": item.fact, "importance": item.importance, "score": score,
+                })
+            elif key[0] == "chat":
+                out.append({
+                    "kind": "chat", "at": _iso(item.at), "until": None, "app": None, "host": None,
+                    "fact": self._chat_text(item), "importance": None, "score": score,
                 })
             else:
                 out.append({
-                    "kind": "episode", "at": _iso(item.started_at), "until": _iso(item.ended_at), "app": None,
-                    "host": None, "fact": item.text, "importance": None, "score": round(scores[key], 5),
+                    "kind": key[0], "at": _iso(item.started_at), "until": _iso(item.ended_at), "app": None,
+                    "host": None, "fact": item.text, "importance": None, "score": score,
                 })
         return out
+
+    @staticmethod
+    def _message(text: str | None, limit: int) -> str:
+        clipped = _clip_sentences(text, limit)
+        if clipped is None:
+            return f"(a long message of {len(text or '')} characters, not shown)"
+        return clipped
+
+    @classmethod
+    def _chat_text(cls, t: ConversationTurn) -> str:
+        """One exchange as a recall line."""
+        out = f'The user said: "{cls._message(t.user_text, 600)}"'
+        if t.reply_text:
+            out += f' Yuki replied: "{cls._message(t.reply_text, 600)}"'
+        if t.actions:
+            out += f" Yuki did: {cls._actions_line(t.actions, 300)}."
+        return out
+
+    @staticmethod
+    def _actions_line(actions: list[str], limit: int) -> str:
+        """Actions joined by "; ", whole items only, "(+N more)" for the ones left out."""
+        kept: list[str] = []
+        for a in actions:
+            if len("; ".join([*kept, a])) > limit - 14:   # room for " (+N more)"
+                break
+            kept.append(a)
+        rest = len(actions) - len(kept)
+        return "; ".join(kept) + (f" (+{rest} more)" if rest else "") if kept else f"({len(actions)} actions)"
+
+    # -- conversation memory (yuki.memory.conversations) ----------------------
+
+    def log_turn(
+        self, session_id: str, request_id: int, at: float, user_text: str, reply_text: str | None,
+        actions: list[str], outcome: str,
+    ) -> int:
+        """Store one exchange between the user and Yuki; returns its turn id (0 if it could not be stored).
+
+        ``session_id``: Yuki's session (one app run); ``request_id``: the
+        request's number in it; ``at``: when the user spoke (epoch seconds);
+        ``user_text``: what the user said; ``reply_text``: Yuki's final reply
+        (``None`` if there was none); ``actions``: one short line per tool call
+        ("open_url https://open.spotify.com ok"); ``outcome``: how the request
+        ended ("done", "cancelled", "error", ...). Encrypted at rest.
+
+        Queues the exchange for the ``yuki-memory`` service, which extracts
+        rules, preferences, commitments and journal facts from it within about a
+        minute (at once from the third pending exchange) and summarises the
+        session once it ends (30 minutes without an exchange, or a new
+        session id). Fast (well under 20 ms; the write waits at most 8 ms for
+        the database, else a background writer finishes it) and never raises.
+        """
+        try:
+            turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions or (), outcome)
+        except Exception as exc:
+            self.last_turn_error = f"{type(exc).__name__}: {exc}"
+            return 0
+        try:
+            signal_turns(self.store.path)
+        except Exception:
+            pass
+        return turn_id
+
+    def _standing_line(self, f: ConversationFact) -> str | None:
+        from yuki.memory.conversations import normalize_quote
+
+        text = _clip_sentences(f.text, 300)
+        quote = _clip_sentences(f.quote, 240) if f.quote else None
+        if f.kind == "commitment":
+            if text is None:
+                return None
+            due = f"due {datetime.fromtimestamp(f.due_at):%Y-%m-%d %H:%M}".replace(" 00:00", "") if f.due_at else ""
+            dates = ", ".join(x for x in (due, f"asked {_day(f.valid_from)}") if x)
+            return f"- {text} ({dates})"
+        if text is None and quote is None:
+            return None
+        if text is None or (quote and normalize_quote(quote) == normalize_quote(text)):
+            return f'- "{quote}" (the user\'s words, {_day(f.valid_from)})'
+        words = f' Their words: "{quote}"' if quote else ""
+        return f"- {text}{words} ({_day(f.valid_from)})"
+
+    def standing_context(self) -> str:
+        """The user's active rules and preferences for Yuki, and Yuki's open commitments, as one block.
+
+        Rules and preferences are how the user told Yuki to talk or behave,
+        each in the user's own words with the date it was said; commitments are
+        what the user asked Yuki to do later or Yuki promised, with the due date
+        when one was given and the date asked. Hard cap 1,200 characters (~300
+        tokens): when it is over, the oldest items are dropped whole (never cut
+        mid-sentence). ``""`` when there is nothing (or memory cannot be read).
+        Meant to be attached to every request after the cached portrait.
+        """
+        try:
+            facts = self.store.conversation_facts(STANDING_KINDS)
+            items = [(f, line) for f in facts if (line := self._standing_line(f))]
+        except Exception:
+            return ""
+        headings = {
+            "rule": "Rules the user set for Yuki:",
+            "preference": "The user's preferences about how Yuki talks or works:",
+            "commitment": "Open commitments (what Yuki is to do later):",
+        }
+
+        def render(chosen: list[tuple[ConversationFact, str]]) -> str:
+            lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
+            for kind in ("rule", "preference", "commitment"):
+                rows = [line for f, line in chosen if f.kind == kind]
+                if rows:
+                    lines += [headings[kind], *rows]
+            return "\n".join(lines)
+
+        kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
+        while kept and len(render(kept)) > STANDING_CONTEXT_CHARS:
+            kept.pop(0)   # the oldest item goes first
+        return render(kept) if kept else ""
+
+    def resume_context(self, within_hours: float = 6.0) -> str | None:
+        """Where the latest conversation left off, when it ended within ``within_hours``; else ``None``.
+
+        The latest session is the one of the newest exchange. The block holds
+        its summary (when the service has written one: after 30 idle minutes or
+        once a new session starts) and its last (up to 6) exchanges, oldest
+        first: what the user said, Yuki's reply and one line of Yuki's actions.
+        Hard cap 4,000 characters (~1,000 tokens): long messages are cut after
+        whole sentences (or shown as "a long message") and, when still over,
+        the oldest exchanges are dropped whole. Never raises (``None`` on errors).
+        """
+        try:
+            latest = self.store.latest_turn()
+            now = time.time()
+            if latest is None or now - latest.at > float(within_hours) * 3600.0:
+                return None
+            sid = latest.session_id
+            turns = self.store.turns_for_session(sid, limit=RESUME_EXCHANGES)
+            start, end, count = self.store.session_span(sid)
+            summaries = self.store.session_summaries(sid, limit=1)
+        except Exception:
+            return None
+        if not turns:
+            return None
+        start = start if start is not None else turns[0].at
+        end = end if end is not None else turns[-1].at
+        header = (f"[Where the last conversation with the user left off: {datetime.fromtimestamp(start):%Y-%m-%d %H:%M}"
+                  f"-{datetime.fromtimestamp(end):%H:%M}, {count} exchange{'' if count == 1 else 's'}, "
+                  f"ended {_ago(now - end)} ago]")
+        summary = ""
+        if summaries:
+            text = _clip_sentences(summaries[-1].text, 1_500)
+            if text:
+                summary = f"Summary: {text}"
+
+        def block(t: ConversationTurn) -> str:
+            lines = [f"{datetime.fromtimestamp(t.at):%H:%M} The user: {self._message(t.user_text, 700)}"]
+            lines.append(f"  Yuki: {self._message(t.reply_text, 900)}" if t.reply_text else "  Yuki: (no reply)")
+            extra = []
+            if t.actions:
+                extra.append("actions: " + self._actions_line(t.actions, 240))
+            if t.outcome:
+                extra.append(f"outcome: {t.outcome}")
+            if extra:
+                lines.append("  " + " | ".join(extra))
+            return "\n".join(lines)
+
+        blocks = [block(t) for t in turns]
+
+        def render(chosen: list[str], summary_text: str) -> str:
+            parts = [header]
+            if summary_text:
+                parts.append(summary_text)
+            if chosen:
+                shown = len(chosen)
+                parts.append(f"Last {shown} exchange{'' if shown == 1 else 's'}, oldest first:")
+                parts.extend(chosen)
+            return "\n".join(parts)
+
+        while blocks and len(render(blocks, summary)) > RESUME_CONTEXT_CHARS:
+            blocks.pop(0)   # the oldest exchange goes first
+        if len(render(blocks, summary)) > RESUME_CONTEXT_CHARS:
+            summary = ""
+        return render(blocks, summary)
+
+    def remember_rule(self, text: str, source_turn: int | None = None) -> int:
+        """Store a standing rule the user just gave, in the user's words; returns its id.
+
+        ``text``: the rule as the user said it ("call me babe always");
+        ``source_turn``: the :meth:`log_turn` id it came from, if known. Stored
+        at once (kind ``rule``, origin ``user``), so it shows in
+        :meth:`standing_context` from the next request. An active rule or
+        preference that says the same thing (identical words, or embedding
+        cosine >= 0.85) is superseded by it (bi-temporal: the old version ends,
+        history kept). Raises ``ValueError`` for an empty text.
+        """
+        from yuki.memory.conversations import normalize_quote
+
+        text = " ".join((text or "").split())
+        if not text:
+            raise ValueError("rule text is empty")
+        vec = self._embed(text)
+        candidates = self.store.conversation_facts(("rule", "preference"))
+        supersedes: int | None = None
+        best = -1.0
+        wanted = normalize_quote(text)
+        for f in candidates:
+            if wanted in (normalize_quote(f.text), normalize_quote(f.quote)):
+                supersedes, best = f.id, 1.0
+                break
+        if supersedes is None and vec is not None and candidates:
+            stored = self.store.conversation_fact_vectors([f.id for f in candidates])
+            for f in candidates:
+                other = stored.get(f.id)
+                if other is None or other.shape != vec.shape:
+                    continue
+                score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
+                if score >= RULE_DUPLICATE_COSINE and score > best:
+                    supersedes, best = f.id, score
+        model = getattr(self._embedder, "model_name", None) if vec is not None else None
+        return self.store.add_conversation_fact(
+            "rule", text, quote=text, subject="", origin="user",
+            source_turn_ids=[int(source_turn)] if source_turn else (), vector=vec, embed_model=model,
+            supersedes=supersedes,
+        )
+
+    def revoke_rule(self, text: str) -> int:
+        """Mark the active rule (or preference) that ``text`` refers to as revoked; returns its id, or 0.
+
+        ``text`` is the rule, or the user's words withdrawing it ("stop
+        calling me babe"). The rule whose text or quote contains every word of
+        ``text`` is chosen (the newest if several); otherwise the nearest by
+        local embedding, if its cosine is at least 0.45. The rule is kept as
+        history (status ``revoked``, ``valid_to`` now, the words kept as the
+        reason). 0 when nothing matches.
+        """
+        from yuki.memory.conversations import normalize_quote
+
+        text = " ".join((text or "").split())
+        if not text:
+            return 0
+        try:
+            candidates = self.store.conversation_facts(("rule", "preference"))
+        except Exception:
+            return 0
+        if not candidates:
+            return 0
+        terms = normalize_quote(text).split()
+        target: ConversationFact | None = None
+        keyword = [f for f in candidates
+                   if all(t in normalize_quote(f"{f.text} {f.quote or ''}") for t in terms)]
+        if keyword:
+            target = keyword[-1]
+        else:
+            vec = self._embed(text)
+            if vec is not None:
+                stored = self.store.conversation_fact_vectors([f.id for f in candidates])
+                best = REVOKE_MIN_COSINE
+                for f in candidates:
+                    other = stored.get(f.id)
+                    if other is None or other.shape != vec.shape:
+                        continue
+                    score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
+                    if score >= best:
+                        target, best = f, score
+        if target is None:
+            return 0
+        ok = self.store.end_conversation_fact(target.id, "revoked", note=f'the user: "{text}"')
+        return target.id if ok else 0
 
     # -- activity (the timeline) and episodes ---------------------------------
 
@@ -464,7 +811,8 @@ class MemoryClient:
             "last_capture_at": _iso(today["last_capture_at"]),
             "portrait_updated_at": _iso(portrait.at) if portrait else None,
             "memory_cost_today_usd": round(
-                today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0), 6
+                today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0)
+                + today.get("conversation_cost_usd", 0.0), 6
             ),
         }
 
@@ -487,4 +835,7 @@ class MemoryClient:
                 pass
 
 
-__all__ = ["MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE"]
+__all__ = [
+    "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE", "REVOKE_MIN_COSINE",
+    "STANDING_CONTEXT_CHARS", "RESUME_CONTEXT_CHARS", "RESUME_EXCHANGES",
+]

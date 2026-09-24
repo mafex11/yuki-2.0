@@ -15,7 +15,7 @@ All rules in `docs/ARCHITECTURE.md` apply (no behaviour heuristics, no fixed sle
 
 ## Processes
 
-- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker and the portrait worker. A crash here must never take Yuki down.
+- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker, the conversation worker (Yuki's own exchanges, see "Conversation memory") and the portrait worker. A crash here must never take Yuki down.
 - Yuki (the agent) reads memory directly from the store (same machine) through tools; no network hop. An MCP server for other agents comes later.
 
 ## Watcher (capture)
@@ -50,7 +50,7 @@ The timeline (`yuki/memory/timeline.py`: foreground stretches with app, page, pr
 ## Store
 
 - One SQLite database under `%LOCALAPPDATA%\Yuki\memory\memory.db` (WAL mode). Content columns encrypted with a key protected by Windows DPAPI (`CryptProtectData`, current user). Metadata (timestamps, app, URL host) cleartext for filtering.
-- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive).
+- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive). Migration 6 (additive) adds conversation memory: `conversation_turns`, `conversation_facts`, `session_summaries`, `conversation_batches` and the vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec` (see "Conversation memory").
 - **Local embeddings** (no cloud): a small CPU embedding model (e.g. `fastembed` + bge-small ONNX) — measure speed/size.
 - Facts are never hard-deleted; contradicted facts get `valid_to` set.
 
@@ -65,10 +65,63 @@ The timeline (`yuki/memory/timeline.py`: foreground stretches with app, page, pr
 - Nightly (first idle moment after a configurable hour) and weekly: read the day's/week's journal (by id checkpoint, so facts dated weeks back by their messages are still consumed) plus current portrait facts, told who the user is; the model returns ADD / UPDATE (supersede) / INVALIDATE / NOOP operations per fact (Mem0 pattern), each citing journal ids. Apply bi-temporally.
 - Render a one-page portrait text (hard cap ~1500 tokens) cached for Yuki.
 
+## Conversation memory
+
+Memory of Yuki's own conversations with the user: rules the user sets mid-chat ("call me babe always"), preferences about how Yuki talks, what the user handed Yuki for later or Yuki promised, facts the user reveals, and continuity across restarts. Design basis: `docs/research/conversation-memory.md` (Mem0 diff operations, Graphiti bi-temporal invalidation, end-of-session summaries, a small always-attached block and just-in-time recall). Code: `yuki/memory/conversations.py` (worker, in `yuki-memory`), `yuki/memory/api.py` (Yuki side), `yuki/memory/store.py` (migration 6).
+
+**Tables (migration 6, additive).**
+- `conversation_turns(id, session_id, request_id, at, user_ciphertext, reply_ciphertext, actions_ciphertext, outcome, extracted, extract_attempts, extract_batch_id, summary_id, summary_attempts, created_at)`: one row per exchange. The id is allocated by the writer from a microsecond clock, so it is known before the write lands. Kept forever: this is the raw conversation log (no capture TTL).
+- `conversation_facts(id, kind rule|preference|commitment|fact, subject_ciphertext, text_ciphertext, quote_ciphertext, status active|done|revoked|superseded, valid_from, valid_to, due_at, source_turn_ids, origin model|user, created_at, expired_at, superseded_by, end_note_ciphertext, batch_id)`: bi-temporal. Nothing is deleted: an UPDATE supersedes the old version, and a revoke or done ends it, keeping `valid_to` and the words or reason that ended it. `quote` holds the user's own words for rules and preferences. `fact` is reserved: durable facts go to the journal (below).
+- `session_summaries(id, session_id, started_at, ended_at, turn_count, text_ciphertext, batch_id, created_at)`. The spec's start/end columns are named `started_at`/`ended_at` because `end` is an SQL keyword.
+- `conversation_batches`: content-free accounting per model call (purpose extract|summary, tokens, cost, latency, ops applied/noop/rejected, journal facts, outcome).
+- Vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec`: local 384-d embeddings, encrypted like the rest.
+
+**Writing a turn (Yuki's process).** `MemoryClient.log_turn(session_id, request_id, at, user_text, reply_text, actions, outcome)` encrypts the exchange and inserts it through a dedicated SQLite connection that waits at most 8 ms for the write lock. If another writer holds the lock longer, the row goes to a background writer: turns queue behind it in order and the id is returned at once. It then sets the named auto-reset event `Local\YukiMemoryTurns-<db digest>`, which wakes the worker across processes. It never raises; it returns 0 if the turn could not be stored. Measured 2026-09-24: 0.5 ms per turn (2.3 ms for the first, which opens the connection); with the database locked, 10.5 ms, then 0.3 ms for each queued turn.
+
+**Extraction (worker, Haiku 4.5).**
+- *When it runs.* When at least 3 turns are pending, or the oldest pending turn was queued 60 s ago. A new turn wakes the worker at once; otherwise it waits on a condition, with a timeout set to the next due time.
+- *Batches.* Pending turns are batched per session, at most 12 turns and 16,000 characters each.
+- *What the model sees.* The current active items (C<n>), items that ended in the last 14 days (never to be re-added), the last 12 journal facts from conversations (so none is repeated), up to 4 earlier exchanges of the session as context only, the new exchanges numbered [n], and a calendar for relative dates.
+- *What it returns.* One forced, strict `record_conversation_memory` call. `operations` are ADD / UPDATE / INVALIDATE (`end_as` done|revoked) / NOOP, each citing exchanges. `journal_facts` are atomic third-person facts, each with an importance and an exchange.
+- *Validation, in code.*
+  - Rules and preferences need a quote that is a span of the cited exchange's user text, after normalising case, whitespace, quote marks and dashes. A paraphrase or an inferred rule is rejected.
+  - Revoking a rule or preference needs the user's words too.
+  - Only a commitment can be `done`.
+  - The target must be active. Evidence older than the item is rejected. Each item gets one operation per call.
+  - A commitment's quote is dropped when Yuki, not the user, said it.
+  - `due` ("YYYY-MM-DD[ HH:MM]") becomes `due_at`.
+- *Durable facts go to the journal,* dated by their exchange (app "Yuki", thread `yuki:conversation`, kind `yuki_chat`). The portrait worker consumes them like any other fact. There is no parallel fact store.
+- *One transaction* writes the batch row, the item changes, the journal facts, the turns marked extracted and all vectors.
+- *Failures.* A failed call bumps `extract_attempts`; after 3 the turn is given up. After a failure the worker waits 5 min.
+
+**Session summaries.** A session's exchanges split where 30 minutes passed without one. A run has ended when a later run of the same session exists, when 30 minutes passed since its last exchange, or when a later exchange belongs to another session id. Each ended run gets a 2-4 sentence, past-tense, third-person summary (forced strict `save_session_summary`). The model sees the exchanges (the latest 24,000 characters) and, as context, the session's previous summary. The summary is embedded and stored. Two known limits: two Yuki front ends running at once with different session ids would split each other's runs, and the summary of the last session appears only once it has ended, so `resume_context` right after a restart shows its exchanges without a summary.
+
+**What Yuki attaches (hard budgets in code).**
+- `standing_context()`: the active rules and preferences, each in the user's own words with the date it was said, and the open commitments with due and asked dates. Hard cap 1,200 characters (~300 tokens). Over the cap, the oldest items are dropped whole. An item is cut only after a whole sentence, and dropped if even its first sentence does not fit. It returns `""` when there is nothing. It is meant to go after the cached portrait prefix on every request.
+- `resume_context(within_hours=6)`: when the newest exchange is at most 6 h old, a header (the session span, the number of exchanges, how long ago it ended), that session's latest summary, and its last 6 exchanges, each with the user's words, Yuki's reply and one line of actions and outcome. Messages are cut after whole sentences, or shown as "a long message of N characters" when the first sentence alone is too long. Hard cap 4,000 characters (~1,000 tokens), dropping the oldest exchange first. It returns `None` otherwise.
+- `remember_rule(text, source_turn=None)`: stores the rule at once in the user's words (origin `user`). It supersedes an active rule or preference with identical words or embedding cosine of at least 0.85.
+- `revoke_rule(text)`: finds the active rule or preference containing every word of `text` (the newest if several). Otherwise it takes the nearest by embedding, at a cosine of at least 0.45. Measured 2026-09-24: a withdrawal in other words scored 0.50-0.57, and unrelated text 0.03-0.29. It marks the rule revoked and returns its id, or 0.
+- `recall(...)` now also returns `kind: "chat"` hits, one exchange each (`The user said: "..." Yuki replied: "..." Yuki did: ...`), and `kind: "session"` hits (summaries, with `until`), each dated. Both use vector plus keyword search with RRF, as for facts and episodes, and are left out when `app` is given.
+
+**Portrait.** The render gets a RELATIONSHIP DATA block: the active rules and preferences in the user's words, and up to 8,000 characters of the last 14 days of session summaries, newest kept. It writes a short Relationship section on how the user likes Yuki to talk, and on running themes that span more than one session. That block feeds this section only: every other section still comes from the facts. A new or ended rule, or a new summary, since the last render re-renders the portrait on the next run.
+
+**Pause.** The `paused` flag does not stop conversation memory. It stops screen capture. Turns the user types to Yuki are still stored and extracted, just as the journal worker finishes what was captured before a pause. Revisit this if the user wants pause to mean "remember nothing".
+
+**Costs** (measured 2026-09-24, synthetic two-session history, list prices):
+
+| Call | Tokens (in / out) | Cost |
+|---|---|---|
+| Extraction, 5 exchanges | 3.7k / 0.3k | $0.0052 |
+| Extraction, 3 exchanges | 3.6k / 0.2k | $0.0046 |
+| Summary | 1.7-1.8k / 0.1-0.16k | $0.0022-0.0026 |
+| Portrait render with Relationship (Sonnet) | 2.1k / 0.24k | $0.0066 |
+
+Logs: `logs/memory/conversations-YYYYMMDD.jsonl`, with usage, cost, latency and stop reason in the clear and the request, response and operations encrypted. Status cost (`memory_cost_today_usd`) includes these calls. `yuki-memory --no-conversations` turns the worker off; turns are still stored.
+
 ## Yuki integration
 
-- The current portrait text + relevant know-how are attached to every request as labelled context ("[What Yuki knows about the user, from memory]").
-- Tools: `recall(query, since?, until?, app?, person?)` → journal facts + snippets; `remember_how(app, text)` → know-how write after a success; `update_portrait(text)` → a user-confirmed correction.
+- The current portrait text + relevant know-how are attached to every request as labelled context ("[What Yuki knows about the user, from memory]"); after it (outside the cached prefix) `standing_context()`, and at the start of a new session `resume_context()`. Every exchange goes to `log_turn(...)`.
+- Tools: `recall(query, since?, until?, app?, person?)` → journal facts, episodes, past chats and sessions; `remember_how(app, text)` → know-how write after a success; `update_portrait(text)` → a user-confirmed correction; `remember_rule(text)` / `revoke_rule(text)` → a standing rule the user just gave or withdrew, applied at once.
 - When a choice is driven by the portrait, Yuki says why in its reply.
 
 ## Build phases
