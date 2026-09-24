@@ -27,21 +27,32 @@ Opening::
 
 Watcher (capture) side::
 
-    store.upsert_thread(app: str, title: str, url: str | None, *, process: str | None = None) -> int
-        # thread_id. A thread is (app, url) when a url is given, else (app, title).
-        # Updates the stored title/url/process and last_seen on every call.
+    store.upsert_thread(app: str, title: str, url: str | None, *, process: str | None = None,
+                        scope: str | None = None, kind: str | None = None) -> int
+        # thread_id. A thread is (app, scope) when a scope (Extraction.thread_scope) is
+        # given, else (app, url) when a url is given, else (app, title); scope == url
+        # keys exactly like url. Updates title/url/scope/kind/process and last_seen.
         # `process` is the image name ("chrome.exe"), stored as app_key() ("chrome").
     store.latest_text(thread_id: int) -> str | None
         # decrypted last full text seen for the thread (for computing the next delta)
     store.add_capture(thread_id: int, at: float, trigger: str,
-                      full_text: str, delta_text: str) -> int | None
-        # capture_id, or None when nothing new was stored: full_text identical to
-        # the latest text, delta empty/whitespace, or this exact delta already
-        # stored for the thread. Whenever full_text differs, it becomes the
-        # thread's latest text (even if no capture row is written).
+                      full_text: str, delta_text: str, *, kind=None, profile=None) -> int | None
+        # pages/documents/lists: capture_id, or None when nothing new was stored:
+        # full_text identical to the latest text, delta empty/whitespace, or this
+        # exact delta already stored for the thread. Whenever full_text differs,
+        # it becomes the thread's latest text (even if no capture row is written).
+    store.add_conversation(thread_id, at, trigger, messages, *, kind="conversation", profile=None,
+                           first_visit_new_s=300, label_tolerance_s=90) -> ConversationWrite
+        # chats/mail: stores messages whose fingerprint the thread has not seen,
+        # each labelled new | history | reread; one capture row carries them.
+    store.messages_for_captures(capture_ids) -> dict[capture_id, list[StoredMessage]]
+    store.message_counts(thread_id) -> dict[status, int]
+    store.add_me_names(app, names) -> int;  store.me_names() -> list[str]
+        # names the screen showed as the user ("Sudhanshu (you)"), encrypted
     store.add_health(at: float, app: str, trigger: str, outcome: str,
-                     reason: str | None, chars: int, ms: float) -> None
-        # content-free capture health; never pass captured text in `reason`.
+                     reason: str | None, chars: int, ms: float, *, profile=None, kind=None,
+                     dropped_chars=None, messages=None, new_messages=None, stats=None) -> None
+        # content-free capture health; never pass captured text in any field.
 
 Journal (worker and Yuki tools)::
 
@@ -190,6 +201,10 @@ class ThreadInfo:
     url: str | None
     first_seen: float
     last_seen: float
+    #: Which conversation/page this is (``Extraction.thread_scope``); None for old threads.
+    scope: str | None = None
+    #: Extraction kind of the latest capture ("conversation", "page", ...); None for old threads.
+    kind: str | None = None
 
 
 @dataclass
@@ -203,6 +218,40 @@ class PendingCapture:
     delta: str
     chars: int
     attempts: int
+    #: Extraction kind ("conversation", "email", "page", ...); None for pre-extraction captures.
+    kind: str | None = None
+    profile: str | None = None
+
+
+@dataclass
+class StoredMessage:
+    """One conversation message as stored (decrypted), see :meth:`Store.add_conversation`."""
+
+    id: int
+    thread_id: int
+    capture_id: int | None
+    sender: str | None
+    is_me: bool
+    time_label: str | None
+    at: float | None
+    text: str
+    first_seen: float
+    #: new (sent/received since the watcher last saw the thread) | history (older,
+    #: being viewed) | reread (a known message shown again without its time label)
+    status: str
+    journaled: bool
+
+
+@dataclass
+class ConversationWrite:
+    """What :meth:`Store.add_conversation` stored (counts only)."""
+
+    capture_id: int | None
+    new: int = 0
+    history: int = 0
+    reread: int = 0
+    seen: int = 0          # fingerprints already stored for the thread
+    chars: int = 0         # characters of the capture row written (0 if none)
 
 
 @dataclass
@@ -562,6 +611,53 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX portraits_at ON portraits(at);
     """,
+    # 3: capture extraction (yuki.memory.extract) - threads keyed by the
+    # extraction's thread scope, conversations stored message by message with
+    # fingerprints, the user's names as learned on screen, richer health.
+    # Additive only, like 2.
+    """
+    ALTER TABLE threads ADD COLUMN scope_ciphertext TEXT;
+    ALTER TABLE threads ADD COLUMN kind TEXT;
+    ALTER TABLE threads ADD COLUMN messages_seen_at REAL;   -- last conversation read of the thread
+
+    ALTER TABLE captures ADD COLUMN kind TEXT;              -- extraction kind, cleartext metadata
+    ALTER TABLE captures ADD COLUMN profile TEXT;
+
+    CREATE TABLE messages (
+        id                INTEGER PRIMARY KEY,
+        thread_id         INTEGER NOT NULL REFERENCES threads(id),
+        capture_id        INTEGER,                 -- the capture that brought it (NULL once pruned)
+        fingerprint       TEXT NOT NULL,           -- HMAC(Message.fingerprint)
+        content_key       TEXT NOT NULL,           -- HMAC(Message.content_key)
+        sender_ciphertext TEXT,
+        is_me             INTEGER NOT NULL DEFAULT 0,
+        time_label        TEXT,                    -- as shown ("18:12", "Yesterday")
+        at                REAL,                    -- absolute estimate, NULL if unknown
+        text_ciphertext   TEXT,                    -- NULL once past the capture TTL (tombstone)
+        first_seen        REAL NOT NULL,
+        status            TEXT NOT NULL,           -- new | history | reread
+        journaled         INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(thread_id, fingerprint)
+    );
+    CREATE INDEX messages_capture ON messages(capture_id);
+    CREATE INDEX messages_thread_content ON messages(thread_id, content_key);
+
+    CREATE TABLE me_names (
+        id              INTEGER PRIMARY KEY,
+        name_key        TEXT NOT NULL UNIQUE,      -- HMAC(casefolded name)
+        app             TEXT,                      -- app it was first learned in
+        name_ciphertext TEXT NOT NULL,
+        first_seen      REAL NOT NULL,
+        last_seen       REAL NOT NULL
+    );
+
+    ALTER TABLE health ADD COLUMN profile TEXT;
+    ALTER TABLE health ADD COLUMN kind TEXT;
+    ALTER TABLE health ADD COLUMN dropped_chars INTEGER;
+    ALTER TABLE health ADD COLUMN messages INTEGER;
+    ALTER TABLE health ADD COLUMN new_messages INTEGER;
+    ALTER TABLE health ADD COLUMN stats TEXT;              -- JSON, content-free (nodes, ms, source)
+    """,
 )
 
 
@@ -688,21 +784,31 @@ class Store:
 
     # -- threads -----------------------------------------------------------
 
-    def upsert_thread(self, app: str, title: str, url: str | None, *, process: str | None = None) -> int:
+    def upsert_thread(
+        self, app: str, title: str, url: str | None, *, process: str | None = None,
+        scope: str | None = None, kind: str | None = None,
+    ) -> int:
         """Find or create the thread for this window/page and return its id.
 
-        The identity is ``(app, url)`` when ``url`` is non-empty, else
-        ``(app, title)``: a page keeps its thread while its title changes
-        (notification counters, "(3) Inbox"), and an app without a URL gets one
-        thread per window title. The latest title/url, ``process`` (stored as
-        :func:`app_key`, e.g. ``"chrome"``) and ``last_seen`` are updated on
-        every call.
+        The identity is ``(app, scope)`` when ``scope`` (the extraction's
+        ``thread_scope``: a Slack channel, a Gmail subject, a page URL) is
+        given, else ``(app, url)`` when ``url`` is non-empty, else
+        ``(app, title)``. A scope equal to the URL keys the thread exactly as a
+        URL does, so pages keep the threads (and latest texts) they had before
+        scopes existed; a page keeps its thread while its title changes
+        (notification counters, "(3) Inbox"). The latest title/url/scope/kind,
+        ``process`` (stored as :func:`app_key`, e.g. ``"chrome"``) and
+        ``last_seen`` are updated on every call.
         """
         app = app or ""
         title = title or ""
         url = url or None
+        scope = (scope or "").strip() or None
         proc = app_key(process)
-        key = self.cipher.digest("url" if url else "title", app, url or title)
+        if scope and scope != url:
+            key = self.cipher.digest("scope", app, scope)
+        else:
+            key = self.cipher.digest("url" if url else "title", app, url or title)
         now = time.time()
 
         def op(conn: sqlite3.Connection) -> int:
@@ -710,14 +816,15 @@ class Store:
             if row:
                 conn.execute(
                     "UPDATE threads SET title_ciphertext=?, url_ciphertext=?, last_seen=?,"
-                    " process=coalesce(?, process) WHERE id=?",
-                    (self._enc(title), self._enc(url), now, proc, row["id"]),
+                    " process=coalesce(?, process), scope_ciphertext=coalesce(?, scope_ciphertext),"
+                    " kind=coalesce(?, kind) WHERE id=?",
+                    (self._enc(title), self._enc(url), now, proc, self._enc(scope), kind, row["id"]),
                 )
                 return int(row["id"])
             cur = conn.execute(
                 "INSERT INTO threads(thread_key, app, host, title_ciphertext, url_ciphertext, first_seen, last_seen,"
-                " process) VALUES (?,?,?,?,?,?,?,?)",
-                (key, app, url_host(url), self._enc(title), self._enc(url), now, now, proc),
+                " process, scope_ciphertext, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (key, app, url_host(url), self._enc(title), self._enc(url), now, now, proc, self._enc(scope), kind),
             )
             return int(cur.lastrowid)
 
@@ -732,6 +839,7 @@ class Store:
         return ThreadInfo(
             id=r["id"], app=r["app"], host=r["host"], title=self._dec(r["title_ciphertext"]) or "",
             url=self._dec(r["url_ciphertext"]), first_seen=r["first_seen"], last_seen=r["last_seen"],
+            scope=self._dec(r["scope_ciphertext"]), kind=r["kind"],
         )
 
     # -- captures ----------------------------------------------------------
@@ -742,9 +850,13 @@ class Store:
         return self._dec(rows[0]["text_ciphertext"]) if rows else None
 
     def add_capture(
-        self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str
+        self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str,
+        *, kind: str | None = None, profile: str | None = None,
     ) -> int | None:
-        """Store one capture's delta; see the module docstring for the dedup rules."""
+        """Store one capture's delta; see the module docstring for the dedup rules.
+
+        ``kind``/``profile``: the extraction that produced the text (cleartext metadata).
+        """
         full_text = full_text or ""
         delta_text = delta_text or ""
         full_hash = self.cipher.digest(full_text)
@@ -771,9 +883,10 @@ class Store:
             if dup:
                 return None
             cur = conn.execute(
-                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash)"
-                " VALUES (?,?,?,?,?,?)",
-                (thread_id, at, trigger or "", self.cipher.encrypt(delta_text), len(delta_text), delta_hash),
+                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (thread_id, at, trigger or "", self.cipher.encrypt(delta_text), len(delta_text), delta_hash,
+                 kind, profile),
             )
             return int(cur.lastrowid)
 
@@ -784,15 +897,210 @@ class Store:
         return capture_id
 
     def add_health(
-        self, at: float, app: str, trigger: str, outcome: str, reason: str | None, chars: int, ms: float
+        self, at: float, app: str, trigger: str, outcome: str, reason: str | None, chars: int, ms: float,
+        *, profile: str | None = None, kind: str | None = None, dropped_chars: int | None = None,
+        messages: int | None = None, new_messages: int | None = None, stats: dict | None = None,
     ) -> None:
-        """Record one content-free capture-health row."""
+        """Record one content-free capture-health row.
+
+        ``profile``/``kind``: the extraction used; ``dropped_chars``: UI chrome
+        removed; ``messages``/``new_messages``: messages on screen / stored as
+        new; ``stats``: the extraction's diagnostics (node count, ms, source).
+        Never pass captured text in any of them.
+        """
         self._write(
             lambda conn: conn.execute(
-                "INSERT INTO health(at, app, trigger, outcome, reason, chars, ms) VALUES (?,?,?,?,?,?,?)",
-                (float(at), app, trigger, outcome, reason, int(chars or 0), float(ms or 0.0)),
+                "INSERT INTO health(at, app, trigger, outcome, reason, chars, ms, profile, kind, dropped_chars,"
+                " messages, new_messages, stats) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (float(at), app, trigger, outcome, reason, int(chars or 0), float(ms or 0.0), profile, kind,
+                 dropped_chars, messages, new_messages, json.dumps(stats) if stats else None),
             )
         )
+
+    # -- conversations -------------------------------------------------------
+
+    def add_conversation(
+        self,
+        thread_id: int,
+        at: float,
+        trigger: str,
+        messages: Sequence[Any],
+        *,
+        kind: str = "conversation",
+        profile: str | None = None,
+        first_visit_new_s: float = 300.0,
+        label_tolerance_s: float = 90.0,
+    ) -> ConversationWrite:
+        """Store the messages on screen that the thread has not seen; one transaction.
+
+        ``messages`` are :class:`yuki.memory.extract.Message`-shaped objects
+        (``fingerprint``, ``content_key``, ``sender``, ``is_me``, ``time_label``,
+        ``at``, ``text``) in on-screen order, oldest first.
+
+        A message is stored only if its fingerprint is unseen in the thread.
+        An unseen fingerprint whose content key the thread already has, when
+        either reading lacks a time label, is the same message read again
+        (``reread``: kept as a fingerprint only, never journaled). The others
+        are classified against *when the watcher last saw this thread*
+        (``threads.messages_seen_at``; a reference point for labelling, not a
+        behaviour rule):
+
+        * ``new`` - sent or received since then: its ``at`` is at or after the
+          last look (less ``label_tolerance_s``: labels show minutes only), or,
+          without an ``at``, it sits below the thread's newest stored message
+          on screen. On a thread never seen before, ``new`` means an ``at``
+          within ``first_visit_new_s`` of this capture.
+        * ``history`` - everything else on screen: older messages being viewed.
+
+        When anything is stored, one capture row (``kind``/``profile``; the
+        delta is a plain rendering of the stored messages) carries them to the
+        journal worker; ``messages.capture_id`` links them to it.
+        """
+        at = float(at)
+        items = [m for m in messages if (getattr(m, "text", "") or "").strip() and getattr(m, "fingerprint", "")]
+
+        def placeholders(n: int) -> str:
+            return ",".join("?" * n)
+
+        def op(conn: sqlite3.Connection) -> ConversationWrite:
+            out = ConversationWrite(capture_id=None)
+            row = conn.execute("SELECT messages_seen_at FROM threads WHERE id=?", (thread_id,)).fetchone()
+            previous = row["messages_seen_at"] if row else None
+            fps = [self.cipher.digest("fp", m.fingerprint) for m in items]
+            cks = [self.cipher.digest("ck", m.content_key or m.fingerprint) for m in items]
+            known: set[str] = set()
+            content: dict[str, bool] = {}   # content key -> some stored reading had no time label
+            for start in range(0, len(items), 400):
+                fchunk, cchunk = fps[start:start + 400], cks[start:start + 400]
+                known.update(r["fingerprint"] for r in conn.execute(
+                    f"SELECT fingerprint FROM messages WHERE thread_id=? AND fingerprint IN ({placeholders(len(fchunk))})",
+                    (thread_id, *fchunk),
+                ))
+                for r in conn.execute(
+                    "SELECT content_key, max(time_label IS NULL) untimed FROM messages"
+                    f" WHERE thread_id=? AND content_key IN ({placeholders(len(cchunk))}) GROUP BY content_key",
+                    (thread_id, *cchunk),
+                ):
+                    content[r["content_key"]] = bool(r["untimed"])
+            # The thread's newest stored message, when it is on screen: unseen
+            # untimed messages below it arrived since the last look.
+            anchor = -1
+            if previous is not None and known:
+                newest = conn.execute(
+                    "SELECT fingerprint FROM messages WHERE thread_id=? AND status != 'reread'"
+                    " ORDER BY coalesce(at, 0) DESC, id DESC LIMIT 1", (thread_id,),
+                ).fetchone()
+                if newest is not None and newest["fingerprint"] in known:
+                    anchor = max(i for i, f in enumerate(fps) if f == newest["fingerprint"])
+            stored: list[tuple[Any, str, int]] = []
+            for pos, (m, fp, ck) in enumerate(zip(items, fps, cks)):
+                if fp in known:
+                    out.seen += 1
+                    continue
+                known.add(fp)  # the same fingerprint twice on one screen is one message
+                if ck in content and (m.time_label is None or content[ck]):
+                    status = "reread"
+                elif previous is None:
+                    status = "new" if m.at is not None and m.at >= at - first_visit_new_s else "history"
+                elif m.at is not None:
+                    status = "new" if m.at >= previous - label_tolerance_s else "history"
+                else:
+                    status = "new" if 0 <= anchor < pos else "history"
+                content[ck] = content.get(ck, False) or m.time_label is None
+                keep = status != "reread"
+                cur = conn.execute(
+                    "INSERT INTO messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me,"
+                    " time_label, at, text_ciphertext, first_seen, status, journaled)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        thread_id, None, fp, ck, self._enc(m.sender) if keep else None, int(bool(m.is_me)),
+                        m.time_label, m.at, self.cipher.encrypt(m.text) if keep else None, at, status,
+                        0 if keep else 1,
+                    ),
+                )
+                if keep:
+                    stored.append((m, status, int(cur.lastrowid)))
+                setattr(out, status, getattr(out, status) + 1)
+            conn.execute(
+                "UPDATE threads SET messages_seen_at=?, last_seen=max(last_seen, ?) WHERE id=?",
+                (at, at, thread_id),
+            )
+            if not stored:
+                return out
+            delta = "\n".join(
+                f"[{status}] {m.time_label or '-'} {'the user' if m.is_me else (m.sender or '?')}: {m.text}"
+                for m, status, _ in stored
+            )
+            cur = conn.execute(
+                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (thread_id, at, trigger or "", self.cipher.encrypt(delta), len(delta),
+                 self.cipher.digest("conv", *sorted(fps)), kind, profile),
+            )
+            out.capture_id = int(cur.lastrowid)
+            out.chars = len(delta)
+            conn.executemany(
+                "UPDATE messages SET capture_id=? WHERE id=?", [(out.capture_id, mid) for _, _, mid in stored]
+            )
+            return out
+
+        result = self._write(op)
+        if result.capture_id is not None:
+            with self._cond:
+                self._cond.notify_all()
+        return result
+
+    def messages_for_captures(self, capture_ids: Iterable[int]) -> dict[int, list[StoredMessage]]:
+        """Stored (not ``reread``) messages per capture id, in on-screen order, decrypted."""
+        ids = [int(i) for i in capture_ids]
+        out: dict[int, list[StoredMessage]] = {i: [] for i in ids}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            rows = self._query(
+                "SELECT * FROM messages WHERE capture_id IN (%s) AND status != 'reread' ORDER BY id"
+                % ",".join("?" * len(chunk)), chunk,
+            )
+            for r in rows:
+                out[r["capture_id"]].append(StoredMessage(
+                    id=r["id"], thread_id=r["thread_id"], capture_id=r["capture_id"],
+                    sender=self._dec(r["sender_ciphertext"]), is_me=bool(r["is_me"]), time_label=r["time_label"],
+                    at=r["at"], text=self._dec(r["text_ciphertext"]) or "", first_seen=r["first_seen"],
+                    status=r["status"], journaled=bool(r["journaled"]),
+                ))
+        return out
+
+    def message_counts(self, thread_id: int) -> dict[str, int]:
+        """Stored messages of one thread by status (content-free)."""
+        return {r["status"]: r["n"] for r in self._query(
+            "SELECT status, count(*) n FROM messages WHERE thread_id=? GROUP BY status", (int(thread_id),)
+        )}
+
+    # -- the user's names ----------------------------------------------------
+
+    def add_me_names(self, app: str | None, names: Iterable[str]) -> int:
+        """Remember names the screen showed as the user ("Sudhanshu (you)"); returns how many were new."""
+        now = time.time()
+        clean = list(dict.fromkeys(n.strip() for n in names if n and n.strip()))
+
+        def op(conn: sqlite3.Connection) -> int:
+            added = 0
+            for name in clean:
+                key = self.cipher.digest("me", name.casefold())
+                if conn.execute("UPDATE me_names SET last_seen=? WHERE name_key=?", (now, key)).rowcount == 0:
+                    conn.execute(
+                        "INSERT INTO me_names(name_key, app, name_ciphertext, first_seen, last_seen) VALUES (?,?,?,?,?)",
+                        (key, app, self.cipher.encrypt(name), now, now),
+                    )
+                    added += 1
+            return added
+
+        return self._write(op) if clean else 0
+
+    def me_names(self) -> list[str]:
+        """Every name learned as the user's, oldest first."""
+        return [self.cipher.decrypt(r["name_ciphertext"]) for r in self._query(
+            "SELECT name_ciphertext FROM me_names ORDER BY first_seen, id"
+        )]
 
     # -- journal worker plumbing ------------------------------------------
 
@@ -807,7 +1115,7 @@ class Store:
     def pending_captures(self, limit: int | None = None, max_attempts: int = 3) -> list[PendingCapture]:
         """Unjournaled captures, oldest first, deltas decrypted."""
         sql = (
-            "SELECT id, thread_id, at, trigger, delta_ciphertext, chars, journal_attempts FROM captures"
+            "SELECT id, thread_id, at, trigger, delta_ciphertext, chars, journal_attempts, kind, profile FROM captures"
             " WHERE journal_batch_id IS NULL AND journal_attempts < ? ORDER BY at, id"
         )
         params: list[Any] = [max_attempts]
@@ -818,7 +1126,7 @@ class Store:
             PendingCapture(
                 id=r["id"], thread_id=r["thread_id"], at=r["at"], trigger=r["trigger"],
                 delta=self.cipher.decrypt(r["delta_ciphertext"]), chars=r["chars"],
-                attempts=r["journal_attempts"],
+                attempts=r["journal_attempts"], kind=r["kind"], profile=r["profile"],
             )
             for r in self._query(sql, params)
         ]
@@ -886,6 +1194,7 @@ class Store:
             for fact in facts:
                 self._insert_journal(conn, fact, batch_id)
             conn.executemany("UPDATE captures SET journal_batch_id=? WHERE id=?", [(batch_id, i) for i in ids])
+            conn.executemany("UPDATE messages SET journaled=1 WHERE capture_id=?", [(i,) for i in ids])
             return batch_id
 
         return self._write(op)
@@ -1519,10 +1828,17 @@ class Store:
 
         Journal facts are never deleted. A capture past the TTL goes whether or
         not it was journaled: raw captures are a 30-day buffer, not an archive.
+        Conversation messages past the TTL keep only their fingerprints, so
+        history read again later is still recognised as already seen.
         """
         cutoff = time.time() - float(older_than_days) * 86400.0
 
         def op(conn: sqlite3.Connection) -> int:
+            conn.execute(
+                "UPDATE messages SET text_ciphertext=NULL, sender_ciphertext=NULL, capture_id=NULL"
+                " WHERE first_seen < ? AND (text_ciphertext IS NOT NULL OR capture_id IS NOT NULL)",
+                (cutoff,),
+            )
             deleted = conn.execute("DELETE FROM captures WHERE at < ?", (cutoff,)).rowcount
             conn.execute(
                 "DELETE FROM thread_latest WHERE thread_id IN (SELECT id FROM threads WHERE last_seen < ?)",

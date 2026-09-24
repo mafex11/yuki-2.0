@@ -152,6 +152,10 @@ class Settings:
             ``cost_usd`` of ``None`` rather than a guess.
         requests_csv: Append-only CSV with one line per finished request,
             resolved against ``project_root`` like ``log_dir``.
+        user_names: The user's own names and handles as apps show them. Memory
+            capture marks messages from these senders as the user's, and the
+            journal is told these names are the user (plus the names the
+            watcher learns on screen, e.g. "Sudhanshu (you)").
     """
 
     model: str = DEFAULT_MODEL
@@ -172,6 +176,7 @@ class Settings:
         default_factory=lambda: {model: dict(rates) for model, rates in DEFAULT_PRICING.items()}
     )
     requests_csv: Path = Path("logs/requests.csv")
+    user_names: list[str] = field(default_factory=lambda: ["Sudhanshu", "Mafex", "mafex11"])
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)
