@@ -17,9 +17,24 @@ store (existing ids, cited ids, user-confirmed facts) and applied bi-temporally 
 one transaction per call: superseded facts get ``valid_to`` and ``superseded_by``,
 nothing is deleted. ``open_loop`` facts drive the ``open_loops`` table.
 
+Open loops are only what is owed by or to the user on direct evidence (an ask
+of the user, a promise by them, an answer they await, a deadline involving
+them) - never FYIs, other people's demos or news, or bot and support offers.
+An ADD/UPDATE of one must carry its ``loop`` (direction, evidence "asked by
+Vinay in Slack on 2026-09-23", ``second_hand`` for a bot's summary), which is
+appended to the stored text; without it the operation is rejected. A loop's
+last evidence is its newest cited journal entry: past :data:`LOOP_STALE_DAYS`
+it renders "may be stale - last seen <date>", past :data:`LOOP_EXPIRE_DAYS` it
+is invalidated at the end of a run (row status ``expired``) unless an UPDATE
+renewed it with newer evidence. A loop failing the bar may be INVALIDATEd
+without citations.
+
 Then the portrait is rendered by a second call (``save_portrait`` tool, effort
 low): one page, at most ~1,500 tokens, addressed to Yuki about the user in the
-third person, and stored encrypted with its ``updated_at``.
+third person, and stored encrypted with its ``updated_at``. The model writes
+every section but Open loops and is told to say nothing is pending; the Open
+loops section is appended from the loop records by code (:meth:`loops_text`),
+so nothing becomes a to-do that no loop record says.
 
 User corrections (:meth:`Store.add_correction`, from Yuki's ``update_portrait``
 tool) are facts of kind ``correction`` with origin ``user``: the render follows
@@ -47,6 +62,7 @@ Public API::
         .run(kind="nightly", *, now=None) -> RunResult      # kind: first | nightly | weekly | refresh
         .render(run_id=None) -> str | None                  # re-render from current facts
         .activity_text(until, days=None) -> str
+        .loops_text(loops, now) -> str / .loop_last_seen(loops) -> {fact id: epoch}
     PortraitScheduler(store, worker, *, db_path, log=None, idle_fn=None, clock=time.time,
                       nightly_hour=22, idle_s=600, first_min_facts=30)
         .run(stop) / .tick() -> str | None / .due(now) -> (kind | None, reason) / .wake()
@@ -96,6 +112,13 @@ RENDER_MAX_TOKENS = 8_000
 CHUNK_CHARS = 60_000
 #: Most episodes given to one run (the latest are kept).
 MAX_EPISODES = 80
+#: Open loops: with no new evidence for this many days a loop is rendered as possibly
+#: stale, and past the second bound it is invalidated (its ``open_loops`` row ``expired``)
+#: unless a later operation renewed it with newer evidence. User-stated loops are only
+#: marked, never expired.
+LOOP_STALE_DAYS = 7
+LOOP_EXPIRE_DAYS = 14
+LOOP_KIND = "open_loop"
 
 OPS_SYSTEM_PROMPT = """\
 You maintain the portrait that Yuki keeps of its user. Yuki is a personal assistant living \
@@ -108,7 +131,8 @@ and collaborators.
 - interest: topics, hobbies, media, creators, channels, artists, games, markets they \
 follow. Name them specifically.
 - person: one person in their life. Subject is the person's name as shown; the text says \
-who they are to the user, where they talk (app), and what is pending between them.
+who they are to the user, where they talk (app) and what about. Anything owed between \
+them and the user is an open_loop fact, never part of the person text.
 - routine: when they do what - time-of-day and weekday patterns, recurring sessions.
 - preference: how they like things: the apps, tools, sites and settings they choose, \
 languages, formats, tastes.
@@ -122,10 +146,20 @@ labels: never "procrastinator", "distracted", "lazy", "addicted", "focused perso
 what happened, how often and how long. Confidence starts low (0.3 or less) for a pattern \
 seen on one day; only raise confidence when a pattern repeats across days, and lower it \
 (or invalidate the fact) when later days do not show it.
-- open_loop: something unfinished - a message the user has not answered, a reply or \
-deliverable they promised, something they are waiting on, a deadline. Subject is the \
-person or thing it concerns; the text says what is pending, since when, and by when if \
-known.
+- open_loop: something owed by or to the user, on direct evidence: someone asked the \
+user for something, the user promised something, the user asked someone and is awaiting \
+the answer, or a deadline involving the user. Not open loops: FYIs and announcements, \
+demos, news or work of other people, offers from bots or support, messages that merely \
+mention the user, anything the user only saw. Subject is the person or thing it \
+concerns; the text is one short sentence: what is owed, by whom, and by when if known - \
+no history and no evidence. The loop field gives the direction and the evidence - who, \
+where, and the date of the journal entry ("asked by Vinay in Slack on 2026-09-23") - and \
+second_hand is true \
+when the only evidence is someone else's account of it, such as a bot's or assistant's \
+summary. When later entries show a loop still live, UPDATE it citing them, with the \
+newest evidence in loop and the text unchanged unless what is owed changed; an existing \
+open_loop that does not meet this bar is INVALIDATEd, citing nothing if nothing new \
+bears on it.
 
 Each request gives you, inside the data fence:
 - CURRENT FACTS, each with its id (F<n>), kind, subject, confidence, origin and the date \
@@ -151,7 +185,8 @@ delivered, decided) is invalidated.
 - NOOP: an existing fact the evidence bears on without changing it. Leave facts the \
 evidence does not touch out of the list.
 Cite the journal ids each operation rests on in journal_ids and the episode ids in \
-episode_ids (each operation must cite at least one of them, or a correction).
+episode_ids (each operation must cite at least one of them, or a correction, except an \
+INVALIDATE of an open_loop that fails the bar above).
 
 What makes a good portrait fact:
 - Durable: it should still help Yuki a week from now. One video watched is an event, not \
@@ -199,7 +234,7 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                     "additionalProperties": False,
                     "required": [
                         "op", "fact_id", "kind", "subject", "text", "confidence",
-                        "journal_ids", "episode_ids", "based_on_facts", "reason",
+                        "journal_ids", "episode_ids", "based_on_facts", "reason", "loop",
                     ],
                     "properties": {
                         "op": {"type": "string", "enum": ["ADD", "UPDATE", "INVALIDATE", "NOOP"]},
@@ -243,6 +278,35 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                             "description": "n of each correction F<n> this operation carries out; else empty.",
                         },
                         "reason": {"type": "string", "description": "One short clause: why."},
+                        "loop": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["owed", "evidence", "second_hand"],
+                                    "properties": {
+                                        "owed": {
+                                            "type": "string", "enum": ["by_user", "to_user"],
+                                            "description": "by_user: the user owes it; to_user: someone owes the user.",
+                                        },
+                                        "evidence": {
+                                            "type": "string",
+                                            "description": (
+                                                "Who, where and the journal entry's date, e.g. \"asked by Vinay "
+                                                "in Slack on 2026-09-23\" or \"the user promised Asha on WhatsApp "
+                                                "on 2026-09-22\"."
+                                            ),
+                                        },
+                                        "second_hand": {
+                                            "type": "boolean",
+                                            "description": "True when the only evidence is someone else's account (a bot's summary, a digest).",
+                                        },
+                                    },
+                                },
+                                {"type": "null"},
+                            ],
+                            "description": "open_loop ADD and UPDATE: the loop's direction and evidence (required). Else null.",
+                        },
                     },
                 },
             }
@@ -258,15 +322,16 @@ building ... They're into ...".
 
 Sections, in this order, each a short heading line followed by tight sentences or "- " \
 bullets; leave out a section that has no facts:
-Work, Interests, People, Routines, Behaviour, Preferences, Open loops.
+Work, Interests, People, Routines, Behaviour, Preferences.
 
-- People: each person, who they are to the user, where they talk, and what is pending \
-with them.
+- People: each person, who they are to the user, where they talk and what about; what \
+they did stays in the past tense with its date, as the facts give it.
 - Behaviour: the observed patterns in how the user spends their time, with their numbers; \
 describe what they do, never label their character.
-- Open loops: exactly the open_loop facts, each one concrete - who or what, what is \
-pending, since when (use the dates given; today's date is in the request), and any \
-deadline. Do not add loops of your own; with no open_loop facts, leave the section out.
+- The open loops (what is owed by or to the user) are appended after your text from their \
+own records. Write no Open loops section, and nowhere say or imply that anything is \
+pending, owed, awaiting a reply or decision, or needs the user's attention; what other \
+people did or announced is their activity, not the user's to-do.
 - Write only what the facts say; do not speculate about what the user may need to do.
 - Facts of origin "user" and corrections are the user's own words and win over inferred \
 facts: where they conflict, follow the user and leave the contradicted fact out.
@@ -296,6 +361,29 @@ _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 def _local(at: float, fmt: str = "%Y-%m-%d %H:%M (%A)") -> str:
     return datetime.fromtimestamp(at).strftime(fmt)
+
+
+def _loop_text(text: str, loop: Any) -> tuple[str | None, str | None]:
+    """An open_loop's stored text: what is owed, then its evidence in brackets.
+
+    Returns ``(text, None)`` or ``(None, why it is refused)``. The evidence is
+    required: a loop nobody can trace to an ask, a promise, an awaited answer or
+    a deadline is not recorded.
+    """
+    if not isinstance(loop, dict):
+        return None, "open_loop needs its loop (direction and evidence)"
+    owed = loop.get("owed")
+    evidence = " ".join(str(loop.get("evidence") or "").split()).strip(" ()")
+    if owed not in ("by_user", "to_user"):
+        return None, "open_loop needs owed = by_user or to_user"
+    if not evidence:
+        return None, "open_loop needs its evidence (who, where, when)"
+    if loop.get("second_hand") is True and not evidence.lower().startswith("second-hand"):
+        evidence = f"second-hand, unconfirmed: {evidence}"
+    body = text.rstrip()
+    if evidence.lower() in body.lower():   # the model repeated the evidence in the text
+        return body, None
+    return f"{body.rstrip('.')} ({evidence}).", None
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +654,11 @@ class PortraitWorker:
         def safe(value: str | None, cap: int) -> str:
             return sanitize_untrusted(value or "", nonce, cap)
 
-        fact_lines = [self._fact_line(f, safe) for f in facts] or ["(none yet)"]
+        seen = self.loop_last_seen([f for f in facts if f.kind == LOOP_KIND])
+        fact_lines = [
+            self._fact_line(f, safe) + (f" [last evidence {_local(seen[f.id], '%Y-%m-%d')}]" if f.id in seen else "")
+            for f in facts
+        ] or ["(none yet)"]
         journal_lines = []
         for j in journal:
             where = j.app + (f" / {j.host}" if j.host else "")
@@ -668,6 +760,12 @@ class PortraitWorker:
                 if not evidenced:
                     reject("cites no journal entry, episode or correction from this request")
                     continue
+                if out.kind == LOOP_KIND:
+                    composed, why = _loop_text(out.text, item.get("loop"))
+                    if composed is None:
+                        reject(why or "open_loop without evidence")
+                        continue
+                    out.text = composed
                 at = min(evidence_at) if evidence_at else now
                 origin = "user" if corrections else "model"
                 changes.append(FactChange(
@@ -689,7 +787,9 @@ class PortraitWorker:
                 out.status = "noop"
                 touched.add(fact_id)
                 continue
-            if not evidenced:
+            # an open loop that fails the bar may be dropped on the rules alone, citing nothing
+            dropping_loop = out.op == "INVALIDATE" and target.kind == LOOP_KIND and target.origin != "user"
+            if not evidenced and not dropping_loop:
                 reject("cites no journal entry, episode or correction from this request")
                 continue
             if target.origin == "user":
@@ -703,6 +803,12 @@ class PortraitWorker:
                     reject("UPDATE needs the new text")
                     continue
                 kind = out.kind if out.kind in PORTRAIT_KINDS else target.kind
+                if kind == LOOP_KIND:
+                    composed, why = _loop_text(out.text, item.get("loop"))
+                    if composed is None:
+                        reject(why or "open_loop without evidence")
+                        continue
+                    out.text = composed
                 changes.append(FactChange(
                     "UPDATE", fact_id, kind, out.subject or target.subject, out.text,
                     1.0 if corrections else confidence, known, latest_evidence or now,
@@ -800,7 +906,12 @@ class PortraitWorker:
                           noop=sum(o.status == "noop" for o in outcomes),
                           rejected=[o.status for o in outcomes if o.status.startswith("rejected")],
                           operations_ciphertext=self._seal([o.__dict__ for o in outcomes]))
-            if changed or kind == "refresh" or (self.store.latest_portrait() is None and self.store.portrait_facts()):
+            expired = self._expire_loops(run_id, now, stats)
+            result.operations.extend(expired)
+            changed += sum(o.status == "applied" for o in expired)
+            latest = self.store.latest_portrait()
+            if (changed or kind == "refresh" or (latest is None and self.store.portrait_facts())
+                    or (latest is not None and self._loops_turned_stale(latest.at, now))):
                 result.portrait = self._render(run_id, stats, now)
             stats.outcome = "ok" if (chunks or result.portrait) else "empty"
         except Exception as exc:
@@ -829,6 +940,25 @@ class PortraitWorker:
         facts = self.store.portrait_facts()
         if not facts:
             return None
+        loops = self.loops_text([f for f in facts if f.kind == LOOP_KIND], now)
+        others = [f for f in facts if f.kind != LOOP_KIND]
+        text = self._render_page(run_id, stats, now, others) if others else ""
+        budget = MAX_PORTRAIT_CHARS - len(loops) - 2
+        if len(text) > budget:
+            cut = text.rfind("\n", 0, budget)
+            original = len(text)
+            text = text[: cut if cut > budget // 2 else budget].rstrip()
+            self._log("portrait_truncated", run_id=run_id, chars=original, kept=len(text))
+        text = f"{text}\n\n{loops}" if text else loops
+        portrait_id = self.store.save_portrait(text, run_id=run_id, model=self.model, fact_count=len(facts))
+        self._log("portrait_saved", run_id=run_id, portrait_id=portrait_id, chars=len(text), facts=len(facts),
+                  open_loops=sum(f.kind == LOOP_KIND for f in facts))
+        return text
+
+    def _render_page(
+        self, run_id: int | None, stats: PortraitRunStats, now: float, facts: Sequence[PortraitFact]
+    ) -> str:
+        """The model-written part of the portrait: every section except Open loops."""
         nonce = str(uuid.uuid4()).upper()
         begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
         end = f"===END_UNTRUSTED_DATA_{nonce}==="
@@ -860,14 +990,74 @@ class PortraitWorker:
         text = str(tool_input.get("text") or "").strip()
         if not text:
             raise _ModelError("save_portrait text is empty")
-        if len(text) > MAX_PORTRAIT_CHARS:
-            cut = text.rfind("\n", 0, MAX_PORTRAIT_CHARS)
-            original = len(text)
-            text = text[: cut if cut > MAX_PORTRAIT_CHARS // 2 else MAX_PORTRAIT_CHARS].rstrip()
-            self._log("portrait_truncated", run_id=run_id, chars=original, kept=len(text))
-        portrait_id = self.store.save_portrait(text, run_id=run_id, model=self.model, fact_count=len(facts))
-        self._log("portrait_saved", run_id=run_id, portrait_id=portrait_id, chars=len(text), facts=len(facts))
         return text
+
+    # -- open loops ----------------------------------------------------------
+
+    def loop_last_seen(self, loops: Sequence[PortraitFact]) -> dict[int, float]:
+        """When each open_loop fact last had evidence: its newest cited journal entry, else ``valid_from``."""
+        ids = sorted({int(i) for f in loops for i in f.source_ids})
+        at: dict[int, float] = {}
+        if ids:
+            try:
+                rows = self.store._query(
+                    "SELECT id, at FROM journal WHERE id IN (%s)" % ",".join("?" * len(ids)), ids
+                )
+                at = {int(r["id"]): float(r["at"]) for r in rows}
+            except Exception:
+                at = {}
+        return {f.id: max([f.valid_from, *(at[i] for i in f.source_ids if i in at)]) for f in loops}
+
+    def loops_text(self, loops: Sequence[PortraitFact], now: float) -> str:
+        """The portrait's Open loops section, written from the loop records (no model)."""
+        if not loops:
+            return "Open loops: none on record."
+        seen = self.loop_last_seen(loops)
+        stale_before = now - LOOP_STALE_DAYS * 86400.0
+        lines = [
+            "Open loops (the only things memory knows to be owed by or to the user; a second-hand or "
+            "possibly stale one is unconfirmed - ask the user whether it still stands):"
+        ]
+        for f in sorted(loops, key=lambda f: -seen[f.id]):
+            text = " ".join(f.text.split())
+            line = f"- {f.subject}: {text}" if f.subject and not text.startswith(f.subject) else f"- {text}"
+            if seen[f.id] < stale_before:
+                line += f" [may be stale — last seen {_local(seen[f.id], '%Y-%m-%d')}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _loops_turned_stale(self, since: float, now: float) -> bool:
+        """Whether a loop crossed the stale mark after ``since`` (the portrait then needs re-rendering)."""
+        seen = self.loop_last_seen(self.store.portrait_facts([LOOP_KIND]))
+        return any(since < at + LOOP_STALE_DAYS * 86400.0 <= now for at in seen.values())
+
+    def _expire_loops(self, run_id: int | None, now: float, stats: PortraitRunStats) -> list[OpOutcome]:
+        """Invalidate model-inferred loops with no evidence for :data:`LOOP_EXPIRE_DAYS`; rows become ``expired``."""
+        loops = [f for f in self.store.portrait_facts([LOOP_KIND]) if f.origin != "user"]
+        seen = self.loop_last_seen(loops)
+        old = [f for f in loops if seen[f.id] < now - LOOP_EXPIRE_DAYS * 86400.0]
+        if not old:
+            return []
+        rows = {r.portrait_fact_id: r for r in self.store.open_loops("open")}
+        written = self.store.commit_portrait_changes(
+            run_id, [FactChange("INVALIDATE", f.id, f.kind, f.subject, "", None, [], now) for f in old]
+        )
+        outcomes: list[OpOutcome] = []
+        for f, (ok, _new) in zip(old, written):
+            last = _local(seen[f.id], "%Y-%m-%d")
+            out = OpOutcome("INVALIDATE", f.id, f.kind, f.subject, "", None, [], [],
+                            f"expired: no new evidence since {last}",
+                            status="applied" if ok else "skipped: target no longer current")
+            outcomes.append(out)
+            if not ok:
+                continue
+            stats.ops_invalidate += 1
+            row = rows.get(f.id)
+            if row is not None:
+                self.store.resolve_open_loop(row.id, at=now, status="expired")
+        self._log("portrait_loops_expired", run_id=run_id, fact_ids=[f.id for f in old],
+                  last_seen=[round(seen[f.id], 1) for f in old], expire_days=LOOP_EXPIRE_DAYS)
+        return outcomes
 
 
 # ---------------------------------------------------------------------------
