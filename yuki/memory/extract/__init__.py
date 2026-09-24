@@ -19,7 +19,8 @@ Layers (all read-only; nothing here sends input or changes focus):
 * :mod:`.profiles` + ``profiles_default.toml`` - per-app anchors as data;
 * :mod:`.conversation` - the generic message extractor (anchors, else structure);
 * :mod:`.page` - the generic main-content extractor (landmarks, control types,
-  side columns);
+  side columns), and video pages (``kind`` "video": title, channel/author,
+  first lines of the description; recommendations and comments left out);
 * :mod:`.timeparse`, :mod:`.fingerprint` - labels -> times, messages -> ids.
 
 Usage::
@@ -38,10 +39,10 @@ from yuki.memory.extract import profiles as _profiles
 from yuki.memory.extract import query, timeparse
 from yuki.memory.extract.conversation import detect_list, extract_conversation, learn_me
 from yuki.memory.extract.model import Extraction, Message, Node, Snapshot
-from yuki.memory.extract.page import extract_page
+from yuki.memory.extract.page import extract_page, extract_video
 from yuki.memory.extract.profiles import Profile, ProfileSet
 from yuki.memory.extract.text import all_text_chars, clean, join, pieces
-from yuki.memory.extract.uia import READ_TIMEOUT_S, read_window, snapshot_from_tree
+from yuki.memory.extract.uia import READ_TIMEOUT_S, content_pid, process_name, read_window, snapshot_from_tree
 
 __all__ = [
     "Extraction",
@@ -91,12 +92,8 @@ def _app_name(process_name: str, pid: int) -> str:
 
 
 def _pid(hwnd: int) -> int:
-    try:
-        import win32process
-
-        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
-    except Exception:
-        return 0
+    """The process whose content the window shows (a UWP app, not its frame host)."""
+    return content_pid(hwnd)
 
 
 def _strip(value: str, affixes: tuple[str, ...]) -> str:
@@ -132,7 +129,11 @@ def _scope(snap: Snapshot, profile: Profile | None, kind: str) -> str:
     root = snap.root
     if profile and root is not None and profile.header:
         for node in query.first_tier(profile.header, root):
-            text = clean(node.text) or clean(join(pieces(node, include_root=True, drop_actions=False)))
+            # The anchor says this is the header: its text counts even when it
+            # sits in a navigation landmark (a breadcrumb bar).
+            text = clean(node.text) or clean(
+                join(pieces(node, include_root=True, drop_actions=False, drop_chrome=False))
+            )
             if text:
                 return _strip(text, profile.scope_strip)[:200]
     title = _stable_title(snap.page_title or snap.title)
@@ -140,7 +141,7 @@ def _scope(snap: Snapshot, profile: Profile | None, kind: str) -> str:
         parts = title.split(profile.title_split)
         if len(parts) > profile.title_part:
             return _strip(parts[profile.title_part], profile.scope_strip)[:200]
-    if kind in ("page", "generic") and snap.url:
+    if kind in ("page", "video", "generic") and snap.url:
         return snap.url
     return (title or snap.url or "")[:200]
 
@@ -149,13 +150,7 @@ def _process_profile(profiles: ProfileSet, hwnd: int, tree: object | None) -> Pr
     """The profile a window's process alone selects (before any read)."""
     process = getattr(tree, "process_name", "") if tree is not None else ""
     if not process:
-        try:
-            from yuki.perception.windows import window_info
-
-            info = window_info(hwnd)
-            process = info.process_name if info else ""
-        except Exception:
-            process = ""
+        process = process_name(content_pid(hwnd))
     return profiles.for_window(process=process, url=None)
 
 
@@ -293,6 +288,17 @@ def extract_snapshot(
                 "terminal shows only its frame); see the extract package notes for other sources"
             )
             return out
+
+    # -- video pages: title, channel/author, first lines of the description ----
+    if profile is None or profile.kind == "video":
+        video = extract_video(snap, profile, page_title=_stable_title(snap.page_title or snap.title))
+        if video is not None:
+            out = base("video", profile.name if profile else "generic_video")
+            out.body, out.dropped_chars = video[0], video[1]
+            out.notes.extend(video[2])
+            return out
+        if profile is not None:
+            notes.append(f"profile {profile.name}: no video on screen; generic page instead")
 
     # -- no profile: a chat after all? ---------------------------------------
     if profile is None:

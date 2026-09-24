@@ -26,11 +26,12 @@ from yuki.memory.extract import query
 
 DEFAULT_PATH = Path(__file__).with_name("profiles_default.toml")
 
-KINDS = ("conversation", "email", "page", "document", "list", "terminal", "generic")
+KINDS = ("conversation", "email", "page", "video", "document", "list", "terminal", "generic")
 
 _PATH_KEYS = (
     "header", "list", "row", "sender", "time", "body", "day_separator", "exclude",
     "composer", "me_row", "self_name", "list_rows", "main", "chrome",
+    "title", "author", "description",
 )
 
 
@@ -80,6 +81,15 @@ class Profile:
     list_rows: tuple[str, ...] = ()
     main: tuple[str, ...] = ()
     chrome: tuple[str, ...] = ()
+    #: Video pages (kind "video"): the video's title, its channel/author, its
+    #: description (see :func:`yuki.memory.extract.page.extract_video`).
+    title: tuple[str, ...] = ()
+    author: tuple[str, ...] = ()
+    description: tuple[str, ...] = ()
+    #: Affixes cut from the page title when it stands in for the video title.
+    title_strip: tuple[str, ...] = ()
+    #: Lines of the description kept (its first lines).
+    description_lines: int = 5
     id_source: str = ""
     id_time: str = ""
     id_epoch_ms: int = 0
@@ -140,6 +150,8 @@ def _profile(raw: dict, problems: list[str]) -> Profile | None:
     values["title_part"] = int(raw.get("title_part") or 0)
     values["scope_strip"] = _strings(raw.get("scope_strip"))
     values["self_name_strip"] = _strings(raw.get("self_name_strip"))
+    values["title_strip"] = _strings(raw.get("title_strip"))
+    values["description_lines"] = max(int(raw.get("description_lines") or 5), 1)
     values["id_source"] = str(raw.get("id_source") or "")
     values["id_time"] = str(raw.get("id_time") or "")
     values["id_epoch_ms"] = int(raw.get("id_epoch_ms") or 0)

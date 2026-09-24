@@ -54,6 +54,7 @@ import win32con
 import win32gui
 
 from yuki.memory.extract import Extraction, extract
+from yuki.memory.extract.uia import content_pid
 from yuki.memory.privacy import PrivacyConfig, PrivacyRules
 from yuki.perception.windows import is_user_window
 
@@ -269,9 +270,16 @@ def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
 
 
 def _window_pid(hwnd: int) -> int:
-    pid = wintypes.DWORD(0)
-    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return int(pid.value)
+    """The process whose content ``hwnd`` shows: for the OS's UWP frame
+    (ApplicationFrameHost.exe) the hosted app's (Windows Settings is
+    SystemSettings.exe), so privacy gates, the app name and the per-process
+    focus hooks all see the app rather than its host."""
+    pid = content_pid(hwnd)
+    if pid:
+        return pid
+    raw = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(raw))
+    return int(raw.value)
 
 
 def user_idle_s() -> float:
@@ -698,7 +706,7 @@ class Watcher:
         self._callback = _WINEVENTPROC(self._on_winevent)
         self._fg_hook = None
         self._pid_hooks: list[int] = []
-        self._hooked_pid = 0
+        self._hooked_pid: tuple[int, ...] = ()
         self._fg = 0
         self._locked = False
         self._fullscreen = False
@@ -989,24 +997,32 @@ class Watcher:
             if self._hwnd:
                 self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
 
-    def _hook_pid(self, pid: int) -> None:
-        if pid == self._hooked_pid:
+    def _hook_pid(self, hwnd: int) -> None:
+        """Focus/name-change hooks for the processes behind ``hwnd``: the
+        window's own and, for a UWP frame, the hosted app's (the frame raises
+        the title changes, the app its focus changes)."""
+        pid = _window_pid(hwnd)
+        raw = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(raw))
+        pids = tuple(p for p in dict.fromkeys((pid, int(raw.value))) if p and p != os.getpid())
+        if pids == self._hooked_pid:
             return
         self._unhook_pid()
-        if not pid or pid == os.getpid():
+        if not pids:
             return
         flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-        for event in (EVENT_OBJECT_FOCUS, EVENT_OBJECT_NAMECHANGE):
-            handle = _user32.SetWinEventHook(event, event, None, self._callback, pid, 0, flags)
-            if handle:
-                self._pid_hooks.append(handle)
-        self._hooked_pid = pid
+        for hooked in pids:
+            for event in (EVENT_OBJECT_FOCUS, EVENT_OBJECT_NAMECHANGE):
+                handle = _user32.SetWinEventHook(event, event, None, self._callback, hooked, 0, flags)
+                if handle:
+                    self._pid_hooks.append(handle)
+        self._hooked_pid = pids
 
     def _unhook_pid(self) -> None:
         for handle in self._pid_hooks:
             _user32.UnhookWinEvent(handle)
         self._pid_hooks = []
-        self._hooked_pid = 0
+        self._hooked_pid = ()
 
     def _on_winevent(self, hook, event, hwnd, id_object, id_child, thread, ms) -> None:
         try:
@@ -1055,7 +1071,7 @@ class Watcher:
             self._unhook_pid()
             self._pending = None
             return
-        self._hook_pid(_window_pid(hwnd))
+        self._hook_pid(hwnd)
         self._arm(trigger, time.monotonic(), force=True)
 
     def _signature(self, hwnd: int) -> tuple:
