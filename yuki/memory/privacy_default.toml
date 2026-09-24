@@ -230,3 +230,37 @@ secret_patterns = [
 # (A git commit hash or a GUID on the command line is dropped by this.)
 entropy_min_length = 24
 entropy_min_bits = 3.5
+
+[nudges]
+# The coach (yuki.memory.nudges): short check-ins while you are at the PC -
+# praise, a nudge back to what you were doing, a break suggestion - and
+# reminders of to-dos that are due.  What to say is the model's call; these
+# are only when it may speak.  (Not privacy rules, but they live here so all
+# of memory's knobs are in one file.)  A missing key keeps its default.
+enabled = true
+# Local quiet hours: nothing at all between these times (wraps midnight).
+quiet_start = "00:30"
+quiet_end = "08:00"
+# At most one praise or nudge per this many minutes (reminders are exempt).
+budget_min = 30
+# After a nudge, this many later switches of activity may still get a short
+# acknowledgement ("good, keep going") inside the budget - never a second nudge.
+follow_ups = 2
+# A routine look this often while you are at the PC (the coach also looks
+# when you switch to something new and stay on it for transition_hold_s).
+periodic_min = 15
+transition_hold_s = 90
+# Model calls at least this far apart, and at most this many per hour.
+min_gap_s = 90
+max_calls_per_hour = 12
+# "At the PC" = active or watching within this many minutes.
+presence_min = 5
+# How far back the coach looks, and what counts as a break.
+lookback_min = 120
+break_min = 5
+# A praise or nudge not shown within this many minutes is dropped (reminders are kept).
+deliver_within_min = 15
+# A reminder more than this many hours late is not sent.
+reminder_late_max_h = 24
+# A to-do due on a day without a time is reminded at this time that day.
+all_day_at = "09:00"

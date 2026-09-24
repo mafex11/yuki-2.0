@@ -15,7 +15,7 @@ All rules in `docs/ARCHITECTURE.md` apply (no behaviour heuristics, no fixed sle
 
 ## Processes
 
-- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker, the conversation worker (Yuki's own exchanges, see "Conversation memory") and the portrait worker. A crash here must never take Yuki down.
+- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker, the conversation worker (Yuki's own exchanges, see "Conversation memory"), the coach (check-ins and reminders, see "Nudges and to-dos") and the portrait worker. A crash here must never take Yuki down.
 - Yuki (the agent) reads memory directly from the store (same machine) through tools; no network hop. An MCP server for other agents comes later.
 
 ## Watcher (capture)
@@ -63,7 +63,7 @@ The timeline (`yuki/memory/timeline.py`: foreground stretches with app, page, pr
 ## Store
 
 - One SQLite database under `%LOCALAPPDATA%\Yuki\memory\memory.db` (WAL mode). Content columns encrypted with a key protected by Windows DPAPI (`CryptProtectData`, current user). Metadata (timestamps, app, URL host) cleartext for filtering.
-- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive). Migration 6 (additive) adds conversation memory: `conversation_turns`, `conversation_facts`, `session_summaries`, `conversation_batches` and the vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec` (see "Conversation memory").
+- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive). Migration 6 (additive) adds conversation memory: `conversation_turns`, `conversation_facts`, `session_summaries`, `conversation_batches` and the vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec` (see "Conversation memory"). Migration 7 (additive) adds the `by_yuki` marks; migration 8 (additive) adds the coach's `todos`, `nudges`, `nudge_checkins` and `nudge_state` (see "Nudges and to-dos").
 - **Local embeddings** (no cloud): a small CPU embedding model (e.g. `fastembed` + bge-small ONNX) — measure speed/size.
 - Facts are never hard-deleted; contradicted facts get `valid_to` set.
 
@@ -131,6 +131,112 @@ Memory of Yuki's own conversations with the user: rules the user sets mid-chat (
 
 Logs: `logs/memory/conversations-YYYYMMDD.jsonl`, with usage, cost, latency and stop reason in the clear and the request, response and operations encrypted. Status cost (`memory_cost_today_usd`) includes these calls. `yuki-memory --no-conversations` turns the worker off; turns are still stored.
 
+## Nudges and to-dos
+
+The coach (`yuki/memory/nudges.py`, thread `yuki-memory-nudges`) looks at what the user is doing **right now**, set against what they did before, and writes short messages for the UI. There are three kinds: `praise` (encouragement or an acknowledgement), `nudge` (a call-back, a call-out or a break suggestion) and `reminder` (an item that is due). Code decides only *when to look*: presence, gates, budget and rate, all plumbing. *What to say, if anything,* is Haiku's call, through a forced strict `coach_decision` call with `reason`, `say` (none, praise or nudge), `text` (null for none) and `mentions` (the to-do ids the text names).
+
+**When it looks.** Every 15 s (`tick_s`) the worker reads the timeline. It uses the user's rows only: `by_yuki` stretches are left out.
+- *transition*: the site or app in front changed (`timeline.group_of`, site grouping) and the new activity has held for `transition_hold_s` (90 s), so a flicker never counts. Coming back after a break of `break_min` (5 min) or more is also a transition. Transitions go first: a periodic look waits while a new activity is still being held.
+- *follow_up*: after a `nudge`, the next `follow_ups` (2) transitions may speak inside the budget, but only to praise ("good, keep going"). A nudge there is suppressed (`suppressed:follow_up_nudge`), so the same drift is never called out twice.
+- *periodic*: a backstop every `periodic_min` (15 min).
+- *reminder*: a user to-do or a commitment with a due time. It fires at that time, or at the first allowed moment after, once per item and due time (`nudges.ref` + `due_at`). A date with no time is reminded at `all_day_at` (09:00) that day, and nothing is sent more than `reminder_late_max_h` (24 h) late. A small Haiku call (`write_reminder`) phrases it in the user's register; if that call fails, the item's own words are used.
+
+**Never while**:
+- memory is paused, or the session is locked;
+- a meeting row is in front, or one ended less than 5 min ago;
+- a full-screen row is in front;
+- Yuki is acting on the desktop;
+- the coach is snoozed (`snooze_nudges`);
+- it is quiet hours (00:30-08:00);
+- the user has not been present (active or watching) in the last `presence_min` (5 min).
+
+Reminders wait through the same gates.
+
+**Budget**: at most one praise or nudge per `budget_min` (30 min). Reminders and follow-ups are exempt. A transition takes priority over a periodic look: praise written at a periodic look does not hold a transition back, but a nudge does. A check-in the budget blocks is recorded as `skipped:budget` and makes no call.
+
+**Rate**: calls are at least `min_gap_s` (90 s) apart, with at most `max_calls_per_hour` (12).
+
+All these knobs live in the `[nudges]` table of the privacy file. The defaults are in `privacy_default.toml`, and a user file without the table gets them.
+
+**What the coach sees.** Two things sit outside the fence: the trigger, and how long the user has been at the PC without a break. Everything else is fenced as untrusted data with a per-request nonce:
+- NOW: the activity in front (app, site, title, how long, active or watching), with the journal facts and the latest two captures since it began. Journal facts lag a few minutes; captures do not. For a transition, it also shows the run just before.
+- BEFORE: the last `lookback_min` (2 h): time per site with titles, the run-by-run sequence, time since the last break, episodes and journal facts (never `by_yuki` ones).
+- TO-DOS, with ids, due dates (today, tomorrow or overdue) and evidence.
+- The portrait's `work`, `interest` and `behaviour` facts.
+- The user's active rules and preferences, in their own words (nicknames, tone).
+- The last 24 h of nudges with the user's reactions, and a count for the last 7 days.
+
+The prompt gives principles, not rules:
+- Judge whether something is related from its content, never from the site name.
+- When the user switches from work to something unrelated, call them back and name the work.
+- Acknowledge a return to work.
+- When a long stretch (about 45 min) ends at a natural break, praise it.
+- Never interrupt a stretch that is still going. The one exception is a break suggestion after about 90 min without a break.
+- After long drift, be firmer: give real numbers and name the to-do due soonest.
+- Never invent numbers or obligations.
+- Be blunt if needed, never insulting.
+- Say less after dismissals, and most of the time say nothing.
+
+A text that names an id not on the list is suppressed.
+
+**Storage** (migration 8, additive):
+- `todos(id, text_ciphertext, due_at, due_all_day, status open|done, created_at, done_at)`.
+- `nudges(id, at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext, ref, due_at, checkin_id, shown_at, reaction shown|dismissed|replied|snoozed|expired, reacted_at)`. `inputs` is an encrypted JSON summary of what the decision rested on: the activity and its length, the previous activity, the time since the break, and the mentions.
+- `nudge_checkins`: content-free accounting of every check-in (trigger, outcome `none|praise|nudge|reminder|suppressed:*|skipped:budget|error`, tokens, cost, latency), written in one transaction with its nudge.
+- `nudge_state`: the snooze.
+
+A praise or nudge not shown within `deliver_within_min` (15 min) expires; reminders never do. After writing a nudge the worker sets the named auto-reset event `Local\YukiNudgeReady`, which it creates and holds open, so the UI wakes at once.
+
+Logs go to `logs/memory/nudges-YYYYMMDD.jsonl`, with usage, cost and latency in the clear and the request and response encrypted. The service log gets one content-free `nudge_checkin` line per check-in. The cost counts toward `memory_cost_today_usd`.
+
+**The to-do list.** `MemoryClient.todos` merges three sources:
+- open loops from the portrait, as `loop:<open_loops.id>`; evidence is who asked, where and when;
+- open commitments from conversation memory, as `commit:<id>`; evidence is the user's words;
+- to-dos the user added with `add_todo`, as `todo:<id>`.
+
+`complete_todo(ref)` takes an id or the item's text. Text matches an item that contains all its words, or else the nearest by local embedding, at a cosine of at least 0.45. What completing does depends on the source:
+- a to-do becomes done;
+- a commitment ends as `done`;
+- a loop becomes `done` and its portrait fact is invalidated. A user correction ("the user said this is done") is also stored, so the render follows it and later runs do not re-open the loop from old evidence, and the portrait is refreshed.
+
+**Reactions feed back only through existing paths.** The coach reads them for its own next decisions. The portrait render's RELATIONSHIP input gets one line of counts (last 14 days, per kind and reaction) for its Relationship section, as an observation, never a rule.
+
+**API** (`yuki/memory/api.py`, used by the UI and the agent):
+- `todos(include_done=False)`
+- `add_todo(text, due=None) -> "todo:N"`
+- `complete_todo(ref) -> id | None`
+- `pending_nudges()`: unshown nudges, oldest first, as `{id, at, kind, text, reason}`
+- `ack_nudge(id, "shown"|"dismissed"|"replied"|"snoozed")`
+- `snooze_nudges(minutes)`: 0 clears the snooze
+- `nudge_status()`: `{quiet_until, last_nudge_at, today: {praise, nudge, reminder}}`
+
+`yuki-memory --no-nudges` turns the coach off.
+
+**Measured 2026-09-24** (temp databases, synthetic timelines, Haiku 4.5 list prices):
+
+| Call | Tokens (in / out) | Cost |
+|---|---|---|
+| Coach check-in | 3.0-3.6k / 110-190 | $0.0035-0.0045 (mean $0.0037) |
+| Reminder | 1.2k / 42 | $0.0014 |
+
+There is no prompt caching: the prompt is shorter than Haiku 4.5's minimum cacheable prefix. At the PC, expect 5-8 calls an hour (a periodic look every 15 min, minus budget skips, plus transitions). That is about $0.20-0.30 for a 10-hour day. The hard ceiling of 12 calls an hour comes to about $0.45.
+
+Scenarios:
+- 50 min of coding, then a chat: praise, "Nice, 50m on the nudge worker. Enjoy your lunch."
+- Reels after coding, with a to-do due tomorrow: a nudge naming the work and the form; 30 min later, "Boss, 32 min on reels - back to store.py. IELTS form is due tomorrow."
+- A YouTube talk on LLM agents while building Yuki: none (twice), then "good, back to it" on return.
+- In a meeting: no check-in.
+- A commitment due at 15:00: "Boss, call Asha about the flat now." at 15:00, once.
+- Two drifts 10 min apart: one nudge, plus a "Good, back on it." follow-up; the second drift is `skipped:budget`.
+- 25 min in Warp: none.
+- Warp, then an unrelated video held for 2 min: a call-back naming the Warp work.
+- Back to Warp after 20 min of reels: "Good, back on it".
+- 1h50 of unbroken focus: a break suggestion.
+
+Known limits:
+- Haiku's wording varies from run to run. It usually uses the nickname, but not always, and a call-back is sometimes less specific than "the memory tests in Warp".
+- The first stretch of the day follows hours with nothing recorded, and the model can read that as a return from a break.
+
 ## Yuki integration
 
 - The current portrait text + relevant know-how are attached to every request as labelled context ("[What Yuki knows about the user, from memory]"); after it (outside the cached prefix) `standing_context()`, and at the start of a new session `resume_context()`. Every exchange goes to `log_turn(...)`.
@@ -141,4 +247,4 @@ Logs: `logs/memory/conversations-YYYYMMDD.jsonl`, with usage, cost, latency and 
 
 1. **A**: watcher + store + journal (this contract's first half). Deliverable: `uv run yuki-memory` runs quietly; a `scripts/memory_report.py` prints today's journal and capture health.
 2. **B**: portrait + know-how + Yuki integration.
-3. **C**: open loops / to-dos, weekly review, MCP server for other agents.
+3. **C**: open loops / to-dos (the merged list and the coach: see "Nudges and to-dos"), weekly review, MCP server for other agents.

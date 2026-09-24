@@ -27,6 +27,15 @@ Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory
     memory.remember_rule(text, source_turn=None) -> int      # immediate, the user's words; supersedes a near-duplicate
     memory.revoke_rule(text) -> int                          # immediate; id revoked or 0
     memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
+
+To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
+
+    memory.todos(include_done=False) -> list[dict]      # open loops + commitments + the user's own to-dos
+    memory.add_todo(text, due=None) -> "todo:N"
+    memory.complete_todo(ref) -> id | None              # an id or the item's text
+    memory.pending_nudges() -> list[dict]               # unshown, oldest first; wait on Local\\YukiNudgeReady
+    memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
+    memory.snooze_nudges(minutes);  memory.nudge_status() -> dict
 """
 
 from __future__ import annotations
@@ -172,6 +181,7 @@ class MemoryClient:
         self._app_names: dict[str, set[str]] = {}
         #: Why the last :meth:`log_turn` returned 0 (content-free), or ``None``.
         self.last_turn_error: str | None = None
+        self._nudge_section: Any = None
 
     @classmethod
     def open(cls, path: str | Path | None = None) -> "MemoryClient":
@@ -787,6 +797,175 @@ class MemoryClient:
             for e in rows
         ]
 
+    # -- to-dos and the coach's nudges (yuki.memory.nudges) ------------------------
+
+    def todos(self, include_done: bool = False) -> list[dict]:
+        """The user's to-do list: one merged view of three sources.
+
+        * open loops from the portrait (what is owed by or to the user, on
+          direct evidence), ``source: "loop"``;
+        * Yuki's open commitments from conversation memory (what the user
+          handed Yuki for later, or Yuki promised), ``source: "commitment"``;
+        * to-dos the user added (:meth:`add_todo`), ``source: "user"``.
+
+        Each item::
+
+            {"id": "loop:12" | "commit:5" | "todo:3", "text": str,
+             "source": "loop" | "commitment" | "user",
+             "due": ISO local time with offset ("2026-09-25T15:00:00+05:30"), or a
+                    date "2026-09-25" when no time was given, or None,
+             "status": "open" | "done",
+             "evidence": str | None,     # a loop: who asked, where, when ("asked by Vinay in
+                                         # Slack on 2026-09-23"); a commitment: the user's words;
+                                         # a user to-do: None
+             "since": ISO}               # when it was opened / asked / added
+
+        Open items first, soonest due first, undated ones after them (oldest
+        first); with ``include_done``, then the items done in the last 14 days
+        (newest first). Never raises (``[]`` if memory cannot be read).
+        """
+        from yuki.memory.nudges import item_dict, todo_items
+
+        try:
+            return [item_dict(i) for i in todo_items(self.store, include_done=include_done)]
+        except Exception:
+            return []
+
+    def add_todo(self, text: str, due: str | None = None) -> str:
+        """Add a to-do in the user's words; returns its id ``"todo:N"``.
+
+        ``due``: ``None``, a date ``"YYYY-MM-DD"`` (due that day, no time: the
+        reminder comes at the configured morning time, 09:00 by default), or a
+        local date and time (``"YYYY-MM-DD HH:MM"``, ``"YYYY-MM-DDTHH:MM"``,
+        full ISO with an offset, or epoch seconds as a string). With a due
+        time the service writes a ``reminder`` nudge at that time (or at the
+        first allowed moment after: not in quiet hours, a meeting, full
+        screen, while snoozed, paused or away), once. Raises ``ValueError``
+        for an empty text or a due it cannot read.
+        """
+        text = " ".join((text or "").split())
+        if not text:
+            raise ValueError("to-do text is empty")
+        due_at, all_day = None, False
+        if due is not None and str(due).strip():
+            raw = str(due).strip()
+            if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+                due_at, all_day = datetime.strptime(raw, "%Y-%m-%d").timestamp(), True
+            else:
+                try:
+                    due_at = float(raw)
+                except ValueError:
+                    due_at = _time_arg(raw.replace(" ", "T", 1) if "T" not in raw else raw)
+        return f"todo:{self.store.add_todo(text, due_at=due_at, all_day=all_day)}"
+
+    def complete_todo(self, ref: str) -> str | None:
+        """Mark one to-do done; returns its id, or ``None`` when nothing matched (or it was not open).
+
+        ``ref`` is an id from :meth:`todos` (``"loop:12"``, ``"commit:5"``,
+        ``"todo:3"``) or the item's text in the user's words: the open item
+        whose text contains every word of it (the newest if several), else the
+        nearest by local embedding if close enough (cosine >= 0.45).
+
+        * a user to-do becomes ``done``;
+        * a commitment ends as ``done`` (kept as history, "the user marked it done");
+        * an open loop becomes ``done`` and its portrait fact is invalidated; a
+          user correction is recorded ("the user said this is done") so the
+          portrait follows it and later runs do not re-open it from old
+          evidence, and the portrait is re-rendered soon (the
+          ``refresh_portrait`` flag).
+        """
+        from yuki.memory.nudges import complete_item
+
+        try:
+            return complete_item(self.store, ref, embed=self._embed)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _nudge_dict(n: Any) -> dict:
+        return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason}
+
+    def pending_nudges(self) -> list[dict]:
+        """Nudges the service wrote that the UI has not shown yet, oldest first.
+
+        Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder",
+        "text": str, "reason": str | None}``. ``text`` is what to show the user
+        (one or two short sentences, already in their register and following
+        their rules); ``reason`` is the coach's one-line why, for a tooltip or
+        the log, not for the user. A praise or nudge not shown within 15
+        minutes (``[nudges] deliver_within_min``) expires and is no longer
+        returned; reminders never expire. The service sets the named
+        auto-reset event ``Local\\YukiNudgeReady`` after writing one, so the UI
+        can wait on it and call this at once. Call :meth:`ack_nudge` with
+        ``"shown"`` when one is on screen. Never raises.
+        """
+        try:
+            from yuki.memory.nudges import NudgeConfig
+            from yuki.memory.timeline import PrivacySection
+
+            window = NudgeConfig().deliver_within_min
+            try:   # the user's [nudges] table, read only (the service applies the same window)
+                from types import SimpleNamespace
+
+                from yuki.memory.privacy import user_config_path
+
+                if self._nudge_section is None:
+                    self._nudge_section = PrivacySection(SimpleNamespace(path=user_config_path()), "nudges",
+                                                         NudgeConfig.from_dict)
+                window = self._nudge_section.get().deliver_within_min
+            except Exception:
+                pass
+            cutoff = time.time() - window * 60.0
+            return [self._nudge_dict(n) for n in self.store.nudges(pending=True)
+                    if n.kind == "reminder" or n.at >= cutoff]
+        except Exception:
+            return []
+
+    def ack_nudge(self, nudge_id: int, reaction: str) -> None:
+        """Record what happened to a nudge: ``"shown"`` | ``"dismissed"`` | ``"replied"`` | ``"snoozed"``.
+
+        ``shown`` when it appears on screen (it leaves :meth:`pending_nudges`);
+        then, if the user acts on it, ``dismissed`` / ``replied`` / ``snoozed``
+        (a later reaction replaces ``shown``; ``shown`` never replaces a real
+        reaction). ``snoozed`` only records the reaction: call
+        :meth:`snooze_nudges` for the quiet period itself. The coach reads the
+        reactions (it gets sparser after dismissals) and the nightly portrait
+        gets their counts for its Relationship section. Raises ``ValueError``
+        for another reaction; an unknown id is ignored.
+        """
+        self.store.react_to_nudge(int(nudge_id), str(reaction))
+
+    def snooze_nudges(self, minutes: int) -> None:
+        """No check-ins and no reminders for ``minutes`` from now (a due reminder waits, it is not lost);
+        ``0`` ends a snooze. The service sees it at its next pass (every 15 s)."""
+        minutes = max(0, int(minutes))
+        self.store.set_nudge_state("quiet_until", str(time.time() + minutes * 60.0) if minutes else None)
+
+    def nudge_status(self) -> dict:
+        """The coach at a glance (content-free).
+
+        ``{"quiet_until": ISO | None (a snooze in force), "last_nudge_at": ISO |
+        None (the newest nudge of any kind), "today": {"praise": n, "nudge": n,
+        "reminder": n}}`` - nudges written since local midnight.
+        """
+        out: dict[str, Any] = {"quiet_until": None, "last_nudge_at": None,
+                               "today": {"praise": 0, "nudge": 0, "reminder": 0}}
+        try:
+            now = time.time()
+            quiet = self.store.nudge_state("quiet_until")
+            if quiet is not None and float(quiet) > now:
+                out["quiet_until"] = _iso(float(quiet))
+            last = self.store.nudges(limit=1)
+            if last:
+                out["last_nudge_at"] = _iso(last[-1].at)
+            midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            for n in self.store.nudges(since=midnight):
+                if n.kind in out["today"]:
+                    out["today"][n.kind] += 1
+        except Exception:
+            pass
+        return out
+
     # -- status and control ------------------------------------------------
 
     def status(self) -> dict:
@@ -796,7 +975,7 @@ class MemoryClient:
         "facts_today": int, "last_capture_at": ISO | None,
         "portrait_updated_at": ISO | None, "memory_cost_today_usd": float}``.
         "Today" is since local midnight; the cost is the estimate for the journal,
-        portrait and episode model calls (list prices, ``Settings.pricing``).
+        portrait, episode, conversation and coach model calls (list prices, ``Settings.pricing``).
         ``service_running`` comes from the service's named mutex for this
         database in this Windows session.
         """
@@ -812,7 +991,7 @@ class MemoryClient:
             "portrait_updated_at": _iso(portrait.at) if portrait else None,
             "memory_cost_today_usd": round(
                 today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0)
-                + today.get("conversation_cost_usd", 0.0), 6
+                + today.get("conversation_cost_usd", 0.0) + today.get("nudge_cost_usd", 0.0), 6
             ),
         }
 

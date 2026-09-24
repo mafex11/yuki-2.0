@@ -5,7 +5,9 @@ Runs the watcher (:mod:`yuki.memory.watcher`), the timeline recorder
 the Warp terminal-history reader (:mod:`yuki.memory.warp`, every 3 minutes),
 the conversation worker (:mod:`yuki.memory.conversations`: rules, preferences,
 commitments and journal facts from Yuki's own exchanges, and session summaries;
-woken by Yuki's named turn event), the episode worker (:mod:`yuki.memory.episodes`) and the portrait scheduler
+woken by Yuki's named turn event), the episode worker (:mod:`yuki.memory.episodes`), the coach
+(:mod:`yuki.memory.nudges`: check-ins and reminders, written as nudges for the UI, which it wakes
+with the named event ``Local\\YukiNudgeReady``) and the portrait scheduler
 (:mod:`yuki.memory.portrait`) against one shared :class:`~yuki.memory.store.Store`
 (the journal worker waits on the store's own "new capture" condition, which only
 fires within one Store instance).  It is its own process so that nothing here
@@ -44,6 +46,7 @@ Usage::
     uv run yuki-memory --no-timeline        # no foreground timeline (and so no episodes)
     uv run yuki-memory --no-terminal        # do not read Warp's command history
     uv run yuki-memory --no-conversations   # do not extract memory from Yuki's own conversations
+    uv run yuki-memory --no-nudges          # no coach: no check-ins, no reminders
 """
 
 from __future__ import annotations
@@ -216,6 +219,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-terminal", action="store_true", help="do not read the Warp terminal's command history")
     parser.add_argument("--no-conversations", action="store_true",
                         help="do not extract memory from Yuki's own conversations (turns are still stored)")
+    parser.add_argument("--no-nudges", action="store_true",
+                        help="no coach: no check-ins and no reminders (to-dos are still kept)")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -252,6 +257,8 @@ def run(args: argparse.Namespace) -> int:
     conversations_thread: threading.Thread | None = None
     acting_thread: threading.Thread | None = None
     acting_event = None
+    nudges = None
+    nudges_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
@@ -271,6 +278,7 @@ def run(args: argparse.Namespace) -> int:
             episodes=not (args.no_journal or args.no_timeline or args.no_episodes),
             terminal=not (args.no_journal or args.no_terminal),
             conversations=not (args.no_journal or args.no_conversations),
+            nudges=not (args.no_journal or args.no_timeline or args.no_nudges),
             duration_s=args.duration,
         )
         try:
@@ -394,6 +402,30 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="episodes_start", error=f"{type(exc).__name__}: {exc}")
                 episodes = None
 
+        if timeline is not None and not (args.no_journal or args.no_nudges):
+            try:
+                from yuki.memory import acting as _acting_mod
+                from yuki.memory.nudges import NudgeWorker
+                from yuki.memory.watcher import session_locked
+
+                def live_state() -> dict[str, Any]:
+                    # the recorder's open stretch (written to the store every 30 s) and Yuki's own marker
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen")),
+                            "acting": _acting_mod.current(db_path) is not None}
+
+                nudges = NudgeWorker(store, db_path=db_path, privacy=privacy, locked_fn=session_locked,
+                                     live_fn=live_state, log=log)
+                nudges_thread = threading.Thread(
+                    target=_guarded(nudges.run, log, "nudges"), args=(stop, pause_path),
+                    name="yuki-memory-nudges", daemon=True,
+                )
+                nudges_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="nudges_start", error=f"{type(exc).__name__}: {exc}")
+                nudges = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
@@ -465,6 +497,8 @@ def run(args: argparse.Namespace) -> int:
             warp.stop()
         if conversations is not None:
             conversations.stop()
+        if nudges is not None:
+            nudges.stop()
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
@@ -479,6 +513,8 @@ def run(args: argparse.Namespace) -> int:
             warp_thread.join(5.0)
         if conversations_thread is not None:
             conversations_thread.join(10.0)  # a call in flight is abandoned (daemon); its turns stay pending
+        if nudges_thread is not None:
+            nudges_thread.join(10.0)  # a call in flight is abandoned (daemon); nothing half-written
         if episodes_thread is not None:
             episodes_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if portrait_thread is not None:
