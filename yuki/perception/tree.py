@@ -3188,6 +3188,15 @@ def pages_on_screen(
         named = [e for e in ordered if e.name and tab.name.startswith(e.name)]
         if named:
             ordered = [named[0], *[e for e in ordered if e is not named[0]]]
+        elif tab.role == "TabItem":
+            # The selected tab names none of several pages: its own page is not
+            # in the snapshot yet (still loading, so its window holds no page
+            # and the background test above could not tell the others apart),
+            # and every page found belongs to a tab behind it. Seen live
+            # 2026-09-24: during a navigation Chrome's hidden tabs came through
+            # and the largest (another tab's page) was taken as the one in front
+            # for up to a minute of the timeline.
+            return []
     stacked = [e for e in ordered if e.bounds == ordered[0].bounds]
     if len(stacked) > 1:
         # Pages in one rectangle: the window title names the one in front;

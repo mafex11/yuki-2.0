@@ -149,6 +149,9 @@ _DOCUMENT_VALUE_CHARS = 30000
 _THIN_TEXT = 200
 _TEXT_PATTERN_CHARS = 30000
 _HANDOFF_S = 0.15
+#: Containers whose items are walked even when the container itself reports
+#: off-screen from a screen-reader-only box (see ``_Walk._hidden_list``).
+_LIST_ROLES = frozenset({"List", "Tree", "DataGrid", "Table"})
 
 
 #: The OS's frame window for UWP apps: owned by ApplicationFrameHost.exe, it
@@ -450,11 +453,31 @@ class _Walk:
         self.count += 1
         return True
 
+    def _hidden_list(self, node: Node, clip: Rect | None) -> bool:
+        """A list reported off-screen from a screen-reader-only box inside the visible area.
+
+        Its own rectangle is a pixel or two (CSS ``sr-only``) while its items
+        are drawn on screen: Slack's message list is one (seen live 2026-09-24:
+        ``List 'Madhu (direct message, active)'`` at 2x1 px, IsOffscreen, every
+        message below it on screen). Its items are walked with the usual tests.
+        """
+        return (
+            self.honor_offscreen and node.offscreen and node.role in _LIST_ROLES
+            and node.bounds is not None and clip is not None and _inside(clip, node.bounds, slack=0)
+        )
+
     def _live_children(self, holder: object, parent: Node, clip: Rect | None) -> None:
         for child in _cached_children(holder):
             if self.out():
                 return
             node = _node_from(child.GetCachedPropertyValue)  # type: ignore[attr-defined]
+            if self._hidden_list(node, clip):
+                if self._keep(node):
+                    parent.children.append(node)
+                    sub = self._fetch(child, self.level_req)
+                    if sub is not None:
+                        self._live_children(sub, node, clip)
+                continue
             if not self._visible(node, clip) or not self._keep(node):
                 continue
             parent.children.append(node)
@@ -476,6 +499,11 @@ class _Walk:
                 self.truncated = True
                 return
             node = _node_from(child.GetCachedPropertyValue)  # type: ignore[attr-defined]
+            if self._hidden_list(node, clip):
+                if self._keep(node):
+                    parent.children.append(node)
+                    self._cached_children_of(child, node, clip)
+                continue
             if not self._visible(node, clip) or not self._keep(node):
                 continue
             parent.children.append(node)

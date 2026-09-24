@@ -108,6 +108,11 @@ PAGE_WAIT_S = 2.5
 #: A page in front is read again this often (a single-page site changes address
 #: without a title change: reels, feeds).
 PAGE_REPROBE_S = 60.0
+#: A stretch that settled without a page, in a process that has shown pages
+#: (fewer than NO_PAGE_STREAK empty probes in a row), is read again this often:
+#: its first probe came while the page was loading. Seen live 2026-09-24: Chrome
+#: stretches opened by a navigation kept host=None until the next title change.
+PAGE_RETRY_S = 5.0
 #: A probe still running after this is reported stuck; new probes are skipped meanwhile.
 PAGE_STUCK_S = 5.0
 #: A process whose last N probes found no page is probed at most once per this long.
@@ -1631,11 +1636,18 @@ class TimelineRecorder:
             self.counters["page_timeouts"] += 1
             self._settle(st)
         if (
-            st is not None and st.settled and st.host and not st.hidden and st.state == "present"
-            and now - st.page_checked_at >= PAGE_REPROBE_S and now - self._input_at < AWAY_AFTER_S
+            st is not None and st.settled and not st.hidden and st.state == "present"
+            and now - self._input_at < AWAY_AFTER_S
         ):
-            st.page_checked_at = now
-            self._probe_page(st, now)
+            if st.host:
+                due = PAGE_REPROBE_S
+            elif not st.withheld and not st.meeting and self._no_page.get(st.pid, (0, 0.0))[0] < NO_PAGE_STREAK:
+                due = PAGE_RETRY_S
+            else:
+                due = None
+            if due is not None and now - st.page_checked_at >= due:
+                st.page_checked_at = now
+                self._probe_page(st, now)
         if mono >= self._next_flush:
             self._next_flush = mono + FLUSH_EVERY_S
             # an unsettled stretch waits for its page (at most PAGE_WAIT_S): its privacy is not known yet

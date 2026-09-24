@@ -442,6 +442,9 @@ class MemoryAccess:
                     turn["outcome"],
                     timeout_s=TURN_LOG_TIMEOUT_S,
                 )
+                if not report["row"]:
+                    # log_turn never raises: it returns 0 and keeps the reason.
+                    report["error"] = getattr(self._client, "last_turn_error", None) or "log_turn returned 0"
             except Exception as exc:  # MemoryUnavailable or worse: never kill the writer
                 report["error"] = str(exc) if isinstance(exc, MemoryUnavailable) else (
                     f"{type(exc).__name__}: {exc}"

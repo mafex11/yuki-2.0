@@ -48,8 +48,15 @@ header = [
 list = [
   '//*[class~="c-message_list"]',
   '//*[class~="p-view_contents--primary"]//List[class~="c-virtual_list__scroll_container"]',
+  # A thread open in the side pane (seen live 2026-09-24 night: the channel's own
+  # list was not in the tree, the thread's replies were).
+  '//*[class~="p-view_contents--secondary"]//List[class~="c-virtual_list__scroll_container"]',
+  # A DM or channel: the message pane's list is a screen-reader-only List (class sr-only,
+  # 2x1 px, off-screen) whose rows are on screen (seen live 2026-09-24 night).
+  '//*[class~="p-message_pane"]//List',
 ]
-row = ['/*[class~="c-virtual_list__item"]', '//*[class^="c-message_kit__background"]']
+# A thread's "12 replies" divider is a list item too, id'd "...-thread-list-Thread_separator".
+row = ['/*[class~="c-virtual_list__item"][!id$="_separator"]', '//*[class^="c-message_kit__background"]']
 sender = ['//*[class^="c-message__sender"]']
 time = ['//*[class~="c-timestamp"]']
 day_separator = ['//*[class^="c-message_list__day_divider"]', '//*[class^="p-message_pane__day_divider"]']
@@ -92,6 +99,11 @@ exclude = [
   '//*[class^="repliedMessage_"]',
   '//*[class^="hoverButton_"]',
   '//*[class^="header_"][aria="heading"]',
+  # The hover bar over the message under the mouse (quick reactions, Edit, Forward, More):
+  # seen live 2026-09-24 night as Group 'Message Actions' class "buttons__5126c container__040f0",
+  # its tooltips (":thumbsup:", "Add Reaction") as Text siblings of the buttons.
+  '//Group[name="Message Actions"]',
+  '//*[class^="buttons__"][class^="container__"]',
 ]
 composer = ['//*[class^="slateTextArea_"]', '//*[aria="textbox"][class^="markup_"]']
 # Rows are id'd "chat-messages-<channel>-<message snowflake>".
@@ -111,7 +123,9 @@ processes = ["whatsapp.exe", "whatsapp.root.exe"]
 # icon names.  The open chat is id="main" (the chat list is id="pane-side"):
 # banner (avatar button with a description, then the chat-name button), the
 # message scroller, and the composer footer.
-header = ['//*[id="main"]/*[aria="banner"]/Button[!desc*=""]']
+# The chat-name button's first Text is the name; the button's own Name adds the group's
+# member list ("RES Eesha, rishabh, You", seen live 2026-09-24 night).
+header = ['//*[id="main"]/*[aria="banner"]/Button[!desc*=""]/Text', '//*[id="main"]/*[aria="banner"]/Button[!desc*=""]']
 list = ['//*[id="main"]']
 # One role="row" per message; each run of one sender's messages shares a parent.
 row = ['//*[aria="row"]']
@@ -119,8 +133,11 @@ row = ['//*[aria="row"]']
 # most of them IsOffscreen, so hidden_labels keeps them for this anchor.
 hidden_labels = true
 sender = ['//Group[name$=":"]']
-sender_strip = [":"]
+sender_strip = [":", "Open chat details for "]
 sender_group = "parent"
+# Group chats (seen live 2026-09-24 night): the bubbles carry no "<name>:" label; the
+# run's container holds the sender's avatar button "Open chat details for <name>".
+sender_parent = ['/Group/Button[name^="Open chat details for "]']
 generic_sender = false
 # Own bubbles: the time sits in a button with the delivery tick ("11:05 Read");
 # incoming bubbles show a bare time text (found structurally).
@@ -184,7 +201,9 @@ paths = ["/messaging"]
 header = ['//*[class~="msg-entity-lockup__entity-title"]', '//*[class^="msg-title-bar"]//*[aria="heading"]']
 list = ['//*[class~="msg-s-message-list"]', '//*[class^="msg-s-message-list-content"]']
 row = ['//*[class~="msg-s-message-list__event"]']
-sender = ['//*[class~="msg-s-message-group__name"]']
+# Seen live 2026-09-24 night: in the open thread the group name is not a visible element;
+# the sender is the row's profile picture (Image named after them).
+sender = ['//*[class~="msg-s-message-group__name"]', '//Image[class~="msg-s-event-listitem__profile-picture"]']
 time = ['//*[class~="msg-s-message-group__timestamp"]']
 body = ['//*[class~="msg-s-event-listitem__body"]']
 day_separator = ['/*[class~="msg-s-message-list__time-heading"]', '//*[class~="msg-s-message-list__time-heading"]']
@@ -217,6 +236,20 @@ list = ['//*[name^="Messages in conversation"]', '//*[aria="grid"][name*="onvers
 row = ['/*[aria="row"]', '//*[aria="row"]']
 
 [[profile]]
+name = "instagram_reels"             # verified 2026-09-24 night (Chrome, instagram.com/reels feed)
+kind = "video"
+hosts = ["www.instagram.com", "instagram.com"]
+paths = ["/reels/", "/reel/"]
+# Atomic CSS, so ARIA facts only. The account is the link to its reels ("<name> reels",
+# its Text child is the bare name); the caption is a Button (Instagram expands it on
+# click), which generic text drops like every action control, so it is the title here:
+# the caption Button's Group holds the text and the hashtag links. The <video> is a plain
+# group, so a reel whose anchors do not match falls back to the generic page.
+title = ['//*[landmark="main"]//Button/Group']
+author = ['//*[landmark="main"]//Hyperlink[value$="/reels/"]/Text']
+description_lines = 2
+
+[[profile]]
 name = "instagram_direct"            # instagram.com/direct (atomic CSS: ARIA names only)
 kind = "conversation"
 hosts = ["www.instagram.com", "instagram.com"]
@@ -226,28 +259,55 @@ list = ['//*[name^="Messages in conversation"]', '//*[aria="grid"]']
 row = ['/*[aria="row"]', '//*[aria="row"]']
 
 # ---------------------------------------------------------------------------
+[[profile]]
+name = "claude_chat"                 # verified 2026-09-24 night (Claude desktop = claude.ai, a Cowork task)
+kind = "conversation"
+hosts = ["claude.ai"]
+paths = ["/chat/", "/cowork/", "/project/"]
+# The feed "Chat messages" holds one article per message ("Message 1 of 2"); each starts
+# with a screen-reader-only heading "You said: ..." / "Claude responded: ...", which
+# repeats the text and is not content. There is no visible sender name, so the user's
+# own messages are told by that heading and the rest have no sender.
+header = ['//*[id="cowork-title-slot"]/Button', '//*[aria="main"]//*[aria="heading"][class~="truncate"]']
+scope_strip = [", rename session"]
+list = ['//*[name="Chat messages"]', '//*[aria="feed"]']
+row = ['/*[aria="article"]']
+time = ['//*[aria="time"]']
+me_row = ['//Text[class~="sr-only"][aria="heading"][name^="You said:"]']
+exclude = ['//Text[class~="sr-only"]', '//*[class~="sr-only"]']
+composer = ['//*[class~="ProseMirror"]', '//Edit[name^="Write your prompt"]']
+generic_sender = false
+
+# ---------------------------------------------------------------------------
 # Video pages (kind "video"): the body is the video's title, its channel and the
 # first lines of its description - recommendations, comments, live chat and the
 # player's controls are never read.  Anchors not found fall back to structure
 # (see extract/page.py extract_video); nothing found at all -> generic page with
 # `main`/`chrome` below.
 [[profile]]
-name = "youtube"                     # from YouTube's watch-page DOM ids; NOT yet read live here (2026-09-24: only a background tab was open)
+name = "youtube"                     # verified 2026-09-24 night (Chrome watch page, read live)
 kind = "video"
 hosts = ["youtube.com"]
 paths = ["/watch"]
-# ytd-watch-metadata: #above-the-fold > #title > h1, #owner > #channel-name > a, #description > #description-inner.
+# Seen live 2026-09-24: Chromium's UIA tree flattens the wrappers (no #above-the-fold,
+# no #channel-name) and reports the <video> as a plain group, so the anchors are the
+# ytd-watch-metadata groups: Group id=title > heading h1, Group id=owner > ... Group
+# class ytd-channel-name > Hyperlink, Group id=description. The older DOM-id paths stay
+# as later tiers.
 title = [
+  '//*[id="title"][class~="ytd-watch-metadata"]//*[aria="heading"]',
   '//*[id="above-the-fold"]//*[id="title"]//*[aria="heading"]',
   '//*[id="above-the-fold"]//*[aria="heading"]',
 ]
 author = [
-  '//*[id="above-the-fold"]//*[id="owner"]//*[id="channel-name"]//Hyperlink',
+  '//*[id="owner"][class~="ytd-watch-metadata"]//*[class~="ytd-channel-name"]//Hyperlink',
   '//*[id="owner"]//*[id="channel-name"]//Hyperlink',
   '//*[id="owner"]//*[id="channel-name"]//*[id="text"]',
 ]
 # The collapsed description box: views and date, then its first lines ("...more" is a button, never text).
+# Below the fold on a 1440-px screen, so often empty (visible-only read).
 description = [
+  '//*[id="description"][class~="ytd-watch-metadata"]',
   '//*[id="above-the-fold"]//*[id="description-inner"]',
   '//*[id="above-the-fold"]//*[id="description"]',
 ]
@@ -260,6 +320,25 @@ main = ['//*[id="primary-inner"]', '//*[id="primary"]']
 chrome = ['//*[id="comments"]', '//*[id="secondary"]']
 
 # ---------------------------------------------------------------------------
+# Spotify desktop (CEF; always the same URL, xpui.app.spotify.com/index.html). Seen live
+# 2026-09-24 night: without a profile a playlist's track grid - rows with a "date added"
+# label - was read by the generic chat detector as a conversation ("Play prozac by
+# brakence" as a sender). A page: the main landmark, one thread per view (the page title,
+# "touch grass - playlist by Mafex | Spotify").
+[[profile]]
+name = "spotify"
+kind = "page"
+processes = ["spotify.exe"]
+hosts = ["open.spotify.com"]
+# While music plays the page title is the track ("IVY • Elroy"); the main landmark's Name
+# stays the view's title, so it is the header.
+header = ['//*[aria="main"][landmark="main"]', '//*[landmark="main"]']
+scope_strip = [" | Spotify"]
+title_split = " | "
+title_part = 0
+main = ['//*[aria="main"]', '//*[landmark="main"]']
+
+# ---------------------------------------------------------------------------
 # Windows Settings (SystemSettings.exe inside the ApplicationFrameHost frame).
 # The breadcrumb names the page ("Personalization Background"): one thread per
 # Settings page.  The navigation pane (account name and e-mail) is not main.
@@ -270,6 +349,8 @@ kind = "page"
 processes = ["systemsettings.exe"]
 header = ['//*[id^="PermanentNavigationViewBreadcr"]', '//Group[class="LandmarkTarget"][landmark="navigation"]']
 main = ['//Group[class="LandmarkTarget"][landmark="main"]']
+# Pages without a main landmark (System, Personalization) are read whole: the search box is not content.
+chrome = ['//Edit[id="CommandSearchTextBox"]']
 
 # ---------------------------------------------------------------------------
 # Terminals: the text is the terminal control's Text pattern (Windows Terminal,
@@ -285,6 +366,12 @@ main = ['//*[class~="TermControl"]', '//Document', '//Edit']
 name = "editor"
 kind = "document"
 processes = ["notepad.exe", "notepad++.exe", "code.exe", "cursor.exe", "winword.exe", "sublime_text.exe", "obsidian.exe"]
+# The document is the thread: window title "<file> - Notepad" / "<file> - <folder> - Visual Studio
+# Code" ("*" marks unsaved). Without this every Notepad document was one thread named after its
+# edit control, "Text editor" (seen live 2026-09-24 night).
+title_split = " - "
+title_part = 0
+scope_strip = ["*", "● "]
 main = ['//*[class^="monaco-editor"]//Edit', '//Document[class*="RichEdit"]', '//Document', '//Edit']
 
 # File Explorer: the items view is the content; the navigation tree is chrome.
@@ -292,4 +379,7 @@ main = ['//*[class^="monaco-editor"]//Edit', '//Document[class*="RichEdit"]', '/
 name = "file_explorer"
 kind = "list"
 processes = ["explorer.exe"]
-main = ['//List[id="ItemsView"]', '//*[class~="UIItemsView"]', '//DataGrid', '//List']
+# Window title "<folder> - File Explorer": the folder is the thread.
+title_split = " - "
+title_part = 0
+main =['//List[id="ItemsView"]', '//*[class~="UIItemsView"]', '//DataGrid', '//List']

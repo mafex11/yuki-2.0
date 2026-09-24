@@ -172,7 +172,10 @@ def detect_list(root: Node, date_order: str | None) -> tuple[Node | None, int]:
 
 
 def _visible_clip(node: Node, viewport: tuple[int, int, int, int] | None) -> tuple[int, int, int, int] | None:
-    rect = node.bounds
+    # A list reported off-screen has a screen-reader-only box (a pixel or two,
+    # see extract.uia ``_Walk._hidden_list``) while its rows are on screen: its
+    # visible area is its container's.
+    rect = None if node.offscreen else node.bounds
     for above in node.ancestors():
         if above.bounds is None:
             continue
@@ -393,6 +396,12 @@ def extract_conversation(
         if not _wholly_visible(row, _row_clip(row, list_node, clip)):
             result.skipped_partial += 1
             continue
+        if any(row is c or row.contains(c) for c in composer):
+            # The input area, not a message: a list found from structure can take
+            # the composer's container as a row, and its "Send now" button then
+            # reads as a time (seen live in Slack 2026-09-24).
+            result.skipped_empty += 1
+            continue
         message = _message(
             row, profile, defaults, date_order, now, day_label, noise, result.scope, me,
             exclude_paths, composer, used, generic_sender,
@@ -471,6 +480,14 @@ def _message(
     sender_node = None
     if profile and profile.sender:
         found = query.first_tier(profile.sender, row)
+        if found:
+            sender_node = found[0]
+            used.add("sender")
+    if (
+        sender_node is None and profile and profile.sender_parent
+        and profile.sender_group == "parent" and row.parent is not None
+    ):
+        found = query.first_tier(profile.sender_parent, row.parent)
         if found:
             sender_node = found[0]
             used.add("sender")

@@ -43,8 +43,8 @@ Output size: full stdout/stderr are captured, but text over
 naming the exact number of characters dropped, and the total length is always
 reported.  Output is never silently shortened.
 
-Timeouts: ``timeout_s`` is a wall-clock budget.  On expiry the child's whole
-process tree is killed, the persistent session is discarded (a timed-out shell
+Timeouts: ``timeout_s`` is a wall-clock budget.  On expiry the shell and
+what the command started are killed (apps launched by earlier commands are not), the persistent session is discarded (a timed-out shell
 is in an unknown state and must never be silently reused), and the result says
 how long it ran and carries whatever partial output arrived first.
 """
@@ -103,14 +103,40 @@ def _powershell_path() -> str:
     return shutil.which("powershell") or "powershell.exe"
 
 
-def _kill_tree(pid: int) -> None:
-    """Kill a process and its children (``Popen.kill`` leaves children alive)."""
-    subprocess.run(
-        ["taskkill", "/F", "/T", "/PID", str(pid)],
-        capture_output=True,
-        creationflags=_CREATE_NO_WINDOW,
-        check=False,
-    )
+def _kill_tree(pid: int, *, since: float | None = None) -> None:
+    """Kill a shell, and those of its descendants started at or after ``since``.
+
+    ``since`` is when the command being stopped began (epoch seconds): what it
+    started is killed with it. Descendants started earlier are apps an earlier
+    command launched (``Start-Process notepad``) - the user's windows now -
+    and are left running, as is everything when ``since`` is ``None`` (the
+    session closing at exit). Until 2026-09-24 this was ``taskkill /F /T``,
+    which killed every app Yuki had ever launched from the session when Yuki
+    exited or a command timed out (seen live: Notepad, opened with a file,
+    closed the moment the launching process ended).
+    """
+    try:
+        import psutil
+
+        root = psutil.Process(pid)
+    except Exception:
+        return
+    victims = []
+    if since is not None:
+        try:
+            for child in root.children(recursive=True):
+                try:
+                    if child.create_time() >= since - 0.5:
+                        victims.append(child)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    for proc in [*victims, root]:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _first_line(text: str, limit: int = _SUMMARY_CHARS) -> str:
@@ -265,9 +291,10 @@ class _Session:
     def alive(self) -> bool:
         return self._process.poll() is None
 
-    def kill(self) -> None:
+    def kill(self, *, command_started: float | None = None) -> None:
+        """End the shell; with ``command_started``, also what that command started."""
         if self._process.poll() is None:
-            _kill_tree(self._process.pid)
+            _kill_tree(self._process.pid, since=command_started)
         try:
             if self._process.stdin is not None:
                 self._process.stdin.close()
@@ -414,10 +441,11 @@ def _run_in_session(command: str, timeout_s: float) -> _RunOutcome | None:
                 _session = _Session()
             except Exception:
                 return None
+        command_started = time.time()
         try:
             return _session.run(command, timeout_s)
         except _SessionTimeout as expired:
-            _session.kill()
+            _session.kill(command_started=command_started)
             _session = None
             return _RunOutcome(
                 exit_code=-1,
@@ -478,6 +506,7 @@ def _run_one_shot(command: str, timeout_s: float) -> _RunOutcome:
         + "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"
     )
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    started = time.time()
     process = subprocess.Popen(  # noqa: S603 - fixed executable, encoded script
         [
             _powershell_path(),
@@ -498,7 +527,7 @@ def _run_one_shot(command: str, timeout_s: float) -> _RunOutcome:
         raw_out, raw_err = process.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
-        _kill_tree(process.pid)
+        _kill_tree(process.pid, since=started)
         try:
             raw_out, raw_err = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:  # pragma: no cover - taskkill failed
