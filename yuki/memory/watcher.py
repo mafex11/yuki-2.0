@@ -303,12 +303,101 @@ def _window_pid(hwnd: int) -> int:
     return int(raw.value)
 
 
-def user_idle_s() -> float:
-    """Seconds since the last keyboard/mouse input in this session."""
+def raw_idle_s() -> float:
+    """Seconds since the last input Windows saw in this session, drift included."""
     info = _LASTINPUTINFO(cbSize=ctypes.sizeof(_LASTINPUTINFO))
     if not _user32.GetLastInputInfo(ctypes.byref(info)):
         return 0.0
     return ((_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+class _PresenceSampler:
+    """Tells a person's input from a drifting mouse, from the idle timer and the cursor.
+
+    Some mice report a one-count move every few seconds with nobody touching
+    them, which resets the system idle timer forever. Measured on this PC
+    (2026-09-24, G402): with hands off, a reset every ~4 s, each moving the
+    cursor 0-1 px, ~9 px per minute in one direction. A person moves the cursor
+    tens of pixels, and typing, clicking, scrolling or turning in a game (cursor
+    captured, so it does not move) produce resets several times a second.
+
+    So a reset counts as the user's only when the cursor moved at least
+    :attr:`MOVE_PX` over the last :attr:`WINDOW_S`, or :attr:`BURST` resets
+    arrived within :attr:`WINDOW_S`. Polls ``GetLastInputInfo`` and
+    ``GetCursorPos`` at 10 Hz on a daemon thread: no hooks, nothing about keys
+    or buttons is read, nothing is stored.
+    """
+
+    PERIOD_S = 0.1
+    WINDOW_S = 1.5
+    MOVE_PX = 4
+    BURST = 3
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._real_tick: int | None = None
+        self._thread: threading.Thread | None = None
+        self._failed = False
+
+    def idle_s(self) -> float:
+        raw = raw_idle_s()
+        if self._failed:
+            return raw
+        if self._thread is None:
+            with self._lock:
+                if self._thread is None:
+                    self._thread = threading.Thread(target=self._run, name="yuki-presence", daemon=True)
+                    self._thread.start()
+        with self._lock:
+            real = self._real_tick
+        if real is None:
+            return raw
+        return max(raw, ((_kernel32.GetTickCount() - real) & 0xFFFFFFFF) / 1000.0)
+
+    def _run(self) -> None:
+        try:
+            info = _LASTINPUTINFO(cbSize=ctypes.sizeof(_LASTINPUTINFO))
+            pt = wintypes.POINT()
+            positions: deque[tuple[float, int, int]] = deque()
+            resets: deque[float] = deque()
+            last_tick: int | None = None
+            while True:
+                now = time.monotonic()
+                have_pos = bool(_user32.GetCursorPos(ctypes.byref(pt)))
+                if have_pos:
+                    positions.append((now, pt.x, pt.y))
+                while positions and now - positions[0][0] > self.WINDOW_S:
+                    positions.popleft()
+                if _user32.GetLastInputInfo(ctypes.byref(info)):
+                    tick = int(info.dwTime)
+                    if last_tick is None:
+                        with self._lock:
+                            self._real_tick = tick
+                    elif tick != last_tick:
+                        resets.append(now)
+                        while resets and now - resets[0] > self.WINDOW_S:
+                            resets.popleft()
+                        moved = 0
+                        if have_pos and positions:
+                            moved = max(abs(pt.x - x) + abs(pt.y - y) for _, x, y in positions)
+                        if moved >= self.MOVE_PX or len(resets) >= self.BURST:
+                            with self._lock:
+                                self._real_tick = tick
+                    last_tick = tick
+                time.sleep(self.PERIOD_S)
+        except Exception:
+            self._failed = True
+
+
+_presence = _PresenceSampler()
+
+
+def user_idle_s() -> float:
+    """Seconds since the user's last real input, a drifting mouse's reports left out.
+
+    See :class:`_PresenceSampler`; falls back to :func:`raw_idle_s` if sampling fails.
+    """
+    return _presence.idle_s()
 
 
 def notification_state() -> int:
