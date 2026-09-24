@@ -226,6 +226,52 @@ list = ['//*[name^="Messages in conversation"]', '//*[aria="grid"]']
 row = ['/*[aria="row"]', '//*[aria="row"]']
 
 # ---------------------------------------------------------------------------
+# Video pages (kind "video"): the body is the video's title, its channel and the
+# first lines of its description - recommendations, comments, live chat and the
+# player's controls are never read.  Anchors not found fall back to structure
+# (see extract/page.py extract_video); nothing found at all -> generic page with
+# `main`/`chrome` below.
+[[profile]]
+name = "youtube"                     # from YouTube's watch-page DOM ids; NOT yet read live here (2026-09-24: only a background tab was open)
+kind = "video"
+hosts = ["youtube.com"]
+paths = ["/watch"]
+# ytd-watch-metadata: #above-the-fold > #title > h1, #owner > #channel-name > a, #description > #description-inner.
+title = [
+  '//*[id="above-the-fold"]//*[id="title"]//*[aria="heading"]',
+  '//*[id="above-the-fold"]//*[aria="heading"]',
+]
+author = [
+  '//*[id="above-the-fold"]//*[id="owner"]//*[id="channel-name"]//Hyperlink',
+  '//*[id="owner"]//*[id="channel-name"]//Hyperlink',
+  '//*[id="owner"]//*[id="channel-name"]//*[id="text"]',
+]
+# The collapsed description box: views and date, then its first lines ("...more" is a button, never text).
+description = [
+  '//*[id="above-the-fold"]//*[id="description-inner"]',
+  '//*[id="above-the-fold"]//*[id="description"]',
+]
+description_lines = 4
+# Window/page title "(3) <video title> - YouTube" (the counter is cut generically).
+title_strip = [" - YouTube"]
+# Generic page fallback: the primary column only (so no recommendations), comments
+# out (`chrome` is tiered like every anchor list: the first path that matches is used).
+main = ['//*[id="primary-inner"]', '//*[id="primary"]']
+chrome = ['//*[id="comments"]', '//*[id="secondary"]']
+
+# ---------------------------------------------------------------------------
+# Windows Settings (SystemSettings.exe inside the ApplicationFrameHost frame).
+# The breadcrumb names the page ("Personalization Background"): one thread per
+# Settings page.  The navigation pane (account name and e-mail) is not main.
+# Password fields (Wi-Fi keys, PINs) are never read (extract/uia.py).
+[[profile]]
+name = "windows_settings"            # verified 2026-09-24 (Settings > Personalization > Background)
+kind = "page"
+processes = ["systemsettings.exe"]
+header = ['//*[id^="PermanentNavigationViewBreadcr"]', '//Group[class="LandmarkTarget"][landmark="navigation"]']
+main = ['//Group[class="LandmarkTarget"][landmark="main"]']
+
+# ---------------------------------------------------------------------------
 # Terminals: the text is the terminal control's Text pattern (Windows Terminal,
 # conhost).  Warp draws with the GPU and exposes only its title (see notes).
 [[profile]]

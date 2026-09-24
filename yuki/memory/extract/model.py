@@ -156,7 +156,7 @@ class Message:
 
 @dataclass
 class Extraction:
-    #: "conversation" | "email" | "page" | "document" | "list" | "terminal" | "generic"
+    #: "conversation" | "email" | "page" | "video" | "document" | "list" | "terminal" | "generic"
     kind: str
     app: str
     title: str

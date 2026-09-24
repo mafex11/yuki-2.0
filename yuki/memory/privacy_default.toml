@@ -57,8 +57,9 @@ blocked_processes = [
     "LogonUI.exe",
     "LockApp.exe",
     "consent.exe",
-    # Settings (Wi-Fi keys, accounts, sign-in options)
-    "SystemSettings.exe",
+    # Windows Settings (SystemSettings.exe) is read on purpose (user's choice,
+    # 2026-09-24).  Its Wi-Fi key and PIN fields are password fields: their
+    # values are never read (see [fields]).
 ]
 # Product-name fragments of password-manager families (process name contains).
 blocked_process_substrings = ["1password", "bitwarden", "lastpass", "dashlane", "keepass"]

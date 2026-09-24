@@ -61,6 +61,7 @@ from dataclasses import dataclass
 import comtypes
 import comtypes.client
 import win32gui
+import win32process
 
 from yuki.memory.extract.model import Node, Rect, Snapshot, number
 
@@ -148,6 +149,59 @@ _DOCUMENT_VALUE_CHARS = 30000
 _THIN_TEXT = 200
 _TEXT_PATTERN_CHARS = 30000
 _HANDOFF_S = 0.15
+
+
+#: The OS's frame window for UWP apps: owned by ApplicationFrameHost.exe, it
+#: hosts the app's own window (a Windows.UI.Core.CoreWindow child) from the
+#: app's process - Windows Settings is SystemSettings.exe inside one.
+_UWP_FRAME_CLASS = "ApplicationFrameWindow"
+
+
+def content_pid(hwnd: int) -> int:
+    """The process whose content top-level window ``hwnd`` shows.
+
+    The window's own process, except for the OS's UWP frame window, whose
+    content is a child window of another process (the app itself); a frame
+    whose app window is detached (a suspended app) stays the frame's process.
+    An OS fact about window ownership, not an app rule: privacy gates, the
+    app's name and profile matching must all see the app, not its host.
+    """
+    try:
+        pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:
+        return 0
+    try:
+        if win32gui.GetClassName(hwnd) != _UWP_FRAME_CLASS:
+            return pid
+        hosted: list[int] = []
+
+        def visit(child: int, _extra: object) -> bool:
+            try:
+                other = int(win32process.GetWindowThreadProcessId(child)[1])
+            except Exception:
+                return True
+            if other and other != pid and win32gui.IsWindowVisible(child):
+                hosted.append(other)
+                return False
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, visit, None)
+        except win32gui.error:
+            pass  # stopping the enumeration early reports as an error on some builds
+        return hosted[0] if hosted else pid
+    except Exception:
+        return pid
+
+
+def process_name(pid: int) -> str:
+    """Image name of ``pid`` ("SystemSettings.exe"), "" when it is gone."""
+    try:
+        import psutil
+
+        return psutil.Process(pid).name()
+    except Exception:
+        return ""
 
 
 def _text(value: object) -> str:
@@ -545,6 +599,9 @@ def read_window(
     if info is None:
         snap.notes.append("not a window (it may have closed)")
         return snap
+    hosted = content_pid(hwnd)
+    if hosted and hosted != info.pid:
+        snap.process_name = process_name(hosted) or snap.process_name
     deadline = time.monotonic() + max(timeout_s - _HANDOFF_S, 0.1)
     cancel = threading.Event()
     shared: dict[str, object] = {}
