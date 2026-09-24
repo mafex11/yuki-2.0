@@ -303,8 +303,9 @@ class AgentRuntime(QObject):
         front_desk_agent: Override the front-desk agent.
         front_desk_blocked: The backend wrapper for the front desk.
         memory: Yuki's memory, shared by both lanes and the tray (so the
-            portrait is fetched once for all of them). Defaults to the
-            process-wide one.
+            portrait is fetched once for all of them, and both lanes log their
+            exchanges under the one conversation session of this app run,
+            ``memory.session_id``). Defaults to the process-wide one.
 
     Signals:
         started: ``(lane, id, request)`` -- a lane picked the request up.
@@ -391,11 +392,22 @@ class AgentRuntime(QObject):
         self.front_desk.start()
 
     def stop(self) -> None:
-        """Cancel everything and wait for both threads to end."""
+        """Cancel everything, wait for both threads to end, then (bounded) for memory's turn log.
+
+        Each lane hands its last exchange to memory's background writer as its
+        request ends; the writer is a daemon thread, so without the flush the
+        exchange that closed the app could be lost at exit.
+        """
         for lane in (self.worker, self.front_desk):
             lane.shutdown()
         for lane in (self.worker, self.front_desk):
             lane.wait(4000)
+        try:
+            flushed = self.memory.flush_turns(3.0)
+        except Exception as exc:  # shutting down must never fail on memory
+            self.ui_log.event("memory_turns_flush", error=f"{type(exc).__name__}: {exc}")
+        else:
+            self.ui_log.event("memory_turns_flush", flushed=flushed)
 
     # -- requests ----------------------------------------------------------
 

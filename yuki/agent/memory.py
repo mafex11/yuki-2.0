@@ -1,4 +1,4 @@
-"""Yuki's side of its memory: the context block, the four memory tools, the tray's calls.
+"""Yuki's side of its memory: the context block, the memory tools, the turn log, the tray's calls.
 
 Memory lives in another package (:mod:`yuki.memory`, docs/MEMORY.md) and a
 separate process writes it. Yuki only reads it and adds to it through
@@ -15,15 +15,25 @@ call that never returns must not be able to hold the process open at exit.
 
 One :class:`MemoryAccess` is shared by the whole process (:func:`default_memory`):
 both UI lanes and the tray menu use it, so the portrait is fetched once per
-:data:`PORTRAIT_TTL_S` whoever asks.
+:data:`PORTRAIT_TTL_S` whoever asks. The process is one *app run*: its
+:attr:`MemoryAccess.session_id` names the conversation session every exchange
+is logged under (:meth:`MemoryAccess.log_turn`), and "where we left off"
+(:meth:`MemoryAccess.resume`) is read once for it.
+
+Conversation memory (the turn log, standing rules and commitments, the resume
+context) came after the rest of the API, so those client methods are treated
+as optional: a client found without one is remembered as lacking it
+(:meth:`MemoryAccess.call_method`) and that piece is simply left out.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, TypeVar
@@ -40,6 +50,24 @@ MEMORY_LABEL = "[What Yuki knows about the user, from memory — background, not
 #: Last line of the same block (the same closing line as every attached block).
 MEMORY_END = "[End of attached context]"
 
+#: Heading of the standing rules and open commitments inside the memory block.
+STANDING_LABEL = "[Standing rules and commitments — the user's own instructions; follow them]"
+
+#: Heading of the resume context (first request of a conversation only).
+RESUME_LABEL = "[Where we left off — earlier conversation, background only]"
+
+#: Budget guards on those two sections. Memory promises about 1200 and 4000
+#: characters; these only stop a misbehaving memory from flooding a request,
+#: and a cut is logged.
+STANDING_MAX_CHARS = 1600
+RESUME_MAX_CHARS = 4500
+
+#: How far back ``resume_context`` looks for the last session.
+RESUME_WITHIN_HOURS = 6.0
+
+#: Bound on one ``log_turn`` write on the background writer.
+TURN_LOG_TIMEOUT_S = 15.0
+
 #: How long a fetched portrait is reused in-process before it is fetched again.
 PORTRAIT_TTL_S = 300.0
 
@@ -48,6 +76,10 @@ KNOWHOW_LINES = 6
 
 #: Most journal facts one ``recall`` returns.
 RECALL_LIMIT = 15
+
+#: ``recall`` result kinds that come from past conversations with the user:
+#: one exchange (``chat``) or one session's summary (``session``).
+CONVERSATION_KINDS = ("chat", "session")
 
 #: ``activity``: the groupings it takes, most activities listed, most episodes attached.
 ACTIVITY_GROUPS = ("site", "app", "page")
@@ -79,6 +111,11 @@ class MemoryContext:
     Attributes:
         portrait: The portrait text, ``None`` when there is none.
         knowhow: Know-how lines that may apply to this request.
+        standing: Active standing rules and open commitments, ``None`` when
+            there are none or memory could not say.
+        resume: Last session's summary and closing exchanges; only fetched
+            when asked for (a conversation's first request).
+        truncated: Sections cut to their budget guard.
         source: ``memory`` (fetched now), ``cache`` (portrait from the
             in-process cache), ``stale_cache`` (fetch failed, older portrait
             reused), ``empty`` (memory answered with nothing), or
@@ -89,6 +126,9 @@ class MemoryContext:
 
     portrait: str | None = None
     knowhow: list[str] = field(default_factory=list)
+    standing: str | None = None
+    resume: str | None = None
+    truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -100,6 +140,10 @@ def _open_real_client(path: Any = None) -> Any:
     return module.MemoryClient.open(path)
 
 
+class _Absent(Exception):
+    """The client has no such method (an older memory API)."""
+
+
 class MemoryAccess:
     """Lazily opened, failure-tolerant access to ``MemoryClient``.
 
@@ -109,6 +153,8 @@ class MemoryAccess:
             checks pass a stub here.
         path: Database path for the default opener (``None``: memory's default).
         portrait_ttl_s: How long a fetched portrait is reused.
+        session_id: The conversation session this app run logs its exchanges
+            under. Default: the start time plus a short random suffix.
     """
 
     def __init__(
@@ -117,6 +163,7 @@ class MemoryAccess:
         *,
         path: Any = None,
         portrait_ttl_s: float = PORTRAIT_TTL_S,
+        session_id: str | None = None,
     ) -> None:
         self._custom = open_client is not None
         self._open = open_client or (lambda: _open_real_client(path))
@@ -129,6 +176,23 @@ class MemoryAccess:
         self._installed: bool | None = None
         #: The last failure, for the tray and the logs.
         self.last_error: str | None = None
+        #: One app run = one conversation session in memory.
+        self.session_id = session_id or (
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        )
+        #: Client methods found missing; not asked for again this process.
+        self._absent: set[str] = set()
+        #: ``resume_context`` as read once for this app run: ``(text,)`` once
+        #: read (``(None,)``: nothing to resume), ``None`` until then.
+        self._resume: tuple[str | None] | None = None
+        self._resume_lock = threading.Lock()
+        #: The background turn writer: one thread, in queue order, never on
+        #: the request path.
+        self._turns: queue.Queue[tuple[dict[str, Any], Callable[..., None] | None]] = queue.Queue()
+        self._turn_writer: threading.Thread | None = None
+        self._turn_lock = threading.Lock()
+        self._turns_idle = threading.Condition(self._turn_lock)
+        self._turns_pending = 0
 
     # -- availability --------------------------------------------------------
 
@@ -198,6 +262,30 @@ class MemoryAccess:
         self.last_error = None
         return box["value"]
 
+    def call_method(self, name: str, *args: Any, timeout_s: float, **kwargs: Any) -> Any:
+        """``client.<name>(*args, **kwargs)`` through :meth:`call`, for optional methods.
+
+        A client without the method raises :class:`MemoryUnavailable` saying
+        so, and is not asked again this process (no thread, no wait).
+        """
+        if name in self._absent:
+            raise MemoryUnavailable(f"memory has no {name}()")
+
+        def fn(client: Any) -> Any:
+            method = getattr(client, name, None)
+            if not callable(method):
+                raise _Absent(name)
+            return method(*args, **kwargs)
+
+        try:
+            return self.call(name, fn, timeout_s=timeout_s)
+        except MemoryUnavailable as exc:
+            if isinstance(exc.__cause__, _Absent):
+                self._absent.add(name)
+                self.last_error = None
+                raise MemoryUnavailable(f"memory has no {name}()") from None
+            raise
+
     # -- portrait --------------------------------------------------------------
 
     def invalidate_portrait(self) -> None:
@@ -230,26 +318,181 @@ class MemoryAccess:
         return text, "memory"
 
     def warm(self, *, timeout_s: float = 30.0) -> MemoryContext:
-        """Open the client and fill the portrait cache, off the request path."""
+        """Open the client, fill the portrait cache and read the resume context, off the request path."""
         started = time.perf_counter()
         try:
             text, source = self.portrait(timeout_s=timeout_s)
             result = MemoryContext(portrait=text, source=source)
         except MemoryUnavailable as exc:
             result = MemoryContext(error=str(exc))
+        if result.error is None:
+            try:
+                result.resume = self.resume(timeout_s=min(timeout_s, TRAY_TIMEOUT_S))
+            except MemoryUnavailable as exc:
+                if "resume_context" not in self._absent:
+                    result.error = str(exc)
         result.elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         return result
+
+    # -- conversation memory ---------------------------------------------------
+
+    def resume(self, *, timeout_s: float = CONTEXT_TIMEOUT_S) -> str | None:
+        """``resume_context()``, read once per app run and then reused.
+
+        Normally read at warm-up, before this run's first exchange is logged,
+        so it describes the previous session; every conversation of this run
+        (both UI lanes) gets the same snapshot. A failed read is not
+        remembered: the next asker tries again.
+
+        Raises:
+            MemoryUnavailable: When it has not been read and cannot be now.
+        """
+        with self._resume_lock:
+            if self._resume is not None:
+                return self._resume[0]
+        value = self.call_method(
+            "resume_context", within_hours=RESUME_WITHIN_HOURS, timeout_s=timeout_s
+        )
+        text = value.strip() if isinstance(value, str) and value.strip() else None
+        with self._resume_lock:
+            if self._resume is None:
+                self._resume = (text,)
+            return self._resume[0]
+
+    def standing(self, *, timeout_s: float = CONTEXT_TIMEOUT_S) -> str | None:
+        """``standing_context()``, fetched fresh every time (a rule saved a moment ago must show).
+
+        Raises:
+            MemoryUnavailable: When memory cannot answer or has no such method.
+        """
+        value = self.call_method("standing_context", timeout_s=timeout_s)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def log_turn(
+        self,
+        *,
+        request_id: str,
+        at: float,
+        user_text: str,
+        reply_text: str,
+        actions: list[str],
+        outcome: str,
+        on_done: Callable[[dict[str, Any]], None] | None = None,
+    ) -> bool:
+        """Queue one exchange for ``MemoryClient.log_turn``. Returns at once.
+
+        One background writer thread writes them one at a time in the order
+        they were queued (so memory's "last few exchanges" are in order), each
+        bounded by :data:`TURN_LOG_TIMEOUT_S`. ``on_done`` is called on that
+        thread with ``{request_id, session_id, row, error, elapsed_ms}``.
+
+        Args:
+            request_id: Unique id of the request within the session.
+            at: When the request was made, epoch seconds.
+            user_text: What the user asked.
+            reply_text: What Yuki finally said (or the error / cancellation).
+            actions: One line per thing Yuki did.
+            outcome: ``final``, ``error``, ``cancelled`` or ``abandoned``.
+            on_done: Result callback; exceptions from it are swallowed.
+
+        Returns:
+            ``False`` when memory is not installed (nothing queued).
+        """
+        if not self.installed:
+            return False
+        turn = {
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "at": at,
+            "user_text": user_text,
+            "reply_text": reply_text,
+            "actions": list(actions),
+            "outcome": outcome,
+        }
+        with self._turn_lock:
+            self._turns_pending += 1
+            if self._turn_writer is None or not self._turn_writer.is_alive():
+                self._turn_writer = threading.Thread(
+                    target=self._write_turns, name="yuki-memory-turns", daemon=True
+                )
+                self._turn_writer.start()
+        self._turns.put((turn, on_done))
+        return True
+
+    def _write_turns(self) -> None:
+        """The writer thread's loop (a daemon: it never holds the process open)."""
+        while True:
+            turn, on_done = self._turns.get()
+            started = time.perf_counter()
+            report: dict[str, Any] = {
+                "request_id": turn["request_id"],
+                "session_id": turn["session_id"],
+                "row": None,
+                "error": None,
+            }
+            try:
+                report["row"] = self.call_method(
+                    "log_turn",
+                    turn["session_id"],
+                    turn["request_id"],
+                    turn["at"],
+                    turn["user_text"],
+                    turn["reply_text"],
+                    turn["actions"],
+                    turn["outcome"],
+                    timeout_s=TURN_LOG_TIMEOUT_S,
+                )
+            except Exception as exc:  # MemoryUnavailable or worse: never kill the writer
+                report["error"] = str(exc) if isinstance(exc, MemoryUnavailable) else (
+                    f"{type(exc).__name__}: {exc}"
+                )
+            report["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            if on_done is not None:
+                try:
+                    on_done(report)
+                except Exception:
+                    pass
+            with self._turn_lock:
+                self._turns_pending -= 1
+                if self._turns_pending <= 0:
+                    self._turns_idle.notify_all()
+
+    def flush_turns(self, timeout_s: float = 3.0) -> bool:
+        """Wait, bounded, for queued exchanges to be written (before exit).
+
+        Returns:
+            ``True`` when nothing is left to write.
+        """
+        deadline = time.monotonic() + timeout_s
+        with self._turn_lock:
+            while self._turns_pending > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._turns_idle.wait(remaining)
+        return True
 
     # -- the per-request block -------------------------------------------------
 
     def context(
-        self, *, app: str | None, query: str, timeout_s: float = CONTEXT_TIMEOUT_S
+        self,
+        *,
+        app: str | None,
+        query: str,
+        resume: bool = False,
+        timeout_s: float = CONTEXT_TIMEOUT_S,
     ) -> MemoryContext:
-        """Portrait plus know-how for one request. Never raises.
+        """Portrait, know-how, standing context and (asked for) resume context. Never raises.
 
-        The two lookups share one bound. When the portrait cannot be fetched
-        but an older one was, that one is used (``stale_cache``); know-how that
-        cannot be fetched is simply left out.
+        The lookups share one bound. When the portrait cannot be fetched but an
+        older one was, that one is used (``stale_cache``); know-how, standing
+        context and resume context that cannot be fetched are simply left out.
+        The last two are cut to :data:`STANDING_MAX_CHARS` /
+        :data:`RESUME_MAX_CHARS` (named in ``truncated``) if memory overshoots.
+
+        Args:
+            resume: Also attach ``resume_context`` (a conversation's first
+                request); usually already read at warm-up.
         """
         started = time.perf_counter()
         deadline = started + timeout_s
@@ -274,7 +517,30 @@ class MemoryAccess:
                 ][:KNOWHOW_LINES]
             except MemoryUnavailable as exc:
                 result.error = result.error or str(exc)
-        if result.source in ("memory", "cache") and not result.portrait and not result.knowhow:
+            if "standing_context" not in self._absent:
+                try:
+                    result.standing = self.standing(
+                        timeout_s=max(deadline - time.perf_counter(), 0.05)
+                    )
+                except MemoryUnavailable as exc:
+                    if "standing_context" not in self._absent:
+                        result.error = result.error or str(exc)
+            if resume and "resume_context" not in self._absent:
+                try:
+                    result.resume = self.resume(
+                        timeout_s=max(deadline - time.perf_counter(), 0.05)
+                    )
+                except MemoryUnavailable as exc:
+                    if "resume_context" not in self._absent:
+                        result.error = result.error or str(exc)
+        for name, limit in (("standing", STANDING_MAX_CHARS), ("resume", RESUME_MAX_CHARS)):
+            text = getattr(result, name)
+            if text and len(text) > limit:
+                setattr(result, name, text[: limit - 1].rstrip() + "…")
+                result.truncated.append(name)
+        if result.source in ("memory", "cache") and not (
+            result.portrait or result.knowhow or result.standing or result.resume
+        ):
             result.source = "empty"
         result.elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         return result
@@ -313,7 +579,7 @@ class MemoryAccess:
 
         Bad input comes back ``ok=False`` so the model fixes its call. Memory
         being unavailable is ``ok=False`` for ``recall`` and ``activity`` (looks
-        that could not be made) but ``ok=True`` with ``saved: false`` for the two writes: a
+        that could not be made) but ``ok=True`` with ``saved: false`` for the writes: a
         note that could not be filed says nothing about the desktop, and must
         not cost the user a round by cancelling the ``done`` sent beside it.
         The text says plainly that nothing was saved.
@@ -326,6 +592,10 @@ class MemoryAccess:
                 outcome = self._remember_how(tool_input, request)
             elif name == "correct_memory":
                 outcome = self._correct(tool_input)
+            elif name == "remember_rule":
+                outcome = self._remember_rule(tool_input)
+            elif name == "forget_rule":
+                outcome = self._forget_rule(tool_input)
             elif name == "activity":
                 outcome = self._activity(tool_input)
             else:
@@ -354,9 +624,13 @@ class MemoryAccess:
         facts = [row for row in (rows or []) if isinstance(row, dict)]
         text = format_recall(facts, query=query, since=since, until=until, app=app)
         episodes = sum(1 for row in facts if row.get("kind") == "episode")
-        summary = f"{len(facts) - episodes} fact{'' if len(facts) - episodes == 1 else 's'}"
+        talks = sum(1 for row in facts if row.get("kind") in CONVERSATION_KINDS)
+        plain = len(facts) - episodes - talks
+        summary = f"{plain} fact{'' if plain == 1 else 's'}"
         if episodes:
-            summary += f" and {episodes} episode{'' if episodes == 1 else 's'}"
+            summary += f", {episodes} episode{'' if episodes == 1 else 's'}"
+        if talks:
+            summary += f", {talks} from past conversations"
         return ToolOutcome(
             name="recall",
             ok=True,
@@ -421,6 +695,42 @@ class MemoryAccess:
             payload={"saved": True, "id": row, "app": app, "text": text, "source_request": request},
         )
 
+    def _remember_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        text = _need_text(tool_input, "text")
+        try:
+            row = self.call_method("remember_rule", text, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _not_saved("remember_rule", exc, {"text": text})
+        return ToolOutcome(
+            name="remember_rule",
+            ok=True,
+            summary="standing rule saved",
+            content=[{"type": "text", "text": f"Saved as a standing rule: {text}"}],
+            payload={"saved": True, "id": row, "text": text},
+        )
+
+    def _forget_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        text = _need_text(tool_input, "text")
+        try:
+            revoked = self.call_method("revoke_rule", text, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _not_saved("forget_rule", exc, {"text": text})
+        if revoked:
+            reply, summary = f"Dropped: {text}", "standing rule dropped"
+        else:
+            reply = (
+                f'No active standing rule matched "{text}", so nothing was dropped; the '
+                "standing rules in the memory block show their exact wording."
+            )
+            summary = "no matching standing rule"
+        return ToolOutcome(
+            name="forget_rule",
+            ok=True,
+            summary=summary,
+            content=[{"type": "text", "text": reply}],
+            payload={"saved": bool(revoked), "revoked": revoked, "text": text},
+        )
+
     def _correct(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = _need_text(tool_input, "text")
         try:
@@ -469,8 +779,14 @@ def memory_block_text(
         repeated_turn: The portrait is byte-identical to the one attached on
             this turn of the same conversation, still there in full: say so
             instead of sending the same page again.
+
+    Order: the time, the portrait, standing rules and commitments (under
+    :data:`STANDING_LABEL`), know-how, and last the resume context (under
+    :data:`RESUME_LABEL`) when it was fetched.
     """
-    if context.source == "unavailable" or (not context.portrait and not context.knowhow):
+    if context.source == "unavailable" or not (
+        context.portrait or context.knowhow or context.standing or context.resume
+    ):
         return None
     now = now or datetime.now()
     parts = [f"Now: {now.strftime('%A %d %B %Y, %H:%M')} local time."]
@@ -482,9 +798,13 @@ def memory_block_text(
             )
         else:
             parts.append(context.portrait)
+    if context.standing:
+        parts.append(f"{STANDING_LABEL}\n{context.standing}")
     if context.knowhow:
         lines = "\n".join(f"- {' '.join(line.split())}" for line in context.knowhow)
         parts.append(f"Know-how saved on this PC that may apply:\n{lines}")
+    if context.resume:
+        parts.append(f"{RESUME_LABEL}\n{context.resume}")
     return f"\n\n{MEMORY_LABEL}\n" + "\n\n".join(parts) + f"\n{MEMORY_END}"
 
 
@@ -509,6 +829,12 @@ def format_recall(
     lines = [f"{len(facts)} result{'' if len(facts) == 1 else 's'} from memory for {', '.join(scope)}:"]
     for row in facts:
         fact = " ".join(str(row.get("fact") or "").split())
+        if row.get("kind") in CONVERSATION_KINDS:
+            label = "conversation" if row.get("kind") == "chat" else "conversation session"
+            end = _when(row.get("until")) if row.get("until") else "(undated)"
+            span = f"-{end[-5:]}" if end != "(undated)" else ""
+            lines.append(f"{_when(row.get('at'))}{span} [{label}] {fact}")
+            continue
         if row.get("kind") == "episode":
             end = _when(row.get("until"))
             lines.append(f"{_when(row.get('at'))}-{end[-5:] if end != '(undated)' else '?'} [episode] {fact}")

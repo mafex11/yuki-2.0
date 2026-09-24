@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
-from yuki.agent.context import ContextManager
+from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.memory import MemoryAccess, default_memory, memory_block_text
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
@@ -79,6 +79,14 @@ _DEFERRED_TOOLS: frozenset[str] = frozenset({"done", "ask_user"})
 #: Stop reasons after which a just-finished ``tool_use`` block may be cut off or
 #: disowned, so it is not run early.
 _UNSAFE_STOPS: frozenset[str] = frozenset({"max_tokens", "refusal"})
+
+#: Tools that are not "actions taken" for the turn log and the collapsed form
+#: of a request: looks change nothing, and ``done`` / ``note_to_self`` are the
+#: reply and the working note. Plumbing for a summary line, not behaviour.
+_NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self"}
+
+#: Longest one-line action summary kept for memory and the collapsed request.
+_ACTION_LINE_CHARS = 160
 
 
 @dataclass
@@ -165,11 +173,14 @@ class Agent:
             ``settings.requests_csv_path``. The ``request_summary`` JSONL record
             is written either way.
         memory: Yuki's memory (:class:`~yuki.agent.memory.MemoryAccess`): the
-            portrait and know-how attached to every request, and what the
-            ``recall`` / ``remember_how`` / ``correct_memory`` tools run
-            against. Defaults to the process-wide one on the real memory
-            database; offline checks pass one built on a stub client. Memory
-            that is missing or failing never fails a request.
+            portrait, standing rules and commitments and know-how attached to
+            every request (plus where the last session left off, on this
+            conversation's first request), what the memory tools run against,
+            and where every finished exchange is logged, on a background
+            thread, under the app run's ``memory.session_id``. Defaults to the
+            process-wide one on the real memory database; offline checks pass
+            one built on a stub client. Memory that is missing or failing
+            never fails or delays a request.
 
     Raises:
         ValueError: If ``tool_names`` contains a name that is not a tool.
@@ -222,6 +233,11 @@ class Agent:
         #: ``(portrait text, turn)`` of the last portrait attached in full to
         #: this conversation; an identical one is not sent again.
         self._portrait_sent: tuple[str, int] | None = None
+        #: Requests this conversation has started (1 on the first).
+        self._requests = 0
+        #: One line per thing done this request, for memory's turn log and
+        #: the request's collapsed form.
+        self._actions: list[str] = []
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None``
         #: while one is running). Read by the UI to label the finished card.
@@ -302,7 +318,7 @@ class Agent:
         self.logger.log("activity_prewarm", started=started)
 
     def _warm_memory(self) -> None:
-        """Open memory and cache the portrait before the first request. Never raises."""
+        """Open memory, cache the portrait and read the resume context before the first request. Never raises."""
         if not self.memory.installed:
             return
         result = self.memory.warm()
@@ -310,6 +326,8 @@ class Agent:
             "memory_prewarm",
             source=result.source,
             portrait_chars=len(result.portrait or ""),
+            resume_chars=len(result.resume or ""),
+            memory_session=getattr(self.memory, "session_id", None),
             error=result.error,
             elapsed_ms=result.elapsed_ms,
         )
@@ -476,9 +494,12 @@ class Agent:
         self._model_calls = 0
         self._call_history = {}
         self._request_text = request
+        self._requests += 1
+        self._actions = []
         self._reset_accounting()
         self.last_summary = None
         started_at = datetime.now()
+        started_epoch = time.time()
         model, effort = self.settings.model, self.settings.effort
         self.logger.reset_usage()
         self.logger.begin_turn()
@@ -486,6 +507,7 @@ class Agent:
         # How the request ended, for the summary. "abandoned" survives only when
         # the caller stopped iterating before a final or an error arrived.
         outcome = "abandoned"
+        reply = ""
         drive: Iterator[AgentEvent] | None = None
         try:
             overview, _ = self._capture_overview()
@@ -494,23 +516,26 @@ class Agent:
             self.context.add_request(
                 request,
                 overview,
-                memory_text=self._memory_context(request),
+                memory_text=self._memory_context(request, first=self._requests == 1),
                 origin_text=origin,
             )
             drive = self._drive()
             for event in drive:
                 if isinstance(event, Final):
-                    outcome = "final"
+                    outcome, reply = "final", event.text
                 elif isinstance(event, ErrorEvent):
                     outcome = "cancelled" if self._cancelled.is_set() else "error"
+                    reply = event.text
                 yield event
         except KeyboardInterrupt:
             outcome = "cancelled"
+            reply = reply or "Interrupted."
             raise
         except Exception as exc:  # never let a crash escape into the REPL
             message = f"{type(exc).__name__}: {exc}"
             self.logger.error(message, exc=exc)
             outcome = "cancelled" if self._cancelled.is_set() else "error"
+            reply = message
             yield ErrorEvent(message)
         finally:
             if drive is not None:
@@ -519,6 +544,13 @@ class Agent:
             self._summarize(
                 request, outcome=outcome, started_at=started_at, model=model, effort=effort
             )
+            # After the reply is out (the caller already has the final or error
+            # event): hand the exchange to memory's background writer, then
+            # shrink the conversation for the next request.
+            self._log_turn(
+                request, reply=reply, outcome=outcome, at=started_epoch
+            )
+            self._end_request(request, reply=reply, outcome=outcome, at=started_at)
 
     # -- per-request accounting --------------------------------------------
 
@@ -624,6 +656,77 @@ class Agent:
                 )
         except Exception as exc:  # accounting must never break a request
             self.logger.error(f"request summary failed: {type(exc).__name__}: {exc}", exc=exc)
+
+    # -- after the request: the turn log and compaction -----------------------
+
+    def _log_turn(self, request: str, *, reply: str, outcome: str, at: float) -> None:
+        """Queue this exchange for memory's turn log. Returns at once; never raises.
+
+        Logged as ``memory_turn_queued`` now and ``memory_turn_logged`` (row
+        id or error) when the background writer is done with it.
+        """
+        request_id = f"{self.lane}-{self._requests}"
+        actions = list(self._actions)
+        logger = self.logger
+
+        def done(report: dict[str, Any]) -> None:
+            logger.log("memory_turn_logged", **report)
+
+        try:
+            queued = self.memory.log_turn(
+                request_id=request_id,
+                at=at,
+                user_text=request,
+                reply_text=reply,
+                actions=actions,
+                outcome=outcome,
+                on_done=done,
+            )
+            self.logger.log(
+                "memory_turn_queued",
+                queued=queued,
+                session_id=getattr(self.memory, "session_id", None),
+                request_id=request_id,
+                outcome=outcome,
+                reply_chars=len(reply),
+                actions=actions,
+            )
+        except Exception as exc:  # memory must never break a request
+            self.logger.error(f"memory turn log failed: {type(exc).__name__}: {exc}", exc=exc)
+
+    def _end_request(self, request: str, *, reply: str, outcome: str, at: datetime) -> None:
+        """Record the request's outcome and collapse old requests. Never raises.
+
+        When the request that carried the portrait in full is collapsed, the
+        portrait is no longer in the conversation, so the next request attaches
+        it again instead of pointing back at it.
+        """
+        try:
+            self.context.end_request(
+                RequestRecord(
+                    text=request, reply=reply, actions=list(self._actions), at=at,
+                    outcome=outcome,
+                )
+            )
+            info = self.context.compact(keep=KEEP_FULL_REQUESTS)
+            if (
+                info is not None
+                and self._portrait_sent is not None
+                and self._portrait_sent[1] in info["turns"]
+            ):
+                self._portrait_sent = None
+        except Exception as exc:  # housekeeping must never break a request
+            self.logger.error(f"context compaction failed: {type(exc).__name__}: {exc}", exc=exc)
+
+    def _note_action(self, name: str, ok: bool, summary: str) -> None:
+        """Add one line to this request's actions (not for looks, done or the note)."""
+        if name in _NOT_ACTIONS:
+            return
+        summary = " ".join(str(summary or "").split())
+        line = f"{name}: {summary}" if ok else f"{name} failed: {summary}"
+        if len(line) > _ACTION_LINE_CHARS:
+            line = line[: _ACTION_LINE_CHARS - 1] + "…"
+        self._actions.append(line)
 
     def _close_dangling_tools(self, overview: str) -> None:
         """Answer tool calls left hanging by a cancelled or interrupted run.
@@ -858,6 +961,7 @@ class Agent:
             self._pending_answer = None
             if answer is None:
                 text = "The user did not answer."
+                self._note_action("asked the user", False, f"{question} (no answer)")
                 self.logger.tool_result(
                     name, ok=False, summary=text, result={"answer": None},
                     elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
@@ -870,6 +974,7 @@ class Agent:
                 turn.stop_after = True
                 return
             self.logger.user_answer(answer)
+            self._note_action("asked the user", True, f"{question} → {answer}")
             self.logger.tool_result(
                 name, ok=True, summary=f"answered: {answer}", result={"answer": answer},
                 elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
@@ -912,6 +1017,7 @@ class Agent:
             )
 
         self._log_outcome(outcome, tool_use_id=tool_id)
+        self._note_action(name, outcome.ok, outcome.summary)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary)
 
         content = list(outcome.content) or [
@@ -1137,20 +1243,27 @@ class Agent:
 
     # -- memory ------------------------------------------------------------
 
-    def _memory_context(self, request: str) -> str | None:
+    def _memory_context(self, request: str, *, first: bool = False) -> str | None:
         """The memory block for this request's first message, or ``None``.
 
-        Portrait (cached in-process by :class:`MemoryAccess`) plus the know-how
-        lines memory finds for the foreground app and the request text. A
+        Portrait (cached in-process by :class:`MemoryAccess`), the standing
+        rules and open commitments (every request), the know-how lines memory
+        finds for the foreground app and the request text, and on this
+        conversation's first request where the last session left off. A
         portrait identical to one already attached in full earlier in this
-        conversation -- still there, never stubbed -- is named rather than sent
-        again. Logs ``memory_context`` every time, whatever happened; never
-        raises.
+        conversation -- still there, never stubbed or collapsed -- is named
+        rather than sent again. Logs ``memory_context`` every time, whatever
+        happened; never raises.
+
+        Args:
+            request: The request text (the know-how query).
+            first: This is the conversation's first request: attach the
+                resume context too.
         """
         started = time.perf_counter()
         app = _foreground_app(self._overview_payload)
         try:
-            fetched = self.memory.context(app=app, query=request)
+            fetched = self.memory.context(app=app, query=request, resume=first)
             repeated = None
             if (
                 fetched.portrait
@@ -1161,9 +1274,14 @@ class Agent:
             text = memory_block_text(fetched, repeated_turn=repeated)
         except Exception as exc:  # memory must never break a request
             self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
-            self._memory_info = {"source": "error", "context_chars": 0, "portrait_chars": 0}
+            self._memory_info = {
+                "source": "error", "context_chars": 0, "portrait_chars": 0,
+                "standing_chars": 0, "resume_chars": 0,
+            }
             return None
         portrait_chars = len(fetched.portrait or "") if text and repeated is None else 0
+        standing_chars = len(fetched.standing or "") if text else 0
+        resume_chars = len(fetched.resume or "") if text else 0
         if text and fetched.portrait and repeated is None:
             self._portrait_sent = (fetched.portrait, self.logger.turn)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -1172,6 +1290,10 @@ class Agent:
             "context_chars": len(text or ""),
             "portrait_chars": portrait_chars,
             "portrait_repeated_from_turn": repeated,
+            "standing_chars": standing_chars,
+            "resume_chars": resume_chars,
+            "resume_requested": first,
+            "truncated": list(fetched.truncated),
             "knowhow_lines": len(fetched.knowhow) if text else 0,
             "lookup_ms": elapsed_ms,
         }
@@ -1182,7 +1304,12 @@ class Agent:
             attached=text is not None,
             portrait_chars=portrait_chars,
             portrait_repeated_from_turn=repeated,
+            standing_chars=standing_chars,
+            resume_chars=resume_chars,
+            resume_requested=first,
+            truncated=list(fetched.truncated),
             knowhow_lines=len(fetched.knowhow),
+            memory_session=getattr(self.memory, "session_id", None),
             app=app,
             error=fetched.error,
             elapsed_ms=elapsed_ms,

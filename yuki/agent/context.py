@@ -81,16 +81,48 @@ Limits respected:
   tool_result run: about five positions), well inside that window.
 * The marker is put on a *copy* of the chosen block at request time; the stored
   transcript never carries ``cache_control``, so markers never pile up.
+
+In-session compaction: finished requests shrink to one line each
+------------------------------------------------------------------
+One conversation spans a whole app run, so without more than stubbing every
+request would still carry every earlier request's words, thinking, tool calls,
+tool results, memory block and last window view. After each request ends,
+:meth:`ContextManager.compact` collapses every finished request older than the
+newest :data:`KEEP_FULL_REQUESTS` into one plain-text user/assistant pair::
+
+    user:      [earlier request, 14:02] <what the user asked>
+    assistant: → <what Yuki finally said> (actions: <one line each>)
+
+Structure stays valid by construction: the pair replaces *all* of that request's
+messages (its tool_use blocks and their tool_result blocks go together, its
+thinking blocks go with the assistant turns they belonged to), the pair is
+rebuilt as plain text with no thinking, tool or image block in it, and requests
+are collapsed oldest first, so the collapsed pairs are always a prefix of the
+transcript followed by untouched requests. Assistant turns that are kept are
+never edited.
+
+Cache: compaction rewrites content, so it is confined to what lies wholly
+*before* the previous request's committed breakpoint (a request not yet
+covered by one is left for the next time) and happens once per request, after
+it ends. The next request then misses the conversation cache from the first
+rewritten message on, once. To keep that miss small the last collapsed pair
+carries a second conversation breakpoint when a slot is free (not when
+``extra_instructions`` already takes the fourth): the collapsed prefix only
+ever grows by one pair per request, so the next request finds the previous
+entry two positions back and reads every earlier pair from cache, paying full
+price only for the three requests kept in full. Every compaction is logged as
+``context_compaction`` with the transcript size before and after.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from yuki.agent.tools import PERCEPTION_TOOLS
-from yuki.log.events import SessionLogger
+from yuki.log.events import SessionLogger, _as_plain
 
 #: First line of every text block Yuki writes into a ``user`` message itself.
 #: The API joins adjacent text blocks with no separator, so without it the
@@ -107,6 +139,55 @@ CACHE_MARKER: dict[str, str] = {"type": "ephemeral"}
 
 #: Supersession key shared by the per-turn overview and explicit look_at_desktop.
 _DESKTOP_KEY: tuple[str, ...] = ("look_at_desktop",)
+
+#: Finished requests kept in full by :meth:`ContextManager.compact`; older ones
+#: are collapsed to one line each.
+KEEP_FULL_REQUESTS = 3
+
+#: Budget guards for one collapsed request (plumbing, not behaviour): most
+#: action lines listed, and longest reply / request text kept.
+COLLAPSED_ACTIONS = 8
+COLLAPSED_TEXT_CHARS = 600
+
+
+@dataclass
+class RequestRecord:
+    """How one finished request went, for its collapsed form.
+
+    Attributes:
+        text: What the user asked.
+        reply: What Yuki finally said, or how the request ended.
+        actions: One line per thing Yuki did.
+        at: When the request was made (local time).
+        outcome: ``final``, ``error``, ``cancelled`` or ``abandoned``.
+    """
+
+    text: str
+    reply: str
+    actions: list[str]
+    at: datetime
+    outcome: str = "final"
+
+
+def collapsed_pair(record: RequestRecord) -> tuple[str, str]:
+    """The user and assistant text a finished request collapses to."""
+
+    def cut(text: str) -> str:
+        text = " ".join(str(text or "").split())
+        return text if len(text) <= COLLAPSED_TEXT_CHARS else text[: COLLAPSED_TEXT_CHARS - 1] + "…"
+
+    user = f"[earlier request, {record.at.strftime('%H:%M')}] {cut(record.text)}"
+    reply = cut(record.reply) or "(no reply)"
+    if record.outcome == "cancelled":
+        reply = f"(cancelled) {reply}"
+    elif record.outcome in ("error", "abandoned"):
+        reply = f"(ended without finishing: {record.outcome}) {reply}"
+    actions = [" ".join(line.split()) for line in record.actions if str(line).strip()]
+    shown = actions[:COLLAPSED_ACTIONS]
+    if len(actions) > len(shown):
+        shown.append(f"+{len(actions) - len(shown)} more")
+    tail = f" (actions: {'; '.join(shown)})" if shown else ""
+    return user, f"→ {reply}{tail}"
 
 
 def attached_text(body: str) -> str:
@@ -134,6 +215,8 @@ class _Slot:
             actions, if this message has one.
         view_hwnd: The window that view shows.
         stubbed: Keys already replaced, so each edit is logged exactly once.
+        request: Which request (1, 2, ...) the message belongs to.
+        collapsed: Part of a collapsed request's plain-text pair.
     """
 
     role: str
@@ -144,6 +227,8 @@ class _Slot:
     view_pos: int | None = None
     view_hwnd: int | None = None
     stubbed: set[str] = field(default_factory=set)
+    request: int = 0
+    collapsed: bool = False
 
 
 @dataclass
@@ -186,6 +271,17 @@ class ContextManager:
         #: Placed by the latest :meth:`request_messages`, committed by
         #: :meth:`commit_breakpoint` once that request succeeded.
         self._pending_breakpoint: tuple[int, int] | None = None
+        #: Number of the request being added to (1 from the first request on).
+        self._request_seq = 0
+        #: How each finished request went (:meth:`end_request`), until collapsed.
+        self._records: dict[int, RequestRecord] = {}
+        #: Slot index of the last collapsed pair's assistant message, which
+        #: carries the compaction breakpoint when a slot is free.
+        self._compact_end: int | None = None
+
+    def _append(self, slot: _Slot) -> None:
+        slot.request = self._request_seq
+        self._slots.append(slot)
 
     # -- state -------------------------------------------------------------
 
@@ -212,6 +308,10 @@ class ContextManager:
         back exactly as the SDK returned them. Only the one marked block is
         copied; the stored transcript stays unmarked.
 
+        With a second slot free, the last collapsed pair (see :meth:`compact`)
+        gets one too, so the collapsed prefix stays cached across requests.
+        That pair is plain text Yuki wrote, so marking a copy of it is safe.
+
         Args:
             max_breakpoints: Breakpoint slots left after system and tools. Zero
                 or less means no conversation breakpoint on this request.
@@ -231,6 +331,12 @@ class ContextManager:
         content[position] = {**content[position], "cache_control": dict(CACHE_MARKER)}
         messages[slot_index] = {"role": "user", "content": content}
         self._pending_breakpoint = target
+        end = self._compact_end
+        if max_breakpoints >= 2 and end is not None and end < slot_index:
+            slot = self._slots[end]
+            marked = list(slot.content)
+            marked[-1] = {**marked[-1], "cache_control": dict(CACHE_MARKER)}
+            messages[end] = {"role": slot.role, "content": marked}
         return messages
 
     def commit_breakpoint(self) -> None:
@@ -326,7 +432,8 @@ class ContextManager:
         content.append(
             {"type": "text", "text": self.situation_text(overview_text, self_facts)}
         )
-        self._slots.append(
+        self._request_seq += 1
+        self._append(
             _Slot(
                 role="user",
                 content=content,
@@ -350,7 +457,7 @@ class ContextManager:
                 self._tool_inputs[str(_block_field(block, "id") or "")] = (
                     dict(tool_input) if isinstance(tool_input, dict) else {}
                 )
-        self._slots.append(_Slot(role="assistant", content=content, turn=self.logger.turn))
+        self._append(_Slot(role="assistant", content=content, turn=self.logger.turn))
 
     def add_tool_results(
         self,
@@ -385,7 +492,7 @@ class ContextManager:
             view_hwnd, view_text = int(window_view[0]), window_view[1]
             content.append({"type": "text", "text": attached_text(view_text)})
             view_pos = len(content) - 1
-        self._slots.append(
+        self._append(
             _Slot(
                 role="user",
                 content=content,
@@ -403,7 +510,7 @@ class ContextManager:
         Framed like the situation block: the next request may land right after
         it, and the two must not read as one piece of the user's writing.
         """
-        self._slots.append(
+        self._append(
             _Slot(
                 role="user",
                 content=[{"type": "text", "text": attached_text(text)}],
@@ -434,6 +541,132 @@ class ContextManager:
                 (str(_block_field(block, "id") or ""), str(_block_field(block, "name") or ""))
             )
         return dangling
+
+    # -- compaction --------------------------------------------------------
+
+    def end_request(self, record: RequestRecord) -> None:
+        """Record how the current request went, so it can be collapsed later."""
+        if self._request_seq > 0:
+            self._records[self._request_seq] = record
+
+    def transcript_chars(self) -> int:
+        """Size of the transcript as sent (JSON characters of ``messages``)."""
+        return len(json.dumps(_as_plain(self.messages), ensure_ascii=False, default=str))
+
+    def compact(self, *, keep: int = KEEP_FULL_REQUESTS) -> dict[str, Any] | None:
+        """Collapse finished requests older than the newest ``keep`` into one pair each.
+
+        Call once per request, after it has ended (:meth:`end_request`).
+        Oldest first, and only a request that has ended and lies wholly before
+        the committed cache breakpoint (the module docstring says why); the
+        first request that does not qualify stops it, so the collapsed pairs
+        stay a prefix of the transcript.
+
+        Returns:
+            What was done (also logged as ``context_compaction``), or ``None``
+            when nothing qualified. ``turns`` lists the turn each collapsed
+            request began on, so the caller can tell whether something it
+            attached there (the portrait) has left the conversation.
+        """
+        newest = self._request_seq
+        bound = self._breakpoint[0] if self._breakpoint is not None else len(self._slots)
+        spans: dict[int, list[int]] = {}
+        for index, slot in enumerate(self._slots):
+            if not slot.collapsed and slot.request > 0:
+                spans.setdefault(slot.request, []).append(index)
+        chosen: list[int] = []
+        for request in sorted(spans):
+            if request > newest - keep or request not in self._records:
+                break
+            if spans[request][-1] >= bound:
+                break
+            chosen.append(request)
+        if not chosen:
+            return None
+
+        chars_before = self.transcript_chars()
+        messages_before = len(self._slots)
+        first = spans[chosen[0]][0]
+        last = spans[chosen[-1]][-1]
+        replaced = self._slots[first : last + 1]
+        per_request = []
+        pairs: list[_Slot] = []
+        for request in chosen:
+            record = self._records.pop(request)
+            slots = [self._slots[i] for i in spans[request]]
+            user_text, assistant_text = collapsed_pair(record)
+            per_request.append(
+                {
+                    "request": request,
+                    "turn": slots[0].turn,
+                    "messages": len(slots),
+                    "chars": len(
+                        json.dumps(
+                            _as_plain([{"role": s.role, "content": s.content} for s in slots]),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    ),
+                    "user": user_text,
+                    "assistant": assistant_text,
+                }
+            )
+            turn = slots[0].turn
+            pairs.append(
+                _Slot(
+                    role="user",
+                    content=[{"type": "text", "text": user_text}],
+                    turn=turn,
+                    request=request,
+                    collapsed=True,
+                )
+            )
+            pairs.append(
+                _Slot(
+                    role="assistant",
+                    content=[{"type": "text", "text": assistant_text}],
+                    turn=slots[-1].turn,
+                    request=request,
+                    collapsed=True,
+                )
+            )
+        for slot in replaced:
+            if slot.role == "assistant" and isinstance(slot.content, (list, tuple)):
+                for block in slot.content:
+                    if _block_field(block, "type") == "tool_use":
+                        self._tool_inputs.pop(str(_block_field(block, "id") or ""), None)
+        self._slots[first : last + 1] = pairs
+        shift = len(replaced) - len(pairs)
+
+        def moved(point: tuple[int, int] | None) -> tuple[int, int] | None:
+            if point is None or point[0] <= last:
+                return point
+            return point[0] - shift, point[1]
+
+        before_breakpoint = self._breakpoint is not None
+        self._breakpoint = moved(self._breakpoint)
+        self._pending_breakpoint = moved(self._pending_breakpoint)
+        self._compact_end = first + len(pairs) - 1
+        info = {
+            "requests": chosen,
+            "turns": [item["turn"] for item in per_request],
+            "kept_full": keep,
+            "messages_before": messages_before,
+            "messages_after": len(self._slots),
+            "chars_before": chars_before,
+            "chars_after": self.transcript_chars(),
+            "collapsed": per_request,
+            "before_cache_breakpoint": before_breakpoint,
+        }
+        self.logger.log("context_compaction", **info)
+        printer = getattr(self.logger, "_print", None)
+        if callable(printer):
+            printer(
+                f"[dim]   context: collapsed request{'s' if len(chosen) > 1 else ''} "
+                f"{', '.join(map(str, chosen))} ({info['chars_before']} -> "
+                f"{info['chars_after']} chars)[/dim]"
+            )
+        return info
 
     # -- hygiene -----------------------------------------------------------
 
