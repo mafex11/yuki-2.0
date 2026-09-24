@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from yuki.config import MODEL_ALIASES, Settings
 from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
+from yuki.ui.memory import STATUS_PENDING, KnowsWindow, MemoryControl, describe_memory_status
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_summary, describe_tool
@@ -83,6 +84,8 @@ class YukiUi(QObject):
         settings: Shared settings for both agents.
         ui_log: Where UI events go.
         runtime: The agent runtime. One is built from ``settings`` if omitted.
+        memory_control: The tray's memory controls. Built on the runtime's
+            memory if omitted.
     """
 
     def __init__(
@@ -90,6 +93,7 @@ class YukiUi(QObject):
         settings: Settings,
         ui_log: UiLog,
         runtime: AgentRuntime | None = None,
+        memory_control: MemoryControl | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -97,6 +101,10 @@ class YukiUi(QObject):
         self.overlay = Overlay()
         self.strip = StatusStrip()
         self.runtime = runtime or AgentRuntime(settings, ui_log)
+        self.memory = memory_control or MemoryControl(self.runtime.memory, ui_log)
+        #: The "what Yuki knows" panel, built the first time it is asked for.
+        self.knows: KnowsWindow | None = None
+        self.memory.knows_ready.connect(self._on_knows_ready)
 
         #: request id -> the card showing it.
         self.cards: dict[int, ReplyCard] = {}
@@ -133,18 +141,25 @@ class YukiUi(QObject):
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Start the lanes and the hotkey listener."""
+        """Start the lanes and the hotkey listener, and the memory service if it is down."""
         self.runtime.start()
         self.hotkeys.start()
+        self.memory.ensure_service()
         self.ui_log.event("start", hotkeys=self.bindings, model=self.settings.model)
 
     def stop(self) -> None:
-        """Shut everything down in the right order."""
+        """Shut everything down in the right order.
+
+        The memory service is left running: it is its own process, with its own
+        lifetime, and keeps remembering while Yuki is closed.
+        """
         self.ui_log.event("stop")
         self.hotkeys.stop()
         self.runtime.stop()
         self.overlay.hide()
         self.strip.hide()
+        if self.knows is not None:
+            self.knows.hide()
 
     # -- input -------------------------------------------------------------
 
@@ -281,6 +296,23 @@ class YukiUi(QObject):
         """
         return self.runtime.set_effort(level)
 
+    def show_knows(self) -> None:
+        """Open the "what Yuki knows" panel and fill it from memory."""
+        if self.knows is None:
+            self.knows = KnowsWindow()
+        self.knows.show_loading()
+        self.knows.open()
+        self.ui_log.event("knows", state="shown")
+        self.memory.fetch_knows()
+
+    def _on_knows_ready(self, portrait: object, knowhow: object, meta: str) -> None:
+        if self.knows is not None:
+            self.knows.show_knows(
+                portrait if isinstance(portrait, str) else None,
+                list(knowhow) if isinstance(knowhow, list) else [],
+                meta,
+            )
+
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
         self.ui_log.event("open_logs", path=str(self.settings.sessions_dir))
@@ -299,6 +331,40 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     """
     tray = QSystemTrayIcon(tray_icon(), app)
     menu = QMenu()
+
+    # Memory first: a status line (read afresh each time the menu opens), then
+    # its three controls. Every memory call runs off the GUI thread and comes
+    # back through MemoryControl's signals.
+    memory_status = QAction(STATUS_PENDING, menu)
+    memory_status.setEnabled(False)
+    menu.addAction(memory_status)
+    pause = QAction("Pause memory", menu, checkable=True)
+    pause.triggered.connect(lambda checked: ui.memory.set_paused(bool(checked)))
+    menu.addAction(pause)
+    refresh_portrait = QAction("Refresh portrait now", menu)
+    refresh_portrait.triggered.connect(lambda _checked=False: ui.memory.refresh_portrait())
+    menu.addAction(refresh_portrait)
+    knows = QAction("Show what Yuki knows", menu)
+    knows.triggered.connect(lambda _checked=False: ui.show_knows())
+    menu.addAction(knows)
+
+    def show_memory_status(status: object, error: object) -> None:
+        del error
+        current = status if isinstance(status, dict) else None
+        memory_status.setText(
+            describe_memory_status(current, installed=ui.memory.memory.installed)
+        )
+        running = bool(current and current.get("service_running"))
+        pause.blockSignals(True)
+        pause.setChecked(bool(current and current.get("paused")))
+        pause.blockSignals(False)
+        pause.setEnabled(running)
+        refresh_portrait.setEnabled(current is not None)
+        knows.setEnabled(ui.memory.memory.installed)
+
+    ui.memory.status_changed.connect(show_memory_status)
+    menu.aboutToShow.connect(lambda: ui.memory.refresh_status())
+    menu.addSeparator()
 
     show = QAction("Show", menu)
     show.triggered.connect(ui.show_overlay)
