@@ -1330,6 +1330,7 @@ class Agent:
             "resume_requested": first,
             "truncated": list(fetched.truncated),
             "knowhow_lines": len(fetched.knowhow) if text else 0,
+            "todo_lines": len(fetched.todos) if text else 0,
             "lookup_ms": elapsed_ms,
         }
         self.logger.log(
@@ -1344,6 +1345,7 @@ class Agent:
             resume_requested=first,
             truncated=list(fetched.truncated),
             knowhow_lines=len(fetched.knowhow),
+            todo_lines=len(fetched.todos),
             memory_session=getattr(self.memory, "session_id", None),
             app=app,
             error=fetched.error,

@@ -10,6 +10,8 @@ Modules:
     glass: the frameless dark-glass window base, with the show/hide animation.
     overlay: the ask-Yuki overlay -- input plus a stack of reply cards.
     status: the bottom-right status strip shown while a task is running.
+    nudges: memory's nudge cards (bottom-right, never focused) and their queue.
+    memory: the tray's memory controls and the portrait / to-do panels.
     runtime: the two agent lanes (worker / front desk) and their queue.
     uilog: UI events written through the existing :class:`SessionLogger`.
     app: ``main()`` -- tray icon, single-instance guard, wiring.

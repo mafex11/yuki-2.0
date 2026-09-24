@@ -1,4 +1,4 @@
-"""The tray's memory controls: service auto-start, status line, pause, portrait window.
+"""The tray's memory controls: service auto-start, status line, pause, portrait and to-do panels.
 
 Memory is a separate process (``yuki-memory``, docs/MEMORY.md) with its own
 lifetime: the tray starts it when it is not running, and leaves it running
@@ -13,8 +13,9 @@ from __future__ import annotations
 import html
 import subprocess
 import sys
+import math
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,13 @@ from PySide6.QtCore import QObject, QPoint, Qt, Signal
 from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QTextBrowser, QToolButton, QVBoxLayout
 
-from yuki.agent.memory import MemoryAccess, MemoryUnavailable
+from yuki.agent.memory import (
+    TODO_SOURCES,
+    MemoryAccess,
+    MemoryUnavailable,
+    due_text,
+    todo_done,
+)
 from yuki.ui.glass import GlassWindow, ui_font
 from yuki.ui.uilog import UiLog
 
@@ -35,8 +42,51 @@ _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 KNOWS_WIDTH = 560
 KNOWS_HEIGHT = 600
 
+#: Size of the "Today's list" panel (without the shadow margin).
+TODAY_WIDTH = 480
+TODAY_HEIGHT = 520
+
+#: An open to-do due within this long (or overdue) is listed under "Due soon".
+DUE_SOON = timedelta(hours=24)
+
+#: "Quiet until tomorrow" lasts until this hour of the next morning.
+TOMORROW_HOUR = 6
+
 #: The status line before the first answer arrives.
 STATUS_PENDING = "Memory: checking…"
+
+
+def quiet_until(status: dict[str, Any] | None, *, now: datetime | None = None) -> datetime | None:
+    """When nudges come back on, from ``status["nudges"]`` (``nudge_status()``); ``None`` when not quiet."""
+    nudges = (status or {}).get("nudges")
+    if not isinstance(nudges, dict):
+        return None
+    moment = local_moment(nudges.get("quiet_until"))
+    now = now or datetime.now()
+    return moment if moment is not None and moment > now else None
+
+
+def quiet_label(moment: datetime, *, now: datetime | None = None) -> str:
+    """``16:30`` today, ``tomorrow 06:00``, else ``Fri 06:00``."""
+    now = now or datetime.now()
+    if moment.date() == now.date():
+        return moment.strftime("%H:%M")
+    if moment.date() == (now + timedelta(days=1)).date():
+        return f"tomorrow {moment.strftime('%H:%M')}"
+    return moment.strftime("%a %H:%M")
+
+
+def minutes_until_tomorrow(now: datetime | None = None) -> int:
+    """Minutes from ``now`` until :data:`TOMORROW_HOUR` o'clock next morning.
+
+    Before that hour it is the same calendar day's morning (at 01:00,
+    "tomorrow" means the morning ahead, not the one after it).
+    """
+    now = now or datetime.now()
+    target = now.replace(hour=TOMORROW_HOUR, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return max(1, math.ceil((target - now).total_seconds() / 60.0))
 
 
 def describe_memory_status(status: dict[str, Any] | None, *, installed: bool = True) -> str:
@@ -52,6 +102,9 @@ def describe_memory_status(status: dict[str, Any] | None, *, installed: bool = T
         return "Memory: not running"
     if status.get("paused"):
         return "Memory: paused"
+    quiet = quiet_until(status)
+    if quiet is not None:
+        return f"Memory: watching · quiet until {quiet_label(quiet)}"
     captures = int(status.get("captures_today") or 0)
     facts = int(status.get("facts_today") or 0)
     return (
@@ -121,6 +174,8 @@ class MemoryControl(QObject):
 
     status_changed = Signal(object, object)
     knows_ready = Signal(object, object, str)
+    #: ``(to-do rows or None, meta line)`` for the "Today's list" panel.
+    today_ready = Signal(object, str)
     #: ``(event name, fields)``: UI log records from the worker threads, written
     #: on the GUI thread (the session file has one writer).
     _logged = Signal(str, object)
@@ -163,10 +218,16 @@ class MemoryControl(QObject):
     # -- status ------------------------------------------------------------
 
     def _read_status(self) -> tuple[dict[str, Any] | None, str | None]:
+        """``status()``, with ``nudge_status()`` under ``"nudges"`` when memory has it."""
         try:
             status, error = self.memory.status(), None
         except MemoryUnavailable as exc:
             status, error = None, str(exc)
+        if status is not None:
+            try:
+                status["nudges"] = self.memory.nudge_status()
+            except MemoryUnavailable:
+                pass  # an older memory, or a slow one: the line just leaves quiet out
         self.last_status, self.last_error = status, error
         return status, error
 
@@ -276,11 +337,32 @@ class MemoryControl(QObject):
 
         return self._background("fetch_knows", work)
 
+    def fetch_today(self) -> threading.Thread:
+        """Fetch the to-do list, done ones included; emits :attr:`today_ready`."""
+
+        def work() -> None:
+            try:
+                rows: list[dict[str, Any]] | None = self.memory.todos(include_done=True)
+                meta = ""
+            except MemoryUnavailable as exc:
+                rows, meta = None, f"To-do list unavailable: {exc}"
+            self._event("today_list", rows=None if rows is None else len(rows), error=meta or None)
+            self.today_ready.emit(rows, meta)
+
+        return self._background("fetch_today", work)
+
 
 class KnowsWindow(GlassWindow):
-    """A small read-only glass panel showing the portrait and the saved know-how."""
+    """A small read-only glass panel showing the portrait and the saved know-how.
 
-    def __init__(self) -> None:
+    Args:
+        title: The panel's heading.
+        size: ``(width, height)`` without the shadow margin.
+    """
+
+    def __init__(
+        self, *, title: str = "What Yuki knows", size: tuple[int, int] = (KNOWS_WIDTH, KNOWS_HEIGHT)
+    ) -> None:
         super().__init__(activates=True, radius=16)
         self.setObjectName("knows")
         margin = self.SHADOW + 18
@@ -289,7 +371,7 @@ class KnowsWindow(GlassWindow):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QLabel("What Yuki knows")
+        title = QLabel(title)
         title.setFont(ui_font(13, weight=QFont.Weight.DemiBold))
         title.setStyleSheet("color: rgba(238,240,245,255); background: transparent;")
         header.addWidget(title)
@@ -328,7 +410,7 @@ class KnowsWindow(GlassWindow):
             "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
         )
         layout.addWidget(self.body, 1)
-        self.resize(KNOWS_WIDTH + 2 * self.SHADOW, KNOWS_HEIGHT + 2 * self.SHADOW)
+        self.resize(size[0] + 2 * self.SHADOW, size[1] + 2 * self.SHADOW)
         self.show_loading()
 
     def focus_target(self) -> QTextBrowser:  # noqa: D102 - GlassWindow override
@@ -383,6 +465,123 @@ class KnowsWindow(GlassWindow):
         super().keyPressEvent(event)
 
 
+class TodayWindow(KnowsWindow):
+    """The read-only "Today's list" panel: due soon, open, and done today."""
+
+    def __init__(self) -> None:
+        super().__init__(title="Today's list", size=(TODAY_WIDTH, TODAY_HEIGHT))
+        self.setObjectName("today")
+
+    def show_loading(self) -> None:
+        """Placeholder while the list is being read."""
+        self.meta.setText("")
+        self.body.setHtml(_paragraphs("Reading the to-do list…", dim=True))
+
+    def show_today(
+        self, rows: list[dict[str, Any]] | None, meta: str = "", *, now: datetime | None = None
+    ) -> None:
+        """Fill the panel.
+
+        Args:
+            rows: ``todos(include_done=True)``; ``None`` when it could not be read.
+            meta: One dim line under the title.
+            now: The time the groups are worked out against.
+        """
+        now = now or datetime.now()
+        if rows is None:
+            self.meta.setText(meta)
+            self.body.setHtml(_paragraphs(meta or "The to-do list could not be read.", dim=True))
+            return
+        groups = today_groups(rows, now=now)
+        open_count = len(groups["due_soon"]) + len(groups["open"])
+        self.meta.setText(
+            meta
+            or f"{open_count} open · {len(groups['done_today'])} done today · {now.strftime('%a %d %b, %H:%M')}"
+        )
+        self.body.setHtml(today_html(groups, now=now))
+
+
+def today_groups(rows: list[dict[str, Any]], *, now: datetime) -> dict[str, list[dict[str, Any]]]:
+    """Sort to-do rows for the panel.
+
+    ``due_soon``: open, due within :data:`DUE_SOON` or overdue, soonest first.
+    ``open``: the other open ones, in memory's order. ``done_today``: done,
+    with ``done_at`` (else ``since``) today; a done row with neither readable
+    is kept, since memory chose to return it.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {"due_soon": [], "open": [], "done_today": []}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if todo_done(row):
+            when = local_moment(row.get("done_at")) or local_moment(row.get("since"))
+            if when is None or when.date() == now.date():
+                groups["done_today"].append(row)
+            continue
+        due = local_moment(row.get("due"))
+        if due is not None and due - now <= DUE_SOON:
+            groups["due_soon"].append(row)
+        else:
+            groups["open"].append(row)
+    groups["due_soon"].sort(key=lambda row: local_moment(row.get("due")) or now)
+    return groups
+
+
+def today_html(groups: dict[str, list[dict[str, Any]]], *, now: datetime) -> str:
+    """The panel's body: one section per non-empty group, each item with its source and evidence."""
+    sections = (("due_soon", "Due soon"), ("open", "Open"), ("done_today", "Done today"))
+    parts: list[str] = []
+    for key, heading in sections:
+        rows = groups.get(key) or []
+        if not rows:
+            continue
+        parts.append(
+            "<p style='color: rgba(126,180,255,255); margin-top: 12px; margin-bottom: 4px;'>"
+            f"{heading}</p>"
+        )
+        for row in rows:
+            parts.append(_todo_html(row, done=key == "done_today", now=now))
+    if not parts:
+        return _paragraphs(
+            "Nothing on the list. Open loops memory notices, things Yuki promises and "
+            "things you ask Yuki to add show up here.",
+            dim=True,
+        )
+    return "".join(parts)
+
+
+def _todo_html(row: dict[str, Any], *, done: bool, now: datetime) -> str:
+    """One to-do: its text, then a dim line of due / source / since, then its evidence."""
+    text = html.escape(" ".join(str(row.get("text") or "").split()))
+    colour = "rgba(238,240,245,150)" if done else "rgba(238,240,245,240)"
+    notes: list[str] = []
+    due = local_moment(row.get("due"))
+    if row.get("due") and not done:
+        overdue = due is not None and due < now
+        label = html.escape(f"{'overdue' if overdue else 'due'} {due_text(row.get('due'))}")
+        notes.append(f"<span style='color: rgba(255,190,110,230);'>{label}</span>" if overdue else label)
+    source = row.get("source")
+    if source:
+        notes.append(html.escape(TODO_SOURCES.get(str(source), str(source))))
+    since = _stamp(row.get("done_at") if done and row.get("done_at") else row.get("since"))
+    if since:
+        notes.append(html.escape(("done " if done else "since ") + since))
+    evidence = " ".join(str(row.get("evidence") or "").split())
+    if len(evidence) > 220:
+        evidence = evidence[:219].rstrip() + "…"
+    lines = [f"<div style='color: {colour}; margin-top: 8px;'>{'✓ ' if done else ''}{text}</div>"]
+    if notes:
+        lines.append(
+            "<div style='color: rgba(238,240,245,140); font-size: 9pt;'>" + " · ".join(notes) + "</div>"
+        )
+    if evidence:
+        lines.append(
+            "<div style='color: rgba(238,240,245,115); font-size: 9pt; font-style: italic;'>"
+            f"{html.escape(evidence)}</div>"
+        )
+    return "".join(lines)
+
+
 def _paragraphs(text: str, *, dim: bool = False) -> str:
     """Plain text as HTML paragraphs, line breaks kept, nothing interpreted."""
     colour = "rgba(238,240,245,150)" if dim else "rgba(238,240,245,235)"
@@ -397,6 +596,14 @@ def _paragraphs(text: str, *, dim: bool = False) -> str:
 
 def _stamp(value: Any) -> str:
     """``Tue 22 Sep, 21:14`` from epoch seconds, a datetime or an ISO string."""
+    moment = local_moment(value)
+    if moment is None:
+        return value.strip() if isinstance(value, str) else ""
+    return moment.strftime("%a %d %b, %H:%M")
+
+
+def local_moment(value: Any) -> datetime | None:
+    """A naive local datetime from epoch seconds, a datetime or an ISO string; else ``None``."""
     moment: datetime | None = None
     if isinstance(value, datetime):
         moment = value
@@ -404,14 +611,17 @@ def _stamp(value: Any) -> str:
         try:
             moment = datetime.fromtimestamp(float(value))
         except (OverflowError, OSError, ValueError):
-            return ""
+            return None
     elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
         try:
-            moment = datetime.fromisoformat(value.strip())
+            moment = datetime.fromisoformat(text)
         except ValueError:
-            return value.strip()
+            return None
     if moment is None:
-        return ""
+        return None
     if moment.tzinfo is not None:
         moment = moment.astimezone().replace(tzinfo=None)
-    return moment.strftime("%a %d %b, %H:%M")
+    return moment
