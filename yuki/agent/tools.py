@@ -11,10 +11,10 @@ They have no backend function: the dispatcher validates them and hands them back
 to :class:`yuki.agent.loop.Agent`, which owns pausing, finishing and the running
 summary.
 
-The four *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
-``activity``) have no backend function either: the agent runs them against
-Yuki's memory through :mod:`yuki.agent.memory`, and they are only listed when
-memory is installed.
+The six *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
+``remember_rule``, ``forget_rule``, ``activity``) have no backend function
+either: the agent runs them against Yuki's memory through
+:mod:`yuki.agent.memory`, and they are only listed when memory is installed.
 """
 
 from __future__ import annotations
@@ -42,7 +42,9 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
 #: Tools backed by Yuki's memory (:mod:`yuki.agent.memory`) rather than the
 #: desktop backend. Left out of the tool block entirely when the memory API is
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
-MEMORY_TOOLS: frozenset[str] = frozenset({"recall", "remember_how", "correct_memory", "activity"})
+MEMORY_TOOLS: frozenset[str] = frozenset(
+    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity"}
+)
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
 #: is dropped from the definitions sent to the model (see :func:`tool_params`)
@@ -419,9 +421,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Remembering",
         "description": (
             "Search the user's memory journal — dated facts about what they did, "
-            "watched, read, and who said what to them — for anything you need to "
-            "know about their past activity, people or plans. Returns the matching "
-            "facts as dated lines."
+            "watched, read, and who said what to them — and your past conversations "
+            "with them, for anything you need to know about their past activity, "
+            "people, plans or what the two of you discussed. Returns the matching "
+            "facts and exchanges as dated lines."
         ),
         "input_schema": _obj(
             {
@@ -474,6 +477,38 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
         "input_schema": _obj(
             {"text": {"type": "string", "description": "The correction, as the user meant it."}},
+            ["text"],
+        ),
+    },
+    {
+        "name": "remember_rule",
+        "label": "Noting that for good",
+        "description": (
+            "Save a standing instruction the user just gave you about how to talk to "
+            "them or behave (in their words), so it holds in every future conversation."
+        ),
+        "input_schema": _obj(
+            {
+                "text": {
+                    "type": "string",
+                    "description": "The instruction, in the user's own words.",
+                }
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "forget_rule",
+        "label": "Dropping that rule",
+        "description": "Drop a standing instruction the user has withdrawn.",
+        "input_schema": _obj(
+            {
+                "text": {
+                    "type": "string",
+                    "description": "The instruction they withdrew, as they put it or as "
+                    "the standing rules list it.",
+                }
+            },
             ["text"],
         ),
     },

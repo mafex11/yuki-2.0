@@ -148,7 +148,12 @@ class YukiUi(QObject):
         self.runtime.start()
         self.hotkeys.start()
         self.memory.ensure_service()
-        self.ui_log.event("start", hotkeys=self.bindings, model=self.settings.model)
+        self.ui_log.event(
+            "start",
+            hotkeys=self.bindings,
+            model=self.settings.model,
+            memory_session=getattr(self.runtime.memory, "session_id", None),
+        )
 
     def stop(self) -> None:
         """Shut everything down in the right order.
