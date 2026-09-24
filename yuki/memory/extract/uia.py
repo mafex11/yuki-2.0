@@ -34,7 +34,19 @@ The read, all on a worker thread with its own COM apartment, bounded by
    scrolled-away rows) are never visited.  Visibility is geometry (the
    element's rectangle against the window and every scrolling ancestor) plus
    ``IsOffscreen`` - except under a page that reports itself off-screen (the
-   covered Gecko window above), where only geometry counts.
+   covered Gecko window above), where only geometry counts.  Covering a
+   Chromium window does not make its rows report ``IsOffscreen`` (measured
+   2026-09-24 on covered WhatsApp and Discord windows: every row read; the few
+   in-view elements flagged off-screen were visually hidden labels and
+   layers); a *minimized* window has no on-screen rectangle, so there
+   ``IsOffscreen`` is all there is (the watcher reads only the foreground
+   window, never a minimized one).
+3. **Hidden labels** (``hidden_labels=True``, a profile's choice): an element
+   reporting ``IsOffscreen`` while wholly inside the visible area is a
+   screen-reader-only element - Chromium flags visually hidden text so, e.g.
+   WhatsApp's "<sender>:" bubble labels.  It is then kept as a leaf marked
+   ``sr_only`` (its subtree not read): anchors may use its name, text
+   extraction never does.
 
 Nothing here sends input, focuses, or changes anything: UIA property reads
 only.  Password fields' values are never kept.
@@ -301,7 +313,9 @@ class _Walk:
         honor_offscreen: bool,
         window_rects: list[Rect],
         raw: bool = False,
+        hidden_labels: bool = False,
     ) -> None:
+        self.hidden_labels = hidden_labels
         self.deadline = deadline
         self.cancel = cancel
         self.max_nodes = max_nodes
@@ -335,6 +349,16 @@ class _Walk:
 
     def _visible(self, node: Node, clip: Rect | None) -> bool:
         if self.honor_offscreen and node.offscreen:
+            # Wholly inside the visible area yet "off-screen": visually hidden
+            # (screen-reader-only), kept as a leaf when asked; else it is gone.
+            if (
+                self.hidden_labels
+                and node.bounds is not None
+                and clip is not None
+                and _inside(clip, node.bounds, slack=0)
+            ):
+                node.sr_only = True
+                return True
             return False
         if node.bounds is None or clip is None:
             return True  # no rectangle: structure only, its children decide
@@ -380,6 +404,8 @@ class _Walk:
             if not self._visible(node, clip) or not self._keep(node):
                 continue
             parent.children.append(node)
+            if node.sr_only:
+                continue
             inner = self._child_clip(node, clip)
             if self._whole(node, clip):
                 sub = self._fetch(child, self.subtree_req)
@@ -399,7 +425,8 @@ class _Walk:
             if not self._visible(node, clip) or not self._keep(node):
                 continue
             parent.children.append(node)
-            self._cached_children_of(child, node, self._child_clip(node, clip))
+            if not node.sr_only:
+                self._cached_children_of(child, node, self._child_clip(node, clip))
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +523,12 @@ def read_window(
     timeout_s: float = READ_TIMEOUT_S,
     max_nodes: int = MAX_NODES,
     text_pattern: bool = False,
+    hidden_labels: bool = False,
 ) -> Snapshot:
     """Structured, visible-only read of one window (never raises; see module docstring).
+
+    ``hidden_labels``: keep screen-reader-only labels as ``sr_only`` leaves
+    (module docstring, step 3).
 
     ``text_pattern``: also read the visible text of the largest element with a
     Text pattern (a terminal's buffer, an editor's document) and add it as a
@@ -524,7 +555,7 @@ def read_window(
         except Exception:
             pass
         try:
-            _read(hwnd, snap, shared, deadline, cancel, max_nodes, text_pattern)
+            _read(hwnd, snap, shared, deadline, cancel, max_nodes, text_pattern, hidden_labels)
         except BaseException as exc:  # noqa: BLE001 - reported in notes
             shared["error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -560,6 +591,7 @@ def _read(
     cancel: threading.Event,
     max_nodes: int,
     text_pattern: bool = False,
+    hidden_labels: bool = False,
 ) -> None:
     module, automation = _automation()
     handles = _tree._surface_handles(hwnd)
@@ -633,6 +665,7 @@ def _read(
                 # The page's own window is not a reason to read level by level.
                 window_rects=[r for r in window_rects if not (chosen.bounds and _inside(r, chosen.bounds))],
                 raw=raw,
+                hidden_labels=hidden_labels,
             )
 
         if chosen.offscreen:
@@ -671,6 +704,7 @@ def _read(
         viewport=viewport,
         honor_offscreen=True,
         window_rects=window_rects,
+        hidden_labels=hidden_labels,
     )
     shared["root"] = walk.run(live_root)
     snap.truncated = snap.truncated or walk.truncated

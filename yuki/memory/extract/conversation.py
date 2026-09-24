@@ -20,9 +20,11 @@ say, or no longer matches, is found from structure:
 * **body**: the row's remaining text, reaction bars, toolbars, buttons and
   images excluded.
 
-Only rows wholly inside the list's visible area are taken: a message cut by
-the edge of the viewport shows part of its text, and its fingerprint would
-differ from the whole message's next time.
+Only rows wholly inside their visible area are taken - the list's rectangle
+cut by every scrolling ancestor of the row, the list's own scroller included
+when it sits below an anchored list container: a message cut by the edge of
+the viewport shows part of its text, and its fingerprint would differ from the
+whole message's next time.
 """
 
 from __future__ import annotations
@@ -59,6 +61,10 @@ class ConversationResult:
     skipped_empty: int = 0
     body_chars: int = 0
     notes: list[str] = field(default_factory=list)
+    #: Senders as the rows themselves showed them (before any carry-over).
+    shown_senders: list[str] = field(default_factory=list)
+    #: The row each message came from (parallel to ``messages``).
+    rows: list[Node] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +183,20 @@ def _visible_clip(node: Node, viewport: tuple[int, int, int, int] | None) -> tup
                     min(rect[2], above.bounds[2]), min(rect[3], above.bounds[3]))
     if rect is not None and viewport is not None:
         rect = (max(rect[0], viewport[0]), max(rect[1], viewport[1]), min(rect[2], viewport[2]), min(rect[3], viewport[3]))
+    return rect
+
+
+def _row_clip(row: Node, list_node: Node, clip: tuple[int, int, int, int] | None) -> tuple[int, int, int, int] | None:
+    """``clip`` (the list's visible area) cut by the scrollers between the list
+    and the row: an anchored list may be a pane whose message scroller is
+    inside it, under a header bar."""
+    rect = clip
+    for above in row.ancestors():
+        if above is list_node:
+            break
+        if above.is_scrollable and above.bounds is not None:
+            b = above.bounds
+            rect = b if rect is None else (max(rect[0], b[0]), max(rect[1], b[1]), min(rect[2], b[2]), min(rect[3], b[3]))
     return rect
 
 
@@ -341,6 +361,9 @@ def extract_conversation(
     generic_sender = not (profile and profile.sender) or not any(
         query.first_tier(profile.sender, r) for r in rows
     )
+    if profile is not None and not profile.generic_sender:
+        generic_sender = False
+    by_parent = bool(profile and profile.sender_group == "parent")
     clip = _visible_clip(list_node, snap.viewport)
     exclude_paths = profile.exclude if profile else ()
     # The composer is never read as content (what the user is typing is not
@@ -350,6 +373,7 @@ def extract_conversation(
     day_label: str | None = None
     last_sender: str | None = None
     last_me = False
+    last_parent: Node | None = None
     used = set(result.used_anchors)
     for _, what, row in events:
         if what == "sep":
@@ -366,7 +390,7 @@ def extract_conversation(
         if not own_sep and row_text and timeparse.is_day_label(row_text, date_order=date_order):
             day_label = row_text
             continue
-        if not _wholly_visible(row, clip):
+        if not _wholly_visible(row, _row_clip(row, list_node, clip)):
             result.skipped_partial += 1
             continue
         message = _message(
@@ -381,13 +405,19 @@ def extract_conversation(
             # before it: a heading or banner row, not a message.
             result.skipped_empty += 1
             continue
+        if message.sender is not None:
+            result.shown_senders.append(message.sender)
+        if by_parent and row.parent is not last_parent:
+            last_sender, last_me = None, False  # a new sender run
         if message.sender is None and (profile is None or profile.sender_carries):
             message.sender = last_sender
             if last_sender is not None:
                 message.is_me = message.is_me or last_me
         if message.sender is not None:
             last_sender, last_me = message.sender, message.is_me
+        last_parent = row.parent
         result.messages.append(message)
+        result.rows.append(row)
         result.body_chars += len(message.text)
     result.used_anchors = [a for a in ("list", "row", "sender", "time", "body", "day_separator", "exclude", "me_row", "id") if a in used]
     return result
@@ -447,6 +477,8 @@ def _message(
     sender = clean(sender_node.text) if sender_node is not None else None
     if sender_node is not None:
         skip.add(id(sender_node))
+        if profile and profile.sender_strip:
+            sender = _strip_affixes(sender or "", profile.sender_strip) or None
 
     if sender_node is None and generic_sender:
         sender_node = _generic_sender(row, skip, time_node)
@@ -509,7 +541,7 @@ def _generic_sender(row: Node, skip: set[int], time_node: Node | None) -> Node |
     """
     first: Node | None = None
     for node in row.walk():
-        if node is row or id(node) in skip:
+        if node is row or id(node) in skip or node.sr_only:
             continue
         if any(id(a) in skip for a in node.ancestors() if row.contains(a)):
             continue
