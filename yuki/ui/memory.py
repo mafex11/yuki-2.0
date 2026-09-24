@@ -1,4 +1,4 @@
-"""The tray's memory controls: service auto-start, status line, pause, portrait and to-do panels.
+"""The tray's memory controls: service auto-start, status line, pause, portrait, to-do and weekly-review panels.
 
 Memory is a separate process (``yuki-memory``, docs/MEMORY.md) with its own
 lifetime: the tray starts it when it is not running, and leaves it running
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QTextBrowser, QToolButton, QV
 
 from yuki.agent.memory import (
     TODO_SOURCES,
+    TRAY_TIMEOUT_S,
     MemoryAccess,
     MemoryUnavailable,
     due_text,
@@ -45,6 +46,19 @@ KNOWS_HEIGHT = 600
 #: Size of the "Today's list" panel (without the shadow margin).
 TODAY_WIDTH = 480
 TODAY_HEIGHT = 520
+
+#: Size of the "This week's review" panel (without the shadow margin).
+REVIEW_WIDTH = 540
+REVIEW_HEIGHT = 640
+
+#: The review's parts in the panel, in order (``weekly_review()["sections"]`` keys).
+REVIEW_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("about", "The week"),
+    ("time", "How the time went"),
+    ("focus", "Focus and drift"),
+    ("done", "Done"),
+    ("still_open", "Still open"),
+)
 
 #: An open to-do due within this long (or overdue) is listed under "Due soon".
 DUE_SOON = timedelta(hours=24)
@@ -176,6 +190,8 @@ class MemoryControl(QObject):
     knows_ready = Signal(object, object, str)
     #: ``(to-do rows or None, meta line)`` for the "Today's list" panel.
     today_ready = Signal(object, str)
+    #: ``(weekly review dict or None, meta line)`` for the "This week's review" panel.
+    review_ready = Signal(object, str)
     #: ``(event name, fields)``: UI log records from the worker threads, written
     #: on the GUI thread (the session file has one writer).
     _logged = Signal(str, object)
@@ -351,6 +367,23 @@ class MemoryControl(QObject):
 
         return self._background("fetch_today", work)
 
+    def fetch_review(self) -> threading.Thread:
+        """Fetch the latest weekly review; emits :attr:`review_ready`."""
+
+        def work() -> None:
+            try:
+                review = self.memory.call_method("weekly_review", "latest", timeout_s=TRAY_TIMEOUT_S)
+                meta = ""
+            except MemoryUnavailable as exc:
+                review, meta = None, f"The weekly review is unavailable: {exc}"
+            if review is not None and not isinstance(review, dict):
+                review = None
+            self._event("review_panel", review_id=(review or {}).get("id"), week=(review or {}).get("week"),
+                        error=meta or None)
+            self.review_ready.emit(review, meta)
+
+        return self._background("fetch_review", work)
+
 
 class KnowsWindow(GlassWindow):
     """A small read-only glass panel showing the portrait and the saved know-how.
@@ -499,6 +532,75 @@ class TodayWindow(KnowsWindow):
             or f"{open_count} open · {len(groups['done_today'])} done today · {now.strftime('%a %d %b, %H:%M')}"
         )
         self.body.setHtml(today_html(groups, now=now))
+
+
+class ReviewWindow(KnowsWindow):
+    """The read-only "This week's review" panel: the latest weekly review and its key numbers."""
+
+    def __init__(self) -> None:
+        super().__init__(title="This week's review", size=(REVIEW_WIDTH, REVIEW_HEIGHT))
+        self.setObjectName("review")
+
+    def show_loading(self) -> None:
+        """Placeholder while the review is being read."""
+        self.meta.setText("")
+        self.body.setHtml(_paragraphs("Reading the weekly review…", dim=True))
+
+    def show_review(self, review: dict[str, Any] | None, meta: str = "") -> None:
+        """Fill the panel.
+
+        Args:
+            review: ``weekly_review("latest")``; ``None`` when there is none or it could not be read.
+            meta: An error line, when memory could not answer.
+        """
+        if review is None:
+            self.meta.setText(meta)
+            self.body.setHtml(_paragraphs(
+                meta or "No weekly review yet. Memory writes one on Sunday evening, at the first "
+                        "quiet moment after 20:00, from the last seven days.",
+                dim=True,
+            ))
+            return
+        self.meta.setText(review_meta(review))
+        self.body.setHtml(review_html(review))
+
+
+def review_meta(review: dict[str, Any]) -> str:
+    """``2026-W39 · Mon 14 Sep – Sun 20 Sep · written Sun 20 Sep, 20:12``."""
+    parts = [str(review.get("week") or "")]
+    start, end = local_moment(review.get("start")), local_moment(review.get("end"))
+    if start and end:
+        parts.append(f"{start.strftime('%a %d %b')} – {end.strftime('%a %d %b')}")
+    written = _stamp(review.get("written_at"))
+    if written:
+        parts.append(f"written {written}")
+    return " · ".join(p for p in parts if p)
+
+
+def review_html(review: dict[str, Any]) -> str:
+    """The panel's body: each part under its heading, the suggestions as a list, then the key numbers."""
+    heading = ("<p style='color: rgba(126,180,255,255); margin-top: 12px; margin-bottom: 4px;'>{}</p>")
+    sections = review.get("sections") if isinstance(review.get("sections"), dict) else {}
+    parts: list[str] = []
+    for key, title in REVIEW_SECTIONS:
+        body = " ".join(str(sections.get(key) or "").split())
+        if body:
+            parts.append(heading.format(html.escape(title)))
+            parts.append(f"<p style='color: rgba(238,240,245,235); margin-bottom: 6px;'>{html.escape(body)}</p>")
+    tips = [" ".join(str(t).split()) for t in sections.get("suggestions") or [] if str(t).strip()]
+    if tips:
+        parts.append(heading.format("Next week"))
+        parts.append("<ul style='margin-left: -18px;'>" + "".join(
+            f"<li style='color: rgba(238,240,245,235);'>{html.escape(t)}</li>" for t in tips) + "</ul>")
+    if not parts:   # an older row without parts: the text as written
+        parts.append(_paragraphs(str(review.get("text") or "")))
+    summary = [str(line) for line in review.get("summary") or [] if str(line).strip()]
+    if summary:
+        parts.append(heading.format("By the numbers"))
+        parts.append("".join(
+            f"<div style='color: rgba(238,240,245,150); font-size: 9pt; margin-top: 2px;'>{html.escape(line)}</div>"
+            for line in summary))
+    return "".join(parts)
 
 
 def today_groups(rows: list[dict[str, Any]], *, now: datetime) -> dict[str, list[dict[str, Any]]]:

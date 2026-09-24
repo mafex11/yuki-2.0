@@ -23,6 +23,9 @@ Flag files next to the database (written by Yuki through
   starts.
 * ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
   rebuilds the portrait now.
+* ``run_weekly_review`` - wakes the weekly-review scheduler (:mod:`yuki.memory.review`,
+  thread ``yuki-memory-review``), which deletes it and writes a review of the last
+  seven days now; the scheduled one runs Sunday evening (``[review]``).
 * ``acting.json`` - Yuki is acting on the desktop for the user
   (:mod:`yuki.memory.acting`). Read when Yuki sets the named event
   ``Local\\YukiMemoryActing-<db digest>`` (this process creates it), and at
@@ -47,6 +50,7 @@ Usage::
     uv run yuki-memory --no-terminal        # do not read Warp's command history
     uv run yuki-memory --no-conversations   # do not extract memory from Yuki's own conversations
     uv run yuki-memory --no-nudges          # no coach: no check-ins, no reminders
+    uv run yuki-memory --no-review          # no weekly review
 """
 
 from __future__ import annotations
@@ -221,6 +225,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                         help="do not extract memory from Yuki's own conversations (turns are still stored)")
     parser.add_argument("--no-nudges", action="store_true",
                         help="no coach: no check-ins and no reminders (to-dos are still kept)")
+    parser.add_argument("--no-review", action="store_true", help="no weekly review (scheduled or requested)")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -228,7 +233,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    from yuki.memory.store import PAUSE_FLAG, REFRESH_FLAG, Store, default_db_path, flag_path
+    from yuki.memory.store import PAUSE_FLAG, REFRESH_FLAG, REVIEW_FLAG, Store, default_db_path, flag_path
 
     db_path = Path(args.db) if args.db else default_db_path()
     mutex = _claim_mutex(db_path)
@@ -259,8 +264,11 @@ def run(args: argparse.Namespace) -> int:
     acting_event = None
     nudges = None
     nudges_thread: threading.Thread | None = None
+    review = None
+    review_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
+    review_path = flag_path(db_path, REVIEW_FLAG)
     store = None
     code = 0
     try:
@@ -279,6 +287,7 @@ def run(args: argparse.Namespace) -> int:
             terminal=not (args.no_journal or args.no_terminal),
             conversations=not (args.no_journal or args.no_conversations),
             nudges=not (args.no_journal or args.no_timeline or args.no_nudges),
+            review=not (args.no_journal or args.no_review),
             duration_s=args.duration,
         )
         try:
@@ -426,6 +435,22 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="nudges_start", error=f"{type(exc).__name__}: {exc}")
                 nudges = None
 
+        if not (args.no_journal or args.no_review):
+            try:
+                from yuki.memory.review import ReviewScheduler, ReviewWorker
+                from yuki.memory.watcher import session_locked, user_idle_s
+
+                review = ReviewScheduler(store, ReviewWorker(store, log=log), db_path=db_path, privacy=privacy,
+                                         log=log, idle_fn=user_idle_s, locked_fn=session_locked)
+                review_thread = threading.Thread(
+                    target=_guarded(review.run, log, "review"), args=(stop,), name="yuki-memory-review",
+                    daemon=True,
+                )
+                review_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="review_start", error=f"{type(exc).__name__}: {exc}")
+                review = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
@@ -459,6 +484,8 @@ def run(args: argparse.Namespace) -> int:
                 log("pause_flag", paused=paused)
             if portrait is not None and refresh_path.exists():
                 portrait.wake()
+            if review is not None and review_path.exists():
+                review.wake()
             if privacy.last_error != privacy_error:
                 privacy_error = privacy.last_error
                 log("privacy_config", error=privacy_error, reloads=privacy.reloads)
@@ -491,6 +518,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
         if portrait is not None:
             portrait.wake()
+        if review is not None:
+            review.wake()
         if episodes is not None:
             episodes.stop()
         if warp is not None:
@@ -519,6 +548,8 @@ def run(args: argparse.Namespace) -> int:
             episodes_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if portrait_thread is not None:
             portrait_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
+        if review_thread is not None:
+            review_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         totals = meter.reading(since_start=True)
         log("service_stop", **totals, watcher=watcher.stats() if watcher else None,
             timeline=timeline.stats() if timeline is not None else None, exit_code=code)

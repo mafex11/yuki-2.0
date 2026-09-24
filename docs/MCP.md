@@ -9,12 +9,13 @@ Every result starts with a `Covers:` line: the time range it covers, in the PC's
 | Tool | Arguments | Wraps | Returns |
 |---|---|---|---|
 | `get_portrait` | none | `portrait_text`, `status` | The portrait, when it was rendered, and whether the memory service is running or paused. |
-| `search_memory` | `query`, `since?`, `until?`, `app?`, `limit` (1-20, default 10) | `recall` | Dated lines, best match first, each tagged `fact`, `episode`, `chat` or `session`. Facts also show their app, site and importance. |
+| `search_memory` | `query`, `since?`, `until?`, `app?`, `limit` (1-20, default 10) | `recall` | Dated lines, best match first, each tagged `fact`, `episode`, `chat`, `session` or `review` (a weekly review, dated by its period). Facts also show their app, site and importance. |
 | `get_activity` | `since?`, `until?`, `group_by` (`site`, `app` or `page`; default `site`) | `activity` | Time use: totals, the top 15 activities, back-and-forth switching, background media and meetings. The default range is today. |
 | `get_episodes` | `since?`, `until?` | `episodes` | Episode narratives, oldest first. The default range is today. |
 | `get_knowhow` | `app?`, `query?` | `knowhow` | Procedures that worked on this PC, up to 15. |
 | `get_standing_rules` | none | `standing_context` | The user's rules and preferences in their own words, with dates, plus open commitments. |
 | `get_todos` | none | `todos` | Registered only when `MemoryClient` has a `todos()` method. It does not have one yet (2026-09-24), so the tool appears on its own once that method lands. Items can be strings or dicts, which it formats generically. |
+| `get_weekly_review` | `week?`: `latest` (the default), an ISO week such as `2026-W38` (the week of the review period's last day), or a date in that week | `weekly_review` | The weekly review as written: what the week was about, how the time went against the week before, focus and drift, what got done, what is still open, and suggestions. Then its key numbers, computed in code. The `Covers:` line gives the review period (days run 04:00-04:00) and when it was written. If there is no review for that week, it says so. It is registered only when `MemoryClient` has `weekly_review()`. |
 
 **Time arguments** (`yuki/mcp/times.py`, parsed in code). A time can be an ISO date (`2026-09-20`), an ISO date-time (`2026-09-20T14:00`, with or without an offset or `Z`), a time today (`14:00`), or a phrase: `now`, `today`, `yesterday`, `day before yesterday`, `this/last week` (calendar weeks starting Monday), `this/last month`, `this year`, `last|past N minutes|hours|days|weeks|months`, `N hours ago`, or a weekday (`monday`, `last friday`).
 
@@ -27,7 +28,7 @@ The rules for combining them:
 ## Instructions sent to the calling agent
 
 The server's `instructions` tell the calling agent five things:
-- This is Yuki's memory of the user of this PC: ambient capture of what was in the window in front, turned into dated facts, a timeline and episodes; the user's conversations with Yuki; a portrait rebuilt nightly; and know-how.
+- This is Yuki's memory of the user of this PC: ambient capture of what was in the window in front, turned into dated facts, a timeline and episodes; the user's conversations with Yuki; a portrait rebuilt nightly; know-how; and a weekly review written on Sunday evenings.
 - Dates matter. Facts are dated by when they happened, can go stale, and can be superseded by later ones. Times are local.
 - Memory is partial and lags behind.
 - It is private personal data, for the current request only.
@@ -96,3 +97,8 @@ Failure paths were also checked:
 - With a missing database, `get_portrait` and `search_memory` return `is_error` with the "not running or not installed" message in 3-6 ms, and no directory is created.
 - With `YUKI_MCP_DISABLED=1`, the server exits with code 1 and a message on stderr, and writes nothing to stdout.
 - `get_todos` was tested in process against a patched `MemoryClient.todos`: it registers and formats the items.
+
+`get_weekly_review` was checked in process with `build_server(...).call_tool` on 2026-09-24, against a temp database holding one synthetic review (see docs/MEMORY.md, "Weekly review"):
+- The tool is listed after `get_todos`.
+- With no argument, and with `week="2026-W38"`, it returns the `Covers:` line, the review text and the key numbers.
+- With `week="2026-W30"`, it says there is no weekly review for that week.

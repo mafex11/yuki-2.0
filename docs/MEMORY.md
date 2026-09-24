@@ -15,7 +15,7 @@ All rules in `docs/ARCHITECTURE.md` apply (no behaviour heuristics, no fixed sle
 
 ## Processes
 
-- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker, the conversation worker (Yuki's own exchanges, see "Conversation memory"), the coach (check-ins and reminders, see "Nudges and to-dos") and the portrait worker. A crash here must never take Yuki down.
+- `yuki-memory`: a separate background process (started by the tray app; its own entry point) that runs the watcher, the journal worker, the conversation worker (Yuki's own exchanges, see "Conversation memory"), the coach (check-ins and reminders, see "Nudges and to-dos"), the weekly review (see "Weekly review") and the portrait worker. A crash here must never take Yuki down.
 - Yuki (the agent) reads memory directly from the store (same machine) through tools; no network hop. An MCP server for other agents comes later.
 
 ## Watcher (capture)
@@ -63,7 +63,7 @@ The timeline (`yuki/memory/timeline.py`: foreground stretches with app, page, pr
 ## Store
 
 - One SQLite database under `%LOCALAPPDATA%\Yuki\memory\memory.db` (WAL mode). Content columns encrypted with a key protected by Windows DPAPI (`CryptProtectData`, current user). Metadata (timestamps, app, URL host) cleartext for filtering.
-- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive). Migration 6 (additive) adds conversation memory: `conversation_turns`, `conversation_facts`, `session_summaries`, `conversation_batches` and the vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec` (see "Conversation memory"). Migration 7 (additive) adds the `by_yuki` marks; migration 8 (additive) adds the coach's `todos`, `nudges`, `nudge_checkins` and `nudge_state` (see "Nudges and to-dos").
+- Tables (shape borrowed from MaxMi): `threads(id, app, title, url, scope, kind, messages_seen_at, first_seen, last_seen)`, `captures(id, thread_id, at, trigger, kind, profile, delta_ciphertext, chars, hash)`, `messages(thread_id, capture_id, fingerprint, content_key, sender_ciphertext, is_me, time_label, at, text_ciphertext, first_seen, status new|history|reread, journaled)` unique on (thread_id, fingerprint) - fingerprints and content keys stored as keyed HMACs; past the 30-day TTL a message keeps only its fingerprint -, `me_names(name_key, app, name_ciphertext, first_seen, last_seen)`, `journal(id, at, thread_id, app, fact_ciphertext, importance)`, `journal_vec` (local embeddings). Search = vector similarity + metadata filters (time, app, URL host); keyword queries decrypt the journal rows inside the requested time window and match in memory (the journal is small — facts, not raw text). No plaintext full-text index. `portrait_facts(id, kind, subject, text_ciphertext, valid_from, valid_to, source_ids, confidence)`, `knowhow(id, app, task_kind, text_ciphertext, valid_from, valid_to, source_request)`, `open_loops(id, person, text_ciphertext, status, opened_at, resolved_at)`, `health(...)`, `timeline(..., fullscreen, meeting, mic_s)` and `source_checkpoints(name, value, updated_at)` (migration 5, additive). Migration 6 (additive) adds conversation memory: `conversation_turns`, `conversation_facts`, `session_summaries`, `conversation_batches` and the vector tables `conversation_turn_vec`, `session_summary_vec`, `conversation_fact_vec` (see "Conversation memory"). Migration 7 (additive) adds the `by_yuki` marks; migration 8 (additive) adds the coach's `todos`, `nudges`, `nudge_checkins` and `nudge_state` (see "Nudges and to-dos"); migration 9 (additive) adds `weekly_reviews` and `weekly_review_vec` (see "Weekly review").
 - **Local embeddings** (no cloud): a small CPU embedding model (e.g. `fastembed` + bge-small ONNX) — measure speed/size.
 - Facts are never hard-deleted; contradicted facts get `valid_to` set.
 
@@ -76,6 +76,7 @@ The timeline (`yuki/memory/timeline.py`: foreground stretches with app, page, pr
 ## Portrait worker
 
 - Nightly (first idle moment after a configurable hour) and weekly: read the day's/week's journal (by id checkpoint, so facts dated weeks back by their messages are still consumed) plus current portrait facts, told who the user is; the model returns ADD / UPDATE (supersede) / INVALIDATE / NOOP operations per fact (Mem0 pattern), each citing journal ids. Apply bi-temporally.
+- The first run after a weekly review (normally the Sunday 22:00 weekly run, two hours after the review) also gets the review's behaviour-pattern candidates as REVIEW CANDIDATES, with the episodes they cite added to its EPISODES. They are proposals: the run decides on them under its own validation and confidence rules, and the review is then marked as given to that run (`weekly_reviews.candidates_run_id`). The review itself never writes portrait facts.
 - Render a one-page portrait text (hard cap ~1500 tokens) cached for Yuki.
 
 ## Conversation memory
@@ -133,7 +134,7 @@ Logs: `logs/memory/conversations-YYYYMMDD.jsonl`, with usage, cost, latency and 
 
 ## Nudges and to-dos
 
-The coach (`yuki/memory/nudges.py`, thread `yuki-memory-nudges`) looks at what the user is doing **right now**, set against what they did before, and writes short messages for the UI. There are three kinds: `praise` (encouragement or an acknowledgement), `nudge` (a call-back, a call-out or a break suggestion) and `reminder` (an item that is due). Code decides only *when to look*: presence, gates, budget and rate, all plumbing. *What to say, if anything,* is Haiku's call, through a forced strict `coach_decision` call with `reason`, `say` (none, praise or nudge), `text` (null for none) and `mentions` (the to-do ids the text names).
+The coach (`yuki/memory/nudges.py`, thread `yuki-memory-nudges`) looks at what the user is doing **right now**, set against what they did before, and writes short messages for the UI. There are three kinds: `praise` (encouragement or an acknowledgement), `nudge` (a call-back, a call-out or a break suggestion) and `reminder` (an item that is due). A fourth kind, `review`, is not the coach's: it is the teaser of a new weekly review (see "Weekly review"), delivered through the same table and event. Code decides only *when to look*: presence, gates, budget and rate, all plumbing. *What to say, if anything,* is Haiku's call, through a forced strict `coach_decision` call with `reason`, `say` (none, praise or nudge), `text` (null for none) and `mentions` (the to-do ids the text names).
 
 **When it looks.** Every 15 s (`tick_s`) the worker reads the timeline. It uses the user's rows only: `by_yuki` stretches are left out.
 - *transition*: the site or app in front changed (`timeline.group_of`, site grouping) and the new activity has held for `transition_hold_s` (90 s), so a flicker never counts. Coming back after a break of `break_min` (5 min) or more is also a transition. Transitions go first: a periodic look waits while a new activity is still being held.
@@ -237,10 +238,87 @@ Known limits:
 - Haiku's wording varies from run to run. It usually uses the nickname, but not always, and a call-back is sometimes less specific than "the memory tests in Warp".
 - The first stretch of the day follows hours with nothing recorded, and the model can read that as a return from a break.
 
+## Weekly review
+
+Once a week, and when the user asks, memory looks back over the last seven days: what the week was about, how the time went against the week before, focus and drift, what got done, what is still open, and one or two suggestions for next week. Code: `yuki/memory/review.py` (thread `yuki-memory-review`), `yuki/memory/store.py` (migration 9), `yuki/memory/api.py`.
+
+**The numbers, in code** (`week_numbers`). Code computes every number. The model only reads them.
+- *The period.* Seven review days, each from 04:00 to 04:00 local time, so a late night counts with the evening it belongs to. The last day runs until now. The seven days before it are the comparison.
+- *Per day:* time at the PC (active = with input; watching = no input while the app in front played media), away time, meetings (hours only), full-screen time (games, full-screen videos), switches per active hour, the longest uninterrupted stretch, when the day at the PC started and ended, and the top five sites or apps.
+- *For the period:* time per site or app with its split by day (top 12), the six longest stretches (meetings left out), back-and-forth pairs, meetings as spans with microphone time, and full-screen time by app or site and day.
+- *Around the time use:* to-dos opened, completed and overdue (user to-dos, commitments and open loops, with ids), open-loop expiries, the open list now, nudges by kind with the user's reactions, and conversation sessions with Yuki (a session's exchanges split at 30 idle minutes).
+- *Left out:* Yuki's own stretches (`by_yuki`) are not the user's time. Only their total is given, as a note.
+- *The change* against the previous week (`compare`): hours at the PC, active, watching, meetings, full screen, switches per active hour, days at the PC, average start and end, and every top site or app that moved by 10 minutes or more. It is computed and given to the model as text, so the model never does the arithmetic.
+
+**The narrative** (Claude Sonnet 5 on Bedrock, adaptive thinking, effort medium; one `save_weekly_review` call).
+- *Input,* fenced as untrusted data with a per-request nonce: the numbers; the week's episodes (at most 60 and 24,000 characters, newest kept); the journal's most important facts (highest importance first, up to 8,000 characters, shown oldest first; no `by_yuki` facts); the portrait's work, behaviour, interest, person, routine and preference facts with their ids; and the user's standing rules in their own words.
+- *Output:* the parts `about`, `time`, `focus`, `done`, `still_open`, `suggestion_1`, `suggestion_2` (may be empty), a `teaser` for the card, `mentions` (the to-do ids the text names) and `behaviour_candidates`.
+- *The prompt's rules:* evidence only, and every number as given; never a character label; never a guess at a meeting's people or topic, or at what was played in full screen; pending items only from TO-DOS; the user's register and rules (nickname, tone); about 250 words.
+- *Strict.* `strict` is sent. Bedrock refused it for Sonnet 5 again on 2026-09-24 (`tools.0.custom.strict: Extra inputs are not permitted`), so it is dropped for the rest of the process after the first 400 (about 4 s, no cost). Every field is then checked in code.
+- *Suggestions* are two string fields, not an array. Without strict, Sonnet sent the array as one string in 2 of 2 runs.
+
+**Validation, in code.**
+- Every part must be a non-empty string, with at least one suggestion.
+- `mentions` must name only ids on the to-do list. A wrong type or an unknown id gets one corrective round (a `tool_result` with `is_error`). If the second answer is still wrong, the run fails and is retried 30 minutes later.
+- A candidate must cite at least one episode that was in the request. Its `fact_id` must be null or a current behaviour fact. There are at most four.
+- A candidate whose cited episodes all fall on one day has its confidence capped at 0.3, the portrait's own rule. The model's figure is kept as `confidence_asked`.
+
+**Storage** (migration 9, additive).
+- `weekly_reviews(id, at, finished_at, week, period_start, period_end, trigger scheduled|demand, model, text, sections, teaser, numbers, candidates, candidates_run_id, nudge_id, calls, tokens, cost_usd, latency_ms, stop_reason, outcome running|ok|empty|error, error)`.
+- The text, sections, teaser, numbers and candidates are encrypted. The accounting is in the clear.
+- `week` is the ISO week of the period's last day (`2026-W38`).
+- `weekly_review_vec` holds the review's local embedding, for recall.
+- A week with under 30 minutes at the PC is stored as `empty`, and no model is called.
+- The cost counts toward `memory_cost_today_usd`.
+
+**When it runs** (`ReviewScheduler`).
+- *The slot:* by default Sunday 20:00, from `[review]` in the privacy file (`weekday`, `at`). The review runs at the first moment after the slot that the user has been idle for `idle_min` (5 min).
+- *Missed slots:* a slot missed while the service was down runs at its next start, but only within `catch_up_h` (36 h) of the slot.
+- *On demand:* `MemoryClient.run_weekly_review()` writes the `run_weekly_review` flag file. The service wakes, deletes the flag and runs at once, even while memory is paused.
+- *Pause:* while memory is paused, no scheduled run starts.
+- *Retries:* a failed run is retried after `retry_min` (30 min).
+- *Order:* the review runs before the 22:00 weekly portrait run, which takes up its candidates.
+
+**Delivery.** The teaser becomes a nudge of kind `review`. It carries `ref` = `review:<id>` and a reason that says where the full text is. It is written through `Store.record_checkin` with a model-less check-in (trigger `review`, left out of the coach's rate, look and budget counts), and then `Local\YukiNudgeReady` is set.
+- *When:* the user must be present (input within `present_s`, 120 s) and the session unlocked, within `deliver_within_h` (72 h). So a review written while the user was idle waits for them to come back.
+- *Extra gates for a scheduled review:* memory's pause, the coach's quiet hours and snooze, and `[nudges] enabled`. A review the user asked for skips these.
+- *Expiry:* `pending_nudges()` never expires a review, as with reminders.
+- *In the UI:* the card's Reply opens the overlay as for any nudge, with the teaser and reason as context.
+
+**API and surfaces.**
+- `MemoryClient.weekly_review(which="latest")`: `which` is `"latest"`, an ISO week (`"2026-W38"`) or a date in that week. It returns `{id, week, trigger, start, end, written_at, text, sections, teaser, summary (a few computed lines of key numbers), numbers, candidates, candidates_given_to_run, nudge_id, model, cost_usd}`, or `None`.
+- `MemoryClient.run_weekly_review()`.
+- `recall` returns `kind: "review"` hits, dated by the review period. They are left out when `app` is given.
+- The tray item "This week's review" opens a read-only glass panel in the style of Today's list. It shows the parts under headings, the suggestions, and "By the numbers".
+- The MCP tool `get_weekly_review(week?)`.
+- `yuki-memory --no-review` turns it off.
+
+**Logs:** `logs/memory/review-YYYYMMDD.jsonl` records usage, cost, latency, whether strict was used, and the stop reason in the clear, and the request and response encrypted. The service log gets content-free `review_run`, `review_delivered` and `review_missed` lines.
+
+**Measured 2026-09-24** (temp database, synthetic two weeks, Sonnet 5 list prices). The synthetic week had a heavy-focus Monday (1h50 unbroken in VS Code, a meeting), a drift-heavy Wednesday (48 switches, 20.2 per active hour, 2h49 of Instagram reels, a meeting), a meeting on Thursday, a short Friday, weekend VALORANT in full screen (5h10, until 01:10 counted with Saturday), to-dos opened and closed (one overdue), and nudges dismissed and replied. The previous week was lighter.
+
+| Call | Tokens (in / out) | Latency | Cost |
+|---|---|---|---|
+| Review, one call | 11.5k / 2.1k | 24 s | $0.044 |
+| Review with one corrective round (before the two-field fix) | 25.3k / 3.8k | 39 s | $0.088 |
+| Weekly portrait run taking the 2 candidates (ops + render) | 13.0k / 4.2k | - | $0.069 |
+
+What the run produced:
+- The review cited the real figures: 31h54 at the PC against 13h27 (+137%), watching 7h04 against 1h24, 5h10 of VALORANT, and Wednesday's 48 switches.
+- It named only listed to-dos. The overdue Q3 deck came first.
+- It proposed two candidates. One refined the existing behaviour fact F6; its asked confidence of 0.35 was capped to 0.3, since its episode fell on one day. The other was new, at 0.3.
+- The teaser: "31h54m at the PC this week (nearly 3x last week) and Vinay's deck is still overdue, boss."
+- The weekly portrait run then updated F6, citing episodes from four days at 0.4, and added the morning-stretch pattern at 0.3. The candidates were marked as given to that run.
+
+Known limits:
+- Small wording slips: "tripled" for 3.4x, and "afternoon block" for one that began at 10:35.
+- The portrait's candidate uptake is the model's call.
+- The card's title for `review` comes from the UI (`yuki/ui/nudges.py`). It shows "Yuki" until that module names the kind.
+
 ## Yuki integration
 
 - The current portrait text + relevant know-how are attached to every request as labelled context ("[What Yuki knows about the user, from memory]"); after it (outside the cached prefix) `standing_context()`, and at the start of a new session `resume_context()`. Every exchange goes to `log_turn(...)`.
-- Tools: `recall(query, since?, until?, app?, person?)` → journal facts, episodes, past chats and sessions; `remember_how(app, text)` → know-how write after a success; `update_portrait(text)` → a user-confirmed correction; `remember_rule(text)` / `revoke_rule(text)` → a standing rule the user just gave or withdrew, applied at once.
+- Tools: `recall(query, since?, until?, app?, person?)` → journal facts, episodes, past chats and sessions, weekly reviews; `remember_how(app, text)` → know-how write after a success; `update_portrait(text)` → a user-confirmed correction; `remember_rule(text)` / `revoke_rule(text)` → a standing rule the user just gave or withdrew, applied at once.
 - When a choice is driven by the portrait, Yuki says why in its reply.
 
 ## Build phases

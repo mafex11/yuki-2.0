@@ -264,3 +264,22 @@ deliver_within_min = 15
 reminder_late_max_h = 24
 # A to-do due on a day without a time is reminded at this time that day.
 all_day_at = "09:00"
+
+[review]
+# The weekly review (yuki.memory.review): the last seven days in numbers and a
+# short narrative, written once a week and delivered as a "review" card.  (Not
+# privacy rules either; a missing key keeps its default.)
+enabled = true
+# The weekly slot: the review runs at the first moment after it that you have
+# been idle for idle_min minutes (or when memory next starts, if it was not running).
+weekday = "sunday"
+at = "20:00"
+idle_min = 5
+# A slot missed while memory was not running is caught up only this many hours late at most.
+catch_up_h = 36
+# The card waits until you are at the PC (input within present_s seconds),
+# outside the [nudges] quiet hours and snooze, for at most deliver_within_h hours.
+present_s = 120
+deliver_within_h = 72
+# A failed run is retried no sooner than this many minutes later.
+retry_min = 30
