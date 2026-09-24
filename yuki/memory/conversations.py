@@ -293,7 +293,9 @@ Write 2-4 sentences, in the past tense and the third person: what the user wante
 Yuki did (and whether it worked), anything decided or left open (what Yuki is to do later, \
 what the user said they would do; an offer of Yuki's that the user did not take up is not \
 left open, so leave it out), and any rule the user set about how Yuki should talk or \
-behave, in their words. Name the specifics - apps, sites, songs, files, people, times - and \
+behave, in their words. Keep who said what: something Yuki claimed is Yuki's claim, never \
+something the user reported, and when the user contradicted or corrected Yuki, their version \
+is what happened. Name the specifics - apps, sites, songs, files, people, times - and \
 turn relative dates into absolute ones by reading the CALENDAR. No preamble, no opinions, \
 nothing the exchanges do not show. EARLIER IN THIS SESSION, when given, is only context.
 

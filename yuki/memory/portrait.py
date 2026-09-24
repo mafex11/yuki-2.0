@@ -396,7 +396,9 @@ personality. When the data lists no rules or preferences, say nothing about rule
 never that none are recorded - since Yuki gets the user's rules separately. The nudge reaction \
 counts may support one \
 plain observation about how the user takes Yuki's check-ins ("usually dismisses nudges back to \
-work, replies to praise"), only when the counts clearly show it; they are never a rule. Yuki \
+work, replies to praise"), only when the counts clearly show it; they are never a rule. A \
+nudge that was only shown was not engaged with - shown is not a reaction - and an observation \
+never contradicts what the user said they want. Yuki \
 also gets the rules separately before every request, so keep this section short. The RELATIONSHIP DATA feeds this section \
 only: every other section (Work, Interests, Behaviour, Preferences...) is written from the \
 FACTS alone, even when a session summary mentions the same app or topic - what reaches the \
