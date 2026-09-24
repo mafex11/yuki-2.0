@@ -9,6 +9,7 @@ dependencies = [
     "comtypes>=1.4.17",
     "cryptography>=50.0.1",
     "fastembed>=0.8.1",
+    "mcp>=2.2.0",
     "numpy>=2.5.3",
     "pillow>=12.3.0",
     "psutil>=7.2.2",
@@ -31,6 +32,7 @@ dev = [
 yuki = "yuki.cli:main"
 yuki-ui = "yuki.ui.app:main"
 yuki-memory = "yuki.memory.service:main"
+yuki-mcp = "yuki.mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.9.9,<0.10.0"]
