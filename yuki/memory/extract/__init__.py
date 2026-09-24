@@ -262,7 +262,7 @@ def extract_snapshot(
             rows = query.first_tier(profile.list_rows, snap.root)
             if rows:
                 out = base("list", profile.name)
-                lines = [clean(join(pieces(r, drop_actions=True))).replace("\n", " · ") for r in rows]
+                lines = [_list_line(r, now) for r in rows]
                 out.body = "\n".join(line for line in lines if line)
                 out.dropped_chars = max(total_chars - len(out.body), 0)
                 out.thread_scope = snap.url or out.thread_scope
@@ -280,7 +280,7 @@ def extract_snapshot(
 
     # -- terminal / document / list profiles ------------------------------------
     if profile and profile.kind in ("terminal", "document", "list"):
-        out = _main_text(snap, profile, base, total_chars)
+        out = _main_text(snap, profile, base, total_chars, now)
         if out is not None:
             return out
         if profile.kind == "terminal":
@@ -346,7 +346,48 @@ def _fill_conversation(out: Extraction, conv, total_chars: int) -> None:
         out.notes.append(f"{conv.skipped_empty} row(s) without message text")
 
 
-def _main_text(snap: Snapshot, profile: Profile, base, total_chars: int) -> Extraction | None:
+#: Prefix of a list row that shows its own date (an email's, a file's modified
+#: time), in the row's own terms resolved against the capture time: the journal
+#: dates a fact from the row by it (yuki.memory.journal.list_row reads it back).
+ROW_DATE_FORMAT = "[dated {}] "
+
+
+def _row_date(parts: list, now: float) -> str:
+    """The date a list row shows ("Sep 9", "23-09-2026 17:35", "3:26 PM"), as
+    ``YYYY-MM-DD[ HH:MM]``, or "" - the rightmost piece (or its tooltip) that is
+    a time label and nothing else; a label that names no day and no clock is
+    not a date."""
+    import datetime as _dt
+
+    for piece in reversed(parts):
+        node = getattr(piece, "node", None)
+        text = piece.text or ""
+        # A labelled cell reads "<column>: <value>" ("Date modified: 9/23/2026 5:35 PM").
+        labelled = text.split(": ", 1)[1] if ": " in text else ""
+        for label in (getattr(node, "help", "") or "", text, labelled):
+            label = clean(label)
+            if not label or not timeparse.is_time_label(label, max_len=60):
+                continue
+            parsed = timeparse.parse(label)
+            at = timeparse.resolve(label, now=now) if parsed is not None else None
+            if at is None or parsed is None or not (parsed.has_day or parsed.has_time or parsed.kind == "ago"):
+                continue
+            moment = _dt.datetime.fromtimestamp(at)
+            return moment.strftime("%Y-%m-%d %H:%M" if (parsed.has_time or parsed.kind == "ago") else "%Y-%m-%d")
+    return ""
+
+
+def _list_line(row: Node, now: float, *, include_root: bool = False) -> str:
+    """One list row as one line, prefixed with the row's own date when it shows one."""
+    parts = pieces(row, drop_actions=True, include_root=include_root)
+    line = clean(join(parts)).replace("\n", " · ")
+    if not line:
+        return ""
+    date = _row_date(parts, now)
+    return ROW_DATE_FORMAT.format(date) + line if date else line
+
+
+def _main_text(snap: Snapshot, profile: Profile, base, total_chars: int, now: float | None = None) -> Extraction | None:
     root = snap.root
     assert root is not None
     tp = [n for n in root.walk() if n.class_name == "yuki:text-pattern"]
@@ -356,7 +397,7 @@ def _main_text(snap: Snapshot, profile: Profile, base, total_chars: int) -> Extr
     region = max(found, key=lambda n: n.width() * n.height())
     if profile.kind == "list":
         rows = [c for c in region.walk() if c.role in ("ListItem", "DataItem", "TreeItem")] or region.children
-        lines = [clean(join(pieces(r, drop_actions=True, include_root=True))).replace("\n", " · ") for r in rows]
+        lines = [_list_line(r, now if now is not None else _time.time(), include_root=True) for r in rows]
         body = "\n".join(line for line in lines if line)
     elif region.role in ("Edit", "Document") and region.value and not snap.url:
         body = region.value

@@ -41,6 +41,7 @@ from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.memory import MemoryAccess, default_memory, memory_block_text
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
+    ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
     MEMORY_TOOLS,
@@ -238,6 +239,9 @@ class Agent:
         #: One line per thing done this request, for memory's turn log and
         #: the request's collapsed form.
         self._actions: list[str] = []
+        #: Token of the "Yuki is acting" marker published for this request
+        #: (from its first action tool until the request ends), else None.
+        self._acting_token: str | None = None
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None``
         #: while one is running). Read by the UI to label the finished card.
@@ -540,6 +544,7 @@ class Agent:
         finally:
             if drive is not None:
                 drive.close()
+            self._acting_done()
             self.logger.usage_total()
             self._summarize(
                 request, outcome=outcome, started_at=started_at, model=model, effort=effort
@@ -717,6 +722,34 @@ class Agent:
                 self._portrait_sent = None
         except Exception as exc:  # housekeeping must never break a request
             self.logger.error(f"context compaction failed: {type(exc).__name__}: {exc}", exc=exc)
+
+    def _acting_start(self) -> None:
+        """Before the request's first action on the desktop: tell memory that what
+        appears on screen from now until the request ends is Yuki's doing, at
+        the user's request (:meth:`MemoryAccess.acting_begin`). Plumbing: it
+        changes nothing about what the agent does; never raises."""
+        if self._acting_token is not None:
+            return
+        token = f"{self.lane}-{self.logger.session_id}-{self._requests}"
+        try:
+            begin = getattr(self.memory, "acting_begin", None)
+            published = bool(begin(token, self._request_text or "", lane=self.lane)) if callable(begin) else False
+        except Exception:
+            published = False
+        self._acting_token = token
+        self.logger.log("memory_acting", state="begin", token=token, published=published)
+
+    def _acting_done(self) -> None:
+        """The request ended: withdraw the marker, if one was published. Never raises."""
+        token, self._acting_token = self._acting_token, None
+        if token is None:
+            return
+        try:
+            end = getattr(self.memory, "acting_end", None)
+            withdrawn = bool(end(token)) if callable(end) else False
+        except Exception:
+            withdrawn = False
+        self.logger.log("memory_acting", state="end", token=token, withdrawn=withdrawn)
 
     def _note_action(self, name: str, ok: bool, summary: str) -> None:
         """Add one line to this request's actions (not for looks, done or the note)."""
@@ -939,6 +972,8 @@ class Agent:
             turn.stop_after = True
             return
 
+        if name in ACTION_TOOL_NAMES:
+            self._acting_start()
         dispatched = time.perf_counter()
         if early:
             turn.early += 1

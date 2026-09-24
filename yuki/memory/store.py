@@ -298,6 +298,10 @@ class PendingCapture:
     #: Extraction kind ("conversation", "email", "page", ...); None for pre-extraction captures.
     kind: str | None = None
     profile: str | None = None
+    #: Captured while Yuki was acting on the desktop for the user (yuki.memory.acting),
+    #: and the request it was carrying out.
+    by_yuki: bool = False
+    yuki_request: str | None = None
 
 
 @dataclass
@@ -342,6 +346,8 @@ class JournalEntry:
     importance: int
     batch_id: int | None
     score: float | None = None      # cosine similarity, set by search_journal
+    #: Drawn from what Yuki itself put on screen at the user's request (not the user's own activity).
+    by_yuki: bool = False
 
 
 @dataclass
@@ -356,6 +362,7 @@ class NewFact:
     importance: int
     vector: np.ndarray | None = None
     embed_model: str | None = None
+    by_yuki: bool = False
 
 
 @dataclass
@@ -542,6 +549,11 @@ class TimelineRow:
     fullscreen: bool = False
     meeting: str | None = None
     mic_s: float = 0.0
+    #: Yuki was acting on the desktop for the user during this stretch
+    #: (yuki.memory.acting): the window in front was Yuki's doing, at the
+    #: user's request ``yuki_request``, not the user's own activity.
+    by_yuki: bool = False
+    yuki_request: str | None = None
 
 
 @dataclass
@@ -1149,6 +1161,18 @@ MIGRATIONS: tuple[str, ...] = (
         vec_ciphertext  BLOB NOT NULL
     );
     """,
+    # 7: Yuki's own actions (yuki.memory.acting). Captures and timeline
+    # stretches made while Yuki was carrying out a request with its hands are
+    # marked by_yuki, with the request's text; journal facts drawn from them
+    # carry the mark, so the portrait never takes them for the user's own
+    # activity. Additive only, like 2-6.
+    """
+    ALTER TABLE captures ADD COLUMN by_yuki INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE captures ADD COLUMN yuki_request_ciphertext TEXT;
+    ALTER TABLE timeline ADD COLUMN by_yuki INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE timeline ADD COLUMN yuki_request_ciphertext TEXT;
+    ALTER TABLE journal ADD COLUMN by_yuki INTEGER NOT NULL DEFAULT 0;
+    """,
 )
 
 
@@ -1387,11 +1411,14 @@ class Store:
 
     def add_capture(
         self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str,
-        *, kind: str | None = None, profile: str | None = None,
+        *, kind: str | None = None, profile: str | None = None, by_yuki: bool = False,
+        yuki_request: str | None = None,
     ) -> int | None:
         """Store one capture's delta; see the module docstring for the dedup rules.
 
         ``kind``/``profile``: the extraction that produced the text (cleartext metadata).
+        ``by_yuki``/``yuki_request``: captured while Yuki was acting for the user
+        (:mod:`yuki.memory.acting`), and the request it was carrying out.
         """
         full_text = full_text or ""
         delta_text = delta_text or ""
@@ -1419,10 +1446,10 @@ class Store:
             if dup:
                 return None
             cur = conn.execute(
-                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile,"
+                " by_yuki, yuki_request_ciphertext) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (thread_id, at, trigger or "", self.cipher.encrypt(delta_text), len(delta_text), delta_hash,
-                 kind, profile),
+                 kind, profile, int(bool(by_yuki)), self._enc(yuki_request) if by_yuki and yuki_request else None),
             )
             return int(cur.lastrowid)
 
@@ -1466,6 +1493,8 @@ class Store:
         profile: str | None = None,
         first_visit_new_s: float = 300.0,
         label_tolerance_s: float = 90.0,
+        by_yuki: bool = False,
+        yuki_request: str | None = None,
     ) -> ConversationWrite:
         """Store the messages on screen that the thread has not seen; one transaction.
 
@@ -1568,10 +1597,11 @@ class Store:
                 for m, status, _ in stored
             )
             cur = conn.execute(
-                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile,"
+                " by_yuki, yuki_request_ciphertext) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (thread_id, at, trigger or "", self.cipher.encrypt(delta), len(delta),
-                 self.cipher.digest("conv", *sorted(fps)), kind, profile),
+                 self.cipher.digest("conv", *sorted(fps)), kind, profile, int(bool(by_yuki)),
+                 self._enc(yuki_request) if by_yuki and yuki_request else None),
             )
             out.capture_id = int(cur.lastrowid)
             out.chars = len(delta)
@@ -1651,7 +1681,8 @@ class Store:
     def pending_captures(self, limit: int | None = None, max_attempts: int = 3) -> list[PendingCapture]:
         """Unjournaled captures, oldest first, deltas decrypted."""
         sql = (
-            "SELECT id, thread_id, at, trigger, delta_ciphertext, chars, journal_attempts, kind, profile FROM captures"
+            "SELECT id, thread_id, at, trigger, delta_ciphertext, chars, journal_attempts, kind, profile, by_yuki,"
+            " yuki_request_ciphertext FROM captures"
             " WHERE journal_batch_id IS NULL AND journal_attempts < ? ORDER BY at, id"
         )
         params: list[Any] = [max_attempts]
@@ -1663,6 +1694,7 @@ class Store:
                 id=r["id"], thread_id=r["thread_id"], at=r["at"], trigger=r["trigger"],
                 delta=self.cipher.decrypt(r["delta_ciphertext"]), chars=r["chars"],
                 attempts=r["journal_attempts"], kind=r["kind"], profile=r["profile"],
+                by_yuki=bool(r["by_yuki"]), yuki_request=self._dec(r["yuki_request_ciphertext"]),
             )
             for r in self._query(sql, params)
         ]
@@ -1705,11 +1737,11 @@ class Store:
 
     def _insert_journal(self, conn: sqlite3.Connection, fact: NewFact, batch_id: int | None) -> int:
         cur = conn.execute(
-            "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
+            " by_yuki) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 float(fact.at), fact.thread_id, fact.app or "", fact.host, self.cipher.encrypt(fact.fact),
-                int(fact.importance), batch_id, time.time(),
+                int(fact.importance), batch_id, time.time(), int(bool(getattr(fact, "by_yuki", False))),
             ),
         )
         journal_id = int(cur.lastrowid)
@@ -1800,7 +1832,7 @@ class Store:
         return JournalEntry(
             id=r["id"], at=r["at"], thread_id=r["thread_id"], app=r["app"], host=r["host"],
             fact=self.cipher.decrypt(r["fact_ciphertext"]), importance=r["importance"],
-            batch_id=r["batch_id"], score=score,
+            batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in r.keys() else False,
         )
 
     def search_journal(
@@ -2186,8 +2218,10 @@ class Store:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         apps: dict[str, set[int]] = {}
         hosts: dict[tuple[str, str], set[int]] = {}
+        # What Yuki put on screen for the user (by_yuki) is not the user's routine.
+        cwhere = where + (" AND " if where else " WHERE ") + "c.by_yuki = 0"
         for r in self._query(
-            "SELECT c.at, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id" + where, params
+            "SELECT c.at, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id" + cwhere, params
         ):
             slot = int(r["at"] // slot_s)
             apps.setdefault(r["app"] or "", set()).add(slot)
@@ -2407,7 +2441,8 @@ class Store:
             round(float(row.away_s), 3), round(float(row.media_s), 3),
             json.dumps({k: round(v, 1) for k, v in sorted(row.media_other.items())}) if row.media_other else None,
             row.withheld, int(row.segments), time.time(), int(bool(row.fullscreen)), row.meeting or None,
-            round(float(row.mic_s or 0.0), 3),
+            round(float(row.mic_s or 0.0), 3), int(bool(row.by_yuki)),
+            self._enc(row.yuki_request) if row.by_yuki and row.yuki_request else None,
         )
 
         def op(conn: sqlite3.Connection) -> int:
@@ -2415,8 +2450,8 @@ class Store:
                 cur = conn.execute(
                     "UPDATE timeline SET started_at=?, ended_at=?, state=?, process=?, app=?, title_ciphertext=?,"
                     " host=?, path_ciphertext=?, page_key=?, active_s=?, passive_s=?, away_s=?, media_s=?,"
-                    " media_other=?, withheld=?, segments=?, updated_at=?, fullscreen=?, meeting=?, mic_s=?"
-                    " WHERE id=?",
+                    " media_other=?, withheld=?, segments=?, updated_at=?, fullscreen=?, meeting=?, mic_s=?,"
+                    " by_yuki=?, yuki_request_ciphertext=? WHERE id=?",
                     (*values, int(row.id)),
                 )
                 if cur.rowcount == 1:
@@ -2424,7 +2459,8 @@ class Store:
             cur = conn.execute(
                 "INSERT INTO timeline(started_at, ended_at, state, process, app, title_ciphertext, host,"
                 " path_ciphertext, page_key, active_s, passive_s, away_s, media_s, media_other, withheld,"
-                " segments, updated_at, fullscreen, meeting, mic_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " segments, updated_at, fullscreen, meeting, mic_s, by_yuki, yuki_request_ciphertext)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
             return int(cur.lastrowid)
@@ -2443,6 +2479,7 @@ class Store:
             page_key=r["page_key"], active_s=r["active_s"], passive_s=r["passive_s"], away_s=r["away_s"],
             media_s=r["media_s"], media_other=other, withheld=r["withheld"], segments=r["segments"],
             fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
+            by_yuki=bool(r["by_yuki"]), yuki_request=self._dec(r["yuki_request_ciphertext"]),
         )
 
     def timeline_between(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:

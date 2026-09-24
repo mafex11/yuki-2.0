@@ -61,8 +61,17 @@ def describe_memory_status(status: dict[str, Any] | None, *, installed: bool = T
 
 
 def memory_service_command() -> list[str]:
-    """How to start ``yuki-memory`` from the same Python environment as this process."""
-    return [sys.executable, "-m", "yuki.memory.service"]
+    """How to start ``yuki-memory`` from the same Python environment as this process.
+
+    Uses ``pythonw.exe`` when it sits next to the interpreter. A venv's
+    ``python.exe`` is only a launcher that starts the real console interpreter,
+    and that child gets a console of its own even when the launcher is detached:
+    a visible terminal window that kills memory if the user closes it.
+    ``pythonw.exe`` is the same interpreter without a console.
+    """
+    windowless = Path(sys.executable).with_name("pythonw.exe")
+    interpreter = str(windowless) if windowless.exists() else sys.executable
+    return [interpreter, "-m", "yuki.memory.service"]
 
 
 def spawn_memory_service(popen: Callable[..., Any] = subprocess.Popen) -> int:

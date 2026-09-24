@@ -175,9 +175,12 @@ it became valid.
 - JOURNAL: short dated facts about what the user did on this PC (id J<n>, local time, \
 app, importance 1-10), extracted from their screen.
 - EPISODES: short narratives of stretches of the user's time (id E<n>, local time span), \
-written from the measured timeline and the journal, with the real numbers.
+written from the measured timeline and the journal, with the real numbers. What an episode \
+says Yuki did at the user's request (opened, played, looked up) was Yuki's doing, not the \
+user's own browsing: never take it as evidence of the user's interests, routines or \
+behaviour.
 - TIME USE: per day, measured time per site or app - present (active = with input; \
-watching = no input while that app played media), visits, longest uninterrupted stretch, \
+watching = while that app played media), visits, longest uninterrupted stretch, \
 switches, and pairs the user went back and forth between.
 - ACTIVITY: foreground time per app and site measured by the memory watcher, by weekday \
 and hour of day. Use it for routines.
@@ -628,7 +631,7 @@ class PortraitWorker:
             start, end = day.timestamp(), min((day + timedelta(days=1)).timestamp(), now)
             day += timedelta(days=1)
             try:
-                rows = self.store.timeline_between(max(start, since), end)
+                rows = [r for r in self.store.timeline_between(max(start, since), end) if not r.by_yuki]
             except Exception:
                 return "(no timeline)"
             if not rows:
@@ -844,15 +847,21 @@ class PortraitWorker:
     # -- run ---------------------------------------------------------------
 
     def _window(self, kind: str, now: float) -> tuple[list[JournalEntry], float | None]:
+        """The run's journal facts, without those drawn from what Yuki itself put on
+        screen at the user's request (``by_yuki``): the pages Yuki opens for a
+        task are not the user's interests or habits (a portrait said the user
+        "likes ramen, udon, soba" after Yuki's own test tasks, 2026-09-24). The
+        user's requests themselves reach the portrait through the facts
+        conversation memory journals from them."""
         if kind == "weekly":
             # the whole week, plus anything older the checkpoint has not reached yet
             since = now - 7 * 86400.0
             merged = {j.id: j for j in self.store.journal_after_id(self.store.portrait_checkpoint())}
             merged.update({j.id: j for j in self.store.journal_between(since, None)})
-            return [merged[i] for i in sorted(merged)], since
+            return [merged[i] for i in sorted(merged) if not merged[i].by_yuki], since
         if kind == "first":
-            return self.store.journal_after_id(0), None
-        return self.store.journal_after_id(self.store.portrait_checkpoint()), None
+            return [j for j in self.store.journal_after_id(0) if not j.by_yuki], None
+        return [j for j in self.store.journal_after_id(self.store.portrait_checkpoint()) if not j.by_yuki], None
 
     def run(self, kind: str = "nightly", *, now: float | None = None) -> RunResult:
         """One portrait run: operations over the window, then a render when anything changed.

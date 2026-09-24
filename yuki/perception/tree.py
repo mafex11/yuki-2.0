@@ -1389,6 +1389,8 @@ class _ViewportPass:
         self.texts_seen = 0
         self.leaves_seen = 0
         self.blank_leaves = 0
+        #: Page reads in progress (a page inside a page is part of it).
+        self._in_page = 0
 
     # -- calls --------------------------------------------------------------
     def _fetch(self, element: object, request: object) -> object | None:
@@ -1637,16 +1639,34 @@ class _ViewportPass:
         walk: Callable[[], None],
     ) -> None:
         """Run ``walk`` (the walk below an element just kept) with the clip its
-        children are held to, as a page read (:meth:`_read_page`) if it is one."""
+        children are held to, as a page read (:meth:`_read_page`) if it is one.
+
+        A top-level page may use the element budget only up to
+        :data:`_AFTER_PAGE_RESERVE` elements short of the cap, so the window's
+        own controls that come after the page in tree order - a browser's tab
+        strip - are still read when the page alone could fill the cap (seen
+        live 2026-09-24: a 400-element read of Chrome ended inside the page,
+        and "list my Chrome tabs" had no tabs to list).
+        """
         saved = self.clip
         self.clip = self._child_clip(get)
+        walker = self.walker
+        saved_cap = walker.max_elements
+        page = not self.stop_at_documents and _page_facts(get) is not None
         try:
-            if not self.stop_at_documents and _page_facts(get) is not None:
-                self._read_page(depth, live_element, walk)
+            if page:
+                if not self._in_page:
+                    walker.max_elements = max(len(walker.elements) + 1, saved_cap - _AFTER_PAGE_RESERVE)
+                self._in_page += 1
+                try:
+                    self._read_page(depth, live_element, walk)
+                finally:
+                    self._in_page -= 1
             else:
                 walk()
         finally:
             self.clip = saved
+            walker.max_elements = saved_cap
 
     def _mark(self) -> dict:
         """Everything a re-read of one page must put back (see :meth:`_read_page`)."""
@@ -3105,6 +3125,12 @@ class PageIdentity:
         return f"{_one_line(self.url, 200)} (no title yet)"
 
 
+#: Elements of the cap a top-level page leaves for what follows it in the
+#: window (see :meth:`_ViewportPass._content`). Chrome's tab strip, toolbar
+#: buttons and side panel after the page came to 20-70 elements (2026-09-24).
+_AFTER_PAGE_RESERVE = 80
+
+
 def _inside_document(element: UIElement, by_id: dict[int, UIElement]) -> bool:
     parent = getattr(element, "parent", -1)
     hops = 0
@@ -3197,7 +3223,16 @@ def pages_on_screen(
             # and the largest (another tab's page) was taken as the one in front
             # for up to a minute of the timeline.
             return []
-    stacked = [e for e in ordered if e.bounds == ordered[0].bounds]
+    elif (
+        tab is not None and tab.role == "TabItem" and len(ordered) == 1 and ordered[0].name and window_title
+        and not tab.name.startswith(ordered[0].name) and not _title_rank(ordered[0].name, window_title)
+    ):
+        # One page found, and neither the selected tab nor the window title
+        # names it: it is a tab behind the one in front, whose own page is not
+        # in the snapshot yet (a new tab loading). Seen live 2026-09-24 night 2:
+        # a new tab opening Instagram was captured as another tab's billing page.
+        return []
+    stacked =[e for e in ordered if e.bounds == ordered[0].bounds]
     if len(stacked) > 1:
         # Pages in one rectangle: the window title names the one in front;
         # the selected tab (already first if it named one) breaks a tie.
@@ -4180,6 +4215,14 @@ def format_window_tree(tree: WindowTree) -> str:
         )
         if page.selected_tab:
             facts.append(f'selected tab: "{_one_line(page.selected_tab, _FORMAT_NAME_CHARS)}"')
+    # The window's own tabs, counted: tab controls inside a page (a site's
+    # "Browse | Chat" switch) are not among them, and a long list is easy to miscount.
+    by_id = {element.id: element for element in tree.elements}
+    own_tabs = sum(
+        1 for element in tree.elements if element.role == "TabItem" and not _inside_document(element, by_id)
+    )
+    if own_tabs >= 2:
+        facts.append(f"{own_tabs} tabs outside the page" if page is not None else f"{own_tabs} tabs")
     facts += [
         f"window {tree.hwnd} \"{tree.title}\" ({tree.process_name or 'unknown'})",
         f"{len(tree.elements)} elements in {tree.elapsed_ms:.0f} ms",

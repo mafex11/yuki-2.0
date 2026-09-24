@@ -163,7 +163,11 @@ city pop on Spotify."), with the number of the exchange it comes from (it is dat
 exchange) and an importance: 1-2 trivial; 3-4 ordinary; 5-6 a clear signal about their work, \
 interests or relationships; 7-8 plans, appointments, personal news; 9-10 critical. Record \
 what the user asked Yuki to do only when it shows something about them (a plan, a deadline, \
-a taste), never as such ("the user asked Yuki to open Spotify"). Skip what FACTS ALREADY IN \
+a taste), never as such ("the user asked Yuki to open Spotify"). A request to look something \
+up, open, play or summarise is a task, not a taste: one such request is never evidence that \
+the user likes or is interested in its subject (asking for the Wikipedia article on soba is \
+not "the user is interested in Japanese cuisine") - record a taste or interest only when the \
+user's own words state it. Skip what FACTS ALREADY IN \
 THE JOURNAL say, small talk, Yuki's own abilities or mistakes, and anything that is a rule, \
 preference or commitment. Never record passwords, codes, keys, account numbers or other \
 secrets.

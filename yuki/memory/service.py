@@ -21,6 +21,11 @@ Flag files next to the database (written by Yuki through
   starts.
 * ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
   rebuilds the portrait now.
+* ``acting.json`` - Yuki is acting on the desktop for the user
+  (:mod:`yuki.memory.acting`). Read when Yuki sets the named event
+  ``Local\\YukiMemoryActing-<db digest>`` (this process creates it), and at
+  least every 2 s; while it names a live request, the watcher's captures and
+  the timeline's stretches are marked ``by_yuki`` with the request's text.
 
 Stopping: Ctrl+C / Ctrl+Break / closing the console, ``WM_CLOSE`` to the
 watcher's hidden window (class :data:`yuki.memory.watcher.WINDOW_CLASS`; this is
@@ -245,6 +250,8 @@ def run(args: argparse.Namespace) -> int:
     warp_thread: threading.Thread | None = None
     conversations = None
     conversations_thread: threading.Thread | None = None
+    acting_thread: threading.Thread | None = None
+    acting_event = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
@@ -290,12 +297,29 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.timeline import TimelineRecorder
 
-                timeline = TimelineRecorder(store, privacy=privacy, log=log)
+                timeline = TimelineRecorder(
+                    store, privacy=privacy, log=log,
+                    # a page that changed address without a title change (a reel, a feed): read it now
+                    on_page_change=lambda hwnd: watcher.request_capture(hwnd, "page"),
+                )
                 timeline.set_paused(paused)  # before start: nothing is recorded, not even the first window
                 timeline.start()
             except Exception as exc:  # capture and journal run on without it
                 log("error", where="timeline_start", error=f"{type(exc).__name__}: {exc}")
                 timeline = None
+
+        try:
+            from yuki.memory import acting as _acting
+
+            acting_event = _acting.ActingEvent(db_path)
+            acting_thread = threading.Thread(
+                target=_guarded(_follow_acting, log, "acting"),
+                args=(stop, acting_event, db_path, watcher, lambda: timeline, log),
+                name="yuki-memory-acting", daemon=True,
+            )
+            acting_thread.start()
+        except Exception as exc:  # capture runs on; Yuki's own actions are then not marked
+            log("error", where="acting_start", error=f"{type(exc).__name__}: {exc}")
 
         if not args.no_journal:
             try:
@@ -426,6 +450,8 @@ def run(args: argparse.Namespace) -> int:
         code = 2
     finally:
         stop.set()
+        if acting_event is not None:
+            acting_event.set()
         if journal is not None:
             try:
                 journal.stop()
@@ -443,6 +469,10 @@ def run(args: argparse.Namespace) -> int:
             watcher.stop()
         if timeline is not None:
             timeline.stop()  # writes the open stretch first
+        if acting_thread is not None:
+            acting_thread.join(3.0)
+        if acting_event is not None:
+            acting_event.close()
         if journal_thread is not None:
             journal_thread.join(10.0)
         if warp_thread is not None:
@@ -467,6 +497,37 @@ def run(args: argparse.Namespace) -> int:
     return code
 
 
+def _follow_acting(
+    stop: threading.Event, event: Any, db_path: Path, watcher: Watcher, timeline_now: Callable[[], Any], log: _Log,
+) -> None:
+    """Keep the watcher and the timeline told whether Yuki is acting (yuki.memory.acting).
+
+    Wakes on Yuki's event, or every 2 s at the latest (a missed signal, an
+    agent that died mid-request: :func:`yuki.memory.acting.current` ignores
+    entries whose process is gone).
+    """
+    from yuki.memory import acting as _acting
+
+    current_token: str | None = None
+    while not stop.is_set():
+        event.wait(2.0)
+        if stop.is_set():
+            break
+        try:
+            now = _acting.current(db_path)
+        except Exception:
+            now = None
+        token = now.token if now is not None else None
+        if token == current_token:
+            continue
+        current_token = token
+        watcher.set_acting(now)
+        timeline = timeline_now()
+        if timeline is not None:
+            timeline.set_acting(now)
+        log("acting", acting=now is not None, lane=now.lane if now is not None else None)
+
+
 def _guarded(fn: Callable[..., Any], log: _Log, where: str) -> Callable[..., None]:
     def runner(*args: Any) -> None:
         try:
@@ -480,6 +541,14 @@ def _guarded(fn: Callable[..., Any], log: _Log, where: str) -> Callable[..., Non
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Started by the tray under pythonw.exe (no console), stdout/stderr can be
+    # None; the status lines printed below must not crash the service then.
+    import os
+
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     return run(_parse(argv))
 
 

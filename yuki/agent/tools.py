@@ -485,7 +485,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Noting that for good",
         "description": (
             "Save a standing instruction the user just gave you about how to talk to "
-            "them or behave (in their words), so it holds in every future conversation."
+            "them or behave from now on (in their words), so it holds in every future "
+            "conversation. Whenever a message sets such a rule, call this in that same "
+            "turn, alongside done -- a rule only acknowledged is forgotten. It applies at "
+            "once, starting with the reply you send in that done."
         ),
         "input_schema": _obj(
             {
