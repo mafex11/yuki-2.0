@@ -616,7 +616,49 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    _install_crash_log()
     return run(_parse(argv))
+
+
+def _install_crash_log() -> None:
+    """Record crashes in ``logs/memory-crash.log``.
+
+    The service runs windowless, so a native crash (a DLL fault in COM or an
+    ONNX runtime) or an exception that escapes a thread would otherwise leave
+    no trace at all. ``faulthandler`` writes the Python stacks of every thread
+    on a fatal signal; the hooks write uncaught exceptions with a timestamp.
+    """
+    import faulthandler
+    import os
+    import traceback
+
+    try:
+        path = PROJECT_ROOT / "logs" / "memory-crash.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        crash_file = open(path, "a", encoding="utf-8", buffering=1)  # kept open for faulthandler
+    except OSError:
+        return
+    crash_file.write(f"\n=== yuki-memory start {datetime.now().isoformat(timespec='seconds')} pid {os.getpid()} ===\n")
+    faulthandler.enable(file=crash_file, all_threads=True)
+
+    def write(kind: str, exc_type, exc, tb, where: str = "") -> None:
+        try:
+            crash_file.write(f"--- {datetime.now().isoformat(timespec='seconds')} {kind} {where}\n")
+            crash_file.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except Exception:
+            pass
+
+    previous_hook = sys.excepthook
+
+    def excepthook(exc_type, exc, tb) -> None:
+        write("uncaught", exc_type, exc, tb)
+        previous_hook(exc_type, exc, tb)
+
+    def thread_hook(args) -> None:
+        write("thread", args.exc_type, args.exc_value, args.exc_traceback, getattr(args.thread, "name", ""))
+
+    sys.excepthook = excepthook
+    threading.excepthook = thread_hook
 
 
 if __name__ == "__main__":

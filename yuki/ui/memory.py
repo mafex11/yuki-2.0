@@ -267,8 +267,12 @@ class MemoryControl(QObject):
 
     # -- service -----------------------------------------------------------
 
-    def ensure_service(self) -> threading.Thread:
-        """Start ``yuki-memory`` when memory reports it is not running."""
+    def ensure_service(self, *, quiet: bool = False) -> threading.Thread:
+        """Start ``yuki-memory`` when memory reports it is not running.
+
+        Called once at start, then periodically by the tray as a watchdog
+        (``quiet=True``: a service found running is not logged each time).
+        """
 
         def work() -> None:
             if not self.memory.installed:
@@ -280,8 +284,9 @@ class MemoryControl(QObject):
                 self.status_changed.emit(None, error)
                 return
             if status.get("service_running"):
-                self._event("memory_service", state="running")
-                self.status_changed.emit(status, None)
+                if not quiet:
+                    self._event("memory_service", state="running")
+                    self.status_changed.emit(status, None)
                 return
             try:
                 pid = self._spawn()
