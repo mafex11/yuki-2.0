@@ -65,7 +65,7 @@ from yuki.perception.windows import is_user_window
 
 
 class CaptureStore(Protocol):
-    def upsert_thread(self, app: str, title: str, url: str | None) -> int: ...
+    def upsert_thread(self, app: str, title: str, url: str | None, *, process: str | None = None) -> int: ...
     def latest_text(self, thread_id: int) -> str | None: ...
     def add_capture(
         self, thread_id: int, at: float, trigger: str, full_text: str, delta_text: str
@@ -235,6 +235,7 @@ WTS_SESSION_UNLOCK = 0x8
 NOTIFY_FOR_THIS_SESSION = 0
 WM_APP_STOP = win32con.WM_APP + 1
 WM_APP_REFRESH = win32con.WM_APP + 2
+WM_APP_PAUSE = win32con.WM_APP + 3
 MONITOR_DEFAULTTONEAREST = 2
 QUNS_BUSY = 2
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
@@ -645,6 +646,8 @@ class Watcher:
         self._fg = 0
         self._locked = False
         self._fullscreen = False
+        #: User pause (the ``paused`` flag file): nothing is captured.
+        self._paused = False
         self._pending: _Pending | None = None
         self._activity_at = 0.0
         self._backstop_interval = self.settings.backstop_min_s
@@ -701,6 +704,25 @@ class Watcher:
         if self._worker is not None:
             self._worker.join(timeout_s)
 
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume capturing (the user's ``paused`` flag); safe from any thread.
+
+        While paused nothing is read or stored: the per-process hooks are
+        dropped, pending and backstop captures are skipped. One ``paused``
+        event is logged per pause (plus a content-free ``paused``/``user``
+        health row). Hooks are owned by the hook thread, so a running watcher
+        applies the change there.
+        """
+        paused = bool(paused)
+        if self._hwnd and self._hook_thread is not None and self._hook_thread.is_alive():
+            _user32.PostMessageW(self._hwnd, WM_APP_PAUSE, int(paused), 0)
+        else:
+            self._set_paused(paused)
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
     @property
     def alive(self) -> bool:
         return bool(self._hook_thread and self._hook_thread.is_alive())
@@ -740,6 +762,7 @@ class Watcher:
             "errors": self._errors,
             "locked": self._locked,
             "fullscreen": self._fullscreen,
+            "paused": self._paused,
             "idle": self._idle,
             "backstop_interval_s": self._backstop_interval,
         }
@@ -855,6 +878,9 @@ class Watcher:
                 elif wparam == WTS_SESSION_UNLOCK:
                     self._set_locked(False)
                 return 0
+            if msg == WM_APP_PAUSE:
+                self._set_paused(bool(wparam))
+                return 0
             if msg == WM_APP_REFRESH:
                 self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
                 return 0
@@ -894,6 +920,20 @@ class Watcher:
         else:
             self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
 
+    def _set_paused(self, paused: bool) -> None:
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if paused:
+            self._pending = None
+            self._unhook_pid()
+            self._log("paused", via="flag")
+            self._health_now(0, "paused", "user", "pause")
+        else:
+            self._log("watcher_state", paused=False)
+            if self._hwnd:
+                self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
+
     def _hook_pid(self, pid: int) -> None:
         if pid == self._hooked_pid:
             return
@@ -921,7 +961,7 @@ class Watcher:
                 self._on_foreground(hwnd or int(_user32.GetForegroundWindow() or 0), "foreground")
                 return
             fg = self._fg
-            if not fg or not hwnd or self._locked or self._fullscreen:
+            if not fg or not hwnd or self._locked or self._fullscreen or self._paused:
                 return
             if hwnd != fg and int(_user32.GetAncestor(hwnd, GA_ROOT) or 0) != fg:
                 return
@@ -943,7 +983,7 @@ class Watcher:
         if hwnd:
             hwnd = int(_user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
         self._fg = hwnd
-        if self._locked or not hwnd:
+        if self._locked or self._paused or not hwnd:
             self._unhook_pid()
             self._pending = None
             return
@@ -967,7 +1007,7 @@ class Watcher:
         return (_window_title(hwnd), _window_rect(hwnd))
 
     def _arm(self, trigger: str, now: float, *, force: bool = False) -> None:
-        if self._locked or self._fullscreen:
+        if self._locked or self._fullscreen or self._paused:
             return
         fg = self._fg
         if not fg:
@@ -1050,7 +1090,7 @@ class Watcher:
             if not is_fullscreen_front(self._fg):
                 self._on_foreground(self._fg, "resume")
             return
-        if self._locked or self._pending is not None or self._busy is not None or not self._fg:
+        if self._locked or self._paused or self._pending is not None or self._busy is not None or not self._fg:
             return
         idle = user_idle_s() > self.settings.idle_limit_s
         if idle != self._idle:
@@ -1144,6 +1184,8 @@ class Watcher:
         hwnd = request.hwnd
         if store is None:
             return done("failed", "store_unavailable")
+        if self._paused:
+            return done("skipped", "paused")
         if not _user32.IsWindow(hwnd):
             return done("skipped", "window_gone")
         if int(_user32.GetForegroundWindow() or 0) != hwnd:
@@ -1193,7 +1235,7 @@ class Watcher:
 
         s0 = time.perf_counter()
         try:
-            thread_id = store.upsert_thread(facts.app_name, title, url)
+            thread_id = store.upsert_thread(facts.app_name, title, url, process=facts.process_name or None)
             previous = store.latest_text(thread_id)
             if previous is not None and _digest(previous) == _digest(text):
                 result.store_ms = (time.perf_counter() - s0) * 1000.0

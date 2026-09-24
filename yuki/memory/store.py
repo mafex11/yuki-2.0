@@ -27,9 +27,10 @@ Opening::
 
 Watcher (capture) side::
 
-    store.upsert_thread(app: str, title: str, url: str | None) -> int
+    store.upsert_thread(app: str, title: str, url: str | None, *, process: str | None = None) -> int
         # thread_id. A thread is (app, url) when a url is given, else (app, title).
-        # Updates the stored title/url and last_seen on every call.
+        # Updates the stored title/url/process and last_seen on every call.
+        # `process` is the image name ("chrome.exe"), stored as app_key() ("chrome").
     store.latest_text(thread_id: int) -> str | None
         # decrypted last full text seen for the thread (for computing the next delta)
     store.add_capture(thread_id: int, at: float, trigger: str,
@@ -47,9 +48,11 @@ Journal (worker and Yuki tools)::
     store.add_journal(at, thread_id, app, fact, importance, *, host=None,
                       batch_id=None, vector=None) -> int
     store.search_journal(query_vec, since=None, until=None, app=None, limit=10,
-                         *, host=None) -> list[JournalEntry]     # .score = cosine
+                         *, host=None, process=None) -> list[JournalEntry]     # .score = cosine
     store.keyword_journal(text, since=None, until=None, app=None, limit=50,
-                          *, host=None) -> list[JournalEntry]    # every term, casefolded
+                          *, host=None, process=None) -> list[JournalEntry]    # every term, casefolded
+        # app: one display name or several (any matches, case-insensitive);
+        # process: an image name/key; with both, a fact matching either is kept.
     store.journal_between(since=None, until=None) -> list[JournalEntry]   # oldest first
     store.journal_for_thread(thread_id, limit=10) -> list[JournalEntry]   # newest N, oldest first
     store.journal_without_vectors(limit=256) -> list[JournalEntry]
@@ -67,16 +70,57 @@ Journal worker plumbing::
     store.record_failed_batch(call: ModelCall, capture_ids) -> int
         # batch row with the error; bumps the captures' attempt counters
 
+Portrait (worker and Yuki)::
+
+    store.journal_after_id(after_id, limit=None) -> list[JournalEntry]   # id > after_id, oldest first
+    store.journal_count(since=None, until=None) -> int
+    store.portrait_facts(kinds=None, *, include_corrections=True) -> list[PortraitFact]   # current (valid_to IS NULL)
+    store.portrait_fact(fact_id) -> PortraitFact | None                  # any version
+    store.add_correction(text, at=None) -> int                            # user-confirmed, kind "correction"
+    store.start_portrait_run(kind, model, at=None) -> int
+    store.commit_portrait_changes(run_id, changes: list[FactChange], *, until_journal_id=None)
+        -> list[tuple[bool, int | None]]   # (applied, new fact id) per change
+        # one transaction: ADD/UPDATE(supersede)/INVALIDATE + open-loop sync + folded corrections retired
+    store.finish_portrait_run(run_id, run: PortraitRunStats) -> None
+    store.portrait_checkpoint() -> int                                    # highest journal id a run consumed
+    store.last_portrait_run_at(kinds=None) -> float | None                # latest successful run start
+    store.save_portrait(text, *, run_id=None, model=None, fact_count=0, at=None) -> int
+    store.latest_portrait() -> Portrait | None
+    store.activity_slots(since, until, slot_s=900) -> dict                # foreground presence for routines
+
+Know-how and open loops::
+
+    app_key(name) -> str | None     # "Arc.exe" / "arc" / " ARC.EXE " -> "arc"
+    store.add_knowhow(app, text, *, source_request=None, vector=None, embed_model=None,
+                      supersedes=None, at=None) -> int                    # bi-temporal supersede; app -> app_key
+    store.knowhow_current(app=None, *, any_app=True) -> list[KnowHow]
+    store.search_knowhow(query_vec, limit=8, *, exclude_ids=()) -> list[KnowHow]   # .score = cosine
+    store.open_loops(status="open") -> list[OpenLoop]
+    store.add_open_loop(person, text, *, opened_at=None, portrait_fact_id=None, source_ids=None) -> int
+    store.resolve_open_loop(loop_id, *, at=None, status="resolved") -> None
+
+Status::
+
+    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait)
+
 Maintenance and reporting::
 
     store.prune(older_than_days: float = 30) -> int     # captures deleted
     store.health_summary(since=None, until=None) -> dict
     store.batch_summary(since=None, until=None) -> dict
     store.db_size_bytes() -> int
+
+Service coordination (flag files next to the database, the service's mutex)::
+
+    PAUSE_FLAG, REFRESH_FLAG
+    flag_path(db_path, name) -> Path
+    service_mutex_name(db_path) -> str
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -107,6 +151,29 @@ def default_memory_dir() -> Path:
 def default_db_path() -> Path:
     """``%LOCALAPPDATA%\\Yuki\\memory\\memory.db``."""
     return default_memory_dir() / DB_FILENAME
+
+
+#: Flag files, next to the database. ``paused`` exists while the user has paused
+#: memory (the watcher captures nothing); ``refresh_portrait`` asks the service
+#: to rebuild the portrait now (the service deletes it when it starts the run).
+PAUSE_FLAG = "paused"
+REFRESH_FLAG = "refresh_portrait"
+
+#: Prefix of the service's named mutex (one service per session and database).
+SERVICE_MUTEX_PREFIX = "Local\\YukiMemorySingleInstance"
+
+
+def flag_path(db_path: str | Path | None, name: str) -> Path:
+    """The flag file ``name`` for the database at ``db_path`` (default location if ``None``)."""
+    db = Path(db_path) if db_path is not None else default_db_path()
+    return db.parent / name
+
+
+def service_mutex_name(db_path: str | Path | None) -> str:
+    """Name of the named mutex the ``yuki-memory`` service holds for ``db_path``."""
+    db = Path(db_path) if db_path is not None else default_db_path()
+    digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
+    return f"{SERVICE_MUTEX_PREFIX}-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +250,120 @@ class ModelCall:
     outcome: str = "ok"             # ok | error | skipped
     error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+#: Portrait fact kinds the portrait worker writes; ``correction`` is the user's
+#: own words (``store.add_correction``), folded into the others by the worker.
+PORTRAIT_KINDS: tuple[str, ...] = ("work", "interest", "person", "routine", "preference", "open_loop")
+CORRECTION_KIND = "correction"
+
+
+@dataclass
+class PortraitFact:
+    """One version of a portrait fact (bi-temporal).
+
+    ``valid_from``/``valid_to`` are valid time (when it was true, from the
+    evidence); ``created_at``/``expired_at`` are transaction time (when the
+    store learned it / learned it stopped). Current facts have ``valid_to`` None.
+    """
+
+    id: int
+    kind: str
+    subject: str
+    text: str
+    valid_from: float
+    valid_to: float | None
+    source_ids: list[int]
+    confidence: float | None
+    origin: str                     # model | user
+    created_at: float | None
+    expired_at: float | None
+    superseded_by: int | None
+    run_id: int | None
+
+
+@dataclass
+class FactChange:
+    """One validated portrait operation for :meth:`Store.commit_portrait_changes`.
+
+    ``op``: ADD (new fact), UPDATE (supersede ``fact_id`` with a new version),
+    INVALIDATE (end ``fact_id``), NOOP (nothing written; counted by the caller).
+    ``at`` is the evidence time: ``valid_from`` of a new version and
+    ``valid_to`` of the one it ends. ``folds`` are correction ids this change
+    implements; they are retired in the same transaction.
+    """
+
+    op: str
+    fact_id: int | None = None
+    kind: str = ""
+    subject: str = ""
+    text: str = ""
+    confidence: float | None = None
+    source_ids: list[int] = field(default_factory=list)
+    at: float | None = None
+    origin: str = "model"
+    folds: list[int] = field(default_factory=list)
+
+
+@dataclass
+class PortraitRunStats:
+    """Content-free accounting for one portrait run (all its model calls)."""
+
+    kind: str
+    model: str
+    window_since: float | None = None
+    window_until: float | None = None
+    since_journal_id: int | None = None
+    until_journal_id: int | None = None
+    journal_facts: int = 0
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    ops_add: int = 0
+    ops_update: int = 0
+    ops_invalidate: int = 0
+    ops_noop: int = 0
+    ops_rejected: int = 0
+    outcome: str = "ok"             # ok | error | empty
+    error: str | None = None
+
+
+@dataclass
+class Portrait:
+    id: int
+    at: float
+    text: str
+    run_id: int | None
+    model: str | None
+    fact_count: int
+
+
+@dataclass
+class KnowHow:
+    id: int
+    app: str | None
+    text: str
+    valid_from: float
+    valid_to: float | None
+    source_request: str | None
+    superseded_by: int | None = None
+    score: float | None = None      # cosine similarity, set by search_knowhow
+
+
+@dataclass
+class OpenLoop:
+    id: int
+    person: str | None
+    text: str
+    status: str                     # open | resolved | superseded
+    opened_at: float
+    resolved_at: float | None
+    portrait_fact_id: int | None
+    source_ids: list[int]
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +494,74 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX health_at ON health(at);
     """,
+    # 2: Phase B - portrait runs and renders, know-how vectors, bi-temporal
+    # bookkeeping. Additive only (new tables, nullable/defaulted columns), so a
+    # service still running migration-1 code keeps working on a migrated file.
+    """
+    ALTER TABLE threads ADD COLUMN process TEXT;         -- app_key(image name), cleartext metadata
+    CREATE INDEX threads_process ON threads(process);
+
+    ALTER TABLE portrait_facts ADD COLUMN origin TEXT NOT NULL DEFAULT 'model';
+    ALTER TABLE portrait_facts ADD COLUMN created_at REAL;
+    ALTER TABLE portrait_facts ADD COLUMN expired_at REAL;
+    ALTER TABLE portrait_facts ADD COLUMN superseded_by INTEGER;
+    ALTER TABLE portrait_facts ADD COLUMN run_id INTEGER;
+
+    ALTER TABLE knowhow ADD COLUMN created_at REAL;
+    ALTER TABLE knowhow ADD COLUMN expired_at REAL;
+    ALTER TABLE knowhow ADD COLUMN superseded_by INTEGER;
+
+    ALTER TABLE open_loops ADD COLUMN portrait_fact_id INTEGER;
+    ALTER TABLE open_loops ADD COLUMN source_ids TEXT;
+    ALTER TABLE open_loops ADD COLUMN updated_at REAL;
+    CREATE INDEX open_loops_fact ON open_loops(portrait_fact_id);
+
+    CREATE TABLE knowhow_vec (
+        knowhow_id      INTEGER PRIMARY KEY REFERENCES knowhow(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL            -- encrypted float32[dim], L2-normalised
+    );
+
+    CREATE TABLE portrait_runs (
+        id                 INTEGER PRIMARY KEY,
+        at                 REAL NOT NULL,        -- started
+        finished_at        REAL,
+        kind               TEXT NOT NULL,        -- first | nightly | weekly | refresh
+        model              TEXT NOT NULL,
+        window_since       REAL,
+        window_until       REAL,
+        since_journal_id   INTEGER,
+        until_journal_id   INTEGER,              -- checkpoint: highest journal id consumed
+        journal_facts      INTEGER NOT NULL DEFAULT 0,
+        calls              INTEGER NOT NULL DEFAULT 0,
+        input_tokens       INTEGER NOT NULL DEFAULT 0,
+        output_tokens      INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+        cost_usd           REAL,
+        latency_ms         REAL NOT NULL DEFAULT 0,
+        ops_add            INTEGER NOT NULL DEFAULT 0,
+        ops_update         INTEGER NOT NULL DEFAULT 0,
+        ops_invalidate     INTEGER NOT NULL DEFAULT 0,
+        ops_noop           INTEGER NOT NULL DEFAULT 0,
+        ops_rejected       INTEGER NOT NULL DEFAULT 0,
+        outcome            TEXT NOT NULL,        -- running | ok | empty | error
+        error              TEXT
+    );
+    CREATE INDEX portrait_runs_at ON portrait_runs(at);
+
+    CREATE TABLE portraits (
+        id              INTEGER PRIMARY KEY,
+        at              REAL NOT NULL,           -- updated_at of this render
+        run_id          INTEGER,
+        model           TEXT,
+        text_ciphertext TEXT NOT NULL,
+        chars           INTEGER NOT NULL,
+        fact_count      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX portraits_at ON portraits(at);
+    """,
 )
 
 
@@ -323,6 +572,18 @@ def _ts(value: TimeArg) -> float | None:
     if isinstance(value, datetime):
         return value.timestamp()
     return float(value)
+
+
+def app_key(name: str | None) -> str | None:
+    """Normalised process form of an app name: stripped, casefolded, no ``.exe``.
+
+    Know-how is keyed by it and ``threads.process`` stores it, so
+    ``"Arc.exe"``, ``"arc.exe"`` and ``"arc"`` are the same app.
+    """
+    key = (name or "").strip().casefold()
+    if key.endswith(".exe"):
+        key = key[:-4].rstrip()
+    return key or None
 
 
 def url_host(url: str | None) -> str | None:
@@ -427,18 +688,20 @@ class Store:
 
     # -- threads -----------------------------------------------------------
 
-    def upsert_thread(self, app: str, title: str, url: str | None) -> int:
+    def upsert_thread(self, app: str, title: str, url: str | None, *, process: str | None = None) -> int:
         """Find or create the thread for this window/page and return its id.
 
         The identity is ``(app, url)`` when ``url`` is non-empty, else
         ``(app, title)``: a page keeps its thread while its title changes
         (notification counters, "(3) Inbox"), and an app without a URL gets one
-        thread per window title. The latest title/url and ``last_seen`` are
-        updated on every call.
+        thread per window title. The latest title/url, ``process`` (stored as
+        :func:`app_key`, e.g. ``"chrome"``) and ``last_seen`` are updated on
+        every call.
         """
         app = app or ""
         title = title or ""
         url = url or None
+        proc = app_key(process)
         key = self.cipher.digest("url" if url else "title", app, url or title)
         now = time.time()
 
@@ -446,14 +709,15 @@ class Store:
             row = conn.execute("SELECT id FROM threads WHERE thread_key=?", (key,)).fetchone()
             if row:
                 conn.execute(
-                    "UPDATE threads SET title_ciphertext=?, url_ciphertext=?, last_seen=? WHERE id=?",
-                    (self._enc(title), self._enc(url), now, row["id"]),
+                    "UPDATE threads SET title_ciphertext=?, url_ciphertext=?, last_seen=?,"
+                    " process=coalesce(?, process) WHERE id=?",
+                    (self._enc(title), self._enc(url), now, proc, row["id"]),
                 )
                 return int(row["id"])
             cur = conn.execute(
-                "INSERT INTO threads(thread_key, app, host, title_ciphertext, url_ciphertext, first_seen, last_seen)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (key, app, url_host(url), self._enc(title), self._enc(url), now, now),
+                "INSERT INTO threads(thread_key, app, host, title_ciphertext, url_ciphertext, first_seen, last_seen,"
+                " process) VALUES (?,?,?,?,?,?,?,?)",
+                (key, app, url_host(url), self._enc(title), self._enc(url), now, now, proc),
             )
             return int(cur.lastrowid)
 
@@ -660,7 +924,8 @@ class Store:
         return self._write(lambda conn: self._insert_journal(conn, new, batch_id))
 
     def _journal_filter(
-        self, since: TimeArg, until: TimeArg, app: str | None, host: str | None
+        self, since: TimeArg, until: TimeArg, app: str | Sequence[str] | None, host: str | None,
+        process: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses, params = [], []
         if (s := _ts(since)) is not None:
@@ -669,9 +934,18 @@ class Store:
         if (u := _ts(until)) is not None:
             clauses.append("j.at < ?")
             params.append(u)
-        if app:
-            clauses.append("lower(j.app) = lower(?)")
-            params.append(app)
+        names = [app] if isinstance(app, str) else list(app or [])
+        names = [n for n in (x.strip() for x in names if x) if n]
+        proc = app_key(process)
+        either = []
+        if names:
+            either.append("lower(j.app) IN (%s)" % ",".join("lower(?)" for _ in names))
+            params.extend(names)
+        if proc:
+            either.append("j.thread_id IN (SELECT id FROM threads WHERE process = ?)")
+            params.append(proc)
+        if either:
+            clauses.append("(" + " OR ".join(either) + ")")
         if host:
             clauses.append("(j.host = lower(?) OR j.host LIKE '%.' || lower(?))")
             params.extend([host, host])
@@ -689,17 +963,18 @@ class Store:
         query_vec: np.ndarray,
         since: TimeArg = None,
         until: TimeArg = None,
-        app: str | None = None,
+        app: str | Sequence[str] | None = None,
         limit: int = 10,
         *,
         host: str | None = None,
+        process: str | None = None,
     ) -> list[JournalEntry]:
         """Journal facts most similar to ``query_vec`` (cosine), within the filters.
 
         Vectors in the window are decrypted and scored in memory with numpy;
         rows embedded with a different dimension are skipped.
         """
-        where, params = self._journal_filter(since, until, app, host)
+        where, params = self._journal_filter(since, until, app, host, process)
         rows = self._query(
             "SELECT j.*, v.vec_ciphertext, v.dim FROM journal j JOIN journal_vec v ON v.journal_id = j.id" + where,
             params,
@@ -728,10 +1003,11 @@ class Store:
         text: str,
         since: TimeArg = None,
         until: TimeArg = None,
-        app: str | None = None,
+        app: str | Sequence[str] | None = None,
         limit: int = 50,
         *,
         host: str | None = None,
+        process: str | None = None,
     ) -> list[JournalEntry]:
         """Facts in the window containing every whitespace-separated term of ``text``.
 
@@ -741,7 +1017,7 @@ class Store:
         terms = [t.casefold() for t in (text or "").split()]
         if not terms:
             return []
-        where, params = self._journal_filter(since, until, app, host)
+        where, params = self._journal_filter(since, until, app, host, process)
         hits: list[JournalEntry] = []
         for r in self._query("SELECT j.* FROM journal j" + where + " ORDER BY j.at DESC, j.id DESC", params):
             entry = self._entry(r)
@@ -787,6 +1063,454 @@ class Store:
             return len(items)
 
         return self._write(op)
+
+    def journal_after_id(self, after_id: int, limit: int | None = None) -> list[JournalEntry]:
+        """Facts with ``id > after_id``, oldest (lowest id) first.
+
+        Ids only grow and journal rows are never deleted, so this is the
+        portrait worker's checkpoint: a fact committed late (its ``at`` is the
+        capture time, minutes earlier) is still picked up by the next run.
+        """
+        sql = "SELECT j.* FROM journal j WHERE j.id > ? ORDER BY j.id"
+        params: list[Any] = [int(after_id)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._entry(r) for r in self._query(sql, params)]
+
+    def journal_count(self, since: TimeArg = None, until: TimeArg = None) -> int:
+        """Number of journal facts in ``[since, until)``."""
+        where, params = self._journal_filter(since, until, None, None)
+        return int(self._query("SELECT count(*) FROM journal j" + where, params)[0][0])
+
+    # -- portrait facts ----------------------------------------------------
+
+    def _fact(self, r: sqlite3.Row) -> PortraitFact:
+        try:
+            sources = [int(i) for i in json.loads(r["source_ids"] or "[]")]
+        except (ValueError, TypeError):
+            sources = []
+        return PortraitFact(
+            id=r["id"], kind=r["kind"], subject=self._dec(r["subject_ciphertext"]) or "",
+            text=self.cipher.decrypt(r["text_ciphertext"]), valid_from=r["valid_from"], valid_to=r["valid_to"],
+            source_ids=sources, confidence=r["confidence"], origin=r["origin"] or "model",
+            created_at=r["created_at"], expired_at=r["expired_at"], superseded_by=r["superseded_by"],
+            run_id=r["run_id"],
+        )
+
+    def portrait_facts(
+        self, kinds: Sequence[str] | None = None, *, include_corrections: bool = True
+    ) -> list[PortraitFact]:
+        """Current portrait facts (``valid_to IS NULL``), by kind then age."""
+        sql = "SELECT * FROM portrait_facts WHERE valid_to IS NULL"
+        params: list[Any] = []
+        if kinds:
+            sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            params.extend(kinds)
+        if not include_corrections:
+            sql += " AND kind != ?"
+            params.append(CORRECTION_KIND)
+        sql += " ORDER BY kind, valid_from, id"
+        return [self._fact(r) for r in self._query(sql, params)]
+
+    def portrait_fact(self, fact_id: int) -> PortraitFact | None:
+        """One fact version by id (current or not)."""
+        rows = self._query("SELECT * FROM portrait_facts WHERE id=?", (int(fact_id),))
+        return self._fact(rows[0]) if rows else None
+
+    def portrait_history(self, limit: int = 200) -> list[PortraitFact]:
+        """Every fact version, newest first (current and superseded)."""
+        return [self._fact(r) for r in self._query(
+            "SELECT * FROM portrait_facts ORDER BY id DESC LIMIT ?", (int(limit),)
+        )]
+
+    def _insert_fact(
+        self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
+        source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
+    ) -> int:
+        cur = conn.execute(
+            "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
+            " source_ids, confidence, origin, created_at, run_id) VALUES (?,?,?,?,NULL,?,?,?,?,?)",
+            (
+                kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
+                json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def _end_fact(
+        self, conn: sqlite3.Connection, fact_id: int, valid_to: float, now: float, superseded_by: int | None
+    ) -> bool:
+        cur = conn.execute(
+            "UPDATE portrait_facts SET valid_to=?, expired_at=?, superseded_by=? WHERE id=? AND valid_to IS NULL",
+            (float(valid_to), now, superseded_by, int(fact_id)),
+        )
+        return cur.rowcount == 1
+
+    def add_correction(self, text: str, at: float | None = None) -> int:
+        """Store a user-confirmed correction (kind ``correction``, origin ``user``, confidence 1)."""
+        now = time.time()
+        when = float(at) if at is not None else now
+        return self._write(lambda conn: self._insert_fact(
+            conn, kind=CORRECTION_KIND, subject="", text=text, valid_from=when, source_ids=(),
+            confidence=1.0, origin="user", run_id=None, now=now,
+        ))
+
+    def commit_portrait_changes(
+        self, run_id: int | None, changes: Sequence[FactChange], *, until_journal_id: int | None = None
+    ) -> list[tuple[bool, int | None]]:
+        """Apply validated operations in one transaction; returns ``(applied, new fact id)`` per change.
+
+        ADD inserts; UPDATE inserts the new version and ends the old one
+        (``valid_to`` = evidence time, ``superseded_by`` = new id); INVALIDATE
+        ends the fact; NOOP writes nothing. A change whose target is no longer
+        current is skipped (``(False, None)``). Open loops follow their ``open_loop``
+        facts: an ADD opens one, an UPDATE moves the loop to the new version,
+        an INVALIDATE (or an UPDATE to another kind) resolves it. Corrections
+        listed in ``folds`` are retired (superseded by the first new fact made
+        from them). ``until_journal_id`` advances the run's checkpoint.
+        """
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> list[tuple[bool, int | None]]:
+            out: list[tuple[bool, int | None]] = []
+            folded: dict[int, int | None] = {}
+            for ch in changes:
+                at = float(ch.at) if ch.at is not None else now
+                new_id: int | None = None
+                old: sqlite3.Row | None = None
+                if ch.op in ("UPDATE", "INVALIDATE"):
+                    old = conn.execute(
+                        "SELECT * FROM portrait_facts WHERE id=? AND valid_to IS NULL", (ch.fact_id,)
+                    ).fetchone()
+                    if old is None:
+                        out.append((False, None))
+                        continue
+                if ch.op in ("ADD", "UPDATE"):
+                    new_id = self._insert_fact(
+                        conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
+                        source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
+                        run_id=run_id, now=now,
+                    )
+                if old is not None:
+                    self._end_fact(conn, old["id"], at, now, new_id)
+                self._sync_loop(conn, ch, old, new_id, at, now)
+                for cid in ch.folds:
+                    if cid not in folded or folded[cid] is None:
+                        folded[cid] = new_id
+                out.append((True, new_id))
+            for cid, by in folded.items():
+                self._end_fact(conn, cid, now, now, by)
+            if run_id is not None and until_journal_id is not None:
+                conn.execute(
+                    "UPDATE portrait_runs SET until_journal_id=max(coalesce(until_journal_id, 0), ?) WHERE id=?",
+                    (int(until_journal_id), run_id),
+                )
+            return out
+
+        return self._write(op)
+
+    def _sync_loop(
+        self, conn: sqlite3.Connection, ch: FactChange, old: sqlite3.Row | None, new_id: int | None,
+        at: float, now: float,
+    ) -> None:
+        sources = json.dumps([int(i) for i in ch.source_ids])
+        loop = None
+        if old is not None:
+            loop = conn.execute(
+                "SELECT id FROM open_loops WHERE portrait_fact_id=? AND status='open'", (old["id"],)
+            ).fetchone()
+        if ch.op == "ADD" and ch.kind == "open_loop":
+            conn.execute(
+                "INSERT INTO open_loops(person_ciphertext, text_ciphertext, status, opened_at, resolved_at,"
+                " portrait_fact_id, source_ids, updated_at) VALUES (?,?,'open',?,NULL,?,?,?)",
+                (self._enc(ch.subject or None), self.cipher.encrypt(ch.text), at, new_id, sources, now),
+            )
+        elif ch.op == "UPDATE" and loop is not None and ch.kind == "open_loop":
+            conn.execute(
+                "UPDATE open_loops SET person_ciphertext=?, text_ciphertext=?, portrait_fact_id=?, source_ids=?,"
+                " updated_at=? WHERE id=?",
+                (self._enc(ch.subject or None), self.cipher.encrypt(ch.text), new_id, sources, now, loop["id"]),
+            )
+        elif ch.op == "UPDATE" and loop is None and ch.kind == "open_loop":
+            conn.execute(
+                "INSERT INTO open_loops(person_ciphertext, text_ciphertext, status, opened_at, resolved_at,"
+                " portrait_fact_id, source_ids, updated_at) VALUES (?,?,'open',?,NULL,?,?,?)",
+                (self._enc(ch.subject or None), self.cipher.encrypt(ch.text), at, new_id, sources, now),
+            )
+        elif loop is not None and (ch.op == "INVALIDATE" or ch.op == "UPDATE"):
+            conn.execute(
+                "UPDATE open_loops SET status='resolved', resolved_at=?, updated_at=? WHERE id=?",
+                (at, now, loop["id"]),
+            )
+
+    # -- portrait runs and renders ----------------------------------------
+
+    def start_portrait_run(self, kind: str, model: str, at: float | None = None) -> int:
+        """Insert a ``running`` run row and return its id."""
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO portrait_runs(at, kind, model, outcome) VALUES (?,?,?,'running')",
+            (float(at) if at is not None else time.time(), kind, model),
+        ).lastrowid))
+
+    def finish_portrait_run(self, run_id: int, run: PortraitRunStats) -> None:
+        """Record a run's accounting and outcome.
+
+        Only a successful run (``ok``/``empty``) moves the checkpoint to its
+        ``until_journal_id``; a failed one keeps what its committed calls
+        advanced, so the facts it did not get to are picked up next time.
+        """
+        self._write(lambda conn: conn.execute(
+            "UPDATE portrait_runs SET finished_at=?, window_since=?, window_until=?, since_journal_id=?,"
+            " until_journal_id=CASE WHEN ? IN ('ok', 'empty')"
+            " THEN max(coalesce(until_journal_id, 0), coalesce(?, 0)) ELSE until_journal_id END,"
+            " journal_facts=?, calls=?,"
+            " input_tokens=?, output_tokens=?, cache_write_tokens=?, cache_read_tokens=?, cost_usd=?,"
+            " latency_ms=?, ops_add=?, ops_update=?, ops_invalidate=?, ops_noop=?, ops_rejected=?,"
+            " outcome=?, error=? WHERE id=?",
+            (
+                time.time(), run.window_since, run.window_until, run.since_journal_id, run.outcome,
+                run.until_journal_id, run.journal_facts, run.calls, run.input_tokens, run.output_tokens, run.cache_write_tokens,
+                run.cache_read_tokens, run.cost_usd, run.latency_ms, run.ops_add, run.ops_update,
+                run.ops_invalidate, run.ops_noop, run.ops_rejected, run.outcome, run.error, int(run_id),
+            ),
+        ))
+
+    def portrait_checkpoint(self) -> int:
+        """Highest journal id any portrait run has consumed (0 if none)."""
+        rows = self._query("SELECT coalesce(max(until_journal_id), 0) FROM portrait_runs")
+        return int(rows[0][0] or 0)
+
+    def last_portrait_run_at(self, kinds: Sequence[str] | None = None) -> float | None:
+        """Start time of the latest successful (``ok``/``empty``) run, optionally of these kinds."""
+        sql = "SELECT max(at) FROM portrait_runs WHERE outcome IN ('ok', 'empty')"
+        params: list[Any] = []
+        if kinds:
+            sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            params.extend(kinds)
+        value = self._query(sql, params)[0][0]
+        return float(value) if value is not None else None
+
+    def portrait_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Latest run rows (content-free), newest first."""
+        return [dict(r) for r in self._query("SELECT * FROM portrait_runs ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    def save_portrait(
+        self, text: str, *, run_id: int | None = None, model: str | None = None, fact_count: int = 0,
+        at: float | None = None,
+    ) -> int:
+        """Store a rendered portrait (encrypted); the newest one is the current portrait."""
+        when = float(at) if at is not None else time.time()
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO portraits(at, run_id, model, text_ciphertext, chars, fact_count) VALUES (?,?,?,?,?,?)",
+            (when, run_id, model, self.cipher.encrypt(text), len(text), int(fact_count)),
+        ).lastrowid))
+
+    def latest_portrait(self) -> Portrait | None:
+        """The newest rendered portrait, decrypted, or ``None``."""
+        rows = self._query("SELECT * FROM portraits ORDER BY at DESC, id DESC LIMIT 1")
+        if not rows:
+            return None
+        r = rows[0]
+        return Portrait(id=r["id"], at=r["at"], text=self.cipher.decrypt(r["text_ciphertext"]),
+                        run_id=r["run_id"], model=r["model"], fact_count=r["fact_count"])
+
+    def activity_slots(self, since: TimeArg, until: TimeArg, slot_s: float = 900.0) -> dict[str, Any]:
+        """Foreground presence in fixed slots: which apps/sites the watcher read, when.
+
+        Returns ``{"apps": {app: set(slot)}, "hosts": {(app, host): set(slot)}, "slot_s": slot_s}``
+        where a slot is ``int(at // slot_s)``. Apps come from captures and from
+        capture-health rows whose outcome shows the window was read (a backstop
+        re-read of unchanged text writes health, not a capture); hosts come
+        from captures (health rows carry no host). Content-free metadata only.
+        """
+        s, u = _ts(since), _ts(until)
+        clauses, params = [], []
+        if s is not None:
+            clauses.append("c.at >= ?")
+            params.append(s)
+        if u is not None:
+            clauses.append("c.at < ?")
+            params.append(u)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        apps: dict[str, set[int]] = {}
+        hosts: dict[tuple[str, str], set[int]] = {}
+        for r in self._query(
+            "SELECT c.at, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id" + where, params
+        ):
+            slot = int(r["at"] // slot_s)
+            apps.setdefault(r["app"] or "", set()).add(slot)
+            if r["host"]:
+                hosts.setdefault((r["app"] or "", r["host"]), set()).add(slot)
+        hwhere = where.replace("c.at", "h.at")
+        hwhere += (" AND " if hwhere else " WHERE ") + (
+            "h.outcome IN ('captured','deduplicated','unchanged','no_new_text','empty') AND coalesce(h.app,'') != ''"
+        )
+        for r in self._query("SELECT h.at, h.app FROM health h" + hwhere, params):
+            apps.setdefault(r["app"], set()).add(int(r["at"] // slot_s))
+        return {"apps": apps, "hosts": hosts, "slot_s": slot_s}
+
+    # -- know-how ----------------------------------------------------------
+
+    def _knowhow(self, r: sqlite3.Row, score: float | None = None) -> KnowHow:
+        return KnowHow(
+            id=r["id"], app=r["app"], text=self.cipher.decrypt(r["text_ciphertext"]), valid_from=r["valid_from"],
+            valid_to=r["valid_to"], source_request=self._dec(r["source_request_ciphertext"]),
+            superseded_by=r["superseded_by"], score=score,
+        )
+
+    def add_knowhow(
+        self,
+        app: str | None,
+        text: str,
+        *,
+        source_request: str | None = None,
+        vector: np.ndarray | None = None,
+        embed_model: str | None = None,
+        supersedes: int | None = None,
+        at: float | None = None,
+    ) -> int:
+        """Write a know-how entry; with ``supersedes``, end that entry (bi-temporal) in the same transaction.
+
+        ``app`` is stored as :func:`app_key` (``"Arc.exe"`` -> ``"arc"``); ``None``/empty = general.
+        """
+        now = time.time()
+        when = float(at) if at is not None else now
+        key = app_key(app)
+
+        def op(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "INSERT INTO knowhow(app, task_kind, text_ciphertext, valid_from, valid_to,"
+                " source_request_ciphertext, created_at) VALUES (?,NULL,?,?,NULL,?,?)",
+                (key, self.cipher.encrypt(text), when, self._enc(source_request), now),
+            )
+            new_id = int(cur.lastrowid)
+            if vector is not None:
+                vec = np.asarray(vector, dtype=np.float32).ravel()
+                conn.execute(
+                    "INSERT INTO knowhow_vec(knowhow_id, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
+                    (new_id, embed_model or "", int(vec.shape[0]), self.cipher.encrypt_bytes(vec.tobytes())),
+                )
+            if supersedes is not None:
+                conn.execute(
+                    "UPDATE knowhow SET valid_to=?, expired_at=?, superseded_by=? WHERE id=? AND valid_to IS NULL",
+                    (when, now, new_id, int(supersedes)),
+                )
+            return new_id
+
+        return self._write(op)
+
+    def knowhow_current(self, app: str | None = None, *, any_app: bool = True) -> list[KnowHow]:
+        """Current know-how, newest first.
+
+        ``app`` given: that app's entries only (matched by :func:`app_key`).
+        ``app=None``: every entry when ``any_app``, else only the entries
+        without an app.
+        """
+        sql = "SELECT * FROM knowhow WHERE valid_to IS NULL"
+        params: list[Any] = []
+        key = app_key(app)
+        if key is not None:
+            sql += " AND app = ?"
+            params.append(key)
+        elif not any_app:
+            sql += " AND app IS NULL"
+        sql += " ORDER BY valid_from DESC, id DESC"
+        return [self._knowhow(r) for r in self._query(sql, params)]
+
+    def knowhow_vectors(self, ids: Sequence[int]) -> dict[int, np.ndarray]:
+        """Stored (decrypted) vectors for these know-how ids."""
+        if not ids:
+            return {}
+        rows = self._query(
+            "SELECT knowhow_id, vec_ciphertext FROM knowhow_vec WHERE knowhow_id IN (%s)" % ",".join("?" * len(ids)),
+            [int(i) for i in ids],
+        )
+        return {
+            r["knowhow_id"]: np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+            for r in rows
+        }
+
+    def search_knowhow(
+        self, query_vec: np.ndarray, limit: int = 8, *, exclude_ids: Sequence[int] = ()
+    ) -> list[KnowHow]:
+        """Current know-how most similar to ``query_vec`` (cosine), best first."""
+        rows = self._query(
+            "SELECT k.*, v.vec_ciphertext, v.dim FROM knowhow k JOIN knowhow_vec v ON v.knowhow_id = k.id"
+            " WHERE k.valid_to IS NULL"
+        )
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(q))
+        skip = {int(i) for i in exclude_ids}
+        keep = [r for r in rows if r["dim"] == q.shape[0] and r["id"] not in skip]
+        if not keep or qn == 0.0:
+            return []
+        matrix = np.stack(
+            [np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32) for r in keep]
+        )
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        scores = (matrix @ (q / qn)) / norms
+        order = np.argsort(-scores)[: max(0, int(limit))]
+        return [self._knowhow(keep[i], float(scores[i])) for i in order]
+
+    # -- open loops --------------------------------------------------------
+
+    def _loop(self, r: sqlite3.Row) -> OpenLoop:
+        try:
+            sources = [int(i) for i in json.loads(r["source_ids"] or "[]")]
+        except (ValueError, TypeError):
+            sources = []
+        return OpenLoop(
+            id=r["id"], person=self._dec(r["person_ciphertext"]), text=self.cipher.decrypt(r["text_ciphertext"]),
+            status=r["status"], opened_at=r["opened_at"], resolved_at=r["resolved_at"],
+            portrait_fact_id=r["portrait_fact_id"], source_ids=sources,
+        )
+
+    def open_loops(self, status: str | None = "open") -> list[OpenLoop]:
+        """Open loops with this status (``None`` = all), oldest first."""
+        sql = "SELECT * FROM open_loops"
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        return [self._loop(r) for r in self._query(sql + " ORDER BY opened_at, id", params)]
+
+    def add_open_loop(
+        self, person: str | None, text: str, *, opened_at: float | None = None,
+        portrait_fact_id: int | None = None, source_ids: Sequence[int] | None = None,
+    ) -> int:
+        """Open a loop directly (the portrait worker opens them through ``open_loop`` facts)."""
+        now = time.time()
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO open_loops(person_ciphertext, text_ciphertext, status, opened_at, resolved_at,"
+            " portrait_fact_id, source_ids, updated_at) VALUES (?,?,'open',?,NULL,?,?,?)",
+            (self._enc(person), self.cipher.encrypt(text), float(opened_at) if opened_at is not None else now,
+             portrait_fact_id, json.dumps([int(i) for i in (source_ids or ())]), now),
+        ).lastrowid))
+
+    def resolve_open_loop(self, loop_id: int, *, at: float | None = None, status: str = "resolved") -> None:
+        """Close a loop (it is kept, with ``resolved_at``)."""
+        now = time.time()
+        self._write(lambda conn: conn.execute(
+            "UPDATE open_loops SET status=?, resolved_at=?, updated_at=? WHERE id=?",
+            (status, float(at) if at is not None else now, now, int(loop_id)),
+        ))
+
+    # -- status ------------------------------------------------------------
+
+    def activity_today(self, since: TimeArg) -> dict[str, Any]:
+        """Counts since ``since`` (e.g. local midnight) plus the latest capture time."""
+        s = _ts(since) or 0.0
+        captures = self._query("SELECT count(*) FROM captures WHERE at >= ?", (s,))[0][0]
+        facts = self._query("SELECT count(*) FROM journal WHERE at >= ?", (s,))[0][0]
+        last = self._query("SELECT max(at) FROM captures")[0][0]
+        journal_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM journal_batches WHERE at >= ?", (s,))[0][0]
+        portrait_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM portrait_runs WHERE at >= ?", (s,))[0][0]
+        return {
+            "captures": int(captures), "facts": int(facts), "last_capture_at": last,
+            "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
+        }
 
     # -- maintenance -------------------------------------------------------
 
