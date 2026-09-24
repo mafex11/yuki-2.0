@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 from typing import Sequence
 
 from PySide6.QtCore import QObject, QUrl, Qt
@@ -24,21 +25,25 @@ from yuki.ui.memory import (
     STATUS_PENDING,
     KnowsWindow,
     MemoryControl,
+    ReviewWindow,
     TodayWindow,
     describe_memory_status,
     minutes_until_tomorrow,
     quiet_until,
 )
 from yuki.ui.nudges import (
+    IMPLICIT_REPLY_S,
     NUDGE_EVENT_NAME,
+    OVERLAY_NUDGES,
     NudgeController,
     kind_accent,
-    kind_title,
+    nudge_answered,
+    nudge_moment,
     nudge_reply_request,
-    when_label,
+    overlay_label,
 )
 from yuki.ui.overlay import Overlay, ReplyCard
-from yuki.ui.runtime import WORKER, AgentRuntime
+from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_summary, describe_tool
 from yuki.ui.uilog import UiLog
 
@@ -127,13 +132,21 @@ class YukiUi(QObject):
         #: The "Today's list" panel, built the first time it is asked for.
         self.today: TodayWindow | None = None
         self.memory.today_ready.connect(self._on_today_ready)
+        #: The "This week's review" panel, built the first time it is asked for.
+        self.review: ReviewWindow | None = None
+        self.memory.review_ready.connect(self._on_review_ready)
         #: Memory's nudge cards, shown only while nothing else needs the screen.
         self.nudges = NudgeController(
-            self.runtime.memory, ui_log, blocked=self._nudge_blocker, event_name=nudge_event
+            self.runtime.memory, ui_log, blocked=self._nudge_blocker, inline=self._nudge_inline,
+            event_name=nudge_event,
         )
         self.nudges.reply_requested.connect(self._on_nudge_reply)
-        #: The nudge the user is writing a reply to (its card is in the overlay).
+        self.nudges.in_overlay.connect(self._on_nudge_in_overlay)
+        self.nudges.recent_ready.connect(self._on_recent_nudges)
+        #: The nudge the user is writing a reply to (its card is in the overlay),
+        #: and where Reply was pressed: ``card`` (the corner) or ``overlay``.
         self._nudge_reply: dict | None = None
+        self._nudge_reply_via: str = "card"
 
         #: request id -> the card showing it.
         self.cards: dict[int, ReplyCard] = {}
@@ -147,6 +160,7 @@ class YukiUi(QObject):
 
         self.overlay.submitted.connect(self._on_submitted)
         self.overlay.dismissed.connect(self._on_overlay_dismissed)
+        self.overlay.opened.connect(self._on_overlay_opened)
         # How each activation got (or failed to get) the keyboard: which step of
         # the foreground hand-over worked, and what Windows reported.
         self.overlay.focus_path.connect(self._on_focus_path)
@@ -201,7 +215,7 @@ class YukiUi(QObject):
         self.runtime.stop()
         self.overlay.hide()
         self.strip.hide()
-        for panel in (self.knows, self.today):
+        for panel in (self.knows, self.today, self.review):
             if panel is not None:
                 panel.hide()
 
@@ -248,22 +262,64 @@ class YukiUi(QObject):
             self.cards[request_id] = card
             self.overlay.expand_input()
             return
-        if self._nudge_reply is not None:
-            nudge, self._nudge_reply = self._nudge_reply, None
-            lane_name, request_id = self.runtime.submit(
-                nudge_reply_request(nudge, text), origin_hwnd=self._origin_hwnd
-            )
-            self.cards[request_id] = self.overlay.add_card(text)
-            self.overlay.expand_input()
-            self.ui_log.event(
-                "submit", id=request_id, lane=lane_name, text=text, nudge_id=nudge.get("id")
-            )
-            self.nudges.reply_sent(nudge, text, request_id, lane_name)
-            return
-        lane_name, request_id = self.runtime.submit(text, origin_hwnd=self._origin_hwnd)
+        # A nudge this answers (Reply pressed, or typed soon after the newest
+        # one in the overlay) goes in front as the reply context; what the coach
+        # said that this lane's agent has not heard yet goes after as a note.
+        nudge, how = self._reply_context()
+        request = (
+            nudge_reply_request(nudge, text, certain=how != "implicit") if nudge is not None else text
+        )
+        nudge_id = nudge.get("id") if nudge is not None else None
+        lane_guess = FRONT_DESK if self.runtime.worker_busy else WORKER  # as runtime.submit picks
+        note, note_ids = self.nudges.coach_note_for(lane_guess, exclude=nudge_id)
+        if note:
+            request = f"{request}\n\n{note}"
+        lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
         self.cards[request_id] = self.overlay.add_card(text)
         self.overlay.expand_input()
-        self.ui_log.event("submit", id=request_id, lane=lane_name, text=text)
+        self.ui_log.event(
+            "submit", id=request_id, lane=lane_name, text=text,
+            **({"nudge_id": nudge_id} if nudge is not None else {}),
+        )
+        if nudge is not None:
+            self.nudges.mark_attached(lane_name, [nudge_id])
+            self.ui_log.event(
+                "nudge_context_attached", mode="reply_prefix", how=how, id=nudge_id,
+                kind=nudge.get("kind"), request_id=request_id, lane=lane_name,
+            )
+            if how != "implicit":
+                # Only a pressed Reply is known to answer the nudge; a message
+                # typed soon after it is context, not a recorded reply.
+                card = self.overlay.nudge_card(nudge_id)
+                if card is not None:
+                    card.set_reply_state("replied")
+                self.nudges.reply_sent(nudge, text, request_id, lane_name)
+        if note:
+            self.nudges.mark_attached(lane_name, note_ids)
+            self.ui_log.event(
+                "nudge_context_attached", mode="note", ids=note_ids, request_id=request_id,
+                lane=lane_name, note=note,
+            )
+
+    def _reply_context(self) -> tuple[dict | None, str | None]:
+        """The nudge the request being sent answers, and how that was decided.
+
+        ``reply_button`` / ``card_reply``: the user pressed Reply on it (in the
+        overlay / on the corner card), however old it is. ``implicit``: nothing
+        was pressed, but the newest nudge in the overlay is unanswered and was
+        seen at most :data:`IMPLICIT_REPLY_S` ago. Otherwise ``(None, None)``.
+        """
+        if self._nudge_reply is not None:
+            nudge, self._nudge_reply = self._nudge_reply, None
+            return nudge, "reply_button" if self._nudge_reply_via == "overlay" else "card_reply"
+        shown = [card.nudge for card in self.overlay.nudge_cards()]
+        if not shown:
+            return None, None
+        newest = max(shown, key=lambda n: nudge_moment(n) or 0.0)
+        seen = nudge_moment(newest)
+        if nudge_answered(newest) or seen is None or time.time() - seen > IMPLICIT_REPLY_S:
+            return None, None
+        return newest, "implicit"
 
     # -- runtime events ----------------------------------------------------
 
@@ -378,24 +434,96 @@ class YukiUi(QObject):
         """A lane finished (emitted from its thread; a bound slot, so it runs on the GUI thread)."""
         self.nudges.try_show()
 
-    def _on_nudge_reply(self, nudge: dict) -> None:
-        """Reply on a nudge card: the overlay opens with the nudge as its context card."""
-        self._nudge_reply = nudge
-        kind = nudge.get("kind")
-        prompt = " · ".join(part for part in (f"Yuki · {kind_title(kind)}", when_label(nudge.get("at"))) if part)
-        self.overlay.add_card(
-            prompt, " ".join(str(nudge.get("text") or "").split()), tone="context",
-            accent=kind_accent(kind),
+    def _nudge_inline(self) -> bool:
+        """True when a nudge should go into the overlay: it is open and not waiting on a question."""
+        return self.overlay.isVisible() and not self.overlay.closing and self._question is None
+
+    def _on_overlay_opened(self) -> None:
+        """The overlay came up: queued nudges and a corner card move in; recent ones are fetched."""
+        self.nudges.try_show()
+        self.nudges.fetch_recent()
+
+    def _on_recent_nudges(self, rows: object) -> None:
+        """Memory's recent nudges arrived: the newest few go into the (still open) overlay."""
+        if not (self.overlay.isVisible() and not self.overlay.closing):
+            return
+        rows = [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
+        for row in rows[-OVERLAY_NUDGES:]:
+            self._add_nudge_card(row, "recent", seen_at=nudge_moment(row))
+
+    def _on_nudge_in_overlay(self, nudge: dict, via: str) -> None:
+        """A nudge delivered straight into the open overlay (it arrived, or the corner card moved in)."""
+        self._add_nudge_card(nudge, via)
+
+    def _add_nudge_card(self, nudge: dict, via: str, *, seen_at: float | None = None) -> ReplyCard | None:
+        """Put ``nudge`` in the overlay's stack by the time it was seen; logs ``nudge_in_overlay``."""
+        card = self.overlay.nudge_card(nudge.get("id"))
+        if card is not None:
+            return card
+        at = seen_at or nudge_moment(nudge) or time.time()
+        card = self.overlay.add_nudge_card(
+            nudge, overlay_label(nudge), accent=kind_accent(nudge.get("kind")), at=at
         )
+        self.ui_log.event(
+            "nudge_in_overlay", id=nudge.get("id"), kind=nudge.get("kind"), via=via,
+            placed=card is not None, reaction=nudge.get("reaction"),
+        )
+        if card is None:  # older than a full stack of newer cards
+            return None
+        # From here the overlay's card and the controller share one dict, so
+        # reactions recorded later show on it; it also counts as delivered.
+        card.nudge = self.nudges.record_delivery(nudge, "overlay" if via != "recent" else "recent", seen_at=at)
+        if card.nudge.get("reaction") == "replied":
+            card.set_reply_state("replied")
+        elif self._nudge_reply is not None and str(self._nudge_reply.get("id")) == str(nudge.get("id")):
+            card.set_reply_state("replying")
+        card.reply_clicked.connect(self._on_overlay_nudge_reply)
+        return card
+
+    def _on_overlay_nudge_reply(self, nudge: object) -> None:
+        """Reply on a nudge card inside the overlay: the next thing typed answers it."""
+        if not isinstance(nudge, dict):
+            return
+        previous = self._nudge_reply
+        if previous is not None and str(previous.get("id")) != str(nudge.get("id")):
+            self._release_nudge_reply(previous)
+        self._nudge_reply, self._nudge_reply_via = nudge, "overlay"
+        card = self.overlay.nudge_card(nudge.get("id"))
+        if card is not None:
+            card.set_reply_state("replying")
+        self.overlay.input.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.ui_log.event("nudge_reply_opened", id=nudge.get("id"), via="overlay")
+
+    def _release_nudge_reply(self, nudge: dict) -> None:
+        """Stop replying to ``nudge`` without sending. Its card's Reply opens again.
+
+        One replied to from the corner card was never acknowledged at all, so it
+        is acknowledged ``shown`` now (it was read, not dismissed).
+        """
+        card = self.overlay.nudge_card(nudge.get("id"))
+        if card is not None:
+            card.set_reply_state("open")
+        if self._nudge_reply_via == "card":
+            self.nudges.ack(nudge, "shown")
+        self._nudge_reply = None
+
+    def _on_nudge_reply(self, nudge: dict) -> None:
+        """Reply on a nudge card: the overlay opens with the nudge in its conversation, being replied to."""
+        self._nudge_reply, self._nudge_reply_via = nudge, "card"
+        self._add_nudge_card(nudge, "reply")
         self.overlay.open()
         self.ui_log.event("overlay", state="shown", via="nudge_reply", nudge_id=nudge.get("id"))
 
     def _on_overlay_dismissed(self) -> None:
-        """The overlay closed; a nudge reply that was never sent counts as dismissed."""
+        """The overlay closed; a corner-card reply that was never sent counts as dismissed."""
         self.ui_log.event("overlay", state="hidden")
         if self._nudge_reply is not None:
             nudge, self._nudge_reply = self._nudge_reply, None
-            self.nudges.reply_abandoned(nudge)
+            card = self.overlay.nudge_card(nudge.get("id"))
+            if card is not None:
+                card.set_reply_state("open")
+            if self._nudge_reply_via == "card":
+                self.nudges.reply_abandoned(nudge)
 
     def snooze_nudges(self, minutes: int) -> None:
         """Quiet nudges for ``minutes`` (``0``: back on), then re-read the tray's status line."""
@@ -449,6 +577,19 @@ class YukiUi(QObject):
         if self.today is not None:
             self.today.show_today(list(rows) if isinstance(rows, list) else None, meta)
 
+    def show_review(self) -> None:
+        """Open the read-only "This week's review" panel and fill it from memory."""
+        if self.review is None:
+            self.review = ReviewWindow()
+        self.review.show_loading()
+        self.review.open()
+        self.ui_log.event("review", state="shown")
+        self.memory.fetch_review()
+
+    def _on_review_ready(self, review: object, meta: str) -> None:
+        if self.review is not None:
+            self.review.show_review(review if isinstance(review, dict) else None, meta)
+
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
         self.ui_log.event("open_logs", path=str(self.settings.sessions_dir))
@@ -486,6 +627,9 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     today = QAction("Today's list", menu)
     today.triggered.connect(lambda _checked=False: ui.show_today())
     menu.addAction(today)
+    week_review = QAction("This week's review", menu)
+    week_review.triggered.connect(lambda _checked=False: ui.show_review())
+    menu.addAction(week_review)
     quiet_hour = QAction("Quiet for 1 hour", menu)
     quiet_hour.triggered.connect(lambda _checked=False: ui.snooze_nudges(60))
     menu.addAction(quiet_hour)
@@ -509,7 +653,7 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
         pause.setEnabled(running)
         refresh_portrait.setEnabled(current is not None)
         installed = ui.memory.memory.installed
-        for item in (knows, today, quiet_hour, quiet_tomorrow):
+        for item in (knows, today, week_review, quiet_hour, quiet_tomorrow):
             item.setEnabled(installed)
         nudges_on.setEnabled(installed and quiet_until(current) is not None)
 

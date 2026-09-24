@@ -3,7 +3,11 @@
 Lifecycle of a request, all of it animated and none of it timed with sleeps:
 submit collapses the input, a card grows in where the input used to be, and a
 fresh (empty) input expands below it. The card fills in when the answer arrives
-and grows to fit. Three cards stay visible; older ones fade away.
+and grows to fit. :data:`MAX_CARDS` cards stay visible; older ones fade away.
+
+Memory's nudges live in the same stack (tone ``nudge``: tinted in their
+kind's accent, labelled ``Yuki · 14:32 · nudge``, with their own Reply), each
+placed by the time the user saw it, so the stack reads as one conversation.
 
 The overlay never decides anything about the request -- it hands the text to
 :mod:`yuki.ui.runtime` and renders what comes back.
@@ -11,7 +15,8 @@ The overlay never decides anything about the request -- it hands the text to
 
 from __future__ import annotations
 
-from typing import Literal
+import time
+from typing import Any, Literal
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -26,8 +31,10 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -49,8 +56,8 @@ PANEL_WIDTH = 620
 #: Padding inside the panel.
 PAD = 14
 
-#: How many reply cards stay on screen.
-MAX_CARDS = 3
+#: How many cards (requests, replies and nudges together) stay on screen.
+MAX_CARDS = 5
 
 #: After the overlay is shown, how long losing activation does not count as the
 #: user clicking away. Covers the transient activate/deactivate messages of the
@@ -58,7 +65,7 @@ MAX_CARDS = 3
 #: a wait: nothing blocks on it.
 FOCUS_GRACE_MS = 200
 
-CardTone = Literal["reply", "question", "error", "context"]
+CardTone = Literal["reply", "question", "error", "context", "nudge"]
 
 
 class AskInput(QPlainTextEdit):
@@ -135,11 +142,21 @@ class ReplyCard(QWidget):
         body: Initial body text; empty means "still working".
         tone: Colour treatment. ``context`` is something Yuki said first (a
             nudge being replied to), marked with a bar in ``accent``.
-        accent: Colour of the ``context`` bar.
+            ``nudge`` is one of memory's nudges in the conversation: tinted in
+            ``accent``, its label in the accent, and a Reply of its own.
+        accent: Colour of the ``context`` bar / the ``nudge`` tint.
+        at: When the card's moment happened (epoch s; now by default): the
+            stack is kept in this order.
+        nudge: The nudge a ``nudge`` card shows.
         parent: Qt parent.
+
+    Signals:
+        reply_clicked: ``(nudge)`` -- Reply on a ``nudge`` card.
     """
 
     PENDING = "…"
+
+    reply_clicked = Signal(object)
 
     def __init__(
         self,
@@ -148,11 +165,15 @@ class ReplyCard(QWidget):
         *,
         tone: CardTone = "reply",
         accent: QColor | None = None,
+        at: float | None = None,
+        nudge: dict[str, Any] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.tone: CardTone = tone
         self.accent = accent
+        self.at: float = at if at is not None else time.time()
+        self.nudge = nudge
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 11)
         layout.setSpacing(4)
@@ -162,7 +183,35 @@ class ReplyCard(QWidget):
         self._prompt.setWordWrap(True)
         self._prompt.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
         self._prompt.setVisible(bool(prompt))
-        layout.addWidget(self._prompt)
+        self.reply_button: QPushButton | None = None
+        if tone == "nudge":
+            a = QColor(accent or QColor(126, 180, 255))
+            self._prompt.setFont(ui_font(9))
+            self._prompt.setTextFormat(Qt.TextFormat.PlainText)
+            self._prompt.setStyleSheet(f"color: rgba({a.red()},{a.green()},{a.blue()},230);")
+            header = QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            header.setSpacing(8)
+            header.addWidget(self._prompt, 1)
+            self.reply_button = QPushButton("Reply", self)
+            self.reply_button.setFont(ui_font(9))
+            self.reply_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            # A click must leave the keyboard in the input below.
+            self.reply_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.reply_button.setStyleSheet(
+                f"QPushButton {{ color: rgb({a.red()},{a.green()},{a.blue()});"
+                f" background: rgba({a.red()},{a.green()},{a.blue()},26);"
+                f" border: 1px solid rgba({a.red()},{a.green()},{a.blue()},80);"
+                " border-radius: 7px; padding: 1px 10px; }"
+                f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},60); }}"
+                "QPushButton:disabled { color: rgba(238,240,245,120); background: transparent;"
+                " border: 1px solid rgba(255,255,255,20); }"
+            )
+            self.reply_button.clicked.connect(lambda: self.reply_clicked.emit(self.nudge))
+            header.addWidget(self.reply_button, 0, Qt.AlignmentFlag.AlignVCenter)
+            layout.addLayout(header)
+        else:
+            layout.addWidget(self._prompt)
 
         self._body = QLabel(body or self.PENDING, self)
         self._body.setFont(ui_font(12))
@@ -215,6 +264,13 @@ class ReplyCard(QWidget):
         self._meta.setVisible(bool(text))
         self.grow_to_fit()
 
+    def set_reply_state(self, state: Literal["open", "replying", "replied"]) -> None:
+        """What a ``nudge`` card's Reply says: ``Reply``, ``Replying…`` or ``Replied``."""
+        if self.reply_button is None:
+            return
+        self.reply_button.setText({"open": "Reply", "replying": "Replying…", "replied": "Replied"}[state])
+        self.reply_button.setEnabled(state == "open")
+
     def wanted_height(self) -> int:
         """Height the card needs for its current text at its current width."""
         width = self.width() or (PANEL_WIDTH - 2 * PAD)
@@ -264,14 +320,22 @@ class ReplyCard(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         error = self.tone == "error"
-        painter.setBrush(ERROR_BG if error else CARD_BG)
-        painter.setPen(QPen(ERROR_BORDER if error else CARD_BORDER, 1.0))
+        if self.tone == "nudge":
+            tint = QColor(self.accent or QColor(126, 180, 255))
+            border = QColor(tint)
+            tint.setAlpha(22)
+            border.setAlpha(70)
+            painter.setBrush(tint)
+            painter.setPen(QPen(border, 1.0))
+        else:
+            painter.setBrush(ERROR_BG if error else CARD_BG)
+            painter.setPen(QPen(ERROR_BORDER if error else CARD_BORDER, 1.0))
         painter.drawRoundedRect(rect, 10, 10)
-        if self.tone in ("question", "context"):
-            bar = QColor(self.accent or QColor(126, 180, 255)) if self.tone == "context" else (
+        if self.tone in ("question", "context", "nudge"):
+            bar = QColor(self.accent or QColor(126, 180, 255)) if self.tone != "question" else (
                 QColor(126, 180, 255)
             )
-            bar.setAlpha(200 if self.tone == "context" else 180)
+            bar.setAlpha(180 if self.tone == "question" else 200)
             painter.setPen(QPen(bar, 2.0))
             painter.drawLine(
                 rect.left() + 1.0, rect.top() + 8.0, rect.left() + 1.0, rect.bottom() - 8.0
@@ -287,10 +351,13 @@ class Overlay(GlassWindow):
             interpret it.
         dismissed: The overlay was closed by Esc, by a click elsewhere, or by the
             hotkey.
+        opened: The overlay came up (from hidden or fading out; not a refocus
+            of an overlay already open).
     """
 
     submitted = Signal(str)
     dismissed = Signal()
+    opened = Signal()
 
     def __init__(self) -> None:
         super().__init__(activates=True, radius=16)
@@ -373,11 +440,14 @@ class Overlay(GlassWindow):
         foreground at once (:meth:`GlassWindow.take_focus`), focusing the input
         before the first animation frame.
         """
+        coming_up = not self.isVisible() or self.closing
         self._focus_grace = True
         self._grace_timer.start()
         self.expand_input()
         self.fit()
         self.fade_in(self.anchor())
+        if coming_up:
+            self.opened.emit()
 
     def dismiss(self) -> None:
         """Hide the overlay and tell the controller it is gone."""
@@ -450,6 +520,52 @@ class Overlay(GlassWindow):
         card.reveal()
         self._trim()
         return card
+
+    def add_nudge_card(
+        self, nudge: dict[str, Any], label: str, *, accent: QColor, at: float
+    ) -> ReplyCard | None:
+        """Put one of memory's nudges in the stack, in time order, and animate it in.
+
+        Args:
+            nudge: The nudge (kept on the card as ``card.nudge``).
+            label: The small label (``Yuki · 14:32 · nudge``).
+            accent: Its kind's colour.
+            at: When the user saw it (epoch s): where it goes in the stack.
+
+        Returns:
+            The card, or ``None`` when the stack is full of newer cards, so it
+            would only be trimmed away again at once.
+        """
+        existing = self.nudge_card(nudge.get("id"))
+        if existing is not None:
+            return existing
+        cards = self.cards()
+        index = next((i for i, c in enumerate(cards) if c.at > at), len(cards))
+        if index == 0 and len(cards) >= MAX_CARDS:
+            return None
+        card = ReplyCard(
+            label, " ".join(str(nudge.get("text") or "").split()), tone="nudge", accent=accent,
+            at=at, nudge=nudge, parent=self,
+        )
+        # Layout index of the card it goes before (cards are the only items).
+        self._cards.insertWidget(index, card)
+        card.height_animation.valueChanged.connect(lambda *_: self.fit())
+        card.show()
+        card.reveal()
+        self._trim()
+        return card
+
+    def nudge_cards(self) -> list[ReplyCard]:
+        """The nudge cards in the stack, oldest first."""
+        return [card for card in self.cards() if card.tone == "nudge" and card.nudge is not None]
+
+    def nudge_card(self, nudge_id: Any) -> ReplyCard | None:
+        """The card showing nudge ``nudge_id``, if it is in the stack."""
+        if nudge_id is None:
+            return None
+        return next(
+            (c for c in self.nudge_cards() if str(c.nudge.get("id")) == str(nudge_id)), None
+        )
 
     def _trim(self) -> None:
         """Fade out the oldest cards until at most :data:`MAX_CARDS` remain."""
