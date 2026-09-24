@@ -170,6 +170,18 @@ The coach (yuki.memory.nudges; yuki.memory.api.MemoryClient.todos / pending_nudg
     store.nudge_state(name) / set_nudge_state(name, value | None)
     store.captures_between(since, until=None, *, limit=4) -> [{"at", "app", "host", "kind", "text"}]   # not by_yuki
 
+The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
+
+    store.start_weekly_review(week, period_start, period_end, trigger, model, *, at=None) -> int
+    store.finish_weekly_review(id, *, outcome, stats: ReviewStats, text=, sections=, teaser=, numbers=,
+                               candidates=, error=, vector=, embed_model=)   # one transaction, encrypted
+    store.weekly_review(id);  store.weekly_reviews(*, week=None, outcomes=("ok",), limit=None)  # newest first
+    store.set_review_nudge(id, nudge_id)
+    store.review_candidates_pending(since=None) / mark_review_candidates(review_ids, run_id)   # -> portrait
+    store.search_reviews(vec, since, until, limit) / keyword_reviews(text, since, until, limit)
+    store.reviews_without_vectors() / add_review_vectors(items, model)
+    store.episodes_by_ids(ids);  store.turn_times(since, until) -> [(at, session_id)]
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
@@ -183,7 +195,7 @@ Maintenance and reporting::
 
 Service coordination (flag files next to the database, the service's mutex)::
 
-    PAUSE_FLAG, REFRESH_FLAG
+    PAUSE_FLAG, REFRESH_FLAG, REVIEW_FLAG
     flag_path(db_path, name) -> Path
     service_mutex_name(db_path) -> str
 """
@@ -229,6 +241,8 @@ def default_db_path() -> Path:
 #: to rebuild the portrait now (the service deletes it when it starts the run).
 PAUSE_FLAG = "paused"
 REFRESH_FLAG = "refresh_portrait"
+#: ``run_weekly_review`` asks the service to write a weekly review now (it deletes the flag when it starts).
+REVIEW_FLAG = "run_weekly_review"
 
 #: Prefix of the service's named mutex (one service per session and database).
 SERVICE_MUTEX_PREFIX = "Local\\YukiMemorySingleInstance"
@@ -736,8 +750,9 @@ class TodoItem:
 
 
 #: ``nudges.kind``: praise (encouragement, an acknowledgement), nudge (a call-back,
-#: a call-out, a break suggestion) or reminder (a due to-do or commitment).
-NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder")
+#: a call-out, a break suggestion), reminder (a due to-do or commitment) or review
+#: (the teaser of a new weekly review, yuki.memory.review; ``ref`` = "review:<id>").
+NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review")
 #: ``nudges.reaction`` values the UI reports (``expired``: never shown in time).
 NUDGE_REACTIONS: tuple[str, ...] = ("shown", "dismissed", "replied", "snoozed")
 
@@ -791,6 +806,47 @@ class NewNudge:
     trigger: str | None = None
     ref: str | None = None
     due_at: float | None = None
+
+
+@dataclass
+class WeeklyReview:
+    """One weekly review run (decrypted), see :mod:`yuki.memory.review`."""
+
+    id: int
+    at: float
+    finished_at: float | None
+    week: str                        # ISO week of the period's last day, "2026-W39"
+    period_start: float
+    period_end: float
+    trigger: str                     # scheduled | demand
+    model: str | None
+    text: str | None
+    sections: dict[str, Any]
+    teaser: str | None
+    numbers: dict[str, Any]
+    candidates: list[dict[str, Any]]
+    candidates_run_id: int | None
+    nudge_id: int | None
+    outcome: str                     # running | ok | empty | error
+    error: str | None
+    cost_usd: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    score: float | None = None       # cosine, set by search_reviews
+
+
+@dataclass
+class ReviewStats:
+    """Content-free accounting for one weekly review run (all its model calls)."""
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    stop_reason: str | None = None
 
 
 @dataclass
@@ -1316,6 +1372,49 @@ MIGRATIONS: tuple[str, ...] = (
         name       TEXT PRIMARY KEY,                -- e.g. quiet_until
         value      TEXT NOT NULL,
         updated_at REAL NOT NULL
+    );
+    """,
+    # 9: the weekly review (yuki.memory.review) - one row per run, the review
+    # text and the numbers it rests on encrypted, the behaviour-pattern
+    # candidates it proposes for the portrait (consumed by the next portrait
+    # run), the teaser nudge it was delivered with, and its embedding for
+    # recall. Additive only, like 2-8.
+    """
+    CREATE TABLE weekly_reviews (
+        id                    INTEGER PRIMARY KEY,
+        at                    REAL NOT NULL,        -- started
+        finished_at           REAL,
+        week                  TEXT NOT NULL,        -- ISO week of the period's last day, e.g. 2026-W39
+        period_start          REAL NOT NULL,        -- local midnight of the first day
+        period_end            REAL NOT NULL,        -- when the numbers stop (the run's now)
+        trigger               TEXT NOT NULL,        -- scheduled | demand
+        model                 TEXT,
+        text_ciphertext       TEXT,                 -- the review as shown
+        sections_ciphertext   TEXT,                 -- JSON: about, time, focus, done, still_open, suggestions, mentions
+        teaser_ciphertext     TEXT,
+        numbers_ciphertext    TEXT,                 -- JSON: the computed numbers (site and app names)
+        candidates_ciphertext TEXT,                 -- JSON: behaviour-pattern candidates for the portrait
+        candidates_run_id     INTEGER,              -- portrait run that was given them
+        nudge_id              INTEGER,              -- the teaser nudge, once delivered
+        calls                 INTEGER NOT NULL DEFAULT 0,
+        input_tokens          INTEGER NOT NULL DEFAULT 0,
+        output_tokens         INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens    INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+        cost_usd              REAL,
+        latency_ms            REAL NOT NULL DEFAULT 0,
+        stop_reason           TEXT,
+        outcome               TEXT NOT NULL,        -- running | ok | empty | error
+        error                 TEXT
+    );
+    CREATE INDEX weekly_reviews_week ON weekly_reviews(week, at);
+    CREATE INDEX weekly_reviews_at ON weekly_reviews(at);
+
+    CREATE TABLE weekly_review_vec (
+        review_id       INTEGER PRIMARY KEY REFERENCES weekly_reviews(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
     );
     """,
 )
@@ -2541,11 +2640,12 @@ class Store:
         conversation_cost = self._query(
             "SELECT coalesce(sum(cost_usd), 0) FROM conversation_batches WHERE at >= ?", (s,))[0][0]
         nudge_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM nudge_checkins WHERE at >= ?", (s,))[0][0]
+        review_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM weekly_reviews WHERE at >= ?", (s,))[0][0]
         return {
             "captures": int(captures), "facts": int(facts), "last_capture_at": last,
             "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
             "episode_cost_usd": float(episode_cost or 0.0), "conversation_cost_usd": float(conversation_cost or 0.0),
-            "nudge_cost_usd": float(nudge_cost or 0.0),
+            "nudge_cost_usd": float(nudge_cost or 0.0), "review_cost_usd": float(review_cost or 0.0),
         }
 
     # -- timeline ------------------------------------------------------------
@@ -2862,6 +2962,16 @@ class Store:
                     break
         return hits
 
+    def episodes_by_ids(self, ids: Iterable[int]) -> list[EpisodeRecord]:
+        """Episodes (any version) with these ids, oldest first."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return []
+        return [self._episode(r) for r in self._query(
+            "SELECT e.* FROM episodes e WHERE e.id IN (%s) ORDER BY e.started_at, e.id" % ",".join("?" * len(wanted)),
+            wanted,
+        )]
+
     def episodes_without_vectors(self, limit: int = 64) -> list[EpisodeRecord]:
         """Current episodes that have no embedding yet."""
         return [self._episode(r) for r in self._query(
@@ -3144,6 +3254,13 @@ class Store:
                 if len(hits) >= limit:
                     break
         return hits
+
+    def turn_times(self, since: TimeArg = None, until: TimeArg = None) -> list[tuple[float, str]]:
+        """``(at, session_id)`` of every exchange in ``[since, until)``, oldest first (content-free)."""
+        where, params = self._turn_filter(since, until)
+        return [(float(r["at"]), str(r["session_id"])) for r in self._query(
+            "SELECT t.at, t.session_id FROM conversation_turns t" + where + " ORDER BY t.at, t.id", params
+        )]
 
     def turns_without_vectors(self, limit: int = 256) -> list[ConversationTurn]:
         return [self._turn(r) for r in self._query(
@@ -3725,6 +3842,163 @@ class Store:
         )
         return [{"at": r["at"], "app": r["app"], "host": r["host"], "kind": r["kind"],
                  "text": self.cipher.decrypt(r["delta_ciphertext"])} for r in reversed(rows)]
+
+    # -- the weekly review (yuki.memory.review) --------------------------------
+
+    def _review(self, r: sqlite3.Row, score: float | None = None) -> WeeklyReview:
+        def load(name: str, default: Any) -> Any:
+            try:
+                value = json.loads(self._dec(r[name]) or "null")
+            except (ValueError, TypeError):
+                return default
+            return value if isinstance(value, type(default)) else default
+
+        return WeeklyReview(
+            id=r["id"], at=r["at"], finished_at=r["finished_at"], week=r["week"], period_start=r["period_start"],
+            period_end=r["period_end"], trigger=r["trigger"], model=r["model"], text=self._dec(r["text_ciphertext"]),
+            sections=load("sections_ciphertext", {}), teaser=self._dec(r["teaser_ciphertext"]),
+            numbers=load("numbers_ciphertext", {}), candidates=load("candidates_ciphertext", []),
+            candidates_run_id=r["candidates_run_id"], nudge_id=r["nudge_id"], outcome=r["outcome"],
+            error=r["error"], cost_usd=r["cost_usd"], input_tokens=r["input_tokens"] or 0,
+            output_tokens=r["output_tokens"] or 0, score=score,
+        )
+
+    def start_weekly_review(
+        self, week: str, period_start: float, period_end: float, trigger: str, model: str | None,
+        *, at: float | None = None,
+    ) -> int:
+        """Insert a ``running`` review row and return its id."""
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO weekly_reviews(at, week, period_start, period_end, trigger, model, outcome)"
+            " VALUES (?,?,?,?,?,?,'running')",
+            (float(at) if at is not None else time.time(), str(week), float(period_start), float(period_end),
+             str(trigger), model),
+        ).lastrowid))
+
+    def finish_weekly_review(
+        self, review_id: int, *, outcome: str, stats: ReviewStats, text: str | None = None,
+        sections: dict[str, Any] | None = None, teaser: str | None = None, numbers: dict[str, Any] | None = None,
+        candidates: Sequence[dict[str, Any]] | None = None, error: str | None = None,
+        vector: np.ndarray | None = None, embed_model: str | None = None,
+    ) -> None:
+        """Record a review's outcome, content (encrypted) and accounting in one transaction (plus its vector)."""
+
+        def seal(value: Any) -> str | None:
+            return None if value is None else self.cipher.encrypt(json.dumps(value, ensure_ascii=False, default=str))
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE weekly_reviews SET finished_at=?, text_ciphertext=?, sections_ciphertext=?, teaser_ciphertext=?,"
+                " numbers_ciphertext=?, candidates_ciphertext=?, calls=?, input_tokens=?, output_tokens=?,"
+                " cache_write_tokens=?, cache_read_tokens=?, cost_usd=?, latency_ms=?, stop_reason=?, outcome=?,"
+                " error=? WHERE id=?",
+                (time.time(), self._enc(text), seal(sections), self._enc(teaser), seal(numbers),
+                 seal(list(candidates)) if candidates is not None else None, stats.calls, stats.input_tokens,
+                 stats.output_tokens, stats.cache_write_tokens, stats.cache_read_tokens, stats.cost_usd,
+                 stats.latency_ms, stats.stop_reason, outcome, error, int(review_id)),
+            )
+            if vector is not None:
+                self._put_vec(conn, "weekly_review_vec", "review_id", int(review_id), vector, embed_model)
+
+        self._write(op)
+
+    def weekly_review(self, review_id: int) -> WeeklyReview | None:
+        rows = self._query("SELECT * FROM weekly_reviews WHERE id=?", (int(review_id),))
+        return self._review(rows[0]) if rows else None
+
+    def weekly_reviews(
+        self, *, week: str | None = None, outcomes: Sequence[str] | None = ("ok",), limit: int | None = None,
+    ) -> list[WeeklyReview]:
+        """Review runs (of one ISO week if given, with these outcomes; ``None`` = any), newest first."""
+        clauses, params = [], []
+        if week:
+            clauses.append("week = ?")
+            params.append(str(week))
+        if outcomes:
+            clauses.append("outcome IN (%s)" % ",".join("?" * len(outcomes)))
+            params.extend(outcomes)
+        sql = "SELECT * FROM weekly_reviews" + ((" WHERE " + " AND ".join(clauses)) if clauses else "")
+        sql += " ORDER BY at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._review(r) for r in self._query(sql, params)]
+
+    def set_review_nudge(self, review_id: int, nudge_id: int) -> None:
+        self._write(lambda conn: conn.execute(
+            "UPDATE weekly_reviews SET nudge_id=? WHERE id=?", (int(nudge_id), int(review_id))))
+
+    def review_candidates_pending(self, since: TimeArg = None) -> list[WeeklyReview]:
+        """Finished reviews whose behaviour candidates no portrait run has been given yet, oldest first."""
+        sql = ("SELECT * FROM weekly_reviews WHERE outcome='ok' AND candidates_run_id IS NULL"
+               " AND candidates_ciphertext IS NOT NULL")
+        params: list[Any] = []
+        if (s := _ts(since)) is not None:
+            sql += " AND at >= ?"
+            params.append(s)
+        return [rv for rv in (self._review(r) for r in self._query(sql + " ORDER BY at, id", params)) if rv.candidates]
+
+    def mark_review_candidates(self, review_ids: Iterable[int], run_id: int) -> None:
+        """The portrait run ``run_id`` was given these reviews' candidates."""
+        ids = [int(i) for i in review_ids]
+        if not ids:
+            return
+        self._write(lambda conn: conn.executemany(
+            "UPDATE weekly_reviews SET candidates_run_id=? WHERE id=? AND candidates_run_id IS NULL",
+            [(int(run_id), i) for i in ids]))
+
+    def _review_filter(self, since: TimeArg, until: TimeArg) -> tuple[str, list[Any]]:
+        clauses, params = ["w.outcome = 'ok'"], []
+        if (s := _ts(since)) is not None:
+            clauses.append("w.period_end >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("w.period_start < ?")
+            params.append(u)
+        return " WHERE " + " AND ".join(clauses), params
+
+    def search_reviews(
+        self, query_vec: np.ndarray, since: TimeArg = None, until: TimeArg = None, limit: int = 10
+    ) -> list[WeeklyReview]:
+        """Finished reviews most similar to ``query_vec`` (cosine) whose period overlaps ``[since, until)``."""
+        where, params = self._review_filter(since, until)
+        rows = self._query(
+            "SELECT w.*, v.vec_ciphertext, v.dim FROM weekly_reviews w JOIN weekly_review_vec v ON v.review_id = w.id"
+            + where, params,
+        )
+        return [self._review(r, score) for r, score in self._rank(rows, query_vec, limit)]
+
+    def keyword_reviews(
+        self, text: str, since: TimeArg = None, until: TimeArg = None, limit: int = 50
+    ) -> list[WeeklyReview]:
+        """Finished reviews whose text contains every term of ``text`` (casefolded), newest first."""
+        terms = [t.casefold() for t in (text or "").split()]
+        if not terms:
+            return []
+        where, params = self._review_filter(since, until)
+        hits: list[WeeklyReview] = []
+        for r in self._query("SELECT w.* FROM weekly_reviews w" + where + " ORDER BY w.at DESC, w.id DESC", params):
+            review = self._review(r)
+            if all(t in (review.text or "").casefold() for t in terms):
+                hits.append(review)
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def reviews_without_vectors(self, limit: int = 16) -> list[WeeklyReview]:
+        return [self._review(r) for r in self._query(
+            "SELECT w.* FROM weekly_reviews w LEFT JOIN weekly_review_vec v ON v.review_id = w.id"
+            " WHERE v.review_id IS NULL AND w.outcome='ok' AND w.text_ciphertext IS NOT NULL ORDER BY w.id LIMIT ?",
+            (int(limit),),
+        )]
+
+    def add_review_vectors(self, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        def op(conn: sqlite3.Connection) -> int:
+            for review_id, vec in items:
+                self._put_vec(conn, "weekly_review_vec", "review_id", review_id, vec, model)
+            return len(items)
+
+        return self._write(op) if items else 0
 
     # -- maintenance -------------------------------------------------------
 

@@ -41,6 +41,12 @@ every section but Open loops and is told to say nothing is pending; the Open
 loops section is appended from the loop records by code (:meth:`loops_text`),
 so nothing becomes a to-do that no loop record says.
 
+Weekly reviews (:mod:`yuki.memory.review`) propose behaviour-pattern candidates;
+the next run after a review (any kind) gets them as REVIEW CANDIDATES in its
+first operations call, with the episodes they cite added to its EPISODES, and
+decides on them like on any other evidence (its own validation applies; the
+review never writes facts). The review is then marked as given to that run.
+
 User corrections (:meth:`Store.add_correction`, from Yuki's ``update_portrait``
 tool) are facts of kind ``correction`` with origin ``user``: the render follows
 them at once, and the next run folds them into the facts they concern (the
@@ -127,6 +133,8 @@ LOOP_KIND = "open_loop"
 #: Relationship input of the render: session summaries of this many days, at most this many characters.
 RELATIONSHIP_DAYS = 14
 RELATIONSHIP_CHARS = 8_000
+#: Behaviour candidates of weekly reviews at most this old are given to a run (yuki.memory.review).
+REVIEW_CANDIDATE_DAYS = 14
 
 OPS_SYSTEM_PROMPT = """\
 You maintain the portrait that Yuki keeps of its user. Yuki is a personal assistant living \
@@ -184,6 +192,12 @@ watching = while that app played media), visits, longest uninterrupted stretch, 
 switches, and pairs the user went back and forth between.
 - ACTIVITY: foreground time per app and site measured by the memory watcher, by weekday \
 and hour of day. Use it for routines.
+- REVIEW CANDIDATES (sometimes): behaviour patterns the user's weekly review proposed from \
+the week's numbers and episodes, each with the episodes it cites (they are among EPISODES), a \
+suggested confidence and the existing fact it would refine. They are proposals, not facts: ADD \
+or UPDATE a behaviour fact only where the cited episodes and TIME USE bear it out, citing those \
+episodes, and set the confidence by the rules above; leave out any the evidence does not \
+support.
 
 Work out what the journal, episodes and activity change, then call update_portrait \
 exactly once with one operation per decision:
@@ -614,6 +628,13 @@ class PortraitWorker:
         last = self.store.last_portrait_run_at()
         return max(last if last is not None else now - 86400.0, now - 7 * 86400.0)
 
+    def review_candidates(self, now: float) -> list[Any]:
+        """Weekly reviews (last :data:`REVIEW_CANDIDATE_DAYS` days) whose behaviour candidates no run has seen."""
+        try:
+            return self.store.review_candidates_pending(since=now - REVIEW_CANDIDATE_DAYS * 86400.0)
+        except Exception:
+            return []
+
     def episodes_for(self, kind: str, now: float) -> list[EpisodeRecord]:
         """The run's episodes (current versions), oldest first, at most :data:`MAX_EPISODES`."""
         try:
@@ -669,6 +690,7 @@ class PortraitWorker:
     def _ops_message(
         self, *, kind: str, now: float, facts: Sequence[PortraitFact], journal: Sequence[JournalEntry],
         activity: str, part: tuple[int, int], episodes: Sequence[EpisodeRecord] = (), time_use: str = "",
+        candidates: Sequence[Any] = (),
     ) -> str:
         nonce = str(uuid.uuid4()).upper()
         begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
@@ -696,12 +718,25 @@ class PortraitWorker:
         if part[1] > 1 and part[0] > 1:
             part_note += " EPISODES and TIME USE were given with part 1."
         episode_lines = [self._episode_line(e, safe) for e in episodes]
+        candidate_lines = []
+        for review in candidates:
+            for n, c in enumerate(review.candidates, start=1):
+                refines = f" refines F{c['fact_id']}" if c.get("fact_id") else ""
+                cited = ", ".join(f"E{i}" for i in c.get("episode_ids") or [])
+                days = ", ".join(c.get("days") or [])
+                candidate_lines.append(
+                    f"R{review.id}.{n} (weekly review {review.week}) subject={safe(c.get('subject'), 120)!r} "
+                    f"suggested confidence {float(c.get('confidence') or 0):.2f}{refines}; episodes {cited} "
+                    f"(days {days}): {safe(c.get('text'), 600)}"
+                )
         data = "\n".join(
             ["CURRENT FACTS:", *fact_lines, "", f"JOURNAL ({len(journal)} entries, oldest first):",
              *(journal_lines or ["(no new entries)"]), "",
              f"EPISODES ({len(episodes)}, oldest first):", *(episode_lines or ["(none)"]), "",
              "TIME USE:", safe(time_use, 12000) or "(none)", "",
              "ACTIVITY:", safe(activity, 8000)]
+            + (["", "REVIEW CANDIDATES (proposals from the weekly review):", *candidate_lines]
+               if candidate_lines else [])
         )
         try:
             learned = self.store.me_names()
@@ -891,17 +926,29 @@ class PortraitWorker:
                 stats.until_journal_id = max(j.id for j in journal)
             pending_corrections = self.store.portrait_facts([CORRECTION_KIND])
             episodes = self.episodes_for(kind, now)
-            chunks = self._chunks(journal) or ([[]] if (pending_corrections or episodes) else [])
+            candidates = self.review_candidates(now)
+            if candidates:
+                # the episodes the candidates cite are part of the evidence this run may cite
+                have = {e.id for e in episodes}
+                cited = {i for r in candidates for c in r.candidates for i in c.get("episode_ids") or []} - have
+                try:
+                    extra = [e for e in self.store.episodes_by_ids(cited)]
+                except Exception:
+                    extra = []
+                episodes = sorted([*episodes, *extra], key=lambda e: (e.started_at, e.id))
+            chunks = self._chunks(journal) or ([[]] if (pending_corrections or episodes or candidates) else [])
             activity = self.activity_text(now) if chunks else ""
             time_use = self.time_use_text(kind, now) if chunks else ""
             self._log("portrait_inputs", run_id=run_id, journal_facts=len(journal), episodes=len(episodes),
-                      time_use_chars=len(time_use), chunks=len(chunks))
+                      time_use_chars=len(time_use), chunks=len(chunks),
+                      review_candidates=sum(len(r.candidates) for r in candidates))
             for number, chunk in enumerate(chunks, start=1):
                 facts = self.store.portrait_facts()
                 part_episodes = episodes if number == 1 else []
                 user = self._ops_message(kind=kind, now=now, facts=facts, journal=chunk, activity=activity,
                                          part=(number, len(chunks)), episodes=part_episodes,
-                                         time_use=time_use if number == 1 else "")
+                                         time_use=time_use if number == 1 else "",
+                                         candidates=candidates if number == 1 else ())
                 tool_input = self._call(
                     purpose="operations", run_id=run_id, system=OPS_SYSTEM_PROMPT, user=user,
                     tool=UPDATE_PORTRAIT_TOOL, effort=self.effort, max_tokens=OPS_MAX_TOKENS, stats=stats,
@@ -935,6 +982,8 @@ class PortraitWorker:
                           noop=sum(o.status == "noop" for o in outcomes),
                           rejected=[o.status for o in outcomes if o.status.startswith("rejected")],
                           operations_ciphertext=self._seal([o.__dict__ for o in outcomes]))
+                if number == 1 and candidates and run_id is not None:
+                    self.store.mark_review_candidates([r.id for r in candidates], run_id)
             expired = self._expire_loops(run_id, now, stats)
             result.operations.extend(expired)
             changed += sum(o.status == "applied" for o in expired)

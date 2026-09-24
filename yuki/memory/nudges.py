@@ -521,7 +521,7 @@ def reaction_summary(store: Store, since: float, until: float | None = None) -> 
         key = n.reaction or "not reacted to"
         counts[key] = counts.get(key, 0) + 1
     parts = []
-    for kind in ("praise", "nudge", "reminder"):
+    for kind in ("praise", "nudge", "reminder", "review"):
         counts = by_kind.get(kind)
         if not counts:
             continue
@@ -1073,7 +1073,7 @@ class NudgeWorker:
                 pending = True   # a new activity, not held yet: a periodic look waits for it
 
         checkins = self.store.nudge_checkins(now - 3600.0)
-        calls = [c for c in checkins if c["model"] and c["trigger"] != "reminder" and c["at"] <= now]
+        calls = [c for c in checkins if c["model"] and c["trigger"] not in ("reminder", "review") and c["at"] <= now]
         rate_ok = len(calls) < config.max_calls_per_hour and (not calls or now - calls[-1]["at"] >= config.min_gap_s)
         last_pn = self.store.nudges(until=now + 1.0, kinds=("praise", "nudge"), limit=1)
         last = last_pn[-1] if last_pn else None
@@ -1100,7 +1100,7 @@ class NudgeWorker:
                                                               follow_up_of), items)
             return self._skip(now, "transition", "budget")
 
-        looked = [c["at"] for c in checkins if c["trigger"] != "reminder" and c["at"] <= now]
+        looked = [c["at"] for c in checkins if c["trigger"] not in ("reminder", "review") and c["at"] <= now]
         last_look = max([self._started_at, *looked]) if looked else self._started_at
         if now - last_look < config.periodic_min * 60.0 or pending:
             return None

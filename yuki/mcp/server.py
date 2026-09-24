@@ -59,7 +59,9 @@ front and for how long, and episode narratives of what the user was doing;
 - the user's conversations with Yuki: exchanges, session summaries, and the standing rules the user set;
 - a one-page portrait of the user (work, interests, people, routines, preferences, open loops), rebuilt \
 nightly from the facts;
-- procedures that worked on this PC (know-how).
+- procedures that worked on this PC (know-how);
+- a weekly review of the user's last seven days (time use against the week before, focus, what got done \
+and what is open), written on Sunday evenings.
 
 Dates matter. Each fact is dated by when it happened or was said, not when it was captured; older facts may \
 be out of date and a later one can supersede an earlier one. Read the dates in each result and narrow \
@@ -258,7 +260,7 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                         "name ('chrome.exe'). Leaves out episodes and conversations.")] = None,
         limit: Annotated[int, Field(ge=1, le=20, description="Maximum results (1-20).")] = 10,
     ) -> str:
-        """Search dated memory: facts from screen capture, episode narratives, past conversations with Yuki ('chat') and conversation summaries ('session'). Returns dated lines, best match first."""
+        """Search dated memory: facts from screen capture, episode narratives, past conversations with Yuki ('chat'), conversation summaries ('session') and weekly reviews ('review'). Returns dated lines, best match first."""
 
         def body() -> tuple[str, Window | None]:
             if not (query or "").strip():
@@ -395,6 +397,40 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                 return "\n".join(lines), None
 
             return run("get_todos", {}, body)
+
+    # -- get_weekly_review (only when the memory API offers it) ---------------
+
+    if callable(getattr(MemoryClient, "weekly_review", None)):
+
+        @server.tool(title="Get weekly review", annotations=READ_ONLY, structured_output=False)
+        def get_weekly_review(
+            week: Annotated[str | None, Field(
+                description="Which review: 'latest' (default), an ISO week such as '2026-W39' (the week of the "
+                            "review period's last day), or a date inside that week ('2026-09-20').")] = None,
+        ) -> str:
+            """The user's weekly review: a short narrative of the last seven days (what the week was about, how time went against the week before, focus and drift, what got done, what is open, suggestions) plus its key numbers, written by Yuki's memory once a week."""
+
+            def body() -> tuple[str, Window | None]:
+                client = memory.client()
+                review = client.weekly_review(week or "latest")
+                if not review:
+                    which = "for that week" if week and week.strip().lower() != "latest" else "yet"
+                    return (f"Covers: nothing (local time, {utc_offset()}).\nNo weekly review {which}. Memory "
+                            "writes one on Sunday evenings from the last seven days."), None
+                start, end = _parse_iso(review.get("start")), _parse_iso(review.get("end"))
+                written = _parse_iso(review.get("written_at"))
+                lines = [
+                    f"Covers: {fmt_span(start, end)} (review week {review.get('week')}; days run 04:00-04:00; "
+                    f"local time, {utc_offset()}). Written {fmt_at(written)}; nothing after that is in it.",
+                    "",
+                    str(review.get("text") or "").strip(),
+                ]
+                summary = [str(x) for x in review.get("summary") or [] if str(x).strip()]
+                if summary:
+                    lines += ["", "Key numbers (measured on the PC):", *[f"- {x}" for x in summary]]
+                return "\n".join(lines), (Window(start, end) if start and end else None)
+
+            return run("get_weekly_review", {"week": week}, body)
 
     return server, memory
 

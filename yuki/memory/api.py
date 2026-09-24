@@ -34,8 +34,15 @@ To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
     memory.add_todo(text, due=None) -> "todo:N"
     memory.complete_todo(ref) -> id | None              # an id or the item's text
     memory.pending_nudges() -> list[dict]               # unshown, oldest first; wait on Local\\YukiNudgeReady
+    memory.recent_nudges(hours=12) -> list[dict]        # shown ones of the last N hours, with shown_at + reaction
     memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
     memory.snooze_nudges(minutes);  memory.nudge_status() -> dict
+
+The weekly review (written by the service, yuki.memory.review)::
+
+    memory.weekly_review(which="latest") -> dict | None   # "latest", an ISO week "2026-W39" or a date in it
+    memory.run_weekly_review()                             # flag file; the service writes one now (non-blocking)
+    memory.recall(...)                                     # also kind "review"
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ import numpy as np
 from yuki.memory.store import (
     PAUSE_FLAG,
     REFRESH_FLAG,
+    REVIEW_FLAG,
     STANDING_KINDS,
     ConversationFact,
     ConversationTurn,
@@ -391,13 +399,16 @@ class MemoryClient:
         of the names that app goes by, or when it came from a window of that
         process; with ``app`` given, episodes, chats and sessions (not tied to
         one app) are left out.
-        Each hit: ``{"kind": "fact" | "episode" | "chat" | "session", "at": ISO
-        local time, "until": ISO | None (an episode's or session's end), "app":
-        str | None, "host": str | None, "fact": str, "importance": int | None,
-        "score": float}``. ``fact`` is the journal fact, the episode text, the
-        session summary, or for a chat one exchange: ``The user said: "..." Yuki
-        replied: "..." Yuki did: ...`` (long messages cut after whole
-        sentences). ``score`` is the fused rank score; higher is better.
+        Each hit: ``{"kind": "fact" | "episode" | "chat" | "session" | "review",
+        "at": ISO local time, "until": ISO | None (an episode's, session's or
+        review period's end), "app": str | None, "host": str | None, "fact": str,
+        "importance": int | None, "score": float}``. ``fact`` is the journal fact,
+        the episode text, the session summary, a weekly review (``Weekly review
+        2026-W39 (Mon 14 Sep - Sun 20 Sep): ...``, its whole text), or for a chat
+        one exchange: ``The user said: "..." Yuki replied: "..." Yuki did: ...``
+        (long messages cut after whole sentences). ``score`` is the fused rank
+        score; higher is better. Reviews, like episodes, are left out when
+        ``app`` is given.
         """
         query = (query or "").strip()
         limit = max(0, int(limit))
@@ -426,6 +437,8 @@ class MemoryClient:
                     add("chat", rank, t)
                 for rank, sm in enumerate(self.store.search_summaries(vec, s, u, pool)):
                     add("session", rank, sm)
+                for rank, rv in enumerate(self._reviews(lambda: self.store.search_reviews(vec, s, u, pool))):
+                    add("review", rank, rv)
         for rank, e in enumerate(self.store.keyword_journal(query, s, u, names, pool, process=process)):
             add("fact", rank, e)
         if names is None:
@@ -435,9 +448,13 @@ class MemoryClient:
                 add("chat", rank, t)
             for rank, sm in enumerate(self.store.keyword_summaries(query, s, u, pool)):
                 add("session", rank, sm)
+            for rank, rv in enumerate(self._reviews(lambda: self.store.keyword_reviews(query, s, u, pool))):
+                add("review", rank, rv)
 
         def at(key: tuple[str, int]) -> float:
             item = entries[key]
+            if key[0] == "review":
+                return item.period_start
             return item.at if key[0] in ("fact", "chat") else item.started_at
 
         order = sorted(scores, key=lambda k: (-scores[k], -at(k)))[:limit]
@@ -455,12 +472,33 @@ class MemoryClient:
                     "kind": "chat", "at": _iso(item.at), "until": None, "app": None, "host": None,
                     "fact": self._chat_text(item), "importance": None, "score": score,
                 })
+            elif key[0] == "review":
+                out.append({
+                    "kind": "review", "at": _iso(item.period_start), "until": _iso(item.period_end), "app": None,
+                    "host": None, "fact": self._review_line(item), "importance": None, "score": score,
+                })
             else:
                 out.append({
                     "kind": key[0], "at": _iso(item.started_at), "until": _iso(item.ended_at), "app": None,
                     "host": None, "fact": item.text, "importance": None, "score": score,
                 })
         return out
+
+    @staticmethod
+    def _reviews(fetch: Any) -> list[Any]:
+        """Weekly reviews from ``fetch()``; ``[]`` on a store without them (an older schema)."""
+        try:
+            return list(fetch())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _review_line(review: Any) -> str:
+        """A weekly review as one recall text: its week and span, then the review."""
+        first = datetime.fromtimestamp(review.period_start)
+        last = datetime.fromtimestamp(review.period_end)
+        text = " ".join((review.text or "").split())
+        return f"Weekly review {review.week} ({first:%a %d %b} - {last:%a %d %b}): {text}"
 
     @staticmethod
     def _message(text: str | None, limit: int) -> str:
@@ -888,13 +926,15 @@ class MemoryClient:
     def pending_nudges(self) -> list[dict]:
         """Nudges the service wrote that the UI has not shown yet, oldest first.
 
-        Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder",
-        "text": str, "reason": str | None}``. ``text`` is what to show the user
-        (one or two short sentences, already in their register and following
-        their rules); ``reason`` is the coach's one-line why, for a tooltip or
-        the log, not for the user. A praise or nudge not shown within 15
-        minutes (``[nudges] deliver_within_min``) expires and is no longer
-        returned; reminders never expire. The service sets the named
+        Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder" |
+        "review", "text": str, "reason": str | None}``. ``text`` is what to show
+        the user (one or two short sentences, already in their register and
+        following their rules); ``reason`` is the coach's one-line why, for a
+        tooltip or the log, not for the user. A ``review`` is the teaser of a
+        new weekly review (:meth:`weekly_review` has the whole text; its reason
+        says where it is). A praise or nudge not shown within 15 minutes
+        (``[nudges] deliver_within_min``) expires and is no longer returned;
+        reminders and reviews never expire. The service sets the named
         auto-reset event ``Local\\YukiNudgeReady`` after writing one, so the UI
         can wait on it and call this at once. Call :meth:`ack_nudge` with
         ``"shown"`` when one is on screen. Never raises.
@@ -917,7 +957,23 @@ class MemoryClient:
                 pass
             cutoff = time.time() - window * 60.0
             return [self._nudge_dict(n) for n in self.store.nudges(pending=True)
-                    if n.kind == "reminder" or n.at >= cutoff]
+                    if n.kind in ("reminder", "review") or n.at >= cutoff]
+        except Exception:
+            return []
+
+    def recent_nudges(self, hours: float = 12) -> list[dict]:
+        """Nudges written in the last ``hours`` that were shown to the user, oldest first. Read-only.
+
+        Each: :meth:`pending_nudges`'s fields plus ``"shown_at": ISO`` and
+        ``"reaction": "shown" | "dismissed" | "replied" | "snoozed"``
+        (``shown``: it was on screen and nothing more, e.g. a card that faded
+        unread). Never-shown ones (pending or expired) are left out. For the
+        UI's history of what Yuki said. Never raises.
+        """
+        try:
+            since = time.time() - max(0.0, float(hours)) * 3600.0
+            return [{**self._nudge_dict(n), "shown_at": _iso(n.shown_at), "reaction": n.reaction}
+                    for n in self.store.nudges(since=since) if n.shown_at is not None]
         except Exception:
             return []
 
@@ -966,6 +1022,85 @@ class MemoryClient:
             pass
         return out
 
+    # -- the weekly review (yuki.memory.review) --------------------------------
+
+    @staticmethod
+    def _review_week(which: Any) -> str | None:
+        """``None`` for the latest; else an ISO week key from ``"2026-W39"`` or a date/datetime in that week."""
+        if which is None or (isinstance(which, str) and which.strip().lower() in ("", "latest")):
+            return None
+        from yuki.memory.review import iso_week
+
+        text = str(which).strip().upper().replace(" ", "")
+        if "W" in text:
+            year, _, week = text.partition("W")
+            year = year.rstrip("-")
+            if year.isdigit() and week.isdigit() and 1 <= int(week) <= 53:
+                return f"{int(year):04d}-W{int(week):02d}"
+            raise ValueError(f"not an ISO week: {which!r} (use 'latest', '2026-W39' or a date)")
+        try:
+            at = _time_arg(which)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"not an ISO week or a date: {which!r} (use 'latest', '2026-W39' or a date)") from exc
+        if at is None:
+            return None
+        if isinstance(which, str) and len(which.strip()) == 10:
+            at += 12 * 3600.0   # a bare date: its midday, whatever the review day boundary
+        return iso_week(at)
+
+    def weekly_review(self, which: Any = "latest") -> dict | None:
+        """The newest finished weekly review (``"latest"``), or the newest one of an ISO week.
+
+        ``which``: ``"latest"``, an ISO week (``"2026-W39"``: the week of the
+        review period's last day) or a date inside that week. ``None`` when
+        there is no such review (or memory cannot be read); ``ValueError`` for a
+        ``which`` it cannot read. Returns::
+
+            {"id": int, "week": "2026-W39", "trigger": "scheduled" | "demand",
+             "start": ISO (the first review day, 04:00), "end": ISO (when its numbers stop),
+             "written_at": ISO, "text": str,            # the review as shown, parts under headings
+             "sections": {"about", "time", "focus", "done", "still_open": str,
+                          "suggestions": [str], "mentions": [to-do ids]},
+             "teaser": str, "summary": [str],           # a few lines of the key numbers (computed)
+             "numbers": dict,                           # everything computed (yuki.memory.review.week_numbers)
+             "candidates": [dict],                      # behaviour patterns proposed to the portrait
+             "candidates_given_to_run": int | None, "nudge_id": int | None,
+             "model": str, "cost_usd": float | None}
+        """
+        week = self._review_week(which)
+        try:
+            rows = self.store.weekly_reviews(week=week, outcomes=("ok",), limit=1)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        from yuki.memory.review import summary_lines
+
+        r = rows[0]
+        try:
+            summary = summary_lines(r.numbers)
+        except Exception:
+            summary = []
+        return {
+            "id": r.id, "week": r.week, "trigger": r.trigger, "start": _iso(r.period_start), "end": _iso(r.period_end),
+            "written_at": _iso(r.finished_at or r.at), "text": r.text, "sections": r.sections, "teaser": r.teaser,
+            "summary": summary, "numbers": r.numbers, "candidates": r.candidates,
+            "candidates_given_to_run": r.candidates_run_id, "nudge_id": r.nudge_id, "model": r.model,
+            "cost_usd": r.cost_usd,
+        }
+
+    def run_weekly_review(self) -> None:
+        """Ask the service to write a weekly review of the last seven days now (the ``run_weekly_review`` flag file).
+
+        Non-blocking: returns at once. The service sees the flag within about a
+        second while it runs (or at its next start), deletes it and writes the
+        review (one Sonnet call, 30-90 s), even while memory is paused; its
+        teaser then arrives as a ``review`` nudge once the user is at the PC.
+        """
+        path = self._flag(REVIEW_FLAG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+
     # -- status and control ------------------------------------------------
 
     def status(self) -> dict:
@@ -975,7 +1110,7 @@ class MemoryClient:
         "facts_today": int, "last_capture_at": ISO | None,
         "portrait_updated_at": ISO | None, "memory_cost_today_usd": float}``.
         "Today" is since local midnight; the cost is the estimate for the journal,
-        portrait, episode, conversation and coach model calls (list prices, ``Settings.pricing``).
+        portrait, episode, conversation, coach and weekly-review model calls (list prices, ``Settings.pricing``).
         ``service_running`` comes from the service's named mutex for this
         database in this Windows session.
         """
@@ -991,7 +1126,8 @@ class MemoryClient:
             "portrait_updated_at": _iso(portrait.at) if portrait else None,
             "memory_cost_today_usd": round(
                 today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0)
-                + today.get("conversation_cost_usd", 0.0) + today.get("nudge_cost_usd", 0.0), 6
+                + today.get("conversation_cost_usd", 0.0) + today.get("nudge_cost_usd", 0.0)
+                + today.get("review_cost_usd", 0.0), 6
             ),
         }
 
