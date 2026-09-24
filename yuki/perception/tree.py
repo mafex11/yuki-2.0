@@ -182,6 +182,58 @@ _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
 _DOCUMENT_CONTROL_TYPE = 50030
 #: ``UIA_HyperlinkControlTypeId``.
 _HYPERLINK_CONTROL_TYPE = 50005
+#: ``UIA_TextControlTypeId``.
+_TEXT_CONTROL_TYPE = 50020
+
+#: Bounds on a scan for page Documents that looks past ``IsOffscreen`` (see
+#: :meth:`_ViewportPass._scan_pages`): levels below where it starts, elements
+#: it may look at, and seconds it may take.  The frame around a browser's pages
+#: is a handful of nested containers; measured 2026-09-24 on a Gecko window with
+#: 18 tabs, its six page Documents sat three levels below the element that
+#: holds them all and were found with 15 cache requests.
+_PAGE_SCAN_DEPTH = 8
+_PAGE_SCAN_NODES = 300
+_PAGE_SCAN_S = 0.3
+#: Large off-screen elements a pass remembers as places to scan.
+_MAX_SUSPECTS = 8
+
+#: A page whose content, read through the UIA control view, is at least
+#: :data:`_HIDDEN_TEXT_MIN_NODES` elements and either has named Text elements
+#: fewer than :data:`_HIDDEN_TEXT_SHARE` of them, or has at least
+#: :data:`_BLANK_LEAF_SHARE` of its leaves saying nothing (no name, no value,
+#: nothing below them - where the view left a container's text out), may keep
+#: its text leaves out of that view, and is read again through the raw view.
+#: Measured 2026-09-24, whole page subtrees, control view vs raw view:
+#: a Gecko Gmail inbox 23 named Text of 1843 elements, 74% blank leaves, raw
+#: text 1.8x; a Gecko Fireflies page 12% Text, 61% blank leaves, raw text
+#: 5.1x; a Gecko Meet call 71% blank leaves, raw text 1.1x; Chromium and
+#: Electron pages (Chrome, Discord, Slack, Claude) 11-39% Text and 4-37% blank
+#: leaves, raw text 1.0-1.6x.
+_HIDDEN_TEXT_MIN_NODES = 50
+_HIDDEN_TEXT_SHARE = 0.05
+_BLANK_LEAF_SHARE = 0.5
+#: The raw-view read replaces the control-view one only when it carries at
+#: least this many times as much text (names and values), so a page whose
+#: control view was merely terse keeps the leaner read.  In the tree walk,
+#: which keeps every named element, what counts is the text the raw read has
+#: that the control read does not: a raw view repeats a row's or a link's name
+#: in the Text leaves below it.  Measured 2026-09-24 on the visible part of
+#: three Gecko pages: the raw read added 6 new characters to the control
+#: read's 47,352 (Gmail), 5 to 4,952 (Fireflies), 1 to 777 (Meet).
+_RAW_TEXT_GAIN = 1.5
+#: ``UIA_IsControlElementPropertyId``: False for an element the control view
+#: leaves out (what a raw-view-only text leaf is).
+_P_IS_CONTROL_ELEMENT = 30016
+
+
+def _text_hidden(nodes: int, texts: int, leaves: int, blank_leaves: int) -> bool:
+    """Whether a control-view read looks like one that kept text leaves out
+    (see :data:`_HIDDEN_TEXT_MIN_NODES`).  Counts of elements, nothing else."""
+    if nodes < _HIDDEN_TEXT_MIN_NODES:
+        return False
+    return texts < _HIDDEN_TEXT_SHARE * nodes or (
+        leaves > 0 and blank_leaves >= _BLANK_LEAF_SHARE * leaves
+    )
 
 #: UIA ControlType id -> role name, per the documented control-type ids.  Kept
 #: local so the tree walk needs nothing but comtypes.
@@ -760,6 +812,16 @@ class _CachedWalker:
         self.surfaces: dict[int, tuple[int, int, int, int]] = {}
         #: Visible part of the window (window rect clipped to the desktop).
         self.viewport: tuple[int, int, int, int] | None = None
+        #: Pages read by geometry alone because they - and everything around
+        #: them - reported ``IsOffscreen`` while lying inside the window's
+        #: visible rectangle (a window covered by other windows, see
+        #: :meth:`_ViewportPass._offscreen_pages`).
+        self.offscreen_pages = 0
+        #: Pages whose content was read through the raw view because the
+        #: control view kept their text out (see :meth:`_ViewportPass._read_page`).
+        self.raw_pages = 0
+        #: Scans for page Documents made past ``IsOffscreen`` (diagnostic).
+        self.page_scans = 0
         #: Called as ``on_window(native_hwnd, depth)`` after an element that owns
         #: a window handle has been walked, so the pass can splice that HWND's own
         #: subtree in right there - keeping depth-first order and real depths -
@@ -1124,6 +1186,50 @@ def _collect_pass_whole(
     return walker
 
 
+def _page_facts(get: object) -> tuple[str, str, tuple[int, int, int, int] | None] | None:
+    """``(name, address, bounds)`` of a page Document (a Document whose Value
+    is an address, see :func:`is_address`), else ``None``."""
+    try:
+        if get(_P_CONTROL_TYPE) != _DOCUMENT_CONTROL_TYPE:  # type: ignore[operator]
+            return None
+        raw = get(_P_VALUE_VALUE) if _as_bool(get(_P_IS_VALUE_AVAILABLE)) else None  # type: ignore[operator]
+        if not isinstance(raw, str) or not is_address(raw):
+            return None
+        return _as_text(get(_P_NAME)), raw, _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+    except Exception:
+        return None
+
+
+def _title_rank(name: str, window_title: str) -> int:
+    """2: the window title starts with the page title; 1: contains it; 0: no.
+
+    A browser titles its window after the page in front ("<page> - <app>").
+    Comparing two titles the browser itself wrote, not naming any app.
+    """
+    name, title = name.strip(), window_title.strip()
+    if not name or not title:
+        return 0
+    if title.startswith(name):
+        return 2
+    return 1 if name in title else 0
+
+
+@dataclass
+class _StackedPage:
+    """A page Document met by :meth:`_ViewportPass._scan_pages`."""
+
+    element: object
+    key: tuple
+    name: str
+    value: str
+    bounds: tuple[int, int, int, int]
+    offscreen: bool
+    focused: bool
+    depth: int
+    window: int
+    order: int
+
+
 class _ViewportPass:
     """One pass over a window, reading only what is on screen, in batches.
 
@@ -1147,6 +1253,32 @@ class _ViewportPass:
     Elements are appended depth-first as they arrive, so whatever has been
     collected when the deadline or cap stops the walk is a true prefix of the
     window's tree - never thrown away.
+
+    Three provider facts are not taken at their word (measured 2026-09-24 on a
+    Gecko window; nothing here knows which program drew a window):
+
+    * **``IsOffscreen`` on a covered window.**  A provider can report every
+      page Document - the one on screen included - and the containers around
+      it as off-screen while its window is merely covered by other windows.
+      When a pass found no page but dropped a large off-screen element inside
+      the window's visible rectangle, those elements are scanned for page
+      Documents past ``IsOffscreen`` (:meth:`_offscreen_pages`), and the page
+      chosen is read by geometry alone: an element is visible when its
+      rectangle meets the viewport clipped by every scrolling ancestor.
+    * **Stacked pages.**  A browser can keep every tab's Document in one
+      window with one rectangle, so the child-window stacking test cannot tell
+      them apart (:meth:`_background_page`).  When a page Document shares its
+      window and rectangle with others (:meth:`_stacked_behind`), the one in
+      front is chosen from facts: not off-screen, then its Name leading the
+      window title (a browser titles its window after the page in front), then
+      the selected TabItem naming it, then keyboard focus, then tree order.
+      The rest count as background pages.
+    * **Text kept out of the control view.**  A page whose control-view read
+      looks like one that left its text leaves out (few named Text elements,
+      or mostly leaves that say nothing) is probed with one search of the raw
+      view; only if that finds visible text the control read lacks is the page
+      read again through the raw view, and that read kept when the text it
+      adds is substantial (:meth:`_read_page`).
     """
 
     def __init__(
@@ -1195,6 +1327,11 @@ class _ViewportPass:
         #: Live UIA elements of the page Documents kept by a page-only pass,
         #: by element id (see :func:`page_text`).
         self.page_elements: dict[int, object] = {}
+        #: The same for pages found past ``IsOffscreen`` in a covered window
+        #: (:meth:`_offscreen_pages`), kept apart because such a page, or the
+        #: containers around it, *report* off-screen: a reader that honours
+        #: ``IsOffscreen`` below it may find nothing, so it must know.
+        self.offscreen_page_elements: dict[int, object] = {}
         frame = _window_rect(hwnd)
         self.viewport = _overlap(frame, virtual_screen_bounds()) if frame else None
         self.walker.viewport = self.viewport
@@ -1218,6 +1355,40 @@ class _ViewportPass:
         #: holds, as ``(RuntimeId, name, value)`` (see :meth:`_pages_in_window`),
         #: asked once per pass.
         self.page_hosts: dict[int, list[tuple]] = {}
+        try:
+            self.window_title = _as_text(win32gui.GetWindowText(hwnd))
+        except Exception:
+            self.window_title = ""
+        #: Whether ``IsOffscreen`` is believed.  Off while reading a page that
+        #: reported itself off-screen inside the visible window, where only
+        #: rectangles decide (see :meth:`_offscreen_pages`).
+        self.trust_offscreen = True
+        #: What rectangles are held to while ``trust_offscreen`` is off: the
+        #: viewport narrowed by every scrolling ancestor on the current path.
+        self.clip = self.viewport
+        #: Reading through the raw view instead of the control view.
+        self.raw = False
+        self._requests: dict[tuple[str, bool, bool], object] = {}
+        #: Elements that reported ``IsOffscreen`` although they cover a large
+        #: part of the visible window, as ``(element, depth, window)``: where
+        #: the pages of a covered window are.
+        self.suspects: list[tuple[object, int, int]] = []
+        #: Page Documents stacked in one window and rectangle behind the one in
+        #: front (see :meth:`_page_key`), and the stacks already settled.
+        self.stacked_behind: set[tuple] = set()
+        self.stacks_settled: set[tuple] = set()
+        #: Live elements of the pages a scan met, by :meth:`_page_key`, for a
+        #: page that arrived in a cached batch without a live reference.
+        self.page_live: dict[tuple, object] = {}
+        #: Live UIA root of every window read, by handle (scans start there).
+        self.window_roots: dict[int, object] = {}
+        #: Elements that passed the visibility test, the named Text elements
+        #: among them, those with nothing visible below them (leaves), and the
+        #: leaves with no name and no value (see :meth:`_read_page`).
+        self.nodes_seen = 0
+        self.texts_seen = 0
+        self.leaves_seen = 0
+        self.blank_leaves = 0
 
     # -- calls --------------------------------------------------------------
     def _fetch(self, element: object, request: object) -> object | None:
@@ -1234,12 +1405,61 @@ class _ViewportPass:
         self.walker.fetches += 1
         return holder
 
+    def _request(self, kind: str) -> object:
+        """The ``"level"`` or ``"subtree"`` request for the current view and mode.
+
+        The control view trusting ``IsOffscreen`` is the default pair built in
+        ``__init__``; the raw view (:meth:`_read_page`) and the geometry-only
+        mode (:meth:`_offscreen_pages`, whose subtree batches cannot be
+        filtered on ``IsOffscreen``) get their own, built once when needed.
+        """
+        if not self.raw and self.trust_offscreen:
+            return self.level_request if kind == "level" else self.subtree_request
+        key = (kind, self.raw, self.trust_offscreen)
+        request = self._requests.get(key)
+        if request is None:
+            automation = self.automation
+            view = (
+                automation.RawViewCondition  # type: ignore[attr-defined]
+                if self.raw
+                else automation.ControlViewCondition  # type: ignore[attr-defined]
+            )
+            if kind == "level":
+                request = _build_cache_request(
+                    automation,
+                    _TREE_SCOPE_CHILDREN,
+                    tree_filter=view,
+                    mode=_AUTOMATION_ELEMENT_MODE_FULL,
+                )
+            else:
+                tree_filter = (
+                    automation.CreateAndCondition(  # type: ignore[attr-defined]
+                        view,
+                        automation.CreatePropertyCondition(_P_IS_OFFSCREEN, False),  # type: ignore[attr-defined]
+                    )
+                    if self.trust_offscreen
+                    else view
+                )
+                request = _build_cache_request(
+                    automation,
+                    _TREE_SCOPE_DESCENDANTS,
+                    tree_filter=tree_filter,
+                    mode=(
+                        _AUTOMATION_ELEMENT_MODE_FULL
+                        if self.stop_at_documents
+                        else _AUTOMATION_ELEMENT_MODE_NONE
+                    ),
+                )
+            self._requests[key] = request
+        return request
+
     def _whole_subtree(self, get: object) -> bool:
         """Whether one filtered subtree request is safe for this element."""
-        if self.viewport is None:
+        area = self.viewport if self.trust_offscreen else self.clip
+        if area is None:
             return False
         bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
-        if bounds is None or not _contains(self.viewport, bounds):
+        if bounds is None or not _contains(area, bounds):
             return False
         if _as_bool(get(_P_IS_SCROLL_AVAILABLE)):  # type: ignore[operator]
             return False  # its content can run far beyond its own rectangle
@@ -1265,7 +1485,7 @@ class _ViewportPass:
             walker.truncated = True
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
-        if _as_bool(get(_P_IS_OFFSCREEN)):
+        if not self._shown(element, get, depth, live=live):
             walker.offscreen_skipped += 1
             return
         runtime_id = _runtime_id(get)
@@ -1282,13 +1502,41 @@ class _ViewportPass:
             if native in self.read_windows:
                 walker._add(element, depth)  # dropped as a duplicate if seen
                 return
-        if self._background_page(get, native or walker.window_at(depth)):
+        own = native or walker.window_at(depth)
+        if self._background_page(get, own) or self._stacked_behind(get, own, runtime_id):
             walker.background_pages += 1
             return
+        self._count(get)
         walker._add(element, depth)
         if self._stops_here(get):
             self._keep_page(element)
             return
+        seen = self.nodes_seen
+        live_element = (
+            element
+            if live
+            else self.page_live.get(self._page_key(get, runtime_id)) if self.page_live else None
+        )
+        self._content(
+            get,
+            depth,
+            live_element,
+            lambda: self._below(element, get, depth, live=live, native=native, runtime_id=runtime_id),
+        )
+        if self.nodes_seen == seen:
+            self._leaf(get)
+
+    def _below(
+        self,
+        element: object,
+        get: object,
+        depth: int,
+        *,
+        live: bool,
+        native: int,
+        runtime_id: tuple[int, ...] | None,
+    ) -> None:
+        """Walk what is below an element :meth:`_visit` has just kept."""
         if not live:
             self._walk_children(element, depth, live=False)
             return
@@ -1302,13 +1550,478 @@ class _ViewportPass:
             if hosted is not None:
                 self._window(hosted, depth + 1, host=runtime_id, host_depth=depth)
         if self._whole_subtree(get):
-            holder = self._fetch(element, self.subtree_request)
+            holder = self._fetch(element, self._request("subtree"))
             if holder is not None:
                 self._walk_children(holder, depth, live=False)
         else:
-            holder = self._fetch(element, self.level_request)
+            holder = self._fetch(element, self._request("level"))
             if holder is not None:
                 self._walk_children(holder, depth, live=True)
+
+    # -- facts the provider does not state reliably -------------------------
+    def _shown(
+        self, element: object, get: object, depth: int, *, live: bool, window: int = 0
+    ) -> bool:
+        """Whether the walk reads this element.
+
+        Normally: it does not report ``IsOffscreen`` (a large one that does is
+        remembered, see :attr:`suspects`).  Under a page read by geometry
+        alone: its rectangle, if it has one, meets :attr:`clip`.
+        """
+        if self.trust_offscreen:
+            if not _as_bool(get(_P_IS_OFFSCREEN)):  # type: ignore[operator]
+                return True
+            if live:
+                self._note_suspect(element, get, depth, window or self.walker.window_at(depth))
+            return False
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        return bounds is None or self.clip is None or _overlap(bounds, self.clip) is not None
+
+    def _note_suspect(self, element: object, get: object, depth: int, window: int) -> None:
+        """Remember an off-screen element that covers much of the visible window."""
+        if self.viewport is None or len(self.suspects) >= _MAX_SUSPECTS:
+            return
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        visible = _overlap(bounds, self.viewport) if bounds else None
+        if visible is not None and _area(visible) >= _SURFACE_MIN_SHARE * _area(self.viewport):
+            self.suspects.append((element, depth, window or self.hwnd))
+
+    def _child_clip(self, get: object) -> tuple[int, int, int, int] | None:
+        """:attr:`clip` for the children of an element (narrowed if it scrolls)."""
+        if self.trust_offscreen:
+            return self.clip
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        scrolls = _as_bool(get(_P_IS_SCROLL_AVAILABLE)) and (  # type: ignore[operator]
+            _as_bool(get(_P_SCROLL_VERTICALLY_SCROLLABLE))  # type: ignore[operator]
+            or _as_bool(get(_P_SCROLL_HORIZONTALLY_SCROLLABLE))  # type: ignore[operator]
+        )
+        if bounds is None or not scrolls:
+            return self.clip
+        return (_overlap(bounds, self.clip) if self.clip else None) or bounds
+
+    def _count(self, get: object) -> None:
+        self.nodes_seen += 1
+        try:
+            if get(_P_CONTROL_TYPE) == _TEXT_CONTROL_TYPE and _as_text(get(_P_NAME)):  # type: ignore[operator]
+                self.texts_seen += 1
+        except Exception:
+            pass
+
+    def _leaf(self, get: object) -> None:
+        """Count an element with nothing visible below it (see :meth:`_read_page`)."""
+        self.leaves_seen += 1
+        try:
+            if _as_text(get(_P_NAME)):  # type: ignore[operator]
+                return
+            if _as_bool(get(_P_IS_VALUE_AVAILABLE)):  # type: ignore[operator]
+                value = get(_P_VALUE_VALUE)  # type: ignore[operator]
+                if isinstance(value, str) and value.strip():
+                    return
+        except Exception:
+            return
+        self.blank_leaves += 1
+
+    @staticmethod
+    def _page_key(get: object, runtime_id: tuple[int, ...] | None) -> tuple:
+        """A page Document's identity: its RuntimeId, else its title and address."""
+        if runtime_id is not None:
+            return runtime_id
+        facts = _page_facts(get)
+        return ("page", facts[0], facts[1]) if facts else ("page",)
+
+    def _content(
+        self,
+        get: object,
+        depth: int,
+        live_element: object | None,
+        walk: Callable[[], None],
+    ) -> None:
+        """Run ``walk`` (the walk below an element just kept) with the clip its
+        children are held to, as a page read (:meth:`_read_page`) if it is one."""
+        saved = self.clip
+        self.clip = self._child_clip(get)
+        try:
+            if not self.stop_at_documents and _page_facts(get) is not None:
+                self._read_page(depth, live_element, walk)
+            else:
+                walk()
+        finally:
+            self.clip = saved
+
+    def _mark(self) -> dict:
+        """Everything a re-read of one page must put back (see :meth:`_read_page`)."""
+        walker = self.walker
+        return {
+            "count": len(walker.elements),
+            "seen": set(walker.seen),
+            "shapes": set(walker._shapes),
+            "lineage": [list(entry) for entry in walker._lineage],
+            "visited": set(self.visited),
+            "read_windows": set(self.read_windows),
+            "pending": dict(self.pending),
+            "offscreen_skipped": walker.offscreen_skipped,
+            "background_pages": walker.background_pages,
+            "truncated": walker.truncated,
+        }
+
+    def _restore(self, mark: dict, base: int, tail: list[UIElement]) -> None:
+        walker = self.walker
+        del walker.elements[base:]
+        walker.elements.extend(tail)
+        walker.seen = set(mark["seen"])
+        walker._shapes = set(mark["shapes"])
+        walker._lineage = [list(entry) for entry in mark["lineage"]]
+        self.visited = set(mark["visited"])
+        self.read_windows = set(mark["read_windows"])
+        self.pending = dict(mark["pending"])
+        walker.offscreen_skipped = mark["offscreen_skipped"]
+        walker.background_pages = mark["background_pages"]
+        walker.truncated = mark["truncated"]
+
+    def _read_page(self, depth: int, live_element: object | None, walk: Callable[[], None]) -> None:
+        """Walk a page's content; re-read it in the raw view if the control view
+        kept its text out.
+
+        The control view is read first (``walk``).  When that read looks like
+        one that kept text leaves out (:func:`_text_hidden`: few named Text
+        elements, or mostly leaves that say nothing), the page's children are
+        probed with one search for a named Text element the control view
+        leaves out (:meth:`_raw_probe`).  Only if that text is not in the
+        control read already is the page read again through the raw view,
+        from the same place in the walk, and that read is kept when the text
+        it has that the control read does not comes to at least
+        ``_RAW_TEXT_GAIN - 1`` times the control read's text; otherwise the
+        control-view read is put back exactly.  Both reads share the pass's
+        deadline and element cap (a control read that filled the cap is still
+        re-read: the raw one is held to the same cap).
+        """
+        walker = self.walker
+        before = self._mark()
+        base = before["count"]
+        counts = (self.nodes_seen, self.texts_seen, self.leaves_seen, self.blank_leaves)
+        walk()
+        nodes, texts, leaves, blank = (
+            self.nodes_seen - counts[0],
+            self.texts_seen - counts[1],
+            self.leaves_seen - counts[2],
+            self.blank_leaves - counts[3],
+        )
+        if (
+            self.raw
+            or live_element is None
+            or not _text_hidden(nodes, texts, leaves, blank)
+            or (self.cancel is not None and self.cancel.is_set())
+            or time.monotonic() >= self.deadline
+        ):
+            return
+        control = self._mark()
+        control_tail = list(walker.elements[base:])
+        known = "\n".join(f"{e.name}\n{e.value or ''}" for e in control_tail)
+        wanted = (_RAW_TEXT_GAIN - 1.0) * max(len(known), 1)
+
+        def new_text(elements: list[UIElement]) -> int:
+            return sum(len(e.name) for e in elements if e.name and e.name not in known)
+
+        if not self._raw_probe(live_element, known):
+            return
+        self._restore(before, base, [])
+        self._raw_walk(live_element, depth, walker.max_elements)
+        if new_text(walker.elements[base:]) >= wanted:
+            walker.raw_pages += 1
+            return
+        self._restore(control, base, control_tail)
+
+    def _raw_probe(self, live_element: object, known: str) -> bool:
+        """Whether the first named Text element below ``live_element`` that the
+        control view leaves out holds text not in ``known``.
+
+        One ``FindFirst`` (it stops at the first match).  On the Gecko pages
+        measured for :data:`_RAW_TEXT_GAIN` such a leaf repeats the name of a
+        row or link the control read already has, so the page is not read
+        twice for nothing.
+        """
+        if (self.cancel is not None and self.cancel.is_set()) or time.monotonic() >= self.deadline:
+            return False
+        automation = self.automation
+        try:
+            condition = automation.CreateAndCondition(  # type: ignore[attr-defined]
+                automation.CreateAndCondition(  # type: ignore[attr-defined]
+                    automation.CreatePropertyCondition(_P_CONTROL_TYPE, _TEXT_CONTROL_TYPE),  # type: ignore[attr-defined]
+                    automation.CreatePropertyCondition(_P_IS_CONTROL_ELEMENT, False),  # type: ignore[attr-defined]
+                ),
+                automation.CreateNotCondition(  # type: ignore[attr-defined]
+                    automation.CreatePropertyCondition(_P_NAME, "")  # type: ignore[attr-defined]
+                ),
+            )
+            # The search runs in the view of the request's TreeFilter: raw.
+            found = live_element.FindFirstBuildCache(  # type: ignore[attr-defined]
+                _TREE_SCOPE_DESCENDANTS,
+                condition,
+                _build_cache_request(
+                    automation,
+                    _TREE_SCOPE_ELEMENT,
+                    tree_filter=automation.RawViewCondition,  # type: ignore[attr-defined]
+                ),
+            )
+            self.walker.fetches += 1
+            if not found:
+                return False
+            get = found.GetCachedPropertyValue
+            name = _as_text(get(_P_NAME))
+            bounds = _rect(get(_P_BOUNDING_RECT))
+            hidden = self.trust_offscreen and _as_bool(get(_P_IS_OFFSCREEN))
+        except Exception:
+            return False
+        # Text the reader could not see anyway (a skip link parked off the
+        # page) says nothing about what the control read missed.
+        area = self.clip if not self.trust_offscreen else self.viewport
+        visible = bounds is not None and not hidden and (area is None or _overlap(bounds, area) is not None)
+        return bool(name) and visible and name not in known
+
+    def _raw_walk(self, live_element: object, depth: int, cap: int) -> None:
+        """Walk ``live_element``'s children through the raw view, up to ``cap`` elements."""
+        walker = self.walker
+        saved_cap = walker.max_elements
+        walker.max_elements = cap
+        self.raw = True
+        try:
+            holder = self._fetch(live_element, self._request("level"))
+            if holder is not None:
+                self._walk_children(holder, depth, live=True)
+        finally:
+            self.raw = False
+            walker.max_elements = saved_cap
+
+    def _stacked_behind(self, get: object, own: int, runtime_id: tuple[int, ...] | None) -> bool:
+        """Whether this page Document shares its window and rectangle with
+        others and is not the one in front (see the class docstring).
+
+        Settled once per window and rectangle, by a scan of that window from
+        its own root that only enters elements containing the rectangle
+        (:meth:`_scan_pages`), so the cost is the few containers around the
+        pages.  Not asked when a descendant window has exactly the page's
+        rectangle (each page drawn in a window of its own, which
+        :meth:`_background_page` settles - measured 2026-09-24 on Chromium and
+        Electron windows), nor for a Document that is its window's own root
+        (nothing can be stacked with it in that window).
+        """
+        facts = _page_facts(get)
+        if facts is None:
+            return False
+        key = self._page_key(get, runtime_id)
+        if key in self.stacked_behind:
+            return True
+        bounds = facts[2]
+        if bounds is None or _native_handle(get):
+            return False
+        if any(_contains(rect, bounds) and _contains(bounds, rect) for rect in self.rects.values()):
+            # A window of exactly the page's size: each page has a window of
+            # its own, which the stacking test above has already settled.
+            return False
+        window = own or self.hwnd
+        if (window, bounds) in self.stacks_settled:
+            return False
+        self.stacks_settled.add((window, bounds))
+        root = self.window_roots.get(window)
+        if root is None:
+            return False
+        stack = self._scan_pages([(root, 0, window)], target=bounds)
+        if len(stack) < 2:
+            return False
+        front = self._front(stack)
+        self.stacked_behind.update(page.key for page in stack if page is not front)
+        return key in self.stacked_behind
+
+    def _scan_pages(
+        self,
+        starts: list[tuple[object, int, int]],
+        *,
+        target: tuple[int, int, int, int] | None,
+    ) -> list["_StackedPage"]:
+        """Page Documents below ``starts``, ``IsOffscreen`` ignored.
+
+        Breadth first through the control view, one cache request per element
+        entered, never inside a Document (a page's frames are part of it).
+        With ``target``, only Documents with exactly that rectangle are
+        collected and only elements containing it are entered; without, every
+        Document meeting the viewport, entering elements that meet it.
+        Bounded by :data:`_PAGE_SCAN_DEPTH`, :data:`_PAGE_SCAN_NODES`,
+        :data:`_PAGE_SCAN_S` and the pass's own deadline.
+        """
+        walker = self.walker
+        walker.page_scans += 1
+        deadline = min(self.deadline, time.monotonic() + _PAGE_SCAN_S)
+        found: list[_StackedPage] = []
+        frontier: list[tuple[object, int, int]] = []
+        for element, depth, window in starts:
+            page = self._scanned_page(element, depth, window, target, len(found))
+            if page is not None:
+                found.append(page)
+            else:
+                frontier.append((element, depth, window))
+        looked = 0
+        for _level in range(_PAGE_SCAN_DEPTH):
+            deeper: list[tuple[object, int, int]] = []
+            for element, depth, window in frontier:
+                if (
+                    (self.cancel is not None and self.cancel.is_set())
+                    or time.monotonic() >= deadline
+                    or looked >= _PAGE_SCAN_NODES
+                ):
+                    return found
+                try:
+                    holder = element.BuildUpdatedCache(self.level_request)  # type: ignore[attr-defined]
+                except Exception:
+                    continue
+                walker.fetches += 1
+                for child in _CachedWalker._cached_children(holder):
+                    looked += 1
+                    get = child.GetCachedPropertyValue
+                    try:
+                        control = get(_P_CONTROL_TYPE)
+                        bounds = _rect(get(_P_BOUNDING_RECT))
+                    except Exception:
+                        continue
+                    if control == _DOCUMENT_CONTROL_TYPE:
+                        page = self._scanned_page(child, depth + 1, window, target, len(found))
+                        if page is not None:
+                            found.append(page)
+                        continue
+                    if bounds is None:
+                        continue
+                    if target is not None:
+                        if not _contains(bounds, target):
+                            continue
+                    elif self.viewport is None or _overlap(bounds, self.viewport) is None:
+                        continue
+                    deeper.append((child, depth + 1, _native_handle(get) or window))
+            frontier = deeper
+            if not frontier:
+                break
+        return found
+
+    def _scanned_page(
+        self,
+        element: object,
+        depth: int,
+        window: int,
+        target: tuple[int, int, int, int] | None,
+        order: int,
+    ) -> "_StackedPage | None":
+        try:
+            get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+            facts = _page_facts(get)
+        except Exception:
+            return None  # a live root with nothing cached: not a page itself
+        if facts is None or facts[2] is None:
+            return None
+        name, value, bounds = facts
+        if target is not None:
+            if not (_contains(bounds, target) and _contains(target, bounds)):
+                return None
+        elif self.viewport is None or _overlap(bounds, self.viewport) is None:
+            return None
+        key = self._page_key(get, _runtime_id(get))
+        self.page_live.setdefault(key, element)
+        return _StackedPage(
+            element=element,
+            key=key,
+            name=name,
+            value=value,
+            bounds=bounds,
+            offscreen=_as_bool(get(_P_IS_OFFSCREEN)),
+            focused=_as_bool(get(_P_HAS_KEYBOARD_FOCUS)),
+            depth=depth,
+            window=window,
+            order=order,
+        )
+
+    def _front(self, stack: list["_StackedPage"]) -> "_StackedPage":
+        """The page in front among Documents stacked in one rectangle."""
+        tabs = [
+            element.name
+            for element in self.walker.elements
+            if element.role == "TabItem" and "selected" in element.states and element.name
+        ]
+
+        def rank(page: _StackedPage) -> tuple:
+            named = bool(page.name) and any(tab.startswith(page.name) for tab in tabs)
+            return (
+                not page.offscreen,
+                _title_rank(page.name, self.window_title),
+                named,
+                page.focused,
+                -page.order,
+            )
+
+        return max(stack, key=rank)
+
+    def _offscreen_pages(self) -> None:
+        """Read the pages of a window that reports them all off-screen.
+
+        Runs after the walk, only when it kept no page Document but dropped a
+        large off-screen element inside the visible window (:attr:`suspects`).
+        Those elements are scanned for page Documents meeting the viewport
+        (:meth:`_scan_pages`); of each group sharing one rectangle the one in
+        front is kept (:meth:`_front`), the rest counted as background pages.
+        A kept page that itself reports off-screen is read by geometry alone.
+        It is added below the window's root (the containers in between are
+        unnamed layout, which the tree never lists), at its real depth.
+        """
+        walker = self.walker
+        if not self.suspects or walker.out_of_budget():
+            return
+        if any(e.role == "Document" and is_address(e.value) for e in walker.elements):
+            return
+        found = self._scan_pages(self.suspects, target=None)
+        stacks: dict[tuple[int, int, int, int], list[_StackedPage]] = {}
+        for page in found:
+            stacks.setdefault(page.bounds, []).append(page)
+        for stack in stacks.values():
+            if walker.out_of_budget():
+                return
+            front = self._front(stack)
+            walker.background_pages += len(stack) - 1
+            self.stacked_behind.update(page.key for page in stack if page is not front)
+            element = front.element
+            get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+            if self._background_page(get, front.window):
+                walker.background_pages += 1
+                continue
+            runtime_id = _runtime_id(get)
+            if runtime_id is not None:
+                if runtime_id in self.visited:
+                    continue
+                self.visited.add(runtime_id)
+            # Below the root: whatever the walk left on the path is another branch.
+            del walker._lineage[1:]
+            before = len(walker.elements)
+            walker._add(element, front.depth, window=front.window)
+            if len(walker.elements) == before:
+                continue  # already listed
+            walker.offscreen_pages += 1
+            if self.stop_at_documents:
+                self._keep_page(element, offscreen=True)
+                continue
+            trust, clip = self.trust_offscreen, self.clip
+            self.trust_offscreen = not front.offscreen
+            self.clip = self.viewport
+            try:
+                self._content(
+                    get,
+                    front.depth,
+                    element,
+                    lambda: self._below(
+                        element,
+                        get,
+                        front.depth,
+                        live=True,
+                        native=_native_handle(get),
+                        runtime_id=runtime_id,
+                    ),
+                )
+            finally:
+                self.trust_offscreen, self.clip = trust, clip
 
     def _stops_here(self, get: object) -> bool:
         """Whether the walk ends at this element (a Document, in a page-only pass)."""
@@ -1319,11 +2032,12 @@ class _ViewportPass:
         except Exception:
             return False
 
-    def _keep_page(self, element: object) -> None:
+    def _keep_page(self, element: object, *, offscreen: bool = False) -> None:
         """Remember the live element of a page Document just kept."""
         walker = self.walker
         if walker.elements and walker.elements[-1].role == "Document":
-            self.page_elements.setdefault(walker.elements[-1].id, element)
+            kept = self.offscreen_page_elements if offscreen else self.page_elements
+            kept.setdefault(walker.elements[-1].id, element)
 
     def _background_page(self, get: object, own: int) -> bool:
         """Whether this element is the page of a tab that is not in front.
@@ -1456,36 +2170,41 @@ class _ViewportPass:
         )
         if live is None:
             return False
+        self.window_roots[handle] = live
         root = self._fetch(live, self.root_request)
         if root is None:
             return False
         self.read_windows.add(handle)
         get = root.GetCachedPropertyValue  # type: ignore[attr-defined]
-        if _as_bool(get(_P_IS_OFFSCREEN)):
+        if not self._shown(root, get, depth, live=True, window=handle):
             walker.offscreen_skipped += 1
             return True
         runtime_id = _runtime_id(get)
-        if self._background_page(get, handle):
+        if self._background_page(get, handle) or self._stacked_behind(get, handle, runtime_id):
             walker.background_pages += 1
             return True
         if host is not None and runtime_id == host:
             # The window's root *is* the element that led here: one element,
             # now read through its own provider.
+            self._count(get)
             walker._add(root, host_depth, window=handle)  # dropped as a duplicate if already kept
             if self._stops_here(get):
                 self._keep_page(live)
             else:
-                self._walk_children(root, host_depth, live=True)
+                self._content(
+                    get, host_depth, live, lambda: self._walk_children(root, host_depth, live=True)
+                )
             return True
         if runtime_id is not None:
             if runtime_id in self.visited:
                 return True  # its content was already read through the parent
             self.visited.add(runtime_id)
+        self._count(get)
         walker._add(root, depth, window=handle)
         if self._stops_here(get):
             self._keep_page(live)
         else:
-            self._walk_children(root, depth, live=True)
+            self._content(get, depth, live, lambda: self._walk_children(root, depth, live=True))
         return True
 
     def run(self) -> _CachedWalker:
@@ -1494,6 +2213,7 @@ class _ViewportPass:
         live_root = _element_from_handle(self.automation, self.hwnd, self.deadline, self.cancel)
         if live_root is None:
             raise RuntimeError(f"UIA would not give an element for hwnd={self.hwnd}")
+        self.window_roots[self.hwnd] = live_root
         # Not through _fetch: if the root itself refuses this request, the
         # caller falls back to the older whole-subtree walk.
         root = live_root.BuildUpdatedCache(self.root_request)  # type: ignore[attr-defined]
@@ -1510,6 +2230,10 @@ class _ViewportPass:
             if walker.out_of_budget():
                 break
             self._window(handle, 1)
+        # No page, but large parts of the visible window called off-screen:
+        # a covered window whose provider says so of everything (see the
+        # class docstring).
+        self._offscreen_pages()
         stopped = (
             len(walker.elements) >= walker.max_elements
             or (self.cancel is not None and self.cancel.is_set())
@@ -2041,6 +2765,14 @@ def get_window_tree(
                 + " - the rest is drawn without accessibility (video, canvas) or has "
                 "not been exposed yet; look again shortly if you expected content there"
             )
+    if elements and chosen.offscreen_pages:
+        # Said because it changes what the reader can do: the window is on
+        # screen but under others, so pointing at it means bringing it up.
+        covered = (
+            "the window reports its page off-screen (probably covered by other "
+            "windows); the page is listed from its rectangles inside the window"
+        )
+        note = f"{note}; {covered}" if note else covered
     passes = max(
         chosen.passes, best.passes if isinstance(best, _CachedWalker) else 1
     )
@@ -2399,22 +3131,35 @@ def _page_documents(elements: list[UIElement]) -> list[UIElement]:
     ]
 
 
-def pages_on_screen(elements: list[UIElement]) -> list[PageIdentity]:
+def pages_on_screen(
+    elements: list[UIElement], window_title: str | None = None
+) -> list[PageIdentity]:
     """Every top-level page in a snapshot, the visible main one first.
 
     A page is a Document whose Value is an address (:func:`is_address`) and
     that is not inside another Document (an embedded frame is part of its
     page).  Background tabs' pages never get into a snapshot (the walk leaves
-    them out, see :meth:`_ViewportPass._background_page`).  The main page is
-    the one the selected tab names, when a selected tab outside the pages
-    names one of them; else a titled page before an untitled one (an app's
-    own shell page, drawn under the page it hosts, has no title), then the
-    largest (ties: tree order).  The selected tab is carried on the first.
+    them out, see :meth:`_ViewportPass._background_page` and
+    :meth:`_ViewportPass._stacked_behind`).  The main page is the one the
+    selected tab names, when a selected tab outside the pages names one of
+    them; else a titled page before an untitled one (an app's own shell page,
+    drawn under the page it hosts, has no title), then the largest (ties:
+    tree order).  When several pages share the main one's rectangle exactly -
+    tabs stacked in one place, which rectangles cannot tell apart - the one
+    whose title leads the window title goes first (a browser titles its window
+    after the page in front), the selected tab settling a tie.  The selected
+    tab is carried on the first.
+
+    ``window_title``: the window's title; by default the Name of the
+    snapshot's root element, which for a top-level window is its title.
     """
     by_id = {element.id: element for element in elements}
     documents = _page_documents(elements)
     if not documents:
         return []
+    if window_title is None:
+        root = elements[0] if elements else None
+        window_title = root.name if root is not None and root.depth == 0 else ""
 
     def area(element: UIElement) -> int:
         left, top, right, bottom = element.bounds
@@ -2443,6 +3188,15 @@ def pages_on_screen(elements: list[UIElement]) -> list[PageIdentity]:
         named = [e for e in ordered if e.name and tab.name.startswith(e.name)]
         if named:
             ordered = [named[0], *[e for e in ordered if e is not named[0]]]
+    stacked = [e for e in ordered if e.bounds == ordered[0].bounds]
+    if len(stacked) > 1:
+        # Pages in one rectangle: the window title names the one in front;
+        # the selected tab (already first if it named one) breaks a tie.
+        front = max(
+            stacked,
+            key=lambda e: (_title_rank(e.name, window_title or ""), -stacked.index(e)),
+        )
+        ordered = [front, *[e for e in ordered if e is not front]]
     pages = [
         PageIdentity(
             title=element.name,
@@ -2457,9 +3211,11 @@ def pages_on_screen(elements: list[UIElement]) -> list[PageIdentity]:
     return pages
 
 
-def page_identity(elements: list[UIElement]) -> PageIdentity | None:
+def page_identity(
+    elements: list[UIElement], window_title: str | None = None
+) -> PageIdentity | None:
     """The main page of a snapshot (see :func:`pages_on_screen`), or ``None``."""
-    pages = pages_on_screen(elements)
+    pages = pages_on_screen(elements, window_title)
     return pages[0] if pages else None
 
 
@@ -2560,7 +3316,9 @@ def _read_pages(automation: object, hwnd: int, deadline: float, cancel: threadin
             main=index == 0,
             selected_tab=page.selected_tab,
         )
-        for index, page in enumerate(pages_on_screen(list(walker.elements)))
+        for index, page in enumerate(
+            pages_on_screen(list(walker.elements), viewport_pass.window_title)
+        )
     ]
 
 
@@ -2714,17 +3472,40 @@ def _text_from_elements(automation: object, element: object, max_chars: int) -> 
     leaves contribute their name (a link's name repeats the text inside it),
     plus every non-empty Value except a link's (its address).  Returns
     ``(text, truncated)``.
+
+    Read through the control view; when that read looks like one that kept
+    the page's text leaves out (:func:`_text_hidden`), read again through the
+    raw view, which is kept if it holds at least :data:`_RAW_TEXT_GAIN` times
+    the text.
     """
+    text, more, counts = _element_text(automation, element, max_chars, raw=False)
+    if _text_hidden(*counts):
+        raw_text, raw_more, _ = _element_text(automation, element, max_chars, raw=True)
+        if len(raw_text) >= _RAW_TEXT_GAIN * max(len(text), 1):
+            return raw_text, raw_more
+    return text, more
+
+
+def _element_text(
+    automation: object, element: object, max_chars: int, *, raw: bool
+) -> tuple[str, bool, tuple[int, int, int, int]]:
+    """``(text, truncated, (elements, named Text, leaves, blank leaves))``
+    for :func:`_text_from_elements`, through the raw or the control view."""
     request = automation.CreateCacheRequest()  # type: ignore[attr-defined]
     for prop in (_P_NAME, _P_VALUE_VALUE, _P_IS_VALUE_AVAILABLE, _P_CONTROL_TYPE):
         request.AddProperty(prop)
     request.TreeScope = _TREE_SCOPE_SUBTREE
-    request.TreeFilter = automation.ControlViewCondition  # type: ignore[attr-defined]
+    request.TreeFilter = (
+        automation.RawViewCondition  # type: ignore[attr-defined]
+        if raw
+        else automation.ControlViewCondition  # type: ignore[attr-defined]
+    )
     request.AutomationElementMode = _AUTOMATION_ELEMENT_MODE_NONE
     root = element.BuildUpdatedCache(request)  # type: ignore[attr-defined]
     lines: list[str] = []
     size = 0
     count = 0
+    texts = leaves = blank = 0
     stack = [root]
     while stack and size <= max_chars and count < _PAGE_TEXT_ELEMENTS:
         node = stack.pop()
@@ -2733,19 +3514,26 @@ def _text_from_elements(automation: object, element: object, max_chars: int) -> 
         children = _CachedWalker._cached_children(node)
         parts = []
         name = _as_text(get(_P_NAME))
+        control = get(_P_CONTROL_TYPE)
+        if name and control == _TEXT_CONTROL_TYPE:
+            texts += 1
+        if not children:
+            leaves += 1
         if name and not children and node is not root:
             parts.append(name)
         # A link's Value is its address, not text on the page.
-        if _as_bool(get(_P_IS_VALUE_AVAILABLE)) and get(_P_CONTROL_TYPE) != _HYPERLINK_CONTROL_TYPE:
+        if _as_bool(get(_P_IS_VALUE_AVAILABLE)) and control != _HYPERLINK_CONTROL_TYPE:
             value = get(_P_VALUE_VALUE)
             if isinstance(value, str) and value.strip() and value.strip() != name and node is not root:
                 parts.append(value.strip())
+        if not children and not name and not parts:
+            blank += 1
         for part in parts:
             lines.append(part)
             size += len(part) + 1
         stack.extend(reversed(children))
     text = "\n".join(lines)
-    return text[:max_chars], len(text) > max_chars or bool(stack)
+    return text[:max_chars], len(text) > max_chars or bool(stack), (count, texts, leaves, blank)
 
 
 #: U+FFFC OBJECT REPLACEMENT CHARACTER: what a Text pattern puts where an
@@ -2807,7 +3595,7 @@ def page_text(
             )
             walker = viewport_pass.run()
             found = PageText(hwnd=int(hwnd), background_pages=walker.background_pages)
-            pages = pages_on_screen(list(walker.elements))
+            pages = pages_on_screen(list(walker.elements), viewport_pass.window_title)
             if not pages:
                 shared["result"] = found
                 return
@@ -2815,7 +3603,9 @@ def page_text(
             found.found = True
             found.title, found.url = page.title, page.url
             shared["result"] = found
-            element = viewport_pass.page_elements.get(page.element_id)
+            element = viewport_pass.page_elements.get(
+                page.element_id
+            ) or viewport_pass.offscreen_page_elements.get(page.element_id)
             if element is None:
                 found.note = "the page was found but could not be asked for its text"
                 return
@@ -3370,7 +4160,7 @@ def format_window_tree(tree: WindowTree) -> str:
     status = getattr(tree, "status", "ok") or "ok"
     note = getattr(tree, "note", "") or ""
     facts: list[str] = []
-    page = page_identity(tree.elements)
+    page = page_identity(tree.elements, tree.title or None)
     if page is not None:
         # The page is the fact about what the window shows: a browser's own
         # window title can stay the same whatever page is on screen, and its
