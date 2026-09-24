@@ -15,7 +15,9 @@ Usage::
     from yuki.memory.api import MemoryClient
     memory = MemoryClient.open()              # default %LOCALAPPDATA%\\Yuki\\memory\\memory.db
     memory.portrait_text()
-    memory.recall("what did Kenji ask me", since="2026-09-20")
+    memory.recall("what did Kenji ask me", since="2026-09-20")    # facts and episodes
+    memory.activity(since="2026-09-24", group_by="site")          # time per site, visits, stretches
+    memory.episodes(since="2026-09-24")                           # what the user was doing, told
 """
 
 from __future__ import annotations
@@ -301,19 +303,22 @@ class MemoryClient:
     def recall(
         self, query: str, since=None, until=None, app: str | None = None, limit: int = 15
     ) -> list[dict]:
-        """Journal facts relevant to ``query``, best first.
+        """Journal facts and episodes relevant to ``query``, best first.
 
         Merges vector search (local embedder, loaded on first use) and keyword
         search (every whitespace-separated term present, case-insensitive) over
-        the journal, by reciprocal rank fusion. ``since``/``until`` take epoch
-        seconds, a datetime/date or an ISO string (naive = local time; ``since``
-        inclusive, ``until`` exclusive). ``app`` takes either the display name
-        the journal records ("Google Chrome", "Spotify") or a process name
-        ("chrome.exe", "Spotify.exe"), case-insensitively: a fact matches when
-        its app is one of the names that app goes by, or when it came from a
-        window of that process. Each hit: ``{"at": ISO local time, "app": str,
-        "host": str | None, "fact": str, "importance": int, "score": float}``
-        (``score`` is the fused rank score; higher is better).
+        the journal and the episodes, by reciprocal rank fusion. ``since``/``until``
+        take epoch seconds, a datetime/date or an ISO string (naive = local time;
+        ``since`` inclusive, ``until`` exclusive; an episode counts when its span
+        overlaps). ``app`` takes either the display name the journal records
+        ("Google Chrome", "Spotify") or a process name ("chrome.exe",
+        "Spotify.exe"), case-insensitively: a fact matches when its app is one
+        of the names that app goes by, or when it came from a window of that
+        process; with ``app`` given, episodes (which span apps) are left out.
+        Each hit: ``{"kind": "fact" | "episode", "at": ISO local time, "until":
+        ISO | None (an episode's end), "app": str | None, "host": str | None,
+        "fact": str (the fact or the episode text), "importance": int | None,
+        "score": float}`` (``score`` is the fused rank score; higher is better).
         """
         query = (query or "").strip()
         limit = max(0, int(limit))
@@ -323,23 +328,116 @@ class MemoryClient:
         names = self._journal_app_names(app) if app and app.strip() else None
         process = app if names else None
         pool = max(limit * 2, 20)
-        scores: dict[int, float] = {}
-        entries: dict[int, JournalEntry] = {}
+        scores: dict[tuple[str, int], float] = {}
+        entries: dict[tuple[str, int], Any] = {}
+
+        def add(kind: str, rank: int, item: Any) -> None:
+            key = (kind, item.id)
+            entries.setdefault(key, item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
         vec = self._embed(query)
         if vec is not None:
             for rank, e in enumerate(self.store.search_journal(vec, s, u, names, pool, process=process)):
-                entries[e.id] = e
-                scores[e.id] = scores.get(e.id, 0.0) + 1.0 / (_RRF_K + rank + 1)
+                add("fact", rank, e)
+            if names is None:
+                for rank, ep in enumerate(self.store.search_episodes(vec, s, u, pool)):
+                    add("episode", rank, ep)
         for rank, e in enumerate(self.store.keyword_journal(query, s, u, names, pool, process=process)):
-            entries.setdefault(e.id, e)
-            scores[e.id] = scores.get(e.id, 0.0) + 1.0 / (_RRF_K + rank + 1)
-        order = sorted(scores, key=lambda i: (-scores[i], -entries[i].at))[:limit]
+            add("fact", rank, e)
+        if names is None:
+            for rank, ep in enumerate(self.store.keyword_episodes(query, s, u, pool)):
+                add("episode", rank, ep)
+
+        def at(key: tuple[str, int]) -> float:
+            item = entries[key]
+            return item.at if key[0] == "fact" else item.started_at
+
+        order = sorted(scores, key=lambda k: (-scores[k], -at(k)))[:limit]
+        out = []
+        for key in order:
+            item = entries[key]
+            if key[0] == "fact":
+                out.append({
+                    "kind": "fact", "at": _iso(item.at), "until": None, "app": item.app, "host": item.host,
+                    "fact": item.fact, "importance": item.importance, "score": round(scores[key], 5),
+                })
+            else:
+                out.append({
+                    "kind": "episode", "at": _iso(item.started_at), "until": _iso(item.ended_at), "app": None,
+                    "host": None, "fact": item.text, "importance": None, "score": round(scores[key], 5),
+                })
+        return out
+
+    # -- activity (the timeline) and episodes ---------------------------------
+
+    @staticmethod
+    def _window(since: Any, until: Any) -> tuple[float, float]:
+        """``[since, until)`` as epoch seconds; default since local midnight, until now."""
+        s, u = _time_arg(since), _time_arg(until)
+        now = datetime.now().timestamp()
+        if u is None:
+            u = now
+        if s is None:
+            s = datetime.fromtimestamp(u if u <= now else now).replace(
+                hour=0, minute=0, second=0, microsecond=0).timestamp()
+            if s >= u:
+                s = u - 86400.0
+        if s >= u:
+            raise ValueError("since must be before until")
+        return s, u
+
+    def activity(self, since=None, until=None, group_by: str = "site", limit: int = 15) -> dict:
+        """How the user spent their time in ``[since, until)``, measured by the timeline.
+
+        ``since``/``until`` as for :meth:`recall` (default: since local midnight,
+        until now). ``group_by``: ``"app"`` (Google Chrome, Claude), ``"site"``
+        (instagram.com; a window without a web page counts as its app) or
+        ``"page"`` (one page or window title). Returns::
+
+            {"since": ISO, "until": ISO, "group_by": str,
+             "totals": {"present_s", "active_s", "passive_s", "away_s", "media_s",
+                        "background_media_s", "switches", "activities", "first_at", "last_at"},
+             "items": [{"label", "app", "host", "present_s", "active_s", "passive_s", "media_s",
+                        "visits", "longest_s", "longest_start", "longest_end", "first_at", "last_at",
+                        "titles": [{"title", "present_s"}]}],      # most time first, at most ``limit``
+             "interleaving": [{"a", "b", "switches"}],             # back and forth between two activities
+             "background_media": [{"app", "seconds"}]}
+
+        *present* = the user at it: *active* (input within the last minute)
+        plus *passive* (no input while that app played media: watching or
+        listening). *away* = no input for over a minute and no media from the
+        app in front. *media_s* = that app's media playing. A *visit* is one
+        uninterrupted run (another activity, an away stretch or a gap over a
+        minute ends it); *longest* is the longest run. Times are ISO local.
+        """
+        from yuki.memory.timeline import aggregate
+
+        if group_by not in ("app", "site", "page"):
+            raise ValueError(f"group_by must be 'app', 'site' or 'page', not {group_by!r}")
+        s, u = self._window(since, until)
+        agg = aggregate(self.store.timeline_between(s, u), s, u, group_by, limit=max(1, int(limit)))
+        agg["since"], agg["until"] = _iso(s), _iso(u)
+        totals = agg["totals"]
+        totals["first_at"], totals["last_at"] = _iso(totals["first_at"]), _iso(totals["last_at"])
+        for item in agg["items"]:
+            item.pop("key", None)
+            for k in ("longest_start", "longest_end", "first_at", "last_at"):
+                item[k] = _iso(item[k])
+        return agg
+
+    def episodes(self, since=None, until=None, limit: int = 50) -> list[dict]:
+        """Episodes overlapping ``[since, until)`` (default today), oldest first.
+
+        Each: ``{"start": ISO, "end": ISO, "text": str, "final": bool (False while
+        its window is still open and may be rewritten), "totals": dict}``.
+        """
+        s, u = self._window(since, until)
+        rows = self.store.episodes_between(s, u)[-max(1, int(limit)):]
         return [
-            {
-                "at": _iso(entries[i].at), "app": entries[i].app, "host": entries[i].host,
-                "fact": entries[i].fact, "importance": entries[i].importance, "score": round(scores[i], 5),
-            }
-            for i in order
+            {"start": _iso(e.started_at), "end": _iso(e.ended_at), "text": e.text, "final": e.final,
+             "totals": (e.aggregates or {}).get("totals") or {}}
+            for e in rows
         ]
 
     # -- status and control ------------------------------------------------
@@ -350,8 +448,8 @@ class MemoryClient:
         ``{"service_running": bool, "paused": bool, "captures_today": int,
         "facts_today": int, "last_capture_at": ISO | None,
         "portrait_updated_at": ISO | None, "memory_cost_today_usd": float}``.
-        "Today" is since local midnight; the cost is the estimate for the journal
-        and portrait model calls (list prices, ``Settings.pricing``).
+        "Today" is since local midnight; the cost is the estimate for the journal,
+        portrait and episode model calls (list prices, ``Settings.pricing``).
         ``service_running`` comes from the service's named mutex for this
         database in this Windows session.
         """
@@ -365,7 +463,9 @@ class MemoryClient:
             "facts_today": today["facts"],
             "last_capture_at": _iso(today["last_capture_at"]),
             "portrait_updated_at": _iso(portrait.at) if portrait else None,
-            "memory_cost_today_usd": round(today["journal_cost_usd"] + today["portrait_cost_usd"], 6),
+            "memory_cost_today_usd": round(
+                today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0), 6
+            ),
         }
 
     def set_paused(self, paused: bool) -> None:

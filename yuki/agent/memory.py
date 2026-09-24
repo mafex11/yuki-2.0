@@ -1,4 +1,4 @@
-"""Yuki's side of its memory: the context block, the three memory tools, the tray's calls.
+"""Yuki's side of its memory: the context block, the four memory tools, the tray's calls.
 
 Memory lives in another package (:mod:`yuki.memory`, docs/MEMORY.md) and a
 separate process writes it. Yuki only reads it and adds to it through
@@ -48,6 +48,11 @@ KNOWHOW_LINES = 6
 
 #: Most journal facts one ``recall`` returns.
 RECALL_LIMIT = 15
+
+#: ``activity``: the groupings it takes, most activities listed, most episodes attached.
+ACTIVITY_GROUPS = ("site", "app", "page")
+ACTIVITY_ITEMS = 15
+ACTIVITY_EPISODES = 20
 
 #: Bound on the memory lookup at the start of a request (portrait and know-how
 #: together). The request goes on without memory past it.
@@ -307,8 +312,8 @@ class MemoryAccess:
         """Run one memory tool and wrap its result for the loop.
 
         Bad input comes back ``ok=False`` so the model fixes its call. Memory
-        being unavailable is ``ok=False`` for ``recall`` (a look that could not
-        be made) but ``ok=True`` with ``saved: false`` for the two writes: a
+        being unavailable is ``ok=False`` for ``recall`` and ``activity`` (looks
+        that could not be made) but ``ok=True`` with ``saved: false`` for the two writes: a
         note that could not be filed says nothing about the desktop, and must
         not cost the user a round by cancelling the ``done`` sent beside it.
         The text says plainly that nothing was saved.
@@ -321,6 +326,8 @@ class MemoryAccess:
                 outcome = self._remember_how(tool_input, request)
             elif name == "correct_memory":
                 outcome = self._correct(tool_input)
+            elif name == "activity":
+                outcome = self._activity(tool_input)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -346,12 +353,52 @@ class MemoryAccess:
             return _fail("recall", text, {"asked": asked, "error": str(exc)})
         facts = [row for row in (rows or []) if isinstance(row, dict)]
         text = format_recall(facts, query=query, since=since, until=until, app=app)
+        episodes = sum(1 for row in facts if row.get("kind") == "episode")
+        summary = f"{len(facts) - episodes} fact{'' if len(facts) - episodes == 1 else 's'}"
+        if episodes:
+            summary += f" and {episodes} episode{'' if episodes == 1 else 's'}"
         return ToolOutcome(
             name="recall",
             ok=True,
-            summary=f"{len(facts)} fact{'' if len(facts) == 1 else 's'} for \"{query[:60]}\"",
+            summary=f"{summary} for \"{query[:60]}\"",
             content=[{"type": "text", "text": text}],
             payload={"asked": asked, "facts": facts},
+        )
+
+    def _activity(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
+        until = _parse_when(tool_input.get("until"), "until", end_of_day=True)
+        group_by = _opt_text(tool_input, "group_by") or "site"
+        if group_by not in ACTIVITY_GROUPS:
+            raise _BadInput(f"'group_by' must be one of {', '.join(ACTIVITY_GROUPS)}, got {group_by!r}")
+        if since is not None and until is not None and since >= until:
+            raise _BadInput("'since' must be before 'until'")
+        asked = {"since": tool_input.get("since"), "until": tool_input.get("until"), "group_by": group_by}
+
+        def look(c: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            return (
+                c.activity(since=since, until=until, group_by=group_by, limit=ACTIVITY_ITEMS),
+                c.episodes(since=since, until=until, limit=ACTIVITY_EPISODES),
+            )
+
+        try:
+            usage, episodes = self.call("activity", look, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            text = f"Memory could not be read: {exc}"
+            return _fail("activity", text, {"asked": asked, "error": str(exc)})
+        usage = usage if isinstance(usage, dict) else {}
+        episodes = [e for e in (episodes or []) if isinstance(e, dict)]
+        text = format_activity(usage, episodes)
+        present = (usage.get("totals") or {}).get("present_s") or 0.0
+        return ToolOutcome(
+            name="activity",
+            ok=True,
+            summary=(
+                f"{_duration(present)} of activity by {group_by}, {len(episodes)} "
+                f"episode{'' if len(episodes) == 1 else 's'}"
+            ),
+            content=[{"type": "text", "text": text}],
+            payload={"asked": asked, "activity": usage, "episodes": episodes},
         )
 
     def _remember_how(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
@@ -459,11 +506,88 @@ def format_recall(
         scope.append(f"in {app}")
     if not facts:
         return f"No facts in memory match {', '.join(scope)}."
-    lines = [f"{len(facts)} fact{'' if len(facts) == 1 else 's'} from memory for {', '.join(scope)}:"]
+    lines = [f"{len(facts)} result{'' if len(facts) == 1 else 's'} from memory for {', '.join(scope)}:"]
     for row in facts:
-        where = ", ".join(str(v) for v in (row.get("app"), row.get("host")) if v)
         fact = " ".join(str(row.get("fact") or "").split())
+        if row.get("kind") == "episode":
+            end = _when(row.get("until"))
+            lines.append(f"{_when(row.get('at'))}-{end[-5:] if end != '(undated)' else '?'} [episode] {fact}")
+            continue
+        where = ", ".join(str(v) for v in (row.get("app"), row.get("host")) if v)
         lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}")
+    return "\n".join(lines)
+
+
+def _duration(seconds: Any) -> str:
+    """``40s``, ``25m``, ``1h50m``."""
+    try:
+        s = max(0.0, float(seconds or 0.0))
+    except (TypeError, ValueError):
+        return "?"
+    if s < 60:
+        return f"{int(round(s))}s"
+    minutes = int(round(s / 60.0))
+    return f"{minutes}m" if minutes < 60 else f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _clock(value: Any) -> str:
+    """``21:14`` from an ISO string (or whatever :func:`_when` reads)."""
+    text = _when(value)
+    return text[-5:] if text != "(undated)" else "?"
+
+
+def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> str:
+    """The ``activity`` tool's text: totals, one line per activity, back and forth, episodes."""
+    totals = usage.get("totals") or {}
+    group_by = usage.get("group_by") or "site"
+    head = f"Time use from {_when(usage.get('since'))} to {_when(usage.get('until'))}, by {group_by}:"
+    present = totals.get("present_s") or 0.0
+    if not present and not episodes:
+        return f"{head}\nNothing recorded in that time (memory may have been paused, the PC locked or off)."
+    lines = [
+        head,
+        f"At the PC {_duration(present)}: active {_duration(totals.get('active_s'))}, watching or "
+        f"listening with no input {_duration(totals.get('passive_s'))}; away {_duration(totals.get('away_s'))}; "
+        f"media playing in the app in front {_duration(totals.get('media_s'))}; "
+        f"{totals.get('switches', 0)} switches between {totals.get('activities', 0)} activities.",
+    ]
+    for item in usage.get("items") or []:
+        where = f" ({item['app']})" if item.get("app") and item.get("app") != item.get("label") else ""
+        extra = []
+        if (item.get("passive_s") or 0) >= 30:
+            extra.append(f"watching {_duration(item['passive_s'])}")
+        if (item.get("media_s") or 0) >= 30:
+            extra.append(f"media {_duration(item['media_s'])}")
+        visits = item.get("visits") or 0
+        longest = (
+            f"longest {_duration(item.get('longest_s'))} from {_clock(item.get('longest_start'))}"
+            if item.get("longest_s") else "longest -"
+        )
+        line = (
+            f"- {item.get('label')}{where}: {_duration(item.get('present_s'))} "
+            f"(active {_duration(item.get('active_s'))}{'; ' + ', '.join(extra) if extra else ''}), "
+            f"{visits} visit{'' if visits == 1 else 's'}, {longest}"
+        )
+        titles = [t for t in item.get("titles") or [] if t.get("title")]
+        if titles and group_by != "page":
+            line += "; " + "; ".join(f"\"{' '.join(t['title'].split())[:80]}\" {_duration(t.get('present_s'))}"
+                                     for t in titles[:3])
+        lines.append(line)
+    for pair in usage.get("interleaving") or []:
+        lines.append(f"Back and forth: {pair.get('a')} <-> {pair.get('b')}, {pair.get('switches')} switches.")
+    media = usage.get("background_media") or []
+    if media:
+        lines.append("Background media: " + ", ".join(f"{m.get('app')} {_duration(m.get('seconds'))}" for m in media))
+    if episodes:
+        lines.append("Episodes:")
+        for e in episodes:
+            # the text starts with its own time span; the line adds the day
+            note = ", so far" if not e.get("final", True) else ""
+            day = _when(e.get("start"))[:14]
+            text = " ".join(str(e.get("text") or "").split())
+            lines.append(f"- ({day}{note}) {text}")
+    else:
+        lines.append("No episodes written for this time yet (they are written hourly and at breaks).")
     return "\n".join(lines)
 
 

@@ -110,9 +110,25 @@ Know-how and open loops::
     store.add_open_loop(person, text, *, opened_at=None, portrait_fact_id=None, source_ids=None) -> int
     store.resolve_open_loop(loop_id, *, at=None, status="resolved") -> None
 
+Timeline (foreground stretches, yuki.memory.timeline) and episodes (yuki.memory.episodes)::
+
+    store.timeline_key(process, host, path, title, withheld=None) -> str   # HMAC identity of a stretch's page
+    store.save_timeline(row: TimelineRow) -> int        # insert (row.id None) or update; page_key filled in
+    store.timeline_between(since=None, until=None) -> list[TimelineRow]   # overlapping rows, oldest first
+    store.start_episode_run(trigger, model, window_start, window_end, final, at=None) -> int
+    store.commit_episodes(run_id, window_start, episodes: list[NewEpisode]) -> list[int]
+        # one transaction: the window's earlier (open-window) episodes superseded, new ones + vectors written
+    store.finish_episode_run(run_id, stats: EpisodeRunStats) -> None
+    store.episode_checkpoint() -> float | None          # end of the last final window
+    store.episode_runs_for_window(window_start) -> list[dict]
+    store.episodes_between(since=None, until=None, *, include_superseded=False) -> list[EpisodeRecord]
+    store.search_episodes(query_vec, since=None, until=None, limit=10) -> list[EpisodeRecord]  # .score = cosine
+    store.keyword_episodes(text, since=None, until=None, limit=50) -> list[EpisodeRecord]
+    store.episodes_without_vectors(limit=64) -> list[EpisodeRecord];  store.add_episode_vectors(items, model)
+
 Status::
 
-    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait)
+    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes)
 
 Maintenance and reporting::
 
@@ -303,7 +319,11 @@ class ModelCall:
 
 #: Portrait fact kinds the portrait worker writes; ``correction`` is the user's
 #: own words (``store.add_correction``), folded into the others by the worker.
-PORTRAIT_KINDS: tuple[str, ...] = ("work", "interest", "person", "routine", "preference", "open_loop")
+#: ``behaviour`` facts are evidence-based patterns in how the user spends time
+#: (from episodes and timeline aggregates), with numbers and a confidence.
+PORTRAIT_KINDS: tuple[str, ...] = (
+    "work", "interest", "person", "routine", "behaviour", "preference", "open_loop",
+)
 CORRECTION_KIND = "correction"
 
 
@@ -329,6 +349,8 @@ class PortraitFact:
     expired_at: float | None
     superseded_by: int | None
     run_id: int | None
+    #: Episodes (``episodes.id``) the fact rests on, besides the journal ids.
+    episode_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -352,6 +374,7 @@ class FactChange:
     at: float | None = None
     origin: str = "model"
     folds: list[int] = field(default_factory=list)
+    episode_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -413,6 +436,90 @@ class OpenLoop:
     resolved_at: float | None
     portrait_fact_id: int | None
     source_ids: list[int]
+
+
+@dataclass
+class TimelineRow:
+    """One foreground stretch (decrypted), see :mod:`yuki.memory.timeline`.
+
+    A stretch is one window (and, in a browser, one page) in front, either
+    ``present`` (the user at it: input within the last minute, or no input
+    while this app plays media) or ``away`` (no input for over a minute and
+    no media from it). Consecutive stretches of the same page and state are
+    merged (``segments`` counts them). ``active_s + passive_s + away_s`` is the
+    time accounted; ``media_s`` (this app's media playing) overlaps the other
+    two; ``media_other`` is ``{app: seconds}`` of other apps' media meanwhile.
+    ``withheld`` is the privacy reason when the title/page (and for a
+    blocked app, the app) were not recorded.
+    """
+
+    id: int | None
+    started_at: float
+    ended_at: float
+    state: str                       # present | away
+    process: str | None              # app_key of the image name ("chrome")
+    app: str                         # display name ("Google Chrome"); "" when withheld
+    title: str | None = None
+    host: str | None = None          # http(s) pages only, cleartext metadata
+    path: str | None = None          # path + query of the page (encrypted at rest)
+    page_key: str | None = None      # HMAC identity (Store.timeline_key)
+    active_s: float = 0.0
+    passive_s: float = 0.0
+    away_s: float = 0.0
+    media_s: float = 0.0
+    media_other: dict[str, float] = field(default_factory=dict)
+    withheld: str | None = None
+    segments: int = 1
+
+
+@dataclass
+class NewEpisode:
+    """One episode narrative to write in :meth:`Store.commit_episodes`."""
+
+    started_at: float
+    ended_at: float
+    window_start: float
+    window_end: float
+    final: bool
+    text: str
+    aggregates: dict[str, Any]
+    vector: np.ndarray | None = None
+    embed_model: str | None = None
+
+
+@dataclass
+class EpisodeRecord:
+    """A stored episode (decrypted)."""
+
+    id: int
+    started_at: float
+    ended_at: float
+    window_start: float
+    window_end: float
+    final: bool
+    text: str
+    aggregates: dict[str, Any]
+    run_id: int | None
+    created_at: float
+    superseded_by: int | None = None
+    score: float | None = None       # cosine, set by search_episodes
+
+
+@dataclass
+class EpisodeRunStats:
+    """Content-free accounting for one episode run."""
+
+    outcome: str = "ok"              # ok | empty | error | gave_up
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    stop_reason: str | None = None
+    episodes: int = 0
+    present_s: float = 0.0
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +764,82 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE health ADD COLUMN messages INTEGER;
     ALTER TABLE health ADD COLUMN new_messages INTEGER;
     ALTER TABLE health ADD COLUMN stats TEXT;              -- JSON, content-free (nodes, ms, source)
+    """,
+    # 4: contextual memory - the foreground timeline (yuki.memory.timeline),
+    # episodes written from it (yuki.memory.episodes) and the episodes a
+    # portrait fact rests on. Additive only, like 2 and 3.
+    """
+    CREATE TABLE timeline (
+        id               INTEGER PRIMARY KEY,
+        started_at       REAL NOT NULL,
+        ended_at         REAL NOT NULL,
+        state            TEXT NOT NULL,             -- present | away
+        process          TEXT,                      -- app_key(image name), cleartext metadata
+        app              TEXT NOT NULL,             -- display name, cleartext metadata ('' when withheld)
+        title_ciphertext TEXT,
+        host             TEXT,                      -- http(s) page host, cleartext metadata
+        path_ciphertext  TEXT,                      -- page path + query
+        page_key         TEXT NOT NULL,             -- HMAC(process, host, path | title)
+        active_s         REAL NOT NULL DEFAULT 0,
+        passive_s        REAL NOT NULL DEFAULT 0,   -- no input, this app's media playing
+        away_s           REAL NOT NULL DEFAULT 0,
+        media_s          REAL NOT NULL DEFAULT 0,   -- this app's media playing (overlaps the above)
+        media_other      TEXT,                      -- JSON {app: seconds}: other apps' media meanwhile
+        withheld         TEXT,                      -- privacy reason when title/page were not kept
+        segments         INTEGER NOT NULL DEFAULT 1,
+        updated_at       REAL NOT NULL
+    );
+    CREATE INDEX timeline_started ON timeline(started_at);
+    CREATE INDEX timeline_ended ON timeline(ended_at);
+
+    CREATE TABLE episode_runs (
+        id                 INTEGER PRIMARY KEY,
+        at                 REAL NOT NULL,
+        finished_at        REAL,
+        trigger            TEXT NOT NULL,           -- hour | break | cap | catch_up
+        model              TEXT NOT NULL,
+        window_start       REAL NOT NULL,
+        window_end         REAL NOT NULL,
+        final              INTEGER NOT NULL DEFAULT 0,
+        present_s          REAL NOT NULL DEFAULT 0,
+        input_tokens       INTEGER NOT NULL DEFAULT 0,
+        output_tokens      INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+        cost_usd           REAL,
+        latency_ms         REAL NOT NULL DEFAULT 0,
+        stop_reason        TEXT,
+        episodes           INTEGER NOT NULL DEFAULT 0,
+        outcome            TEXT NOT NULL,           -- running | ok | empty | error | gave_up
+        error              TEXT
+    );
+    CREATE INDEX episode_runs_window ON episode_runs(window_start, at);
+
+    CREATE TABLE episodes (
+        id                    INTEGER PRIMARY KEY,
+        started_at            REAL NOT NULL,
+        ended_at              REAL NOT NULL,
+        window_start          REAL NOT NULL,
+        window_end            REAL NOT NULL,
+        final                 INTEGER NOT NULL DEFAULT 0,
+        text_ciphertext       TEXT NOT NULL,
+        aggregates_ciphertext TEXT,                 -- JSON (holds titles and pages)
+        run_id                INTEGER,
+        created_at            REAL NOT NULL,
+        expired_at            REAL,                 -- set when a later run of the window replaced it
+        superseded_by         INTEGER
+    );
+    CREATE INDEX episodes_span ON episodes(started_at, ended_at);
+    CREATE INDEX episodes_window ON episodes(window_start, expired_at);
+
+    CREATE TABLE episode_vec (
+        episode_id      INTEGER PRIMARY KEY REFERENCES episodes(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+
+    ALTER TABLE portrait_facts ADD COLUMN episode_ids TEXT;   -- JSON list of episode ids
     """,
 )
 
@@ -1399,12 +1582,16 @@ class Store:
             sources = [int(i) for i in json.loads(r["source_ids"] or "[]")]
         except (ValueError, TypeError):
             sources = []
+        try:
+            episodes = [int(i) for i in json.loads(r["episode_ids"] or "[]")]
+        except (ValueError, TypeError, IndexError):
+            episodes = []
         return PortraitFact(
             id=r["id"], kind=r["kind"], subject=self._dec(r["subject_ciphertext"]) or "",
             text=self.cipher.decrypt(r["text_ciphertext"]), valid_from=r["valid_from"], valid_to=r["valid_to"],
             source_ids=sources, confidence=r["confidence"], origin=r["origin"] or "model",
             created_at=r["created_at"], expired_at=r["expired_at"], superseded_by=r["superseded_by"],
-            run_id=r["run_id"],
+            run_id=r["run_id"], episode_ids=episodes,
         )
 
     def portrait_facts(
@@ -1436,13 +1623,15 @@ class Store:
     def _insert_fact(
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
         source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
+        episode_ids: Sequence[int] = (),
     ) -> int:
         cur = conn.execute(
             "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
-            " source_ids, confidence, origin, created_at, run_id) VALUES (?,?,?,?,NULL,?,?,?,?,?)",
+            " source_ids, confidence, origin, created_at, run_id, episode_ids) VALUES (?,?,?,?,NULL,?,?,?,?,?,?)",
             (
                 kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
                 json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
+                json.dumps([int(i) for i in episode_ids]) if episode_ids else None,
             ),
         )
         return int(cur.lastrowid)
@@ -1499,7 +1688,7 @@ class Store:
                     new_id = self._insert_fact(
                         conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
                         source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
-                        run_id=run_id, now=now,
+                        run_id=run_id, now=now, episode_ids=ch.episode_ids,
                     )
                 if old is not None:
                     self._end_fact(conn, old["id"], at, now, new_id)
@@ -1816,10 +2005,274 @@ class Store:
         last = self._query("SELECT max(at) FROM captures")[0][0]
         journal_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM journal_batches WHERE at >= ?", (s,))[0][0]
         portrait_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM portrait_runs WHERE at >= ?", (s,))[0][0]
+        episode_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM episode_runs WHERE at >= ?", (s,))[0][0]
         return {
             "captures": int(captures), "facts": int(facts), "last_capture_at": last,
             "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
+            "episode_cost_usd": float(episode_cost or 0.0),
         }
+
+    # -- timeline ------------------------------------------------------------
+
+    def timeline_key(
+        self, process: str | None, host: str | None, path: str | None, title: str | None,
+        withheld: str | None = None,
+    ) -> str:
+        """The keyed identity of a stretch's page: what "the same page" means for merging and grouping.
+
+        A web page is (process, host, path + query); any other window is
+        (process, title); a withheld stretch is its privacy reason (and the
+        app when the app itself was kept).
+        """
+        proc = app_key(process) or ""
+        if withheld:
+            return self.cipher.digest("tl-withheld", withheld, proc)
+        if host or path:
+            return self.cipher.digest("tl-page", proc, host or "", path or "")
+        return self.cipher.digest("tl-title", proc, title or "")
+
+    def save_timeline(self, row: TimelineRow) -> int:
+        """Insert (``row.id`` None) or update one stretch; sets and returns ``row.id``.
+
+        ``row.page_key`` is computed from the row when missing.
+        """
+        if not row.page_key:
+            row.page_key = self.timeline_key(row.process, row.host, row.path, row.title, row.withheld)
+        values = (
+            float(row.started_at), float(row.ended_at), row.state, app_key(row.process), row.app or "",
+            self._enc(row.title) if row.title else None, row.host, self._enc(row.path) if row.path else None,
+            row.page_key, round(float(row.active_s), 3), round(float(row.passive_s), 3),
+            round(float(row.away_s), 3), round(float(row.media_s), 3),
+            json.dumps({k: round(v, 1) for k, v in sorted(row.media_other.items())}) if row.media_other else None,
+            row.withheld, int(row.segments), time.time(),
+        )
+
+        def op(conn: sqlite3.Connection) -> int:
+            if row.id is not None:
+                cur = conn.execute(
+                    "UPDATE timeline SET started_at=?, ended_at=?, state=?, process=?, app=?, title_ciphertext=?,"
+                    " host=?, path_ciphertext=?, page_key=?, active_s=?, passive_s=?, away_s=?, media_s=?,"
+                    " media_other=?, withheld=?, segments=?, updated_at=? WHERE id=?",
+                    (*values, int(row.id)),
+                )
+                if cur.rowcount == 1:
+                    return int(row.id)
+            cur = conn.execute(
+                "INSERT INTO timeline(started_at, ended_at, state, process, app, title_ciphertext, host,"
+                " path_ciphertext, page_key, active_s, passive_s, away_s, media_s, media_other, withheld,"
+                " segments, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+            return int(cur.lastrowid)
+
+        row.id = self._write(op)
+        return row.id
+
+    def _timeline_row(self, r: sqlite3.Row) -> TimelineRow:
+        try:
+            other = {str(k): float(v) for k, v in json.loads(r["media_other"] or "{}").items()}
+        except (ValueError, TypeError, AttributeError):
+            other = {}
+        return TimelineRow(
+            id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], state=r["state"], process=r["process"],
+            app=r["app"], title=self._dec(r["title_ciphertext"]), host=r["host"], path=self._dec(r["path_ciphertext"]),
+            page_key=r["page_key"], active_s=r["active_s"], passive_s=r["passive_s"], away_s=r["away_s"],
+            media_s=r["media_s"], media_other=other, withheld=r["withheld"], segments=r["segments"],
+        )
+
+    def timeline_between(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
+        """Stretches overlapping ``[since, until)``, oldest first (decrypted, not clipped)."""
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("ended_at > ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("started_at < ?")
+            params.append(u)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return [self._timeline_row(r) for r in self._query(
+            "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
+        )]
+
+    def timeline_bounds(self) -> tuple[float | None, float | None]:
+        """Earliest start and latest end in the timeline."""
+        r = self._query("SELECT min(started_at), max(ended_at) FROM timeline")[0]
+        return (r[0], r[1])
+
+    # -- episodes ------------------------------------------------------------
+
+    def start_episode_run(
+        self, trigger: str, model: str, window_start: float, window_end: float, final: bool,
+        at: float | None = None,
+    ) -> int:
+        """Insert a ``running`` episode-run row and return its id."""
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO episode_runs(at, trigger, model, window_start, window_end, final, outcome)"
+            " VALUES (?,?,?,?,?,?,'running')",
+            (float(at) if at is not None else time.time(), trigger, model, float(window_start),
+             float(window_end), int(bool(final))),
+        ).lastrowid))
+
+    def finish_episode_run(self, run_id: int, stats: EpisodeRunStats) -> None:
+        """Record a run's accounting and outcome."""
+        self._write(lambda conn: conn.execute(
+            "UPDATE episode_runs SET finished_at=?, present_s=?, input_tokens=?, output_tokens=?,"
+            " cache_write_tokens=?, cache_read_tokens=?, cost_usd=?, latency_ms=?, stop_reason=?, episodes=?,"
+            " outcome=?, error=? WHERE id=?",
+            (time.time(), stats.present_s, stats.input_tokens, stats.output_tokens, stats.cache_write_tokens,
+             stats.cache_read_tokens, stats.cost_usd, stats.latency_ms, stats.stop_reason, stats.episodes,
+             stats.outcome, stats.error, int(run_id)),
+        ))
+
+    def episode_checkpoint(self) -> float | None:
+        """End of the latest final window that is done (ok, empty or given up)."""
+        value = self._query(
+            "SELECT max(window_end) FROM episode_runs WHERE final=1 AND outcome IN ('ok','empty','gave_up')"
+        )[0][0]
+        return float(value) if value is not None else None
+
+    def episode_runs_for_window(self, window_start: float) -> list[dict[str, Any]]:
+        """Runs (content-free) of the window starting at ``window_start``, oldest first."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM episode_runs WHERE abs(window_start - ?) < 0.001 ORDER BY at, id",
+            (float(window_start),),
+        )]
+
+    def episode_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Latest episode runs (content-free), newest first."""
+        return [dict(r) for r in self._query("SELECT * FROM episode_runs ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    def commit_episodes(self, run_id: int | None, window_start: float, episodes: Sequence[NewEpisode]) -> list[int]:
+        """Write a window's episodes; the window's current episodes (from earlier runs) are superseded.
+
+        One transaction. Earlier episodes of the same window are kept, with
+        ``expired_at`` and ``superseded_by`` (the first new id) set.
+        """
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> list[int]:
+            ids: list[int] = []
+            for ep in episodes:
+                cur = conn.execute(
+                    "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext,"
+                    " aggregates_ciphertext, run_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (float(ep.started_at), float(ep.ended_at), float(ep.window_start), float(ep.window_end),
+                     int(bool(ep.final)), self.cipher.encrypt(ep.text),
+                     self.cipher.encrypt(json.dumps(ep.aggregates, ensure_ascii=False, default=str)),
+                     run_id, now),
+                )
+                eid = int(cur.lastrowid)
+                ids.append(eid)
+                if ep.vector is not None:
+                    vec = np.asarray(ep.vector, dtype=np.float32).ravel()
+                    conn.execute(
+                        "INSERT INTO episode_vec(episode_id, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
+                        (eid, ep.embed_model or "", int(vec.shape[0]), self.cipher.encrypt_bytes(vec.tobytes())),
+                    )
+            placeholders = ",".join("?" * len(ids)) if ids else "NULL"
+            conn.execute(
+                "UPDATE episodes SET expired_at=?, superseded_by=? WHERE abs(window_start - ?) < 0.001"
+                f" AND expired_at IS NULL AND id NOT IN ({placeholders})",
+                (now, ids[0] if ids else None, float(window_start), *ids),
+            )
+            return ids
+
+        return self._write(op)
+
+    def _episode(self, r: sqlite3.Row, score: float | None = None) -> EpisodeRecord:
+        try:
+            aggregates = json.loads(self._dec(r["aggregates_ciphertext"]) or "{}")
+        except ValueError:
+            aggregates = {}
+        return EpisodeRecord(
+            id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], window_start=r["window_start"],
+            window_end=r["window_end"], final=bool(r["final"]), text=self.cipher.decrypt(r["text_ciphertext"]),
+            aggregates=aggregates if isinstance(aggregates, dict) else {}, run_id=r["run_id"],
+            created_at=r["created_at"], superseded_by=r["superseded_by"], score=score,
+        )
+
+    def _episode_filter(self, since: TimeArg, until: TimeArg, include_superseded: bool = False) -> tuple[str, list]:
+        clauses, params = [], []
+        if not include_superseded:
+            clauses.append("e.expired_at IS NULL")
+        if (s := _ts(since)) is not None:
+            clauses.append("e.ended_at > ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("e.started_at < ?")
+            params.append(u)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def episodes_between(
+        self, since: TimeArg = None, until: TimeArg = None, *, include_superseded: bool = False
+    ) -> list[EpisodeRecord]:
+        """Episodes overlapping ``[since, until)`` (current ones unless asked), oldest first."""
+        where, params = self._episode_filter(since, until, include_superseded)
+        return [self._episode(r) for r in self._query(
+            "SELECT e.* FROM episodes e" + where + " ORDER BY e.started_at, e.id", params
+        )]
+
+    def search_episodes(
+        self, query_vec: np.ndarray, since: TimeArg = None, until: TimeArg = None, limit: int = 10
+    ) -> list[EpisodeRecord]:
+        """Current episodes most similar to ``query_vec`` (cosine), within the window."""
+        where, params = self._episode_filter(since, until)
+        rows = self._query(
+            "SELECT e.*, v.vec_ciphertext, v.dim FROM episodes e JOIN episode_vec v ON v.episode_id = e.id" + where,
+            params,
+        )
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(q))
+        keep = [r for r in rows if r["dim"] == q.shape[0]]
+        if not keep or qn == 0.0:
+            return []
+        matrix = np.stack(
+            [np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32) for r in keep]
+        )
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        scores = (matrix @ (q / qn)) / norms
+        order = np.argsort(-scores)[: max(0, int(limit))]
+        return [self._episode(keep[i], float(scores[i])) for i in order]
+
+    def keyword_episodes(
+        self, text: str, since: TimeArg = None, until: TimeArg = None, limit: int = 50
+    ) -> list[EpisodeRecord]:
+        """Current episodes whose text contains every term of ``text`` (casefolded), newest first."""
+        terms = [t.casefold() for t in (text or "").split()]
+        if not terms:
+            return []
+        where, params = self._episode_filter(since, until)
+        hits: list[EpisodeRecord] = []
+        for r in self._query("SELECT e.* FROM episodes e" + where + " ORDER BY e.started_at DESC, e.id DESC", params):
+            ep = self._episode(r)
+            folded = ep.text.casefold()
+            if all(t in folded for t in terms):
+                hits.append(ep)
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def episodes_without_vectors(self, limit: int = 64) -> list[EpisodeRecord]:
+        """Current episodes that have no embedding yet."""
+        return [self._episode(r) for r in self._query(
+            "SELECT e.* FROM episodes e LEFT JOIN episode_vec v ON v.episode_id = e.id"
+            " WHERE v.episode_id IS NULL AND e.expired_at IS NULL ORDER BY e.id LIMIT ?", (int(limit),),
+        )]
+
+    def add_episode_vectors(self, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        """Store embeddings for existing episodes (replacing any old one)."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            for episode_id, vector in items:
+                vec = np.asarray(vector, dtype=np.float32).ravel()
+                conn.execute(
+                    "INSERT OR REPLACE INTO episode_vec(episode_id, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
+                    (int(episode_id), model, int(vec.shape[0]), self.cipher.encrypt_bytes(vec.tobytes())),
+                )
+            return len(items)
+
+        return self._write(op)
 
     # -- maintenance -------------------------------------------------------
 
