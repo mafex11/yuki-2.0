@@ -344,8 +344,10 @@ of their conversations with Yuki. Draw it only from the RELATIONSHIP data: the r
 preferences are the user's own words (keep nicknames and wording exact, with the date \
 given), and a theme needs the session summaries to show it in more than one session (what \
 they keep asking Yuki for, topics or jokes that recur). Never guess at feelings or \
-personality; no rules there means no rules here. Yuki also gets the rules separately \
-before every request, so keep this section short. The RELATIONSHIP DATA feeds this section \
+personality; no rules there means no rules here. The nudge reaction counts may support one \
+plain observation about how the user takes Yuki's check-ins ("usually dismisses nudges back to \
+work, replies to praise"), only when the counts clearly show it; they are never a rule. Yuki \
+also gets the rules separately before every request, so keep this section short. The RELATIONSHIP DATA feeds this section \
 only: every other section (Work, Interests, Behaviour, Preferences...) is written from the \
 FACTS alone, even when a session summary mentions the same app or topic - what reaches the \
 journal from conversations becomes a fact through its own path.
@@ -1033,7 +1035,13 @@ class PortraitWorker:
             sessions = self.store.session_summaries(since=now - RELATIONSHIP_DAYS * 86400.0)
         except Exception:
             return ""
-        if not rules and not sessions:
+        try:
+            from yuki.memory.nudges import reaction_summary
+
+            reactions = reaction_summary(self.store, now - RELATIONSHIP_DAYS * 86400.0, now)
+        except Exception:
+            reactions = ""
+        if not rules and not sessions and not reactions:
             return ""
         lines = [
             "RELATIONSHIP DATA - for the Relationship section only; nothing below may appear in any other section.",
@@ -1056,6 +1064,9 @@ class PortraitWorker:
         lines.append(f"Conversation sessions with Yuki, last {RELATIONSHIP_DAYS} days "
                      f"({len(session_lines)} of {len(sessions)}, oldest first; themes only):")
         lines.extend(session_lines or ["(none)"])
+        lines.append(f"How the user reacted to Yuki's check-in nudges (praise, nudges back to work, reminders), "
+                     f"last {RELATIONSHIP_DAYS} days (counts only):")
+        lines.append(f"- {reactions}" if reactions else "(none)")
         return "\n".join(lines)
 
     def _relationship_changed(self, since: float) -> bool:

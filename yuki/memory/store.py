@@ -157,9 +157,22 @@ Conversations with Yuki (yuki.memory.conversations; yuki.memory.api.MemoryClient
     store.turns/summaries/conversation_facts_without_vectors();  add_conversation_vectors(what, items, model)
     store.conversation_changed_since(at) -> bool;  conversation_batches(limit);  conversation_thread_id()
 
+The coach (yuki.memory.nudges; yuki.memory.api.MemoryClient.todos / pending_nudges / ...)::
+
+    store.add_todo(text, *, due_at=None, all_day=False) -> int;  store.todos(statuses=("open",), *, done_since=None)
+    store.todo(id);  store.complete_todo(id) -> bool
+    store.complete_open_loop(loop_id) -> bool      # loop row done + its portrait fact invalidated, one transaction
+    store.open_loops_done_since(since) -> list[OpenLoop]
+    store.record_checkin(checkin: NudgeCheckin, nudge: NewNudge | None) -> (checkin_id, nudge_id | None)
+    store.nudges(since=None, until=None, *, kinds=None, pending=False, limit=None) -> list[NudgeRecord]
+    store.nudge(id);  store.react_to_nudge(id, reaction);  store.expire_nudges(before, kinds) -> int
+    store.reminded(ref, due_at) -> bool;  store.nudge_checkins(since=None, limit=None) -> list[dict]
+    store.nudge_state(name) / set_nudge_state(name, value | None)
+    store.captures_between(since, until=None, *, limit=4) -> [{"at", "app", "host", "kind", "text"}]   # not by_yuki
+
 Status::
 
-    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations)
+    store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
 
 Maintenance and reporting::
 
@@ -710,6 +723,77 @@ class ConversationCall:
 
 
 @dataclass
+class TodoItem:
+    """A to-do the user added themselves (``todos``, decrypted)."""
+
+    id: int
+    text: str
+    due_at: float | None
+    due_all_day: bool
+    status: str                      # open | done
+    created_at: float
+    done_at: float | None
+
+
+#: ``nudges.kind``: praise (encouragement, an acknowledgement), nudge (a call-back,
+#: a call-out, a break suggestion) or reminder (a due to-do or commitment).
+NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder")
+#: ``nudges.reaction`` values the UI reports (``expired``: never shown in time).
+NUDGE_REACTIONS: tuple[str, ...] = ("shown", "dismissed", "replied", "snoozed")
+
+
+@dataclass
+class NudgeRecord:
+    """One nudge written for the UI (decrypted)."""
+
+    id: int
+    at: float
+    kind: str
+    trigger: str | None
+    text: str
+    reason: str | None
+    inputs: dict[str, Any]
+    ref: str | None
+    due_at: float | None
+    checkin_id: int | None
+    shown_at: float | None
+    reaction: str | None
+    reacted_at: float | None
+
+
+@dataclass
+class NudgeCheckin:
+    """Content-free accounting for one coach check-in (one model call, or a skipped one)."""
+
+    at: float
+    trigger: str                     # periodic | transition | follow_up | reminder
+    outcome: str                     # none | praise | nudge | reminder | suppressed:<why> | skipped:<why> | error
+    model: str | None = None
+    input_chars: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float | None = None
+    latency_ms: float = 0.0
+    stop_reason: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class NewNudge:
+    """A nudge to write with its check-in (:meth:`Store.record_checkin`)."""
+
+    kind: str
+    text: str
+    reason: str | None = None
+    inputs: dict[str, Any] = field(default_factory=dict)
+    trigger: str | None = None
+    ref: str | None = None
+    due_at: float | None = None
+
+
+@dataclass
 class EpisodeRunStats:
     """Content-free accounting for one episode run."""
 
@@ -1172,6 +1256,67 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE timeline ADD COLUMN by_yuki INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE timeline ADD COLUMN yuki_request_ciphertext TEXT;
     ALTER TABLE journal ADD COLUMN by_yuki INTEGER NOT NULL DEFAULT 0;
+    """,
+    # 8: the coach (yuki.memory.nudges) - to-dos the user added themselves,
+    # the nudges written for the UI (praise, nudge, reminder) with the user's
+    # reaction, the content-free accounting of every check-in, and small
+    # coach state (the snooze). Additive only, like 2-7.
+    """
+    CREATE TABLE todos (
+        id              INTEGER PRIMARY KEY,
+        text_ciphertext TEXT NOT NULL,
+        due_at          REAL,                      -- local time as epoch seconds; NULL = no due date
+        due_all_day     INTEGER NOT NULL DEFAULT 0, -- 1: due_at is a day (its local midnight), no time
+        status          TEXT NOT NULL,             -- open | done
+        created_at      REAL NOT NULL,
+        done_at         REAL,
+        updated_at      REAL NOT NULL
+    );
+    CREATE INDEX todos_status ON todos(status, due_at);
+
+    CREATE TABLE nudge_checkins (
+        id                 INTEGER PRIMARY KEY,
+        at                 REAL NOT NULL,
+        trigger            TEXT NOT NULL,           -- periodic | transition | follow_up | reminder
+        outcome            TEXT NOT NULL,           -- none | praise | nudge | reminder | suppressed:<why> | skipped:<why> | error
+        model              TEXT,
+        input_chars        INTEGER NOT NULL DEFAULT 0,
+        input_tokens       INTEGER NOT NULL DEFAULT 0,
+        output_tokens      INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+        cost_usd           REAL,
+        latency_ms         REAL NOT NULL DEFAULT 0,
+        stop_reason        TEXT,
+        nudge_id           INTEGER,
+        error              TEXT
+    );
+    CREATE INDEX nudge_checkins_at ON nudge_checkins(at);
+
+    CREATE TABLE nudges (
+        id                INTEGER PRIMARY KEY,
+        at                REAL NOT NULL,
+        kind              TEXT NOT NULL,            -- praise | nudge | reminder
+        trigger           TEXT,
+        text_ciphertext   TEXT NOT NULL,
+        reason_ciphertext TEXT,
+        inputs_ciphertext TEXT,                     -- JSON: what the decision rested on (activity, numbers, to-dos)
+        ref               TEXT,                     -- reminders: the item reminded ("commit:5", "todo:3")
+        due_at            REAL,                     -- reminders: the due time reminded (once per item and due)
+        checkin_id        INTEGER,
+        shown_at          REAL,
+        reaction          TEXT,                     -- shown | dismissed | replied | snoozed | expired
+        reacted_at        REAL
+    );
+    CREATE INDEX nudges_at ON nudges(at);
+    CREATE INDEX nudges_pending ON nudges(shown_at, reaction, at);
+    CREATE INDEX nudges_ref ON nudges(ref, due_at);
+
+    CREATE TABLE nudge_state (
+        name       TEXT PRIMARY KEY,                -- e.g. quiet_until
+        value      TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    );
     """,
 )
 
@@ -2395,10 +2540,12 @@ class Store:
         episode_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM episode_runs WHERE at >= ?", (s,))[0][0]
         conversation_cost = self._query(
             "SELECT coalesce(sum(cost_usd), 0) FROM conversation_batches WHERE at >= ?", (s,))[0][0]
+        nudge_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM nudge_checkins WHERE at >= ?", (s,))[0][0]
         return {
             "captures": int(captures), "facts": int(facts), "last_capture_at": last,
             "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
             "episode_cost_usd": float(episode_cost or 0.0), "conversation_cost_usd": float(conversation_cost or 0.0),
+            "nudge_cost_usd": float(nudge_cost or 0.0),
         }
 
     # -- timeline ------------------------------------------------------------
@@ -3345,6 +3492,239 @@ class Store:
             " + (SELECT count(*) FROM session_summaries WHERE created_at > ?)", (t, t, t),
         )[0][0]
         return bool(row)
+
+    # -- the coach: to-dos, nudges, check-ins (yuki.memory.nudges) ------------
+
+    def _todo(self, r: sqlite3.Row) -> TodoItem:
+        return TodoItem(
+            id=r["id"], text=self.cipher.decrypt(r["text_ciphertext"]), due_at=r["due_at"],
+            due_all_day=bool(r["due_all_day"]), status=r["status"], created_at=r["created_at"], done_at=r["done_at"],
+        )
+
+    def add_todo(self, text: str, *, due_at: float | None = None, all_day: bool = False,
+                 at: float | None = None) -> int:
+        """Store a to-do the user added (encrypted); returns its id."""
+        now = float(at) if at is not None else time.time()
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at)"
+            " VALUES (?,?,?,'open',?,?)",
+            (self.cipher.encrypt(text), float(due_at) if due_at is not None else None, int(bool(all_day)), now, now),
+        ).lastrowid))
+
+    def todos(self, statuses: Sequence[str] | None = ("open",), *, done_since: TimeArg = None) -> list[TodoItem]:
+        """User-added to-dos with these statuses (``None`` = any), oldest first.
+
+        ``done_since``: done ones only when they were done at or after it.
+        """
+        clauses, params = [], []
+        if statuses:
+            clauses.append("status IN (%s)" % ",".join("?" * len(statuses)))
+            params.extend(statuses)
+        if (s := _ts(done_since)) is not None:
+            clauses.append("(status != 'done' OR done_at >= ?)")
+            params.append(s)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return [self._todo(r) for r in self._query("SELECT * FROM todos" + where + " ORDER BY created_at, id", params)]
+
+    def todo(self, todo_id: int) -> TodoItem | None:
+        rows = self._query("SELECT * FROM todos WHERE id=?", (int(todo_id),))
+        return self._todo(rows[0]) if rows else None
+
+    def complete_todo(self, todo_id: int, *, at: float | None = None) -> bool:
+        """Mark an open user to-do done; False if it was not open."""
+        now = float(at) if at is not None else time.time()
+        return self._write(lambda conn: conn.execute(
+            "UPDATE todos SET status='done', done_at=?, updated_at=? WHERE id=? AND status='open'",
+            (now, now, int(todo_id)),
+        ).rowcount == 1)
+
+    def complete_open_loop(self, loop_id: int, *, at: float | None = None) -> bool:
+        """The user says an open loop is done: in one transaction the loop row becomes ``done``
+        and its current portrait fact is invalidated (``valid_to`` = now, history kept).
+        False if the loop was not open."""
+        now = float(at) if at is not None else time.time()
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT portrait_fact_id FROM open_loops WHERE id=? AND status='open'",
+                               (int(loop_id),)).fetchone()
+            if row is None:
+                return False
+            conn.execute("UPDATE open_loops SET status='done', resolved_at=?, updated_at=? WHERE id=?",
+                         (now, now, int(loop_id)))
+            if row["portrait_fact_id"] is not None:
+                self._end_fact(conn, int(row["portrait_fact_id"]), now, now, None)
+            return True
+
+        return self._write(op)
+
+    def open_loops_done_since(self, since: TimeArg) -> list[OpenLoop]:
+        """Loops closed as done or resolved at or after ``since``, oldest first."""
+        return [self._loop(r) for r in self._query(
+            "SELECT * FROM open_loops WHERE status IN ('done','resolved') AND resolved_at >= ?"
+            " ORDER BY resolved_at, id", (_ts(since) or 0.0,),
+        )]
+
+    def _nudge(self, r: sqlite3.Row) -> NudgeRecord:
+        try:
+            inputs = json.loads(self._dec(r["inputs_ciphertext"]) or "{}")
+        except (ValueError, TypeError):
+            inputs = {}
+        return NudgeRecord(
+            id=r["id"], at=r["at"], kind=r["kind"], trigger=r["trigger"], text=self.cipher.decrypt(r["text_ciphertext"]),
+            reason=self._dec(r["reason_ciphertext"]), inputs=inputs if isinstance(inputs, dict) else {},
+            ref=r["ref"], due_at=r["due_at"], checkin_id=r["checkin_id"], shown_at=r["shown_at"],
+            reaction=r["reaction"], reacted_at=r["reacted_at"],
+        )
+
+    def record_checkin(self, checkin: NudgeCheckin, nudge: NewNudge | None = None) -> tuple[int, int | None]:
+        """One transaction: the check-in's accounting and, when it said something, the nudge.
+
+        Returns ``(checkin_id, nudge_id or None)``.
+        """
+        if nudge is not None and nudge.kind not in NUDGE_KINDS:
+            raise ValueError(f"unknown nudge kind {nudge.kind!r}")
+
+        def op(conn: sqlite3.Connection) -> tuple[int, int | None]:
+            c = checkin
+            cur = conn.execute(
+                "INSERT INTO nudge_checkins(at, trigger, outcome, model, input_chars, input_tokens, output_tokens,"
+                " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (c.at, c.trigger, c.outcome, c.model, c.input_chars, c.input_tokens, c.output_tokens,
+                 c.cache_write_tokens, c.cache_read_tokens, c.cost_usd, c.latency_ms, c.stop_reason, c.error),
+            )
+            checkin_id = int(cur.lastrowid)
+            nudge_id = None
+            if nudge is not None:
+                cur = conn.execute(
+                    "INSERT INTO nudges(at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext,"
+                    " ref, due_at, checkin_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (c.at, nudge.kind, nudge.trigger or c.trigger, self.cipher.encrypt(nudge.text),
+                     self._enc(nudge.reason), self._enc(json.dumps(nudge.inputs, ensure_ascii=False, default=str)),
+                     nudge.ref, nudge.due_at, checkin_id),
+                )
+                nudge_id = int(cur.lastrowid)
+                conn.execute("UPDATE nudge_checkins SET nudge_id=? WHERE id=?", (nudge_id, checkin_id))
+            return checkin_id, nudge_id
+
+        return self._write(op)
+
+    def nudges(
+        self, since: TimeArg = None, until: TimeArg = None, *, kinds: Sequence[str] | None = None,
+        pending: bool = False, limit: int | None = None,
+    ) -> list[NudgeRecord]:
+        """Nudges written in ``[since, until)``, oldest first (with ``limit``: the newest N).
+
+        ``pending``: only those never shown and without a reaction.
+        """
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("at < ?")
+            params.append(u)
+        if kinds:
+            clauses.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            params.extend(kinds)
+        if pending:
+            clauses.append("shown_at IS NULL AND reaction IS NULL")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = "SELECT * FROM nudges" + where + " ORDER BY at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._nudge(r) for r in reversed(self._query(sql, params))]
+
+    def nudge(self, nudge_id: int) -> NudgeRecord | None:
+        rows = self._query("SELECT * FROM nudges WHERE id=?", (int(nudge_id),))
+        return self._nudge(rows[0]) if rows else None
+
+    def react_to_nudge(self, nudge_id: int, reaction: str, *, at: float | None = None) -> bool:
+        """Record what the user did with a nudge; ``shown`` also sets ``shown_at`` (first time only).
+
+        A later reaction replaces an earlier one (shown -> dismissed); ``shown``
+        never replaces a real reaction. False if the nudge does not exist.
+        """
+        if reaction not in NUDGE_REACTIONS:
+            raise ValueError(f"reaction must be one of {NUDGE_REACTIONS}, not {reaction!r}")
+        now = float(at) if at is not None else time.time()
+        if reaction == "shown":
+            sql = ("UPDATE nudges SET shown_at=coalesce(shown_at, ?),"
+                   " reaction=CASE WHEN reaction IS NULL OR reaction='expired' THEN 'shown' ELSE reaction END,"
+                   " reacted_at=CASE WHEN reaction IS NULL OR reaction='expired' THEN ? ELSE reacted_at END WHERE id=?")
+            params: tuple[Any, ...] = (now, now, int(nudge_id))
+        else:
+            sql = "UPDATE nudges SET shown_at=coalesce(shown_at, ?), reaction=?, reacted_at=? WHERE id=?"
+            params = (now, reaction, now, int(nudge_id))
+        return self._write(lambda conn: conn.execute(sql, params).rowcount == 1)
+
+    def expire_nudges(self, before: float, kinds: Sequence[str]) -> int:
+        """Mark never-shown nudges of these kinds written before ``before`` as ``expired``; returns how many."""
+        if not kinds:
+            return 0
+        return self._write(lambda conn: conn.execute(
+            "UPDATE nudges SET reaction='expired', reacted_at=? WHERE shown_at IS NULL AND reaction IS NULL"
+            " AND at < ? AND kind IN (%s)" % ",".join("?" * len(kinds)),
+            (time.time(), float(before), *kinds),
+        ).rowcount)
+
+    def reminded(self, ref: str, due_at: float | None) -> bool:
+        """Whether a reminder for this item and due time was already written."""
+        if due_at is None:
+            rows = self._query("SELECT 1 FROM nudges WHERE kind='reminder' AND ref=? AND due_at IS NULL LIMIT 1", (ref,))
+        else:
+            rows = self._query(
+                "SELECT 1 FROM nudges WHERE kind='reminder' AND ref=? AND abs(due_at - ?) < 1 LIMIT 1",
+                (ref, float(due_at)),
+            )
+        return bool(rows)
+
+    def nudge_checkins(self, since: TimeArg = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """Check-in accounting rows (content-free) since ``since``, oldest first (with ``limit``: the newest N)."""
+        sql = "SELECT * FROM nudge_checkins"
+        params: list[Any] = []
+        if (s := _ts(since)) is not None:
+            sql += " WHERE at >= ?"
+            params.append(s)
+        sql += " ORDER BY at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in reversed(self._query(sql, params))]
+
+    def nudge_state(self, name: str) -> str | None:
+        rows = self._query("SELECT value FROM nudge_state WHERE name=?", (name,))
+        return rows[0]["value"] if rows else None
+
+    def set_nudge_state(self, name: str, value: str | None) -> None:
+        """Set (or with ``None`` delete) one coach state value."""
+        if value is None:
+            self._write(lambda conn: conn.execute("DELETE FROM nudge_state WHERE name=?", (name,)))
+            return
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO nudge_state(name, value, updated_at) VALUES (?,?,?)"
+            " ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (name, str(value), time.time()),
+        ))
+
+    def captures_between(self, since: TimeArg, until: TimeArg = None, *, limit: int = 4) -> list[dict[str, Any]]:
+        """The newest ``limit`` captures in ``[since, until)`` that were the user's own screen (not ``by_yuki``),
+        oldest first: ``{"at", "app", "host", "kind", "text"}`` (text decrypted)."""
+        clauses, params = ["c.by_yuki = 0"], []
+        if (s := _ts(since)) is not None:
+            clauses.append("c.at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("c.at < ?")
+            params.append(u)
+        params.append(int(limit))
+        rows = self._query(
+            "SELECT c.at, c.kind, c.delta_ciphertext, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id"
+            " WHERE " + " AND ".join(clauses) + " ORDER BY c.at DESC, c.id DESC LIMIT ?", params,
+        )
+        return [{"at": r["at"], "app": r["app"], "host": r["host"], "kind": r["kind"],
+                 "text": self.cipher.decrypt(r["delta_ciphertext"])} for r in reversed(rows)]
 
     # -- maintenance -------------------------------------------------------
 
