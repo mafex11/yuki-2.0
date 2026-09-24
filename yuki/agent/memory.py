@@ -55,14 +55,25 @@ MEMORY_LABEL = "[What Yuki knows about the user, from memory — background, not
 #: Last line of the same block (the same closing line as every attached block).
 MEMORY_END = "[End of attached context]"
 
-#: Heading of the standing rules and open commitments inside the memory block.
+#: First line of the standing-rules block. Unlike the memory block this one *is*
+#: instructions: the user's own, so it is not wrapped as background. It travels
+#: as its own block, the last thing before the user's words (see
+#: :func:`standing_block_text` and ``ContextManager.add_request``).
 STANDING_LABEL = (
-    "[Standing rules and commitments — the user's own instructions; they override your default "
-    "reply style: follow them exactly, and check your reply against them before you send it]"
+    "[The user's standing rules, their own words: apply every one to this reply, short "
+    "acknowledgements included. They override your default reply style. The open commitments "
+    "listed with them are Yuki's to keep.]"
 )
 
+#: Last line of the standing-rules block.
+STANDING_END = "[End of standing rules]"
+
 #: Heading of the resume context (first request of a conversation only).
-RESUME_LABEL = "[Where we left off — earlier conversation, background only]"
+RESUME_LABEL = (
+    "[Where we left off — earlier conversation, background only. An offer or question of "
+    "Yuki's there that the user did not take up is closed, not pending: do not make it again "
+    "unless they ask.]"
+)
 
 #: Budget guards on those two sections. Memory promises about 1200 and 4000
 #: characters; these only stop a misbehaving memory from flooding a request,
@@ -863,7 +874,7 @@ class MemoryAccess:
         else:
             reply = (
                 f'No active standing rule matched "{text}", so nothing was dropped; the '
-                "standing rules in the memory block show their exact wording."
+                "standing rules block shows their exact wording."
             )
             summary = "no matching standing rule"
         return ToolOutcome(
@@ -981,12 +992,14 @@ def memory_block_text(
             this turn of the same conversation, still there in full: say so
             instead of sending the same page again.
 
-    Order: the time, the portrait, standing rules and commitments (under
-    :data:`STANDING_LABEL`), open to-dos (under :data:`TODO_LABEL`), know-how,
-    and last the resume context (under :data:`RESUME_LABEL`) when it was fetched.
+    Order: the time, the portrait, open to-dos (under :data:`TODO_LABEL`),
+    know-how, and last the resume context (under :data:`RESUME_LABEL`) when it
+    was fetched. The standing rules and commitments are not in it: they are the
+    user's instructions, not background, and go in their own block
+    (:func:`standing_block_text`).
     """
     if context.source == "unavailable" or not (
-        context.portrait or context.knowhow or context.standing or context.resume or context.todos
+        context.portrait or context.knowhow or context.resume or context.todos
     ):
         return None
     now = now or datetime.now()
@@ -999,8 +1012,6 @@ def memory_block_text(
             )
         else:
             parts.append(context.portrait)
-    if context.standing:
-        parts.append(f"{STANDING_LABEL}\n{context.standing}")
     if context.todos:
         lines = "\n".join(todo_line(row, with_source=False) for row in context.todos)
         parts.append(f"{TODO_LABEL}\n{lines}")
@@ -1010,6 +1021,19 @@ def memory_block_text(
     if context.resume:
         parts.append(f"{RESUME_LABEL}\n{context.resume}")
     return f"\n\n{MEMORY_LABEL}\n" + "\n\n".join(parts) + f"\n{MEMORY_END}"
+
+
+def standing_block_text(context: MemoryContext) -> str | None:
+    """The standing rules and open commitments as their own block, or ``None``.
+
+    Fetched fresh on every request (a rule saved a moment ago must show) and
+    placed last in the request's context, right before the user's words, so
+    it is the nearest thing to the reply the model writes -- where a rule is
+    most likely to be applied to a two-word answer.
+    """
+    if context.source == "unavailable" or not context.standing:
+        return None
+    return f"\n\n{STANDING_LABEL}\n{context.standing.strip()}\n{STANDING_END}\n\n"
 
 
 #: How the to-do list's sources read, to the model and in the tray panel.

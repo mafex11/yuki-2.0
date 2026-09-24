@@ -79,6 +79,7 @@ from yuki.memory.store import (
     ConversationTurn,
     NewFact,
     Store,
+    request_render,
     turns_event_name,
 )
 
@@ -111,12 +112,28 @@ meant to hold beyond the current request: what to call them, tone, language, len
 what to do or never do (without asking). Examples: "call me captain always", "keep your answers \
 short from now on", "never close my tabs without asking".
 - preference: something the user said they like or dislike about how Yuki talks or works, \
-without making it an instruction: "I like it when you just do it without explaining", "those \
-long summaries annoy me".
+without asking Yuki to change anything: "I like it when you just do it without explaining", \
+"those long summaries annoy me".
 - commitment: something Yuki is to do later: a task the user handed to Yuki for later \
 ("remind me about the PR review tomorrow"), or something Yuki promised in its reply ("I'll \
 check the download again in ten minutes"). Not something that was done within the same \
-exchange, and not something Yuki refused or said it cannot do.
+exchange, not something Yuki refused or said it cannot do, and not an offer or question of \
+Yuki's ("want me to send it to Slack?") that the user did not take up: an offer becomes a \
+commitment only when the user accepts it in a NEW exchange.
+
+Rule or preference: when the user corrects how Yuki behaves and means it to hold from now on, \
+it is a rule, however it is phrased - "you don't have to...", "stop doing...", "no need \
+to...", "that's a rule", said in annoyance or in passing. A preference is only a like or \
+dislike that asks for no change. An existing preference the user restates as an instruction \
+becomes a rule (UPDATE it with kind rule).
+
+Keep the rule's scope. A rule or preference covers exactly the situation the user named, \
+never a wider one. Read the exchange it answers to know what "that", "it" or "the same text" \
+means, and name that situation in the text: the user who says "you don't have to repeat the \
+same text message back to me" right after Yuki quoted a message it had sent for them set a \
+rule about confirming sent messages ("When Yuki sends a message for the user, confirm it in \
+a few words without quoting the message back."), not "never repeat the user's request back". \
+Likewise a rule said about one app, one kind of task or one time of day stays about that one.
 
 Rules and preferences come ONLY from the user's own words. Record one only when the user \
 said it themselves in a NEW exchange, and put their exact words in quote, copied character \
@@ -167,7 +184,10 @@ a taste), never as such ("the user asked Yuki to open Spotify"). A request to lo
 up, open, play or summarise is a task, not a taste: one such request is never evidence that \
 the user likes or is interested in its subject (asking for the Wikipedia article on soba is \
 not "the user is interested in Japanese cuisine") - record a taste or interest only when the \
-user's own words state it. Skip what FACTS ALREADY IN \
+user's own words state it. A journal fact rests on what the user said or what \
+Yuki actually did, never on Yuki's own words alone: what Yuki offered, suggested, claimed \
+was pending or reminded the user of is not a fact about the user ("Yuki offered to post the \
+review to Slack" is not "the user needs to send the review to Slack"). Skip what FACTS ALREADY IN \
 THE JOURNAL say, small talk, Yuki's own abilities or mistakes, and anything that is a rule, \
 preference or commitment. Never record passwords, codes, keys, account numbers or other \
 secrets.
@@ -271,7 +291,8 @@ WHO THE USER IS: {identity} Write "the user", never their name.
 
 Write 2-4 sentences, in the past tense and the third person: what the user wanted and what \
 Yuki did (and whether it worked), anything decided or left open (what Yuki is to do later, \
-what the user said they would do), and any rule the user set about how Yuki should talk or \
+what the user said they would do; an offer of Yuki's that the user did not take up is not \
+left open, so leave it out), and any rule the user set about how Yuki should talk or \
 behave, in their words. Name the specifics - apps, sites, songs, files, people, times - and \
 turn relative dates into absolute ones by reading the CALENDAR. No preamble, no opinions, \
 nothing the exchanges do not show. EARLIER IN THIS SESSION, when given, is only context.
@@ -815,6 +836,8 @@ class ConversationWorker:
                 if not ok:
                     rec.status = "skipped: target no longer active"
                 rec.new_id = new_id
+            if any(r.status == "applied" and r.kind in ("rule", "preference") for r in records):
+                request_render(self.store.path)   # the portrait's Relationship section follows the rules
             usage = {k: getattr(call, k) for k in ("input_tokens", "output_tokens", "cache_write_tokens",
                                                    "cache_read_tokens")}
             self._log(

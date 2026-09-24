@@ -208,8 +208,9 @@ Maintenance and reporting::
 
 Service coordination (flag files next to the database, the service's mutex)::
 
-    PAUSE_FLAG, REFRESH_FLAG, REVIEW_FLAG
+    PAUSE_FLAG, REFRESH_FLAG, RENDER_FLAG, REVIEW_FLAG
     flag_path(db_path, name) -> Path
+    request_render(db_path) -> bool          # the render_portrait flag (debounced render)
     service_mutex_name(db_path) -> str
 """
 
@@ -254,6 +255,11 @@ def default_db_path() -> Path:
 #: to rebuild the portrait now (the service deletes it when it starts the run).
 PAUSE_FLAG = "paused"
 REFRESH_FLAG = "refresh_portrait"
+#: ``render_portrait`` asks the service to re-render the portrait page from the
+#: current facts (no operations call: one render), after the flag has been left
+#: alone for a short debounce, so a few rule changes in a row cost one render.
+#: Written after a standing rule is saved or dropped (the Relationship section).
+RENDER_FLAG = "render_portrait"
 #: ``run_weekly_review`` asks the service to write a weekly review now (it deletes the flag when it starts).
 REVIEW_FLAG = "run_weekly_review"
 
@@ -265,6 +271,17 @@ def flag_path(db_path: str | Path | None, name: str) -> Path:
     """The flag file ``name`` for the database at ``db_path`` (default location if ``None``)."""
     db = Path(db_path) if db_path is not None else default_db_path()
     return db.parent / name
+
+
+def request_render(db_path: str | Path | None) -> bool:
+    """Write the ``render_portrait`` flag (restarting its debounce); False if it could not be written."""
+    try:
+        path = flag_path(db_path, RENDER_FLAG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+        return True
+    except OSError:
+        return False
 
 
 def service_mutex_name(db_path: str | Path | None) -> str:

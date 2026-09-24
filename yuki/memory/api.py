@@ -24,8 +24,10 @@ Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory
     memory.log_turn(session_id, request_id, at, user_text, reply_text, actions, outcome) -> int
     memory.standing_context() -> str                  # active rules/preferences + open commitments, <= 1,200 chars
     memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
-    memory.remember_rule(text, source_turn=None) -> int      # immediate, the user's words; supersedes a near-duplicate
+    memory.remember_rule(text, source_turn=None, supersedes=None) -> int   # immediate, the user's words;
+                                                             # supersedes a near-duplicate (or the given id)
     memory.revoke_rule(text) -> int                          # immediate; id revoked or 0
+    (both ask the service for a debounced portrait re-render, for its Relationship section)
     memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
 
 To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
@@ -76,6 +78,7 @@ from yuki.memory.store import (
     Store,
     app_key,
     flag_path,
+    request_render,
     service_mutex_name,
     signal_turns,
 )
@@ -302,6 +305,16 @@ class MemoryClient:
         path = self._flag(REFRESH_FLAG)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+
+    def rerender_portrait(self) -> None:
+        """Ask the service to re-render the portrait from the current facts (the ``render_portrait`` flag).
+
+        Cheaper than :meth:`refresh_portrait`: no operations call over the
+        journal, one render. Debounced by the service: it renders once the flag
+        has been left alone for a short while, so a burst of rule changes costs
+        one render; every call restarts the wait. Non-blocking; never raises.
+        """
+        request_render(self.store.path)
 
     # -- know-how ----------------------------------------------------------
 
@@ -693,7 +706,7 @@ class MemoryClient:
             summary = ""
         return render(blocks, summary)
 
-    def remember_rule(self, text: str, source_turn: int | None = None) -> int:
+    def remember_rule(self, text: str, source_turn: int | None = None, supersedes: int | None = None) -> int:
         """Store a standing rule the user just gave, in the user's words; returns its id.
 
         ``text``: the rule as the user said it ("call me captain always");
@@ -702,7 +715,12 @@ class MemoryClient:
         :meth:`standing_context` from the next request. An active rule or
         preference that says the same thing (identical words, or embedding
         cosine >= 0.85) is superseded by it (bi-temporal: the old version ends,
-        history kept). Raises ``ValueError`` for an empty text.
+        history kept). ``supersedes``: the id of an active rule or preference
+        this one restates or replaces, when the caller knows it (the words may
+        differ too much for the embedding to tell); an id that is not an active
+        rule or preference is ignored. Asks the service for a portrait
+        re-render (:meth:`rerender_portrait`). Raises ``ValueError`` for an
+        empty text.
         """
         from yuki.memory.conversations import normalize_quote
 
@@ -711,10 +729,11 @@ class MemoryClient:
             raise ValueError("rule text is empty")
         vec = self._embed(text)
         candidates = self.store.conversation_facts(("rule", "preference"))
-        supersedes: int | None = None
-        best = -1.0
+        given = int(supersedes) if supersedes else None
+        supersedes = given if any(f.id == given for f in candidates) else None
+        best = 1.0 if supersedes is not None else -1.0
         wanted = normalize_quote(text)
-        for f in candidates:
+        for f in candidates if supersedes is None else ():
             if wanted in (normalize_quote(f.text), normalize_quote(f.quote)):
                 supersedes, best = f.id, 1.0
                 break
@@ -728,11 +747,13 @@ class MemoryClient:
                 if score >= RULE_DUPLICATE_COSINE and score > best:
                     supersedes, best = f.id, score
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
-        return self.store.add_conversation_fact(
+        fact_id = self.store.add_conversation_fact(
             "rule", text, quote=text, subject="", origin="user",
             source_turn_ids=[int(source_turn)] if source_turn else (), vector=vec, embed_model=model,
             supersedes=supersedes,
         )
+        self.rerender_portrait()
+        return fact_id
 
     def revoke_rule(self, text: str) -> int:
         """Mark the active rule (or preference) that ``text`` refers to as revoked; returns its id, or 0.
@@ -742,7 +763,8 @@ class MemoryClient:
         ``text`` is chosen (the newest if several); otherwise the nearest by
         local embedding, if its cosine is at least 0.45. The rule is kept as
         history (status ``revoked``, ``valid_to`` now, the words kept as the
-        reason). 0 when nothing matches.
+        reason). 0 when nothing matches. A revocation asks the service for a
+        portrait re-render (:meth:`rerender_portrait`).
         """
         from yuki.memory.conversations import normalize_quote
 
@@ -776,6 +798,8 @@ class MemoryClient:
         if target is None:
             return 0
         ok = self.store.end_conversation_fact(target.id, "revoked", note=f'the user: "{text}"')
+        if ok:
+            self.rerender_portrait()
         return target.id if ok else 0
 
     # -- activity (the timeline) and episodes ---------------------------------

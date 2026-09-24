@@ -46,8 +46,11 @@ perception payload older than two turns) rewrote something two turns back on
 *every* round, so no messages prefix ever matched twice. Now:
 
 * The breakpoint sits on the last block *before* the situation block of the
-  newest user message (the last tool result, or the user's own words on a new
-  request), never on the situation block itself. The situation block is the one
+  newest user message (the last tool result, or on a new request the memory
+  block or the request origin), never on the situation block itself. On a new
+  request the standing rules and the user's own words come *after* the
+  situation block (see :meth:`ContextManager.add_request`), so they too are
+  written to cache one round later, never rewritten. The situation block is the one
   thing guaranteed to be superseded next round -- by the next turn's overview.
   Leaving it after the breakpoint means stubbing it next round touches only
   content *after* the previous breakpoint, which costs no cache. The price: each
@@ -409,36 +412,63 @@ class ContextManager:
         self_facts: str | None = None,
         memory_text: str | None = None,
         origin_text: str | None = None,
+        standing_text: str | None = None,
     ) -> None:
         """Append a new user request together with the current situation.
 
-        The request is the first block, verbatim and alone; the situation is the
-        last, separately labelled block (see :meth:`situation_text`). Between
-        them, when there are any, sit the request origin (where the user was when
-        they asked: the window in front, media, microphone and camera, framed by
-        :func:`attached_text`) and the memory block (what Yuki knows about the
-        user, already framed by :func:`yuki.agent.memory.memory_block_text`).
-        Both are background for the whole request and are never stubbed -- the
-        origin matters most at the end, when the model decides whether to put
-        the user back; being before the situation block, they are also where this
-        message's cache breakpoint lands, so they are read from cache on every
-        later round.
+        Layout, in order (each its own text block; the ones with nothing to say
+        are left out):
+
+        1. the request origin (where the user was when they asked: the window in
+           front, media, microphone and camera, framed by :func:`attached_text`);
+        2. the memory block (what Yuki knows about the user, background, already
+           framed by :func:`yuki.agent.memory.memory_block_text`);
+        3. the situation block (fresh desktop, request facts, working note; see
+           :meth:`situation_text`);
+        4. the standing rules and open commitments (the user's own instructions,
+           framed by :func:`yuki.agent.memory.standing_block_text`);
+        5. the user's words, verbatim and alone, last.
+
+        The rules sit right before the user's words so that the last thing the
+        model reads before replying is what the user asked and how they want to
+        be answered; with the desktop list after them, a rule read as one more
+        piece of background and was often not applied to short replies.
+
+        Cache: the breakpoint lands on the last block before the situation
+        block (the memory block, or the origin), so origin and memory are read
+        from cache on every later round. The situation block is stubbed next
+        round, which touches only content after that breakpoint; the rules and
+        the user's words (a few hundred tokens) are after it too, so they are
+        written to cache once, on the next round. Origin and memory are never
+        stubbed: the origin matters most at the end, when the model decides
+        whether to put the user back.
         """
-        content = [{"type": "text", "text": text}]
+        content: list[dict[str, Any]] = []
         if origin_text and origin_text.strip():
             content.append({"type": "text", "text": attached_text(origin_text)})
         if memory_text and memory_text.strip():
             content.append({"type": "text", "text": memory_text})
-        content.append(
-            {"type": "text", "text": self.situation_text(overview_text, self_facts)}
-        )
+        situation = self.situation_text(overview_text, self_facts)
+        has_standing = bool(standing_text and standing_text.strip())
+        if not has_standing:
+            # The API joins adjacent text blocks with no separator: keep the
+            # user's words off the end of the block before them.
+            situation += "\n\n"
+        content.append({"type": "text", "text": situation})
+        situation_pos = len(content) - 1
+        if has_standing:
+            standing = str(standing_text)
+            content.append(
+                {"type": "text", "text": standing if standing.endswith("\n\n") else standing + "\n\n"}
+            )
+        content.append({"type": "text", "text": text})
         self._request_seq += 1
         self._append(
             _Slot(
                 role="user",
                 content=content,
                 turn=self.logger.turn,
-                situation_pos=len(content) - 1,
+                situation_pos=situation_pos,
             )
         )
 
@@ -799,11 +829,13 @@ class ContextManager:
             slot.stubbed.add(f"view@{look.position}")
         elif look.is_situation:
             original = _chars(block)
-            # Same leading break as the block it replaces: in the first message
-            # it sits right after the user's own words.
+            # Same breaks as the block it replaces: in a request's message it
+            # sits after the memory block and may be followed directly by the
+            # user's own words (the API joins text blocks with no separator).
+            tail = "\n\n" if str(_block_field(block, "text") or "").endswith("\n\n") else ""
             stub = (
                 f"\n\n[desktop overview attached by Yuki on turn {slot.turn}"
-                f" - superseded by {by}]"
+                f" - superseded by {by}]{tail}"
             )
             slot.content[look.position] = {"type": "text", "text": stub}
             slot.stubbed.add(f"situation@{look.position}")

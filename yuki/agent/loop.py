@@ -38,7 +38,12 @@ from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
-from yuki.agent.memory import MemoryAccess, default_memory, memory_block_text
+from yuki.agent.memory import (
+    MemoryAccess,
+    default_memory,
+    memory_block_text,
+    standing_block_text,
+)
 from yuki.agent.prompt import system_blocks
 from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
@@ -517,11 +522,15 @@ class Agent:
             overview, _ = self._capture_overview()
             origin = self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
+            memory_text, standing_text = self._memory_context(
+                request, first=self._requests == 1
+            )
             self.context.add_request(
                 request,
                 overview,
-                memory_text=self._memory_context(request, first=self._requests == 1),
+                memory_text=memory_text,
                 origin_text=origin,
+                standing_text=standing_text,
             )
             drive = self._drive()
             for event in drive:
@@ -1278,13 +1287,19 @@ class Agent:
 
     # -- memory ------------------------------------------------------------
 
-    def _memory_context(self, request: str, *, first: bool = False) -> str | None:
-        """The memory block for this request's first message, or ``None``.
+    def _memory_context(
+        self, request: str, *, first: bool = False
+    ) -> tuple[str | None, str | None]:
+        """The memory block and the standing-rules block for this request's first message.
 
-        Portrait (cached in-process by :class:`MemoryAccess`), the standing
-        rules and open commitments (every request), the know-how lines memory
+        The memory block (background): the portrait (cached in-process by
+        :class:`MemoryAccess`), the open to-dos, the know-how lines memory
         finds for the foreground app and the request text, and on this
-        conversation's first request where the last session left off. A
+        conversation's first request where the last session left off. The
+        standing-rules block (the user's instructions, fetched fresh every
+        request): the active rules and open commitments, placed right before
+        the user's words by ``ContextManager.add_request``. Either is ``None``
+        when there is nothing to say. A
         portrait identical to one already attached in full earlier in this
         conversation -- still there, never stubbed or collapsed -- is named
         rather than sent again. Logs ``memory_context`` every time, whatever
@@ -1307,15 +1322,16 @@ class Agent:
             ):
                 repeated = self._portrait_sent[1]
             text = memory_block_text(fetched, repeated_turn=repeated)
+            standing = standing_block_text(fetched)
         except Exception as exc:  # memory must never break a request
             self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
             self._memory_info = {
                 "source": "error", "context_chars": 0, "portrait_chars": 0,
                 "standing_chars": 0, "resume_chars": 0,
             }
-            return None
+            return None, None
         portrait_chars = len(fetched.portrait or "") if text and repeated is None else 0
-        standing_chars = len(fetched.standing or "") if text else 0
+        standing_chars = len(fetched.standing or "") if standing else 0
         resume_chars = len(fetched.resume or "") if text else 0
         if text and fetched.portrait and repeated is None:
             self._portrait_sent = (fetched.portrait, self.logger.turn)
@@ -1341,6 +1357,7 @@ class Agent:
             portrait_chars=portrait_chars,
             portrait_repeated_from_turn=repeated,
             standing_chars=standing_chars,
+            standing_attached=standing is not None,
             resume_chars=resume_chars,
             resume_requested=first,
             truncated=list(fetched.truncated),
@@ -1351,7 +1368,7 @@ class Agent:
             error=fetched.error,
             elapsed_ms=elapsed_ms,
         )
-        return text
+        return text, standing
 
     # -- self-awareness facts ----------------------------------------------
 

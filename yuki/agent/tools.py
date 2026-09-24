@@ -472,8 +472,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "correct_memory",
         "label": "Noting that",
         "description": (
-            "Record a correction the user gave you about themselves or their "
-            "preferences."
+            "Record a correction the user gave you about a fact of their life, "
+            "work or people. How they want you to talk or behave is a rule: "
+            "use remember_rule for that instead."
         ),
         "input_schema": _obj(
             {"text": {"type": "string", "description": "The correction, as the user meant it."}},

@@ -23,6 +23,9 @@ Flag files next to the database (written by Yuki through
   starts.
 * ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
   rebuilds the portrait now.
+* ``render_portrait`` - a standing rule was saved or dropped: wakes the portrait
+  scheduler (once per write), which re-renders the portrait page from the
+  current facts once the flag has been left alone for a short debounce.
 * ``run_weekly_review`` - wakes the weekly-review scheduler (:mod:`yuki.memory.review`,
   thread ``yuki-memory-review``), which deletes it and writes a review of the last
   seven days now; the scheduled one runs Sunday evening (``[review]``).
@@ -246,7 +249,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    from yuki.memory.store import PAUSE_FLAG, REFRESH_FLAG, REVIEW_FLAG, Store, default_db_path, flag_path
+    from yuki.memory.store import (
+        PAUSE_FLAG, REFRESH_FLAG, RENDER_FLAG, REVIEW_FLAG, Store, default_db_path, flag_path,
+    )
 
     db_path = Path(args.db) if args.db else default_db_path()
     mutex = _claim_mutex(db_path)
@@ -285,6 +290,8 @@ def run(args: argparse.Namespace) -> int:
     transcriber_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
+    render_path = flag_path(db_path, RENDER_FLAG)
+    render_seen: float | None = None   # mtime of the render flag the scheduler was last woken for
     review_path = flag_path(db_path, REVIEW_FLAG)
     store = None
     code = 0
@@ -538,6 +545,14 @@ def run(args: argparse.Namespace) -> int:
                 log("pause_flag", paused=paused)
             if portrait is not None and refresh_path.exists():
                 portrait.wake()
+            if portrait is not None:
+                try:
+                    render_mtime: float | None = render_path.stat().st_mtime
+                except OSError:
+                    render_mtime = None
+                if render_mtime is not None and render_mtime != render_seen:
+                    portrait.wake()   # the scheduler sets its own debounce deadline from the mtime
+                render_seen = render_mtime
             if review is not None and review_path.exists():
                 review.wake()
             if privacy.last_error != privacy_error:
