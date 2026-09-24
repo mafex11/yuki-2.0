@@ -63,7 +63,11 @@ class DeferConfig:
     check_s: float = 60.0
     idle_min: float = 5.0
     night: tuple[str, str] = ("01:00", "07:00")
-    gpu_max_util: float = 10.0
+    #: Average GPU use over the quiet window; the desktop alone (browser, Discord, the
+    #: compositor) sits at 4-18 % on this PC, a game far above (measured 2026-09-25).
+    gpu_max_util: float = 25.0
+    #: No single sample in the window above this (a game or video render in bursts).
+    gpu_spike_util: float = 60.0
     gpu_quiet_min: float = 3.0
     vram_free_mb: float = 2500.0
     cpu_max_percent: float = 40.0
@@ -90,6 +94,7 @@ class DeferConfig:
         return cls(
             check_s=max(10.0, num("defer_check_s", d.check_s)), idle_min=num("defer_idle_min", d.idle_min),
             night=(str(night[0]), str(night[1])), gpu_max_util=num("defer_gpu_max_util", d.gpu_max_util),
+            gpu_spike_util=num("defer_gpu_spike_util", d.gpu_spike_util),
             gpu_quiet_min=num("defer_gpu_quiet_min", d.gpu_quiet_min), vram_free_mb=num("defer_vram_free_mb", d.vram_free_mb),
             cpu_max_percent=num("defer_cpu_max_percent", d.cpu_max_percent),
             back_idle_s=num("defer_back_idle_s", d.back_idle_s), stop_grace_s=num("defer_stop_grace_s", d.stop_grace_s),
@@ -254,11 +259,12 @@ class TranscribeScheduler:
         span = [s for s in self._samples if now - s[0] <= window + 1.0]
         if not span or now - span[0][0] < window - cfg.check_s:
             return "gpu_not_yet_observed", ""
-        if max(s[1] for s in span) > cfg.gpu_max_util:
+        utils = [s[1] for s in span]
+        if sum(utils) / len(utils) > cfg.gpu_max_util or max(utils) > cfg.gpu_spike_util:
             return "gpu_busy", ""
         if min(s[2] for s in span) < cfg.vram_free_mb:
             return "vram_low", ""
-        if max(s[3] for s in span) > cfg.cpu_max_percent:
+        if sum(s[3] for s in span) / len(span) > cfg.cpu_max_percent:
             return "cpu_busy", ""
         if self.locked_fn():
             return None, "locked"

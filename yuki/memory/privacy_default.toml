@@ -369,16 +369,18 @@ pause_s = 0.7
 # The deferred transcription runs only when ALL of these hold: no call is
 # going on; nothing full screen in front (the timeline's fact, or Windows
 # saying a game or presentation is up); for defer_gpu_quiet_min minutes the
-# GPU stayed at or under defer_gpu_max_util % and kept defer_vram_free_mb free
+# GPU averaged at or under defer_gpu_max_util % (no sample over defer_gpu_spike_util)
+# and kept defer_vram_free_mb free
 # (VRAM counts: a game left open holds it even when idle), and the CPU stayed
-# under defer_cpu_max_percent; and you are away (no input for defer_idle_min
+# under defer_cpu_max_percent on average; and you are away (no input for defer_idle_min
 # minutes, or the session is locked) or it is night (defer_night, local time).
 # It stops after the chunk in hand when you come back (input within
 # defer_back_idle_s; not at night), a call or a game starts, or memory is paused.
 defer_check_s = 60
 defer_idle_min = 5
 defer_night = ["01:00", "07:00"]
-defer_gpu_max_util = 10
+defer_gpu_max_util = 25      # average % over the quiet window (the desktop alone is 4-18 %)
+defer_gpu_spike_util = 60    # and no single sample above this
 defer_gpu_quiet_min = 3
 defer_vram_free_mb = 2500
 defer_cpu_max_percent = 40
