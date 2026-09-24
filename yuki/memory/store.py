@@ -112,7 +112,8 @@ Know-how and open loops::
 
 Timeline (foreground stretches, yuki.memory.timeline) and episodes (yuki.memory.episodes)::
 
-    store.timeline_key(process, host, path, title, withheld=None) -> str   # HMAC identity of a stretch's page
+    store.timeline_key(process, host, path, title, withheld=None, *, fullscreen=False, meeting=None) -> str
+        # HMAC identity of a stretch's page (a meeting: process + service; full screen marked)
     store.save_timeline(row: TimelineRow) -> int        # insert (row.id None) or update; page_key filled in
     store.timeline_between(since=None, until=None) -> list[TimelineRow]   # overlapping rows, oldest first
     store.start_episode_run(trigger, model, window_start, window_end, final, at=None) -> int
@@ -125,6 +126,14 @@ Timeline (foreground stretches, yuki.memory.timeline) and episodes (yuki.memory.
     store.search_episodes(query_vec, since=None, until=None, limit=10) -> list[EpisodeRecord]  # .score = cosine
     store.keyword_episodes(text, since=None, until=None, limit=50) -> list[EpisodeRecord]
     store.episodes_without_vectors(limit=64) -> list[EpisodeRecord];  store.add_episode_vectors(items, model)
+
+Outside sources (yuki.memory.warp)::
+
+    store.source_checkpoint(name) -> str | None;  store.set_source_checkpoint(name, value)
+    store.add_terminal_commands(checkpoint: (name, value), groups: [(folder, [command dict])], *,
+                                app="Warp", process="warp", profile="warp") -> list[capture_id]
+        # one transaction: a "terminal" thread per folder, one capture per folder (delta = JSON
+        # {"commands": [...]}, encrypted), the checkpoint moved; wakes the journal worker
 
 Status::
 
@@ -451,6 +460,14 @@ class TimelineRow:
     two; ``media_other`` is ``{app: seconds}`` of other apps' media meanwhile.
     ``withheld`` is the privacy reason when the title/page (and for a
     blocked app, the app) were not recorded.
+
+    ``fullscreen``: a full-screen window was in front (a game, an F11 video);
+    while privacy pauses content in full screen such a row carries only the
+    process and app (and a host carried over from the same window just
+    before). ``meeting``: the meeting service ("Google Meet", "Zoom") when the
+    app or page is in the privacy file's ``[meetings]`` list; such a row has
+    no title and no path. ``mic_s``: seconds the app in front was using the
+    microphone (measured during meetings only).
     """
 
     id: int | None
@@ -470,6 +487,9 @@ class TimelineRow:
     media_other: dict[str, float] = field(default_factory=dict)
     withheld: str | None = None
     segments: int = 1
+    fullscreen: bool = False
+    meeting: str | None = None
+    mic_s: float = 0.0
 
 
 @dataclass
@@ -841,6 +861,20 @@ MIGRATIONS: tuple[str, ...] = (
 
     ALTER TABLE portrait_facts ADD COLUMN episode_ids TEXT;   -- JSON list of episode ids
     """,
+    # 5: full-screen and meeting stretches in the timeline, and checkpoints of
+    # outside sources read by the service (the Warp terminal history).
+    # Additive only, like 2-4.
+    """
+    ALTER TABLE timeline ADD COLUMN fullscreen INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE timeline ADD COLUMN meeting TEXT;                    -- meeting service, cleartext metadata
+    ALTER TABLE timeline ADD COLUMN mic_s REAL NOT NULL DEFAULT 0;   -- microphone in use by the app in front
+
+    CREATE TABLE source_checkpoints (
+        name       TEXT PRIMARY KEY,                -- e.g. warp.commands
+        value      TEXT NOT NULL,                   -- last row consumed (source-specific, content-free)
+        updated_at REAL NOT NULL
+    );
+    """,
 )
 
 
@@ -983,6 +1017,15 @@ class Store:
         ``process`` (stored as :func:`app_key`, e.g. ``"chrome"``) and
         ``last_seen`` are updated on every call.
         """
+        return self._write(
+            lambda conn: self._upsert_thread(conn, app, title, url, process=process, scope=scope, kind=kind)
+        )
+
+    def _upsert_thread(
+        self, conn: sqlite3.Connection, app: str, title: str, url: str | None, *, process: str | None = None,
+        scope: str | None = None, kind: str | None = None,
+    ) -> int:
+        """:meth:`upsert_thread` inside a caller's transaction."""
         app = app or ""
         title = title or ""
         url = url or None
@@ -1011,7 +1054,7 @@ class Store:
             )
             return int(cur.lastrowid)
 
-        return self._write(op)
+        return op(conn)
 
     def thread_info(self, thread_id: int) -> ThreadInfo | None:
         """Decrypted thread metadata, or ``None``."""
@@ -2016,15 +2059,21 @@ class Store:
 
     def timeline_key(
         self, process: str | None, host: str | None, path: str | None, title: str | None,
-        withheld: str | None = None,
+        withheld: str | None = None, *, fullscreen: bool = False, meeting: str | None = None,
     ) -> str:
         """The keyed identity of a stretch's page: what "the same page" means for merging and grouping.
 
         A web page is (process, host, path + query); any other window is
         (process, title); a withheld stretch is its privacy reason (and the
-        app when the app itself was kept).
+        app when the app itself was kept). A meeting is (process, service);
+        a full-screen stretch is marked as such, so it never merges with the
+        same window's stretch out of full screen.
         """
         proc = app_key(process) or ""
+        if meeting:
+            return self.cipher.digest("tl-meeting", proc, meeting, "fs" if fullscreen else "")
+        if fullscreen:
+            return self.cipher.digest("tl-fullscreen", proc, withheld or "", host or "", path or "", title or "")
         if withheld:
             return self.cipher.digest("tl-withheld", withheld, proc)
         if host or path:
@@ -2037,14 +2086,16 @@ class Store:
         ``row.page_key`` is computed from the row when missing.
         """
         if not row.page_key:
-            row.page_key = self.timeline_key(row.process, row.host, row.path, row.title, row.withheld)
+            row.page_key = self.timeline_key(row.process, row.host, row.path, row.title, row.withheld,
+                                             fullscreen=row.fullscreen, meeting=row.meeting)
         values = (
             float(row.started_at), float(row.ended_at), row.state, app_key(row.process), row.app or "",
             self._enc(row.title) if row.title else None, row.host, self._enc(row.path) if row.path else None,
             row.page_key, round(float(row.active_s), 3), round(float(row.passive_s), 3),
             round(float(row.away_s), 3), round(float(row.media_s), 3),
             json.dumps({k: round(v, 1) for k, v in sorted(row.media_other.items())}) if row.media_other else None,
-            row.withheld, int(row.segments), time.time(),
+            row.withheld, int(row.segments), time.time(), int(bool(row.fullscreen)), row.meeting or None,
+            round(float(row.mic_s or 0.0), 3),
         )
 
         def op(conn: sqlite3.Connection) -> int:
@@ -2052,7 +2103,8 @@ class Store:
                 cur = conn.execute(
                     "UPDATE timeline SET started_at=?, ended_at=?, state=?, process=?, app=?, title_ciphertext=?,"
                     " host=?, path_ciphertext=?, page_key=?, active_s=?, passive_s=?, away_s=?, media_s=?,"
-                    " media_other=?, withheld=?, segments=?, updated_at=? WHERE id=?",
+                    " media_other=?, withheld=?, segments=?, updated_at=?, fullscreen=?, meeting=?, mic_s=?"
+                    " WHERE id=?",
                     (*values, int(row.id)),
                 )
                 if cur.rowcount == 1:
@@ -2060,7 +2112,7 @@ class Store:
             cur = conn.execute(
                 "INSERT INTO timeline(started_at, ended_at, state, process, app, title_ciphertext, host,"
                 " path_ciphertext, page_key, active_s, passive_s, away_s, media_s, media_other, withheld,"
-                " segments, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " segments, updated_at, fullscreen, meeting, mic_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
             return int(cur.lastrowid)
@@ -2078,6 +2130,7 @@ class Store:
             app=r["app"], title=self._dec(r["title_ciphertext"]), host=r["host"], path=self._dec(r["path_ciphertext"]),
             page_key=r["page_key"], active_s=r["active_s"], passive_s=r["passive_s"], away_s=r["away_s"],
             media_s=r["media_s"], media_other=other, withheld=r["withheld"], segments=r["segments"],
+            fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
         )
 
     def timeline_between(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
@@ -2098,6 +2151,66 @@ class Store:
         """Earliest start and latest end in the timeline."""
         r = self._query("SELECT min(started_at), max(ended_at) FROM timeline")[0]
         return (r[0], r[1])
+
+    # -- outside sources (the Warp terminal history, yuki.memory.warp) ----------
+
+    def source_checkpoint(self, name: str) -> str | None:
+        """The checkpoint of an outside source (content-free), or ``None`` before its first read."""
+        rows = self._query("SELECT value FROM source_checkpoints WHERE name=?", (name,))
+        return rows[0]["value"] if rows else None
+
+    def set_source_checkpoint(self, name: str, value: str) -> None:
+        self._write(lambda conn: self._set_checkpoint(conn, name, value))
+
+    @staticmethod
+    def _set_checkpoint(conn: sqlite3.Connection, name: str, value: str) -> None:
+        conn.execute(
+            "INSERT INTO source_checkpoints(name, value, updated_at) VALUES (?,?,?)"
+            " ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (name, str(value), time.time()),
+        )
+
+    def add_terminal_commands(
+        self, checkpoint: tuple[str, str], groups: Sequence[tuple[str, Sequence[dict[str, Any]]]], *,
+        app: str = "Warp", process: str = "warp", profile: str = "warp", at: float | None = None,
+    ) -> list[int]:
+        """Store terminal commands for the journal and move the source checkpoint, in one transaction.
+
+        ``groups``: ``(folder, commands)`` pairs; each folder is one thread
+        (``kind`` "terminal", scope = the folder) and gets one capture whose
+        delta is ``{"commands": [...]}`` as JSON (encrypted like every capture,
+        kept for the capture TTL). A command is a plain dict (``at``, ``command``,
+        ``pwd``, ``branch``, ``exit_code``, ``shell``, ...), already filtered
+        by the privacy rules. Returns the capture ids.
+        """
+        name, value = checkpoint
+        when = float(at) if at is not None else time.time()
+
+        def op(conn: sqlite3.Connection) -> list[int]:
+            ids: list[int] = []
+            for folder, commands in groups:
+                if not commands:
+                    continue
+                thread_id = self._upsert_thread(conn, app, folder or "", None, process=process,
+                                                scope=f"terminal:{folder or ''}", kind="terminal")
+                delta = json.dumps({"commands": list(commands)}, ensure_ascii=False)
+                first = min(float(c.get("at") or when) for c in commands)
+                cur = conn.execute(
+                    "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash, kind, profile)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (thread_id, first, profile, self.cipher.encrypt(delta), len(delta),
+                     self.cipher.digest("terminal", *[str(c.get("id", "")) for c in commands]), "terminal", profile),
+                )
+                ids.append(int(cur.lastrowid))
+                conn.execute("UPDATE threads SET last_seen=max(last_seen, ?) WHERE id=?", (when, thread_id))
+            self._set_checkpoint(conn, name, value)
+            return ids
+
+        ids = self._write(op)
+        if ids:
+            with self._cond:
+                self._cond.notify_all()
+        return ids
 
     # -- episodes ------------------------------------------------------------
 

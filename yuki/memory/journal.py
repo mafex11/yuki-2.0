@@ -6,7 +6,10 @@ batches of at most ``batch_chars`` characters, and asks Claude Haiku 4.5 (Bedroc
 to record atomic facts through a forced, strict ``record_facts`` tool call (no
 text parsing). A batch is a list of numbered sources: one per conversation
 message (sender, "the user" for the user's own, its own time, NEW or HISTORY -
-see :meth:`yuki.memory.store.Store.add_conversation`) and one per page capture.
+see :meth:`yuki.memory.store.Store.add_conversation`), one per terminal command
+(``terminal`` captures written by :mod:`yuki.memory.warp`: command line, folder,
+branch, exit code, start time - never output; the prompt asks for sequences to
+be summarised, never listed, and never a secret) and one per page capture.
 Each fact cites its source and is dated by it (a message's own time, never the
 moment an old message was re-read), embedded locally
 (:mod:`yuki.memory.embed`) and written together with the batch's accounting and
@@ -88,9 +91,9 @@ invitation, a mention, a reply, a signature - write "the user", never their name
 they were someone else: "Sudhanshu invited Kenji to #design" is recorded as "The user \
 invited Kenji to #design".
 
-Each request shows what newly appeared in one window or web page (a "thread") as \
+Each request shows what newly appeared in one window, web page or terminal folder (a "thread") as \
 numbered SOURCES [1], [2], ..., each with the local date and time it is dated by. There \
-are two kinds:
+are three kinds:
 - MESSAGES of a conversation or an email thread, one source per message, with its sender \
 ("the user" marks the user's own messages) and when it was sent. Each is marked:
   NEW - sent or received since Yuki last looked at this conversation;
@@ -102,6 +105,22 @@ in the past tense, as what was said then. Never record HISTORY as something happ
 now or something the user just did: rereading an old conversation is not news.
 - CAPTURES of a page, document or list: the text that newly appeared on screen at that \
 moment (a delta against what the window showed before).
+- COMMANDS the user ran in their terminal (Warp), one source per command in the order \
+they ran: the command line, the folder it ran in, the git branch, the exit code (0 = it \
+succeeded, anything else = it failed; "not recorded" = unknown) and when it started. A \
+command marked "run by Warp's AI agent" was not typed by the user. The output of \
+commands is never given.
+
+For COMMANDS, summarise; do not transcribe. Write one fact per coherent piece of work: a \
+sequence of related commands becomes one fact that says what the user was doing, in which \
+folder or project and on which branch, and how it went - for example "The user ran the Yuki \
+test suite in C:\\Users\\esska\\yuki on branch main; it failed twice, then passed." - citing \
+the last command of the sequence. Never list commands one by one, never copy long command \
+lines, and leave out routine navigation (cd, ls, clear, git status) unless nothing else \
+happened. Never record a secret from a command - a token, key, password, credential, \
+connection string or any random-looking string - even if one slipped through; describe the \
+action without it. Routine terminal work is importance 2-4; setting up, releasing or \
+deploying a project, or a failure the user kept working on, 5-6.
 
 Record the facts worth remembering with the record_facts tool, giving for each the number \
 of the source it comes from (the latest one if several): the fact is stored with that \
@@ -227,30 +246,54 @@ def _local(at: float) -> str:
 
 #: Capture kinds whose captures are carried as messages (see Store.add_conversation).
 MESSAGE_KINDS = ("conversation", "email")
+#: Capture kind of terminal commands (yuki.memory.warp, Store.add_terminal_commands).
+TERMINAL_KIND = "terminal"
 
 
 @dataclass
 class Source:
-    """One numbered item the model may cite: a conversation message or a page capture."""
+    """One numbered item the model may cite: a conversation message, a terminal command or a page capture."""
 
     at: float                      # what a fact citing it is dated by
     capture: PendingCapture
     message: StoredMessage | None = None
     #: The message had no absolute time of its own; ``at`` comes from a neighbour or the capture.
     at_estimated: bool = False
+    #: A terminal command (``Store.add_terminal_commands`` dict: command, pwd, branch, exit_code, ...).
+    command: dict[str, Any] | None = None
+
+
+def terminal_commands(cap: PendingCapture) -> list[dict[str, Any]]:
+    """The commands a ``terminal`` capture carries (its delta is our own JSON, written by the store)."""
+    try:
+        data = json.loads(cap.delta or "{}")
+    except ValueError:
+        return []
+    items = data.get("commands") if isinstance(data, dict) else None
+    return [c for c in (items or []) if isinstance(c, dict) and str(c.get("command") or "").strip()]
 
 
 def build_sources(
     captures: Sequence[PendingCapture], messages: dict[int, list[StoredMessage]] | None = None,
 ) -> list[Source]:
-    """The batch as numbered sources: one per message of a conversation capture, one per other capture.
+    """The batch as numbered sources: one per message of a conversation capture, one per terminal
+    command, one per other capture.
 
     A message without an absolute time is dated by the nearest earlier message
     of the same capture that has one (messages are in on-screen order, oldest
-    first), else the nearest later one, else the capture time.
+    first), else the nearest later one, else the capture time. A command is
+    dated by its start.
     """
     out: list[Source] = []
     for cap in captures:
+        if cap.kind == TERMINAL_KIND:
+            for c in terminal_commands(cap):
+                try:
+                    at = float(c.get("at") or cap.at)
+                except (TypeError, ValueError):
+                    at = cap.at
+                out.append(Source(at=at, capture=cap, command=c))
+            continue
         msgs = (messages or {}).get(cap.id) or []
         if cap.kind not in MESSAGE_KINDS or not msgs:
             out.append(Source(at=cap.at, capture=cap))
@@ -290,17 +333,35 @@ def build_user_message(
 
     previous = "\n".join(f"- {_local(f.at)[:16]}: {f.fact}" for f in previous_facts)
     parts = [f"app: {safe(thread.app, 120)}"]
-    if thread.scope and thread.scope != thread.url:
-        label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
-        parts.append(f"{label}: {safe(thread.scope, 300)}")
+    if (thread.kind or "") == TERMINAL_KIND:
+        parts[0] += " (terminal)"
+        parts.append(f"folder: {safe(thread.title, 300)}")
+    else:
+        if thread.scope and thread.scope != thread.url:
+            label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
+            parts.append(f"{label}: {safe(thread.scope, 300)}")
+        parts += [f"window title: {safe(thread.title, 300)}", f"url: {safe(thread.url, 500)}"]
     parts += [
-        f"window title: {safe(thread.title, 300)}",
-        f"url: {safe(thread.url, 500)}",
         "FACTS ALREADY RECORDED for this thread (never extract from these):",
         safe(previous, PREVIOUS_FACTS_CHARS) or "(none)",
         "SOURCES (the only fact source):",
     ]
     for number, src in enumerate(sources, start=1):
+        c = src.command
+        if c is not None:
+            where = f"in {safe(c.get('pwd') or '(folder not recorded)', 300)}"
+            if c.get("branch"):
+                where += f" on branch {safe(str(c['branch']), 120)}"
+            how = [safe(str(c['shell']), 20)] if c.get("shell") else []
+            code = c.get("exit_code")
+            how.append(f"exit {code}" if code is not None else "exit code not recorded")
+            if c.get("seconds") is not None:
+                how.append(f"took {c['seconds']:g}s")
+            if c.get("agent"):
+                how.append("run by Warp's AI agent, not typed by the user")
+            command = safe(str(c.get("command") or ""), 1_000).replace("\n", "\n      ")
+            parts.append(f"[{number}] COMMAND {_local(src.at)} {where}, {', '.join(how)}:\n    $ {command}")
+            continue
         m = src.message
         if m is None:
             cap = src.capture
@@ -502,7 +563,8 @@ class JournalWorker:
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
-                sources=len(sources), messages_new=sum(1 for x in sources if x.message and x.message.status == "new"),
+                sources=len(sources), commands=sum(1 for x in sources if x.command is not None),
+                messages_new=sum(1 for x in sources if x.message and x.message.status == "new"),
                 messages_history=sum(1 for x in sources if x.message and x.message.status != "new"),
                 usage=tokens, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
                 stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,

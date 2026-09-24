@@ -20,7 +20,9 @@ Windows (computed, content-free):
 Per window, in code: time per app / site / page (active, watching = no input
 while that app played media, media time), visits, switches, longest
 uninterrupted stretch per activity, back-and-forth pairs, background media,
-the run-by-run sequence, and the journal facts dated in it.  Claude Haiku 4.5
+full-screen time (a game, a full-screen video: app and carried-over site only),
+meetings as hours only ("in a meeting 15:00-15:45 (Google Meet)", with the
+microphone time), the run-by-run sequence, and the journal facts dated in it.  Claude Haiku 4.5
 (Bedrock, as :mod:`yuki.memory.journal`) writes 1-3 episodes from those
 numbers through a forced, strict ``record_episodes`` tool; titles, addresses
 and facts are fenced as untrusted data.  Episodes are stored encrypted with
@@ -69,6 +71,7 @@ from yuki.memory.timeline import (
     aggregate,
     breaks,
     describe,
+    describe_meeting,
     format_duration,
     sequence,
 )
@@ -91,6 +94,14 @@ Each request covers one window of time and gives you, measured on the PC rather 
 video, music). Away time is counted separately and is in neither. A visit is one uninterrupted \
 run of an activity; "longest" is its longest run. Switches count one activity directly \
 followed by another; "back and forth" names pairs the user alternated between and how often.
+  "Full screen" is time with a full-screen window in front (a game, a video in full screen): \
+only the app is known then, plus the site when the same window showed it just before - never \
+the title or page, so do not guess what exactly was played or watched unless the JOURNAL says. \
+Write it plainly: "played VALORANT for 1h40", "watched YouTube full-screen for 40 min".
+  "In a meeting (Google Meet)" is a video call: only the service and the times are recorded, \
+plus how long the app used the microphone - never who was in it or what was said, so never \
+guess the topic or the people. Write it as "in a meeting 15:00-15:45 (Google Meet)", using the \
+meeting line's span.
 - SEQUENCE: the window in order, run by run, with short visits folded together and away spans \
 marked.
 - JOURNAL: facts already extracted from what was on screen during the window (what the pages, \
@@ -223,6 +234,8 @@ def compact_aggregates(facts: dict[str, Any]) -> dict[str, Any]:
                   for i in facts["page"]["items"][:8]],
         "interleaving": site["interleaving"][:5],
         "background_media": site["background_media"][:5],
+        "meetings": [{k: m.get(k) for k in ("label", "app", "host", "start", "end", "in_front_s", "mic_s")}
+                     for m in site.get("meetings", [])[:8]],
     }
 
 
@@ -234,9 +247,12 @@ def _sequence_lines(seq: Sequence[dict[str, Any]], safe) -> list[str]:
             app = f" in {safe(e['app'], 60)}" if e.get("app") and e["app"] != e["label"] else ""
             how = [f"active {format_duration(e['active_s'])}"]
             if e["passive_s"] >= 30:
-                how.append(f"watching {format_duration(e['passive_s'])}")
+                what = "no input, microphone on" if e.get("meeting") else "watching"
+                how.append(f"{what} {format_duration(e['passive_s'])}")
             if e["media_s"] >= 30:
                 how.append(f"media {format_duration(e['media_s'])}")
+            if e.get("fullscreen_s", 0) >= 30:
+                how.append(f"full screen {format_duration(e['fullscreen_s'])}")
             title = f" \"{safe(e['title'], 100)}\"" if e.get("title") else ""
             lines.append(f"- {span} {safe(e['label'], 100)}{app} {format_duration(e['present_s'])} "
                          f"({', '.join(how)}){title}")
@@ -244,7 +260,7 @@ def _sequence_lines(seq: Sequence[dict[str, Any]], safe) -> list[str]:
             labels = ", ".join(safe(x, 60) for x in e["labels"])
             lines.append(f"- {span} {e['count']} short visits ({format_duration(e['present_s'])} in all): {labels}")
         elif e["kind"] in ("away", "gap"):
-            what = "away" if e["kind"] == "away" else "nothing recorded (paused, locked, full screen or asleep)"
+            what = "away" if e["kind"] == "away" else "nothing recorded (memory paused, PC locked or asleep)"
             lines.append(f"- {span} {what} {format_duration(e['seconds'])}")
         elif e["kind"] == "earlier":
             lines.append(f"- {span} ({e['count']} earlier entries not shown)")
@@ -266,7 +282,10 @@ def build_user_message(
     parts = ["TIME USE:", "totals: " + describe(site, max_items=0)[0], "BY APP:"]
     parts += [safe(x, 400) for x in describe(app, max_items=8, titles=False)[1:] if x.startswith("- ")]
     parts.append("BY SITE (a window without a web page counts as its app):")
-    parts += [safe(x, 700) for x in describe(site, max_items=12)[1:]]
+    parts += [safe(x, 700) for x in describe(site, max_items=12)[1:] if not x.startswith("meeting: ")]
+    if site.get("meetings"):
+        parts.append("MEETINGS (hours only; nothing of their content is recorded):")
+        parts += [f"- {safe(describe_meeting(m).removeprefix('meeting: '), 300)}" for m in site["meetings"][:8]]
     parts.append("TOP PAGES:")
     parts += [safe(x, 300) for x in describe(page, max_items=10, titles=False)[1:] if x.startswith("- ")]
     parts.append("SEQUENCE:")
