@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiA
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from yuki.config import MODEL_ALIASES, Settings
+from yuki.ui import startup
 from yuki.ui.calls import CallController
 from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
@@ -770,6 +771,27 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     logs.triggered.connect(ui.open_logs)
     menu.addAction(logs)
 
+    # Start with Windows: the per-user Run value (yuki.ui.startup), read afresh each time the menu opens.
+    start_with_windows = QAction("Start with Windows", menu, checkable=True)
+
+    def show_startup() -> None:
+        start_with_windows.blockSignals(True)
+        start_with_windows.setChecked(startup.is_enabled())
+        start_with_windows.blockSignals(False)
+
+    def toggle_startup(checked: bool) -> None:
+        try:
+            now_on = startup.set_enabled(bool(checked))
+            ui.ui_log.event("startup_toggle", enabled=now_on, command=startup.read_value())
+        except OSError as exc:
+            ui.ui_log.event("startup_toggle", enabled=startup.is_enabled(), error=f"{type(exc).__name__}: {exc}")
+        show_startup()
+
+    start_with_windows.triggered.connect(toggle_startup)
+    menu.aboutToShow.connect(show_startup)
+    show_startup()
+    menu.addAction(start_with_windows)
+
     menu.addSeparator()
     quit_action = QAction("Quit", menu)
     quit_action.triggered.connect(app.quit)
@@ -810,6 +832,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     settings = Settings()
     ui_log = UiLog(sessions_dir=settings.sessions_dir, session_id=None)
+    # Start with Windows is on by default: the first run turns it on once and records that it
+    # did, so a later "off" from the tray is kept (yuki.ui.startup.apply_default).
+    ui_log.event("startup_default", **startup.apply_default())
     ui = YukiUi(settings, ui_log)
     tray = build_tray(ui, app)
     ui.start()

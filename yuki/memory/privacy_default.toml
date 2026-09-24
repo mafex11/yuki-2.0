@@ -264,6 +264,17 @@ deliver_within_min = 15
 reminder_late_max_h = 24
 # A to-do due on a day without a time is reminded at this time that day.
 all_day_at = "09:00"
+# Picking up after the PC was off or asleep: one short message once you have
+# settled in, when the PC was off or asleep at least resume_after_h hours, or
+# at your first time at the PC on a new day (days start at resume_day_start).
+# Not sent during a call, a meeting or full screen: it waits for a calm moment
+# within resume_within_min minutes of your return, else it is skipped.
+resume_enabled = true
+resume_after_h = 3
+resume_day_start = "04:00"
+resume_within_min = 60
+# What it may draw on: your last this-many minutes at the PC before the gap.
+resume_before_min = 90
 
 [review]
 # The weekly review (yuki.memory.review): the last seven days in numbers and a

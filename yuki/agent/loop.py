@@ -76,6 +76,10 @@ from yuki.log.requests import TOKEN_KEYS, append_request_row, usage_tokens
 #: The API's limit on ``cache_control`` breakpoints in one request.
 MAX_CACHE_BREAKPOINTS = 4
 
+#: When the model warm-up could not reach Bedrock at all (the network not up yet
+#: after logon or a wake), it is tried again after these waits (seconds), then left.
+PREWARM_RETRY_S: tuple[float, ...] = (30.0, 90.0, 240.0)
+
 #: Tools never dispatched while the response is still streaming. ``done`` is
 #: evaluated last, after everything else in the turn; ``ask_user`` pauses the
 #: generator for the user's answer, and whatever the model wrote after it must
@@ -295,9 +299,16 @@ class Agent:
 
         def warm() -> None:
             self._warm_activity()
-            self._warm_model()
+            warmed = self._warm_model()
             self._warm_memory()
             self._warm_shell()
+            # Started at logon (or after a wake) the network may not be up yet: when Bedrock
+            # could not be reached at all, try the warm-up again a few times, quietly.
+            for delay in PREWARM_RETRY_S:
+                if warmed is not False:
+                    break
+                threading.Event().wait(delay)
+                warmed = self._warm_model()
 
         thread = threading.Thread(target=warm, name="yuki-prewarm", daemon=True)
         thread.start()
@@ -354,13 +365,21 @@ class Agent:
 
         Never raises, and never touches :attr:`~yuki.log.events.SessionLogger.usage`:
         this request is overhead, not part of any user request's accounting.
+
+        Returns True when warmed, False when Bedrock could not be reached at
+        all (no network yet: worth retrying), None on any other failure.
         """
         started = time.perf_counter()
         try:
             response = self.client.messages.create(**self._request_params(warmup=True))
         except Exception as exc:
             self.logger.error(f"model prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
-            return
+            try:
+                import anthropic
+
+                return False if isinstance(exc, anthropic.APIConnectionError) else None
+            except Exception:
+                return None
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         model = self.settings.model
         usage = getattr(response, "usage", None)
@@ -382,6 +401,7 @@ class Agent:
             tokens=tokens,
             cost_usd=None if cost is None else round(cost, 6),
         )
+        return True
 
     def wait_for_prewarm(self, timeout_s: float | None = None) -> bool:
         """Block until the pre-warm thread has finished (tests and diagnostics).

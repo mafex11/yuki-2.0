@@ -68,14 +68,21 @@ from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted
 from yuki.memory.store import EpisodeRunStats, JournalEntry, NewEpisode, Store
 from yuki.memory.timeline import (
     BREAK_S,
+    GAP_WORDS,
+    POWER_WORDS,
     RUN_GAP_S,
     aggregate,
     breaks,
     describe,
     describe_meeting,
+    describe_power,
     format_duration,
+    power_spans,
     sequence,
 )
+
+#: The PC off or asleep that ended this close before a window's start is the window's "before".
+POWER_BEFORE_S = 1800.0
 
 MAX_OUTPUT_TOKENS = 2_048
 MAX_EPISODES = 3
@@ -105,6 +112,11 @@ guess the topic or the people. Write it as "in a meeting 15:00-15:45 (Google Mee
 meeting line's span.
 - SEQUENCE: the window in order, run by run, with short visits folded together and away spans \
 marked.
+- PC OFF / ASLEEP (sometimes): when the PC itself was shut down, asleep or stopped without a clean \
+shutdown, from Windows' own records, including the span just before the window. That is a break \
+the user took from the PC, not missing data: an episode may start "after the PC had been off \
+since 03:05, ..." when it helps. "Nothing recorded" in the SEQUENCE is different: the PC was on \
+but memory was not recording, so say nothing about what happened then.
 - JOURNAL: facts already extracted from what was on screen during the window (what the pages, \
 videos and conversations were about).
 - YUKI ACTING: spans when Yuki itself, the assistant, was working on the desktop for the user, \
@@ -237,9 +249,17 @@ def window_facts(store: Store, since: float, until: float) -> dict[str, Any]:
             continue
         yuki.append({"start": start, "end": end, "request": r.yuki_request or "",
                      "apps": [r.app] if r.app else [], "sites": [r.host] if r.host else []})
+    # what the PC was doing just before the window (a window starts after a break): off, asleep
+    before = []
+    try:
+        before = [p for p in power_spans(store.power_spans(since - POWER_BEFORE_S, since + 1.0))
+                  if since - POWER_BEFORE_S <= p["end"] <= since + 1.0]
+    except Exception:
+        before = []
     return {
         "rows": len(rows),
         "yuki": yuki,
+        "power_before": before[-1] if before else None,
         "site": aggregate(rows, since, until, "site", limit=12),
         "app": aggregate(rows, since, until, "app", limit=8, titles=0),
         "page": aggregate(rows, since, until, "page", limit=10, titles=0),
@@ -289,8 +309,8 @@ def _sequence_lines(seq: Sequence[dict[str, Any]], safe) -> list[str]:
         elif e["kind"] == "short":
             labels = ", ".join(safe(x, 60) for x in e["labels"])
             lines.append(f"- {span} {e['count']} short visits ({format_duration(e['present_s'])} in all): {labels}")
-        elif e["kind"] in ("away", "gap"):
-            what = "away" if e["kind"] == "away" else "nothing recorded (memory paused, PC locked or asleep)"
+        elif e["kind"] in ("away", "gap") or e["kind"] in POWER_WORDS:
+            what = "away" if e["kind"] == "away" else GAP_WORDS if e["kind"] == "gap" else POWER_WORDS[e["kind"]]
             lines.append(f"- {span} {what} {format_duration(e['seconds'])}")
         elif e["kind"] == "earlier":
             lines.append(f"- {span} ({e['count']} earlier entries not shown)")
@@ -312,10 +332,18 @@ def build_user_message(
     parts = ["TIME USE:", "totals: " + describe(site, max_items=0)[0], "BY APP:"]
     parts += [safe(x, 400) for x in describe(app, max_items=8, titles=False)[1:] if x.startswith("- ")]
     parts.append("BY SITE (a window without a web page counts as its app):")
-    parts += [safe(x, 700) for x in describe(site, max_items=12)[1:] if not x.startswith("meeting: ")]
+    parts += [safe(x, 700) for x in describe(site, max_items=12)[1:]
+              if not x.startswith("meeting: ") and not x.startswith("power: ")]
     if site.get("meetings"):
         parts.append("MEETINGS (hours only; nothing of their content is recorded):")
         parts += [f"- {safe(describe_meeting(m).removeprefix('meeting: '), 300)}" for m in site["meetings"][:8]]
+    power = [p for p in site.get("power", []) if p["seconds"] >= 60]
+    before = facts.get("power_before")
+    if power or before:
+        parts.append("PC OFF / ASLEEP (Windows' own power history):")
+        if before:
+            parts.append(f"- before this window: {describe_power(before)}")
+        parts += [f"- {describe_power(p)}" for p in power[-8:]]
     parts.append("TOP PAGES:")
     parts += [safe(x, 300) for x in describe(page, max_items=10, titles=False)[1:] if x.startswith("- ")]
     parts.append("SEQUENCE:")

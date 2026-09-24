@@ -61,6 +61,12 @@ Two parts:
     :data:`MEDIA_EVERY_S`; the app in front using the microphone counts as
     present without input (``passive_s``) and as ``mic_s``.
 
+The PC's own power history (:mod:`yuki.memory.power`) lives in the same table
+as rows with state ``off`` / ``asleep`` / ``unknown`` (no app, no counters):
+the helpers here show them as what they are - "PC off 23:10-08:05" - so a
+hole in the timeline is either one of those or time the PC was on and memory
+was not recording.
+
 Nothing here sends input, changes focus, launches anything or takes pixels.
 Logs are content-free.
 """
@@ -81,7 +87,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from yuki.memory.store import Store, TimelineRow, app_key, url_host
+from yuki.memory.store import POWER_STATES, Store, TimelineRow, app_key, url_host
 
 # ---------------------------------------------------------------------------
 # Budgets (plumbing, not behaviour)
@@ -320,6 +326,51 @@ def _app_label(row: TimelineRow) -> str:
     return row.app or row.process or "(unknown app)"
 
 
+#: How a power row (yuki.memory.power) reads in a description.
+POWER_WORDS: dict[str, str] = {
+    "off": "PC off",
+    "asleep": "PC asleep",
+    "unknown": "PC stopped without a clean shutdown (a crash or power cut; not known exactly when)",
+}
+#: What an untracked gap is once the power history is known: the PC was on
+#: (no shutdown or sleep recorded), memory was simply not recording.
+GAP_WORDS = "nothing recorded (the PC was on; Yuki not running, memory paused or the PC locked)"
+
+
+def is_power(row: TimelineRow) -> bool:
+    """A power row: the PC off, asleep or stopped (not a stretch of the user's)."""
+    return row.state in POWER_STATES
+
+
+def _hm_span(start: float, end: float) -> str:
+    """``23:10-08:05`` within a day, ``Thu 23:10-Fri 08:05`` across days."""
+    a, b = datetime.fromtimestamp(start), datetime.fromtimestamp(end)
+    if a.date() == b.date():
+        return f"{a:%H:%M}-{b:%H:%M}"
+    return f"{a:%a %H:%M}-{b:%a %H:%M}"
+
+
+def power_list(clips: Sequence[_Clip]) -> list[dict[str, Any]]:
+    """The power spans among clipped rows, oldest first: ``{"kind", "start", "end", "seconds", "source"}``."""
+    return [
+        {"kind": c.row.state, "start": c.start, "end": c.end, "seconds": round(c.end - c.start, 1),
+         "source": c.row.source}
+        for c in clips if is_power(c.row)
+    ]
+
+
+def power_spans(rows: Sequence[TimelineRow], since: float | None = None,
+                until: float | None = None) -> list[dict[str, Any]]:
+    """The PC's off / asleep / unknown spans in ``[since, until)`` (clipped), oldest first."""
+    return power_list(_clip(rows, since, until))
+
+
+def describe_power(span: dict[str, Any]) -> str:
+    """``PC off 23:10-08:05 (8h55m)``."""
+    return f"{POWER_WORDS.get(span['kind'], span['kind'])} {_hm_span(span['start'], span['end'])} " \
+           f"({format_duration(span['seconds'])})"
+
+
 def group_of(row: TimelineRow, group_by: str) -> tuple[str, str]:
     """``(key, label)`` of the activity a row belongs to at this grouping.
 
@@ -430,6 +481,12 @@ def aggregate(
     are one meeting - with ``in_front_s`` (time it was the window in front),
     ``present_s`` and ``mic_s`` (the app in front using the microphone);
     ``totals.meeting_s`` is the present time in meetings.
+
+    The PC's own power history (:mod:`yuki.memory.power`): ``power`` lists
+    the spans it was off, asleep or stopped without a clean shutdown
+    (``{"kind", "start", "end", "seconds", "source"}``), and
+    ``totals.off_s`` / ``asleep_s`` / ``unknown_s`` add them up. They are
+    breaks, not activity and not away time.
     """
     if group_by not in ("app", "site", "page"):
         raise ValueError(f"group_by must be app, site or page, not {group_by!r}")
@@ -489,6 +546,8 @@ def aggregate(
         for app, seconds in (c.row.media_other or {}).items():
             background[app] += float(seconds) * c.f
     present = [c for c in clips if c.row.state == "present"]
+    power = power_list(clips)
+    tracked = [c for c in clips if not is_power(c.row)]
     totals = {
         "present_s": round(sum(c.present_s for c in present), 1),
         "active_s": round(sum(c.val("active_s") for c in present), 1),
@@ -500,8 +559,10 @@ def aggregate(
         "meeting_s": round(sum(c.present_s for c in present if c.row.meeting), 1),
         "switches": switches,
         "activities": total_items,
-        "first_at": clips[0].start if clips else None,
-        "last_at": clips[-1].end if clips else None,
+        "first_at": tracked[0].start if tracked else None,
+        "last_at": max(c.end for c in tracked) if tracked else None,
+        # the PC's own power history (yuki.memory.power): off, asleep, stopped without a clean shutdown
+        **{f"{kind}_s": round(sum(p["seconds"] for p in power if p["kind"] == kind), 1) for kind in POWER_STATES},
     }
     return {
         "since": since, "until": until, "group_by": group_by, "totals": totals, "items": out_items,
@@ -510,6 +571,7 @@ def aggregate(
         ],
         "background_media": [{"app": a, "seconds": round(s, 1)} for a, s in background.most_common(8) if s >= 1],
         "meetings": meetings(clips),
+        "power": power,
     }
 
 
@@ -556,8 +618,11 @@ def sequence(
 
     Runs shorter than ``min_run_s`` are folded into ``{"kind": "short", "count",
     "present_s", "labels"}`` entries between the longer ones; away spans and
-    untracked gaps of at least ``min_run_s`` appear as ``{"kind": "away" | "gap"}``.
-    At most ``max_lines`` entries (the earliest are merged into one note when cut).
+    untracked gaps of at least ``min_run_s`` appear as ``{"kind": "away" | "gap"}``,
+    and the PC's own power spans (yuki.memory.power) as ``{"kind": "off" |
+    "asleep" | "unknown"}`` - a gap is then time the PC was on but nothing was
+    recorded. At most ``max_lines`` entries (the earliest are merged into one
+    note when cut).
     """
     clips = _clip(rows, since, until)
     out: list[dict[str, Any]] = []
@@ -577,7 +642,13 @@ def sequence(
     for c in clips:
         if last_end is not None and c.start - last_end >= min_run_s:
             events.append((last_end, "gap", (last_end, c.start)))
-        last_end = c.end
+        last_end = c.end if last_end is None else max(last_end, c.end)
+        if is_power(c.row):
+            if away_start is not None:
+                events.append((away_start, "away", (away_start, away_end)))
+                away_start = away_end = None
+            events.append((c.start, c.row.state, (c.start, c.end)))
+            continue
         if c.row.state != "present":
             if away_start is not None and away_end is not None and c.start - away_end <= RUN_GAP_S:
                 away_end = c.end
@@ -594,7 +665,7 @@ def sequence(
         events.append((run.start, "run", run))
     events.sort(key=lambda e: e[0])
     for _, kind, value in events:
-        if kind in ("away", "gap"):
+        if kind in ("away", "gap") or kind in POWER_STATES:
             start, end = value
             if end - start < min_run_s:
                 continue
@@ -638,7 +709,12 @@ def breaks(
     With ``now``, the time after the last row up to ``now`` counts as a gap
     (the recorder writes the open stretch every :data:`FLUSH_EVERY_S`, so a
     silence longer than that is time nothing was recorded: paused, locked,
-    the PC asleep; full screen is recorded).  Each: ``{"start", "end", "seconds", "ongoing"}``.
+    the PC asleep; full screen is recorded).  The PC's own power spans
+    (yuki.memory.power: off, asleep, unknown) are breaks too, never missing
+    data.  Each: ``{"start", "end", "seconds", "ongoing", "kind", "power",
+    "away_s", "gap_s"}`` - ``kind`` is what most of it was (``off`` |
+    ``asleep`` | ``unknown`` | ``away`` | ``gap``), ``power`` the seconds per
+    power kind inside it.
     """
     clips = _clip(rows, since, until)
     spans: list[list[float]] = []
@@ -666,8 +742,34 @@ def breaks(
         if end - start >= min_s:
             # the open stretch is written every FLUSH_EVERY_S, so "reaches now" allows for that
             ongoing = limit is not None and end >= limit - FLUSH_EVERY_S * 2
-            out.append({"start": start, "end": end, "seconds": round(end - start, 1), "ongoing": ongoing})
+            power: Counter = Counter()
+            away = 0.0
+            for c in clips:
+                overlap = min(end, c.end) - max(start, c.start)
+                if overlap <= 0 or c.row.state == "present":
+                    continue
+                if is_power(c.row):
+                    power[c.row.state] += overlap
+                else:
+                    away += overlap
+            gap = max(0.0, (end - start) - sum(power.values()) - away)
+            parts = {**power, "away": away, "gap": gap}
+            kind = max(parts, key=lambda k: parts[k])
+            out.append({"start": start, "end": end, "seconds": round(end - start, 1), "ongoing": ongoing,
+                        "kind": kind, "power": {k: round(v, 1) for k, v in power.items()},
+                        "away_s": round(away, 1), "gap_s": round(gap, 1)})
     return out
+
+
+def describe_break(span: dict[str, Any]) -> str:
+    """What a break was, from :func:`breaks`: ``8h55m (PC off 5h53m, away 12m, nothing recorded 2m)``."""
+    parts = [f"{POWER_WORDS.get(k, k).split(' (')[0]} {format_duration(s)}"
+             for k, s in sorted((span.get("power") or {}).items(), key=lambda kv: -kv[1]) if s >= 30]
+    if span.get("away_s", 0) >= 30:
+        parts.append(f"away from the PC {format_duration(span['away_s'])}")
+    if span.get("gap_s", 0) >= 30:
+        parts.append(f"PC on but not recorded {format_duration(span['gap_s'])}")
+    return f"{format_duration(span['seconds'])}" + (f" ({', '.join(parts)})" if parts else "")
 
 
 def _hm(at: float | None) -> str:
@@ -682,6 +784,9 @@ def describe(agg: dict[str, Any], *, max_items: int = 12, titles: bool = True) -
         special += f", full screen {format_duration(t['fullscreen_s'])}"
     if t.get("meeting_s", 0) >= 30:
         special += f", in meetings {format_duration(t['meeting_s'])}"
+    for kind in POWER_STATES:
+        if t.get(f"{kind}_s", 0) >= 60:
+            special += f", {POWER_WORDS[kind].split(' (')[0]} {format_duration(t[f'{kind}_s'])}"
     lines = [
         f"present {format_duration(t['present_s'])} (active {format_duration(t['active_s'])}, watching or "
         f"listening with no input {format_duration(t['passive_s'])}), away {format_duration(t['away_s'])}, "
@@ -719,6 +824,8 @@ def describe(agg: dict[str, Any], *, max_items: int = 12, titles: bool = True) -
         lines.append(f"background media: {media['app']} {format_duration(media['seconds'])}")
     for m in agg.get("meetings", [])[:8]:
         lines.append(describe_meeting(m))
+    for p in [p for p in agg.get("power", []) if p["seconds"] >= 60][-8:]:
+        lines.append(f"power: {describe_power(p)}")
     return lines
 
 
@@ -1803,4 +1910,5 @@ __all__ = [
     "TimelineRecorder", "aggregate", "sequence", "breaks", "describe", "describe_meeting", "meetings",
     "format_duration", "group_of", "site_of", "MeetingRules", "PrivacySection",
     "AWAY_AFTER_S", "BREAK_S", "RUN_GAP_S", "MEETING_GAP_S",
+    "POWER_STATES", "POWER_WORDS", "GAP_WORDS", "is_power", "power_spans", "describe_power", "describe_break",
 ]

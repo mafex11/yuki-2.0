@@ -1,4 +1,4 @@
-"""Nudge cards: memory's praise, nudges and reminders, bottom-right, never taking focus.
+"""Nudge cards: memory's praise, nudges, reminders, reviews and "welcome back" messages, bottom-right, never taking focus.
 
 The memory service writes a nudge and sets the named, auto-reset Windows event
 :data:`NUDGE_EVENT_NAME`. :class:`NudgeWatcher` waits on that event on its own
@@ -90,9 +90,11 @@ KIND_ACCENTS: dict[str, QColor] = {
     "nudge": QColor(255, 190, 110),
     "reminder": ACCENT,
     "review": QColor(196, 160, 255),
+    "resume": QColor(140, 200, 255),
 }
 KIND_TITLES: dict[str, str] = {
     "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
+    "resume": "Welcome back",
 }
 
 #: ``QUERY_USER_NOTIFICATION_STATE`` values, and the ones that mean "not now".

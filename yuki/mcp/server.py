@@ -491,6 +491,11 @@ def _format_activity(agg: dict[str, Any], window: Window, group_by: str) -> str:
         lines.append(f"Meeting: {m.get('label')} {fmt_span(_parse_iso(m.get('start')), _parse_iso(m.get('end')))}"
                      + (f" in {where}" if where else "")
                      + f", in front {_dur(m.get('in_front_s'))}, microphone on {_dur(m.get('mic_s'))}")
+    words = {"off": "PC off", "asleep": "PC asleep", "unknown": "PC stopped without a clean shutdown"}
+    for p in agg.get("power") or []:
+        if (p.get("seconds") or 0) >= 60:
+            lines.append(f"{words.get(p.get('kind'), p.get('kind'))} (Windows' power history): "
+                         f"{fmt_span(_parse_iso(p.get('start')), _parse_iso(p.get('end')))}, {_dur(p.get('seconds'))}")
     return "\n".join(lines)
 
 

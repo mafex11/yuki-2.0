@@ -218,7 +218,9 @@ user's own browsing: never take it as evidence of the user's interests, routines
 behaviour.
 - TIME USE: per day, measured time per site or app - present (active = with input; \
 watching = while that app played media), visits, longest uninterrupted stretch, \
-switches, and pairs the user went back and forth between.
+switches, and pairs the user went back and forth between; "power:" lines say when the PC \
+itself was off or asleep (from Windows' own records), which is time away from the PC, not \
+missing data - when the day at the PC ended and began.
 - ACTIVITY: foreground time per app and site measured by the memory watcher, by weekday \
 and hour of day. Use it for routines.
 - REVIEW CANDIDATES (sometimes): behaviour patterns the user's weekly review proposed from \

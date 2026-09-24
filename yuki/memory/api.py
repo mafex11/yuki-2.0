@@ -835,7 +835,13 @@ class MemoryClient:
                         "visits", "longest_s", "longest_start", "longest_end", "first_at", "last_at",
                         "titles": [{"title", "present_s"}]}],      # most time first, at most ``limit``
              "interleaving": [{"a", "b", "switches"}],             # back and forth between two activities
-             "background_media": [{"app", "seconds"}]}
+             "background_media": [{"app", "seconds"}],
+             "power": [{"kind": "off" | "asleep" | "unknown", "start", "end", "seconds", "source"}]}
+
+        ``power`` (and ``totals.off_s`` / ``asleep_s`` / ``unknown_s``) is the
+        PC's own history from Windows (yuki.memory.power): shut down, asleep, or
+        stopped without a clean shutdown. Time in none of the rows and none of
+        these spans is time the PC was on and memory was not recording.
 
         *present* = the user at it: *active* (input within the last minute)
         plus *passive* (no input while that app played media: watching or
@@ -857,6 +863,8 @@ class MemoryClient:
             item.pop("key", None)
             for k in ("longest_start", "longest_end", "first_at", "last_at"):
                 item[k] = _iso(item[k])
+        for span in agg.get("power", []):
+            span["start"], span["end"] = _iso(span["start"]), _iso(span["end"])
         return agg
 
     def episodes(self, since=None, until=None, limit: int = 50) -> list[dict]:
@@ -965,7 +973,8 @@ class MemoryClient:
         """Nudges the service wrote that the UI has not shown yet, oldest first.
 
         Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder" |
-        "review", "text": str, "reason": str | None}``. ``text`` is what to show
+        "review" | "resume", "text": str, "reason": str | None}`` (``resume``:
+        picking up after the PC was off or asleep; it expires like a praise). ``text`` is what to show
         the user (one or two short sentences, already in their register and
         following their rules); ``reason`` is the coach's one-line why, for a
         tooltip or the log, not for the user. A ``review`` is the teaser of a
@@ -1043,7 +1052,7 @@ class MemoryClient:
         "reminder": n}}`` - nudges written since local midnight.
         """
         out: dict[str, Any] = {"quiet_until": None, "last_nudge_at": None,
-                               "today": {"praise": 0, "nudge": 0, "reminder": 0}}
+                               "today": {"praise": 0, "nudge": 0, "reminder": 0, "resume": 0}}
         try:
             now = time.time()
             quiet = self.store.nudge_state("quiet_until")

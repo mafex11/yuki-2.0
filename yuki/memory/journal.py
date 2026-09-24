@@ -326,6 +326,20 @@ def sanitize_untrusted(value: str, nonce: str, max_chars: int) -> str:
     return result[: cap - 1] + "…"
 
 
+def unreachable(exc: BaseException) -> bool:
+    """True when a model call failed without reaching the model (no network or DNS yet, a timeout).
+
+    Plumbing on the SDK's own exception types: after logon or a wake the
+    network can take a minute to come up, and such a failure says nothing
+    about the request, so it is retried without counting against it.
+    """
+    try:
+        import anthropic
+    except Exception:
+        return False
+    return isinstance(exc, anthropic.APIConnectionError)   # APITimeoutError is a subclass
+
+
 def _local(at: float) -> str:
     return datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M (%A)")
 
@@ -752,7 +766,9 @@ class JournalWorker:
                 call.latency_ms = (time.perf_counter() - t0) * 1000
             call.outcome = "error"
             call.error = f"{type(exc).__name__}: {exc}"
-            batch_id = self.store.record_failed_batch(call, capture_ids)
+            # Bedrock not reachable at all (no network yet after logon or a wake): the captures keep
+            # their attempts and wait for the next pass, so a slow network never loses them.
+            batch_id = self.store.record_failed_batch(call, capture_ids, count_attempt=not unreachable(exc))
             self._log(
                 "journal_error", batch_id=batch_id, thread_id=thread_id, model=self.model,
                 capture_ids=capture_ids, error=call.error, traceback=traceback.format_exc(),

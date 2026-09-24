@@ -29,6 +29,9 @@ Flag files next to the database (written by Yuki through
 * ``run_weekly_review`` - wakes the weekly-review scheduler (:mod:`yuki.memory.review`,
   thread ``yuki-memory-review``), which deletes it and writes a review of the last
   seven days now; the scheduled one runs Sunday evening (``[review]``).
+* (not a flag) the PC's power history - :mod:`yuki.memory.power` reads the
+  System event log at start and after the process did not run for a while
+  (sleep), and records off / asleep / unknown spans in the timeline.
 * ``acting.json`` - Yuki is acting on the desktop for the user
   (:mod:`yuki.memory.acting`). Read when Yuki sets the named event
   ``Local\\YukiMemoryActing-<db digest>`` (this process creates it), and at
@@ -322,6 +325,19 @@ def run(args: argparse.Namespace) -> int:
             log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
         last_prune = time.monotonic()
 
+        # The PC's own power history (off / asleep / unknown spans, yuki.memory.power): read before the
+        # timeline starts, so the hole before this start is explained (or left a gap: the PC was on).
+        power = None
+        try:
+            from yuki.memory.power import PowerHistory
+
+            power = PowerHistory(store, log=log)
+            power.sync("start")
+        except Exception as exc:   # everything else runs on without it
+            log("error", where="power_start", error=f"{type(exc).__name__}: {exc}")
+            power = None
+        power_recheck_at: float | None = None
+
         shared = store
         from yuki.config import Settings
 
@@ -516,6 +532,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
         privacy_error = privacy.last_error
+        wall_seen = time.time()
         while not stop.is_set():
             now = time.monotonic()
             deadline = next_stats
@@ -534,6 +551,21 @@ def run(args: argparse.Namespace) -> int:
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
+            if power is not None:
+                # This loop wakes every second: a jump in wall time means the process did not run
+                # (sleep, hibernation). Read the power history then, and once more when Windows has
+                # written the wake event.
+                from yuki.memory.power import RECHECK_AFTER_S, RESUME_JUMP_S
+
+                wall = time.time()
+                if wall - wall_seen > RESUME_JUMP_S:
+                    log("service_resumed", slept_s=round(wall - wall_seen, 1))
+                    power.sync("resume")
+                    power_recheck_at = now + RECHECK_AFTER_S
+                elif power_recheck_at is not None and now >= power_recheck_at:
+                    power_recheck_at = None
+                    power.sync("recheck")
+                wall_seen = wall
             now_paused = pause_path.exists()
             if now_paused != paused:
                 paused = now_paused

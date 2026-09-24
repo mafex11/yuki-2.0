@@ -116,6 +116,8 @@ Timeline (foreground stretches, yuki.memory.timeline) and episodes (yuki.memory.
         # HMAC identity of a stretch's page (a meeting: process + service; full screen marked)
     store.save_timeline(row: TimelineRow) -> int        # insert (row.id None) or update; page_key filled in
     store.timeline_between(since=None, until=None) -> list[TimelineRow]   # overlapping rows, oldest first
+    store.add_power_spans([(state, start, end, source)]) -> int   # PC off/asleep/unknown rows (yuki.memory.power)
+    store.power_spans(since=None, until=None) -> list[TimelineRow];  store.timeline_last_end_before(at)
     store.start_episode_run(trigger, model, window_start, window_end, final, at=None) -> int
     store.commit_episodes(run_id, window_start, episodes: list[NewEpisode]) -> list[int]
         # one transaction: the window's earlier (open-window) episodes superseded, new ones + vectors written
@@ -645,6 +647,10 @@ class TimelineRow:
     #: user's request ``yuki_request``, not the user's own activity.
     by_yuki: bool = False
     yuki_request: str | None = None
+    #: Power rows only (``state`` off | asleep | unknown, yuki.memory.power):
+    #: what Windows' own power history says the span was ("shutdown",
+    #: "sleep", "modern_standby", "unexpected_shutdown", "no_record").
+    source: str | None = None
 
 
 @dataclass
@@ -814,9 +820,14 @@ class TodoItem:
 
 
 #: ``nudges.kind``: praise (encouragement, an acknowledgement), nudge (a call-back,
-#: a call-out, a break suggestion), reminder (a due to-do or commitment) or review
-#: (the teaser of a new weekly review, yuki.memory.review; ``ref`` = "review:<id>").
-NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review")
+#: a call-out, a break suggestion), reminder (a due to-do or commitment), review
+#: (the teaser of a new weekly review, yuki.memory.review; ``ref`` = "review:<id>")
+#: or resume (picking up after the PC was off or asleep; ``ref`` = "resume:<gap end>").
+NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review", "resume")
+#: ``timeline.state`` of the power rows (yuki.memory.power): the PC itself was
+#: off (shutdown to start), asleep (sleep to wake) or stopped without a clean
+#: shutdown (unknown: a crash, a power cut). Not the user's stretches.
+POWER_STATES: tuple[str, ...] = ("off", "asleep", "unknown")
 #: ``nudges.reaction`` values the UI reports (``expired``: never shown in time).
 NUDGE_REACTIONS: tuple[str, ...] = ("shown", "dismissed", "replied", "snoozed")
 
@@ -1613,6 +1624,15 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX call_chunks_status ON call_chunks(status, start_at);
     CREATE INDEX call_chunks_call ON call_chunks(call_id, seq);
     """,
+    # 12: the PC's own power history (yuki.memory.power) in the timeline: rows
+    # with state off | asleep | unknown, read from Windows' System event log,
+    # so a hole in the timeline says whether the PC was off, asleep or the
+    # service was simply not running. One row per span, unique on its kind and
+    # end (re-reading the log never doubles one). Additive only, like 2-11.
+    """
+    ALTER TABLE timeline ADD COLUMN source TEXT;     -- power rows: shutdown | sleep | modern_standby | unexpected_shutdown | no_record
+    CREATE UNIQUE INDEX timeline_power ON timeline(state, ended_at) WHERE state IN ('off', 'asleep', 'unknown');
+    """,
 )
 
 
@@ -2207,15 +2227,21 @@ class Store:
 
         return self._write(op)
 
-    def record_failed_batch(self, call: ModelCall, capture_ids: Iterable[int]) -> int:
-        """Record a failed call and bump its captures' attempt counters (they stay pending)."""
+    def record_failed_batch(self, call: ModelCall, capture_ids: Iterable[int], *, count_attempt: bool = True) -> int:
+        """Record a failed call and bump its captures' attempt counters (they stay pending).
+
+        ``count_attempt=False`` (the model could not be reached at all: no
+        network yet after logon or a wake) records the call without spending
+        one of the captures' attempts.
+        """
         ids = list(capture_ids)
 
         def op(conn: sqlite3.Connection) -> int:
             batch_id = self._insert_batch(conn, call, len(ids), 0)
-            conn.executemany(
-                "UPDATE captures SET journal_attempts=journal_attempts+1 WHERE id=?", [(i,) for i in ids]
-            )
+            if count_attempt:
+                conn.executemany(
+                    "UPDATE captures SET journal_attempts=journal_attempts+1 WHERE id=?", [(i,) for i in ids]
+                )
             return batch_id
 
         return self._write(op)
@@ -2923,6 +2949,7 @@ class Store:
             media_s=r["media_s"], media_other=other, withheld=r["withheld"], segments=r["segments"],
             fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
             by_yuki=bool(r["by_yuki"]), yuki_request=self._dec(r["yuki_request_ciphertext"]),
+            source=r["source"],
         )
 
     def timeline_between(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
@@ -2943,6 +2970,52 @@ class Store:
         """Earliest start and latest end in the timeline."""
         r = self._query("SELECT min(started_at), max(ended_at) FROM timeline")[0]
         return (r[0], r[1])
+
+    # -- the PC's power history (yuki.memory.power) ------------------------------
+
+    def add_power_spans(self, spans: Iterable[tuple[str, float, float, str | None]]) -> int:
+        """Record ``(state, start, end, source)`` power spans as timeline rows; returns how many were new.
+
+        ``state`` is one of :data:`POWER_STATES`. A span already recorded
+        (same state and end) is left as it is, so the log can be re-read.
+        """
+        values = []
+        now = time.time()
+        for state, start, end, source in spans:
+            if state not in POWER_STATES or not end > start:
+                continue
+            values.append((float(start), float(end), state, "", self.cipher.digest("tl-power", state), now, source))
+
+        def op(conn: sqlite3.Connection) -> int:
+            added = 0
+            for v in values:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO timeline(started_at, ended_at, state, app, page_key, updated_at, source)"
+                    " VALUES (?,?,?,?,?,?,?)", v)
+                added += cur.rowcount
+            return added
+
+        return self._write(op) if values else 0
+
+    def power_spans(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
+        """Power rows (off / asleep / unknown) overlapping ``[since, until)``, oldest first."""
+        clauses = ["state IN (%s)" % ",".join("?" * len(POWER_STATES))]
+        params: list[Any] = list(POWER_STATES)
+        if (s := _ts(since)) is not None:
+            clauses.append("ended_at > ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("started_at < ?")
+            params.append(u)
+        return [self._timeline_row(r) for r in self._query(
+            "SELECT * FROM timeline WHERE " + " AND ".join(clauses) + " ORDER BY started_at, id", params)]
+
+    def timeline_last_end_before(self, at: float) -> float | None:
+        """The latest end of a recorded stretch (present or away) that began before ``at``, or ``None``."""
+        r = self._query(
+            "SELECT max(ended_at) FROM timeline WHERE started_at < ? AND state IN ('present', 'away')",
+            (float(at),))[0]
+        return float(r[0]) if r[0] is not None else None
 
     # -- outside sources (the Warp terminal history, yuki.memory.warp) ----------
 

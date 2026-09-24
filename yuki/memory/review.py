@@ -419,6 +419,7 @@ def period_numbers(store: Store, days: Sequence[tuple[float, float]], *, detail:
             "present_s": t["present_s"], "active_s": t["active_s"], "passive_s": t["passive_s"], "away_s": t["away_s"],
             "meeting_s": t["meeting_s"], "fullscreen_s": t["fullscreen_s"], "switches": t["switches"],
             "switches_per_active_h": round(t["switches"] / active_h, 1) if t["active_s"] >= RATE_MIN_ACTIVE_S else None,
+            "off_s": t.get("off_s", 0.0), "asleep_s": t.get("asleep_s", 0.0),   # the PC's own power history
             "start_at": present[0].start if present else None,
             "end_at": max(c.end for c in present) if present else None,
             "start_min": _minutes_of_day(present[0].start, ds) if present else None,

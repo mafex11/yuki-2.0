@@ -1151,14 +1151,34 @@ def _clock(value: Any) -> str:
     return text[-5:] if text != "(undated)" else "?"
 
 
+#: How the ``activity`` tool names the PC's own power spans (``usage["power"]``, yuki.memory.power).
+POWER_TEXT: dict[str, str] = {
+    "off": "PC off (shut down)",
+    "asleep": "PC asleep",
+    "unknown": "PC stopped without a clean shutdown (a crash or power cut; not known exactly when)",
+}
+
+
 def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> str:
     """The ``activity`` tool's text: totals, one line per activity, back and forth, episodes."""
     totals = usage.get("totals") or {}
     group_by = usage.get("group_by") or "site"
     head = f"Time use from {_when(usage.get('since'))} to {_when(usage.get('until'))}, by {group_by}:"
     present = totals.get("present_s") or 0.0
+    power = [p for p in usage.get("power") or [] if isinstance(p, dict) and (p.get("seconds") or 0) >= 60]
+    power_lines = [
+        f"- {POWER_TEXT.get(str(p.get('kind')), str(p.get('kind')))} from {_when(p.get('start'))} to "
+        f"{_when(p.get('end'))} ({_duration(p.get('seconds'))})"
+        for p in power[-10:]
+    ]
+    if power_lines:
+        power_lines.insert(0, "The PC itself (Windows' own power history; time in none of these and in no activity "
+                              "was the PC on with memory not recording):")
     if not present and not episodes:
-        return f"{head}\nNothing recorded in that time (memory may have been paused, the PC locked or off)."
+        if power_lines:
+            return "\n".join([head, "No activity recorded in that time.", *power_lines])
+        return f"{head}\nNothing recorded in that time (memory may have been paused or the PC locked; " \
+               "no shutdown or sleep of the PC is on record for it)."
     lines = [
         head,
         f"At the PC {_duration(present)}: active {_duration(totals.get('active_s'))}, watching or "
@@ -1193,6 +1213,7 @@ def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> st
     media = usage.get("background_media") or []
     if media:
         lines.append("Background media: " + ", ".join(f"{m.get('app')} {_duration(m.get('seconds'))}" for m in media))
+    lines += power_lines
     if episodes:
         lines.append("Episodes:")
         for e in episodes:
