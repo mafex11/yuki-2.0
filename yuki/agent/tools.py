@@ -11,9 +11,10 @@ They have no backend function: the dispatcher validates them and hands them back
 to :class:`yuki.agent.loop.Agent`, which owns pausing, finishing and the running
 summary.
 
-The three *memory* tools (``recall``, ``remember_how``, ``correct_memory``) have
-no backend function either: the agent runs them against Yuki's memory through
-:mod:`yuki.agent.memory`, and they are only listed when memory is installed.
+The four *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
+``activity``) have no backend function either: the agent runs them against
+Yuki's memory through :mod:`yuki.agent.memory`, and they are only listed when
+memory is installed.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: hygiene (:mod:`yuki.agent.context`) to decide what may be stubbed once stale.
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
-    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts", "recall"}
+    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts", "recall", "activity"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -41,7 +42,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
 #: Tools backed by Yuki's memory (:mod:`yuki.agent.memory`) rather than the
 #: desktop backend. Left out of the tool block entirely when the memory API is
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
-MEMORY_TOOLS: frozenset[str] = frozenset({"recall", "remember_how", "correct_memory"})
+MEMORY_TOOLS: frozenset[str] = frozenset({"recall", "remember_how", "correct_memory", "activity"})
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
 #: is dropped from the definitions sent to the model (see :func:`tool_params`)
@@ -474,6 +475,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _obj(
             {"text": {"type": "string", "description": "The correction, as the user meant it."}},
             ["text"],
+        ),
+    },
+    {
+        "name": "activity",
+        "label": "Looking at how your time went",
+        "description": (
+            "How the user spent their time: time per app, site or page, visits, "
+            "longest stretches, and episode summaries of what they were doing."
+        ),
+        "input_schema": _obj(
+            {
+                "since": {
+                    "type": "string",
+                    "description": "Earliest local date or date-time, ISO format, e.g. "
+                    "2026-09-20 or 2026-09-20T18:00. Default: the start of today.",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "Latest local date or date-time, same format; a date "
+                    "alone includes that whole day. Default: now.",
+                },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["site", "app", "page"],
+                    "description": "Count time per site (a window without a web page "
+                    "counts as its app), per app, or per page. Default: site.",
+                },
+            }
         ),
     },
 ]

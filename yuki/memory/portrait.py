@@ -3,12 +3,16 @@
 Contract: ``docs/MEMORY.md`` -> "Portrait worker".
 
 A run reads the journal (since the last run's checkpoint, or the last 7 days for
-the weekly run, or everything for the first run) plus the current portrait facts
+the weekly run, or everything for the first run) plus the current portrait facts,
+the episodes written since the last run (:mod:`yuki.memory.episodes`; a week for
+the weekly run), per-day time use from the timeline (:mod:`yuki.memory.timeline`)
 and computed foreground-activity aggregates, and asks Claude Sonnet 5 (Bedrock,
 adaptive thinking, effort medium) to decide ADD / UPDATE / INVALIDATE / NOOP per
 fact through an ``update_portrait`` tool call with a closed JSON schema (Mem0's
 pattern; no text parsing; Bedrock refuses ``strict`` for Sonnet 5, so every field
-is re-validated here). Each operation cites journal ids. Operations are validated against the
+is re-validated here). Each operation cites journal ids and/or episode ids; ``behaviour``
+facts (observed patterns in how the user spends time, with numbers) usually rest on
+episodes. Operations are validated against the
 store (existing ids, cited ids, user-confirmed facts) and applied bi-temporally in
 one transaction per call: superseded facts get ``valid_to`` and ``superseded_by``,
 nothing is deleted. ``open_loop`` facts drive the ``open_loops`` table.
@@ -72,6 +76,7 @@ from yuki.memory.store import (
     PORTRAIT_KINDS,
     REFRESH_FLAG,
     PAUSE_FLAG,
+    EpisodeRecord,
     FactChange,
     JournalEntry,
     PortraitFact,
@@ -89,6 +94,8 @@ OPS_MAX_TOKENS = 32_000
 RENDER_MAX_TOKENS = 8_000
 #: Journal characters per operations call; a bigger window becomes several calls in a row.
 CHUNK_CHARS = 60_000
+#: Most episodes given to one run (the latest are kept).
+MAX_EPISODES = 80
 
 OPS_SYSTEM_PROMPT = """\
 You maintain the portrait that Yuki keeps of its user. Yuki is a personal assistant living \
@@ -105,6 +112,16 @@ who they are to the user, where they talk (app), and what is pending between the
 - routine: when they do what - time-of-day and weekday patterns, recurring sessions.
 - preference: how they like things: the apps, tools, sites and settings they choose, \
 languages, formats, tastes.
+- behaviour: a pattern in how the user spends their time and moves between things, \
+observed in the EPISODES and TIME USE - what they do together or in sequence, how long \
+their stretches last, when they switch, what plays while they work - stated with the \
+numbers that show it ("On 3 of the last 4 evenings the user alternated between Instagram \
+reels and coding in Claude, 30-40 switches an hour, longest coding stretch about 10 min"). \
+Subject is the activity or pair of activities. Describe observed patterns, not character \
+labels: never "procrastinator", "distracted", "lazy", "addicted", "focused person" - say \
+what happened, how often and how long. Confidence starts low (0.3 or less) for a pattern \
+seen on one day; only raise confidence when a pattern repeats across days, and lower it \
+(or invalidate the fact) when later days do not show it.
 - open_loop: something unfinished - a message the user has not answered, a reply or \
 deliverable they promised, something they are waiting on, a deadline. Subject is the \
 person or thing it concerns; the text says what is pending, since when, and by when if \
@@ -115,11 +132,16 @@ Each request gives you, inside the data fence:
 it became valid.
 - JOURNAL: short dated facts about what the user did on this PC (id J<n>, local time, \
 app, importance 1-10), extracted from their screen.
+- EPISODES: short narratives of stretches of the user's time (id E<n>, local time span), \
+written from the measured timeline and the journal, with the real numbers.
+- TIME USE: per day, measured time per site or app - present (active = with input; \
+watching = no input while that app played media), visits, longest uninterrupted stretch, \
+switches, and pairs the user went back and forth between.
 - ACTIVITY: foreground time per app and site measured by the memory watcher, by weekday \
 and hour of day. Use it for routines.
 
-Work out what the journal and activity change, then call update_portrait exactly once \
-with one operation per decision:
+Work out what the journal, episodes and activity change, then call update_portrait \
+exactly once with one operation per decision:
 - ADD: a fact the evidence newly supports.
 - UPDATE: an existing fact the evidence refines, extends or changes. Give the complete \
 new text; the old version is kept as history.
@@ -128,7 +150,8 @@ contradicted by later evidence. An open loop the user has since dealt with (repl
 delivered, decided) is invalidated.
 - NOOP: an existing fact the evidence bears on without changing it. Leave facts the \
 evidence does not touch out of the list.
-Cite the journal ids each operation rests on in journal_ids.
+Cite the journal ids each operation rests on in journal_ids and the episode ids in \
+episode_ids (each operation must cite at least one of them, or a correction).
 
 What makes a good portrait fact:
 - Durable: it should still help Yuki a week from now. One video watched is an event, not \
@@ -176,7 +199,7 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                     "additionalProperties": False,
                     "required": [
                         "op", "fact_id", "kind", "subject", "text", "confidence",
-                        "journal_ids", "based_on_facts", "reason",
+                        "journal_ids", "episode_ids", "based_on_facts", "reason",
                     ],
                     "properties": {
                         "op": {"type": "string", "enum": ["ADD", "UPDATE", "INVALIDATE", "NOOP"]},
@@ -209,6 +232,11 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                             "items": {"type": "integer"},
                             "description": "n of each journal entry J<n> the operation rests on.",
                         },
+                        "episode_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "n of each episode E<n> the operation rests on; else empty.",
+                        },
                         "based_on_facts": {
                             "type": "array",
                             "items": {"type": "integer"},
@@ -230,10 +258,12 @@ building ... They're into ...".
 
 Sections, in this order, each a short heading line followed by tight sentences or "- " \
 bullets; leave out a section that has no facts:
-Work, Interests, People, Routines, Preferences, Open loops.
+Work, Interests, People, Routines, Behaviour, Preferences, Open loops.
 
 - People: each person, who they are to the user, where they talk, and what is pending \
 with them.
+- Behaviour: the observed patterns in how the user spends their time, with their numbers; \
+describe what they do, never label their character.
 - Open loops: exactly the open_loop facts, each one concrete - who or what, what is \
 pending, since when (use the dates given; today's date is in the request), and any \
 deadline. Do not add loops of your own; with no open_loop facts, leave the section out.
@@ -288,6 +318,7 @@ class OpOutcome:
     reason: str
     status: str = "applied"          # applied | rejected: <why> | skipped: <why>
     new_id: int | None = None
+    episode_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -463,6 +494,59 @@ class PortraitWorker:
             lines.append(f"- site {host} (in {app}): {describe(slots)}")
         return "\n".join(lines)
 
+    def _episode_since(self, kind: str, now: float) -> float:
+        """Where a run's episodes start: since the last run (nightly/refresh), a week (weekly), two (first)."""
+        if kind == "weekly":
+            return now - 7 * 86400.0
+        if kind == "first":
+            return now - self.activity_days * 86400.0
+        last = self.store.last_portrait_run_at()
+        return max(last if last is not None else now - 86400.0, now - 7 * 86400.0)
+
+    def episodes_for(self, kind: str, now: float) -> list[EpisodeRecord]:
+        """The run's episodes (current versions), oldest first, at most :data:`MAX_EPISODES`."""
+        try:
+            episodes = self.store.episodes_between(self._episode_since(kind, now), now)
+        except Exception:
+            return []
+        return episodes[-MAX_EPISODES:]
+
+    def time_use_text(self, kind: str, now: float) -> str:
+        """Per local day of the run's window: time per site, visits, longest stretches, back and forth."""
+        from yuki.memory.timeline import aggregate, describe
+
+        since = self._episode_since(kind, now)
+        day = datetime.fromtimestamp(since).replace(hour=0, minute=0, second=0, microsecond=0)
+        lines: list[str] = []
+        while day.timestamp() < now and len(lines) < 7 * 12:
+            start, end = day.timestamp(), min((day + timedelta(days=1)).timestamp(), now)
+            day += timedelta(days=1)
+            try:
+                rows = self.store.timeline_between(max(start, since), end)
+            except Exception:
+                return "(no timeline)"
+            if not rows:
+                continue
+            agg = aggregate(rows, max(start, since), end, "site", limit=8, titles=0)
+            if agg["totals"]["present_s"] < 60:
+                continue
+            body = describe(agg, max_items=8, titles=False)
+            lines.append(f"DAY {_local(start, '%Y-%m-%d (%A)')}: {body[0]}")
+            lines.extend(f"  {x}" for x in body[1:])
+        return "\n".join(lines) or "(no timeline recorded in this window)"
+
+    @staticmethod
+    def _episode_line(e: EpisodeRecord, safe: Callable[[str | None, int], str]) -> str:
+        span = f"{_local(e.started_at, '%Y-%m-%d %H:%M')}-{_local(e.ended_at, '%H:%M')} ({_local(e.started_at, '%A')})"
+        totals = (e.aggregates or {}).get("totals") or {}
+        numbers = ""
+        if totals:
+            numbers = (
+                f" [window present {round(totals.get('present_s', 0) / 60)} min, active "
+                f"{round(totals.get('active_s', 0) / 60)} min, {totals.get('switches', 0)} switches]"
+            )
+        return f"E{e.id} {span}: {safe(e.text, 900)}{numbers}"
+
     @staticmethod
     def _fact_line(f: PortraitFact, safe: Callable[[str | None, int], str]) -> str:
         conf = "-" if f.confidence is None else f"{f.confidence:.2f}"
@@ -473,7 +557,7 @@ class PortraitWorker:
 
     def _ops_message(
         self, *, kind: str, now: float, facts: Sequence[PortraitFact], journal: Sequence[JournalEntry],
-        activity: str, part: tuple[int, int],
+        activity: str, part: tuple[int, int], episodes: Sequence[EpisodeRecord] = (), time_use: str = "",
     ) -> str:
         nonce = str(uuid.uuid4()).upper()
         begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
@@ -494,9 +578,15 @@ class PortraitWorker:
             "refresh": "the journal since the last portrait run (requested now)",
         }.get(kind, kind)
         part_note = f" This is part {part[0]} of {part[1]} of that journal." if part[1] > 1 else ""
+        if part[1] > 1 and part[0] > 1:
+            part_note += " EPISODES and TIME USE were given with part 1."
+        episode_lines = [self._episode_line(e, safe) for e in episodes]
         data = "\n".join(
             ["CURRENT FACTS:", *fact_lines, "", f"JOURNAL ({len(journal)} entries, oldest first):",
-             *(journal_lines or ["(no new entries)"]), "", "ACTIVITY:", safe(activity, 8000)]
+             *(journal_lines or ["(no new entries)"]), "",
+             f"EPISODES ({len(episodes)}, oldest first):", *(episode_lines or ["(none)"]), "",
+             "TIME USE:", safe(time_use, 12000) or "(none)", "",
+             "ACTIVITY:", safe(activity, 8000)]
         )
         try:
             learned = self.store.me_names()
@@ -528,11 +618,13 @@ class PortraitWorker:
     # -- validation --------------------------------------------------------
 
     def _validate(
-        self, items: list[Any], facts: Sequence[PortraitFact], journal: Sequence[JournalEntry], now: float
+        self, items: list[Any], facts: Sequence[PortraitFact], journal: Sequence[JournalEntry], now: float,
+        episodes: Sequence[EpisodeRecord] = (),
     ) -> tuple[list[FactChange], list[OpOutcome]]:
         """Turn raw tool operations into store changes; rejected ones are kept with the reason."""
         current = {f.id: f for f in facts}
         journal_at = {j.id: j.at for j in journal}
+        episode_at = {e.id: e.started_at for e in episodes}
         touched: set[int] = set()
         changes: list[FactChange] = []
         outcomes: list[OpOutcome] = []
@@ -547,18 +639,21 @@ class PortraitWorker:
             fact_id = item.get("fact_id")
             fact_id = int(fact_id) if isinstance(fact_id, (int, float)) and not isinstance(fact_id, bool) else None
             cited = [int(i) for i in item.get("journal_ids") or [] if isinstance(i, int)]
+            cited_episodes = [int(i) for i in item.get("episode_ids") or [] if isinstance(i, int)]
             based = [int(i) for i in item.get("based_on_facts") or [] if isinstance(i, int)]
             out = OpOutcome(
                 op=str(item.get("op") or ""), fact_id=fact_id, kind=str(item.get("kind") or ""),
                 subject=str(item.get("subject") or "").strip(), text=str(item.get("text") or "").strip(),
                 confidence=confidence, journal_ids=cited, based_on_facts=based,
-                reason=str(item.get("reason") or "").strip(),
+                reason=str(item.get("reason") or "").strip(), episode_ids=cited_episodes,
             )
             outcomes.append(out)
             known = [i for i in cited if i in journal_at]
+            known_episodes = [i for i in cited_episodes if i in episode_at]
             corrections = [i for i in based if i in current and current[i].kind == CORRECTION_KIND]
-            evidence_at = [journal_at[i] for i in known]
+            evidence_at = [journal_at[i] for i in known] + [episode_at[i] for i in known_episodes]
             latest_evidence = max(evidence_at) if evidence_at else None
+            evidenced = bool(known or known_episodes or corrections)
 
             def reject(why: str) -> None:
                 out.status = f"rejected: {why}"
@@ -570,14 +665,14 @@ class PortraitWorker:
                 if not out.text or out.kind not in PORTRAIT_KINDS:
                     reject("ADD needs a text and a known kind")
                     continue
-                if not known and not corrections:
-                    reject("cites no journal entry or correction from this request")
+                if not evidenced:
+                    reject("cites no journal entry, episode or correction from this request")
                     continue
                 at = min(evidence_at) if evidence_at else now
                 origin = "user" if corrections else "model"
                 changes.append(FactChange(
                     "ADD", None, out.kind, out.subject, out.text, 1.0 if corrections else confidence, known, at,
-                    origin, corrections,
+                    origin, corrections, episode_ids=known_episodes,
                 ))
                 continue
             target = current.get(fact_id) if fact_id is not None else None
@@ -594,8 +689,8 @@ class PortraitWorker:
                 out.status = "noop"
                 touched.add(fact_id)
                 continue
-            if not known and not corrections:
-                reject("cites no journal entry or correction from this request")
+            if not evidenced:
+                reject("cites no journal entry, episode or correction from this request")
                 continue
             if target.origin == "user":
                 newer_correction = any(current[c].valid_from > target.valid_from for c in corrections)
@@ -611,12 +706,13 @@ class PortraitWorker:
                 changes.append(FactChange(
                     "UPDATE", fact_id, kind, out.subject or target.subject, out.text,
                     1.0 if corrections else confidence, known, latest_evidence or now,
-                    "user" if corrections else "model", corrections,
+                    "user" if corrections else "model", corrections, episode_ids=known_episodes,
                 ))
             else:
                 changes.append(FactChange(
                     "INVALIDATE", fact_id, target.kind, target.subject, "", None, known,
                     latest_evidence or now, "user" if corrections else "model", corrections,
+                    episode_ids=known_episodes,
                 ))
             touched.add(fact_id)
         return changes, outcomes
@@ -659,12 +755,18 @@ class PortraitWorker:
                 stats.since_journal_id = journal[0].id
                 stats.until_journal_id = max(j.id for j in journal)
             pending_corrections = self.store.portrait_facts([CORRECTION_KIND])
-            chunks = self._chunks(journal) or ([[]] if pending_corrections else [])
+            episodes = self.episodes_for(kind, now)
+            chunks = self._chunks(journal) or ([[]] if (pending_corrections or episodes) else [])
             activity = self.activity_text(now) if chunks else ""
+            time_use = self.time_use_text(kind, now) if chunks else ""
+            self._log("portrait_inputs", run_id=run_id, journal_facts=len(journal), episodes=len(episodes),
+                      time_use_chars=len(time_use), chunks=len(chunks))
             for number, chunk in enumerate(chunks, start=1):
                 facts = self.store.portrait_facts()
+                part_episodes = episodes if number == 1 else []
                 user = self._ops_message(kind=kind, now=now, facts=facts, journal=chunk, activity=activity,
-                                         part=(number, len(chunks)))
+                                         part=(number, len(chunks)), episodes=part_episodes,
+                                         time_use=time_use if number == 1 else "")
                 tool_input = self._call(
                     purpose="operations", run_id=run_id, system=OPS_SYSTEM_PROMPT, user=user,
                     tool=UPDATE_PORTRAIT_TOOL, effort=self.effort, max_tokens=OPS_MAX_TOKENS, stats=stats,
@@ -672,7 +774,7 @@ class PortraitWorker:
                 items = tool_input.get("operations")
                 if not isinstance(items, list):
                     raise _ModelError("update_portrait input has no operations list")
-                changes, outcomes = self._validate(items, facts, chunk, now)
+                changes, outcomes = self._validate(items, facts, chunk, now, part_episodes)
                 written = iter(self.store.commit_portrait_changes(
                     run_id, changes, until_journal_id=max((j.id for j in chunk), default=None)
                 ))

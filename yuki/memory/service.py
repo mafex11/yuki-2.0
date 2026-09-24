@@ -1,7 +1,8 @@
 """``yuki-memory``: the background memory process (docs/MEMORY.md, "Processes").
 
-Runs the watcher (:mod:`yuki.memory.watcher`), the journal worker
-(:mod:`yuki.memory.journal`) and the portrait scheduler
+Runs the watcher (:mod:`yuki.memory.watcher`), the timeline recorder
+(:mod:`yuki.memory.timeline`), the journal worker (:mod:`yuki.memory.journal`),
+the episode worker (:mod:`yuki.memory.episodes`) and the portrait scheduler
 (:mod:`yuki.memory.portrait`) against one shared :class:`~yuki.memory.store.Store`
 (the journal worker waits on the store's own "new capture" condition, which only
 fires within one Store instance).  It is its own process so that nothing here
@@ -12,7 +13,8 @@ Flag files next to the database (written by Yuki through
 :class:`yuki.memory.api.MemoryClient`), checked about once a second:
 
 * ``paused`` - while it exists the watcher captures nothing (one ``paused``
-  event) and no scheduled portrait run starts.
+  event), the timeline records nothing, and no scheduled portrait or episode
+  run starts.
 * ``refresh_portrait`` - wakes the portrait scheduler, which deletes it and
   rebuilds the portrait now.
 
@@ -29,7 +31,8 @@ Usage::
     uv run yuki-memory                     # the real store, journal on
     uv run yuki-memory --verbose           # one console line per capture
     uv run yuki-memory --db %TEMP%\\m\\memory.db --no-journal --duration 90
-    uv run yuki-memory --no-portrait        # watcher + journal only
+    uv run yuki-memory --no-portrait        # watcher + journal only (timeline and episodes still run)
+    uv run yuki-memory --no-timeline        # no foreground timeline (and so no episodes)
 """
 
 from __future__ import annotations
@@ -197,6 +200,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--privacy", type=Path, default=None, help="privacy rules file (default: %%LOCALAPPDATA%%\\Yuki\\memory\\privacy.toml)")
     parser.add_argument("--no-journal", action="store_true", help="capture only; no journal worker, no portrait")
     parser.add_argument("--no-portrait", action="store_true", help="do not run the portrait scheduler")
+    parser.add_argument("--no-timeline", action="store_true", help="do not record the foreground timeline")
+    parser.add_argument("--no-episodes", action="store_true", help="do not write episodes from the timeline")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -224,6 +229,9 @@ def run(args: argparse.Namespace) -> int:
     journal_thread: threading.Thread | None = None
     portrait = None
     portrait_thread: threading.Thread | None = None
+    timeline = None
+    episodes = None
+    episodes_thread: threading.Thread | None = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     store = None
@@ -239,6 +247,8 @@ def run(args: argparse.Namespace) -> int:
             privacy_error=privacy.last_error,
             journal=not args.no_journal,
             portrait=not (args.no_journal or args.no_portrait),
+            timeline=not args.no_timeline,
+            episodes=not (args.no_journal or args.no_timeline or args.no_episodes),
             duration_s=args.duration,
         )
         try:
@@ -260,6 +270,17 @@ def run(args: argparse.Namespace) -> int:
             watcher.set_paused(True)  # before start: nothing is read, not even the first window
         log("pause_flag", paused=paused, at_start=True)
         watcher.start()
+
+        if not args.no_timeline:
+            try:
+                from yuki.memory.timeline import TimelineRecorder
+
+                timeline = TimelineRecorder(store, privacy=privacy, log=log)
+                timeline.set_paused(paused)  # before start: nothing is recorded, not even the first window
+                timeline.start()
+            except Exception as exc:  # capture and journal run on without it
+                log("error", where="timeline_start", error=f"{type(exc).__name__}: {exc}")
+                timeline = None
 
         if not args.no_journal:
             try:
@@ -291,6 +312,20 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="portrait_start", error=f"{type(exc).__name__}: {exc}")
                 portrait = None
 
+        if timeline is not None and not (args.no_journal or args.no_episodes):
+            try:
+                from yuki.memory.episodes import EpisodeWorker
+
+                episodes = EpisodeWorker(store, log=log)
+                episodes_thread = threading.Thread(
+                    target=_guarded(episodes.run, log, "episodes"), args=(stop, pause_path),
+                    name="yuki-memory-episodes", daemon=True,
+                )
+                episodes_thread.start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="episodes_start", error=f"{type(exc).__name__}: {exc}")
+                episodes = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
@@ -310,10 +345,15 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="watcher", error="hook thread exited")
                 code = 2
                 break
+            if timeline is not None and not timeline.alive:
+                log("error", where="timeline", error="timeline thread exited")  # not fatal
+                timeline = None
             now_paused = pause_path.exists()
             if now_paused != paused:
                 paused = now_paused
                 watcher.set_paused(paused)
+                if timeline is not None:
+                    timeline.set_paused(paused)
                 log("pause_flag", paused=paused)
             if portrait is not None and refresh_path.exists():
                 portrait.wake()
@@ -322,7 +362,8 @@ def run(args: argparse.Namespace) -> int:
                 log("privacy_config", error=privacy_error, reloads=privacy.reloads)
             if now >= next_stats:
                 next_stats = now + args.stats_every
-                log("stats", **meter.reading(), watcher=watcher.stats())
+                log("stats", **meter.reading(), watcher=watcher.stats(),
+                    timeline=timeline.stats() if timeline is not None else None)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
@@ -345,14 +386,21 @@ def run(args: argparse.Namespace) -> int:
                 pass
         if portrait is not None:
             portrait.wake()
+        if episodes is not None:
+            episodes.stop()
         if watcher is not None:
             watcher.stop()
+        if timeline is not None:
+            timeline.stop()  # writes the open stretch first
         if journal_thread is not None:
             journal_thread.join(10.0)
+        if episodes_thread is not None:
+            episodes_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         if portrait_thread is not None:
             portrait_thread.join(10.0)  # a run mid-call is abandoned (daemon); its row stays "running"
         totals = meter.reading(since_start=True)
-        log("service_stop", **totals, watcher=watcher.stats() if watcher else None, exit_code=code)
+        log("service_stop", **totals, watcher=watcher.stats() if watcher else None,
+            timeline=timeline.stats() if timeline is not None else None, exit_code=code)
         if store is not None:
             try:
                 store.close()
