@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import queue
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -53,6 +54,7 @@ from yuki.log.events import (
     AskUser,
     ErrorEvent,
     Final,
+    Say,
     SessionLogger,
     Thinking,
     ToolCall,
@@ -141,6 +143,8 @@ class Job:
     #: The window that was in front before the overlay took the keyboard, so the
     #: agent knows where the user was (the overlay itself is in front by then).
     origin_hwnd: int | None = None
+    #: Where the request came from: ``text`` (typed) or ``voice``. Logged only.
+    source: str = "text"
 
 
 class Lane(QThread):
@@ -172,6 +176,14 @@ class Lane(QThread):
         self.blocked = blocked
         self._jobs: queue.Queue[Job | None] = queue.Queue()
         self._answers: queue.Queue[str | None] = queue.Queue()
+        #: The job being driven now, and the ids still waiting in the queue
+        #: (in order), for per-job cancel and steering. Guarded by ``_state``:
+        #: the lane thread and the GUI thread both touch them.
+        self._state = threading.Lock()
+        self._current: Job | None = None
+        self._waiting: list[int] = []
+        #: Queued ids cancelled before they started: skipped when dequeued.
+        self._skip: set[int] = set()
 
     @property
     def allowed_tools(self) -> tuple[str, ...] | None:
@@ -182,8 +194,46 @@ class Lane(QThread):
 
     def enqueue(self, job: Job) -> int:
         """Add a job to this lane's FIFO and return how many are now waiting."""
+        with self._state:
+            self._waiting.append(job.id)
         self._jobs.put(job)
         return self._jobs.qsize()
+
+    @property
+    def current_id(self) -> int | None:
+        """The id of the job being driven now, or ``None``."""
+        with self._state:
+            return self._current.id if self._current is not None else None
+
+    def waiting_ids(self) -> list[int]:
+        """Ids waiting in this lane's queue, oldest first (cancelled ones left out)."""
+        with self._state:
+            return [i for i in self._waiting if i not in self._skip]
+
+    def cancel_job(self, job_id: int) -> str:
+        """Cancel one job: the running one, or a queued one before it starts.
+
+        Returns:
+            ``running`` (cancel sent to the agent), ``queued`` (it will be
+            skipped when its turn comes), or ``unknown`` (not on this lane).
+        """
+        with self._state:
+            running = self._current is not None and self._current.id == job_id
+            queued = job_id in self._waiting and job_id not in self._skip
+            if queued and not running:
+                self._skip.add(job_id)
+        if running:
+            self.cancel()
+            return "running"
+        return "queued" if queued else "unknown"
+
+    def steer_job(self, job_id: int, text: str) -> bool:
+        """Hand ``text`` to the running job's agent (:meth:`Agent.steer`); ``False`` if it is not running."""
+        with self._state:
+            running = self._current is not None and self._current.id == job_id
+        if running:
+            self.agent.steer(text)
+        return running
 
     def answer(self, text: str) -> None:
         """Hand the user's answer to a paused request."""
@@ -212,6 +262,18 @@ class Lane(QThread):
             job = self._jobs.get()
             if job is None:
                 return
+            with self._state:
+                if job.id in self._waiting:
+                    self._waiting.remove(job.id)
+                skipped = job.id in self._skip
+                self._skip.discard(job.id)
+                self._current = None if skipped else job
+            if skipped:
+                # Cancelled while it waited: it never reaches the agent, so a
+                # cancel meant for it cannot land on the next request instead.
+                self.runtime.failed.emit(self.name, job.id, "Cancelled before it started.")
+                self.runtime.lane_done.emit(self.name, job.id, job.request, False, [])
+                continue
             reached_for_hands: list[str] = []
             try:
                 reached_for_hands = self._drive(job)
@@ -221,7 +283,14 @@ class Lane(QThread):
                 summary = self.agent.last_summary
                 if summary is not None:
                     self.runtime.summarized.emit(self.name, job.id, dict(summary))
+                late = self.agent.take_steers()
+                if late:
+                    # Said after the request's last step: the caller decides what
+                    # to do with it (voice passes it on as a new request).
+                    self.runtime.steer_unread.emit(self.name, job.id, late)
             finally:
+                with self._state:
+                    self._current = None
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
                 )
@@ -267,6 +336,8 @@ class Lane(QThread):
                     self.agent.answer("(the user cancelled instead of answering)")
                 else:
                     self.agent.answer(answer)
+            elif isinstance(event, Say):
+                runtime.said.emit(self.name, job.id, event.text)
             elif isinstance(event, Final):
                 runtime.finished.emit(self.name, job.id, event.text)
             elif isinstance(event, ErrorEvent):
@@ -320,6 +391,11 @@ class AgentRuntime(QObject):
             (time, steps, tokens, estimated cost), right after finished/failed.
         lane_done: ``(lane, id, request, needed_hands, refused_tools)`` -- the lane
             is free again.
+        said: ``(lane, id, text)`` -- a progress line from the agent's ``say``.
+        handed_off: ``(front-desk id, worker id, waiting)`` -- a front-desk request
+            that needed hands went to the worker's queue under a new id.
+        steer_unread: ``(lane, id, texts)`` -- things the user added to a request
+            (:meth:`steer`) that arrived after its last step.
     """
 
     started = Signal(str, int, str)
@@ -332,6 +408,9 @@ class AgentRuntime(QObject):
     queued = Signal(int, str, int)
     summarized = Signal(str, int, dict)
     lane_done = Signal(str, int, str, bool, list)
+    said = Signal(str, int, str)
+    handed_off = Signal(int, int, int)
+    steer_unread = Signal(str, int, list)
 
     def __init__(
         self,
@@ -416,7 +495,9 @@ class AgentRuntime(QObject):
         """True while the worker has a request in hand or waiting."""
         return bool(self._worker_outstanding)
 
-    def submit(self, request: str, *, origin_hwnd: int | None = None) -> tuple[str, int]:
+    def submit(
+        self, request: str, *, origin_hwnd: int | None = None, source: str = "text"
+    ) -> tuple[str, int]:
         """Route one request to a lane.
 
         The worker takes it whenever the worker is free. Otherwise the front desk
@@ -426,7 +507,8 @@ class AgentRuntime(QObject):
         what the request says.
 
         Args:
-            request: What the user typed.
+            request: What the user typed (or said, for ``source="voice"``).
+            source: ``text`` or ``voice``; logged, never routed on.
 
         Returns:
             ``(lane name, request id)``.
@@ -435,10 +517,10 @@ class AgentRuntime(QObject):
         lane = self.worker if not self.worker_busy else self.front_desk
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
-        waiting = lane.enqueue(Job(request_id, request, origin_hwnd))
+        waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
-            origin_hwnd=origin_hwnd,
+            origin_hwnd=origin_hwnd, source=source,
         )
         return lane.name, request_id
 
@@ -475,6 +557,34 @@ class AgentRuntime(QObject):
         """Cancel whatever the worker is doing."""
         self.ui_log.event("cancel", lane=WORKER, outstanding=len(self._worker_outstanding))
         self.worker.cancel()
+
+    def cancel(self, request_id: int) -> str:
+        """Cancel one request by id, running or still queued, on whichever lane has it.
+
+        Returns:
+            ``running``, ``queued`` or ``unknown`` (see :meth:`Lane.cancel_job`).
+        """
+        how = "unknown"
+        for lane in (self.worker, self.front_desk):
+            how = lane.cancel_job(request_id)
+            if how != "unknown":
+                break
+        self.ui_log.event("cancel", id=request_id, how=how)
+        return how
+
+    def steer(self, request_id: int, text: str) -> bool:
+        """Pass something the user added to a running request (:meth:`Agent.steer`).
+
+        Returns:
+            ``False`` when that request is not running (finished, or still queued).
+        """
+        ok = any(lane.steer_job(request_id, text) for lane in (self.worker, self.front_desk))
+        self.ui_log.event("steer", id=request_id, delivered=ok, text=text)
+        return ok
+
+    def running_ids(self) -> dict[str, int | None]:
+        """``lane -> id`` of the request each lane is driving now."""
+        return {lane.name: lane.current_id for lane in (self.worker, self.front_desk)}
 
     def lane(self, name: str) -> Lane:
         """The lane object for a lane name."""
@@ -531,4 +641,5 @@ class AgentRuntime(QObject):
             return
         if needed_hands:
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
-            self.queue_for_worker(request, origin_id=request_id)
+            new_id = self.queue_for_worker(request, origin_id=request_id)
+            self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))

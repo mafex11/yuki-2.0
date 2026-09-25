@@ -95,7 +95,20 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
         "cache_write": 1.25,
         "cache_read": 0.10,
     },
+    # The same model through the global inference profile: the voice mouth
+    # (yuki.voice), measured faster from India than ``us.`` (docs/VOICE.md §14).
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input": 1.00,
+        "output": 5.00,
+        "cache_write": 1.25,
+        "cache_read": 0.10,
+    },
 }
+
+#: The voice mouth (docs/VOICE.md §5). Claude Haiku 4.5 is Active on Bedrock with
+#: an end-of-life "no sooner than 2026-10-16" and no Haiku successor listed
+#: (checked 2026-09-25), so this is a setting, not a constant in code.
+DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 @dataclass
@@ -156,6 +169,44 @@ class Settings:
             capture marks messages from these senders as the user's, and the
             journal is told these names are the user (plus the names the
             watcher learns on screen, e.g. "Kian (you)").
+
+    Voice (``voice_*``, docs/VOICE.md §15). None of it costs anything until
+    voice is turned on from the tray or its hotkey, or the wake word is:
+        voice_hotkey: Global combo that starts or ends a voice conversation
+            (``YUKI_VOICE_HOTKEY`` overrides it).
+        voice_wake: Listen for "Yuki" locally and start a conversation on it.
+            Off by default; the tray's "Listen for 'Yuki'" switch changes it
+            and remembers the choice (``%LOCALAPPDATA%\\Yuki\\voice.json``).
+        voice_wake_during_calls: Keep listening for "Yuki" while a call or a
+            meeting is on (off: saying the name to friends does nothing).
+        voice_wake_threshold: The keyword spotter's trigger threshold (higher
+            = fewer false wakes, more misses); measured in docs/VOICE.md §22.
+        voice_wake_boost: The spotter's boosting score for the keyword.
+        voice_idle_s: Quiet seconds (nobody speaking, no result owed) that
+            end a conversation.
+        voice_hold_max_s: Longest a quiet conversation stays open waiting to
+            speak a running task's result; past it the result lands as a card.
+        voice_input_device: Microphone (name, or part of it). ``None``: the
+            Windows default communications input.
+        voice_output_device: Output device name. ``None``: the default output.
+        voice_require_headphones: Refuse to start a conversation while the
+            sound comes out of speakers (no echo canceller yet, §11).
+        voice_headphone_devices: Outputs to count as headphones although
+            Windows calls them something else ("Speakers" on an interface).
+        voice_stt_model / voice_stt_languages: Deepgram Flux model and the
+            language hints it is given.
+        voice_eot_threshold / voice_eager_eot_threshold / voice_eot_timeout_ms:
+            Flux's end-of-turn settings (eager off: ``None``).
+        voice_mouth_model: Bedrock model id of the fast mouth.
+        voice_mouth_max_tokens: Output ceiling for one spoken reply.
+        voice_tts_provider: ``elevenlabs`` or ``deepgram`` (Aura-2, English only).
+        voice_tts_model / voice_tts_voice: The provider's model and voice id
+            (empty: the provider's default in :mod:`yuki.voice.pipeline`).
+        voice_tts_fallback: Provider used when the main one cannot speak (its
+            key is missing or lacks permission); ``""`` = no fallback, voice
+            then refuses to start and says why.
+        voice_usd_per_stt_min / voice_usd_per_1k_tts_chars: List prices for the
+            cost estimate in the voice log (estimates only; nothing decides on them).
     """
 
     model: str = DEFAULT_MODEL
@@ -177,6 +228,32 @@ class Settings:
     )
     requests_csv: Path = Path("logs/requests.csv")
     user_names: list[str] = field(default_factory=lambda: ["Kian", "Mafex", "mafex11"])
+    voice_hotkey: str = "ctrl+alt+y"
+    voice_wake: bool = False
+    voice_wake_during_calls: bool = False
+    voice_wake_threshold: float = 0.25
+    voice_wake_boost: float = 2.0
+    voice_idle_s: float = 20.0
+    voice_hold_max_s: float = 600.0
+    voice_input_device: str | None = None
+    voice_output_device: str | None = None
+    voice_require_headphones: bool = True
+    voice_headphone_devices: tuple[str, ...] = ()
+    voice_stt_model: str = "flux-general-multi"
+    voice_stt_languages: tuple[str, ...] = ("en", "hi")
+    voice_eot_threshold: float = 0.7
+    voice_eager_eot_threshold: float | None = None
+    voice_eot_timeout_ms: int = 5000
+    voice_mouth_model: str = DEFAULT_VOICE_MOUTH_MODEL
+    voice_mouth_max_tokens: int = 400
+    voice_tts_provider: str = "elevenlabs"
+    voice_tts_model: str = "eleven_flash_v2_5"
+    voice_tts_voice: str = ""
+    voice_tts_fallback: str = "deepgram"
+    voice_usd_per_stt_min: float = 0.0078
+    voice_usd_per_1k_tts_chars: dict[str, float] = field(
+        default_factory=lambda: {"elevenlabs": 0.05, "deepgram": 0.030}
+    )
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)
@@ -187,6 +264,11 @@ class Settings:
         """Absolute directory for session logs."""
         log_dir = Path(self.log_dir)
         return log_dir if log_dir.is_absolute() else self.project_root / log_dir
+
+    @property
+    def voice_log_dir(self) -> Path:
+        """Absolute directory of the content-free voice logs (``logs/voice``)."""
+        return self.sessions_dir.parent / "voice"
 
     @property
     def requests_csv_path(self) -> Path:

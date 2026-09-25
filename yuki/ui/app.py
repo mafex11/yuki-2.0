@@ -48,6 +48,8 @@ from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_summary, describe_tool
 from yuki.ui.uilog import UiLog
+from yuki.voice.indicator import VoicePill
+from yuki.voice.session import VoiceSession
 
 #: The effort levels offered in the tray menu (all five stay reachable from the
 #: CLI's ``/effort``); a level outside these simply shows nothing ticked.
@@ -198,6 +200,13 @@ class YukiUi(QObject):
         self.hotkeys.failed.connect(
             lambda action, reason: self.ui_log.event("hotkey_failed", action=action, reason=reason)
         )
+        #: Voice (docs/VOICE.md): nothing runs until the tray, the hotkey or the
+        #: wake word (if the user turned it on) starts it.
+        self.voice = VoiceSession(settings, self.runtime, self.runtime.memory, ui_log)
+        self.voice_pill = VoicePill()
+        self.voice.state_changed.connect(self._on_voice_state)
+        self.calls.changed.connect(self.voice.on_call_status)
+        runtime_signals.said.connect(self._on_said)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -214,6 +223,7 @@ class YukiUi(QObject):
         self._memory_watchdog.start()
         self.nudges.start()
         self.calls.start()
+        self.voice.start()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -228,6 +238,8 @@ class YukiUi(QObject):
         lifetime, and keeps remembering while Yuki is closed.
         """
         self.ui_log.event("stop")
+        self.voice.shutdown()
+        self.voice_pill.hide()
         self.nudges.stop()
         self.calls.stop()
         self.hotkeys.stop()
@@ -245,6 +257,10 @@ class YukiUi(QObject):
         self.ui_log.event("hotkey", action=action)
         if action == "cancel":
             self.runtime.cancel_worker()
+            self.voice.interrupt()
+            return
+        if action == "voice":
+            self.voice.toggle_conversation("hotkey")
             return
         self.overlay.toggle()
         if self.overlay.isVisible() and not self.overlay.closing:
@@ -372,6 +388,12 @@ class YukiUi(QObject):
     def _on_asked(self, lane_name: str, request_id: int, question: str) -> None:
         """A lane needs an answer: bring the overlay back with the question."""
         self.ui_log.event("ask_user", id=request_id, lane=lane_name, question=question)
+        if self.voice.owns(request_id):
+            # Asked by voice: the voice says it and hears the answer. The strip
+            # shows it without taking focus, and an answer typed later still works.
+            self._question = (lane_name, request_id)
+            self.strip.show_step(question)
+            return
         self.strip.dismiss()
         self._question = (lane_name, request_id)
         card = self.cards.get(request_id)
@@ -380,6 +402,17 @@ class YukiUi(QObject):
         else:
             card.set_body(question, tone="question")
         self.overlay.open()
+
+    def _on_said(self, lane_name: str, request_id: int, text: str) -> None:
+        """A progress line from the brain's ``say``: the strip shows it while the worker has the screen."""
+        if lane_name == WORKER and request_id in self._acting:
+            self.strip.show_step(text)
+
+    def _on_voice_state(self, state: str, detail: str) -> None:
+        """Voice changed state (listening, speaking, ...): the pill shows it."""
+        self.voice_pill.show_state(state, detail)
+        if state in ("error", "off", "starting"):
+            self.ui_log.event("voice", state=state, detail=detail)
 
     def _on_finished(self, lane_name: str, request_id: int, text: str) -> None:
         self._settle(lane_name, request_id, text, tone="reply")
@@ -717,6 +750,24 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     show = QAction("Show", menu)
     show.triggered.connect(ui.show_overlay)
     menu.addAction(show)
+
+    # Voice: a conversation now (headphones on), and the wake word (remembered).
+    voice_item = QAction(f"Voice ({ui.bindings.get('voice') or 'no hotkey'}, headphones)", menu, checkable=True)
+    voice_item.triggered.connect(
+        lambda checked: ui.voice.start_conversation("tray") if checked else ui.voice.stop_conversation("tray")
+    )
+
+    def show_voice(on: bool) -> None:
+        voice_item.blockSignals(True)
+        voice_item.setChecked(bool(on))
+        voice_item.blockSignals(False)
+
+    ui.voice.conversation_changed.connect(show_voice)
+    menu.addAction(voice_item)
+    wake_item = QAction("Listen for \u2018Yuki\u2019", menu, checkable=True)
+    wake_item.setChecked(ui.voice.wake_enabled)
+    wake_item.triggered.connect(lambda checked: ui.voice.set_wake(bool(checked)))
+    menu.addAction(wake_item)
 
     # Model and effort: one checkable item per choice, the current one ticked.
     # Both go through the runtime, so both lanes switch and each agent logs it.

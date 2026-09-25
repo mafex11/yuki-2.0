@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -64,6 +65,7 @@ from yuki.log.events import (
     AskUser,
     ErrorEvent,
     Final,
+    Say,
     SessionLogger,
     Thinking,
     ToolCall,
@@ -93,10 +95,14 @@ _UNSAFE_STOPS: frozenset[str] = frozenset({"max_tokens", "refusal"})
 #: Tools that are not "actions taken" for the turn log and the collapsed form
 #: of a request: looks change nothing, and ``done`` / ``note_to_self`` are the
 #: reply and the working note. Plumbing for a summary line, not behaviour.
-_NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self"}
+_NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self", "say"}
 
 #: Longest one-line action summary kept for memory and the collapsed request.
 _ACTION_LINE_CHARS = 160
+
+#: How a correction the user added mid-task reaches the model (:meth:`Agent.steer`):
+#: framed as theirs, so it reads as the user's words and not as a tool's output.
+STEER_LABEL = "[The user added while you were working]"
 
 
 @dataclass
@@ -227,6 +233,9 @@ class Agent:
         self._client = client
         self._client_lock = threading.Lock()
         self._cancelled = threading.Event()
+        #: Corrections and additions the user made while a request runs
+        #: (:meth:`steer`), drained at the next step boundary.
+        self._steers: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._pending_answer: str | None = None
         self._awaiting_answer = False
         self._prewarm_thread: threading.Thread | None = None
@@ -470,6 +479,37 @@ class Agent:
             raise RuntimeError("Agent is not waiting for an answer")
         self._pending_answer = text
 
+    def steer(self, text: str) -> None:
+        """Add something the user said while this request runs. Safe from any thread.
+
+        It is not an answer to a question (that is :meth:`answer`) and it does
+        not interrupt anything: the text waits in an inbox and goes into the
+        next message to the model, after the results of the tools running now,
+        as the user's words. A request about to finish takes one more step
+        when the inbox is not empty, so a correction made during the last model
+        call is not dropped. Logged as ``steer``.
+        """
+        text = (text or "").strip()
+        if text:
+            self._steers.put(text)
+
+    def take_steers(self) -> list[str]:
+        """Everything in the steering inbox, emptying it (what arrived too late for a request)."""
+        out: list[str] = []
+        while True:
+            try:
+                out.append(self._steers.get_nowait())
+            except queue.Empty:
+                return out
+
+    def _steer_blocks(self) -> list[dict[str, Any]]:
+        """The inbox as text blocks for the next message (empty when nothing arrived)."""
+        texts = self.take_steers()
+        if not texts:
+            return []
+        self.logger.log("steer", texts=texts, count=len(texts))
+        return [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
+
     def cancel(self) -> None:
         """Ask the run to stop. Safe to call from any thread, at any time.
 
@@ -516,6 +556,7 @@ class Agent:
             :class:`~yuki.log.events.Final` or :class:`~yuki.log.events.ErrorEvent`.
         """
         self._cancelled.clear()
+        stale = self.take_steers()
         self._pending_answer = None
         self._awaiting_answer = False
         self._request_started = time.monotonic()
@@ -533,6 +574,10 @@ class Agent:
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.user_message(request)
+        if stale:
+            # Added after the previous request's last step: the caller hears of
+            # it through take_steers() at the end of a request, so this is rare.
+            self.logger.log("steer", texts=stale, count=len(stale), dropped="arrived between requests")
         # How the request ended, for the summary. "abandoned" survives only when
         # the caller stopped iterating before a final or an error arrived.
         outcome = "abandoned"
@@ -835,6 +880,14 @@ class Agent:
             stop_reason = getattr(response, "stop_reason", None)
             tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
 
+            # Cancelled while the model was answering: a reply with no tool call
+            # would otherwise be delivered as the final word after a stop.
+            # (Tool calls are refused one by one in _run_one and the loop ends
+            # at the next step's check.)
+            if self._cancelled.is_set() and not tool_uses:
+                yield self._cancel_event()
+                return
+
             if stop_reason == "refusal":
                 details = getattr(response, "stop_details", None)
                 message = "The model declined this request"
@@ -866,10 +919,20 @@ class Agent:
                 if stop_reason == "max_tokens":
                     self._skip_truncated(response, turn)
                 blocks, names = yield from self._run_tools(tool_uses, turn)
+                steers = self._steer_blocks()
+                if turn.finished and steers:
+                    # The user added something before the closing message went
+                    # out: it is not sent, and the model takes one more step.
+                    steers.insert(0, {"type": "text", "text": (
+                        "Your done message was not sent: the user added this before it went "
+                        "out. Take it into account, then finish with a new done."
+                    )})
+                    self.logger.log("steer", held_final=turn.finished[0])
+                    turn.finished.clear()
                 view = None if turn.finished else self._auto_view(turn)
                 overview, facts = self._capture_overview()
                 self.context.add_tool_results(
-                    blocks, overview, tool_names=names, self_facts=facts, window_view=view
+                    blocks + steers, overview, tool_names=names, self_facts=facts, window_view=view
                 )
                 if turn.finished:
                     self.logger.final(turn.finished[0])
@@ -885,6 +948,17 @@ class Agent:
             text = "\n".join(
                 getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text"
             ).strip()
+            steers = self._steer_blocks()
+            if steers:
+                # Same as a held done: the user added something while this reply
+                # was being written, so it is not the last word yet.
+                self.logger.log("steer", held_final=text)
+                self.context.add_note(
+                    "Your reply above was not sent: the user added this before it went out. "
+                    "Take it into account, then finish with done.\n"
+                    + "\n".join(block["text"] for block in steers)
+                )
+                continue
             if text:
                 self.logger.final(text)
                 yield Final(text)
@@ -1052,6 +1126,11 @@ class Agent:
 
         if outcome.kind == "done":
             turn.finished.append(outcome.control_input["message"])
+
+        if outcome.kind == "say":
+            # A progress line for the user; the run does not pause for it.
+            self.logger.log("say", text=outcome.control_input["text"], tool_use_id=tool_id)
+            yield Say(outcome.control_input["text"])
 
         # What the view after this turn's actions should show, and whether an
         # explicit read after the last action already shows it.

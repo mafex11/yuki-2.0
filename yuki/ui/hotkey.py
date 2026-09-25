@@ -124,11 +124,13 @@ _VK_NAMES: dict[str, int] = {
 }
 
 #: Environment variable that may override each action's combo. The defaults live
-#: in :class:`yuki.config.Settings` (``ui_hotkey`` / ``ui_cancel_hotkey``); these
-#: are the escape hatch for trying a different combo without editing anything.
+#: in :class:`yuki.config.Settings` (``ui_hotkey`` / ``ui_cancel_hotkey`` /
+#: ``voice_hotkey``); these are the escape hatch for trying a different combo
+#: without editing anything.
 HOTKEY_ENV: dict[str, str] = {
     "toggle": "YUKI_HOTKEY",
     "cancel": "YUKI_CANCEL_HOTKEY",
+    "voice": "YUKI_VOICE_HOTKEY",
 }
 
 
@@ -257,7 +259,11 @@ def hotkey_bindings(
         ``action -> combo`` for every action in :data:`HOTKEY_ENV`.
     """
     source = os.environ if env is None else env
-    defaults = {"toggle": settings.ui_hotkey, "cancel": settings.ui_cancel_hotkey}
+    defaults = {
+        "toggle": settings.ui_hotkey,
+        "cancel": settings.ui_cancel_hotkey,
+        "voice": getattr(settings, "voice_hotkey", ""),
+    }
     return {
         action: ((source.get(HOTKEY_ENV[action]) or defaults[action]) or "").strip()
         for action in HOTKEY_ENV

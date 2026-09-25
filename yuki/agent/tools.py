@@ -37,13 +37,14 @@ PERCEPTION_TOOLS: frozenset[str] = frozenset(
 )
 
 #: Tools handled by the agent loop rather than a backend function.
-CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self"})
+CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "say"})
 
 #: Tools backed by Yuki's memory (:mod:`yuki.agent.memory`) rather than the
 #: desktop backend. Left out of the tool block entirely when the memory API is
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
-    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo"}
+    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
+     "answer_question"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -417,6 +418,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "say",
+        "label": "Telling you",
+        "description": (
+            "Tell the user something worth hearing while you keep working: a milestone, a "
+            "finding, or why this is taking a while. They may be listening rather than "
+            "watching (a request that came by voice is spoken back to them), so a line "
+            "here keeps them in the loop without stopping the work. It returns at once. "
+            "Not every step, never a guess about an outcome you have not seen, and never "
+            "the final answer, which goes in done. Their standing rules apply to it."
+        ),
+        "input_schema": _obj(
+            {"text": {"type": "string", "description": "One short sentence, the way you would say it."}},
+            ["text"],
+        ),
+    },
+    {
         "name": "recall",
         "label": "Remembering",
         "description": (
@@ -479,6 +496,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _obj(
             {"text": {"type": "string", "description": "The correction, as the user meant it."}},
             ["text"],
+        ),
+    },
+    {
+        "name": "answer_question",
+        "label": "Noting your answer",
+        "description": (
+            "Save the user's reply to one of your getting-to-know-you questions (a nudge of kind question, "
+            "id question:<n>): their answer in their own words, or that they skipped it or do not want to "
+            "be asked about it. Call it in the turn their reply arrives, alongside done. The answer becomes "
+            "what memory knows, over anything it had inferred."
+        ),
+        "input_schema": _obj(
+            {
+                "question": {"type": "string", "description": "The question's id, e.g. question:12."},
+                "outcome": {
+                    "type": "string",
+                    "enum": ["answered", "skipped", "never"],
+                    "description": "answered; skipped (not now); never (don't ask about this).",
+                },
+                "answer": {
+                    "type": "string",
+                    "description": "answered: the user's own words that answer it, copied exactly from their "
+                    "message. Otherwise empty.",
+                },
+            },
+            ["question", "outcome"],
         ),
     },
     {
@@ -691,9 +734,10 @@ def available_tool_names(
 def resolve_tool_names(names: Iterable[str] | None) -> tuple[str, ...] | None:
     """Validate a requested tool subset and return it in registry order.
 
-    The three control tools are always added: without ``done`` a turn can never
-    end, without ``ask_user`` the agent cannot pause, and without
-    ``note_to_self`` it loses its memory as older context ages out.
+    The control tools are always added: without ``done`` a turn can never
+    end, without ``ask_user`` the agent cannot pause, without
+    ``note_to_self`` it loses its memory as older context ages out, and without
+    ``say`` it cannot keep a listening user in the loop.
 
     Args:
         names: The tools to expose, or ``None`` for all of them.
@@ -973,7 +1017,7 @@ def default_backend() -> Backend:
 # Dispatch results
 # ---------------------------------------------------------------------------
 
-Kind = Literal["normal", "ask_user", "done", "note"]
+Kind = Literal["normal", "ask_user", "done", "note", "say"]
 
 
 @dataclass
@@ -1875,6 +1919,18 @@ class Dispatcher:
             kind="done",
             control_input={"message": message},
             payload={"message": message},
+        )
+
+    def _do_say(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        text = self._need_str(tool_input, "text")
+        return ToolOutcome(
+            name="say",
+            ok=True,
+            summary=text,
+            kind="say",
+            control_input={"text": text},
+            content=[{"type": "text", "text": "Said. Keep going."}],
+            payload={"text": text},
         )
 
     def _do_note_to_self(self, tool_input: dict[str, Any]) -> ToolOutcome:

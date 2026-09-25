@@ -87,7 +87,19 @@ class ErrorEvent:
     kind: Literal["error"] = "error"
 
 
-AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Final | ErrorEvent
+@dataclass(frozen=True)
+class Say:
+    """Something the agent wants the user to hear while it keeps working (the ``say`` tool).
+
+    The run does not pause: it is a progress line, not a question. Voice
+    speaks it through the mouth; text mode shows it in the status strip.
+    """
+
+    text: str
+    kind: Literal["say"] = "say"
+
+
+AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent
 
 #: Every event type name that may appear in a session JSONL file. Anything
 #: :meth:`SessionLogger.log` is called with should be in here, so a reader can
@@ -122,6 +134,9 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "effort_switch",
         # the desktop shell's own decisions (:class:`yuki.ui.uilog.UiLog`)
         "ui",
+        # voice: a progress line the agent said, and a correction the user added mid-task
+        "say",
+        "steer",
     }
 )
 

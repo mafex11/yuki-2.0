@@ -13,11 +13,14 @@ dependencies = [
     "mcp>=2.2.0",
     "numpy>=2.5.3",
     "pillow>=12.3.0",
+    "pipecat-ai[anthropic,deepgram,elevenlabs]==1.11.0",
     "psutil>=7.2.2",
     "pyautogui>=0.9.54",
     "pyside6>=6.11.2",
     "pywin32>=312",
     "rich>=15.0.0",
+    "sherpa-onnx==1.13.8",
+    "sherpa-onnx-core==1.13.8",
     "sounddevice>=0.5.6",
     "uiautomation>=2.0.29",
     "winrt-windows-foundation>=3.2.1",
@@ -44,6 +47,13 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 markers = ["live: makes a real Bedrock API call (costs money); run explicitly"]
 addopts = "-m 'not live'"
+
+[tool.uv]
+# pipecat-ai 1.11 pins onnxruntime~=1.24.3 for its own Silero/Smart Turn helpers,
+# which Yuki's voice layer does not use (Deepgram Flux does turn detection).
+# The memory service already runs onnxruntime 1.30 (Silero VAD, fastembed), and
+# a downgrade under a running service would swap DLLs it has loaded.
+override-dependencies = ["onnxruntime>=1.30.0"]
 
 [tool.uv.build-backend]
 module-root = ""
