@@ -382,12 +382,44 @@ def test_gate_merges_near_results_into_one_turn() -> None:
                 got.append((name, run_llm, stale))
             return d
 
+        state.s["jobs_open"] = 1  # job 2 still running: job 1's result settles for it
         gate.enqueue(Item(job=1, kind="final", deliver=deliver("a")))
         await asyncio.sleep(0.02)
+        state.s["jobs_open"] = 0
         gate.enqueue(Item(job=2, kind="final", deliver=deliver("b")))
         await asyncio.sleep(0.3)
         assert got == [("a", False, False), ("b", True, False)]  # one mouth run for both
         assert gate.stats["turns"] == 1 and gate.stats["merged"] == 1
+        await gate.stop()
+
+    asyncio.run(main())
+
+
+def test_gate_says_a_lone_result_at_once() -> None:
+    """One result, nothing else running: no settle, and only the short gap after Yuki's own speech."""
+    import time as _t
+
+    from yuki.voice.narrator import Item, NarratorGate
+
+    async def main() -> None:
+        state, got = _State(), []
+        gate = NarratorGate(state, settle_s=2.0, settle_max_s=6.0, cooldown_s=2.0, final_gap_s=0.1)
+        gate.start()
+        state.s["last_bot_stop"] = _t.monotonic()
+
+        async def d(run_llm: bool, stale: bool) -> None:
+            got.append(_t.monotonic())
+
+        async def step(run_llm: bool, stale: bool) -> None:
+            got.append("step")
+
+        t0 = _t.monotonic()
+        gate.enqueue(Item(job=1, kind="final", deliver=d))
+        await asyncio.sleep(0.3)
+        assert len(got) == 1 and got[0] - t0 < 0.25  # the gap, not the 2 s cooldown or settle
+        gate.enqueue(Item(job=2, kind="step", deliver=step))
+        await asyncio.sleep(0.3)
+        assert got[1:] == []  # a progress line still settles and waits out the cooldown
         await gate.stop()
 
     asyncio.run(main())
@@ -576,7 +608,8 @@ def test_grounding_takes_life_facts_and_never_waits_long() -> None:
     release = _th.Event()
 
     class FakeClient:
-        def recall(self, query: str, limit: int = 15) -> list[dict]:
+        def recall(self, query: str, limit: int = 15, embed_wait_s: float | None = None) -> list[dict]:
+            assert embed_wait_s is not None and embed_wait_s < 1.0  # never waits for a model load
             if "slow" in query:
                 release.wait(2)
             return [{"kind": "chat", "fact": "The user said: hi", "at": None},
@@ -636,3 +669,179 @@ def test_mouth_memory_does_not_embed() -> None:
 
     fetch_memory(Mem())
     assert seen["query"] == ""  # a query would load the ~600 MB embedder for know-how the mouth never reads
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-25 live-test fixes
+# ---------------------------------------------------------------------------
+
+
+def test_action_marked_as_finishing_ends_the_request_in_one_call(tmp_path: Path) -> None:
+    from yuki.agent.tools import FINISHES_FIELD, TOOLS_BY_NAME
+
+    assert FINISHES_FIELD in TOOLS_BY_NAME["run_powershell"]["input_schema"]["properties"]
+    assert FINISHES_FIELD not in TOOLS_BY_NAME["look_at_desktop"]["input_schema"]["properties"]
+    client = FakeClient([_response(_block("tool_use", id="t1", name="hotkey",
+                                          input={"keys": ["win", "down"], FINISHES_FIELD: "Discord's minimized."}))])
+    events = list(_agent(client, tmp_path).run("minimize discord"))
+    assert isinstance(events[-1], Final) and events[-1].text == "Discord's minimized."
+    assert len(client.calls) == 1  # no second call only to say it worked
+
+
+def test_finishing_mark_is_dropped_when_the_action_fails(tmp_path: Path) -> None:
+    from yuki.agent.tools import FINISHES_FIELD
+
+    client = FakeClient([
+        _response(_block("tool_use", id="t1", name="hotkey", input={"keys": [], FINISHES_FIELD: "Done."})),
+        _response(_block("tool_use", id="t2", name="done", input={"message": "That didn't work."})),
+    ])
+    events = list(_agent(client, tmp_path).run("minimize discord"))
+    assert events[-1].text == "That didn't work." and len(client.calls) == 2
+
+
+def test_voice_request_runs_at_the_voice_effort(tmp_path: Path) -> None:
+    client = FakeClient([_response(_block("tool_use", id="t1", name="done", input={"message": "Six."}))] * 2)
+    agent = _agent(client, tmp_path)
+    list(agent.run("what time is it in tokyo", effort="low"))
+    list(agent.run("typed request"))
+    assert [c["output_config"]["effort"] for c in client.calls] == ["low", "medium"]
+
+
+def test_remember_hand_off_is_saved_quietly_and_rules_refresh() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None)
+        bridge.attach(asyncio.get_running_loop())
+        refreshed: list[bool] = []
+
+        async def on_remembered() -> None:
+            refreshed.append(True)
+
+        bridge.on_remembered = on_remembered
+        params = Params("Stop calling me babe", intent="remember")
+        task = asyncio.create_task(bridge.tell_yuki(params))
+        await _settle()
+        job, text, _src = rt.submitted[0]
+        assert "remember_rule" in text  # the brain is told to save it
+        rt.started.emit("worker", job, "x")
+        rt.tool_called.emit("worker", job, "remember_rule", {"text": "Stop calling me babe"})
+        rt.finished.emit("worker", job, "Got it, no more babe.")
+        rt.lane_done.emit("worker", job, "x", False, [])
+        await _settle()
+        await asyncio.wait_for(task, 1)
+        assert [list(r)[0] for r, _ in params.results] == ["saved"]  # no progress line, nothing to say
+        assert refreshed == [True]
+
+    asyncio.run(main())
+
+
+def test_silent_hand_off_speaks_its_own_words() -> None:
+    class LLM:
+        def __init__(self) -> None:
+            self.pushed: list[Any] = []
+
+        async def push_frame(self, frame: Any) -> None:
+            self.pushed.append(frame)
+
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None)
+        bridge.attach(asyncio.get_running_loop())
+        for spoke in (False, True):
+            bridge.spoke_in_reply = lambda spoke=spoke: spoke
+            params = Params("Minimize Discord")
+            params.arguments["say_first"] = "Sure, one sec."
+            params.llm = LLM()
+            task = asyncio.create_task(bridge.tell_yuki(params))
+            await _settle()
+            said = [getattr(f, "text", None) for f in params.llm.pushed]
+            assert said == ([] if spoke else ["Sure, one sec."])
+            task.cancel()
+            bridge.closing = True
+
+    asyncio.run(main())
+
+
+def test_end_of_speech_falls_back_to_the_last_word_heard() -> None:
+    import time as _t
+
+    from yuki.voice.pipeline import TurnObserver
+
+    obs = TurnObserver(settings=Settings(), log=None, memory=None, session="t", speech_end=lambda: None,
+                       on_state=lambda *a: None, tts_provider="elevenlabs", activity=lambda: None)
+    obs._user_started_at = _t.monotonic()
+    obs.on_update("minimize")
+    obs.on_update("minimize discord")
+    heard = obs._words_at
+    obs.on_update("minimize discord")  # no new word: the time stays
+    assert obs._words_at == heard
+    when, how = obs._end_of_speech(_t.monotonic())
+    assert how == "stt" and when == heard
+
+
+def test_quiet_mic_still_marks_voiced_audio() -> None:
+    import numpy as np
+
+    from yuki.voice.audio import SharedMic
+
+    mic = SharedMic()
+    rng = np.random.default_rng(1)
+    t = 100.0
+    for _ in range(50):  # a quiet room, -70 dBFS
+        mic.feed((rng.standard_normal(320) * 10 ** (-70 / 20)).astype(np.float32), t)
+        t += 0.02
+    assert mic.stats.last_voiced == 0.0
+    for _ in range(25):  # speech at -50 dBFS: under the old fixed -42 dBFS, well over this room
+        mic.feed((rng.standard_normal(320) * 10 ** (-50 / 20)).astype(np.float32), t)
+        t += 0.02
+    assert abs(mic.stats.last_voiced - t) < 0.03 and mic.stats.levels()["voiced_blocks"] >= 20
+
+
+def test_turn_csv_columns_follow_the_pipeline() -> None:
+    from yuki.voice.log import TURN_COLUMNS
+
+    order = [TURN_COLUMNS.index(c) for c in ("eos_to_transcript_ms", "eos_to_first_token_ms", "eos_to_first_audio_ms",
+                                             "llm_api_ttft_ms", "tts_ttfb_ms", "mouth_cost_usd")]
+    assert order == sorted(order) and len(set(TURN_COLUMNS)) == len(TURN_COLUMNS)
+
+
+def test_embedder_pipe_serves_only_the_key_holder_and_never_blocks(tmp_path: Path) -> None:
+    import time as _t
+
+    import numpy as np
+
+    from yuki.memory.crypto import FieldCipher
+    from yuki.memory.embed_ipc import EmbedClient, EmbedServer
+
+    class Emb:
+        model_name = "fake"
+
+        def __init__(self, delay: float = 0.0) -> None:
+            self.delay = delay
+
+        def embed(self, texts: list[str]) -> Any:
+            _t.sleep(self.delay)
+            return np.ones((len(texts), 4), np.float32) / 2
+
+        def stats(self) -> dict:
+            return {"loaded": True}
+
+    db = tmp_path / "memory.db"
+    key = FieldCipher(b"k" * 32)
+    slow = Emb()
+    server = EmbedServer(key, db, embedder=lambda: slow).start()
+    try:
+        client = EmbedClient(key, db, local=lambda: (_ for _ in ()).throw(AssertionError("no local load")))
+        vecs = client.embed(["hello", "there"], 1.0)
+        assert vecs.shape == (2, 4) and client.last_source == "remote"
+        slow.delay = 1.0  # the service is busy (loading its model): the caller goes on without
+        started = _t.perf_counter()
+        assert client.embed(["x"], 0.2) is None and _t.perf_counter() - started < 0.6
+        slow.delay = 0.0
+        stranger = EmbedClient(FieldCipher(b"z" * 32), db, local=lambda: Emb())
+        assert stranger.embed(["x"], 1.0) is not None and stranger.last_source == "local"
+        assert server.stats["refused"] >= 1
+    finally:
+        server.stop()
+    absent = EmbedClient(key, tmp_path / "other.db", local=lambda: Emb())
+    assert absent.embed(["x"], 0.5) is not None and absent.last_source == "local"

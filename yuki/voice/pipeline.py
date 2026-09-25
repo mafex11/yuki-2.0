@@ -96,15 +96,38 @@ def forget_tts_check() -> None:
     _TTS_CHECK.clear()
 
 
-def elevenlabs_can_speak(settings: Settings) -> tuple[bool, str]:
-    """Whether the ElevenLabs key may synthesise speech (one 1-character request, once per app run).
+#: ElevenLabs error statuses (``detail.status`` of its JSON error body) that refuse one voice,
+#: not the key: another voice can still speak. Parsing the API's structured answer, not text.
+_VOICE_REFUSALS = {"paid_plan_required", "voice_not_found", "voice_not_fine_tuned", "invalid_voice_id",
+                   "voice_access_denied"}
 
-    The key can be valid yet lack the Text to Speech permission (a scoped key);
-    then every reply would be silent, so this is checked before a conversation
-    rather than discovered in one. Returns ``(ok, reason)``; never raises.
+
+def _elevenlabs_error(exc: Any) -> tuple[str, str]:
+    """``(status, message)`` from an ElevenLabs HTTP error's JSON body (``("", "")`` if it has none)."""
+    import json
+
+    try:
+        detail = json.loads(exc.read()[:2000].decode("utf-8", "replace")).get("detail")
+    except (ValueError, AttributeError, OSError):
+        return "", ""
+    if isinstance(detail, dict):
+        return str(detail.get("status") or ""), str(detail.get("message") or "")
+    return "", str(detail or "")
+
+
+def elevenlabs_can_speak(settings: Settings, voice: str | None = None) -> tuple[bool, str]:
+    """Whether ElevenLabs will speak with ``voice`` (one 1-character request, once per voice per app run).
+
+    The key can be valid yet lack the Text to Speech permission (a scoped key), or
+    the account may not be allowed a voice (a library voice on the free plan answers
+    402 ``paid_plan_required``); then every reply would be silent, so this is checked
+    before a conversation rather than discovered in one. Returns ``(ok, reason)``,
+    where a refusal of the voice itself starts with ``voice:``; never raises.
     """
-    if "elevenlabs" in _TTS_CHECK:
-        return _TTS_CHECK["elevenlabs"]
+    voice = voice or settings.voice_tts_voice or DEFAULT_VOICES["elevenlabs"]
+    cache_key = f"elevenlabs:{voice}:{settings.voice_tts_model}"
+    if cache_key in _TTS_CHECK:
+        return _TTS_CHECK[cache_key]
     key = get_key(ELEVENLABS)
     if not key:
         result = (False, "ELEVENLABS_API_KEY is not set")
@@ -113,7 +136,6 @@ def elevenlabs_can_speak(settings: Settings) -> tuple[bool, str]:
         import urllib.error
         import urllib.request
 
-        voice = settings.voice_tts_voice or DEFAULT_VOICES["elevenlabs"]
         req = urllib.request.Request(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=pcm_16000",
             data=json.dumps({"text": ".", "model_id": settings.voice_tts_model}).encode(), method="POST",
@@ -124,13 +146,18 @@ def elevenlabs_can_speak(settings: Settings) -> tuple[bool, str]:
                 response.read()
             result = (True, "ok")
         except urllib.error.HTTPError as exc:
-            body = exc.read()[:400].decode("utf-8", "replace")
-            result = (False, "the key lacks the Text to Speech permission" if "missing_permissions" in body
-                      else ("the voice id is not in the account's voices" if exc.code in (400, 404) and "voice" in body
-                            else f"HTTP {exc.code}"))
+            status, message = _elevenlabs_error(exc)
+            if status == "missing_permissions":
+                result = (False, "the key lacks the Text to Speech permission")
+            elif status in _VOICE_REFUSALS or exc.code in (402, 404):
+                why = "it needs a paid plan" if status == "paid_plan_required" or exc.code == 402 else (
+                    message[:120] or "it is not in the account's voices")
+                result = (False, f"voice: {why}")
+            else:
+                result = (False, f"HTTP {exc.code}{' ' + status if status else ''}")
         except (urllib.error.URLError, OSError) as exc:
             return False, f"cannot reach ElevenLabs ({type(exc).__name__})"  # not cached: may be the network
-    _TTS_CHECK["elevenlabs"] = result
+    _TTS_CHECK[cache_key] = result
     return result
 
 
@@ -146,6 +173,17 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
         raise VoiceUnavailable("Voice needs DEEPGRAM_API_KEY (a Windows user environment variable).")
     if settings.voice_tts_provider == "elevenlabs":
         ok, reason = elevenlabs_can_speak(settings)
+        default = DEFAULT_VOICES["elevenlabs"]
+        if not ok and reason.startswith("voice:") and (settings.voice_tts_voice or default) != default:
+            # That voice is refused (e.g. a library voice on the free plan): this conversation
+            # speaks with the default ElevenLabs voice and says why; the chosen one is kept,
+            # so it just works once the account allows it.
+            ok_default, _why = elevenlabs_can_speak(settings, default)
+            if ok_default:
+                facts["tts_voice"] = default
+                facts["tts_note"] = (f"ElevenLabs won't use the chosen voice: {reason[6:].strip().rstrip('.')}. "
+                                     f"Using the default voice for now")
+                ok, reason = True, "ok"
         if not ok:
             if settings.voice_tts_fallback:
                 facts["tts_provider"] = settings.voice_tts_fallback
@@ -340,6 +378,8 @@ class _Turn:
     language: str | None = None
     user_text: str = ""
     speech_end: float | None = None
+    eos_source: str = "none"             # mic | stt | none (how the end of speech is known)
+    responses: int = 0                   # mouth runs finished in this turn
     eot_at: float | None = None          # Flux's end-of-turn event arrived
     eager_at: float | None = None        # Flux's eager end-of-turn (a speculative reply started)
     transcript_at: float | None = None
@@ -397,6 +437,8 @@ class TurnObserver:
         self._pending_call: LlmCall | None = None
         self._eot_at: float | None = None
         self._eager_at: float | None = None
+        self._last_words = ""
+        self._words_at: float | None = None
         self.grounder: Any = None
         self.state = "starting"
         self.fatal: str | None = None
@@ -434,8 +476,27 @@ class TurnObserver:
             self.grounder.interim(transcript)
 
     def on_update(self, transcript: str) -> None:
+        words = " ".join((transcript or "").split())
+        if words and words != self._last_words:
+            self._last_words = words
+            self._words_at = time.monotonic()  # when speech recognition last heard a new word
         if self.grounder is not None:
             self.grounder.interim(transcript)
+
+    def _end_of_speech(self, now: float) -> tuple[float | None, str]:
+        """When the user stopped talking this turn, and how that is known.
+
+        ``mic``: the microphone's last voiced block (its level against the room's floor);
+        ``stt``: speech recognition's last new word, when the microphone saw no speech
+        in this turn (a very quiet mic). Measurement only.
+        """
+        mic = self._speech_end()
+        if mic is not None and self._user_started_at - 0.3 <= mic <= now:
+            return mic, "mic"
+        words = self._words_at
+        if words is not None and self._user_started_at - 0.3 <= words <= now:
+            return words, "stt"
+        return None, "none"
 
     def call_started(self, call: LlmCall) -> None:
         """A mouth call began (the LLM service's hook): attach it to the turn it answers."""
@@ -488,7 +549,9 @@ class TurnObserver:
         row = {
             "session": self.session, "turn": turn.n, "trigger": turn.trigger, "language": turn.language,
             "user_chars": len(turn.user_text), "reply_chars": len(reply),
+            "eos_source": turn.eos_source if turn.trigger == "user" else None,
             "eos_to_transcript_ms": ms(turn.speech_end, turn.transcript_at),
+            "eos_to_first_token_ms": ms(turn.speech_end, c.first_text if c else None),
             "mouth_ttft_ms": round(turn.llm_ttfb * 1000, 1) if turn.llm_ttfb is not None else None,
             "tts_ttfb_ms": round(turn.tts_ttfb * 1000, 1) if turn.tts_ttfb is not None else None,
             "eos_to_first_audio_ms": ms(turn.speech_end, turn.first_audio),
@@ -569,7 +632,8 @@ class TurnObserver:
             turn = self._open("user")
             turn.user_text = frame.text or ""
             turn.transcript_at = now
-            turn.speech_end = self._speech_end()
+            turn.speech_end, turn.eos_source = self._end_of_speech(now)
+            self._last_words, self._words_at = "", None
             turn.eot_at = now  # Flux pushes the final transcript at its end of turn
             turn.eager_at, self._eager_at = self._eager_at, None
             if self.grounder is not None:
@@ -588,13 +652,17 @@ class TurnObserver:
                 self.turn.context_at = now
         elif isinstance(frame, LLMFullResponseStartFrame):
             self.generating = True
-            if self.turn is None or self.turn.first_audio is not None:
+            if self.turn is None or self.turn.first_audio is not None or self.turn.responses:
+                # A new mouth run after this turn already had one (a result, a progress line,
+                # a follow-up to a tool-only reply) is its own turn, with its own stages.
                 self._open("result")
             if self.turn.llm is None and self._pending_call is not None:
                 self.turn.llm, self._pending_call = self._pending_call, None
             self._activity()
         elif isinstance(frame, LLMFullResponseEndFrame):
             self.generating = False
+            if self.turn is not None:
+                self.turn.responses += 1
             if self.turn is not None and not "".join(self.turn.reply).strip() and not self.bot_speaking:
                 self.owes_reply_since = None  # a turn that only called a tool: nothing to wait for
             self._activity()
@@ -777,9 +845,10 @@ class Conversation:
         from pipecat.transcriptions.language import Language
 
         s = self.settings
-        # Pipecat's standing async-tool paragraph uses an em dash; a model copies the
-        # punctuation it is shown, and the user asked for none. Same words, a comma.
-        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = llm_service_module.ASYNC_TOOL_INSTRUCTIONS.replace(" — ", ", ")
+        # Pipecat's standing async-tool paragraph says a result must be added to whatever
+        # reply is in progress and is "owed whatever the conversation moved on to"; here the
+        # narrator gate decides when a result is said, and the user's rules ban em dashes.
+        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = async_tool_instructions()
         # Pipecat's final-result note says a result must be spoken whatever the
         # conversation moved on to. Here the narrator gate decides that, and a
         # stale result arrives marked held_back; the note defers to the payload.
@@ -835,8 +904,17 @@ class Conversation:
         else:
             from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 
+            # Voice settings only when set (Settings / voice.json); unset, ElevenLabs uses the
+            # voice's own defaults and speed 1.0. Flash v2.5 honours speed, stability,
+            # similarity_boost and use_speaker_boost; ElevenLabs documents style for its v2 and
+            # later models, so it is passed through when set and costs nothing when not.
+            tuning = {name: value for name, value in (
+                ("speed", s.voice_tts_speed), ("stability", s.voice_tts_stability),
+                ("similarity_boost", s.voice_tts_similarity_boost), ("style", s.voice_tts_style),
+                ("use_speaker_boost", s.voice_tts_speaker_boost)) if value is not None}
             tts = ElevenLabsTTSService(api_key=get_key(ELEVENLABS) or "",
-                                       settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model))
+                                       settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model,
+                                                                              **tuning))
         return stt, llm, tts
 
     def _build(self) -> Any:
@@ -850,10 +928,15 @@ class Conversation:
         )
 
         stt, llm, tts = self._services()
+        self._llm = llm
+        # Whether the mouth's reply now making a tool call said anything aloud (a stream fact).
+        self.bridge.spoke_in_reply = lambda: bool(getattr(llm, "_yuki_call", None) is not None
+                                                  and llm._yuki_call.first_text is not None)
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"]) for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT)
         ])
+        self._tools = tools
         context = LLMContext(tools=tools)
         # Flux's own turn strategies from the start. Left to default, the aggregator first
         # builds Pipecat's local ones, which load the Smart Turn ONNX model and onnxruntime
@@ -889,6 +972,7 @@ class Conversation:
     def _gate_state(self) -> dict[str, Any]:
         state = self.observer.live_state()
         state["busy_tools"] = self.bridge.busy_tools
+        state["jobs_open"] = self.bridge.open_voice_jobs()
         if self._voice_activity is not None:
             since, last = self._voice_activity()
             now = time.monotonic()
@@ -914,10 +998,15 @@ class Conversation:
         from yuki.voice.narrator import NarratorGate
 
         quiet_pipecat_logging(self.settings.voice_log_dir)
+        import threading
+
+        # While Deepgram connects (2-3 s), off the loop; done long before the first reply.
+        threading.Thread(target=_preimport, name="yuki-voice-preimport", daemon=True).start()
         s = self.settings
         self._loop = asyncio.get_running_loop()
         self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
-                                 cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log)
+                                 cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log,
+                                 final_gap_s=s.voice_final_gap_s)
         if s.voice_grounding and self.memory is not None:
             from yuki.voice.grounding import Grounder
 
@@ -928,6 +1017,7 @@ class Conversation:
         self.bridge.announce = self._announce
         self.bridge.gate = self.gate
         self.bridge.progress_answerer = self._progress_answer
+        self.bridge.on_remembered = self._refresh_rules
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
         await runner.add_workers(worker)
@@ -961,36 +1051,128 @@ class Conversation:
     async def _lag_monitor(self, every_s: float = 0.05, report_ms: float = 100.0) -> None:
         """How late the voice loop wakes up (a blocked loop delays every stage). Logs stalls and a summary."""
         lags: list[float] = []
+        import threading
+
+        state = {"tick": time.monotonic(), "stop": False, "stacks": []}
+        loop_thread = threading.get_ident()
+        watchdog = threading.Thread(target=self._stall_watch, args=(state, loop_thread), name="yuki-voice-watch",
+                                    daemon=True)
+        watchdog.start()
         try:
             while True:
                 started = time.monotonic()
                 await asyncio.sleep(every_s)
-                late = (time.monotonic() - started - every_s) * 1000
+                state["tick"] = time.monotonic()
+                late = (state["tick"] - started - every_s) * 1000
                 lags.append(late)
                 if late >= report_ms:
-                    self.log.event("loop_lag", ms=round(late))
+                    stacks, state["stacks"] = state["stacks"], []
+                    self.log.event("loop_lag", ms=round(late), **({"where": stacks} if stacks else {}))
         except asyncio.CancelledError:
+            state["stop"] = True
             if lags:
                 ordered = sorted(lags)
                 self.log.event("loop_lag", op="summary", n=len(ordered), p50_ms=round(ordered[len(ordered) // 2], 1),
                                p99_ms=round(ordered[int(len(ordered) * 0.99)], 1), max_ms=round(ordered[-1], 1))
             raise
 
+    @staticmethod
+    def _stall_watch(state: dict[str, Any], loop_thread: int, every_s: float = 0.1, stall_s: float = 0.3) -> None:
+        """While the voice loop is stalled, note where it is and what the other threads run.
+
+        One sample per stall, 0.3 s into it: the loop thread's innermost frames and the
+        innermost frame of every other thread (file, line, function and thread name
+        only: content-free). Logged with the ``loop_lag`` event that ends the stall
+        (measured 2026-09-25: a 3 s stall before the first live reply had no explanation).
+        """
+        import os
+        import sys
+        import threading
+
+        sampled_for = None
+        while not state["stop"]:
+            time.sleep(every_s)
+            tick = state["tick"]
+            if time.monotonic() - tick < stall_s or sampled_for == tick:
+                continue
+            sampled_for = tick
+            names = {t.ident: t.name for t in threading.enumerate()}
+            frames = sys._current_frames()
+
+            def where(frame: Any, depth: int) -> list[str]:
+                out = []
+                while frame is not None and len(out) < depth:
+                    code = frame.f_code
+                    out.append(f"{os.path.basename(code.co_filename)}:{frame.f_lineno}:{code.co_name}")
+                    frame = frame.f_back
+                return out
+
+            sample = {"loop": where(frames.get(loop_thread), 14)}
+            others = {}
+            for ident, frame in frames.items():
+                if ident in (loop_thread, threading.get_ident()):
+                    continue
+                top = where(frame, 1)
+                if top and len(others) < 16:
+                    others[names.get(ident, str(ident))] = top[0]
+            sample["threads"] = others
+            state["stacks"] = [sample]
+
     async def _warm(self) -> None:
-        """Open the Bedrock connection while Deepgram connects (a one-token request).
+        """Open the Bedrock connection and write the mouth's prompt cache while Deepgram connects.
 
         Each conversation has a fresh client (it belongs to this event loop), so
-        without this the first reply pays the TLS handshake. Logged as ``warm``.
+        without this the first reply pays the TLS handshake. The one-token request
+        carries the mouth's real system layers and tools, so it also writes their
+        cache: the first turn then reads it instead (measured 2026-09-25, 4 pairs:
+        first-turn time to first token median 1,031 ms vs 1,186 ms, max 1,090 vs
+        2,715 ms; the cache write is the one the first turn would have made). Logged
+        as ``warm`` with the tokens it wrote.
         """
         started = time.monotonic()
+        request: dict[str, Any] = {"messages": [{"role": "user", "content": "."}]}
         try:
-            await self._client.messages.create(
-                model=self.settings.voice_mouth_model, max_tokens=1,
-                messages=[{"role": "user", "content": "."}],
-            )
-            self.log.event("warm", ms=round((time.monotonic() - started) * 1000))
+            from pipecat.processors.aggregators.llm_context import LLMContext
+
+            llm = self._llm
+            # Pipecat settles its built-in cancel tool and the composed instruction on the
+            # first context frame; do it now, or this prefix differs from the real calls'
+            # (measured: the first turn then missed the cache and wrote it again).
+            llm._sync_cancel_tools()
+            llm._compose_system_instruction()
+            params = llm._get_llm_invocation_params(LLMContext(messages=[{"role": "user", "content": "."}],
+                                                               tools=self._tools))
+            request = {"system": params["system"], "tools": params["tools"], "messages": params["messages"]}
+        except Exception as exc:  # noqa: BLE001 - then only the connection is warmed
+            self.log.event("warm", note=f"plain warm-up ({type(exc).__name__})")
+        try:
+            response = await self._client.messages.create(model=self.settings.voice_mouth_model, max_tokens=1,
+                                                          **request)
+            usage = getattr(response, "usage", None)
+            self.log.event("warm", ms=round((time.monotonic() - started) * 1000),
+                           cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None),
+                           cache_read_tokens=getattr(usage, "cache_read_input_tokens", None))
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.log.event("warm", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    async def _refresh_rules(self) -> None:
+        """Re-read the user's standing rules after a spoken rule was saved (off the loop, bounded).
+
+        The mouth's rules layer was read when the conversation started; a rule the user
+        just gave or withdrew by voice must hold from the next reply, not the next
+        conversation. One cache write of the rules layer; logged as ``rules_refreshed``.
+        """
+        if self.memory is None:
+            return
+        try:
+            text = await asyncio.to_thread(self.memory.standing, timeout_s=3.0)
+        except Exception as exc:  # noqa: BLE001 - the mouth keeps the rules it has
+            self.log.event("rules_refreshed", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+            return
+        changed = (text or None) != (self.mouth_memory.standing or None)
+        if text is not None:
+            self.mouth_memory.standing = text
+        self.log.event("rules_refreshed", changed=changed, chars=len(text or ""))
 
     async def _announce(self, payload: dict[str, Any], run_llm: bool = True) -> None:
         """A result with no open tool call (a correction that came too late): into the context, said if ``run_llm``."""
@@ -1031,6 +1213,48 @@ class Conversation:
                 break
         self.bridge.closing = True
         await runner.cancel()
+
+
+def _preimport() -> None:
+    """Import what the first turn would otherwise import on the voice loop, before anything is live.
+
+    anyio builds its lazy-import maps by reading and parsing its own source when a
+    module of it is first imported; that happened on the voice loop during the first
+    user turn (measured offline 2026-09-25: a 669 ms stall inside ``inspect.getsource``;
+    live, a 2,964 ms stall right before the first reply). Tens of milliseconds here.
+
+    The bigger one: the Bedrock stream decoder loads botocore's ``bedrock-runtime``
+    service model (a large JSON) the first time a streamed reply is parsed, and it did
+    that on the voice loop inside the first reply (measured: a 403 ms stall offline in
+    ``botocore.loaders``; live, llm_open 2,433 ms on the first turn only). It is cached
+    process-wide, so loading it here once costs the first turn nothing.
+    """
+    import importlib
+
+    for name in ("anyio.abc", "anyio._backends._asyncio", "anyio.from_thread", "anyio.to_thread",
+                 "anyio.streams.memory", "botocore.parsers", "botocore.eventstream"):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - only an optimisation
+            pass
+    try:
+        from anthropic.lib.bedrock._stream_decoder import get_response_stream_shape
+
+        get_response_stream_shape()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def async_tool_instructions() -> str:
+    """The standing async-tool paragraph composed into the mouth's prompt (replaces Pipecat's)."""
+    return (
+        "ASYNC TOOLS:\n"
+        "tell_yuki keeps running after you have replied. What it sends back (progress, questions, "
+        "the result) arrives as messages in the conversation when it is a good moment to say it: "
+        "after the user has finished and you have answered them. Say each thing once, in its own "
+        "fields' terms, and never repeat it in a later reply; a later \"okay\" or \"thanks\" is not "
+        "a cue to say it again."
+    )
 
 
 #: Replaces Pipecat's final-result note (see ``Conversation._services``).

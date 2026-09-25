@@ -10,8 +10,12 @@ every write takes a lock.
 Turn fields (all milliseconds unless named otherwise; ``None`` when a stage
 did not happen, e.g. no speech in a turn the mouth opened to speak a result):
 
+* ``eos_source``: how the end of speech is known: ``mic`` (the last voiced
+  block, judged against the room's own floor), ``stt`` (speech recognition's
+  last new word, when the mic level never rose above the floor) or ``none``.
 * ``eos_to_transcript_ms``: the user's last voiced audio to Flux's final
   transcript (end of turn detection included).
+* ``eos_to_first_token_ms``: end of speech to the mouth's first text token.
 * ``mouth_ttft_ms``: the mouth request to its first token (Pipecat's TTFB).
 * ``tts_ttfb_ms``: text sent to TTS to its first audio byte.
 * ``eos_to_first_audio_ms``: the user's last voiced audio to Yuki's first
@@ -50,21 +54,12 @@ TURN_COLUMNS: tuple[str, ...] = (
     "language",
     "user_chars",
     "reply_chars",
+    # the user-felt path first: end of speech -> transcript -> mouth's first token -> first audio
+    "eos_source",
     "eos_to_transcript_ms",
-    "mouth_ttft_ms",
-    "tts_ttfb_ms",
+    "eos_to_first_token_ms",
     "eos_to_first_audio_ms",
-    "mouth_input_tokens",
-    "mouth_cache_read_tokens",
-    "mouth_cache_write_tokens",
-    "mouth_output_tokens",
-    "mouth_cost_usd",
-    "tts_chars",
-    "tts_cost_usd",
-    "tool_calls",
-    "interrupted",
-    "error",
-    # stage by stage (2026-09-25, docs/VOICE.md §14)
+    # then every stage in pipeline order (2026-09-25, docs/VOICE.md §14)
     "eos_to_eot_ms",
     "eos_to_eager_ms",
     "transcript_to_context_ms",
@@ -76,10 +71,23 @@ TURN_COLUMNS: tuple[str, ...] = (
     "llm_open_ms",
     "llm_first_event_ms",
     "llm_api_ttft_ms",
+    "mouth_ttft_ms",
     "llm_first_text_ms",
     "text_to_tts_ms",
+    "tts_ttfb_ms",
     "tts_audio_to_speaking_ms",
     "eager",
+    # usage and outcome
+    "mouth_input_tokens",
+    "mouth_cache_read_tokens",
+    "mouth_cache_write_tokens",
+    "mouth_output_tokens",
+    "mouth_cost_usd",
+    "tts_chars",
+    "tts_cost_usd",
+    "tool_calls",
+    "interrupted",
+    "error",
 )
 
 

@@ -35,6 +35,7 @@ STAGES = (
     ("text_to_tts_ms", "first text -> TTS request"),
     ("tts_ttfb_ms", "TTS time to first byte"),
     ("tts_audio_to_speaking_ms", "first TTS audio -> playing"),
+    ("eos_to_first_token_ms", "end of speech -> mouth's first token"),
     ("eos_to_first_audio_ms", "end of speech -> first audio"),
 )
 
@@ -65,7 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(turns)} turns ({len(rows)} rows) from {', '.join(str(p) for p in args.csv)}")
     grounding = Counter(r.get("grounding") or "-" for r in turns)
     eager = sum(1 for r in turns if r.get("eager") == "True")
-    print(f"grounding: {dict(grounding)}; eager replies: {eager}")
+    print(f"grounding: {dict(grounding)}; eager replies: {eager}; "
+          f"end of speech from: {dict(Counter(r.get('eos_source') or '-' for r in turns))}")
     print(f"{'stage':40s} {'n':>4s} {'p50':>7s} {'p90':>7s} {'p95':>7s} {'max':>7s}")
     for key, label in STAGES:
         values = [float(r[key]) for r in turns if r.get(key) not in (None, "")]

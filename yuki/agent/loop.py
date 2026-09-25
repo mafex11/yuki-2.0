@@ -51,6 +51,7 @@ from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
+    FINISHES_FIELD,
     MEMORY_TOOLS,
     PERCEPTION_TOOLS,
     Backend,
@@ -135,6 +136,10 @@ class _Turn:
     looked: set[int] = field(default_factory=set)
     early: int = 0
     first_early_at: float | None = None
+    #: ``finishes_with`` messages of actions in this response that succeeded (the brain's
+    #: mark that the action completes the request); the request ends with the last one
+    #: once every call of the response has succeeded.
+    finishing: list[str] = field(default_factory=list)
 
     def record(self, tool_use_id: str, block: dict[str, Any]) -> None:
         """Store one result block, noting whether it is an error."""
@@ -248,6 +253,8 @@ class Agent:
         self._call_history: dict[str, list[tuple[str, str]]] = {}
         #: The request being handled, handed to ``remember_how`` as its source.
         self._request_text: str | None = None
+        #: The effort of the request being run, when its caller chose one (``run(effort=...)``).
+        self._request_effort: str | None = None
         #: The newest desktop overview as plain data (for the foreground app).
         self._overview_payload: Any = None
         #: ``(portrait text, turn)`` of the last portrait attached in full to
@@ -545,7 +552,9 @@ class Agent:
 
     # -- main entry point --------------------------------------------------
 
-    def run(self, request: str, *, origin_hwnd: int | None = None) -> Iterator[AgentEvent]:
+    def run(
+        self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None
+    ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
         Args:
@@ -555,6 +564,10 @@ class Agent:
                 keyboard to be typed into). Without it, the request origin
                 reports whatever is in front now, and when that is Yuki's own
                 window, the top window beneath it.
+            effort: ``output_config.effort`` for this request only (the caller's
+                setting for where the request came from, e.g.
+                ``Settings.voice_brain_effort`` for a spoken one); ``None``: the
+                agent's own :attr:`Settings.effort`.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -576,7 +589,8 @@ class Agent:
         self.last_summary = None
         started_at = datetime.now()
         started_epoch = time.time()
-        model, effort = self.settings.model, self.settings.effort
+        self._request_effort = resolve_effort(effort) if effort else None
+        model, effort = self.settings.model, self._request_effort or self.settings.effort
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.user_message(request)
@@ -925,6 +939,11 @@ class Agent:
                 if stop_reason == "max_tokens":
                     self._skip_truncated(response, turn)
                 blocks, names = yield from self._run_tools(tool_uses, turn)
+                if not turn.finished and turn.finishing and not turn.failed and not turn.stop_after:
+                    # The brain marked an action as finishing the request and every call of
+                    # the response succeeded: that is its done, with no extra round trip.
+                    turn.finished.append(turn.finishing[-1])
+                    self.logger.log("finished_by_action", message=turn.finishing[-1])
                 steers = self._steer_blocks()
                 if turn.finished and steers:
                     # The user added something before the closing message went
@@ -1168,6 +1187,9 @@ class Agent:
         self._log_outcome(outcome, tool_use_id=tool_id)
         self._note_action(name, outcome.ok, outcome.summary)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary)
+        finishing = tool_input.get(FINISHES_FIELD) if name in ACTION_TOOL_NAMES else None
+        if outcome.ok and isinstance(finishing, str) and finishing.strip():
+            turn.finishing.append(finishing.strip())
 
         content = list(outcome.content) or [
             {"type": "text", "text": outcome.summary or "Done."}
@@ -1585,7 +1607,7 @@ class Agent:
             "messages": messages,
             "tools": tools,
             "thinking": {"type": "adaptive", "display": self.settings.thinking_display},
-            "output_config": {"effort": self.settings.effort},
+            "output_config": {"effort": self._request_effort or self.settings.effort},
         }
 
     def _request(self, turn: _Turn) -> Iterator[AgentEvent]:

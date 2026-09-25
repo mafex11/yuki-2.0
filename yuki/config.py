@@ -205,7 +205,15 @@ class Settings:
             (empty: the provider's default in :mod:`yuki.voice.pipeline`).
         voice_tts_fallback: Provider used when the main one cannot speak (its
             key is missing or lacks permission); ``""`` = no fallback, voice
-            then refuses to start and says why.
+            then refuses to start and says why. A voice the account may not use
+            (a library voice on the free plan) falls back to the default
+            ElevenLabs voice for that conversation instead, with a note.
+        voice_tts_speed / voice_tts_stability / voice_tts_similarity_boost /
+            voice_tts_style / voice_tts_speaker_boost: ElevenLabs voice settings
+            (speed 0.7-1.2; the others 0-1 and a switch). ``None`` = unset: the
+            voice's own defaults and speed 1.0 (the user's choice, 2026-09-25).
+            ``voice.json`` keys ``tts_speed``, ``tts_stability``,
+            ``tts_similarity_boost``, ``tts_style``, ``tts_speaker_boost`` win.
         voice_usd_per_stt_min / voice_usd_per_1k_tts_chars: List prices for the
             cost estimate in the voice log (estimates only; nothing decides on them).
         voice_grounding: Look the user's words up in local memory on every turn
@@ -223,6 +231,13 @@ class Settings:
         voice_progress_lines: Most spoken progress lines per task.
         voice_result_sentences / voice_result_chars: How much of a result is
             spoken at first (the rest waits for "want the rest?").
+        voice_brain_effort: The brain's ``output_config.effort`` for requests
+            that came by voice (typed ones keep ``effort``). Spoken requests are
+            heard live and are mostly one quick action or fact; measured
+            2026-09-25 (docs/VOICE.md §7): "minimize Discord" and "what time is
+            it in Tokyo" at medium vs low, see there.
+        voice_final_gap_s: The narrator's pause after Yuki's own speech before a
+            result or a question is said (progress lines keep ``voice_cooldown_s``).
     """
 
     model: str = DEFAULT_MODEL
@@ -266,11 +281,16 @@ class Settings:
     voice_tts_model: str = "eleven_flash_v2_5"
     voice_tts_voice: str = ""
     voice_tts_fallback: str = "deepgram"
+    voice_tts_speed: float | None = None
+    voice_tts_stability: float | None = None
+    voice_tts_similarity_boost: float | None = None
+    voice_tts_style: float | None = None
+    voice_tts_speaker_boost: bool | None = None
     voice_usd_per_stt_min: float = 0.0078
     voice_usd_per_1k_tts_chars: dict[str, float] = field(
         default_factory=lambda: {"elevenlabs": 0.05, "deepgram": 0.030}
     )
-    voice_grounding: bool = False   # off: it loads the ~550 MB embedder in the tray for the whole session; memory questions go to the brain anyway
+    voice_grounding: bool = True    # on again 2026-09-25: the service's embedder over its pipe (tray ~210 MB in a conversation); off by itself when no service answers
     voice_grounding_wait_ms: float = 60.0
     voice_grounding_facts: int = 4
     voice_settle_s: float = 1.5
@@ -280,10 +300,13 @@ class Settings:
     voice_progress_lines: int = 2
     voice_result_sentences: int = 2
     voice_result_chars: int = 280
+    voice_brain_effort: str = "low"
+    voice_final_gap_s: float = 0.3
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)
+        self.voice_brain_effort = resolve_effort(self.voice_brain_effort)
 
     @property
     def sessions_dir(self) -> Path:

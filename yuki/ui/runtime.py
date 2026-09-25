@@ -309,7 +309,10 @@ class Lane(QThread):
         runtime = self.runtime
         runtime.started.emit(self.name, job.id, job.request)
 
-        events = self.agent.run(job.request, origin_hwnd=job.origin_hwnd)
+        # A spoken request runs at its own effort setting (heard live, and mostly one quick
+        # action); a typed one at the agent's. Chosen by where it came from, never by its words.
+        effort = getattr(self.runtime.settings, "voice_brain_effort", None) if job.source == "voice" else None
+        events = self.agent.run(job.request, origin_hwnd=job.origin_hwnd, effort=effort or None)
         while True:
             try:
                 event = next(events)
@@ -428,6 +431,8 @@ class AgentRuntime(QObject):
         self.memory = memory if memory is not None else default_memory()
         self._ids = itertools.count(1)
         self._worker_outstanding: list[int] = []
+        #: Where each front-desk request came from, for a hand-off to the worker.
+        self._sources: dict[int, str] = {}
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -517,6 +522,8 @@ class AgentRuntime(QObject):
         lane = self.worker if not self.worker_busy else self.front_desk
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
+        else:
+            self._sources[request_id] = source  # kept if the front desk hands it to the worker
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
@@ -524,19 +531,20 @@ class AgentRuntime(QObject):
         )
         return lane.name, request_id
 
-    def queue_for_worker(self, request: str, *, origin_id: int | None = None) -> int:
+    def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text") -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
             request: What the user asked for.
             origin_id: The front-desk request it came from, for the log.
+            source: Where the request came from (``text`` or ``voice``), kept across the hand-off.
 
         Returns:
             The new request id.
         """
         request_id = next(self._ids)
         self._worker_outstanding.append(request_id)
-        waiting = self.worker.enqueue(Job(request_id, request))
+        waiting = self.worker.enqueue(Job(request_id, request, None, source))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
         )
@@ -641,5 +649,8 @@ class AgentRuntime(QObject):
             return
         if needed_hands:
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
-            new_id = self.queue_for_worker(request, origin_id=request_id)
+            new_id = self.queue_for_worker(request, origin_id=request_id,
+                                           source=self._sources.pop(request_id, "text"))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
+        else:
+            self._sources.pop(request_id, None)

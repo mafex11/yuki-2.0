@@ -297,6 +297,7 @@ def run(args: argparse.Namespace) -> int:
     render_seen: float | None = None   # mtime of the render flag the scheduler was last woken for
     review_path = flag_path(db_path, REVIEW_FLAG)
     store = None
+    embed_server = None
     code = 0
     try:
         store = Store.open(db_path)
@@ -338,6 +339,15 @@ def run(args: argparse.Namespace) -> int:
             power = None
         power_recheck_at: float | None = None
 
+        # The one embedder on this PC: Yuki's tray asks this process for vectors over a
+        # local, user-only pipe instead of loading its own ~550 MB copy (yuki.memory.embed_ipc).
+        try:
+            from yuki.memory.embed_ipc import EmbedServer
+
+            embed_server = EmbedServer(store.cipher, db_path, log=log).start()
+        except Exception as exc:   # Yuki then embeds locally; nothing else depends on it
+            log("error", where="embed_ipc_start", error=f"{type(exc).__name__}: {exc}")
+
         shared = store
         from yuki.config import Settings
 
@@ -351,6 +361,16 @@ def run(args: argparse.Namespace) -> int:
         log("pause_flag", paused=paused, at_start=True)
         watcher.start()
 
+        # Who holds the microphone and camera, and which of them plays sound: measured, shared by the
+        # timeline (meetings) and the call worker (calls); re-read only when Windows changes them.
+        av_signals = None
+        try:
+            from yuki.memory.avsignals import AvSignals
+
+            av_signals = AvSignals()
+        except Exception as exc:  # each reader then makes its own
+            log("error", where="avsignals_start", error=f"{type(exc).__name__}: {exc}")
+
         if not args.no_timeline:
             try:
                 from yuki.memory.timeline import TimelineRecorder
@@ -359,6 +379,7 @@ def run(args: argparse.Namespace) -> int:
                     store, privacy=privacy, log=log,
                     # a page that changed address without a title change (a reel, a feed): read it now
                     on_page_change=lambda hwnd: watcher.request_capture(hwnd, "page"),
+                    signals=av_signals,
                 )
                 timeline.set_paused(paused)  # before start: nothing is recorded, not even the first window
                 timeline.start()
@@ -500,7 +521,8 @@ def run(args: argparse.Namespace) -> int:
                     tl = timeline
                     return tl.current_meeting() if tl is not None and tl.alive else None
 
-                calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now)
+                calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now,
+                                   signals=av_signals)
                 calls_thread = threading.Thread(
                     target=_guarded(calls.run, log, "calls"), args=(stop, pause_path),
                     name="yuki-memory-calls", daemon=True,
@@ -610,6 +632,11 @@ def run(args: argparse.Namespace) -> int:
         code = 2
     finally:
         stop.set()
+        if embed_server is not None:
+            try:
+                embed_server.stop()
+            except Exception:
+                pass
         if acting_event is not None:
             acting_event.set()
         if journal is not None:

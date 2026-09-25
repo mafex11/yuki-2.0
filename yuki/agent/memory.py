@@ -113,6 +113,12 @@ PORTRAIT_TTL_S = 300.0
 #: Most know-how lines attached to one request.
 KNOWHOW_LINES = 6
 
+#: Longest a request waits for the embedding of its words for the know-how similarity
+#: lookup. The memory service's embedder answers in ~10-30 ms; a cold one (or a local
+#: load while the service is down) takes 1-2 s, and then this request goes without the
+#: similar entries rather than waiting (measured 2026-09-25: the wait was 2.3-3.9 s).
+KNOWHOW_EMBED_WAIT_S = 0.6
+
 #: Most journal facts one ``recall`` returns.
 RECALL_LIMIT = 15
 
@@ -589,7 +595,8 @@ class MemoryAccess:
             try:
                 lines = self.call(
                     "knowhow",
-                    lambda c: c.knowhow(app=app, query=query, limit=KNOWHOW_LINES),
+                    lambda c: c.knowhow(app=app, query=query, limit=KNOWHOW_LINES,
+                                        embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining)),
                     timeout_s=remaining,
                 )
                 result.knowhow = [
@@ -1058,7 +1065,7 @@ def memory_block_text(
         else:
             parts.append(context.portrait)
     if context.todos:
-        lines = "\n".join(todo_line(row, with_source=False) for row in context.todos)
+        lines = "\n".join(todo_line(row) for row in context.todos)   # with ids: todo done takes an id
         parts.append(f"{TODO_LABEL}\n{lines}")
     if context.knowhow:
         lines = "\n".join(f"- {' '.join(line.split())}" for line in context.knowhow)

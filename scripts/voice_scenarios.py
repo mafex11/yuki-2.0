@@ -189,7 +189,62 @@ def _copy_db(src: Path, tmp: Path) -> Path:
     return dst / "memory.db"
 
 
-def _real_brain(settings: Settings, memory: Any, timeline: Timeline) -> tuple[Any, Any]:
+def _discord_desk() -> Any:
+    """The stub desktop with a Discord window in front that really minimizes (the 25 Sept replay)."""
+    from yuki.voice.offline import StubResult, StubDesktop
+
+    class DiscordDesk(StubDesktop):
+        def __init__(self) -> None:
+            super().__init__(action_delay_s=0.6)
+            self.minimized = False
+
+        def get_desktop_overview(self) -> dict[str, Any]:
+            o = super().get_desktop_overview()
+            for w in o["windows"]:
+                w["is_foreground"] = False
+            o["windows"].insert(0, {"hwnd": 0x2002, "process_name": "Discord.exe", "title": "#general | Friends - Discord",
+                                    "is_foreground": not self.minimized, "is_minimized": self.minimized, "pid": 99,
+                                    "bounds": (-32000, -32000, -31840, -31972) if self.minimized else (0, 0, 1920, 1040)})
+            if self.minimized:
+                o["windows"][1]["is_foreground"] = True
+            o["foreground_hwnd"] = o["windows"][0 if not self.minimized else 1]["hwnd"]
+            return o
+
+        def format_overview(self, overview: dict[str, Any]) -> str:
+            lines = [f"Open windows ({len(overview['windows'])}), foreground first:"]
+            for w in overview["windows"]:
+                mark = (" [foreground]" if w["is_foreground"] else "") + (" [minimized]" if w["is_minimized"] else "")
+                lines.append(f"- [{w['hwnd']}] {w['process_name']} \"{w['title']}\"{mark}")
+            return "\n".join(lines)
+
+        def _act(self, name: str, summary: str, *args: Any, **kwargs: Any) -> StubResult:
+            result = super()._act(name, summary, *args, **kwargs)
+            self.minimized = True
+            return result
+
+        def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> StubResult:
+            result = self._act("run_powershell", "powershell exit 0; stdout: True", command)
+            result.details = {"stdout": "True", "stderr": "", "exit_code": 0}
+            return result
+
+    return DiscordDesk()
+
+
+def _serve_embedder(db: Path) -> Any:
+    """A stand-in memory service serving its (loaded) embedder on ``db``'s pipe, in its own process."""
+    import subprocess
+
+    code = ("import sys,time; sys.path.insert(0, r'%s'); from yuki.memory.store import Store; "
+            "from yuki.memory.embed import get_embedder; from yuki.memory.embed_ipc import EmbedServer; "
+            "s=Store.open(r'%s'); get_embedder().embed(['warm']); EmbedServer(s.cipher, s.path).start(); "
+            "print('serving', flush=True); time.sleep(900)") % (ROOT, db)
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    while "serving" not in (proc.stdout.readline() or "serving"):
+        pass
+    return proc
+
+
+def _real_brain(settings: Settings, memory: Any, timeline: Timeline, desk: Any = None) -> tuple[Any, Any]:
     from yuki.agent.loop import Agent
     from yuki.agent.tools import Dispatcher
     from yuki.log.events import SessionLogger
@@ -199,7 +254,7 @@ def _real_brain(settings: Settings, memory: Any, timeline: Timeline) -> tuple[An
 
     ui_log = UiLog(sessions_dir=settings.sessions_dir, session_id=None)
     session = ui_log.logger.session_id
-    desk = StubDesktop(action_delay_s=0.6)
+    desk = desk or StubDesktop(action_delay_s=0.6)
     worker = Agent(settings, SessionLogger(settings.sessions_dir, console=None, session_id=f"{session}-worker"),
                    backend=desk, lane="worker", memory=memory, prewarm=True)
     blocked = HandsBlockedBackend(StubDesktop(action_delay_s=0))
@@ -257,10 +312,19 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         over["voice_eot_threshold"] = args.eot
     if scenario in ("pauses", "wake1"):
         over["voice_hold_max_s"] = 8.0
+    if args.grounding is not None:
+        over["voice_grounding"] = args.grounding == "on"
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider=args.tts,
                         voice_tts_voice=args.voice or ("" if args.tts == "elevenlabs" else "aura-2-thalia-en"),
                         voice_idle_s=args.idle, **over)
-    memory = MemoryAccess(path=_copy_db(args.db, tmp)) if args.db else None
+    db_copy = _copy_db(args.db, tmp) if args.db else None
+    service = _serve_embedder(db_copy) if db_copy is not None and args.serve_embedder else None
+    if db_copy is not None and args.add_rule:
+        from yuki.memory.api import MemoryClient
+
+        with MemoryClient.open(db_copy) as client:  # the temp copy only
+            client.remember_rule(args.add_rule)
+    memory = MemoryAccess(path=db_copy) if db_copy is not None else None
     timeline = Timeline()
     vlog = VoiceLog(args.out / "voice-log", args.out / f"voice_turns_{scenario}.csv")
 
@@ -276,7 +340,20 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         return "reply_done"
 
     runtime = desk = None
-    if scenario == "talk":
+    if scenario == "live925":
+        # The user's first live conversation (2026-09-25), replayed: a one-action task, a question
+        # while it runs, an acknowledgement, a rule change, small talk, thanks.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_discord_desk())
+        lines = [
+            ScriptLine(clip("l_hello"), "l_hello", after_s=1.0),
+            ScriptLine(clip("l_minimize"), "l_minimize", after_s=0.8, wait_for=reply_done()),
+            ScriptLine(clip("l_time"), "l_time", after_s=0.6, wait_for=reply_done()),
+            ScriptLine(clip("l_okay"), "l_okay", after_s=1.0, wait_for=done_after("l_minimize")),
+            ScriptLine(clip("l_babe"), "l_babe", after_s=1.0, wait_for=reply_done()),
+            ScriptLine(clip("l_work"), "l_work", after_s=1.0, wait_for=reply_done()),
+            ScriptLine(clip("l_thanks"), "l_thanks", after_s=1.0, wait_for=reply_done()),
+        ]
+    elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
             ScriptLine(clip("v3_hello"), "v3_hello", after_s=1.0),
@@ -427,6 +504,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     usage = sampler.stop()
     if hasattr(runtime, "stop"):
         runtime.stop()
+    if service is not None:
+        service.kill()
     out = args.out / scenario
     out.mkdir(parents=True, exist_ok=True)
     if "output" in box:
@@ -499,7 +578,11 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "all"))
+    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "all"))
+    ap.add_argument("--grounding", choices=("on", "off"), default=None)
+    ap.add_argument("--serve-embedder", dest="serve_embedder", action="store_true",
+                    help="serve the embedder from a stand-in memory service process on the DB copy")
+    ap.add_argument("--add-rule", dest="add_rule", default="", help="a standing rule added to the temp DB copy")
     ap.add_argument("--more-clips", dest="more_clips", type=Path, nargs="*", help="more clip folders (manifest.json)")
     ap.add_argument("--wake-clips", dest="wake_clips", default="", help="comma-separated clip names for wake2")
     ap.add_argument("--clips", type=Path, required=True)

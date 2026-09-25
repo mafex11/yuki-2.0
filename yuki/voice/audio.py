@@ -36,9 +36,16 @@ BLOCK_SAMPLES = RATE * BLOCK_MS // 1000
 #: word starts (the name itself and what follows it).
 BACKLOG_S = 3.0
 
-#: A 20 ms block at or above this level counts as voiced for the "end of
-#: speech" timing in the voice log. Measurement only; nothing decides on it.
+#: A 20 ms block at or above this level always counts as voiced for the "end of
+#: speech" timing in the voice log (and the narrator's raw-sound gate).
 VOICED_DBFS = -42.0
+#: A quieter block counts as voiced when it is this many times above the room's
+#: floor (+12 dB) and above an absolute minimum. A Bluetooth headset's mic in
+#: hands-free mode delivers speech well below -42 dBFS: on the first live test
+#: (2026-09-25) not one block reached it, so every live turn's end-of-speech
+#: timing was empty. Measurement only.
+VOICED_OVER_FLOOR = 4.0
+VOICED_MIN_DBFS = -62.0
 
 
 def _wasapi(sd: Any) -> int | None:
@@ -97,6 +104,19 @@ class MicStats:
     last_voiced: float = 0.0
     #: Start of the current stretch of voiced blocks (gaps under half a second join them).
     voiced_since: float = 0.0
+    voiced_blocks: int = 0
+    #: The room's level (RMS, linear): falls at once to a quieter block, rises slowly.
+    floor: float = 0.0
+    #: Loudest block RMS seen (linear), for the log.
+    loudest: float = 0.0
+
+    def levels(self) -> dict[str, Any]:
+        """Content-free level facts for the log (dBFS)."""
+        def db(x: float) -> float | None:
+            return round(20 * float(np.log10(x)), 1) if x > 0 else None
+
+        return {"blocks": self.blocks, "voiced_blocks": self.voiced_blocks, "floor_dbfs": db(self.floor),
+                "loudest_dbfs": db(self.loudest)}
 
 
 class SharedMic:
@@ -125,6 +145,7 @@ class SharedMic:
         self._resample: Any = None
         self._channels = 1
         self._voiced_floor = float(10 ** (VOICED_DBFS / 20.0))
+        self._voiced_min = float(10 ** (VOICED_MIN_DBFS / 20.0))
 
     @property
     def is_open(self) -> bool:
@@ -206,13 +227,20 @@ class SharedMic:
         """Push float32 mono 16 kHz audio as if it came from the device (tests use this too)."""
         if mono.size == 0:
             return
-        peak = float(np.sqrt(np.mean(mono * mono)))
+        level = float(np.sqrt(np.mean(mono * mono)))
         pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-        self.stats.blocks += 1
-        if peak >= self._voiced_floor:
-            if at - self.stats.last_voiced > 0.5:
-                self.stats.voiced_since = at
-            self.stats.last_voiced = at + len(mono) / RATE
+        st = self.stats
+        st.blocks += 1
+        st.loudest = max(st.loudest, level)
+        if st.floor <= 0.0 or level < st.floor:
+            st.floor = max(level, 1e-6)
+        else:
+            st.floor += (level - st.floor) * 0.002  # rises over ~10 s of steady sound
+        if level >= min(self._voiced_floor, max(self._voiced_min, st.floor * VOICED_OVER_FLOOR)):
+            st.voiced_blocks += 1
+            if at - st.last_voiced > 0.5:
+                st.voiced_since = at
+            st.last_voiced = at + len(mono) / RATE
         with self._lock:
             self._backlog.append((at, pcm))
             subs = list(self._subs.values())

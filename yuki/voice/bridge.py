@@ -36,7 +36,7 @@ from typing import Any, Awaitable, Callable
 
 from PySide6.QtCore import QObject, Signal
 
-from yuki.voice.mouth import SPOKEN_NOTE, brain_request, progress_payload, result_payload
+from yuki.voice.mouth import SAVED_NOTE, SPOKEN_NOTE, brain_request, progress_payload, result_payload
 from yuki.voice.narrator import RANKS, Item, condense
 from yuki.voice.progress import JobLog, StepPacer, step_of
 
@@ -83,6 +83,8 @@ class Job:
     token: int = 0
     log: JobLog | None = None
     pacer: StepPacer | None = None
+    #: Handed over with intent ``remember`` (a rule, correction or life fact to keep).
+    remember: bool = False
 
     def status(self, now: float) -> dict[str, Any]:
         return {
@@ -168,6 +170,11 @@ class VoiceBridge(QObject):
         self.progress_answerer: Callable[[str, str], Awaitable[tuple[str | None, dict]]] | None = None
         #: The mouth's own quick tools in flight (check_progress): the gate waits for them.
         self.busy_tools = 0
+        #: Whether the mouth's reply that is making a tool call has put any words out
+        #: (set by the conversation; ``None``: assume it has).
+        self.spoke_in_reply: Callable[[], bool] | None = None
+        #: ``async ()``: a ``remember`` hand-off was saved (the conversation re-reads the rules).
+        self.on_remembered: Callable[[], Awaitable[None]] | None = None
         self._gui_call.connect(self._run)
         for name, slot in (
             ("started", self._on_started), ("tool_called", self._on_tool_called),
@@ -194,6 +201,8 @@ class VoiceBridge(QObject):
         if loop is None:
             self.gate = None
             self.progress_answerer = None
+            self.spoke_in_reply = None
+            self.on_remembered = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -277,7 +286,9 @@ class VoiceBridge(QObject):
         intent = str(args.get("intent") or "new_task")
         heard = heard_words(params.context)
         request = request or (heard[-1] if heard else "")
-        text = brain_request(request, heard, context=context)
+        remember = intent == "remember"
+        text = brain_request(request, heard, context=context, remember=remember)
+        await self._ack_if_silent(params, args)
         if intent == "follow_up":
             target = self._follow_up_target()
             if target is not None:
@@ -299,6 +310,10 @@ class VoiceBridge(QObject):
                              f'finished{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
                     if x))
         job = self._new_job(request)
+        if remember:
+            # Saved quietly: no progress lines, and its outcome folded in unless it failed.
+            job.remember = True
+            job.pacer = StepPacer(0)
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
@@ -319,6 +334,24 @@ class VoiceBridge(QObject):
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
 
+    async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
+        """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.
+
+        The mouth's words normally come before the call in its reply and are already
+        being spoken; measured 2026-09-25 (live and in a text probe, 5 of 5), it also
+        hands over with no words at all, and the user heard silence until the first
+        progress line 11 s later. Whether the reply had words is a fact about the stream
+        (:attr:`spoke_in_reply`), not about what they say; the words are the mouth's own.
+        """
+        words = str(args.get("say_first") or "").strip()
+        spoke = self.spoke_in_reply() if self.spoke_in_reply is not None else True
+        if spoke or not words:
+            return
+        from pipecat.frames.frames import TTSSpeakFrame
+
+        await params.llm.push_frame(TTSSpeakFrame(text=words))
+        self._log("bridge", op="ack_spoken", call=params.tool_call_id, chars=len(words))
+
     async def _relay(self, job: Job, params: Any) -> None:
         """Pass the job's items to the narrator gate (or straight to the mouth) until its final result is delivered."""
         from pipecat.frames.frames import FunctionCallResultProperties
@@ -328,6 +361,15 @@ class VoiceBridge(QObject):
             kind, payload = await job.events.get()
             self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
                       chars=len(str(payload)))
+            if kind == "done" and job.remember:
+                # The mouth already reacted when it handed this over; the brain's "saved" is
+                # put into the conversation without a turn (a spoken "noted" would repeat it).
+                await params.result_callback({"saved": payload, "how_to_handle_it": SAVED_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                self._log("bridge", op="remembered", job_id=job.job_id, chars=len(payload))
+                if self.on_remembered is not None:
+                    await self.on_remembered()  # the mouth's own rules layer follows at once
+                return
             if kind in ("done", "failed"):
                 head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
                 job.rest = rest

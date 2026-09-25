@@ -50,6 +50,24 @@ def voice_id(settings: Settings, prefs: dict[str, Any]) -> str:
     return str(prefs.get("tts_voice") or os.environ.get(VOICE_ID_ENV) or settings.voice_tts_voice or "").strip()
 
 
+#: ``voice.json`` keys that set ElevenLabs voice settings (``Settings`` field names on the right).
+TTS_PREFS = {"tts_speed": "voice_tts_speed", "tts_stability": "voice_tts_stability",
+             "tts_similarity_boost": "voice_tts_similarity_boost", "tts_style": "voice_tts_style",
+             "tts_speaker_boost": "voice_tts_speaker_boost"}
+
+
+def conversation_settings(settings: Settings, prefs: dict[str, Any]) -> Settings:
+    """The settings one conversation runs with: the voice id and voice settings from ``voice.json`` applied."""
+    from dataclasses import replace
+
+    over: dict[str, Any] = {"voice_tts_voice": voice_id(settings, prefs)}
+    for key, name in TTS_PREFS.items():
+        value = prefs.get(key)
+        if isinstance(value, bool) if name == "voice_tts_speaker_boost" else isinstance(value, (int, float)):
+            over[name] = value
+    return replace(settings, **over)
+
+
 def load_prefs(path: Path = PREFS_PATH) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -311,9 +329,13 @@ class VoiceSession(QObject):
         started = time.monotonic()
         reason, error = "error", ""
         speaker = None
-        settings = replace(self.settings, voice_tts_voice=voice_id(self.settings, load_prefs(self._prefs_path)))
+        settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
         try:
             facts = preflight(settings)
+            if facts.get("tts_voice"):
+                # The chosen voice was refused (e.g. needs a paid plan): this conversation only.
+                settings = replace(settings, voice_tts_voice=facts["tts_voice"])
+                self.log.event("voice_id", state="refused_fallback", note=facts.get("tts_note"))
             mouth_memory = fetch_memory(self.memory)
             mic = self._ensure_mic()
             speaker = Speaker(24_000, self.settings.voice_output_device)
@@ -354,6 +376,8 @@ class VoiceSession(QObject):
         finally:
             if speaker is not None:
                 speaker.close()
+            if self._mic is not None:
+                self.log.event("mic", state="levels", **self._mic.stats.levels())
             obs = getattr(self._conversation, "observer", None)
             self.log.event("session", state="stop", session=session, reason=reason, error=error or None,
                            seconds=round(time.monotonic() - started, 1),

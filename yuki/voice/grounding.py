@@ -18,10 +18,11 @@ brain's to weigh. This is a hint, not an answer: the mouth's prompt says what
 it may answer from it (one fact that plainly answers a simple question) and
 that anything about the user's day or activity is still handed over.
 
-The embedder is memory's process-wide one (``yuki.memory.embed.get_embedder``,
-~600 MB loaded; the brain loads the same one for its first request). It is
-loaded when a conversation starts, off the voice loop, and unloaded when the
-conversation ends if it was not loaded before it (``release``).
+The embeddings come from the memory service's embedder over its local pipe
+(``yuki.memory.embed_ipc``), so a conversation costs the tray no model at all
+(it did ~550 MB before 2026-09-25). Only when the service is down is a local
+one loaded, when the conversation starts and off the voice loop, and unloaded
+when the conversation ends if it was not loaded before it (``release``).
 """
 
 from __future__ import annotations
@@ -39,6 +40,9 @@ LIFE_KINDS = ("fact", "episode", "review")
 RECALL_LIMIT = 12
 #: Longest fact text shown (whole sentences).
 FACT_CHARS = 220
+#: Longest one lookup waits for its words' embedding (the service answers in tens of ms);
+#: past it that lookup is keyword-only instead of waiting for a model to load.
+EMBED_WAIT_S = 0.4
 
 
 @dataclass
@@ -107,6 +111,10 @@ class Grounder:
         self._latest: Lookup | None = None      # newest finished lookup (any turn)
         self._by_text: dict[str, Lookup] = {}   # this turn's lookups
         self.embedder_was_loaded: bool | None = None
+        #: Where the lookups' embeddings come from: ``remote`` (the memory service), ``local`` or ``none``.
+        self.source: str | None = None
+        #: No service embedder answered at the start: no lookups this conversation.
+        self.disabled = False
         self.ready = threading.Event()
         #: For the log and the tests: every lookup's time, and what each call got.
         self.timings: list[float] = []
@@ -115,16 +123,26 @@ class Grounder:
     # -- lifecycle -------------------------------------------------------------
 
     def warm(self) -> None:
-        """Load the embedder now, off the caller's thread (a one-word recall does it)."""
+        """Have the embedder ready before the first lookup, off the caller's thread.
+
+        The memory service's embedder is asked to load (it usually is loaded already);
+        only when the service does not answer does a local one load here, in the
+        background (``yuki.memory.embed_ipc.EmbedClient.warm``).
+        """
         def work() -> None:
             started = time.perf_counter()
             try:
                 from yuki.memory.embed import get_embedder
 
                 self.embedder_was_loaded = bool(get_embedder().stats().get("loaded"))
-                self.memory.call("voice_grounding_warm", lambda c: c.recall("hello", limit=1), timeout_s=30.0)
+                self.source = self.memory.call("voice_grounding_warm",
+                                               lambda c: c.embedder.warm(allow_local=False), timeout_s=5.0)
+                if self.source != "remote" and not self.embedder_was_loaded:
+                    # No service embedder to ask: the lookup would load ~550 MB into the tray
+                    # for a hint. This conversation goes without it (memory questions go to the brain).
+                    self.disabled = True
                 self._log("grounding", op="warm", ms=round((time.perf_counter() - started) * 1000),
-                          was_loaded=self.embedder_was_loaded)
+                          source=self.source, was_loaded=self.embedder_was_loaded, disabled=self.disabled)
             except Exception as exc:  # noqa: BLE001 - voice works without it
                 self._log("grounding", op="warm", error=f"{type(exc).__name__}: {str(exc)[:160]}")
             finally:
@@ -133,13 +151,14 @@ class Grounder:
         self._pool.submit(work)
 
     def release(self, *, busy: bool) -> bool:
-        """End of the conversation: unload the embedder if this conversation loaded it and nothing else is working.
+        """End of the conversation: unload a local embedder this conversation loaded, if nothing else works.
 
         Returns whether it was unloaded. ``busy``: a brain request is running
         (it may be using the embedder; memory's own idle timer unloads it later).
+        The service's embedder is the service's to keep or drop.
         """
         self._pool.shutdown(wait=False, cancel_futures=True)
-        if busy or self.embedder_was_loaded is not False:
+        if busy or self.embedder_was_loaded is not False or self.source != "local":
             return False
         try:
             from yuki.memory.embed import get_embedder
@@ -172,7 +191,7 @@ class Grounder:
 
     def _want(self, text: str) -> None:
         text = " ".join((text or "").split())
-        if len(text) < 3:
+        if len(text) < 3 or self.disabled:
             return
         with self._lock:
             if text in self._by_text:
@@ -189,9 +208,13 @@ class Grounder:
         self._pool.submit(self._work, lookup)
 
     def _work(self, lookup: Lookup) -> None:
+        if self.disabled:
+            lookup.error = "grounding off: no service embedder"
+            lookup.done.set()
+            return
         try:
-            hits = self.memory.call("voice_grounding", lambda c: c.recall(lookup.text, limit=RECALL_LIMIT),
-                                    timeout_s=2.0)
+            hits = self.memory.call("voice_grounding", lambda c: c.recall(
+                lookup.text, limit=RECALL_LIMIT, embed_wait_s=EMBED_WAIT_S), timeout_s=2.0)
             lookup.facts = [h for h in (hits or []) if h.get("kind") in LIFE_KINDS][: self.keep]
         except Exception as exc:  # noqa: BLE001
             lookup.error = f"{type(exc).__name__}: {str(exc)[:120]}"

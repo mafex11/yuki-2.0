@@ -103,6 +103,8 @@ def condense(text: str, *, max_sentences: int = 2, max_chars: int = 280) -> tupl
 RANKS = {"step": 0, "queued": 0, "say": 1, "ask": 2, "final": 3}
 #: User turns an item may wait through before it is stale (``final`` uses the setting).
 STALE_AFTER = {"step": 1, "queued": 1, "say": 2}
+#: Kinds said as soon as the user may be spoken to (no settle, only a short gap after Yuki's speech).
+URGENT = ("final", "ask")
 
 
 @dataclass
@@ -131,17 +133,21 @@ class NarratorGate:
             speech recognition says so),
             ``bot_speaking``, ``generating``, ``owes_reply``, ``busy_tools``
             (the mouth's own quick tools in flight), ``last_bot_stop``
-            (monotonic, 0 if never) and ``user_turns`` (final transcripts so far).
-        settle_s / settle_max_s / cooldown_s / stale_turns: see ``Settings.voice_*``.
+            (monotonic, 0 if never), ``user_turns`` (final transcripts so far) and
+            ``jobs_open`` (this conversation's tasks still running).
+        settle_s / settle_max_s / cooldown_s / stale_turns / final_gap_s: see ``Settings.voice_*``
+            (``final_gap_s`` ``None``: the cooldown, as before).
         log: Content-free event log (``event(kind, **fields)``) or ``None``.
     """
 
     def __init__(self, state: Callable[[], dict[str, Any]], *, settle_s: float = 1.5, settle_max_s: float = 6.0,
-                 cooldown_s: float = 1.5, stale_turns: int = 3, log: Any = None) -> None:
+                 cooldown_s: float = 1.5, stale_turns: int = 3, log: Any = None,
+                 final_gap_s: float | None = None) -> None:
         self._state = state
         self.settle_s = settle_s
         self.settle_max_s = settle_max_s
         self.cooldown_s = cooldown_s
+        self.final_gap_s = cooldown_s if final_gap_s is None else final_gap_s
         self.stale_turns = stale_turns
         self.log = log
         self.pending: list[Item] = []
@@ -220,10 +226,18 @@ class NarratorGate:
             return "owes_reply", None
         if s.get("busy_tools"):
             return "mouth_tool", None
+        # A result or a question is said as soon as the user is not talking and nothing is
+        # owed: after Yuki's own speech only a short natural gap, and no settle unless another
+        # task of this conversation is still running (its result may land a moment later and
+        # be said in the same turn). Progress lines keep the full cooldown and settle, so a
+        # result that follows within the settle replaces them (measured 2026-09-25: a
+        # one-action result waited 4.5 s here, 1.5 s of it settle and cooldown).
+        urgent = any(i.kind in URGENT for i in self.pending)
+        cooldown = self.final_gap_s if urgent else self.cooldown_s
         last_stop = float(s.get("last_bot_stop") or 0.0)
-        if last_stop and now - last_stop < self.cooldown_s:
-            return "cooldown", last_stop + self.cooldown_s
-        if self._first_at is not None:
+        if last_stop and now - last_stop < cooldown:
+            return "cooldown", last_stop + cooldown
+        if self._first_at is not None and not (urgent and not s.get("jobs_open")):
             settle_until = min(self._last_at + self.settle_s, self._first_at + self.settle_max_s)
             if now < settle_until:
                 return "settle", settle_until
