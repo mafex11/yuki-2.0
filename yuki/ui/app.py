@@ -657,7 +657,7 @@ class YukiUi(QObject):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.settings.sessions_dir)))
 
 
-def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
+def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSystemTrayIcon:
     """Create the tray icon and its menu.
 
     Args:
@@ -667,7 +667,7 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     Returns:
         The tray icon, which the caller must keep a reference to.
     """
-    tray = QSystemTrayIcon(tray_icon(), app)
+    tray = QSystemTrayIcon(icon or tray_icon(), app)
     menu = QMenu()
 
     # Memory first: a status line (read afresh each time the menu opens), then
@@ -896,13 +896,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setApplicationName("Yuki")
     app.setQuitOnLastWindowClosed(False)
 
+    # Load the heavy native modules and draw the tray icon on this thread before any worker
+    # thread starts. On 2026-09-25 the agent's prewarm thread was loading PIL's DLL (inside the
+    # Windows loader lock) while this thread painted the icon, and Qt's raster engine waited on a
+    # helper thread that could not start without that lock: the tray never came up and the
+    # memory service was never started.
+    import yuki.perception  # noqa: F401  (PIL, win32ui, comtypes: loaded here, not in a thread)
+
+    icon = tray_icon()
     settings = Settings()
     ui_log = UiLog(sessions_dir=settings.sessions_dir, session_id=None)
     # Start with Windows is on by default: the first run turns it on once and records that it
     # did, so a later "off" from the tray is kept (yuki.ui.startup.apply_default).
     ui_log.event("startup_default", **startup.apply_default())
     ui = YukiUi(settings, ui_log)
-    tray = build_tray(ui, app)
+    tray = build_tray(ui, app, icon)
     ui.start()
 
     try:
