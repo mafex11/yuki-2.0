@@ -95,6 +95,11 @@ Portrait (worker and Yuki)::
     store.add_correction(text, at=None) -> int                            # user-confirmed, kind "correction"
     store.start_portrait_run(kind, model, at=None) -> int
     store.commit_portrait_changes(run_id, changes: list[FactChange], *, until_journal_id=None)
+    # the portrait audit (migration 15): its findings with the reasoning, and its evidence helpers
+    store.add_audit_findings(run_id, findings) -> ids;  store.audit_findings(run_id=None, limit=100)
+    store.journal_by_ids(ids);  store.similar_journal(vectors, limit=6) -> [[JournalEntry]]
+    store.batch_captures(batch_ids, per_batch=3) -> {batch: [capture dicts]};  store.first_capture_text(thread_id, before=None)
+    store.journal_superseded_since(ids, since) -> set;  store.questions_changed_since(since)
         -> list[tuple[bool, int | None]]   # (applied, new fact id) per change
         # one transaction: ADD/UPDATE(supersede)/INVALIDATE + open-loop sync + folded corrections retired
     store.finish_portrait_run(run_id, run: PortraitRunStats) -> None
@@ -226,7 +231,7 @@ Maintenance and reporting::
 
 Service coordination (flag files next to the database, the service's mutex)::
 
-    PAUSE_FLAG, REFRESH_FLAG, RENDER_FLAG, REVIEW_FLAG
+    PAUSE_FLAG, REFRESH_FLAG, RENDER_FLAG, REVIEW_FLAG, AUDIT_FLAG
     flag_path(db_path, name) -> Path
     request_render(db_path) -> bool          # the render_portrait flag (debounced render)
     service_mutex_name(db_path) -> str
@@ -280,6 +285,9 @@ REFRESH_FLAG = "refresh_portrait"
 RENDER_FLAG = "render_portrait"
 #: ``run_weekly_review`` asks the service to write a weekly review now (it deletes the flag when it starts).
 REVIEW_FLAG = "run_weekly_review"
+#: ``audit_portrait`` asks the service's portrait scheduler for a portrait audit now ("connect the dots";
+#: the file's text "all" audits every fact, anything else only the facts new evidence touches).
+AUDIT_FLAG = "audit_portrait"
 
 #: Prefix of the service's named mutex (one service per session and database).
 SERVICE_MUTEX_PREFIX = "Local\\YukiMemorySingleInstance"
@@ -1794,6 +1802,28 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE journal_batches ADD COLUMN supersedes TEXT;     -- JSON: the batch ids a re-journal replaced
     ALTER TABLE portrait_facts ADD COLUMN aspect TEXT;
     """,
+    # 15: the portrait audit (yuki.memory.portrait, "connect the dots"): each finding
+    # of an audit run - a contradiction, a misattribution (whose account, course,
+    # task or document), a relationship, a stale status, an agent's work told as the
+    # user's - with the facts and evidence it rests on, the model's reasoning
+    # (encrypted), what was decided (resolved | asked | kept | rejected) and the fact
+    # versions and questions it produced. The superseded facts keep their history
+    # as always (valid_to, superseded_by); this is the why. Additive only, like 2-14.
+    """
+    CREATE TABLE portrait_audits (
+        id                   INTEGER PRIMARY KEY,
+        run_id               INTEGER,              -- portrait_runs row (kind 'audit')
+        at                   REAL NOT NULL,
+        finding              TEXT NOT NULL,        -- contradiction | misattribution | relationship | stale | agent_work
+        decision             TEXT NOT NULL,        -- resolved | asked | kept | rejected
+        fact_ids             TEXT,                 -- JSON: the facts it is about
+        journal_ids          TEXT,                 -- JSON: the evidence
+        new_fact_ids         TEXT,                 -- JSON: fact versions written for it
+        question_ids         TEXT,                 -- JSON: questions raised for it
+        reasoning_ciphertext TEXT
+    );
+    CREATE INDEX portrait_audits_at ON portrait_audits(at);
+    """,
 )
 
 
@@ -2895,6 +2925,124 @@ class Store:
     def portrait_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         """Latest run rows (content-free), newest first."""
         return [dict(r) for r in self._query("SELECT * FROM portrait_runs ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    # -- the portrait audit (yuki.memory.portrait, "connect the dots") -------------
+
+    def journal_by_ids(self, ids: Iterable[int]) -> list[JournalEntry]:
+        """The current (not superseded) journal rows with these ids, oldest first."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return []
+        return [self._entry(r) for r in self._query(
+            "SELECT j.* FROM journal j WHERE j.superseded_at IS NULL AND j.id IN (%s) ORDER BY j.at, j.id"
+            % ",".join("?" * len(wanted)), wanted)]
+
+    def similar_journal(self, vectors: Sequence[np.ndarray], limit: int = 6) -> list[list[JournalEntry]]:
+        """For each query vector, the ``limit`` most similar current journal rows (cosine), best first.
+
+        The journal's vectors are decrypted once for all queries (the audit asks for
+        dozens at a time; :meth:`search_journal` would decrypt them once per query).
+        """
+        if not vectors:
+            return []
+        rows = [r for r in self._query(
+            "SELECT j.*, v.vec_ciphertext, v.dim FROM journal j JOIN journal_vec v ON v.journal_id = j.id"
+            " WHERE j.superseded_at IS NULL")]
+        dim = int(np.asarray(vectors[0]).ravel().shape[0])
+        rows = [r for r in rows if r["dim"] == dim]
+        if not rows:
+            return [[] for _ in vectors]
+        matrix = np.stack([np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+                           for r in rows])
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        out: list[list[JournalEntry]] = []
+        for vec in vectors:
+            q = np.asarray(vec, dtype=np.float32).ravel()
+            qn = float(np.linalg.norm(q)) or 1.0
+            scores = (matrix @ (q / qn)) / norms
+            order = np.argsort(-scores)[: max(0, int(limit))]
+            out.append([self._entry(rows[i], float(scores[i])) for i in order])
+        return out
+
+    def batch_captures(self, batch_ids: Iterable[int], *, per_batch: int = 3) -> dict[int, list[dict[str, Any]]]:
+        """``{batch id: [{id, at, kind, thread_id, text}]}``: the captures still stored that a journal batch
+        was read from (at most ``per_batch`` each, oldest first; text decrypted). Captures past their TTL are gone."""
+        ids = sorted({int(b) for b in batch_ids})
+        if not ids:
+            return {}
+        out: dict[int, list[dict[str, Any]]] = {}
+        for r in self._query(
+            "SELECT id, at, kind, thread_id, journal_batch_id, delta_ciphertext FROM captures"
+            " WHERE journal_batch_id IN (%s) ORDER BY at, id" % ",".join("?" * len(ids)), ids):
+            items = out.setdefault(int(r["journal_batch_id"]), [])
+            if len(items) < per_batch:
+                items.append({"id": int(r["id"]), "at": float(r["at"]), "kind": r["kind"],
+                              "thread_id": r["thread_id"], "text": self._dec(r["delta_ciphertext"]) or ""})
+        return out
+
+    def first_capture_text(self, thread_id: int, before: float | None = None) -> tuple[float, str] | None:
+        """``(at, text)`` of the oldest capture still stored for a thread (before ``before``), or ``None``:
+        the top of a page, where it shows its title, author and date, when later captures are deltas."""
+        sql, params = "SELECT at, delta_ciphertext FROM captures WHERE thread_id=?", [int(thread_id)]
+        if before is not None:
+            sql += " AND at < ?"
+            params.append(float(before))
+        rows = self._query(sql + " ORDER BY at, id LIMIT 1", params)
+        return (float(rows[0]["at"]), self._dec(rows[0]["delta_ciphertext"]) or "") if rows else None
+
+    def journal_superseded_since(self, journal_ids: Iterable[int], since: float) -> set[int]:
+        """Those of ``journal_ids`` a re-journal replaced after ``since``."""
+        ids = sorted({int(i) for i in journal_ids})
+        if not ids:
+            return set()
+        return {int(r["id"]) for r in self._query(
+            "SELECT id FROM journal WHERE superseded_at > ? AND id IN (%s)" % ",".join("?" * len(ids)),
+            [float(since), *ids])}
+
+    def questions_changed_since(self, since: float) -> list[QuestionRecord]:
+        """Questions answered, skipped, refused or expired after ``since`` (their facts may now be settled)."""
+        return [self._question_row(r) for r in self._query(
+            "SELECT * FROM questions WHERE updated_at > ? AND status IN ('answered', 'skipped', 'never', 'expired')",
+            (float(since),))]
+
+    def add_audit_findings(self, run_id: int | None, findings: Sequence[dict[str, Any]],
+                           at: float | None = None) -> list[int]:
+        """Record an audit run's findings (the reasoning encrypted); returns their ids."""
+        when = float(at) if at is not None else time.time()
+
+        def op(conn: sqlite3.Connection) -> list[int]:
+            out = []
+            for f in findings:
+                cur = conn.execute(
+                    "INSERT INTO portrait_audits(run_id, at, finding, decision, fact_ids, journal_ids, new_fact_ids,"
+                    " question_ids, reasoning_ciphertext) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (run_id, when, str(f.get("finding") or "contradiction"), str(f.get("decision") or "kept"),
+                     json.dumps([int(i) for i in f.get("fact_ids") or []]),
+                     json.dumps([int(i) for i in f.get("journal_ids") or []]),
+                     json.dumps([int(i) for i in f.get("new_fact_ids") or []]),
+                     json.dumps([int(i) for i in f.get("question_ids") or []]),
+                     self._enc(str(f.get("reasoning") or "") or None)),
+                )
+                out.append(int(cur.lastrowid))
+            return out
+
+        return self._write(op) if findings else []
+
+    def audit_findings(self, *, run_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Recorded audit findings (reasoning decrypted), newest first."""
+        sql, params = "SELECT * FROM portrait_audits", []
+        if run_id is not None:
+            sql += " WHERE run_id=?"
+            params.append(int(run_id))
+        out = []
+        for r in self._query(sql + " ORDER BY id DESC LIMIT ?", [*params, int(limit)]):
+            item = dict(r)
+            for key in ("fact_ids", "journal_ids", "new_fact_ids", "question_ids"):
+                item[key] = json.loads(item[key] or "[]")
+            item["reasoning"] = self._dec(item.pop("reasoning_ciphertext"))
+            out.append(item)
+        return out
 
     def save_portrait(
         self, text: str, *, run_id: int | None = None, model: str | None = None, fact_count: int = 0,
@@ -5104,22 +5252,31 @@ class Store:
     def commit_call_batch(
         self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
         commitments: Sequence[ConversationChange] = (), *, supersedes: Sequence[int] = (),
+        questions: Sequence[NewQuestion] = (), question_outcomes: list[tuple[int | None, str]] | None = None,
     ) -> tuple[int, list[int]]:
         """:meth:`commit_batch` for a call's side, plus the user's commitments from it, in one transaction.
 
         Commitments are conversation facts of kind ``commitment``, origin
         ``call`` (so they reach the to-do list and reminders like any other),
         each already checked to quote the user's own words. Returns the batch
-        id and the new commitment ids. ``supersedes``: as for :meth:`commit_batch`.
+        id and the new commitment ids. ``supersedes``, ``questions`` and
+        ``question_outcomes``: as for :meth:`commit_batch` (a call's questions are
+        about names the user said).
         """
         ids = list(capture_ids)
         now = time.time()
+        known = self.question_known_keys() if questions else set()
 
         def op(conn: sqlite3.Connection) -> tuple[int, list[int]]:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
-            for fact in facts:
-                self._insert_journal(conn, fact, batch_id)
+            journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            for q in questions:
+                q.source_ids = sorted({*q.source_ids, *(journal_ids[i] for i in q.fact_indexes
+                                                        if 0 <= i < len(journal_ids))})
+            outcomes = [self._insert_question(conn, q, time.time(), known) for q in questions]
+            if question_outcomes is not None:
+                question_outcomes[:] = outcomes
             new_ids = [self._insert_cfact(conn, ch, now, None) for ch in commitments]
             conn.executemany("UPDATE captures SET journal_batch_id=? WHERE id=?", [(batch_id, i) for i in ids])
             return batch_id, new_ids

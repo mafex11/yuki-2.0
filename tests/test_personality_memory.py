@@ -79,7 +79,7 @@ class ToolClient:
 
 
 def test_migration_14_nature_and_supersede(store):
-    assert store._query("PRAGMA user_version")[0][0] == 14
+    assert store._query("PRAGMA user_version")[0][0] >= 14   # 15: the portrait audit
     cols = {r["name"] for r in store._query("PRAGMA table_info(journal)")}
     assert {"nature", "superseded_at", "superseded_by"} <= cols
     old = store.add_journal(T0, None, "Discord", "The user needs a pilot who earns millions.", 4)

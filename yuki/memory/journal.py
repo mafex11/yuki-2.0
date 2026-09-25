@@ -100,6 +100,8 @@ EMPTY_REJOURNAL = "re-journal found no facts where the earlier run had some; the
 #: the default batch size.
 MAX_BATCH_CHARS = 12_000
 PREVIOUS_FACTS_CHARS = 2_000
+#: How much of a page's first capture is shown as TOP OF THIS PAGE with its later deltas.
+PAGE_TOP_CHARS = 600
 MAX_OUTPUT_TOKENS = 4_096
 
 SYSTEM_PROMPT = """\
@@ -125,7 +127,11 @@ a commitment, a deadline. Record those, cite the message they come from and writ
 in the past tense, as what was said then. Never record HISTORY as something happening \
 now or something the user just did: rereading an old conversation is not news.
 - CAPTURES of a page or document: the text that newly appeared on screen at that \
-moment (a delta against what the window showed before).
+moment (a delta against what the window showed before). A capture is dated by when it was on \
+screen, but what it shows can be much older: a video's upload date, a post's, comment's or \
+article's date, an email's date ("738 views 1 year ago", "Jun 12, 2025"). TOP OF THIS PAGE, when \
+given, is how the page began when it was first read - its title, author, account and date - as \
+context for dating and naming what the captures show; it is never a source itself.
 - LIST ITEMS: one row each of a list that was on screen - an inbox, a folder, a playlist, \
 search results - dated by the row's own date when it shows one (an email's date, a file's \
 modified time), else by when the list was seen. A list is what was VISIBLE, not what the user \
@@ -206,6 +212,20 @@ the sentence. Do turn relative dates in the content ("tomorrow", "by Friday", "n
 month") into absolute dates, counting from the date of the source that says them and \
 reading the weekday and date off the CALENDAR given with the request rather than \
 working them out.
+- Dated by the content when it shows its own date: what a page, video, post, comment, article \
+or document says was said when it was posted or written, not when the user saw it. For a fact \
+that reports what such content says - a status, news, a plan, a claim about someone - give its \
+content_date: the date the content shows, as YYYY-MM-DD, or YYYY-MM when only the month is \
+clear ("7 months ago" or "1 year ago" counted back from the capture's date). Word the fact as \
+of that date, as something said then, never as now: "In the description of 'YOU WERE THE ONE' \
+by Driftwood Music, posted around June 2025, the uploader said quix was on a break for exams." A \
+"currently", "now" or "is" in old content describes that time, not today. A fact about what the \
+user did with the content - watched, opened, read, listened to, commented on it - happened when \
+the source was seen: it never gets a content_date, even when it mentions when the content was \
+posted. When one capture gives both, write two facts: "The user watched 'X' by Y on YouTube." \
+(no content_date) and "In the description of 'X', posted around June 2025, Y said ..." \
+(content_date 2025-06). content_date also stays empty for messages and list rows (they carry \
+their own time) and whenever no date shows.
 - In English, keeping names, titles and quotes in their original script (a Japanese \
 title stays in Japanese).
 - Never record passwords, one-time codes, card or account numbers, or other secrets, \
@@ -284,18 +304,31 @@ in the transcript: never assume what they said or who they are beyond what the u
 make plain."""
 
 
+#: A call's own side asks only about names the user said (:data:`RECORD_CALL_SIDE_TOOL` ``questions``).
+CALL_QUESTION_GUIDANCE = """\
+ASK ABOUT NAMES, NEVER GUESS. Never state a relationship, a meaning or an owner the user's words \
+do not say. When the user names someone or something in the call that WHAT MEMORY ALREADY KNOWS \
+does not cover - a person they are with, talk to or talk about, a name their plans or work use - \
+and knowing it would change how Yuki understands them, put it in questions ("Who is <name> to the \
+user?"), citing the utterance. Only a name clear enough that you would write it in a fact; never \
+about what anyone else said, who the others in the call are beyond the name the user used, or what \
+the call was about. At most two; most calls need none."""
+
+
 def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bool = False) -> str:
     """:data:`SYSTEM_PROMPT` with the user's identity and the shared guidance filled in.
 
-    ``questions``: include the ask-don't-guess guidance (the ``record_facts`` batches;
-    a call's own side has no questions: nothing is inferred about the others in it).
-    ``call_side``: add :data:`CALL_TRANSCRIPT_GUIDANCE` (how to read a noisy transcript).
+    ``questions``: include the ask-don't-guess guidance (the ``record_facts`` batches).
+    ``call_side``: add :data:`CALL_TRANSCRIPT_GUIDANCE` (how to read a noisy transcript); a
+    call's own side asks only about names the user said (:data:`CALL_QUESTION_GUIDANCE`):
+    nothing is inferred about the others in it.
     """
+    guidance = (CALL_QUESTION_GUIDANCE if call_side else QUESTION_GUIDANCE if questions else
+                "Never state a relationship, a meaning or an owner the sources do not say in words.")
     text = (SYSTEM_PROMPT.replace("{identity}", user_identity(names))
             .replace("{agent_work}", AGENT_WORK_GUIDANCE)
             .replace("{nature}", NATURE_GUIDANCE)
-            .replace("{questions}", QUESTION_GUIDANCE if questions else
-                     "Never state a relationship, a meaning or an owner the sources do not say in words."))
+            .replace("{questions}", guidance))
     return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}" if call_side else text
 
 
@@ -316,7 +349,7 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "nature", "importance", "source"],
+                    "required": ["text", "nature", "importance", "source", "content_date"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -341,6 +374,16 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                             "description": (
                                 "Number of the source (message or capture) the fact comes from, the "
                                 "latest one if several. The fact is dated by it."
+                            ),
+                        },
+                        "content_date": {
+                            "type": "string",
+                            "description": (
+                                "Only for a fact that reports what a page, video, post or document said (never "
+                                "for what the user did with it): the date that content shows it was posted or "
+                                "written, YYYY-MM-DD or YYYY-MM. The fact is then dated by it instead of by the "
+                                "source. \"\" for what the user watched, read or did, for messages, and when no "
+                                "date shows."
                             ),
                         },
                     },
@@ -379,7 +422,8 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                     "additionalProperties": False,
                     "required": ["text", "nature", "importance", "source"],
                     "properties": {
-                        **RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]["properties"],
+                        **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
+                           ["properties"].items() if k != "content_date"},   # a call's words are dated by themselves
                         "nature": {
                             "type": "string",
                             "enum": list(NATURES),
@@ -424,9 +468,15 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                     },
                 },
             },
+            "questions": {
+                "type": "array",
+                "description": "Names the user said that memory cannot place (see ASK ABOUT NAMES); usually empty.",
+                "items": question_item_schema("source"),
+            },
         },
     },
 }
+RECORD_CALL_SIDE_TOOL["input_schema"]["required"] = ["facts", "commitments", "questions"]
 
 
 def sanitize_untrusted(value: str, nonce: str, max_chars: int) -> str:
@@ -475,6 +525,24 @@ CALL_SIDE_KIND = "my_call_side"
 #: The date the extractor put in front of a list row that shows one
 #: (yuki.memory.extract: "[dated 2026-09-09 14:03] ..."): our own format.
 _ROW_DATE = _re.compile(r"^\[dated (\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\] ")
+
+
+def content_date(value: Any, seen_at: float) -> float | None:
+    """Epoch of a fact's ``content_date`` ("YYYY-MM-DD" or "YYYY-MM", the date the content itself shows),
+    or ``None`` when it is empty, unreadable, or not before the day the source was seen (then the source
+    dates the fact). A month alone is dated to its middle, noon local time."""
+    text = " ".join(str(value or "").split())
+    for fmt, day in (("%Y-%m-%d", None), ("%Y-%m", 15)):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        when = parsed.replace(day=day or parsed.day, hour=12)
+        seen_day = datetime.fromtimestamp(seen_at).replace(hour=0, minute=0, second=0, microsecond=0)
+        if when.year < 1990 or when >= seen_day:
+            return None
+        return when.timestamp()
+    return None
 
 
 def list_row(line: str) -> tuple[float | None, str]:
@@ -600,13 +668,16 @@ def build_user_message(
     *,
     known: str = "",
     absent: set[int] | None = None,
+    page_top: tuple[float, str] | None = None,
 ) -> str:
     """The fenced user message for one batch (MaxMi's ``ExtractPrompt`` shape).
 
     ``known``: the WHAT MEMORY ALREADY KNOWS block (:func:`yuki.memory.questions.known_text`,
     already scrubbed with this ``nonce``). ``absent``: ids of the captures taken while the
     user gave no input for over a minute (the timeline's own away state), marked NO USER
-    INPUT on their sources.
+    INPUT on their sources. ``page_top``: ``(when, text)`` of the page's first capture when
+    the batch holds only later deltas of it - where a page shows its title, account and date -
+    given as TOP OF THIS PAGE (context, never a source).
     """
     nonce = nonce or str(uuid.uuid4()).upper()
     begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
@@ -634,6 +705,9 @@ def build_user_message(
             label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
             parts.append(f"{label}: {safe(thread.scope, 300)}")
         parts += [f"window title: {safe(thread.title, 300)}", f"url: {safe(thread.url, 500)}"]
+        if page_top and page_top[1].strip():
+            parts += [f"TOP OF THIS PAGE (as first read {_local(page_top[0])[:16]}; context only, never a source):",
+                      safe(page_top[1], PAGE_TOP_CHARS)]
     parts += [
         "FACTS ALREADY RECORDED for this thread (never extract from these):",
         safe(previous, PREVIOUS_FACTS_CHARS) or "(none)",
@@ -885,7 +959,7 @@ class JournalWorker:
             self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce, cap), about=about)
         absent = self.absent_captures(captures)
         user = build_user_message(thread, sources, previous, nonce, max_capture_chars=self.batch_chars,
-                                  known=known, absent=absent)
+                                  known=known, absent=absent, page_top=self.page_top(thread, captures))
         tool = RECORD_CALL_SIDE_TOOL if call_side else RECORD_FACTS_TOOL
         request = {
             "model": self.model,
@@ -1021,7 +1095,11 @@ class JournalWorker:
         rejected: list[str] = []
         requests: list[dict[str, Any]] = []
         responses: list[Any] = []
+        questions: list[NewQuestion] = []
         cost: float | None = 0.0
+        nonce_known = str(uuid.uuid4()).upper()
+        known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap),
+                           about=" ".join(str((s.utterance or {}).get("text") or "") for s in sources))
         t0 = time.perf_counter()
         try:
             for part in parts:
@@ -1030,8 +1108,8 @@ class JournalWorker:
                 earlier += [JournalEntry(id=0, at=c.at, thread_id=None, app="", host=None,
                                          fact=f"(to-do already recorded) {c.text}", importance=7, batch_id=None)
                             for c in commitments]
-                user = build_user_message(thread, part, earlier + previous, str(uuid.uuid4()).upper(),
-                                          max_capture_chars=self.batch_chars)
+                user = build_user_message(thread, part, earlier + previous, nonce_known,
+                                          max_capture_chars=self.batch_chars, known=known)
                 request = {"model": self.model, "max_tokens": MAX_OUTPUT_TOKENS, "system": system, "tools": [tool],
                            "tool_choice": {"type": "tool", "name": tool["name"]},
                            "messages": [{"role": "user", "content": user}]}
@@ -1045,7 +1123,12 @@ class JournalWorker:
                 part_cost = self.settings.estimate_cost(self.model, tokens)
                 cost = None if cost is None or part_cost is None else cost + part_cost
                 call.stop_reason = response.stop_reason
-                facts += self._parse_facts(response, thread, part, tool=tool["name"])
+                part_sources: list[int] = []
+                offset = len(facts)
+                facts += self._parse_facts(response, thread, part, tool=tool["name"], indexes=part_sources)
+                for q in self._parse_questions(response, thread, part, part_sources, tool=tool["name"]):
+                    q.fact_indexes = [offset + i for i in q.fact_indexes]
+                    questions.append(q)
                 kept, why = self._parse_commitments(response, thread, part, tool["name"])
                 commitments += kept
                 rejected += why
@@ -1061,12 +1144,16 @@ class JournalWorker:
                         fact.embed_model = self.embedder.model_name
                 except Exception as exc:  # facts are kept; backfill_vectors retries
                     embed_error = f"{type(exc).__name__}: {exc}"
+            if questions:
+                embed_error = embed_questions(questions, self.embedder) or embed_error
             if supersedes and not facts and self._guard_empty:
                 return self._empty_rejournal(thread_id, capture_ids, totals, call)
             # a re-journal leaves the call's to-dos where they are (their own path, already written once)
             ignored = len(commitments) if supersedes else 0
+            question_outcomes: list[tuple[int | None, str]] = []
             batch_id, commitment_ids = self.store.commit_call_batch(
-                call, capture_ids, facts, [] if supersedes else commitments, supersedes=supersedes)
+                call, capture_ids, facts, [] if supersedes else commitments, supersedes=supersedes,
+                questions=questions, question_outcomes=question_outcomes)
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
@@ -1075,11 +1162,15 @@ class JournalWorker:
                 parts=len(parts), usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
                 stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,
                 utterances=len(sources), unclear=sum(1 for s in sources if (s.utterance or {}).get("unclear")),
-                commitments=len(commitment_ids), commitments_rejected=rejected,
+                commitments=len(commitment_ids), commitments_rejected=rejected, known_chars=len(known),
+                questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
+                           for q, (qid, outcome) in zip(questions, question_outcomes)],
                 request_ciphertext=self._seal(requests), response_ciphertext=self._seal(responses),
             )
             return BatchResult(batch_id, thread_id, capture_ids, True, [f.fact for f in facts], totals,
-                               call.cost_usd, call.latency_ms, natures=[f.nature for f in facts])
+                               call.cost_usd, call.latency_ms, natures=[f.nature for f in facts],
+                               questions=[(f"{q.subject}: {q.question}", outcome)
+                                          for q, (_qid, outcome) in zip(questions, question_outcomes)])
         except Exception as exc:
             call.latency_ms = (time.perf_counter() - t0) * 1000
             call.input_tokens, call.output_tokens = totals["input_tokens"], totals["output_tokens"]
@@ -1191,6 +1282,22 @@ class JournalWorker:
                 out.append(q)
         return out
 
+    def page_top(self, thread: ThreadInfo, captures: Sequence[PendingCapture]) -> tuple[float, str] | None:
+        """The page's first capture, when this batch holds only later deltas of a page or document.
+
+        Pages are stored as deltas (only what changed), so a later capture of a video
+        or a post lacks the lines at the top that say whose it is and when it was
+        posted; the journal gets them back as context. Not for messages, lists,
+        terminals or calls: those carry their own dates and senders.
+        """
+        if (thread.kind or "") in (*MESSAGE_KINDS, LIST_KIND, TERMINAL_KIND, CALL_SIDE_KIND) or not captures:
+            return None
+        try:
+            first = self.store.first_capture_text(thread.id, before=min(c.at for c in captures))
+        except Exception:
+            return None
+        return first if first and first[1].strip() else None
+
     def absent_captures(self, captures: Sequence[PendingCapture]) -> set[int]:
         """Captures taken while the user gave no input for over a minute (the timeline's ``away`` state).
 
@@ -1248,7 +1355,8 @@ class JournalWorker:
             if not 0 <= index < len(sources):
                 index = len(sources) - 1
             facts.append(
-                NewFact(at=sources[index].at, thread_id=thread.id, app=thread.app, host=thread.host,
+                NewFact(at=content_date(item.get("content_date"), sources[index].at) or sources[index].at,
+                        thread_id=thread.id, app=thread.app, host=thread.host,
                         fact=text, importance=importance,
                         by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)), nature=nature)
             )
