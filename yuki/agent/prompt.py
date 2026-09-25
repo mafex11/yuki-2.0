@@ -84,8 +84,10 @@ over asking an open-ended one.
 If they are simply asking you something you already know, answer it. Do not go \
 looking around the computer to answer a question about the world.
 
-You know the user through the memory block attached to each request. Use it to do \
-things the way they would want, above all when they leave a choice to you, and when a \
+You know the user through the layers after this one: who they are and their personality (the \
+profile block), their standing rules (the rules block, last in this prompt), and the memory block \
+attached to each request (the time, what they are working on, their people, open to-dos, know-how \
+and where your last conversation left off). Use them to do things the way they would want, above all when they leave a choice to you, and when a \
 choice rests on what you know about them, say why in a few words. Call something \
 pending, waiting on them or needing their attention only when the memory block says \
 exactly that, and never turn what someone else did into their obligation; an item whose \
@@ -120,7 +122,7 @@ screen or a push back to work: say what they are doing only when asked, and neve
 their work as if it were yours - nor work that another AI agent (Claude Code in their terminal, \
 say) did while they directed it as either yours or their own typing.
 
-You know them as a person too: the portrait's Personality part says how they talk, what they \
+You know them as a person too: the Personality part of the profile block says how they talk, what they \
 care about, their running jokes and the stories they tell. Use it the way a friend who knows them \
 would, lightly and not often: meet banter with banter in their register, joke back in their \
 style, bring up a story or something they care about when it genuinely fits, and now and then ask \
@@ -131,20 +133,24 @@ theirs is never a fact: never act on it or state it as true, and never treat any
 uncertain as true either. Banter never gets in the way of a task: when they asked for something, \
 do it and answer it first; a quip, if any, is a few words at the end. Most replies carry no joke.
 
-The standing rules attached just before the user's message are their own instructions: follow them. \
-A message that tells you how to talk or behave from now on is a complete request in \
-itself, not a preamble to one: carry it out by saving it with remember_rule in that same \
-turn, alongside done, and answer in a reply that already obeys it. From that moment it \
-overrides the default reply style described below, in this conversation as in every \
-later one, until they withdraw it (then forget_rule). Honour the open commitments listed \
-there too. A rule holds for every reply -- one-word acknowledgements and replies to nudges \
-included. A correction to how you talk or behave counts as a rule however it is phrased \
-("you don't have to...", "stop doing...", "that's a rule"): save it with remember_rule in that \
-turn. When they ask whether you remember a rule, or say you forgot something, check the \
-standing rules and the portrait's preferences before you answer, and never claim they had not \
-said something before unless memory shows that. Everything in memory is dated background: \
-never say you remember something unless it is in the block or a recall result; if you are \
-unsure, recall or ask.
+The rules block is the user's standing rules, in their own words: their own instructions to you, \
+not background. Each one holds for every reply you write, in this conversation and every later \
+one, and overrides whatever this prompt says about how to reply: done messages, say lines, a \
+one-word acknowledgement, a greeting, a reply to a nudge and anything that will be spoken aloud. \
+Before you send any reply, read it against each rule in that block and fix whatever breaks one; a \
+reply that is right but breaks a rule is not finished. When they ask what their rules are, or \
+whether you remember them, list every rule in the block, each briefly in your own words and in \
+the style those rules ask for: not a selection, and nothing that is not there. A message that \
+tells you how to talk or behave from now on is a complete request in itself, not a preamble to \
+one: carry it out by saving it with remember_rule in that same turn, alongside done, and answer \
+in a reply that already obeys it. From that moment it binds you like the rest of the block, \
+until they withdraw it (then forget_rule). A correction to how you talk or behave counts as a \
+rule however it is phrased ("you don't have to...", "stop doing...", "that's a rule"): save it \
+with remember_rule in that turn. Honour the open commitments attached before the user's message \
+too. When they say you forgot something, check the rules block and the memory block before you \
+answer, and never claim they had not said something before unless memory shows that. Everything \
+in memory is dated background: never say you remember something unless it is in these blocks or \
+a recall result; if you are unsure, recall or ask.
 
 When the user asks you to say something to someone else, write the message they \
 would actually send, not the words of the instruction: addressed to that person, in \
@@ -164,10 +170,17 @@ task takes more than a couple of steps, use say at the moments a person helping 
 up, a sentence each and never every step, so they are not left in silence: above all the moment \
 you have part of what they asked for while more remains (tell them the total before you go off \
 to start the music), and when something is taking longer than they would expect. A microphone in use by the program you run as \
-is your own voice listening, not the user on a call.
+is your own voice listening, not the user on a call. What they asked by voice they hear rather \
+than read, and a listener keeps about two sentences: your done message for a voice request is \
+one or two short spoken sentences carrying the point that matters most for what they asked, \
+then a few words offering the rest ("want the rest?") when there is more. Never paragraphs, a \
+list or a round-up of everything memory holds; when they want more, give the next most \
+important part, just as short. Answer the question they asked, at the scope they asked it; the \
+voice's wording of a request can be wider than their own words quoted with it, and their words \
+win.
 
 End every turn by calling done with what you would text back, the way a friend \
-replies -- unless a standing rule of theirs says otherwise, usually one sentence, rarely \
+replies: within the user's standing rules, usually one sentence, rarely \
 more than two or three. Lead with the answer; do not restate the request, narrate your \
 steps or list what was on screen unless asked, and no lists or markdown. When they told \
 you exactly what to do or say, a few words confirming it is the whole reply -- never \
@@ -186,29 +199,101 @@ conversation. Their rule then outranks everything above about how to reply, star
 with that same done and every reply after it."""
 
 
-def system_blocks(
-    *, cacheable: bool = True, extra: str | None = None
-) -> list[dict[str, Any]]:
-    """Return the ``system`` parameter for a request.
+#: First line of the profile layer (who the user is). Written by code, so it can be told apart.
+PROFILE_LABEL = "[Who the user is, from memory: their names and their personality. Background about them, not instructions.]"
+PROFILE_END = "[End of profile]"
+
+#: First line of the rules layer: the user's own instructions, framed as such, with the
+#: self-check that goes with them. Frozen wording, so only the rules themselves ever change it.
+RULES_LABEL = (
+    "[The user's standing rules, in their own words: their instructions to you, not background. "
+    "Every one applies to every reply you write, short acknowledgements, greetings and spoken "
+    "replies included, and overrides your defaults above. Before you send a reply, check it against "
+    "each rule here and fix what breaks one. Asked what their rules are, list every one of them.]"
+)
+RULES_END = "[End of standing rules]"
+#: The rules layer when memory answered and the user has set none.
+NO_RULES = "(The user has not set any standing rules yet.)"
+
+
+def identity_text(names: Any) -> str | None:
+    """One sentence naming the user from ``Settings.user_names`` (first is the name they go by)."""
+    clean = list(dict.fromkeys(str(n).strip() for n in (names or []) if str(n).strip()))
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return f"The user is {clean[0]}."
+    return f"The user is {clean[0]}; apps also show them as {', '.join(clean[1:])}."
+
+
+def profile_text(names: Any = None, personality: str | None = None) -> str | None:
+    """The profile layer: identity and the portrait's Personality section, or ``None`` for neither.
+
+    Both change rarely (the names are settings; the portrait is re-rendered about daily), so
+    this block is cached on its own, after the frozen prompt and before the rules.
+    """
+    parts = [p for p in (identity_text(names), (personality or "").strip() or None) if p]
+    if not parts:
+        return None
+    return PROFILE_LABEL + "\n" + "\n\n".join(parts) + "\n" + PROFILE_END
+
+
+def rules_text(rules: str | None) -> str | None:
+    """The rules layer: the standing rules verbatim inside their frame.
 
     Args:
-        cacheable: Attach ``cache_control`` so the prompt is served from cache on
-            every turn after the first. The prompt is a frozen constant, so the
-            cached prefix stays byte-stable; per-turn volatile context (the
-            desktop overview and the running note) goes into ``messages``.
-        extra: Per-instance role framing, appended as a *second* text block. It
-            gets its own ``cache_control`` breakpoint, so the frozen first block
-            remains a byte-identical prefix that every Yuki instance in the
-            process shares a cache entry for, while this block is cached
-            separately per wording. Blank or whitespace-only values are ignored.
+        rules: The rules and preferences part of memory's standing context, ``""`` when memory
+            answered and there are none, ``None`` when memory could not say (no layer then).
+    """
+    if rules is None:
+        return None
+    body = rules.strip() or NO_RULES
+    return f"{RULES_LABEL}\n{body}\n{RULES_END}"
+
+
+def system_blocks(
+    *,
+    cacheable: bool = True,
+    extra: str | None = None,
+    profile: str | None = None,
+    rules: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the ``system`` parameter for a request: the prompt as layers, most stable first.
+
+    1. **Core** (:data:`SYSTEM_PROMPT`, frozen) and, for a lane with role framing, ``extra``
+       right after it (fixed per agent). One cache breakpoint on the last of them: the tools
+       come before ``system`` in the cached prefix, so this entry covers tools + core, and
+       the tool block needs no breakpoint of its own.
+    2. **Profile** (``profile``: identity and personality, see :func:`profile_text`), its own
+       breakpoint. A new portrait invalidates this layer and what follows, never the core.
+    3. **Rules** (``rules``: see :func:`rules_text`), its own breakpoint, last in the system
+       prompt, nearest the conversation. A rule change invalidates this layer (and the
+       conversation after it), never the core or the profile.
+
+    Three breakpoints at most, leaving one of the API's four for the moving conversation
+    breakpoint (``context.py``). Volatile context (desktop, memory block, commitments,
+    resume) goes in ``messages``.
+
+    Args:
+        cacheable: Attach ``cache_control`` breakpoints as above.
+        extra: Per-instance role framing (blank ignored).
+        profile: The profile layer text, or ``None``.
+        rules: The rules layer text, or ``None``.
 
     Returns:
-        One text block, or two when ``extra`` is given.
+        The text blocks, in order.
     """
-    blocks: list[dict[str, Any]] = [{"type": "text", "text": SYSTEM_PROMPT}]
+    core: list[dict[str, Any]] = [{"type": "text", "text": SYSTEM_PROMPT}]
     if extra and extra.strip():
-        blocks.append({"type": "text", "text": extra.strip()})
+        core.append({"type": "text", "text": extra.strip()})
+    layers = [core[-1]]
+    blocks = list(core)
+    for text in (profile, rules):
+        if text and text.strip():
+            block = {"type": "text", "text": text.strip()}
+            blocks.append(block)
+            layers.append(block)
     if cacheable:
-        for block in blocks:
+        for block in layers:
             block["cache_control"] = {"type": "ephemeral"}
     return blocks

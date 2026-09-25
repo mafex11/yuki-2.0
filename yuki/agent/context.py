@@ -48,7 +48,7 @@ perception payload older than two turns) rewrote something two turns back on
 * The breakpoint sits on the last block *before* the situation block of the
   newest user message (the last tool result, or on a new request the memory
   block or the request origin), never on the situation block itself. On a new
-  request the standing rules and the user's own words come *after* the
+  request the open commitments and the user's own words come *after* the
   situation block (see :meth:`ContextManager.add_request`), so they too are
   written to cache one round later, never rewritten. The situation block is the one
   thing guaranteed to be superseded next round -- by the next turn's overview.
@@ -71,8 +71,9 @@ perception payload older than two turns) rewrote something two turns back on
 Limits respected:
 
 * At most 4 breakpoints per request. The caller passes how many slots system
-  and tools already use; with ``extra_instructions`` that is 3 (two system
-  blocks plus the tools), leaving exactly one for the conversation. With none
+  and tools already use: the system prompt's layers take up to 3 (core, profile,
+  rules; ``prompt.system_blocks``) and the tools none, leaving one for the
+  conversation (so the compaction breakpoint below is normally not placed). With none
   left, no conversation breakpoint is added.
 * Minimum cacheable prefix: 1024 tokens on Claude Sonnet 5 (512 on Claude
   Opus 5). A breakpoint's prefix includes tools and system (~4.6k tokens here),
@@ -425,20 +426,21 @@ class ContextManager:
            framed by :func:`yuki.agent.memory.memory_block_text`);
         3. the situation block (fresh desktop, request facts, working note; see
            :meth:`situation_text`);
-        4. the standing rules and open commitments (the user's own instructions,
-           framed by :func:`yuki.agent.memory.standing_block_text`);
+        4. the open commitments (framed by
+           :func:`yuki.agent.memory.commitments_block_text`; the user's standing
+           rules themselves are a cached system layer, ``prompt.system_blocks``);
         5. the user's words, verbatim and alone, last.
 
-        The rules sit right before the user's words so that the last thing the
-        model reads before replying is what the user asked and how they want to
-        be answered; with the desktop list after them, a rule read as one more
-        piece of background and was often not applied to short replies.
+        The commitments sit where the standing rules used to (right before the
+        user's words). The rules moved to the system prompt's rules layer: cached,
+        framed as the user's own instructions with a self-check, and last in the
+        system prompt, so a rule change costs only that layer's cache.
 
         Cache: the breakpoint lands on the last block before the situation
         block (the memory block, or the origin), so origin and memory are read
         from cache on every later round. The situation block is stubbed next
-        round, which touches only content after that breakpoint; the rules and
-        the user's words (a few hundred tokens) are after it too, so they are
+        round, which touches only content after that breakpoint; the commitments
+        and the user's words (a few hundred tokens) are after it too, so they are
         written to cache once, on the next round. Origin and memory are never
         stubbed: the origin matters most at the end, when the model decides
         whether to put the user back.

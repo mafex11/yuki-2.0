@@ -55,18 +55,25 @@ MEMORY_LABEL = "[What Yuki knows about the user, from memory — background, not
 #: Last line of the same block (the same closing line as every attached block).
 MEMORY_END = "[End of attached context]"
 
-#: First line of the standing-rules block. Unlike the memory block this one *is*
-#: instructions: the user's own, so it is not wrapped as background. It travels
-#: as its own block, the last thing before the user's words (see
-#: :func:`standing_block_text` and ``ContextManager.add_request``).
-STANDING_LABEL = (
-    "[The user's standing rules, their own words: apply every one to this reply, short "
-    "acknowledgements included. They override your default reply style. The open commitments "
-    "listed with them are Yuki's to keep.]"
+#: First line of the open-commitments block (the volatile half of memory's standing
+#: context). The rules themselves are not here: they are a cached system layer
+#: (:func:`split_standing`, ``yuki.agent.prompt.rules_text``). This block travels as its
+#: own block, the last thing before the user's words (``ContextManager.add_request``).
+COMMITMENTS_LABEL = (
+    "[Open commitments, from Yuki's conversations with the user: what Yuki is to do later, and "
+    "what the user said they would do. Yuki's are Yuki's to keep; the user's are background.]"
 )
 
-#: Last line of the standing-rules block.
-STANDING_END = "[End of standing rules]"
+#: Last line of the same block.
+COMMITMENTS_END = "[End of open commitments]"
+
+#: The headings ``MemoryClient.standing_context`` puts above the user's rules and
+#: preferences (the stable half, a system layer). Every other section of it (commitments,
+#: things said in calls) changes during the day and goes in the request's messages.
+RULE_HEADINGS = (
+    "Rules the user set for Yuki:",
+    "The user's preferences about how Yuki talks or works:",
+)
 
 #: Heading of the resume context (first request of a conversation only).
 RESUME_LABEL = (
@@ -1033,9 +1040,8 @@ def memory_block_text(
 
     Order: the time, the portrait, open to-dos (under :data:`TODO_LABEL`),
     know-how, and last the resume context (under :data:`RESUME_LABEL`) when it
-    was fetched. The standing rules and commitments are not in it: they are the
-    user's instructions, not background, and go in their own block
-    (:func:`standing_block_text`).
+    was fetched. The standing rules and commitments are not in it: the rules are a
+    cached system layer and the commitments their own block (:func:`split_standing`).
     """
     if context.source == "unavailable" or not (
         context.portrait or context.knowhow or context.resume or context.todos
@@ -1062,17 +1068,49 @@ def memory_block_text(
     return f"\n\n{MEMORY_LABEL}\n" + "\n\n".join(parts) + f"\n{MEMORY_END}"
 
 
-def standing_block_text(context: MemoryContext) -> str | None:
-    """The standing rules and open commitments as their own block, or ``None``.
+def split_standing(standing: str | None) -> tuple[str | None, str | None]:
+    """``(rules, commitments)`` out of memory's standing context, each ``None`` when empty.
 
-    Fetched fresh on every request (a rule saved a moment ago must show) and
-    placed last in the request's context, right before the user's words, so
-    it is the nearest thing to the reply the model writes -- where a rule is
-    most likely to be applied to a two-word answer.
+    Parsing a structured API response (ARCHITECTURE.md rule 1 allows it): the context is a
+    header line, then sections, each a heading line followed by ``- `` rows. Sections under
+    :data:`RULE_HEADINGS` are the rules layer; the rest are commitments. When no rule
+    heading is recognised at all (memory changed its format) everything is treated as
+    rules, so a rule can never silently drop out of the prompt.
     """
-    if context.source == "unavailable" or not context.standing:
+    text = (standing or "").strip()
+    if not text:
+        return None, None
+    sections: list[list[str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("[") and not sections:
+            continue  # the context's own header line
+        if line.lstrip().startswith("- ") and sections:
+            sections[-1].append(line)
+        else:
+            sections.append([line])
+    rules = [s for s in sections if s[0].strip() in RULE_HEADINGS]
+    if not rules:
+        return text, None
+    rest = [s for s in sections if s[0].strip() not in RULE_HEADINGS]
+    return _sections(rules), _sections(rest)
+
+
+def _sections(group: list[list[str]]) -> str | None:
+    """Sections (heading line plus rows) back to text, ``None`` for none."""
+    return "\n".join("\n".join(section) for section in group) or None
+
+
+def commitments_block_text(commitments: str | None) -> str | None:
+    """The open commitments as their own block for the request's messages, or ``None``.
+
+    Placed last before the user's words (``ContextManager.add_request``). The rules that
+    used to share this block are a system layer now (``yuki.agent.prompt.rules_text``).
+    """
+    if not commitments or not commitments.strip():
         return None
-    return f"\n\n{STANDING_LABEL}\n{context.standing.strip()}\n{STANDING_END}\n\n"
+    return f"\n\n{COMMITMENTS_LABEL}\n{commitments.strip()}\n{COMMITMENTS_END}\n\n"
 
 
 #: How the to-do list's sources read, to the model and in the tray panel.

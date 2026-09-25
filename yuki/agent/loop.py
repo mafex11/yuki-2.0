@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
@@ -42,10 +42,11 @@ from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.memory import (
     MemoryAccess,
     default_memory,
+    commitments_block_text,
     memory_block_text,
-    standing_block_text,
+    split_standing,
 )
-from yuki.agent.prompt import system_blocks
+from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
@@ -254,6 +255,11 @@ class Agent:
         self._portrait_sent: tuple[str, int] | None = None
         #: Requests this conversation has started (1 on the first).
         self._requests = 0
+        #: The profile and rules layers of the system prompt for the request being handled
+        #: (``prompt.system_blocks``), set by ``_memory_context``; ``None`` when memory had
+        #: nothing (then the layer is left out).
+        self._profile_layer: str | None = None
+        self._rules_layer: str | None = None
         #: One line per thing done this request, for memory's turn log and
         #: the request's collapsed form.
         self._actions: list[str] = []
@@ -587,7 +593,7 @@ class Agent:
             overview, _ = self._capture_overview()
             origin = self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
-            memory_text, standing_text = self._memory_context(
+            memory_text, commitments_text = self._memory_context(
                 request, first=self._requests == 1
             )
             self.context.add_request(
@@ -595,7 +601,7 @@ class Agent:
                 overview,
                 memory_text=memory_text,
                 origin_text=origin,
-                standing_text=standing_text,
+                standing_text=commitments_text,
             )
             drive = self._drive()
             for event in drive:
@@ -1389,20 +1395,23 @@ class Agent:
     def _memory_context(
         self, request: str, *, first: bool = False
     ) -> tuple[str | None, str | None]:
-        """The memory block and the standing-rules block for this request's first message.
+        """Split what memory knows into the system layers and this request's message blocks.
 
-        The memory block (background): the portrait (cached in-process by
-        :class:`MemoryAccess`), the open to-dos, the know-how lines memory
-        finds for the foreground app and the request text, and on this
-        conversation's first request where the last session left off. The
-        standing-rules block (the user's instructions, fetched fresh every
-        request): the active rules and open commitments, placed right before
-        the user's words by ``ContextManager.add_request``. Either is ``None``
-        when there is nothing to say. A
-        portrait identical to one already attached in full earlier in this
-        conversation -- still there, never stubbed or collapsed -- is named
-        rather than sent again. Logs ``memory_context`` every time, whatever
-        happened; never raises.
+        System layers (``prompt.system_blocks``, cached, stored on the agent for
+        ``_request_params``): the **profile** (the user's names from settings and the
+        portrait's Personality section) and the **rules** (the rules and preferences part
+        of the standing context, verbatim, fetched fresh every request so a rule saved a
+        moment ago shows).
+
+        Returned for the request's first message: the memory block (background: the rest
+        of the portrait, the open to-dos, know-how for the foreground app and the request,
+        and on this conversation's first request where the last session left off) and the
+        open-commitments block (the volatile half of the standing context), placed right
+        before the user's words by ``ContextManager.add_request``. Either is ``None`` when
+        there is nothing to say. A portrait identical to one already attached in full
+        earlier in this conversation -- still there, never stubbed or collapsed -- is named
+        rather than sent again. Logs ``memory_context`` every time, whatever happened;
+        never raises.
 
         Args:
             request: The request text (the know-how query).
@@ -1411,17 +1420,25 @@ class Agent:
         """
         started = time.perf_counter()
         app = _foreground_app(self._overview_payload)
+        self._profile_layer = profile_text(self.settings.user_names, None)
+        self._rules_layer = None
         try:
             fetched = self.memory.context(app=app, query=request, resume=first)
+            rest, personality = _split_personality(fetched.portrait)
+            rules, commitments = split_standing(fetched.standing)
+            self._profile_layer = profile_text(self.settings.user_names, personality)
+            if fetched.source != "unavailable":
+                self._rules_layer = rules_text(rules or "")
+            background = replace(fetched, portrait=(rest or "").strip() or None)
             repeated = None
             if (
-                fetched.portrait
+                background.portrait
                 and self._portrait_sent is not None
-                and self._portrait_sent[0] == fetched.portrait
+                and self._portrait_sent[0] == background.portrait
             ):
                 repeated = self._portrait_sent[1]
-            text = memory_block_text(fetched, repeated_turn=repeated)
-            standing = standing_block_text(fetched)
+            text = memory_block_text(background, repeated_turn=repeated)
+            standing = commitments_block_text(commitments)
         except Exception as exc:  # memory must never break a request
             self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
             self._memory_info = {
@@ -1429,11 +1446,11 @@ class Agent:
                 "standing_chars": 0, "resume_chars": 0,
             }
             return None, None
-        portrait_chars = len(fetched.portrait or "") if text and repeated is None else 0
-        standing_chars = len(fetched.standing or "") if standing else 0
+        portrait_chars = len(background.portrait or "") if text and repeated is None else 0
+        standing_chars = len(fetched.standing or "")
         resume_chars = len(fetched.resume or "") if text else 0
-        if text and fetched.portrait and repeated is None:
-            self._portrait_sent = (fetched.portrait, self.logger.turn)
+        if text and background.portrait and repeated is None:
+            self._portrait_sent = (background.portrait, self.logger.turn)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         self._memory_info = {
             "source": fetched.source,
@@ -1456,7 +1473,11 @@ class Agent:
             portrait_chars=portrait_chars,
             portrait_repeated_from_turn=repeated,
             standing_chars=standing_chars,
-            standing_attached=standing is not None,
+            commitments_attached=standing is not None,
+            profile_layer_chars=len(self._profile_layer or ""),
+            personality_chars=len(personality or ""),
+            rules_layer_chars=len(self._rules_layer or ""),
+            commitments_chars=len(commitments or ""),
             resume_chars=resume_chars,
             resume_requested=first,
             truncated=list(fetched.truncated),
@@ -1526,8 +1547,18 @@ class Agent:
         Returns:
             Keyword arguments for ``messages.create`` / ``messages.stream``.
         """
-        system = system_blocks(extra=self.extra_instructions)
+        # The prompt in layers, most stable first (prompt.system_blocks): core (+ this lane's
+        # framing), profile, rules. The warm-up sends the core alone: its breakpoint sits at
+        # the same position, so the entry it writes is the one real requests read.
+        system = system_blocks(
+            extra=self.extra_instructions,
+            profile=None if warmup else self._profile_layer,
+            rules=None if warmup else self._rules_layer,
+        )
         tools = tool_params(
+            # No breakpoint of its own: tools come first in the cached prefix, so the core
+            # layer's breakpoint already covers them (and frees a slot for the rules layer).
+            cacheable=False,
             names=self.tool_names,
             # The dispatcher's policy is the one that gates dispatch, so the
             # block the model sees must agree with it (never -> no
@@ -1799,6 +1830,15 @@ class Agent:
             },
         )
         return hwnd, text
+
+
+def _split_personality(portrait: str | None) -> tuple[str, str | None]:
+    """The portrait without its Personality section, and the section (memory is optional)."""
+    try:
+        from yuki.memory.personality import split_personality
+    except Exception:  # noqa: BLE001 - no memory package: the whole page stays background
+        return portrait or "", None
+    return split_personality(portrait)
 
 
 def _as_hwnd(value: Any) -> int | None:

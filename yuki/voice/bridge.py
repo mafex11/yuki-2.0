@@ -30,7 +30,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, Signal
 
 from yuki.agent.tools import tool_label
-from yuki.voice.mouth import brain_request
+from yuki.voice.mouth import brain_request, result_payload
 
 #: Job states.
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
@@ -267,9 +267,9 @@ class VoiceBridge(QObject):
                 elif kind == "queued":
                     await params.result_callback({"status": payload}, properties=intermediate)
                 elif kind in ("done", "failed"):
-                    # "result", not "done": the word must not tell the mouth it worked;
-                    # the brain's own words say what happened.
-                    await params.result_callback({"result" if kind == "done" else "failed": payload})
+                    # "result", not "done" (the word must not tell the mouth it worked), with
+                    # the note on saying it briefly where the mouth reads the result.
+                    await params.result_callback(result_payload(kind, payload))
                     return
         except asyncio.CancelledError:
             if not self.closing:
@@ -417,7 +417,8 @@ class VoiceBridge(QObject):
             async def relay() -> None:
                 while True:
                     kind, payload = await follow.events.get()
-                    await announce({{"say": "yuki_says", "ask": "yuki_asks", "done": "result"}.get(kind, kind): payload})
+                    await announce(result_payload(kind, payload) if kind in ("done", "failed") else
+                                   {{"say": "yuki_says", "ask": "yuki_asks"}.get(kind, kind): payload})
                     if kind in ("done", "failed"):
                         return
             asyncio.run_coroutine_threadsafe(relay(), loop)

@@ -9,6 +9,12 @@ Memory's nudges live in the same stack (tone ``nudge``: tinted in their
 kind's accent, labelled ``Yuki · 14:32 · nudge``, with their own Reply), each
 placed by the time the user saw it, so the stack reads as one conversation.
 
+The card stack sits in a scroll area whose height follows its content up to
+:data:`MAX_CARDS_FRACTION` of the screen; past that it scrolls (wheel anywhere on
+the panel, or the thin scrollbar) and the input below it stays on screen and
+keeps the keyboard. A new card or a reply filling in scrolls the stack to the
+bottom; scrolling up stops that following until the user is back at the bottom.
+
 The overlay never decides anything about the request -- it hands the text to
 :mod:`yuki.ui.runtime` and renders what comes back.
 """
@@ -28,13 +34,16 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +67,22 @@ PAD = 14
 
 #: How many cards (requests, replies and nudges together) stay on screen.
 MAX_CARDS = 5
+
+#: Tallest the card stack gets, as a share of the screen's available height; a
+#: longer conversation scrolls inside it. The panel's top sits at 18% of the
+#: screen, so stack + input end well above the taskbar at any screen size.
+MAX_CARDS_FRACTION = 0.55
+
+#: The stack's scrollbar: thin, translucent, only there when it can scroll.
+SCROLL_STYLE = (
+    "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
+    "QScrollBar:vertical { background: transparent; width: 6px; margin: 2px 0 2px 0; }"
+    "QScrollBar::handle:vertical { background: rgba(238,240,245,70); border-radius: 3px;"
+    " min-height: 24px; }"
+    "QScrollBar::handle:vertical:hover { background: rgba(238,240,245,120); }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+)
 
 #: After the overlay is shown, how long losing activation does not count as the
 #: user clicking away. Covers the transient activate/deactivate messages of the
@@ -157,6 +182,8 @@ class ReplyCard(QWidget):
     PENDING = "…"
 
     reply_clicked = Signal(object)
+    #: The body was replaced (a reply arrived): the overlay brings it into view.
+    content_changed = Signal()
 
     def __init__(
         self,
@@ -217,6 +244,8 @@ class ReplyCard(QWidget):
         self._body.setFont(ui_font(12))
         self._body.setWordWrap(True)
         self._body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # Selecting text with the mouse must not pull the keyboard out of the input.
+        self._body.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._body.setStyleSheet("color: rgba(238,240,245,255);")
         layout.addWidget(self._body)
 
@@ -253,6 +282,7 @@ class ReplyCard(QWidget):
         self._body.setText(text)
         self.update()
         self.grow_to_fit()
+        self.content_changed.emit()
 
     def set_meta(self, text: str) -> None:
         """Show a dim footer line (``52 s · 10 steps · 8¢``) and grow to fit.
@@ -275,6 +305,15 @@ class ReplyCard(QWidget):
         """Height the card needs for its current text at its current width."""
         width = self.width() or (PANEL_WIDTH - 2 * PAD)
         return self.layout().minimumHeightForWidth(width)
+
+    def resizeEvent(self, event: object) -> None:  # noqa: D102 - Qt override
+        super().resizeEvent(event)  # type: ignore[arg-type]
+        # A new width (the scrollbar came or went) rewraps the text: follow it, once the
+        # grow animation is not the one setting the height.
+        if self._grow.state() != QPropertyAnimation.State.Running and self.maximumHeight() > 0:
+            target = self.wanted_height()
+            if target != self.maximumHeight():
+                self.setMaximumHeight(target)
 
     # -- animation ---------------------------------------------------------
 
@@ -368,10 +407,31 @@ class Overlay(GlassWindow):
         outer.setContentsMargins(margin, margin, margin, margin)
         outer.setSpacing(10)
 
-        self._cards = QVBoxLayout()
+        # The card stack scrolls inside a capped area; the input below it never moves off screen.
+        self._content = QWidget()
+        self._content.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._cards = QVBoxLayout(self._content)
         self._cards.setContentsMargins(0, 0, 0, 0)
         self._cards.setSpacing(8)
-        outer.addLayout(self._cards)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidget(self._content)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.verticalScrollBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._scroll.viewport().setAutoFillBackground(False)
+        self._scroll.setStyleSheet(SCROLL_STYLE)
+        self._scroll.setFixedHeight(0)
+        self._scroll.setVisible(False)
+        outer.addWidget(self._scroll)
+        #: Keep the newest card in view while the user has not scrolled up.
+        self._follow = True
+        self._forwarding_wheel = False
+        bar = self._scroll.verticalScrollBar()
+        bar.rangeChanged.connect(self._on_scroll_range)
+        bar.valueChanged.connect(self._on_scroll_value)
 
         self.input = AskInput(self)
         self.input.submitted.connect(self._on_submit)
@@ -411,12 +471,61 @@ class Overlay(GlassWindow):
         y = area.top() + int(area.height() * 0.18) - self.SHADOW
         return QPoint(x, y)
 
+    def max_cards_height(self) -> int:
+        """Tallest the card stack may be on the overlay's screen (:data:`MAX_CARDS_FRACTION`)."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else self.geometry()
+        return max(120, int(area.height() * MAX_CARDS_FRACTION))
+
     def fit(self) -> None:
-        """Resize to the height the layout wants, keeping the top-left fixed."""
+        """Size the card stack to its content (capped), then the window to the layout.
+
+        Keeps the top-left fixed. Past the cap the stack scrolls and the input
+        stays where it is, below it.
+        """
+        content = self._cards.sizeHint().height() if self.cards() else 0
+        stack = min(content, self.max_cards_height())
+        if self._scroll.height() != stack or self._scroll.isVisible() != (stack > 0):
+            self._scroll.setFixedHeight(stack)
+            self._scroll.setVisible(stack > 0)
         width = PANEL_WIDTH + 2 * self.SHADOW
         height = self.layout().sizeHint().height()
         if (self.width(), self.height()) != (width, height):
             self.resize(width, height)
+
+    # -- scrolling ---------------------------------------------------------
+
+    def scroll_to_latest(self) -> None:
+        """Follow the newest card again and bring the bottom of the stack into view."""
+        self._follow = True
+        bar = self._scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _on_scroll_range(self, _minimum: int, maximum: int) -> None:
+        if self._follow:
+            self._scroll.verticalScrollBar().setValue(maximum)
+
+    def _on_scroll_value(self, value: int) -> None:
+        # At the bottom: follow new content; scrolled up: leave the view where the user put it.
+        self._follow = value >= self._scroll.verticalScrollBar().maximum() - 2
+
+    def scroll_range(self) -> tuple[int, int]:
+        """``(value, maximum)`` of the stack's scrollbar (0, 0 when it fits)."""
+        bar = self._scroll.verticalScrollBar()
+        return bar.value(), bar.maximum()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: D102 - Qt override
+        # The wheel scrolls the stack wherever it is turned over the panel (margins,
+        # the gap above the input), not only over the cards themselves.
+        if self._scroll.isVisible() and not self._forwarding_wheel:
+            self._forwarding_wheel = True
+            try:
+                QApplication.sendEvent(self._scroll.verticalScrollBar(), event)
+            finally:
+                self._forwarding_wheel = False
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def _on_input_height(self, height: int) -> None:
         """Follow the input's own growth as the user types onto a new line."""
@@ -513,13 +622,19 @@ class Overlay(GlassWindow):
         Returns:
             The new card, so the caller can fill it in when the answer arrives.
         """
-        card = ReplyCard(prompt, body, tone=tone, accent=accent, parent=self)
+        card = ReplyCard(prompt, body, tone=tone, accent=accent, parent=self._content)
         self._cards.addWidget(card)
-        card.height_animation.valueChanged.connect(lambda *_: self.fit())
+        self._watch(card)
         card.show()
         card.reveal()
         self._trim()
+        self.scroll_to_latest()
         return card
+
+    def _watch(self, card: ReplyCard) -> None:
+        """Resize with the card's growth, and bring a reply into view when it lands."""
+        card.height_animation.valueChanged.connect(lambda *_: self.fit())
+        card.content_changed.connect(self.scroll_to_latest)
 
     def add_nudge_card(
         self, nudge: dict[str, Any], label: str, *, accent: QColor, at: float
@@ -545,11 +660,11 @@ class Overlay(GlassWindow):
             return None
         card = ReplyCard(
             label, " ".join(str(nudge.get("text") or "").split()), tone="nudge", accent=accent,
-            at=at, nudge=nudge, parent=self,
+            at=at, nudge=nudge, parent=self._content,
         )
         # Layout index of the card it goes before (cards are the only items).
         self._cards.insertWidget(index, card)
-        card.height_animation.valueChanged.connect(lambda *_: self.fit())
+        self._watch(card)
         card.show()
         card.reveal()
         self._trim()
@@ -572,7 +687,7 @@ class Overlay(GlassWindow):
         cards = self.cards()
         for card in cards[: max(0, len(cards) - MAX_CARDS)]:
             self._cards.removeWidget(card)
-            card.setParent(self)
+            card.setParent(self._content)
             card.dismiss()
 
     def clear_cards(self) -> None:

@@ -20,6 +20,7 @@ from yuki.agent.memory import MemoryAccess
 from yuki.config import Settings
 from yuki.log.events import Final, Say, SessionLogger
 from yuki.voice.bridge import VoiceBridge
+from yuki.voice.mouth import SPOKEN_NOTE
 from yuki.voice.offline import StubDesktop
 
 APP = QCoreApplication.instance() or QCoreApplication([])
@@ -188,7 +189,7 @@ def test_new_task_relays_say_then_final() -> None:
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle()
         await asyncio.wait_for(task, 1)
-        assert params.results == [({"yuki_says": "Found three invoices"}, False), ({"result": "Total is 48,200"}, True)]
+        assert params.results == [({"yuki_says": "Found three invoices"}, False), ({"result": "Total is 48,200", "how_to_say_it": SPOKEN_NOTE}, True)]
         assert bridge.open_voice_jobs() == 0
 
     asyncio.run(main())

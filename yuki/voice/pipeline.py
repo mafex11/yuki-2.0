@@ -21,12 +21,13 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from yuki.config import Settings
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, get_key
-from yuki.voice.mouth import TELL_YUKI, YUKI_STATUS, MouthMemory, mouth_system
+from yuki.voice.mouth import MOUTH_PROMPT, TELL_YUKI, YUKI_STATUS, MouthMemory, mouth_system_blocks
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
 DEFAULT_VOICES = {"elevenlabs": "cgSgspJ2msm6clMCkdW9", "deepgram": "aura-2-thalia-en"}
@@ -152,6 +153,30 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
 
 
 _LOGGING_SET = False
+
+
+def _layered_service(base: type, memory: MouthMemory) -> type:
+    """``base`` (Pipecat's ``AnthropicLLMService``) sending the mouth's prompt as cached layers.
+
+    Pipecat passes ``system`` as one string. This subclass swaps it for the blocks of
+    :func:`~yuki.voice.mouth.mouth_system_blocks`: the composed core (our prompt plus
+    Pipecat's async-tool paragraphs, frozen), the profile, the standing rules and the time,
+    with breakpoints on profile and rules (Pipecat marks the last two user messages; four
+    in all). Built per conversation with that conversation's memory and start time, so the
+    bytes stay the same on every call of the conversation. Made on first use so importing
+    this module loads no Pipecat (voice off costs nothing).
+    """
+    started = datetime.now()
+
+    class LayeredAnthropicLLMService(base):  # type: ignore[misc, valid-type]
+        def _get_llm_invocation_params(self, context: Any) -> Any:
+            params = super()._get_llm_invocation_params(context)
+            composed = self._settings.system_instruction or MOUTH_PROMPT
+            tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
+            params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], now=started)
+            return params
+
+    return LayeredAnthropicLLMService
 
 
 def quiet_pipecat_logging(log_dir: Any) -> None:
@@ -489,14 +514,16 @@ class Conversation:
             ),
         )
         self._client = AsyncAnthropicBedrock(aws_region=s.aws_region)
-        llm = AnthropicLLMService(
+        llm = _layered_service(AnthropicLLMService, self.mouth_memory)(
             api_key="bedrock",  # unused: the Bedrock client carries the auth
             client=self._client,
             retry_on_timeout=True,
             settings=AnthropicLLMService.Settings(
                 model=s.voice_mouth_model, max_tokens=s.voice_mouth_max_tokens, enable_prompt_caching=True,
                 thinking=AnthropicLLMService.ThinkingConfig(type="disabled"),
-                system_instruction=mouth_system(self.mouth_memory),
+                # The core layer: Pipecat composes its async-tool paragraphs onto it; the
+                # service subclass sends the result as the first of the prompt's layers.
+                system_instruction=MOUTH_PROMPT,
             ),
         )
         llm.register_function("tell_yuki", self.bridge.tell_yuki, cancel_on_interruption=False,
