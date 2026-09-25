@@ -576,6 +576,18 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("h_volume"), "h_volume", after_s=0.5, wait_for=reply_done()),
             ScriptLine(clip("h_thanks"), "h_thanks", after_s=0.8, wait_for=settled()),
         ]
+    elif scenario == "hands3":
+        # The live test of 2026-09-25 18:54-18:57 on a stub Chrome (tabs, a page that scrolls
+        # only when the scroll reaches it, a new page that takes a moment to get its title,
+        # the cursor over the tab bar). --era picks which scroll the stub behaves like.
+        from yuki.voice.offline import BrowserDesk
+
+        runtime, desk = _real_brain(settings, memory, timeline, desk=BrowserDesk(era=args.era, timeline=timeline))
+        box["desk"] = desk
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [ScriptLine(clip("c_hello"), "c_hello", after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=0.8, wait_for=settled())
+            for n in ("c_tab", "c_scroll", "c_newtab", "c_back", "c_newone", "c_again", "c_thanks")]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -707,6 +719,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                     for ln in script.lines:
                         if ln.started_at is not None and ln.label not in seen:
                             seen.add(ln.label)
+                            if "desk" in box:
+                                timeline.add("desk", **box["desk"].desk_state(timeline.t0))
                             timeline.add("line", label=ln.label)
                             if "started" in box:
                                 box["started"][ln.label] = ln.started_at
@@ -771,7 +785,10 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
-    if scenario == "hands":
+    if scenario in ("hands", "hands3"):
+        if "desk" in box:
+            timeline.add("desk", **box["desk"].desk_state(timeline.t0))
+            report["timeline"] = timeline.events
         report["hands"] = hands_metrics(report, [ln.label for ln in lines])
     if scenario == "pauses" and "script" in box:
         # Per clip: did the turn end inside the sentence (a transcript before its last word), and
@@ -830,7 +847,10 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "all"))
+    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
+                                         "all"))
+    ap.add_argument("--era", default="after", choices=("before", "after"),
+                    help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
     ap.add_argument("--serve-embedder", dest="serve_embedder", action="store_true",
                     help="serve the embedder from a stand-in memory service process on the DB copy")

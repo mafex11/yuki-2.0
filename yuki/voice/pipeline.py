@@ -227,6 +227,7 @@ class LlmCall:
     desk: str = "off"                   # fresh | previous | none | off (the desktop summary, §5.6)
     desk_ms: float | None = None        # capturing it (fresh) or its age (previous)
     desk_chars: int = 0
+    desk_tabs_ms: float | None = None   # reading the foreground window's tabs for it
 
 
 def with_volatile(messages: Any, block: dict[str, Any]) -> Any:
@@ -282,6 +283,35 @@ def chronological(messages: list[Any], spoke: set[str]) -> list[Any]:
                 i += 1
         i += 1
     return out
+
+
+def settle_only_when_newest(aggregator: Any) -> None:
+    """A tool's result settles in place only while its placeholder is the newest message.
+
+    Pipecat settles an async result in place (overwriting its "started" placeholder)
+    unless a user or developer message follows it; assistant messages, other calls and
+    their results do not count. Live 2026-09-25 18:56:57: a thinker's result arrived
+    after the mouth had spoken and called stay_quiet on another task's result; it
+    settled in place, in the middle of the conversation, the newest thing the mouth saw
+    was its own stay_quiet, and it answered the run with "What's up?". Here a result
+    goes in place only when nothing at all came after its placeholder; otherwise it is
+    appended as Pipecat's deferred final message, so a result is always the newest
+    thing when the mouth is asked to speak. Plumbing: where a message goes, not what it
+    says. ``aggregator`` is Pipecat 1.11's ``LLMAssistantAggregator``.
+    """
+    context = aggregator._context
+
+    def _is_deferred(in_progress_frame: Any) -> bool:
+        if in_progress_frame.cancel_on_interruption:
+            return False  # a synchronous call: always in place, as Pipecat does
+        messages = context.messages
+        for i, message in enumerate(messages):
+            if (isinstance(message, dict) and message.get("role") == "tool"
+                    and message.get("tool_call_id") == in_progress_frame.tool_call_id):
+                return i != len(messages) - 1
+        return True  # the placeholder is gone (the context was rebuilt): deferred, as Pipecat does
+
+    aggregator._is_deferred = _is_deferred
 
 
 def bedrock_client(region: str) -> Any:
@@ -448,6 +478,7 @@ class _Turn:
     tts_ttfb: float | None = None
     tts_audio: float | None = None
     first_audio: float | None = None
+    action_at: float | None = None       # a hand's action went out (v3.3: end of speech -> action)
     reply: list[str] = field(default_factory=list)
     spoken: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
@@ -498,6 +529,7 @@ class TurnObserver:
         self._last_words = ""
         self._words_at: float | None = None
         self.grounder: Any = None
+        self.hands: Any = None
         self.state = "starting"
         self.fatal: str | None = None
         self.totals = {"turns": 0, "mouth_cost_usd": 0.0, "tts_chars": 0}
@@ -556,6 +588,12 @@ class TurnObserver:
             return words, "stt"
         return None, "none"
 
+    def hand_acted(self, sent_at: float | None) -> None:
+        """A hand's action went out (monotonic): the turn's end of speech -> action (v3.3)."""
+        turn = self.turn
+        if turn is not None and sent_at is not None and turn.action_at is None:
+            turn.action_at = sent_at
+
     def call_started(self, call: LlmCall) -> None:
         """A mouth call began (the LLM service's hook): attach it to the turn it answers."""
         turn = self.turn
@@ -613,6 +651,7 @@ class TurnObserver:
             "mouth_ttft_ms": round(turn.llm_ttfb * 1000, 1) if turn.llm_ttfb is not None else None,
             "tts_ttfb_ms": round(turn.tts_ttfb * 1000, 1) if turn.tts_ttfb is not None else None,
             "eos_to_first_audio_ms": ms(turn.speech_end, turn.first_audio),
+            "eos_to_action_ms": ms(turn.speech_end, turn.action_at),
             "mouth_input_tokens": usage["input_tokens"], "mouth_cache_read_tokens": usage["cache_read_tokens"],
             "mouth_cache_write_tokens": usage["cache_write_tokens"], "mouth_output_tokens": usage["output_tokens"],
             "mouth_cost_usd": round(cost, 6) if cost is not None else None,
@@ -627,6 +666,7 @@ class TurnObserver:
             "grounding_wait_ms": ms(c.entered, c.grounded) if c else None,
             "desk": c.desk if c else None, "desk_ms": c.desk_ms if c else None,
             "desk_chars": c.desk_chars if c else None,
+            "desk_tabs_ms": c.desk_tabs_ms if c else None,
             "llm_prep_ms": ms(c.grounded, c.sent) if c else None,
             "llm_open_ms": ms(c.sent, c.opened) if c else None,
             "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
@@ -683,6 +723,8 @@ class TurnObserver:
                 self.turn.interrupted = True
             if self.grounder is not None:
                 self.grounder.new_turn()
+            if self.hands is not None:
+                self.hands.prefetch()  # the tabs for the reply's desktop block, read while they talk
             self.set_state("hearing")
             self._activity()
         elif isinstance(frame, UserStoppedSpeakingFrame):
@@ -809,6 +851,7 @@ class _Hooks:
                 desk_text = snap.text
                 call.desk_chars = len(snap.text)
                 call.desk_ms = round(snap.ms if how == "fresh" else (time.monotonic() - snap.at) * 1000, 1)
+                call.desk_tabs_ms = snap.tabs_ms
         return lookup_text, desk_text
 
     async def _lookup(self, call: LlmCall, user_turn: bool) -> str | None:
@@ -974,6 +1017,9 @@ class Conversation:
         llm.register_function("more_of_result", self.bridge.more_of_result)
         llm.register_function("stay_quiet", self.bridge.stay_quiet)
         hands = getattr(self.bridge, "hands", None)
+        if hands is not None:
+            hands.on_action = self.observer.hand_acted
+            self.observer.hands = hands
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
@@ -1011,6 +1057,7 @@ class Conversation:
         from pipecat.processors.aggregators.llm_response_universal import (
             LLMAssistantAggregatorParams, LLMContextAggregatorPair, LLMUserAggregatorParams,
         )
+        from pipecat.utils.context.llm_context_summarization import LLMAutoContextSummarizationConfig
 
         stt, llm, tts = self._services()
         self._llm = llm
@@ -1037,8 +1084,18 @@ class Conversation:
             context,
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=stt.recommended_user_turn_strategies(enable_interruptions=True)),
-            assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
+            # Summaries by size only: Pipecat's default also summarises every 20 messages, and
+            # each hand or hand-off adds three, so a 4-minute live conversation (2026-09-25) was
+            # summarised twice by the mouth's model, losing what was done.
+            assistant_params=LLMAssistantAggregatorParams(
+                enable_auto_context_summarization=True,
+                auto_context_summarization_config=LLMAutoContextSummarizationConfig(
+                    max_context_tokens=8000, max_unsummarized_messages=None)),
         )
+        settle_only_when_newest(assistant_agg)
+        summarizer = getattr(assistant_agg, "_summarizer", None)
+        # The summary is a user-role message nobody said: never "what the user said" to the thinker.
+        self.bridge.not_heard = lambda message: message is getattr(summarizer, "_summary_message", None)
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._activity.set)
         pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, self.transport.output(),

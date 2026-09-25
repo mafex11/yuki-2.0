@@ -198,7 +198,8 @@ def test_new_task_relays_say_then_final() -> None:
         await _settle()
         await asyncio.wait_for(task, 1)
         assert params.results == [({"yuki_says": "Found three invoices"}, False),
-                                  ({"result": "Total is 48,200", "more_available": False, "how_to_say_it": SPOKEN_NOTE}, True)]
+                                  ({"result": "Total is 48,200", "for_request": "Add up the September invoices in Downloads",
+                                    "more_available": False, "how_to_say_it": SPOKEN_NOTE}, True)]
         assert bridge.open_voice_jobs() == 0
 
     asyncio.run(main())

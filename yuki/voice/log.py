@@ -61,6 +61,7 @@ TURN_COLUMNS: tuple[str, ...] = (
     "eos_to_transcript_ms",
     "eos_to_first_token_ms",
     "eos_to_first_audio_ms",
+    "eos_to_action_ms",
     # then every stage in pipeline order (2026-09-25, docs/VOICE.md §14)
     "eos_to_eot_ms",
     "eos_to_eager_ms",
@@ -72,6 +73,7 @@ TURN_COLUMNS: tuple[str, ...] = (
     "desk",
     "desk_ms",
     "desk_chars",
+    "desk_tabs_ms",
     "llm_prep_ms",
     "llm_open_ms",
     "llm_first_event_ms",

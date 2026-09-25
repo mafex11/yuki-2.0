@@ -1031,6 +1031,25 @@ class _LazyRealBackend:
 
         importlib.import_module("yuki.perception.system").warm_activity()
 
+    # Optional, for the voice's hands (docs/VOICE.md §5.6), not contract functions.
+    def read_tabs(self, hwnd: int, *, budget_s: float = 0.2) -> Any:
+        """:func:`yuki.perception.tabs.read_tabs`: a window's own tab strip, read-only."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.tabs").read_tabs(hwnd, budget_s=budget_s)
+
+    def select_tab(self, hwnd: int, index: int, *, expect_name: str | None = None) -> Any:
+        """:func:`yuki.actions.tabs.select_tab`: one tab of a window made the one showing, verified."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.tabs").select_tab(hwnd, index, expect_name=expect_name)
+
+    def master_volume(self) -> dict[str, Any] | None:
+        """:func:`yuki.perception.audio.master_volume`: the output volume, read-only."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.audio").master_volume()
+
     def __getattr__(self, name: str) -> Callable[..., Any]:
         import importlib
 

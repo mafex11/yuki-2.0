@@ -37,6 +37,8 @@ STAGES = (
     ("tts_audio_to_speaking_ms", "first TTS audio -> playing"),
     ("eos_to_first_token_ms", "end of speech -> mouth's first token"),
     ("eos_to_first_audio_ms", "end of speech -> first audio"),
+    ("eos_to_action_ms", "end of speech -> a hand's action (v3.3)"),
+    ("desk_tabs_ms", "tabs line for the desktop block"),
 )
 
 

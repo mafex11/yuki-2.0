@@ -357,3 +357,46 @@ def output_is_headphones(
 
 __all__ = ["default_endpoints", "list_endpoints", "output_is_headphones", "capture_sessions", "render_sessions",
            "FORM_FACTORS", "E_RENDER", "E_CAPTURE"]
+
+
+class IAudioEndpointVolume(IUnknown):
+    """Only the reads (the order of the methods before them is the interface's vtable)."""
+
+    _iid_ = GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "RegisterControlChangeNotify", (["in"], c_void_p, "notify")),
+        COMMETHOD([], HRESULT, "UnregisterControlChangeNotify", (["in"], c_void_p, "notify")),
+        COMMETHOD([], HRESULT, "GetChannelCount", (["out"], POINTER(wintypes.UINT), "count")),
+        COMMETHOD([], HRESULT, "SetMasterVolumeLevel", (["in"], ctypes.c_float, "db"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "SetMasterVolumeLevelScalar", (["in"], ctypes.c_float, "level"),
+                  (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "GetMasterVolumeLevel", (["out"], POINTER(ctypes.c_float), "db")),
+        COMMETHOD([], HRESULT, "GetMasterVolumeLevelScalar", (["out"], POINTER(ctypes.c_float), "level")),
+        COMMETHOD([], HRESULT, "SetChannelVolumeLevel", (["in"], wintypes.UINT, "ch"), (["in"], ctypes.c_float, "db"),
+                  (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "SetChannelVolumeLevelScalar", (["in"], wintypes.UINT, "ch"),
+                  (["in"], ctypes.c_float, "level"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "GetChannelVolumeLevel", (["in"], wintypes.UINT, "ch"),
+                  (["out"], POINTER(ctypes.c_float), "db")),
+        COMMETHOD([], HRESULT, "GetChannelVolumeLevelScalar", (["in"], wintypes.UINT, "ch"),
+                  (["out"], POINTER(ctypes.c_float), "level")),
+        COMMETHOD([], HRESULT, "SetMute", (["in"], wintypes.BOOL, "mute"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "GetMute", (["out"], POINTER(wintypes.BOOL), "mute")),
+    ]
+
+
+def master_volume() -> dict[str, Any] | None:
+    """The default output device's master volume: ``{"level": 0-100, "muted": bool}``, or ``None``.
+
+    Read-only (``GetMasterVolumeLevelScalar`` / ``GetMute``); what a volume or mute key
+    changed is read back from it (docs/VOICE.md §5.6). Never raises.
+    """
+    try:
+        device = _enumerator().GetDefaultAudioEndpoint(E_RENDER, E_CONSOLE)
+        iid = IAudioEndpointVolume._iid_
+        raw = device.Activate(byref(iid), comtypes.CLSCTX_ALL, None)
+        volume = ctypes.cast(c_void_p(raw), POINTER(IAudioEndpointVolume))
+        return {"level": round(float(volume.GetMasterVolumeLevelScalar()) * 100.0, 1),
+                "muted": bool(volume.GetMute())}
+    except Exception:  # noqa: BLE001 - a fact for a report, never a failure
+        return None

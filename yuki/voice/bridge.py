@@ -85,6 +85,8 @@ class Job:
     pacer: StepPacer | None = None
     #: Handed over with intent ``remember`` (a rule, correction or life fact to keep).
     remember: bool = False
+    #: The desktop action it is running now, in a few words (for the shared action log).
+    acting: str = ""
 
     def status(self, now: float) -> dict[str, Any]:
         return {
@@ -103,12 +105,14 @@ class Job:
 HEARD_TURNS = 3
 
 
-def heard_words(context: Any, turns: int = HEARD_TURNS) -> list[str]:
+def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bool] | None = None) -> list[str]:
     """The user's latest spoken turns in a Pipecat ``LLMContext``, oldest first (plumbing for the brain).
 
     Several, not one: the mouth may hand a request over a turn or two after
     it was made (the user said something else meanwhile), and the brain must
     see the words the request came from, not only the last thing said.
+    ``skip`` leaves out user-role messages nobody said: Pipecat's context summary is
+    one (live 2026-09-25 the thinker was told the user had said a whole summary).
     """
     try:
         messages = context.get_messages()
@@ -117,6 +121,8 @@ def heard_words(context: Any, turns: int = HEARD_TURNS) -> list[str]:
     out: list[str] = []
     for message in reversed(messages or []):
         if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if skip is not None and skip(message):
             continue
         content = message.get("content")
         text = ""
@@ -182,11 +188,15 @@ class VoiceBridge(QObject):
         #: Whether the mouth run making the current tool call answered a user turn (not a
         #: result arriving); set by the conversation. ``None``: assume it did.
         self.user_turn: Callable[[], bool] | None = None
-        #: The mouth's own one-step hands (docs/VOICE.md §5.6), over the brain's backend.
-        from yuki.voice.hands import Hands, hands_backend as _brain_backend
+        #: ``(message) -> bool``: a user-role context message nobody said (the context summary).
+        self.not_heard: Callable[[Any], bool] | None = None
+        #: The mouth's own one-step hands (docs/VOICE.md §5.6), over the brain's backend, and what
+        #: they and the thinker did on the desktop (shared with the mouth and every hand-off).
+        from yuki.voice.hands import ActionLog, Hands, hands_backend as _brain_backend
 
+        self.actions = ActionLog()
         backend = hands_backend if hands_backend is not None else _brain_backend(runtime)
-        self.hands: Hands | None = Hands(backend, log) if backend is not None else None
+        self.hands: Hands | None = Hands(backend, log, self.actions) if backend is not None else None
         if self.hands is not None:
             self.hands.bridge = self
         self._gui_call.connect(self._run)
@@ -300,10 +310,11 @@ class VoiceBridge(QObject):
         request = str(args.get("request") or args.get("message") or "").strip()
         context = str(args.get("context") or "").strip() or None
         intent = str(args.get("intent") or "new_task")
-        heard = heard_words(params.context)
+        heard = heard_words(params.context, skip=self.not_heard)
         request = request or (heard[-1] if heard else "")
         remember = intent == "remember"
-        text = brain_request(request, heard, context=context, remember=remember)
+        done_before = self.actions.text()
+        text = brain_request(request, heard, context=context, remember=remember, done_before=done_before)
         await self._ack_if_silent(params, args)
         if intent == "follow_up":
             target = self._follow_up_target()
@@ -324,7 +335,7 @@ class VoiceBridge(QObject):
                 text = brain_request(request, heard, context="; ".join(x for x in (
                     context, f'this adds to the request just before it ("{target.request}"), which had just '
                              f'finished{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
-                    if x))
+                    if x), done_before=done_before)
         job = self._new_job(request)
         if remember:
             # Saved quietly: no progress lines, and its outcome folded in unless it failed.
@@ -335,7 +346,8 @@ class VoiceBridge(QObject):
         origin = self._foreground()
         self._gui(lambda: self._submit(job, text, origin))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
-                  request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin)
+                  request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
+                  done_before_chars=len(done_before), heard_turns=len(heard))
         try:
             await self._relay(job, params)
         except asyncio.CancelledError:
@@ -395,7 +407,8 @@ class VoiceBridge(QObject):
 
                 async def final(run_llm: bool, stale: bool, kind=kind, head=head, rest=rest,
                                 delivered=delivered) -> None:
-                    await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale),
+                    await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
+                                                                request=job.request),
                                                  properties=FunctionCallResultProperties(run_llm=run_llm))
                     if not delivered.done():
                         delivered.set_result(stale)
@@ -613,6 +626,7 @@ class VoiceBridge(QObject):
         job = self._job(job_id)
         if job is None:
             return
+        job.acting = _action_words(name, tool_input)
         step = step_of(name, tool_input)
         if step is None:
             return
@@ -627,6 +641,13 @@ class VoiceBridge(QObject):
 
     def _on_tool_finished(self, lane: str, job_id: int, name: str, ok: bool, summary: str) -> None:
         job = self._job(job_id)
+        from yuki.agent.tools import ACTION_TOOL_NAMES
+
+        if name in ACTION_TOOL_NAMES:
+            # What the thinker did on the desktop, for the mouth and the next hand-off (a list
+            # of tool names is plumbing: which calls act, not what anything means).
+            what = (job.acting if job is not None and job.acting else name)
+            self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
         if job is None or job.log is None or step_of(name, None) is None:
             return
         job.log.add("returned", f"{job.step or name}: {'ok' if ok else 'failed'}, {summary}")
@@ -728,6 +749,16 @@ class VoiceBridge(QObject):
                     if kind in ("done", "failed"):
                         return
             asyncio.run_coroutine_threadsafe(relay(), loop)
+
+
+def _action_words(name: str, tool_input: dict | None) -> str:
+    """One line naming a thinker's action from its input (plumbing; typed text is left out)."""
+    parts = [name]
+    for key in ("element", "x", "y", "dy", "dx", "keys", "key", "url", "app", "query", "hwnd", "expect_hwnd"):
+        value = (tool_input or {}).get(key)
+        if value not in (None, "", []):
+            parts.append(f"{key}={str(value)[:80]}")
+    return " ".join(parts)
 
 
 def _foreground_hwnd() -> int | None:

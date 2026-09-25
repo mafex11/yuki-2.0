@@ -2471,13 +2471,21 @@ def press(
 def scroll(
     x: int, y: int, *, dy: int = 0, dx: int = 0, expect_hwnd: int | None = None
 ) -> ActionResult:
-    """Scroll at a point: ``dy`` wheel notches up (+) / down (-), ``dx`` right.
+    """Scroll at a point: ``dy`` wheel notches up (+) / down (-), ``dx`` right, and say whether it moved.
 
-    The cursor is moved to (x, y) first because Windows delivers wheel events to
-    the window under the cursor.
+    The scrollable element at the point (or its nearest scrollable ancestor, else
+    the window's largest scrollable area) is scrolled through UI Automation's
+    ScrollPattern, without touching the cursor; only when nothing there has one is
+    the wheel sent at the point, with the cursor put back afterwards
+    (:mod:`yuki.actions.scrolling`). Either way the effect is read back: ``ok`` is
+    False when the content provably did not move (it was already at the end, or the
+    wheel went somewhere that does not scroll), and ``details["verified"]`` is
+    True / False / None (moved / did not / could not be read). Measured live
+    2026-09-25: notches sent at (1135,600) and at the cursor over Chrome's tab bar
+    were reported "scrolled" while nothing moved.
     """
     started = time.perf_counter()
-    details = {"x": x, "y": y, "dy": dy, "dx": dx, "expect_hwnd": expect_hwnd}
+    details: dict = {"x": x, "y": y, "dy": dy, "dx": dx, "expect_hwnd": expect_hwnd}
     if not _in_screen_bounds(x, y):
         return _result(
             False,
@@ -2490,14 +2498,20 @@ def scroll(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
-    _move(x, y)
-    if dy:
-        _user32.mouse_event(_MOUSEEVENTF_WHEEL, 0, 0, int(dy) * _WHEEL_DELTA, 0)
-    if dx:
-        _user32.mouse_event(_MOUSEEVENTF_HWHEEL, 0, 0, int(dx) * _WHEEL_DELTA, 0)
-    parts = []
-    if dy:
-        parts.append(f"{abs(dy)} notch(es) {'up' if dy > 0 else 'down'}")
-    if dx:
-        parts.append(f"{abs(dx)} notch(es) {'right' if dx > 0 else 'left'}")
-    return _result(True, f"scrolled {' and '.join(parts)} at ({x},{y})", details, started)
+    from yuki.actions.scrolling import describe, scroll_at
+
+    oks, parts, axes = [], [], []
+    for vertical, notches in ((True, dy), (False, dx)):
+        if not notches:
+            continue
+        outcome, facts = scroll_at(x, y, dy=notches if vertical else 0, dx=0 if vertical else notches,
+                                   hwnd=expect_hwnd)
+        direction = ("up" if notches > 0 else "down") if vertical else ("right" if notches > 0 else "left")
+        ok, text = describe(outcome, direction=direction, notches=abs(notches), x=x, y=y)
+        oks.append(ok)
+        parts.append(text)
+        axes.append({"axis": "vertical" if vertical else "horizontal", **outcome.facts(), **facts})
+    details["scrolls"] = axes
+    moved = [a["moved"] for a in axes]
+    details["verified"] = True if all(m is True for m in moved) else (False if any(m is False for m in moved) else None)
+    return _result(all(oks), "; ".join(parts), details, started)
