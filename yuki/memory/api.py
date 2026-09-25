@@ -40,6 +40,13 @@ To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
     memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
     memory.snooze_nudges(minutes);  memory.nudge_status() -> dict
 
+Getting to know the user (yuki.memory.questions; asked on cards of kind "question")::
+
+    memory.answer_question(ref, answer="", outcome="answered" | "skipped" | "never") -> dict
+        # the user's own words -> a user-origin portrait correction naming the question; render flag
+    memory.skip_question(ref, never=False) -> dict      # the card's Skip / "Don't ask"
+    memory.questions(statuses=None, limit=50) -> list[dict]
+
 The weekly review (written by the service, yuki.memory.review)::
 
     memory.weekly_review(which="latest") -> dict | None   # "latest", an ISO week "2026-W39" or a date in it
@@ -967,7 +974,61 @@ class MemoryClient:
 
     @staticmethod
     def _nudge_dict(n: Any) -> dict:
-        return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason}
+        return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref}
+
+    # -- questions for the user (yuki.memory.questions) -----------------------------
+
+    @staticmethod
+    def _question_id(ref: Any) -> int | None:
+        """``question:12`` / ``12`` -> 12 (plumbing on our own id format); ``None`` otherwise."""
+        text = str(ref or "").strip()
+        prefix, sep, number = text.partition(":")
+        if sep and prefix.strip() == "question":
+            text = number.strip()
+        return int(text) if text.isdigit() else None
+
+    def answer_question(self, ref: Any, answer: str = "", outcome: str = "answered") -> dict:
+        """Record the user's reply to one of Yuki's questions (``ref``: ``"question:12"``).
+
+        ``outcome``: ``answered`` (``answer`` is the user's own words; it becomes a
+        user-origin portrait correction that states the question it answers, and the
+        portrait folds it into the facts it concerns within about a minute - the
+        ``render_portrait`` flag - superseding a wrong one), ``skipped`` (not now:
+        not asked again) or ``never`` (don't ask about this). Returns ``{"saved":
+        bool, "question": ref, "outcome", "correction_id", "why"}``; never raises for
+        a question that is unknown or already answered (``saved`` false, ``why`` says).
+        """
+        qid = self._question_id(ref)
+        if outcome not in ("answered", "skipped", "never"):
+            raise ValueError("outcome must be answered, skipped or never")
+        if qid is None:
+            return {"saved": False, "question": ref, "outcome": outcome, "correction_id": None,
+                    "why": "not a question id (question:<n>)"}
+        q = self.store.question(qid)
+        if q is None:
+            return {"saved": False, "question": ref, "outcome": outcome, "correction_id": None, "why": "no such question"}
+        if outcome == "answered" and not (answer or "").strip():
+            return {"saved": False, "question": q.ref, "outcome": outcome, "correction_id": None,
+                    "why": "an answer needs the user's words"}
+        fact_id = self.store.answer_question(qid, outcome, answer or "")
+        if fact_id is None:
+            return {"saved": False, "question": q.ref, "outcome": outcome, "correction_id": None,
+                    "why": f"already {q.status}"}
+        if outcome == "answered":
+            request_render(self.store.path)
+        return {"saved": True, "question": q.ref, "outcome": outcome, "correction_id": fact_id or None,
+                "subject": q.subject, "asked": q.question, "why": None}
+
+    def skip_question(self, ref: Any, never: bool = False) -> dict:
+        """The card's Skip (``never=False``) or "Don't ask" (``never=True``) for question ``ref``."""
+        return self.answer_question(ref, "", "never" if never else "skipped")
+
+    def questions(self, statuses: Any = None, limit: int = 50) -> list[dict]:
+        """Yuki's questions for the user, newest first (content decrypted), for the UI and the agent."""
+        rows = self.store.questions(tuple(statuses) if statuses else None, limit=limit)
+        return [{"id": q.ref, "kind": q.kind, "subject": q.subject, "question": q.question, "evidence": q.evidence,
+                 "importance": q.importance, "origin": q.origin, "status": q.status, "answer": q.answer,
+                 "at": _iso(q.at), "asked_at": _iso(q.asked_at), "answered_at": _iso(q.answered_at)} for q in rows]
 
     def pending_nudges(self) -> list[dict]:
         """Nudges the service wrote that the UI has not shown yet, oldest first.
@@ -1052,7 +1113,7 @@ class MemoryClient:
         "reminder": n}}`` - nudges written since local midnight.
         """
         out: dict[str, Any] = {"quiet_until": None, "last_nudge_at": None,
-                               "today": {"praise": 0, "nudge": 0, "reminder": 0, "resume": 0}}
+                               "today": {"praise": 0, "nudge": 0, "reminder": 0, "resume": 0, "question": 0}}
         try:
             now = time.time()
             quiet = self.store.nudge_state("quiet_until")

@@ -450,6 +450,16 @@ class NudgeConfig:
     resume_within_min: float = 60.0
     #: What the message may draw on: the user's last this-many minutes at the PC before the gap.
     resume_before_min: float = 90.0
+    #: Getting-to-know-you questions (kind ``question``, :mod:`yuki.memory.questions`): the most
+    #: important open one, at a calm moment (the gates above, no call, no other card in the last
+    #: min_gap_s), at most one per question_gap_min and questions_per_day a day (days start at
+    #: resume_day_start); only questions of question_min_importance or more whose evidence is at
+    #: most question_max_age_days old (older ones expire unasked).
+    questions_enabled: bool = True
+    question_gap_min: float = 20.0
+    questions_per_day: int = 6
+    question_min_importance: int = 5
+    question_max_age_days: float = 7.0
 
     @classmethod
     def from_dict(cls, table: dict | None) -> NudgeConfig:
@@ -660,7 +670,7 @@ def reaction_summary(store: Store, since: float, until: float | None = None) -> 
         key = n.reaction or "not reacted to"
         counts[key] = counts.get(key, 0) + 1
     parts = []
-    for kind in ("praise", "nudge", "reminder", "review", "resume"):
+    for kind in ("praise", "nudge", "reminder", "review", "resume", "question"):
         counts = by_kind.get(kind)
         if not counts:
             continue
@@ -1230,6 +1240,8 @@ class NudgeWorker:
         self._gate: str | None = "start"
         #: The resume gap as computed on an earlier tick (reused while it is the latest).
         self._gap: ResumeGap | None = None
+        #: When the questions' upkeep (expiry, cards that expired unshown) last ran.
+        self._question_upkeep_at = 0.0
 
     # -- dependencies ------------------------------------------------------------
 
@@ -1314,7 +1326,7 @@ class NudgeWorker:
         config = self.config()
         done: list[dict[str, Any]] = []
         try:
-            self.store.expire_nudges(now - config.deliver_within_min * 60.0, COACH_KINDS)
+            self.store.expire_nudges(now - config.deliver_within_min * 60.0, (*COACH_KINDS, "question"))
         except Exception as exc:
             self._log("nudge_error", where="expire", error=f"{type(exc).__name__}: {exc}")
         gate = self.gate(now, config)
@@ -1339,6 +1351,11 @@ class NudgeWorker:
         if resumed is not None:
             if isinstance(resumed, dict):
                 done.append(resumed)
+            return done
+        # A getting-to-know-you question, soon after memory found it, at a calm moment: one card at a time.
+        asked = self._question(now, config, view, reminded=bool(done))
+        if asked is not None:
+            done.append(asked)
             return done
         result = self._checkin(now, config, view, items)
         if result is not None:
@@ -1477,6 +1494,136 @@ class NudgeWorker:
                 "mentions": decision.get("mentions"), "cost_usd": checkin.cost_usd, "usage": self._usage(checkin),
                 "latency_ms": round(checkin.latency_ms), "error": checkin.error}
 
+    # -- getting-to-know-you questions ------------------------------------------------
+
+    def _question_budget(self, now: float, config: NudgeConfig) -> str | None:
+        """Why no question may be asked now (content-free plumbing), or ``None``."""
+        if self._in_call():
+            return "call"
+        recent = self.store.nudges(now - max(config.question_gap_min * 60.0, config.min_gap_s), now + 1.0)
+        if any(n.kind == "question" for n in recent):
+            return "gap"
+        if any(now - n.at < config.min_gap_s for n in recent):
+            return "card_just_sent"
+        start = datetime.fromtimestamp(now) - timedelta(minutes=_minutes_of_day(config.resume_day_start))
+        day_start = (start.replace(hour=0, minute=0, second=0, microsecond=0)
+                     + timedelta(minutes=_minutes_of_day(config.resume_day_start))).timestamp()
+        if len(self.store.nudges(day_start, now + 1.0, kinds=("question",))) >= config.questions_per_day:
+            return "day"
+        if not self._rate_ok(now, config):
+            return "rate"
+        failed = [c for c in self.store.nudge_checkins(now - 3600.0)
+                  if c["trigger"] == "question" and c["outcome"] == "error"]
+        if len(failed) >= 3:   # the model not reachable: leave the coach its calls
+            return "errors"
+        return None
+
+    def _question(self, now: float, config: NudgeConfig, view: View, *, reminded: bool = False
+                  ) -> dict[str, Any] | None:
+        """Ask the most important open question for the user (kind ``question``), when allowed; else None.
+
+        The usual gates (pause, lock, snooze, quiet hours, a meeting or full screen
+        in front, Yuki acting, away) have already held the tick back. Here: no call
+        going on, no card written this tick or in the last ``min_gap_s``, one
+        question per ``question_gap_min``, ``questions_per_day`` a day, the model
+        call rate, and the user settled in something (a current activity). Most
+        important first. Each question is asked once: an answer, a skip or "don't
+        ask" is the user's; a card that expired unshown puts it back to open.
+        """
+        if not config.questions_enabled or reminded:
+            return None
+        max_age = config.question_max_age_days * 86400.0
+        if now - self._question_upkeep_at >= 600.0:
+            self._question_upkeep_at = now
+            try:
+                self.store.reopen_unshown_questions()
+                self.store.expire_questions(now - max_age)
+            except Exception as exc:
+                self._log("nudge_error", where="question_upkeep", error=f"{type(exc).__name__}: {exc}")
+        try:
+            q = self.store.next_question(min_importance=config.question_min_importance, since=now - max_age)
+        except Exception as exc:
+            self._log("nudge_error", where="next_question", error=f"{type(exc).__name__}: {exc}")
+            return None
+        if q is None or view.current is None:
+            return None
+        held = self._question_budget(now, config)
+        if held is not None:
+            if held != getattr(self, "_question_held", None):
+                self._question_held = held
+                self._log("question_held", question_id=q.id, reason=held)
+            return None
+        self._question_held = None
+        return self._ask(now, config, q)
+
+    def _ask(self, now: float, config: NudgeConfig, q: Any) -> dict[str, Any]:
+        """One ``ask_question`` call: the question in the user's register and rules, on a card of kind question."""
+        from yuki.memory.questions import ASK_SYSTEM_PROMPT, ASK_TOOL, build_ask_message
+
+        checkin = NudgeCheckin(at=now, trigger="question", outcome="error", model=self.model)
+        request: dict[str, Any] | None = None
+        response = None
+        nudge: NewNudge | None = None
+        decision: dict[str, Any] = {}
+        status: str | None = None
+        t0 = time.perf_counter()
+        try:
+            nonce = str(uuid.uuid4()).upper()
+            rules = rules_text(self.store, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()), nonce, cap))
+            user = build_ask_message(self.store, q, rules, now, nonce)
+            checkin.input_chars = len(user)
+            request = {
+                "model": self.model, "max_tokens": 300,
+                "system": ASK_SYSTEM_PROMPT.replace("{identity}", self._identity()),
+                "tools": [ASK_TOOL], "tool_choice": {"type": "tool", "name": ASK_TOOL["name"]},
+                "messages": [{"role": "user", "content": user}],
+            }
+            response = self.client.messages.create(**request)
+            checkin.latency_ms = (time.perf_counter() - t0) * 1000
+            self._account(checkin, response)
+            if response.stop_reason == "max_tokens":
+                raise RuntimeError("response hit max_tokens; tool input may be incomplete")
+            block = next((b for b in response.content if b.type == "tool_use" and b.name == ASK_TOOL["name"]), None)
+            if block is None:
+                raise RuntimeError(f"no ask_question call (stop_reason={response.stop_reason})")
+            decision = dict(block.input or {})
+            text = " ".join(str(decision.get("text") or "").split())
+            if decision.get("say") == "none":
+                checkin.outcome, status = "none", "dropped"   # memory already knows it, or not worth asking
+            elif decision.get("say") != "ask":
+                raise RuntimeError(f"ask_question say {decision.get('say')!r}")
+            elif not text:
+                checkin.outcome = "suppressed:empty_text"
+            else:
+                checkin.outcome, status = "question", "asked"
+                evidence = f" (evidence: {q.evidence})" if q.evidence else ""
+                nudge = NewNudge(
+                    kind="question", text=text, trigger="question", ref=q.ref,
+                    reason=f"{q.ref} - memory asked \"{q.question}\"{evidence}",
+                    inputs={"question_id": q.id, "kind": q.kind, "importance": q.importance, "origin": q.origin,
+                            "subject": q.subject},
+                )
+        except Exception as exc:
+            checkin.latency_ms = checkin.latency_ms or (time.perf_counter() - t0) * 1000
+            checkin.outcome = "error"
+            checkin.error = f"{type(exc).__name__}: {exc}"
+            self._log("nudge_error", where="question", error=checkin.error, traceback=traceback.format_exc())
+        checkin_id, nudge_id = self.store.record_checkin(checkin, nudge,
+                                                         question=(q.id, status) if status else None)
+        if nudge_id is not None:
+            self._event.set()
+        self._log("nudge_call", checkin_id=checkin_id, trigger="question", model=self.model, question_id=q.id,
+                  outcome=checkin.outcome, usage=self._usage(checkin), cost_usd=checkin.cost_usd,
+                  latency_ms=round(checkin.latency_ms, 1), stop_reason=checkin.stop_reason,
+                  input_chars=checkin.input_chars,
+                  request_ciphertext=self._seal(request) if request else None,
+                  response_ciphertext=self._seal(response.content) if response is not None else None)
+        self._log_checkin(checkin_id, checkin, nudge_id)
+        return {"trigger": "question", "outcome": checkin.outcome, "nudge_id": nudge_id, "question_id": q.id,
+                "say": decision.get("say"), "text": decision.get("text"), "reason": decision.get("reason"),
+                "cost_usd": checkin.cost_usd, "usage": self._usage(checkin),
+                "latency_ms": round(checkin.latency_ms), "error": checkin.error}
+
     # -- reminders -------------------------------------------------------------------
 
     def _remind_at(self, item: Item, config: NudgeConfig) -> float:
@@ -1600,7 +1747,7 @@ class NudgeWorker:
                                                               follow_up_of), items)
             return self._skip(now, "transition", "budget")
 
-        looked = [c["at"] for c in checkins if c["trigger"] not in ("reminder", "review") and c["at"] <= now]
+        looked = [c["at"] for c in checkins if c["trigger"] not in ("reminder", "review", "question") and c["at"] <= now]
         last_look = max([self._started_at, *looked]) if looked else self._started_at
         if now - last_look < config.periodic_min * 60.0 or pending:
             return None

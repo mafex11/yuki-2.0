@@ -68,11 +68,20 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.embed import Embedder, get_embedder
+from yuki.memory.questions import (
+    AGENT_WORK_GUIDANCE,
+    QUESTION_GUIDANCE,
+    embed_questions,
+    known_text,
+    question_from_item,
+    question_item_schema,
+)
 from yuki.memory.store import (
     ConversationChange,
     JournalEntry,
     ModelCall,
     NewFact,
+    NewQuestion,
     PendingCapture,
     Store,
     StoredMessage,
@@ -158,10 +167,15 @@ connection string or any random-looking string - even if one slipped through; de
 action without it. Routine terminal work is importance 2-4; setting up, releasing or \
 deploying a project, or a failure the user kept working on, 5-6.
 
+{agent_work}
+
+{questions}
+
 Record the facts worth remembering with the record_facts tool, giving for each the number \
 of the source it comes from (the latest one if several): the fact is stored with that \
-source's date and time. Extract facts ONLY from the SOURCES section; FACTS ALREADY \
-RECORDED is there only so you do not repeat them.
+source's date and time, and the questions the same way. Extract facts ONLY from the SOURCES \
+section; FACTS ALREADY RECORDED is there only so you do not repeat them, and WHAT MEMORY \
+ALREADY KNOWS (when given) is what the user told Yuki and what is already asked.
 
 What a good fact is:
 - Atomic: one thing per fact, one sentence, third person ("The user ...", "Kenji Tanaka \
@@ -176,7 +190,8 @@ unanswered or pending; interests and preferences the screen shows.
 - Faithful: only what the sources support. Something merely shown on screen - \
 recommendations, feeds, ads, menus, sidebars, notifications about other content - is \
 not something the user did; do not claim they watched, read or bought it. If it is \
-unclear who wrote a message, say what the screen shows rather than guessing.
+unclear who wrote a message, say what the screen shows rather than guessing. Keep what the \
+screen says a thing is, in its words; never add what you think a name means.
 - Dated correctly: the cited source's date is stored with the fact, so leave it out of \
 the sentence. Do turn relative dates in the content ("tomorrow", "by Friday", "next \
 month") into absolute dates, counting from the date of the source that says them and \
@@ -188,7 +203,7 @@ title stays in Japanese).
 even if visible.
 
 Skip interface chrome, navigation, boilerplate, and anything already in FACTS ALREADY \
-RECORDED. If nothing is worth remembering, call record_facts with an empty list.
+RECORDED. If nothing is worth remembering, call record_facts with empty lists.
 
 Importance (1-10) is how much the fact helps Yuki understand or help the user later: \
 1-2 trivial or routine (scrolling a home feed); 3-4 ordinary activity (watched a video, \
@@ -213,9 +228,42 @@ def user_identity(names: Sequence[str]) -> str:
     return f"The user is {clean[0]}, who also appears as {', '.join(clean[1:])}, {also}."
 
 
-def system_prompt(names: Sequence[str]) -> str:
-    """:data:`SYSTEM_PROMPT` with the user's identity filled in."""
-    return SYSTEM_PROMPT.replace("{identity}", user_identity(names))
+#: Appended to the system prompt of a call's own side only (``record_call_side`` batches).
+CALL_TRANSCRIPT_GUIDANCE = """\
+THE CALL TRANSCRIPT IS NOISY. It comes from a speech recogniser (Whisper) run on the user's \
+microphone alone, and it makes predictable mistakes:
+- On breathing, keyboard and mouse clicks, game sounds or near-silence it invents short phrases, \
+often the same few words over several utterances in a row, or a stock phrase ("Thank you for \
+watching"). A short phrase that keeps coming back, or a fragment that fits nothing around it, is \
+noise: skip it.
+- It mishears words: names, English words inside Hindi sentences (often written phonetically in \
+Devanagari - "क्लॉड" may be "Claude"), and above all it swaps a word for a commoner one that \
+sounds alike ("praises" heard as "prices", "Claude" as "cloud", "deck" as "debt"). Read each \
+utterance in the light of the ones around it and of the whole call, and check that the words of \
+each fact make sense together: a word that sits oddly in its sentence ("generic prices" about \
+feedback on a design) is a sound-alike, not what the user said.
+- An utterance marked UNCLEAR was recognised with low confidence (the recogniser's own \
+probabilities said so).
+So: never build a fact on one odd word, on a repeated fragment, or on an UNCLEAR utterance \
+alone. A word that is odd in its sentence was probably misheard: write the fact from the sense \
+you are sure of; if the fact still depends on that word, quote it as heard ("what sounded like \
+'generic prices'") and set uncertain - never state a possibly misheard word as plain fact. Take \
+a commitment only from words that are clear; never from an UNCLEAR utterance or a guess at what \
+was meant."""
+
+
+def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bool = False) -> str:
+    """:data:`SYSTEM_PROMPT` with the user's identity and the shared guidance filled in.
+
+    ``questions``: include the ask-don't-guess guidance (the ``record_facts`` batches;
+    a call's own side has no questions: nothing is inferred about the others in it).
+    ``call_side``: add :data:`CALL_TRANSCRIPT_GUIDANCE` (how to read a noisy transcript).
+    """
+    text = (SYSTEM_PROMPT.replace("{identity}", user_identity(names))
+            .replace("{agent_work}", AGENT_WORK_GUIDANCE)
+            .replace("{questions}", QUESTION_GUIDANCE if questions else
+                     "Never state a relationship, a meaning or an owner the sources do not say in words."))
+    return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}" if call_side else text
 
 
 RECORD_FACTS_TOOL: dict[str, Any] = {
@@ -255,10 +303,19 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                         },
                     },
                 },
-            }
+            },
+            "questions": {
+                "type": "array",
+                "description": (
+                    "What you would otherwise have to guess and that matters for knowing the user, as questions "
+                    "for them (see ASK, DON'T GUESS). Usually empty; at most two."
+                ),
+                "items": question_item_schema("source"),
+            },
         },
     },
 }
+RECORD_FACTS_TOOL["input_schema"]["required"] = ["facts", "questions"]
 
 #: The tool for a call's user side: journal facts plus the user's own commitments (to-dos).
 RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
@@ -273,7 +330,25 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
         "additionalProperties": False,
         "required": ["facts", "commitments"],
         "properties": {
-            "facts": RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"],
+            "facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["text", "importance", "source", "uncertain"],
+                    "properties": {
+                        **RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]["properties"],
+                        "uncertain": {
+                            "type": "boolean",
+                            "description": (
+                                "true when the fact rests on words that may have been misheard: an UNCLEAR "
+                                "utterance, a word that is odd in its sentence, a possible sound-alike. The fact "
+                                "is then stored marked as unclear in the transcript."
+                            ),
+                        },
+                    },
+                },
+            },
             "commitments": {
                 "type": "array",
                 "description": (
@@ -478,22 +553,37 @@ def build_user_message(
     previous_facts: Sequence[JournalEntry],
     nonce: str | None = None,
     max_capture_chars: int = MAX_BATCH_CHARS,
+    *,
+    known: str = "",
+    absent: set[int] | None = None,
 ) -> str:
-    """The fenced user message for one batch (MaxMi's ``ExtractPrompt`` shape)."""
+    """The fenced user message for one batch (MaxMi's ``ExtractPrompt`` shape).
+
+    ``known``: the WHAT MEMORY ALREADY KNOWS block (:func:`yuki.memory.questions.known_text`,
+    already scrubbed with this ``nonce``). ``absent``: ids of the captures taken while the
+    user gave no input for over a minute (the timeline's own away state), marked NO USER
+    INPUT on their sources.
+    """
     nonce = nonce or str(uuid.uuid4()).upper()
     begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
     end = f"===END_UNTRUSTED_DATA_{nonce}==="
+    absent = absent or set()
 
     def safe(value: str | None, cap: int) -> str:
         return sanitize_untrusted(value or "", nonce, cap)
 
+    def no_input(src: Source) -> str:
+        return (" NO USER INPUT (nobody typed, clicked or scrolled for over a minute when this was on screen)"
+                if src.capture.id in absent else "")
+
     previous = "\n".join(f"- {_local(f.at)[:16]}: {f.fact}" for f in previous_facts)
-    parts = [f"app: {safe(thread.app, 120)}"]
+    parts = [known, ""] if known else []
+    parts.append(f"app: {safe(thread.app, 120)}")
     if (thread.kind or "") == TERMINAL_KIND:
-        parts[0] += " (terminal)"
+        parts[-1] += " (terminal)"
         parts.append(f"folder: {safe(thread.title, 300)}")
     elif (thread.kind or "") == CALL_SIDE_KIND:
-        parts[0] += " (a call: only the user's own microphone was transcribed; nobody else's words are here)"
+        parts[-1] += " (a call: only the user's own microphone was transcribed; nobody else's words are here)"
     else:
         if thread.scope and thread.scope != thread.url:
             label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
@@ -516,7 +606,8 @@ def build_user_message(
             lang = safe(str(src.utterance.get("lang") or ""), 8)
             said = safe(str(src.utterance.get("text") or ""), 2_000).replace("\n", " ")
             where = f"in the {safe(src.call_app or thread.app, 80)} call" + (f", transcribed as '{lang}'" if lang else "")
-            parts.append(f"[{number}] THE USER SAID {_local(src.at)} ({where}): \"{said}\"")
+            unclear = " UNCLEAR" if src.utterance.get("unclear") else ""
+            parts.append(f"[{number}] THE USER SAID {_local(src.at)} ({where}){unclear}: \"{said}\"")
             continue
         c = src.command
         if c is not None:
@@ -537,12 +628,12 @@ def build_user_message(
             cap = src.capture
             when = (f"dated {_local(src.at)}, seen in the list {_local(cap.at)[:16]}" if src.item_dated
                     else f"no date shown, seen in the list {_local(cap.at)}")
-            parts.append(f"[{number}] LIST ITEM ({when}){by_yuki(src)}: {safe(src.item, 1_000)}")
+            parts.append(f"[{number}] LIST ITEM ({when}){by_yuki(src)}{no_input(src)}: {safe(src.item, 1_000)}")
             continue
         m = src.message
         if m is None:
             cap = src.capture
-            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}{by_yuki(src)}")
+            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}{by_yuki(src)}{no_input(src)}")
             parts.append(safe(cap.delta, max_capture_chars))
             continue
         mark = "NEW" if m.status == "new" else "HISTORY"
@@ -551,7 +642,7 @@ def build_user_message(
             shown = f", shown as '{safe(m.time_label, 60)}'" if m.time_label else ""
             when = f"time not shown{shown}; on or after {when}"
         text = safe(m.text, max_capture_chars).replace("\n", "\n    ")
-        parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}:\n    {text}")
+        parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}{no_input(src)}:\n    {text}")
     data = "\n".join(parts)
     return (
         f"CALENDAR: {_calendar([s.at for s in sources])}\n\n"
@@ -597,6 +688,9 @@ class BatchResult:
     cost_usd: float | None = None
     latency_ms: float = 0.0
     error: str | None = None
+    #: The questions for the user the batch returned, and what the store made of each
+    #: (added | merged | reopened | known | rejected:...).
+    questions: list[tuple[str, str]] = field(default_factory=list)
 
 
 class JournalWorker:
@@ -700,16 +794,22 @@ class JournalWorker:
         previous = self.store.journal_for_thread(thread_id, limit=12)
         call_side = (thread.kind or "") == CALL_SIDE_KIND
         if call_side:   # the user's to-dos from calls already recorded: never a second one
-            previous = self._call_commitments_as_facts() + previous
+            return self._journal_call_side(thread, captures, self._call_commitments_as_facts() + previous)
         message_ids = [c.id for c in captures if c.kind in MESSAGE_KINDS]
         messages = self.store.messages_for_captures(message_ids) if message_ids else {}
         sources = build_sources(captures, messages)
-        user = build_user_message(thread, sources, previous, max_capture_chars=self.batch_chars)
+        nonce = str(uuid.uuid4()).upper()
+        about = " ".join([thread.title or "", thread.scope or "", *(c.delta or "" for c in captures)])
+        known = "" if call_side else known_text(
+            self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce, cap), about=about)
+        absent = self.absent_captures(captures)
+        user = build_user_message(thread, sources, previous, nonce, max_capture_chars=self.batch_chars,
+                                  known=known, absent=absent)
         tool = RECORD_CALL_SIDE_TOOL if call_side else RECORD_FACTS_TOOL
         request = {
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
-            "system": system_prompt(self.user_names()),
+            "system": system_prompt(self.user_names(), questions=not call_side),
             "tools": [tool],
             "tool_choice": {"type": "tool", "name": tool["name"]},
             "messages": [{"role": "user", "content": user}],
@@ -728,9 +828,12 @@ class JournalWorker:
             call.cache_read_tokens = tokens["cache_read_tokens"]
             call.cost_usd = self.settings.estimate_cost(self.model, tokens)
             call.stop_reason = response.stop_reason
-            facts = self._parse_facts(response, thread, sources, tool=tool["name"])
+            fact_sources: list[int] = []
+            facts = self._parse_facts(response, thread, sources, tool=tool["name"], indexes=fact_sources)
             commitments, rejected = (self._parse_commitments(response, thread, sources, tool["name"])
                                      if call_side else ([], []))
+            questions = ([] if call_side else
+                         self._parse_questions(response, thread, sources, fact_sources, tool=tool["name"]))
             vectors = None
             embed_error = None
             if facts:
@@ -742,10 +845,14 @@ class JournalWorker:
                 for fact, vec in zip(facts, vectors):
                     fact.vector = vec
                     fact.embed_model = self.embedder.model_name
+            if questions:
+                embed_error = embed_questions(questions, self.embedder) or embed_error
+            question_outcomes: list[tuple[int | None, str]] = []
             if call_side:
                 batch_id, commitment_ids = self.store.commit_call_batch(call, capture_ids, facts, commitments)
             else:
-                batch_id, commitment_ids = self.store.commit_batch(call, capture_ids, facts), []
+                batch_id, commitment_ids = self.store.commit_batch(
+                    call, capture_ids, facts, questions, question_outcomes), []
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
@@ -756,11 +863,16 @@ class JournalWorker:
                 stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,
                 utterances=sum(1 for x in sources if x.utterance is not None),
                 commitments=len(commitment_ids), commitments_rejected=rejected,
+                no_input_captures=len(absent), known_chars=len(known),
+                questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
+                           for q, (qid, outcome) in zip(questions, question_outcomes)],
                 request_ciphertext=self._seal(request),
                 response_ciphertext=self._seal(response.content),
             )
             return BatchResult(batch_id, thread_id, capture_ids, True, [f.fact for f in facts], tokens,
-                               call.cost_usd, call.latency_ms)
+                               call.cost_usd, call.latency_ms,
+                               questions=[(f"{q.subject}: {q.question}", outcome)
+                                          for q, (_qid, outcome) in zip(questions, question_outcomes)])
         except Exception as exc:
             if not call.latency_ms:
                 call.latency_ms = (time.perf_counter() - t0) * 1000
@@ -778,6 +890,120 @@ class JournalWorker:
                 response_ciphertext=self._seal(response.content) if response is not None else None,
             )
             return BatchResult(batch_id, thread_id, capture_ids, False, [], {}, call.cost_usd,
+                               call.latency_ms, call.error)
+
+    def _call_parts(self, sources: Sequence[Source]) -> list[list[Source]]:
+        """A call's utterances cut, in order, into runs of about ``batch_chars`` characters: one model call each.
+
+        A call is one capture (all its words, written when its last chunk is
+        transcribed), so a 30-minute call is ~60k characters; sent whole it is one
+        ~40k-token request whose facts thin out, and a longer call can outgrow the
+        output limit and be given up on after its attempts.
+        """
+        parts: list[list[Source]] = []
+        current: list[Source] = []
+        size = 0
+        for src in sources:
+            n = len(str((src.utterance or {}).get("text") or "")) + 100   # + the source line around the words
+            if current and size + n > self.batch_chars:
+                parts.append(current)
+                current, size = [], 0
+            current.append(src)
+            size += n
+        if current:
+            parts.append(current)
+        return parts
+
+    def _journal_call_side(self, thread: ThreadInfo, captures: list[PendingCapture],
+                           previous: list[JournalEntry]) -> BatchResult:
+        """A call's own side: ``record_call_side`` over each part of the call (:meth:`_call_parts`), then all its
+        facts and the user's quote-checked commitments in one transaction with the captures' checkpoint.
+
+        The facts and to-dos of the earlier parts are shown to the later ones as
+        already recorded. Any part failing fails the batch (nothing is written; it
+        is retried whole, like any batch).
+        """
+        thread_id = thread.id
+        capture_ids = [c.id for c in captures]
+        sources = build_sources(captures, {})
+        parts = self._call_parts(sources)
+        system = system_prompt(self.user_names(), questions=False, call_side=True)
+        tool = RECORD_CALL_SIDE_TOOL
+        call = ModelCall(at=time.time(), thread_id=thread_id, model=self.model, input_chars=0)
+        totals = {"input_tokens": 0, "output_tokens": 0, "cache_write_tokens": 0, "cache_read_tokens": 0}
+        facts: list[NewFact] = []
+        commitments: list[ConversationChange] = []
+        rejected: list[str] = []
+        requests: list[dict[str, Any]] = []
+        responses: list[Any] = []
+        cost: float | None = 0.0
+        t0 = time.perf_counter()
+        try:
+            for part in parts:
+                earlier = [JournalEntry(id=0, at=f.at, thread_id=thread_id, app=thread.app, host=None, fact=f.fact,
+                                        importance=f.importance, batch_id=None) for f in facts]
+                earlier += [JournalEntry(id=0, at=c.at, thread_id=None, app="", host=None,
+                                         fact=f"(to-do already recorded) {c.text}", importance=7, batch_id=None)
+                            for c in commitments]
+                user = build_user_message(thread, part, earlier + previous, str(uuid.uuid4()).upper(),
+                                          max_capture_chars=self.batch_chars)
+                request = {"model": self.model, "max_tokens": MAX_OUTPUT_TOKENS, "system": system, "tools": [tool],
+                           "tool_choice": {"type": "tool", "name": tool["name"]},
+                           "messages": [{"role": "user", "content": user}]}
+                requests.append(request)
+                call.input_chars += len(user)
+                response = self.client.messages.create(**request)
+                responses.append(response.content)
+                tokens = usage_tokens(response.usage)
+                for k in totals:
+                    totals[k] += int(tokens.get(k) or 0)
+                part_cost = self.settings.estimate_cost(self.model, tokens)
+                cost = None if cost is None or part_cost is None else cost + part_cost
+                call.stop_reason = response.stop_reason
+                facts += self._parse_facts(response, thread, part, tool=tool["name"],
+                                           uncertain_mark="(unclear in the call's transcript)")
+                kept, why = self._parse_commitments(response, thread, part, tool["name"])
+                commitments += kept
+                rejected += why
+            call.latency_ms = (time.perf_counter() - t0) * 1000
+            call.input_tokens, call.output_tokens = totals["input_tokens"], totals["output_tokens"]
+            call.cache_write_tokens, call.cache_read_tokens = totals["cache_write_tokens"], totals["cache_read_tokens"]
+            call.cost_usd = cost
+            embed_error = None
+            if facts:
+                try:
+                    for fact, vec in zip(facts, self.embedder.embed([f.fact for f in facts])):
+                        fact.vector = vec
+                        fact.embed_model = self.embedder.model_name
+                except Exception as exc:  # facts are kept; backfill_vectors retries
+                    embed_error = f"{type(exc).__name__}: {exc}"
+            batch_id, commitment_ids = self.store.commit_call_batch(call, capture_ids, facts, commitments)
+            self._log(
+                "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
+                model=self.model, capture_ids=capture_ids, truncated_capture_ids=[], sources=len(sources),
+                parts=len(parts), usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
+                stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,
+                utterances=len(sources), unclear=sum(1 for s in sources if (s.utterance or {}).get("unclear")),
+                commitments=len(commitment_ids), commitments_rejected=rejected,
+                request_ciphertext=self._seal(requests), response_ciphertext=self._seal(responses),
+            )
+            return BatchResult(batch_id, thread_id, capture_ids, True, [f.fact for f in facts], totals,
+                               call.cost_usd, call.latency_ms)
+        except Exception as exc:
+            call.latency_ms = (time.perf_counter() - t0) * 1000
+            call.input_tokens, call.output_tokens = totals["input_tokens"], totals["output_tokens"]
+            call.cost_usd = cost
+            call.outcome = "error"
+            call.error = f"{type(exc).__name__}: {exc}"
+            batch_id = self.store.record_failed_batch(call, capture_ids, count_attempt=not unreachable(exc))
+            self._log(
+                "journal_error", batch_id=batch_id, thread_id=thread_id, model=self.model, capture_ids=capture_ids,
+                parts=len(parts), parts_done=len(responses), error=call.error, traceback=traceback.format_exc(),
+                usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
+                stop_reason=call.stop_reason, request_ciphertext=self._seal(requests),
+                response_ciphertext=self._seal(responses),
+            )
+            return BatchResult(batch_id, thread_id, capture_ids, False, [], totals, call.cost_usd,
                                call.latency_ms, call.error)
 
     def _call_commitments_as_facts(self) -> list[JournalEntry]:
@@ -840,12 +1066,65 @@ class JournalWorker:
             ))
         return out, rejected
 
+    def _parse_questions(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
+                         fact_sources: Sequence[int], tool: str = "record_facts") -> list[NewQuestion]:
+        """Questions for the user from the ``record_facts`` call, dated by the source they cite.
+
+        Each carries the indexes of the batch's facts from the same source, whose journal
+        ids become its evidence ids in the batch's transaction. A question citing a
+        source put on screen by Yuki is kept too: what Yuki showed can still hold a
+        name the user uses.
+        """
+        items = (self._tool_block(response, tool).input or {}).get("questions") or []
+        out: list[NewQuestion] = []
+        for item in items[:4]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("source")) - 1
+            except (TypeError, ValueError):
+                index = len(sources) - 1
+            if not 0 <= index < len(sources):
+                index = len(sources) - 1
+            q = question_from_item(item, at=sources[index].at, origin="journal",
+                                   fact_indexes=[i for i, s in enumerate(fact_sources) if s == index])
+            if q is not None:
+                out.append(q)
+        return out
+
+    def absent_captures(self, captures: Sequence[PendingCapture]) -> set[int]:
+        """Captures taken while the user gave no input for over a minute (the timeline's ``away`` state).
+
+        The timeline's presence comes from :func:`yuki.memory.watcher.user_idle_s`,
+        which leaves a drifting mouse's reports out, so an agent streaming into a
+        window nobody touches reads as away. Terminal commands and a call's own
+        side are dated by themselves, not by the screen, and are left out.
+        """
+        caps = [c for c in captures if c.kind not in (TERMINAL_KIND, CALL_SIDE_KIND)]
+        if not caps:
+            return set()
+        try:
+            rows = [r for r in self.store.timeline_between(min(c.at for c in caps) - 5.0, max(c.at for c in caps) + 5.0)
+                    if r.state in ("present", "away")]
+        except Exception:
+            return set()
+        out: set[int] = set()
+        for c in caps:
+            row = next((r for r in rows if r.started_at <= c.at < r.ended_at), None) or next(
+                (r for r in rows if r.started_at - 2.0 <= c.at <= r.ended_at + 2.0), None)
+            if row is not None and row.state == "away":
+                out.add(c.id)
+        return out
+
     def _parse_facts(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
-                     tool: str = "record_facts") -> list[NewFact]:
+                     tool: str = "record_facts", indexes: list[int] | None = None,
+                     uncertain_mark: str = "") -> list[NewFact]:
         """Facts from the ``record_facts`` tool_use block (structured, schema-checked).
 
         Each fact is dated by the source it cites: a message's own time, a
-        capture's time.
+        capture's time. ``indexes`` receives the source index of each fact.
+        ``uncertain_mark`` is appended to a fact the model flagged ``uncertain``
+        (``record_call_side``: it may rest on a misheard word).
         """
         block = self._tool_block(response, tool)
         items = (block.input or {}).get("facts")
@@ -858,6 +1137,8 @@ class JournalWorker:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
+            if uncertain_mark and item.get("uncertain") is True:
+                text = f"{text} {uncertain_mark}"
             try:
                 importance = min(10, max(1, int(item.get("importance"))))
             except (TypeError, ValueError):
@@ -873,6 +1154,8 @@ class JournalWorker:
                         fact=text, importance=importance,
                         by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)))
             )
+            if indexes is not None:
+                indexes.append(index)
         return facts
 
     # -- public ------------------------------------------------------------

@@ -109,6 +109,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
+from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema
 from yuki.memory.store import (
     CORRECTION_KIND,
     PORTRAIT_KINDS,
@@ -223,6 +224,8 @@ itself was off or asleep (from Windows' own records), which is time away from th
 missing data - when the day at the PC ended and began.
 - ACTIVITY: foreground time per app and site measured by the memory watcher, by weekday \
 and hour of day. Use it for routines.
+- QUESTIONS (sometimes): what Yuki already asked the user, the answered ones with the user's \
+own words, and the ones still waiting to be asked.
 - REVIEW CANDIDATES (sometimes): behaviour patterns the user's weekly review proposed from \
 the week's numbers and episodes, each with the episodes it cites (they are among EPISODES), a \
 suggested confidence and the existing fact it would refine. They are proposals, not facts: ADD \
@@ -261,7 +264,43 @@ near-duplicate. Keep one fact per person.
 - Honest about evidence: confidence (0 to 1) is how well the evidence supports the fact - \
 a single passing mention is low, repeated or explicit evidence is high. Do not state \
 guesses as facts.
+- Who, what and whose only as stated: every fact you ADD or UPDATE says who a person is to \
+the user, what a name is and whose a task, exam, study, account or obligation is only where a \
+journal entry or the user says so in words. A current fact is not evidence for its own \
+wording: when you UPDATE one that carries such a guess, the new text drops it ("Bro, whom the \
+user talks to on WhatsApp about ...", not "Bro, a friend ..."; "the user prepared chapter 1 to \
+go over with Ravi2099, who has a OpenSchool exam soon", not "the user is studying for their \
+exam"), and a fact that is only a guess is INVALIDATEd. When the journal shows a thing \
+differently from a current fact (a name listed among AI models where a fact calls it a team \
+workspace), that fact is contradicted: UPDATE it to what the journal shows, or ask.
 - Never record passwords, codes, account or card numbers, balances or other secrets.
+
+Ask, don't guess. Who a person is to the user, what a name means, and whose a task, study, \
+account, document or obligation is come from the evidence in words or from the user - never \
+from inference: a nickname is not "a friend", a model or product name is not "a workspace", \
+material the user prepares, reads or looks up for someone else (teaching, helping, an agent \
+opening someone's portal) is not their own study, degree, fees or obligation. When the \
+evidence contradicts itself about something that matters (two colleges, two degrees, whose \
+fees), or a fact would rest on such a guess, keep to what the evidence says (leave the guess \
+out, or lower the confidence) and put the unknown in questions, citing the journal entries and \
+facts it rests on. Never ask what CURRENT FACTS of origin user, corrections or ANSWERED \
+QUESTIONS settle, nor what QUESTIONS WAITING already asks; at most three questions per call, \
+usually none. An existing fact's relationship, meaning or owner is not evidence either: \
+when you UPDATE or keep a fact whose "friend", "workspace", "their exam" the journal never \
+stated, take the guess out of the new text (UPDATE it) - and so for anything QUESTIONS WAITING \
+asks about ("Bro, whom the user talks to on WhatsApp about ...", not "Bro, a friend ..."). \
+A correction that records an answer ("Asked \\"...\\", the user answered in their \
+own words: \\"...\\"") is the user's word: carry it out like any correction - UPDATE the fact \
+it concerns with what the user said, or INVALIDATE a fact it shows wrong.
+
+AI agents' work is not the user's. The user builds with AI agents (such as Claude Code, a \
+coding agent in their Warp terminal) and has assistants act for them. What an agent wrote, \
+edited, opened or said is the agent's doing; the user's part is directing, answering, \
+reviewing and testing it. Time with an agent's window in front is not the user's own focused \
+work: TIME USE's active time there is the user's input, away time is the agent working \
+alone. Say what it was - "Claude Code worked on the Yuki harness while the user directed and \
+reviewed it" - and never call it the user heads down, their longest focused stretch or their \
+own coding unless the journal shows the user's own work.
 
 Origin "user" marks facts the user stated themselves; they outrank anything inferred. \
 Change one only when journal entries dated after it show that it is no longer true. A \
@@ -370,7 +409,12 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                         },
                     },
                 },
-            }
+            },
+            "questions": {
+                "type": "array",
+                "description": "Questions for the user instead of guesses (see Ask, don't guess); usually empty.",
+                "items": question_item_schema("portrait"),
+            },
         },
     },
 }
@@ -835,6 +879,8 @@ class PortraitWorker:
             "weekly": "the whole last 7 days (weekly review: look for patterns across days)",
             "nightly": "the journal since the last portrait run",
             "refresh": "the journal since the last portrait run (requested now)",
+            "fold": ("no new journal: carry out the user's corrections among CURRENT FACTS (their answers to "
+                     "Yuki's questions among them) on the facts they concern, and nothing else"),
         }.get(kind, kind)
         part_note = f" This is part {part[0]} of {part[1]} of that journal." if part[1] > 1 else ""
         if part[1] > 1 and part[0] > 1:
@@ -851,12 +897,17 @@ class PortraitWorker:
                     f"suggested confidence {float(c.get('confidence') or 0):.2f}{refines}; episodes {cited} "
                     f"(days {days}): {safe(c.get('text'), 600)}"
                 )
+        asked = known_text(self.store, lambda v, cap: safe(str(v or ""), cap), with_facts=False)
+        asked = (asked.replace("WHAT MEMORY ALREADY KNOWS", "QUESTIONS - ANSWERED")
+                 .replace("QUESTIONS ALREADY WAITING FOR THE USER",
+                          "QUESTIONS WAITING (memory does not know these yet: no fact may state an answer to one)"))
         data = "\n".join(
             ["CURRENT FACTS:", *fact_lines, "", f"JOURNAL ({len(journal)} entries, oldest first):",
              *(journal_lines or ["(no new entries)"]), "",
              f"EPISODES ({len(episodes)}, oldest first):", *(episode_lines or ["(none)"]), "",
              "TIME USE:", safe(time_use, 12000) or "(none)", "",
              "ACTIVITY:", safe(activity, 8000)]
+            + (["", asked] if asked else [])
             + (["", "REVIEW CANDIDATES (proposals from the weekly review):", *candidate_lines]
                if candidate_lines else [])
         )
@@ -1003,6 +1054,84 @@ class PortraitWorker:
             touched.add(fact_id)
         return changes, outcomes
 
+    def _record_questions(self, run_id: int | None, items: Any, facts: Sequence[PortraitFact],
+                          journal: Sequence[JournalEntry], now: float) -> list[tuple[int | None, str]]:
+        """Questions the operations call raised (contradictions, guesses it did not make), stored deduped.
+
+        Each must cite a journal entry of this request or a current fact; it is dated by its
+        newest cited evidence. Never raises: a question is extra, the operations are the run.
+        """
+        if not isinstance(items, list) or not items:
+            return []
+        journal_at = {j.id: j.at for j in journal}
+        current = {f.id: f for f in facts}
+        questions = []
+        for item in items[:4]:
+            if not isinstance(item, dict):
+                continue
+            jids = [int(i) for i in item.get("journal_ids") or [] if isinstance(i, int) and int(i) in journal_at]
+            fids = [int(i) for i in item.get("fact_ids") or [] if isinstance(i, int) and int(i) in current]
+            if not jids and not fids:
+                continue
+            at = max([journal_at[i] for i in jids] + [current[i].valid_from for i in fids])
+            q = question_from_item(item, at=at, origin="portrait", source_ids=jids, fact_ids=fids)
+            if q is not None:
+                questions.append(q)
+        if not questions:
+            return []
+        try:
+            from yuki.memory.embed import get_embedder
+
+            embed_error = embed_questions(questions, get_embedder())
+            outcomes = self.store.add_questions(questions)
+        except Exception as exc:
+            self._log("portrait_questions_error", run_id=run_id, error=f"{type(exc).__name__}: {exc}")
+            return []
+        self._log("portrait_questions", run_id=run_id, embed_error=embed_error,
+                  questions=[{"id": qid, "outcome": o, "kind": q.kind, "importance": q.importance}
+                             for q, (qid, o) in zip(questions, outcomes)])
+        return outcomes
+
+    def fold_corrections(self, run_id: int | None, stats: PortraitRunStats, now: float) -> int:
+        """Carry out pending corrections (the user's answers among them) on the facts they concern, now.
+
+        One operations call over the current facts alone - no journal, episodes or
+        time use, effort low - validated and applied like any run's operations, so
+        an answer supersedes the wrong fact within a render's debounce instead of
+        waiting for the night. Returns the operations applied.
+        """
+        if not self.store.portrait_facts([CORRECTION_KIND]):
+            return 0
+        facts = self.store.portrait_facts()
+        user = self._ops_message(kind="fold", now=now, facts=facts, journal=[], activity="(not needed)",
+                                 part=(1, 1), time_use="(not needed)")
+        tool_input = self._call(
+            purpose="fold", run_id=run_id, system=OPS_SYSTEM_PROMPT, user=user, tool=UPDATE_PORTRAIT_TOOL,
+            effort="low", max_tokens=OPS_MAX_TOKENS, stats=stats,
+        )
+        items = tool_input.get("operations")
+        if not isinstance(items, list):
+            raise _ModelError("update_portrait input has no operations list")
+        changes, outcomes = self._validate(items, facts, [], now)
+        written = iter(self.store.commit_portrait_changes(run_id, changes))
+        applied = 0
+        for out in outcomes:
+            if out.status != "applied":
+                continue
+            ok, new_id = next(written)
+            out.status, out.new_id = ("applied", new_id) if ok else ("skipped: target no longer current", None)
+            applied += bool(ok)
+            stats.ops_add += ok and out.op == "ADD"
+            stats.ops_update += ok and out.op == "UPDATE"
+            stats.ops_invalidate += ok and out.op == "INVALIDATE"
+        stats.ops_noop += sum(o.status == "noop" for o in outcomes)
+        stats.ops_rejected += sum(o.status.startswith("rejected") for o in outcomes)
+        self._log("portrait_ops", run_id=run_id, part=1, parts=1, purpose="fold", applied=applied,
+                  noop=sum(o.status == "noop" for o in outcomes),
+                  rejected=[o.status for o in outcomes if o.status.startswith("rejected")],
+                  operations_ciphertext=self._seal([o.__dict__ for o in outcomes]))
+        return applied
+
     # -- run ---------------------------------------------------------------
 
     def _window(self, kind: str, now: float) -> tuple[list[JournalEntry], float | None]:
@@ -1079,6 +1208,7 @@ class PortraitWorker:
                 if not isinstance(items, list):
                     raise _ModelError("update_portrait input has no operations list")
                 changes, outcomes = self._validate(items, facts, chunk, now, part_episodes)
+                self._record_questions(run_id, tool_input.get("questions"), facts, chunk, now)
                 written = iter(self.store.commit_portrait_changes(
                     run_id, changes, until_journal_id=max((j.id for j in chunk), default=None)
                 ))
@@ -1315,11 +1445,14 @@ class PortraitWorker:
 
     # -- between runs: a re-render, a loop check --------------------------------
 
-    def rerender(self, *, now: float | None = None, reason: str = "render flag") -> RunResult:
+    def rerender(self, *, now: float | None = None, reason: str = "render flag", fold: bool = True) -> RunResult:
         """Re-render the portrait page from the current facts, as a ``render`` run (accounted, no journal).
 
         What a standing rule saved or dropped asks for (the Relationship
-        section): one render call, no operations call over the journal.
+        section): one render call, no operations call over the journal. With
+        ``fold`` and corrections pending (an answer to one of Yuki's questions,
+        a user correction), they are first carried out on the facts they
+        concern (:meth:`fold_corrections`, one small operations call).
         """
         with self._run_lock:
             now = time.time() if now is None else float(now)
@@ -1328,6 +1461,8 @@ class PortraitWorker:
             result = RunResult(run_id, "render", True, stats=stats)
             self._log("portrait_run_start", run_id=run_id, kind="render", reason=reason)
             try:
+                if fold:
+                    self.fold_corrections(run_id, stats, now)
                 result.portrait = self._render(run_id, stats, now)
                 stats.outcome = "ok" if result.portrait else "empty"
             except Exception as exc:

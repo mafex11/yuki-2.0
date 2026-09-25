@@ -275,6 +275,18 @@ resume_day_start = "04:00"
 resume_within_min = 60
 # What it may draw on: your last this-many minutes at the PC before the gap.
 resume_before_min = 90
+# Getting to know you: when memory sees something it cannot make sense of without
+# guessing (who someone is to you, what a name is, whose task something is), it
+# asks you on a "Getting to know you" card instead - the most important first, at
+# a calm moment (not in a call, a meeting, full screen, quiet hours or a snooze),
+# at most one per question_gap_min minutes and questions_per_day a day, only of
+# importance question_min_importance (1-10) or more, and only about what memory
+# saw in the last question_max_age_days days.
+questions_enabled = true
+question_gap_min = 20
+questions_per_day = 6
+question_min_importance = 5
+question_max_age_days = 7
 
 [review]
 # The weekly review (yuki.memory.review): the last seven days in numbers and a
@@ -389,6 +401,41 @@ defer_back_idle_s = 20
 # this (MB, ~11 MB per hour of speech); past either the oldest is deleted.
 spool_max_age_days = 7
 spool_max_mb = 500
+# How the deferred worker turns speech into text (measured 2026-09-25 on synthetic
+# speech and noise; docs/MEMORY.md "Calls: just my side").  Each chunk's language
+# is detected first and the chunk decoded once, beam stt_beam_size, never
+# conditioned on the previous chunk's text.  Whisper retries a decode hotter
+# (stt_temperatures) when its text compresses too well (a loop) or its average
+# log-probability is too low; each decode may write at most stt_tokens_per_s x
+# the chunk's seconds, and no new decode starts after stt_chunk_limit_s +
+# stt_chunk_limit_rtf x the chunk's seconds (what was decoded is kept).
+stt_beam_size = 5
+stt_temperatures = [0.0, 0.4, 0.8]
+stt_compression_ratio_threshold = 2.4
+stt_log_prob_threshold = -1.0
+stt_no_speech_threshold = 0.6
+stt_chunk_limit_s = 10
+stt_chunk_limit_rtf = 1.0
+# What is kept, from Whisper's own probabilities: a segment is dropped when its
+# no-speech probability is over stt_drop_no_speech while its average
+# log-probability is under stt_drop_log_prob, or when it still compresses over
+# the ratio above; it is marked unclear for the journal under
+# stt_unclear_log_prob or over stt_unclear_no_speech, and an unclear exact
+# repeat of the previous segment of at most stt_repeat_max_tokens tokens is
+# dropped (Whisper's loop on breathing, clicks and game sound).
+stt_drop_no_speech = 0.2
+stt_drop_log_prob = -0.8
+stt_unclear_log_prob = -0.6
+stt_unclear_no_speech = 0.4
+stt_repeat_max_tokens = 12
+# Names and terms from memory (portrait, conversation facts, the journal of the
+# last stt_vocab_days days) that Whisper does not know as one word, given to it
+# as a hint of at most stt_vocab_tokens tokens (0 = no hint).
+stt_vocab_tokens = 40
+stt_vocab_days = 14
+# Only for these languages: the names are in Latin script, and with them in the
+# prompt Whisper translated Kannada speech into English (measured).
+stt_vocab_languages = ["en", "hi"]
 # Display names for the card ("Remember what you say in this call?" ... "Always for Zoom").
 [calls.names]
 "Zoom.exe" = "Zoom"
@@ -404,3 +451,20 @@ spool_max_mb = 500
 "Webex.exe" = "Webex"
 "CiscoCollabHost.exe" = "Webex"
 "5319275A.WhatsAppDesktop" = "WhatsApp"
+
+# Upper bound of Whisper tokens per second of audio, per language: ~2x what
+# synthetic speech needs (en 4, hi 14, ta 13, kn 30, te 25 tokens/s; Indian
+# scripts cost many tokens).  A decode stuck in a loop stops there.
+[calls.stt_tokens_per_s]
+en = 8
+hi = 28
+ta = 26
+kn = 60
+te = 52
+
+# A style example per language, given to Whisper as the text before the chunk.
+# Written the way you speak, it makes Whisper write the same way: Hindi with the
+# English words in Latin script ("meeting", "busy") instead of transliterated
+# into Devanagari ("मीटिंग").  Keep it short and free of names.
+[calls.stt_prompts]
+hi = "हाँ यार, meeting के बाद call करता हूँ, अभी थोड़ा busy हूँ, the build is failing."

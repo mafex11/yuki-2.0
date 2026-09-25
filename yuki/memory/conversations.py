@@ -71,6 +71,13 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, _calendar, sanitize_untrusted, user_identity
+from yuki.memory.questions import (
+    QUESTION_GUIDANCE,
+    embed_questions,
+    known_text,
+    question_from_item,
+    question_item_schema,
+)
 from yuki.memory.store import (
     STANDING_KINDS,
     ConversationCall,
@@ -78,6 +85,7 @@ from yuki.memory.store import (
     ConversationFact,
     ConversationTurn,
     NewFact,
+    NewQuestion,
     Store,
     request_render,
     turns_event_name,
@@ -192,6 +200,16 @@ THE JOURNAL say, small talk, Yuki's own abilities or mistakes, and anything that
 preference or commitment. Never record passwords, codes, keys, account numbers or other \
 secrets.
 
+{questions}
+Here the sources are the NEW EXCHANGES and the facts are your journal_facts; Yuki's own guesses \
+in its replies are not evidence. Do not add a question Yuki itself just asked in its reply.
+
+Answers: when, in a NEW exchange, the user answers one of the QUESTIONS ALREADY WAITING FOR THE \
+USER (Q<n>) - replying to Yuki's question or saying it in passing - record it in answers: \
+outcome "answered" with the user's exact words in quote, copied character for character (the \
+shortest span that answers it), or "skipped" / "never" when they decline it now or say not to \
+ask about that (quote their words then too). Only the user's own words answer a question.
+
 Work only from the NEW EXCHANGES. EARLIER IN THIS CONVERSATION is context for \
 understanding them (what "that" or "yes, do it" refers to); never cite it. If nothing \
 changes, call the tool with empty lists.
@@ -277,9 +295,32 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                     },
                 },
             },
+            "questions": {
+                "type": "array",
+                "description": "What you would otherwise have to guess about the user's people, names or tasks, as "
+                               "questions for them (ASK, DON'T GUESS). Usually empty; at most two.",
+                "items": question_item_schema("exchange"),
+            },
+            "answers": {
+                "type": "array",
+                "description": "The user's answers, in NEW exchanges, to QUESTIONS ALREADY WAITING (Q<n>). Usually empty.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["question", "outcome", "quote", "exchange"],
+                    "properties": {
+                        "question": {"type": "integer", "description": "n of the question Q<n>."},
+                        "outcome": {"type": "string", "enum": ["answered", "skipped", "never"]},
+                        "quote": {"type": "string",
+                                  "description": "The user's exact words, copied character for character."},
+                        "exchange": {"type": "integer", "description": "Number [n] of the NEW exchange."},
+                    },
+                },
+            },
         },
     },
 }
+RECORD_CONVERSATION_TOOL["input_schema"]["required"] = ["operations", "journal_facts", "questions", "answers"]
 
 SUMMARY_SYSTEM_PROMPT = """\
 You write the summary of one finished conversation session between the user and Yuki, a \
@@ -421,6 +462,8 @@ class ExtractResult:
     cost_usd: float | None = None
     latency_ms: float = 0.0
     error: str | None = None
+    #: What the store made of each question and answer (added | merged | known | answer:answered ...).
+    questions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -643,7 +686,10 @@ class ConversationWorker:
         def safe(value: str | None, cap: int) -> str:
             return sanitize_untrusted(value or "", nonce, cap)
 
-        parts = ["CURRENT ITEMS (active):", *([self._item_line(f, safe) for f in current] or ["(none)"]), ""]
+        about = " ".join(f"{t.user_text or ''} {t.reply_text or ''}" for t in [*context, *turns])
+        known = known_text(self.store, lambda v, cap: safe(str(v or ""), cap), with_ids=True, about=about)
+        parts = [known, ""] if known else []
+        parts += ["CURRENT ITEMS (active):", *([self._item_line(f, safe) for f in current] or ["(none)"]), ""]
         parts += [f"RECENTLY ENDED (last {ENDED_DAYS} days; history, never re-add):",
                   *([self._item_line(f, safe, ended=True) for f in ended] or ["(none)"]), ""]
         parts += ["FACTS ALREADY IN THE JOURNAL (from conversations with Yuki; never repeat):",
@@ -787,6 +833,58 @@ class ConversationWorker:
                                  fact=text, importance=importance))
         return facts
 
+    @staticmethod
+    def questions_from(items: list[Any], turns: Sequence[ConversationTurn]) -> list[NewQuestion]:
+        """``questions`` of the tool call, dated by their exchange (evidence: that turn's id)."""
+        out: list[NewQuestion] = []
+        for item in (items or [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("exchange")) - 1
+            except (TypeError, ValueError):
+                index = len(turns) - 1
+            if not 0 <= index < len(turns):
+                index = len(turns) - 1
+            q = question_from_item(item, at=turns[index].at, origin="conversation", source_ids=[turns[index].id])
+            if q is not None:
+                out.append(q)
+        return out
+
+    def answers_from(self, items: list[Any], turns: Sequence[ConversationTurn]
+                     ) -> tuple[list[tuple[int, str, str, float]], list[str]]:
+        """``answers`` of the tool call as ``(question id, outcome, the user's words, at)``; rejected reasons.
+
+        The quote rule of rules and preferences applies: the words must be a span of
+        the cited exchange's user text, and the question must be waiting (open or asked).
+        """
+        by_number = {n: t for n, t in enumerate(turns, start=1)}
+        waiting = {q.id for q in self.store.questions(("open", "asked", "skipped"))}
+        out: list[tuple[int, str, str, float]] = []
+        rejected: list[str] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                qid, number = int(item.get("question")), int(item.get("exchange"))
+            except (TypeError, ValueError):
+                rejected.append("bad ids")
+                continue
+            outcome = str(item.get("outcome") or "")
+            quote = " ".join(str(item.get("quote") or "").split())
+            turn = by_number.get(number)
+            if qid not in waiting:
+                rejected.append("not a waiting question")
+            elif turn is None:
+                rejected.append("cites no NEW exchange")
+            elif outcome not in ("answered", "skipped", "never"):
+                rejected.append("unknown outcome")
+            elif outcome == "answered" and not quote_in(quote, turn.user_text):
+                rejected.append("quote is not the user's words in the cited exchange")
+            else:
+                out.append((qid, outcome, quote if quote_in(quote, turn.user_text) else "", turn.at))
+        return out, rejected
+
     def extract(self, session_id: str, turns: Sequence[ConversationTurn], now: float | None = None) -> ExtractResult:
         """One extraction call over ``turns`` (one session, oldest first) and its transaction."""
         now = time.time() if now is None else float(now)
@@ -802,13 +900,17 @@ class ConversationWorker:
                        if t.id not in set(turn_ids)]
             journal = self.store.journal_for_thread(self.store.conversation_thread_id(), limit=12)
             user = self.build_extract_message(turns, current, ended, context, journal, now)
-            system = EXTRACT_SYSTEM_PROMPT.replace("{identity}", user_identity(self.user_names()))
+            system = (EXTRACT_SYSTEM_PROMPT.replace("{identity}", user_identity(self.user_names()))
+                      .replace("{questions}", QUESTION_GUIDANCE))
             tool_input, response, request = self._call("extract", system, user, RECORD_CONVERSATION_TOOL, call)
             ops = tool_input.get("operations")
             if not isinstance(ops, list):
                 raise _ModelError("record_conversation_memory input has no operations list")
             changes, records = self.validate(ops, turns, current)
             facts = self.journal_facts(tool_input.get("journal_facts") or [], turns)
+            questions = self.questions_from(tool_input.get("questions") or [], turns)
+            answers, answer_rejected = self.answers_from(tool_input.get("answers") or [], turns)
+            question_error = embed_questions(questions, self.embedder) if questions else None
             # embeddings: new item versions, journal facts, the turns themselves
             embed_texts = ([f"{c.text} {c.quote or ''}".strip() for c in changes if c.op in ("ADD", "UPDATE")]
                            + [f.fact for f in facts] + [Store.turn_text(t)[:2000] for t in turns])
@@ -827,9 +929,13 @@ class ConversationWorker:
             call.ops_rejected = sum(r.status.startswith("rejected") for r in records)
             call.journal_facts = len(facts)
             call.ops_applied = len(changes)
+            question_outcomes: list[tuple[int | None, str]] = []
             batch_id, written = self.store.commit_conversation_batch(
                 call, turn_ids, changes, facts, turn_vectors=turn_vectors, embed_model=model_name,
+                questions=questions, answers=answers, question_outcomes=question_outcomes,
             )
+            if any(o.startswith("answer:") and o != "answer:not_open" for _q, o in question_outcomes):
+                request_render(self.store.path)   # the portrait folds the user's answer in
             results = iter(written)
             for rec in records:
                 if rec.status != "applied":
@@ -847,12 +953,13 @@ class ConversationWorker:
                 model=self.model, usage=usage, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
                 stop_reason=call.stop_reason, applied=sum(r.status == "applied" for r in records),
                 noop=call.ops_noop, rejected=[r.status for r in records if r.status.startswith("rejected")],
-                journal_facts=len(facts), embed_error=embed_error,
+                journal_facts=len(facts), embed_error=embed_error or question_error,
+                questions=[o for _q, o in question_outcomes], answers_rejected=answer_rejected,
                 request_ciphertext=self._seal(request), response_ciphertext=self._seal(response.content),
                 operations_ciphertext=self._seal([r.__dict__ for r in records]),
             )
             return ExtractResult(batch_id, session_id, turn_ids, True, records, [f.fact for f in facts], usage,
-                                 call.cost_usd, call.latency_ms)
+                                 call.cost_usd, call.latency_ms, questions=[o for _q, o in question_outcomes])
         except Exception as exc:
             call.outcome = "error"
             call.error = f"{type(exc).__name__}: {exc}"

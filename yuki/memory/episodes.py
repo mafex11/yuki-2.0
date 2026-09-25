@@ -139,6 +139,12 @@ Rules:
 - Only what the data supports. Name apps, sites, pages, videos, channels and projects as the \
 data shows them, and use the JOURNAL to say what the activity was about. Do not guess \
 intentions or feelings, and do not judge ("wasted", "procrastinated", "productive"): describe.
+- An AI agent's work is not the user's. The user builds with AI agents (such as Claude Code, a \
+coding agent in their Warp terminal) and has assistants act for them; a window title or journal \
+fact that shows an agent working means the agent did that work. Active time there is the user \
+directing or reviewing it, away time is the agent working alone: write "Claude Code worked on X \
+while the user directed it (12 min active)", never that the user was heads down, focused or \
+coding on their own, unless the JOURNAL shows the user's own work.
 - Round durations sensibly (1h50, 25 min, 40 s) and never invent a number.
 - Each episode's start and end are local times inside the window, formatted YYYY-MM-DD HH:MM.
 - When the window is still open, describe what has happened so far.

@@ -172,6 +172,17 @@ The coach (yuki.memory.nudges; yuki.memory.api.MemoryClient.todos / pending_nudg
     store.nudge_state(name) / set_nudge_state(name, value | None)
     store.captures_between(since, until=None, *, limit=4) -> [{"at", "app", "host", "kind", "text"}]   # not by_yuki
 
+Questions for the user (yuki.memory.questions; migration 13)::
+
+    store.add_questions([NewQuestion]) -> [(id | None, added | merged | reopened | known | rejected:...)]
+        # deduped by subject HMAC and "subject: question" embedding; a subject the user stated is known
+    store.commit_batch(..., questions=, question_outcomes=)   # journal questions in the batch's transaction
+    store.commit_conversation_batch(..., questions=, answers=, question_outcomes=)
+    store.questions(statuses=None, limit=None) / question(id) / next_question(min_importance=, since=)
+    store.answer_question(id, "answered" | "skipped" | "never", words) -> correction id | 0 | None
+    store.record_checkin(checkin, nudge, question=(id, "asked" | "dropped"))
+    store.reopen_unshown_questions() / expire_questions(before)
+
 The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
 
     store.start_weekly_review(week, period_start, period_end, trigger, model, *, at=None) -> int
@@ -823,7 +834,7 @@ class TodoItem:
 #: a call-out, a break suggestion), reminder (a due to-do or commitment), review
 #: (the teaser of a new weekly review, yuki.memory.review; ``ref`` = "review:<id>")
 #: or resume (picking up after the PC was off or asleep; ``ref`` = "resume:<gap end>").
-NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review", "resume")
+NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review", "resume", "question")
 #: ``timeline.state`` of the power rows (yuki.memory.power): the PC itself was
 #: off (shutdown to start), asleep (sleep to wake) or stopped without a clean
 #: shutdown (unknown: a crash, a power cut). Not the user's stretches.
@@ -991,6 +1002,80 @@ class CallRecord:
     stt_device: str | None
     captures: int
     updated_at: float
+
+
+#: ``questions.kind``: what memory does not know - who a person is to the user,
+#: what a name (product, project, place, organisation) is, whose task or material
+#: something is, or another fact it would otherwise have to guess.
+QUESTION_KINDS: tuple[str, ...] = ("person", "meaning", "ownership", "fact")
+#: ``questions.status``: open (waiting to be asked), asked (on a card), answered,
+#: skipped / never (the user's choice on the card or in words), expired (never
+#: asked in time) or dropped (memory turned out to know it already).
+QUESTION_STATUSES: tuple[str, ...] = ("open", "asked", "answered", "skipped", "never", "expired", "dropped")
+#: A question whose "subject: question" embedding is at least this close to an
+#: existing one is the same question. Measured 2026-09-25 (multilingual MiniLM):
+#: the same question reworded 0.73-0.78 ("Bro" / "Bro (WhatsApp)", "Ravi" /
+#: "Ravi2099", two wordings of the OpenSchool one), different people and names at
+#: most 0.64 ("Ravi2099" / "Komal").
+QUESTION_DUPLICATE_COSINE = 0.70
+
+
+def question_subject_key(cipher: FieldCipher, subject: str) -> str:
+    """The HMAC identity of a question's subject: casefolded, whitespace and edge punctuation squashed."""
+    norm = " ".join((subject or "").casefold().split()).strip(" \"'.,;:!?()[]{}")
+    return cipher.digest("question", norm)
+
+
+@dataclass
+class NewQuestion:
+    """A candidate question for the user (:meth:`Store.add_questions`), from the journal,
+    conversation memory or the portrait."""
+
+    at: float                         # the evidence's time
+    kind: str                         # QUESTION_KINDS
+    subject: str                      # the unknown, as shown ("Bro", "Fable")
+    question: str                     # neutral, third person ("Who is Bro to the user?")
+    evidence: str                     # what memory saw, briefly ("they talk about football plans on WhatsApp")
+    reason: str                       # what memory would otherwise have to guess
+    importance: int                   # 1-10
+    origin: str                       # journal | conversation | portrait
+    source_ids: list[int] = field(default_factory=list)   # journal ids (turn ids for conversation)
+    fact_ids: list[int] = field(default_factory=list)     # portrait facts it bears on
+    vector: np.ndarray | None = None  # embedding of "subject: question"
+    embed_model: str | None = None
+    #: Journal only: indexes (into the batch's facts) of the facts from the same source; their
+    #: journal ids become ``source_ids`` inside the batch's transaction.
+    fact_indexes: list[int] = field(default_factory=list)
+
+
+@dataclass
+class QuestionRecord:
+    """One stored question (decrypted)."""
+
+    id: int
+    at: float
+    created_at: float
+    kind: str
+    subject: str
+    question: str
+    evidence: str | None
+    reason: str | None
+    importance: int
+    origin: str
+    source_ids: list[int]
+    fact_ids: list[int]
+    status: str
+    seen: int
+    nudge_id: int | None
+    asked_at: float | None
+    answered_at: float | None
+    answer: str | None
+    answer_fact_id: int | None
+    updated_at: float
+
+    @property
+    def ref(self) -> str:
+        return f"question:{self.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -1633,6 +1718,47 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE timeline ADD COLUMN source TEXT;     -- power rows: shutdown | sleep | modern_standby | unexpected_shutdown | no_record
     CREATE UNIQUE INDEX timeline_power ON timeline(state, ended_at) WHERE state IN ('off', 'asleep', 'unknown');
     """,
+    # 13: getting to know the user (yuki.memory.questions) - questions memory
+    # would otherwise answer by guessing (who a person is to the user, what a
+    # name is, whose task something is), found by the journal, conversation
+    # memory or the portrait, asked on a card of kind "question" and answered in
+    # the user's own words (the answer becomes a user-origin portrait
+    # correction). Text encrypted like everything else; the subject's HMAC and
+    # a local embedding dedupe them. Additive only, like 2-12.
+    """
+    CREATE TABLE questions (
+        id                  INTEGER PRIMARY KEY,
+        at                  REAL NOT NULL,          -- when the evidence was
+        created_at          REAL NOT NULL,
+        kind                TEXT NOT NULL,          -- person | meaning | ownership | fact
+        subject_ciphertext  TEXT NOT NULL,
+        subject_key         TEXT NOT NULL,          -- HMAC(normalised subject), for dedupe
+        question_ciphertext TEXT NOT NULL,
+        evidence_ciphertext TEXT,
+        reason_ciphertext   TEXT,
+        importance          INTEGER NOT NULL,
+        origin              TEXT NOT NULL,          -- journal | conversation | portrait
+        source_ids          TEXT,                   -- JSON: journal ids (turn ids for conversation)
+        fact_ids            TEXT,                   -- JSON: portrait facts it bears on
+        status              TEXT NOT NULL,          -- open | asked | answered | skipped | never | expired | dropped
+        seen                INTEGER NOT NULL DEFAULT 1,
+        nudge_id            INTEGER,                -- the card it was asked on
+        asked_at            REAL,
+        answered_at         REAL,
+        answer_ciphertext   TEXT,                   -- the user's own words
+        answer_fact_id      INTEGER,                -- the portrait correction the answer became
+        updated_at          REAL NOT NULL
+    );
+    CREATE INDEX questions_status ON questions(status, importance, at);
+    CREATE INDEX questions_subject ON questions(subject_key);
+
+    CREATE TABLE question_vec (
+        question_id     INTEGER PRIMARY KEY REFERENCES questions(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    """,
 )
 
 
@@ -2213,14 +2339,24 @@ class Store:
             )
         return journal_id
 
-    def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact]) -> int:
-        """Atomically record a batch, its facts (+vectors) and mark its captures journaled."""
+    def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
+                     questions: Sequence[NewQuestion] = (),
+                     question_outcomes: list[tuple[int | None, str]] | None = None) -> int:
+        """Atomically record a batch, its facts (+vectors), its questions for the user (deduped,
+        see :meth:`add_questions`; each gets the journal ids of the facts from its source) and
+        mark its captures journaled. ``question_outcomes`` receives ``(id, outcome)`` per question."""
         ids = list(capture_ids)
+        known = self.question_known_keys() if questions else set()
 
         def op(conn: sqlite3.Connection) -> int:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
-            for fact in facts:
-                self._insert_journal(conn, fact, batch_id)
+            journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            for q in questions:
+                q.source_ids = sorted({*q.source_ids, *(journal_ids[i] for i in q.fact_indexes
+                                                        if 0 <= i < len(journal_ids))})
+            outcomes = [self._insert_question(conn, q, time.time(), known) for q in questions]
+            if question_outcomes is not None:
+                question_outcomes[:] = outcomes
             conn.executemany("UPDATE captures SET journal_batch_id=? WHERE id=?", [(batch_id, i) for i in ids])
             conn.executemany("UPDATE messages SET journaled=1 WHERE capture_id=?", [(i,) for i in ids])
             return batch_id
@@ -3713,20 +3849,33 @@ class Store:
     def commit_conversation_batch(
         self, call: ConversationCall, turn_ids: Iterable[int], changes: Sequence[ConversationChange],
         journal_facts: Sequence[NewFact], *, turn_vectors: Sequence[tuple[int, np.ndarray]] = (),
-        embed_model: str | None = None,
+        embed_model: str | None = None, questions: Sequence[NewQuestion] = (),
+        answers: Sequence[tuple[int, str, str, float]] = (),
+        question_outcomes: list[tuple[int | None, str]] | None = None,
     ) -> tuple[int, list[tuple[bool, int | None]]]:
         """One transaction: the batch row, the fact changes, the journal facts (filed under
-        the Yuki conversation thread), the turns marked extracted and their vectors.
+        the Yuki conversation thread), the questions for the user found in the exchanges
+        (deduped), the answers the user gave to asked questions (``(question id, outcome,
+        the user's words, at)``, see :meth:`answer_question`), the turns marked extracted
+        and their vectors.
 
         Returns ``(batch_id, [(applied, new fact id) per change])``; a change
         whose target is no longer active is skipped (``(False, None)``).
+        ``question_outcomes`` receives ``(id, outcome)`` per question, then per answer.
         """
         ids = [int(i) for i in turn_ids]
         now = time.time()
+        known = self.question_known_keys() if questions else set()
 
         def op(conn: sqlite3.Connection) -> tuple[int, list[tuple[bool, int | None]]]:
             batch_id = self._insert_cbatch(conn, call)
             results = self._apply_cchanges(conn, changes, now, batch_id)
+            outcomes = [self._insert_question(conn, q, now, known) for q in questions]
+            for qid, outcome, words, at in answers:
+                fact = self._answer_question(conn, qid, outcome, words, at, now)
+                outcomes.append((qid, f"answer:{outcome}" if fact is not None else "answer:not_open"))
+            if question_outcomes is not None:
+                question_outcomes[:] = outcomes
             if journal_facts:
                 thread_id = self._upsert_thread(conn, self.CONVERSATION_APP, "Conversations with Yuki", None,
                                                 scope=self.CONVERSATION_SCOPE, kind="yuki_chat")
@@ -3962,9 +4111,13 @@ class Store:
             reaction=r["reaction"], reacted_at=r["reacted_at"],
         )
 
-    def record_checkin(self, checkin: NudgeCheckin, nudge: NewNudge | None = None) -> tuple[int, int | None]:
+    def record_checkin(self, checkin: NudgeCheckin, nudge: NewNudge | None = None, *,
+                       question: tuple[int, str] | None = None) -> tuple[int, int | None]:
         """One transaction: the check-in's accounting and, when it said something, the nudge.
 
+        ``question``: ``(question id, status)`` of the question this check-in was
+        about - ``asked`` with the nudge written, or ``dropped`` when the phrasing
+        call found memory already knows it - set in the same transaction.
         Returns ``(checkin_id, nudge_id or None)``.
         """
         if nudge is not None and nudge.kind not in NUDGE_KINDS:
@@ -3991,6 +4144,14 @@ class Store:
                 )
                 nudge_id = int(cur.lastrowid)
                 conn.execute("UPDATE nudge_checkins SET nudge_id=? WHERE id=?", (nudge_id, checkin_id))
+            if question is not None:
+                qid, status = question
+                conn.execute(
+                    "UPDATE questions SET status=?, nudge_id=coalesce(?, nudge_id),"
+                    " asked_at=CASE WHEN ?='asked' THEN ? ELSE asked_at END, updated_at=?"
+                    " WHERE id=? AND status IN ('open', 'asked')",
+                    (status, nudge_id, status, c.at, time.time(), int(qid)),
+                )
             return checkin_id, nudge_id
 
         return self._write(op)
@@ -4111,6 +4272,180 @@ class Store:
         )
         return [{"at": r["at"], "app": r["app"], "host": r["host"], "kind": r["kind"],
                  "text": self.cipher.decrypt(r["delta_ciphertext"])} for r in reversed(rows)]
+
+    # -- questions for the user (yuki.memory.questions) ----------------------------
+
+    def _question_row(self, r: sqlite3.Row) -> QuestionRecord:
+        def ids(raw: Any) -> list[int]:
+            try:
+                return [int(i) for i in json.loads(raw or "[]")]
+            except (ValueError, TypeError):
+                return []
+
+        return QuestionRecord(
+            id=r["id"], at=r["at"], created_at=r["created_at"], kind=r["kind"],
+            subject=self.cipher.decrypt(r["subject_ciphertext"]), question=self.cipher.decrypt(r["question_ciphertext"]),
+            evidence=self._dec(r["evidence_ciphertext"]), reason=self._dec(r["reason_ciphertext"]),
+            importance=int(r["importance"]), origin=r["origin"], source_ids=ids(r["source_ids"]),
+            fact_ids=ids(r["fact_ids"]), status=r["status"], seen=int(r["seen"] or 1), nudge_id=r["nudge_id"],
+            asked_at=r["asked_at"], answered_at=r["answered_at"], answer=self._dec(r["answer_ciphertext"]),
+            answer_fact_id=r["answer_fact_id"], updated_at=r["updated_at"],
+        )
+
+    def question_known_keys(self) -> set[str]:
+        """Subject keys of what the user already told memory themselves (current user-origin portrait facts)."""
+        return {question_subject_key(self.cipher, f.subject) for f in self.portrait_facts()
+                if f.origin == "user" and f.kind != CORRECTION_KIND and (f.subject or "").strip()}
+
+    def _insert_question(self, conn: sqlite3.Connection, q: NewQuestion, now: float,
+                         known: set[str]) -> tuple[int | None, str]:
+        """Store one candidate unless it is already known; returns ``(id, outcome)``.
+
+        Dedupe (plumbing, not judgement - the model that found it was shown what
+        memory knows and what is already asked): the same subject (its HMAC key)
+        or a "subject: question" embedding within :data:`QUESTION_DUPLICATE_COSINE`
+        of an existing question is that question - merged into it while it is
+        still open or asked (seen +1, the higher importance, the evidence ids
+        joined), reopened if it expired unasked, and otherwise left alone
+        (answered, skipped, "never", dropped: ``known``). A subject the user
+        already stated a fact about (a user-origin portrait fact) is ``known`` too.
+        """
+        subject, question = " ".join((q.subject or "").split()), " ".join((q.question or "").split())
+        if not subject or not question:
+            return None, "rejected:empty"
+        kind = q.kind if q.kind in QUESTION_KINDS else "fact"
+        key = question_subject_key(self.cipher, subject)
+        if key in known:
+            return None, "known"
+        row = conn.execute("SELECT * FROM questions WHERE subject_key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        if row is None and q.vector is not None:
+            vec_rows = conn.execute(
+                "SELECT q.*, v.dim, v.vec_ciphertext FROM questions q JOIN question_vec v ON v.question_id = q.id"
+            ).fetchall()
+            ranked = self._rank(vec_rows, q.vector, 1)
+            if ranked and ranked[0][1] >= QUESTION_DUPLICATE_COSINE:
+                row = ranked[0][0]
+        importance = min(10, max(1, int(q.importance)))
+        if row is not None:
+            merged_sources = json.dumps(sorted({*(json.loads(row["source_ids"] or "[]")), *map(int, q.source_ids)}))
+            merged_facts = json.dumps(sorted({*(json.loads(row["fact_ids"] or "[]")), *map(int, q.fact_ids)}))
+            if row["status"] in ("open", "asked", "expired"):
+                reopen = row["status"] == "expired"
+                conn.execute(
+                    "UPDATE questions SET seen=seen+1, importance=max(importance, ?), source_ids=?, fact_ids=?,"
+                    " status=CASE WHEN status='expired' THEN 'open' ELSE status END,"
+                    " at=CASE WHEN status='expired' THEN ? ELSE at END, updated_at=? WHERE id=?",
+                    (importance, merged_sources, merged_facts, float(q.at), now, row["id"]),
+                )
+                return int(row["id"]), "reopened" if reopen else "merged"
+            conn.execute("UPDATE questions SET seen=seen+1, updated_at=? WHERE id=?", (now, row["id"]))
+            return int(row["id"]), "known"
+        cur = conn.execute(
+            "INSERT INTO questions(at, created_at, kind, subject_ciphertext, subject_key, question_ciphertext,"
+            " evidence_ciphertext, reason_ciphertext, importance, origin, source_ids, fact_ids, status, seen,"
+            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',1,?)",
+            (float(q.at), now, kind, self.cipher.encrypt(subject), key, self.cipher.encrypt(question),
+             self._enc(" ".join((q.evidence or "").split()) or None), self._enc(" ".join((q.reason or "").split()) or None),
+             importance, q.origin, json.dumps(sorted({int(i) for i in q.source_ids})),
+             json.dumps(sorted({int(i) for i in q.fact_ids})), now),
+        )
+        qid = int(cur.lastrowid)
+        if q.vector is not None:
+            self._put_vec(conn, "question_vec", "question_id", qid, q.vector, q.embed_model)
+        return qid, "added"
+
+    def add_questions(self, questions: Sequence[NewQuestion]) -> list[tuple[int | None, str]]:
+        """Store candidate questions (deduped, :meth:`_insert_question`) in one transaction; ``(id, outcome)`` each."""
+        if not questions:
+            return []
+        known = self.question_known_keys()
+        now = time.time()
+        return self._write(lambda conn: [self._insert_question(conn, q, now, known) for q in questions])
+
+    def questions(self, statuses: Sequence[str] | None = None, *, limit: int | None = None) -> list[QuestionRecord]:
+        """Stored questions (with ``statuses``: only those), newest first."""
+        sql, params = "SELECT * FROM questions", []
+        if statuses:
+            sql += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+            params.extend(statuses)
+        sql += " ORDER BY coalesce(answered_at, asked_at, updated_at) DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._question_row(r) for r in self._query(sql, params)]
+
+    def question(self, question_id: int) -> QuestionRecord | None:
+        rows = self._query("SELECT * FROM questions WHERE id=?", (int(question_id),))
+        return self._question_row(rows[0]) if rows else None
+
+    def next_question(self, *, min_importance: int = 1, since: TimeArg = None) -> QuestionRecord | None:
+        """The open question to ask next: the most important, then the newest evidence."""
+        sql = "SELECT * FROM questions WHERE status='open' AND importance >= ?"
+        params: list[Any] = [int(min_importance)]
+        if (s := _ts(since)) is not None:
+            sql += " AND at >= ?"
+            params.append(s)
+        rows = self._query(sql + " ORDER BY importance DESC, at DESC, id DESC LIMIT 1", params)
+        return self._question_row(rows[0]) if rows else None
+
+    def _answer_question(self, conn: sqlite3.Connection, question_id: int, outcome: str, words: str,
+                         at: float, now: float) -> int | None:
+        """Record the user's answer (``answered``: their words become a user-origin portrait correction
+        that states the question it answers) or their choice (``skipped`` / ``never``).
+        Returns the correction id (0 for a skip or never), or ``None`` when the question does not
+        exist, is already answered, or an answer came without words."""
+        row = conn.execute("SELECT * FROM questions WHERE id=?", (int(question_id),)).fetchone()
+        if row is None or row["status"] not in ("open", "asked", "skipped", "expired", "dropped"):
+            return None
+        words = " ".join((words or "").split())
+        if outcome == "answered":
+            if not words:
+                return None
+            subject = self.cipher.decrypt(row["subject_ciphertext"])
+            question = self.cipher.decrypt(row["question_ciphertext"])
+            evidence = self._dec(row["evidence_ciphertext"])
+            seen = f"; memory had seen: {evidence}" if evidence else ""
+            text = (f'Asked "{question}" (about {subject}{seen}), the user answered in their own words: '
+                    f'"{words}"')
+            fact_id = self._insert_fact(
+                conn, kind=CORRECTION_KIND, subject="", text=text, valid_from=float(at),
+                source_ids=json.loads(row["source_ids"] or "[]"), confidence=1.0, origin="user", run_id=None, now=now,
+            )
+            conn.execute(
+                "UPDATE questions SET status='answered', answered_at=?, answer_ciphertext=?, answer_fact_id=?,"
+                " updated_at=? WHERE id=?",
+                (float(at), self.cipher.encrypt(words), fact_id, now, row["id"]),
+            )
+            return fact_id
+        if outcome not in ("skipped", "never"):
+            raise ValueError(f"outcome must be answered, skipped or never, not {outcome!r}")
+        if row["status"] == "skipped" and outcome == "skipped":
+            return 0
+        conn.execute("UPDATE questions SET status=?, answered_at=?, answer_ciphertext=?, updated_at=? WHERE id=?",
+                     (outcome, float(at), self._enc(words or None), now, row["id"]))
+        return 0
+
+    def answer_question(self, question_id: int, outcome: str = "answered", words: str = "", *,
+                        at: float | None = None) -> int | None:
+        """The user's answer to a question, or their skip / "don't ask about this" (see :meth:`_answer_question`)."""
+        now = time.time()
+        when = float(at) if at is not None else now
+        return self._write(lambda conn: self._answer_question(conn, question_id, outcome, words, when, now))
+
+    def reopen_unshown_questions(self) -> int:
+        """Questions whose card expired without ever being shown go back to ``open`` (asked at a later calm moment)."""
+        return self._write(lambda conn: conn.execute(
+            "UPDATE questions SET status='open', nudge_id=NULL, asked_at=NULL, updated_at=? WHERE status='asked'"
+            " AND nudge_id IN (SELECT id FROM nudges WHERE shown_at IS NULL AND reaction='expired')",
+            (time.time(),),
+        ).rowcount)
+
+    def expire_questions(self, before: float) -> int:
+        """Open questions whose evidence is older than ``before`` are not asked any more (``expired``)."""
+        return self._write(lambda conn: conn.execute(
+            "UPDATE questions SET status='expired', updated_at=? WHERE status='open' AND at < ?",
+            (time.time(), float(before)),
+        ).rowcount)
 
     # -- the weekly review (yuki.memory.review) --------------------------------
 

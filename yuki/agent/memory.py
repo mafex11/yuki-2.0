@@ -752,6 +752,8 @@ class MemoryAccess:
                 outcome = self._activity(tool_input)
             elif name == "todo":
                 outcome = self._todo(tool_input)
+            elif name == "answer_question":
+                outcome = self._answer_question(tool_input, request)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -941,6 +943,43 @@ class MemoryAccess:
             summary=summary,
             content=[{"type": "text", "text": reply}],
             payload={"action": action, "saved": bool(completed), "completed": completed, "text": text},
+        )
+
+    def _answer_question(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
+        """The user's reply to a question: their own words (checked against this request) or a skip."""
+        ref = _need_text(tool_input, "question")
+        outcome = _opt_text(tool_input, "outcome") or "answered"
+        if outcome not in ("answered", "skipped", "never"):
+            raise _BadInput(f"'outcome' must be answered, skipped or never, got {outcome!r}")
+        answer = _opt_text(tool_input, "answer") or ""
+        if outcome == "answered":
+            if not answer:
+                raise _BadInput("'answer' needs the user's own words when the outcome is answered")
+            if request is not None:
+                from yuki.memory.conversations import quote_in
+
+                if not quote_in(answer, request):
+                    raise _BadInput(
+                        "'answer' must be the user's own words, copied exactly from their message (the shortest "
+                        "part that answers it), not a paraphrase"
+                    )
+        try:
+            result = self.call_method("answer_question", ref, answer, outcome, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _not_saved("answer_question", exc, {"question": ref, "outcome": outcome, "answer": answer})
+        result = dict(result) if isinstance(result, dict) else {"saved": bool(result)}
+        if result.get("saved"):
+            self.invalidate_portrait()
+            text = {"answered": f"Saved as the user's answer to {ref}: {answer}",
+                    "skipped": f"{ref} skipped; it will not be asked again.",
+                    "never": f"{ref}: noted not to ask about this."}[outcome]
+            summary = f"answer saved ({outcome})"
+        else:
+            text = f"Nothing saved for {ref}: {result.get('why') or 'unknown question'}."
+            summary = "answer not saved"
+        return ToolOutcome(
+            name="answer_question", ok=True, summary=summary, content=[{"type": "text", "text": text}],
+            payload={**result, "question": ref, "outcome": outcome, "answer": answer},
         )
 
     def _correct(self, tool_input: dict[str, Any]) -> ToolOutcome:

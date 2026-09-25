@@ -91,11 +91,14 @@ KIND_ACCENTS: dict[str, QColor] = {
     "reminder": ACCENT,
     "review": QColor(196, 160, 255),
     "resume": QColor(140, 200, 255),
+    "question": QColor(255, 160, 205),
 }
 KIND_TITLES: dict[str, str] = {
     "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
-    "resume": "Welcome back",
+    "resume": "Welcome back", "question": "Getting to know you",
 }
+#: A question card's buttons: answer it (opens the overlay), not now, don't ask about this.
+QUESTION_BUTTONS: tuple[str, str, str] = ("Answer", "Skip", "Don't ask")
 
 #: ``QUERY_USER_NOTIFICATION_STATE`` values, and the ones that mean "not now".
 NOTIFICATION_STATES: dict[int, str] = {
@@ -164,7 +167,9 @@ def nudge_reply_request(nudge: dict[str, Any], reply: str, *, certain: bool = Tr
     sent = when_label(nudge.get("at"))
     text = " ".join(str(nudge.get("text") or "").split())
     lead = "Replying to your nudge" if certain else "The user may be answering your recent nudge, or may be asking something else"
-    head = f'[{lead} (kind: {kind}){f", sent {sent}" if sent else ""}: "{text}"'
+    ref = " ".join(str(nudge.get("ref") or "").split())
+    ident = f", id {ref}" if ref and kind == "question" else ""
+    head = f'[{lead} (kind: {kind}{ident}){f", sent {sent}" if sent else ""}: "{text}"'
     reason = " ".join(str(nudge.get("reason") or "").split())
     if reason:
         head += f" -- why you sent it: {reason}"
@@ -398,11 +403,13 @@ class NudgeCard(GlassWindow):
         replied: ``(nudge)`` -- the user pressed Reply.
         dismissed: ``(nudge)`` -- the user pressed Dismiss.
         expired: ``(nudge)`` -- it faded on its own after :attr:`linger_ms`.
+        never_ask: ``(nudge)`` -- "Don't ask" on a question card (its Dismiss reads "Skip").
     """
 
     replied = Signal(object)
     dismissed = Signal(object)
     expired = Signal(object)
+    never_ask = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
         super().__init__(activates=False, radius=14)
@@ -442,10 +449,14 @@ class NudgeCard(GlassWindow):
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         buttons.addStretch(1)
+        self.never_button = self._button(QUESTION_BUTTONS[2])
+        self.never_button.setVisible(False)   # question cards only
         self.dismiss_button = self._button("Dismiss")
         self.reply_button = self._button("Reply")
+        self.never_button.clicked.connect(self._on_never)
         self.dismiss_button.clicked.connect(self._on_dismiss)
         self.reply_button.clicked.connect(self._on_reply)
+        buttons.addWidget(self.never_button)
         buttons.addWidget(self.dismiss_button)
         buttons.addWidget(self.reply_button)
         column.addLayout(buttons)
@@ -473,11 +484,13 @@ class NudgeCard(GlassWindow):
             " border-radius: 8px; padding: 3px 12px; }"
             f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},64); }}"
         )
-        self.dismiss_button.setStyleSheet(
+        quiet = (
             "QPushButton { color: rgba(238,240,245,170); background: transparent;"
             " border: 1px solid rgba(255,255,255,26); border-radius: 8px; padding: 3px 12px; }"
             "QPushButton:hover { color: rgba(238,240,245,240); background: rgba(255,255,255,18); }"
         )
+        self.dismiss_button.setStyleSheet(quiet)
+        self.never_button.setStyleSheet(quiet)
         self.title.setStyleSheet(f"color: rgb({a.red()},{a.green()},{a.blue()});")
 
     # -- content -----------------------------------------------------------
@@ -487,6 +500,10 @@ class NudgeCard(GlassWindow):
         self.nudge = nudge
         self._accent = kind_accent(nudge.get("kind"))
         self.title.setText(kind_title(nudge.get("kind")))
+        question = str(nudge.get("kind") or "") == "question"
+        self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
+        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else "Dismiss")
+        self.never_button.setVisible(question)
         self.when.setText(when_label(nudge.get("at")))
         text = _squash(nudge.get("text"))
         self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
@@ -573,6 +590,11 @@ class NudgeCard(GlassWindow):
         if nudge is not None:
             self.replied.emit(nudge)
 
+    def _on_never(self) -> None:
+        nudge = self.close_card()
+        if nudge is not None:
+            self.never_ask.emit(nudge)
+
 
 class NudgeController(QObject):
     """The nudge queue: what arrives, when it may show, and every acknowledgement.
@@ -644,6 +666,7 @@ class NudgeController(QObject):
         self.card.expired.connect(self._on_expired)
         self.card.dismissed.connect(self._on_dismissed)
         self.card.replied.connect(self._on_replied)
+        self.card.never_ask.connect(self._on_never_ask)
         self.card.faded_out.connect(self.try_show)
         self._retry = QTimer(self)
         self._retry.setInterval(RETRY_MS)
@@ -882,6 +905,33 @@ class NudgeController(QObject):
     def _on_dismissed(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card")
         self.ack(nudge, "dismissed")
+        if str(nudge.get("kind") or "") == "question":
+            self.question_feedback(nudge, never=False)
+
+    def _on_never_ask(self, nudge: dict[str, Any]) -> None:
+        self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card_never")
+        self.ack(nudge, "dismissed")
+        self.question_feedback(nudge, never=True)
+
+    def question_feedback(self, nudge: dict[str, Any], *, never: bool) -> threading.Thread:
+        """A question card's Skip / "Don't ask": ``skip_question(ref, never)`` off the GUI thread; logs ``question_skip``."""
+        ref = nudge.get("ref")
+
+        def work() -> None:
+            fields: dict[str, Any] = {"id": nudge.get("id"), "ref": ref, "never": never}
+            try:
+                result = self.memory.call_method("skip_question", ref, never, timeout_s=TRAY_TIMEOUT_S)
+                fields.update(ok=True, saved=bool((result or {}).get("saved")) if isinstance(result, dict) else None)
+            except MemoryUnavailable as exc:
+                fields.update(ok=False, error=str(exc))
+            except Exception as exc:  # never take the UI down
+                fields.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+            self._logged.emit("question_skip", fields)
+
+        thread = threading.Thread(target=work, name="yuki-ui-question-skip", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
 
     def _on_replied(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_reply_opened", id=nudge.get("id"))
