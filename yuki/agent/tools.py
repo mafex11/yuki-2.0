@@ -307,7 +307,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Press a single key, optionally several times, e.g. 'enter', 'tab', "
             "'down'. The result says where keyboard focus is afterwards and whether "
-            "it moved, and names any new window the application showed."
+            "it moved, and names any new window the application showed. Media keys "
+            "('playpause', 'nexttrack', 'prevtrack', 'stop', 'volumemute', "
+            "'volumeup', 'volumedown') act system-wide on whatever is playing: no "
+            "window needs focus, so leave expect_hwnd out and do not switch windows."
         ),
         "input_schema": _obj(
             {

@@ -371,6 +371,22 @@ _KEY_ALIASES = {
     "spacebar": "space",
     "plus": "add",
     "minus": "subtract",
+    # Media keys under the names models reach for (Windows' VK_MEDIA_* and the
+    # usual spellings) -> pyautogui's playpause / nexttrack / prevtrack / stop.
+    "mediaplaypause": "playpause",
+    "mediaplay": "playpause",
+    "mediapause": "playpause",
+    "play": "playpause",
+    "medianexttrack": "nexttrack",
+    "medianext": "nexttrack",
+    "next": "nexttrack",
+    "mediaprevtrack": "prevtrack",
+    "mediaprevioustrack": "prevtrack",
+    "mediaprev": "prevtrack",
+    "previoustrack": "prevtrack",
+    "mediastop": "stop",
+    "volumemuted": "volumemute",
+    "mute": "volumemute",
 }
 
 
@@ -2366,7 +2382,8 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
             return _result(
                 False,
                 f"unknown key {key!r} (use pyautogui key names, e.g. ctrl, alt, "
-                f"win, enter, f5, volume_mute)",
+                f"win, enter, f5; media keys: playpause, nexttrack, prevtrack, stop, "
+                f"volumemute, volumeup, volumedown)",
                 details,
                 started,
             )
