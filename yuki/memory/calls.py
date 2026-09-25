@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +79,19 @@ FRAME_S = FRAME / RATE
 # ---------------------------------------------------------------------------
 
 
+def _packaged_calls_table() -> dict:
+    """The packaged ``[calls]`` table (privacy_default.toml); {} when unreadable."""
+    try:
+        import tomllib
+
+        from yuki.memory.privacy import DEFAULT_PATH
+
+        with DEFAULT_PATH.open("rb") as fh:
+            return tomllib.load(fh).get("calls") or {}
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class CallConfig:
     enabled: bool = True
@@ -102,6 +115,48 @@ class CallConfig:
     chunk_min_s: float = 6.0
     chunk_max_s: float = 25.0
     pause_s: float = 0.7
+    # -- speech to text in the deferred worker (the stt_* keys; docs/MEMORY.md "Calls: just my side") --
+    stt_beam_size: int = 5
+    #: Whisper's temperature fallback: a decode that fails the thresholds below is retried hotter.
+    stt_temperatures: tuple[float, ...] = (0.0, 0.4, 0.8)
+    #: Whisper's own rules: retry when the text compresses too well (a loop) or its average token
+    #: log-probability is too low; a result is silence when no_speech_prob is high AND the log-probability low.
+    stt_compression_ratio_threshold: float = 2.4
+    stt_log_prob_threshold: float = -1.0
+    stt_no_speech_threshold: float = 0.6
+    #: Kept segments are dropped when Whisper's no-speech probability is over ``stt_drop_no_speech`` while
+    #: its log-probability is under ``stt_drop_log_prob`` (a stricter use of the rule above).
+    stt_drop_no_speech: float = 0.2
+    stt_drop_log_prob: float = -0.8
+    #: A segment is marked unclear for the journal under this average log-probability or over this
+    #: no-speech probability; an exact repeat of the previous segment that is unclear and at most
+    #: ``stt_repeat_max_tokens`` tokens long is dropped (Whisper's loop on breathing, clicks, game sound).
+    stt_unclear_log_prob: float = -0.6
+    stt_unclear_no_speech: float = 0.4
+    stt_repeat_max_tokens: int = 12
+    #: Upper bound of Whisper tokens per second of audio, per language (measured: ~2x the rate of
+    #: synthetic speech - en 4, hi 14, ta 13, kn 30, te 25 tokens/s): a decode stuck in a loop stops there.
+    stt_tokens_per_s: tuple[tuple[str, float], ...] = (("en", 8.0), ("hi", 28.0), ("ta", 26.0), ("kn", 60.0),
+                                                       ("te", 52.0))
+    #: A chunk gets ``stt_chunk_limit_s + stt_chunk_limit_rtf * its seconds``; past it no new decode starts
+    #: and what was decoded so far is kept.
+    stt_chunk_limit_s: float = 10.0
+    stt_chunk_limit_rtf: float = 1.0
+    #: Names and terms from memory given to Whisper as a hint (hotwords), at most this many tokens; 0 = off.
+    stt_vocab_tokens: int = 40
+    stt_vocab_days: float = 14.0
+    #: Languages the hint is given for (memory's names are in Latin script; with them Whisper translated
+    #: Kannada speech into English - measured). Empty = every language.
+    stt_vocab_languages: tuple[str, ...] = ("en", "hi")
+    #: A style example per language, given to Whisper as the previous text (``[calls.stt_prompts]``).
+    stt_prompts: tuple[tuple[str, str], ...] = ()
+
+    def tokens_per_s(self, lang: str | None) -> float:
+        rates = dict(self.stt_tokens_per_s)
+        return rates.get(lang or "", max(rates.values(), default=60.0))
+
+    def prompt_for(self, lang: str | None) -> str:
+        return next((p for k, p in self.stt_prompts if k == lang), "")
 
     @classmethod
     def from_dict(cls, table: dict | None) -> CallConfig:
@@ -120,8 +175,25 @@ class CallConfig:
                 return default
             return tuple(str(x).strip() for x in raw if str(x).strip())
 
+        def table_of(key: str) -> dict:
+            # a user file written before a key existed still gets the packaged value (stt_* only)
+            raw = t.get(key)
+            if raw is None:
+                raw = _packaged_calls_table().get(key)
+            return raw if isinstance(raw, dict) else {}
+
         apps = frozenset(k for k in (app_key(a) for a in strings("apps", ())) if k)
         names = tuple((app_key(k) or "", str(v)) for k, v in (t.get("names") or {}).items() if str(v).strip())
+        try:
+            temps = tuple(float(x) for x in t.get("stt_temperatures", d.stt_temperatures))
+        except (TypeError, ValueError):
+            temps = d.stt_temperatures
+        try:
+            rates = tuple((str(k).casefold(), float(v)) for k, v in table_of("stt_tokens_per_s").items())
+        except (TypeError, ValueError):
+            rates = d.stt_tokens_per_s
+        prompts = tuple((str(k).casefold(), str(v).strip()) for k, v in table_of("stt_prompts").items()
+                        if str(v).strip())
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
             poll_s=max(1.0, num("poll_s", d.poll_s)),
@@ -139,6 +211,23 @@ class CallConfig:
             vad_threshold=num("vad_threshold", d.vad_threshold), min_speech_s=num("min_speech_s", d.min_speech_s),
             chunk_min_s=num("chunk_min_s", d.chunk_min_s), chunk_max_s=max(2.0, num("chunk_max_s", d.chunk_max_s)),
             pause_s=num("pause_s", d.pause_s),
+            stt_beam_size=max(1, int(num("stt_beam_size", d.stt_beam_size))),
+            stt_temperatures=temps or d.stt_temperatures,
+            stt_compression_ratio_threshold=num("stt_compression_ratio_threshold", d.stt_compression_ratio_threshold),
+            stt_log_prob_threshold=num("stt_log_prob_threshold", d.stt_log_prob_threshold),
+            stt_no_speech_threshold=num("stt_no_speech_threshold", d.stt_no_speech_threshold),
+            stt_drop_no_speech=num("stt_drop_no_speech", d.stt_drop_no_speech),
+            stt_drop_log_prob=num("stt_drop_log_prob", d.stt_drop_log_prob),
+            stt_unclear_log_prob=num("stt_unclear_log_prob", d.stt_unclear_log_prob),
+            stt_unclear_no_speech=num("stt_unclear_no_speech", d.stt_unclear_no_speech),
+            stt_repeat_max_tokens=int(num("stt_repeat_max_tokens", d.stt_repeat_max_tokens)),
+            stt_tokens_per_s=rates or d.stt_tokens_per_s,
+            stt_chunk_limit_s=max(1.0, num("stt_chunk_limit_s", d.stt_chunk_limit_s)),
+            stt_chunk_limit_rtf=max(0.0, num("stt_chunk_limit_rtf", d.stt_chunk_limit_rtf)),
+            stt_vocab_tokens=max(0, int(num("stt_vocab_tokens", d.stt_vocab_tokens))),
+            stt_vocab_days=max(0.0, num("stt_vocab_days", d.stt_vocab_days)),
+            stt_vocab_languages=tuple(s.casefold() for s in strings("stt_vocab_languages", d.stt_vocab_languages)),
+            stt_prompts=prompts,
         )
 
     def name_of(self, key: str | None, fallback: str = "") -> str:
@@ -593,6 +682,134 @@ class Segment:
     end: float
     text: str
     lang: str | None = None
+    #: Whisper's own signals for the decode this segment came from.
+    avg_logprob: float = 0.0
+    no_speech_prob: float = 0.0
+    compression_ratio: float = 0.0
+    tokens: int = 0
+    #: Recognised with low confidence (see :func:`screen_segments`); the journal is told.
+    unclear: bool = False
+
+
+def _same_words(text: str) -> str:
+    """Casefolded words without punctuation, for "is this the same phrase again"."""
+    import unicodedata
+
+    kept = "".join(" " if unicodedata.category(ch)[0] in "PS" else ch for ch in text.casefold())
+    return " ".join(kept.split())
+
+
+def screen_segments(segments: Sequence[Segment], cfg: CallConfig,
+                    previous: str | None = None) -> tuple[list[Segment], dict[str, int], str | None]:
+    """Whisper's own signals decide what of a chunk is kept: ``(kept, dropped counts by reason, last phrase)``.
+
+    * ``no_speech``: Whisper's no-speech probability over ``stt_drop_no_speech`` while its average
+      log-probability is under ``stt_drop_log_prob`` - it heard no speech and was unsure of its words.
+    * ``repetitive``: compression ratio over ``stt_compression_ratio_threshold`` even after the
+      temperature fallback (a decoding loop: "भाग भाग भाग ...").
+    * ``repeat``: the same phrase as the previous segment (``previous`` carries it across the chunks
+      of a call), unclear and at most ``stt_repeat_max_tokens`` tokens: the loop Whisper falls into on
+      breathing, clicks and game sound ("कर दो" six times running).
+
+    A kept segment is marked ``unclear`` when its log-probability is under ``stt_unclear_log_prob`` or
+    its no-speech probability over ``stt_unclear_no_speech``.
+    """
+    kept: list[Segment] = []
+    dropped: dict[str, int] = {}
+    last = previous
+    for s in segments:
+        phrase = _same_words(s.text)
+        reason = None
+        if not phrase:
+            reason = "empty"
+        elif s.no_speech_prob > cfg.stt_drop_no_speech and s.avg_logprob < cfg.stt_drop_log_prob:
+            reason = "no_speech"
+        elif s.compression_ratio > cfg.stt_compression_ratio_threshold:
+            reason = "repetitive"
+        else:
+            s.unclear = s.avg_logprob < cfg.stt_unclear_log_prob or s.no_speech_prob > cfg.stt_unclear_no_speech
+            if phrase == last and s.unclear and s.tokens <= cfg.stt_repeat_max_tokens:
+                reason = "repeat"
+        if reason is not None:
+            dropped[reason] = dropped.get(reason, 0) + 1
+        else:
+            kept.append(s)
+        if phrase:
+            last = phrase
+    return kept, dropped, last
+
+
+def vocabulary_hint(texts: Iterable[str], count_tokens: Callable[[str], int], budget_tokens: int,
+                    *, min_facts: int = 2) -> str:
+    """Names and terms from memory for Whisper's hint (``hotwords``): ``"Claude, Corvana, ..."``.
+
+    A word counts when memory writes it with a capital (a name, a product, a project) in at least
+    ``min_facts`` of ``texts`` (it recurs in the user's life), and Whisper's own tokenizer needs two
+    tokens or more for it in every casing (Whisper does not know it as one word; a word it knows needs
+    no hint). Words are ranked by facts x (tokens - 1) and taken until the hint would pass
+    ``budget_tokens``: a short hint, so that it guides spelling without being heard where nobody said it.
+    """
+    if budget_tokens <= 0:
+        return ""
+    counts: dict[str, int] = {}
+    forms: dict[str, dict[str, int]] = {}
+    for text in texts:
+        seen: set[str] = set()
+        for raw in (text or "").split():
+            word = ""
+            for ch in raw + " ":
+                if ch.isalpha():
+                    word += ch
+                    continue
+                if len(word) > 1 and word[0].isupper():
+                    seen.add(word)
+                word = ""
+        for word in seen:
+            key = word.casefold()
+            counts[key] = counts.get(key, 0) + 1
+            forms.setdefault(key, {})[word] = forms.setdefault(key, {}).get(word, 0) + 1
+    scored = []
+    for key, n in counts.items():
+        if n < min_facts:
+            continue
+        form = max(forms[key].items(), key=lambda kv: kv[1])[0]
+        cost = min(count_tokens(" " + form), count_tokens(" " + form.lower()), count_tokens(" " + form.capitalize()))
+        if cost >= 2:
+            scored.append((n * (cost - 1), n, form))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    chosen: list[str] = []
+    for _score, _n, form in scored:
+        if count_tokens(" " + ", ".join([*chosen, form])) > budget_tokens:
+            continue
+        chosen.append(form)
+    return ", ".join(chosen)
+
+
+class ChunkTimeout(Exception):
+    """A chunk ran past its time limit (:class:`_DecodeGuard`)."""
+
+
+class _DecodeGuard:
+    """Stands in for CTranslate2's Whisper inside faster-whisper: counts ``generate`` calls and tokens, and
+    refuses to start another once the chunk's time is up. One ``generate`` is bounded by ``max_new_tokens``,
+    so a chunk never runs much past its limit (a temperature-fallback loop on noise used to take 300 s)."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.deadline: float | None = None
+        self.calls = 0
+        self.tokens = 0
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        if self.deadline is not None and time.perf_counter() > self.deadline:
+            raise ChunkTimeout()
+        out = self._inner.generate(*args, **kwargs)
+        self.calls += 1
+        self.tokens += sum(len(seq) for r in out for seq in r.sequences_ids)
+        return out
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 def _add_cuda_dirs() -> list[str]:
@@ -622,14 +839,19 @@ def _add_cuda_dirs() -> list[str]:
 class FasterWhisperBackend:
     """``faster-whisper:<model>``: CTranslate2 Whisper, int8 (int8_float16 on CUDA)."""
 
+    #: Whisper's decoder context (prompt + generated tokens).
+    MAX_LENGTH = 448
+
     def __init__(self, model: str, *, device: str, model_dir: Path, languages: Sequence[str] = (),
-                 cpu_threads: int = 4) -> None:
+                 cpu_threads: int = 4, options: CallConfig | None = None) -> None:
         self.model_name = model
         self.device = device
         self.model_dir = Path(model_dir)
         self.languages = tuple(languages)
         self.cpu_threads = cpu_threads
+        self.options = options or CallConfig()
         self.model: Any = None
+        self.guard: _DecodeGuard | None = None
         self.load_ms = 0.0
 
     @property
@@ -648,27 +870,72 @@ class FasterWhisperBackend:
                                   download_root=str(self.model_dir), cpu_threads=self.cpu_threads)
         # one tiny pass: a missing CUDA library shows here, not mid-call
         list(self.model.transcribe(np.zeros(RATE // 2, np.float32), language="en", beam_size=1)[0])
+        self.guard = _DecodeGuard(self.model.model)
+        self.model.model = self.guard
         self.load_ms = (time.perf_counter() - t0) * 1000.0
 
-    def transcribe(self, audio: np.ndarray) -> tuple[list[Segment], dict[str, Any]]:
-        # beam 5 on the GPU; greedy on the CPU, where beam search costs ~1.6x for the same words (measured)
-        kwargs = dict(beam_size=5 if self.device == "cuda" else 1, vad_filter=True,
-                      condition_on_previous_text=False, task="transcribe")
-        segments, info = self.model.transcribe(audio, language=None, **kwargs)
-        lang = info.language
-        segs = list(segments)
-        if self.languages and lang not in self.languages:
-            probs = dict(info.all_language_probs or [])
-            best = max(self.languages, key=lambda code: probs.get(code, 0.0))
-            segments, info = self.model.transcribe(audio, language=best, **kwargs)
-            segs, lang = list(segments), best
-        out = []
-        for s in segs:
-            text = (s.text or "").strip()
-            if not text or (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0):
-                continue   # Whisper's own no-speech rule: silence it "heard" words in
-            out.append(Segment(float(s.start), float(s.end), text, lang))
-        return out, {"lang": lang, "lang_prob": round(float(info.language_probability or 0.0), 3)}
+    def count_tokens(self, text: str) -> int:
+        """Whisper tokens of ``text`` (its own tokenizer)."""
+        return len(self.model.hf_tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def pick_language(self, audio: np.ndarray) -> tuple[str | None, float]:
+        """The most likely language by Whisper's language detection (on the speech only), among ``languages``
+        when some are configured; None = let Whisper choose (nothing to detect on)."""
+        try:
+            top, top_p, all_probs = self.model.detect_language(audio, vad_filter=True)
+        except Exception:   # e.g. nothing left after its VAD
+            return None, 0.0
+        if not self.languages:
+            return top, float(top_p)
+        probs = dict(all_probs or [])
+        best = max(self.languages, key=lambda code: probs.get(code, 0.0))
+        return best, float(probs.get(best, 0.0))
+
+    def transcribe(self, audio: np.ndarray, *, hint: str = "") -> tuple[list[Segment], dict[str, Any]]:
+        """Every segment Whisper decodes, with its own signals (:func:`screen_segments` decides what is kept).
+
+        The language is detected first and the chunk decoded once in it (it used to be decoded twice when
+        Whisper's first guess was not one of ``languages``). ``hint`` (memory's names and terms) goes in as
+        faster-whisper's ``hotwords``, the language's style example from ``stt_prompts`` as the previous
+        text. Each decode may produce at most ``stt_tokens_per_s`` x the chunk's seconds, and no new decode
+        starts past the chunk's time limit (``info["timed_out"]``; what was decoded before is kept).
+        """
+        o = self.options
+        seconds = len(audio) / RATE
+        lang, lang_prob = self.pick_language(audio)
+        prompt = o.prompt_for(lang)
+        if o.stt_vocab_languages and lang not in o.stt_vocab_languages:
+            hint = ""
+        used = (self.count_tokens(" " + prompt) if prompt else 0) + (self.count_tokens(" " + hint) if hint else 0)
+        room = self.MAX_LENGTH - used - 8          # the prompt's special tokens and the start sequence
+        max_new = int(max(1, min(room, 16 + o.tokens_per_s(lang) * seconds)))
+        # beam search on the GPU; greedy on the CPU, where beam search costs ~1.6x for the same words (measured)
+        kwargs = dict(beam_size=o.stt_beam_size if self.device == "cuda" else 1, vad_filter=True,
+                      condition_on_previous_text=False, task="transcribe", temperature=list(o.stt_temperatures),
+                      compression_ratio_threshold=o.stt_compression_ratio_threshold,
+                      log_prob_threshold=o.stt_log_prob_threshold, no_speech_threshold=o.stt_no_speech_threshold,
+                      initial_prompt=prompt or None, hotwords=hint or None, max_new_tokens=max_new)
+        guard = self.guard
+        calls0, tokens0 = (guard.calls, guard.tokens) if guard else (0, 0)
+        if guard is not None:
+            guard.deadline = time.perf_counter() + o.stt_chunk_limit_s + o.stt_chunk_limit_rtf * seconds
+        out: list[Segment] = []
+        timed_out = False
+        try:
+            segments, info = self.model.transcribe(audio, language=lang, **kwargs)
+            lang = lang or info.language
+            for s in segments:
+                out.append(Segment(float(s.start), float(s.end), (s.text or "").strip(), lang,
+                                   avg_logprob=float(s.avg_logprob), no_speech_prob=float(s.no_speech_prob),
+                                   compression_ratio=float(s.compression_ratio), tokens=len(s.tokens)))
+        except ChunkTimeout:
+            timed_out = True
+        finally:
+            if guard is not None:
+                guard.deadline = None
+        return out, {"lang": lang, "lang_prob": round(lang_prob, 3), "timed_out": timed_out,
+                     "max_new_tokens": max_new, "decodes": (guard.calls - calls0) if guard else None,
+                     "tokens": (guard.tokens - tokens0) if guard else None}
 
     def close(self) -> None:
         self.model = None
@@ -677,7 +944,8 @@ class FasterWhisperBackend:
         gc.collect()
 
 
-def make_backend(spec: str, *, device: str, model_dir: Path, languages: Sequence[str] = ()) -> Any:
+def make_backend(spec: str, *, device: str, model_dir: Path, languages: Sequence[str] = (),
+                 options: CallConfig | None = None) -> Any:
     """A speech-to-text backend by name: ``faster-whisper:<model>`` (``large-v3``, ``large-v3-turbo``, ``small``, ...).
 
     Raises ``ValueError`` for an unknown backend. (Handy's Nemotron 3.5 GGUF
@@ -686,7 +954,7 @@ def make_backend(spec: str, *, device: str, model_dir: Path, languages: Sequence
     """
     kind, _, model = (spec or "").partition(":")
     if kind == "faster-whisper" and model:
-        return FasterWhisperBackend(model, device=device, model_dir=model_dir, languages=languages)
+        return FasterWhisperBackend(model, device=device, model_dir=model_dir, languages=languages, options=options)
     raise ValueError(f"unknown speech-to-text backend {spec!r}")
 
 
@@ -708,7 +976,8 @@ def load_backend(cfg: CallConfig, log: Callable[..., Any] | None = None) -> Any:
     last: Exception | None = None
     for spec, device in attempts:
         try:
-            backend = make_backend(spec, device=device, model_dir=cfg.models_path(), languages=cfg.languages)
+            backend = make_backend(spec, device=device, model_dir=cfg.models_path(), languages=cfg.languages,
+                                   options=cfg)
             backend.load()
             return backend
         except Exception as exc:
@@ -1323,5 +1592,6 @@ class CallWorker:
 __all__ = [
     "CallConfig", "CallWorker", "Chunker", "Chunk", "MicSource", "ArraySource", "RecordingSession",
     "FasterWhisperBackend", "make_backend", "load_backend", "mic_holders", "headphones_now",
-    "capture_device_for", "own_executables", "summarize", "Gpu", "RATE",
+    "capture_device_for", "own_executables", "summarize", "Gpu", "RATE", "Segment", "screen_segments",
+    "vocabulary_hint", "ChunkTimeout",
 ]

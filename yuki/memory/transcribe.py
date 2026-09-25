@@ -349,6 +349,9 @@ class TranscribeScheduler:
             self._retry_after = now + cfg.retry_min * 60.0
         self._proc = None
         self._samples.clear()    # the GPU was ours meanwhile: observe it quiet again before the next run
+        # The worker wrote the finished calls as captures from its own process, which the journal (waiting for
+        # min_captures or its interval) would only notice at its next timeout: wake it so they are journaled now.
+        self.store.wake()
 
     def run(self, stop: threading.Event | None = None, pause_path: Path | None = None) -> None:
         stop = stop or self._stop
@@ -389,28 +392,56 @@ def _stop_requested(handle: Any) -> bool:
     return ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0
 
 
+def memory_texts(store: Store, days: float) -> list[str]:
+    """What memory says about the user's life, for the vocabulary hint: the portrait (subjects and facts),
+    the conversation facts and the journal of the last ``days``. Read once per batch."""
+    texts: list[str] = []
+    for read in (lambda: [f"{f.subject}. {f.text}" for f in store.portrait_facts()],
+                 lambda: [f"{f.subject}. {f.text}" for f in store.conversation_facts()],
+                 lambda: [j.fact for j in store.journal_between(time.time() - days * 86400.0)]):
+        try:
+            texts += read()
+        except Exception:
+            pass
+    return texts
+
+
 def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log: Callable[..., Any],
                        backend: Any = None, max_attempts: int = 3) -> dict[str, Any]:
     """Transcribe every waiting chunk of an ended call, oldest first, until done or ``stop()``.
 
-    Per chunk: decrypt, decode (in memory), transcribe, store the words
-    (encrypted) and delete the audio. A call with no chunk left waiting goes to
-    the journal. Returns content-free totals.
+    Per chunk: decrypt, decode (in memory), transcribe (with memory's names and
+    terms as a hint, built once per batch: :func:`yuki.memory.calls.vocabulary_hint`),
+    keep what Whisper's own signals support (:func:`yuki.memory.calls.screen_segments`,
+    repeats followed across the chunks of a call), store the words (encrypted) and
+    delete the audio. A call with no chunk left waiting goes to the journal.
+    Returns content-free totals.
     """
-    from yuki.memory.calls import Gpu, decode_speech, load_backend
+    from yuki.memory.calls import Gpu, decode_speech, load_backend, screen_segments, vocabulary_hint
 
-    done = failed = 0
+    done = failed = timed_out = unclear = 0
     audio_s = 0.0
     ms_all: list[float] = []
+    dropped_all: dict[str, int] = {}
     gpu = Gpu()
     rows = [r for r in store.call_chunks() if r.get("call_status") == "ended"]
     calls = sorted({r["call_id"] for r in rows})
     stopped = None
+    hint = ""
     if rows and backend is None:
         t0 = time.perf_counter()
         backend = load_backend(cfg, log)
         log("transcribe_model_ready", stt_model=backend.name, stt_device=backend.device,
             load_ms=round((time.perf_counter() - t0) * 1000), gpu=gpu.snapshot())
+    if rows and hasattr(backend, "count_tokens") and getattr(cfg, "stt_vocab_tokens", 0) > 0:
+        t0 = time.perf_counter()
+        try:
+            hint = vocabulary_hint(memory_texts(store, cfg.stt_vocab_days), backend.count_tokens, cfg.stt_vocab_tokens)
+        except Exception as exc:
+            log("error", where="transcribe.hint", error=f"{type(exc).__name__}: {exc}")
+        log("transcribe_hint", terms=len([w for w in hint.split(",") if w.strip()]),
+            tokens=backend.count_tokens(" " + hint) if hint else 0, ms=round((time.perf_counter() - t0) * 1000))
+    last_phrase: dict[int, str | None] = {}
     try:
         for r in rows:
             if stop():
@@ -419,17 +450,27 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
             try:
                 audio = decode_speech(store.read_spool(r["file"]), r["codec"] or "opus")
                 t0 = time.perf_counter()
-                segments, info = backend.transcribe(audio)
+                segments, info = backend.transcribe(audio, hint=hint) if hint else backend.transcribe(audio)
                 ms = (time.perf_counter() - t0) * 1000.0
+                kept, dropped, last_phrase[r["call_id"]] = screen_segments(segments, cfg, last_phrase.get(r["call_id"]))
                 utterances = [{"at": round(r["start_at"] + s.start, 2), "end": round(r["start_at"] + s.end, 2),
-                               "text": s.text, "lang": s.lang} for s in segments]
+                               "text": s.text, "lang": s.lang, "lp": round(s.avg_logprob, 2),
+                               "nsp": round(s.no_speech_prob, 2), **({"unclear": True} if s.unclear else {})}
+                              for s in kept]
                 store.finish_call_chunk(r["id"], utterances, lang=info.get("lang"), ms=ms, model=backend.name,
                                         device=backend.device)
                 done += 1
                 audio_s += float(r["audio_s"])
                 ms_all.append(ms)
+                timed_out += bool(info.get("timed_out"))
+                unclear += sum(1 for s in kept if s.unclear)
+                for k, v in dropped.items():
+                    dropped_all[k] = dropped_all.get(k, 0) + v
                 log("transcribe_chunk", chunk_id=r["id"], call_id=r["call_id"], audio_s=r["audio_s"], ms=round(ms),
-                    segments=len(utterances), lang=info.get("lang"), gpu=gpu.snapshot())
+                    segments=len(utterances), dropped=dropped, unclear=sum(1 for s in kept if s.unclear),
+                    lang=info.get("lang"), lang_prob=info.get("lang_prob"), decodes=info.get("decodes"),
+                    tokens=info.get("tokens"), max_new_tokens=info.get("max_new_tokens"),
+                    timed_out=bool(info.get("timed_out")), gpu=gpu.snapshot())
                 del audio
             except FileNotFoundError:
                 store.remove_call_chunks([r["id"]], "lost")
@@ -450,7 +491,8 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
     ms_all.sort()
     return {"chunks_done": done, "chunks_failed": failed, "audio_s": round(audio_s, 1), "calls_journaled": journaled,
             "stopped": stopped, "chunk_ms_p50": round(ms_all[len(ms_all) // 2]) if ms_all else None,
-            "chunk_ms_max": round(ms_all[-1]) if ms_all else None}
+            "chunk_ms_max": round(ms_all[-1]) if ms_all else None, "chunks_timed_out": timed_out,
+            "segments_dropped": dropped_all, "utterances_unclear": unclear}
 
 
 def main(argv: list[str] | None = None) -> int:
