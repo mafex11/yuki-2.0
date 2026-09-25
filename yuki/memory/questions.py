@@ -104,8 +104,11 @@ def question_item_schema(source: str = "source") -> dict[str, Any]:
         },
         "evidence": {
             "type": "string",
-            "description": "What the sources show, in a few plain words (\"they talk about grad-school "
-                           "applications on WhatsApp\"). No secrets.",
+            "description": "What the sources show and where, in a few plain words (\"they talk about "
+                           "grad-school applications on WhatsApp\"; \"a line in a YouTube video's description\"). "
+                           "Say who wrote or said it only as the sources show it, and never claim the user told "
+                           "Yuki something unless WHAT MEMORY ALREADY KNOWS marks it as the user's own words. "
+                           "No secrets.",
         },
         "why": {"type": "string", "description": "One short clause: what memory would otherwise have to guess."},
         "importance": {
@@ -266,6 +269,11 @@ apps on WhatsApp"). One or two short sentences.
 - Ask exactly what memory does not know, openly: never put a guess inside it ("is Bro your \
 friend?" is a guess) and never offer candidate answers ("a student you tutor, or a classmate?"), \
 even when WHY IT MATTERS lists some.
+- Say where the evidence came from exactly as SEEN IN gives it (a YouTube video's description, a \
+WhatsApp chat, a call). Put words in the user's mouth ("when you said ...") only when SEEN IN shows \
+they are the user's own words, and date them only as SEEN IN does: page content seen on a day can \
+be much older than that day, so never say "the other day" or "recently" about it - say it was on \
+the page, or leave the time out.
 - The evidence plainly and briefly, as memory gives it: never add an owner or a detail it does \
 not state ("your exam" when it says "an exam"), never quote a private message at length, never a \
 secret, an account number or a fee. Do not explain why you are asking.
@@ -303,6 +311,28 @@ ASK_TOOL: dict[str, Any] = {
 }
 
 
+def _seen_in(store: Store, q: Any, safe: Callable[[Any, int], str]) -> list[str]:
+    """Where the evidence was seen, from the journal entries it rests on (app, page, date, nature).
+
+    Provenance comes from the store, not from the model's own evidence wording, so the card can
+    say "in a YouTube video's description" instead of "when you said", and never dates old page
+    content as recent.
+    """
+    ids = [int(i) for i in (getattr(q, "source_ids", None) or [])][:3]
+    if not ids or getattr(q, "origin", "") not in ("journal", "portrait", "audit"):
+        return [f"SEEN IN: (not recorded; seen on {_day(q.at)})"]
+    try:
+        entries = store.journal_by_ids(ids)
+    except Exception:
+        return [f"SEEN IN: (not recorded; seen on {_day(q.at)})"]
+    lines = []
+    for j in entries:
+        where = j.app + (f" / {j.host}" if j.host else "")
+        lines.append(f"SEEN IN: {safe(where, 80)}, dated {_day(j.at)} (a page's date is when it was seen unless "
+                     f"the entry says when it was written), {j.nature}: {safe(j.fact, 300)}")
+    return lines or [f"SEEN IN: (not recorded; seen on {_day(q.at)})"]
+
+
 def build_ask_message(store: Store, q: Any, rules: str, now: float, nonce: str) -> str:
     """The fenced user message of one ``ask_question`` call (``rules``: :func:`yuki.memory.nudges.rules_text`)."""
     from yuki.memory.journal import sanitize_untrusted
@@ -316,7 +346,8 @@ def build_ask_message(store: Store, q: Any, rules: str, now: float, nonce: str) 
         f"QUESTION ({q.kind}): {safe(q.question, 400)}",
         f"ABOUT: {safe(q.subject, 200)}",
         f"WHY IT MATTERS: {safe(q.reason, 300) or '(not given)'}",
-        f"EVIDENCE (from {_day(q.at)}): {safe(q.evidence, 400) or '(not given)'}",
+        f"EVIDENCE: {safe(q.evidence, 400) or '(not given)'}",
+        *_seen_in(store, q, safe),
         "",
         known_text(store, safe, cap=1_800, with_waiting=False) or "WHAT MEMORY ALREADY KNOWS: (nothing yet)",
     ])

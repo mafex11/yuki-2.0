@@ -220,9 +220,13 @@ clear ("7 months ago" or "1 year ago" counted back from the capture's date). Wor
 of that date, as something said then, never as now: "In the description of 'YOU WERE THE ONE' \
 by Driftwood Music, posted around June 2025, the uploader said quix was on a break for exams." A \
 "currently", "now" or "is" in old content describes that time, not today. A fact about what the \
-user did with the content - watched, opened, read, listened to, commented on it - happened when \
-the source was seen: it never gets a content_date, even when it mentions when the content was \
-posted. When one capture gives both, write two facts: "The user watched 'X' by Y on YouTube." \
+user did with the content - watched, opened, read, listened to it - happened when the source was \
+seen: it never gets a content_date, even when it mentions when the content was posted. But \
+something the user WROTE that the page shows with its own date - their old comment, post, reply \
+or a video description they wrote - was written then, not now: give it that content_date and \
+word it as written then ("In the description of 'X', posted around February 2026 under the \
+user's channel, it said ..."). Read what kind of text it is from the page: a video's description \
+is not a comment. When one capture gives both, write two facts: "The user watched 'X' by Y on YouTube." \
 (no content_date) and "In the description of 'X', posted around June 2025, Y said ..." \
 (content_date 2025-06). content_date also stays empty for messages and list rows (they carry \
 their own time) and whenever no date shows.
