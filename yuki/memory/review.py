@@ -99,7 +99,7 @@ from yuki.memory.store import (
 )
 from yuki.memory.timeline import _clip, _runs, aggregate, format_duration
 
-SONNET_MODEL = "us.anthropic.claude-sonnet-5"
+SONNET_MODEL = "global.anthropic.claude-sonnet-5"
 MAX_OUTPUT_TOKENS = 16_000
 #: A review day runs from this local hour to the same hour next day (a late night belongs to its evening).
 DAY_START_HOUR = 4

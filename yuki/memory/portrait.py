@@ -77,7 +77,7 @@ file, and once as soon as 30 journal facts exist and no portrait does.
 
 Public API::
 
-    SONNET_MODEL = "us.anthropic.claude-sonnet-5"
+    SONNET_MODEL = "global.anthropic.claude-sonnet-5"
     OPS_SYSTEM_PROMPT, UPDATE_PORTRAIT_TOOL, RENDER_SYSTEM_PROMPT, SAVE_PORTRAIT_TOOL
         # personality facts (aspect talk | cares | joke | story | people) render into their own
         # Personality section under personality.PERSONALITY_HEADING, before the Open loops
@@ -134,7 +134,7 @@ from yuki.memory.store import (
     request_render,
 )
 
-SONNET_MODEL = "us.anthropic.claude-sonnet-5"
+SONNET_MODEL = "global.anthropic.claude-sonnet-5"
 
 #: Hard cap for the rendered portrait: ~1,500 tokens at ~4 characters a token, plus the
 #: Personality section's own cap.

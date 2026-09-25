@@ -34,7 +34,7 @@ contain captured screen text. Tokens and cost are also stored per batch in
 
 Public API::
 
-    HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    HAIKU_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
     SYSTEM_PROMPT (template), system_prompt(user_names) -> str, user_identity(user_names) -> str
     RECORD_FACTS_TOOL, RECORD_CALL_SIDE_TOOL   # the latter for my_call_side threads (facts + the user's commitments)
         # every fact carries a nature: fact | trait | story | humor | uncertain (yuki.memory.personality)
@@ -91,7 +91,7 @@ from yuki.memory.store import (
     ThreadInfo,
 )
 
-HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+HAIKU_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 #: A re-journal answered with no facts where the replaced batches had some (nothing written).
 EMPTY_REJOURNAL = "re-journal found no facts where the earlier run had some; the earlier facts are kept"

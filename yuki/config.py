@@ -17,8 +17,8 @@ ScreenshotPolicy = Literal["never", "ask", "auto"]
 
 #: Short aliases the user (and the CLI's ``/model`` command) can type.
 MODEL_ALIASES: dict[str, str] = {
-    "sonnet": "us.anthropic.claude-sonnet-5",
-    "opus": "us.anthropic.claude-opus-5",
+    "sonnet": "global.anthropic.claude-sonnet-5",
+    "opus": "global.anthropic.claude-opus-5",
 }
 
 DEFAULT_MODEL = MODEL_ALIASES["sonnet"]
@@ -252,7 +252,7 @@ class Settings:
     """
 
     model: str = DEFAULT_MODEL
-    aws_region: str = field(default_factory=lambda: os.environ.get("AWS_REGION", "us-east-1"))
+    aws_region: str = field(default_factory=lambda: os.environ.get("AWS_REGION", "ap-south-1"))
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
     log_dir: Path = Path("logs/sessions")
     screenshot_policy: ScreenshotPolicy = "never"
