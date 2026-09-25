@@ -845,3 +845,201 @@ def test_embedder_pipe_serves_only_the_key_holder_and_never_blocks(tmp_path: Pat
         server.stop()
     absent = EmbedClient(key, tmp_path / "other.db", local=lambda: Emb())
     assert absent.embed(["x"], 0.5) is not None and absent.last_source == "local"
+
+
+# ---------------------------------------------------------------------------
+# v3.2: hands, one spoken result, the voice thinker, devices
+# ---------------------------------------------------------------------------
+
+
+def test_a_result_is_the_newest_thing_the_mouth_sees() -> None:
+    """The words a reply said before its tool call go back before the call (no "." padding)."""
+    import json
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.anthropic.llm import AnthropicLLMService
+
+    from yuki.voice.pipeline import chronological
+
+    as_pipecat_writes_it = [
+        {"role": "user", "content": "Minimize Discord."},
+        {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function",
+                                              "function": {"name": "window", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": json.dumps({"done": "Discord is now minimized"})},
+        {"role": "assistant", "content": "Sure."},
+    ]
+    svc = AnthropicLLMService(api_key="x", settings=AnthropicLLMService.Settings(
+        model="global.anthropic.claude-haiku-4-5-20251001-v1:0"))
+    before = svc._get_llm_invocation_params(LLMContext(messages=list(as_pipecat_writes_it)))["messages"]
+    assert before[-1]["content"] == [{"type": "text", "text": "."}]  # the padding that made "What's up?"
+    ordered = chronological(as_pipecat_writes_it, {"t1"})
+    assert [m["role"] for m in ordered] == ["user", "assistant", "assistant", "tool"]
+    after = svc._get_llm_invocation_params(LLMContext(messages=ordered))["messages"]
+    assert after[-1]["role"] == "user" and after[-1]["content"][0]["type"] == "tool_result"
+    assert after[1]["content"][0] == {"type": "text", "text": "Sure."}  # merged: words, then the call
+    # A reply that had no words is left as it was.
+    assert chronological(as_pipecat_writes_it, set()) == as_pipecat_writes_it
+
+
+def test_check_progress_is_refused_when_nobody_asked() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None)
+        bridge.attach(asyncio.get_running_loop())
+        bridge.user_turn = lambda: False  # the run was started by a progress line, not the user
+        params = Params("")
+        params.arguments = {"question": "how's it going"}
+        await bridge.check_progress(params)
+        assert params.results and params.results[0][0]["progress"] is None
+        bridge.user_turn = lambda: True
+        params2 = Params("")
+        params2.arguments = {"question": "how's it going"}
+        await bridge.check_progress(params2)
+        assert "Nothing is running" in params2.results[0][0]["note"]
+
+    asyncio.run(main())
+
+
+def test_progress_waits_for_a_real_pause_and_a_result_replaces_it() -> None:
+    import time as _t
+
+    from yuki.voice.narrator import Item, NarratorGate
+
+    async def main() -> None:
+        state, got = _State(), []
+        gate = NarratorGate(state, settle_s=0.05, settle_max_s=0.5, cooldown_s=0.05, final_gap_s=0.05,
+                            progress_pause_s=0.5)
+        gate.start()
+        state.s["last_bot_stop"] = _t.monotonic()  # the acknowledgement just ended
+
+        def d(name: str) -> Any:
+            async def deliver(run_llm: bool, stale: bool) -> None:
+                got.append(name)
+            return deliver
+
+        gate.enqueue(Item(job=1, kind="step", deliver=d("step")))
+        await asyncio.sleep(0.25)
+        assert got == []  # no progress line 0.25 s after Yuki spoke
+        gate.enqueue(Item(job=1, kind="final", deliver=d("final")))
+        await asyncio.sleep(0.2)
+        assert got == ["final"]  # the result replaced it: one spoken line for the job
+        state.s["last_bot_stop"] = _t.monotonic()
+        gate.enqueue(Item(job=2, kind="step", deliver=d("step2")))
+        await asyncio.sleep(0.75)
+        assert got == ["final", "step2"]  # a job still running after a real pause gets its line
+        await gate.stop()
+
+    asyncio.run(main())
+
+
+class _Desk(StubDesktop):
+    """A stub desktop with two windows and a media session, for the hands."""
+
+    def __init__(self) -> None:
+        super().__init__(action_delay_s=0)
+        self.playing = True
+
+    def get_desktop_overview(self) -> dict[str, Any]:
+        o = super().get_desktop_overview()
+        o["windows"] = o["windows"][:2]
+        return o
+
+    def activity_facts(self) -> dict[str, Any]:
+        return {"media": [{"app_id": "Spotify", "status": "playing" if self.playing else "paused",
+                           "title": "Song", "artist": "A", "current": True}]}
+
+    def press(self, key: str, **kwargs: Any) -> Any:
+        if key == "playpause":
+            self.playing = not self.playing
+        return self._act("press", f"pressed {key}", key, **kwargs)
+
+
+def test_hands_act_only_on_windows_they_were_shown() -> None:
+    from yuki.voice.hands import Hands
+
+    desk = _Desk()
+    hands = Hands(desk)
+    snap = hands.snapshot()
+    assert "Spotify" in snap.text and "media: Spotify \"Song\" by A playing" in snap.text
+    assert snap.hwnds == {0x1001, 0x1002}
+    ok, report, _ = hands._run("window", {"window": 0x1003, "action": "minimize"})
+    assert not ok and "not in the desktop block" in report and not desk.calls  # never guessed
+    ok, report, _ = hands._run("window", {"window": 0x1002, "action": "minimize"})
+    assert ok and desk.calls[-1][0] == "window_action"
+    ok, report, _ = hands._run("press_keys", {"window": 0x1001, "keys": ["k"]})
+    assert ok and desk.calls[-1] == ("press", ("k",), {"times": 1, "expect_hwnd": 0x1001})  # guarded
+    ok, report, _ = hands._run("media_key", {"key": "playpause"})
+    assert ok and "media: Spotify now paused (was Spotify playing)" in report  # the measured effect
+    ok, report, _ = hands._run("scroll", {"window": 0x1001, "direction": "down", "amount": 3})
+    assert ok and desk.calls[-1][2]["dy"] == -3 and desk.calls[-1][2]["expect_hwnd"] == 0x1001
+
+
+def test_hands_report_back_and_a_failure_says_hand_over() -> None:
+    from yuki.voice.hands import Hands
+
+    async def main() -> None:
+        hands = Hands(_Desk())
+        hands.snapshot()
+        spoken: list[str] = []
+
+        async def push_frame(frame: Any) -> None:
+            spoken.append(frame.text)
+
+        good = Params("")
+        good.llm = SimpleNamespace(push_frame=push_frame)
+        good.function_name, good.arguments = "window", {"window": 0x1001, "action": "maximize",
+                                                         "say_when_done": "Done, it's big."}
+        await hands.handle(good)
+        assert spoken == ["Done, it's big."] and good.results[0][0]["said"] == "Done, it's big."  # no model call
+        bad = Params("")
+        bad.llm = good.llm
+        bad.function_name, bad.arguments = "window", {"window": 42, "action": "close", "say_when_done": "Closed."}
+        await hands.handle(bad)
+        assert spoken == ["Done, it's big."]  # a failed hand never says its done line
+        assert "failed" in bad.results[0][0] and "tell_yuki" in bad.results[0][0]["how_to_say_it"]
+
+    asyncio.run(main())
+
+
+def test_no_hands_without_a_worker_backend() -> None:
+    """A stand-in brain (no worker) gives the mouth no hands, never the real desktop."""
+    assert VoiceBridge(FakeRuntime(), foreground=lambda: None).hands is None
+
+
+def test_voice_request_runs_lean_without_thinking(tmp_path: Path) -> None:
+    client = FakeClient([_response(_block("tool_use", id="t1", name="done", input={"message": "Ok."}))] * 2)
+    agent = _agent(client, tmp_path)
+    list(agent.run("scroll down", effort="low", thinking=False, lean=True, model="haiku"))
+    list(agent.run("typed request"))
+    first, second = client.calls
+    assert first["thinking"] == {"type": "disabled"} and second["thinking"]["type"] == "adaptive"
+    assert "haiku" in first["model"] and second["model"] == agent.settings.model
+
+
+def test_a_missing_device_falls_back_to_the_default_with_a_note() -> None:
+    from yuki.voice.audio import resolve_device
+
+    devices = {"capture": ["Headset (WH-XB900N)"], "render": ["Speakers"], "default_capture": "Mic Array",
+               "default_render": "Speakers"}
+    assert resolve_device("capture", "Headset (WH-XB900N)", devices) == ("Headset (WH-XB900N)", "")
+    name, note = resolve_device("capture", "AirPods", devices)
+    assert name is None and "AirPods" in note and "Mic Array" in note
+    assert resolve_device("render", None, devices) == (None, "")
+
+
+def test_device_choice_is_remembered_and_shown(tmp_path: Path) -> None:
+    from yuki.voice.session import VoiceSession
+
+    settings = Settings(log_dir=tmp_path / "sessions", requests_csv=tmp_path / "r.csv")
+    session = VoiceSession(settings, FakeRuntime(), None, prefs_path=tmp_path / "voice.json")
+    assert session.device_choice("capture") is None and "Mic: system default" in session.devices_text()
+    shown: list[str] = []
+    session.devices_changed.connect(shown.append)
+    session.set_device("capture", "Headset (WH-XB900N)")
+    session.set_device("render", "Speakers (4- M-Audio AIR 192 4)")
+    again = VoiceSession(settings, FakeRuntime(), None, prefs_path=tmp_path / "voice.json")
+    assert again.device_choice("capture") == "Headset (WH-XB900N)"
+    assert again.device_choice("render") == "Speakers (4- M-Audio AIR 192 4)"
+    assert shown and "Speaker: Speakers (4- M-Audio AIR 192 4)" in shown[-1]
+    session.set_device("capture", None)
+    assert again.device_choice("capture") is None

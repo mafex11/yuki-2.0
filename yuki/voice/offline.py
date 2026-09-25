@@ -126,3 +126,6 @@ class StubDesktop:
 
     def scroll(self, x: int, y: int, **kwargs: Any) -> StubResult:
         return self._act("scroll", f"scrolled at ({x}, {y})", x, y, **kwargs)
+
+    def window_action(self, hwnd: int, action: str) -> StubResult:
+        return self._act("window_action", f"window {hwnd} is now {action}d", hwnd, action)

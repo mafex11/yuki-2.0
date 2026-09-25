@@ -75,6 +75,7 @@ class Timeline:
                     tl.add("user", text=frame.text)
                 elif isinstance(frame, LLMFullResponseStartFrame):
                     tl._reply = {"text": ""}
+                    tl.add("reply_start")
                 elif isinstance(frame, LLMTextFrame):
                     if tl._reply is None:
                         tl._reply = {"text": ""}
@@ -230,6 +231,211 @@ def _discord_desk() -> Any:
     return DiscordDesk()
 
 
+def _hands_desk(timeline: Timeline) -> Any:
+    """A stub desktop for the hands scenarios: Discord in front, YouTube playing in Chrome, Spotify.
+
+    Every action is timestamped on the timeline (``action``), takes a stand-in 0.15 s, and
+    changes the pretend state the way the real one would (a minimized window is minimized,
+    a paused video is paused), so the overview and the media line the mouth and the brain
+    see next are true. Test code only: never touches the real machine.
+    """
+    from yuki.voice.offline import StubResult, StubDesktop
+
+    class HandsDesk(StubDesktop):
+        def __init__(self) -> None:
+            super().__init__(action_delay_s=0.15)
+            self.win = {
+                0x2002: {"process_name": "Discord.exe", "title": "#general | Friends - Discord", "state": "normal"},
+                0x3003: {"process_name": "chrome.exe", "title": "Opus 5.5 walkthrough - YouTube - Google Chrome",
+                         "state": "normal"},
+                0x1002: {"process_name": "Spotify.exe", "title": "Spotify Premium", "state": "normal"},
+            }
+            self.front = 0x2002
+            self.playing = True
+            self.volume = 60
+
+        def get_desktop_overview(self) -> dict[str, Any]:
+            order = [self.front] + [h for h in self.win if h != self.front]
+            windows = []
+            for i, h in enumerate(order):
+                w = self.win[h]
+                if w["state"] == "closed":
+                    continue
+                minimized = w["state"] == "minimized"
+                windows.append({"hwnd": h, "process_name": w["process_name"], "title": w["title"],
+                                "is_foreground": h == self.front and not minimized, "is_minimized": minimized,
+                                "pid": 100 + i, "bounds": (-32000, -32000, -31840, -31972) if minimized
+                                else (0, 0, 1920, 1040)})
+            return {"windows": windows, "foreground_hwnd": self.front, "cursor": (960, 540),
+                    "screen_size": (1920, 1080), "captured_at": time.time(), "monitors": [],
+                    "virtual_bounds": (0, 0, 1920, 1080)}
+
+        def format_overview(self, overview: dict[str, Any]) -> str:
+            lines = [f"screen space 1920x1080 @0,0 (one screen) | cursor {overview['cursor']}"]
+            for w in overview["windows"]:
+                mark = (" FOREGROUND" if w["is_foreground"] else "") + (" (minimized)" if w["is_minimized"] else "")
+                lines.append(f"[{w['hwnd']}] {w['process_name']} \"{w['title']}\" @0,0 1920x1040{mark}")
+            return "\n".join(lines)
+
+        def activity_facts(self) -> dict[str, Any]:
+            return {"media": [{"app_id": "Chrome", "status": "playing" if self.playing else "paused",
+                               "title": "Opus 5.5 walkthrough", "artist": "Anthropic", "current": True}],
+                    "microphone": [], "camera": [],
+                    "foreground": {"hwnd": self.front, "process_name": self.win[self.front]["process_name"],
+                                   "title": self.win[self.front]["title"]}}
+
+        def _act(self, name: str, summary: str, *args: Any, **kwargs: Any) -> StubResult:
+            timeline.add("action", name=name, args=[str(a)[:80] for a in args],
+                         kwargs={k: str(v)[:40] for k, v in kwargs.items()})
+            return super()._act(name, summary, *args, **kwargs)
+
+        def _guard(self, expect: Any) -> str | None:
+            if expect is not None and int(expect) != self.front:
+                return f"window {expect} is not in front ({self.front} is); nothing was sent"
+            return None
+
+        def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> StubResult:
+            result = self._act("run_powershell", "powershell exit 0 in 90 ms; stdout 0 chars", command)
+            if "2002" in command or "8194" in command:  # the brain's ShowWindow on Discord's hwnd (test stub)
+                self.win[0x2002]["state"] = "minimized"
+                self.front = 0x3003
+            result.details = {"stdout": "", "stderr": "", "exit_code": 0}
+            return result
+
+        def window_action(self, hwnd: int, action: str, **kwargs: Any) -> StubResult:
+            w = self.win.get(int(hwnd))
+            if w is None:
+                return StubResult(ok=False, summary=f"hwnd {hwnd} is not a window (it may have closed)")
+            result = self._act("window_action", f"{action}d", hwnd, action)
+            w["state"] = {"minimize": "minimized", "close": "closed"}.get(action, "normal")
+            if action in ("minimize", "close") and self.front == int(hwnd):
+                self.front = next(h for h, x in self.win.items() if x["state"] == "normal" and h != int(hwnd))
+            elif action in ("maximize", "restore", "focus"):
+                self.front = int(hwnd)
+            result.summary = (f"{w['process_name']} \"{w['title']}\" is now {w['state']}"
+                              + ("; in the foreground" if self.front == int(hwnd) else ""))
+            return result
+
+        def focus_window(self, hwnd: int, **kwargs: Any) -> StubResult:
+            return self.window_action(hwnd, "focus")
+
+        def hotkey(self, *keys: str, expect_hwnd: Any = None, **kwargs: Any) -> StubResult:
+            refused = self._guard(expect_hwnd)
+            if refused:
+                return StubResult(ok=False, summary=refused)
+            result = self._act("hotkey", f"pressed {'+'.join(keys)}", *keys, expect_hwnd=expect_hwnd)
+            if keys in (("k",), ("space",), ("playpause",)):
+                self.playing = not self.playing
+            if keys and keys[0] in ("volumedown", "volume_down"):
+                self.volume -= 2
+            result.summary += f"; focus unchanged, still Group \"YouTube Video Player\"" if self.front == 0x3003 else ""
+            return result
+
+        def press(self, key: str, *, times: int = 1, expect_hwnd: Any = None, **kwargs: Any) -> StubResult:
+            refused = self._guard(expect_hwnd)
+            if refused:
+                return StubResult(ok=False, summary=refused)
+            result = self._act("press", f"pressed {key}" + (f" x{times}" if times > 1 else ""), key,
+                               times=times, expect_hwnd=expect_hwnd)
+            if key in ("k", "space", "playpause"):
+                self.playing = not self.playing
+            if key in ("volumedown", "volume_down"):
+                self.volume -= 2 * times
+            return result
+
+        def scroll(self, x: int, y: int, *, dy: int = 0, dx: int = 0, expect_hwnd: Any = None,
+                   **kwargs: Any) -> StubResult:
+            refused = self._guard(expect_hwnd)
+            if refused:
+                return StubResult(ok=False, summary=refused)
+            return self._act("scroll", f"scrolled {abs(dy)} notch(es) {'up' if dy > 0 else 'down'} at ({x},{y})",
+                             x, y, dy=dy, expect_hwnd=expect_hwnd)
+
+        def open_url(self, url: str, *, app: str | None = None, **kwargs: Any) -> StubResult:
+            result = self._act("open_url", f"Google Chrome is now showing {url} (page \"YouTube\"): hwnd 12291 "
+                               f"(chrome.exe) \"YouTube - Google Chrome\"; in the foreground", url, app=app)
+            self.win[0x3003].update(title="YouTube - Google Chrome", state="normal")
+            self.front = 0x3003
+            return result
+
+        def launch_app(self, query: str, **kwargs: Any) -> StubResult:
+            result = self._act("launch_app", f"launched {query!r}: hwnd 4098 (Spotify.exe) \"Spotify Premium\"; "
+                               f"in the foreground and ready for input", query, **kwargs)
+            self.front = 0x1002
+            self.win[0x1002]["state"] = "normal"
+            return result
+
+    return HandsDesk()
+
+
+def _settled(conv_box: dict[str, Any], quiet_s: float = 1.5) -> Any:
+    """A condition: nothing is being said or owed (no job open, nothing held, no tool in flight) for ``quiet_s``."""
+    state = {"since": None}
+
+    def check() -> bool:
+        conv = conv_box.get("conv")
+        if conv is None:
+            return False
+        obs = conv.observer
+        busy = (obs.bot_speaking or obs.generating or obs.user_speaking or conv.bridge.open_voice_jobs()
+                or (conv.gate is not None and conv.gate.holding) or conv.bridge.busy_tools)
+        now = time.monotonic()
+        if busy:
+            state["since"] = None
+            return False
+        state["since"] = state["since"] or now
+        return now - state["since"] >= quiet_s
+
+    return check
+
+
+def hands_metrics(report: dict[str, Any], labels: list[str]) -> list[dict[str, Any]]:
+    """Per scripted line: end of speech -> first audio, -> action executed, action -> next audio, spoken turns."""
+    ev = report["timeline"]
+    ends = report.get("speech_ends") or {}
+    starts = [(e["t"], e["label"]) for e in ev if e["kind"] == "line"]
+    out = []
+    for i, (t0, label) in enumerate(starts):
+        t1 = starts[i + 1][0] if i + 1 < len(starts) else float("inf")
+        eos = ends.get(label, t0)
+        window = [e for e in ev if eos <= e["t"] < t1]
+        audio = [e["t"] for e in window if e["kind"] == "audio_start"]
+        actions = [e for e in window if e["kind"] == "action"]
+        spoken = [e["text"] for e in window if e["kind"] == "yuki"] + [
+            e["result"]["said"] for e in window if e["kind"] == "to_mouth" and isinstance(e.get("result"), dict)
+            and e["result"].get("said")]
+        tools = [e["name"] for e in window if e["kind"] == "mouth_tool"]
+        brain = [e.get("detail") for e in window if e["kind"] == "brain" and e.get("event") == "tool_called"]
+        row: dict[str, Any] = {"line": label, "ack_ms": round((audio[0] - eos) * 1000) if audio else None,
+                               "spoken_turns": len(spoken), "spoken": spoken, "mouth_tools": tools,
+                               "actions": [a["name"] for a in actions], "brain_tools": [b[0] if b else None for b in brain]}
+        if actions:
+            at = actions[0]["t"]
+            row["action_ms"] = round((at - eos) * 1000)
+            # "done" audio: the first audio after the action's report reached the mouth (a hand's
+            # result, or the thinker's final result), not the acknowledgement already playing
+            reported = [e["t"] for e in window if e["kind"] == "to_mouth" and e.get("final")
+                        and e["name"] != "stay_quiet" and e["t"] >= at]
+            # the reply the report started: its first audio (older reports have no reply_start:
+            # the first reply that finished after the report, less the time to its text)
+            replies = [e["t"] for e in window if e["kind"] == "reply_start" and reported and e["t"] >= reported[0]]
+            if not replies and reported:
+                replies = [e["t"] - 0.5 for e in window if e["kind"] == "yuki" and e["t"] > reported[0]]
+            after = [t for t in audio if replies and t > replies[0]]
+            said = [e for e in window if e["kind"] == "to_mouth" and isinstance(e.get("result"), dict)
+                    and e["result"].get("said")]
+            segments = [a for a, _d in report.get("audio_segments") or [] if eos <= a < t1]
+            if said and segments:
+                # a done line said by the hand itself: its audio is the first stretch after the
+                # acknowledgement's that starts after the report (queued behind the words)
+                later = [a for a in segments[1:] if a >= said[0]["t"]]
+                after = later or after
+            row["action_to_done_audio_ms"] = round((after[0] - at) * 1000) if after else None
+            row["eos_to_done_audio_ms"] = round((after[0] - eos) * 1000) if after else None
+        out.append(row)
+    return out
+
+
 def _serve_embedder(db: Path) -> Any:
     """A stand-in memory service serving its (loaded) embedder on ``db``'s pipe, in its own process."""
     import subprocess
@@ -353,6 +559,23 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("l_work"), "l_work", after_s=1.0, wait_for=reply_done()),
             ScriptLine(clip("l_thanks"), "l_thanks", after_s=1.0, wait_for=reply_done()),
         ]
+    elif scenario == "hands":
+        # Single actions the talker can do itself, a two-step task and a memory question that
+        # must still go to the thinker, small talk, and a quick action while a thinker job runs.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_hands_desk(timeline))
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [
+            ScriptLine(clip("h_hello"), "h_hello", after_s=1.0),
+            ScriptLine(clip("h_minimize"), "h_minimize", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_scroll"), "h_scroll", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_pause"), "h_pause", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_youtube"), "h_youtube", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_twostep"), "h_twostep", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_memory"), "h_memory", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_today"), "h_today", after_s=0.8, wait_for=settled()),
+            ScriptLine(clip("h_volume"), "h_volume", after_s=0.5, wait_for=reply_done()),
+            ScriptLine(clip("h_thanks"), "h_thanks", after_s=0.8, wait_for=settled()),
+        ]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -422,6 +645,25 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"unknown scenario {scenario}")
 
     bridge = VoiceBridge(runtime, vlog, foreground=lambda: None, settings=settings)
+    if args.dump_mouth:
+        # Test report only: the tail of every request the mouth sends (what it was shown).
+        import yuki.voice.pipeline as pipeline_module
+
+        made = pipeline_module._layered_service
+
+        def dumping(base: Any, memory_: Any, hooks: Any) -> Any:
+            cls = made(base, memory_, hooks)
+
+            class Dumping(cls):  # type: ignore[misc, valid-type]
+                def _get_llm_invocation_params(self, context: Any) -> Any:
+                    params = super()._get_llm_invocation_params(context)
+                    timeline.add("mouth_request", tail=json.loads(json.dumps(
+                        (params.get("messages") or [])[-4:], default=str)))
+                    return params
+
+            return Dumping
+
+        pipeline_module._layered_service = dumping
     params = TransportParams(audio_in_enabled=True, audio_in_sample_rate=16_000, audio_out_enabled=True,
                              audio_out_sample_rate=24_000, audio_out_auto_silence=True)
     states: list[tuple[float, str]] = []
@@ -522,7 +764,15 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         "grounding_ms": sorted(round(x, 1) for x in (conv.grounder.timings if conv and conv.grounder else [])),
         "brain_requests_sent": getattr(runtime, "requests", None),
         "stub_desktop_calls": [c[0] for c in desk.calls] if desk is not None else None,
+        "speech_ends": {ln.label: round(ln.speech_end_at - timeline.t0, 2) for ln in box["script"].lines
+                        if ln.speech_end_at} if "script" in box else {},
     }
+    if "output" in box:
+        # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
+        report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
+                                    for at, samples in box["output"].replies(gap_s=0.12)]
+    if scenario == "hands":
+        report["hands"] = hands_metrics(report, [ln.label for ln in lines])
     if scenario == "pauses" and "script" in box:
         # Per clip: did the turn end inside the sentence (a transcript before its last word), and
         # did Yuki start talking before the user had finished?
@@ -571,6 +821,8 @@ def summary(report: dict[str, Any]) -> str:
                          f"{json.dumps(e.get('detail'), ensure_ascii=False)[:240]}")
         elif k == "line":
             lines.append(f"{e['t']:7.1f}  [clip {e['label']}]")
+        elif k == "action":
+            lines.append(f"{e['t']:7.1f}   ACTION {e['name']} {e.get('args')} {e.get('kwargs')}")
     if report.get("error"):
         lines.append("ERROR " + report["error"])
     return "\n".join(lines)
@@ -578,7 +830,7 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "all"))
+    ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "all"))
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
     ap.add_argument("--serve-embedder", dest="serve_embedder", action="store_true",
                     help="serve the embedder from a stand-in memory service process on the DB copy")
@@ -594,6 +846,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-s", dest="max_s", type=float, default=240.0)
     ap.add_argument("--eager", type=float, default=None)
     ap.add_argument("--eot", type=float, default=None)
+    ap.add_argument("--dump-mouth", dest="dump_mouth", action="store_true",
+                    help="put the tail of every mouth request on the timeline (the JSON report only)")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     app = QCoreApplication.instance() or QCoreApplication([])

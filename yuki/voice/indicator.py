@@ -31,6 +31,7 @@ LOOK: dict[str, tuple[str, QColor]] = {
     "speaking": ("Speaking", QColor(190, 150, 255)),
     "working": ("Working on it", QColor(255, 200, 110)),
     "error": ("Voice error", QColor(255, 120, 120)),
+    "note": ("Voice", QColor(170, 176, 190)),
 }
 
 
@@ -52,6 +53,12 @@ class VoicePill(GlassWindow):
         self._fade = QTimer(self)
         self._fade.setSingleShot(True)
         self._fade.timeout.connect(self.fade_out)
+        self._devices = ""
+
+    def set_devices(self, text: str) -> None:
+        """The devices voice uses now (``Mic: … · Speaker: …``), shown as the pill's tooltip."""
+        self._devices = text or ""
+        self.setToolTip(self._devices)
 
     def anchor(self) -> QPoint:
         screen = QGuiApplication.primaryScreen()
@@ -67,14 +74,16 @@ class VoicePill(GlassWindow):
                 self.fade_out()
             return
         label, self._dot = LOOK.get(state, (state.capitalize(), ACCENT))
-        if state in ("error", "starting") and detail and detail not in ("tray", "hotkey", "wake"):
-            label = detail  # an error, or a note such as the voice falling back
-            self.setToolTip(detail)
+        if state in ("error", "starting", "note") and detail and detail not in ("tray", "hotkey", "wake"):
+            label = detail  # an error, or a note such as the voice or a device falling back
+            self.setToolTip(detail + (f"\n{self._devices}" if self._devices else ""))
+        elif self._devices:
+            self.setToolTip(self._devices)
         self.label.setText(self.label.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, PILL_WIDTH - 44))
         self.update()
         if not self.isVisible() or self.closing:
             self.fade_in(self.anchor())
-        if state == "error":
+        if state in ("error", "note"):
             self._fade.start(NOTE_MS)
 
     def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override

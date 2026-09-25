@@ -139,12 +139,14 @@ class VoiceBridge(QObject):
         log: ``VoiceLog``-like object with ``event(kind, **fields)``; content-free.
         foreground: Returns the window in front (``origin_hwnd`` for a voice request).
         settings: Voice settings (result length, progress lines); defaults when ``None``.
+        hands_backend: The desktop the mouth's hands act on (docs/VOICE.md §5.6); ``None``:
+            the brain worker's own backend (the real desktop, or a test's stub).
     """
 
     _gui_call = Signal(object)
 
     def __init__(self, runtime: Any, log: Any = None, *, foreground: Callable[[], int | None] | None = None,
-                 settings: Any = None) -> None:
+                 settings: Any = None, hands_backend: Any = None) -> None:
         super().__init__()
         self.runtime = runtime
         self.log = log
@@ -175,6 +177,18 @@ class VoiceBridge(QObject):
         self.spoke_in_reply: Callable[[], bool] | None = None
         #: ``async ()``: a ``remember`` hand-off was saved (the conversation re-reads the rules).
         self.on_remembered: Callable[[], Awaitable[None]] | None = None
+        #: ``(tool_call_id)``: words were spoken for this call (its say_first), set by the conversation.
+        self.mark_spoken: Callable[[str], None] | None = None
+        #: Whether the mouth run making the current tool call answered a user turn (not a
+        #: result arriving); set by the conversation. ``None``: assume it did.
+        self.user_turn: Callable[[], bool] | None = None
+        #: The mouth's own one-step hands (docs/VOICE.md §5.6), over the brain's backend.
+        from yuki.voice.hands import Hands, hands_backend as _brain_backend
+
+        backend = hands_backend if hands_backend is not None else _brain_backend(runtime)
+        self.hands: Hands | None = Hands(backend, log) if backend is not None else None
+        if self.hands is not None:
+            self.hands.bridge = self
         self._gui_call.connect(self._run)
         for name, slot in (
             ("started", self._on_started), ("tool_called", self._on_tool_called),
@@ -203,6 +217,8 @@ class VoiceBridge(QObject):
             self.progress_answerer = None
             self.spoke_in_reply = None
             self.on_remembered = None
+            self.mark_spoken = None
+            self.user_turn = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -350,6 +366,8 @@ class VoiceBridge(QObject):
         from pipecat.frames.frames import TTSSpeakFrame
 
         await params.llm.push_frame(TTSSpeakFrame(text=words))
+        if self.mark_spoken is not None:
+            self.mark_spoken(params.tool_call_id)
         self._log("bridge", op="ack_spoken", call=params.tool_call_id, chars=len(words))
 
     async def _relay(self, job: Job, params: Any) -> None:
@@ -419,6 +437,17 @@ class VoiceBridge(QObject):
         """Pipecat handler for ``check_progress``: an isolated one-shot answer over the task's real log."""
         args = params.arguments if isinstance(params.arguments, dict) else {}
         question = str(args.get("question") or "").strip()
+        if self.user_turn is not None and not self.user_turn():
+            # Called in a run that a result or progress message started, not the user: nobody
+            # asked (measured 2026-09-25: after a progress line the mouth checked progress on
+            # its own, twice, and each answer was one more spoken turn). Settled quietly.
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            self._log("bridge", op="progress", refused="not_asked")
+            await params.result_callback({"progress": None, "note": "Nobody asked; check_progress is only for "
+                                          "when the user asks how a task is going."},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         job = self._progress_target()
         if job is None or job.log is None:
             self._log("bridge", op="progress", jobs=0)
@@ -470,6 +499,13 @@ class VoiceBridge(QObject):
         self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest))
         await params.result_callback({"more": head, "more_available": bool(rest),
                                       "how_to_say_it": SPOKEN_NOTE + (" Still more after this." if rest else "")})
+
+    async def stay_quiet(self, params: Any) -> None:
+        """Pipecat handler for ``stay_quiet``: the mouth chose to say nothing; settled without a turn."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        self._log("bridge", op="quiet", asked_by_user=self.user_turn() if self.user_turn is not None else None)
+        await params.result_callback({"ok": True}, properties=FunctionCallResultProperties(run_llm=False))
 
     def _progress_target(self) -> Job | None:
         """The task "how's it going?" is about: the newest open voice task, else any open one, else a recent one."""

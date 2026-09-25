@@ -205,6 +205,7 @@ class YukiUi(QObject):
         self.voice = VoiceSession(settings, self.runtime, self.runtime.memory, ui_log)
         self.voice_pill = VoicePill()
         self.voice.state_changed.connect(self._on_voice_state)
+        self.voice.devices_changed.connect(self.voice_pill.set_devices)
         self.calls.changed.connect(self.voice.on_call_status)
         runtime_signals.said.connect(self._on_said)
 
@@ -411,7 +412,7 @@ class YukiUi(QObject):
     def _on_voice_state(self, state: str, detail: str) -> None:
         """Voice changed state (listening, speaking, ...): the pill shows it."""
         self.voice_pill.show_state(state, detail)
-        if state in ("error", "off", "starting"):
+        if state in ("error", "off", "starting", "note"):
             self.ui_log.event("voice", state=state, detail=detail)
 
     def _on_finished(self, lane_name: str, request_id: int, text: str) -> None:
@@ -784,6 +785,36 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     voice_id_item.triggered.connect(choose_voice)
     menu.addAction(voice_id_item)
 
+    # Which microphone and which output voice uses: the active Core Audio devices, listed
+    # afresh each time the menu opens, "System default" first; remembered in voice.json.
+    device_menus = {kind: menu.addMenu(label) for kind, label in (("capture", "Microphone"), ("render", "Speaker"))}
+
+    def fill_devices() -> None:
+        from yuki.voice.audio import audio_devices
+
+        found = audio_devices()
+        for kind, submenu in device_menus.items():
+            submenu.clear()
+            group = QActionGroup(submenu)
+            group.setExclusive(True)
+            chosen = ui.voice.device_choice(kind)
+            default = found.get(f"default_{kind}")
+            names: list[str | None] = [None, *found.get(kind, [])]
+            if chosen and chosen not in names:
+                names.append(chosen)  # chosen but not connected now: shown, so it can be un-chosen
+            for name in names:
+                if name is None:
+                    label = "System default" + (f" ({default})" if default else "")
+                else:
+                    label = name + ("" if name in found.get(kind, []) else " (not connected)")
+                item = QAction(label, submenu, checkable=True)
+                item.setChecked((name or None) == (chosen or None))
+                item.triggered.connect(lambda _checked=False, k=kind, n=name: ui.voice.set_device(k, n))
+                group.addAction(item)
+                submenu.addAction(item)
+
+    menu.aboutToShow.connect(fill_devices)
+
     # Model and effort: one checkable item per choice, the current one ticked.
     # Both go through the runtime, so both lanes switch and each agent logs it.
     menu.addSeparator()
@@ -820,7 +851,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
             for key, item in items.items():
                 item.setChecked(key == current)
             group.setExclusive(True)
-        tray.setToolTip(f"Yuki — {ui.settings.model} · effort {ui.settings.effort}")
+        tray.setToolTip(f"Yuki — {ui.settings.model} · effort {ui.settings.effort}\n{ui.voice.devices_text()}")
 
     def switch_model(alias: str) -> None:
         ui.set_model(alias)

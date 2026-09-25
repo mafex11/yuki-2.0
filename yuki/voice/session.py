@@ -44,6 +44,14 @@ WAKE_PREROLL_S = 1.2
 #: Environment variable that sets the ElevenLabs voice id (the tray's "Voice id…" wins over it).
 VOICE_ID_ENV = "YUKI_VOICE_ID"
 
+#: ``voice.json`` keys of the tray's device choices, by kind (``Settings`` field on the right).
+DEVICE_PREFS = {"capture": ("mic_device", "voice_input_device"), "render": ("speaker_device", "voice_output_device")}
+
+#: How often the chosen devices are looked for while the mic is open (a Bluetooth headset
+#: switched off must fall back to the default, not leave voice deaf). A status poll of Core
+#: Audio (~15 ms, off the GUI thread), not a behaviour timer.
+DEVICE_WATCH_MS = 3000
+
 
 def voice_id(settings: Settings, prefs: dict[str, Any]) -> str:
     """The TTS voice id in force: the tray's choice (``voice.json``), else ``YUKI_VOICE_ID``, else the setting."""
@@ -104,6 +112,10 @@ class VoiceSession(QObject):
     state_changed = Signal(str, str)
     conversation_changed = Signal(bool)
     wake_changed = Signal(bool)
+    #: ``"Mic: … · Speaker: …"``: the devices voice is using (the pill's and tray's tooltip).
+    devices_changed = Signal(str)
+    _devices_seen = Signal(object)
+    _watch_start = Signal()
     _wake_heard = Signal(float)
     _thread_state = Signal(str, str)
     _thread_done = Signal(str, str)
@@ -132,6 +144,17 @@ class VoiceSession(QObject):
         self._wake_heard.connect(self._on_wake_heard)
         self._thread_state.connect(self._on_thread_state)
         self._thread_done.connect(self._on_thread_done)
+        self._devices_seen.connect(self._on_devices_seen)
+        #: The output the current (or last) conversation plays to (``None``: the default).
+        self.speaker_used: str | None = None
+        self._last_blocks = -1
+        self._watching = False
+        from PySide6.QtCore import QTimer
+
+        self._device_timer = QTimer(self)
+        self._device_timer.setInterval(DEVICE_WATCH_MS)
+        self._device_timer.timeout.connect(self._watch_devices)
+        self._watch_start.connect(self._device_timer.start)  # the mic may open on the voice thread
 
     # -- public (GUI thread) ------------------------------------------------------
 
@@ -180,6 +203,111 @@ class VoiceSession(QObject):
         self.log.event("wake", state="enabled" if enabled else "disabled")
         self._apply_wake()
         self.wake_changed.emit(self.wake_enabled)
+
+    # -- devices (tray "Microphone" / "Speaker") --------------------------------------
+
+    def device_choice(self, kind: str) -> str | None:
+        """The device the user chose for ``kind`` (``capture`` / ``render``), ``None``: system default."""
+        key, field = DEVICE_PREFS[kind]
+        chosen = load_prefs(self._prefs_path).get(key)
+        return str(chosen) if chosen else getattr(self.settings, field, None)
+
+    def set_device(self, kind: str, name: str | None) -> None:
+        """The tray's choice: remembered in ``voice.json``; the mic switches at once (wake word and
+        a running conversation keep listening through it), the speaker from the next conversation."""
+        key, _field = DEVICE_PREFS[kind]
+        prefs = load_prefs(self._prefs_path)
+        if name:
+            prefs[key] = name
+        else:
+            prefs.pop(key, None)
+        save_prefs(prefs, self._prefs_path)
+        self.log.event("device", kind=kind, state="chosen" if name else "default")
+        if kind == "capture":
+            self._reopen_mic()
+        self._emit_devices()
+
+    def devices_text(self) -> str:
+        """What voice uses now, for tooltips: ``Mic: … · Speaker: …``."""
+        mic = self._mic.device_used if self._mic is not None and self._mic.is_open else None
+        speaker = self.speaker_used if self.in_conversation else None
+        mic_text = mic or self.device_choice("capture") or "system default"
+        speaker_text = speaker or self.device_choice("render") or "system default"
+        return f"Mic: {mic_text} · Speaker: {speaker_text}"
+
+    def _emit_devices(self) -> None:
+        self.devices_changed.emit(self.devices_text())
+
+    def _resolve(self, kind: str) -> str | None:
+        """The chosen device if it is connected, else ``None`` (the default) with a note in the pill."""
+        from yuki.voice.audio import audio_devices, resolve_device
+
+        wanted = self.device_choice(kind)
+        if not wanted:
+            return None
+        name, note = resolve_device(kind, wanted, audio_devices())
+        if note:
+            self.log.event("device", kind=kind, state="missing_fallback")
+            self.state_changed.emit("note", note)
+        return name
+
+    def _reopen_mic(self) -> None:
+        """Open the microphone again on the device in force now (the subscribers stay)."""
+        with self._mic_lock:
+            mic = self._mic
+            if mic is None:
+                return
+            was_open = mic.is_open
+            mic.device = self._resolve("capture")
+            if was_open:
+                mic.close()
+                try:
+                    facts = mic.open()
+                    self.log.event("mic", state="reopened", **facts)
+                except Exception as exc:  # noqa: BLE001 - shown in the pill, never raised into Qt
+                    self.log.event("mic", state="error", error=f"{type(exc).__name__}: {exc}")
+                    self.state_changed.emit("error", f"Can't open the microphone: {exc}")
+
+    def _watch_devices(self) -> None:
+        """Every few seconds while the mic is open: is the chosen device still there, is audio arriving?"""
+        mic = self._mic
+        if mic is None or not mic.is_open:
+            self._device_timer.stop()
+            return
+        if self._watching:
+            return
+        self._watching = True
+        blocks = mic.stats.blocks
+        stalled = blocks == self._last_blocks  # no audio at all for a whole tick: the stream died
+        self._last_blocks = blocks
+
+        def look() -> None:
+            from yuki.voice.audio import audio_devices
+
+            self._devices_seen.emit({"devices": audio_devices(), "stalled": stalled})
+
+        threading.Thread(target=look, name="yuki-voice-devices", daemon=True).start()
+
+    def _on_devices_seen(self, seen: object) -> None:
+        self._watching = False
+        info = seen if isinstance(seen, dict) else {}
+        devices = info.get("devices") or {}
+        mic = self._mic
+        if mic is None or not mic.is_open or devices.get("error"):
+            return
+        wanted = self.device_choice("capture")
+        present = devices.get("capture") or []
+        gone = bool(wanted) and mic.device == wanted and wanted not in present
+        back = bool(wanted) and mic.device is None and wanted in present
+        if gone or back or info.get("stalled"):
+            self.log.event("device", kind="capture", state="gone" if gone else "back" if back else "stalled")
+            self._reopen_mic()
+            self._emit_devices()
+        speaker = self.speaker_used
+        if self.in_conversation and speaker and speaker not in (devices.get("render") or []):
+            self.log.event("device", kind="render", state="gone")
+            self.state_changed.emit("note", f"Speaker '{speaker}' disconnected; ending this conversation")
+            self.stop_conversation("speaker_gone")
 
     @property
     def tts_voice(self) -> str:
@@ -249,10 +377,14 @@ class VoiceSession(QObject):
 
         with self._mic_lock:
             if self._mic is None:
-                self._mic = SharedMic(self.settings.voice_input_device)
+                self._mic = SharedMic(None)
             if not self._mic.is_open:
+                self._mic.device = self._resolve("capture")
                 facts = self._mic.open()
                 self.log.event("mic", state="open", **facts)
+                self._last_blocks = -1
+                self._watch_start.emit()
+                self._emit_devices()
             return self._mic
 
     def _close_mic(self) -> None:
@@ -306,6 +438,8 @@ class VoiceSession(QObject):
     def _on_thread_done(self, reason: str, error: str) -> None:
         self._thread = None
         self._conversation = None
+        self.speaker_used = None
+        self._emit_devices()
         self.conversation_changed.emit(False)
         if error:
             self._set_state("error", error)
@@ -331,6 +465,9 @@ class VoiceSession(QObject):
         speaker = None
         settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
         try:
+            # The chosen output if it is connected (else the default, with a note); the
+            # headphone rule is checked on that very device.
+            settings = replace(settings, voice_output_device=self._resolve("render"))
             facts = preflight(settings)
             if facts.get("tts_voice"):
                 # The chosen voice was refused (e.g. needs a paid plan): this conversation only.
@@ -338,8 +475,10 @@ class VoiceSession(QObject):
                 self.log.event("voice_id", state="refused_fallback", note=facts.get("tts_note"))
             mouth_memory = fetch_memory(self.memory)
             mic = self._ensure_mic()
-            speaker = Speaker(24_000, self.settings.voice_output_device)
+            speaker = Speaker(24_000, settings.voice_output_device)
             out_facts = speaker.open()
+            self.speaker_used = out_facts.get("device")
+            self.devices_changed.emit(self.devices_text())
             from pipecat.transports.base_transport import TransportParams
 
             from yuki.voice.transport import MicInput, PairTransport, SpeakerOutput

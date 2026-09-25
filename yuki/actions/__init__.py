@@ -39,6 +39,7 @@ from yuki.actions.launch import (  # noqa: E402
     get_start_apps,
     launch_app,
     open_url,
+    window_action,
 )
 from yuki.actions.shell import run_powershell  # noqa: E402
 
@@ -56,4 +57,5 @@ __all__ = [
     "scroll",
     "type_text",
     "wait_for_input_ready",
+    "window_action",
 ]

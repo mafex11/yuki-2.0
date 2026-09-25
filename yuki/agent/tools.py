@@ -953,6 +953,9 @@ class Backend(Protocol):
     ) -> Any: ...
     def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any: ...
     def open_url(self, url: str, *, app: str | None = None) -> Any: ...
+    # Optional (the voice's hands, yuki.voice.hands): minimize / maximize / restore / close /
+    # focus one window, verified. A backend without it simply has no such hand.
+    def window_action(self, hwnd: int, action: str) -> Any: ...  # pragma: no cover - protocol only
 
     # Optional, and not part of the architecture contract: a backend without it
     # simply never gets pre-warmed. See :meth:`Dispatcher.prewarm_shell`.
@@ -993,7 +996,16 @@ class _LazyRealBackend:
         "scroll",
         "run_powershell",
         "open_url",
+        "window_action",
     }
+
+    def prewarm_apps(self) -> int:
+        """Read the Start menu list now (it is cached for the process): 1-3 s of PowerShell
+        that the first ``launch_app`` / ``open_url(app=...)`` would otherwise pay in front of
+        the user (the 25 Sept live "open YouTube on Chrome" did). Returns how many apps."""
+        import importlib
+
+        return len(importlib.import_module("yuki.actions.launch").get_start_apps())
 
     def prewarm_shell(self) -> bool:
         """Open the persistent PowerShell session now, before anything needs it.
@@ -1176,6 +1188,11 @@ class Dispatcher:
         if not callable(prewarm):
             return False
         return bool(prewarm())
+
+    def prewarm_apps(self) -> int:
+        """Ask the backend to read the Start menu list now (off the main thread). ``0`` without one."""
+        prewarm = getattr(self.backend, "prewarm_apps", None)
+        return int(prewarm()) if callable(prewarm) else 0
 
     def activity_facts(self) -> dict[str, Any]:
         """What the user is engaged in (media, microphone/camera, foreground).

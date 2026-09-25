@@ -1541,16 +1541,13 @@ def _page_opened(
     ]
     _note_fresh(hwnd)
     forward = _bring_forward(hwnd, time.monotonic(), details)
-    content_note = ""
-    remaining = content_deadline - time.monotonic()
-    if remaining > 0.05:
-        content_note = _wait_for_opened_content(hwnd, remaining, details)
-        for document in (details.get("content") or {}).get("documents") or []:
-            value = str(document.get("value") or "")
-            if value and any(_same_page(target, value) for target in targets):
-                seen.url, seen.title = value, str(document.get("name") or "") or seen.title
-                details["page"] = {"title": seen.title, "url": seen.url}
-                break
+    # The page at the address is the navigation confirmed: return now. Waiting on for the
+    # page's content cost 1.9 s on the 25 Sept live "open YouTube on Chrome" (16.4 s in all)
+    # and bought nothing the caller needs; the window is noted fresh, so the next tree read
+    # of it waits out a half-built page itself.
+    del content_deadline
+    content_note = "navigation confirmed; the page's content was not waited for (the next look waits for it)"
+    details["content_ready"] = None
     if (fresh := window_info(hwnd)) is not None:
         details["title"] = fresh.title
     new_window = hwnd in appeared
@@ -1768,8 +1765,15 @@ def launch_app(
             {"launched": False, "hwnd": None, "candidates": []},
         )
     arg_list = [a for a in (args or []) if a != ""]
+    # Where the time goes, stage by stage (the 25 Sept "open YouTube on Chrome" took 16.4 s
+    # and the log could not say where): ms since the call started, per stage end.
+    timings: dict[str, float] = {}
+
+    def mark(stage: str) -> None:
+        timings[stage] = round((time.perf_counter() - started) * 1000.0, 1)
 
     apps = get_start_apps()
+    mark("start_menu")
     chosen, candidates = _match_apps(query, apps)
     if chosen is None:
         listed = ", ".join(app["name"] for app in candidates) or "none"
@@ -1786,6 +1790,7 @@ def launch_app(
         "candidates": [],
         "name": chosen["name"],
         "appid": chosen["appid"],
+        "timings_ms": timings,
     }
     start_budget = max(2.0, min(timeout_s, 15.0))
     plan: dict | None = None
@@ -1802,6 +1807,7 @@ def launch_app(
                 f"file was found for it ({'; '.join(notes)}). Nothing was started.",
                 details,
             )
+        mark("plan")
         details["via"] = plan["via"]
         details["arguments"] = plan["arguments"]
         if "command" in plan:
@@ -1825,6 +1831,7 @@ def launch_app(
     hidden_before = {
         hwnd for hwnd in _top_level_windows(running_before) if not is_user_window(hwnd)
     }
+    mark("identity")
 
     if not arg_list and already_running:
         # Running, but with no window on screen (closed to the background or the
@@ -1875,6 +1882,7 @@ def launch_app(
             f"activating the packaged app {plan['aumid']!r} with arguments "
             f"({plan['via']}) failed: {error}"
         )
+    mark("start")
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
 
@@ -1901,6 +1909,7 @@ def launch_app(
         details["page_targets"] = page_targets
         content_deadline = handed_off + content_timeout_s + (0.0 if already_running else timeout_s)
         page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic())
+        mark("page")
         details["page_check"] = _page_details(page_wait)
         details["identity"] = identity.describe()
         if page_wait is not None and page_wait.matched is not None:
@@ -2305,6 +2314,73 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
         f"{details['foreground_hwnd']}",
         details,
     )
+
+
+#: ``window_action`` verbs and the ``ShowWindow`` command each one sends.
+_SHOW_COMMANDS = {"minimize": win32con.SW_MINIMIZE, "maximize": win32con.SW_MAXIMIZE,
+                  "restore": win32con.SW_RESTORE}
+#: Bound on the wait for a window to reach the state it was asked for (a condition poll).
+_STATE_WAIT_S = 1.0
+#: Bound on the wait for a window asked to close to go away (it may ask to save first).
+_CLOSE_WAIT_S = 2.0
+
+
+def window_action(hwnd: int, action: str) -> ActionResult:
+    """Minimize, maximize, restore, close or focus one top-level window, and verify it happened.
+
+    ``focus`` is :func:`focus_window`. ``minimize`` / ``maximize`` / ``restore``
+    send ``ShowWindow`` and then wait (a condition poll, at most
+    :data:`_STATE_WAIT_S`) until ``IsIconic`` / ``IsZoomed`` report the new state;
+    ``close`` posts ``WM_CLOSE`` (what the window's own X does: the app may ask
+    to save) and waits up to :data:`_CLOSE_WAIT_S` for the window to go. ``ok``
+    is True only when the new state was observed, so the summary is the effect,
+    not the request: "Discord.exe "..." is now minimized", or "... asked to close;
+    still open after 2.0 s (it may be asking something)".
+    """
+    started = time.perf_counter()
+
+    def finish(ok: bool, summary: str, details: dict) -> ActionResult:
+        return ActionResult(ok=ok, summary=summary, details=details,
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0)
+
+    details: dict = {"hwnd": hwnd, "action": action}
+    if action == "focus":
+        return focus_window(hwnd)
+    if action not in (*_SHOW_COMMANDS, "close"):
+        return finish(False, f"unknown window action {action!r} (minimize, maximize, restore, close, focus)",
+                      details)
+    if not win32gui.IsWindow(hwnd):
+        return finish(False, f"hwnd {hwnd} is not a window (it may have closed)", details)
+    info = window_info(hwnd)
+    name = f"{info.process_name} \"{info.title}\"" if info else f"hwnd {hwnd}"
+    details.update(title=info.title if info else "", process_name=info.process_name if info else "",
+                   was_minimized=bool(win32gui.IsIconic(hwnd)), was_maximized=bool(win32gui.IsZoomed(hwnd)))
+    if action == "close":
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        deadline = time.monotonic() + _CLOSE_WAIT_S
+        while time.monotonic() < deadline:
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return finish(True, f"{name} is closed", details)
+            time.sleep(_POLL_S)
+        return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s (it may be asking "
+                             f"something, e.g. to save)", details)
+
+    def reached() -> bool:
+        iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(win32gui.IsZoomed(hwnd))
+        return {"minimize": iconic, "maximize": zoomed and not iconic, "restore": not iconic and not zoomed}[action]
+
+    already = reached()
+    if not already:
+        win32gui.ShowWindow(hwnd, _SHOW_COMMANDS[action])
+    deadline = time.monotonic() + _STATE_WAIT_S
+    while not reached() and time.monotonic() < deadline:
+        time.sleep(_POLL_S)
+    state = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"}[action]
+    if reached():
+        front = _user32.GetForegroundWindow() == hwnd
+        return finish(True, f"{name} is {'already ' if already else 'now '}{state}"
+                            + ("; in the foreground" if front else ""), details)
+    return finish(False, f"{name}: asked to be {state}, not {state} after {_STATE_WAIT_S:g} s", details)
 
 
 #: ``ASSOCSTR_EXECUTABLE``, ``ASSOCF_NOTRUNCATE`` and ``ASSOCF_IS_PROTOCOL`` for

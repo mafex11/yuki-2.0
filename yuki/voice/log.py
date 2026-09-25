@@ -24,7 +24,9 @@ did not happen, e.g. no speech in a turn the mouth opened to speak a result):
   ``eos_to_eager_ms`` (its eager prediction, when on), ``transcript_to_context_ms``
   (the user aggregator hands the context to the mouth), ``llm_start_after_eos_ms``
   (the mouth's call begins), ``grounding_wait_ms`` (waiting for the memory
-  lookup; ``grounding`` says which one it got), ``llm_prep_ms`` (building the
+  lookup; ``grounding`` says which one it got), ``desk`` / ``desk_ms`` / ``desk_chars``
+  (the desktop summary for the mouth's hands: fresh or the previous one, its
+  capture time or age, its size), ``llm_prep_ms`` (building the
   request), ``llm_open_ms`` (request out to stream open), ``llm_first_event_ms``,
   ``llm_api_ttft_ms`` (request out to the first content block),
   ``llm_first_text_ms``, ``text_to_tts_ms`` (first text to the TTS request),
@@ -67,6 +69,9 @@ TURN_COLUMNS: tuple[str, ...] = (
     "grounding",
     "grounding_facts",
     "grounding_wait_ms",
+    "desk",
+    "desk_ms",
+    "desk_chars",
     "llm_prep_ms",
     "llm_open_ms",
     "llm_first_event_ms",

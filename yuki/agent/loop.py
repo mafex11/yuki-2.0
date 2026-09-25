@@ -255,6 +255,12 @@ class Agent:
         self._request_text: str | None = None
         #: The effort of the request being run, when its caller chose one (``run(effort=...)``).
         self._request_effort: str | None = None
+        #: This request's own model / thinking / slim context, when its caller chose them
+        #: (``run(model=..., thinking=..., lean=...)``: a spoken request, by its source).
+        self._request_model: str | None = None
+        self._request_thinking: bool | None = None
+        self._request_lean = False
+        self._request_omit_effort = False
         #: The newest desktop overview as plain data (for the foreground app).
         self._overview_payload: Any = None
         #: ``(portrait text, turn)`` of the last portrait attached in full to
@@ -324,6 +330,7 @@ class Agent:
             warmed = self._warm_model()
             self._warm_memory()
             self._warm_shell()
+            self._warm_apps()
             # Started at logon (or after a wake) the network may not be up yet: when Bedrock
             # could not be reached at all, try the warm-up again a few times, quietly.
             for delay in PREWARM_RETRY_S:
@@ -349,6 +356,16 @@ class Agent:
             live=live,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
+
+    def _warm_apps(self) -> None:
+        """Read the Start menu list now, so the first app launch does not pay for it. Never raises."""
+        started = time.perf_counter()
+        try:
+            count = self.dispatcher.prewarm_apps()
+        except Exception as exc:
+            self.logger.error(f"start menu prewarm failed: {type(exc).__name__}: {exc}", exc=exc)
+            return
+        self.logger.log("apps_prewarm", apps=count, elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
 
     def _warm_activity(self) -> None:
         """Start the WinRT import behind the media facts (returns at once). Never raises."""
@@ -553,7 +570,8 @@ class Agent:
     # -- main entry point --------------------------------------------------
 
     def run(
-        self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None
+        self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None,
+        model: str | None = None, thinking: bool | None = None, lean: bool = False,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -564,10 +582,19 @@ class Agent:
                 keyboard to be typed into). Without it, the request origin
                 reports whatever is in front now, and when that is Yuki's own
                 window, the top window beneath it.
-            effort: ``output_config.effort`` for this request only (the caller's
+            effort: ``output_config.effort`` for this request only (``""``: none sent,
+                for a model that takes no effort parameter; the caller's
                 setting for where the request came from, e.g.
                 ``Settings.voice_brain_effort`` for a spoken one); ``None``: the
                 agent's own :attr:`Settings.effort`.
+            model: Model id (or alias) for this request only; ``None``: the agent's.
+            thinking: ``False`` turns thinking off for this request (``None``: the
+                agent's adaptive thinking).
+            lean: A slim memory block for this request: the profile and rules
+                layers stay (the system prompt), the rest of the portrait and the
+                resume are left out (to-dos, know-how and commitments stay). For a
+                spoken request, chosen by its source, never its words
+                (docs/VOICE.md §7).
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -590,7 +617,12 @@ class Agent:
         started_at = datetime.now()
         started_epoch = time.time()
         self._request_effort = resolve_effort(effort) if effort else None
-        model, effort = self.settings.model, self._request_effort or self.settings.effort
+        #: ``effort=""``: send no effort at all (a model that takes none, e.g. Haiku 4.5).
+        self._request_omit_effort = effort == ""
+        self._request_model = resolve_model(model) if model else None
+        self._request_thinking = thinking
+        self._request_lean = bool(lean)
+        model, effort = self._request_model or self.settings.model, self._request_effort or self.settings.effort
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.user_message(request)
@@ -608,7 +640,7 @@ class Agent:
             origin = self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
             memory_text, commitments_text = self._memory_context(
-                request, first=self._requests == 1
+                request, first=self._requests == 1, lean=self._request_lean
             )
             self.context.add_request(
                 request,
@@ -1415,7 +1447,7 @@ class Agent:
     # -- memory ------------------------------------------------------------
 
     def _memory_context(
-        self, request: str, *, first: bool = False
+        self, request: str, *, first: bool = False, lean: bool = False
     ) -> tuple[str | None, str | None]:
         """Split what memory knows into the system layers and this request's message blocks.
 
@@ -1439,19 +1471,22 @@ class Agent:
             request: The request text (the know-how query).
             first: This is the conversation's first request: attach the
                 resume context too.
+            lean: Leave the rest of the portrait and the resume out of the block
+                (the profile and rules layers are unchanged).
         """
         started = time.perf_counter()
         app = _foreground_app(self._overview_payload)
         self._profile_layer = profile_text(self.settings.user_names, None)
         self._rules_layer = None
         try:
-            fetched = self.memory.context(app=app, query=request, resume=first)
+            fetched = self.memory.context(app=app, query=request, resume=first and not lean)
             rest, personality = _split_personality(fetched.portrait)
             rules, commitments = split_standing(fetched.standing)
             self._profile_layer = profile_text(self.settings.user_names, personality)
             if fetched.source != "unavailable":
                 self._rules_layer = rules_text(rules or "")
-            background = replace(fetched, portrait=(rest or "").strip() or None)
+            background = replace(fetched, portrait=None if lean else ((rest or "").strip() or None),
+                                 resume=None if lean else fetched.resume)
             repeated = None
             if (
                 background.portrait
@@ -1482,6 +1517,7 @@ class Agent:
             "standing_chars": standing_chars,
             "resume_chars": resume_chars,
             "resume_requested": first,
+            "lean": lean,
             "truncated": list(fetched.truncated),
             "knowhow_lines": len(fetched.knowhow) if text else 0,
             "todo_lines": len(fetched.todos) if text else 0,
@@ -1600,15 +1636,19 @@ class Agent:
             messages = self.context.request_messages(
                 max_breakpoints=MAX_CACHE_BREAKPOINTS - used
             )
-        return {
-            "model": self.settings.model,
+        params = {
+            "model": (None if warmup else self._request_model) or self.settings.model,
             "max_tokens": 1 if warmup else self.settings.max_tokens,
             "system": system,
             "messages": messages,
             "tools": tools,
-            "thinking": {"type": "adaptive", "display": self.settings.thinking_display},
+            "thinking": ({"type": "disabled"} if not warmup and self._request_thinking is False
+                         else {"type": "adaptive", "display": self.settings.thinking_display}),
             "output_config": {"effort": self._request_effort or self.settings.effort},
         }
+        if self._request_omit_effort and not warmup:
+            del params["output_config"]
+        return params
 
     def _request(self, turn: _Turn) -> Iterator[AgentEvent]:
         """Send one request, running tools as their blocks complete; return the response.
@@ -1651,7 +1691,7 @@ class Agent:
             tools=params["tools"],
             max_tokens=params["max_tokens"],
             thinking=params["thinking"],
-            output_config=params["output_config"],
+            output_config=params.get("output_config"),
             stream=self.settings.stream,
         )
         started = time.perf_counter()

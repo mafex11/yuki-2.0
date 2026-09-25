@@ -238,6 +238,17 @@ class Settings:
             it in Tokyo" at medium vs low, see there.
         voice_final_gap_s: The narrator's pause after Yuki's own speech before a
             result or a question is said (progress lines keep ``voice_cooldown_s``).
+        voice_brain_thinking: Thinking for spoken requests (off: ``thinking`` is
+            disabled for them; typed ones keep adaptive thinking).
+        voice_brain_portrait: Attach the rest of the portrait and the resume to a
+            spoken request's memory block (off: the profile and rules layers only,
+            plus to-dos, know-how and commitments).
+        voice_brain_model: The thinker's model for spoken requests (alias or id;
+            empty: the brain's own ``model``). Measured in docs/VOICE.md §7.
+        voice_progress_pause_s: A progress line of a running task is said only
+            after Yuki has been quiet this long (a real pause), never after its result.
+        voice_hands: Give the mouth its own single-step desktop tools (docs/VOICE.md §5.6).
+        voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
     """
 
     model: str = DEFAULT_MODEL
@@ -301,12 +312,18 @@ class Settings:
     voice_result_sentences: int = 2
     voice_result_chars: int = 280
     voice_brain_effort: str = "low"
+    voice_brain_thinking: bool = False
+    voice_brain_portrait: bool = False
+    voice_brain_model: str = ""
     voice_final_gap_s: float = 0.3
+    voice_progress_pause_s: float = 8.0
+    voice_hands: bool = True
+    voice_desk_wait_ms: float = 250.0
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)
-        self.voice_brain_effort = resolve_effort(self.voice_brain_effort)
+        self.voice_brain_effort = resolve_effort(self.voice_brain_effort) if self.voice_brain_effort else ""
 
     @property
     def sessions_dir(self) -> Path:

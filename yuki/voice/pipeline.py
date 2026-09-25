@@ -31,8 +31,10 @@ from typing import Any, Callable
 
 from yuki.config import Settings
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, get_key
+from yuki.voice.hands import HAND_TOOLS
 from yuki.voice.mouth import (
-    CHECK_PROGRESS, MORE_OF_RESULT, MOUTH_PROMPT, TELL_YUKI, MouthMemory, mouth_system_blocks, volatile_block,
+    CHECK_PROGRESS, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, mouth_system_blocks,
+    volatile_block,
 )
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
@@ -195,7 +197,7 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
     if need_headphones and settings.voice_require_headphones:
         from yuki.voice.audio import headphones_check
 
-        ok, heard = headphones_check(settings.voice_headphone_devices)
+        ok, heard = headphones_check(settings.voice_headphone_devices, device=settings.voice_output_device)
         facts["output"] = heard
         if not ok:
             where = heard.get("device") or "the speakers"
@@ -222,6 +224,9 @@ class LlmCall:
     first_content: float | None = None  # first content block (Pipecat's TTFB ends here)
     first_text: float | None = None     # first text delta
     user_turn: bool = True
+    desk: str = "off"                   # fresh | previous | none | off (the desktop summary, §5.6)
+    desk_ms: float | None = None        # capturing it (fresh) or its age (previous)
+    desk_chars: int = 0
 
 
 def with_volatile(messages: Any, block: dict[str, Any]) -> Any:
@@ -244,6 +249,39 @@ def with_volatile(messages: Any, block: dict[str, Any]) -> Any:
             out[i] = {**message, "content": [*parts, block]}
             return out
     return messages
+
+
+def chronological(messages: list[Any], spoke: set[str]) -> list[Any]:
+    """``messages`` with each reply's spoken words back before the tool calls it made.
+
+    Pipecat writes a reply that spoke and then called a tool as the tool call, its
+    placeholder, and only then the words (the words are committed when the reply ends).
+    A result that settles in the placeholder therefore sits *before* the words that
+    announced it, the conversation ends on the mouth's own words, and the Anthropic
+    adapter pads it with a user message "." (models past 4.5 take no prefill; the
+    ``global.`` id is not in Pipecat's prefill list). Measured 2026-09-25: that "." made
+    the mouth answer a finished job with "What's up?" / "I'm here. What's up?", and in the
+    offline replay read out a "<thinking>" about the time. Moving each reply's words back
+    before its own calls restores the order they were said in, so a result is the newest
+    thing and no "." is added. ``spoke`` holds the tool call ids of replies that had words
+    (a stream fact, recorded by the service). Plumbing: only the order changes.
+    """
+    out = list(messages)
+    i = 0
+    while i < len(out):
+        message = out[i]
+        calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
+        if calls and any(isinstance(c, dict) and c.get("id") in spoke for c in calls):
+            j = i + 1
+            while j < len(out) and isinstance(out[j], dict) and (
+                    out[j].get("role") == "tool" or (out[j].get("role") == "assistant" and out[j].get("tool_calls"))):
+                j += 1
+            if (j < len(out) and isinstance(out[j], dict) and out[j].get("role") == "assistant"
+                    and not out[j].get("tool_calls") and out[j].get("content")):
+                out.insert(i, out.pop(j))
+                i += 1
+        i += 1
+    return out
 
 
 def bedrock_client(region: str) -> Any:
@@ -276,25 +314,45 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
     class LayeredAnthropicLLMService(base):  # type: ignore[misc, valid-type]
         _yuki_lookup: str | None = None
+        _yuki_desk: str | None = None
         _yuki_call: LlmCall | None = None
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            #: Tool call ids of replies that said words before calling (see ``chronological``).
+            self._yuki_spoke: set[str] = set()
+
+        async def run_function_calls(self, function_calls: Any) -> None:
+            call = self._yuki_call
+            if call is not None and call.first_text is not None:
+                self._yuki_spoke.update(str(fc.tool_call_id) for fc in function_calls)
+            await super().run_function_calls(function_calls)
 
         async def _process_context(self, context: Any) -> None:
             call = LlmCall(entered=time.monotonic())
             self._yuki_call = call
             try:
-                self._yuki_lookup = await hooks.before_call(context, call)
+                self._yuki_lookup, self._yuki_desk = await hooks.before_call(context, call)
             except Exception:  # noqa: BLE001 - grounding is a hint; never block the reply on it
-                self._yuki_lookup = None
+                self._yuki_lookup, self._yuki_desk = None, None
             call.grounded = time.monotonic()
             hooks.call_started(call)
             await super()._process_context(context)
 
         def _get_llm_invocation_params(self, context: Any) -> Any:
+            if self._yuki_spoke:
+                from pipecat.processors.aggregators.llm_context import LLMContext
+
+                messages = context.get_messages()
+                ordered = chronological(messages, self._yuki_spoke)
+                if ordered != messages:
+                    context = LLMContext(messages=ordered, tools=context.tools, tool_choice=context.tool_choice)
             params = super()._get_llm_invocation_params(context)
             composed = self._settings.system_instruction or MOUTH_PROMPT
             tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()])
-            params["messages"] = with_volatile(params.get("messages"), volatile_block(lookup=self._yuki_lookup))
+            params["messages"] = with_volatile(params.get("messages"), volatile_block(
+                lookup=self._yuki_lookup, desk=self._yuki_desk))
             return params
 
         async def _cancel_tool_handler(self, params: Any) -> None:
@@ -567,6 +625,8 @@ class TurnObserver:
             "llm_start_after_eos_ms": ms(turn.speech_end, c.entered) if c else None,
             "grounding": c.grounding if c else None, "grounding_facts": c.facts if c else None,
             "grounding_wait_ms": ms(c.entered, c.grounded) if c else None,
+            "desk": c.desk if c else None, "desk_ms": c.desk_ms if c else None,
+            "desk_chars": c.desk_chars if c else None,
             "llm_prep_ms": ms(c.grounded, c.sent) if c else None,
             "llm_open_ms": ms(c.sent, c.opened) if c else None,
             "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
@@ -730,14 +790,32 @@ class _Hooks:
     def __init__(self, conversation: "Conversation") -> None:
         self.c = conversation
 
-    async def before_call(self, context: Any, call: LlmCall) -> str | None:
-        """Wait (bounded) for the grounding lookup; returns the lookup block text, or ``None``."""
+    async def before_call(self, context: Any, call: LlmCall) -> tuple[str | None, str | None]:
+        """Wait (bounded) for the grounding lookup and the desktop summary, both at once.
+
+        Returns ``(lookup block text or None, desktop summary or None)``.
+        """
+        user_turn = _last_role(context) == "user"
+        call.user_turn = user_turn
+        hands = getattr(self.c.bridge, "hands", None) if self.c.settings.voice_hands else None
+        desk_task = (asyncio.ensure_future(hands.for_call(self.c.settings.voice_desk_wait_ms))
+                     if hands is not None else None)
+        lookup_text = await self._lookup(call, user_turn)
+        desk_text = None
+        if desk_task is not None:
+            snap, how = await desk_task
+            call.desk = how if snap is not None else "none"
+            if snap is not None:
+                desk_text = snap.text
+                call.desk_chars = len(snap.text)
+                call.desk_ms = round(snap.ms if how == "fresh" else (time.monotonic() - snap.at) * 1000, 1)
+        return lookup_text, desk_text
+
+    async def _lookup(self, call: LlmCall, user_turn: bool) -> str | None:
         grounder = self.c.grounder
         if grounder is None:
             call.grounding = "off"
             return None
-        user_turn = _last_role(context) == "user"
-        call.user_turn = user_turn
         lookup, how = await grounder.for_call(self.c.settings.voice_grounding_wait_ms if user_turn else 0.0)
         if lookup is None or (user_turn and how == "previous"):
             call.grounding = "none"
@@ -894,6 +972,13 @@ class Conversation:
                               cancellable_by_llm=True, timeout_secs=None)
         llm.register_function("check_progress", self.bridge.check_progress)
         llm.register_function("more_of_result", self.bridge.more_of_result)
+        llm.register_function("stay_quiet", self.bridge.stay_quiet)
+        hands = getattr(self.bridge, "hands", None)
+        if s.voice_hands and hands is not None:
+            # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
+            # may already have happened, and its report must reach the context either way.
+            for tool in HAND_TOOLS:
+                llm.register_function(tool["name"], hands.handle, cancel_on_interruption=False, timeout_secs=30)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
         if provider == "deepgram":
@@ -932,9 +1017,15 @@ class Conversation:
         # Whether the mouth's reply now making a tool call said anything aloud (a stream fact).
         self.bridge.spoke_in_reply = lambda: bool(getattr(llm, "_yuki_call", None) is not None
                                                   and llm._yuki_call.first_text is not None)
+        # The say_first words spoken for a silent hand-over belong before its call, too.
+        self.bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
+        # Whether the mouth run now calling a tool was the user's turn (not a result's).
+        self.bridge.user_turn = lambda: bool(getattr(llm, "_yuki_call", None) is None or llm._yuki_call.user_turn)
+        hand_tools = HAND_TOOLS if (self.settings.voice_hands and getattr(self.bridge, "hands", None)) else []
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
-                           required=t["required"]) for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT)
+                           required=t["required"])
+            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, *hand_tools)
         ])
         self._tools = tools
         context = LLMContext(tools=tools)
@@ -1000,13 +1091,11 @@ class Conversation:
         quiet_pipecat_logging(self.settings.voice_log_dir)
         import threading
 
-        # While Deepgram connects (2-3 s), off the loop; done long before the first reply.
-        threading.Thread(target=_preimport, name="yuki-voice-preimport", daemon=True).start()
         s = self.settings
         self._loop = asyncio.get_running_loop()
         self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
                                  cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log,
-                                 final_gap_s=s.voice_final_gap_s)
+                                 final_gap_s=s.voice_final_gap_s, progress_pause_s=s.voice_progress_pause_s)
         if s.voice_grounding and self.memory is not None:
             from yuki.voice.grounding import Grounder
 
@@ -1020,6 +1109,10 @@ class Conversation:
         self.bridge.on_remembered = self._refresh_rules
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
+        # While Deepgram connects (2-3 s), off the loop; done long before the first reply. Started
+        # after the services are built: they import anthropic, and importing it on two threads at
+        # once raised an import deadlock (a stand-in-brain run, where nothing had imported it yet).
+        threading.Thread(target=_preimport, name="yuki-voice-preimport", daemon=True).start()
         await runner.add_workers(worker)
         self.observer.set_state("listening")
         self.gate.start()
@@ -1253,7 +1346,7 @@ def async_tool_instructions() -> str:
         "the result) arrives as messages in the conversation when it is a good moment to say it: "
         "after the user has finished and you have answered them. Say each thing once, in its own "
         "fields' terms, and never repeat it in a later reply; a later \"okay\" or \"thanks\" is not "
-        "a cue to say it again."
+        "a cue to say it again. Your hands report back the same way, as soon as they are done."
     )
 
 

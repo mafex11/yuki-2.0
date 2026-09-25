@@ -288,11 +288,67 @@ class Speaker:
                 pass
 
 
-def headphones_check(known: tuple[str, ...] = ()) -> tuple[bool, dict[str, Any]]:
-    """Whether the sound goes to headphones now (``(ok, facts)``; never raises)."""
-    try:
-        from yuki.perception.audio import output_is_headphones
+def headphones_check(known: tuple[str, ...] = (), device: str | None = None) -> tuple[bool, dict[str, Any]]:
+    """Whether the sound goes to headphones now (``(ok, facts)``; never raises).
 
+    ``device``: the output voice will use when the user chose one (tray "Speaker"):
+    then that endpoint's own form factor is what counts, not the Windows defaults'.
+    """
+    try:
+        from yuki.perception.audio import E_RENDER, list_endpoints, output_is_headphones
+
+        if device:
+            chosen = next((d for d in list_endpoints(E_RENDER) if d.get("name") == device), None)
+            if chosen is not None:
+                endpoints = {"render": {"console": chosen, "communications": chosen}}
+                return output_is_headphones(endpoints, known_headphones=tuple(known))
         return output_is_headphones(known_headphones=tuple(known))
     except Exception as exc:  # noqa: BLE001 - unknown counts as not headphones
         return False, {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Device choice (tray "Microphone" / "Speaker", docs/VOICE.md §12)
+# ---------------------------------------------------------------------------
+
+#: ``kind`` -> the word the user sees.
+KIND_WORD = {"capture": "Microphone", "render": "Speaker"}
+
+
+def audio_devices() -> dict[str, Any]:
+    """The active capture and render devices (Core Audio, read-only, ~15 ms) and the defaults.
+
+    ``{"capture": [names], "render": [names], "default_capture": name, "default_render": name}``;
+    the capture default is Windows' communications input (what voice uses when nothing is
+    chosen), the render default the console output (what PortAudio's default plays to).
+    Never raises: on a failure the lists are empty and ``error`` says why.
+    """
+    try:
+        from yuki.perception.audio import E_CAPTURE, E_RENDER, default_endpoints, list_endpoints
+
+        defaults = default_endpoints()
+        caps = defaults.get("capture") or {}
+        cap = caps.get("communications") or caps.get("console") or {}
+        ren = (defaults.get("render") or {}).get("console") or {}
+        return {"capture": [str(d["name"]) for d in list_endpoints(E_CAPTURE) if d.get("name")],
+                "render": [str(d["name"]) for d in list_endpoints(E_RENDER) if d.get("name")],
+                "default_capture": cap.get("name"), "default_render": ren.get("name")}
+    except Exception as exc:  # noqa: BLE001 - the menu then offers the default only
+        return {"capture": [], "render": [], "default_capture": None, "default_render": None,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def resolve_device(kind: str, wanted: str | None, devices: dict[str, Any]) -> tuple[str | None, str]:
+    """The device to open for a choice: ``(name, "")``, or ``(None, note)`` when it is not connected.
+
+    ``None`` means Windows' default. A chosen device that is not among the active ones
+    (Bluetooth off, unplugged) falls back to the default, with a note for the pill.
+    Matching is on the exact name Core Audio lists (plumbing, not a guess).
+    """
+    if not wanted:
+        return None, ""
+    if wanted in (devices.get(kind) or []) or devices.get("error"):
+        return wanted, ""
+    default = devices.get(f"default_{kind}")
+    return None, (f"{KIND_WORD.get(kind, kind)} '{wanted}' isn't connected; using "
+                  f"{('the default, ' + default) if default else 'the default'}")

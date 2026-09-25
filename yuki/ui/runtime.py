@@ -311,8 +311,18 @@ class Lane(QThread):
 
         # A spoken request runs at its own effort setting (heard live, and mostly one quick
         # action); a typed one at the agent's. Chosen by where it came from, never by its words.
-        effort = getattr(self.runtime.settings, "voice_brain_effort", None) if job.source == "voice" else None
-        events = self.agent.run(job.request, origin_hwnd=job.origin_hwnd, effort=effort or None)
+        # Chosen by where it came from, never by its words: a spoken request also runs with
+        # thinking off, a slim memory block and, when set, the voice thinker's own model
+        # (docs/VOICE.md §7, measured there).
+        settings = self.runtime.settings
+        voice = job.source == "voice"
+        effort = getattr(settings, "voice_brain_effort", None) if voice else None
+        events = self.agent.run(
+            job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
+            model=(getattr(settings, "voice_brain_model", "") or None) if voice else None,
+            thinking=None if not voice or getattr(settings, "voice_brain_thinking", True) else False,
+            lean=voice and not getattr(settings, "voice_brain_portrait", True),
+        )
         while True:
             try:
                 event = next(events)

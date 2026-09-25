@@ -105,6 +105,8 @@ RANKS = {"step": 0, "queued": 0, "say": 1, "ask": 2, "final": 3}
 STALE_AFTER = {"step": 1, "queued": 1, "say": 2}
 #: Kinds said as soon as the user may be spoken to (no settle, only a short gap after Yuki's speech).
 URGENT = ("final", "ask")
+#: Kinds that are progress of a running task: said only after a real pause in Yuki's speech.
+PROGRESS = ("step", "queued")
 
 
 @dataclass
@@ -135,19 +137,21 @@ class NarratorGate:
             (the mouth's own quick tools in flight), ``last_bot_stop``
             (monotonic, 0 if never), ``user_turns`` (final transcripts so far) and
             ``jobs_open`` (this conversation's tasks still running).
-        settle_s / settle_max_s / cooldown_s / stale_turns / final_gap_s: see ``Settings.voice_*``
-            (``final_gap_s`` ``None``: the cooldown, as before).
+        settle_s / settle_max_s / cooldown_s / stale_turns / final_gap_s / progress_pause_s: see
+            ``Settings.voice_*`` (``final_gap_s`` ``None``: the cooldown, as before;
+            ``progress_pause_s`` ``None``: progress keeps the cooldown).
         log: Content-free event log (``event(kind, **fields)``) or ``None``.
     """
 
     def __init__(self, state: Callable[[], dict[str, Any]], *, settle_s: float = 1.5, settle_max_s: float = 6.0,
                  cooldown_s: float = 1.5, stale_turns: int = 3, log: Any = None,
-                 final_gap_s: float | None = None) -> None:
+                 final_gap_s: float | None = None, progress_pause_s: float | None = None) -> None:
         self._state = state
         self.settle_s = settle_s
         self.settle_max_s = settle_max_s
         self.cooldown_s = cooldown_s
         self.final_gap_s = cooldown_s if final_gap_s is None else final_gap_s
+        self.progress_pause_s = cooldown_s if progress_pause_s is None else max(cooldown_s, progress_pause_s)
         self.stale_turns = stale_turns
         self.log = log
         self.pending: list[Item] = []
@@ -233,7 +237,12 @@ class NarratorGate:
         # result that follows within the settle replaces them (measured 2026-09-25: a
         # one-action result waited 4.5 s here, 1.5 s of it settle and cooldown).
         urgent = any(i.kind in URGENT for i in self.pending)
-        cooldown = self.final_gap_s if urgent else self.cooldown_s
+        # Progress of a running task only after a real pause: Yuki has said nothing for
+        # progress_pause_s (the acknowledgement counts), so a quick job is never narrated
+        # step by step (measured 2026-09-25: "Opening the Chrome link now." right after
+        # "Opening YouTube on Chrome"). A result that lands meanwhile replaces it.
+        only_progress = all(i.kind in PROGRESS for i in self.pending)
+        cooldown = self.final_gap_s if urgent else (self.progress_pause_s if only_progress else self.cooldown_s)
         last_stop = float(s.get("last_bot_stop") or 0.0)
         if last_stop and now - last_stop < cooldown:
             return "cooldown", last_stop + cooldown
