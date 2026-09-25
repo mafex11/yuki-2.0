@@ -74,6 +74,7 @@ from typing import Any
 
 import numpy as np
 
+from yuki.memory import secret_filter
 from yuki.memory.store import (
     PAUSE_FLAG,
     REFRESH_FLAG,
@@ -295,7 +296,7 @@ class MemoryClient:
         contradicted ones) and retires it. Also asks the service for a
         re-render soon (same flag as :meth:`refresh_portrait`).
         """
-        text = (text or "").strip()
+        text = secret_filter.redact_text((text or "").strip())
         if not text:
             raise ValueError("correction text is empty")
         fact_id = self.store.add_correction(text)
@@ -380,7 +381,8 @@ class MemoryClient:
         text), that entry is superseded (its ``valid_to`` set, history kept)
         instead of piling up near-duplicates.
         """
-        text = (text or "").strip()
+        text = secret_filter.redact_text((text or "").strip())
+        source_request = secret_filter.redact_text(source_request) if source_request else source_request
         if not text:
             raise ValueError("know-how text is empty")
         app = app_key(app)
@@ -583,7 +585,12 @@ class MemoryClient:
         the database, else a background writer finishes it) and never raises.
         """
         try:
-            turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions or (), outcome)
+            # A key or password the user pastes is used by the agent in the moment (it has the words in its
+            # own context); what memory keeps, and later sends to a model, has it as "[API key hidden]".
+            user_text = secret_filter.redact_text(user_text or "")
+            reply_text = secret_filter.redact_text(reply_text) if reply_text else reply_text
+            actions = [secret_filter.redact_text(str(a)) for a in (actions or ())]
+            turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions, outcome)
         except Exception as exc:
             self.last_turn_error = f"{type(exc).__name__}: {exc}"
             return 0
@@ -742,7 +749,7 @@ class MemoryClient:
         """
         from yuki.memory.conversations import normalize_quote
 
-        text = " ".join((text or "").split())
+        text = secret_filter.redact_text(" ".join((text or "").split()))
         if not text:
             raise ValueError("rule text is empty")
         vec = self._embed(text)

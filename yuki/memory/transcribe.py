@@ -49,6 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from yuki.memory.secret_filter import redact_utterances
 from yuki.memory.store import CALL_OPEN_STATUSES, Store, default_db_path
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
@@ -442,6 +443,7 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
         log("transcribe_hint", terms=len([w for w in hint.split(",") if w.strip()]),
             tokens=backend.count_tokens(" " + hint) if hint else 0, ms=round((time.perf_counter() - t0) * 1000))
     last_phrase: dict[int, str | None] = {}
+    last_said: dict[int, str] = {}
     try:
         for r in rows:
             if stop():
@@ -457,6 +459,11 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
                                "text": s.text, "lang": s.lang, "lp": round(s.avg_logprob, 2),
                                "nsp": round(s.no_speech_prob, 2), **({"unclear": True} if s.unclear else {})}
                               for s in kept]
+                # a password or code said aloud is hidden before the words are stored (docs/MEMORY.md,
+                # "Secret filter"); each utterance is read with the one before it as context
+                secrets = redact_utterances(utterances, last_said.get(r["call_id"], ""))
+                if utterances:
+                    last_said[r["call_id"]] = utterances[-1]["text"]
                 store.finish_call_chunk(r["id"], utterances, lang=info.get("lang"), ms=ms, model=backend.name,
                                         device=backend.device)
                 done += 1
@@ -470,7 +477,7 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
                     segments=len(utterances), dropped=dropped, unclear=sum(1 for s in kept if s.unclear),
                     lang=info.get("lang"), lang_prob=info.get("lang_prob"), decodes=info.get("decodes"),
                     tokens=info.get("tokens"), max_new_tokens=info.get("max_new_tokens"),
-                    timed_out=bool(info.get("timed_out")), gpu=gpu.snapshot())
+                    timed_out=bool(info.get("timed_out")), gpu=gpu.snapshot(), secrets=dict(secrets))
                 del audio
             except FileNotFoundError:
                 store.remove_call_chunks([r["id"]], "lost")

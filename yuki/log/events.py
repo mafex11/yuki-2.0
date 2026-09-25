@@ -27,6 +27,8 @@ from typing import Any, Literal, TextIO
 
 from rich.console import Console
 
+from yuki.memory import secret_filter
+
 # ---------------------------------------------------------------------------
 # Agent-facing events
 # ---------------------------------------------------------------------------
@@ -280,7 +282,15 @@ class SessionLogger:
             "type": type,
         }
         record.update({k: _as_plain(v) for k, v in fields.items()})
-        self._fh.write(json.dumps(record, ensure_ascii=False, default=_as_plain) + "\n")
+        line = json.dumps(record, ensure_ascii=False, default=_as_plain)
+        if secret_filter.find(line):
+            # A password or key in a request, a tool input or captured screen text: the log keeps the
+            # record with the secret as "[password hidden]" (docs/MEMORY.md, "Secret filter"). The
+            # serialized line is checked in one pass; only a hit walks the record's strings. The caller
+            # (the agent) still gets the record as it was.
+            hidden, _ = secret_filter.redact_json(json.loads(line))
+            line = json.dumps(hidden, ensure_ascii=False)
+        self._fh.write(line + "\n")
         self._fh.flush()
         return record
 

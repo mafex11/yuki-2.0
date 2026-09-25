@@ -233,7 +233,8 @@ their own time) and whenever no date shows.
 - In English, keeping names, titles and quotes in their original script (a Japanese \
 title stays in Japanese).
 - Never record passwords, one-time codes, card or account numbers, or other secrets, \
-even if visible.
+even if visible. A secret the capture already hid shows as "[password hidden]", "[API key hidden]" and the \
+like: record that one was shared or shown ("pixel.fox sent the login for a university portal"), never guess it.
 
 Skip interface chrome, navigation, boilerplate, and anything already in FACTS ALREADY \
 RECORDED. If nothing is worth remembering, call record_facts with empty lists.

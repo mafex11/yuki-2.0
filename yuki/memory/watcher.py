@@ -53,6 +53,7 @@ import win32api
 import win32con
 import win32gui
 
+from yuki.memory import secret_filter
 from yuki.memory.extract import Extraction, extract
 from yuki.memory.extract.uia import content_pid
 from yuki.memory.privacy import PrivacyConfig, PrivacyRules
@@ -774,6 +775,47 @@ class CaptureResult:
     password_check: str = "off"
     read_ms: float = 0.0
     store_ms: float = 0.0
+    #: Secrets hidden before storing (:mod:`yuki.memory.secret_filter`): counts by kind, and its cost.
+    secrets: dict[str, int] = field(default_factory=dict)
+    secret_ms: float = 0.0
+
+
+def _hide_secrets(ex: Extraction, result: CaptureResult) -> Extraction:
+    """The extraction with every secret in its messages, body, title, address and scope replaced by a
+    typed placeholder (``[password hidden]``), before anything is diffed, stored or sent to a model.
+
+    A message is read with the message before it as context ("pass :" then the password alone). The
+    fingerprints stay those of the text on screen, so a message re-read later is still recognised.
+    """
+    t0 = time.perf_counter()
+    counts: Counter = Counter()
+
+    def hide(text: str | None, context: str = "") -> str | None:
+        if not text:
+            return text
+        r = secret_filter.redact(text, context=context)
+        counts.update(r.counts)
+        return r.text
+
+    changes: dict[str, Any] = {}
+    if ex.messages:
+        messages, previous = [], ""
+        for m in ex.messages:
+            text = hide(m.text, previous)
+            previous = m.text or ""
+            messages.append(m if text == m.text else replace(m, text=text))
+        changes["messages"] = messages
+    for name in ("body", "title", "url", "thread_scope"):
+        value = getattr(ex, name, None)
+        if isinstance(value, str) and value:
+            hidden = hide(value)
+            if hidden != value:
+                changes[name] = hidden
+    result.secret_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    if not counts:
+        return ex
+    result.secrets = dict(counts)
+    return replace(ex, **changes)
 
 
 class Watcher:
@@ -1562,6 +1604,9 @@ class Watcher:
         if block:
             return "skipped", block
         self._learn_names(store, extraction)
+        # Secrets typed into chats, pages and documents become typed placeholders here,
+        # before the delta, the store and every model call (docs/MEMORY.md, "Secret filter").
+        extraction = _hide_secrets(extraction, result)
 
         s0 = time.perf_counter()
         yuki = {"by_yuki": True, "yuki_request": getattr(acting, "request", "") or ""} if acting is not None else {}

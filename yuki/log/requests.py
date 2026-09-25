@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from yuki.log.events import _as_plain
+from yuki.memory.secret_filter import redact_text
 
 #: Column order of ``requests.csv``. Readers use the header, so new columns go
 #: at the end and old rows stay readable.
@@ -91,4 +92,6 @@ def _cell(value: Any) -> Any:
         return ""
     if isinstance(value, dict):
         return " ".join(f"{key}={count}" for key, count in value.items())
+    if isinstance(value, str):
+        return redact_text(value)  # the request column is the user's words: no secret in the ledger
     return value

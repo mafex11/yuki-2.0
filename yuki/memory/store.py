@@ -255,6 +255,7 @@ from urllib.parse import urlsplit
 import numpy as np
 
 from yuki.memory.crypto import FieldCipher, load_or_create_key
+from yuki.memory.secret_filter import redact_utterances
 
 KEY_FILENAME = "memory.key"
 DB_FILENAME = "memory.db"
@@ -5054,6 +5055,7 @@ class Store:
 
     def _add_call_side(self, conn: sqlite3.Connection, call_id: int, app: str, process: str | None,
                        started_at: float, ended_at: float, items: list[dict[str, Any]], final: bool) -> int:
+        redact_utterances(items)   # the transcriber already did; a second pass costs microseconds and holds for any writer
         delta = json.dumps({"call_id": int(call_id), "app": app, "start": float(started_at), "end": float(ended_at),
                             "final": bool(final), "utterances": items}, ensure_ascii=False)
         thread_id = self._upsert_thread(conn, app or "", f"{app} call", None, process=process,

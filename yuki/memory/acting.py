@@ -136,6 +136,10 @@ def _signal(db_path: str | Path | None) -> bool:
 def begin(db_path: str | Path | None, token: str, request: str, *, lane: str = "") -> bool:
     """Publish that Yuki is acting on ``request`` (idempotent per token). Never raises."""
     try:
+        from yuki.memory.secret_filter import redact_text  # light (re only)
+
+        # the marker is a plain file and its request is stored with the captures: no secret in either
+        request = redact_text(request or "")
         path = acting_path(db_path)
         with _lock:
             items = [i for i in _read_raw(path) if i.get("token") != token and _pid_alive(int(i.get("pid") or 0))]

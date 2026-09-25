@@ -51,7 +51,6 @@ Public API::
 
 from __future__ import annotations
 
-import math
 import os
 import re
 import sqlite3
@@ -65,6 +64,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from yuki.memory import secret_filter
+from yuki.memory.secret_filter import shannon_bits
 from yuki.memory.store import Store
 from yuki.memory.timeline import PrivacySection
 
@@ -110,14 +111,6 @@ def parse_warp_ts(value: Any) -> float | None:
     return base + (float("0." + digits) if digits else 0.0)
 
 
-def shannon_bits(word: str) -> float:
-    """Entropy of ``word``'s characters, bits per character."""
-    if not word:
-        return 0.0
-    n = len(word)
-    return -sum((c / n) * math.log2(c / n) for c in Counter(word).values())
-
-
 @dataclass(frozen=True)
 class TerminalRules:
     """The privacy file's ``[terminal]`` table."""
@@ -158,13 +151,22 @@ class TerminalRules:
         return shannon_bits(word) >= self.entropy_min_bits
 
     def secret_reason(self, *texts: str) -> str | None:
-        """``"pattern:<n>"`` / ``"high_entropy"`` when any text looks like it holds a secret, else None.
+        """``"secret:<kind>"`` / ``"pattern:<n>"`` / ``"high_entropy"`` when any text looks like it holds a
+        secret, else None.
 
+        First the shared detector every memory entry point uses (:mod:`yuki.memory.secret_filter`: known key
+        formats, labelled credentials, codes, cards, secret-context entropy), then the privacy file's own
+        ``secret_patterns`` (data the user can extend: assignments and flags of shell syntax), then the
+        stricter terminal-only test: any long high-entropy word, even without a secret word next to it.
+        A command is dropped whole (not redacted): a command line is short and its secret is its point.
         Content-free: the reason names the rule, never the text.
         """
         for text in texts:
             if not text:
                 continue
+            found = secret_filter.find(text)
+            if found:
+                return f"secret:{found[0].kind}"
             for i, pattern in enumerate(self.patterns):
                 if pattern.search(text):
                     return f"pattern:{i}"
