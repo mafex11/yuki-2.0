@@ -175,8 +175,9 @@ class Settings:
         voice_hotkey: Global combo that starts or ends a voice conversation
             (``YUKI_VOICE_HOTKEY`` overrides it).
         voice_wake: Listen for "Yuki" locally and start a conversation on it.
-            Off by default; the tray's "Listen for 'Yuki'" switch changes it
-            and remembers the choice (``%LOCALAPPDATA%\\Yuki\\voice.json``).
+            On by default (the user asked for it, 2026-09-25); the tray's
+            "Listen for 'Yuki'" switch changes it and remembers the choice
+            (``%LOCALAPPDATA%\\Yuki\\voice.json``).
         voice_wake_during_calls: Keep listening for "Yuki" while a call or a
             meeting is on (off: saying the name to friends does nothing).
         voice_wake_threshold: The keyword spotter's trigger threshold (higher
@@ -207,6 +208,21 @@ class Settings:
             then refuses to start and says why.
         voice_usd_per_stt_min / voice_usd_per_1k_tts_chars: List prices for the
             cost estimate in the voice log (estimates only; nothing decides on them).
+        voice_grounding: Look the user's words up in local memory on every turn
+            and show the mouth the nearest facts (docs/VOICE.md §5.5).
+        voice_grounding_wait_ms: How long the mouth's call may wait for that
+            lookup; a slower lookup is attached to the next call instead.
+        voice_grounding_facts: How many facts the mouth is shown.
+        voice_settle_s / voice_settle_max_s: The narrator's settle window: things
+            that arrive this close together are said as one turn, waiting at
+            most the second figure from the first (docs/VOICE.md §6.4).
+        voice_cooldown_s: Quiet after Yuki's own speech before a result or a
+            progress line may start.
+        voice_stale_turns: User turns a waiting result may sit through before it
+            is folded into the conversation silently instead of spoken.
+        voice_progress_lines: Most spoken progress lines per task.
+        voice_result_sentences / voice_result_chars: How much of a result is
+            spoken at first (the rest waits for "want the rest?").
     """
 
     model: str = DEFAULT_MODEL
@@ -229,9 +245,9 @@ class Settings:
     requests_csv: Path = Path("logs/requests.csv")
     user_names: list[str] = field(default_factory=lambda: ["Kian", "Mafex", "mafex11"])
     voice_hotkey: str = "ctrl+alt+y"
-    voice_wake: bool = False
+    voice_wake: bool = True
     voice_wake_during_calls: bool = False
-    voice_wake_threshold: float = 0.25
+    voice_wake_threshold: float = 0.2
     voice_wake_boost: float = 2.0
     voice_idle_s: float = 20.0
     voice_hold_max_s: float = 600.0
@@ -254,6 +270,16 @@ class Settings:
     voice_usd_per_1k_tts_chars: dict[str, float] = field(
         default_factory=lambda: {"elevenlabs": 0.05, "deepgram": 0.030}
     )
+    voice_grounding: bool = False   # off: it loads the ~550 MB embedder in the tray for the whole session; memory questions go to the brain anyway
+    voice_grounding_wait_ms: float = 60.0
+    voice_grounding_facts: int = 4
+    voice_settle_s: float = 1.5
+    voice_settle_max_s: float = 6.0
+    voice_cooldown_s: float = 1.5
+    voice_stale_turns: int = 3
+    voice_progress_lines: int = 2
+    voice_result_sentences: int = 2
+    voice_result_chars: int = 280
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)

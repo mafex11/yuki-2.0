@@ -6,16 +6,23 @@ explicit:
 * **voice → GUI**: :meth:`VoiceBridge._gui` emits a Qt signal carrying a
   callable; the bridge lives on the GUI thread, so Qt queues it there. That is
   how ``AgentRuntime.submit`` / ``answer`` / ``steer`` / ``cancel`` are called.
+  A follow-up waits for the GUI thread's routing decision (a future resolved
+  with ``call_soon_threadsafe``), so a correction that reaches a task as it
+  finishes can start a new task instead of being lost.
 * **GUI → voice**: runtime signals arrive on the GUI thread; the bridge turns
   them into ``(kind, payload)`` items and hands them to the waiting
-  ``tell_yuki`` handler with ``loop.call_soon_threadsafe``.
+  ``tell_yuki`` handler with ``loop.call_soon_threadsafe``. The handler passes
+  each one to the conversation's :class:`~yuki.voice.narrator.NarratorGate`,
+  which decides when it is said.
 
-Routing is on state only (rule 3): is a job running, queued, or waiting for an
-answer. What the words mean is the mouth's call (the ``intent`` it passes).
+Routing is on state only (rule 3): is a job running, queued, closing or
+waiting for an answer. What the words mean is the mouth's call (the ``intent``
+it passes).
 
-The job table (§6.3) is the single source of truth for ``yuki_status``: every
-request the runtime runs is in it (typed ones too), with its state, current
-step, last spoken progress line and pending question.
+Each job keeps its real action log (:class:`~yuki.voice.progress.JobLog`):
+the source for spoken progress (real tool calls only) and for
+``check_progress`` ("how's it going?"). The job table is also the source for
+:meth:`snapshot` (the UI and the tests).
 """
 
 from __future__ import annotations
@@ -25,28 +32,31 @@ import itertools
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from PySide6.QtCore import QObject, Signal
 
-from yuki.agent.tools import tool_label
-from yuki.voice.mouth import brain_request, result_payload
+from yuki.voice.mouth import SPOKEN_NOTE, brain_request, progress_payload, result_payload
+from yuki.voice.narrator import RANKS, Item, condense
+from yuki.voice.progress import JobLog, StepPacer, step_of
 
 #: Job states.
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
     "queued", "running", "waiting_for_answer", "done", "failed", "cancelled")
 OPEN_STATES = (QUEUED, RUNNING, WAITING)
 
-#: Finished jobs kept in the table for ``yuki_status`` ("it finished a minute ago").
+#: Finished jobs kept in the table ("it finished a minute ago", "want the rest?").
 KEEP_FINISHED = 6
+#: A finished job still answers check_progress for this long.
+RECENT_S = 180.0
 
 
 @dataclass
 class Job:
     """One request as the bridge tracks it.
 
-    ``request`` is the mouth's own message (or the typed text); it stays in
-    memory for ``yuki_status`` and is never logged by the voice log.
+    ``request`` is the mouth's request (or the typed text); it stays in
+    memory for progress answers and is never logged by the voice log.
     """
 
     job_id: int | None
@@ -55,10 +65,13 @@ class Job:
     lane: str | None = None
     state: str = QUEUED
     started_at: float = field(default_factory=time.monotonic)
+    finished_at: float | None = None
     step: str | None = None
     last_say: str | None = None
     question: str | None = None
     outcome: str | None = None
+    #: What of the outcome has not been spoken yet ("want the rest?").
+    rest: str = ""
     #: The lane's closing text, held until ``lane_done`` says whether it was
     #: the answer or a front desk handing the request to the worker.
     closing: tuple[str, str] | None = None
@@ -68,6 +81,8 @@ class Job:
     #: Only for voice jobs: where the ``tell_yuki`` handler waits.
     events: asyncio.Queue | None = None
     token: int = 0
+    log: JobLog | None = None
+    pacer: StepPacer | None = None
 
     def status(self, now: float) -> dict[str, Any]:
         return {
@@ -121,15 +136,20 @@ class VoiceBridge(QObject):
         runtime: The runtime (or anything with the same signals and methods).
         log: ``VoiceLog``-like object with ``event(kind, **fields)``; content-free.
         foreground: Returns the window in front (``origin_hwnd`` for a voice request).
+        settings: Voice settings (result length, progress lines); defaults when ``None``.
     """
 
     _gui_call = Signal(object)
 
-    def __init__(self, runtime: Any, log: Any = None, *, foreground: Callable[[], int | None] | None = None) -> None:
+    def __init__(self, runtime: Any, log: Any = None, *, foreground: Callable[[], int | None] | None = None,
+                 settings: Any = None) -> None:
         super().__init__()
         self.runtime = runtime
         self.log = log
         self._foreground = foreground or _foreground_hwnd
+        self._max_sentences = int(getattr(settings, "voice_result_sentences", 2))
+        self._max_chars = int(getattr(settings, "voice_result_chars", 280))
+        self._progress_lines = int(getattr(settings, "voice_progress_lines", 2))
         self._lock = threading.Lock()
         self._jobs: dict[int, Job] = {}
         self._unsubmitted: dict[int, Job] = {}
@@ -142,9 +162,16 @@ class VoiceBridge(QObject):
         #: Called (on the voice loop) with a payload for a result that has no
         #: open tell_yuki call to go to (a correction that arrived too late).
         self.announce: Callable[[dict[str, Any]], Any] | None = None
+        #: The conversation's narrator gate (``None``: deliver at once, as in tests).
+        self.gate: Any = None
+        #: ``async (log_text, question) -> (text | None, facts)``: the isolated progress call.
+        self.progress_answerer: Callable[[str, str], Awaitable[tuple[str | None, dict]]] | None = None
+        #: The mouth's own quick tools in flight (check_progress): the gate waits for them.
+        self.busy_tools = 0
         self._gui_call.connect(self._run)
         for name, slot in (
             ("started", self._on_started), ("tool_called", self._on_tool_called),
+            ("tool_finished", self._on_tool_finished),
             ("said", self._on_said), ("asked", self._on_asked), ("finished", self._on_finished),
             ("failed", self._on_failed), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
@@ -165,6 +192,9 @@ class VoiceBridge(QObject):
         self._loop = loop
         self.closing = False
         if loop is None:
+            self.gate = None
+            self.progress_answerer = None
+            self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
                     job.events = None
@@ -209,8 +239,13 @@ class VoiceBridge(QObject):
             live = list(self._jobs.values()) + list(self._unsubmitted.values())
         return sum(1 for j in live if j.events is not None and j.state in (QUEUED, RUNNING))
 
+    def brain_busy(self) -> bool:
+        """Whether any request (typed or spoken) is still open."""
+        with self._lock:
+            return any(j.state in OPEN_STATES for j in list(self._jobs.values()) + list(self._unsubmitted.values()))
+
     def snapshot(self) -> list[dict[str, Any]]:
-        """``yuki_status``'s answer: open jobs first, then the last few finished ones."""
+        """The job table: open jobs first, then the last few finished ones."""
         now = time.monotonic()
         with self._lock:
             open_jobs = [j for j in list(self._unsubmitted.values()) + list(self._jobs.values())
@@ -220,69 +255,189 @@ class VoiceBridge(QObject):
             j.status(now) for j in reversed(done)]
 
     def _finish(self, job: Job, state: str, outcome: str) -> None:
-        job.state, job.outcome = state, outcome
+        job.state, job.outcome, job.finished_at = state, outcome, time.monotonic()
         with self._lock:
             if job.job_id is not None:
                 self._jobs.pop(job.job_id, None)
             self._finished.append(job)
             del self._finished[:-KEEP_FINISHED]
 
+    def _new_job(self, request: str, *, source: str = "voice", with_queue: bool = True) -> Job:
+        return Job(job_id=None, request=request, source=source, token=next(self._tokens),
+                   events=asyncio.Queue() if with_queue else None, log=JobLog(request=request),
+                   pacer=StepPacer(self._progress_lines))
+
     # -- the mouth's tools (voice thread) ---------------------------------------
 
     async def tell_yuki(self, params: Any) -> None:
         """Pipecat handler for ``tell_yuki`` (async: registered with ``cancel_on_interruption=False``)."""
-        from pipecat.frames.frames import FunctionCallResultProperties
-
         args = params.arguments if isinstance(params.arguments, dict) else {}
-        message = str(args.get("message") or "").strip()
+        request = str(args.get("request") or args.get("message") or "").strip()
+        context = str(args.get("context") or "").strip() or None
         intent = str(args.get("intent") or "new_task")
         heard = heard_words(params.context)
-        text = brain_request(message or (heard[-1] if heard else ""), heard)
+        request = request or (heard[-1] if heard else "")
+        text = brain_request(request, heard, context=context)
         if intent == "follow_up":
             target = self._follow_up_target()
             if target is not None:
-                how = self._follow_up(target, text)
-                self._log("bridge", op="follow_up", job_id=target.job_id, how=how,
-                          call=params.tool_call_id)
-                await params.result_callback({"status": f"passed on to the running task ({how})"})
-                return
-        job = Job(job_id=None, request=message or (heard[-1] if heard else ""), events=asyncio.Queue(),
-                  token=next(self._tokens))
+                how = await self._follow_up(target, text)
+                self._log("bridge", op="follow_up", job_id=target.job_id, how=how, call=params.tool_call_id)
+                if how != "restart":
+                    # The mouth acknowledged in the same reply: this settles the call without
+                    # another turn (measured: with a turn, it asked itself "how's it going?").
+                    from pipecat.frames.frames import FunctionCallResultProperties
+
+                    await params.result_callback({"status": f"passed on to the running task ({how})"},
+                                                 properties=FunctionCallResultProperties(run_llm=False))
+                    return
+                # The task was finishing: start the addition as its own task, quietly
+                # (gradient-bang's task_closing path). This call carries its outcome.
+                prev = target.outcome or (target.closing[1] if target.closing else "")
+                text = brain_request(request, heard, context="; ".join(x for x in (
+                    context, f'this adds to the request just before it ("{target.request}"), which had just '
+                             f'finished{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
+                    if x))
+        job = self._new_job(request)
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
         self._gui(lambda: self._submit(job, text, origin))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
-                  message_chars=len(message), origin_hwnd=origin)
-        intermediate = FunctionCallResultProperties(is_final=False)
+                  request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin)
         try:
-            while True:
-                kind, payload = await job.events.get()
-                self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
-                          chars=len(str(payload)))
-                if kind == "say":
-                    await params.result_callback({"yuki_says": payload}, properties=intermediate)
-                elif kind == "ask":
-                    await params.result_callback({"yuki_asks": payload}, properties=intermediate)
-                elif kind == "queued":
-                    await params.result_callback({"status": payload}, properties=intermediate)
-                elif kind in ("done", "failed"):
-                    # "result", not "done" (the word must not tell the mouth it worked), with
-                    # the note on saying it briefly where the mouth reads the result.
-                    await params.result_callback(result_payload(kind, payload))
-                    return
+            await self._relay(job, params)
         except asyncio.CancelledError:
             if not self.closing:
-                # The mouth called cancel_tell_yuki: stop the brain's work too.
+                # The mouth called cancel_tell_yuki: stop the brain's work too, and say
+                # nothing more of it (a progress line of a stopped task is noise).
                 self._gui(lambda: self._cancel(job))
+                if self.gate is not None:
+                    for item in self.gate.take(job.token, kinds=tuple(RANKS)):
+                        if item.drop is not None:
+                            item.drop()
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
 
-    async def yuki_status(self, params: Any) -> None:
-        """Pipecat handler for ``yuki_status``: the job table, instantly."""
-        jobs = self.snapshot()
-        self._log("bridge", op="status", jobs=len(jobs))
-        await params.result_callback({"tasks": jobs} if jobs else {"tasks": [], "note": "Nothing is running."})
+    async def _relay(self, job: Job, params: Any) -> None:
+        """Pass the job's items to the narrator gate (or straight to the mouth) until its final result is delivered."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        loop = asyncio.get_running_loop()
+        while True:
+            kind, payload = await job.events.get()
+            self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
+                      chars=len(str(payload)))
+            if kind in ("done", "failed"):
+                head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
+                job.rest = rest
+                delivered = loop.create_future()
+
+                async def final(run_llm: bool, stale: bool, kind=kind, head=head, rest=rest,
+                                delivered=delivered) -> None:
+                    await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale),
+                                                 properties=FunctionCallResultProperties(run_llm=run_llm))
+                    if not delivered.done():
+                        delivered.set_result(stale)
+
+                self._log("bridge", op="condensed", job_id=job.job_id, chars=len(payload), spoken_chars=len(head),
+                          rest_chars=len(rest))
+                await self._offer(job, "final", final)
+                await delivered
+                return
+            if kind == "step":
+                label, detail = payload
+                body: dict[str, Any] = progress_payload(label, detail)
+            elif kind == "say":
+                body = {"yuki_says": payload}
+            elif kind == "ask":
+                body = {"yuki_asks": payload}
+            else:
+                body = {"status": payload}
+
+            async def intermediate(run_llm: bool, stale: bool, body=body) -> None:
+                del stale
+                await params.result_callback(body, properties=FunctionCallResultProperties(
+                    is_final=False, run_llm=run_llm))
+
+            drop = None
+            if kind == "step" and job.pacer is not None:
+                drop = (lambda label=payload[0]: job.pacer.dropped(label))
+            await self._offer(job, kind, intermediate, drop)
+
+    async def _offer(self, job: Job, kind: str, deliver: Callable[[bool, bool], Awaitable[None]],
+                     drop: Callable[[], None] | None = None) -> None:
+        gate = self.gate
+        if gate is None:
+            await deliver(True, False)
+            return
+        gate.enqueue(Item(job=job.token, kind=kind, deliver=deliver, drop=drop))
+
+    async def check_progress(self, params: Any) -> None:
+        """Pipecat handler for ``check_progress``: an isolated one-shot answer over the task's real log."""
+        args = params.arguments if isinstance(params.arguments, dict) else {}
+        question = str(args.get("question") or "").strip()
+        job = self._progress_target()
+        if job is None or job.log is None:
+            self._log("bridge", op="progress", jobs=0)
+            await params.result_callback({"progress": None, "note": "Nothing is running or recently finished."})
+            return
+        state = job.state if not (job.closing and job.state in OPEN_STATES) else "finishing"
+        waiting = self.gate.take(job.token) if self.gate is not None and job.source == "voice" else []
+        if waiting:
+            # It has finished and its result is still waiting for a quiet moment: that result
+            # is the answer. It goes into the conversation now (not spoken on its own), and
+            # this call tells the mouth to say it.
+            for item in waiting:
+                await item.deliver(False, False)
+            self._log("bridge", op="progress", job_id=job.job_id, state=state, answered="result")
+            await params.result_callback({"progress": "It has just finished; its result is right above. Say "
+                                                      "that result now, briefly.", "state": state})
+            return
+        answer, facts = None, {}
+        self.busy_tools += 1
+        try:
+            if self.progress_answerer is not None:
+                answer, facts = await self.progress_answerer(job.log.render(state), question)
+        finally:
+            self.busy_tools = max(0, self.busy_tools - 1)
+            if self.gate is not None:
+                self.gate.poke()
+        self._log("bridge", op="progress", job_id=job.job_id, state=state, log_lines=len(job.log.lines),
+                  answered=answer is not None, **{k: v for k, v in facts.items() if k != "error"},
+                  error=facts.get("error"))
+        if answer is None:
+            await params.result_callback({"tasks": [job.status(time.monotonic())]})
+            return
+        await params.result_callback({"progress": answer, "state": state,
+                                      "for_seconds": round(time.monotonic() - job.started_at),
+                                      "how_to_say_it": "Say this in your own words, adding nothing."})
+
+    async def more_of_result(self, params: Any) -> None:
+        """Pipecat handler for ``more_of_result``: the next part of the latest result that has more."""
+        with self._lock:
+            job = next((j for j in reversed(self._finished) if j.source == "voice" and j.rest), None)
+        if job is None:
+            self._log("bridge", op="more", found=False)
+            await params.result_callback({"more": None, "note": (
+                "Nothing of the last result was held back. If they want more detail, that is a new "
+                "question for the thinker: hand it over with tell_yuki in their words.")})
+            return
+        head, rest = condense(job.rest, max_sentences=self._max_sentences, max_chars=self._max_chars)
+        job.rest = rest
+        self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest))
+        await params.result_callback({"more": head, "more_available": bool(rest),
+                                      "how_to_say_it": SPOKEN_NOTE + (" Still more after this." if rest else "")})
+
+    def _progress_target(self) -> Job | None:
+        """The task "how's it going?" is about: the newest open voice task, else any open one, else a recent one."""
+        now = time.monotonic()
+        with self._lock:
+            live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values()) if j.state in OPEN_STATES]
+            recent = [j for j in self._finished if j.finished_at and now - j.finished_at < RECENT_S]
+        voice = [j for j in live if j.source == "voice"]
+        pool = voice or live or recent
+        return max(pool, key=lambda j: j.started_at) if pool else None
 
     def _follow_up_target(self) -> Job | None:
         """The most recent unfinished voice job, the one waiting for an answer first."""
@@ -294,17 +449,41 @@ class VoiceBridge(QObject):
         waiting = [j for j in live if j.state == WAITING]
         return max(waiting or live, key=lambda j: j.started_at)
 
-    def _follow_up(self, job: Job, text: str) -> str:
-        """Route a follow-up by the job's state: answer a question, steer running work, or hold it."""
+    async def _follow_up(self, job: Job, text: str) -> str:
+        """Route a follow-up by the job's state, decided on the GUI thread; returns how.
+
+        ``answered`` (it was waiting for the user), ``added`` (steered into the
+        running work), ``added for when it starts`` (queued), or ``restart``:
+        the job was already finishing, so the caller starts the addition as a
+        new task.
+        """
+        loop = asyncio.get_running_loop()
+        decided: asyncio.Future = loop.create_future()
+
+        def decide() -> None:
+            how = self._route(job, text)
+            loop.call_soon_threadsafe(lambda: decided.done() or decided.set_result(how))
+
+        self._gui(decide)
+        try:
+            return await asyncio.wait_for(decided, timeout=5.0)
+        except asyncio.TimeoutError:
+            return "restart"
+
+    def _route(self, job: Job, text: str) -> str:
+        """On the GUI thread: where a follow-up goes, by the job's state at this moment."""
+        if job.log is not None:
+            job.log.add("the user added", text.split("\n\n[", 1)[0])
+        if job.closing is not None or job.state not in OPEN_STATES:
+            return "restart"
         if job.state == WAITING and job.lane is not None:
             job.state, job.question = RUNNING, None
-            lane = job.lane
-            self._gui(lambda: self.runtime.answer(lane, text))
+            self.runtime.answer(job.lane, text)
             return "answered"
         if job.state == RUNNING and job.job_id is not None:
-            job_id = job.job_id
-            self._gui(lambda: self._steer(job, job_id, text))
-            return "added"
+            if self.runtime.steer(job.job_id, text):
+                return "added"
+            return "restart"
         job.pending_steers.append(text)  # queued: delivered when it starts
         return "added for when it starts"
 
@@ -315,6 +494,9 @@ class VoiceBridge(QObject):
         with self._lock:
             self._unsubmitted.pop(job.token, None)
             job.job_id, job.lane = job_id, lane
+            early = self._jobs.get(job_id)
+            if early is not None and early.source == "text":
+                job.state = early.state  # the runtime said "started" before submit returned
             self._jobs[job_id] = job
         self._log("bridge", op="submitted", token=job.token, job_id=job_id, lane=lane)
 
@@ -325,13 +507,16 @@ class VoiceBridge(QObject):
     def _cancel(self, job: Job) -> None:
         # Queued on the GUI thread after this job's _submit, so its id is known.
         job.cancel_requested = True
+        if job.log is not None:
+            job.log.add("the user", "asked to stop")
         if job.job_id is not None:
             how = self.runtime.cancel(job.job_id)
             self._log("bridge", op="cancelled", job_id=job.job_id, how=how)
 
     def _typed(self, lane: str, job_id: int, request: str) -> Job:
-        """A job the bridge did not submit (typed in the overlay): tracked for yuki_status."""
-        job = Job(job_id=job_id, request=request, source="text", lane=lane, state=RUNNING)
+        """A job the bridge did not submit (typed in the overlay): tracked for progress questions."""
+        job = Job(job_id=job_id, request=request, source="text", lane=lane, state=RUNNING,
+                  log=JobLog(request=request), pacer=StepPacer(0))
         with self._lock:
             self._jobs[job_id] = job
         return job
@@ -339,6 +524,8 @@ class VoiceBridge(QObject):
     def _on_started(self, lane: str, job_id: int, request: str) -> None:
         job = self._job(job_id) or self._typed(lane, job_id, request)
         job.lane, job.state = lane, RUNNING
+        if job.log is not None:
+            job.log.add("started", f"on the {lane.replace('_', ' ')}")
         steers, job.pending_steers = job.pending_steers, []
         for text in steers:
             self._steer(job, job_id, text)
@@ -346,14 +533,33 @@ class VoiceBridge(QObject):
 
     def _on_tool_called(self, lane: str, job_id: int, name: str, tool_input: dict) -> None:
         job = self._job(job_id)
-        if job is not None:
-            job.step = tool_label(name) or name.replace("_", " ")
+        if job is None:
+            return
+        step = step_of(name, tool_input)
+        if step is None:
+            return
+        label, detail = step
+        job.step = label
+        if job.log is not None:
+            job.log.steps += 1
+            job.log.add("step", label + (f" ({detail})" if detail else ""))
+        if job.source == "voice" and job.pacer is not None and job.pacer.offer(label):
+            self._post(job, "step", (label, detail))
+            self._log("bridge", op="step", job_id=job_id, tool=name)
+
+    def _on_tool_finished(self, lane: str, job_id: int, name: str, ok: bool, summary: str) -> None:
+        job = self._job(job_id)
+        if job is None or job.log is None or step_of(name, None) is None:
+            return
+        job.log.add("returned", f"{job.step or name}: {'ok' if ok else 'failed'}, {summary}")
 
     def _on_said(self, lane: str, job_id: int, text: str) -> None:
         job = self._job(job_id)
         if job is None:
             return
         job.last_say = text
+        if job.log is not None:
+            job.log.add("said to the user", text)
         self._post(job, "say", text)
 
     def _on_asked(self, lane: str, job_id: int, question: str) -> None:
@@ -361,6 +567,8 @@ class VoiceBridge(QObject):
         if job is None:
             return
         job.state, job.question, job.lane = WAITING, question, lane
+        if job.log is not None:
+            job.log.add("asked the user", question)
         self._post(job, "ask", question)
         self._log("bridge", op="state", job_id=job_id, state=WAITING)
 
@@ -382,6 +590,8 @@ class VoiceBridge(QObject):
             return  # the front desk passed it to the worker: handed_off follows with the new id
         kind, text = job.closing or ("failed", "It stopped without saying anything.")
         state = DONE if kind == "done" else (CANCELLED if job.cancel_requested else FAILED)
+        if job.log is not None:
+            job.log.add("finished" if kind == "done" else "stopped", text)
         self._finish(job, state, text)
         self._post(job, kind, text)
         self._log("bridge", op="state", job_id=job_id, state=state, source=job.source)
@@ -394,6 +604,8 @@ class VoiceBridge(QObject):
                 self._jobs[new_id] = job
         if job is None:
             return
+        if job.log is not None:
+            job.log.add("queued", "it needs Yuki's hands; waiting for the task before it")
         ahead = max(0, waiting - 1)
         self._post(job, "queued", "It needs Yuki's hands; queued behind the current task"
                    + (f" ({ahead} more ahead)" if ahead else "") + ".")
@@ -405,8 +617,7 @@ class VoiceBridge(QObject):
             finished = next((j for j in reversed(self._finished) if j.job_id == job_id), None)
         if finished is None or finished.source != "voice":
             return
-        follow = Job(job_id=None, request="(added to the earlier task) " + " ".join(texts),
-                     events=asyncio.Queue() if self._loop else None, token=next(self._tokens))
+        follow = self._new_job("(added to the earlier task) " + " ".join(texts), with_queue=self._loop is not None)
         with self._lock:
             self._unsubmitted[follow.token] = follow
         self._submit(follow, "\n".join(texts) + "\n\n[Added by voice right after the previous request finished.]",
@@ -417,8 +628,25 @@ class VoiceBridge(QObject):
             async def relay() -> None:
                 while True:
                     kind, payload = await follow.events.get()
-                    await announce(result_payload(kind, payload) if kind in ("done", "failed") else
-                                   {{"say": "yuki_says", "ask": "yuki_asks"}.get(kind, kind): payload})
+                    if kind == "step":
+                        continue
+                    if kind in ("done", "failed"):
+                        head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
+                        follow.rest = rest
+                        body = result_payload(kind, head, more=bool(rest))
+                    else:
+                        body = {{"say": "yuki_says", "ask": "yuki_asks"}.get(kind, kind): payload}
+
+                    async def deliver(run_llm: bool, stale: bool, body=body) -> None:
+                        del stale
+                        await announce(body, run_llm)
+
+                    gate = self.gate
+                    if gate is not None:
+                        gate.enqueue(Item(job=follow.token, kind="final" if kind in ("done", "failed") else kind,
+                                          deliver=deliver))
+                    else:
+                        await deliver(True, False)
                     if kind in ("done", "failed"):
                         return
             asyncio.run_coroutine_threadsafe(relay(), loop)

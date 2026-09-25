@@ -151,8 +151,9 @@ class FakeRuntime(QObject):
 
 
 class Params:
-    def __init__(self, message: str, intent: str = "new_task", heard: str = "hey yuki do it") -> None:
-        self.arguments = {"message": message, "intent": intent}
+    def __init__(self, message: str, intent: str = "new_task", heard: str = "hey yuki do it",
+                 context: str | None = None) -> None:
+        self.arguments = {"request": message, "intent": intent, **({"context": context} if context else {})}
         self.tool_call_id = "call-1"
         self.context = SimpleNamespace(get_messages=lambda: [{"role": "user", "content": heard}])
         self.results: list[tuple[dict, bool]] = []
@@ -169,6 +170,13 @@ async def _settle() -> None:
     for _ in range(5):
         _pump()
         await asyncio.sleep(0)
+
+
+async def _pumping() -> None:
+    """Keep the GUI thread's queue moving while a handler awaits a GUI decision (a follow-up)."""
+    while True:
+        _pump()
+        await asyncio.sleep(0.001)
 
 
 def test_new_task_relays_say_then_final() -> None:
@@ -189,7 +197,8 @@ def test_new_task_relays_say_then_final() -> None:
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle()
         await asyncio.wait_for(task, 1)
-        assert params.results == [({"yuki_says": "Found three invoices"}, False), ({"result": "Total is 48,200", "how_to_say_it": SPOKEN_NOTE}, True)]
+        assert params.results == [({"yuki_says": "Found three invoices"}, False),
+                                  ({"result": "Total is 48,200", "more_available": False, "how_to_say_it": SPOKEN_NOTE}, True)]
         assert bridge.open_voice_jobs() == 0
 
     asyncio.run(main())
@@ -228,6 +237,7 @@ def test_follow_up_routes_by_state() -> None:
         task = asyncio.create_task(bridge.tell_yuki(first))
         await _settle()
         job = rt.submitted[0][0]
+        pump = asyncio.create_task(_pumping())
         # queued: held, delivered when it starts
         await bridge.tell_yuki(Params("Use YouTube", intent="follow_up"))
         assert rt.steers == []
@@ -242,6 +252,7 @@ def test_follow_up_routes_by_state() -> None:
         await _settle()
         assert rt.answers and rt.answers[0][0] == "worker"
         assert ({"yuki_asks": "Beats or Study?"}, False) in first.results
+        pump.cancel()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -319,3 +330,309 @@ def test_voice_off_imports_nothing_heavy() -> None:
             "print(any(m in sys.modules for m in ('pipecat', 'sounddevice', 'sherpa_onnx')))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "False"
+
+
+# ---------------------------------------------------------------------------
+# v3: condensation, the narrator gate, progress from real steps, follow-up
+# restarts, check_progress, more_of_result, grounding
+# ---------------------------------------------------------------------------
+
+
+def test_condense_keeps_whole_sentences_and_the_rest() -> None:
+    from yuki.voice.narrator import condense
+
+    text = ("You spent most of today in VS Code on the voice work. You also had two calls, "
+            "one with Priya at 3.5 hours in. Then YouTube for an hour. And a walk.")
+    head, rest = condense(text, max_sentences=2, max_chars=200)
+    assert head.startswith("You spent most of today") and head.endswith("hours in.")
+    assert rest == "Then YouTube for an hour. And a walk."
+    head, rest = condense("- first item\n- second item\n- third", max_sentences=2, max_chars=200)
+    assert head == "first item second item" and rest == "third"
+    long = "word " * 120
+    head, rest = condense(long, max_sentences=2, max_chars=100)
+    assert len(head) <= 102 and head.endswith("…") and rest
+
+
+class _State:
+    def __init__(self) -> None:
+        self.s = {"user_speaking": False, "bot_speaking": False, "generating": False, "owes_reply": False,
+                  "busy_tools": 0, "last_bot_stop": 0.0, "user_turns": 0}
+
+    def __call__(self) -> dict:
+        return dict(self.s)
+
+
+def _gate(state: _State, **kw: Any) -> Any:
+    from yuki.voice.narrator import NarratorGate
+
+    return NarratorGate(state, settle_s=kw.get("settle", 0.05), settle_max_s=0.5, cooldown_s=kw.get("cool", 0.05),
+                        stale_turns=kw.get("stale", 2))
+
+
+def test_gate_merges_near_results_into_one_turn() -> None:
+    from yuki.voice.narrator import Item
+
+    async def main() -> None:
+        state, got = _State(), []
+        gate = _gate(state)
+        gate.start()
+
+        def deliver(name: str) -> Any:
+            async def d(run_llm: bool, stale: bool) -> None:
+                got.append((name, run_llm, stale))
+            return d
+
+        gate.enqueue(Item(job=1, kind="final", deliver=deliver("a")))
+        await asyncio.sleep(0.02)
+        gate.enqueue(Item(job=2, kind="final", deliver=deliver("b")))
+        await asyncio.sleep(0.3)
+        assert got == [("a", False, False), ("b", True, False)]  # one mouth run for both
+        assert gate.stats["turns"] == 1 and gate.stats["merged"] == 1
+        await gate.stop()
+
+    asyncio.run(main())
+
+
+def test_gate_holds_while_user_speaks_and_folds_stale_results() -> None:
+    from yuki.voice.narrator import Item
+
+    async def main() -> None:
+        state, got = _State(), []
+        gate = _gate(state, stale=2)
+        gate.start()
+
+        async def d(run_llm: bool, stale: bool) -> None:
+            got.append((run_llm, stale))
+
+        state.s["user_speaking"] = True
+        gate.enqueue(Item(job=1, kind="final", deliver=d))
+        await asyncio.sleep(0.2)
+        assert got == []  # held while the user talks
+        state.s["user_turns"] = 1
+        gate.poke()
+        await asyncio.sleep(0.05)
+        assert got == []
+        state.s["user_turns"] = 2  # the conversation moved on two turns: stale
+        gate.poke()
+        await asyncio.sleep(0.05)
+        assert got == [(False, True)]  # folded silently, never spoken
+        assert gate.stats["folded"] == 1
+        await gate.stop()
+
+    asyncio.run(main())
+
+
+def test_gate_supersedes_progress_and_waits_for_cooldown() -> None:
+    import time as _t
+
+    from yuki.voice.narrator import Item
+
+    async def main() -> None:
+        state, got, dropped = _State(), [], []
+        gate = _gate(state, cool=0.3)
+        gate.start()
+        state.s["last_bot_stop"] = _t.monotonic()
+
+        def d(name: str) -> Any:
+            async def deliver(run_llm: bool, stale: bool) -> None:
+                got.append(name)
+            return deliver
+
+        gate.enqueue(Item(job=1, kind="step", deliver=d("step1"), drop=lambda: dropped.append("step1")))
+        gate.enqueue(Item(job=1, kind="step", deliver=d("step2")))
+        await asyncio.sleep(0.15)
+        assert got == []  # still in the cooldown after Yuki's own speech
+        await asyncio.sleep(0.4)
+        assert got == ["step2"] and dropped == ["step1"]
+        await gate.stop()
+
+    asyncio.run(main())
+
+
+def test_steps_come_from_real_tool_calls_paced_by_activity() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None, settings=Settings(voice_progress_lines=2))
+        bridge.attach(asyncio.get_running_loop())
+        params = Params("What have I done today?")
+        task = asyncio.create_task(bridge.tell_yuki(params))
+        await _settle()
+        job = rt.submitted[0][0]
+        rt.started.emit("worker", job, "x")
+        for name, inp in (("activity", {"since": "2026-09-25"}), ("activity", {"since": "2026-09-25"}),
+                          ("note_to_self", {"text": "x"}), ("recall", {"query": "calls today"}),
+                          ("look_at_window", {"hwnd": 1})):
+            rt.tool_called.emit("worker", job, name, inp)
+        await _settle()
+        steps = [r for r, _ in params.results if "progress" in r]
+        # the same tool twice is one step, note_to_self is not a step, and at most two lines
+        assert [s["progress"] for s in steps] == ["Looking at how your time went", "Remembering"]
+        assert steps[0]["about"] == "since: 2026-09-25" and steps[1]["about"] == "query: calls today"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+
+def test_follow_up_to_a_finishing_task_starts_a_new_one() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None)
+        bridge.attach(asyncio.get_running_loop())
+        first = Params("Play lo-fi on Spotify")
+        task = asyncio.create_task(bridge.tell_yuki(first))
+        await _settle()
+        job = rt.submitted[0][0]
+        rt.started.emit("worker", job, "x")
+        rt.finished.emit("worker", job, "Lo-fi is playing on Spotify.")  # closing, lane_done not yet
+        await _settle()
+        pump = asyncio.create_task(_pumping())
+        follow = Params("Actually use YouTube", intent="follow_up")
+        follow_task = asyncio.create_task(bridge.tell_yuki(follow))
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if len(rt.submitted) == 2:
+                break
+        assert len(rt.submitted) == 2 and rt.steers == []  # not steered into a closing task
+        assert "Actually use YouTube" in rt.submitted[1][1] and "Play lo-fi on Spotify" in rt.submitted[1][1]
+        assert follow.results == []  # it carries the new task's outcome, not a "passed on"
+        new = rt.submitted[1][0]
+        rt.lane_done.emit("worker", job, "x", False, [])
+        rt.started.emit("worker", new, "y")
+        rt.finished.emit("worker", new, "Switched to YouTube.")
+        rt.lane_done.emit("worker", new, "y", False, [])
+        await asyncio.wait_for(asyncio.gather(task, follow_task), 1)
+        pump.cancel()
+        assert follow.results[-1][0]["result"] == "Switched to YouTube."
+
+    asyncio.run(main())
+
+
+def test_check_progress_answers_from_the_log_only() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None)
+        bridge.attach(asyncio.get_running_loop())
+        seen: dict[str, str] = {}
+
+        async def answerer(log_text: str, question: str) -> tuple[str, dict]:
+            seen["log"], seen["q"] = log_text, question
+            return "I'm going through your activity now.", {"ms": 5}
+
+        bridge.progress_answerer = answerer
+        task = asyncio.create_task(bridge.tell_yuki(Params("What have I done today?")))
+        await _settle()
+        job = rt.submitted[0][0]
+        rt.started.emit("worker", job, "x")
+        rt.tool_called.emit("worker", job, "activity", {"since": "2026-09-25"})
+        await _settle()
+        progress = Params("")
+        progress.arguments = {"question": "how's it going?"}
+        await bridge.check_progress(progress)
+        assert progress.results[-1][0]["progress"] == "I'm going through your activity now."
+        assert "Request: What have I done today?" in seen["log"] and "Looking at how your time went" in seen["log"]
+        assert seen["q"] == "how's it going?"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+
+def test_long_result_is_cut_and_the_rest_waits() -> None:
+    async def main() -> None:
+        rt = FakeRuntime()
+        bridge = VoiceBridge(rt, foreground=lambda: None, settings=Settings(voice_result_sentences=1))
+        bridge.attach(asyncio.get_running_loop())
+        params = Params("What have I done today?")
+        task = asyncio.create_task(bridge.tell_yuki(params))
+        await _settle()
+        job = rt.submitted[0][0]
+        rt.started.emit("worker", job, "x")
+        rt.finished.emit("worker", job, "Mostly coding in VS Code. Two calls in the afternoon. YouTube at night.")
+        rt.lane_done.emit("worker", job, "x", False, [])
+        await _settle()
+        await asyncio.wait_for(task, 1)
+        final = params.results[-1][0]
+        assert final["result"] == "Mostly coding in VS Code." and final["more_available"] is True
+        more = Params("")
+        await bridge.more_of_result(more)
+        assert more.results[-1][0]["more"] == "Two calls in the afternoon."
+        await bridge.more_of_result(more)
+        assert more.results[-1][0]["more"] == "YouTube at night." and more.results[-1][0]["more_available"] is False
+        await bridge.more_of_result(more)
+        assert more.results[-1][0]["more"] is None
+
+    asyncio.run(main())
+
+
+def test_grounding_takes_life_facts_and_never_waits_long() -> None:
+    import threading as _th
+    import time as _t
+
+    from yuki.voice.grounding import Grounder, format_facts
+
+    release = _th.Event()
+
+    class FakeClient:
+        def recall(self, query: str, limit: int = 15) -> list[dict]:
+            if "slow" in query:
+                release.wait(2)
+            return [{"kind": "chat", "fact": "The user said: hi", "at": None},
+                    {"kind": "fact", "fact": "The user's accountant is Priya.", "at": "2026-09-22T10:00:00",
+                     "app": "Gmail", "nature": "fact"},
+                    {"kind": "fact", "fact": "The user joked they are a potato.", "at": None, "nature": "humor"}]
+
+    class FakeMemory:
+        def call(self, what: str, fn: Any, *, timeout_s: float) -> Any:
+            return fn(FakeClient())
+
+    async def main() -> None:
+        g = Grounder(FakeMemory(), facts=4)
+        g.new_turn()
+        g.final("who is my accountant")
+        lookup, how = await g.for_call(500)
+        assert how == "final" and [f["kind"] for f in lookup.facts] == ["fact", "fact"]
+        text = format_facts(lookup.facts)
+        assert "Priya" in text and "Gmail" in text and "[humor: not a plain fact]" in text and "hi" not in text
+        g.new_turn()
+        g.final("slow question")
+        started = _t.perf_counter()
+        lookup, how = await g.for_call(60)
+        assert (_t.perf_counter() - started) < 0.2 and how == "previous"  # did not wait for the slow lookup
+        release.set()
+
+    asyncio.run(main())
+
+
+def test_volatile_block_goes_after_every_cache_breakpoint() -> None:
+    from yuki.voice.mouth import MouthMemory, mouth_system_blocks, volatile_block
+    from yuki.voice.pipeline import with_volatile
+
+    blocks = mouth_system_blocks(MouthMemory(source="db", standing="Rules:\n- be brief"))
+    assert all("[Now:" not in b["text"] for b in blocks)
+    history = [
+        {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "hey"}]},
+        {"role": "user", "content": [{"type": "text", "text": "what time is it", "cache_control": {"type": "ephemeral"}}]},
+    ]
+    sent = with_volatile(history, volatile_block(lookup="- (fact) x"))
+    assert sent[-1]["content"][-1]["text"].startswith("[Now:") and "cache_control" not in sent[-1]["content"][-1]
+    assert sent[-1]["content"][0]["cache_control"] and history[-1]["content"][-1]["text"] == "what time is it"
+    assert sent[:2] == history[:2]  # nothing before the newest user message changes
+
+
+def test_mouth_memory_does_not_embed() -> None:
+    from yuki.voice.mouth import fetch_memory
+
+    seen: dict[str, Any] = {}
+
+    class Mem:
+        def context(self, **kw: Any) -> Any:
+            seen.update(kw)
+            return SimpleNamespace(todos=[], portrait=None, standing=None, resume=None, source="db", error=None,
+                                   elapsed_ms=1.0)
+
+    fetch_memory(Mem())
+    assert seen["query"] == ""  # a query would load the ~600 MB embedder for know-how the mouth never reads

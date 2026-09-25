@@ -112,6 +112,59 @@ BACKGROUND = [
 ]
 
 
+#: v3 (2026-09-25): the user's side of the behaviour scenarios, in an ElevenLabs voice.
+V3_VOICE = ("elevenlabs", "nPczCjzI2devNBz1zQrb")  # Brian (a premade voice)
+V3_SCENARIO = [
+    ("v3_hello", "Hey Yuki, how's your day going?"),
+    ("v3_run", "Haha nice. I just got back from a run and I'm totally dead."),
+    ("v3_today", "Yuki, what have I done today?"),
+    ("v3_time", "Oh wait, what time is it right now?"),
+    ("v3_status", "How's it going?"),
+    ("v3_rest", "Yeah, tell me the rest."),
+    ("v3_invoices", "Yuki, add up my September invoices in the Downloads folder."),
+    ("v3_steer", "Actually, only count the ones above five thousand rupees."),
+    ("v3_music", "Yuki, put on some lo-fi music on Spotify."),
+    ("v3_cancel", "Actually no, stop that, never mind."),
+    ("v3_long", "So my plan for the weekend is to finally clean the flat, then maybe go see a movie with Rohan, "
+                "and on Sunday I really want to cook something nice, like a proper biryani, from scratch."),
+    ("v3_chat1", "Anyway, do you like biryani?"),
+    ("v3_chat2", "What's your favourite colour?"),
+    ("v3_chat3", "Ha, fair enough. Okay, and dogs or cats?"),
+    ("v3_ask_back", "Did you ever find that invoice total?"),
+    ("v3_two_a", "Yuki, how much time did I spend on YouTube today?"),
+    ("v3_two_b", "And when did I last talk to Rohan?"),
+    ("v3_thanks", "Perfect, thanks."),
+]
+#: Clips with natural pauses mid-sentence ("|" = a pause of PAUSE_S), for end-of-turn tuning.
+PAUSE_S = 0.9
+V3_PAUSES = [
+    ("p_think", "So I was thinking... | maybe we could check my calendar for tomorrow."),
+    ("p_list", "Can you open Spotify, | and then play my focus playlist?"),
+    ("p_um", "What did Rohan say about, um... | the flat deposit?"),
+    ("p_two", "Remind me to call my mom | at seven tonight."),
+    ("p_long", "I need you to find the invoice from Acme... | the one from early September... | and tell me the total."),
+    ("p_none1", "What's the weather like tomorrow morning?"),
+    ("p_none2", "Play something chill on YouTube."),
+]
+#: More wake-word clips, in ElevenLabs voices (positives and the confusable negatives).
+V3_WAKE_VOICES = [("elevenlabs", "nPczCjzI2devNBz1zQrb"), ("elevenlabs", "EXAVITQu4vr4xnSDxMaL"),
+                  ("elevenlabs", "TX3LPaxmHKxFdv7VOQHJ"), ("elevenlabs", "pFZP5JQG7iQjIQuC4Bku")]
+V3_WAKE_POS = [
+    ("yuki_hey", "Yuki, hey."),
+    ("yuki_fast", "Yuki what's on my calendar"),
+    ("yuki_ok", "Okay Yuki, play some music."),
+    ("yuki_mid2", "Hmm, Yuki, what did I do yesterday?"),
+]
+V3_WAKE_NEG = [
+    ("yucky2", "That was so yucky, honestly."),
+    ("you_key2", "You key in your password here."),
+    ("cookie2", "Grab me a cookie, would you?"),
+    ("you_kid", "Are you kidding me right now?"),
+    ("euchre", "We played euchre all night."),
+    ("ukulele2", "Is that a ukulele?"),
+]
+
+
 class Budget:
     def __init__(self) -> None:
         self.chars: dict[str, int] = {}
@@ -219,6 +272,19 @@ def synth(provider: str, text: str, voice: str, path: Path, budget: Budget) -> n
     raise ValueError(provider)
 
 
+def synth_paused(provider: str, text: str, voice: str, path: Path, budget: Budget) -> np.ndarray:
+    """``text`` with ``|`` marks: each part said on its own, joined by ``PAUSE_S`` of silence."""
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+    gap = np.zeros(int(PAUSE_S * RATE), np.float32)
+    out: list[np.ndarray] = []
+    for i, part in enumerate(parts):
+        audio = synth(provider, part, voice, path, budget)
+        out.append(audio.astype(np.float32))
+        if i < len(parts) - 1:
+            out.append(gap)
+    return np.concatenate(out)
+
+
 def pad(samples: np.ndarray, lead_s: float = 0.3, tail_s: float = 0.5) -> np.ndarray:
     return np.concatenate([np.zeros(int(lead_s * RATE), np.float32), samples.astype(np.float32),
                            np.zeros(int(tail_s * RATE), np.float32)])
@@ -254,13 +320,28 @@ def plan(which: str) -> list[dict]:
         for name, text, provider, voice in BACKGROUND:
             items.append({"set": "background", "name": name, "language": "hi" if provider == "piper" else "en",
                           "text": text, "provider": provider, "voice": voice, "wake": False})
+    if which in ("v3", "all"):
+        provider, voice = V3_VOICE
+        for name, text in V3_SCENARIO:
+            items.append({"set": "v3", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": "yuki" in text.lower()})
+        for name, text in V3_PAUSES:
+            items.append({"set": "pause", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": False, "pauses": text.count("|")})
+        for provider, voice in V3_WAKE_VOICES:
+            for name, text in V3_WAKE_POS:
+                items.append({"set": "wake", "name": f"{name}__el{voice[:4]}", "language": "en", "text": text,
+                              "provider": provider, "voice": voice, "wake": True})
+            for name, text in V3_WAKE_NEG:
+                items.append({"set": "wake", "name": f"{name}__el{voice[:4]}", "language": "en", "text": text,
+                              "provider": provider, "voice": voice, "wake": False})
     return items
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "all"))
+    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)
@@ -278,11 +359,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if args.dry_run:
             if item["provider"] in ("deepgram", "elevenlabs"):
-                budget.add(item["provider"], item["text"])
+                budget.add(item["provider"], item["text"].replace("|", ""))
             continue
         started = time.perf_counter()
         try:
-            samples = synth(item["provider"], item["text"], item["voice"], path, budget)
+            if "|" in item["text"]:
+                samples = synth_paused(item["provider"], item["text"], item["voice"], path, budget)
+            else:
+                samples = synth(item["provider"], item["text"], item["voice"], path, budget)
         except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
             print(f"FAILED {item['name']}: {type(exc).__name__}: {getattr(exc, 'code', '')}", file=sys.stderr)
             continue

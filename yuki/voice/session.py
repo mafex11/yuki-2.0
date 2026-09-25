@@ -4,7 +4,7 @@ States, and what each one costs:
 
 * **off** (the default): nothing. No thread, no socket, no model, no open
   microphone; ``yuki.voice`` has not even imported Pipecat.
-* **listening for "Yuki"** (tray switch, remembered): the shared microphone is
+* **listening for "Yuki"** (on by default; tray switch, remembered): the shared microphone is
   open and :class:`~yuki.voice.wake.WakeListener` decodes it locally on one
   thread. No network. Paused while a call or meeting is on (unless
   ``voice_wake_during_calls``), so saying the name to friends does nothing.
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 import uuid
@@ -39,6 +40,14 @@ PREFS_PATH = Path.home() / "AppData" / "Local" / "Yuki" / "voice.json"
 #: How much audio from before the wake word's end is replayed into the conversation
 #: (the name itself; the spotter fires as it ends).
 WAKE_PREROLL_S = 1.2
+
+#: Environment variable that sets the ElevenLabs voice id (the tray's "Voice id…" wins over it).
+VOICE_ID_ENV = "YUKI_VOICE_ID"
+
+
+def voice_id(settings: Settings, prefs: dict[str, Any]) -> str:
+    """The TTS voice id in force: the tray's choice (``voice.json``), else ``YUKI_VOICE_ID``, else the setting."""
+    return str(prefs.get("tts_voice") or os.environ.get(VOICE_ID_ENV) or settings.voice_tts_voice or "").strip()
 
 
 def load_prefs(path: Path = PREFS_PATH) -> dict[str, Any]:
@@ -91,7 +100,7 @@ class VoiceSession(QObject):
         self.memory = memory
         self.ui_log = ui_log
         self.log = VoiceLog(settings.voice_log_dir, settings.project_root / "logs" / "voice_turns.csv")
-        self.bridge = VoiceBridge(runtime, self.log)
+        self.bridge = VoiceBridge(runtime, self.log, settings=settings)
         self._prefs_path = prefs_path
         prefs = load_prefs(prefs_path)
         self.wake_enabled = bool(prefs.get("wake", settings.voice_wake))
@@ -113,7 +122,7 @@ class VoiceSession(QObject):
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        """App start: listen for the name only if the user turned that on. Nothing else starts."""
+        """App start: listen for the name unless the user turned that off (it is on by default). Nothing else starts."""
         if self.wake_enabled:
             self._apply_wake()
 
@@ -153,6 +162,25 @@ class VoiceSession(QObject):
         self.log.event("wake", state="enabled" if enabled else "disabled")
         self._apply_wake()
         self.wake_changed.emit(self.wake_enabled)
+
+    @property
+    def tts_voice(self) -> str:
+        """The voice id conversations use (empty: the provider's default)."""
+        return voice_id(self.settings, load_prefs(self._prefs_path))
+
+    def set_tts_voice(self, voice: str) -> None:
+        """The tray's "Voice id…": remembered in ``voice.json``; the next conversation uses it (empty: default)."""
+        prefs = load_prefs(self._prefs_path)
+        voice = (voice or "").strip()
+        if voice:
+            prefs["tts_voice"] = voice
+        else:
+            prefs.pop("tts_voice", None)
+        save_prefs(prefs, self._prefs_path)
+        from yuki.voice.pipeline import forget_tts_check
+
+        forget_tts_check()
+        self.log.event("voice_id", state="set" if voice else "default", chars=len(voice))
 
     def on_call_status(self, status: object) -> None:
         """Memory's call status changed (``CallController.changed``): gate the wake word."""
@@ -239,7 +267,8 @@ class VoiceSession(QObject):
             listener.stop()
             heard = listener.heard_s
             self.log.event("wake", state="stopped", heard_s=round(heard, 1), decoded_s=round(listener.audio_s, 1),
-                           cpu_pct_one_core=round(100 * listener.decode_s / heard, 3) if heard else None)
+                           cpu_pct_one_core=round(100 * listener.decode_s / heard, 3) if heard else None,
+                           near_misses=listener.near_misses)
 
     def _on_wake_heard(self, at: float) -> None:
         if not self._wake_allowed() or self.in_conversation:
@@ -277,11 +306,14 @@ class VoiceSession(QObject):
         from yuki.voice.mouth import fetch_memory
         from yuki.voice.pipeline import Conversation, VoiceUnavailable, preflight
 
+        from dataclasses import replace
+
         started = time.monotonic()
         reason, error = "error", ""
         speaker = None
+        settings = replace(self.settings, voice_tts_voice=voice_id(self.settings, load_prefs(self._prefs_path)))
         try:
-            facts = preflight(self.settings)
+            facts = preflight(settings)
             mouth_memory = fetch_memory(self.memory)
             mic = self._ensure_mic()
             speaker = Speaker(24_000, self.settings.voice_output_device)
@@ -295,9 +327,10 @@ class VoiceSession(QObject):
             since = (wake_at - WAKE_PREROLL_S) if wake_at is not None else None
             transport = PairTransport(MicInput(mic, params, backlog_since=since), SpeakerOutput(speaker, params))
             conversation = Conversation(
-                settings=self.settings, bridge=self.bridge, transport=transport, memory=self.memory,
+                settings=settings, bridge=self.bridge, transport=transport, memory=self.memory,
                 mouth_memory=mouth_memory, log=self.log,
                 speech_end=lambda: mic.stats.last_voiced or None,
+                voice_activity=lambda: (mic.stats.voiced_since, mic.stats.last_voiced),
                 on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
                 tts_provider=facts.get("tts_provider"),
             )
@@ -309,7 +342,8 @@ class VoiceSession(QObject):
                            headphones=facts.get("output"), stt=self.settings.voice_stt_model,
                            mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
                            tts_note=facts.get("tts_note"),
-                           tts_model=self.settings.voice_tts_model, memory=mouth_memory.facts())
+                           tts_model=self.settings.voice_tts_model, tts_voice_set=bool(settings.voice_tts_voice),
+                           memory=mouth_memory.facts())
             reason = asyncio.run(conversation.run())
             if conversation.observer.fatal:
                 error = _plain_error(conversation.observer.fatal)

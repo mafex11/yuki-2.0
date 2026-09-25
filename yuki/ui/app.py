@@ -769,6 +769,21 @@ def build_tray(ui: YukiUi, app: QApplication) -> QSystemTrayIcon:
     wake_item.triggered.connect(lambda checked: ui.voice.set_wake(bool(checked)))
     menu.addAction(wake_item)
 
+    def choose_voice() -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getText(
+            None, "Yuki's voice",
+            "ElevenLabs voice id (from the voice's page in ElevenLabs).\nLeave empty for the default voice.",
+            text=ui.voice.tts_voice,
+        )
+        if ok:
+            ui.voice.set_tts_voice(text)
+
+    voice_id_item = QAction("Voice id…", menu)
+    voice_id_item.triggered.connect(choose_voice)
+    menu.addAction(voice_id_item)
+
     # Model and effort: one checkable item per choice, the current one ticked.
     # Both go through the runtime, so both lanes switch and each agent logs it.
     menu.addSeparator()

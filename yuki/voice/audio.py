@@ -95,6 +95,8 @@ class MicStats:
     blocks: int = 0
     overflows: int = 0
     last_voiced: float = 0.0
+    #: Start of the current stretch of voiced blocks (gaps under half a second join them).
+    voiced_since: float = 0.0
 
 
 class SharedMic:
@@ -208,6 +210,8 @@ class SharedMic:
         pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         self.stats.blocks += 1
         if peak >= self._voiced_floor:
+            if at - self.stats.last_voiced > 0.5:
+                self.stats.voiced_since = at
             self.stats.last_voiced = at + len(mono) / RATE
         with self._lock:
             self._backlog.append((at, pcm))

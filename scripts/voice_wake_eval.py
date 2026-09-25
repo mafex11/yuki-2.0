@@ -11,7 +11,12 @@ For each keyword-spotting model and each (threshold, boost) pair it reports:
 
 Usage::
 
-    uv run python scripts/voice_wake_eval.py --clips <dir with manifest.json> [--models zh-en-3M,gigaspeech-3.3M]
+    uv run python scripts/voice_wake_eval.py --clips <dir with manifest.json> [<more dirs>] [--models ...] [--babble-snr 10]
+
+``--babble-snr`` mixes the background-talk clips into every clip at that signal-to-noise
+ratio (the wake word in a room where people talk). The spotter's competing variants
+(``yuki.voice.wake.MODELS``) are in force, so a sound-alike reported instead of the name
+counts as no wake.
 """
 
 from __future__ import annotations
@@ -31,7 +36,8 @@ from yuki.voice.transport import load_clip  # noqa: E402
 from yuki.voice.wake import MODELS, WakeSpotter  # noqa: E402
 
 RATE = 16_000
-SIMILAR = ("you_key", "cookie", "yucky", "ukulele", "youtube", "tokyo")
+SIMILAR = ("you_key", "cookie", "yucky", "ukulele", "youtube", "tokyo", "you_key2", "cookie2", "yucky2", "you_kid",
+           "euchre", "ukulele2", "fw_story", "fw_mom")
 
 
 def group(name: str) -> str:
@@ -58,15 +64,27 @@ def run_clip(spotter: WakeSpotter, audio: np.ndarray) -> tuple[int, float]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--clips", required=True, type=Path)
+    ap.add_argument("--clips", required=True, type=Path, nargs="+")
+    ap.add_argument("--babble-snr", dest="babble_snr", type=float, default=None)
     ap.add_argument("--models", default=",".join(MODELS))
-    ap.add_argument("--thresholds", default="0.1,0.15,0.2,0.25,0.3,0.4")
-    ap.add_argument("--boosts", default="1.0,2.0,3.0")
+    ap.add_argument("--thresholds", default="0.15,0.2,0.25,0.3")
+    ap.add_argument("--boosts", default="2.0")
     ap.add_argument("--json", type=Path, help="write the results table here")
     args = ap.parse_args(argv)
-    manifest = json.loads((args.clips / "manifest.json").read_text(encoding="utf-8"))
+    manifest = [c for d in args.clips for c in json.loads((d / "manifest.json").read_text(encoding="utf-8"))]
     wake = [c for c in manifest if c["set"] in ("wake", "background")]
     audio = {c["name"]: load_clip(Path(c["file"])) for c in wake}
+    if args.babble_snr is not None:
+        babble = np.concatenate([audio[c["name"]] for c in wake if c["set"] == "background"])
+        rng = np.random.default_rng(1)
+        for c in wake:
+            if c["set"] != "wake":
+                continue
+            x = audio[c["name"]]
+            start = int(rng.integers(0, max(1, len(babble) - len(x))))
+            n = np.resize(babble[start:start + len(x)], len(x))
+            gain = np.sqrt((np.mean(x ** 2) + 1e-9) / (np.mean(n ** 2) + 1e-9) / 10 ** (args.babble_snr / 10))
+            audio[c["name"]] = (x + n * gain).astype(np.float32)
     positives = [c for c in wake if c["wake"]]
     negatives = [c for c in wake if not c["wake"]]
     gap = np.zeros(int(0.8 * RATE), np.float32)

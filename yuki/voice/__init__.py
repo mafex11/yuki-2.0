@@ -7,6 +7,9 @@ Layout (§17):
 * :mod:`yuki.voice.pipeline` - one conversation's Pipecat pipeline and its measurements.
 * :mod:`yuki.voice.mouth` - the mouth's prompt, tools and memory context.
 * :mod:`yuki.voice.bridge` - job table and hand-over between the mouth and the brain.
+* :mod:`yuki.voice.narrator` - when the brain's news is said (the gate) and how much (condense).
+* :mod:`yuki.voice.progress` - the brain's real action log, spoken steps, "how's it going?".
+* :mod:`yuki.voice.grounding` - the memory lookup on every user turn.
 * :mod:`yuki.voice.audio` / :mod:`yuki.voice.transport` - devices and Pipecat transports.
 * :mod:`yuki.voice.wake` - the local "Yuki" keyword spotter.
 * :mod:`yuki.voice.log` - the content-free voice log.

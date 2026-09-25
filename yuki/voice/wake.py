@@ -11,8 +11,12 @@ so what the user said right after the name is heard too.
 Open vocabulary means no training: the keyword is written as the model's own
 units. The default model (GigaSpeech English, 3.3M parameters) spells words in
 BPE pieces, so "Yuki" is ``▁ Y U K I``; the phoneme-based zh-en model was
-evaluated too and missed far more. Threshold and boost are settings, tuned by
-``scripts/voice_wake_eval.py`` on generated clips (docs/VOICE.md §22).
+evaluated too and missed far more (and, as a second-stage check on the same
+audio, raised misses from 5 to 20 of 58 while removing few false wakes).
+Sound-alikes ("yucky", "you key") are listed as competing variants in the same
+search, so the model says which one it heard. Threshold and boost are
+settings, tuned by ``scripts/voice_wake_eval.py`` on generated clips
+(docs/VOICE.md §22).
 
 Decoding only runs while there is sound: a 20 ms block well above the room's
 noise floor opens a gate (with half a second of pre-roll, so the start of the
@@ -59,8 +63,12 @@ MODELS: dict[str, KwsModel] = {
         encoder="encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
         decoder="decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
         joiner="joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-        # A second spelling ("▁YOU K I") was tried: it added no hits, only false ones.
-        keywords=("▁ Y U K I @YUKI",),
+        # A second spelling of the name ("▁YOU K I") was tried: it added no hits, only false ones.
+        # The other two lines are competing variants in the spotter's own search: phrases that
+        # sound like the name. When one of them fits the audio better, the spotter reports it
+        # instead of YUKI, and that is not a wake (WakeSpotter.feed). Measured 2026-09-25 on
+        # 158 clips: false accepts 14 -> 3 of 100 at the same misses (docs/VOICE.md §22).
+        keywords=("▁ Y U K I @YUKI", "▁ Y U CK Y @NOT_YUKI", "▁YOU ▁K E Y @NOT_YUKI"),
         url="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
             "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
     ),
@@ -87,7 +95,10 @@ class WakeSpotter:
         base: Models directory.
     """
 
-    def __init__(self, model: str = DEFAULT_MODEL, *, threshold: float = 0.25, boost: float = 2.0,
+    #: The keyword that is a wake; any other one the model lists is a competing variant.
+    WAKE = "YUKI"
+
+    def __init__(self, model: str = DEFAULT_MODEL, *, threshold: float = 0.2, boost: float = 2.0,
                  base: Path = MODELS_DIR) -> None:
         import sherpa_onnx
 
@@ -112,16 +123,21 @@ class WakeSpotter:
             provider="cpu",
         )
         self._stream = self._kws.create_stream()
+        #: Competing variants heard instead of the name (a false wake avoided), for the log.
+        self.near_misses = 0
 
     def feed(self, samples: np.ndarray) -> str | None:
-        """Push audio; returns the keyword heard (``"YUKI"``) or ``None``."""
+        """Push audio; returns ``"YUKI"`` when the name is heard, else ``None`` (a competing variant counts as none)."""
         self._stream.accept_waveform(RATE, samples)
         heard = None
         while self._kws.is_ready(self._stream):
             self._kws.decode_stream(self._stream)
             result = self._kws.get_result(self._stream)
             if result:
-                heard = result
+                if result == self.WAKE:
+                    heard = result
+                else:
+                    self.near_misses += 1
                 self._kws.reset_stream(self._stream)
         return heard
 
@@ -164,6 +180,7 @@ class WakeListener:
         self.decode_s = 0.0
         self.audio_s = 0.0
         self.heard_s = 0.0  # all audio seen, gated or not
+        self.near_misses = 0  # sound-alikes the spotter heard instead of the name
 
     @property
     def running(self) -> bool:
@@ -254,6 +271,7 @@ class WakeListener:
             started = time.perf_counter()
             heard = spotter.feed(samples)
             self.decode_s += time.perf_counter() - started
+            self.near_misses = spotter.near_misses
             self.audio_s += samples.size / RATE
             if heard:
                 if self._log is not None:

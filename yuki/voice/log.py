@@ -16,6 +16,19 @@ did not happen, e.g. no speech in a turn the mouth opened to speak a result):
 * ``tts_ttfb_ms``: text sent to TTS to its first audio byte.
 * ``eos_to_first_audio_ms``: the user's last voiced audio to Yuki's first
   audio going out: what the user feels.
+* Stage by stage: ``eos_to_eot_ms`` (Flux's end-of-turn event),
+  ``eos_to_eager_ms`` (its eager prediction, when on), ``transcript_to_context_ms``
+  (the user aggregator hands the context to the mouth), ``llm_start_after_eos_ms``
+  (the mouth's call begins), ``grounding_wait_ms`` (waiting for the memory
+  lookup; ``grounding`` says which one it got), ``llm_prep_ms`` (building the
+  request), ``llm_open_ms`` (request out to stream open), ``llm_first_event_ms``,
+  ``llm_api_ttft_ms`` (request out to the first content block),
+  ``llm_first_text_ms``, ``text_to_tts_ms`` (first text to the TTS request),
+  ``tts_audio_to_speaking_ms`` (first TTS audio to it playing); ``eager`` says
+  the reply was started from Flux's prediction.
+
+A CSV written with an older column set is moved aside (``*.old-<time>.csv``)
+the first time a row with the new set is written, so every file has one header.
 """
 
 from __future__ import annotations
@@ -51,6 +64,22 @@ TURN_COLUMNS: tuple[str, ...] = (
     "tool_calls",
     "interrupted",
     "error",
+    # stage by stage (2026-09-25, docs/VOICE.md §14)
+    "eos_to_eot_ms",
+    "eos_to_eager_ms",
+    "transcript_to_context_ms",
+    "llm_start_after_eos_ms",
+    "grounding",
+    "grounding_facts",
+    "grounding_wait_ms",
+    "llm_prep_ms",
+    "llm_open_ms",
+    "llm_first_event_ms",
+    "llm_api_ttft_ms",
+    "llm_first_text_ms",
+    "text_to_tts_ms",
+    "tts_audio_to_speaking_ms",
+    "eager",
 )
 
 
@@ -93,6 +122,13 @@ class VoiceLog:
             try:
                 self.turns_csv.parent.mkdir(parents=True, exist_ok=True)
                 new = not self.turns_csv.exists()
+                if not new:
+                    with self.turns_csv.open(encoding="utf-8") as fh:
+                        header = fh.readline().strip().split(",")
+                    if tuple(header) != TURN_COLUMNS:
+                        self.turns_csv.rename(self.turns_csv.with_name(
+                            f"{self.turns_csv.stem}.old-{datetime.now():%Y%m%d-%H%M%S}.csv"))
+                        new = True
                 with self.turns_csv.open("a", newline="", encoding="utf-8") as fh:
                     writer = csv.DictWriter(fh, fieldnames=list(TURN_COLUMNS))
                     if new:

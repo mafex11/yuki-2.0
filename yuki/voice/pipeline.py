@@ -1,19 +1,23 @@
-"""One voice conversation: the Pipecat pipeline, its measurements and its end (docs/VOICE.md §4, §9, §13).
+"""One voice conversation: the Pipecat pipeline, its measurements and its end (docs/VOICE.md §4, §9, §13, §14).
 
 ``audio in -> Deepgram Flux (transcript + end of turn) -> user aggregator ->
-mouth (Haiku on Bedrock, async tell_yuki / yuki_status) -> TTS (ElevenLabs or
-Deepgram Aura) -> audio out -> assistant aggregator``
+mouth (Haiku on Bedrock; async tell_yuki, check_progress, more_of_result) ->
+TTS (ElevenLabs or Deepgram Aura) -> audio out -> assistant aggregator``
 
 :class:`Conversation` builds it and runs it on the calling asyncio loop (the
-voice thread's; never the Qt thread). It ends when nobody has spoken and no
-result is owed for ``Settings.voice_idle_s``, when asked to stop, or on a fatal
-service error. A running brain task holds a quiet conversation open for at
-most ``voice_hold_max_s`` so its result can be spoken.
+voice thread's; never the Qt thread), with the conversation's
+:class:`~yuki.voice.narrator.NarratorGate` (when the brain's news is said) and
+:class:`~yuki.voice.grounding.Grounder` (the memory lookup on every turn). It
+ends when nobody has spoken and nothing is owed for ``Settings.voice_idle_s``,
+when asked to stop, or on a fatal service error. A running brain task (or a
+result the gate still holds) keeps a quiet conversation open for at most
+``voice_hold_max_s``.
 
 :class:`TurnObserver` watches the frames and writes the content-free turn
-record (stage timings, tokens, cost, language), drives the voice state the UI
-shows, and hands each spoken exchange to memory's turn log (encrypted), marked
-as voice: ``request_id`` ``voice-<n>`` and ``outcome`` ``voice``.
+record (every stage's timing, tokens, cost, language), drives the voice state
+the UI shows, gives the gate the conversation's live state, and hands each
+spoken exchange to memory's turn log (encrypted), marked as voice:
+``request_id`` ``voice-<n>`` and ``outcome`` ``voice``.
 """
 
 from __future__ import annotations
@@ -27,7 +31,9 @@ from typing import Any, Callable
 
 from yuki.config import Settings
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, get_key
-from yuki.voice.mouth import MOUTH_PROMPT, TELL_YUKI, YUKI_STATUS, MouthMemory, mouth_system_blocks
+from yuki.voice.mouth import (
+    CHECK_PROGRESS, MORE_OF_RESULT, MOUTH_PROMPT, TELL_YUKI, MouthMemory, mouth_system_blocks, volatile_block,
+)
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
 DEFAULT_VOICES = {"elevenlabs": "cgSgspJ2msm6clMCkdW9", "deepgram": "aura-2-thalia-en"}
@@ -40,7 +46,8 @@ class VoiceUnavailable(Exception):
     """Voice cannot start or went down: the text says why, for the UI and the log."""
 
 
-def hold_until_connected(ready: Callable[[], bool], log: Any, max_s: float = 10.0) -> Any:
+def hold_until_connected(ready: Callable[[], bool], log: Any, max_s: float = 10.0,
+                         on_connected: Callable[[], None] | None = None) -> Any:
     """A processor that holds microphone audio until speech-to-text is connected, then lets it all through.
 
     Deepgram's Flux service drops audio that arrives before its websocket is
@@ -68,6 +75,8 @@ def hold_until_connected(ready: Callable[[], bool], log: Any, max_s: float = 10.
                         self._held.pop(0)  # 16 kHz 16-bit mono = 32,000 bytes a second
                     return
                 held, self._held = self._held, None
+                if on_connected is not None:
+                    on_connected()  # the quiet-time clock starts now, not while Deepgram was connecting
                 if log is not None:
                     log.event("stt_connected", waited_ms=round((time.monotonic() - self._since) * 1000),
                               held_ms=round(sum(len(f.audio) for f in held) / 32))
@@ -80,6 +89,11 @@ def hold_until_connected(ready: Callable[[], bool], log: Any, max_s: float = 10.
 
 #: ElevenLabs can-speak check, done once per process: ``(ok, reason)``.
 _TTS_CHECK: dict[str, tuple[bool, str]] = {}
+
+
+def forget_tts_check() -> None:
+    """Check the TTS again before the next conversation (the voice id changed)."""
+    _TTS_CHECK.clear()
 
 
 def elevenlabs_can_speak(settings: Settings) -> tuple[bool, str]:
@@ -112,7 +126,8 @@ def elevenlabs_can_speak(settings: Settings) -> tuple[bool, str]:
         except urllib.error.HTTPError as exc:
             body = exc.read()[:400].decode("utf-8", "replace")
             result = (False, "the key lacks the Text to Speech permission" if "missing_permissions" in body
-                      else f"HTTP {exc.code}")
+                      else ("the voice id is not in the account's voices" if exc.code in (400, 404) and "voice" in body
+                            else f"HTTP {exc.code}"))
         except (urllib.error.URLError, OSError) as exc:
             return False, f"cannot reach ElevenLabs ({type(exc).__name__})"  # not cached: may be the network
     _TTS_CHECK["elevenlabs"] = result
@@ -155,26 +170,133 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
 _LOGGING_SET = False
 
 
-def _layered_service(base: type, memory: MouthMemory) -> type:
-    """``base`` (Pipecat's ``AnthropicLLMService``) sending the mouth's prompt as cached layers.
+@dataclass
+class LlmCall:
+    """Timestamps (monotonic) of one mouth call, stage by stage (docs/VOICE.md §14)."""
+
+    entered: float                      # LLM service got the context
+    grounded: float | None = None       # grounding wait over
+    grounding: str = "off"              # final | partial | previous | none | off
+    facts: int = 0
+    sent: float | None = None           # the API request went out
+    opened: float | None = None         # the stream was open (response headers)
+    first_event: float | None = None    # message_start
+    first_content: float | None = None  # first content block (Pipecat's TTFB ends here)
+    first_text: float | None = None     # first text delta
+    user_turn: bool = True
+
+
+def with_volatile(messages: Any, block: dict[str, Any]) -> Any:
+    """``messages`` with ``block`` appended to the last user message, after its cache breakpoint.
+
+    The time and the grounding lookup change on every call. In the system prompt they
+    would sit before the whole conversation and break its cache (measured: every turn
+    rewrote 1-2k tokens of history); as the last block of the newest user message they
+    come after every breakpoint, so the next call reads everything before them from the
+    cache. Only the copy sent is changed, never the conversation's context.
+    """
+    if not isinstance(messages, list):
+        return messages
+    for i in range(len(messages) - 1, -1, -1):
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            parts = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+            out = list(messages)
+            out[i] = {**message, "content": [*parts, block]}
+            return out
+    return messages
+
+
+def bedrock_client(region: str) -> Any:
+    """The mouth's Bedrock client, keeping its connection between turns.
+
+    httpx drops an idle connection after 5 s by default, so every turn after a pause
+    paid a new TCP and TLS handshake: measured 2026-09-25 from this PC, time to the first
+    token after 8-20 s idle p50 1,362 ms with the default against 860 ms with the
+    connection kept (this was the "unexplained ~0.7 s" of docs/VOICE.md §14).
+    """
+    import httpx
+    from anthropic import AsyncAnthropicBedrock, DefaultAsyncHttpxClient
+
+    return AsyncAnthropicBedrock(aws_region=region, http_client=DefaultAsyncHttpxClient(
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=4, keepalive_expiry=300.0)))
+
+
+def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
+    """``base`` (Pipecat's ``AnthropicLLMService``) sending the mouth's prompt as cached layers, instrumented.
 
     Pipecat passes ``system`` as one string. This subclass swaps it for the blocks of
     :func:`~yuki.voice.mouth.mouth_system_blocks`: the composed core (our prompt plus
-    Pipecat's async-tool paragraphs, frozen), the profile, the standing rules and the time,
-    with breakpoints on profile and rules (Pipecat marks the last two user messages; four
-    in all). Built per conversation with that conversation's memory and start time, so the
-    bytes stay the same on every call of the conversation. Made on first use so importing
-    this module loads no Pipecat (voice off costs nothing).
+    Pipecat's async-tool paragraphs, frozen), the profile, the standing rules, and a
+    volatile tail with the time now and the grounding lookup for this call (after every
+    cache breakpoint, so the cached layers stay byte-identical). Before each call it
+    waits (bounded) for the grounding lookup, and it records every stage of the call
+    (context in, request out, stream open, first event, first content, first text) for
+    the turn log. Made on first use so importing this module loads no Pipecat.
     """
-    started = datetime.now()
 
     class LayeredAnthropicLLMService(base):  # type: ignore[misc, valid-type]
+        _yuki_lookup: str | None = None
+        _yuki_call: LlmCall | None = None
+
+        async def _process_context(self, context: Any) -> None:
+            call = LlmCall(entered=time.monotonic())
+            self._yuki_call = call
+            try:
+                self._yuki_lookup = await hooks.before_call(context, call)
+            except Exception:  # noqa: BLE001 - grounding is a hint; never block the reply on it
+                self._yuki_lookup = None
+            call.grounded = time.monotonic()
+            hooks.call_started(call)
+            await super()._process_context(context)
+
         def _get_llm_invocation_params(self, context: Any) -> Any:
             params = super()._get_llm_invocation_params(context)
             composed = self._settings.system_instruction or MOUTH_PROMPT
             tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
-            params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], now=started)
+            params["system"] = mouth_system_blocks(memory, tail=[tail.strip()])
+            params["messages"] = with_volatile(params.get("messages"), volatile_block(lookup=self._yuki_lookup))
             return params
+
+        async def _cancel_tool_handler(self, params: Any) -> None:
+            # A successful cancel settles without another turn: the mouth says it is
+            # stopping in the same reply as the call (measured: the extra turn made it
+            # greet the user out of nowhere). A refusal still gets a turn, to react to it.
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            original = params.result_callback
+
+            async def settle(result: Any, *, properties: Any = None) -> None:
+                if isinstance(result, dict) and result.get("cancelled"):
+                    properties = FunctionCallResultProperties(run_llm=False)
+                await original(result, properties=properties)
+
+            params.result_callback = settle
+            await super()._cancel_tool_handler(params)
+
+        async def _create_message_stream(self, api_call: Any, params: Any) -> Any:
+            call = self._yuki_call
+            if call is not None:
+                call.sent = time.monotonic()
+            response = await super()._create_message_stream(api_call, params)
+            if call is None:
+                return response
+            call.opened = time.monotonic()
+
+            async def timed() -> Any:
+                async for event in response:
+                    now = time.monotonic()
+                    if call.first_event is None:
+                        call.first_event = now
+                    kind = getattr(event, "type", "")
+                    if call.first_content is None and kind in ("content_block_start", "content_block_delta"):
+                        call.first_content = now
+                    if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
+                        call.first_text = now
+                    yield event
+
+            return timed()
 
     return LayeredAnthropicLLMService
 
@@ -218,9 +340,15 @@ class _Turn:
     language: str | None = None
     user_text: str = ""
     speech_end: float | None = None
+    eot_at: float | None = None          # Flux's end-of-turn event arrived
+    eager_at: float | None = None        # Flux's eager end-of-turn (a speculative reply started)
     transcript_at: float | None = None
+    context_at: float | None = None      # the user aggregator pushed the context to the mouth
+    llm: LlmCall | None = None
     llm_ttfb: float | None = None
+    tts_started: float | None = None
     tts_ttfb: float | None = None
+    tts_audio: float | None = None
     first_audio: float | None = None
     reply: list[str] = field(default_factory=list)
     spoken: list[str] = field(default_factory=list)
@@ -232,7 +360,14 @@ class _Turn:
 
 
 class TurnObserver:
-    """Frame observer: turn timings, usage, state, and the memory turn log. Content goes only to memory."""
+    """Frame observer: turn timings, usage, state, and the memory turn log. Content goes only to memory.
+
+    Also the conversation's live state for the narrator gate (who is speaking,
+    whether Yuki owes a reply, when it last stopped talking, how many user turns).
+    """
+
+    #: A reply owed for longer than this is treated as given (a turn that ended in silence).
+    OWES_REPLY_MAX_S = 8.0
 
     def __init__(self, *, settings: Settings, log: Any, memory: Any, session: str,
                  speech_end: Callable[[], float | None], on_state: Callable[[str, str], None],
@@ -255,6 +390,14 @@ class TurnObserver:
         self.user_speaking = False
         self.bot_speaking = False
         self.generating = False
+        self.owes_reply_since: float | None = None
+        self.last_bot_stop = 0.0
+        self.user_turns = 0
+        self._user_started_at = 0.0
+        self._pending_call: LlmCall | None = None
+        self._eot_at: float | None = None
+        self._eager_at: float | None = None
+        self.grounder: Any = None
         self.state = "starting"
         self.fatal: str | None = None
         self.totals = {"turns": 0, "mouth_cost_usd": 0.0, "tts_chars": 0}
@@ -267,6 +410,41 @@ class TurnObserver:
                 outer.on_frame(data.frame)
 
         return _Obs()
+
+    # -- live state (the narrator gate) -------------------------------------------
+
+    @property
+    def owes_reply(self) -> bool:
+        since = self.owes_reply_since
+        return since is not None and time.monotonic() - since < self.OWES_REPLY_MAX_S
+
+    def live_state(self) -> dict[str, Any]:
+        return {"user_speaking": self.user_speaking, "bot_speaking": self.bot_speaking,
+                "generating": self.generating, "owes_reply": self.owes_reply,
+                "last_bot_stop": self.last_bot_stop, "user_turns": self.user_turns}
+
+    # -- STT events (Flux), called from the STT service's event handlers --------------
+
+    def on_eot(self, transcript: str) -> None:
+        """Flux's end-of-turn event (it comes after the transcript frame, which is pushed at end of turn)."""
+
+    def on_eager(self, transcript: str) -> None:
+        self._eager_at = time.monotonic()
+        if self.grounder is not None:
+            self.grounder.interim(transcript)
+
+    def on_update(self, transcript: str) -> None:
+        if self.grounder is not None:
+            self.grounder.interim(transcript)
+
+    def call_started(self, call: LlmCall) -> None:
+        """A mouth call began (the LLM service's hook): attach it to the turn it answers."""
+        turn = self.turn
+        if (turn is not None and turn.llm is None and turn.first_audio is None
+                and turn.transcript_at is not None and call.entered >= turn.transcript_at):
+            turn.llm = call
+        else:
+            self._pending_call = call  # speculative (eager) or a result turn: attached when it opens
 
     # -- helpers -----------------------------------------------------------------
 
@@ -282,7 +460,8 @@ class TurnObserver:
         self.turn = _Turn(n=self._n, trigger=trigger, opened=time.monotonic())
         return self.turn
 
-    def _ms(self, a: float | None, b: float | None) -> float | None:
+    @staticmethod
+    def _ms(a: float | None, b: float | None) -> float | None:
         return round((b - a) * 1000, 1) if a is not None and b is not None else None
 
     def close(self) -> None:
@@ -304,18 +483,35 @@ class TurnObserver:
             turn.tts_chars = len(reply)  # the service reported no usage: what was sent to it
         tts_rate = self.settings.voice_usd_per_1k_tts_chars.get(self._tts_provider)
         tts_cost = round(turn.tts_chars / 1000 * tts_rate, 6) if tts_rate is not None else None
+        c = turn.llm
+        ms = self._ms
         row = {
             "session": self.session, "turn": turn.n, "trigger": turn.trigger, "language": turn.language,
             "user_chars": len(turn.user_text), "reply_chars": len(reply),
-            "eos_to_transcript_ms": self._ms(turn.speech_end, turn.transcript_at),
+            "eos_to_transcript_ms": ms(turn.speech_end, turn.transcript_at),
             "mouth_ttft_ms": round(turn.llm_ttfb * 1000, 1) if turn.llm_ttfb is not None else None,
             "tts_ttfb_ms": round(turn.tts_ttfb * 1000, 1) if turn.tts_ttfb is not None else None,
-            "eos_to_first_audio_ms": self._ms(turn.speech_end, turn.first_audio),
+            "eos_to_first_audio_ms": ms(turn.speech_end, turn.first_audio),
             "mouth_input_tokens": usage["input_tokens"], "mouth_cache_read_tokens": usage["cache_read_tokens"],
             "mouth_cache_write_tokens": usage["cache_write_tokens"], "mouth_output_tokens": usage["output_tokens"],
             "mouth_cost_usd": round(cost, 6) if cost is not None else None,
             "tts_chars": turn.tts_chars, "tts_cost_usd": tts_cost,
             "tool_calls": ";".join(turn.tools), "interrupted": turn.interrupted, "error": turn.error,
+            # stage by stage (docs/VOICE.md §14)
+            "eos_to_eot_ms": ms(turn.speech_end, turn.eot_at),
+            "eos_to_eager_ms": ms(turn.speech_end, turn.eager_at),
+            "transcript_to_context_ms": ms(turn.transcript_at, turn.context_at),
+            "llm_start_after_eos_ms": ms(turn.speech_end, c.entered) if c else None,
+            "grounding": c.grounding if c else None, "grounding_facts": c.facts if c else None,
+            "grounding_wait_ms": ms(c.entered, c.grounded) if c else None,
+            "llm_prep_ms": ms(c.grounded, c.sent) if c else None,
+            "llm_open_ms": ms(c.sent, c.opened) if c else None,
+            "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
+            "llm_api_ttft_ms": ms(c.sent, c.first_content) if c else None,
+            "llm_first_text_ms": ms(c.sent, c.first_text) if c else None,
+            "text_to_tts_ms": ms(c.first_text if c else None, turn.tts_started),
+            "tts_audio_to_speaking_ms": ms(turn.tts_audio, turn.first_audio),
+            "eager": bool(c and turn.transcript_at and c.entered < turn.transcript_at),
         }
         self.totals["turns"] += 1
         self.totals["mouth_cost_usd"] += cost or 0.0
@@ -338,8 +534,9 @@ class TurnObserver:
     def on_frame(self, frame: Any) -> None:  # noqa: C901 - one switch over frame types
         from pipecat.frames.frames import (
             BotStartedSpeakingFrame, BotStoppedSpeakingFrame, ErrorFrame, FunctionCallInProgressFrame,
-            InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, MetricsFrame,
-            TranscriptionFrame, TTSTextFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+            InterruptionFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
+            MetricsFrame, TranscriptionFrame, TTSAudioRawFrame, TTSStartedFrame, TTSTextFrame,
+            UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
         )
         from pipecat.metrics.metrics import LLMUsageMetricsData, TTFBMetricsData, TTSUsageMetricsData
 
@@ -352,10 +549,17 @@ class TurnObserver:
                 del self._seen[key]
         now = time.monotonic()
 
+        if isinstance(frame, TTSAudioRawFrame):
+            if self.turn is not None and self.turn.tts_audio is None:
+                self.turn.tts_audio = now
+            return
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
+            self._user_started_at = now
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
+            if self.grounder is not None:
+                self.grounder.new_turn()
             self.set_state("hearing")
             self._activity()
         elif isinstance(frame, UserStoppedSpeakingFrame):
@@ -366,21 +570,40 @@ class TurnObserver:
             turn.user_text = frame.text or ""
             turn.transcript_at = now
             turn.speech_end = self._speech_end()
+            turn.eot_at = now  # Flux pushes the final transcript at its end of turn
+            turn.eager_at, self._eager_at = self._eager_at, None
+            if self.grounder is not None:
+                self.grounder.final(turn.user_text)  # before the aggregator hands the context over
+            pending, self._pending_call = self._pending_call, None
+            if pending is not None and pending.entered >= self._user_started_at:
+                turn.llm = pending  # the eager (speculative) reply, confirmed by this transcript
             lang = getattr(frame, "language", None)
             turn.language = str(getattr(lang, "value", lang)) if lang else None
+            self.user_turns += 1
+            self.owes_reply_since = now
             self.set_state("thinking")
             self._activity()
+        elif isinstance(frame, LLMContextFrame):
+            if self.turn is not None and self.turn.context_at is None and self.turn.transcript_at is not None:
+                self.turn.context_at = now
         elif isinstance(frame, LLMFullResponseStartFrame):
             self.generating = True
             if self.turn is None or self.turn.first_audio is not None:
                 self._open("result")
+            if self.turn.llm is None and self._pending_call is not None:
+                self.turn.llm, self._pending_call = self._pending_call, None
             self._activity()
         elif isinstance(frame, LLMFullResponseEndFrame):
             self.generating = False
+            if self.turn is not None and not "".join(self.turn.reply).strip() and not self.bot_speaking:
+                self.owes_reply_since = None  # a turn that only called a tool: nothing to wait for
             self._activity()
         elif isinstance(frame, LLMTextFrame):
             if self.turn is not None:
                 self.turn.reply.append(frame.text or "")
+        elif isinstance(frame, TTSStartedFrame):
+            if self.turn is not None and self.turn.tts_started is None:
+                self.turn.tts_started = now
         elif isinstance(frame, TTSTextFrame):
             if self.turn is not None:
                 self.turn.spoken.append((frame.text or "") + " ")
@@ -397,6 +620,8 @@ class TurnObserver:
             self._activity()
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self.bot_speaking = False
+            self.last_bot_stop = now
+            self.owes_reply_since = None
             self.set_state("listening")
             self._activity()
         elif isinstance(frame, InterruptionFrame):
@@ -431,6 +656,44 @@ class TurnObserver:
             self._activity()
 
 
+class _Hooks:
+    """What the mouth's LLM service asks of the conversation around each call."""
+
+    def __init__(self, conversation: "Conversation") -> None:
+        self.c = conversation
+
+    async def before_call(self, context: Any, call: LlmCall) -> str | None:
+        """Wait (bounded) for the grounding lookup; returns the lookup block text, or ``None``."""
+        grounder = self.c.grounder
+        if grounder is None:
+            call.grounding = "off"
+            return None
+        user_turn = _last_role(context) == "user"
+        call.user_turn = user_turn
+        lookup, how = await grounder.for_call(self.c.settings.voice_grounding_wait_ms if user_turn else 0.0)
+        if lookup is None or (user_turn and how == "previous"):
+            call.grounding = "none"
+            return None
+        from yuki.voice.grounding import format_facts
+
+        call.grounding, call.facts = how, len(lookup.facts)
+        return format_facts(lookup.facts)
+
+    def call_started(self, call: LlmCall) -> None:
+        self.c.observer.call_started(call)
+
+
+def _last_role(context: Any) -> str | None:
+    try:
+        messages = context.get_messages()
+    except Exception:  # noqa: BLE001
+        return None
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") in ("user", "assistant", "developer", "tool"):
+            return str(message.get("role"))
+    return None
+
+
 class Conversation:
     """One conversation's pipeline, run on the current asyncio loop.
 
@@ -438,18 +701,24 @@ class Conversation:
         settings: Voice settings.
         bridge: :class:`~yuki.voice.bridge.VoiceBridge` (its handlers are the mouth's tools).
         transport: Input and output processors (:class:`~yuki.voice.transport.PairTransport`).
-        memory: :class:`~yuki.agent.memory.MemoryAccess` for the turn log, or ``None``.
+        memory: :class:`~yuki.agent.memory.MemoryAccess` for the turn log and the grounding
+            lookup, or ``None``.
         mouth_memory: Rules and memory block, fetched before the loop started.
         log: The voice log.
         speech_end: Returns the monotonic time of the user's last voiced audio.
         on_state: ``(state, detail)`` callback (called on the voice thread).
         session: Id of this conversation, for the logs.
+        voice_activity: ``(start of the current voiced stretch, end of the last voiced
+            audio)`` from the microphone (monotonic), so results never start over the user
+            before speech recognition notices them.
     """
 
     def __init__(self, *, settings: Settings, bridge: Any, transport: Any, memory: Any, mouth_memory: MouthMemory,
                  log: Any, speech_end: Callable[[], float | None], on_state: Callable[[str, str], None],
-                 session: str, extra_observers: list[Any] | None = None, tts_provider: str | None = None) -> None:
+                 session: str, extra_observers: list[Any] | None = None, tts_provider: str | None = None,
+                 voice_activity: Callable[[], tuple[float, float]] | None = None) -> None:
         self.settings = settings
+        self._voice_activity = voice_activity
         self.bridge = bridge
         self.transport = transport
         self.memory = memory
@@ -461,13 +730,21 @@ class Conversation:
         self._activity = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self.reason = "running"
+        self.gate: Any = None
+        self.grounder: Any = None
         self.observer = TurnObserver(
             settings=settings, log=log, memory=memory, session=session, speech_end=speech_end,
-            on_state=on_state, tts_provider=self.tts_provider, activity=self._activity.set,
+            on_state=on_state, tts_provider=self.tts_provider, activity=self._on_activity,
         )
         self.worker: Any = None
         self.started_at = time.monotonic()
         self._extra_observers = list(extra_observers or [])
+        self.progress_cost_usd = 0.0
+
+    def _on_activity(self) -> None:
+        self._activity.set()
+        if self.gate is not None:
+            self.gate.poke()
 
     def request_stop(self, reason: str = "stopped") -> None:
         """Ask the conversation to end (thread-safe)."""
@@ -494,7 +771,7 @@ class Conversation:
 
     def _services(self) -> tuple[Any, Any, Any]:
         import pipecat.services.llm_service as llm_service_module
-        from anthropic import AsyncAnthropicBedrock
+        from pipecat.processors.aggregators import async_tool_messages
         from pipecat.services.anthropic.llm import AnthropicLLMService
         from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
         from pipecat.transcriptions.language import Language
@@ -502,7 +779,11 @@ class Conversation:
         s = self.settings
         # Pipecat's standing async-tool paragraph uses an em dash; a model copies the
         # punctuation it is shown, and the user asked for none. Same words, a comma.
-        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = llm_service_module.ASYNC_TOOL_INSTRUCTIONS.replace(" \u2014 ", ", ")
+        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = llm_service_module.ASYNC_TOOL_INSTRUCTIONS.replace(" — ", ", ")
+        # Pipecat's final-result note says a result must be spoken whatever the
+        # conversation moved on to. Here the narrator gate decides that, and a
+        # stale result arrives marked held_back; the note defers to the payload.
+        async_tool_messages._FINAL_DESCRIPTION = FINAL_DESCRIPTION
         hints = [Language(code) for code in s.voice_stt_languages] if s.voice_stt_model.endswith("multi") else None
         stt = DeepgramFluxSTTService(
             api_key=get_key(DEEPGRAM) or "",
@@ -513,8 +794,22 @@ class Conversation:
                 keyterm=["Yuki", *s.user_names],
             ),
         )
-        self._client = AsyncAnthropicBedrock(aws_region=s.aws_region)
-        llm = _layered_service(AnthropicLLMService, self.mouth_memory)(
+        obs = self.observer
+
+        async def on_update(_service: Any, transcript: str) -> None:
+            obs.on_update(transcript)
+
+        async def on_eager(_service: Any, transcript: str) -> None:
+            obs.on_eager(transcript)
+
+        async def on_eot(_service: Any, transcript: str) -> None:
+            obs.on_eot(transcript)
+
+        stt.add_event_handler("on_update", on_update)
+        stt.add_event_handler("on_eager_end_of_turn", on_eager)
+        stt.add_event_handler("on_end_of_turn", on_eot)
+        self._client = bedrock_client(s.aws_region)
+        llm = _layered_service(AnthropicLLMService, self.mouth_memory, _Hooks(self))(
             api_key="bedrock",  # unused: the Bedrock client carries the auth
             client=self._client,
             retry_on_timeout=True,
@@ -528,7 +823,8 @@ class Conversation:
         )
         llm.register_function("tell_yuki", self.bridge.tell_yuki, cancel_on_interruption=False,
                               cancellable_by_llm=True, timeout_secs=None)
-        llm.register_function("yuki_status", self.bridge.yuki_status)
+        llm.register_function("check_progress", self.bridge.check_progress)
+        llm.register_function("more_of_result", self.bridge.more_of_result)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
         if provider == "deepgram":
@@ -550,19 +846,27 @@ class Conversation:
         from pipecat.pipeline.worker import PipelineParams, PipelineWorker
         from pipecat.processors.aggregators.llm_context import LLMContext
         from pipecat.processors.aggregators.llm_response_universal import (
-            LLMAssistantAggregatorParams, LLMContextAggregatorPair,
+            LLMAssistantAggregatorParams, LLMContextAggregatorPair, LLMUserAggregatorParams,
         )
 
         stt, llm, tts = self._services()
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
-                           required=t["required"]) for t in (TELL_YUKI, YUKI_STATUS)
+                           required=t["required"]) for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT)
         ])
         context = LLMContext(tools=tools)
+        # Flux's own turn strategies from the start. Left to default, the aggregator first
+        # builds Pipecat's local ones, which load the Smart Turn ONNX model and onnxruntime
+        # (measured 2026-09-25: imported in every conversation, never used), before Flux's
+        # recommendation replaces them.
         user_agg, assistant_agg = LLMContextAggregatorPair(
-            context, assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
+            context,
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=stt.recommended_user_turn_strategies(enable_interruptions=True)),
+            assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
         )
-        hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log)
+        hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
+                                    on_connected=self._activity.set)
         pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, self.transport.output(),
                              assistant_agg])
         self.worker = PipelineWorker(
@@ -577,33 +881,100 @@ class Conversation:
 
     # -- running -----------------------------------------------------------------
 
+    #: Raw sound counts as the user talking only this soon after it (s), and not when a
+    #: stretch of it has gone on this long without speech recognition hearing a turn (noise).
+    SOUND_RECENT_S = 0.35
+    SOUND_MAX_STRETCH_S = 6.0
+
+    def _gate_state(self) -> dict[str, Any]:
+        state = self.observer.live_state()
+        state["busy_tools"] = self.bridge.busy_tools
+        if self._voice_activity is not None:
+            since, last = self._voice_activity()
+            now = time.monotonic()
+            state["user_sound"] = bool(last and now - last < self.SOUND_RECENT_S
+                                       and (last - since) < self.SOUND_MAX_STRETCH_S)
+        return state
+
+    async def _progress_answer(self, log_text: str, question: str) -> tuple[str | None, dict[str, Any]]:
+        from yuki.voice.progress import answer_progress
+
+        text, facts = await answer_progress(self._client, self.settings.voice_mouth_model, log_text, question)
+        cost = self.settings.estimate_cost(self.settings.voice_mouth_model, {
+            "input_tokens": facts.get("input_tokens") or 0, "output_tokens": facts.get("output_tokens") or 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0})
+        self.progress_cost_usd += cost or 0.0
+        facts["cost_usd"] = round(cost or 0.0, 6)
+        return text, facts
+
     async def run(self) -> str:
         """Run until idle, stopped or failed. Returns why it ended."""
         from pipecat.workers.runner import WorkerRunner
 
-        quiet_pipecat_logging(self.settings.voice_log_dir)
+        from yuki.voice.narrator import NarratorGate
 
+        quiet_pipecat_logging(self.settings.voice_log_dir)
+        s = self.settings
         self._loop = asyncio.get_running_loop()
+        self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
+                                 cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log)
+        if s.voice_grounding and self.memory is not None:
+            from yuki.voice.grounding import Grounder
+
+            self.grounder = Grounder(self.memory, facts=s.voice_grounding_facts, log=self.log)
+            self.grounder.warm()
+            self.observer.grounder = self.grounder
         self.bridge.attach(self._loop)
         self.bridge.announce = self._announce
+        self.bridge.gate = self.gate
+        self.bridge.progress_answerer = self._progress_answer
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
         await runner.add_workers(worker)
         self.observer.set_state("listening")
+        self.gate.start()
         warm = asyncio.create_task(self._warm())
         watch = asyncio.create_task(self._watch(runner))
+        lag = asyncio.create_task(self._lag_monitor())
         try:
             await runner.run()
         finally:
             watch.cancel()
             warm.cancel()
+            lag.cancel()
+            await self.gate.stop()
             self.observer.close()
             self.bridge.closing = True
             self.bridge.attach(None)
             self.bridge.announce = None
+            if self.grounder is not None:
+                unloaded = self.grounder.release(busy=self.bridge.brain_busy())
+                timings = sorted(self.grounder.timings)
+                self.log.event("grounding", op="summary", lookups=len(timings), unloaded=unloaded,
+                               p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
+                               max_ms=round(timings[-1], 1) if timings else None)
+            self.log.event("narrator", op="summary", **self.gate.stats)
         if self.observer.fatal and self.reason == "running":
             self.reason = "error"
         return self.reason
+
+    async def _lag_monitor(self, every_s: float = 0.05, report_ms: float = 100.0) -> None:
+        """How late the voice loop wakes up (a blocked loop delays every stage). Logs stalls and a summary."""
+        lags: list[float] = []
+        try:
+            while True:
+                started = time.monotonic()
+                await asyncio.sleep(every_s)
+                late = (time.monotonic() - started - every_s) * 1000
+                lags.append(late)
+                if late >= report_ms:
+                    self.log.event("loop_lag", ms=round(late))
+        except asyncio.CancelledError:
+            if lags:
+                ordered = sorted(lags)
+                self.log.event("loop_lag", op="summary", n=len(ordered), p50_ms=round(ordered[len(ordered) // 2], 1),
+                               p99_ms=round(ordered[int(len(ordered) * 0.99)], 1), max_ms=round(ordered[-1], 1))
+            raise
 
     async def _warm(self) -> None:
         """Open the Bedrock connection while Deepgram connects (a one-token request).
@@ -621,15 +992,15 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.log.event("warm", error=f"{type(exc).__name__}: {str(exc)[:200]}")
 
-    async def _announce(self, payload: dict[str, Any]) -> None:
-        """A result with no open tool call (a correction that came too late): say it now."""
+    async def _announce(self, payload: dict[str, Any], run_llm: bool = True) -> None:
+        """A result with no open tool call (a correction that came too late): into the context, said if ``run_llm``."""
         import json
 
         from pipecat.frames.frames import LLMMessagesAppendFrame
 
         if self.worker is not None:
             message = {"role": "developer", "content": json.dumps({"late_result": payload}, ensure_ascii=False)}
-            await self.worker.queue_frame(LLMMessagesAppendFrame(messages=[message], run_llm=True))
+            await self.worker.queue_frame(LLMMessagesAppendFrame(messages=[message], run_llm=run_llm))
 
     async def _watch(self, runner: Any) -> None:
         """End the conversation when it has been quiet long enough, or on stop / fatal error."""
@@ -638,7 +1009,7 @@ class Conversation:
         while True:
             obs = self.observer
             busy = obs.user_speaking or obs.bot_speaking or obs.generating
-            owed = self.bridge.open_voice_jobs()
+            owed = self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
             limit = s.voice_hold_max_s if owed else s.voice_idle_s
             if owed and not busy:
                 obs.set_state("working")
@@ -660,3 +1031,12 @@ class Conversation:
                 break
         self.bridge.closing = True
         await runner.cancel()
+
+
+#: Replaces Pipecat's final-result note (see ``Conversation._services``).
+FINAL_DESCRIPTION = (
+    "This is the final result for the asynchronous task associated with this tool_call_id. The task "
+    "has completed and no further results will arrive for it. Handle it as its own fields say: a "
+    "result or failed is to be said now, briefly; a held_back one is kept for reference and not "
+    "brought up. Convey it once; do not repeat it in later responses."
+)

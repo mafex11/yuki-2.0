@@ -20,9 +20,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGES = (
+    ("eos_to_eager_ms", "end of speech -> Flux eager end of turn"),
+    ("eos_to_eot_ms", "end of speech -> Flux end of turn"),
     ("eos_to_transcript_ms", "end of speech -> final transcript"),
-    ("mouth_ttft_ms", "mouth time to first token"),
+    ("transcript_to_context_ms", "transcript -> context to the mouth"),
+    ("llm_start_after_eos_ms", "end of speech -> mouth call starts"),
+    ("grounding_wait_ms", "waiting for the memory lookup"),
+    ("llm_prep_ms", "building the request"),
+    ("llm_open_ms", "request out -> stream open"),
+    ("llm_first_event_ms", "request out -> first event"),
+    ("llm_api_ttft_ms", "request out -> first content"),
+    ("mouth_ttft_ms", "mouth TTFB (Pipecat's metric)"),
+    ("llm_first_text_ms", "request out -> first text"),
+    ("text_to_tts_ms", "first text -> TTS request"),
     ("tts_ttfb_ms", "TTS time to first byte"),
+    ("tts_audio_to_speaking_ms", "first TTS audio -> playing"),
     ("eos_to_first_audio_ms", "end of speech -> first audio"),
 )
 
@@ -51,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
             rows += [r for r in csv.DictReader(fh) if r.get("timestamp", "") >= args.since]
     turns = rows if args.all_turns else [r for r in rows if r.get("trigger") == "user"]
     print(f"{len(turns)} turns ({len(rows)} rows) from {', '.join(str(p) for p in args.csv)}")
+    grounding = Counter(r.get("grounding") or "-" for r in turns)
+    eager = sum(1 for r in turns if r.get("eager") == "True")
+    print(f"grounding: {dict(grounding)}; eager replies: {eager}")
     print(f"{'stage':40s} {'n':>4s} {'p50':>7s} {'p90':>7s} {'p95':>7s} {'max':>7s}")
     for key, label in STAGES:
         values = [float(r[key]) for r in turns if r.get(key) not in (None, "")]
