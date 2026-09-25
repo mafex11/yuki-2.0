@@ -1168,8 +1168,17 @@ def format_recall(
             lines.append(f"{_when(row.get('at'))}-{end[-5:] if end != '(undated)' else '?'} [episode] {fact}")
             continue
         where = ", ".join(str(v) for v in (row.get("app"), row.get("host")) if v)
-        lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}")
+        lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}{_NATURE_MARKS.get(row.get('nature'), '')}")
     return "\n".join(lines)
+
+
+#: How a recalled journal item that is not a plain fact is marked (yuki.memory.personality).
+_NATURE_MARKS = {
+    "trait": " [trait]",
+    "story": " [a story they told]",
+    "humor": " [joke/banter - humour, not a fact]",
+    "uncertain": " [uncertain - possibly misheard or ambiguous, not a fact]",
+}
 
 
 def _duration(seconds: Any) -> str:

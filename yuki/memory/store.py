@@ -76,8 +76,13 @@ Journal worker plumbing::
     store.wait_for_captures(min_pending: int, timeout_s: float) -> int
     store.wake() -> None                          # releases wait_for_captures
     store.thread_info(thread_id) -> ThreadInfo | None
-    store.commit_batch(call: ModelCall, capture_ids, facts: list[NewFact]) -> int
-        # one transaction: batch row + facts + vectors + captures marked journaled
+    store.commit_batch(call: ModelCall, capture_ids, facts: list[NewFact], *, supersedes=()) -> int
+        # one transaction: batch row + facts + vectors + captures marked journaled; each fact has a
+        # nature (fact | trait | story | humor | uncertain, migration 14); supersedes: a re-journal's
+        # earlier batches, whose facts are superseded (kept; every journal reader leaves them out)
+    store.journaled_captures(thread_kind=, since=, until=, batch_ids=) -> [(PendingCapture, batch id)]
+    store.journal_of_batches(batch_ids, include_superseded=False);  store.superseded_journal(ids) -> {id: batch}
+    store.timeline_states(since, until) -> list[TimelineRow]   # content-free, nothing decrypted (the coach's resume)
     store.record_failed_batch(call: ModelCall, capture_ids) -> int
         # batch row with the error; bumps the captures' attempt counters
 
@@ -452,6 +457,9 @@ class JournalEntry:
     score: float | None = None      # cosine similarity, set by search_journal
     #: Drawn from what Yuki itself put on screen at the user's request (not the user's own activity).
     by_yuki: bool = False
+    #: What the item is (yuki.memory.personality.NATURES): fact | trait | story | humor | uncertain.
+    #: Rows recorded before natures existed read as "fact".
+    nature: str = "fact"
 
 
 @dataclass
@@ -467,6 +475,7 @@ class NewFact:
     vector: np.ndarray | None = None
     embed_model: str | None = None
     by_yuki: bool = False
+    nature: str = "fact"
 
 
 @dataclass
@@ -494,9 +503,14 @@ class ModelCall:
 #: ``behaviour`` facts are evidence-based patterns in how the user spends time
 #: (from episodes and timeline aggregates), with numbers and a confidence.
 PORTRAIT_KINDS: tuple[str, ...] = (
-    "work", "interest", "person", "routine", "behaviour", "preference", "open_loop",
+    "work", "interest", "person", "routine", "behaviour", "preference", "personality", "open_loop",
 )
 CORRECTION_KIND = "correction"
+#: What a journal item is (migration 14; yuki.memory.personality): told as true, how the user is,
+#: an anecdote they told, a joke or bit (never a fact), possibly misheard or ambiguous (never a fact).
+JOURNAL_NATURES: tuple[str, ...] = ("fact", "trait", "story", "humor", "uncertain")
+#: The parts of the portrait's Personality section a ``personality`` fact belongs to.
+PERSONALITY_ASPECTS: tuple[str, ...] = ("talk", "cares", "joke", "story", "people")
 
 
 @dataclass
@@ -523,6 +537,9 @@ class PortraitFact:
     run_id: int | None
     #: Episodes (``episodes.id``) the fact rests on, besides the journal ids.
     episode_ids: list[int] = field(default_factory=list)
+    #: ``personality`` facts: which part of the Personality section it is
+    #: (yuki.memory.personality.ASPECTS: talk | cares | joke | story | people).
+    aspect: str | None = None
 
 
 @dataclass
@@ -547,6 +564,7 @@ class FactChange:
     origin: str = "model"
     folds: list[int] = field(default_factory=list)
     episode_ids: list[int] = field(default_factory=list)
+    aspect: str | None = None
 
 
 @dataclass
@@ -1007,7 +1025,7 @@ class CallRecord:
 #: ``questions.kind``: what memory does not know - who a person is to the user,
 #: what a name (product, project, place, organisation) is, whose task or material
 #: something is, or another fact it would otherwise have to guess.
-QUESTION_KINDS: tuple[str, ...] = ("person", "meaning", "ownership", "fact")
+QUESTION_KINDS: tuple[str, ...] = ("person", "meaning", "ownership", "fact", "personality")
 #: ``questions.status``: open (waiting to be asked), asked (on a card), answered,
 #: skipped / never (the user's choice on the card or in words), expired (never
 #: asked in time) or dropped (memory turned out to know it already).
@@ -1759,6 +1777,23 @@ MIGRATIONS: tuple[str, ...] = (
         vec_ciphertext  BLOB NOT NULL
     );
     """,
+    # 14: what each journal item is (yuki.memory.personality): its nature - fact
+    # (told as true), trait (how the user is), story (an anecdote they told),
+    # humor (a joke, bit, tease or boast: kept as humour, never a fact) or
+    # uncertain (possibly misheard or ambiguous: never used as a fact). NULL is a
+    # fact recorded before natures existed. A re-journal (yuki.memory.rejournal)
+    # supersedes what the same captures produced before, keeping the old rows
+    # (superseded_at, superseded_by = the new batch) and recording on the new
+    # batch which batches it replaced. The portrait's personality facts carry an
+    # aspect (talk | cares | joke | story | people). Additive only, like 2-13.
+    """
+    ALTER TABLE journal ADD COLUMN nature TEXT;
+    ALTER TABLE journal ADD COLUMN superseded_at REAL;
+    ALTER TABLE journal ADD COLUMN superseded_by INTEGER;       -- the journal_batches row that replaced it
+    CREATE INDEX journal_superseded ON journal(superseded_at);
+    ALTER TABLE journal_batches ADD COLUMN supersedes TEXT;     -- JSON: the batch ids a re-journal replaced
+    ALTER TABLE portrait_facts ADD COLUMN aspect TEXT;
+    """,
 )
 
 
@@ -2322,12 +2357,14 @@ class Store:
         return int(cur.lastrowid)
 
     def _insert_journal(self, conn: sqlite3.Connection, fact: NewFact, batch_id: int | None) -> int:
+        nature = getattr(fact, "nature", None)
         cur = conn.execute(
             "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
-            " by_yuki) VALUES (?,?,?,?,?,?,?,?,?)",
+            " by_yuki, nature) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 float(fact.at), fact.thread_id, fact.app or "", fact.host, self.cipher.encrypt(fact.fact),
                 int(fact.importance), batch_id, time.time(), int(bool(getattr(fact, "by_yuki", False))),
+                nature if nature in JOURNAL_NATURES else "fact",
             ),
         )
         journal_id = int(cur.lastrowid)
@@ -2339,17 +2376,31 @@ class Store:
             )
         return journal_id
 
+    def _supersede_batches(self, conn: sqlite3.Connection, batch_id: int, supersedes: Sequence[int]) -> int:
+        """A re-journal: the facts the replaced batches wrote are superseded by ``batch_id`` (kept, never deleted)."""
+        old = sorted({int(b) for b in supersedes if b is not None and int(b) != batch_id})
+        if not old:
+            return 0
+        conn.execute("UPDATE journal_batches SET supersedes=? WHERE id=?", (json.dumps(old), batch_id))
+        return conn.execute(
+            "UPDATE journal SET superseded_at=?, superseded_by=? WHERE batch_id IN (%s) AND superseded_at IS NULL"
+            % ",".join("?" * len(old)), (time.time(), batch_id, *old)).rowcount
+
     def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
                      questions: Sequence[NewQuestion] = (),
-                     question_outcomes: list[tuple[int | None, str]] | None = None) -> int:
+                     question_outcomes: list[tuple[int | None, str]] | None = None,
+                     *, supersedes: Sequence[int] = ()) -> int:
         """Atomically record a batch, its facts (+vectors), its questions for the user (deduped,
         see :meth:`add_questions`; each gets the journal ids of the facts from its source) and
-        mark its captures journaled. ``question_outcomes`` receives ``(id, outcome)`` per question."""
+        mark its captures journaled. ``question_outcomes`` receives ``(id, outcome)`` per question.
+        ``supersedes``: a re-journal's earlier batches of the same captures, whose facts it replaces
+        (:meth:`_supersede_batches`, same transaction)."""
         ids = list(capture_ids)
         known = self.question_known_keys() if questions else set()
 
         def op(conn: sqlite3.Connection) -> int:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
+            self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
             for q in questions:
                 q.source_ids = sorted({*q.source_ids, *(journal_ids[i] for i in q.fact_indexes
@@ -2406,7 +2457,7 @@ class Store:
         self, since: TimeArg, until: TimeArg, app: str | Sequence[str] | None, host: str | None,
         process: str | None = None,
     ) -> tuple[str, list[Any]]:
-        clauses, params = [], []
+        clauses, params = ["j.superseded_at IS NULL"], []   # a re-journal's replaced rows are history only
         if (s := _ts(since)) is not None:
             clauses.append("j.at >= ?")
             params.append(s)
@@ -2431,10 +2482,13 @@ class Store:
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
     def _entry(self, r: sqlite3.Row, score: float | None = None) -> JournalEntry:
+        keys = r.keys()
+        nature = r["nature"] if "nature" in keys else None
         return JournalEntry(
             id=r["id"], at=r["at"], thread_id=r["thread_id"], app=r["app"], host=r["host"],
             fact=self.cipher.decrypt(r["fact_ciphertext"]), importance=r["importance"],
-            batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in r.keys() else False,
+            batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in keys else False,
+            nature=nature if nature in JOURNAL_NATURES else "fact",
         )
 
     def search_journal(
@@ -2515,7 +2569,8 @@ class Store:
     def journal_for_thread(self, thread_id: int, limit: int = 10) -> list[JournalEntry]:
         """The ``limit`` newest facts of one thread, returned oldest first."""
         rows = self._query(
-            "SELECT j.* FROM journal j WHERE j.thread_id=? ORDER BY j.at DESC, j.id DESC LIMIT ?",
+            "SELECT j.* FROM journal j WHERE j.thread_id=? AND j.superseded_at IS NULL"
+            " ORDER BY j.at DESC, j.id DESC LIMIT ?",
             (thread_id, int(limit)),
         )
         return [self._entry(r) for r in reversed(rows)]
@@ -2524,7 +2579,7 @@ class Store:
         """Facts that have no embedding yet (e.g. the embedder failed when they were written)."""
         rows = self._query(
             "SELECT j.* FROM journal j LEFT JOIN journal_vec v ON v.journal_id = j.id"
-            " WHERE v.journal_id IS NULL ORDER BY j.id LIMIT ?",
+            " WHERE v.journal_id IS NULL AND j.superseded_at IS NULL ORDER BY j.id LIMIT ?",
             (int(limit),),
         )
         return [self._entry(r) for r in rows]
@@ -2550,12 +2605,70 @@ class Store:
         portrait worker's checkpoint: a fact committed late (its ``at`` is the
         capture time, minutes earlier) is still picked up by the next run.
         """
-        sql = "SELECT j.* FROM journal j WHERE j.id > ? ORDER BY j.id"
+        sql = "SELECT j.* FROM journal j WHERE j.id > ? AND j.superseded_at IS NULL ORDER BY j.id"
         params: list[Any] = [int(after_id)]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
         return [self._entry(r) for r in self._query(sql, params)]
+
+    # -- re-journal (yuki.memory.rejournal) ---------------------------------
+
+    def journaled_captures(
+        self, *, thread_kind: str | None = None, since: TimeArg = None, until: TimeArg = None,
+        batch_ids: Iterable[int] | None = None,
+    ) -> list[tuple[PendingCapture, int]]:
+        """Captures still stored that were journaled, with the batch that journaled each, oldest first.
+
+        Filtered by the thread's kind (``threads.kind``, e.g. ``my_call_side``), the
+        capture time window, or the batches given. Captures past their TTL are gone
+        (:meth:`prune`) and cannot be re-journaled.
+        """
+        clauses, params = ["c.journal_batch_id IS NOT NULL"], []
+        if thread_kind:
+            clauses.append("t.kind = ?")
+            params.append(thread_kind)
+        if (s := _ts(since)) is not None:
+            clauses.append("c.at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("c.at < ?")
+            params.append(u)
+        if batch_ids is not None:
+            ids = sorted({int(b) for b in batch_ids})
+            if not ids:
+                return []
+            clauses.append("c.journal_batch_id IN (%s)" % ",".join("?" * len(ids)))
+            params.extend(ids)
+        rows = self._query(
+            "SELECT c.id, c.thread_id, c.at, c.trigger, c.delta_ciphertext, c.chars, c.journal_attempts, c.kind,"
+            " c.profile, c.by_yuki, c.yuki_request_ciphertext, c.journal_batch_id FROM captures c"
+            " JOIN threads t ON t.id = c.thread_id WHERE " + " AND ".join(clauses) + " ORDER BY c.at, c.id", params)
+        return [(PendingCapture(
+            id=r["id"], thread_id=r["thread_id"], at=r["at"], trigger=r["trigger"],
+            delta=self.cipher.decrypt(r["delta_ciphertext"]), chars=r["chars"], attempts=r["journal_attempts"],
+            kind=r["kind"], profile=r["profile"], by_yuki=bool(r["by_yuki"]),
+            yuki_request=self._dec(r["yuki_request_ciphertext"]),
+        ), int(r["journal_batch_id"])) for r in rows]
+
+    def journal_of_batches(self, batch_ids: Iterable[int], *, include_superseded: bool = False) -> list[JournalEntry]:
+        """The journal rows the given batches wrote, oldest first (superseded ones too when asked)."""
+        ids = sorted({int(b) for b in batch_ids})
+        if not ids:
+            return []
+        extra = "" if include_superseded else " AND j.superseded_at IS NULL"
+        return [self._entry(r) for r in self._query(
+            "SELECT j.* FROM journal j WHERE j.batch_id IN (%s)%s ORDER BY j.at, j.id"
+            % (",".join("?" * len(ids)), extra), ids)]
+
+    def superseded_journal(self, journal_ids: Iterable[int]) -> dict[int, int]:
+        """``{journal id: the batch that replaced it}`` for those of ``journal_ids`` a re-journal superseded."""
+        ids = sorted({int(i) for i in journal_ids})
+        if not ids:
+            return {}
+        return {int(r["id"]): int(r["superseded_by"] or 0) for r in self._query(
+            "SELECT id, superseded_by FROM journal WHERE superseded_at IS NOT NULL AND id IN (%s)"
+            % ",".join("?" * len(ids)), ids)}
 
     def journal_count(self, since: TimeArg = None, until: TimeArg = None) -> int:
         """Number of journal facts in ``[since, until)``."""
@@ -2579,6 +2692,7 @@ class Store:
             source_ids=sources, confidence=r["confidence"], origin=r["origin"] or "model",
             created_at=r["created_at"], expired_at=r["expired_at"], superseded_by=r["superseded_by"],
             run_id=r["run_id"], episode_ids=episodes,
+            aspect=(r["aspect"] if "aspect" in r.keys() and r["aspect"] in PERSONALITY_ASPECTS else None),
         )
 
     def portrait_facts(
@@ -2610,15 +2724,17 @@ class Store:
     def _insert_fact(
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
         source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
-        episode_ids: Sequence[int] = (),
+        episode_ids: Sequence[int] = (), aspect: str | None = None,
     ) -> int:
         cur = conn.execute(
             "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
-            " source_ids, confidence, origin, created_at, run_id, episode_ids) VALUES (?,?,?,?,NULL,?,?,?,?,?,?)",
+            " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect)"
+            " VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?)",
             (
                 kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
                 json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
                 json.dumps([int(i) for i in episode_ids]) if episode_ids else None,
+                aspect if kind == "personality" and aspect in PERSONALITY_ASPECTS else None,
             ),
         )
         return int(cur.lastrowid)
@@ -2675,7 +2791,7 @@ class Store:
                     new_id = self._insert_fact(
                         conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
                         source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
-                        run_id=run_id, now=now, episode_ids=ch.episode_ids,
+                        run_id=run_id, now=now, episode_ids=ch.episode_ids, aspect=ch.aspect,
                     )
                 if old is not None:
                     self._end_fact(conn, old["id"], at, now, new_id)
@@ -3101,6 +3217,32 @@ class Store:
         return [self._timeline_row(r) for r in self._query(
             "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
         )]
+
+    def timeline_states(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
+        """Like :meth:`timeline_between` but content-free and cheap: nothing is decrypted.
+
+        The rows carry times, state, app, host, counters and flags only (no
+        title, path or Yuki request): enough for presence and breaks, read on
+        every coach tick over a day and a half.
+        """
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("ended_at > ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("started_at < ?")
+            params.append(u)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return [TimelineRow(
+            id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], state=r["state"], process=r["process"],
+            app=r["app"], host=r["host"], page_key=r["page_key"], active_s=r["active_s"] or 0.0,
+            passive_s=r["passive_s"] or 0.0, away_s=r["away_s"] or 0.0, media_s=r["media_s"] or 0.0,
+            withheld=r["withheld"], fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
+            by_yuki=bool(r["by_yuki"]), source=r["source"],
+        ) for r in self._query(
+            "SELECT id, started_at, ended_at, state, process, app, host, page_key, active_s, passive_s, away_s,"
+            " media_s, withheld, fullscreen, meeting, mic_s, by_yuki, source FROM timeline" + where
+            + " ORDER BY started_at, id", params)]
 
     def timeline_bounds(self) -> tuple[float | None, float | None]:
         """Earliest start and latest end in the timeline."""
@@ -4961,20 +5103,21 @@ class Store:
 
     def commit_call_batch(
         self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
-        commitments: Sequence[ConversationChange] = (),
+        commitments: Sequence[ConversationChange] = (), *, supersedes: Sequence[int] = (),
     ) -> tuple[int, list[int]]:
         """:meth:`commit_batch` for a call's side, plus the user's commitments from it, in one transaction.
 
         Commitments are conversation facts of kind ``commitment``, origin
         ``call`` (so they reach the to-do list and reminders like any other),
         each already checked to quote the user's own words. Returns the batch
-        id and the new commitment ids.
+        id and the new commitment ids. ``supersedes``: as for :meth:`commit_batch`.
         """
         ids = list(capture_ids)
         now = time.time()
 
         def op(conn: sqlite3.Connection) -> tuple[int, list[int]]:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
+            self._supersede_batches(conn, batch_id, supersedes)
             for fact in facts:
                 self._insert_journal(conn, fact, batch_id)
             new_ids = [self._insert_cfact(conn, ch, now, None) for ch in commitments]

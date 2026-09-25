@@ -94,7 +94,9 @@ def question_item_schema(source: str = "source") -> dict[str, Any]:
         "kind": {
             "type": "string", "enum": list(QUESTION_KINDS),
             "description": "person: who someone is to the user; meaning: what a name is; ownership: whose "
-                           "task, study, account or obligation it is; fact: anything else.",
+                           "task, study, account or obligation it is; personality: about the user themselves "
+                           "(the story behind a bit of theirs, what got them into something, whether something "
+                           "they said was real or a joke); fact: anything else.",
         },
         "question": {
             "type": "string",
@@ -269,6 +271,10 @@ not state ("your exam" when it says "an exam"), never quote a private message at
 secret, an account number or a fee. Do not explain why you are asking.
 - Never mention Yuki's memory, journal, data, facts, questions list or that this is a check-in; \
 no preamble, no apology, no "quick question", no emojis unless their rules ask.
+- A personality question is about the user themselves, asked out of real interest like a friend \
+who was there: warm, and playful when the subject is one of their own jokes; whether something \
+was real or a joke may be asked just like that ("okay, the rich-partner plan: real or a bit?"). \
+Never about their health, body, family or money troubles.
 - If WHAT MEMORY ALREADY KNOWS already answers it, or it is not worth the user's attention, say \
 none.
 

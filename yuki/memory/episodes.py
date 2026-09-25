@@ -65,6 +65,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted
+from yuki.memory.personality import nature_mark, usable
 from yuki.memory.store import EpisodeRunStats, JournalEntry, NewEpisode, Store
 from yuki.memory.timeline import (
     BREAK_S,
@@ -366,7 +367,8 @@ def build_user_message(
     for j in journal:
         where = j.app + (f" / {j.host}" if j.host else "")
         mark = " [by Yuki]" if getattr(j, "by_yuki", False) else ""
-        line = f"- {_local(j.at, '%H:%M')} [{safe(where, 100)}]{mark} {safe(j.fact, 600)}"
+        line = (f"- {_local(j.at, '%H:%M')} [{safe(where, 100)}]{mark} {safe(j.fact, 600)}"
+                f"{nature_mark(getattr(j, 'nature', 'fact'))}")
         if used + len(line) > JOURNAL_CHARS:
             journal_lines.append(f"- ... {len(journal) - len(journal_lines)} more facts not shown")
             break
@@ -551,7 +553,8 @@ class EpisodeWorker:
             elif stats.present_s < self.min_present_s:
                 stats.outcome = result.outcome = "empty"
             else:
-                journal = self.store.journal_between(window.start, window.end)
+                # an item that may be misheard or ambiguous is never evidence (yuki.memory.personality)
+                journal = [j for j in self.store.journal_between(window.start, window.end) if usable(j)]
                 user = build_user_message(window, facts, journal)
                 request = {
                     "model": self.model,

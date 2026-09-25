@@ -71,6 +71,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, _calendar, sanitize_untrusted, user_identity
+from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
 from yuki.memory.questions import (
     QUESTION_GUIDANCE,
     embed_questions,
@@ -284,9 +285,15 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "importance", "exchange"],
+                    "required": ["text", "nature", "importance", "exchange"],
                     "properties": {
                         "text": {"type": "string", "description": "One atomic, self-contained third-person sentence."},
+                        "nature": {
+                            "type": "string", "enum": list(NATURES),
+                            "description": "fact (told as true), trait (how the user is), story (an anecdote they "
+                                           "told), humor (a joke, bit, tease or banter - never a fact) or uncertain "
+                                           "(ambiguous, or you cannot tell whether they meant it).",
+                        },
                         "importance": {"type": "integer", "enum": list(range(1, 11))},
                         "exchange": {
                             "type": "integer",
@@ -693,7 +700,8 @@ class ConversationWorker:
         parts += [f"RECENTLY ENDED (last {ENDED_DAYS} days; history, never re-add):",
                   *([self._item_line(f, safe, ended=True) for f in ended] or ["(none)"]), ""]
         parts += ["FACTS ALREADY IN THE JOURNAL (from conversations with Yuki; never repeat):",
-                  *([f"- {_local(j.at, '%Y-%m-%d %H:%M')}: {safe(j.fact, 400)}" for j in journal] or ["(none)"]), ""]
+                  *([f"- {_local(j.at, '%Y-%m-%d %H:%M')}: {safe(j.fact, 400)}{nature_mark(j.nature)}"
+                     for j in journal] or ["(none)"]), ""]
         if context:
             parts.append("EARLIER IN THIS CONVERSATION (context only, never cite):")
             for t in context:
@@ -830,7 +838,7 @@ class ConversationWorker:
             if not 0 <= index < len(turns):
                 index = len(turns) - 1
             facts.append(NewFact(at=turns[index].at, thread_id=None, app=Store.CONVERSATION_APP, host=None,
-                                 fact=text, importance=importance))
+                                 fact=text, importance=importance, nature=normalize_nature(item.get("nature"))))
         return facts
 
     @staticmethod
@@ -901,7 +909,7 @@ class ConversationWorker:
             journal = self.store.journal_for_thread(self.store.conversation_thread_id(), limit=12)
             user = self.build_extract_message(turns, current, ended, context, journal, now)
             system = (EXTRACT_SYSTEM_PROMPT.replace("{identity}", user_identity(self.user_names()))
-                      .replace("{questions}", QUESTION_GUIDANCE))
+                      .replace("{questions}", f"{NATURE_GUIDANCE}\n\n{QUESTION_GUIDANCE}"))
             tool_input, response, request = self._call("extract", system, user, RECORD_CONVERSATION_TOOL, call)
             ops = tool_input.get("operations")
             if not isinstance(ops, list):

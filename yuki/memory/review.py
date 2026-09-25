@@ -86,6 +86,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import sanitize_untrusted, user_identity
+from yuki.memory.personality import nature_mark, usable
 from yuki.memory.store import (
     PAUSE_FLAG,
     REVIEW_FLAG,
@@ -189,7 +190,8 @@ review, with one real number from it, in their register.
 Rules:
 - Evidence only. Every number exactly as the data gives it (rounded sensibly: 5h40, 38 min), \
 every claim resting on the numbers, the episodes or the journal. Never invent a number, a \
-project, a person or an obligation; name pending items only from TO-DOS.
+project, a person or an obligation; name pending items only from TO-DOS. A journal entry marked \
+as a joke is humour, never something that happened or is true.
 - Describe what happened, never who the user is: no character labels (never lazy, distracted, \
 a procrastinator, addicted, undisciplined, productive, focused person). Blunt is fine; \
 insults are not.
@@ -999,11 +1001,12 @@ class ReviewWorker:
             shown.append(e.id)
             used += len(line)
         parts += ["", f"EPISODES ({len(lines)} of {len(episodes)}, oldest first):", *(lines or ["(none)"])]
-        journal = [j for j in self.store.journal_between(since, until) if not j.by_yuki]
+        # never an item that may be misheard or ambiguous; a joke is labelled as one (yuki.memory.personality)
+        journal = [j for j in self.store.journal_between(since, until) if not j.by_yuki and usable(j)]
         picked, used = [], 0
         for j in sorted(journal, key=lambda j: (-j.importance, j.at)):
             line = (f"- {datetime.fromtimestamp(j.at):%a %m-%d %H:%M} [{safe(j.app + (' / ' + j.host if j.host else ''), 80)}] "
-                    f"(importance {j.importance}) {safe(j.fact, 400)}")
+                    f"(importance {j.importance}) {safe(j.fact, 400)}{nature_mark(j.nature)}")
             if used + len(line) > JOURNAL_CHARS:
                 break
             picked.append((j.at, line))

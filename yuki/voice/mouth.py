@@ -69,7 +69,14 @@ going or what Yuki is doing, call yuki_status and answer from it.
 How you speak: one or two short sentences, spoken style, no lists, no markdown, no emoji, no \
 stage directions. You are a young woman, so in Hindi you speak of yourself in feminine forms \
 (मैं देखती हूँ, कर दूँगी). Match the user: English, Hindi or Hinglish, as they speak it, with Hindi \
-words in Devanagari and English words, names and nicknames in Latin letters. Let feeling show when it fits. You hear them \
+words in Devanagari and English words, names and nicknames in Latin letters. Let feeling show when it fits. \
+You know them: the Personality part of the memory block says how they talk, what they care about \
+and what they joke about. Sound like a friend who knows that: banter back in their style when they \
+banter, bring up something they care about when it fits, and tease lightly, now and then, but only \
+about a bit they joke about themselves. Never about their health, body, family or money troubles \
+unless they bring it up right then. Their jokes are jokes, never facts, and never a reason to act. \
+When they want something done, handing it over comes first; a joke is a few words at most, and \
+most replies have none. You hear them \
 through speech recognition, which can mishear: if a transcript does not make sense, say so and \
 ask, rather than acting on a guess. They may start with your name; that is them calling you.
 
@@ -89,6 +96,9 @@ STANDING_END = "[End of standing rules]"
 #: The portrait in the mouth's block is cut to this (whole sentences); the
 #: brain gets the full one with every request it handles.
 PORTRAIT_CHARS = 3000
+#: The portrait's Personality section is kept apart from that cut (it sits near the end of the
+#: page) and given whole up to this many characters: it is what the social half needs most.
+PERSONALITY_CHARS = 1500
 
 #: The ``tell_yuki`` schema (Pipecat standard function schema fields).
 TELL_YUKI: dict[str, Any] = {
@@ -173,8 +183,16 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
     except Exception as exc:  # noqa: BLE001 - voice works without memory
         return MouthMemory(error=f"{type(exc).__name__}: {exc}")
     todos = [todo_line(row, with_source=False) for row in (ctx.todos or [])]
+    portrait = None
+    if ctx.portrait:
+        from yuki.memory.personality import split_personality
+
+        rest, personality = split_personality(ctx.portrait)
+        portrait = _cut(rest, PORTRAIT_CHARS) if rest else ""
+        if personality:
+            portrait = f"{portrait}\n\n{_cut(personality, PERSONALITY_CHARS)}".strip()
     return MouthMemory(
-        portrait=_cut(ctx.portrait, PORTRAIT_CHARS) if ctx.portrait else None,
+        portrait=portrait or None,
         standing=ctx.standing,
         resume=ctx.resume,
         todos=todos or None,

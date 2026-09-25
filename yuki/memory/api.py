@@ -431,7 +431,9 @@ class MemoryClient:
         Each hit: ``{"kind": "fact" | "episode" | "chat" | "session" | "review",
         "at": ISO local time, "until": ISO | None (an episode's, session's or
         review period's end), "app": str | None, "host": str | None, "fact": str,
-        "importance": int | None, "score": float}``. ``fact`` is the journal fact,
+        "importance": int | None, "score": float}``, plus ``"nature"`` on journal facts (fact | trait |
+        story | humor | uncertain, yuki.memory.personality: a joke or an uncertain item is not a fact;
+        readers label them). ``fact`` is the journal fact,
         the episode text, the session summary, a weekly review (``Weekly review
         2026-W39 (Mon 14 Sep - Sun 20 Sep): ...``, its whole text), or for a chat
         one exchange: ``The user said: "..." Yuki replied: "..." Yuki did: ...``
@@ -495,6 +497,7 @@ class MemoryClient:
                 out.append({
                     "kind": "fact", "at": _iso(item.at), "until": None, "app": item.app, "host": item.host,
                     "fact": item.fact, "importance": item.importance, "score": score,
+                    "nature": getattr(item, "nature", "fact"),
                 })
             elif key[0] == "chat":
                 out.append({
@@ -616,8 +619,9 @@ class MemoryClient:
         each in the user's own words with the date it was said; commitments are
         what the user asked Yuki to do later or Yuki promised, with the due date
         when one was given and the date asked. Hard cap 1,200 characters (~300
-        tokens): when it is over, the oldest items are dropped whole (never cut
-        mid-sentence). ``""`` when there is nothing (or memory cannot be read).
+        tokens): when it is over, items are dropped whole (never cut
+        mid-sentence), call commitments first, then commitments, then preferences, rules
+        last, oldest first within each. ``""`` when there is nothing (or memory cannot be read).
         Meant to be attached to every request after the cached portrait.
         """
         try:
@@ -643,9 +647,16 @@ class MemoryClient:
                     lines += [headings[kind], *rows]
             return "\n".join(lines)
 
+        # Over the cap, what goes first is what matters least on every request: the user's
+        # own call commitments, then Yuki's, then preferences; rules go only when nothing
+        # else is left. Oldest first within each. (Call commitments once pushed "call me
+        # captain" out of every request.)
+        drop_order = {"call": 0, "commitment": 1, "preference": 2, "rule": 3}
         kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
         while kept and len(render(kept)) > STANDING_CONTEXT_CHARS:
-            kept.pop(0)   # the oldest item goes first
+            victim = min(kept, key=lambda item: (drop_order.get(group(item[0]), 0),
+                                                 item[0].valid_from, item[0].id))
+            kept.remove(victim)
         return render(kept) if kept else ""
 
     def resume_context(self, within_hours: float = 6.0) -> str | None:

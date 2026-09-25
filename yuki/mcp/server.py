@@ -57,12 +57,14 @@ assistant. Its memory holds:
 documents, terminal commands) turned into short dated facts, a timeline of which apps and sites were in \
 front and for how long, and episode narratives of what the user was doing;
 - the user's conversations with Yuki: exchanges, session summaries, and the standing rules the user set;
-- a one-page portrait of the user (work, interests, people, routines, preferences, open loops), rebuilt \
-nightly from the facts;
+- a one-page portrait of the user (work, interests, people, routines, preferences, personality, open \
+loops), rebuilt nightly from the facts;
 - procedures that worked on this PC (know-how);
 - a weekly review of the user's last seven days (time use against the week before, focus, what got done \
 and what is open), written on Sunday evenings.
 
+Not everything in memory is a fact: an item marked as a joke is the user's humour (a bit, a tease, a boast), \
+never something true about them, and an item marked uncertain may be misheard; treat neither as fact. \
 Dates matter. Each fact is dated by when it happened or was said, not when it was captured; older facts may \
 be out of date and a later one can supersede an earlier one. Read the dates in each result and narrow \
 searches with since/until. Times are the PC's local time. Every result starts with the time range it covers. \
@@ -277,6 +279,11 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                 start, end = _parse_iso(hit.get("at")), _parse_iso(hit.get("until"))
                 when = fmt_span(start, end) if end else fmt_at(start)
                 meta = [hit.get("kind") or "fact"]
+                nature = hit.get("nature")
+                if nature and nature != "fact":   # a joke or an uncertain item is not a fact
+                    meta.append({"humor": "joke/banter - humour, not a fact",
+                                 "uncertain": "uncertain - possibly misheard or ambiguous, not a fact",
+                                 "story": "a story the user told", "trait": "trait"}.get(nature, nature))
                 where = ", ".join(x for x in (hit.get("app"), hit.get("host")) if x)
                 if where:
                     meta.append(where)
