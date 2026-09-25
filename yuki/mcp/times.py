@@ -1,27 +1,23 @@
-"""Time arguments of the MCP tools: ISO strings or plain phrases, resolved to local time.
+"""Time arguments of the MCP tools: ISO strings (or ``now``), resolved to local time.
 
 Argument parsing only (plumbing): every accepted form resolves to a span
 ``[start, end)`` in the PC's local time zone. A *point* (an ISO date-time,
-"now", "3 hours ago") has ``start == end``; a *period* (a day, a week, "last 7
-days") has an extent. :func:`resolve_range` turns a tool's ``since``/``until``
-into one window:
+"now") has ``start == end``; a *period* (an ISO date: that whole day) has an
+extent. :func:`resolve_range` turns a tool's ``since``/``until`` into one window:
 
 - ``since`` takes the start of its span, ``until`` the end of its span, so a day
-  given as ``until`` is included whole (until="yesterday" runs through the end of
-  yesterday; until="2026-09-20" through the end of that day).
-- A period given alone as ``since`` is the whole window (since="yesterday" is
-  yesterday only; since="last 7 days" ends now). A point given alone as ``since``
-  runs until now. ``until="now"`` extends any ``since`` to the present.
+  given as ``until`` is included whole (until="2026-09-20" runs through the end
+  of that day).
+- A day given alone as ``since`` is the whole window (since="2026-09-20" is that
+  day only). A point given alone as ``since`` runs until now. ``until="now"``
+  extends any ``since`` to the present.
 - Windows never extend past now (nothing is recorded in the future).
 
-Accepted forms (case-insensitive): ``now``, ``today``, ``yesterday``, ``day
-before yesterday``, ``this week`` / ``last week`` (calendar weeks from Monday),
-``this month`` / ``last month``, ``this year``, ``last|past N
-minutes|hours|days|weeks|months`` (also ``last hour``, ``past day``), ``N
-minutes|hours|days|weeks ago``, a weekday (``monday``: the latest Monday, today
-included; ``last monday``: the latest before today), an ISO date
-(``2026-09-20``), an ISO date-time (``2026-09-20T14:00``, ``2026-09-20 14:00``,
-with or without an offset or ``Z``) and a time today (``14:00``).
+Accepted forms: ``now``, an ISO date (``2026-09-20``), an ISO date-time
+(``2026-09-20T14:00``, ``2026-09-20 14:00``, with or without an offset or
+``Z``) and an ISO time today (``14:00``). Phrases ("yesterday", "last 7 days",
+"last friday") are the caller's to turn into dates - a grammar of English time
+words here would be code deciding what someone meant (docs/research/no-pattern-audit.md H).
 """
 
 from __future__ import annotations
@@ -29,15 +25,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
-WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-_UNITS = {
-    "minute": timedelta(minutes=1), "min": timedelta(minutes=1), "mins": timedelta(minutes=1),
-    "hour": timedelta(hours=1), "hr": timedelta(hours=1), "hrs": timedelta(hours=1),
-    "day": timedelta(days=1), "week": timedelta(weeks=1),
-}
 FORMS_HELP = (
-    "use an ISO date or date-time (2026-09-20, 2026-09-20T14:00) or a phrase: now, today, yesterday, "
-    "this week, last week, this month, last month, last 7 days, past 3 hours, 2 days ago, monday, last friday"
+    "use an ISO date or date-time in the PC's local time (2026-09-20, 2026-09-20T14:00) or 'now'; turn "
+    "phrases like 'yesterday' or 'last 7 days' into dates first"
 )
 
 
@@ -69,91 +59,17 @@ def _day_span(d: date) -> Span:
     return Span(_midnight(d), _midnight(d + timedelta(days=1)), True)
 
 
-def _month_start(d: date, back: int = 0) -> date:
-    y, m = d.year, d.month - back
-    while m <= 0:
-        y, m = y - 1, m + 12
-    return date(y, m, 1)
-
-
-def _count(word: str) -> int | None:
-    words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-             "eight": 8, "nine": 9, "ten": 10, "twelve": 12, "fourteen": 14, "thirty": 30}
-    if word.isdigit():
-        return int(word)
-    return words.get(word)
-
-
-def _unit(word: str) -> str | None:
-    w = word[:-1] if word.endswith("s") and word[:-1] in ("minute", "hour", "day", "week", "month", "year") else word
-    if w in _UNITS or w in ("month", "year"):
-        return w
-    return None
-
-
-def _minus(now: datetime, n: int, unit: str) -> datetime:
-    if unit == "month":
-        target = _month_start(now.date(), n)
-        day = min(now.day, 28)
-        return _local(datetime.combine(target.replace(day=day), now.time().replace(tzinfo=None)))
-    if unit == "year":
-        return _minus(now, 12 * n, "month")
-    return now - _UNITS[unit] * n
-
-
 def resolve(value: str, now: datetime | None = None) -> Span:
     """The span ``value`` names. Raises :class:`TimeArgError` for anything else."""
     now = now or local_now()
-    text = " ".join(str(value).strip().lower().replace(",", " ").split())
+    text = str(value).strip()
     if not text:
         raise TimeArgError("empty time argument")
     today = now.date()
-    if text == "now":
+    if text.lower() == "now":
         return Span(now, now, False)
-    if text == "today":
-        return _day_span(today)
-    if text == "yesterday":
-        return _day_span(today - timedelta(days=1))
-    if text in ("day before yesterday", "the day before yesterday"):
-        return _day_span(today - timedelta(days=2))
-    monday = today - timedelta(days=today.weekday())
-    if text == "this week":
-        return Span(_midnight(monday), _midnight(monday + timedelta(days=7)), True)
-    if text == "last week":
-        return Span(_midnight(monday - timedelta(days=7)), _midnight(monday), True)
-    if text == "this month":
-        start = _month_start(today)
-        return Span(_midnight(start), _midnight(_month_start(start + timedelta(days=32))), True)
-    if text == "last month":
-        start = _month_start(today, 1)
-        return Span(_midnight(start), _midnight(_month_start(today)), True)
-    if text == "this year":
-        return Span(_midnight(date(today.year, 1, 1)), _midnight(date(today.year + 1, 1, 1)), True)
-    words = text.split()
-    # weekday: "monday", "on monday", "last monday"
-    if words and words[0] == "on":
-        words = words[1:]
-    if len(words) in (1, 2) and words[-1] in WEEKDAYS and (len(words) == 1 or words[0] in ("last", "past")):
-        back = (today.weekday() - WEEKDAYS.index(words[-1])) % 7
-        if len(words) == 2 and back == 0:
-            back = 7
-        return _day_span(today - timedelta(days=back))
-    # "last 7 days", "past 3 hours", "last hour", "past day", "the last 2 weeks"
-    if words and words[0] == "the":
-        words = words[1:]
-    if len(words) in (2, 3) and words[0] in ("last", "past"):
-        n = _count(words[1]) if len(words) == 3 else 1
-        unit = _unit(words[-1])
-        if n is not None and unit and n > 0:
-            return Span(_minus(now, n, unit), now, True)
-    # "3 hours ago", "a week ago"
-    if len(words) == 3 and words[2] == "ago":
-        n, unit = _count(words[0]), _unit(words[1])
-        if n is not None and unit:
-            at = _minus(now, n, unit)
-            return Span(at, at, False)
     # ISO forms
-    raw = str(value).strip()
+    raw = text
     iso = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
     try:
         if len(iso) == 10 and iso[4] == "-" and iso[7] == "-":

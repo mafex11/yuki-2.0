@@ -29,22 +29,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from secret_cases import NEGATIVES, POSITIVES  # noqa: E402
+from secret_cases import LABEL_ONLY, NEGATIVES, POSITIVES  # noqa: E402
+from secret_cases_holdout import HOLDOUT_LABEL_ONLY, HOLDOUT_NEGATIVES, HOLDOUT_POSITIVES  # noqa: E402
 
 from yuki.memory.secret_filter import KINDS, find, redact  # noqa: E402
 
 
-def evaluate(finder) -> dict:
-    """``finder(text) -> [(kind, start, end)]``; per kind: tp, fn, fp, wrong-kind hides."""
+def evaluate(finder, positives=POSITIVES, negatives=NEGATIVES, skip=frozenset()) -> dict:
+    """``finder(text) -> [(kind, start, end)]``; per kind: tp, fn, fp, wrong-kind hides.
+
+    ``skip``: secrets left out of the recall (out of scope); hiding one is not a false positive either.
+    """
     stats = {k: Counter() for k in KINDS}
     misses, false = [], []
-    for i, (text, expected) in enumerate(POSITIVES):
+    for i, (text, expected) in enumerate(positives):
         found = finder(text)
         spans = []
         for kind, secret in expected:
             s = text.find(secret)
             e = s + len(secret)
             spans.append((s, e))
+            if secret in skip:
+                continue
             over = [f for f in found if f[1] < e and s < f[2]]
             if any(f[0] == kind for f in over):
                 stats[kind]["tp"] += 1
@@ -59,11 +65,11 @@ def evaluate(finder) -> dict:
                 false.append(("pos", i, f[0]))
             elif not any(f[0] == k and f[1] < e and s < f[2] for (k, _), (s, e) in zip(expected, spans)):
                 stats.setdefault(f[0], Counter())["fp_kind"] += 1
-    for i, text in enumerate(NEGATIVES):
+    for i, text in enumerate(negatives):
         for f in finder(text):
             stats.setdefault(f[0], Counter())["fp"] += 1
             false.append(("neg", i, f[0]))
-    return {"stats": stats, "misses": misses, "false": false}
+    return {"stats": stats, "misses": misses, "false": false, "negatives": len(negatives)}
 
 
 def table(result: dict, title: str) -> str:
@@ -82,7 +88,7 @@ def table(result: dict, title: str) -> str:
     prec = tot["hidden"] / (tot["hidden"] + tot["fp"]) if tot["hidden"] + tot["fp"] else float("nan")
     rows.append(f"{'all':<13} {tot['n']:>3} {tot['hidden']:>3} {tot['fn']:>3} {tot['fp']:>3}  {prec:>9.2f} "
                 f"{tot['hidden'] / tot['n']:>7.2f}   (typed right: {tot['typed']}/{tot['n']}; negatives: "
-                f"{len(NEGATIVES)}, flagged: {sum(1 for f in result['false'] if f[0] == 'neg')})")
+                f"{result['negatives']}, flagged: {sum(1 for f in result['false'] if f[0] == 'neg')})")
     return "\n".join(rows)
 
 
@@ -186,11 +192,24 @@ def main() -> int:
     print(f"labelled set: {sum(len(e) for _, e in POSITIVES)} secrets in {len(POSITIVES)} positive texts, "
           f"{len(NEGATIVES)} hard negatives\n")
     res = evaluate(ours)
-    print(table(res, "yuki.memory.secret_filter"))
-    if res["misses"]:
-        print("missed (case index, kind):", res["misses"])
-    if res["false"]:
-        print("false positives (set, case index, kind):", res["false"])
+    print(table(res, "yuki.memory.secret_filter - main set, every case (label-only ones are out of scope)"))
+    print()
+    scoped = evaluate(ours, skip=LABEL_ONLY)
+    print(table(scoped, f"main set, fixed-format scope ({len(LABEL_ONLY)} label-only secrets left out)"))
+    if scoped["misses"]:
+        print("missed (case index, kind):", scoped["misses"])
+    if scoped["false"]:
+        print("false positives (set, case index, kind):", scoped["false"])
+    print()
+    hold = evaluate(ours, HOLDOUT_POSITIVES, HOLDOUT_NEGATIVES)
+    print(table(hold, "blind hold-out set, every case"))
+    print()
+    hold_scoped = evaluate(ours, HOLDOUT_POSITIVES, HOLDOUT_NEGATIVES, HOLDOUT_LABEL_ONLY)
+    print(table(hold_scoped, f"hold-out, fixed-format scope ({len(HOLDOUT_LABEL_ONLY)} label-only secrets left out)"))
+    if hold_scoped["misses"]:
+        print("missed (case index, kind):", hold_scoped["misses"])
+    if hold_scoped["false"]:
+        print("false positives (set, case index, kind):", hold_scoped["false"])
     big = synthetic_capture()
     if args.ds:
         out = subprocess.run([args.ds, "-c", DS_SCRIPT, str(ROOT), big], capture_output=True, text=True,

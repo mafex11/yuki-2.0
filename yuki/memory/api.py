@@ -7,8 +7,10 @@ never talks to the service directly: the service is steered with flag files next
 to the database (``paused``, ``refresh_portrait``) and observed through its named
 mutex and the database itself.
 
-Nothing here calls a model. The local embedder (for ``recall`` and know-how
-similarity) loads lazily on first use, in this process.
+Nothing here calls a model. Embeddings (for ``recall``, know-how similarity and
+rule matching) come from the memory service's embedder over its local pipe
+(:mod:`yuki.memory.embed_ipc`); only while the service is down does a local
+embedder load, lazily and in the background, in this process.
 
 Usage::
 
@@ -26,7 +28,7 @@ Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory
     memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
     memory.remember_rule(text, source_turn=None, supersedes=None) -> int   # immediate, the user's words;
                                                              # supersedes a near-duplicate (or the given id)
-    memory.revoke_rule(text) -> int                          # immediate; id revoked or 0
+    memory.revoke_rule(ref) -> int                           # "rule:12" as standing_context shows it; 0 if not one
     (both ask the service for a debounced portrait re-render, for its Relationship section)
     memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
 
@@ -34,7 +36,7 @@ To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
 
     memory.todos(include_done=False) -> list[dict]      # open loops + commitments + the user's own to-dos
     memory.add_todo(text, due=None) -> "todo:N"
-    memory.complete_todo(ref) -> id | None              # an id or the item's text
+    memory.complete_todo(ref) -> id | None              # an id ("todo:3", "commit:5", "loop:12"), never text
     memory.pending_nudges() -> list[dict]               # unshown, oldest first; wait on Local\\YukiNudgeReady
     memory.recent_nudges(hours=12) -> list[dict]        # shown ones of the last N hours, with shown_at + reaction
     memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
@@ -97,11 +99,6 @@ KNOWHOW_DUPLICATE_COSINE = 0.85
 #: A rule given with :meth:`MemoryClient.remember_rule` whose embedding is at
 #: least this close to an active rule or preference supersedes it.
 RULE_DUPLICATE_COSINE = 0.85
-#: :meth:`MemoryClient.revoke_rule` without a keyword match revokes the nearest
-#: active rule or preference only when it is at least this close. Measured
-#: 2026-09-24 (multilingual MiniLM): withdrawals of a rule in other words scored
-#: 0.50-0.57 against it, unrelated requests and other rules 0.03-0.29.
-REVOKE_MIN_COSINE = 0.45
 #: Hard budgets (characters, ~4 per token) of the blocks Yuki attaches to requests.
 STANDING_CONTEXT_CHARS = 1_200
 RESUME_CONTEXT_CHARS = 4_000
@@ -236,17 +233,28 @@ class MemoryClient:
     def _flag(self, name: str) -> Path:
         return flag_path(self.store.path, name)
 
-    def _embed(self, text: str) -> np.ndarray | None:
-        """Embedding of ``text`` with the local model, or ``None`` if the model cannot load."""
+    @property
+    def embedder(self) -> Any:
+        """The :class:`~yuki.memory.embed_ipc.EmbedClient`: the memory service's embedder over its
+        local pipe, else a local one loaded lazily (``yuki.memory.embed_ipc``)."""
         with self._embedder_lock:
             if self._embedder is None:
-                from yuki.memory.embed import get_embedder
+                from yuki.memory.embed_ipc import EmbedClient
 
-                self._embedder = get_embedder()
+                self._embedder = EmbedClient(self.store.cipher, self.store.path)
+            return self._embedder
+
+    def _embed(self, text: str, wait_s: float | None = None) -> np.ndarray | None:
+        """Embedding of ``text``, or ``None`` if none could be had within ``wait_s`` (default: a long bound).
+
+        A caller on a request's path passes a short ``wait_s`` and goes on without the vector
+        rather than waiting for a model to load (the service's embedder is used when it runs).
+        """
         try:
-            return self._embedder.embed_one(text)
+            vecs = self.embedder.embed([text], wait_s)
         except Exception:
             return None
+        return None if vecs is None or len(vecs) == 0 else vecs[0]
 
     def _journal_app_names(self, app: str) -> list[str]:
         """Display names the journal may carry for ``app`` (a display name or a process name).
@@ -330,7 +338,8 @@ class MemoryClient:
     def _format_knowhow(app: str | None, text: str) -> str:
         return f"[{app}] {text}" if app else text
 
-    def knowhow(self, app: str | None = None, query: str | None = None, limit: int = 8) -> list[str]:
+    def knowhow(self, app: str | None = None, query: str | None = None, limit: int = 8,
+                embed_wait_s: float | None = None) -> list[str]:
         """Current (valid) procedures that worked on this PC, as short strings.
 
         ``app`` is the foreground window's process name ("arc.exe",
@@ -341,7 +350,8 @@ class MemoryClient:
         rest is general know-how (entries without an app), or with no app
         either, every current entry. Each string is the procedure, prefixed with
         ``[app]`` when it belongs to one: "[arc] pass the URL as a launch
-        argument". At most ``limit`` entries.
+        argument". At most ``limit`` entries. ``embed_wait_s`` bounds the wait for the query's
+        embedding; past it the similar entries are left out (the app's own still come back).
         """
         limit = max(0, int(limit))
         if limit == 0:
@@ -355,7 +365,7 @@ class MemoryClient:
                 picked.append((k.app, k.text))
                 seen.add(k.id)
         if len(picked) < limit and query:
-            vec = self._embed(query)
+            vec = self._embed(query, embed_wait_s)
             if vec is not None:
                 for k in self.store.search_knowhow(vec, limit - len(picked), exclude_ids=sorted(seen)):
                     picked.append((k.app, k.text))
@@ -413,7 +423,8 @@ class MemoryClient:
     # -- recall ------------------------------------------------------------
 
     def recall(
-        self, query: str, since=None, until=None, app: str | None = None, limit: int = 15
+        self, query: str, since=None, until=None, app: str | None = None, limit: int = 15,
+        embed_wait_s: float | None = None,
     ) -> list[dict]:
         """Journal facts, episodes and past conversations with Yuki relevant to ``query``, best first.
 
@@ -441,7 +452,8 @@ class MemoryClient:
         one exchange: ``The user said: "..." Yuki replied: "..." Yuki did: ...``
         (long messages cut after whole sentences). ``score`` is the fused rank
         score; higher is better. Reviews, like episodes, are left out when
-        ``app`` is given.
+        ``app`` is given. ``embed_wait_s`` bounds the wait for the query's embedding; past
+        it the search is keyword-only (the voice grounding lookup cannot wait for a model load).
         """
         query = (query or "").strip()
         limit = max(0, int(limit))
@@ -459,7 +471,7 @@ class MemoryClient:
             entries.setdefault(key, item)
             scores[key] = scores.get(key, 0.0) + 1.0 / (_RRF_K + rank + 1)
 
-        vec = self._embed(query)
+        vec = self._embed(query, embed_wait_s)
         if vec is not None:
             for rank, e in enumerate(self.store.search_journal(vec, s, u, names, pool, process=process)):
                 add("fact", rank, e)
@@ -611,13 +623,14 @@ class MemoryClient:
             due = f"due {datetime.fromtimestamp(f.due_at):%Y-%m-%d %H:%M}".replace(" 00:00", "") if f.due_at else ""
             said = "said in a call" if f.origin == "call" else "asked"
             dates = ", ".join(x for x in (due, f"{said} {_day(f.valid_from)}") if x)
-            return f"- {text} ({dates})"
+            return f"- [commit:{f.id}] {text} ({dates})"   # the to-do id todo done takes
         if text is None and quote is None:
             return None
+        # the id forget_rule takes: the model picks the rule, no words are matched (no-pattern audit F)
         if text is None or (quote and normalize_quote(quote) == normalize_quote(text)):
-            return f'- "{quote}" (the user\'s words, {_day(f.valid_from)})'
+            return f'- [rule:{f.id}] "{quote}" (the user\'s words, {_day(f.valid_from)})'
         words = f' Their words: "{quote}"' if quote else ""
-        return f"- {text}{words} ({_day(f.valid_from)})"
+        return f"- [rule:{f.id}] {text}{words} ({_day(f.valid_from)})"
 
     def standing_context(self) -> str:
         """The user's active rules and preferences for Yuki, and Yuki's open commitments, as one block.
@@ -780,49 +793,29 @@ class MemoryClient:
         self.rerender_portrait()
         return fact_id
 
-    def revoke_rule(self, text: str) -> int:
-        """Mark the active rule (or preference) that ``text`` refers to as revoked; returns its id, or 0.
+    def revoke_rule(self, ref: str) -> int:
+        """Mark one active rule (or preference) revoked by its id; returns the id, or 0.
 
-        ``text`` is the rule, or the user's words withdrawing it ("stop
-        calling me babe"). The rule whose text or quote contains every word of
-        ``text`` is chosen (the newest if several); otherwise the nearest by
-        local embedding, if its cosine is at least 0.45. The rule is kept as
-        history (status ``revoked``, ``valid_to`` now, the words kept as the
-        reason). 0 when nothing matches. A revocation asks the service for a
-        portrait re-render (:meth:`rerender_portrait`).
+        ``ref`` is the id :meth:`standing_context` shows (``"rule:12"``, also
+        ``"[rule:12]"`` or ``"12"``): the model picks the rule the user
+        withdrew; no text is matched here (docs/research/no-pattern-audit.md F).
+        The rule is kept as history (status ``revoked``, ``valid_to`` now). 0
+        when ``ref`` is not the id of an active rule or preference. A
+        revocation asks the service for a portrait re-render
+        (:meth:`rerender_portrait`).
         """
-        from yuki.memory.conversations import normalize_quote
-
-        text = " ".join((text or "").split())
-        if not text:
+        prefix, sep, number = str(ref or "").strip().strip("[]").strip().rpartition(":")
+        if (sep and prefix.strip() != "rule") or not number.strip().isdigit():
             return 0
+        wanted = int(number)
         try:
             candidates = self.store.conversation_facts(("rule", "preference"))
         except Exception:
             return 0
-        if not candidates:
-            return 0
-        terms = normalize_quote(text).split()
-        target: ConversationFact | None = None
-        keyword = [f for f in candidates
-                   if all(t in normalize_quote(f"{f.text} {f.quote or ''}") for t in terms)]
-        if keyword:
-            target = keyword[-1]
-        else:
-            vec = self._embed(text)
-            if vec is not None:
-                stored = self.store.conversation_fact_vectors([f.id for f in candidates])
-                best = REVOKE_MIN_COSINE
-                for f in candidates:
-                    other = stored.get(f.id)
-                    if other is None or other.shape != vec.shape:
-                        continue
-                    score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
-                    if score >= best:
-                        target, best = f, score
+        target: ConversationFact | None = next((f for f in candidates if f.id == wanted), None)
         if target is None:
             return 0
-        ok = self.store.end_conversation_fact(target.id, "revoked", note=f'the user: "{text}"')
+        ok = self.store.end_conversation_fact(target.id, "revoked", note="the user withdrew it")
         if ok:
             self.rerender_portrait()
         return target.id if ok else 0
@@ -970,10 +963,9 @@ class MemoryClient:
     def complete_todo(self, ref: str) -> str | None:
         """Mark one to-do done; returns its id, or ``None`` when nothing matched (or it was not open).
 
-        ``ref`` is an id from :meth:`todos` (``"loop:12"``, ``"commit:5"``,
-        ``"todo:3"``) or the item's text in the user's words: the open item
-        whose text contains every word of it (the newest if several), else the
-        nearest by local embedding if close enough (cosine >= 0.45).
+        ``ref`` is an id from :meth:`todos` or the standing context
+        (``"loop:12"``, ``"commit:5"``, ``"todo:3"``): the model picks the
+        item; no text is matched (docs/research/no-pattern-audit.md F).
 
         * a user to-do becomes ``done``;
         * a commitment ends as ``done`` (kept as history, "the user marked it done");
@@ -986,7 +978,7 @@ class MemoryClient:
         from yuki.memory.nudges import complete_item
 
         try:
-            return complete_item(self.store, ref, embed=self._embed)
+            return complete_item(self.store, ref)
         except Exception:
             return None
 
@@ -1378,6 +1370,6 @@ class MemoryClient:
 
 
 __all__ = [
-    "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE", "REVOKE_MIN_COSINE",
+    "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
     "STANDING_CONTEXT_CHARS", "RESUME_CONTEXT_CHARS", "RESUME_EXCHANGES",
 ]

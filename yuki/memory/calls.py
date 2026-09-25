@@ -8,12 +8,16 @@ else said.
 
 One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
 
-1. **Detect.** Every ``poll_s`` it reads, content-free, which apps hold the
-   microphone (the ConsentStore facts of ``activity_facts()["microphone"]``,
-   Yuki's own processes left out) and whether the timeline has a meeting row
-   in front. A call is a communication app of the privacy file's ``[calls]
-   apps`` holding the microphone, or a meeting row (``[meetings]``). It ends
-   once neither has been seen for ``end_grace_s``.
+1. **Detect** (measured, no app list: :mod:`yuki.memory.avsignals`). Every
+   ``poll_s`` it reads, content-free, which apps hold the microphone and the
+   camera (the ConsentStore, re-read only when Windows changes it; Yuki's own
+   processes left out), which of them also play sound (Core Audio render
+   sessions, read only while someone holds the microphone), and whether the
+   timeline has a meeting row in front. A call is an app that has held the
+   microphone for ``hold_s`` while it also plays sound or holds the camera,
+   an app the user listed in ``[calls] apps`` holding the microphone, or a
+   meeting row. It ends once its app has let go of the microphone (and no
+   meeting row is in front) for ``end_grace_s``.
 2. **Ask, every call.** A ``calls`` row with status ``asking`` and the named
    event ``Local\\YukiCallReady`` for the UI, which shows a glass card
    (:mod:`yuki.ui.calls`): Yes / No / Always for <app> / Never for <app>. The
@@ -49,7 +53,6 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
-import sys
 import threading
 import time
 import traceback
@@ -60,6 +63,7 @@ from typing import Any
 
 import numpy as np
 
+from yuki.memory.avsignals import AvSignals, Holder, display_name, own_executables
 from yuki.memory.store import (
     CALL_OPEN_STATUSES,
     CALL_READY_EVENT,
@@ -95,8 +99,13 @@ def _packaged_calls_table() -> dict:
 @dataclass(frozen=True)
 class CallConfig:
     enabled: bool = True
+    #: The user's own additions (empty by default): apps that are a call whenever they hold the
+    #: microphone, sound out or not. Every other call is measured (see the module docstring).
     apps: frozenset[str] = frozenset()
+    #: The user's own display names (process or package family -> name); default: the app's own name.
     names: tuple[tuple[str, str], ...] = ()
+    #: How long an app must have held the microphone (with sound out or the camera) to be a call.
+    hold_s: float = 15.0
     poll_s: float = 5.0
     holders_backstop_s: float = 60.0
     end_grace_s: float = 30.0
@@ -196,6 +205,7 @@ class CallConfig:
                         if str(v).strip())
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
+            hold_s=max(0.0, num("hold_s", d.hold_s)),
             poll_s=max(1.0, num("poll_s", d.poll_s)),
             holders_backstop_s=max(5.0, num("holders_backstop_s", d.holders_backstop_s)), end_grace_s=max(0.0, num("end_grace_s", d.end_grace_s)),
             ask_timeout_s=max(10.0, num("ask_timeout_s", d.ask_timeout_s)),
@@ -245,46 +255,12 @@ class CallConfig:
 # ---------------------------------------------------------------------------
 
 
-def own_executables() -> frozenset[str]:
-    """Image paths of this process and its interpreter(s), casefolded: never a call app.
-
-    A uv/venv ``python.exe`` launches the base interpreter, which is the
-    process that holds the microphone, so both are listed.
-    """
-    paths = {sys.executable, getattr(sys, "_base_executable", "") or ""}
-    try:
-        import psutil
-
-        me = psutil.Process()
-        paths.add(me.exe())
-        parent = me.parent()
-        if parent is not None and Path(parent.exe()).name.lower().startswith("python"):
-            paths.add(parent.exe())
-    except Exception:
-        pass
-    out = set()
-    for p in paths:
-        if p:
-            out.add(str(Path(p)).casefold())
-            stem = Path(p)
-            for variant in ("python.exe", "pythonw.exe"):   # the UI runs under pythonw
-                out.add(str(stem.with_name(variant)).casefold())
-    return frozenset(out)
-
-
 def mic_holders(exclude_paths: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
     """Apps using the microphone now (ConsentStore; ``activity_facts()["microphone"]``), minus ``exclude_paths``."""
-    import psutil
+    from yuki.memory.avsignals import _consent_users
 
-    from yuki.perception import system as _system
-
-    processes = _system._process_entries()
-    boot_ft = int(psutil.boot_time() * 1e7) + _system._FILETIME_UNIX_EPOCH
-    try:
-        users = _system._device_users("microphone", processes, boot_ft)
-    except FileNotFoundError:
-        return []
-    return [u for u in users if not (u.get("path") and str(u["path"]).casefold() in exclude_paths)]
+    return [u for u in _consent_users("microphone")
+            if not (u.get("path") and str(u["path"]).casefold() in exclude_paths)]
 
 
 def headphones_now(cfg: CallConfig) -> tuple[bool, dict[str, Any]]:
@@ -739,21 +715,24 @@ def screen_segments(segments: Sequence[Segment], cfg: CallConfig,
     return kept, dropped, last
 
 
-def vocabulary_hint(texts: Iterable[str], count_tokens: Callable[[str], int], budget_tokens: int,
+def vocabulary_hint(subjects: Iterable[str], count_tokens: Callable[[str], int], budget_tokens: int,
                     *, min_facts: int = 2) -> str:
     """Names and terms from memory for Whisper's hint (``hotwords``): ``"Claude, Corvana, ..."``.
 
-    A word counts when memory writes it with a capital (a name, a product, a project) in at least
-    ``min_facts`` of ``texts`` (it recurs in the user's life), and Whisper's own tokenizer needs two
-    tokens or more for it in every casing (Whisper does not know it as one word; a word it knows needs
-    no hint). Words are ranked by facts x (tokens - 1) and taken until the hint would pass
-    ``budget_tokens``: a short hint, so that it guides spelling without being heard where nobody said it.
+    ``subjects``: what memory's models named as the subject of each fact (portrait and conversation
+    facts, the questions' unknowns, the names the user goes by on screen) - who and what the facts are
+    about, as the models wrote them. A word of them counts when it is the subject of at least
+    ``min_facts`` facts (it recurs in the user's life) and Whisper's own tokenizer needs two tokens or
+    more for it in every casing (Whisper does not know it as one word; a common word or one it knows
+    needs no hint - the measured filter, no capital-letter guess about what a name is). Words are ranked
+    by facts x (tokens - 1) and taken until the hint would pass ``budget_tokens``: a short hint, so that it
+    guides spelling without being heard where nobody said it.
     """
     if budget_tokens <= 0:
         return ""
     counts: dict[str, int] = {}
     forms: dict[str, dict[str, int]] = {}
-    for text in texts:
+    for text in subjects:
         seen: set[str] = set()
         for raw in (text or "").split():
             word = ""
@@ -761,7 +740,7 @@ def vocabulary_hint(texts: Iterable[str], count_tokens: Callable[[str], int], bu
                 if ch.isalpha():
                     word += ch
                     continue
-                if len(word) > 1 and word[0].isupper():
+                if len(word) > 1:
                     seen.add(word)
                 word = ""
         for word in seen:
@@ -1321,6 +1300,7 @@ class CallWorker:
         self, store: Store, *, db_path: Path | None = None, privacy: Any = None,
         log: Callable[..., Any] | None = None, meeting_fn: Callable[[], dict | None] = lambda: None,
         holders_fn: Callable[[], list[dict]] | None = None,
+        signals: AvSignals | None = None,
         headphones_fn: Callable[[CallConfig], tuple[bool, dict]] = headphones_now,
         source_factory: Callable[[CallConfig, str | None], Any] | None = None,
         config: CallConfig | None = None,
@@ -1333,15 +1313,16 @@ class CallWorker:
         self._config = config
         self._log_fn = log
         self.meeting_fn = meeting_fn
-        own = own_executables()
-        #: Who holds the microphone is read again only when Windows changed the ConsentStore key
-        #: (registry change notification) or every ``holders_backstop_s``; a poll between is a cached read.
-        self._watch_registry = holders_fn is None
-        self.holders_fn = holders_fn or (lambda: mic_holders(own))
-        self._holders: list[dict] = []
-        self._holders_at = 0.0
-        self._holders_dirty = True
-        self.holder_reads = 0
+        #: The measured facts (shared with the timeline in the service). Holders are read again only when
+        #: Windows changed a ConsentStore key or every ``holders_backstop_s``; a poll between is a cached read.
+        #: ``holders_fn`` (a stub of the microphone holders alone, no sound out, no camera) is the old test hook.
+        if signals is None:
+            signals = (AvSignals(frozenset(), mic_fn=holders_fn, camera_fn=list, render_fn=list, watch=False,
+                                 backstop_s=0.0) if holders_fn is not None else AvSignals(own_executables()))
+        self.signals = signals
+        #: The wake-up on a ConsentStore change (the loop's wait), only with real signals.
+        self._watch_registry = holders_fn is None and bool(getattr(signals, "_watch", False))
+        self._held: set[str] = set()
         self.headphones_fn = headphones_fn
         self.source_factory = source_factory or (lambda cfg, app: MicSource(capture_device_for(cfg, app)))
         self.active: _Active | None = None
@@ -1402,8 +1383,7 @@ class CallWorker:
                               traceback=traceback.format_exc())
                 timeout = self.cfg.poll_s * (1 if self._errors < 3 else 6)
                 if watch is not None and watch.ok:
-                    if watch.wait(self._event, timeout) == "registry":
-                        self._holders_dirty = True
+                    watch.wait(self._event, timeout)   # the signals see the same change on their next read
                 else:
                     self._event.wait(timeout)
         finally:
@@ -1422,25 +1402,45 @@ class CallWorker:
 
     # -- one pass ------------------------------------------------------------
 
-    def _candidates(self, cfg: CallConfig) -> list[tuple[str, str, str | None, str]]:
-        """``(app key, via, meeting service, display name)`` of what makes a call now; mic holders first."""
+    @property
+    def holder_reads(self) -> int:
+        return int(self.signals.counters.get("holder_reads", 0))
+
+    def _candidates(self, cfg: CallConfig, now: float | None = None) -> list[tuple[str, str, str | None, str]]:
+        """``(app key, via, meeting service, display name)`` of what makes a call now; mic holders first.
+
+        Measured: an app that has held the microphone for ``hold_s`` while it plays sound (an active
+        output stream) or holds the camera; an app of the user's ``[calls] apps`` holding the
+        microphone; the timeline's meeting row in front. Also sets :attr:`_held` (every microphone
+        holder now), which keeps a call going through a quiet moment.
+        """
+        now = time.time() if now is None else float(now)
         meeting = None
         try:
             meeting = self.meeting_fn()
         except Exception:
             meeting = None
         meeting_key = app_key((meeting or {}).get("process")) if meeting else None
+        snap = self.signals.read()
+        mic: tuple[Holder, ...] = snap.mic
+        self._held = {h.key for h in mic if h.key}
+        cameras = {h.key for h in snap.camera if h.key}
+        held_long = [h for h in mic if h.key and now - h.since >= cfg.hold_s]
+        # sound out is read only for an app that could become a call by it: not one the camera, the user's list
+        # or a meeting already makes a call, and not the call going on (its microphone keeps it going)
+        going = self.active.key if self.active is not None else None
+        playing = {h.key for h in self.signals.playing(
+            h for h in held_long
+            if h.key not in cameras and h.key not in cfg.apps and h.key not in (meeting_key, going))}
         out: list[tuple[str, str, str | None, str]] = []
-        now = time.monotonic()
-        if self._holders_dirty or not self._watch_registry or now - self._holders_at >= cfg.holders_backstop_s:
-            self._holders = self.holders_fn()
-            self._holders_at, self._holders_dirty = now, False
-            self.holder_reads += 1
-        for h in self._holders:
-            key = app_key(h.get("app"))
-            if key and (key in cfg.apps or key == meeting_key):
+        for h in mic:
+            key = h.key
+            if not key:
+                continue
+            measured = h in held_long and (key in playing or key in cameras)
+            if key in cfg.apps or key == meeting_key or measured:
                 service = (meeting or {}).get("service") if key == meeting_key else None
-                out.append((key, "mic", service, cfg.name_of(key, service or str(h.get("app") or ""))))
+                out.append((key, "mic", service, cfg.name_of(key, service or display_name(h))))
         if meeting and meeting_key:
             service = meeting.get("service")
             out.append((meeting_key, "meeting", service, service or cfg.name_of(meeting_key, meeting.get("app") or "")))
@@ -1454,10 +1454,11 @@ class CallWorker:
                 self._end(self.active, "paused" if self.paused else "disabled")
                 self.active = None
             return
-        cands = self._candidates(cfg)
+        cands = self._candidates(cfg, now)
         act = self.active
         if act is not None:
-            if any(k == act.key for k, *_ in cands):
+            # a call goes on while its app holds the microphone (a quiet moment plays no sound) or is a candidate
+            if act.key in self._held or any(k == act.key for k, *_ in cands):
                 act.last_seen = now
             elif now - act.last_seen >= cfg.end_grace_s:
                 self._end(act, "call_ended")

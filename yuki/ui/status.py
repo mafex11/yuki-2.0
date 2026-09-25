@@ -4,8 +4,8 @@ While a task runs the overlay gets out of the way and this strip takes over: a
 spinner and one line of text. The line is the tool's own one-line ``label`` from
 the registry (:func:`yuki.agent.tools.tool_label`) plus its most telling argument,
 so the phrase a user reads is written next to the tool it describes rather than
-re-derived here from its identifier. A tool with no label still gets a readable
-line: its name is reshaped into one.
+re-derived here from its identifier. Every tool in the registry has a label
+(``tests/test_no_pattern.py``); a name the registry does not know reads "Working".
 """
 
 from __future__ import annotations
@@ -38,51 +38,15 @@ STRIP_MARGIN = 24
 #: How long a finished message stays up before it fades.
 FINAL_LINGER_MS = 4000
 
-#: Vowel letters, for the participle rule below.
-_VOWELS = "aeiou"
-
-
-def _participle(word: str) -> str:
-    """Turn a verb into its ``-ing`` form using ordinary English spelling rules.
-
-    Spelling only -- drop a silent ``e``, double a final consonant after a single
-    vowel in a one-syllable word. It knows nothing about any particular tool.
-
-    Args:
-        word: A lower-case word.
-
-    Returns:
-        The ``-ing`` form.
-    """
-    if not word or word.endswith("ing"):
-        return word
-    if word.endswith("ie"):
-        return word[:-2] + "ying"
-    if word.endswith("e") and not word.endswith(("ee", "oe")):
-        return word[:-1] + "ing"
-    groups = "aeiouy"
-    syllables = sum(
-        1 for i, ch in enumerate(word) if ch in groups and (i == 0 or word[i - 1] not in groups)
-    )
-    doubles = (
-        syllables == 1
-        and len(word) >= 3
-        and word[-1] not in _VOWELS + "wxy"
-        and word[-2] in _VOWELS
-        and word[-3] not in _VOWELS
-    )
-    return word + word[-1] + "ing" if doubles else word + "ing"
-
 
 def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit: int = 44) -> str:
     """One line of present-tense status text for a tool call.
 
     The phrase is the tool's own ``label`` (``hotkey`` -> ``Pressing a shortcut``),
     with its most descriptive argument appended when there is one
-    (``Opening an app — spotify``). A tool the registry has never heard of falls
-    back to its name reshaped into a phrase, so an unlabelled tool still reads as
-    English instead of as an identifier. Purely presentational: nothing here
-    changes what runs.
+    (``Opening an app — spotify``). A name the registry has never heard of reads
+    "Working" (every registered tool has a label). Purely presentational: nothing
+    here changes what runs.
 
     Args:
         name: Tool name exactly as the model called it.
@@ -92,19 +56,9 @@ def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit:
     Returns:
         A single line, no trailing punctuation except an ellipsis.
     """
-    phrase = tool_label(name) or _phrase_from_name(name)
-    if not phrase:
-        return "Working…"
+    phrase = tool_label(name) or "Working"
     detail = _detail(tool_input or {}, limit=limit)
     return f"{phrase} — {detail}" if detail else f"{phrase}…"
-
-
-def _phrase_from_name(name: str) -> str:
-    """Last resort: turn ``launch_app`` into ``Launching app``."""
-    words = [word for word in name.split("_") if word]
-    if not words:
-        return ""
-    return " ".join([_participle(words[0])] + words[1:]).capitalize()
 
 
 def _detail(tool_input: dict[str, Any], *, limit: int) -> str:

@@ -190,6 +190,19 @@ POSITIVES: list[tuple[str, list[tuple[str, str]]]] = [
 # a None secret means "the whole text after the label": resolve it
 POSITIVES = [(t, [(k, s if s is not None else t) for k, s in exp]) for t, exp in POSITIVES]
 
+#: Secrets that only a label or a word next to them identifies ("pass : X", "OTP 482913", "api key: <hex>",
+#: "A/C no: ..."): out of the filter's scope since the owner's decision of 2026-09-25 (docs/MEMORY.md
+#: "Secret filter", option B: fixed formats only). A password counts only inside a URL's userinfo.
+LABEL_ONLY: frozenset[str] = frozenset(
+    {s for t, exp in POSITIVES for k, s in exp
+     if k in ("otp", "cvv", "bank_account") or (k == "password" and "://" not in t)}
+    | {HEX32, AZURE, "7Hq9Lm2Rt8Vw4Zp1Ks6Nd3", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", SESSION,
+       "8Jd9Kq2Lp4Mz7Nx1Qw5Er3Ty", SIGNING}
+)
+#: Hard negatives the fixed-format filter hides anyway: 4111111111111111 is the canonical Visa test number,
+#: Luhn-valid in a Visa IIN range - a card number by format, and no word may say otherwise.
+ACCEPTED_FALSE_POSITIVES: frozenset[str] = frozenset({"Invoice no 4111111111111111 dated 2026-09-25"})
+
 NEGATIVES: list[str] = [
     # ids and hashes
     "request id 550e8400-e29b-41d4-a716-446655440000 failed",

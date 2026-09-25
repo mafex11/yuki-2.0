@@ -82,7 +82,7 @@ Public API::
     SYSTEM_PROMPT, COACH_TOOL, REMINDER_SYSTEM_PROMPT, REMINDER_TOOL
     NudgeConfig(...).from_dict(table);  in_quiet_hours(at, config) -> bool
     todo_items(store, *, include_done=False, now=None) -> list[Item];  item_dict(item) -> dict
-    complete_item(store, ref, *, embed=None, now=None) -> str | None
+    complete_item(store, ref, *, now=None) -> str | None    # ref: an id ("todo:3"), never text
     reaction_summary(store, since, until=None) -> str
     signal_nudge(event_name=NUDGE_EVENT_NAME) -> bool
     NudgeWorker(store, *, db_path=None, privacy=None, config=None, settings=None, client=None, log_dir=None,
@@ -167,8 +167,6 @@ RECENT_NUDGES = 8
 SEQUENCE_LINES = 40
 #: Done items shown by ``todo_items(include_done=True)``: those done within this many days.
 DONE_DAYS = 14
-#: complete_item() by text: the nearest open item by local embedding, if at least this close.
-COMPLETE_MIN_COSINE = 0.45
 
 SYSTEM_PROMPT = """\
 You are Yuki's coach. Yuki is a personal assistant on the user's Windows PC. A few times an \
@@ -599,50 +597,24 @@ def item_dict(item: Item) -> dict[str, Any]:
 
 
 def _parse_ref(ref: str) -> tuple[str, int] | None:
-    prefix, sep, number = (ref or "").strip().partition(":")
+    """``"todo:3"`` (also as the lists show it, ``"[todo:3]"``) -> ``("todo", 3)``: our own id format."""
+    prefix, sep, number = (ref or "").strip().strip("[]").strip().partition(":")
     if sep and prefix in ("loop", "commit", "todo") and number.strip().isdigit():
         return prefix, int(number)
     return None
 
 
-def complete_item(
-    store: Store, ref: str, *, embed: Callable[[str], Any] | None = None, now: float | None = None,
-) -> str | None:
-    """Mark one item done by id ("loop:12", "commit:5", "todo:3") or by its text; returns the id or None.
+def complete_item(store: Store, ref: str, *, now: float | None = None) -> str | None:
+    """Mark one item done by its id ("loop:12", "commit:5", "todo:3"); returns the id, or None.
 
-    By text: the open item whose text contains every word of ``ref`` (the
-    newest if several), else the nearest by local embedding at a cosine of at
-    least :data:`COMPLETE_MIN_COSINE`.
+    The model picks the id from the to-do list or the standing block it was
+    shown (docs/research/no-pattern-audit.md F): no text is matched here. None
+    when ``ref`` is not an id or the item is not open.
     """
-    from yuki.memory.conversations import normalize_quote
-
     now = time.time() if now is None else float(now)
     parsed = _parse_ref(ref)
     if parsed is None:
-        wanted = normalize_quote(ref or "")
-        if not wanted:
-            return None
-        candidates = todo_items(store, now=now)
-        terms = wanted.split()
-        hits = [i for i in candidates if all(t in normalize_quote(f"{i.text} {i.evidence or ''}") for t in terms)]
-        target: Item | None = max(hits, key=lambda i: i.since) if hits else None
-        if target is None and embed is not None and candidates:
-            import numpy as np
-
-            q = embed(ref)
-            best = COMPLETE_MIN_COSINE
-            for item in candidates:
-                v = embed(item.text) if q is not None else None
-                if q is None or v is None or getattr(v, "shape", None) != getattr(q, "shape", None):
-                    continue
-                score = float(np.dot(q, v) / ((np.linalg.norm(q) * np.linalg.norm(v)) or 1.0))
-                if score >= best:
-                    target, best = item, score
-        if target is None:
-            return None
-        parsed = _parse_ref(target.ref)
-        if parsed is None:
-            return None
+        return None
     kind, number = parsed
     if kind == "todo":
         ok = store.complete_todo(number, at=now)

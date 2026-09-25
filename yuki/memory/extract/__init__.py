@@ -177,7 +177,9 @@ def extract(
         page: a :class:`~yuki.perception.tree.PageText` already read; its text is
             the body fallback when the structured read finds nothing.
         now: capture time (epoch), for resolving "Yesterday", "18:12".
-        user_names: the user's names ("Kian"); senders with these names are ``is_me``.
+        user_names: the user's names ("Kian"); accepted, not matched: ``is_me`` comes from the
+            app's profile (``me_row``, ``me_senders``, its self-name anchor), and the journal model
+            attributes any other sender with these names as context.
         app: app display name; derived from the process when omitted.
         timeout_s: budget of the structured read.
         snapshot: a Snapshot already read (tests, or a caller that budgets reads itself).
@@ -208,6 +210,9 @@ def extract(
         nodes=snap.nodes, read_ms=round(read_ms, 1),
         total_ms=round((_time.perf_counter() - started) * 1000.0, 1),
         source=snap.source, truncated=snap.truncated,
+        # UIA IsPassword elements on screen: the window shows a password field (a sign-in page, a
+        # credentials dialog), which the watcher's privacy gate skips (docs/MEMORY.md, "Privacy gates")
+        password_fields=sum(1 for n in snap.root.walk() if n.is_password) if snap.root is not None else 0,
     )
     if profiles.problems:
         result.notes.extend(f"profiles: {p}" for p in profiles.problems)

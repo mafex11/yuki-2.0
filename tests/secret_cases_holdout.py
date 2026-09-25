@@ -262,6 +262,15 @@ HOLDOUT_POSITIVES: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 
+#: Secrets only a label or a word next to them identifies: out of the filter's scope since 2026-09-25
+#: (docs/MEMORY.md "Secret filter", option B: fixed formats only). Added after the set was written.
+HOLDOUT_LABEL_ONLY: frozenset[str] = frozenset(
+    {s for t, exp in HOLDOUT_POSITIVES for k, s in exp
+     if k in ("otp", "cvv", "bank_account") or (k == "password" and "://" not in t)}
+    | {_AWS_SECRET, _RZP_SECRET, _DJANGO}
+)
+
+
 HOLDOUT_NEGATIVES: list[str] = [
     # chat about credentials without values
     "otp aaya kya? mera abhi tak nahi aaya, network hi nahi hai hostel mein",

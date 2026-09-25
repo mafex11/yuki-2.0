@@ -52,14 +52,18 @@ Two parts:
     same window was showing a site just before it went full screen, that
     host (not the path) is carried over, so "YouTube full screen" is known
     without reading the page.
-  - **Meetings**: an app or page in the privacy file's ``[meetings]`` table
-    (:class:`MeetingRules`) is recorded as a ``meeting`` row: app, host and
-    service name ("Google Meet"), start/end - no title, no path.  Its content
-    stays blocked by the ``[apps]``/``[web]`` rules.  While a meeting is in
-    front the microphone users (ConsentStore, as
-    :func:`yuki.perception.system.activity_facts`) are read every
-    :data:`MEDIA_EVERY_S`; the app in front using the microphone counts as
-    present without input (``passive_s``) and as ``mic_s``.
+  - **Meetings** are measured, not listed: the app in front has held the
+    microphone (or the camera) for ``[meetings] hold_s`` seconds, per the
+    ConsentStore (:mod:`yuki.memory.avsignals`, read every
+    :data:`MEDIA_EVERY_S` - a cached read unless Windows changed it). For an
+    app that shows web pages the meeting is the site that was in front when
+    it took the device. Such a stretch is recorded as a ``meeting`` row: app,
+    host and service name (the app's own name, or the site), start/end - no
+    title, no path; it ends ``end_grace_s`` after the app lets go. Content
+    stays blocked by the ``[apps]``/``[web]`` rules; the user's
+    ``always_*``/``never_*`` lists (:class:`MeetingRules`) override. The
+    meeting app using the microphone counts as present without input
+    (``passive_s``) and as ``mic_s``.
 
 The PC's own power history (:mod:`yuki.memory.power`) lives in the same table
 as rows with state ``off`` / ``asleep`` / ``unknown`` (no app, no counters):
@@ -221,39 +225,79 @@ def _name_key(value: str) -> str:
     return (app_key(value) or "") if value.endswith(".exe") else value
 
 
+def _site_list(values: Any) -> tuple[str, ...]:
+    return tuple(str(h).strip().lower() for h in (values or []) if str(h).strip())
+
+
+def _app_set(values: Any) -> frozenset[str]:
+    return frozenset(k for k in (app_key(str(p)) for p in (values or [])) if k)
+
+
 @dataclass(frozen=True)
 class MeetingRules:
-    """The privacy file's ``[meetings]`` table: apps and pages recorded as meeting hours only."""
+    """The privacy file's ``[meetings]`` table.
 
-    processes: frozenset[str] = frozenset()               # app_key form ("zoom")
-    host_suffixes: tuple[str, ...] = ()
-    host_paths: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    A meeting is **measured**, not listed: the app in front has held the
+    microphone (or the camera, with ``camera``) for ``hold_s`` seconds, per
+    the ConsentStore (:mod:`yuki.memory.avsignals`); it ends ``end_grace_s``
+    after the app lets go. The rest is the user's own overrides, empty by
+    default: ``always_apps`` / ``always_sites`` are meetings whenever they are
+    in front, ``never_apps`` / ``never_sites`` never are, ``names`` renames a
+    process or site for display. The keys ``processes``, ``host_suffixes`` and
+    ``host_paths`` of files written before 2026-09-25 (a seeded list of
+    meeting apps and sites) are not read.
+    """
+
+    hold_s: float = 20.0
+    end_grace_s: float = 30.0
+    camera: bool = True
+    always_apps: frozenset[str] = frozenset()             # app_key form ("zoom")
+    always_sites: tuple[str, ...] = ()
+    never_apps: frozenset[str] = frozenset()
+    never_sites: tuple[str, ...] = ()
     names: tuple[tuple[str, str], ...] = ()               # (process key or host, service name)
 
     @classmethod
     def from_dict(cls, table: dict) -> MeetingRules:
         table = table or {}
-        processes = frozenset(k for k in (app_key(str(p)) for p in table.get("processes", []) or []) if k)
-        hosts = tuple(str(h).strip().lower() for h in table.get("host_suffixes", []) or [] if str(h).strip())
-        paths = tuple(
-            (str(h).strip().lower(), tuple(str(f).lower() for f in (frags or []) if str(f)))
-            for h, frags in (table.get("host_paths", {}) or {}).items()
-        )
+        d = cls()
+
+        def num(key: str, default: float) -> float:
+            try:
+                return max(0.0, float(table.get(key, default)))
+            except (TypeError, ValueError):
+                return default
+
         names = tuple((_name_key(k), str(v)) for k, v in (table.get("names", {}) or {}).items() if str(v).strip())
-        return cls(processes=processes, host_suffixes=hosts, host_paths=paths, names=names)
+        return cls(
+            hold_s=num("hold_s", d.hold_s), end_grace_s=num("end_grace_s", d.end_grace_s),
+            camera=bool(table.get("camera", d.camera)),
+            always_apps=_app_set(table.get("always_apps")), always_sites=_site_list(table.get("always_sites")),
+            never_apps=_app_set(table.get("never_apps")), never_sites=_site_list(table.get("never_sites")),
+            names=names,
+        )
 
     def _name(self, key: str) -> str | None:
         return next((v for k, v in self.names if k == key), None)
 
+    def name_for(self, key: str, fallback: str) -> str:
+        """A meeting's display name: the user's ``names`` entry for the process key or host, else ``fallback``."""
+        return self._name(key) or fallback
+
+    def never(self, process_key: str, host: str | None) -> bool:
+        """The user said this app or site is never a meeting."""
+        return (bool(process_key) and process_key in self.never_apps) or (
+            bool(host) and any(_host_matches(host or "", s) for s in self.never_sites))
+
     def match_process(self, process_name: str, app_name: str = "") -> str | None:
-        """The meeting service a process is (its name from ``names``, else the app name), or None."""
+        """An ``always_apps`` override: the service name, or None (the measured signal decides the rest)."""
         key = app_key(process_name)
-        if not key or key not in self.processes:
+        if not key or key not in self.always_apps:
             return None
         return self._name(key) or (app_name or "").strip() or key
 
     def match_url(self, url: str) -> str | None:
-        """The meeting service an http(s) page is, or None."""
+        """An ``always_sites`` override for an http(s) page: the service name, or None."""
         try:
             parts = urlsplit((url or "").strip())
             host = (parts.hostname or "").lower()
@@ -261,13 +305,9 @@ class MeetingRules:
             return None
         if parts.scheme.lower() not in ("http", "https") or not host:
             return None
-        for suffix in self.host_suffixes:
+        for suffix in self.always_sites:
             if _host_matches(host, suffix):
                 return self._name(suffix) or site_of(host)
-        path = (parts.path or "").lower()
-        for rule_host, fragments in self.host_paths:
-            if _host_matches(host, rule_host) and any(f in path for f in fragments):
-                return self._name(rule_host) or site_of(host)
         return None
 
 
@@ -903,26 +943,18 @@ class _Stretch:
     #: Yuki was acting for the user when this stretch began (yuki.memory.acting).
     by_yuki: bool = False
     yuki_request: str | None = None
-
-
-def _mic_users() -> frozenset[str]:
-    """Apps using the microphone now (ConsentStore), as app keys / package families, casefolded.
-
-    The same read-only registry facts as ``activity_facts()["microphone"]``
-    (:func:`yuki.perception.system._device_users`), without its media and
-    foreground parts.
-    """
-    import psutil
-
-    from yuki.perception import system as _system
-
-    processes = _system._process_entries()
-    boot_ft = int(psutil.boot_time() * 1e7) + _system._FILETIME_UNIX_EPOCH
-    try:
-        users = _system._device_users("microphone", processes, boot_ft)
-    except FileNotFoundError:
-        return frozenset()
-    return frozenset(k for k in ((app_key(u.get("app")) or "") for u in users) if k)
+    #: In memory only, never written unless the stretch becomes a meeting: the process behind the
+    #: window (also when privacy keeps it out of the row), and the page's host and path (also when
+    #: its address is blocked). The meeting signal is matched against these.
+    proc: str = ""
+    proc_app: str = ""
+    exe: str = ""
+    own: bool = False
+    seen_host: str | None = None
+    seen_path: str | None = None
+    #: The meeting comes from the measured signal (an app holding the microphone or camera), not from
+    #: an ``always_*`` override: it ends when the app lets go.
+    signal_meeting: bool = False
 
 
 class _PageProbe:
@@ -1016,7 +1048,7 @@ class TimelineRecorder:
 
     def __init__(
         self, store: Store, *, privacy: Any = None, log: Callable[..., Any] | None = None,
-        on_page_change: Callable[[int], None] | None = None,
+        on_page_change: Callable[[int], None] | None = None, signals: Any = None,
     ) -> None:
         from yuki.memory import watcher as _w
         from yuki.memory.privacy import PrivacyConfig
@@ -1063,9 +1095,18 @@ class TimelineRecorder:
         self._paused = False
         self._blocked: str | None = None     # paused | locked
         self._meetings = PrivacySection(self.privacy, "meetings", MeetingRules.from_dict)
-        self._mic: frozenset[str] = frozenset()
-        self._mic_at = 0.0
+        #: Who holds the microphone and camera (yuki.memory.avsignals.AvSignals; shared with the call
+        #: worker in the service), read every MEDIA_EVERY_S - a cached read unless Windows changed them.
+        self._signals = signals
+        self._av: Any = None                      # the last AvSnapshot
         self._mic_errors = 0
+        #: Per app key with a measured meeting on: the site it is on ("" for an app without pages), and
+        #: the last time (monotonic) the app was seen holding the device.
+        self._meeting_sites: dict[str, str] = {}
+        self._hold_seen: dict[str, float] = {}
+        #: The last stretches (start, end, app key, page host), to find the page that was in front when
+        #: an app took the microphone.
+        self._recent: list[tuple[float, float, str, str | None]] = []
         self._current: _Stretch | None = None
         self._last_row: TimelineRow | None = None
         self._acc_at = time.time()
@@ -1164,6 +1205,8 @@ class TimelineRecorder:
             "fullscreen": bool(self._current.fullscreen) if self._current else None,
             "meeting": bool(self._current.meeting) if self._current else None,
             "meetings_config_error": self._meetings.last_error or None,
+            "meetings_on": len(self._meeting_sites),
+            "av": self._signals.stats() if self._signals is not None and hasattr(self._signals, "stats") else None,
         }
 
     # -- logging -------------------------------------------------------------
@@ -1489,16 +1532,18 @@ class TimelineRecorder:
         hidden = fullscreen and rules.pause_when_fullscreen
         app, withheld, title, host = facts.app_name, None, "", None
         meeting = None
+        seen_host, signal = None, False
         if facts.is_own and rules.skip_own_windows:
             app, withheld = "Yuki", "own_window"
         elif meeting := self._meetings.get().match_process(facts.process_name, facts.app_name):
-            # meeting hours only: the app's name and the time, nothing from its windows
+            # the user's always_apps override: meeting hours only, nothing from its windows
             withheld, hidden = rules.check_app(facts.process_name, facts.app_name) or "meeting", True
         elif reason := rules.check_app(facts.process_name, facts.app_name):
             app, withheld = "", reason
         elif hidden:
             if carry is not None and carry.hwnd == hwnd and carry.pid == pid and not carry.hidden:
                 host, withheld, meeting = carry.host, carry.withheld, carry.meeting
+                seen_host, signal = carry.seen_host, carry.signal_meeting
         else:
             title = self._w._window_title(hwnd)
             if reason := rules.check_window(facts.process_name, title):
@@ -1506,7 +1551,9 @@ class TimelineRecorder:
         ids, entry = self._identity(pid, facts.exe, facts.process_name)
         st = _Stretch(start=now, end=now, hwnd=hwnd, pid=pid, process=facts.process_name if app else "",
                       app=app, title=title, withheld=withheld, host=host, ids=ids, entry=entry,
-                      fullscreen=fullscreen, hidden=hidden, meeting=meeting)
+                      fullscreen=fullscreen, hidden=hidden, meeting=meeting,
+                      proc=facts.process_name, proc_app=facts.app_name, exe=facts.exe, own=facts.is_own,
+                      seen_host=seen_host, signal_meeting=signal)
         self._mark_acting(st)
         self._current = st
         if hidden:
@@ -1514,8 +1561,6 @@ class TimelineRecorder:
         else:
             self._hook_names(hwnd)
         idle = now - self._input_at
-        if meeting:
-            self._poll_mic()
         if idle >= AWAY_AFTER_S and not self._engaged(st):
             st.state = "away"
         if withheld or hidden or not self._probe_page(st, now):
@@ -1565,36 +1610,39 @@ class TimelineRecorder:
             st.page_checked_at = now
             if st.settled and not page:
                 continue  # a re-read that found nothing (loading, not answering) changes nothing
-            host = path = meeting = None
+            host = path = meeting = seen_host = seen_path = None
             withheld = st.withheld
             title = st.title
             if page and page[1]:
                 url = page[1]
                 reason = self.privacy.rules().check_url(url)
                 meeting = self._meetings.get().match_url(url)
+                try:
+                    parts = urlsplit(url)
+                except ValueError:
+                    parts = None
+                if parts is not None and parts.scheme.lower() in ("http", "https"):
+                    seen_host, seen_path = url_host(url), parts.path or "/"   # in memory only
                 if meeting:
-                    # meeting hours only: the service and host, never the title or the path
+                    # the user's always_sites override: the service and host, never the title or the path
                     host, withheld, title = url_host(url), reason, ""
                 elif reason:
                     withheld, title = reason, ""
-                else:
-                    try:
-                        parts = urlsplit(url)
-                    except ValueError:
-                        parts = None
-                    if parts is not None:
-                        if parts.scheme.lower() in ("http", "https"):
-                            host = url_host(url)
-                        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-                        if not host:
-                            path = f"{parts.scheme}:{path}"
+                elif parts is not None:
+                    if parts.scheme.lower() in ("http", "https"):
+                        host = url_host(url)
+                    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+                    if not host:
+                        path = f"{parts.scheme}:{path}"
             if not st.settled:
                 st.host, st.path, st.withheld, st.title, st.meeting = host, path, withheld, title, meeting
+                st.seen_host, st.seen_path = seen_host, seen_path
                 if meeting:
-                    self._poll_mic()
                     self.counters["meeting_stretches"] += 1
                 self._settle(st)
                 continue
+            if st.signal_meeting and seen_host is not None and seen_host == st.seen_host:
+                continue  # still the meeting's site (its path and title are not recorded)
             if (host, path, withheld, meeting) != (st.host, st.path, st.withheld, st.meeting):
                 # the page changed under the same title (a feed, a single-page site)
                 self._advance(now)
@@ -1602,7 +1650,8 @@ class TimelineRecorder:
                 if st.meeting and not meeting:
                     self._open(st.hwnd, now)  # left the meeting page: read the window afresh
                 else:
-                    new = replace(st, host=host, path=path, withheld=withheld, title=title, meeting=meeting)
+                    new = replace(st, host=host, path=path, withheld=withheld, title=title, meeting=meeting,
+                                  seen_host=seen_host, seen_path=seen_path, signal_meeting=False)
                     self._open(st.hwnd, now, like=new, state=st.state)
                 self.counters["page_rotations"] += 1
                 if self.on_page_change is not None and host and not withheld and not meeting:
@@ -1615,6 +1664,12 @@ class TimelineRecorder:
     def _settle(self, st: _Stretch) -> None:
         """Decide the stretch's identity; continue the previous row when it is the same page."""
         st.settled = True
+        if not st.meeting and self._current is st:
+            now = max(st.start, time.time())
+            self._poll_av(now)
+            service = self._signal_service(st, now)
+            if service:
+                self._as_meeting(st, service)
         key = self.store.timeline_key(st.process, st.host, st.path, st.title, st.withheld,
                                       fullscreen=st.fullscreen, meeting=st.meeting)
         last = self._last_row
@@ -1663,9 +1718,140 @@ class TimelineRecorder:
         st, self._current = self._current, None
         if st is None:
             return
+        self._remember(st, now)
         row = self._write(st, now)
         if row is not None:
             self._last_row = row
+
+    def _remember(self, st: _Stretch, end: float) -> None:
+        self._recent.append((st.start, end, app_key(st.proc) or "", st.seen_host))
+        if len(self._recent) > 64:
+            del self._recent[:32]
+
+    # -- meetings: measured (an app in front holding the microphone or camera) --------------------
+
+    def _poll_av(self, now: float) -> None:
+        """The microphone and camera holders now (a cached read unless Windows changed them)."""
+        if self._signals is None:
+            try:
+                from yuki.memory.avsignals import AvSignals
+
+                self._signals = AvSignals()
+            except Exception:
+                self.counters["mic_errors"] += 1
+                return
+        try:
+            self._av = self._signals.read()
+            self._mic_errors = 0
+        except Exception:
+            self._mic_errors += 1
+            self.counters["mic_errors"] += 1
+            if self._mic_errors >= 3:
+                self._av = None
+            return
+        rules = self._meetings.get()
+        held = {h.key for h in self._devices(rules.camera)}
+        for key in held:
+            self._hold_seen[key] = now
+        for key in list(self._meeting_sites):
+            if key not in held and now - self._hold_seen.get(key, 0.0) >= rules.end_grace_s:
+                del self._meeting_sites[key]   # the app let go: its meeting is over
+                self.counters["meetings_ended"] += 1
+
+    def _devices(self, camera: bool = True) -> tuple:
+        av = self._av
+        if av is None:
+            return ()
+        return tuple(av.mic) + (tuple(av.camera) if camera else ())
+
+    def _holder(self, st: _Stretch, *, camera: bool = True) -> Any:
+        """The microphone (or camera) holder that is the app of ``st``, or None."""
+        if not st.proc or st.own:
+            return None
+        key = app_key(st.proc) or ""
+        for h in self._devices(camera):
+            if h.matches(process_key=key, exe=st.exe, ids=st.ids):
+                return h
+        return None
+
+    def _site_at(self, key: str, since: float, st: _Stretch) -> str | None:
+        """The page host in front, in the app ``key``, when it took the device at ``since`` (None: not known)."""
+        if st.start <= since:
+            return st.seen_host
+        for start, end, k, host in reversed(self._recent):
+            if k == key and start <= since <= end:
+                return host
+        return None
+
+    def _signal_service(self, st: _Stretch, now: float) -> str | None:
+        """The meeting ``st`` is by the measured signal, or None.
+
+        The app in front has held the microphone (or the camera) for ``hold_s``. For an app that shows
+        web pages the meeting is the site that was in front when the app took the device (a browser
+        holds the microphone for one of its tabs; another site in front is not the meeting).
+        """
+        rules = self._meetings.get()
+        h = self._holder(st, camera=rules.camera)
+        if h is None:
+            return None
+        key = app_key(st.proc) or ""
+        if rules.never(key, st.seen_host):
+            return None
+        site = self._meeting_sites.get(key)
+        if site is None:
+            if now - h.since < rules.hold_s:
+                return None
+            site = ""
+            if st.seen_host is not None:
+                site = self._site_at(key, h.since, st) or ""
+                if not site:
+                    return None   # an app showing pages, but which page took the device is not known
+            self._meeting_sites[key] = site
+            self._hold_seen[key] = now
+            self.counters["meetings_started"] += 1
+        if site:
+            if st.seen_host != site:
+                return None
+            return rules.name_for(site, site_of(site) or site)
+        if st.seen_host is not None:
+            return None   # the meeting is an app without pages; this is one of its pages? not the meeting
+        return rules.name_for(key, st.proc_app or key)
+
+    def _as_meeting(self, st: _Stretch, service: str) -> None:
+        """Turn ``st`` into a meeting row: the app and service, the site's host - never a title or path."""
+        st.meeting, st.signal_meeting = service, True
+        st.title, st.path = "", None
+        st.host = st.seen_host
+        st.process, st.app = st.proc, st.proc_app or st.app or st.proc
+        if st.seen_host is None:
+            st.withheld = st.withheld or "meeting"
+            if not st.hidden:
+                st.hidden = True   # nothing about the window is read while it is a meeting
+                if self._current is st:
+                    self._unhook_names()
+        self.counters["meeting_stretches"] += 1
+
+    def _check_meeting(self, now: float) -> None:
+        """At each signal read: the stretch in front starts or ends a measured meeting."""
+        st = self._current
+        if st is None or self._blocked or not st.settled:
+            return
+        if st.signal_meeting:
+            if (app_key(st.proc) or "") not in self._meeting_sites:
+                # the app let go of the microphone and camera: the window is read afresh
+                self._close(now)
+                self._open(st.hwnd, now)
+            return
+        if st.meeting:
+            return   # an always_* override
+        service = self._signal_service(st, now)
+        if service:
+            self._close(now)
+            meeting = replace(st)
+            self._as_meeting(meeting, service)
+            self._open(st.hwnd, now, like=meeting, state=st.state)
+            if self._current is not None and self._current.hidden:
+                self._unhook_names()
 
     # -- time accounting ---------------------------------------------------------------
 
@@ -1699,27 +1885,12 @@ class TimelineRecorder:
         return " ".join(media_title.casefold().split()) in " ".join(st.title.casefold().split())
 
     def _mic_on(self, st: _Stretch) -> bool:
-        """A meeting's app is using the microphone (by image key, or package family for a packaged app)."""
-        if not st.meeting or not self._mic:
-            return False
-        key = app_key(st.process) or ""
-        return key in self._mic or any(i.startswith(m + "_") or i.startswith(m + "!") for m in self._mic
-                                       for i in st.ids)
+        """A meeting's app is using the microphone (by executable, image key or package family)."""
+        return bool(st.meeting) and self._holder(st, camera=False) is not None
 
     def _engaged(self, st: _Stretch) -> bool:
         """At the app without input: its media plays, or it is a meeting using the microphone."""
         return self._fg_media(st) or self._mic_on(st)
-
-    def _poll_mic(self) -> None:
-        self._mic_at = time.monotonic()
-        try:
-            self._mic = _mic_users()
-            self._mic_errors = 0
-        except Exception:
-            self._mic_errors += 1
-            self.counters["mic_errors"] += 1
-            if self._mic_errors >= 3:
-                self._mic = frozenset()
 
     def _credit(self, st: _Stretch, a: float, b: float, kind: str) -> None:
         if b <= a:
@@ -1739,6 +1910,7 @@ class TimelineRecorder:
     def _switch(self, st: _Stretch, at: float, state: str) -> _Stretch:
         """End ``st`` at ``at`` and continue the same window in ``state``."""
         self._current = st
+        self._remember(st, at)
         row = self._write(st, at)
         if row is not None:
             self._last_row = row
@@ -1840,10 +2012,8 @@ class TimelineRecorder:
         if mono >= self._next_media:
             self._next_media = mono + MEDIA_EVERY_S
             self._poll_media()
-            if self._current is not None and self._current.meeting:
-                self._poll_mic()
-            else:
-                self._mic = frozenset()
+            self._poll_av(now)
+            self._check_meeting(now)
         self._take_pages(now)
         st = self._current
         if self._title_first is not None:

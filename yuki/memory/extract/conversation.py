@@ -250,25 +250,32 @@ def _app_id(row: Node, profile: Profile) -> str:
 # ---------------------------------------------------------------------------
 
 
-def learn_me(root: Node, profile: Profile | None, defaults: Defaults, user_names: list[str]) -> list[str]:
-    """Names on screen that are the user: configured ones, the profile's
-    self-name anchor ("User: Kian"), and any "<name> (you)"."""
-    names: list[str] = [n for n in (clean(u) for u in user_names) if n]
+def learn_me(root: Node, profile: Profile | None, defaults: Defaults | None = None,
+             user_names: list[str] | None = None) -> list[str]:
+    """Names this screen itself shows as the user, from the app's profile only: its self-name anchor
+    ("User: Kian") and names written with the app's own ``me_suffixes`` ("Kian (you)").
+
+    ``defaults`` and ``user_names`` are accepted for the callers' sake: the configured names are no
+    match list (docs/research/no-pattern-audit.md D). They reach the journal model as context
+    (WHO THE USER IS), which attributes a message whose sender is one of them.
+    """
+    names: list[str] = []
     if profile and profile.self_name:
         for node in query.first_tier(profile.self_name, root):
             name = _strip_affixes(clean(node.text), profile.self_name_strip)
             if name and len(name) <= _SENDER_MAX:
                 names.append(name)
             break
-    for node in root.walk():
-        text = clean(node.name)
-        if not text or len(text) > _SENDER_MAX + 8:
-            continue
-        for suffix in defaults.me_suffixes:
-            if text.endswith(suffix):
-                name = text[: -len(suffix)].strip()
-                if name and len(name) <= _SENDER_MAX:
-                    names.append(name)
+    if profile and profile.me_suffixes:
+        for node in root.walk():
+            text = clean(node.name)
+            if not text or len(text) > _SENDER_MAX + 8:
+                continue
+            for suffix in profile.me_suffixes:
+                if text.endswith(suffix):
+                    name = text[: -len(suffix)].strip()
+                    if name and len(name) <= _SENDER_MAX:
+                        names.append(name)
     return list(dict.fromkeys(names))
 
 
@@ -283,15 +290,21 @@ def _row_is_mine(row: Node, paths: tuple[str, ...]) -> bool:
 
 
 def _is_me(sender: str | None, row: Node, profile: Profile | None, defaults: Defaults, me: set[str]) -> tuple[bool, str | None]:
-    """``(is_me, sender as it should be stored)``."""
+    """``(is_me, sender as it should be stored)``, from the app's own structure only.
+
+    The profile's ``me_row`` anchor (the app marks the user's rows), the app's own words for the
+    user as a sender (``me_senders``, ``me_suffixes``), or the name the app's self-name anchor
+    shows on this screen (``me``). Anything else - every generic chat - is left to the journal
+    model, which reads the raw sender with the user's names as context.
+    """
     if profile and profile.me_row and _row_is_mine(row, profile.me_row):
         return True, sender
-    if sender is None:
-        return False, None
-    for suffix in defaults.me_suffixes:
+    if sender is None or profile is None:
+        return False, sender
+    for suffix in profile.me_suffixes:
         if sender.endswith(suffix):
             return True, sender[: -len(suffix)].strip() or sender
-    if _norm_name(sender) in {_norm_name(s) for s in defaults.me_senders}:
+    if sender in profile.me_senders:
         return True, sender
     return _norm_name(sender) in me, sender
 

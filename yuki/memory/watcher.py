@@ -1603,6 +1603,10 @@ class Watcher:
         block = rules.check_url(extraction.url or "")
         if block:
             return "skipped", block
+        if rules.skip_when_password_present and extraction.stats.get("password_fields"):
+            # a password field on screen (UIA IsPassword): a sign-in page or credentials dialog, whatever its
+            # address says - measured on the window itself instead of guessed from words in the URL path
+            return "skipped", "password_field"
         self._learn_names(store, extraction)
         # Secrets typed into chats, pages and documents become typed placeholders here,
         # before the delta, the store and every model call (docs/MEMORY.md, "Secret filter").

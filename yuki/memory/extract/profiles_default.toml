@@ -21,15 +21,15 @@
 #   verified 2026-09-24 = read live (read-only) from the app on this PC
 #   MaxMi              = ported from MaxMi's fixture-verified anchors, not yet seen live here
 
+# Whose a message is comes from each app's own structure: `me_row` (the app
+# marks the user's rows), `me_senders` / `me_suffixes` (the app's own words for
+# the user as a sender: WhatsApp's "You:" label) and `self_name` (the account
+# name the app shows).  There is no cross-app word list; in a generic chat the
+# sender is kept as shown and the journal model, which knows the user's names,
+# decides who it is.  Marks an app writes into its messages ("(edited)") are
+# the app's `text_noise`.
 [defaults]
-# Marks an app puts inside or next to a message that are not the message.
-text_noise = ["(edited)", "(bearbeitet)", "(modifié)", "(editado)"]
-# A sender shown with one of these names is the user.
-me_senders = ["You", "you", "Me"]
-# "Kian (you)" - the name before the suffix is the user's.
-me_suffixes = ["(you)", "(You)"]
-# Sidebar previews "You: ok" (only used to learn nothing about senders: previews are chrome).
-me_prefixes = ["You:"]
+text_noise = []
 
 # ---------------------------------------------------------------------------
 [[profile]]
@@ -74,6 +74,7 @@ id_source = "automation_id"
 id_time = "epoch_seconds"
 self_name = ['//*[class^="p-ia__nav__user__button"]']
 self_name_strip = ["User: "]
+text_noise = ["(edited)"]
 
 # ---------------------------------------------------------------------------
 [[profile]]
@@ -112,6 +113,7 @@ id_time = "snowflake"
 id_epoch_ms = 1420070400000
 # The account panel at the bottom left: its first text is the user's display name.
 self_name = ['//*[class^="accountPopoutButtonWrapper_"]//Text', '//*[class^="panelTitleContainer_"]']
+text_noise = ["(edited)"]
 
 # ---------------------------------------------------------------------------
 [[profile]]
@@ -134,6 +136,8 @@ row = ['//*[aria="row"]']
 hidden_labels = true
 sender = ['//Group[name$=":"]']
 sender_strip = [":", "Open chat details for "]
+# The label WhatsApp writes on the user's own bubbles ("You:", seen live 2026-09-24).
+me_senders = ["You"]
 sender_group = "parent"
 # Group chats (seen live 2026-09-24 night): the bubbles carry no "<name>:" label; the
 # run's container holds the sender's avatar button "Open chat details for <name>".

@@ -354,40 +354,32 @@ def wait_for_input_ready(hwnd: int, *, timeout_s: float = _READY_S) -> tuple[boo
 #: before restoring the previous contents.
 _CLIPBOARD_HANDOFF_S = 0.5
 
+#: Other names of the very same key that pyautogui does not know itself (one to one, nothing
+#: guessed). Names that could mean another key ("play" is not a toggle, "next" may be Tab,
+#: "mute" may be the microphone, "plus" is not the numpad's add, a Mac "cmd" is not the Windows
+#: key) are not here: an unknown name fails with the valid ones listed, and the model picks.
 _KEY_ALIASES = {
     "control": "ctrl",
     "ctl": "ctrl",
-    "cmd": "win",
     "windows": "win",
     "super": "win",
-    "meta": "win",
-    "return": "enter",
-    "escape": "esc",
-    "del": "delete",
     "ins": "insert",
-    "pgup": "pageup",
-    "pgdn": "pagedown",
     "pgdown": "pagedown",
     "spacebar": "space",
-    "plus": "add",
-    "minus": "subtract",
-    # Media keys under the names models reach for (Windows' VK_MEDIA_* and the
-    # usual spellings) -> pyautogui's playpause / nexttrack / prevtrack / stop.
-    "mediaplaypause": "playpause",
-    "mediaplay": "playpause",
-    "mediapause": "playpause",
-    "play": "playpause",
-    "medianexttrack": "nexttrack",
-    "medianext": "nexttrack",
-    "next": "nexttrack",
-    "mediaprevtrack": "prevtrack",
-    "mediaprevioustrack": "prevtrack",
-    "mediaprev": "prevtrack",
-    "previoustrack": "prevtrack",
-    "mediastop": "stop",
     "volumemuted": "volumemute",
-    "mute": "volumemute",
 }
+
+#: The unknown-key message: the canonical names, then any valid name sharing the start of the given one.
+_KEY_HELP = ("use pyautogui key names, e.g. ctrl, alt, win, enter, f5; media keys: playpause, nexttrack, "
+             "prevtrack, stop, volumemute, volumeup, volumedown")
+
+
+def _unknown_key(key: str) -> str:
+    folded = "".join(ch for ch in str(key).lower() if ch not in "_- ")
+    near = [k for k in pyautogui.KEYBOARD_KEYS
+            if len(k) > 1 and len(folded) >= 3 and (k.startswith(folded[:3]) or folded.startswith(k))][:8]
+    hint = f"; valid names starting alike: {', '.join(near)}" if near else ""
+    return f"unknown key {key!r} ({_KEY_HELP}{hint})"
 
 
 def _result(
@@ -404,9 +396,10 @@ def _result(
 def normalize_key(key: str) -> str | None:
     """Map a key name onto a pyautogui key name, or ``None`` if unknown.
 
-    Accepts the pyautogui names plus the readable variants a model is likely to
-    emit: ``volume_mute`` -> ``volumemute``, ``Control`` -> ``ctrl``,
-    ``Page Up`` -> ``pageup``.
+    Accepts the pyautogui names, the same names with case, ``_``, ``-`` and
+    spaces folded (``volume_mute`` -> ``volumemute``, ``Page Up`` ->
+    ``pageup``), and the one-to-one spellings of :data:`_KEY_ALIASES`
+    (``Control`` -> ``ctrl``).
     """
     if not isinstance(key, str) or not key:
         return None
@@ -2381,9 +2374,7 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
         if normalized is None:
             return _result(
                 False,
-                f"unknown key {key!r} (use pyautogui key names, e.g. ctrl, alt, "
-                f"win, enter, f5; media keys: playpause, nexttrack, prevtrack, stop, "
-                f"volumemute, volumeup, volumedown)",
+                _unknown_key(key),
                 details,
                 started,
             )
@@ -2437,7 +2428,7 @@ def press(
     details: dict = {"key": key, "times": times, "expect_hwnd": expect_hwnd}
     normalized = normalize_key(key)
     if normalized is None:
-        return _result(False, f"unknown key {key!r}", details, started)
+        return _result(False, _unknown_key(key), details, started)
     if times < 1:
         return _result(False, f"times must be >= 1, got {times}", details, started)
     details["resolved"] = normalized

@@ -13,6 +13,7 @@ speakers), and how the microphone is shared.
 
 * :func:`capture_sessions` - which processes have an audio session on which
   input device, and whether it is active (recording now).
+* :func:`render_sessions` - the same for output devices (playing sound now).
 
 Everything here opens property stores with ``STGM_READ`` and at most
 activates a session manager to list session states: no stream is opened, no
@@ -287,11 +288,27 @@ def capture_sessions() -> list[dict[str, Any]]:
     ``active`` session is a process recording from that device right now,
     which is how the call memory finds the microphone a call app uses.
     """
-    devices = _enumerator().EnumAudioEndpoints(E_CAPTURE, _DEVICE_STATE_ACTIVE)
+    return _sessions(E_CAPTURE)
+
+
+def render_sessions() -> list[dict[str, Any]]:
+    """Which processes have an audio session on which output device, and whether it is active.
+
+    Same shape as :func:`capture_sessions`, over every active render endpoint:
+    an ``active`` session is a process playing sound (an open output stream)
+    right now - with the microphone held, the measured sign of a call
+    (:mod:`yuki.memory.avsignals`). Session state only: nothing is played,
+    captured or changed.
+    """
+    return _sessions(E_RENDER)
+
+
+def _sessions(flow: int) -> list[dict[str, Any]]:
+    devices = _enumerator().EnumAudioEndpoints(flow, _DEVICE_STATE_ACTIVE)
     out: list[dict[str, Any]] = []
     for i in range(devices.GetCount()):
         device = devices.Item(i)
-        facts = _describe(device, capture=True)
+        facts = _describe(device, capture=flow == E_CAPTURE)
         iid = IAudioSessionManager2._iid_
         raw = device.Activate(byref(iid), comtypes.CLSCTX_ALL, None)
         manager = ctypes.cast(c_void_p(raw), POINTER(IAudioSessionManager2))
@@ -338,5 +355,5 @@ def output_is_headphones(
     return bad is None, {"form_factor": pick["form_factor"], "device": pick["name"], "checked": checked}
 
 
-__all__ = ["default_endpoints", "list_endpoints", "output_is_headphones", "capture_sessions", "FORM_FACTORS",
-           "E_RENDER", "E_CAPTURE"]
+__all__ = ["default_endpoints", "list_endpoints", "output_is_headphones", "capture_sessions", "render_sessions",
+           "FORM_FACTORS", "E_RENDER", "E_CAPTURE"]

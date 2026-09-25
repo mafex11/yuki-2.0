@@ -394,14 +394,17 @@ def _stop_requested(handle: Any) -> bool:
 
 
 def memory_texts(store: Store, days: float) -> list[str]:
-    """What memory says about the user's life, for the vocabulary hint: the portrait (subjects and facts),
-    the conversation facts and the journal of the last ``days``. Read once per batch."""
+    """Who and what the user's life is about, for the vocabulary hint: the subjects memory's models gave
+    its portrait and conversation facts, the unknowns its questions asked about, and the names the user
+    is shown by on screen - one entry per fact. Read once per batch. (``days`` is kept for the callers:
+    journal facts carry no subject.)"""
     texts: list[str] = []
-    for read in (lambda: [f"{f.subject}. {f.text}" for f in store.portrait_facts()],
-                 lambda: [f"{f.subject}. {f.text}" for f in store.conversation_facts()],
-                 lambda: [j.fact for j in store.journal_between(time.time() - days * 86400.0)]):
+    for read in (lambda: [f.subject for f in store.portrait_facts()],
+                 lambda: [f.subject for f in store.conversation_facts()],
+                 lambda: [q.subject for q in store.questions()],
+                 lambda: store.me_names()):
         try:
-            texts += read()
+            texts += [s for s in read() if s]
         except Exception:
             pass
     return texts

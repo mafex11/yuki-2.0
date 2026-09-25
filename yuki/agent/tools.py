@@ -289,7 +289,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Pressing a shortcut",
         "description": (
             "Press a key combination, given as the keys held together, e.g. "
-            "['ctrl','t'] or ['win','r'] or ['volume_mute']. The result says where "
+            "['ctrl','t'] or ['win','r'] or ['volumemute']. The result says where "
             "keyboard focus is afterwards and whether it moved, and names any new "
             "window the application showed."
         ),
@@ -555,8 +555,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             {
                 "text": {
                     "type": "string",
-                    "description": "The instruction they withdrew, as they put it or as "
-                    "the standing rules list it.",
+                    "description": "The id of the rule they withdrew, exactly as the standing "
+                    "rules list shows it in brackets, e.g. rule:12.",
                 }
             },
             ["text"],
@@ -611,7 +611,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "text": {
                     "type": "string",
                     "description": "add: the to-do, in one short line. done: the item's id "
-                    "or its words as the list shows them.",
+                    "exactly as shown in brackets (e.g. todo:3, commit:5, loop:12); list "
+                    "first when you do not have it.",
                 },
                 "due": {
                     "type": "string",
@@ -623,6 +624,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
 ]
+
+#: The optional field every action tool takes: the brain's own mark that this call finishes
+#: the request, with what to tell the user. It is ``done`` riding on the action itself, the
+#: shape Sonnet actually fills (measured 2026-09-25: in 159 real requests it never sent
+#: ``done`` alongside an action, so every one-action task cost a whole extra model call,
+#: ~2.5 s, only to say it worked). The loop ends the request with it once every call of the
+#: response has succeeded (``Agent._run_tools``); a failure discards it.
+FINISHES_FIELD = "finishes_with"
+FINISHES_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Optional. Fill it only when this action by itself completes what the user asked and you "
+        "would not need to read its result first: the reply you would give done, worded as the "
+        "outcome (\"Discord's minimized\"). The request then ends the moment this succeeds, with "
+        "no further call; if it fails, the message is discarded and you get the result. Leave it "
+        "out when more steps follow or when you need its output."
+    ),
+}
 
 #: Name -> schema, for validation and lookups.
 TOOLS_BY_NAME: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOL_SCHEMAS}
@@ -646,6 +665,9 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "run_powershell",
     "open_url",
 )
+
+for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each action's schema
+    TOOLS_BY_NAME[_name]["input_schema"]["properties"][FINISHES_FIELD] = FINISHES_SCHEMA
 
 #: Actions after which the loop attaches a fresh read of the window acted on to
 #: the next turn (see :meth:`Dispatcher.window_view`), so the model does not

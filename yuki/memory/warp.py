@@ -16,10 +16,11 @@ runs in ``yuki-memory`` every :data:`EVERY_S`:
 * waits for a command's completion (``completed_ts``) up to
   :data:`SETTLE_S` so its exit code is known; the checkpoint only moves over
   a contiguous run of taken rows;
-* drops, entirely, every command the privacy file's ``[terminal]`` rules
-  call a secret (:class:`TerminalRules`: regular expressions and a
-  high-entropy-word test, both data in the TOML) - a dropped command is
-  never stored and never reaches the model; only its count is logged;
+* drops, entirely, every command that holds a secret (:class:`TerminalRules`:
+  the fixed-format detector every memory entry point uses, then a
+  high-entropy-word test whose thresholds are data in the TOML) - a dropped
+  command is never stored and never reaches the model; only its count is
+  logged;
 * writes the rest with :meth:`yuki.memory.store.Store.add_terminal_commands`:
   one ``terminal`` thread per folder, one capture per folder and pass
   (encrypted, 30-day TTL like every capture), checkpoint moved in the same
@@ -86,7 +87,6 @@ _COLUMNS = ("id, command, exit_code, start_ts, completed_ts, pwd, shell, git_bra
             "is_agent_executed")
 #: Word boundaries of the high-entropy test (plumbing: what a "word" is).
 _WORD_SPLIT = re.compile(r"[\s'\"=:,;()<>|&/\\]+")
-_CLASSES = (re.compile(r"[a-z]"), re.compile(r"[A-Z]"), re.compile(r"[0-9]"))
 
 
 def default_db_path() -> Path:
@@ -118,48 +118,42 @@ class TerminalRules:
     enabled: bool = True
     database: str = ""
     include_agent_commands: bool = True
-    patterns: tuple[re.Pattern, ...] = ()
     entropy_min_length: int = 24
     entropy_min_bits: float = 3.5
-    #: Patterns that did not compile (index: error); such a file keeps working with the others.
+    #: Kept for the log's shape; always empty (``secret_patterns`` is no longer read).
     errors: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, table: dict) -> TerminalRules:
+        # A user file written before 2026-09-25 may still hold ``secret_patterns`` (22 regular
+        # expressions naming secret words and tools): it is ignored. What counts as a secret is the
+        # shared fixed-format detector plus the measured entropy test below.
         table = table or {}
-        patterns, errors = [], []
-        for i, raw in enumerate(table.get("secret_patterns", []) or []):
-            try:
-                patterns.append(re.compile(str(raw), re.IGNORECASE))
-            except re.error as exc:
-                errors.append(f"{i}: {exc}")
         return cls(
             enabled=bool(table.get("enabled", True)),
             database=str(table.get("database", "") or ""),
             include_agent_commands=bool(table.get("include_agent_commands", True)),
-            patterns=tuple(patterns),
             entropy_min_length=int(table.get("entropy_min_length", 24)),
             entropy_min_bits=float(table.get("entropy_min_bits", 3.5)),
-            errors=tuple(errors),
         )
 
     def _random_word(self, word: str) -> bool:
         if len(word) < self.entropy_min_length:
             return False
-        if sum(1 for c in _CLASSES if c.search(word)) < 2:
+        if any(ch.islower() for ch in word) + any(ch.isupper() for ch in word) + any(ch.isdigit() for ch in word) < 2:
             return False
         return shannon_bits(word) >= self.entropy_min_bits
 
     def secret_reason(self, *texts: str) -> str | None:
-        """``"secret:<kind>"`` / ``"pattern:<n>"`` / ``"high_entropy"`` when any text looks like it holds a
-        secret, else None.
+        """``"secret:<kind>"`` / ``"high_entropy"`` when any text holds a secret, else None.
 
-        First the shared detector every memory entry point uses (:mod:`yuki.memory.secret_filter`: known key
-        formats, labelled credentials, codes, cards, secret-context entropy), then the privacy file's own
-        ``secret_patterns`` (data the user can extend: assignments and flags of shell syntax), then the
-        stricter terminal-only test: any long high-entropy word, even without a secret word next to it.
-        A command is dropped whole (not redacted): a command line is short and its secret is its point.
-        Content-free: the reason names the rule, never the text.
+        First the shared fixed-format detector every memory entry point uses
+        (:mod:`yuki.memory.secret_filter`: vendor key formats, private keys, JWTs, a URL's password,
+        Authorization credentials, cards, IFSC), then the terminal-only measured test: any long
+        high-entropy word. A password given as a flag (``mysql -pX``, ``--password X``) is no fixed
+        format and is kept (the known limit of docs/MEMORY.md "Secret filter"). A command is dropped
+        whole (not redacted): a command line is short and its secret is its point. Content-free: the
+        reason names the rule, never the text.
         """
         for text in texts:
             if not text:
@@ -167,9 +161,6 @@ class TerminalRules:
             found = secret_filter.find(text)
             if found:
                 return f"secret:{found[0].kind}"
-            for i, pattern in enumerate(self.patterns):
-                if pattern.search(text):
-                    return f"pattern:{i}"
             if any(self._random_word(w) for w in _WORD_SPLIT.split(text) if w):
                 return "high_entropy"
         return None

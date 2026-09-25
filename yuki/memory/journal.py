@@ -112,7 +112,9 @@ in their life, their routines and preferences, and what is still pending.
 WHO THE USER IS: {identity} Wherever the user appears - as a message's sender, in an \
 invitation, a mention, a reply, a signature - write "the user", never their name as if \
 they were someone else: "Kian invited Kenji to #design" is recorded as "The user \
-invited Kenji to #design".
+invited Kenji to #design". A sender is shown as the app shows it; one of the user's \
+names, or the app's own word for whoever is looking at it (such as "You" or "Name (you)"), \
+is the user, even when it is not marked "the user".
 
 Each request shows what newly appeared in one window, web page or terminal folder (a "thread") as \
 numbered SOURCES [1], [2], ..., each with the local date and time it is dated by. There \

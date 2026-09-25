@@ -9,7 +9,12 @@
 #   * process names are Windows image names ("chrome.exe"), case-insensitive;
 #   * hosts match exactly or as a parent domain ("chase.com" also blocks
 #     "secure.chase.com"), case-insensitive;
-#   * path fragments and query terms are case-insensitive substrings.
+#   * per-site path fragments are case-insensitive substrings.
+# Keys older copies of this file had and that are no longer read (they were
+# word lists guessing what a page or app is): blocked_process_substrings,
+# blocked_path_fragments, [adult] host_substrings / query_terms / query_params,
+# [terminal] secret_patterns, [meetings] processes / host_suffixes /
+# host_paths, and the [calls] app list's old meaning (see those tables).
 # Seeded from MaxMi's Denylist.swift, mapped to Windows.
 
 version = 1
@@ -28,6 +33,10 @@ when_fullscreen = true
 drop_password_values = true
 # Skip the whole capture while the focused control is a password field.
 skip_when_password_focused = true
+# Skip the whole capture while any password field is on screen (a sign-in
+# page, a credentials dialog, a Wi-Fi key field in Settings) - read from the
+# window itself (UIA IsPassword), whatever its address says.
+skip_when_password_present = true
 # A value or line made only of these characters is a masked secret: dropped.
 mask_characters = "•●∙·*◦⦁⚫"
 
@@ -59,14 +68,12 @@ blocked_processes = [
     "LogonUI.exe",
     "LockApp.exe",
     "consent.exe",
-    # meeting apps: never read, recorded as meeting hours only (see [meetings])
+    # meeting apps: never read (the timeline still counts meeting hours, see [meetings])
     "Zoom.exe",
     # Windows Settings (SystemSettings.exe) is read on purpose (user's choice,
     # 2026-09-24).  Its Wi-Fi key and PIN fields are password fields: their
-    # values are never read (see [fields]).
+    # values are never read, and a page showing one is skipped (see [fields]).
 ]
-# Product-name fragments of password-manager families (process name contains).
-blocked_process_substrings = ["1password", "bitwarden", "lastpass", "dashlane", "keepass"]
 # Window titles (exact, case-insensitive) never read, whatever the process:
 # Control Panel applets that live inside explorer.exe.
 blocked_window_titles = ["Credential Manager"]
@@ -121,30 +128,22 @@ blocked_host_suffixes = [
     "paypal.com",
     "meet.google.com", "zoom.us",
 ]
-# Any site: a page whose path contains one of these is not read.
-blocked_path_fragments = [
-    "/login", "/signin", "/sign-in", "/sign_in", "/auth/", "/oauth/",
-    "/reset-password", "/forgot-password", "/change-password",
-    "/2fa", "/mfa", "/otp",
-]
+# Sign-in pages anywhere are skipped by the password field they show (see
+# [fields] skip_when_password_present), not by words in their address.
 
 # Per-site path rules: host (and its subdomains) -> path fragments.
 [web.blocked_host_paths]
-"stripe.com" = ["/login"]
 "teams.microsoft.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
 "teams.live.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
 
 [adult]
+# Named sites never read (hosts and their subdomains).  Add your own here or
+# to [user] blocked_domains.
 host_suffixes = [
     "pornhub.com", "pornhub.org", "xvideos.com", "xnxx.com", "redtube.com",
     "youporn.com", "xhamster.com", "spankbang.com", "jav.guru", "hanime.tv",
     "onlyfans.com", "chaturbate.com", "stripchat.com",
 ]
-host_substrings = ["porn", "xvideos", "xhamster", "hentai", "javhd"]
-# A search whose query contains one of these is not read.
-query_terms = ["porn", "hentai", "xxx", "nsfw", "jav ", "sex video"]
-# URL query parameters that carry a search query.
-query_params = ["q", "search_query", "query", "p"]
 
 [user]
 # Your own blocklist.  Apps: process name ("discord.exe") or app name
@@ -154,76 +153,48 @@ blocked_domains = []
 
 [meetings]
 # Meetings are remembered as hours only: the timeline records a "meeting"
-# row with the app or site, the service name below and start/end (plus how
-# long the app used the microphone) - never a window title, a page path, or
-# anything said or shown.  Their content stays blocked by [apps] and [web]
-# above; keep the two lists in step.
-# Apps (process names) that are meetings whenever they are in front.
-processes = ["Zoom.exe"]
-# Sites (and their subdomains) that are meetings.
-host_suffixes = ["meet.google.com", "zoom.us"]
+# row with the app or site, its name and start/end (plus how long the app
+# used the microphone) - never a window title, a page path, or anything said
+# or shown.  Their content stays blocked by [apps] and [web] above.
+# What a meeting is, is measured, not listed: the app in front has held the
+# microphone (or, with camera = true, the camera) for hold_s seconds - Windows'
+# own record of who uses them.  For a browser, the meeting is the site that
+# was in front when it took the microphone.  It ends end_grace_s seconds after
+# the app lets go.
+hold_s = 20
+end_grace_s = 30
+camera = true
+# Your own overrides (empty by default): apps (process names) and sites that
+# are meetings whenever they are in front, and ones that never are (a voice
+# recorder, a music app).
+always_apps = []
+always_sites = []
+never_apps = []
+never_sites = []
+# (processes, host_suffixes and host_paths - a list of meeting apps and sites -
+# are no longer read.)
 
-# Sites where only some paths are meetings: host -> path fragments.
-[meetings.host_paths]
-"teams.microsoft.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
-"teams.live.com" = ["/l/meetup-join", "/meetup-join/", "/meeting/"]
-
-# The service name shown in the timeline and episodes (process or host -> name).
+# Optional display names (process or host -> name), e.g. "meet.google.com" =
+# "Google Meet".  Default: the app's own name, or the site.
 [meetings.names]
-"Zoom.exe" = "Zoom"
-"meet.google.com" = "Google Meet"
-"zoom.us" = "Zoom"
-"teams.microsoft.com" = "Microsoft Teams"
-"teams.live.com" = "Microsoft Teams"
 
 [terminal]
 # The Warp terminal's command history (its own local database, read-only).
 # Every few minutes the new commands are journaled: the command line, its
 # folder, git branch, exit code and time.  Command OUTPUT is never read.
-# A command matching any rule below is dropped entirely (never stored, never
-# sent to the model).  Set enabled = false to stop reading Warp's history.
+# A command that holds a secret is dropped entirely (never stored, never sent
+# to the model): a key, token or private key in its vendor's published format,
+# a URL with a password, an Authorization header, a card number (the same
+# fixed-format detector as the rest of memory).  A password passed as a flag
+# (mysql -pX, --password X) is no fixed format and is NOT caught.  Set
+# enabled = false to stop reading Warp's history.
 enabled = true
 # Path of Warp's database; empty = %LOCALAPPDATA%\warp\Warp\data\warp.sqlite.
 database = ""
 # Commands Warp's own AI agent ran (not typed by you) are journaled too, marked as such.
 include_agent_commands = true
+# (secret_patterns, a list of regular expressions, is no longer read.)
 
-# Secret rules: Python regular expressions, matched case-insensitively against
-# the command line, its folder and its branch.  Literal strings: no escaping.
-secret_patterns = [
-    # an assignment naming a secret: API_KEY=..., $env:GITHUB_TOKEN = ..., export DB_PASSWORD=...
-    '''[a-z0-9_.-]*(key|token|secret|passw|pwd|credential|creds|auth(?!or))[a-z0-9_.-]*\s*=\s*\S''',
-    # setx / SetEnvironmentVariable of such a name
-    '''\bsetx\s+\S*(key|token|secret|passw|credential|auth(?!or))''',
-    '''SetEnvironmentVariable\s*\(\s*['"]?[^,'"]*(key|token|secret|passw|credential|auth(?!or))''',
-    # a tool's config set of such a name: aws configure set aws_secret_access_key ..., npm config set //x/:_authToken ...
-    '''\bconfig(ure)?\s+(set\s+)?\S*(key|token|secret|passw|credential|auth(?!or))\S*\s+\S''',
-    # a flag naming a secret, with a value: --api-key abc, --password=..., -Token x
-    '''(^|\s)--?[a-z0-9-]*(key|token|secret|passw|credential|creds|auth(?!or))[a-z0-9-]*(\s+|=)[^\s-]''',
-    # HTTP headers
-    '''\bauthorization\s*:''',
-    '''\bbearer\s+\S{8,}''',
-    '''\b(x-)?(api|access|auth)[-_]?(key|token)\s*:''',
-    # a URL with a user name and password
-    '''[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@''',
-    # well-known key and token shapes
-    '''\b(sk|pk|rk)-[a-z0-9_-]{16,}''',
-    '''\bgh[pousr]_[a-z0-9]{20,}''',
-    '''\bgithub_pat_\w{20,}''',
-    '''\bxox[abprs]-[a-z0-9-]{10,}''',
-    '''\bAKIA[0-9A-Z]{16}\b''',
-    '''\bAIza[0-9a-z_-]{30,}''',
-    '''\bABSK[a-z0-9+/=]{20,}''',
-    '''\beyJ[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}''',
-    '''-----BEGIN [A-Z ]*PRIVATE KEY''',
-    # passwords handed to a tool on the command line
-    '''ConvertTo-SecureString''',
-    '''-AsPlainText''',
-    '''\bsshpass\b''',
-    '''\bmysql(admin)?\b.*\s-p\S''',
-    '''\bcmdkey\b.*/pass''',
-    '''\bnet\s+user\s+\S+\s+\S+''',
-]
 # Long random-looking words are treated as secrets too: a word (split at
 # spaces, quotes, = : , ; ( ) < > | & / \) at least this long whose characters
 # carry at least this many bits of entropy each, mixing letters and digits.
@@ -315,17 +286,18 @@ retry_min = 30
 # what you said you would do.  It asks every call unless you chose "Always"
 # or "Never" for that app; no answer means nothing is recorded.
 enabled = true
-# Communication apps: one of these holding the microphone is a call.  (A
-# meeting row of the timeline - [meetings] - is a call too, whatever the app.)
-# Process names of desktop apps, or package family names of Store apps.
-apps = [
-    "Zoom.exe", "Discord.exe", "ms-teams.exe", "Teams.exe", "Slack.exe", "Telegram.exe",
-    "Signal.exe", "Skype.exe", "Webex.exe", "CiscoCollabHost.exe",
-    "5319275A.WhatsAppDesktop", "MSTeams", "Microsoft.SkypeApp",
-]
-# How often the microphone's users are read (a registry read, ~30 ms), and how
-# long a call may go quiet (app off the microphone, meeting not in front)
-# before it counts as ended.
+# What a call is, is measured, not listed: an app (any app, a browser too) that
+# has held the microphone for hold_s seconds while it also plays sound or
+# holds the camera - or a meeting row of the timeline ([meetings]).  The card
+# still asks every time; "Never for <app>" is remembered.
+hold_s = 15
+# Your own additions (empty by default): apps that are a call whenever they
+# hold the microphone, sound or not.  Process names of desktop apps, or
+# package family names of Store apps.
+apps = []
+# How often the call worker wakes (the microphone's users are read again only
+# when Windows changes them), and how long a call may go quiet (app off the
+# microphone, meeting not in front) before it counts as ended.
 poll_s = 5
 end_grace_s = 30
 # The card goes away unanswered after this long (= no recording for this call).
@@ -436,21 +408,9 @@ stt_vocab_days = 14
 # Only for these languages: the names are in Latin script, and with them in the
 # prompt Whisper translated Kannada speech into English (measured).
 stt_vocab_languages = ["en", "hi"]
-# Display names for the card ("Remember what you say in this call?" ... "Always for Zoom").
+# Optional display names for the card (process name -> name).  Default: the
+# app's own name (its file description, e.g. "Discord", "Google Chrome").
 [calls.names]
-"Zoom.exe" = "Zoom"
-"Discord.exe" = "Discord"
-"ms-teams.exe" = "Microsoft Teams"
-"Teams.exe" = "Microsoft Teams"
-"MSTeams" = "Microsoft Teams"
-"Slack.exe" = "Slack"
-"Telegram.exe" = "Telegram"
-"Signal.exe" = "Signal"
-"Skype.exe" = "Skype"
-"Microsoft.SkypeApp" = "Skype"
-"Webex.exe" = "Webex"
-"CiscoCollabHost.exe" = "Webex"
-"5319275A.WhatsAppDesktop" = "WhatsApp"
 
 # Upper bound of Whisper tokens per second of audio, per language: ~2x what
 # synthetic speech needs (en 4, hi 14, ta 13, kn 30, te 25 tokens/s; Indian

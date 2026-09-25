@@ -50,10 +50,12 @@ def _strings(value: object) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Defaults:
-    text_noise: tuple[str, ...] = ("(edited)",)
-    me_senders: tuple[str, ...] = ("You",)
-    me_suffixes: tuple[str, ...] = ("(you)",)
-    me_prefixes: tuple[str, ...] = ("You:",)
+    """Cross-app settings. Only ``text_noise`` remains, empty by default: marks and the user's own
+    labels ("(edited)", "You") belong to the profile of the app whose UI writes them. The old
+    ``me_senders`` / ``me_suffixes`` / ``me_prefixes`` keys (English words deciding whose a message
+    is, in every app) are no longer read."""
+
+    text_noise: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,10 @@ class Profile:
     exclude: tuple[str, ...] = ()
     composer: tuple[str, ...] = ()
     me_row: tuple[str, ...] = ()
+    #: How this app's own UI names the user as a sender ("You" in WhatsApp's "You:" label), and
+    #: the suffix it writes after the user's name ("Kian (you)"): the app's strings, per app.
+    me_senders: tuple[str, ...] = ()
+    me_suffixes: tuple[str, ...] = ()
     self_name: tuple[str, ...] = ()
     self_name_strip: tuple[str, ...] = ()
     list_rows: tuple[str, ...] = ()
@@ -154,6 +160,8 @@ def _profile(raw: dict, problems: list[str]) -> Profile | None:
     values["title_part"] = int(raw.get("title_part") or 0)
     values["scope_strip"] = _strings(raw.get("scope_strip"))
     values["self_name_strip"] = _strings(raw.get("self_name_strip"))
+    values["me_senders"] = _strings(raw.get("me_senders"))
+    values["me_suffixes"] = _strings(raw.get("me_suffixes"))
     values["title_strip"] = _strings(raw.get("title_strip"))
     values["description_lines"] = max(int(raw.get("description_lines") or 5), 1)
     values["id_source"] = str(raw.get("id_source") or "")
@@ -211,12 +219,7 @@ def load(default_path: Path = DEFAULT_PATH, override_path: Path | None = None) -
     base_defaults, base = _load_file(default_path, problems)
     user_defaults, user = _load_file(override_path or user_path(), problems)
     merged_defaults = {**base_defaults, **user_defaults}
-    defaults = Defaults(
-        text_noise=_strings(merged_defaults.get("text_noise")) or Defaults.text_noise,
-        me_senders=_strings(merged_defaults.get("me_senders")) or Defaults.me_senders,
-        me_suffixes=_strings(merged_defaults.get("me_suffixes")) or Defaults.me_suffixes,
-        me_prefixes=_strings(merged_defaults.get("me_prefixes")) or Defaults.me_prefixes,
-    )
+    defaults = Defaults(text_noise=_strings(merged_defaults.get("text_noise")))
     names = {p.name for p in user}
     return ProfileSet(defaults=defaults, profiles=user + [p for p in base if p.name not in names], problems=problems)
 
