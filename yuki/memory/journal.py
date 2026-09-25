@@ -249,7 +249,17 @@ alone. A word that is odd in its sentence was probably misheard: write the fact 
 you are sure of; if the fact still depends on that word, quote it as heard ("what sounded like \
 'generic prices'") and set uncertain - never state a possibly misheard word as plain fact. Take \
 a commitment only from words that are clear; never from an UNCLEAR utterance or a guess at what \
-was meant."""
+was meant.
+
+IT IS TALK AMONG FRIENDS, heard from one side. People joke, exaggerate, tease, play along, \
+talk hypothetically and give advice. A boast or a joke ("I need a rich spouse so I never have \
+to work", "I have unlimited accounts") is not a fact about their life; keep a fact only when \
+the user is plainly telling it as true, and when you cannot tell, leave it out rather than \
+record it as fact. Advice or instructions the user gives someone else describe what they \
+recommend, not necessarily their own setup, unless they say so. Numbers and dates heard once \
+(scores, durations, amounts) are easy to mishear: keep them only when the words around them \
+confirm them. The other side is not in the transcript: never assume what they said or who they \
+are beyond what the user's own words make plain."""
 
 
 def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bool = False) -> str:
