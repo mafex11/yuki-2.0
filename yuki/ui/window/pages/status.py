@@ -11,11 +11,17 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import StatusView, day_label, dur, hm
 from yuki.ui.window.theme import SPACE, Theme
-from yuki.ui.window.widgets import Dot, Glass, Pill, Toggle, icon_label, page_header, text_label
+from yuki.ui.window.widgets import Glass, Pill, Toggle, icon_label, page_header, text_label
 
 
-def _row(t: Theme, dot: QColor, glyph: str, title: str, text: str, actions: list[QWidget]) -> Glass:
-    card = Glass(t, level="regular", radius=22, padding=SPACE["l"])
+def _row(t: Theme, tone: QColor | None, glyph: str, title: str, text: str, actions: list[QWidget]) -> Glass:
+    """One status line. The title says the state in words; something that needs the user (``tone``) gets a
+    faint wash of that colour on its glass instead of a coloured dot."""
+    wash = None
+    if tone is not None:
+        wash = QColor(tone)
+        wash.setAlphaF(0.07 if not t.dark else 0.10)
+    card = Glass(t, level="regular", radius=22, padding=SPACE["l"], tint=wash)
     row = QHBoxLayout()
     row.setSpacing(SPACE["m"])
     icon = Glass(t, level="inset", radius=18, padding=0)
@@ -28,7 +34,6 @@ def _row(t: Theme, dot: QColor, glyph: str, title: str, text: str, actions: list
     col.setSpacing(3)
     head = QHBoxLayout()
     head.setSpacing(4)
-    head.addWidget(Dot(t, dot, 8))
     head.addWidget(text_label(t, title, "headline"))
     head.addStretch(1)
     col.addLayout(head)
@@ -89,7 +94,8 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     col = QVBoxLayout(page)
     col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
     col.setSpacing(SPACE["m"])
-    good, warn, bad = t.status["good"], t.status["warning"], t.status["critical"]
+    # fine needs no colour at all; what needs the user gets a faint warm or red wash, with the words
+    good, warn, bad = None, t.kind("nudge"), t.kind("error")
     waiting_calls = (v.calls_waiting or {}).get("calls", 0)
     waiting = waiting_calls + len(v.questions_waiting)
     if not v.service_running:
@@ -157,19 +163,19 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
                            f"Quiet hours {v.quiet_hours[0]}–{v.quiet_hours[1]}. Today: {said or 'nothing yet'}.",
                            [_pill(t, "Quiet 1 hour", lambda: act.snooze(60), glyph="moon", size="small"),
                             _pill(t, "Until tomorrow", lambda: act.snooze(minutes_until(6)), size="small")]))
-    col.addWidget(_row(t, good if v.wake_on else t.text_3, "mic",
+    col.addWidget(_row(t, None, "mic",
                        "Listening for “Yuki”" if v.wake_on else "Not listening for “Yuki”",
                        f"Say “Yuki” or press Ctrl+Alt+Y. Mic: {v.mic}. Speaker: {v.speaker}. "
                        "Nothing is sent anywhere until you say its name.",
                        [_pill(t, "Turn off" if v.wake_on else "Turn on", lambda: act.set_wake(not v.wake_on),
                               size="small")]))
-    col.addWidget(_row(t, t.accent, "money", f"${v.cost_today:.2f} today",
+    col.addWidget(_row(t, None, "money", f"${v.cost_today:.2f} today",
                        "What remembering cost today: reading your screen into facts, your portrait, the story "
                        "of your day, your chats with Yuki and the coach (list prices).", []))
     if v.start_with_windows is not None:
         sw = Toggle(t, bool(v.start_with_windows))
         sw.toggled.connect(act.set_startup)
-        col.addWidget(_row(t, good if v.start_with_windows else t.text_3, "power",
+        col.addWidget(_row(t, None, "power",
                            "Starts with Windows" if v.start_with_windows else "Doesn't start with Windows",
                            "Yuki and its memory come up when you sign in." if v.start_with_windows else
                            "Start Yuki yourself from the Start menu.", [sw]))

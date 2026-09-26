@@ -143,36 +143,52 @@ def paint_glass(
         p.setBrush(QBrush(g))
         p.drawPath(path)
     if edge:
-        # hairline outline just outside the specular edge: definition on bright backdrops
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(level.outline, 1.0))
-        p.drawPath(rounded(rect.adjusted(-0.5, -0.5, 0.5, 0.5), radius + 0.5))
-        # specular edge: bright at the top left, clear across the middle, a faint rim bottom right
-        g = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        g.setColorAt(0.0, level.edge)
-        mid = QColor(level.edge)
-        mid.setAlpha(int(level.edge.alpha() * 0.18))
-        g.setColorAt(0.38, mid)
-        g.setColorAt(0.62, mid)
-        g.setColorAt(1.0, level.rim)
-        p.setPen(QPen(QBrush(g), 1.2))
-        p.drawPath(rounded(rect.adjusted(0.6, 0.6, -0.6, -0.6), max(0.0, radius - 0.6)))
+        paint_catchlight(p, rect, radius, level)
     p.restore()
 
 
+def paint_catchlight(p: QPainter, rect: QRectF, radius: float, level: GlassLevel) -> None:
+    """The v3 edge: a faint catch-light on the lit (top-left) side that fades out before the middle, and a
+    fainter shade on the far side for definition. No outline goes all the way round (2026-09-27)."""
+    if level.outline.alpha():   # a level that still asks for a hairline (none of the current ones)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(level.outline, 1.0))
+        p.drawPath(rounded(rect.adjusted(-0.5, -0.5, 0.5, 0.5), radius + 0.5))
+    # the light falls from the top left: along the diagonal the edge is bright only near that corner
+    span = max(rect.width(), rect.height())
+    end = QPointF(rect.left() + min(rect.width(), span), rect.top() + min(rect.height(), span))
+    g = QLinearGradient(rect.topLeft(), end)
+    clear = QColor(level.edge)
+    clear.setAlpha(0)
+    g.setColorAt(0.0, level.edge)
+    g.setColorAt(0.30, clear)
+    shade = QColor(level.rim)
+    far = QColor(shade)
+    far.setAlpha(0)
+    g.setColorAt(0.70, far)
+    g.setColorAt(1.0, shade)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QBrush(g), 1.0))
+    p.drawPath(rounded(rect.adjusted(0.5, 0.5, -0.5, -0.5), max(0.0, radius - 0.5)))
+
+
 def paint_backdrop(p: QPainter, rect: QRectF, theme: Theme, image: QImage | None, *,
-                   offset: QPointF = QPointF(0, 0), dwm: bool = False) -> None:
+                   offset: QPointF = QPointF(0, 0), dwm: bool = False, solid: bool = False) -> None:
     """The window's floor.
 
-    ``dwm``: DWM paints the blurred backdrop behind a transparent client area;
-    only the tint is laid on it. ``image``: a pre-blurred picture of what is
-    behind (mockups, or a painted fallback from the wallpaper); ``offset`` is
-    where the window sits in it. Neither: an opaque tinted gradient (the fallback
-    when transparency effects are off).
+    ``solid`` (the live window's default since 2026-09-27): the plain background, black in dark and white in
+    light. ``dwm``: DWM paints the blurred desktop behind a transparent client area ("See-through"); only a
+    faint wash of the background is laid on it, for text. ``image``: a pre-blurred picture of what is behind
+    (the phase-1 mockups); ``offset`` is where the window sits in it. None of them: an opaque tinted gradient
+    (the fallback when transparency effects are off).
     """
     p.save()
-    if dwm:
-        p.fillRect(rect, theme.window_tint)
+    if solid:
+        p.fillRect(rect, theme.bg)
+    elif dwm:
+        wash = QColor(theme.bg)
+        wash.setAlphaF(0.30)
+        p.fillRect(rect, wash)
     elif image is not None:
         dpr = image.devicePixelRatio() or 1.0
         src = QRectF(offset.x() * dpr, offset.y() * dpr, rect.width() * dpr, rect.height() * dpr)

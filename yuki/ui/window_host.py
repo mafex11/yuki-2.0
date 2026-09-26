@@ -58,6 +58,9 @@ class WindowHost(QObject):
         rt.started.connect(self._on_started)
         rt.tool_called.connect(self._on_tool_called)
         rt.tool_finished.connect(self._on_tool_finished)
+        helper_step = getattr(rt, "helper_step", None)
+        if helper_step is not None:
+            helper_step.connect(self._on_helper_step)
         rt.said.connect(lambda lane, job, text: self.emit({"type": "said", "job": job, "text": text}))
         rt.asked.connect(lambda lane, job, q: self.emit({"type": "asked", "job": job, "question": q}))
         rt.finished.connect(lambda lane, job, text: self.emit({"type": "finished", "job": job, "text": text}))
@@ -120,10 +123,19 @@ class WindowHost(QObject):
     def _on_tool_called(self, lane: str, job: int, name: str, tool_input: dict) -> None:
         from yuki.ui.status import describe_tool
 
+        if name == "helper":   # a helper sub-agent: shown from ``helper_step`` (labelled as a helper), not twice
+            return
         self.emit({"type": "tool_called", "job": job, "name": name, "label": describe_tool(name, tool_input, limit=60)})
 
     def _on_tool_finished(self, lane: str, job: int, name: str, ok: bool, summary: str) -> None:
+        if name == "helper":
+            return
         self.emit({"type": "tool_finished", "job": job, "name": name, "ok": bool(ok), "summary": summary})
+
+    def _on_helper_step(self, lane: str, job: int, helper: int, state: str, text: str, ok: bool) -> None:
+        """A read-only helper of a request: a "Helper N" step (and its tools) in the response's fold."""
+        self.emit({"type": "helper_step", "job": job, "helper": int(helper), "state": state, "text": text,
+                   "ok": bool(ok)})
 
     def _on_summarized(self, lane: str, job: int, summary: dict) -> None:
         from yuki.ui.status import _money

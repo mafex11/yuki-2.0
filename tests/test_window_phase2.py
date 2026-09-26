@@ -111,10 +111,15 @@ def test_ui_settings_round_trip_clamps_and_keeps_unknown_keys(tmp_path):
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["future_key"] == 3 and "not_a_setting" not in raw
     pol = s.policy()
-    assert pol.refracts("regular") == (s.glass != "off") and not ui_settings.UiSettings(glass="off").policy() \
-        .refracts("regular")
-    assert ui_settings.UiSettings(glass="light").policy().refracts("regular")
-    assert not ui_settings.UiSettings(glass="light").policy().refracts("control")
+    # 2026-09-27: the window's background is plain, so page glass is a cached GPU picture only in Full (and
+    # not See-through); Light and Full both bend what floats over the app's own content
+    # every page's glass is a cached picture (drawn on a change, then composited): on the GPU only in Full
+    assert pol.refracts("regular") and ui_settings.UiSettings(glass="off").policy().refracts("regular")
+    assert pol.gpu == (s.glass == "full") and ui_settings.UiSettings(glass="full").policy().gpu
+    assert not ui_settings.UiSettings(glass="full", background="see-through").policy().gpu
+    assert ui_settings.UiSettings(glass="light").policy().floats_refract
+    assert not ui_settings.UiSettings(glass="off").policy().floats_refract
+    assert ui_settings.update(path, background="nonsense").background == "solid"
 
 
 # -- the frameless chrome --------------------------------------------------------------------------------
@@ -185,7 +190,8 @@ def test_glass_setting_decides_what_is_refracted_and_what_is_painted(qapp):
     img = QImage(200, 100, QImage.Format.Format_ARGB32_Premultiplied)
     saved = lens.policy()
     try:
-        for mode, expect in (("full", {"regular", "control"}), ("light", {"regular"}), ("off", set())):
+        both = {"regular", "control"}   # recorded for the page's cached picture in every mode; the bubble never
+        for mode, expect in (("full", both), ("light", both), ("off", both)):
             lens.set_policy(lens.GlassPolicy(mode))
             COLLECTOR.begin(t)
             p = QPainter(img)

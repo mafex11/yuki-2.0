@@ -37,8 +37,10 @@ import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath
 
-#: The glass levels the Light mode refracts (large glass); everything else is painted crisp.
-LIGHT_LEVELS = frozenset({"floor", "regular", "raised", "popover"})
+#: Kept for older callers. Since 2026-09-27 the window has a plain background (or DWM's blur of the desktop,
+#: which no app can read), so page glass has nothing of its own to bend in Light: it is painted crisp, and
+#: Light refracts only glass that floats over the app's own content (see :func:`refract_under`).
+LIGHT_LEVELS: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -49,11 +51,23 @@ class GlassPolicy:
     bend: float = 1.0           # 0..2: how far the rim bends light
     blur: float = 1.0           # 0..2: frost
     reduce_motion: bool = False
+    see_through: bool = False   # the window shows DWM's blur of the desktop instead of its plain background
 
     def refracts(self, level: str | None) -> bool:
-        if self.mode == "full":
-            return True
-        return self.mode == "light" and (level or "") in LIGHT_LEVELS
+        """Whether page glass of ``level`` is part of its page's cached picture (it always is: drawn on a
+        change, then only composited; Full refracts it on the GPU, Light and Off paint it flat, once)."""
+        del level
+        return True
+
+    @property
+    def gpu(self) -> bool:
+        """Whether a page's glass picture is refracted on the GPU (Full on the plain background)."""
+        return self.mode == "full" and not self.see_through
+
+    @property
+    def floats_refract(self) -> bool:
+        """Whether glass floating over the app's content (hover card, toast, menus, tooltips) bends it."""
+        return self.mode in ("light", "full")
 
 
 _POLICY = GlassPolicy()
@@ -243,7 +257,8 @@ def render_light(base: QImage, depths: Sequence[Sequence[Any]], *, shadows: bool
         if not shapes:
             continue
         src = _view(out).copy()           # what this depth refracts: everything below it
-        sources = [_source(s, src) for s in shapes]
+        opaque = bool(src[..., 3].min() == 255)
+        sources = [_source(s, src, opaque) for s in shapes]
         p = QPainter(out)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if shadows:
@@ -271,25 +286,26 @@ class _Source:
     x0: int
     y0: int
     image: QImage | None = None   # the blurred crop, for painting the flat middle
+    opaque: bool = True           # every pixel below is opaque (the usual case: the plain window background)
 
 
-def _source(s: Any, src: np.ndarray) -> _Source:
+def _source(s: Any, src: np.ndarray, opaque: bool = True) -> _Source:
     from yuki.ui.window.glass import blur_image
 
     blur = s.optics.blur * s.scale
     if blur < 1.5:
-        return _Source(src, 0, 0)
+        return _Source(src, 0, 0, None, opaque)
     H, W = src.shape[:2]
     _r, _c, _b, height = _shape_geometry(s)
     m = int(math.ceil(height + blur * 2)) + 2
     x0, y0 = max(0, int(s.rect.left()) - m), max(0, int(s.rect.top()) - m)
     x1, y1 = min(W, int(math.ceil(s.rect.right())) + m), min(H, int(math.ceil(s.rect.bottom())) + m)
     if x1 <= x0 or y1 <= y0:
-        return _Source(src, 0, 0)
+        return _Source(src, 0, 0, None, opaque)
     crop = np.ascontiguousarray(src[y0:y1, x0:x1])
     img = QImage(crop.data, x1 - x0, y1 - y0, (x1 - x0) * 4, QImage.Format.Format_ARGB32_Premultiplied).copy()
     img = blur_image(img, blur, passes=2).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-    return _Source(_view(img).copy(), x0, y0, img)
+    return _Source(_view(img).copy(), x0, y0, img, opaque)
 
 
 def _paint_shadow(p: QPainter, s: Any, outside: QPainterPath) -> None:
@@ -326,7 +342,9 @@ def _paint_interior(p: QPainter, s: Any, source: _Source) -> None:
         p.setClipRect(s.clip)
     p.setClipPath(_rounded(inner, max(0.0, radius - bezel * 0.5)), Qt.ClipOperation.IntersectClip)
     if source.image is not None:
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)   # the frost replaces what's there
         p.drawImage(source.x0, source.y0, source.image)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
     fill = _tone_fill(o.tone)
     if fill is not None:
         p.fillRect(s.rect, fill)
@@ -468,11 +486,28 @@ def _refract_band(img: QImage, s: Any, source: _Source) -> None:
     col += 0.5
     out32 = np.frombuffer(img.bits(), np.uint32)
     di = gy * stride + gx
+    if source.opaque:
+        if len(edge):
+            c2 = cov[edge][:, None]
+            col[edge] = col[edge] * c2 + _unpack(out32[di[edge]]) * (1.0 - c2)
+        c = col.astype(np.uint32)
+        out32[di] = np.uint32(0xFF000000) | (c[:, 2] << 16) | (c[:, 1] << 8) | c[:, 0]
+        return
+    # a source with transparent parts (the See-through window): the same light, premultiplied, so the rim
+    # stays as clear as what it bends instead of turning into an opaque ring
+    a = flat[i00] >> 24
+    sa = (a.astype(np.float32) / 255.0)
+    alpha = (hi - lo) * (1.0 - ta) * sa + (1.0 - (hi - lo) * (1.0 - ta))
+    alpha = np.minimum(1.0, alpha + light)
+    np.clip(col, 0.0, alpha[:, None] * 255.0, out=col)
+    alpha *= 255.0
     if len(edge):
-        c2 = cov[edge][:, None]
-        col[edge] = col[edge] * c2 + _unpack(out32[di[edge]]) * (1.0 - c2)
+        c2 = cov[edge]
+        prev = out32[di[edge]]
+        col[edge] = col[edge] * c2[:, None] + _unpack(prev) * (1.0 - c2[:, None])
+        alpha[edge] = alpha[edge] * c2 + (prev >> 24).astype(np.float32) * (1.0 - c2)
     c = col.astype(np.uint32)
-    out32[di] = np.uint32(0xFF000000) | (c[:, 2] << 16) | (c[:, 1] << 8) | c[:, 0]
+    out32[di] = (np.clip(alpha + 0.5, 0, 255).astype(np.uint32) << 24) | (c[:, 2] << 16) | (c[:, 1] << 8) | c[:, 0]
 
 
 # -- one entry point for both modes ----------------------------------------------------------------------
@@ -511,6 +546,56 @@ def render(base: QImage, layers: Sequence[tuple[str, Any]], mode: str | None = N
             p.end()
     out.setDevicePixelRatio(dpr)
     return out
+
+
+def render_flat(base: QImage, layers: Sequence[tuple[str, Any]]) -> QImage:
+    """``base`` with every glass shape of ``layers`` painted flat (fill, tint, catch-light; no bending), in
+    depth order: the Light / Off page picture, made once per change on the glass thread. Shadows are left to
+    :class:`~yuki.ui.window.glasscache.GlassPage` (it paints them outside the glass)."""
+    from yuki.ui.window.glass import paint_glass
+
+    out = base.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    out.setDevicePixelRatio(1.0)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    for kind, shapes in layers:
+        if kind != "glass":
+            continue
+        for s in shapes:
+            if s.level is None:
+                continue
+            p.save()
+            if s.clip is not None:
+                p.setClipRect(s.clip)
+            paint_glass(p, s.rect, s.radius, s.level, tint=s.tint, shadow=False, painted=True)
+            p.restore()
+    p.end()
+    return out
+
+
+def float_lens(content: QImage, rect: QRectF, radius: float, optics: Any, *, tint: QColor | None = None,
+               mode: str | None = None) -> QImage | None:
+    """One floating lens over the app's own content, cropped to the lens (device px).
+
+    ``content``: what lies under the glass (a grab of the app's widgets with a margin round the lens, so the
+    rim has something to bend inwards), device px with its ``devicePixelRatio`` set. ``rect`` and ``radius``:
+    the lens in ``content``'s device px. Light draws it on the CPU, Full on the GPU; called on the glass
+    thread, once per place and size (the caller caches the result).
+    """
+    from yuki.ui.window.refract import Shape
+
+    mode = mode or _POLICY.mode
+    if mode == "off" or content.isNull() or rect.width() < 4 or rect.height() < 4:
+        return None
+    dpr = content.devicePixelRatio() or 1.0
+    base = content.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    base.setDevicePixelRatio(1.0)
+    shape = Shape(QRectF(rect), radius, scaled_optics(optics), dpr, tint, None, False)
+    out = render(base, [("glass", [shape])], mode)
+    out.setDevicePixelRatio(1.0)
+    crop = out.copy(rect.toAlignedRect())
+    crop.setDevicePixelRatio(dpr)
+    return crop
 
 
 # -- the desktop wallpaper behind a surface (decoded once per screen size) ---------------------------

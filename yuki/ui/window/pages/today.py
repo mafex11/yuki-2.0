@@ -88,6 +88,93 @@ def _lane_color(t: Theme, day: DayView, key_or_label: str) -> QColor:
     return t.series_other
 
 
+class _Swatch(QWidget):
+    """An app's colour key in a list: a short rounded bar (not a dot); a call's is the call colour."""
+
+    def __init__(self, t: Theme, color: QColor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.color = color
+        self.setFixedSize(12, 14)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.color)
+        p.drawRoundedRect(QRectF(0, 5, 12, 4), 2, 2)
+        p.end()
+
+
+def _app_rows(t: Theme, day: DayView, apps: list[tuple[str, float]], calls: list, start: float, end: float,
+              panel: Panel) -> None:
+    """The session's apps as a list ("Warp 27m · Chrome 13m · Discord call · ongoing · Other apps"): a call
+    is just another row in it, with how long it overlapped the stretch (or "ongoing")."""
+    keys = QHBoxLayout()
+    keys.setSpacing(SPACE["s"])
+    panel.body.addLayout(keys)
+    rows: list[tuple[QColor, str]] = [(_lane_color(t, day, name), f"{name} {dur(v)}") for name, v in apps[:4]]
+    for c in calls:
+        overlap = min(c.end, end) - max(c.start, start)
+        how = "ongoing" if c.ongoing and c.end >= end - 60 else dur(overlap)
+        rows.append((t.kind("call"), f"{c.app} call · {how}"))
+    if len(apps) > 4:
+        rows.append((t.series_other, f"Other apps {dur(sum(v for _n, v in apps[4:]))}"))
+    for i, (color, words) in enumerate(rows):
+        if i:
+            keys.addSpacing(SPACE["s"])
+        keys.addWidget(_Swatch(t, color, panel))
+        keys.addWidget(text_label(t, words, "caption", "text_2"))
+    keys.addStretch(1)
+
+
+def _call_details(t: Theme, day: DayView, index: int) -> Panel:
+    """A call picked on the call band: its real times, and what the user did during it."""
+    c = day.calls[index]
+
+    def when(at: float | None) -> str:
+        if at is None:
+            return ""
+        d = datetime.fromtimestamp(at)
+        return f"{d:%H:%M}" if d.date() == day.day else f"{d:%a} {d:%H:%M}"
+
+    start = when(c.real_start or c.start)
+    end = "now" if c.ongoing else when(c.real_end or c.end)
+    span = (c.real_end or c.end) - (c.real_start or c.start)
+    sub = f"{dur(c.seconds)} with your microphone on, {dur(span)} end to end" + (" · still going" if c.ongoing else "")
+    panel = Panel(t, f"{c.app} call · {start} – {end}", sub, glyph="phone")
+    per: dict[str, float] = {}
+    for seg in day.segments:
+        if seg.state != "present" or seg.end <= c.start or seg.start >= c.end:
+            continue
+        ov = min(seg.end, c.end) - max(seg.start, c.start)
+        name = next((ln.label for ln in day.lanes if ln.key == seg.lane), "Other apps")
+        per[name] = per.get(name, 0.0) + seg.present_s * ov / max(1e-6, seg.end - seg.start)
+    apps = sorted(per.items(), key=lambda kv: -kv[1])
+    if apps:
+        panel.body.addWidget(_AppBar(t, [(_lane_color(t, day, name), v) for name, v in apps[:6]]))
+        _app_rows(t, day, apps, [], c.start, c.end, panel)
+    if c.drops:
+        n = len(c.drops)
+        panel.body.addWidget(text_label(t, f"Your microphone was off {n} time{'s' if n != 1 else ''} during it.",
+                                        "caption", "text_3"))
+    eps = [s for s in day.sessions if s.end > c.start and s.start < c.end]
+    if eps:
+        panel.body.addWidget(Divider(t))
+        panel.body.addWidget(text_label(t, "What you were doing meanwhile", "caption_strong", "text_2"))
+        for s in eps[:4]:
+            line = QHBoxLayout()
+            line.setSpacing(SPACE["s"])
+            panel.body.addLayout(line)
+            stamp = text_label(t, f"{hm(max(s.start, c.start))}–{hm(min(s.end, c.end))}", "caption", "text_3")
+            stamp.setFixedWidth(84)
+            line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
+            line.addWidget(text_label(t, s.title, "callout", "text", wrap=True), 1)
+    if c.detail:
+        panel.body.addWidget(text_label(t, second_person(c.detail), "caption", "text_3", wrap=True))
+    panel.body.addStretch(1)
+    return panel
+
+
 def _details(t: Theme, day: DayView, index: int | None) -> Panel:
     if index is None or not day.sessions:
         panel = Panel(t, "Pick a session", "Click a capsule on the Sessions row to see what you were doing.",
@@ -95,31 +182,12 @@ def _details(t: Theme, day: DayView, index: int | None) -> Panel:
         return panel
     s = day.sessions[index]
     lead = next((ln.label for ln in day.lanes if ln.key == s.lane), "Other apps")
-    voice = any(seg.voice for seg in day.segments if seg.lane == s.lane and seg.end > s.start and seg.start < s.end)
     calls = [c for c in day.calls if c.end > s.start and c.start < s.end]
-    right = QWidget()
-    rrow = QHBoxLayout(right)
-    rrow.setContentsMargins(0, 0, 0, 0)
-    rrow.setSpacing(6)
-    if voice:
-        rrow.addWidget(Chip(t, "call", "Voice on"))
-    for c in calls[:1]:
-        rrow.addWidget(Chip(t, "call", f"On a {c.app} call"))
     panel = Panel(t, f"{hm(s.start)} – {hm(s.end)} · {lead}",
-                  f"{dur(s.end - s.start)} session, {dur(s.present_s)} of it at the PC", right=right, glyph="history")
+                  f"{dur(s.end - s.start)} session, {dur(s.present_s)} of it at the PC", glyph="history")
     parts = [(_lane_color(t, day, name), v) for name, v in s.apps[:6]]
     panel.body.addWidget(_AppBar(t, parts))
-    keys = QHBoxLayout()
-    keys.setSpacing(SPACE["m"])
-    for name, v in s.apps[:4]:
-        dot = QWidget()
-        dot.setFixedSize(8, 8)
-        c = _lane_color(t, day, name)
-        dot.setStyleSheet(f"background: rgba({c.red()},{c.green()},{c.blue()},255); border-radius: 4px;")
-        keys.addWidget(dot)
-        keys.addWidget(text_label(t, f"{name} {dur(v)}", "caption", "text_2"))
-    keys.addStretch(1)
-    panel.body.addLayout(keys)
+    _app_rows(t, day, s.apps, calls, s.start, s.end, panel)
     panel.body.addWidget(Divider(t))
     panel.body.addWidget(text_label(t, "What you were doing", "caption_strong", "text_2"))
     for text in s.episodes[:3]:
@@ -269,16 +337,23 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
 
     holder = {"details": details}
 
-    def pick(index: int) -> None:   # the details panel follows the chosen session, in place
-        new = _details(t, day, index)
+    def show(new: QWidget) -> None:   # the details panel follows the chosen session or call, in place
         old = holder["details"]
         bottom.replaceWidget(old, new)
         bottom.setStretchFactor(new, 3)
+        old.hide()
         old.deleteLater()
         holder["details"] = new
+
+    def pick(index: int) -> None:
+        show(_details(t, day, index))
         page.selected = index  # type: ignore[attr-defined]
 
+    def pick_call(index: int) -> None:
+        show(_call_details(t, day, index))
+
     chart.session_clicked.connect(pick)
+    chart.call_clicked.connect(pick_call)
     page.chart = chart  # type: ignore[attr-defined]
     page.selected = selected  # type: ignore[attr-defined]
     return page

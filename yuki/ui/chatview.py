@@ -94,13 +94,11 @@ class _Tiny(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         ink = QColor(self.ink or self.t.text_2)
-        if self.pill:
+        if self.pill:   # a faint glass wash of its colour, no outline
             wash = QColor(ink)
-            wash.setAlphaF(0.20 if self.t.dark else 0.13)
-            edge = QColor(ink)
-            edge.setAlphaF(0.40)
+            wash.setAlphaF(0.18 if self.t.dark else 0.12)
             p.setBrush(wash)
-            p.setPen(QPen(edge, 1.0))
+            p.setPen(Qt.PenStyle.NoPen)
             p.drawPath(rounded(r, r.height() / 2))
         elif self.underMouse():
             hover = QColor(self.t.grid)
@@ -151,7 +149,9 @@ class _Spin(QWidget):
 
 
 class _Bubble(QWidget):
-    """A message's glass: the user's accent-tinted on the right, Yuki's clear on the left."""
+    """A message's glass: the user's a faint blue-hued glass on the right, Yuki's clear glass on the left.
+    Both are painted (a streaming bubble changes size every word: it is never re-rendered), with the v3
+    catch-light on the lit edge and no outline."""
 
     def __init__(self, t: Theme, *, mine: bool, tone: str = "") -> None:
         super().__init__()
@@ -166,7 +166,7 @@ class _Bubble(QWidget):
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         t = self.t
         if self.mine:
-            paint_glass(p, r, 18, t.level("lens"), tint=t.accent_soft, shadow=False, painted=True)
+            paint_glass(p, r, 18, t.level("lens"), shadow=False, painted=True)
         else:
             tint = None
             if self.tone in ("error", "question", "interrupted"):
@@ -193,7 +193,7 @@ class _StepRow(QWidget):
             row.addWidget(self.spin, 0, Qt.AlignmentFlag.AlignVCenter)
         else:
             glyph, ink = ("chat", t.text_3) if step.kind == "say" else (
-                ("check", t.status["good"]) if step.ok else ("close", t.status["critical"]) if step.ok is False
+                ("check", t.text_2) if step.ok else ("close", t.kind("error")) if step.ok is False
                 else ("more", t.text_3))
             icon = QLabel(ICON[glyph])
             icon.setFont(font("icon_small"))
@@ -202,6 +202,8 @@ class _StepRow(QWidget):
             row.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
         kind_word = {"hand": "Hands", "job": "Thinker"}.get(step.kind)
         text = step.label if not kind_word else f"{kind_word} · {step.label}"
+        if step.kind == "helper" and step.depth and not step.name.startswith("helper"):
+            text = f"reads · {step.label}"   # a helper's own tool use, under its "Helper N" line
         main = _label(t, text, "caption", t.text_2 if step.kind != "say" else t.text_3, wrap=False)
         main.setToolTip(text)
         row.addWidget(main, 0)
@@ -326,10 +328,6 @@ class _ItemWidget(QWidget):
             self.bubble.setMaximumWidth(self.max_w)
             head = QHBoxLayout()
             head.setSpacing(6)
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color: {css(t.kind(kind))}; background: transparent;")
-            dot.setFont(font("caption"))
-            head.addWidget(dot)
             head.addWidget(_label(t, f"{KIND_TITLES.get(kind, 'Yuki')} · {_stamp(item.at)}", "caption_strong",
                                   t.kind(kind), wrap=False, select=False))
             head.addStretch(1)
@@ -459,6 +457,9 @@ class ChatThreadView(QWidget):
         self._follow = True
         self._earlier: _Tiny | None = None
         self._empty: QLabel | None = None
+        from yuki.ui.window.widgets import smooth
+
+        self.scroller = smooth(self.area)   # pixel-smooth, eased, kinetic (wheel and touchpad)
         bar = self.area.verticalScrollBar()
         bar.rangeChanged.connect(self._on_range)
         bar.valueChanged.connect(self._on_value)
@@ -534,6 +535,9 @@ class ChatThreadView(QWidget):
         w.reply_nudge.connect(self.reply_nudge.emit)
         w.toggle.connect(self.model.toggle)
         self._widgets[item.id] = w
+        from yuki.ui.window.widgets import attach_tips
+
+        attach_tips(w, self.theme)
         return w
 
     def _append(self, item: Item) -> None:

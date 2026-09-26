@@ -18,6 +18,9 @@ from typing import Any
 GLASS_MODES = ("off", "light", "full")
 #: The default glass (measured 2026-09-26, docs/UI-window.md "Phase 2 measurements").
 DEFAULT_GLASS = "light"
+#: The window's background: plain black / white (2026-09-27), or "see-through" (DWM Acrylic of the desktop).
+BACKGROUNDS = ("solid", "see-through")
+DEFAULT_BACKGROUND = "solid"
 
 
 def settings_path() -> Path:
@@ -34,17 +37,19 @@ class UiSettings:
     appearance: str = "system"          # system | light | dark
     window: list[int] | None = None     # x, y, w, h of the window when it last closed
     maximized: bool = False
+    background: str = DEFAULT_BACKGROUND   # solid (black / white) | see-through (DWM's blur of the desktop)
 
     def policy(self) -> Any:
         from yuki.ui.lens import GlassPolicy
 
-        return GlassPolicy(self.glass, self.bend, self.blur, self.reduce_motion)
+        return GlassPolicy(self.glass, self.bend, self.blur, self.reduce_motion, self.background == "see-through")
 
 
 def _clean(raw: dict[str, Any]) -> UiSettings:
     d = UiSettings()
     glass = str(raw.get("glass", d.glass)).lower()
     appearance = str(raw.get("appearance", d.appearance)).lower()
+    background = str(raw.get("background", d.background)).lower()
 
     def num(key: str, default: float) -> float:
         try:
@@ -58,7 +63,8 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     return UiSettings(glass if glass in GLASS_MODES else d.glass, num("bend", 1.0), num("blur", 1.0),
                       bool(raw.get("reduce_motion", False)),
                       appearance if appearance in ("system", "light", "dark") else "system", win,
-                      bool(raw.get("maximized", False)))
+                      bool(raw.get("maximized", False)),
+                      background if background in BACKGROUNDS else d.background)
 
 
 def load(path: Path | None = None) -> UiSettings:
@@ -101,5 +107,5 @@ def apply_policy(settings: UiSettings | None = None) -> UiSettings:
     return settings
 
 
-__all__ = ["UiSettings", "GLASS_MODES", "DEFAULT_GLASS", "settings_path", "load", "save", "update", "apply_policy",
+__all__ = ["UiSettings", "GLASS_MODES", "DEFAULT_GLASS", "BACKGROUNDS", "DEFAULT_BACKGROUND", "settings_path", "load", "save", "update", "apply_policy",
            "replace"]

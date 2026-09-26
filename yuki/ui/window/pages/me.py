@@ -27,6 +27,7 @@ from yuki.ui.window.widgets import (
     ItemRow,
     Panel,
     Pill,
+    Shimmer,
     page_header,
     text_label,
 )
@@ -58,11 +59,16 @@ def _evidence(item: Item) -> list[tuple[str, str, str]]:
     return out
 
 
+#: Corrections the user sent that memory has not applied yet (ref -> {kind, words, at, late}); set by
+#: :func:`build` for the rows it makes.
+_PENDING: dict[str, dict] = {}
+
+
 def _row(t: Theme, item: Item, expand: str | None, compose: str | None, act: Actions, *,
          leading: QWidget | None = None, title: bool = True) -> ItemRow:
     row = ItemRow(t, item.ref, item.title if title else "", item.short, item.source, tags=item.tags,
                   leading=leading, evidence=_evidence(item), show_evidence=item.ref == expand,
-                  composer=item.ref == compose,
+                  composer=item.ref == compose, pending=_PENDING.get(item.ref),
                   placeholder=f"e.g. “{item.title} is my friend from college”" if item.kind == "person" else "")
     row.correct.connect(lambda _ref, words, it=item: act.correct_item(it, words))
     row.forget.connect(lambda _ref, it=item: act.forget_item(it))
@@ -164,7 +170,7 @@ def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
         if i:
             panel.body.addWidget(Divider(t))
         row = ItemRow(t, it.ref, "", it.short, it.source, tags=[], evidence=_evidence(it),
-                      placeholder="Say what was really said, or what's true")
+                      placeholder="Say what was really said, or what's true", pending=_PENDING.get(it.ref))
         row.correct.connect(lambda _ref, words, item=it: act.correct_item(item, words))
         row.forget.connect(lambda _ref, item=it: act.forget_item(item))
         right = Pill(t, "That's right", glyph="check", style="quiet", size="small")
@@ -187,7 +193,14 @@ def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
 
 
 def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | None = None,
-          act: Actions = NOOP) -> QWidget:
+          act: Actions = NOOP, pending: dict[str, dict] | None = None, progressive: bool = True) -> QWidget:
+    """The page. ``pending``: corrections not applied yet (shown as "Updating…" in the user's words).
+
+    ``progressive``: the first panel of each column is built now and the rest one per turn of the event
+    loop (``page.deferred``, run by the window), each into a shimmering placeholder already in the page.
+    """
+    _PENDING.clear()
+    _PENDING.update(pending or {})
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
@@ -216,27 +229,52 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
 
     grid = QHBoxLayout()
     grid.setSpacing(SPACE["l"])
+    col.addLayout(grid)
     left = QVBoxLayout()
     left.setSpacing(SPACE["l"])
-    left.addWidget(_list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
-                               expand, compose, act, limit=3))
-    left.addWidget(_list_panel(t, "On your plate", "What you owe people, and what they owe you.", "flag",
-                               view.on_your_plate, expand, compose, act, limit=4))
-    left.addWidget(_list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose, act,
-                               limit=3))
-    left.addWidget(_list_panel(t, "Routines", "Patterns in how your days go.", "history", view.routines,
-                               expand, compose, act, limit=2))
-    left.addStretch(1)
     right = QVBoxLayout()
     right.setSpacing(SPACE["l"])
-    right.addWidget(_people(t, view, expand, compose, act))
-    right.addWidget(_personality(t, view, expand, compose, act))
-    right.addWidget(_unsure(t, view, act))
-    right.addStretch(1)
     grid.addLayout(left, 1)
     grid.addLayout(right, 1)
-    col.addLayout(grid)
+    left_parts = [
+        lambda: _list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
+                            expand, compose, act, limit=3),
+        lambda: _list_panel(t, "On your plate", "What you owe people, and what they owe you.", "flag",
+                            view.on_your_plate, expand, compose, act, limit=4),
+        lambda: _list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose, act,
+                            limit=3),
+        lambda: _list_panel(t, "Routines", "Patterns in how your days go.", "history", view.routines,
+                            expand, compose, act, limit=2),
+    ]
+    right_parts = [
+        lambda: _people(t, view, expand, compose, act),
+        lambda: _personality(t, view, expand, compose, act),
+        lambda: _unsure(t, view, act),
+    ]
+    columns: list[list] = []
+    for lay, parts in ((left, left_parts), (right, right_parts)):
+        later: list = []
+        for i, make in enumerate(parts):
+            if i == 0 or not progressive:
+                lay.addWidget(make())
+                continue
+            holder = Shimmer(t, rows=3, height=150, parent=page)
+            lay.addWidget(holder)
+
+            def fill(make=make, holder=holder, lay=lay) -> None:
+                panel = make()
+                lay.replaceWidget(holder, panel)
+                holder.hide()
+                holder.deleteLater()
+
+            later.append(fill)
+        lay.addStretch(1)
+        columns.append(later)
     col.addStretch(1)
+    # both columns fill in together, top first
+    from itertools import zip_longest
+
+    page.deferred = [f for pair in zip_longest(*columns) for f in pair if f is not None]  # type: ignore[attr-defined]
     return page
 
 

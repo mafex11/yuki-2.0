@@ -230,8 +230,18 @@ class StatusStrip(GlassWindow):
         self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        from yuki.ui.glass import text_halo
+
+        self.glass_density = "clear"
+        text_halo(self.label, self.theme().dark)
         self.label.setStyleSheet(f"color: {self.ink_css('error' if self._tone == 'error' else 'text')};")
         self.meta.setStyleSheet(f"color: {self.ink_css('text_3')};")
+        wash = None
+        if self._tone == "error":   # an error is said in words, with a faint red wash on the clear glass
+            wash = QColor(self.ink("error"))
+            wash.setAlphaF(0.08 if not self.theme().dark else 0.12)
+        self.glass_tint = wash
+        self.update()
 
     def anchor(self) -> QPoint:
         """Top-left to sit at: bottom-right of the primary screen's work area."""

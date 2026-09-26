@@ -42,6 +42,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from yuki.agent.loop import Agent
 from yuki.agent.memory import MemoryAccess, default_memory
+from yuki.agent.subagents import HelperStep
 from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
     ALL_TOOL_NAMES,
@@ -351,6 +352,16 @@ class Lane(QThread):
                     self.agent.answer(answer)
             elif isinstance(event, Say):
                 runtime.said.emit(self.name, job.id, event.text)
+            elif isinstance(event, HelperStep):
+                # A read-only helper's step (yuki.agent.subagents): its own signal, and as a step of
+                # the request (tool name "helper") for a chat that lists tool calls. Emitted directly,
+                # so it never counts as a tool this lane reached for.
+                runtime.helper_step.emit(self.name, job.id, event.index, event.state, event.text, event.ok)
+                label = f"helper {event.index}"
+                if event.state == "started":
+                    runtime.tool_called.emit(self.name, job.id, "helper", {"helper": event.index, "task": event.text})
+                elif event.state == "finished":
+                    runtime.tool_finished.emit(self.name, job.id, "helper", event.ok, f"{label}: {event.text}")
             elif isinstance(event, Final):
                 runtime.finished.emit(self.name, job.id, event.text)
             elif isinstance(event, ErrorEvent):
@@ -409,6 +420,11 @@ class AgentRuntime(QObject):
             that needed hands went to the worker's queue under a new id.
         steer_unread: ``(lane, id, texts)`` -- things the user added to a request
             (:meth:`steer`) that arrived after its last step.
+        helper_step: ``(lane, id, helper, state, text, ok)`` -- a read-only helper of the request
+            started (text: its task), used a tool (text: tool and summary) or finished (text: its
+            report's first line); also sent as ``tool_called`` / ``tool_finished`` named ``helper``.
+        notice: ``(kind, text)`` -- something to tell the user once, unasked (``cost``: the day's
+            model spend passed ``Settings.daily_cost_alert_usd``); the tray shows it.
     """
 
     started = Signal(str, int, str)
@@ -424,6 +440,8 @@ class AgentRuntime(QObject):
     said = Signal(str, int, str)
     handed_off = Signal(int, int, int)
     steer_unread = Signal(str, int, list)
+    helper_step = Signal(str, int, int, str, str, bool)
+    notice = Signal(str, str)
 
     def __init__(
         self,
@@ -477,13 +495,45 @@ class AgentRuntime(QObject):
         self.worker = Lane(WORKER, worker_agent, self)
         self.front_desk = Lane(FRONT_DESK, front_desk_agent, self, blocked=front_desk_blocked)
         self.lane_done.connect(self._on_lane_done)
+        #: The daily cost soft alert (yuki.core.cost): checked after every request and every
+        #: ``COST_CHECK_S`` (incremental log reads), one ``notice`` a day past the threshold.
+        self._cost_alert = None
+        self._cost_stop = threading.Event()
+        try:
+            from yuki.core.cost import CostAlert, CostLedger
+
+            self._cost_alert = CostAlert(
+                float(getattr(settings, "daily_cost_alert_usd", 3.0)),
+                CostLedger(settings.sessions_dir.parent),
+                notify=lambda text, spend: self.notice.emit("cost", text),
+                log=lambda event, **fields: self.ui_log.event(event, **fields),
+            )
+        except Exception as exc:  # the alert is optional; it must never stop the tray
+            self.ui_log.event("cost_alert", error=f"{type(exc).__name__}: {exc}")
+        self.summarized.connect(lambda *_: self.check_cost())
 
     # -- lifecycle ---------------------------------------------------------
 
+    #: Seconds between two background checks of the day's spend (memory spends while no request runs).
+    COST_CHECK_S = 600.0
+
     def start(self) -> None:
-        """Start both lane threads."""
+        """Start both lane threads (and the daily cost check)."""
         self.worker.start()
         self.front_desk.start()
+        if self._cost_alert is not None:
+            def loop() -> None:
+                while not self._cost_stop.wait(self.COST_CHECK_S if self._cost_checked else 30.0):
+                    self._cost_checked = True
+                    self._cost_alert.check()
+
+            self._cost_checked = False
+            threading.Thread(target=loop, name="yuki-cost-check", daemon=True).start()
+
+    def check_cost(self) -> None:
+        """Check the day's spend now, off the GUI thread (one notice a day past the line)."""
+        if self._cost_alert is not None:
+            threading.Thread(target=self._cost_alert.check, name="yuki-cost-check-now", daemon=True).start()
 
     def stop(self) -> None:
         """Cancel everything, wait for both threads to end, then (bounded) for memory's turn log.
@@ -492,6 +542,7 @@ class AgentRuntime(QObject):
         request ends; the writer is a daemon thread, so without the flush the
         exchange that closed the app could be lost at exit.
         """
+        self._cost_stop.set()
         for lane in (self.worker, self.front_desk):
             lane.shutdown()
         for lane in (self.worker, self.front_desk):

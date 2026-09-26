@@ -127,7 +127,6 @@ class CallConsentCard(GlassWindow):
         column.setSpacing(5)
 
         self.title = QLabel("Yuki · call", self)
-        self.title.setIndent(14)   # the dot is painted in front of it
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
         column.addWidget(self.title)
         self.question = QLabel(self)
@@ -242,45 +241,42 @@ class CallConsentCard(GlassWindow):
         if call is not None:
             self.answered.emit(call, answer)
 
-    def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        dot = self.ink("call")
-        g = self.title.geometry()
-        painter.setPen(Qt.PenStyle.NoPen)
-        halo = QColor(dot)
-        halo.setAlphaF(0.22)
-        painter.setBrush(halo)
-        painter.drawEllipse(QRectF(g.left() - 16, g.center().y() - 6, 12, 12))
-        painter.setBrush(dot)
-        painter.drawEllipse(QRectF(g.left() - 13, g.center().y() - 3, 6, 6))
-
-
 class CallIndicator(GlassWindow):
-    """The small "Remembering your side · Zoom" pill (or "Waiting for headphones"). Never takes focus."""
+    """The small "Remembering your side · Zoom" pill (or "Waiting for headphones"). Never takes focus.
+
+    Clear glass like every surface (2026-09-27): the state is in its words, with a faint wash of the call's
+    colour (or the waiting colour) on the glass; no coloured dot, no dark block, no border.
+    """
 
     def __init__(self) -> None:
         super().__init__(activates=False, radius=INDICATOR_HEIGHT // 2)
         self.setObjectName("YukiCallIndicator")
         self.setFixedSize(INDICATOR_WIDTH + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 26, self.SHADOW, self.SHADOW + 12, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 14, self.SHADOW)
         self.label = QLabel(self)
         self.label.setFont(ui_font(9))
         self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
-        self._dot = CALL_ACCENT
         self.call: dict[str, Any] | None = None
         self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        from yuki.ui.glass import text_halo
+
+        self.glass_density = "clear"
         self.label.setStyleSheet(f"color: {self.ink_css('text')};")
+        text_halo(self.label, self.theme().dark)
+        waiting = (self.call or {}).get("status") == "waiting_headphones"
+        wash = QColor(self.ink("nudge" if waiting else "call"))
+        wash.setAlphaF(0.08 if not self.theme().dark else 0.12)
+        self.glass_tint = wash
 
     def set_call(self, call: dict[str, Any]) -> None:
         self.call = call
-        self._dot = self.ink("nudge") if call.get("status") == "waiting_headphones" else self.ink("call")
         self.label.setText(indicator_text(call))
+        self.restyle()
         self.update()
 
     def anchor(self, *, above: int = 0) -> QPoint:
@@ -289,15 +285,6 @@ class CallIndicator(GlassWindow):
         x = area.right() - self.width() + self.SHADOW - STRIP_MARGIN
         y = area.bottom() - self.height() + self.SHADOW - STRIP_MARGIN - above
         return QPoint(x, y)
-
-    def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        panel = QRectF(self.panel_rect())
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._dot)
-        painter.drawEllipse(QRectF(panel.left() + 13, panel.center().y() - 4, 8, 8))
 
 
 class CallController(QObject):

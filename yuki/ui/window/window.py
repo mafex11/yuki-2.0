@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QHBoxLayout, QStackedWidget, QVBoxLayout, QWidget
 from yuki.ui.window.glass import paint_backdrop, paint_glass
 from yuki.ui.window.refract import collecting
 from yuki.ui.window.theme import SIDEBAR_W, SPACE, WINDOW_SIZE, Theme, font
-from yuki.ui.window.widgets import Dot, Glass, NavItem, text_label
+from yuki.ui.window.widgets import Glass, NavItem, text_label
 
 #: (key, glyph, label) of the six pages, in sidebar order.
 PAGES: tuple[tuple[str, str, str], ...] = (
@@ -114,12 +114,8 @@ class Sidebar(Glass):
         foot.body.setSpacing(4)
         for on, text_on, text_off in ((listening, "Listening for “Yuki”", "Voice is off"),
                                       (remembering, "Remembering your day", "Memory paused")):
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            row.addWidget(Dot(t, t.status["good"] if on else t.status["warning"], 7))
-            row.addWidget(text_label(t, text_on if on else text_off, "caption", "text_2"))
-            row.addStretch(1)
-            foot.body.addLayout(row)
+            foot.body.addWidget(text_label(t, text_on if on else text_off, "caption_strong" if on else "caption",
+                                           "text_2" if on else "text_3"))
         if footnote:
             foot.body.addWidget(text_label(t, footnote, "caption", "text_3", wrap=True))
         self.body.addWidget(foot)

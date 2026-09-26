@@ -430,8 +430,7 @@ class NudgeCard(GlassWindow):
         self.title = QLabel(self)
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
         self.title.setTextFormat(Qt.TextFormat.PlainText)
-        header.addSpacing(14)   # the kind's dot is painted here
-        header.addWidget(self.title)
+        header.addWidget(self.title)   # the kind is in its word and a faint wash of the glass (no dot)
         self.when = QLabel(self)
         self.when.setFont(ui_font(9))
         self.when.setTextFormat(Qt.TextFormat.PlainText)
@@ -490,7 +489,7 @@ class NudgeCard(GlassWindow):
         self.title.setStyleSheet(f"color: rgb({a.red()},{a.green()},{a.blue()});")
         wash = QColor(a)
         wash.setAlphaF(0.07 if not self.theme().dark else 0.10)
-        self.glass_tint = wash   # the kind is a tint of the glass and a dot, not a bar
+        self.glass_tint = wash   # the kind is a faint tint of the glass and its title's colour
 
     def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
         self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
@@ -534,7 +533,27 @@ class NudgeCard(GlassWindow):
         self.set_nudge(nudge)
         self._paused = False
         self.fade_in(self.anchor())
+        self._attention(True)
         self._linger.start(self.linger_ms)
+
+    def _attention(self, shown: bool) -> None:
+        """Tell the shared attention state (``yuki.core.attention``: the voice narrator waits for a card the
+        user is reading) that a card is up, or went away. Never fails the card."""
+        try:
+            from yuki.core.attention import shared
+
+            if shown:
+                self._attention_id = str((self.nudge or {}).get("id"))
+                shared().card_shown(self._attention_id)
+            elif getattr(self, "_attention_id", None) is not None:
+                shared().card_closed(self._attention_id)
+                self._attention_id = None
+        except Exception:
+            pass
+
+    def hideEvent(self, event: object) -> None:  # noqa: D102 - faded out, withdrawn or closed: the card is gone
+        self._attention(False)
+        super().hideEvent(event)
 
     def withdraw(self) -> dict[str, Any] | None:
         """Hide at once without an outcome (to make way for the strip). Returns the nudge."""
@@ -551,22 +570,6 @@ class NudgeCard(GlassWindow):
         self._linger.stop()
         self.fade_out()
         return nudge
-
-    # -- painting ----------------------------------------------------------
-
-    def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        dot = self._kind_ink()
-        centre = self.title.geometry().center()
-        painter.setPen(Qt.PenStyle.NoPen)
-        halo = QColor(dot)
-        halo.setAlphaF(0.22)
-        painter.setBrush(halo)
-        painter.drawEllipse(QRectF(centre.x() - self.title.width() / 2 - 16, centre.y() - 6, 12, 12))
-        painter.setBrush(dot)
-        painter.drawEllipse(QRectF(centre.x() - self.title.width() / 2 - 13, centre.y() - 3, 6, 6))
 
     # -- pointer: reading it pauses the fade, leaving starts it over --------
 
@@ -603,6 +606,25 @@ class NudgeCard(GlassWindow):
         nudge = self.close_card()
         if nudge is not None:
             self.never_ask.emit(nudge)
+
+
+class NoticeCard(NudgeCard):
+    """A one-off notice from the runtime (``AgentRuntime.notice``: the daily cost alert), as the same clear
+    glass card as a nudge: its heading, the text, one "OK". Nothing is acknowledged to memory; it is not a
+    nudge. Shown by :meth:`yuki.ui.app.YukiUi.show_notice` when the screen is free."""
+
+    TITLES = {"cost": "Today's spend", "doctor": "Health check"}
+
+    def show_notice(self, kind: str, text: str) -> None:
+        self.set_nudge({"id": f"notice:{kind}", "kind": kind, "text": text, "at": None})
+        self.title.setText(self.TITLES.get(kind, "Yuki"))
+        self.reply_button.hide()
+        self.never_button.hide()
+        self.dismiss_button.setText("OK")
+        self._paused = False
+        self.fade_in(self.anchor())
+        self._attention(True)
+        self._linger.start(self.linger_ms)
 
 
 class NudgeController(QObject):

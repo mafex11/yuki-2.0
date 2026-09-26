@@ -46,7 +46,7 @@ class Step:
     """One tool call or action under a response."""
 
     key: str
-    kind: str                  # tool | hand | job | say
+    kind: str                  # tool | hand | job | say | helper (a read-only helper sub-agent, and its tools)
     name: str
     label: str                 # what the user reads ("Opening an app — spotify")
     started: float
@@ -338,6 +338,44 @@ class ChatModel:
                 s.result = _short(ev.get("summary"))
                 self._changed(item)
                 return
+
+    def _on_helper_step(self, ev: dict[str, Any], at: float) -> None:
+        """A read-only helper sub-agent of a request (the runtime's ``helper_step``): a "Helper N" step in the
+        response's fold, its tool uses nested under it, its first report line as its result."""
+        job, index = ev.get("job"), ev.get("helper")
+        if not isinstance(job, int) or not isinstance(index, int):
+            return
+        voice = job in self._voice_job
+        item = self._by_id.get(self._job_item.get(job, "")) if voice else self._assistant_for_job(job, at)
+        if item is None:
+            return
+        state = str(ev.get("state") or "")
+        text = str(ev.get("text") or "").strip()
+        key = f"helper:{job}:{index}"
+        depth = 1 if voice else 0
+        head = next((s for s in item.steps if s.key == key), None)
+        if state == "started" or head is None:
+            if head is None:
+                head = Step(key, "helper", f"helper {index}", f"Helper {index} · {text or 'looking into it'}", at,
+                            depth=depth, job=job)
+                item.steps.append(head)
+            if state == "started":
+                if item.status == "pending":
+                    item.status = "running"
+                self._changed(item)
+                return
+        if state == "tool":
+            n = sum(1 for s in item.steps if s.key.startswith(key + ":"))
+            name, _sep, summary = text.partition(": ")
+            step = Step(f"{key}:{n}", "helper", name or "tool", name or text, at, ended=at,
+                        ok=bool(ev.get("ok", True)), result=_short(summary), depth=depth + 1, job=job)
+            # under its own helper (helpers run side by side, so their steps interleave in time)
+            last = max(i for i, s in enumerate(item.steps) if s.key == key or s.key.startswith(key + ":"))
+            item.steps.insert(last + 1, step)
+        elif state == "finished":
+            head.ended, head.ok = at, bool(ev.get("ok", True))
+            head.result = _short(text)
+        self._changed(item)
 
     def _on_said(self, ev: dict[str, Any], at: float) -> None:
         job = ev.get("job")

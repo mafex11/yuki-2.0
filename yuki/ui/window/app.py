@@ -40,6 +40,15 @@ FOCUS_EVENT = "Local\\YukiWindowFocus"
 TODAY_REFRESH_MS = 60_000
 #: While yuki-ui is not answering, look for it again this often.
 RECONNECT_MS = 10_000
+#: While a correction from the Me page waits to be applied by memory, look this often (a read, no model).
+PENDING_POLL_MS = 15_000
+#: A correction not applied after this long says "Still updating" (it keeps the user's words either way).
+PENDING_LATE_S = 10 * 60
+#: A "That's right" is shown as confirmed this long, or until memory marks the item as the user's.
+CONFIRM_KEEP_S = 10 * 60
+#: A correction about something that never changes in memory (a possibly misheard line from a call) is
+#: shown as corrected until it leaves the Me page's week anyway.
+JOURNAL_KEEP_S = 8 * 86400
 
 
 class _Bridge(QObject):
@@ -63,7 +72,7 @@ class WindowApp(Actions):
         self.real_db = real_db
         self.ui_path = ui_path
         self.ui = ui_settings.apply_policy(ui_settings.load(ui_path))
-        LIVE.on = self.ui.glass != "off"
+        LIVE.on = True   # page glass is always a cached picture (flat in Light / Off, GPU in Full)
         self.model = ChatModel()
         self.state: dict[str, Any] = {}
         self.connected = False
@@ -87,6 +96,14 @@ class WindowApp(Actions):
         self._reconnect = QTimer()
         self._reconnect.setInterval(RECONNECT_MS)
         self._reconnect.timeout.connect(self._connect_bg)
+        #: Corrections sent from the Me page that memory has not applied yet: ref -> {kind, words, at, old,
+        #: late}. Kept in a small file next to ui.json, so reopening the window never shows stale text.
+        self.pending: dict[str, dict] = self._load_pending()
+        self._pending_timer = QTimer()
+        self._pending_timer.setInterval(PENDING_POLL_MS)
+        self._pending_timer.timeout.connect(self._check_pending)
+        if self.pending:
+            self._pending_timer.start()
         try:
             from PySide6.QtGui import QGuiApplication
 
@@ -126,7 +143,7 @@ class WindowApp(Actions):
             win.show()
         else:
             win.showMaximized() if self.ui.maximized else win.show()
-            win.make_native(dwm_backdrop=self.ui.glass == "off")
+            win.make_native(dwm_backdrop=self.ui.background == "see-through")
             win.raise_()
             win.activateWindow()
         self.load(win.current)
@@ -148,6 +165,7 @@ class WindowApp(Actions):
         self._closing = True
         self._today_timer.stop()
         self._reconnect.stop()
+        self._pending_timer.stop()
         win = self.win
         try:
             g = win.normalGeometry() if win.isMaximized() else win.geometry()
@@ -166,7 +184,6 @@ class WindowApp(Actions):
         offscreen = old.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         self.t = self._theme()
         self.win = self._make_window(page)
-        self.win.wallpaper_base = old.wallpaper_base
         self.win.setGeometry(geo)
         try:
             old.closing.disconnect(self._on_close)
@@ -179,7 +196,7 @@ class WindowApp(Actions):
             self.win.show()
         else:
             self.win.showMaximized() if maxed else self.win.show()
-            self.win.make_native(dwm_backdrop=self.ui.glass == "off")
+            self.win.make_native(dwm_backdrop=self.ui.background == "see-through")
         for key in list(self._views):
             self._build(key)
         self._sync_footer()
@@ -265,7 +282,9 @@ class WindowApp(Actions):
                 selected = len(view.sessions) - 1
             widget = today.build(t, view, selected=selected, today=view.day == date.today(), act=self, view=zoom)
         elif key == "me" and view is not None:
-            widget = me.build(t, view, act=self)
+            widget = me.build(t, view, act=self, pending=self.pending)
+            if self.pending:
+                self._check_pending()   # something may have been applied while the page was away
         elif key == "yuki" and view is not None:
             widget = yuki_page.build(t, view, act=self)
         elif key == "status" and view is not None:
@@ -459,12 +478,9 @@ class WindowApp(Actions):
         self._on_navigate("today")
 
     def day_menu(self, anchor: Any) -> None:
-        from PySide6.QtWidgets import QMenu
+        from yuki.ui.window.widgets import GlassMenu
 
-        from yuki.ui.window.widgets import menu_css
-
-        menu = QMenu(self.win)
-        menu.setStyleSheet(menu_css(self.t))
+        menu = GlassMenu(self.t, anchor)
         today = date.today()
         for n in range(14):
             d = today - timedelta(days=n)
@@ -482,19 +498,158 @@ class WindowApp(Actions):
 
     # -- Me -----------------------------------------------------------------------------------------------
 
-    def _correct(self, item: Any, words: str, done: str) -> None:
+    def _correct(self, item: Any, words: str, done: str, kind: str, shown: str) -> None:
+        """Send a correction and show it at once as pending (in the user's words) until memory applies it."""
         text = correction_text(item.title or "this", item.text, words)
-        self.bg(lambda: self.memory.correct_portrait(text), lambda _id: self.toast(done, "praise"),
-                failed="Couldn't save that. Memory didn't answer.")
+        self._record_pending(item, kind, shown)
+
+        def then(fid: Any) -> None:
+            p = self.pending.get(item.ref)
+            if p is not None and fid is not None:   # memory's own progress for it (correction_status)
+                p["fid"] = fid
+                self._save_pending()
+            self.toast(done, "praise")
+
+        def work() -> Any:
+            try:
+                return self.memory.correct_portrait(text)
+            except Exception:
+                self._bridge.run.emit(lambda: self._drop_pending(item.ref))   # not sent: never show it as sent
+                raise
+
+        self.bg(work, then, failed="Couldn't save that. Memory didn't answer.")
 
     def correct_item(self, item: Any, words: str) -> None:
-        self._correct(item, words, "Told Yuki. It will put this right within a minute.")
+        self._correct(item, words, "Told Yuki. It shows as updating until it's applied.", "correct", words)
 
     def forget_item(self, item: Any) -> None:
-        self._correct(item, "It's just wrong, forget it", "Told Yuki to forget it.")
+        self._correct(item, "It's just wrong, forget it", "Told Yuki to forget it.", "forget", "")
 
     def confirm_item(self, item: Any) -> None:
-        self._correct(item, "That's right", "Thanks. Yuki will treat it as true now.")
+        self._correct(item, "That's right", "Thanks. Yuki will treat it as true now.", "confirm", "")
+
+    # pending corrections (shown as "Updating…" with the user's words until memory has applied them)
+
+    def _pending_path(self) -> Path:
+        from yuki.ui import ui_settings
+
+        return (self.ui_path or ui_settings.settings_path()).parent / "window-pending.json"
+
+    def _load_pending(self) -> dict[str, dict]:
+        import json
+
+        try:
+            raw = json.loads(self._pending_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        # a file from another database (a test copy) says nothing about this one
+        if raw.get("db") not in (None, str(self.db_path or "")):
+            return {}
+        items = raw.get("items") or {}
+        return {str(k): v for k, v in items.items() if isinstance(v, dict)}
+
+    def _save_pending(self) -> None:
+        import json
+
+        path = self._pending_path()
+        try:
+            if not self.pending:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"db": str(self.db_path or ""), "items": self.pending}, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _record_pending(self, item: Any, kind: str, words: str) -> None:
+        self.pending[item.ref] = {"kind": kind, "words": words, "at": time.time(), "old": item.text,
+                                  "subject": item.title or ""}
+        self._save_pending()
+        if not self._pending_timer.isActive():
+            self._pending_timer.start()
+
+    def _drop_pending(self, ref: str) -> None:
+        if self.pending.pop(ref, None) is not None:
+            self._save_pending()
+            if "me" in self._views:
+                self._build("me")
+
+    def _check_pending(self) -> None:
+        """Has memory applied the corrections yet? Reads only (no model call): memory's own progress for each
+        correction (``correction_status``: updating / done / failed), and, for one it doesn't track, whether
+        the fact it answers is gone or reworded. Once applied, the pages are read again."""
+        if not self.pending:
+            self._pending_timer.stop()
+            return
+        if getattr(self, "_pending_busy", False):
+            return
+        self._pending_busy = True
+        from yuki.ui.window.data import second_person
+
+        pending = dict(self.pending)
+
+        def work() -> tuple[dict[str, str], dict[str, str]]:
+            states: dict[str, str] = {}
+            status = getattr(self.memory, "correction_status", None)
+            for ref, p in pending.items():
+                if status is not None and p.get("fid") is not None:
+                    states[ref] = str((status(p["fid"]) or {}).get("state") or "none")
+            texts = {f["ref"]: second_person(f["text"]) for f in self.memory.portrait_facts_with_evidence(0)}
+            return texts, states
+
+        def then(got: tuple[dict[str, str], dict[str, str]]) -> None:
+            current, states = got
+            self._pending_busy = False
+            now = time.time()
+            applied, changed = [], False
+            for ref, p in list(self.pending.items()):
+                age = now - float(p.get("at") or now)
+                state = states.get(ref, "none")
+                if state == "done":
+                    done = True
+                elif state == "failed" and not p.get("late"):
+                    p["late"] = True   # memory couldn't apply it now; its next portrait update will
+                    changed = True
+                    done = False
+                elif ref.startswith("fact:"):
+                    moved = current.get(ref) != p.get("old")
+                    done = moved or (p.get("kind") == "confirm" and age > CONFIRM_KEEP_S)
+                else:
+                    done = age > JOURNAL_KEEP_S
+                if done:
+                    self.pending.pop(ref, None)
+                    applied.append(p)
+                    changed = True
+                elif age > PENDING_LATE_S and not p.get("late"):
+                    p["late"] = True
+                    changed = True
+            if not changed:
+                return
+            self._save_pending()
+            if not self.pending:
+                self._pending_timer.stop()
+            if any(p.get("kind") != "confirm" for p in applied):
+                self.toast("Yuki updated your portrait with your corrections.", "praise")
+            # a correction can change facts, to-dos, questions and persona: every page that shows them
+            for key in ("me", "yuki", "today"):
+                self._views.pop(key, None)
+                if key == self.win.current:
+                    self.load(key)
+
+        def run() -> None:
+            try:
+                result = work()
+            except Exception:
+                self._bridge.run.emit(lambda: setattr(self, "_pending_busy", False))
+                return
+            self._bridge.run.emit(lambda: then(result))
+
+        threading.Thread(target=run, name="yuki-window-pending", daemon=True).start()
 
     def refresh_portrait(self) -> None:
         self.bg(self.memory.refresh_portrait, lambda _r: self.toast("Rebuilding your portrait. It takes a minute or two."))
@@ -526,6 +681,23 @@ class WindowApp(Actions):
     def skip_question(self, ref: str, never: bool) -> None:
         self.bg(lambda: self.memory.skip_question(ref, never=never),
                 lambda _r: (self.toast("Yuki won't ask about that again." if never else "Skipped."), self.load("status")))
+
+    def todo_close(self, todo: dict, how: str) -> None:
+        """A to-do: ``done``, ``not_needed``, or ``wrong`` (captured by mistake; memory shows it to its
+        extractor so the like isn't captured again). Ended by id through ``end_todo``."""
+        ref = str(todo.get("id") or "")
+
+        def work() -> Any:
+            end = getattr(self.memory, "end_todo", None)
+            return end(ref, how) if end is not None else self.memory.complete_todo(ref)
+
+        def then(got: Any) -> None:
+            words = {"done": "Marked done.", "not_needed": "Taken off your list.",
+                     "wrong": "Removed, and Yuki was told it wasn't yours."}[how]
+            self.toast(words if got else "That one was already closed.", "praise" if got else "")
+            self.load("yuki")
+
+        self.bg(work, then, failed="Couldn't change that. Memory didn't answer.")
 
     # -- Status ---------------------------------------------------------------------------------------------
 
@@ -676,7 +848,7 @@ class WindowApp(Actions):
         before = self.ui
         self.ui = ui_settings.update(self.ui_path, **changes)
         ui_settings.apply_policy(self.ui)
-        LIVE.on = self.ui.glass != "off"
+        LIVE.on = True   # page glass is always a cached picture (flat in Light / Off, GPU in Full)
         if self.ui.glass == "off":
             lens.release()
         if self.client is not None:
@@ -684,8 +856,8 @@ class WindowApp(Actions):
         if self.ui.appearance != before.appearance and self._theme().name != self.t.name:
             self._rebuild_window()
             return
-        if (before.glass == "off") != (self.ui.glass == "off"):
-            self.win.set_backdrop(self.ui.glass == "off")
+        if before.background != self.ui.background:
+            self.win.set_backdrop(self.ui.background == "see-through")
         if (before.glass == "full") != (self.ui.glass == "full"):
             for key in list(self._views):   # controls switch between glass droplets and crisp painted pills
                 if key != "settings":
@@ -698,6 +870,11 @@ class WindowApp(Actions):
     def set_glass(self, mode: str) -> None:
         self._ui(glass=mode)
         self.toast({"off": "Glass off: simple panels.", "light": "Light glass.", "full": "Full glass."}.get(mode, ""))
+
+    def set_background(self, mode: str) -> None:
+        self._ui(background=mode)
+        self.toast("See-through: your desktop shows, blurred, behind Yuki." if mode == "see-through" else
+                   "Plain background.")
 
     def set_bend(self, value: float) -> None:
         self._ui(bend=value)

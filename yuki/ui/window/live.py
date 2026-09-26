@@ -1,12 +1,18 @@
-"""The live Yuki window: frameless Windows 11 chrome, the sidebar, one page at a time, cached glass.
+"""The live Yuki window: frameless Windows 11 chrome, the sidebar, one page at a time, clear glass.
 
 Built by :mod:`yuki.ui.window.app` in the window's own process and destroyed
-with it. The window paints its floor -- the desktop wallpaper under it,
-refracted through the window's sheet (:mod:`yuki.ui.window.glasscache`) -- and
-every page (and the sidebar) sits in a :class:`~yuki.ui.window.glasscache.GlassPage`
-that paints its own cached glass. With the glass setting Off, the window asks
-DWM for Acrylic behind it (or paints a plain gradient when transparency effects
-are off) and every glass shape paints itself as crisp flat glass.
+with it. Since 2026-09-27 the window's background is plain: black in dark mode,
+white in light (no wallpaper picture; Windows gives no app the desktop's pixels
+without a screen capture, so nothing behind the window can be refracted). The
+Appearance setting "See-through" instead asks DWM for Acrylic, DWM's own blur of
+the real desktop, composited for free.
+
+Everything on it is clear glass. Page glass (panels, cards, pills) is painted
+by Qt; with the Full setting each page's glass is one cached GPU picture
+(:class:`~yuki.ui.window.glasscache.GlassPage`) that refracts the layers under
+it. Glass that floats over the app's own content -- the timeline's hover card,
+the toast, menus, tooltips -- bends that content, rendered once when it comes to
+rest (:class:`~yuki.ui.window.widgets.FloatLens`).
 
 Chrome (:mod:`yuki.ui.window.chrome`): drag from the sidebar's head or any empty
 part of the top band, resize from the edges, Aero Snap, Windows 11's snap
@@ -31,9 +37,9 @@ from PySide6.QtWidgets import (
 )
 
 from yuki.ui.window.glass import paint_backdrop, paint_glass, rounded
-from yuki.ui.window.glasscache import GlassPage, render_floor
+from yuki.ui.window.glasscache import GlassPage
 from yuki.ui.window.theme import ICON, RADIUS, SIDEBAR_W, SPACE, WINDOW_SIZE, Theme, font
-from yuki.ui.window.widgets import Dot, Glass, NavItem, Toast, scroll, text_label
+from yuki.ui.window.widgets import Glass, NavItem, Shimmer, Toast, attach_tips, scroll, text_label
 from yuki.ui.window.window import PAGES, _Orb
 
 #: The top band that drags the window (logical px).
@@ -147,31 +153,45 @@ class LiveSidebar(Glass):
                     w = sub.takeAt(0).widget()
                     if w is not None:
                         w.deleteLater()
+        # state in words (no coloured dots): what is on reads plainly, what is off reads dimmer, and the
+        # footer's glass takes a faint warm wash while something is off
         rows = [(listening, voice_detail or "Listening for “Yuki”", "Voice is off"),
                 (remembering, "Remembering your day", "Memory paused")]
         if not connected:
             rows.insert(0, (False, "", "Yuki isn't running"))
         for on, text_on, text_off in rows:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            row.addWidget(Dot(t, t.status["good"] if on else t.status["warning"], 7))
-            row.addWidget(text_label(t, text_on if on else text_off, "caption", "text_2"))
-            row.addStretch(1)
-            lay.addLayout(row)
+            lay.addWidget(text_label(t, text_on if on else text_off, "caption_strong" if on else "caption",
+                                     "text_2" if on else "text_3"))
+        off = not all(on for on, _a, _b in rows)
+        wash = QColor(t.kind("nudge"))
+        wash.setAlphaF(0.08 if not t.dark else 0.10)
+        self.foot.tint = wash if off else None
+        self.foot.update()
         if footnote:
             lay.addWidget(text_label(t, footnote, "caption", "text_3", wrap=True))
 
 
 class _Loading(QWidget):
-    """What a page shows while its data is read (on a background thread)."""
+    """What a page shows while its data is read (on a background thread): its title and shimmering glass
+    placeholders where its panels will be. Everything is a child of this widget, so nothing pops up."""
 
     def __init__(self, t: Theme, title: str) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         col = QVBoxLayout(self)
         col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
-        col.addWidget(text_label(t, title, "large_title"))
-        col.addWidget(text_label(t, "Reading your memory…", "callout", "text_3"))
+        col.setSpacing(SPACE["l"])
+        col.addWidget(text_label(t, title, "large_title", parent=self))
+        col.addWidget(text_label(t, "Reading your memory…", "callout", "text_3", parent=self))
+        grid = QHBoxLayout()
+        grid.setSpacing(SPACE["l"])
+        col.addLayout(grid)
+        for rows in ((4, 3), (3, 5)):
+            column = QVBoxLayout()
+            column.setSpacing(SPACE["l"])
+            grid.addLayout(column, 1)
+            for n in rows:
+                column.addWidget(Shimmer(t, rows=n, height=70 + 24 * n, parent=self))
         col.addStretch(1)
 
 
@@ -197,15 +217,8 @@ class LiveWindow(QWidget):
         self.current = current
         self._native = False
         self._dwm = False
-        self._floor: QImage | None = None
-        self._floor_key: tuple | None = None
-        self._floor_pending: tuple | None = None
-        self._waiting: list[GlassPage] = []
-        self._floor_timer = QTimer(self)
-        self._floor_timer.setSingleShot(True)
-        self._floor_timer.setInterval(MOVE_SETTLE_MS)
-        self._floor_timer.timeout.connect(self.render_floor)
-        self.wallpaper_base: Callable[[], QImage | None] | None = None   # set by the controller (or a test)
+        self._deferred_gen: dict[str, int] = {}
+        self.wallpaper_base: Callable[[], QImage | None] | None = None   # unused since 2026-09-27 (kept for callers)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(SPACE["m"], SPACE["m"], 0, SPACE["m"])
@@ -247,6 +260,7 @@ class LiveWindow(QWidget):
             self.stack.addWidget(holder)
         self.toast = Toast(t, self)
         self.show_page(current)
+        attach_tips(self, lambda: self.t)
 
     # -- pages ------------------------------------------------------------------------------------
 
@@ -279,29 +293,75 @@ class LiveWindow(QWidget):
         if scrolls:
             area = scroll(page)
             lay.addWidget(area)
+            self._opaque(area)
             if old_value is not None:
                 QTimer.singleShot(0, lambda: area.verticalScrollBar().setValue(old_value))
         else:
             lay.addWidget(page)
         page.schedule()
+        attach_tips(page, lambda: self.t)
+        self._run_deferred(key, widget)
         return page
+
+    def _opaque(self, area: QScrollArea) -> None:
+        """On the plain background a scrolled page paints that background itself (opaque), so Qt scrolls it
+        by moving the pixels already drawn and paints only the strip that comes into view: most of a
+        smooth-scroll frame costs nothing. See-through keeps it translucent (the desktop shows through)."""
+        from yuki.ui.window.widgets import scroll_css
+
+        page = area.widget()
+        opaque = not self.see_through()
+        bar = area.verticalScrollBar()
+        if opaque:
+            # the background comes from the palette, not a style sheet: a style-sheet background is never
+            # treated as opaque (no pixel-moving scroll), and a style sheet on the area resets its children's
+            # palettes; so the style sheet sits on the scrollbar alone
+            area.setStyleSheet("")
+            bar.setStyleSheet(scroll_css(True).split("}", 1)[1])
+        else:
+            bar.setStyleSheet("")
+            area.setStyleSheet(scroll_css(True))
+        # the page (it always covers the whole viewport: the area resizes it to fit) paints the background
+        # itself and says so (WA_OpaquePaintEvent), which is what lets Qt move pixels when it scrolls
+        area.viewport().setAutoFillBackground(False)
+        area.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not opaque)
+        page.setAutoFillBackground(False)
+        page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not opaque)
+        page.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, opaque)
+        if isinstance(page, GlassPage):
+            page.opaque_bg = QColor(self.t.bg) if opaque else None
+            page.update()
+
+    def _run_deferred(self, key: str, widget: QWidget) -> None:
+        """A page that loads progressively lists its later sections in ``widget.deferred``: each is built on
+        its own turn of the event loop, into a placeholder already in the page (no window ever pops up), so
+        the first sections show at once and the rest fill in without freezing the window."""
+        steps = getattr(widget, "deferred", None)   # the page's own list: it is empty once all are built
+        if not steps:
+            return
+        gen = self._deferred_gen.get(key, 0) + 1
+        self._deferred_gen[key] = gen
+
+        def step() -> None:
+            if self._deferred_gen.get(key) != gen or not steps:
+                return
+            try:
+                steps.pop(0)()
+            except RuntimeError:   # the page was replaced meanwhile
+                return
+            if steps:
+                QTimer.singleShot(0, step)
+            else:
+                page = self.glass_pages.get(key)
+                if page is not None:
+                    attach_tips(page, lambda: self.t)
+                    page.schedule()
+
+        QTimer.singleShot(0, step)
 
     def page_widget(self, key: str) -> QWidget | None:
         gp = self.glass_pages.get(key)
         return gp.content if gp is not None else None
-
-    # -- the floor ----------------------------------------------------------------------------------
-
-    def floor_image(self) -> QImage | None:
-        return self._floor
-
-    def floor_key(self) -> tuple | None:
-        return self._floor_key
-
-    def need_floor(self, page: GlassPage) -> None:
-        if page not in self._waiting:
-            self._waiting.append(page)
-        self.render_floor()
 
     def page_offset(self, page: GlassPage) -> tuple[int, int]:
         """Where ``page``'s top-left sits in the window when unscrolled (logical px)."""
@@ -313,74 +373,15 @@ class LiveWindow(QWidget):
             origin += QPoint(0, area.verticalScrollBar().value())
         return origin.x(), origin.y()
 
-    def _geometry_key(self) -> tuple:
+    def see_through(self) -> bool:
         from yuki.ui import lens
 
-        g = self.geometry()
-        return (g.x(), g.y(), g.width(), g.height(), round(self.devicePixelRatioF(), 3), self.t.name, lens.policy())
-
-    def render_floor(self) -> None:
-        """(Re)make the floor picture for the window's size and place (on the glass thread)."""
-        from yuki.ui import lens
-        from yuki.ui.glass import glass_worker
-        from yuki.ui.window import glasscache
-
-        if lens.policy().mode == "off":
-            self._floor, self._floor_key = None, None
-            self.update()
-            return
-        key = self._geometry_key()
-        if key == self._floor_key or key == self._floor_pending:
-            return
-        self._floor_pending = key
-        dpr = self.devicePixelRatioF()
-        base = self.wallpaper_base() if self.wallpaper_base is not None else self._wallpaper_crop(dpr)
-        if base is None:
-            self._floor_pending = None
-            return
-        t = self.t
-
-        def work() -> QImage:
-            t0 = time.perf_counter()
-            img = render_floor(base, t, RADIUS["window"], dpr)
-            glasscache.STATS.floor_renders += 1
-            glasscache.STATS.last_ms = (time.perf_counter() - t0) * 1000
-            glasscache.STATS.total_ms += glasscache.STATS.last_ms
-            return img
-
-        def deliver(img: QImage | None) -> None:
-            if img is None or self._floor_pending != key:
-                return
-            img.setDevicePixelRatio(dpr)
-            self._floor, self._floor_key, self._floor_pending = img, key, None
-            self.update()
-            waiting, self._waiting = self._waiting, []
-            for page in list(self.glass_pages.values()) + [self.sidebar_glass] + waiting:
-                try:
-                    page.schedule()
-                except RuntimeError:
-                    pass
-
-        glass_worker().submit(work, deliver)
-
-    def _wallpaper_crop(self, dpr: float) -> QImage | None:
-        from yuki.ui import lens
-
-        screen = self.screen()
-        if screen is None:
-            return None
-        g = self.geometry()
-        crop = lens.WALLPAPER.crop(screen.geometry(), QRectF(g), dpr)
-        lens.WALLPAPER.forget()   # the crop is all the floor needs; the decoded picture is let go (8 MB at 1080p)
-        return crop
+        return lens.policy().see_through and self._dwm
 
     def forget_glass(self) -> None:
-        """The glass setting or the wallpaper changed: every picture is made again."""
-        self._floor, self._floor_key, self._floor_pending = None, None, None
+        """A glass or background setting changed: every cached picture is made again."""
         for page in list(self.glass_pages.values()) + [self.sidebar_glass]:
             page.forget()
-        self.render_floor()
-        for page in list(self.glass_pages.values()) + [self.sidebar_glass]:
             page.schedule()
         self.update()
 
@@ -388,23 +389,20 @@ class LiveWindow(QWidget):
 
     def paintEvent(self, _e: Any) -> None:  # noqa: D102
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect())
-        if self._floor is not None:
-            p.drawImage(r, self._floor)
+        if self.see_through():
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.fillRect(r, Qt.GlobalColor.transparent)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            paint_backdrop(p, r, self.t, None, dwm=True)
         else:
-            paint_backdrop(p, r, self.t, None, dwm=self._dwm)
+            paint_backdrop(p, r, self.t, None, solid=True)
         p.end()
 
     def resizeEvent(self, e: Any) -> None:  # noqa: D102
         super().resizeEvent(e)
-        self._floor_timer.start()
         if self.toast.isVisible():
             self.toast.hide()
-
-    def moveEvent(self, e: Any) -> None:  # noqa: D102
-        super().moveEvent(e)
-        self._floor_timer.start()   # the wallpaper under it changed: re-rendered once it is still
 
     def changeEvent(self, e: QEvent) -> None:  # noqa: D102
         if e.type() == QEvent.Type.WindowStateChange:
@@ -424,7 +422,10 @@ class LiveWindow(QWidget):
     # -- native chrome (Windows) ----------------------------------------------------------------------
 
     def make_native(self, *, dwm_backdrop: bool) -> None:
-        """Called once the native window exists (after show). Rule 7: never offscreen."""
+        """Called once the native window exists (after show). Rule 7: never offscreen.
+
+        ``dwm_backdrop``: the "See-through" background (DWM Acrylic of the desktop behind the window).
+        """
         from yuki.ui.window import chrome
 
         hwnd = int(self.winId())
@@ -436,7 +437,7 @@ class LiveWindow(QWidget):
         self.update()
 
     def set_backdrop(self, on: bool) -> None:
-        """Acrylic behind the window (the Off setting) or none (Light/Full paint their own floor)."""
+        """Acrylic behind the window ("See-through") or none (the plain black / white background)."""
         if not self._native:
             return
         import ctypes
@@ -455,6 +456,10 @@ class LiveWindow(QWidget):
             except Exception:
                 pass
             self._dwm = False
+        for holder in self.slots.values():   # the pages go opaque (plain) or translucent (see-through)
+            area = holder.findChild(QScrollArea, options=Qt.FindChildOption.FindDirectChildrenOnly)
+            if area is not None:
+                self._opaque(area)
         self.update()
 
     def _caption_at(self, x: float, y: float) -> bool:
@@ -510,9 +515,4 @@ class LiveWindow(QWidget):
         elif msg == chrome.WM_NCMOUSELEAVE and self.max_button.hot:
             self.max_button.hot = False
             self.max_button.update()
-        elif msg == chrome.WM_SETTINGCHANGE and wparam == chrome.SPI_SETDESKWALLPAPER:
-            from yuki.ui import lens
-
-            lens.WALLPAPER.forget()
-            self.forget_glass()
         return False, 0

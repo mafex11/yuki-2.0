@@ -390,6 +390,47 @@ class MemoryControl(QObject):
         return self._background("fetch_review", work)
 
 
+class _InkBrowser(QTextBrowser):
+    """The panels' text: their HTML is written in the dark palette; on clear glass it takes the theme's
+    text and accent colours (so it reads in light mode too), keeping each line's own opacity."""
+
+    def __init__(self, ink: Any) -> None:
+        super().__init__()
+        self._ink = ink
+
+    def setHtml(self, text: str) -> None:  # noqa: D102, N802 - Qt override
+        t, a = self._ink()
+        text = (text.replace("rgba(238,240,245,", f"rgba({t.red()},{t.green()},{t.blue()},")
+                .replace("rgba(126,180,255,", f"rgba({a.red()},{a.green()},{a.blue()},"))
+        super().setHtml(text)
+
+
+def health_html(results: list[Any]) -> str:
+    """``yuki doctor``'s checklist (:func:`yuki.core.doctor.run_checks`) as plain lines: the verdict, then each
+    check with its state in words (no coloured dots) and, under a problem, what to do about it."""
+    words = {"ok": "OK", "warn": "Needs a look", "fail": "Problem", "skip": "Skipped"}
+    fails = sum(getattr(c, "status", "") == "fail" for c in results)
+    warns = sum(getattr(c, "status", "") == "warn" for c in results)
+    verdict = ("All good." if not fails and not warns
+               else f"{fails} problem{'s' if fails != 1 else ''}, {warns} thing{'s' if warns != 1 else ''} to look at.")
+    parts = [f"<p style='color: rgba(238,240,245,240); margin-bottom: 10px;'><b>{html.escape(verdict)}</b></p>"]
+    order = {"fail": 0, "warn": 1, "ok": 2, "skip": 3}
+    for c in sorted(results, key=lambda c: order.get(getattr(c, "status", ""), 4)):
+        status = getattr(c, "status", "")
+        word = words.get(status, status)
+        dim = 150 if status in ("ok", "skip") else 240
+        parts.append(
+            f"<p style='margin-bottom: 6px;'><span style='color: rgba(238,240,245,240);'><b>"
+            f"{html.escape(str(c.name))}</b></span> <span style='color: rgba(238,240,245,{dim});'>· "
+            f"{html.escape(word)}</span><br><span style='color: rgba(238,240,245,{dim});'>"
+            f"{html.escape(str(c.detail))}</span>")
+        if getattr(c, "fix", "") and status in ("warn", "fail"):
+            parts.append(f"<br><span style='color: rgba(126,180,255,255);'>What to do: {html.escape(str(c.fix))}"
+                         "</span>")
+        parts.append("</p>")
+    return "".join(parts)
+
+
 class KnowsWindow(GlassWindow):
     """A small read-only glass panel showing the portrait and the saved know-how.
 
@@ -409,47 +450,54 @@ class KnowsWindow(GlassWindow):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QLabel(title)
-        title.setFont(ui_font(13, weight=QFont.Weight.DemiBold))
-        title.setStyleSheet("color: rgba(238,240,245,255); background: transparent;")
-        header.addWidget(title)
+        self.title = QLabel(title)
+        self.title.setFont(ui_font(13, weight=QFont.Weight.DemiBold))
+        header.addWidget(self.title)
         header.addStretch(1)
-        close = QToolButton()
+        self.close_button = close = QToolButton()
         close.setText("✕")
         close.setCursor(Qt.CursorShape.PointingHandCursor)
-        close.setStyleSheet(
-            "QToolButton { color: rgba(238,240,245,150); background: transparent;"
-            " border: none; padding: 2px 6px; font-size: 13px; }"
-            "QToolButton:hover { color: rgba(238,240,245,255); }"
-        )
         close.clicked.connect(self.fade_out)
         header.addWidget(close)
         layout.addLayout(header)
 
         self.meta = QLabel("")
         self.meta.setFont(ui_font(9))
-        self.meta.setStyleSheet("color: rgba(238,240,245,150); background: transparent;")
         self.meta.setWordWrap(True)
         layout.addWidget(self.meta)
 
-        self.body = QTextBrowser()
+        self.body = _InkBrowser(lambda: (self.ink("text"), self.ink("accent")))
         self.body.setReadOnly(True)
         self.body.setOpenLinks(False)
         self.body.setFont(ui_font(11))
         self.body.setFrameShape(QTextBrowser.Shape.NoFrame)
-        self.body.setStyleSheet(
-            "QTextBrowser { background: transparent; color: rgba(238,240,245,235);"
-            " border: none; selection-background-color: rgba(126,180,255,90); }"
-            "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }"
-            "QScrollBar::handle:vertical { background: rgba(255,255,255,50);"
-            " border-radius: 3px; min-height: 24px; }"
-            "QScrollBar::handle:vertical:hover { background: rgba(255,255,255,90); }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
-        )
         layout.addWidget(self.body, 1)
+        from yuki.ui.window.widgets import smooth
+
+        smooth(self.body)
         self.resize(size[0] + 2 * self.SHADOW, size[1] + 2 * self.SHADOW)
+        self.restyle()
         self.show_loading()
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook: theme inks on clear glass (2026-09-27)
+        if not hasattr(self, "body"):
+            return
+        sel = self.theme().accent_soft
+        handle = self.ink("text_3")
+        self.title.setStyleSheet(f"color: {self.ink_css('text')}; background: transparent;")
+        self.close_button.setStyleSheet(
+            f"QToolButton {{ color: {self.ink_css('text_2')}; background: transparent;"
+            " border: none; padding: 2px 6px; font-size: 13px; }"
+            f"QToolButton:hover {{ color: {self.ink_css('text')}; }}")
+        self.meta.setStyleSheet(f"color: {self.ink_css('text_3')}; background: transparent;")
+        self.body.setStyleSheet(
+            f"QTextBrowser {{ background: transparent; color: {self.ink_css('text')};"
+            f" border: none; selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},90); }}"
+            "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }"
+            f"QScrollBar::handle:vertical {{ background: rgba({handle.red()},{handle.green()},{handle.blue()},70);"
+            " border-radius: 3px; min-height: 24px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }")
 
     def focus_target(self) -> QTextBrowser:  # noqa: D102 - GlassWindow override
         return self.body
@@ -536,6 +584,28 @@ class TodayWindow(KnowsWindow):
         note = getattr(self, "waiting_note", "")
         self.meta.setText(meta or (f"{line} · {note}" if note else line))
         self.body.setHtml(today_html(groups, now=now))
+
+
+class HealthWindow(KnowsWindow):
+    """The tray's "Health check": ``yuki doctor``'s checklist with fixes, as a clear glass panel. The checks
+    run off the GUI thread (:meth:`yuki.ui.app.YukiUi.show_health`); this only shows them."""
+
+    def __init__(self) -> None:
+        super().__init__(title="Health check", size=(REVIEW_WIDTH, REVIEW_HEIGHT))
+        self.setObjectName("health")
+
+    def show_loading(self) -> None:
+        self.meta.setText("")
+        self.body.setHtml(_paragraphs("Checking memory, models, voice, devices and disk… (a few seconds)", dim=True))
+
+    def show_checks(self, results: list[Any] | None, report: str = "", meta: str = "") -> None:
+        """Fill it from :func:`yuki.core.doctor.run_checks` (``report``: :func:`format_report`'s text, shown
+        as written when the structured list is missing)."""
+        self.meta.setText(meta)
+        if results:
+            self.body.setHtml(health_html(results))
+        else:
+            self.body.setHtml(_paragraphs(report or "The health check didn't run.", dim=not report))
 
 
 class ReviewWindow(KnowsWindow):

@@ -376,7 +376,9 @@ class ReplyCard(QWidget):
             painter.setPen(QPen(border, 1.0))
         else:
             painter.setBrush(ERROR_BG if error else CARD_BG)
-            painter.setPen(QPen(ERROR_BORDER if error else CARD_BORDER, 1.0))
+            painter.setPen(Qt.PenStyle.NoPen)   # clear glass: no outline (2026-09-27)
+        if self.tone == "nudge":
+            painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(rect, 10, 10)
         if self.tone in ("question", "context", "nudge"):
             bar = QColor(self.accent or QColor(126, 180, 255)) if self.tone != "question" else (
@@ -435,6 +437,9 @@ class Overlay(GlassWindow):
         self._scroll.verticalScrollBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._scroll.viewport().setAutoFillBackground(False)
         self._scroll.setStyleSheet(SCROLL_STYLE)
+        from yuki.ui.window.widgets import smooth
+
+        smooth(self._scroll)
         self._scroll.setFixedHeight(0)
         self._scroll.setVisible(False)
         outer.addWidget(self._scroll)
@@ -611,7 +616,9 @@ class Overlay(GlassWindow):
         if shown and not self._forwarding_wheel:
             self._forwarding_wheel = True
             try:
-                QApplication.sendEvent(area.verticalScrollBar(), event)
+                from yuki.ui.window.widgets import smooth
+
+                smooth(area).wheel(event)   # the same smooth, eased, kinetic scroll as over the thread itself
             finally:
                 self._forwarding_wheel = False
             event.accept()

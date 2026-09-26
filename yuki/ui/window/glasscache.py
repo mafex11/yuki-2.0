@@ -1,13 +1,12 @@
 """The live window's glass as cached pictures (the user's rule: render on change, then just composite).
 
-Two kinds of picture, both made on the one glass thread (:func:`yuki.ui.glass.glass_worker`):
+Since 2026-09-27 the window has a plain background (black / white) and no floor
+picture; with the Light and Off settings (and See-through) the page glass is
+painted by the widgets themselves and nothing here renders. With Full:
 
-* **The floor** -- the window's sheet: the desktop wallpaper under the window,
-  refracted through the window's rim. Made again only when the window is
-  resized, comes to rest after a move, or the theme, the wallpaper or a glass
-  setting changes. :class:`~yuki.ui.window.live.LiveWindow` paints it.
-* **A page's glass** -- the panels, cards (and in Full, every pill and row) of
-  one page, drawn over the floor. :class:`GlassPage` holds its page's widgets and
+* **A page's glass** -- the panels, cards, every pill and row of one page, drawn
+  over the plain background on the GPU, each depth refracting the ones under it
+  (droplet pills, dispersion). :class:`GlassPage` holds its page's widgets and
   paints this picture under them, so it scrolls with the page for free: nothing
   is rendered while scrolling. It is made again when the page's shapes change
   (the page was rebuilt with new data, resized, something folded open, a
@@ -87,6 +86,9 @@ class GlassPage(QWidget):
         self._sig: tuple | None = None
         self._pending: tuple | None = None
         self._collecting = False
+        #: The window's plain background, painted by the page itself when it scrolls opaquely (see
+        #: ``LiveWindow._opaque``); ``None``: see-through, nothing painted under the glass.
+        self.opaque_bg: QColor | None = None
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
         self._settle.setInterval(SETTLE_MS)
@@ -95,7 +97,9 @@ class GlassPage(QWidget):
     # -- when -----------------------------------------------------------------------------------------
 
     def schedule(self) -> None:
-        self._settle.start()
+        # a page with no picture yet renders on the next turn (its glass would be missing meanwhile); after
+        # that a change waits to settle, so a burst of changes costs one render
+        self._settle.start(0 if self._image is None and self._pending is None else SETTLE_MS)
 
     def resizeEvent(self, e: Any) -> None:  # noqa: D102
         super().resizeEvent(e)
@@ -149,23 +153,14 @@ class GlassPage(QWidget):
         if host is None or not self.isVisible():
             return   # rendered when it is shown
         pol = lens.policy()
-        if pol.mode == "off":
-            if self._image is not None:
-                self.forget()
-            return
-        floor = host.floor_image()
-        if floor is None:
-            host.need_floor(self)
-            return
         dpr = self.devicePixelRatioF()
         started = time.perf_counter()
         shapes = self.collect(dpr)
-        offset = host.page_offset(self)
         sig = (tuple((round(s.rect.x()), round(s.rect.y()), round(s.rect.width()), round(s.rect.height()),
                       round(s.radius), s.depth, id(s.optics), s.tint.rgba() if s.tint is not None else 0,
                       (round(s.clip.x()), round(s.clip.y()), round(s.clip.width()), round(s.clip.height()))
                       if s.clip is not None else None) for s in shapes),
-               self.width(), self.height(), offset, host.floor_key(), pol)
+               self.width(), self.height(), host.t.name, pol)
         if sig == self._sig or sig == self._pending:
             STATS.skipped += 1
             return
@@ -174,8 +169,12 @@ class GlassPage(QWidget):
             self._image, self._shadows, self._sig, self._pending = None, [], sig, None
             self.update()
             return
-        base = page_base(floor, QSize(int(self.width() * dpr), int(self.height() * dpr)),
-                         QPointF(offset[0] * dpr, offset[1] * dpr))
+        # Full: the page's glass refracts the plain background and, depth by depth, the glass under it.
+        # Light / Off (and See-through): the same shapes painted flat, once, over nothing (the window's own
+        # background shows through the clear glass)
+        gpu = pol.gpu
+        base = QImage(int(self.width() * dpr), int(self.height() * dpr), QImage.Format.Format_ARGB32_Premultiplied)
+        base.fill(host.t.bg if gpu else Qt.GlobalColor.transparent)
         top = [s for s in shapes if s.depth == 0]
         depths = sorted({s.depth for s in shapes})
         layers = [("glass", [s for s in shapes if s.depth == d]) for d in depths]
@@ -185,10 +184,7 @@ class GlassPage(QWidget):
 
         def work() -> QImage:
             t0 = time.perf_counter()
-            if mode == "light":
-                img = lens.render_light(base, [p for _k, p in layers], shadows=False)
-            else:
-                img = lens.render(base, layers, "full")
+            img = lens.render(base, layers, "full") if gpu else lens.render_flat(base, layers)
             out = mask(img, top)
             STATS.last_ms = (time.perf_counter() - t0) * 1000 + collect_ms
             STATS.total_ms += STATS.last_ms
@@ -212,8 +208,14 @@ class GlassPage(QWidget):
 
     # -- painting ----------------------------------------------------------------------------------
 
-    def paintEvent(self, _e: Any) -> None:  # noqa: D102
-        if self._collecting or self._image is None:
+    def paintEvent(self, e: Any) -> None:  # noqa: D102
+        if self._collecting:
+            return
+        if self.opaque_bg is not None:
+            bg = QPainter(self)
+            bg.fillRect(e.rect(), self.opaque_bg)
+            bg.end()
+        if self._image is None:
             return
         from yuki.ui.window.glass import SHADOWS
 

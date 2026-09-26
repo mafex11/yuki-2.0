@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Sequence
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Qt
+from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -25,6 +25,7 @@ from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 from yuki.ui.memory import (
     STATUS_PENDING,
+    HealthWindow,
     KnowsWindow,
     MemoryControl,
     ReviewWindow,
@@ -34,14 +35,17 @@ from yuki.ui.memory import (
     quiet_until,
 )
 from yuki.ui.nudges import (
+    BUSY_NOTIFICATION_STATES,
     IMPLICIT_REPLY_S,
     NUDGE_EVENT_NAME,
     OVERLAY_NUDGES,
+    NoticeCard,
     NudgeController,
     kind_accent,
     nudge_answered,
     nudge_moment,
     nudge_reply_request,
+    notification_state,
     overlay_label,
 )
 from yuki.ui.overlay import Overlay, ReplyCard
@@ -55,6 +59,12 @@ from yuki.voice.session import VoiceSession
 #: The effort levels offered in the tray menu (all five stay reachable from the
 #: CLI's ``/effort``); a level outside these simply shows nothing ticked.
 TRAY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+
+class _HealthBridge(QObject):
+    """The health check's thread hands its result to the GUI thread through this."""
+
+    done = Signal(object)
+
 
 #: Name of the mutex that keeps one Yuki UI per session.
 MUTEX_NAME = "Local\\YukiUiSingleInstance"
@@ -212,7 +222,19 @@ class YukiUi(QObject):
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
         self.overlay.attach_thread(self.window_host.model)
-        self.voice_pill.theme_mode = "dark"   # its label is light text until the voice side uses GlassWindow.ink
+        #: One-off notices from the runtime (the daily cost alert) as a clear glass card, when the screen is free.
+        self.notice_card: NoticeCard | None = None
+        self._notices: list[tuple[str, str]] = []
+        self._notice_retry = QTimer(self)
+        self._notice_retry.setInterval(60_000)
+        self._notice_retry.timeout.connect(self._show_next_notice)
+        notice = getattr(runtime_signals, "notice", None)
+        if notice is not None:
+            notice.connect(self.show_notice)
+        #: The tray's "Health check" panel (yuki doctor), built the first time it is asked for.
+        self.health: HealthWindow | None = None
+        self._health_bridge = _HealthBridge()
+        self._health_bridge.done.connect(self._on_health_ready)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -254,7 +276,8 @@ class YukiUi(QObject):
         self.runtime.stop()
         self.overlay.hide()
         self.strip.hide()
-        for panel in (self.knows, self.today, self.review):
+        self._notice_retry.stop()
+        for panel in (self.knows, self.today, self.review, self.health, self.notice_card):
             if panel is not None:
                 panel.hide()
 
@@ -661,6 +684,72 @@ class YukiUi(QObject):
         if self.review is not None:
             self.review.show_review(review if isinstance(review, dict) else None, meta)
 
+    # -- runtime notices and the health check ------------------------------
+
+    def show_notice(self, kind: str, text: str) -> None:
+        """``AgentRuntime.notice``: tell the user once, in a clear glass card bottom-right. It waits while a
+        game or anything full screen is up, or while another card, the strip or the overlay has the screen."""
+        self._notices.append((str(kind or ""), str(text or "")))
+        self.ui_log.event("notice", kind=kind)
+        self._show_next_notice()
+
+    def _screen_free(self) -> bool:
+        if self.strip.isVisible() or (self.overlay.isVisible() and not self.overlay.closing):
+            return False
+        if self.nudges.showing is not None or self.calls.card_up:
+            return False
+        value, _name = notification_state()
+        return value not in BUSY_NOTIFICATION_STATES
+
+    def _show_next_notice(self) -> None:
+        if not self._notices:
+            self._notice_retry.stop()
+            return
+        if not self._screen_free() or (self.notice_card is not None and self.notice_card.isVisible()):
+            self._notice_retry.start()
+            return
+        kind, text = self._notices.pop(0)
+        if self.notice_card is None:
+            self.notice_card = NoticeCard()
+            self.notice_card.faded_out.connect(self._show_next_notice)
+        self.notice_card.show_notice(kind, text)
+        self.ui_log.event("notice_shown", kind=kind)
+        if not self._notices:
+            self._notice_retry.stop()
+
+    def show_health(self) -> None:
+        """The tray's "Health check": ``yuki doctor`` off the GUI thread, then its checklist in a glass panel."""
+        import threading
+
+        if self.health is None:
+            self.health = HealthWindow()
+        self.health.show_loading()
+        self.health.open()
+        self.ui_log.event("health_check", state="started")
+        settings = self.settings
+
+        def run() -> None:
+            started = time.monotonic()
+            try:
+                from yuki.core.doctor import format_report, run_checks
+
+                results = run_checks(settings)
+                report = format_report(results)
+            except Exception as exc:   # the check itself failing is shown, never raised into the tray
+                results, report = [], f"The health check couldn't run: {type(exc).__name__}: {exc}"
+            self._health_bridge.done.emit((results, report, time.monotonic() - started))
+
+        threading.Thread(target=run, name="yuki-health-check", daemon=True).start()
+
+    def _on_health_ready(self, payload: object) -> None:
+        results, report, took = payload if isinstance(payload, tuple) else ([], str(payload), 0.0)
+        if self.health is not None:
+            from datetime import datetime as _dt
+
+            self.health.show_checks(list(results), report, f"Checked at {_dt.now():%H:%M} · took {took:.1f} s")
+        self.ui_log.event("health_check", state="done", checks=len(results),
+                          problems=sum(getattr(c, "status", "") == "fail" for c in results))
+
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
         self.ui_log.event("open_logs", path=str(self.settings.sessions_dir))
@@ -678,7 +767,21 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
         The tray icon, which the caller must keep a reference to.
     """
     tray = QSystemTrayIcon(icon or tray_icon(), app)
-    menu = QMenu()
+    from yuki.ui.glass import current_theme
+    from yuki.ui.window.widgets import GlassMenu, menu_css
+
+    menu = GlassMenu(current_theme())   # clear glass like every surface (2026-09-27)
+
+    def _menu_theme() -> None:   # follows Windows' app mode / the Appearance setting each time it opens
+        from yuki.ui.window.widgets import glassify
+
+        menu.t = current_theme()
+        menu.setStyleSheet(menu_css(menu.t))
+        for sub in menu.findChildren(QMenu):   # the Microphone / Speaker / model submenus: glass too
+            if sub is not menu:
+                glassify(sub, current_theme)
+
+    menu.aboutToShow.connect(_menu_theme)
 
     # Memory first: a status line (read afresh each time the menu opens), then
     # its three controls. Every memory call runs off the GUI thread and comes
@@ -701,6 +804,9 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     week_review = QAction("This week's review", menu)
     week_review.triggered.connect(lambda _checked=False: ui.show_review())
     menu.addAction(week_review)
+    health = QAction("Health check", menu)
+    health.triggered.connect(lambda _checked=False: ui.show_health())
+    menu.addAction(health)
     quiet_hour = QAction("Quiet for 1 hour", menu)
     quiet_hour.triggered.connect(lambda _checked=False: ui.snooze_nudges(60))
     menu.addAction(quiet_hour)

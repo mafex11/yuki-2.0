@@ -143,12 +143,20 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     mode = Segmented(t, ("System", "Light", "Dark"), ui.appearance.capitalize(), small=True)
     mode.changed.connect(lambda word: act.set_appearance(word.lower()))
     look.body.addWidget(SettingRow(t, "sparkle", "Light or dark", "System follows Windows.", mode))
+    background = Segmented(t, ("Plain", "See-through"),
+                           "See-through" if ui.background == "see-through" else "Plain", small=True)
+    background.changed.connect(lambda word: act.set_background("see-through" if word == "See-through" else "solid"))
+    look.body.addWidget(SettingRow(t, "globe", "Background",
+                                   "Plain: black in dark, white in light. See-through: your desktop shows behind "
+                                   "the window, blurred by Windows.", background))
     glass = Segmented(t, tuple(GLASS_WORDS.values()), GLASS_WORDS.get(ui.glass, "Light"), small=True)
     look.body.addWidget(SettingRow(t, "bulb", "Glass effect",
-                                   "Off: simple see-through panels. Light: glass that bends the desktop behind it, "
-                                   "drawn once and kept. Full: every button is glass too.", glass))
+                                   "Off: clear glass, nothing bends. Light: glass floating over the app (hover "
+                                   "cards, menus, tooltips) bends what's under it, drawn once and kept. Full: every "
+                                   "card and button bends light too (uses the graphics card).", glass))
     sliders = QWidget()
     sliders.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    look.body.addWidget(sliders)   # parented before anything shows it (a parentless shown widget is a window)
     srow = QVBoxLayout(sliders)
     srow.setContentsMargins(0, 0, 0, 0)
     srow.setSpacing(2)
@@ -158,8 +166,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     blur = GlassSlider(t, ui.blur, width=200)
     blur.committed.connect(act.set_blur)
     srow.addWidget(SettingRow(t, "cloud", "Blur", "How frosted the glass is.", blur))
-    sliders.setVisible(ui.glass != "off")
-    look.body.addWidget(sliders)
+    if ui.glass == "off":
+        sliders.hide()
 
     def glass_changed(word: str) -> None:
         mode_key = next((k for k, w in GLASS_WORDS.items() if w == word), "light")
@@ -232,6 +240,7 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     adv.body.addLayout(head)
     inner = QWidget()
     inner.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    adv.body.addWidget(inner)
     ilay = QVBoxLayout(inner)
     ilay.setContentsMargins(0, 0, 0, 0)
     model = Segmented(t, ("Sonnet", "Opus"), v.model, small=True)
@@ -244,8 +253,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     logs = Pill(t, "Open logs folder", size="small")
     logs.clicked.connect(act.open_logs)
     ilay.addWidget(SettingRow(t, "book", "Logs", "", logs))
-    inner.setVisible(advanced)
-    adv.body.addWidget(inner)
+    if not advanced:
+        inner.hide()
 
     def toggle_fold() -> None:
         inner.setVisible(not inner.isVisible())

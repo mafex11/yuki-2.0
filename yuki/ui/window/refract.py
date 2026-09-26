@@ -136,6 +136,7 @@ class Shape:
     shadow: bool = True
     depth: int = 0
     floating: bool = False
+    level: GlassLevel | None = None   # the painted look, for the flat (Light / Off) cached picture
 
     def moved(self, dx: float, dy: float) -> "Shape":
         from dataclasses import replace
@@ -655,7 +656,7 @@ class _Collector:
             for s in self.shapes:
                 if not s.floating and s.rect.adjusted(-1.5, -1.5, 1.5, 1.5).contains(dev):
                     depth = max(depth, s.depth + 1)
-        self.shapes.append(Shape(dev, radius * scale, optics, scale, tint, clip, shadow, depth, floating))
+        self.shapes.append(Shape(dev, radius * scale, optics, scale, tint, clip, shadow, depth, floating, level))
         if floating:   # what this painter draws next, inside the shape, belongs on top of its glass
             outside = QPainterPath()
             outside.addRect(QRectF(-1e5, -1e5, 2e5, 2e5))

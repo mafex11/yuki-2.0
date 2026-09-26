@@ -154,6 +154,12 @@ class Theme:
     glass: dict[str, GlassLevel] = field(default_factory=dict)
     # how each glass level refracts (the GPU path, yuki.ui.window.refract)
     optics: dict[str, Optics] = field(default_factory=dict)
+    # ink for text on the accent glass (the primary button): readable on a faint blue wash
+    accent_ink: QColor = field(default_factory=lambda: QColor(255, 255, 255))
+    # the window's plain background (2026-09-27: black in dark, white in light; no wallpaper)
+    bg: QColor = field(default_factory=lambda: QColor(0, 0, 0))
+    # floating surfaces over the desktop (overlay, cards, strip, pill): clear glass, a light smoke only
+    surface_fill: QColor = field(default_factory=lambda: QColor(18, 20, 26, 87))
     # scene (mockups only): the simulated wallpaper
     wallpaper: tuple[tuple[QColor, float, float, float], ...] = ()
     wallpaper_base: tuple[QColor, QColor] = (QColor(0, 0, 0), QColor(0, 0, 0))
@@ -184,6 +190,7 @@ _STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a", "criti
 def _light() -> Theme:
     return Theme(
         name="light", dark=False,
+        bg=hexa("#ffffff"), surface_fill=rgba(250, 250, 252, 0.50), accent_ink=hexa("#1d4fb8"),
         window_tint=rgba(246, 247, 251, 0.64),
         fallback_top=hexa("#f4f6fb"), fallback_bottom=hexa("#e9edf5"),
         text=rgba(14, 16, 22), text_2=rgba(14, 16, 22, 0.64), text_3=rgba(14, 16, 22, 0.44),
@@ -200,21 +207,28 @@ def _light() -> Theme:
         grid=rgba(14, 16, 22, 0.07), baseline=rgba(14, 16, 22, 0.16),
         away=rgba(14, 16, 22, 0.30), off_fill=rgba(20, 24, 36, 0.07), off_hatch=rgba(20, 24, 36, 0.16),
         unrecorded=rgba(20, 24, 36, 0.04),
+        # 2026-09-27: clear glass on a plain white window. No solid blocks and no white outline: a faint
+        # wash, a catch-light on the lit edge (white, seen where the wash is), a faint shade on the far
+        # edge for definition, and a soft shadow. The selection and the main action are a blue-hued wash.
         glass={
-            "inset": GlassLevel(rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.85),
-                                rgba(255, 255, 255, 0.30), rgba(30, 40, 70, 0.06), rgba(30, 40, 80, 0.0), 0, 0),
-            "regular": GlassLevel(rgba(255, 255, 255, 0.52), rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.98),
-                                  rgba(255, 255, 255, 0.45), rgba(30, 40, 70, 0.08), rgba(30, 44, 90, 0.13), 28, 8),
-            "raised": GlassLevel(rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 1.0),
-                                 rgba(255, 255, 255, 0.55), rgba(30, 40, 70, 0.10), rgba(30, 44, 90, 0.20), 34, 12),
-            "lens": GlassLevel(rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.60), rgba(255, 255, 255, 1.0),
-                               rgba(255, 255, 255, 0.70), rgba(47, 111, 228, 0.22), rgba(47, 90, 180, 0.22), 18, 6),
-            "control": GlassLevel(rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 1.0),
-                                  rgba(255, 255, 255, 0.55), rgba(30, 40, 70, 0.10), rgba(30, 44, 90, 0.12), 10, 3),
-            "accent": GlassLevel(hexa("#2f6fe4"), rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.55),
-                                 rgba(255, 255, 255, 0.25), rgba(20, 60, 160, 0.20), rgba(30, 80, 200, 0.28), 12, 4),
-            "floor": GlassLevel(rgba(246, 247, 251, 0.64), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.6),
-                                rgba(255, 255, 255, 0.2), rgba(0, 0, 0, 0.12), rgba(20, 30, 60, 0.24), 36, 14),
+            "inset": GlassLevel(rgba(16, 24, 48, 0.035), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
+                                rgba(16, 24, 48, 0.07), rgba(0, 0, 0, 0.0), rgba(30, 40, 80, 0.0), 0, 0),
+            "regular": GlassLevel(rgba(16, 24, 48, 0.022), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
+                                  rgba(16, 24, 48, 0.06), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.10), 28, 8),
+            "raised": GlassLevel(rgba(16, 24, 48, 0.03), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
+                                 rgba(16, 24, 48, 0.07), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.14), 32, 10),
+            "lens": GlassLevel(rgba(47, 111, 228, 0.09), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
+                               rgba(47, 111, 228, 0.20), rgba(0, 0, 0, 0.0), rgba(47, 90, 180, 0.10), 14, 4),
+            "control": GlassLevel(rgba(16, 24, 48, 0.045), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
+                                  rgba(16, 24, 48, 0.08), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.08), 8, 2),
+            "accent": GlassLevel(rgba(47, 111, 228, 0.14), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
+                                 rgba(47, 111, 228, 0.28), rgba(0, 0, 0, 0.0), rgba(30, 80, 200, 0.12), 10, 3),
+            "bead": GlassLevel(rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
+                               rgba(16, 24, 48, 0.12), rgba(0, 0, 0, 0.0), rgba(20, 30, 60, 0.22), 6, 1),
+            "popover": GlassLevel(rgba(252, 252, 254, 0.80), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
+                                  rgba(16, 24, 48, 0.08), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.16), 30, 10),
+            "floor": GlassLevel(rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
+                                rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(20, 30, 60, 0.0), 0, 0),
         },
         optics={
             # Clear lenses, not bubbles: the edge is carried by the bending itself, with only a faint
@@ -225,24 +239,24 @@ def _light() -> Theme:
                             inner_shadow=0.03, shadow=0.30, shadow_blur=40, shadow_y=16, corner=2.0),
             # panels and the sidebar: clear glass with a wide rim that bends what is behind
             "regular": Optics(height=36, bezel=42, curvature=1.6, chroma=0.21, blur=0.8,
-                              tint=rgba(255, 255, 255, 0.18), tone=(0.14, 1.0), saturation=1.3, specular=0.25,
+                              tint=rgba(16, 24, 48, 0.022), tone=(0.14, 1.0), saturation=1.3, specular=0.25,
                               rim_width=0.7, rim_floor=0.08, inner_shadow=0.04, shadow=0.16, shadow_blur=30, shadow_y=10,
                               corner=2.6),
             # cards: a little thicker and brighter
-            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.22, blur=0.8, tint=rgba(255, 255, 255, 0.28),
+            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.22, blur=0.8, tint=rgba(16, 24, 48, 0.03),
                              tone=(0.16, 1.0), saturation=1.3, specular=0.28, rim_width=0.7, rim_floor=0.08,
                              inner_shadow=0.04, shadow=0.20, shadow_blur=30, shadow_y=12, corner=2.6),
             # rows inside a panel: thin glass, a narrow rim
-            "inset": Optics(height=15, bezel=18, curvature=1.5, chroma=0.16, blur=0.5, tint=rgba(255, 255, 255, 0.16),
+            "inset": Optics(height=15, bezel=18, curvature=1.5, chroma=0.16, blur=0.5, tint=rgba(16, 24, 48, 0.035),
                             tone=(0.10, 1.0), saturation=1.25, specular=0.18, rim_width=0.6, rim_floor=0.06,
                             inner_shadow=0.04, shadow=0.0, corner=2.6),
             # pills and fields: clear droplets, curved across their whole height
             "control": Optics(height=18, bezel=999, curvature=1.8, chroma=0.25, blur=0.0,
-                              tint=rgba(255, 255, 255, 0.14), tone=(0.06, 1.0), saturation=1.35, magnify=0.07,
+                              tint=rgba(16, 24, 48, 0.045), tone=(0.06, 1.0), saturation=1.35, magnify=0.07,
                               specular=0.25, rim_width=0.6, rim_floor=0.08, inner_shadow=0.04, shadow=0.10,
                               shadow_blur=10, shadow_y=3),
             # the selected pill: the clearest, strongest lens
-            "lens": Optics(height=20, bezel=999, curvature=1.9, chroma=0.3, blur=0.0, tint=rgba(255, 255, 255, 0.28),
+            "lens": Optics(height=20, bezel=999, curvature=1.9, chroma=0.3, blur=0.0, tint=rgba(47, 111, 228, 0.09),
                            tone=(0.10, 1.0), saturation=1.35, magnify=0.10, specular=0.30, rim_width=0.6,
                            rim_floor=0.08, inner_shadow=0.03, shadow=0.14, shadow_blur=14, shadow_y=4),
             # popovers over busy content (the timeline's hover card): frosted more, for reading
@@ -250,7 +264,7 @@ def _light() -> Theme:
                               tone=(0.30, 1.0), saturation=1.3, specular=0.25, rim_width=0.7, rim_floor=0.08,
                               inner_shadow=0.03, shadow=0.22, shadow_blur=30, shadow_y=12, corner=2.6),
             # the main action: glass flooded with the accent
-            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.24, tint=hexa("#2f6fe4", 0.78),
+            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.24, tint=rgba(47, 111, 228, 0.14),
                              tone=(0.0, 1.0), saturation=1.3, magnify=0.07, specular=0.25, rim_width=0.6,
                              rim_floor=0.08, inner_shadow=0.06, shadow=0.22, shadow_blur=12, shadow_y=4),
         },
@@ -266,6 +280,7 @@ def _light() -> Theme:
 def _dark() -> Theme:
     return Theme(
         name="dark", dark=True,
+        bg=hexa("#000000"), surface_fill=rgba(18, 20, 26, 0.34), accent_ink=rgba(255, 255, 255),
         window_tint=rgba(20, 22, 28, 0.66),
         fallback_top=hexa("#1d2028"), fallback_bottom=hexa("#15171d"),
         text=rgba(245, 246, 250), text_2=rgba(245, 246, 250, 0.66), text_3=rgba(245, 246, 250, 0.44),
@@ -282,37 +297,43 @@ def _dark() -> Theme:
         grid=rgba(255, 255, 255, 0.06), baseline=rgba(255, 255, 255, 0.14),
         away=rgba(255, 255, 255, 0.32), off_fill=rgba(0, 0, 0, 0.26), off_hatch=rgba(255, 255, 255, 0.10),
         unrecorded=rgba(255, 255, 255, 0.03),
+        # 2026-09-27: clear glass on a plain black window: a faint white wash, a catch-light on the lit
+        # edge only (no outline all the way round), the selection and the main action a blue-hued wash.
         glass={
-            "inset": GlassLevel(rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.16),
-                                rgba(255, 255, 255, 0.05), rgba(0, 0, 0, 0.30), rgba(0, 0, 0, 0.0), 0, 0),
-            "regular": GlassLevel(rgba(46, 49, 60, 0.46), rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.30),
-                                  rgba(255, 255, 255, 0.09), rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.36), 30, 10),
-            "raised": GlassLevel(rgba(62, 66, 80, 0.58), rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.38),
-                                 rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.48), 36, 14),
-            "lens": GlassLevel(rgba(93, 155, 255, 0.24), rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.50),
-                               rgba(255, 255, 255, 0.16), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.40), 18, 6),
-            "control": GlassLevel(rgba(62, 66, 80, 0.58), rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.38),
-                                  rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.30), 10, 3),
-            "accent": GlassLevel(hexa("#3d7fe8"), rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.45),
-                                 rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.40), 12, 4),
-            "floor": GlassLevel(rgba(20, 22, 28, 0.66), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.22),
-                                rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.50), 36, 14),
+            "inset": GlassLevel(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.13),
+                                rgba(255, 255, 255, 0.03), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.0), 0, 0),
+            "regular": GlassLevel(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.17),
+                                  rgba(255, 255, 255, 0.035), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.45), 30, 10),
+            "raised": GlassLevel(rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.20),
+                                 rgba(255, 255, 255, 0.045), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 34, 12),
+            "lens": GlassLevel(rgba(93, 155, 255, 0.16), rgba(255, 255, 255, 0.0), rgba(185, 210, 255, 0.30),
+                               rgba(93, 155, 255, 0.10), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.30), 14, 4),
+            "control": GlassLevel(rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.18),
+                                  rgba(255, 255, 255, 0.04), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.30), 8, 2),
+            "accent": GlassLevel(rgba(93, 155, 255, 0.24), rgba(255, 255, 255, 0.0), rgba(200, 220, 255, 0.32),
+                                 rgba(93, 155, 255, 0.14), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.35), 10, 3),
+            "bead": GlassLevel(rgba(255, 255, 255, 0.30), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.55),
+                               rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.40), 6, 1),
+            "popover": GlassLevel(rgba(30, 32, 40, 0.86), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.18),
+                                  rgba(255, 255, 255, 0.04), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 30, 10),
+            "floor": GlassLevel(rgba(0, 0, 0, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
+                                rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.0), 0, 0),
         },
         optics={
             # dark glass: the same geometry, a dimmer range, an even fainter catch-light
             "floor": Optics(height=34, bezel=48, curvature=1.5, chroma=0.14, blur=2.5, tint=rgba(16, 18, 26, 0.28),
                             tone=(0.0, 0.50), saturation=1.3, specular=0.14, rim_width=0.8, rim_floor=0.08,
                             inner_shadow=0.08, shadow=0.55, shadow_blur=40, shadow_y=16, corner=2.0),
-            "regular": Optics(height=36, bezel=42, curvature=1.6, chroma=0.19, blur=0.8, tint=rgba(40, 44, 56, 0.20),
+            "regular": Optics(height=36, bezel=42, curvature=1.6, chroma=0.19, blur=0.8, tint=rgba(255, 255, 255, 0.055),
                               tone=(0.0, 0.86), saturation=1.3, specular=0.16, rim_width=0.7, rim_floor=0.08,
                               inner_shadow=0.10, shadow=0.34, shadow_blur=30, shadow_y=10, corner=2.6),
-            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.2, blur=0.8, tint=rgba(60, 64, 80, 0.26),
+            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.2, blur=0.8, tint=rgba(255, 255, 255, 0.075),
                              tone=(0.0, 0.90), saturation=1.3, specular=0.18, rim_width=0.7, rim_floor=0.08,
                              inner_shadow=0.10, shadow=0.42, shadow_blur=30, shadow_y=12, corner=2.6),
             "inset": Optics(height=15, bezel=18, curvature=1.5, chroma=0.14, blur=0.5, tint=rgba(255, 255, 255, 0.04),
                             tone=(0.0, 0.95), saturation=1.25, specular=0.12, rim_width=0.6, rim_floor=0.06,
                             inner_shadow=0.08, shadow=0.0, corner=2.6),
-            "control": Optics(height=18, bezel=999, curvature=1.8, chroma=0.23, tint=rgba(255, 255, 255, 0.05),
+            "control": Optics(height=18, bezel=999, curvature=1.8, chroma=0.23, tint=rgba(255, 255, 255, 0.07),
                               tone=(0.0, 1.0), saturation=1.35, magnify=0.07, specular=0.16, rim_width=0.6,
                               rim_floor=0.08, inner_shadow=0.08, shadow=0.28, shadow_blur=10, shadow_y=3),
             "lens": Optics(height=20, bezel=999, curvature=1.9, chroma=0.28, tint=rgba(93, 155, 255, 0.16),
@@ -321,7 +342,7 @@ def _dark() -> Theme:
             "popover": Optics(height=30, bezel=28, curvature=1.6, chroma=0.18, blur=7.0, tint=rgba(40, 44, 58, 0.66),
                               tone=(0.0, 0.80), saturation=1.3, specular=0.16, rim_width=0.7, rim_floor=0.08,
                               inner_shadow=0.10, shadow=0.45, shadow_blur=30, shadow_y=12, corner=2.6),
-            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.22, tint=hexa("#3d7fe8", 0.78),
+            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.22, tint=rgba(93, 155, 255, 0.24),
                              tone=(0.0, 1.0), saturation=1.3, magnify=0.07, specular=0.16, rim_width=0.6,
                              rim_floor=0.08, inner_shadow=0.08, shadow=0.34, shadow_blur=12, shadow_y=4),
         },

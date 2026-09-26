@@ -194,6 +194,7 @@ class Band:
     detail: str = ""
     drops: list[tuple[float, float]] = field(default_factory=list)
     seconds: float = 0.0       # a call's measured length (microphone held), whole call
+    ongoing: bool = False      # a call still going on now
 
 
 @dataclass
@@ -326,7 +327,7 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
         calls.append(Band("call", max(rs, since), min(re_, end), f"{c.get('app')} call", c.get("app") or "",
                           rs, re_, c.get("text") or "",
                           [(epoch(d["start"]) or 0.0, epoch(d["end"]) or 0.0) for d in c.get("drops", [])],
-                          float(c.get("seconds") or 0.0)))
+                          float(c.get("seconds") or 0.0), bool(c.get("ongoing"))))
 
     facts = memory.journal_entries(since, until)
     milestones = [f for f in facts if f["milestone"]]
@@ -456,27 +457,28 @@ def _source_line(origin: str, since: float, evidence: list[Evidence], today: dat
     return f"Yuki's reading of your week · {when}"
 
 
+def portrait_item(f: dict[str, Any], today: date | None = None) -> Item:
+    """One portrait fact (``portrait_facts_with_evidence``) as the window shows it."""
+    ev = [Evidence(e["at"], e["app"], e["text"], e["nature"]) for e in f["evidence"]]
+    tags = []
+    if f["aspect"] == "joke":
+        tags.append("joke")
+    if f["aspect"] == "story":
+        tags.append("story")
+    if f["origin"] == "user":
+        tags.append("you")
+    elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
+        tags.append("unsure")
+    text = second_person(f["text"])
+    return Item(f["ref"], f["subject"], text, first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
+                f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev)
+
+
 def build_me(memory: Any, *, today: date | None = None) -> MeView:
     facts = memory.portrait_facts_with_evidence()
-
-    def item(f: dict[str, Any]) -> Item:
-        ev = [Evidence(e["at"], e["app"], e["text"], e["nature"]) for e in f["evidence"]]
-        tags = []
-        if f["aspect"] == "joke":
-            tags.append("joke")
-        if f["aspect"] == "story":
-            tags.append("story")
-        if f["origin"] == "user":
-            tags.append("you")
-        elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
-            tags.append("unsure")
-        text = second_person(f["text"])
-        return Item(f["ref"], f["subject"], text, first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
-                    f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev)
-
     by_kind: dict[str, list[Item]] = defaultdict(list)
     for f in facts:
-        by_kind[f["kind"]].append(item(f))
+        by_kind[f["kind"]].append(portrait_item(f, today))
     for items in by_kind.values():
         items.sort(key=lambda i: (i.origin != "user", -(i.confidence or 0.5), -i.since))
     personality: dict[str, list[Item]] = {k: [] for k in ASPECT_TITLES}
@@ -504,41 +506,102 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
 
 
 @dataclass
+class Todo:
+    """One of the user's own to-dos, with where it came from."""
+
+    ref: str                   # "loop:12" | "commit:5" | "todo:3": what complete_todo takes
+    text: str                  # second person
+    source: str                # "You said it on a call · 25 Sep" / "Komal asked in Slack · 24 Sep"
+    quote: str                 # the user's own words, when memory kept them
+    due: str                   # "due today" / ""
+    raw: dict[str, Any] = field(default_factory=dict)
+    owner: str = "user"        # user (the user's own to-do) | yuki (something Yuki promised to do)
+
+
+@dataclass
 class YukiView:
-    persona: list[str]
-    talk: list[str]
-    rules: list[dict[str, Any]]
+    talk: list[str]                     # how Yuki talks to this user: the portrait's reply-style section
+    talk_at: float | None               # when that was last written (the portrait)
+    persona: list[str]                  # Yuki's own persona with this user (memory's persona lines)
+    picked_up: list[Item]               # from how the user talks with people: talk, humour, openness
+    todos: list[Todo]                   # the user's own to-dos (memory's owner "user")
+    promises: list[Todo]                # what Yuki itself promised to do (owner "yuki"), shown apart
     knowhow: list[str]
-    promised: list[dict[str, Any]]      # Yuki's own commitments
-    reminding: list[dict[str, Any]]     # things the user said they'd do, that Yuki will remind about
     waiting: list[dict[str, Any]]       # questions waiting to be asked
     asked: list[dict[str, Any]]         # asked, with the answer if any
 
 
-#: Who Yuki is, in the words of its own system prompt (yuki/agent/prompt.py).
-PERSONA = [
-    "Lives on your PC and gets things done on it: your hands and eyes on this machine, not a chatbot.",
-    "Quick, uses its own judgement, and talks like a capable friend rather than a service desk.",
-    "Reaches for Windows' own tools (PowerShell, shortcuts, an app's own commands) before the mouse.",
-]
-#: How it uses what it knows about you (the same prompt's Personality paragraph).
-TALK = [
-    "Replies the way a friend texts back: usually one sentence, leading with the answer.",
-    "Meets banter with banter in your register, lightly and not often; a task always comes first.",
-    "Teases only with your own jokes, never about health, body, family or money.",
-    "Never treats a joke, or anything it isn't sure it heard right, as a fact.",
-]
+def portrait_section(text: str | None, heading: str) -> str:
+    """The body of one section of the rendered portrait (its own fixed layout: a heading line, then the
+    section, a blank line before the next heading); ``""`` when it has none."""
+    for block in (text or "").replace("\r\n", "\n").split("\n\n"):
+        lines = block.strip().split("\n")
+        if lines and lines[0].strip().rstrip(":").casefold() == heading.casefold():
+            return " ".join(" ".join(lines[1:]).split())
+    return ""
 
 
-def build_yuki(memory: Any) -> YukiView:
-    rules = memory.rules()
-    todos = memory.todos(include_done=False)
-    promised = [t for t in todos if t["source"] == "commitment"]
-    reminding = [t for t in todos if t["source"] == "call"]
+def sentences(text: str) -> list[str]:
+    """``text`` as its sentences (presentation only: one line each on the page)."""
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'(])", " ".join((text or "").split()))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _todo_source(t: dict[str, Any]) -> tuple[str, str]:
+    """(where it came from and when, the user's own words if kept) for one ``todos()`` item."""
+    since = epoch(t.get("since"))
+    when = day_label(since) if since else ""
+    ev = str(t.get("evidence") or "")
+    quote = ""
+    if '"' in ev:
+        quote = ev.split('"', 1)[1].rsplit('"', 1)[0].strip()
+    src = t.get("source")
+    if src == "call":
+        return f"You said it on a call · {when}", quote
+    if src == "chat":
+        return f"You told Yuki in a chat · {when}", quote
+    if src == "commitment":
+        return f"Yuki promised in a chat · {when}", quote
+    if src == "user":
+        return f"You added it · {when}", ""
+    return (second_person(ev)[:1].upper() + second_person(ev)[1:] if ev else f"Seen in your day · {when}"), ""
+
+
+def _due_label(value: Any) -> str:
+    if not value:
+        return ""
+    if len(str(value)) == 10:
+        d = datetime.fromisoformat(str(value))
+        return f"due {day_label(d.timestamp() + 43200)}"
+    at = epoch(value)
+    return f"due {day_label(at)} {datetime.fromtimestamp(at):%H:%M}" if at else ""
+
+
+def build_yuki(memory: Any, *, today: date | None = None) -> YukiView:
+    portrait = memory.portrait_text()
+    talk = [second_person(s) for s in sentences(portrait_section(portrait, "Relationship"))]
+    persona_block = memory.yuki_persona() or ""
+    persona = [ln.strip().lstrip("-").strip() for ln in persona_block.split("\n") if ln.strip().lstrip("-").strip()]
+    picked: list[Item] = []
+    for f in memory.portrait_facts_with_evidence():
+        if f["kind"] == "personality" and f["aspect"] in ("talk", "people", "joke"):
+            picked.append(portrait_item(f, today))
+    order = {"talk": 0, "people": 1, "joke": 2}
+    picked.sort(key=lambda i: (order.get(i.aspect or "", 3), -(i.confidence or 0.5)))
+    todos, promises = [], []
+    for t in memory.todos(include_done=False):
+        source, quote = _todo_source(t)
+        text = second_person(str(t.get("text") or ""))
+        # memory says whose it is ("owner", 2026-09-27); an older memory without it: Yuki's own promises
+        # were its "commitment" source
+        owner = str(t.get("owner") or ("yuki" if t.get("source") == "commitment" else "user"))
+        item = Todo(str(t.get("id")), first_sentence(text, 200), source, quote, _due_label(t.get("due")), t, owner)
+        (promises if owner == "yuki" else todos).append(item)
     qs = memory.questions(limit=30)
     waiting = [q for q in qs if q["status"] in ("open",)]
     asked = [q for q in qs if q["status"] in ("asked", "answered", "skipped", "never")]
-    return YukiView(PERSONA, TALK, rules, memory.knowhow(limit=20), promised, reminding, waiting, asked[:6])
+    talk_at = epoch(memory.status().get("portrait_updated_at"))
+    return YukiView(talk, talk_at, persona, picked, todos, promises, memory.knowhow(limit=20), waiting, asked[:6])
 
 
 # -- Status ---------------------------------------------------------------------------
