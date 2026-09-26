@@ -77,8 +77,11 @@ def nature_mark(nature: Any) -> str:
 
 
 def usable(entry: Any) -> bool:
-    """Whether a journal item may be read as evidence at all (``uncertain`` ones may not)."""
-    return normalize_nature(getattr(entry, "nature", "fact")) != "uncertain"
+    """Whether a journal item may be read as evidence at all: not ``uncertain`` (possibly misheard), and not
+    text the user typed into, or read from, another AI tool (``tainted``, migration 17: a prompt or an AI's
+    answer says nothing true about the user - the coach, episodes and the weekly review leave it out)."""
+    return (normalize_nature(getattr(entry, "nature", "fact")) != "uncertain"
+            and not getattr(entry, "tainted", False))
 
 
 NATURE_GUIDANCE = """\

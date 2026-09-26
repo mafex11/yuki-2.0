@@ -290,7 +290,11 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                     meta.append(where)
                 if hit.get("importance") is not None:
                     meta.append(f"importance {hit['importance']}")
-                lines.append(f"- [{when}] ({'; '.join(meta)}) {_one_line(hit.get('fact'))}")
+                if hit.get("other_ai"):   # text the user typed into, or read from, another AI tool
+                    meta.append("text for or from another AI tool - not a fact about the user")
+                source = _one_line(hit.get("source") or "")
+                lines.append(f"- [{when}] ({'; '.join(meta)}) {_one_line(hit.get('fact'))}"
+                             + (f" [from: {source}]" if source else ""))
             if not hits:
                 lines.append("Nothing found.")
             return "\n".join(lines), window

@@ -71,6 +71,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.embed import Embedder, get_embedder
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
+from yuki.memory.provenance import source_of
 from yuki.memory.questions import (
     AGENT_WORK_GUIDANCE,
     QUESTION_GUIDANCE,
@@ -84,6 +85,8 @@ from yuki.memory.store import (
     JournalEntry,
     ModelCall,
     NewFact,
+    NewNudge,
+    NudgeCheckin,
     NewQuestion,
     PendingCapture,
     Store,
@@ -183,6 +186,8 @@ action without it. Routine terminal work is importance 2-4; setting up, releasin
 deploying a project, or a failure the user kept working on, 5-6.
 
 {agent_work}
+
+{other_ai}
 
 {nature}
 
@@ -322,7 +327,78 @@ about what anyone else said, who the others in the call are beyond the name the 
 the call was about. At most two; most calls need none."""
 
 
-def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bool = False) -> str:
+#: Text the user typed into, or read from, another AI tool (migration 17, ``journal.tainted``): the model
+#: judges it from the content, never from a site or app name (docs/research/coach-and-answers-review.md
+#: C2: a ChatGPT test prompt was read as a fact about the user's life).
+OTHER_AI_GUIDANCE = """\
+TEXT FOR OR FROM ANOTHER AI TOOL. The user also talks to other AI assistants (a chatbot in the \
+browser, an assistant app, a coding agent's chat). What they type there is a prompt - often a test, \
+a role-play, a made-up scenario or a task done for someone else - and what the AI answers is the \
+AI's text; neither says who the user is, what they do or what is happening in their life. Judge it \
+from the content: a prompt box and its reply, a conversation with an assistant, a draft they are \
+composing for an AI. Record what the user did ("The user asked ChatGPT to draft a Spanish tutorial \
+script for a Gamma workspace video") as usual, with other_ai false; mark other_ai true on any fact \
+whose content comes from such a prompt or answer (what the prompt claims about a person, a plan, a \
+job, a place), so it is never taken as a fact about the user. Everything else is other_ai false."""
+
+#: The journal's model also checks each batch against the user's open standing requests (migration 17).
+REQUEST_GUIDANCE = """\
+OPEN REQUESTS. The user asked Yuki to tell them when something happens; each open request is \
+listed after the data as R<n> with the user's own words. When a SOURCE in this batch shows that \
+the thing a request waits for has now happened (the person replied, the build finished, the \
+email arrived) - judged from what the source says, not from a shared word - add one item to \
+request_matches: the request's number, the source's number, why in a clause, and message: the \
+one short line Yuki will show the user, like a friend texting ("Varun replied on Slack: \
+approved, go ahead with the scope"), naming who and where and the gist in their words. Only \
+something that happened in this batch counts: an older message the user is only rereading \
+(HISTORY), something merely mentioned, or the user's own message does not, unless the request \
+asks for exactly that. Usually request_matches is empty."""
+
+
+def cached_system(text: str) -> list[dict[str, Any]]:
+    """The system prompt as one block with a prompt-cache breakpoint (plumbing, cost only).
+
+    The journal's fixed part - tool schema plus system prompt - is ~5k tokens, above Haiku 4.5's
+    4,096-token minimum cacheable prefix, and most batches are one or two sources (measured
+    2026-09-26: 128 of 160 calls), so without the cache ~80% of every call's input was the same
+    text paid again. Calls within five minutes of each other now read it at a tenth of the price.
+    """
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+def system_text(system: Any) -> str:
+    """The text of a request's ``system`` (a string or text blocks), for logs and checks."""
+    if isinstance(system, str):
+        return system
+    return "\n".join(str(b.get("text") or "") for b in system or [] if isinstance(b, dict))
+
+
+def record_facts_tool(requests: bool = False) -> dict[str, Any]:
+    """``record_facts`` as sent: with ``request_matches`` only while the user has open standing requests."""
+    if not requests:
+        return RECORD_FACTS_TOOL
+    tool = json.loads(json.dumps(RECORD_FACTS_TOOL))
+    tool["input_schema"]["properties"]["request_matches"] = {
+        "type": "array",
+        "description": "Open requests (R<n>) a source in this batch shows have now happened. Usually empty.",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["request", "source", "why", "message"],
+            "properties": {
+                "request": {"type": "integer", "description": "n of the open request R<n>."},
+                "source": {"type": "integer", "description": "Number of the source that shows it happened."},
+                "why": {"type": "string", "description": "One short clause."},
+                "message": {"type": "string", "description": "The one line Yuki shows the user."},
+            },
+        },
+    }
+    tool["input_schema"]["required"] = [*tool["input_schema"]["required"], "request_matches"]
+    return tool
+
+
+def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bool = False,
+                  requests: bool = False) -> str:
     """:data:`SYSTEM_PROMPT` with the user's identity and the shared guidance filled in.
 
     ``questions``: include the ask-don't-guess guidance (the ``record_facts`` batches).
@@ -334,8 +410,11 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
                 "Never state a relationship, a meaning or an owner the sources do not say in words.")
     text = (SYSTEM_PROMPT.replace("{identity}", user_identity(names))
             .replace("{agent_work}", AGENT_WORK_GUIDANCE)
+            .replace("{other_ai}", "" if call_side else OTHER_AI_GUIDANCE)
             .replace("{nature}", NATURE_GUIDANCE)
             .replace("{questions}", guidance))
+    if requests and not call_side:
+        text = f"{text}\n\n{REQUEST_GUIDANCE}"
     return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}" if call_side else text
 
 
@@ -356,7 +435,8 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "nature", "importance", "source", "content_date", "milestone"],
+                    "required": ["text", "nature", "importance", "source", "content_date", "milestone",
+                                 "other_ai"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -402,6 +482,14 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                                 "they read about. Almost always false."
                             ),
                         },
+                        "other_ai": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the fact's content comes from text the user typed into, or read from, "
+                                "another AI tool (a prompt or the AI's answer), so it says nothing true about the "
+                                "user (see TEXT FOR OR FROM ANOTHER AI TOOL). What the user did with the tool is false."
+                            ),
+                        },
                     },
                 },
             },
@@ -439,7 +527,8 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                     "required": ["text", "nature", "importance", "source"],
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
-                           ["properties"].items() if k not in ("content_date", "milestone")},   # dated by themselves
+                           ["properties"].items() if k not in ("content_date", "milestone", "other_ai")},
+                        # dated by themselves; the user's own voice is never another AI tool's text
                         "nature": {
                             "type": "string",
                             "enum": list(NATURES),
@@ -493,6 +582,21 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
     },
 }
 RECORD_CALL_SIDE_TOOL["input_schema"]["required"] = ["facts", "commitments", "questions"]
+
+
+#: At most this many standing-request cards in 24 hours, whatever the model matches (plumbing).
+REQUEST_CARDS_PER_DAY = 6
+#: The UI's wake-up event for new cards (``yuki.memory.nudges.NUDGE_EVENT_NAME``).
+NUDGE_EVENT_NAME = "Local\\YukiNudgeReady"
+
+
+def requests_text(requests: Sequence[dict[str, Any]]) -> str:
+    """OPEN REQUESTS, after the data fence: the user's own words, trusted (they said them to Yuki)."""
+    lines = ["OPEN REQUESTS (the user asked Yuki to tell them when these happen; see OPEN REQUESTS above):"]
+    for r in requests:
+        lines.append(f"R{r['id']}: watch for: {' '.join(str(r['condition']).split())[:300]} "
+                     f"(the user's words: \"{' '.join(str(r['quote']).split())[:300]}\")")
+    return "\n".join(lines)
 
 
 def sanitize_untrusted(value: str, nonce: str, max_chars: int) -> str:
@@ -1019,11 +1123,15 @@ class JournalWorker:
         absent = self.absent_captures(captures)
         user = build_user_message(thread, sources, previous, nonce, max_capture_chars=self.batch_chars,
                                   known=known, absent=absent, page_top=self.page_top(thread, captures))
-        tool = RECORD_CALL_SIDE_TOOL if call_side else RECORD_FACTS_TOOL
+        open_requests = [] if (call_side or supersedes) else self.open_requests()
+        if open_requests:
+            user += "\n\n" + requests_text(open_requests)
+        tool = RECORD_CALL_SIDE_TOOL if call_side else record_facts_tool(bool(open_requests))
         request = {
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
-            "system": system_prompt(self.user_names(), questions=not call_side),
+            "system": cached_system(system_prompt(self.user_names(), questions=not call_side,
+                                                  requests=bool(open_requests))),
             "tools": [tool],
             "tool_choice": {"type": "tool", "name": tool["name"]},
             "messages": [{"role": "user", "content": user}],
@@ -1069,9 +1177,11 @@ class JournalWorker:
             else:
                 batch_id, commitment_ids = self.store.commit_batch(
                     call, capture_ids, facts, questions, question_outcomes, supersedes=supersedes), []
+            fired = self._fire_requests(response, tool["name"], open_requests, sources, thread) if open_requests else []
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
+                tainted=sum(1 for f in facts if f.tainted), open_requests=len(open_requests), requests_fired=fired,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
                 sources=len(sources), commands=sum(1 for x in sources if x.command is not None),
                 messages_new=sum(1 for x in sources if x.message and x.message.status == "new"),
@@ -1145,7 +1255,7 @@ class JournalWorker:
         capture_ids = [c.id for c in captures]
         sources = build_sources(captures, {})
         parts = self._call_parts(sources)
-        system = system_prompt(self.user_names(), questions=False, call_side=True)
+        system = cached_system(system_prompt(self.user_names(), questions=False, call_side=True))
         tool = RECORD_CALL_SIDE_TOOL
         call = ModelCall(at=time.time(), thread_id=thread_id, model=self.model, input_chars=0)
         totals = {"input_tokens": 0, "output_tokens": 0, "cache_write_tokens": 0, "cache_read_tokens": 0}
@@ -1342,6 +1452,67 @@ class JournalWorker:
                 out.append(q)
         return out
 
+    # -- standing requests (migration 17) --------------------------------------
+
+    def open_requests(self) -> list[dict[str, Any]]:
+        """The user's open standing requests (none: the batch runs exactly as before, at no extra cost)."""
+        try:
+            return self.store.standing_requests(("open",))
+        except Exception:
+            return []
+
+    def _fire_requests(self, response: Any, tool: str, open_requests: Sequence[dict[str, Any]],
+                       sources: Sequence[Source], thread: ThreadInfo) -> list[dict[str, Any]]:
+        """Cards for the model's matches, each gated in code: a known open request, a real source of this
+        batch, the request's cooldown and fire budget, and a daily budget of request cards
+        (:meth:`Store.fire_standing_request`, one transaction). Returns what happened to each match."""
+        items = (self._tool_block(response, tool).input or {}).get("request_matches") or []
+        known = {int(r["id"]): r for r in open_requests}
+        out: list[dict[str, Any]] = []
+        now = time.time()
+        for item in items[:3]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                rid, index = int(item.get("request")), int(item.get("source")) - 1
+            except (TypeError, ValueError):
+                out.append({"outcome": "rejected: bad ids"})
+                continue
+            message = " ".join(str(item.get("message") or "").split())
+            if rid not in known:
+                out.append({"request": rid, "outcome": "rejected: not an open request"})
+                continue
+            if not 0 <= index < len(sources) or not message:
+                out.append({"request": rid, "outcome": "rejected: cites no source of this batch"})
+                continue
+            src = sources[index]
+            where = source_of(src, thread, sources, index)
+            checkin = NudgeCheckin(at=now, trigger="request", outcome="reminder", model=self.model,
+                                   reason=f"standing request R{rid} matched: {str(item.get('why') or '')[:200]}")
+            nudge = NewNudge(kind="reminder", text=message[:300], trigger="request", ref=f"request:{rid}",
+                             reason=f"You asked: \"{known[rid]['quote'][:200]}\"",
+                             inputs={"request": rid, "source": where, "why": str(item.get("why") or "")[:300]})
+            try:
+                nudge_id, outcome = self.store.fire_standing_request(
+                    rid, checkin, nudge, now=now, daily_budget=REQUEST_CARDS_PER_DAY,
+                    day_start=now - 86400.0)
+            except Exception as exc:
+                nudge_id, outcome = None, f"error: {type(exc).__name__}"
+            if nudge_id is not None:
+                self.signal_nudge()
+            out.append({"request": rid, "outcome": outcome, "nudge_id": nudge_id})
+        return out
+
+    def signal_nudge(self) -> None:
+        """Wake the UI for a new card (only for the database the UI reads: the default one)."""
+        try:
+            from yuki.memory.store import default_db_path, signal_event
+
+            if Path(self.store.path).resolve() == default_db_path().resolve():
+                signal_event(NUDGE_EVENT_NAME)
+        except Exception:
+            pass
+
     def page_top(self, thread: ThreadInfo, captures: Sequence[PendingCapture]) -> tuple[float, str] | None:
         """The page's first capture, when this batch holds only later deltas of a page or document.
 
@@ -1419,7 +1590,9 @@ class JournalWorker:
                         thread_id=thread.id, app=thread.app, host=thread.host,
                         fact=text, importance=importance,
                         by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)), nature=nature,
-                        milestone=item.get("milestone") is True)
+                        milestone=item.get("milestone") is True,
+                        source=source_of(sources[index], thread, sources, index),
+                        tainted=item.get("other_ai") is True)
             )
             if indexes is not None:
                 indexes.append(index)

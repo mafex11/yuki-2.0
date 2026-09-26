@@ -444,11 +444,13 @@ def run(args: argparse.Namespace) -> int:
 
         if not (args.no_journal or args.no_portrait):
             try:
+                from yuki.memory.embed import get_embedder   # the shared one: loaded only when a fact needs a vector
                 from yuki.memory.portrait import PortraitScheduler, PortraitWorker
                 from yuki.memory.watcher import user_idle_s
 
                 portrait = PortraitScheduler(
-                    store, PortraitWorker(store), db_path=db_path, log=log, idle_fn=user_idle_s
+                    store, PortraitWorker(store, embedder=get_embedder()), db_path=db_path, log=log,
+                    idle_fn=user_idle_s,
                 )
                 portrait_thread = threading.Thread(
                     target=_guarded(portrait.run, log, "portrait"), args=(stop,), name="yuki-memory-portrait",

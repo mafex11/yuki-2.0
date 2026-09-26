@@ -131,7 +131,10 @@ def test_page_delta_gets_its_top_and_old_content_is_dated_by_it(store):
     assert result.ok
     request = client.requests[0]["messages"][0]["content"]
     assert "TOP OF THIS PAGE" in request and "Jun 12, 2025" in request
-    assert "content_date" in client.requests[0]["system"] or "content date" in client.requests[0]["system"].lower()
+    from yuki.memory.journal import system_text
+
+    sent = system_text(client.requests[0]["system"])
+    assert "content_date" in sent or "content date" in sent.lower()
     rows = {j.fact[:20]: j for j in store.journal_between()}
     watched = next(j for j in rows.values() if j.fact.startswith("The user watched"))
     said = next(j for j in rows.values() if "quix" in j.fact)
@@ -158,7 +161,9 @@ def test_call_side_questions_are_stored_with_their_evidence(store):
     [q] = store.questions()
     [j] = store.journal_between()
     assert q.subject == "Tibo" and q.origin == "journal" and q.source_ids == [j.id]
-    assert "ASK ABOUT NAMES" in client.requests[0]["system"]
+    from yuki.memory.journal import system_text
+
+    assert "ASK ABOUT NAMES" in system_text(client.requests[0]["system"])
     assert RECORD_CALL_SIDE_TOOL["input_schema"]["required"] == ["facts", "commitments", "questions"]
 
 
@@ -258,12 +263,29 @@ def test_audit_scope_only_what_new_evidence_touches(store):
         assert worker.audit(now=T0 + 7200) is not None and len(client.requests) == 1
         # nothing new: no model call
         assert worker.audit(now=T0 + 7300) is None and len(client.requests) == 1
-        # new evidence names Elina: only her fact is looked at again
-        journal_page(store, logs, "WhatsApp", "RES", "elina: thanks for the help",
-                     [fact("In the WhatsApp group RES, Elina thanked the user for the help.", 1)], T0 + 9000)
+        # new evidence close in meaning to Elina's fact (the shared embedder's vectors): only hers is looked at
+        def axis(i):
+            v = np.zeros(32, dtype=np.float32)
+            v[i] = 1.0
+            return v
+
+        store.add_portrait_fact_vectors([(ids["course"], axis(0)), (ids["elina"], axis(1)), (ids["cse"], axis(2))],
+                                        "stub")
+        [thanks] = journal_page(store, logs, "WhatsApp", "RES", "elina: thanks for the help",
+                                [fact("In the WhatsApp group RES, Elina thanked the user for the help.", 1)], T0 + 9000)
+        store.add_vectors([(thanks.id, axis(1) + 0.1 * axis(5))], "stub")
+        store._conn.commit()
         under, reasons, recent = worker.audit_scope(T0 + 9100)
-        assert [f.id for f in under] == [ids["elina"]] and reasons[ids["elina"]] == "new journal entries name it"
+        assert [f.id for f in under] == [ids["elina"]] and "close to it in meaning" in reasons[ids["elina"]]
         assert len(recent) == 1
+        # a new version that only rewords (same meaning) is not new evidence; a moved one is
+        [(ok, reworded)] = store.commit_portrait_changes(None, [FactChange("UPDATE", ids["cse"], "interest", "CSE",
+                                                                           "The user studied BE in CSE.", 0.6,
+                                                                           [thanks.id], T0 + 9200)])
+        store.add_portrait_fact_vectors([(reworded, axis(2) + 0.05 * axis(6))], "stub")
+        store._conn.commit()
+        under, reasons, _ = worker.audit_scope(T0 + 9300)
+        assert reworded not in {f.id for f in under}
 
 
 def test_repair_of_mangled_tool_input():

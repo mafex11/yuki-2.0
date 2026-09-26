@@ -479,6 +479,10 @@ class JournalEntry:
     nature: str = "fact"
     #: The extractor judged it records something the user finished, shipped, merged, fixed or sent.
     milestone: bool = False
+    #: Where it came from (migration 17): ``{kind, by, quote, where, at}``, or ``None`` (older rows).
+    source: dict[str, Any] | None = None
+    #: Text the user typed into, or read from, another AI tool: never evidence of who the user is.
+    tainted: bool = False
 
 
 @dataclass
@@ -496,6 +500,9 @@ class NewFact:
     by_yuki: bool = False
     nature: str = "fact"
     milestone: bool = False
+    #: Provenance of the cited source (:func:`yuki.memory.provenance.source_of`), stored encrypted.
+    source: dict[str, Any] | None = None
+    tainted: bool = False
 
 
 @dataclass
@@ -560,6 +567,9 @@ class PortraitFact:
     #: ``personality`` facts: which part of the Personality section it is
     #: (yuki.memory.personality.ASPECTS: talk | cares | joke | story | people).
     aspect: str | None = None
+    #: 1-10, how much it matters for helping the user (migration 17): written by the model that
+    #: wrote the fact, moved by the nightly dreaming pass; ``None`` for facts written before.
+    importance: int | None = None
 
 
 @dataclass
@@ -585,6 +595,8 @@ class FactChange:
     folds: list[int] = field(default_factory=list)
     episode_ids: list[int] = field(default_factory=list)
     aspect: str | None = None
+    #: 1-10; ``None`` on an UPDATE keeps the old version's.
+    importance: int | None = None
 
 
 @dataclass
@@ -1861,6 +1873,69 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE journal ADD COLUMN milestone INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX journal_milestone ON journal(milestone, at);
     """,
+    # 17: OpenClaw-inspired memory (docs/MEMORY.md, "Fast memory, provenance, dreaming"):
+    # - journal.source: where each fact came from (the cited source's kind, who said it, a short
+    #   quote, the conversation or page), encrypted JSON, so every answer can say where and when;
+    # - journal.tainted: text the user typed into, or read from, another AI tool (judged by the
+    #   journal model from the content), never evidence of who the user is;
+    # - portrait_facts.importance (1-10, written by the model that writes the fact; the nightly
+    #   dreaming pass promotes and demotes it) and portrait_fact_vec, for the per-message recall;
+    # - standing_requests: "tell me when Varun replies", checked by the journal's own model call;
+    # - yuki_persona: Yuki's own short, evidence-cited "how Yuki talks" block, bi-temporal;
+    # - memory_changelog: the visible diary of what dreaming and the persona pass changed;
+    # - knowhow.origin: agent (remember_how) or conversation (the post-job extraction).
+    # Additive only, like 2-16.
+    """
+    ALTER TABLE journal ADD COLUMN source_ciphertext TEXT;
+    ALTER TABLE journal ADD COLUMN tainted INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE portrait_facts ADD COLUMN importance INTEGER;
+    CREATE TABLE portrait_fact_vec (
+        fact_id         INTEGER PRIMARY KEY REFERENCES portrait_facts(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    CREATE TABLE standing_requests (
+        id                   INTEGER PRIMARY KEY,
+        created_at           REAL NOT NULL,
+        condition_ciphertext TEXT NOT NULL,       -- what to watch for, as the agent wrote it
+        quote_ciphertext     TEXT NOT NULL,       -- the user's own words asking for it
+        source_request_ciphertext TEXT,
+        status               TEXT NOT NULL,       -- open | fired | cancelled | expired
+        max_fires            INTEGER NOT NULL DEFAULT 1,
+        fires                INTEGER NOT NULL DEFAULT 0,
+        cooldown_s           REAL NOT NULL,
+        expires_at           REAL,
+        last_fired_at        REAL,
+        last_nudge_id        INTEGER,
+        ended_at             REAL,
+        updated_at           REAL NOT NULL
+    );
+    CREATE INDEX standing_requests_status ON standing_requests(status, created_at);
+    CREATE TABLE yuki_persona (
+        id                  INTEGER PRIMARY KEY,
+        text_ciphertext     TEXT NOT NULL,
+        evidence_ciphertext TEXT,                 -- JSON: turn ids, quotes, card ids it rests on
+        valid_from          REAL NOT NULL,
+        valid_to            REAL,
+        superseded_by       INTEGER,
+        run_id              INTEGER,
+        created_at          REAL NOT NULL
+    );
+    CREATE TABLE memory_changelog (
+        id              INTEGER PRIMARY KEY,
+        at              REAL NOT NULL,
+        run_id          INTEGER,
+        pass            TEXT NOT NULL,            -- dream | persona
+        action          TEXT NOT NULL,            -- merge | retire | promote | demote | add | update | remove
+        fact_ids        TEXT,                     -- JSON: the facts (or persona items) it is about
+        new_fact_ids    TEXT,                     -- JSON: the versions it wrote
+        cites           TEXT,                     -- JSON: journal ids / turn ids it rests on
+        text_ciphertext TEXT NOT NULL             -- one human-readable diary line
+    );
+    CREATE INDEX memory_changelog_at ON memory_changelog(at);
+    ALTER TABLE knowhow ADD COLUMN origin TEXT;
+    """,
 )
 
 
@@ -2427,11 +2502,13 @@ class Store:
         nature = getattr(fact, "nature", None)
         cur = conn.execute(
             "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
-            " by_yuki, nature, milestone) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " by_yuki, nature, milestone, source_ciphertext, tainted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 float(fact.at), fact.thread_id, fact.app or "", fact.host, self.cipher.encrypt(fact.fact),
                 int(fact.importance), batch_id, time.time(), int(bool(getattr(fact, "by_yuki", False))),
                 nature if nature in JOURNAL_NATURES else "fact", int(bool(getattr(fact, "milestone", False))),
+                self._enc(json.dumps(fact.source, ensure_ascii=False)) if getattr(fact, "source", None) else None,
+                int(bool(getattr(fact, "tainted", False))),
             ),
         )
         journal_id = int(cur.lastrowid)
@@ -2557,7 +2634,19 @@ class Store:
             batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in keys else False,
             nature=nature if nature in JOURNAL_NATURES else "fact",
             milestone=bool(r["milestone"]) if "milestone" in keys else False,
+            source=self._source(r["source_ciphertext"]) if "source_ciphertext" in keys else None,
+            tainted=bool(r["tainted"]) if "tainted" in keys else False,
         )
+
+    def _source(self, stored: str | None) -> dict[str, Any] | None:
+        """A journal row's provenance JSON (decrypted), ``None`` when absent or unreadable."""
+        if not stored:
+            return None
+        try:
+            value = json.loads(self.cipher.decrypt(stored))
+        except Exception:
+            return None
+        return value if isinstance(value, dict) else None
 
     def search_journal(
         self,
@@ -2761,6 +2850,7 @@ class Store:
             created_at=r["created_at"], expired_at=r["expired_at"], superseded_by=r["superseded_by"],
             run_id=r["run_id"], episode_ids=episodes,
             aspect=(r["aspect"] if "aspect" in r.keys() and r["aspect"] in PERSONALITY_ASPECTS else None),
+            importance=(int(r["importance"]) if "importance" in r.keys() and r["importance"] is not None else None),
         )
 
     def portrait_facts(
@@ -2792,17 +2882,18 @@ class Store:
     def _insert_fact(
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
         source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
-        episode_ids: Sequence[int] = (), aspect: str | None = None,
+        episode_ids: Sequence[int] = (), aspect: str | None = None, importance: int | None = None,
     ) -> int:
         cur = conn.execute(
             "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
-            " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect)"
-            " VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?)",
+            " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect, importance)"
+            " VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
             (
                 kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
                 json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
                 json.dumps([int(i) for i in episode_ids]) if episode_ids else None,
                 aspect if kind == "personality" and aspect in PERSONALITY_ASPECTS else None,
+                None if importance is None else min(10, max(1, int(importance))),
             ),
         )
         return int(cur.lastrowid)
@@ -2856,10 +2947,14 @@ class Store:
                         out.append((False, None))
                         continue
                 if ch.op in ("ADD", "UPDATE"):
+                    importance = ch.importance
+                    if importance is None and old is not None and "importance" in old.keys():
+                        importance = old["importance"]   # an UPDATE that does not re-rate keeps the rating
                     new_id = self._insert_fact(
                         conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
                         source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
                         run_id=run_id, now=now, episode_ids=ch.episode_ids, aspect=ch.aspect,
+                        importance=importance,
                     )
                 if old is not None:
                     self._end_fact(conn, old["id"], at, now, new_id)
@@ -3158,8 +3253,12 @@ class Store:
         embed_model: str | None = None,
         supersedes: int | None = None,
         at: float | None = None,
+        origin: str | None = None,
     ) -> int:
         """Write a know-how entry; with ``supersedes``, end that entry (bi-temporal) in the same transaction.
+
+        ``origin``: ``agent`` (the agent's remember_how) or ``conversation`` (the conversation worker's
+        post-job extraction after a correction led to success).
 
         ``app`` is stored as :func:`app_key` (``"Arc.exe"`` -> ``"arc"``); ``None``/empty = general.
         """
@@ -3170,8 +3269,8 @@ class Store:
         def op(conn: sqlite3.Connection) -> int:
             cur = conn.execute(
                 "INSERT INTO knowhow(app, task_kind, text_ciphertext, valid_from, valid_to,"
-                " source_request_ciphertext, created_at) VALUES (?,NULL,?,?,NULL,?,?)",
-                (key, self.cipher.encrypt(text), when, self._enc(source_request), now),
+                " source_request_ciphertext, created_at, origin) VALUES (?,NULL,?,?,NULL,?,?,?)",
+                (key, self.cipher.encrypt(text), when, self._enc(source_request), now, origin),
             )
             new_id = int(cur.lastrowid)
             if vector is not None:
@@ -3206,6 +3305,29 @@ class Store:
             sql += " AND app IS NULL"
         sql += " ORDER BY valid_from DESC, id DESC"
         return [self._knowhow(r) for r in self._query(sql, params)]
+
+    def knowhow_duplicate(self, app: str | None, text: str, vector: np.ndarray | None,
+                          threshold: float = 0.85) -> int | None:
+        """The current entry a new know-how entry restates (same app; identical text, or embedding cosine at
+        least ``threshold``), which it then supersedes; ``None`` when it is new."""
+        key = app_key(app)
+        candidates = self.knowhow_current(key) if key else self.knowhow_current(None, any_app=False)
+        for k in candidates:
+            if k.text.casefold() == (text or "").casefold():
+                return k.id
+        if vector is None or not candidates:
+            return None
+        vec = np.asarray(vector, dtype=np.float32).ravel()
+        stored = self.knowhow_vectors([k.id for k in candidates])
+        best, best_id = -1.0, None
+        for k in candidates:
+            other = stored.get(k.id)
+            if other is None or other.shape != vec.shape:
+                continue
+            score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
+            if score >= threshold and score > best:
+                best, best_id = score, k.id
+        return best_id
 
     def knowhow_vectors(self, ids: Sequence[int]) -> dict[int, np.ndarray]:
         """Stored (decrypted) vectors for these know-how ids."""
@@ -3988,6 +4110,12 @@ class Store:
                     break
         return hits
 
+    def turns_between(self, since: TimeArg = None, until: TimeArg = None) -> list[ConversationTurn]:
+        """Every exchange in ``[since, until)``, oldest first (decrypted)."""
+        where, params = self._turn_filter(since, until)
+        return [self._turn(r) for r in self._query(
+            "SELECT t.* FROM conversation_turns t" + where + " ORDER BY t.at, t.id", params)]
+
     def turn_times(self, since: TimeArg = None, until: TimeArg = None) -> list[tuple[float, str]]:
         """``(at, session_id)`` of every exchange in ``[since, until)``, oldest first (content-free)."""
         where, params = self._turn_filter(since, until)
@@ -4453,40 +4581,41 @@ class Store:
         """
         if nudge is not None and nudge.kind not in NUDGE_KINDS:
             raise ValueError(f"unknown nudge kind {nudge.kind!r}")
+        return self._write(lambda conn: self._record_checkin(conn, checkin, nudge, question))
 
-        def op(conn: sqlite3.Connection) -> tuple[int, int | None]:
-            c = checkin
+    def _record_checkin(self, conn: sqlite3.Connection, checkin: NudgeCheckin, nudge: NewNudge | None,
+                        question: tuple[int, str] | None) -> tuple[int, int | None]:
+        """:meth:`record_checkin`'s writes, inside the caller's transaction."""
+        c = checkin
+        cur = conn.execute(
+            "INSERT INTO nudge_checkins(at, trigger, outcome, model, input_chars, input_tokens, output_tokens,"
+            " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error, reason_ciphertext)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (c.at, c.trigger, c.outcome, c.model, c.input_chars, c.input_tokens, c.output_tokens,
+             c.cache_write_tokens, c.cache_read_tokens, c.cost_usd, c.latency_ms, c.stop_reason, c.error,
+             self._enc(c.reason) if c.reason else None),
+        )
+        checkin_id = int(cur.lastrowid)
+        nudge_id = None
+        if nudge is not None:
             cur = conn.execute(
-                "INSERT INTO nudge_checkins(at, trigger, outcome, model, input_chars, input_tokens, output_tokens,"
-                " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error, reason_ciphertext)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (c.at, c.trigger, c.outcome, c.model, c.input_chars, c.input_tokens, c.output_tokens,
-                 c.cache_write_tokens, c.cache_read_tokens, c.cost_usd, c.latency_ms, c.stop_reason, c.error,
-                 self._enc(c.reason) if c.reason else None),
+                "INSERT INTO nudges(at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext,"
+                " ref, due_at, checkin_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (c.at, nudge.kind, nudge.trigger or c.trigger, self.cipher.encrypt(nudge.text),
+                 self._enc(nudge.reason), self._enc(json.dumps(nudge.inputs, ensure_ascii=False, default=str)),
+                 nudge.ref, nudge.due_at, checkin_id),
             )
-            checkin_id = int(cur.lastrowid)
-            nudge_id = None
-            if nudge is not None:
-                cur = conn.execute(
-                    "INSERT INTO nudges(at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext,"
-                    " ref, due_at, checkin_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (c.at, nudge.kind, nudge.trigger or c.trigger, self.cipher.encrypt(nudge.text),
-                     self._enc(nudge.reason), self._enc(json.dumps(nudge.inputs, ensure_ascii=False, default=str)),
-                     nudge.ref, nudge.due_at, checkin_id),
-                )
-                nudge_id = int(cur.lastrowid)
-                conn.execute("UPDATE nudge_checkins SET nudge_id=? WHERE id=?", (nudge_id, checkin_id))
-            if question is not None:
-                qid, status = question
-                conn.execute(
-                    "UPDATE questions SET status=?, nudge_id=coalesce(?, nudge_id),"
-                    " asked_at=CASE WHEN ?='asked' THEN ? ELSE asked_at END, updated_at=?"
-                    " WHERE id=? AND status IN ('open', 'asked')",
-                    (status, nudge_id, status, c.at, time.time(), int(qid)),
-                )
-            return checkin_id, nudge_id
-
-        return self._write(op)
+            nudge_id = int(cur.lastrowid)
+            conn.execute("UPDATE nudge_checkins SET nudge_id=? WHERE id=?", (nudge_id, checkin_id))
+        if question is not None:
+            qid, status = question
+            conn.execute(
+                "UPDATE questions SET status=?, nudge_id=coalesce(?, nudge_id),"
+                " asked_at=CASE WHEN ?='asked' THEN ? ELSE asked_at END, updated_at=?"
+                " WHERE id=? AND status IN ('open', 'asked')",
+                (status, nudge_id, status, c.at, time.time(), int(qid)),
+            )
+        return checkin_id, nudge_id
 
     def nudges(
         self, since: TimeArg = None, until: TimeArg = None, *, kinds: Sequence[str] | None = None,
@@ -5414,6 +5543,329 @@ class Store:
         return self._write(op)
 
     # -- maintenance -------------------------------------------------------
+
+    # -- fast recall index (migration 17) ------------------------------------
+
+    #: What :meth:`recall_vectors` reads per kind: the metadata columns and the join to the vectors.
+    _RECALL_SQL = {
+        "journal": ("SELECT j.id, j.at, j.importance, j.nature, j.tainted, j.by_yuki, v.vec_ciphertext, v.dim"
+                    " FROM journal j JOIN journal_vec v ON v.journal_id = j.id"
+                    " WHERE j.superseded_at IS NULL AND j.id > ?"),
+        "portrait": ("SELECT f.id, f.valid_from AS at, f.importance, f.kind, f.origin, f.confidence,"
+                     " v.vec_ciphertext, v.dim FROM portrait_facts f JOIN portrait_fact_vec v ON v.fact_id = f.id"
+                     " WHERE f.valid_to IS NULL AND f.id > ?"),
+        "episode": ("SELECT e.id, e.started_at AS at, e.ended_at, v.vec_ciphertext, v.dim"
+                    " FROM episodes e JOIN episode_vec v ON v.episode_id = e.id"
+                    " WHERE e.expired_at IS NULL AND e.id > ?"),
+        "commitment": ("SELECT c.id, c.valid_from AS at, c.status, c.kind, v.vec_ciphertext, v.dim"
+                       " FROM conversation_facts c JOIN conversation_fact_vec v ON v.fact_id = c.id"
+                       " WHERE c.kind = 'commitment' AND c.status IN ('active', 'done') AND c.id > ?"),
+    }
+
+    def recall_vectors(self, kind: str, after_id: int = 0) -> list[tuple[sqlite3.Row, np.ndarray]]:
+        """Rows of one recall-index kind with id above ``after_id``, each with its decrypted vector.
+
+        Kinds: ``journal`` (current facts), ``portrait`` (current facts), ``episode`` (current),
+        ``commitment`` (open or done). Nothing but the vectors is decrypted: the index
+        (:mod:`yuki.memory.relevant`) decrypts the text of the few it picks.
+        """
+        rows = self._query(self._RECALL_SQL[kind], (int(after_id),))
+        out: list[tuple[sqlite3.Row, np.ndarray]] = []
+        for r in rows:
+            try:
+                out.append((r, np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)))
+            except Exception:
+                continue
+        return out
+
+    def recall_live_ids(self) -> dict[str, set[int]]:
+        """Which indexed rows are still live, per kind (cheap id-only queries; nothing decrypted).
+
+        A journal fact can be superseded by a re-journal, a portrait fact or an episode replaced,
+        a commitment superseded or revoked after the index loaded it; the index drops those.
+        """
+        return {
+            "journal_dead": {r[0] for r in self._query("SELECT id FROM journal WHERE superseded_at IS NOT NULL")},
+            "portrait": {r[0] for r in self._query("SELECT id FROM portrait_facts WHERE valid_to IS NULL")},
+            "episode": {r[0] for r in self._query("SELECT id FROM episodes WHERE expired_at IS NULL")},
+            "commitment": {r[0] for r in self._query(
+                "SELECT id FROM conversation_facts WHERE kind='commitment' AND status IN ('active','done')")},
+        }
+
+    def episode_importance(self, spans: Sequence[tuple[int, float, float]]) -> dict[int, int]:
+        """The highest journal importance inside each episode's span (a measured signal the journal's model
+        wrote); ``{episode id: importance}``, episodes with no journal fact left out."""
+        out: dict[int, int] = {}
+        for eid, start, end in spans:
+            row = self._query("SELECT max(importance) FROM journal WHERE superseded_at IS NULL AND at >= ? AND at < ?",
+                              (float(start), float(end)))
+            if row and row[0][0] is not None:
+                out[int(eid)] = int(row[0][0])
+        return out
+
+    def journal_entries(self, ids: Iterable[int]) -> dict[int, JournalEntry]:
+        """Journal rows by id, superseded ones included (provenance of old citations)."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return {}
+        rows = self._query("SELECT * FROM journal WHERE id IN (%s)" % ",".join("?" * len(wanted)), wanted)
+        return {r["id"]: self._entry(r) for r in rows}
+
+    def portrait_facts_without_vectors(self, limit: int = 256) -> list[PortraitFact]:
+        """Current portrait facts that have no vector yet (new versions, or written before migration 17)."""
+        return [self._fact(r) for r in self._query(
+            "SELECT f.* FROM portrait_facts f LEFT JOIN portrait_fact_vec v ON v.fact_id = f.id"
+            " WHERE f.valid_to IS NULL AND v.fact_id IS NULL ORDER BY f.id LIMIT ?", (int(limit),))]
+
+    def add_portrait_fact_vectors(self, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        def op(conn: sqlite3.Connection) -> int:
+            for fact_id, vec in items:
+                self._put_vec(conn, "portrait_fact_vec", "fact_id", fact_id, vec, model)
+            return len(items)
+        return self._write(op) if items else 0
+
+    def point_superseded(self, fact_ids: Sequence[int], by: int) -> int:
+        """Point ended fact versions at the version that replaced them (a dreaming merge: each merged-away
+        fact is superseded by the merged one, so its history leads there)."""
+        ids = [int(i) for i in fact_ids]
+        if not ids:
+            return 0
+        return self._write(lambda conn: conn.execute(
+            "UPDATE portrait_facts SET superseded_by=? WHERE id IN (%s) AND valid_to IS NOT NULL AND superseded_by IS NULL"
+            % ",".join("?" * len(ids)), (int(by), *ids)).rowcount)
+
+    def portrait_fact_vectors(self, ids: Sequence[int]) -> dict[int, np.ndarray]:
+        """Stored (decrypted) vectors of these portrait fact versions (current or not)."""
+        wanted = [int(i) for i in ids]
+        if not wanted:
+            return {}
+        rows = self._query("SELECT fact_id, vec_ciphertext FROM portrait_fact_vec WHERE fact_id IN (%s)"
+                           % ",".join("?" * len(wanted)), wanted)
+        return {r["fact_id"]: np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+                for r in rows}
+
+    def fact_predecessors(self, ids: Sequence[int]) -> dict[int, int]:
+        """``{new version id: the version it superseded}`` for these fact ids (those that replaced one)."""
+        wanted = [int(i) for i in ids]
+        if not wanted:
+            return {}
+        rows = self._query("SELECT id, superseded_by FROM portrait_facts WHERE superseded_by IN (%s)"
+                           % ",".join("?" * len(wanted)), wanted)
+        return {int(r["superseded_by"]): int(r["id"]) for r in rows}
+
+    def set_fact_importance(self, fact_id: int, importance: int) -> bool:
+        """Re-rate a current portrait fact in place (the dreaming pass's promote / demote; logged in its diary)."""
+        return self._write(lambda conn: conn.execute(
+            "UPDATE portrait_facts SET importance=? WHERE id=? AND valid_to IS NULL",
+            (min(10, max(1, int(importance))), int(fact_id))).rowcount == 1)
+
+    # -- provenance backfill (yuki.memory.provenance) ----------------------------
+
+    def journal_without_source(self, limit: int = 5000) -> list[JournalEntry]:
+        """Current journal rows with no provenance yet (written before migration 17), oldest first."""
+        return [self._entry(r) for r in self._query(
+            "SELECT * FROM journal WHERE source_ciphertext IS NULL AND superseded_at IS NULL ORDER BY id LIMIT ?",
+            (int(limit),))]
+
+    def set_journal_sources(self, items: Sequence[tuple[int, dict[str, Any]]]) -> int:
+        """Write provenance onto journal rows that have none (never overwrites one)."""
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for jid, source in items:
+                n += conn.execute(
+                    "UPDATE journal SET source_ciphertext=? WHERE id=? AND source_ciphertext IS NULL",
+                    (self.cipher.encrypt(json.dumps(source, ensure_ascii=False)), int(jid))).rowcount
+            return n
+        return self._write(op) if items else 0
+
+    def batch_capture_rows(self, batch_id: int) -> list[PendingCapture]:
+        """Every capture a journal batch read that is still stored (30-day TTL), oldest first."""
+        rows = self._query(
+            "SELECT id, thread_id, at, trigger, delta_ciphertext, chars, journal_attempts, kind, profile, by_yuki,"
+            " yuki_request_ciphertext FROM captures WHERE journal_batch_id = ? ORDER BY at, id", (int(batch_id),))
+        return [
+            PendingCapture(
+                id=r["id"], thread_id=r["thread_id"], at=r["at"], trigger=r["trigger"],
+                delta=self.cipher.decrypt(r["delta_ciphertext"]), chars=r["chars"],
+                attempts=r["journal_attempts"], kind=r["kind"], profile=r["profile"],
+                by_yuki=bool(r["by_yuki"]), yuki_request=self._dec(r["yuki_request_ciphertext"]),
+            )
+            for r in rows
+        ]
+
+    # -- standing requests (migration 17) -------------------------------------
+
+    def _request_row(self, r: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": r["id"], "created_at": r["created_at"], "condition": self.cipher.decrypt(r["condition_ciphertext"]),
+            "quote": self.cipher.decrypt(r["quote_ciphertext"]),
+            "request": self._dec(r["source_request_ciphertext"]), "status": r["status"],
+            "max_fires": r["max_fires"], "fires": r["fires"], "cooldown_s": r["cooldown_s"],
+            "expires_at": r["expires_at"], "last_fired_at": r["last_fired_at"], "last_nudge_id": r["last_nudge_id"],
+            "ended_at": r["ended_at"],
+        }
+
+    def add_standing_request(self, condition: str, quote: str, *, request: str | None = None, max_fires: int = 1,
+                             cooldown_s: float = 1800.0, expires_at: float | None = None,
+                             at: float | None = None) -> int:
+        now = time.time() if at is None else float(at)
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO standing_requests(created_at, condition_ciphertext, quote_ciphertext,"
+            " source_request_ciphertext, status, max_fires, fires, cooldown_s, expires_at, updated_at)"
+            " VALUES (?,?,?,?,'open',?,0,?,?,?)",
+            (now, self.cipher.encrypt(condition), self.cipher.encrypt(quote), self._enc(request),
+             max(1, int(max_fires)), float(cooldown_s), expires_at, now)).lastrowid))
+
+    def standing_requests(self, statuses: Sequence[str] | None = ("open",), *, now: float | None = None
+                          ) -> list[dict[str, Any]]:
+        """Standing requests by status, oldest first; open ones past their expiry are marked expired first."""
+        now = time.time() if now is None else float(now)
+        expired = self._query("SELECT count(*) FROM standing_requests WHERE status='open'"
+                              " AND expires_at IS NOT NULL AND expires_at <= ?", (now,))[0][0]
+        if expired:
+            self._write(lambda conn: conn.execute(
+                "UPDATE standing_requests SET status='expired', ended_at=?, updated_at=? WHERE status='open'"
+                " AND expires_at IS NOT NULL AND expires_at <= ?", (now, now, now)))
+        sql = "SELECT * FROM standing_requests"
+        params: list[Any] = []
+        if statuses:
+            sql += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+            params.extend(statuses)
+        return [self._request_row(r) for r in self._query(sql + " ORDER BY created_at, id", params)]
+
+    def standing_request(self, request_id: int) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM standing_requests WHERE id=?", (int(request_id),))
+        return self._request_row(rows[0]) if rows else None
+
+    def end_standing_request(self, request_id: int, status: str = "cancelled", *, at: float | None = None) -> bool:
+        now = time.time() if at is None else float(at)
+        return self._write(lambda conn: conn.execute(
+            "UPDATE standing_requests SET status=?, ended_at=?, updated_at=? WHERE id=? AND status='open'",
+            (status, now, now, int(request_id))).rowcount == 1)
+
+    def fire_standing_request(self, request_id: int, checkin: NudgeCheckin, nudge: NewNudge, *,
+                              now: float | None = None, daily_budget: int = 6,
+                              day_start: float | None = None) -> tuple[int | None, str]:
+        """Write the card for one match, in one transaction with the request's count (plumbing gates in code).
+
+        Refused (``(None, why)``) when the request is not open, is still in its cooldown since
+        its last card, already fired its own budget, or ``daily_budget`` request cards were
+        already written since ``day_start``. The last allowed fire closes it (``fired``).
+        """
+        now = time.time() if now is None else float(now)
+        if nudge.kind not in NUDGE_KINDS:
+            raise ValueError(f"unknown nudge kind {nudge.kind!r}")
+
+        def op(conn: sqlite3.Connection) -> tuple[int | None, str]:
+            r = conn.execute("SELECT * FROM standing_requests WHERE id=?", (int(request_id),)).fetchone()
+            if r is None or r["status"] != "open":
+                return None, "not open"
+            if r["expires_at"] is not None and r["expires_at"] <= now:
+                conn.execute("UPDATE standing_requests SET status='expired', ended_at=?, updated_at=? WHERE id=?",
+                             (now, now, r["id"]))
+                return None, "expired"
+            if r["last_fired_at"] is not None and now - r["last_fired_at"] < r["cooldown_s"]:
+                return None, "cooldown"
+            if r["fires"] >= r["max_fires"]:
+                return None, "budget"
+            if day_start is not None:
+                today = conn.execute("SELECT count(*) FROM nudges WHERE ref LIKE 'request:%' AND at >= ?",
+                                     (float(day_start),)).fetchone()[0]
+                if today >= daily_budget:
+                    return None, "daily budget"
+            _checkin_id, nudge_id = self._record_checkin(conn, checkin, nudge, None)
+            fires = r["fires"] + 1
+            status = "fired" if fires >= r["max_fires"] else "open"
+            conn.execute(
+                "UPDATE standing_requests SET fires=?, last_fired_at=?, last_nudge_id=?, status=?, ended_at=?,"
+                " updated_at=? WHERE id=?",
+                (fires, now, nudge_id, status, now if status != "open" else None, now, r["id"]))
+            return nudge_id, "fired"
+
+        return self._write(op)
+
+    # -- Yuki's persona and the changelog (migration 17) ------------------------
+
+    def persona_items(self, *, include_ended: bool = False) -> list[dict[str, Any]]:
+        """Yuki's own persona items (current ones, or every version), oldest first."""
+        sql = "SELECT * FROM yuki_persona" + ("" if include_ended else " WHERE valid_to IS NULL") + " ORDER BY id"
+        out = []
+        for r in self._query(sql):
+            try:
+                evidence = json.loads(self._dec(r["evidence_ciphertext"]) or "{}")
+            except ValueError:
+                evidence = {}
+            out.append({"id": r["id"], "text": self.cipher.decrypt(r["text_ciphertext"]), "evidence": evidence,
+                        "valid_from": r["valid_from"], "valid_to": r["valid_to"],
+                        "superseded_by": r["superseded_by"], "run_id": r["run_id"]})
+        return out
+
+    def commit_persona(self, run_id: int | None, changes: Sequence[dict[str, Any]],
+                       diary: Sequence[dict[str, Any]], *, now: float | None = None) -> list[int | None]:
+        """Apply validated persona changes (``{op: add|update|remove, id, text, evidence}``) and their diary lines
+        in one transaction; returns the new row id per change (``None`` for a remove or a skipped one)."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> list[int | None]:
+            out: list[int | None] = []
+            for ch in changes:
+                new_id = None
+                if ch["op"] in ("update", "remove"):
+                    live = conn.execute("SELECT id FROM yuki_persona WHERE id=? AND valid_to IS NULL",
+                                        (int(ch.get("id") or 0),)).fetchone()
+                    if live is None:
+                        out.append(None)
+                        continue
+                if ch["op"] in ("add", "update"):
+                    new_id = int(conn.execute(
+                        "INSERT INTO yuki_persona(text_ciphertext, evidence_ciphertext, valid_from, run_id, created_at)"
+                        " VALUES (?,?,?,?,?)",
+                        (self.cipher.encrypt(ch["text"]),
+                         self.cipher.encrypt(json.dumps(ch.get("evidence") or {}, ensure_ascii=False)),
+                         now, run_id, now)).lastrowid)
+                if ch["op"] in ("update", "remove"):
+                    conn.execute("UPDATE yuki_persona SET valid_to=?, superseded_by=? WHERE id=? AND valid_to IS NULL",
+                                 (now, new_id, int(ch["id"])))
+                out.append(new_id)
+            for line in diary:
+                self._insert_diary(conn, run_id, now, line)
+            return out
+
+        return self._write(op)
+
+    def _insert_diary(self, conn: sqlite3.Connection, run_id: int | None, now: float, line: dict[str, Any]) -> int:
+        return int(conn.execute(
+            "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (now, run_id, line["pass"], line["action"], json.dumps(line.get("fact_ids") or []),
+             json.dumps(line.get("new_fact_ids") or []), json.dumps(line.get("cites") or []),
+             self.cipher.encrypt(line["text"]))).lastrowid)
+
+    def add_diary(self, run_id: int | None, lines: Sequence[dict[str, Any]], *, now: float | None = None) -> int:
+        """Append diary lines (``{pass, action, text, fact_ids, new_fact_ids, cites}``) to the memory changelog."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> int:
+            for line in lines:
+                self._insert_diary(conn, run_id, now, line)
+            return len(lines)
+
+        return self._write(op) if lines else 0
+
+    def changelog(self, *, since: TimeArg = None, pass_: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """The memory diary, newest first: what dreaming and the persona pass changed, one line each."""
+        sql, params = "SELECT * FROM memory_changelog WHERE 1=1", []
+        if (s := _ts(since)) is not None:
+            sql += " AND at >= ?"
+            params.append(s)
+        if pass_:
+            sql += " AND pass = ?"
+            params.append(pass_)
+        rows = self._query(sql + " ORDER BY at DESC, id DESC LIMIT ?", [*params, int(limit)])
+        return [{"id": r["id"], "at": r["at"], "run_id": r["run_id"], "pass": r["pass"], "action": r["action"],
+                 "fact_ids": json.loads(r["fact_ids"] or "[]"), "new_fact_ids": json.loads(r["new_fact_ids"] or "[]"),
+                 "cites": json.loads(r["cites"] or "[]"), "text": self.cipher.decrypt(r["text_ciphertext"])}
+                for r in rows]
 
     def prune(self, older_than_days: float = 30) -> int:
         """Delete captures (and stale latest texts) older than the TTL; returns captures deleted.
