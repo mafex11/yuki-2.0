@@ -844,7 +844,10 @@ def test_transcriber_waits_for_a_free_pc(blocker: str, fact: str, value: Any) ->
 
 
 def test_transcriber_waits_during_a_call_and_stops_when_one_starts() -> None:
+    # With defer_during_calls off, the old behaviour: no batch while a call is open.
     sched, state, store, logged, spawned = _scheduler()
+    from dataclasses import replace
+    sched._config = replace(sched._config, during_calls=False)
     store.call_open = True
     _observe(sched)
     assert not spawned
@@ -892,3 +895,10 @@ def test_without_present_runs_the_old_gates_hold() -> None:
     state["night"] = True
     _observe(sched, 6.0)
     assert [f["why"] for t, f in logged if t == "call_transcribe_start"] == ["night"]
+
+
+def test_transcriber_runs_during_an_idle_call_when_nothing_is_full_screen() -> None:
+    sched, state, store, logged, spawned = _scheduler()
+    store.call_open = True
+    _observe(sched)
+    assert len(spawned) == 1
