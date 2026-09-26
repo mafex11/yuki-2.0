@@ -392,6 +392,7 @@ defer_vram_free_mb = 2500
 defer_cpu_max_percent = 75   # average %; the worker is on the GPU at below-normal priority
 defer_back_idle_s = 20
 defer_when_present = true
+defer_during_calls = true   # also while a call is open, if nothing is full screen and the GPU is quiet
 defer_gpu_others_max_util = 25
 defer_others_window_s = 30
 defer_vram_min_free_running_mb = 300

@@ -86,6 +86,9 @@ class DeferConfig:
     #: Run while the user is at the PC when every other gate holds (no call, nothing full
     #: screen, the GPU quiet by the averaged measure, VRAM free, the CPU not busy).
     present: bool = True
+    #: Also run while a call is open, when nothing is full screen (no game) and the GPU is quiet:
+    #: an idle Discord call used to hold transcription back for hours (2026-09-27).
+    during_calls: bool = True
     #: During a present run: other processes' share of the GPU (SM %, summed, averaged over
     #: ``others_window_s``) above which it stops (a game or a render started in a window).
     gpu_others_max_util: float = 25.0
@@ -112,6 +115,7 @@ class DeferConfig:
         if not (isinstance(night, list) and len(night) == 2):
             night = list(d.night)
         present = t.get("defer_when_present", d.present)
+        during_calls = t.get("defer_during_calls", d.during_calls)
         return cls(
             check_s=max(10.0, num("defer_check_s", d.check_s)), idle_min=num("defer_idle_min", d.idle_min),
             night=(str(night[0]), str(night[1])), gpu_max_util=num("defer_gpu_max_util", d.gpu_max_util),
@@ -120,6 +124,7 @@ class DeferConfig:
             cpu_max_percent=num("defer_cpu_max_percent", d.cpu_max_percent),
             back_idle_s=num("defer_back_idle_s", d.back_idle_s), stop_grace_s=num("defer_stop_grace_s", d.stop_grace_s),
             present=present if isinstance(present, bool) else d.present,
+            during_calls=during_calls if isinstance(during_calls, bool) else d.during_calls,
             gpu_others_max_util=num("defer_gpu_others_max_util", d.gpu_others_max_util),
             others_window_s=num("defer_others_window_s", d.others_window_s),
             vram_min_free_running_mb=num("defer_vram_min_free_running_mb", d.vram_min_free_running_mb),
@@ -291,7 +296,7 @@ class TranscribeScheduler:
         (``locked`` | ``away`` | ``night`` | ``present``)."""
         if self.paused:
             return "paused", ""
-        if self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
+        if not cfg.during_calls and self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
             return "call_active", ""
         if bool((self.live_fn() or {}).get("fullscreen")) or self.busy_fn():
             return "fullscreen", ""
@@ -326,7 +331,7 @@ class TranscribeScheduler:
         now = time.monotonic() if now is None else float(now)
         if self.paused:
             return "paused"
-        if self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
+        if not cfg.during_calls and self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
             return "call_started"
         if bool((self.live_fn() or {}).get("fullscreen")) or self.busy_fn():
             return "fullscreen"
