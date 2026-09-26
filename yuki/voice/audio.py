@@ -6,9 +6,12 @@
   the wake-word spotter between conversations, the pipeline during one. It
   keeps the last few seconds in memory only, so the words right after "Yuki"
   reach the conversation that the name starts. Nothing is written anywhere.
-* :class:`Speaker` plays 16-bit mono PCM on the default output (shared mode).
-* :func:`headphones_check` is the headphone rule (docs/VOICE.md §11): the
-  existing Core Audio check (:func:`yuki.perception.audio.output_is_headphones`).
+* :class:`Speaker` plays 16-bit mono PCM on the default output (shared mode) and
+  tells the echo guard's :class:`~yuki.voice.echo.PlaybackTimeline` what it plays.
+* :func:`headphones_check` reads the output's form factor through Core Audio
+  (:func:`yuki.perception.audio.output_is_headphones`); it picks the echo mode
+  (docs/VOICE.md §11): headphones full duplex, speakers echo-cancelled or half duplex.
+* :func:`play_pcm` plays a short earcon (a failure's tone) outside a conversation.
 
 Which microphone: the configured one (``Settings.voice_input_device``, a name
 or part of one), else Windows' default *communications* input, found by the
@@ -32,9 +35,14 @@ RATE = 16_000
 BLOCK_MS = 20
 BLOCK_SAMPLES = RATE * BLOCK_MS // 1000
 
-#: How much recent audio the mic keeps in memory for a conversation the wake
-#: word starts (the name itself and what follows it).
-BACKLOG_S = 3.0
+#: How much recent audio the mic keeps in memory (RAM only, ~380 KB) for a conversation
+#: the wake word starts: the name itself and everything said after it until speech
+#: recognition is connected. The first wake after the app starts imports Pipecat
+#: (3.6-5.5 s measured) and Deepgram connects in 1.2-3 s, so 3 s lost the words right
+#: after the name ("Yuki, pause the music" in one breath) on a cold start.
+BACKLOG_S = 12.0
+#: A block whose peak reaches this is counted as clipped (the input's gain is too hot).
+CLIP_PEAK = 0.999
 
 #: A 20 ms block at or above this level always counts as voiced for the "end of
 #: speech" timing in the voice log (and the narrator's raw-sound gate).
@@ -46,6 +54,34 @@ VOICED_DBFS = -42.0
 #: timing was empty. Measurement only.
 VOICED_OVER_FLOOR = 4.0
 VOICED_MIN_DBFS = -62.0
+
+
+#: PortAudio streams this process has open (mic and speakers). PortAudio reads the device
+#: list once, when it starts; after a device change or the PC waking from sleep an index
+#: can point at a device that is gone. It can only be re-read with no stream open.
+_OPEN_STREAMS = 0
+_STREAMS_LOCK = threading.Lock()
+
+
+def _stream_opened(delta: int) -> None:
+    global _OPEN_STREAMS
+    with _STREAMS_LOCK:
+        _OPEN_STREAMS = max(0, _OPEN_STREAMS + delta)
+
+
+def refresh_devices() -> bool:
+    """Re-read PortAudio's device list (after a device change or sleep); only when no stream is open."""
+    import sounddevice as sd
+
+    with _STREAMS_LOCK:
+        if _OPEN_STREAMS:
+            return False
+        try:
+            sd._terminate()
+            sd._initialize()
+            return True
+        except Exception:  # noqa: BLE001 - the old list stays
+            return False
 
 
 def _wasapi(sd: Any) -> int | None:
@@ -109,14 +145,26 @@ class MicStats:
     floor: float = 0.0
     #: Loudest block RMS seen (linear), for the log.
     loudest: float = 0.0
+    #: Highest sample seen (linear) and blocks whose peak reached full scale (a hot input gain).
+    peak: float = 0.0
+    clipped_blocks: int = 0
+    #: Blocks the echo guard replaced by silence while Yuki was audible (half duplex).
+    gated_blocks: int = 0
+    #: Of a two-channel input, how many blocks came from each channel (the louder one is kept).
+    channel_picks: list[int] | None = None
 
     def levels(self) -> dict[str, Any]:
         """Content-free level facts for the log (dBFS)."""
         def db(x: float) -> float | None:
             return round(20 * float(np.log10(x)), 1) if x > 0 else None
 
-        return {"blocks": self.blocks, "voiced_blocks": self.voiced_blocks, "floor_dbfs": db(self.floor),
-                "loudest_dbfs": db(self.loudest)}
+        out = {"blocks": self.blocks, "voiced_blocks": self.voiced_blocks, "floor_dbfs": db(self.floor),
+               "loudest_dbfs": db(self.loudest), "peak_dbfs": db(self.peak), "clipped_blocks": self.clipped_blocks}
+        if self.gated_blocks:
+            out["gated_blocks"] = self.gated_blocks
+        if self.channel_picks:
+            out["channel_picks"] = list(self.channel_picks)
+        return out
 
 
 class SharedMic:
@@ -146,6 +194,12 @@ class SharedMic:
         self._channels = 1
         self._voiced_floor = float(10 ** (VOICED_DBFS / 20.0))
         self._voiced_min = float(10 ** (VOICED_MIN_DBFS / 20.0))
+        #: The echo guard of the conversation on speakers (:class:`yuki.voice.echo.EchoGuard`), or ``None``.
+        self.echo: Any = None
+        #: The capture latency the stream reports (s), for lining Yuki's echo up with what she played.
+        self.input_latency_s = 0.02
+        #: Facts about the stream as opened (rate, channels), for the log.
+        self.format: dict[str, Any] = {}
 
     @property
     def is_open(self) -> bool:
@@ -166,6 +220,18 @@ class SharedMic:
         with self._lock:
             return [(pcm, at) for at, pcm in self._backlog if at >= since]
 
+    def subscribe_from(self, fn: Callable[[bytes, float], None], since: float) -> tuple[int, list[tuple[bytes, float]]]:
+        """Subscribe and take the kept blocks from ``since`` in one step: none lost, none twice."""
+        with self._lock:
+            kept = [(pcm, at) for at, pcm in self._backlog if at >= since]
+            self._next += 1
+            self._subs[self._next] = fn
+            return self._next, kept
+
+    def set_echo(self, guard: Any) -> None:
+        """Put an echo guard in front of every subscriber (``None``: none)."""
+        self.echo = guard
+
     def open(self) -> dict[str, Any]:
         """Open the stream (no-op when open). Returns facts for the log. Raises on failure."""
         if self._stream is not None:
@@ -173,10 +239,21 @@ class SharedMic:
         import sounddevice as sd
 
         name = self.device or default_capture_name()
+        try:
+            return self._open(sd, name)
+        except Exception:  # noqa: BLE001 - the device list may be stale (a device change, sleep): re-read once
+            if not refresh_devices():
+                raise
+            facts = self._open(sd, name)
+            facts["devices_refreshed"] = True
+            return facts
+
+    def _open(self, sd: Any, name: str | None) -> dict[str, Any]:
         index, facts = find_device(sd, kind="input", name=name)
         info = sd.query_devices(index if index is not None else sd.default.device[0])
         self.device_used = str(info["name"])
         self._channels = max(1, min(2, int(info["max_input_channels"])))
+        self.stats.channel_picks = [0, 0] if self._channels == 2 else None
         try:
             self._stream = sd.InputStream(
                 device=index, samplerate=RATE, channels=self._channels, dtype="float32",
@@ -194,10 +271,27 @@ class SharedMic:
                 blocksize=native * BLOCK_MS // 1000, callback=self._callback,
             )
             self.opened_as = f"wasapi_shared_{native}hz_resampled"
-        self._stream.start()
-        return {"device": self.device_used, "opened_as": self.opened_as, "wanted": name, **facts}
+        try:
+            self._stream.start()
+        except Exception:
+            stream, self._stream = self._stream, None
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        _stream_opened(+1)
+        try:
+            self.input_latency_s = float(self._stream.latency)
+        except (TypeError, ValueError, AttributeError):
+            self.input_latency_s = 0.02
+        self.format = {"device_rate": int(info["default_samplerate"]), "channels": self._channels,
+                       "input_latency_ms": round(self.input_latency_s * 1000, 1)}
+        return {"device": self.device_used, "opened_as": self.opened_as, "wanted": name, **facts, **self.format}
 
-    def close(self) -> None:
+    def close(self, *, keep_backlog: bool = False) -> None:
+        """Close the stream. ``keep_backlog``: only for a moment (PortAudio re-reading its device
+        list): the kept audio and the subscribers stay, and ``open()`` carries on."""
         stream, self._stream = self._stream, None
         if stream is not None:
             try:
@@ -205,9 +299,11 @@ class SharedMic:
                 stream.close()
             except Exception:  # noqa: BLE001
                 pass
+            _stream_opened(-1)
         self._resample = None
-        with self._lock:
-            self._backlog.clear()
+        if not keep_backlog:
+            with self._lock:
+                self._backlog.clear()
 
     def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         del frames, time_info
@@ -218,19 +314,42 @@ class SharedMic:
             # An interface's mic is usually on one input: keep the louder channel.
             loud = int(np.argmax(np.abs(block).mean(axis=0)))
             block = block[:, loud]
+            picks = self.stats.channel_picks
+            if picks is not None and loud < len(picks):
+                picks[loud] += 1
         mono = np.ascontiguousarray(block.reshape(-1), dtype=np.float32)
         if self._resample is not None:
             mono = self._resample.resample_chunk(mono)
         self.feed(mono, time.monotonic() - len(mono) / RATE)
 
     def feed(self, mono: np.ndarray, at: float) -> None:
-        """Push float32 mono 16 kHz audio as if it came from the device (tests use this too)."""
+        """Push float32 mono 16 kHz audio as if it came from the device (tests use this too).
+
+        With an echo guard set (a conversation on speakers), the block is cleaned first, so
+        every subscriber, the backlog and the levels see the mic without Yuki's own voice.
+        """
         if mono.size == 0:
             return
-        level = float(np.sqrt(np.mean(mono * mono)))
-        pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         st = self.stats
-        st.blocks += 1
+        st.blocks += 1  # every block, gated or not: the device watch reads a still counter as a dead stream
+        peak = float(np.max(np.abs(mono)))
+        st.peak = max(st.peak, peak)
+        if peak >= CLIP_PEAK:
+            st.clipped_blocks += 1
+        guard = self.echo
+        if guard is not None:
+            try:
+                if guard.expired(at):
+                    self.echo = guard = None
+                else:
+                    mono, gated = guard.process(mono, at)
+                    if gated:
+                        st.gated_blocks += 1
+                        self._fan_out(mono, at)  # silence: the room's floor and "voiced" skip it
+                        return
+            except Exception:  # noqa: BLE001 - a guard error must never stop the microphone
+                self.echo = None
+        level = float(np.sqrt(np.mean(mono * mono)))
         st.loudest = max(st.loudest, level)
         if st.floor <= 0.0 or level < st.floor:
             st.floor = max(level, 1e-6)
@@ -241,6 +360,10 @@ class SharedMic:
             if at - st.last_voiced > 0.5:
                 st.voiced_since = at
             st.last_voiced = at + len(mono) / RATE
+        self._fan_out(mono, at)
+
+    def _fan_out(self, mono: np.ndarray, at: float) -> None:
+        pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         with self._lock:
             self._backlog.append((at, pcm))
             subs = list(self._subs.values())
@@ -252,40 +375,105 @@ class SharedMic:
 
 
 class Speaker:
-    """Blocking 16-bit mono output on a WASAPI shared-mode device."""
+    """Blocking 16-bit mono output on a WASAPI shared-mode device.
+
+    ``device`` is the output's friendly name (the tray's choice, or Windows' default as Core
+    Audio names it now); ``open()`` reports in ``found`` whether PortAudio had that device
+    (its list is read once, when it starts: a device connected later is missing until the
+    list is re-read, :func:`refresh_devices`). ``timeline`` (a
+    :class:`yuki.voice.echo.PlaybackTimeline`) is told about every chunk just before it is
+    written, so the echo guard knows what the mic will hear and when. :meth:`switch` moves
+    a running output to another device between two writes.
+    """
 
     def __init__(self, rate: int, device: str | None = None) -> None:
         self.rate = rate
         self.device = device
         self.device_used: str | None = None
         self._stream: Any = None
+        self._lock = threading.Lock()
+        self.timeline: Any = None
+        #: The output latency the stream reports (s).
+        self.latency_s = 0.03
 
     def open(self) -> dict[str, Any]:
+        with self._lock:
+            return self._open()
+
+    def _open(self) -> dict[str, Any]:
         import sounddevice as sd
 
         index, facts = find_device(sd, kind="output", name=self.device)
         info = sd.query_devices(index if index is not None else sd.default.device[1])
         self.device_used = str(info["name"])
-        self._stream = sd.RawOutputStream(
+        stream = sd.RawOutputStream(
             device=index, samplerate=self.rate, channels=1, dtype="int16",
             extra_settings=sd.WasapiSettings(auto_convert=True),
         )
-        self._stream.start()
-        return {"device": self.device_used, **facts}
+        stream.start()
+        self._stream = stream
+        _stream_opened(+1)
+        try:
+            self.latency_s = float(stream.latency)
+        except (TypeError, ValueError, AttributeError):
+            self.latency_s = 0.03
+        return {"device": self.device_used, "wanted": self.device, "index": index, **facts,
+                "found": bool(self.device) and facts.get("reason") == "named",
+                "output_latency_ms": round(self.latency_s * 1000, 1)}
 
-    def write(self, pcm: bytes) -> None:
-        stream = self._stream
-        if stream is not None:
-            stream.write(pcm)
+    def write(self, pcm: bytes, *, gate: bool = True) -> None:
+        """Play ``pcm`` (blocking). ``gate=False``: an earcon the echo guard cancels but never silences the mic for."""
+        with self._lock:
+            stream = self._stream
+            if stream is not None:
+                timeline = self.timeline
+                if timeline is not None:
+                    try:
+                        timeline.played(pcm, self.rate, gate=gate)
+                    except Exception:  # noqa: BLE001 - the echo guard then gates by the tail only
+                        pass
+                stream.write(pcm)
+
+    def switch(self, device: str | None, *, between: Any = None) -> dict[str, Any]:
+        """Move to ``device`` between two writes (what is queued on the old one plays out first).
+
+        ``between()`` runs with no stream of ours open (the session re-reads PortAudio's list there).
+        """
+        with self._lock:
+            self._close()
+            if between is not None:
+                between()
+            self.device = device
+            return self._open()
 
     def close(self) -> None:
+        with self._lock:
+            self._close()
+
+    def _close(self) -> None:
         stream, self._stream = self._stream, None
         if stream is not None:
             try:
-                stream.stop()
+                stream.stop()  # plays what is queued first
                 stream.close()
             except Exception:  # noqa: BLE001
                 pass
+            _stream_opened(-1)
+
+
+def play_pcm(pcm: bytes, rate: int, device: str | None = None) -> None:
+    """Play a short int16 mono clip on ``device`` (``None``: the default output) and wait; never raises.
+
+    For the earcons outside a conversation (a failure's tone): its own short-lived stream.
+    """
+    speaker = Speaker(rate, device)
+    try:
+        speaker.open()
+        speaker.write(pcm)
+    except Exception:  # noqa: BLE001 - the pill still says it
+        pass
+    finally:
+        speaker.close()
 
 
 def headphones_check(known: tuple[str, ...] = (), device: str | None = None) -> tuple[bool, dict[str, Any]]:

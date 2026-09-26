@@ -12,6 +12,7 @@ file transport opens a device.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,38 @@ from yuki.voice.audio import BLOCK_MS, BLOCK_SAMPLES, RATE, SharedMic, Speaker
 #: per-frame work of 20 ms frames while a conversation is open.
 FRAME_BLOCKS = 4
 
+#: The kept audio replayed after a wake is squeezed before it goes to speech recognition:
+#: Deepgram Flux works through a burst at only ~1.25x real time (measured 2026-09-26: an
+#: instant 7 s burst got its end of turn 1.3 s sooner than streaming it live), so every
+#: second replayed stays as lag for about four seconds of the conversation. A silence in it
+#: longer than this is cut down to it (a pause stays a pause)...
+REPLAY_MAX_PAUSE_BLOCKS = 20   # 0.4 s
+#: ...and this much of the silence at its end is kept (the live mic carries on from there).
+REPLAY_TAIL_BLOCKS = 15        # 0.3 s
+#: A kept block is speech when it is this many times above the kept audio's own floor.
+REPLAY_VOICE_RATIO = 3.0
+REPLAY_MIN_RMS = 10 ** (-55 / 20)
+
+
+def squeeze_replay(kept: list[tuple[bytes, float]]) -> list[tuple[bytes, float]]:
+    """The kept blocks with long silences shortened and the trailing silence trimmed (measured levels only)."""
+    if not kept:
+        return kept
+    rms = np.array([np.sqrt(np.mean((np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0) ** 2))
+                    for pcm, _at in kept])
+    floor = float(np.percentile(rms, 10))
+    voiced = rms > max(REPLAY_MIN_RMS, floor * REPLAY_VOICE_RATIO)
+    if not voiced.any():
+        return kept[-REPLAY_TAIL_BLOCKS:]
+    last = int(np.nonzero(voiced)[0][-1])
+    out: list[tuple[bytes, float]] = []
+    quiet = 0
+    for i, block in enumerate(kept[: last + 1 + REPLAY_TAIL_BLOCKS]):
+        quiet = 0 if voiced[i] else quiet + 1
+        if quiet <= REPLAY_MAX_PAUSE_BLOCKS:
+            out.append(block)
+    return out
+
 
 class MicInput(BaseInputTransport):
     """Input transport fed by a :class:`SharedMic` subscription.
@@ -49,26 +82,52 @@ class MicInput(BaseInputTransport):
         self._mic = mic
         self._token: int | None = None
         self._backlog_since = backlog_since
+        #: Seconds of audio kept since the wake, and how much of it was replayed after squeezing.
+        self.kept_s = 0.0
+        self.replayed_s = 0.0
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
         loop = self.get_event_loop()
-        if self._backlog_since is not None:
-            for pcm, _at in self._mic.backlog(self._backlog_since):
-                await self.push_audio_frame(InputAudioRawFrame(audio=pcm, sample_rate=RATE, num_channels=1))
-
         pending: list[bytes] = []
+        gate = threading.Lock()
+        held: list[InputAudioRawFrame] | None = [] if self._backlog_since is not None else None
 
         def on_block(pcm: bytes, _at: float) -> None:
+            nonlocal held
             pending.append(pcm)
             if len(pending) < FRAME_BLOCKS:
                 return
             frame_ = InputAudioRawFrame(audio=b"".join(pending), sample_rate=RATE, num_channels=1)
             pending.clear()
+            with gate:
+                if held is not None:  # still replaying the kept audio: keep the order
+                    held.append(frame_)
+                    return
             asyncio.run_coroutine_threadsafe(self.push_audio_frame(frame_), loop)
 
-        self._token = self._mic.subscribe(on_block)
+        # Ready first: Pipecat creates the input queue there, and a frame pushed before it fails
+        # (v3.3 replayed the kept audio before this call, so a wake-started conversation would
+        # have lost everything; found 2026-09-26 by the first end-to-end run through MicInput).
         await self.set_transport_ready(frame)
+        if self._backlog_since is not None:
+            # Subscribing and taking the kept audio in one step: the words said after the name
+            # while the conversation was starting, then the live mic, with no block lost or doubled.
+            self._token, kept = self._mic.subscribe_from(on_block, self._backlog_since)
+            self.kept_s = len(kept) * BLOCK_MS / 1000.0
+            kept = squeeze_replay(kept)
+            self.replayed_s = len(kept) * BLOCK_MS / 1000.0
+            for pcm, _at in kept:
+                await self.push_audio_frame(InputAudioRawFrame(audio=pcm, sample_rate=RATE, num_channels=1))
+            while True:
+                with gate:
+                    batch, held = held, ([] if held else None)
+                if not batch:
+                    break
+                for frame_ in batch:
+                    await self.push_audio_frame(frame_)
+        else:
+            self._token = self._mic.subscribe(on_block)
 
     async def cleanup(self) -> None:
         if self._token is not None:

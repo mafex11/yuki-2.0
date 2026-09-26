@@ -13,6 +13,11 @@ when asked to stop, or on a fatal service error. A running brain task (or a
 result the gate still holds) keeps a quiet conversation open for at most
 ``voice_hold_max_s``.
 
+In **call mode** (the user is in a voice call, docs/VOICE.md §25) the mouth gets the call
+layer and a call line on every request and decides itself whether each utterance was for
+Yuki or for the people on the call; the conversation then ends ``voice_call_idle_s`` after
+the last exchange with Yuki, and talk to the call is neither answered nor kept in memory.
+
 :class:`TurnObserver` watches the frames and writes the content-free turn
 record (every stage's timing, tokens, cost, language), drives the voice state
 the UI shows, gives the gate the conversation's live state, and hands each
@@ -168,7 +173,8 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
 
     Returns facts for the log, including ``tts_provider``: the configured one,
     or ``voice_tts_fallback`` (with ``tts_note`` saying why) when the configured
-    one cannot speak.
+    one cannot speak. Speakers are no reason to refuse any more (the echo guard,
+    docs/VOICE.md §11) unless ``voice_require_headphones`` asks for the v3.3 rule.
     """
     facts: dict[str, Any] = {"tts_provider": settings.voice_tts_provider}
     if not get_key(DEEPGRAM):
@@ -380,9 +386,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             params = super()._get_llm_invocation_params(context)
             composed = self._settings.system_instruction or MOUTH_PROMPT
             tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
-            params["system"] = mouth_system_blocks(memory, tail=[tail.strip()])
+            call = hooks.call()
+            params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call)
             params["messages"] = with_volatile(params.get("messages"), volatile_block(
-                lookup=self._yuki_lookup, desk=self._yuki_desk))
+                lookup=self._yuki_lookup, desk=self._yuki_desk, call=call))
             return params
 
         async def _cancel_tool_handler(self, params: Any) -> None:
@@ -486,6 +493,8 @@ class _Turn:
     tts_chars: int = 0
     interrupted: bool = False
     error: str | None = None
+    call: bool = False                   # the user was in a voice call (call mode)
+    counted: bool = False                # counted as an exchange with Yuki
 
 
 class TurnObserver:
@@ -500,7 +509,8 @@ class TurnObserver:
 
     def __init__(self, *, settings: Settings, log: Any, memory: Any, session: str,
                  speech_end: Callable[[], float | None], on_state: Callable[[str, str], None],
-                 tts_provider: str, activity: Callable[[], None]) -> None:
+                 tts_provider: str, activity: Callable[[], None],
+                 call_mode: Callable[[], bool] = lambda: False) -> None:
         from pipecat.observers.base_observer import BaseObserver
 
         self._base = BaseObserver
@@ -532,7 +542,14 @@ class TurnObserver:
         self.hands: Any = None
         self.state = "starting"
         self.fatal: str | None = None
-        self.totals = {"turns": 0, "mouth_cost_usd": 0.0, "tts_chars": 0}
+        self.totals = {"turns": 0, "mouth_cost_usd": 0.0, "tts_chars": 0, "for_others": 0}
+        self._call_mode = call_mode
+        #: User turns Yuki answered (words or an action; not stay_quiet), and when Yuki last took
+        #: part (spoke, acted, handed over): the idle clocks run from these (docs/VOICE.md §25).
+        self.exchanges = 0
+        self.last_exchange: float | None = None
+        #: When the mouth's last reply stream ended (its tool calls start just after it).
+        self.last_response_end = 0.0
 
     def as_observer(self) -> Any:
         outer = self
@@ -614,8 +631,22 @@ class TurnObserver:
         if self.turn is not None:
             self.close()
         self._n += 1
-        self.turn = _Turn(n=self._n, trigger=trigger, opened=time.monotonic())
+        self.turn = _Turn(n=self._n, trigger=trigger, opened=time.monotonic(), call=bool(self._call_mode()))
         return self.turn
+
+    def _took_part(self, now: float) -> None:
+        """Yuki spoke, acted or handed something over: an exchange with her is going on."""
+        self.last_exchange = now
+        turn = self.turn
+        if turn is not None and turn.trigger == "user" and not turn.counted:
+            turn.counted = True
+            self.exchanges += 1
+
+    @staticmethod
+    def for_others(turn: _Turn, reply: str) -> bool:
+        """A call-mode user turn Yuki took no part in: the mouth stayed quiet (its judgement that the words
+        were for the people on the call), or the next words came before it said or did anything."""
+        return turn.call and turn.trigger == "user" and not reply and not turn.counted
 
     @staticmethod
     def _ms(a: float | None, b: float | None) -> float | None:
@@ -676,12 +707,21 @@ class TurnObserver:
             "tts_audio_to_speaking_ms": ms(turn.tts_audio, turn.first_audio),
             "eager": bool(c and turn.transcript_at and c.entered < turn.transcript_at),
         }
+        others = self.for_others(turn, reply)
+        if turn.call:
+            row["call_mode"] = True
+            if turn.trigger == "user":
+                row["addressed"] = ("yuki" if not others else
+                                    "others" if "stay_quiet" in turn.tools else "unanswered")
         self.totals["turns"] += 1
+        self.totals["for_others"] += int(others)
         self.totals["mouth_cost_usd"] += cost or 0.0
         self.totals["tts_chars"] += turn.tts_chars
         if self.log is not None:
             self.log.turn(row)
-        if self.memory is not None and (turn.user_text or reply):
+        if self.memory is not None and (turn.user_text or reply) and not others:
+            # Talk to the people on a call is not a conversation with Yuki: it is not kept (the
+            # call memory has the user's side of the call, with their consent, on its own terms).
             try:
                 self.memory.log_turn(
                     request_id=f"voice-{self.session}-{turn.n}", at=time.time(),
@@ -763,6 +803,7 @@ class TurnObserver:
             self._activity()
         elif isinstance(frame, LLMFullResponseEndFrame):
             self.generating = False
+            self.last_response_end = now
             if self.turn is not None:
                 self.turn.responses += 1
             if self.turn is not None and not "".join(self.turn.reply).strip() and not self.bot_speaking:
@@ -782,15 +823,19 @@ class TurnObserver:
             if self.turn is not None and call not in self._calls:
                 self._calls.add(call)
                 self.turn.tools.append(frame.function_name)
+                if frame.function_name != "stay_quiet":
+                    self._took_part(now)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.bot_speaking = True
             if self.turn is not None and self.turn.first_audio is None:
                 self.turn.first_audio = now
+            self._took_part(now)
             self.set_state("speaking")
             self._activity()
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self.bot_speaking = False
             self.last_bot_stop = now
+            self.last_exchange = now
             self.owes_reply_since = None
             self.set_state("listening")
             self._activity()
@@ -871,6 +916,33 @@ class _Hooks:
     def call_started(self, call: LlmCall) -> None:
         self.c.observer.call_started(call)
 
+    def call(self) -> str | None:
+        """The app of the voice call the user is in (call mode), else ``None``."""
+        return self.c.call_app
+
+
+def quiet_answered(messages: list[Any] | None) -> set[int]:
+    """Ids of the user messages the mouth answered only with ``stay_quiet`` (in a call: talk to the others).
+
+    Read from the context's own structure (which tool the next assistant message called), so the
+    thinker is never handed those words as what the user said to Yuki. Plumbing, no words read.
+    """
+    out: set[int] = set()
+    items = list(messages or [])
+    for i, message in enumerate(items):
+        if not (isinstance(message, dict) and message.get("role") == "user"):
+            continue
+        for nxt in items[i + 1:]:
+            if not isinstance(nxt, dict) or nxt.get("role") == "user":
+                break
+            if nxt.get("role") == "assistant":
+                calls = nxt.get("tool_calls") or []
+                names = [(c.get("function") or {}).get("name") for c in calls if isinstance(c, dict)]
+                if names and all(n == "stay_quiet" for n in names) and not nxt.get("content"):
+                    out.add(id(message))
+                break
+    return out
+
 
 def _last_role(context: Any) -> str | None:
     try:
@@ -900,13 +972,24 @@ class Conversation:
         voice_activity: ``(start of the current voiced stretch, end of the last voiced
             audio)`` from the microphone (monotonic), so results never start over the user
             before speech recognition notices them.
+        call_app: The app of the voice call the user is in (call mode, docs/VOICE.md §25), or
+            ``None``; :meth:`set_call` changes it while the conversation runs.
+        on_closing: Called (on the voice loop) the moment the conversation decides to end, with
+            the reason, before its teardown: the wake word listens again from then on.
     """
 
     def __init__(self, *, settings: Settings, bridge: Any, transport: Any, memory: Any, mouth_memory: MouthMemory,
                  log: Any, speech_end: Callable[[], float | None], on_state: Callable[[str, str], None],
                  session: str, extra_observers: list[Any] | None = None, tts_provider: str | None = None,
-                 voice_activity: Callable[[], tuple[float, float]] | None = None) -> None:
+                 voice_activity: Callable[[], tuple[float, float]] | None = None, call_app: str | None = None,
+                 on_closing: Callable[[str], None] | None = None) -> None:
         self.settings = settings
+        self.call_app = call_app
+        self._on_closing = on_closing
+        #: When speech recognition was connected (the idle clocks start there, not while connecting).
+        self.stt_ready_at: float | None = None
+        #: Called once (on the voice loop) when speech recognition is connected (the session's timings).
+        self.on_stt_connected: Callable[[], None] | None = None
         self._voice_activity = voice_activity
         self.bridge = bridge
         self.transport = transport
@@ -924,6 +1007,7 @@ class Conversation:
         self.observer = TurnObserver(
             settings=settings, log=log, memory=memory, session=session, speech_end=speech_end,
             on_state=on_state, tts_provider=self.tts_provider, activity=self._on_activity,
+            call_mode=lambda: bool(self.call_app),
         )
         self.worker: Any = None
         self.started_at = time.monotonic()
@@ -946,6 +1030,29 @@ class Conversation:
             self.reason = reason
         self._stop.set()
         self._activity.set()
+
+    def set_call(self, app: str | None) -> None:
+        """A call started (``app``) or ended (``None``) while the conversation runs. Thread-safe."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._set_call, app)
+        else:
+            self.call_app = app
+
+    def _set_call(self, app: str | None) -> None:
+        if bool(app) != bool(self.call_app):
+            self.log.event("session", state="call_mode_on" if app else "call_mode_off", session=self.session)
+        self.call_app = app
+        self._activity.set()
+
+    def _stt_connected(self) -> None:
+        self.stt_ready_at = time.monotonic()
+        self._activity.set()
+        if self.on_stt_connected is not None:
+            try:
+                self.on_stt_connected()
+            except Exception:  # noqa: BLE001 - timings only
+                pass
 
     def interrupt(self) -> None:
         """Cut Yuki's current speech (the cancel hotkey). Thread-safe."""
@@ -1066,8 +1173,10 @@ class Conversation:
                                                   and llm._yuki_call.first_text is not None)
         # The say_first words spoken for a silent hand-over belong before its call, too.
         self.bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
+        self._llm_context: Any = None
         # Whether the mouth run now calling a tool was the user's turn (not a result's).
         self.bridge.user_turn = lambda: bool(getattr(llm, "_yuki_call", None) is None or llm._yuki_call.user_turn)
+        self.bridge.call_mode = lambda: bool(self.call_app)
         hand_tools = HAND_TOOLS if (self.settings.voice_hands and getattr(self.bridge, "hands", None)) else []
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
@@ -1076,6 +1185,7 @@ class Conversation:
         ])
         self._tools = tools
         context = LLMContext(tools=tools)
+        self._llm_context = context
         # Flux's own turn strategies from the start. Left to default, the aggregator first
         # builds Pipecat's local ones, which load the Smart Turn ONNX model and onnxruntime
         # (measured 2026-09-25: imported in every conversation, never used), before Flux's
@@ -1094,10 +1204,12 @@ class Conversation:
         )
         settle_only_when_newest(assistant_agg)
         summarizer = getattr(assistant_agg, "_summarizer", None)
-        # The summary is a user-role message nobody said: never "what the user said" to the thinker.
-        self.bridge.not_heard = lambda message: message is getattr(summarizer, "_summary_message", None)
+        # The summary is a user-role message nobody said: never "what the user said" to the thinker;
+        # nor, in a call, what the mouth judged was said to the people on it (it stayed quiet).
+        self.bridge.not_heard = lambda message: (message is getattr(summarizer, "_summary_message", None)
+                                                 or id(message) in quiet_answered(context.get_messages()))
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
-                                    on_connected=self._activity.set)
+                                    on_connected=self._stt_connected)
         pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, self.transport.output(),
                              assistant_agg])
         self.worker = PipelineWorker(
@@ -1334,26 +1446,57 @@ class Conversation:
             message = {"role": "developer", "content": json.dumps({"late_result": payload}, ensure_ascii=False)}
             await self.worker.queue_frame(LLMMessagesAppendFrame(messages=[message], run_llm=run_llm))
 
+    #: In call mode, a user still talking when the call idle runs out gets this much longer
+    #: (a sentence to Yuki that started just before the end is not cut off).
+    CALL_SPEECH_GRACE_S = 4.0
+    #: A mouth reply that ended this recently may still be starting its tool call (Pipecat runs
+    #: the calls after the stream ends): the conversation does not end in between (measured: a
+    #: call-mode run ended 0.4 s before the "turn it up" hand it had just decided on).
+    CALL_TOOL_START_S = 1.0
+
+    def idle_limit(self) -> float:
+        """Quiet seconds that end a conversation: longer the more the user has been talking with Yuki."""
+        s = self.settings
+        extra = s.voice_idle_per_exchange_s * max(0, self.observer.exchanges - 1)
+        return max(s.voice_idle_s, min(s.voice_idle_max_s, s.voice_idle_s + extra))
+
     async def _watch(self, runner: Any) -> None:
-        """End the conversation when it has been quiet long enough, or on stop / fatal error."""
+        """End the conversation when it has been quiet long enough, or on stop / fatal error.
+
+        Normal mode: after :meth:`idle_limit` of nobody speaking (longer while a task runs, up
+        to ``voice_hold_max_s``). Call mode: ``voice_call_idle_s`` after the last exchange with
+        Yuki, however much the user goes on talking to the people on the call.
+        """
         s = self.settings
         last = time.monotonic()
         while True:
             obs = self.observer
-            busy = obs.user_speaking or obs.bot_speaking or obs.generating
+            now = time.monotonic()
             owed = self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
-            limit = s.voice_hold_max_s if owed else s.voice_idle_s
+            if self.call_app:
+                busy = (obs.bot_speaking or obs.generating or obs.owes_reply
+                        or now - obs.last_response_end < self.CALL_TOOL_START_S)
+                since = max(x for x in (self.stt_ready_at, obs.last_exchange, self.started_at) if x is not None)
+                limit = s.voice_hold_max_s if owed else s.voice_call_idle_s
+                if obs.user_speaking and not owed:
+                    limit += self.CALL_SPEECH_GRACE_S
+                remaining = limit - (now - since)
+                wait = 1.0 if busy else max(0.05, remaining)  # owes_reply expires by time, not by an event
+            else:
+                busy = obs.user_speaking or obs.bot_speaking or obs.generating
+                limit = s.voice_hold_max_s if owed else self.idle_limit()
+                remaining = limit - (now - last)
+                wait = None if busy else max(0.05, remaining)
             if owed and not busy:
                 obs.set_state("working")
-            remaining = limit - (time.monotonic() - last)
             if self._stop.is_set() or obs.fatal:
                 break
             if not busy and remaining <= 0:
-                self._set_stop("held_too_long" if owed else "idle")
+                self._set_stop("held_too_long" if owed else ("call_idle" if self.call_app else "idle"))
                 break
             self._activity.clear()
             try:
-                await asyncio.wait_for(self._activity.wait(), timeout=max(0.05, remaining) if not busy else None)
+                await asyncio.wait_for(self._activity.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -1361,6 +1504,11 @@ class Conversation:
             last = time.monotonic()
             if self._stop.is_set():
                 break
+        if self._on_closing is not None:
+            try:
+                self._on_closing(self.reason)
+            except Exception:  # noqa: BLE001 - only a hint to the session
+                pass
         self.bridge.closing = True
         await runner.cancel()
 

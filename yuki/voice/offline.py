@@ -373,3 +373,226 @@ class BrowserDesk(StubDesktop):
                            expect_hwnd=expect_hwnd)
         result.summary += self._keys((key,), times)
         return result
+
+
+# ---------------------------------------------------------------------------
+# A pretend room for the speakers tests (docs/VOICE.md §11): what Yuki plays on
+# a stand-in speaker comes back into a stand-in microphone, the way it would
+# from real speakers, and nothing touches a real device (rule 7).
+# ---------------------------------------------------------------------------
+
+
+class Room:
+    """The acoustic path from a speaker to a microphone, on the monotonic clock (tests only).
+
+    Audio played at heard-time ``t`` arrives in the mic at ``t + acoustic_s`` through a
+    reverberant impulse response (``rt60``) at ``echo_db`` relative to what was played,
+    after a speaker nonlinearity. Played audio is added into a growing buffer; the mic
+    reads it back by capture time.
+    """
+
+    RATE = 16_000
+
+    def __init__(self, *, acoustic_s: float = 0.004, rt60: float = 0.3, echo_db: float = -8.0,
+                 drr_db: float = 3.0, seed: int = 1, t0: float | None = None) -> None:
+        import threading
+
+        import numpy as np
+
+        self._np = np
+        self.t0 = time.monotonic() if t0 is None else t0
+        self.acoustic_s = acoustic_s
+        rng = np.random.default_rng(seed)
+        n = int(rt60 * self.RATE)
+        t = np.arange(n) / self.RATE
+        tail = rng.standard_normal(n) * np.exp(-6.9 * t / rt60)
+        tail[: int(0.004 * self.RATE)] = 0.0
+        # The reverberant tail carries 10^(-drr/10) of the direct sound's energy (a desk speaker a
+        # metre from the mic: the direct sound a little louder than the room's reflections).
+        tail *= np.sqrt(10 ** (-drr_db / 10) / np.sum(tail ** 2))
+        ir = tail
+        ir[0] += 1.0
+        self.ir = (ir / np.sqrt(np.sum(ir ** 2)) * 10 ** (echo_db / 20)).astype(np.float32)
+        self._buf = np.zeros(self.RATE * 30, np.float32)
+        self._lock = threading.Lock()
+        self.played_s = 0.0
+
+    def _grow(self, end: int) -> None:
+        if end > len(self._buf):
+            extra = max(end - len(self._buf), self.RATE * 30)
+            self._buf = self._np.concatenate([self._buf, self._np.zeros(extra, self._np.float32)])
+
+    def play(self, samples: Any, heard_at: float) -> None:
+        """``samples`` (float32, 16 kHz) leave the speaker at ``heard_at`` (monotonic)."""
+        np = self._np
+        if not len(samples):
+            return
+        wet = np.convolve(np.tanh(samples * 1.6) / 1.6, self.ir).astype(np.float32)
+        i = int(round((heard_at + self.acoustic_s - self.t0) * self.RATE))
+        if i < 0:
+            wet, i = wet[-i:], 0
+        with self._lock:
+            self._grow(i + len(wet))
+            self._buf[i:i + len(wet)] += wet
+            self.played_s += len(samples) / self.RATE
+
+    def pick(self, at: float, n: int) -> Any:
+        """What reaches the mic's membrane during ``[at, at + n / RATE)``."""
+        i = int(round((at - self.t0) * self.RATE))
+        if i < 0:
+            return self._np.zeros(n, self._np.float32)
+        with self._lock:
+            self._grow(i + n)
+            return self._buf[i:i + n].copy()
+
+
+class RoomSpeaker:
+    """A stand-in :class:`yuki.voice.audio.Speaker` that plays into a :class:`Room`, in real time.
+
+    It reports ``reported_latency_s`` (what a device would claim) while the audio really
+    leaves ``true_latency_s`` after it is written (behind what is queued): the echo guard
+    must cope with the difference. ``timeline`` is fed exactly as the real speaker feeds it.
+    """
+
+    def __init__(self, rate: int, device: str | None = None, *, room: Room, reported_latency_s: float = 0.02,
+                 true_latency_s: float = 0.045, buffer_s: float = 0.03) -> None:
+        self.rate = rate
+        self.device = device
+        self.device_used = device or "Speakers (room)"
+        self.room = room
+        self.latency_s = reported_latency_s
+        self.true_latency_s = true_latency_s
+        self.buffer_s = buffer_s
+        self.timeline: Any = None
+        self._clock = 0.0
+        self._resample: Any = None
+        self.chunks: list[tuple[float, bytes]] = []
+        self.opened = False
+
+    def open(self) -> dict[str, Any]:
+        self.opened = True
+        return {"device": self.device_used, "output_latency_ms": round(self.latency_s * 1000, 1)}
+
+    def write(self, pcm: bytes, *, gate: bool = True) -> None:
+        import numpy as np
+
+        if not self.opened or not pcm:
+            return
+        if self.timeline is not None:
+            self.timeline.played(pcm, self.rate, gate=gate)
+        now = time.monotonic()
+        start = max(now + self.true_latency_s, self._clock)
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if self.rate != Room.RATE:
+            import soxr
+
+            if self._resample is None:
+                self._resample = soxr.ResampleStream(self.rate, Room.RATE, 1, dtype="float32")
+            samples = self._resample.resample_chunk(samples)
+        self.room.play(samples, start)
+        self.chunks.append((start, pcm))
+        self._clock = start + len(pcm) / 2 / self.rate
+        wait = self._clock - self.true_latency_s - self.buffer_s - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)  # a blocking device: the write returns once the buffer has room
+
+    def close(self) -> None:
+        wait = self._clock - time.monotonic()
+        if self.opened and wait > 0:
+            time.sleep(min(wait, 2.0))  # a real stop() plays what is queued first
+        self.opened = False
+
+    def switch(self, device: str | None, *, between: Any = None) -> dict[str, Any]:
+        self.close()
+        if between is not None:
+            between()
+        self.device = device
+        self.device_used = device or "Speakers (room)"
+        return self.open()
+
+
+def clip_mic(device: str | None = None, *, room: Room | None = None, script: list | None = None,
+             noise_dbfs: float = -60.0, reported_input_latency_s: float = 0.01,
+             true_input_latency_s: float = 0.02) -> Any:
+    """A stand-in :class:`yuki.voice.audio.SharedMic` fed in real time from clips and a :class:`Room`.
+
+    The real ``SharedMic`` (its fan-out, backlog, echo guard and levels) with only the device
+    replaced: a thread delivers 20 ms blocks of the script's clips, plus what the room carries
+    from the speaker, plus low noise. ``script`` is a list of ``(clip, after_s, wait_for)``:
+    each clip starts ``after_s`` after the previous one ended, counted from when
+    ``wait_for()`` (if given) became true. A block is stamped ``true_input_latency_s`` after
+    its sound (the mic reports ``reported_input_latency_s``). ``.lines`` records when each
+    clip started (monotonic).
+    """
+    import threading
+
+    import numpy as np
+
+    from yuki.voice.audio import BLOCK_SAMPLES, SharedMic
+
+    class ClipMic(SharedMic):
+        def __init__(self) -> None:
+            super().__init__(device)
+            self.room = room
+            self.script = list(script or [])
+            self.noise = 10 ** (noise_dbfs / 20)
+            self._run = False
+            self._thread: Any = None
+            self.lines: list[dict[str, Any]] = []
+            self.done = threading.Event()
+
+        @property
+        def is_open(self) -> bool:
+            return self._run
+
+        def open(self) -> dict[str, Any]:
+            if self._run:
+                return {"device": self.device_used}
+            self.device_used = "Microphone (clips)"
+            self.opened_as = "clips"
+            self.input_latency_s = reported_input_latency_s
+            self.format = {"device_rate": 16000, "channels": 1,
+                           "input_latency_ms": round(reported_input_latency_s * 1000, 1)}
+            self._run = True
+            self._thread = threading.Thread(target=self._feed, name="clip-mic", daemon=True)
+            self._thread.start()
+            return {"device": self.device_used, "opened_as": self.opened_as}
+
+        def close(self, *, keep_backlog: bool = False) -> None:
+            self._run = False
+            if not keep_backlog:
+                with self._lock:
+                    self._backlog.clear()
+
+        def _feed(self) -> None:
+            rng = np.random.default_rng(3)
+            clock = time.monotonic()
+            queue = list(self.script)
+            current, pos, ready_since = None, 0, None
+            while self._run:
+                if current is None and queue:
+                    clip, after_s, wait_for = queue[0]
+                    if ready_since is None and (wait_for is None or wait_for()):
+                        ready_since = clock
+                    if ready_since is not None and clock - ready_since >= after_s:
+                        queue.pop(0)
+                        current, pos, ready_since = clip, 0, None
+                        self.lines.append({"started_at": clock, "seconds": len(clip) / 16000})
+                block = rng.standard_normal(BLOCK_SAMPLES).astype(np.float32) * self.noise
+                if current is not None:
+                    part = current[pos:pos + BLOCK_SAMPLES]
+                    block[:len(part)] += part
+                    pos += BLOCK_SAMPLES
+                    if pos >= len(current):
+                        current = None
+                        if not queue:
+                            self.done.set()
+                if self.room is not None:
+                    block += self.room.pick(clock - true_input_latency_s, BLOCK_SAMPLES)
+                self.feed(block, clock)
+                clock += BLOCK_SAMPLES / 16000
+                delay = clock + true_input_latency_s - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+
+    return ClipMic()

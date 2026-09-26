@@ -752,8 +752,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     show.triggered.connect(ui.show_overlay)
     menu.addAction(show)
 
-    # Voice: a conversation now (headphones on), and the wake word (remembered).
-    voice_item = QAction(f"Voice ({ui.bindings.get('voice') or 'no hotkey'}, headphones)", menu, checkable=True)
+    # Voice: a conversation now (headphones or speakers, docs/VOICE.md §11), and the wake word (remembered).
+    voice_item = QAction(f"Voice ({ui.bindings.get('voice') or 'no hotkey'})", menu, checkable=True)
     voice_item.triggered.connect(
         lambda checked: ui.voice.start_conversation("tray") if checked else ui.voice.stop_conversation("tray")
     )
@@ -787,6 +787,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
 
     # Which microphone and which output voice uses: the active Core Audio devices, listed
     # afresh each time the menu opens, "System default" first; remembered in voice.json.
+    # The first line of each says what voice has open right now (the speaker choice moves a
+    # running conversation's output at once; the mic is never changed with it).
     device_menus = {kind: menu.addMenu(label) for kind, label in (("capture", "Microphone"), ("render", "Speaker"))}
 
     def fill_devices() -> None:
@@ -799,6 +801,11 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
             group.setExclusive(True)
             chosen = ui.voice.device_choice(kind)
             default = found.get(f"default_{kind}")
+            in_use = ui.voice.device_in_use(kind)
+            info = QAction(f"In use now: {in_use}" if in_use else "Not open right now", submenu)
+            info.setEnabled(False)
+            submenu.addAction(info)
+            submenu.addSeparator()
             names: list[str | None] = [None, *found.get(kind, [])]
             if chosen and chosen not in names:
                 names.append(chosen)  # chosen but not connected now: shown, so it can be un-chosen

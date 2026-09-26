@@ -190,6 +190,15 @@ def _copy_db(src: Path, tmp: Path) -> Path:
     return dst / "memory.db"
 
 
+def _empty_db(tmp: Path) -> Path:
+    """A fresh, empty encrypted memory database in ``tmp`` (the run's memory when no --db copy is given)."""
+    from yuki.memory.store import Store
+
+    path = tmp / "memory" / "memory.db"
+    Store.open(path).close()
+    return path
+
+
 def _discord_desk() -> Any:
     """The stub desktop with a Discord window in front that really minimizes (the 25 Sept replay)."""
     from yuki.voice.offline import StubResult, StubDesktop
@@ -523,14 +532,17 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider=args.tts,
                         voice_tts_voice=args.voice or ("" if args.tts == "elevenlabs" else "aura-2-thalia-en"),
                         voice_idle_s=args.idle, **over)
-    db_copy = _copy_db(args.db, tmp) if args.db else None
-    service = _serve_embedder(db_copy) if db_copy is not None and args.serve_embedder else None
-    if db_copy is not None and args.add_rule:
+    # Without --db the brain gets a fresh, empty temp database, never the real one: an Agent built
+    # without memory= falls back to the process-wide real memory, and on 2026-09-25 19:40 a hands3 run
+    # without --db wrote its three exchanges and the acting marker into the user's real memory.
+    db_copy = _copy_db(args.db, tmp) if args.db else _empty_db(tmp)
+    service = _serve_embedder(db_copy) if args.serve_embedder else None
+    if args.add_rule:
         from yuki.memory.api import MemoryClient
 
         with MemoryClient.open(db_copy) as client:  # the temp copy only
             client.remember_rule(args.add_rule)
-    memory = MemoryAccess(path=db_copy) if db_copy is not None else None
+    memory = MemoryAccess(path=db_copy)
     timeline = Timeline()
     vlog = VoiceLog(args.out / "voice-log", args.out / f"voice_turns_{scenario}.csv")
 
@@ -743,7 +755,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         finally:
             box["done"] = True
 
-    box["mouth_memory"] = fetch_memory(memory) if memory is not None else None
+    box["mouth_memory"] = fetch_memory(memory) if args.db else None   # the empty temp DB: as before, no memory
     if box["mouth_memory"] is None:
         from yuki.voice.mouth import MouthMemory
 

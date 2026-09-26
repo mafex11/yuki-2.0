@@ -181,6 +181,7 @@ class WakeListener:
         self.audio_s = 0.0
         self.heard_s = 0.0  # all audio seen, gated or not
         self.near_misses = 0  # sound-alikes the spotter heard instead of the name
+        self.errors = 0  # batches the spotter failed on (logged; listening goes on)
 
     @property
     def running(self) -> bool:
@@ -241,6 +242,7 @@ class WakeListener:
         floor = self.GATE_MIN_RMS
         quiet = self.GATE_HOLD_BLOCKS + 1  # blocks since the last loud one (the gate starts closed)
         was_paused = False
+        decoding = False  # the gate is open and the spotter has been fed since it opened
         while True:
             item = self._q.get()
             if item is None:
@@ -263,13 +265,28 @@ class WakeListener:
             levels.extend(float(x) for x in rms)
             floor = float(np.percentile(levels, 10))  # the room's floor: the quiet end of the last seconds
             if quiet > self.GATE_HOLD_BLOCKS:
+                if decoding:
+                    # The sound episode is over: the next one is decoded from a fresh stream (with its
+                    # pre-roll). Seconds of other speech left in the stream (a video, Yuki's residual
+                    # echo) cost the name right after it: measured 2 of 5 hits without, see §11.
+                    spotter.reset()
+                    decoding = False
                 preroll.append(samples)
                 continue
+            decoding = True
             if preroll:
                 samples = np.concatenate([*preroll, samples])  # the gate just opened: the word's start is here
                 preroll.clear()
             started = time.perf_counter()
-            heard = spotter.feed(samples)
+            try:
+                heard = spotter.feed(samples)
+            except Exception as exc:  # noqa: BLE001 - one bad batch must not end listening for good
+                self.errors += 1
+                if self._log is not None and self.errors in (1, 10, 100):
+                    self._log.event("wake", state="decode_error", errors=self.errors,
+                                    error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                spotter.reset()
+                continue
             self.decode_s += time.perf_counter() - started
             self.near_misses = spotter.near_misses
             self.audio_s += samples.size / RATE

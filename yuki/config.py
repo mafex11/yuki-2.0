@@ -179,21 +179,42 @@ class Settings:
             "Listen for 'Yuki'" switch changes it and remembers the choice
             (``%LOCALAPPDATA%\\Yuki\\voice.json``).
         voice_wake_during_calls: Keep listening for "Yuki" while a call or a
-            meeting is on (off: saying the name to friends does nothing).
+            meeting is on (on since v3.4, the user's wish, 2026-09-26). A
+            conversation started or running during a call is in call mode: the
+            mouth decides whether each utterance was for Yuki or for the people on
+            the call and stays quiet on the latter (docs/VOICE.md §25).
         voice_wake_threshold: The keyword spotter's trigger threshold (higher
             = fewer false wakes, more misses); measured in docs/VOICE.md §22.
         voice_wake_boost: The spotter's boosting score for the keyword.
         voice_idle_s: Quiet seconds (nobody speaking, no result owed) that
-            end a conversation.
+            end a conversation after its first exchange.
+        voice_idle_per_exchange_s / voice_idle_max_s: Each further exchange with
+            Yuki (a user turn she answered) adds this much to that quiet time, up
+            to the maximum: a back-and-forth is not cut off mid-thought.
+        voice_call_idle_s: In call mode, the conversation ends this long after the
+            last exchange with Yuki (talk to the others does not count), so the
+            rest of the call is not streamed or judged.
         voice_hold_max_s: Longest a quiet conversation stays open waiting to
             speak a running task's result; past it the result lands as a card.
         voice_input_device: Microphone (name, or part of it). ``None``: the
             Windows default communications input.
         voice_output_device: Output device name. ``None``: the default output.
         voice_require_headphones: Refuse to start a conversation while the
-            sound comes out of speakers (no echo canceller yet, §11).
+            sound comes out of speakers (the v3.3 rule; off since the echo guard).
         voice_headphone_devices: Outputs to count as headphones although
             Windows calls them something else ("Speakers" on an interface).
+        voice_echo: How a conversation on speakers keeps Yuki from hearing
+            herself (docs/VOICE.md §11): ``auto`` (WebRTC echo cancellation, else
+            half duplex), ``half`` (the mic is silenced while Yuki is audible; no
+            barge-in) or ``full`` (treat the output as headphones). Headphones are
+            always full duplex.
+        voice_echo_tail_ms: Half duplex: how long after Yuki's audio ends the mic
+            stays silenced (the room's echo and the devices' latency).
+        voice_wake_chime: A soft two-note chime the moment the wake word is
+            heard, so the user knows Yuki is listening before the pill is seen.
+        voice_notice_repeat_s: A failure to start or a conversation ending in an
+            error plays a short tone and shows the reason in the pill; the same
+            reason again within this many seconds only shows the pill.
         voice_stt_model / voice_stt_languages: Deepgram Flux model and the
             language hints it is given.
         voice_eot_threshold / voice_eager_eot_threshold / voice_eot_timeout_ms:
@@ -272,15 +293,22 @@ class Settings:
     user_names: list[str] = field(default_factory=lambda: ["Kian", "Mafex", "mafex11"])
     voice_hotkey: str = "ctrl+alt+y"
     voice_wake: bool = True
-    voice_wake_during_calls: bool = False
+    voice_wake_during_calls: bool = True
     voice_wake_threshold: float = 0.2
     voice_wake_boost: float = 2.0
     voice_idle_s: float = 20.0
+    voice_idle_per_exchange_s: float = 8.0
+    voice_idle_max_s: float = 45.0
+    voice_call_idle_s: float = 10.0
     voice_hold_max_s: float = 600.0
     voice_input_device: str | None = None
     voice_output_device: str | None = None
-    voice_require_headphones: bool = True
+    voice_require_headphones: bool = False
     voice_headphone_devices: tuple[str, ...] = ()
+    voice_echo: str = "auto"
+    voice_echo_tail_ms: float = 400.0
+    voice_wake_chime: bool = True
+    voice_notice_repeat_s: float = 60.0
     voice_stt_model: str = "flux-general-multi"
     voice_stt_languages: tuple[str, ...] = ("en", "hi")
     voice_eot_threshold: float = 0.7

@@ -11,13 +11,19 @@ Two halves:
   waiting, it looks at content-free facts: is a call going on, is the thing
   in front full screen (the timeline's fact, and Windows' own "busy"
   notification state: a game, a presentation), has the GPU been quiet for a
-  while (NVML utilisation and free VRAM), has the CPU, and is the user away
-  (no input for ``defer_idle_min``, or the session is locked) or is it night.
-  When every gate holds it starts the worker process below; while it runs it
-  keeps watching and, the moment the user comes back, a call or a game
-  starts, or memory is paused, it asks the worker to stop after the chunk in
-  hand (a named event), and ends it if it does not. It also enforces the
-  spool's caps (age, total size) and removes orphans, logging counts only.
+  while (NVML utilisation and free VRAM), and has the CPU. When every gate
+  holds it starts the worker process below: because the user is away (no
+  input for ``defer_idle_min``, or the session is locked), because it is
+  night, or, since 2026-09-26, with the user **present** (``defer_when_present``,
+  the user's own words: "process it when no GPU is being used"; they turn the
+  PC off at night and are rarely away). While it runs it keeps watching and,
+  the moment a call or a game starts (full screen, or other processes taking
+  the GPU: NVML's per-process utilisation, the worker's own excluded), or
+  memory is paused, it asks the worker to stop after the chunk in hand (a
+  named event), and ends it if it does not. A run started while the user was
+  away carries on as a present run when they come back, if present runs are
+  allowed (else it stops, as before). It also enforces the spool's caps (age,
+  total size) and removes orphans, logging counts only.
 * ``python -m yuki.memory.transcribe`` - the worker process, at below-normal
   priority. It loads the speech-to-text model (:func:`yuki.memory.calls.load_backend`),
   transcribes the waiting chunks oldest first, stores each chunk's words
@@ -71,8 +77,21 @@ class DeferConfig:
     gpu_spike_util: float = 60.0
     gpu_quiet_min: float = 3.0
     vram_free_mb: float = 2500.0
-    cpu_max_percent: float = 40.0
+    #: Average system CPU over the quiet window above which a run does not start. The worker runs
+    #: Whisper on the GPU at below-normal priority, so it takes little CPU and yields what it takes;
+    #: 40 % held it back all day behind builds, Chrome and editor sessions (live 2026-09-26:
+    #: ``cpu_busy`` most of the time). 75 % keeps it off a PC that is really loaded.
+    cpu_max_percent: float = 75.0
     back_idle_s: float = 20.0
+    #: Run while the user is at the PC when every other gate holds (no call, nothing full
+    #: screen, the GPU quiet by the averaged measure, VRAM free, the CPU not busy).
+    present: bool = True
+    #: During a present run: other processes' share of the GPU (SM %, summed, averaged over
+    #: ``others_window_s``) above which it stops (a game or a render started in a window).
+    gpu_others_max_util: float = 25.0
+    others_window_s: float = 30.0
+    #: During a present run: free VRAM below this stops it (someone else needs the memory).
+    vram_min_free_running_mb: float = 300.0
     stop_grace_s: float = 90.0
     retry_min: float = 30.0
     spool_max_age_days: float = 7.0
@@ -92,6 +111,7 @@ class DeferConfig:
         night = t.get("defer_night", list(d.night))
         if not (isinstance(night, list) and len(night) == 2):
             night = list(d.night)
+        present = t.get("defer_when_present", d.present)
         return cls(
             check_s=max(10.0, num("defer_check_s", d.check_s)), idle_min=num("defer_idle_min", d.idle_min),
             night=(str(night[0]), str(night[1])), gpu_max_util=num("defer_gpu_max_util", d.gpu_max_util),
@@ -99,6 +119,10 @@ class DeferConfig:
             gpu_quiet_min=num("defer_gpu_quiet_min", d.gpu_quiet_min), vram_free_mb=num("defer_vram_free_mb", d.vram_free_mb),
             cpu_max_percent=num("defer_cpu_max_percent", d.cpu_max_percent),
             back_idle_s=num("defer_back_idle_s", d.back_idle_s), stop_grace_s=num("defer_stop_grace_s", d.stop_grace_s),
+            present=present if isinstance(present, bool) else d.present,
+            gpu_others_max_util=num("defer_gpu_others_max_util", d.gpu_others_max_util),
+            others_window_s=num("defer_others_window_s", d.others_window_s),
+            vram_min_free_running_mb=num("defer_vram_min_free_running_mb", d.vram_min_free_running_mb),
             retry_min=num("defer_retry_min", d.retry_min),
             spool_max_age_days=num("spool_max_age_days", d.spool_max_age_days),
             spool_max_mb=num("spool_max_mb", d.spool_max_mb),
@@ -145,7 +169,9 @@ class TranscribeScheduler:
     checked offline: ``live_fn() -> {"fullscreen": bool}``, ``idle_fn() -> s``,
     ``locked_fn() -> bool``, ``gpu_fn() -> {"gpu_util", "vram_used_mb", "vram_total_mb"} | None``,
     ``cpu_fn() -> system CPU % since the last call``, ``busy_fn() -> bool``,
-    ``now_fn() -> datetime``, ``spawn(argv) -> Popen``.
+    ``now_fn() -> datetime``, ``spawn(argv) -> Popen``,
+    ``procs_fn() -> {pid: GPU SM %} | None`` (per-process GPU use), ``family_fn(pid) -> set of pids``
+    (the worker and its children: a venv's python.exe starts the base interpreter).
     """
 
     def __init__(self, store: Store, *, db_path: Path | None = None, privacy: Any = None,
@@ -153,7 +179,9 @@ class TranscribeScheduler:
                  idle_fn: Callable[[], float] | None = None, locked_fn: Callable[[], bool] | None = None,
                  gpu_fn: Callable[[], dict | None] | None = None, cpu_fn: Callable[[], float] | None = None,
                  busy_fn: Callable[[], bool] = screen_busy, now_fn: Callable[[], datetime] = datetime.now,
-                 spawn: Callable[[list[str]], Any] | None = None, config: DeferConfig | None = None) -> None:
+                 spawn: Callable[[list[str]], Any] | None = None, config: DeferConfig | None = None,
+                 procs_fn: Callable[[], dict[int, float] | None] | None = None,
+                 family_fn: Callable[[int], set[int]] | None = None) -> None:
         from yuki.memory.timeline import PrivacySection
 
         self.store = store
@@ -180,6 +208,9 @@ class TranscribeScheduler:
         self.busy_fn = busy_fn
         self.now_fn = now_fn
         self.spawn = spawn or self._spawn
+        self.procs_fn = procs_fn or self._nvml_procs
+        self.family_fn = family_fn or _process_family
+        self._others: deque[tuple[float, float, float]] = deque()   # (t, others' GPU %, free VRAM) during a run
         self.paused = False
         self._samples: deque[tuple[float, float, float, float]] = deque()   # (t, gpu util, vram free, cpu)
         self._proc: Any = None
@@ -212,6 +243,13 @@ class TranscribeScheduler:
 
             self._gpu = Gpu()
         return self._gpu.snapshot()
+
+    def _nvml_procs(self) -> dict[int, float] | None:
+        if self._gpu is None:
+            from yuki.memory.calls import Gpu
+
+            self._gpu = Gpu()
+        return self._gpu.process_utilization()
 
     def _spawn(self, argv: list[str]) -> Any:
         return subprocess.Popen(argv, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -249,7 +287,8 @@ class TranscribeScheduler:
             self._samples.popleft()
 
     def blocked(self, now: float, cfg: DeferConfig) -> tuple[str | None, str]:
-        """Why a batch may not start now (``None`` when it may), and why it may (``away`` | ``locked`` | ``night``)."""
+        """Why a batch may not start now (``None`` when it may), and why it may
+        (``locked`` | ``away`` | ``night`` | ``present``)."""
         if self.paused:
             return "paused", ""
         if self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
@@ -273,18 +312,52 @@ class TranscribeScheduler:
             return None, "away"
         if in_window(self.now_fn(), *cfg.night):
             return None, "night"
+        if cfg.present:
+            return None, "present"   # every gate above holds: no call, nothing full screen, GPU and VRAM free
         return "user_present", ""
 
-    def interrupt(self, cfg: DeferConfig) -> str | None:
-        """Why a running batch must stop at its next chunk boundary, or None."""
+    def interrupt(self, cfg: DeferConfig, now: float | None = None) -> str | None:
+        """Why a running batch must stop at its next chunk boundary, or None.
+
+        A call or anything full screen always stops it. An away or locked run stops when the
+        user comes back unless present runs are allowed: then it carries on as one. A present
+        run stops when other processes take the GPU (a game in a window) or its memory.
+        """
+        now = time.monotonic() if now is None else float(now)
         if self.paused:
             return "paused"
         if self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
             return "call_started"
         if bool((self.live_fn() or {}).get("fullscreen")) or self.busy_fn():
             return "fullscreen"
-        if self._run_why != "night" and not self.locked_fn() and self.idle_fn() < cfg.back_idle_s:
-            return "user_back"
+        if self._run_why in ("away", "locked") and not self.locked_fn() and self.idle_fn() < cfg.back_idle_s:
+            if not cfg.present:
+                return "user_back"
+            self._log("call_transcribe_continues", was=self._run_why, now="present")
+            self._run_why = "present"
+            self._others.clear()
+        if self._run_why == "present":
+            return self._contended(now, cfg)
+        return None
+
+    def _contended(self, now: float, cfg: DeferConfig) -> str | None:
+        """During a present run: are other processes taking the GPU or its memory?"""
+        procs = self.procs_fn()
+        gpu = self.gpu_fn()
+        free = float(gpu["vram_total_mb"] - gpu["vram_used_mb"]) if gpu else float("inf")
+        if procs is not None:
+            mine = self.family_fn(getattr(self._proc, "pid", 0) or 0) if self._proc is not None else set()
+            others = sum(u for pid, u in procs.items() if pid not in mine)
+            self._others.append((now, float(others), free))
+        elif gpu:
+            self._others.append((now, 0.0, free))
+        while self._others and now - self._others[0][0] > cfg.others_window_s:
+            self._others.popleft()
+        if free < cfg.vram_min_free_running_mb:
+            return "vram_contended"
+        span = [s[1] for s in self._others]
+        if len(span) >= 3 and sum(span) / len(span) > cfg.gpu_others_max_util:
+            return "gpu_contended"
         return None
 
     # -- one pass --------------------------------------------------------------
@@ -320,6 +393,7 @@ class TranscribeScheduler:
 
     def _start(self, now: float, why: str, waiting: dict[str, Any]) -> None:
         self._signal_stop(False)
+        self._others.clear()
         argv = [sys.executable, "-m", "yuki.memory.transcribe", "--db", str(self.db_path),
                 "--stop-event", stop_event_name(self.db_path)]
         path = getattr(self._privacy, "path", None)
@@ -335,7 +409,7 @@ class TranscribeScheduler:
         code = self._proc.poll()
         if code is None:
             if self._stopping is None:
-                reason = self.interrupt(cfg)
+                reason = self.interrupt(cfg, now)
                 if reason is not None:
                     self._stopping, self._stop_sent_at = reason, now
                     self._signal_stop(True)
@@ -385,6 +459,19 @@ class TranscribeScheduler:
 # ---------------------------------------------------------------------------
 # The worker process
 # ---------------------------------------------------------------------------
+
+
+def _process_family(pid: int) -> set[int]:
+    """``pid`` and its descendants (the worker: a venv's ``python.exe`` starts the base interpreter,
+    which is the process that holds the GPU)."""
+    out = {int(pid)} if pid else set()
+    try:
+        import psutil
+
+        out |= {c.pid for c in psutil.Process(pid).children(recursive=True)}
+    except Exception:
+        pass
+    return out
 
 
 def _stop_requested(handle: Any) -> bool:

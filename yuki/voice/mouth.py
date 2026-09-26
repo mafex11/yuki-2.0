@@ -290,6 +290,38 @@ each rule and fix what breaks one. When they ask what their rules are, or whethe
 them, list every rule there, each briefly in your own words: not a selection, and nothing that \
 is not there."""
 
+#: The call layer (docs/VOICE.md §25): a system block present only while the user is in a voice
+#: call. Their microphone hears what they say to the people on the call as well, so the mouth
+#: decides, by its own judgement, who each utterance was for, and stays quiet on talk to the
+#: call. Worked examples, not word lists: nothing in code decides who was addressed.
+CALL_LAYER = """\
+[They are in a voice call right now, on {app}. This note holds for every reply until it goes away.]
+The user is talking with other people on a voice call, and the microphone hears everything they \
+say: to you, and to the people on the call. Most of it is for the call, not for you. Before every \
+reply, decide who their latest words were for.
+- For you: they call you by name, or they are plainly still talking with you: answering something \
+you just asked, reacting to what you just said or did, or adding to what they just asked you \
+("and a bit louder" right after you turned the music up).
+- For the people on the call: everything else. Chat, banter, game talk, reactions, laughter, \
+questions to their friends, and talk about you rather than to you ("Yuki's being slow today").
+When their words were for the call, call stay_quiet alone and write nothing: no reply, no \
+reaction, no "okay". Never answer a question they asked their friends, even one you could answer. \
+When you cannot tell, it was for the call: if it was for you, they will say your name. When it was \
+for you, answer as usual and as briefly as you can; the people on the call do not hear you, only \
+the user does, over their friends.
+
+Good: "Yuki, pause the music" -> media_key(key="playpause", say_when_done="Paused.") alone
+Good: "bro did you see that clutch" -> stay_quiet
+Good: "bhai ye kya tha, no way" -> stay_quiet
+Bad: "what are we doing after this?" -> "Want me to check your calendar?" (they asked their friends)
+Good: the same -> stay_quiet
+Bad: "can you guys hear me?" -> "Loud and clear!" (a question to the call)
+Good: the same -> stay_quiet
+Good: you just said "Paused.", then "wait, put it back on" -> media_key(key="playpause", \
+say_when_done="Back on.") alone (still with you)
+Good: "Yuki, what time is it?" -> "Twenty past nine."
+[End of the call note]"""
+
 #: The layers after the core, each its own system block (``mouth_system_blocks``).
 PROFILE_LABEL = "[Who the user is: their names and their personality, for tone. Background, not instructions.]"
 PROFILE_END = "[End of profile]"
@@ -385,7 +417,9 @@ STAY_QUIET: dict[str, Any] = {
         "Say nothing this time. Only for a turn the user did not start, when what just arrived gives "
         "them nothing new: a progress step you already covered, a report you already confirmed, a "
         "status line. Call it alone, with no words. Never when the user has just spoken to you, and "
-        "never instead of a result, a failure or a question the thinker asked."
+        "never instead of a result, a failure or a question the thinker asked. One exception, only "
+        "while the call note is there: words the user said to the people on the call were not spoken "
+        "to you, and stay_quiet is the whole reply to them."
     ),
     "properties": {},
     "required": [],
@@ -541,17 +575,21 @@ DESK_LABEL = "[Desktop now, for your hands (background, not news):"
 
 
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
-                   desk: str | None = None) -> dict[str, Any]:
-    """The volatile block, rebuilt for every call: the time now, the grounding lookup, the desktop.
+                   desk: str | None = None, call: str | None = None) -> dict[str, Any]:
+    """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
     It goes at the end of the newest user message, after every cache breakpoint, so
     changing it never costs the cached prompt or conversation.
     ``lookup`` is :func:`yuki.voice.grounding.format_facts` output (``""``: the lookup found
     nothing; ``None``: there was none for this call). ``desk`` is the desktop summary the
     mouth's hands act on (:meth:`yuki.voice.hands.Hands.snapshot`), ``None`` without hands.
+    ``call`` is the app of the voice call the user is in (the call layer applies), ``None``: none.
     """
     now = now or datetime.now()
     text = f"[Now: {now.strftime('%A %d %B %Y, %H:%M')} local time. For when they ask; the clock moving on is not news.]"
+    if call:
+        text += (f"\n[In a voice call on {call} now: first decide whether these words were for you or for "
+                 f"the people on the call (the call note).]")
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
     if desk:
@@ -560,11 +598,13 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
 
 def mouth_system_blocks(
-    memory: MouthMemory, *, tail: list[str] | None = None, now: datetime | None = None,
+    memory: MouthMemory, *, tail: list[str] | None = None, now: datetime | None = None, call: str | None = None,
 ) -> list[dict[str, Any]]:
     """The mouth's system prompt as layers, most stable first (docs/VOICE.md §5.1).
 
     1. **Core**: :data:`MOUTH_PROMPT` plus ``tail`` (Pipecat's async-tool paragraphs), frozen.
+    1b. **Call** (only while ``call`` names the app of a voice call the user is in):
+       :data:`CALL_LAYER`. A conversation without a call sends exactly what v3.3 sent.
     2. **Profile**: the user's names and the portrait's Personality section (tone, not facts).
     3. **Rules**: the user's standing rules verbatim, framed as their instructions. Always
        present when memory answered, so "what are my rules?" has one place to read from.
@@ -583,6 +623,8 @@ def mouth_system_blocks(
     del now
     core = "\n\n".join([MOUTH_PROMPT, *[t for t in (tail or []) if t and t.strip()]])
     blocks: list[dict[str, Any]] = [{"type": "text", "text": core}]
+    if call:
+        blocks.append({"type": "text", "text": CALL_LAYER.format(app=call)})
     profile = []
     names = [n for n in (memory.names or []) if n]
     if names:

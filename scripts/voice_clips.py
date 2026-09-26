@@ -13,7 +13,7 @@ Providers:
 
 Usage::
 
-    uv run python scripts/voice_clips.py --out <dir> [--set stt|wake|all] [--dry-run]
+    uv run python scripts/voice_clips.py --out <dir> [--set stt|wake|scenario|v3|v34|all] [--dry-run]
 
 Every clip is 16 kHz mono 16-bit. ``manifest.json`` in the output folder lists
 each clip with its text, language, provider, voice and whether it contains the
@@ -162,6 +162,27 @@ V3_WAKE_NEG = [
     ("you_kid", "Are you kidding me right now?"),
     ("euchre", "We played euchre all night."),
     ("ukulele2", "Is that a ukulele?"),
+]
+
+
+#: v3.4 (2026-09-26): speakers and call mode. The user's side in one voice, Yuki's own reply
+#: (played into the mic path by the echo tests: it says her name twice) in another.
+V34_USER = ("deepgram", "aura-2-arcas-en")
+V34_YUKI = ("deepgram", "aura-2-thalia-en")
+V34_USER_CLIPS = [
+    ("k_name", "Yuki."),                  # the name alone: its end is known, for the wake latency
+    ("k_pause_cmd", "Pause the music."),
+    ("k_pause", "Yuki, pause the music."),
+    ("k_clutch", "Bro, did you see that clutch?"),
+    ("k_insane", "No way, he got all three of them, that's insane."),
+    ("k_after", "What are we doing after this?"),
+    ("k_hear", "Can you guys hear me?"),
+    ("k_lol", "Haha okay okay, let's queue again."),
+    ("k_turnup", "Yuki, turn it up a bit."),
+    ("k_nice", "Yuki, say something nice about my friend Rohan, in two sentences."),
+]
+V34_YUKI_CLIPS = [
+    ("y_reply", "Yuki here! I paused the music for you. Yuki will keep it quiet until you want it back, okay?"),
 ]
 
 
@@ -335,13 +356,18 @@ def plan(which: str) -> list[dict]:
             for name, text in V3_WAKE_NEG:
                 items.append({"set": "wake", "name": f"{name}__el{voice[:4]}", "language": "en", "text": text,
                               "provider": provider, "voice": voice, "wake": False})
+    if which in ("v34", "all"):
+        for (provider, voice), clips in ((V34_USER, V34_USER_CLIPS), (V34_YUKI, V34_YUKI_CLIPS)):
+            for name, text in clips:
+                items.append({"set": "v34", "name": name, "language": "en", "text": text, "provider": provider,
+                              "voice": voice, "wake": "yuki" in text.lower()})
     return items
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "all"))
+    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

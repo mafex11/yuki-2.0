@@ -188,8 +188,11 @@ class VoiceBridge(QObject):
         #: Whether the mouth run making the current tool call answered a user turn (not a
         #: result arriving); set by the conversation. ``None``: assume it did.
         self.user_turn: Callable[[], bool] | None = None
-        #: ``(message) -> bool``: a user-role context message nobody said (the context summary).
+        #: ``(message) -> bool``: a user-role context message nobody said to Yuki (the context
+        #: summary; in a call, what the mouth judged was said to the people on it).
         self.not_heard: Callable[[Any], bool] | None = None
+        #: Whether the conversation is in call mode (set by the conversation; docs/VOICE.md §25).
+        self.call_mode: Callable[[], bool] | None = None
         #: The mouth's own one-step hands (docs/VOICE.md §5.6), over the brain's backend, and what
         #: they and the thinker did on the desktop (shared with the mouth and every hand-off).
         from yuki.voice.hands import ActionLog, Hands, hands_backend as _brain_backend
@@ -229,6 +232,7 @@ class VoiceBridge(QObject):
             self.on_remembered = None
             self.mark_spoken = None
             self.user_turn = None
+            self.call_mode = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -517,7 +521,12 @@ class VoiceBridge(QObject):
         """Pipecat handler for ``stay_quiet``: the mouth chose to say nothing; settled without a turn."""
         from pipecat.frames.frames import FunctionCallResultProperties
 
-        self._log("bridge", op="quiet", asked_by_user=self.user_turn() if self.user_turn is not None else None)
+        by_user = self.user_turn() if self.user_turn is not None else None
+        in_call = bool(self.call_mode()) if self.call_mode is not None else False
+        # In a call, staying quiet on the user's own turn is the mouth's judgement that the words
+        # were for the people on the call (logged as such; content-free).
+        self._log("bridge", op="quiet", asked_by_user=by_user,
+                  **({"call_mode": True, "addressed": "others" if by_user else None} if in_call else {}))
         await params.result_callback({"ok": True}, properties=FunctionCallResultProperties(run_llm=False))
 
     def _progress_target(self) -> Job | None:
