@@ -145,8 +145,16 @@ class NarratorGate:
 
     def __init__(self, state: Callable[[], dict[str, Any]], *, settle_s: float = 1.5, settle_max_s: float = 6.0,
                  cooldown_s: float = 1.5, stale_turns: int = 3, log: Any = None,
-                 final_gap_s: float | None = None, progress_pause_s: float | None = None) -> None:
+                 final_gap_s: float | None = None, progress_pause_s: float | None = None,
+                 attention: Any = None) -> None:
         self._state = state
+        #: The shared anti-spam gates (yuki.core.attention, channel ``voice_progress``): proactive
+        #: lines (progress, the brain's say) within its budget and cooldown, held in a meeting.
+        if attention is None:
+            from yuki.core.attention import shared
+
+            attention = shared()
+        self.attention = attention
         self.settle_s = settle_s
         self.settle_max_s = settle_max_s
         self.cooldown_s = cooldown_s
@@ -305,6 +313,9 @@ class NarratorGate:
             if self._blocked(self._state(), time.monotonic())[0] is not None:
                 continue
             batch, self.pending, self._first_at = self.pending, [], None
+            batch = self._within_budget(batch)
+            if not batch:
+                continue
             # Results last: the turn is run by the last item, and it is the one that matters most.
             batch.sort(key=lambda i: (RANKS.get(i.kind, 0), i.at))
             self.stats["turns"] += 1
@@ -319,6 +330,29 @@ class NarratorGate:
             self._log("narrator", op="spoke", items=len(batch), kinds=[i.kind for i in batch],
                       jobs=sorted({i.job for i in batch}),
                       waited_ms=[round((time.monotonic() - i.at) * 1000) for i in batch])
+
+    def _within_budget(self, batch: list[Item]) -> list[Item]:
+        """The batch with its proactive lines (progress, say) dropped when the shared budget says no.
+
+        One check per turn (lines said together are one delivery); results and questions always pass.
+        """
+        proactive = [i for i in batch if i.kind in PROGRESS or i.kind == "say"]
+        if not proactive or self.attention is None:
+            return batch
+        try:
+            decision = self.attention.check("voice_progress",
+                                            facts={"meeting": bool(self._state().get("call_mode"))})
+        except Exception:  # noqa: BLE001 - the gate must never stop the voice
+            return batch
+        if decision.allowed:
+            self.attention.record("voice_progress")
+            return batch
+        for item in proactive:
+            self.stats["dropped"] += 1
+            if item.drop is not None:
+                item.drop()
+        self._log("narrator", op="held_by_attention", reason=decision.reason, items=len(proactive))
+        return [i for i in batch if i not in proactive]
 
     async def _settle_stale(self, item: Item) -> None:
         if item.kind == "final":

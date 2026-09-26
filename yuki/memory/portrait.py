@@ -1029,10 +1029,9 @@ class PortraitWorker:
     @property
     def client(self) -> Any:
         if self._client is None:
-            import anthropic
+            from yuki.agent.failover import make_client   # backup model / region when Bedrock errors
 
-            region = self.settings.aws_region or os.environ["AWS_REGION"]
-            self._client = anthropic.AnthropicBedrock(aws_region=region)
+            self._client = make_client(self.settings, log=self._log)
         return self._client
 
     def _log(self, type: str, **fields: Any) -> None:
@@ -2717,6 +2716,10 @@ class PortraitScheduler:
         self._startup = True
         self._retry_at = 0.0
         self._paused_logged = False
+        #: The correction-apply pass (yuki.memory.corrections), made on first use; corrections written from
+        #: this moment on that no pass row covers (a process on older code wrote them) are taken up too.
+        self._corrections: Any = None
+        self._started_at = self.clock()
 
     def _log(self, type: str, **fields: Any) -> None:
         if self._log_fn is not None:
@@ -2769,9 +2772,44 @@ class PortraitScheduler:
 
     # -- loop --------------------------------------------------------------
 
+    def _pending_corrections(self) -> list[int]:
+        try:
+            from yuki.memory.corrections import MAX_ATTEMPTS
+
+            return self.store.corrections_to_apply(max_attempts=MAX_ATTEMPTS, since=self._started_at)
+        except Exception:   # a store without the pass (tests, an older schema): nothing to apply
+            return []
+
+    def _apply_corrections(self, ids: Sequence[int]) -> str:
+        """The correction-apply pass for each queued correction (fold, reword everywhere, one render). A render
+        flag the correction wrote before the pass began is then spent: the pass rendered already."""
+        from yuki.memory.corrections import CorrectionApplier
+
+        if self._corrections is None:
+            self._corrections = CorrectionApplier(self.worker)
+        started = self.clock()
+        ok = True
+        with self.worker.one_render():   # several corrections at once: the page is rendered once, at the end
+            for cid in ids:
+                result = self._corrections.apply(int(cid))
+                ok = ok and result.ok
+                self._log("portrait_run", kind="correct", correction=int(cid), ok=result.ok, folded=result.folded,
+                          changes=len(result.changes), candidates=result.candidates, aliases=len(result.aliases),
+                          cost_usd=round(result.cost_usd, 6), error=result.error)
+        if ok:
+            try:
+                if self.render_path.stat().st_mtime <= started:
+                    self.render_path.unlink()
+            except OSError:
+                pass
+        return "correct"
+
     def tick(self) -> str | None:
         """One scheduling decision; runs the worker when something is due. Returns the kind run."""
         now = self.clock()
+        pending = self._pending_corrections()
+        if pending:   # the user's own correction first: it reaches every surface within minutes
+            return self._apply_corrections(pending)
         if self.refresh_path.exists():
             for path in (self.refresh_path, self.render_path):   # a refresh run re-renders
                 try:

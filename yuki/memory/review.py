@@ -933,10 +933,9 @@ class ReviewWorker:
     @property
     def client(self) -> Any:
         if self._client is None:
-            import anthropic
+            from yuki.agent.failover import make_client   # backup model / region when Bedrock errors
 
-            region = self.settings.aws_region or os.environ["AWS_REGION"]
-            self._client = anthropic.AnthropicBedrock(aws_region=region)
+            self._client = make_client(self.settings, log=self._log)
         return self._client
 
     @property

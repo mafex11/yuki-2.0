@@ -758,7 +758,13 @@ CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", 
 #: The kinds the conversation worker maintains (and ``standing_context`` shows).
 STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback")
 #: ``conversation_facts.status``: active (a rule in force, an open commitment) or how it ended.
-CONVERSATION_FACT_STATUSES: tuple[str, ...] = ("active", "done", "revoked", "superseded")
+CONVERSATION_FACT_STATUSES: tuple[str, ...] = ("active", "done", "revoked", "superseded", "dropped", "wrong")
+#: How the user can end one of their to-dos or one of Yuki's commitments by hand (migration 18): done,
+#: not needed any more ("dropped"), or never a real to-do - captured by mistake ("wrong"; the extractor sees
+#: it among the recently ended items and does not capture the like again).
+TODO_END_STATUSES: tuple[str, ...] = ("done", "dropped", "wrong")
+#: A commitment's owner (migration 18): Yuki's own promise, or the user's own plan / to-do.
+COMMITMENT_OWNERS: tuple[str, ...] = ("yuki", "user")
 
 
 @dataclass
@@ -778,6 +784,9 @@ class ConversationTurn:
     summary_id: int | None
     created_at: float
     score: float | None = None       # cosine, set by search_turns
+    #: Who a voice turn was said to (migration 18): "yuki", "others" (the people on a call, dictation into
+    #: another app), or None when not known (typed turns are to Yuki).
+    addressed: str | None = None
 
 
 @dataclass
@@ -807,6 +816,9 @@ class ConversationFact:
     score: float | None = None
     #: feedback: the card (``nudges.id``) the user was replying to; None for feedback on the coach in general.
     nudge_id: int | None = None
+    #: commitment (migration 18): "yuki" (what Yuki promised or was handed to do), "user" (the user's own plan
+    #: or to-do), or None on older rows until the conversation worker judges them.
+    owner: str | None = None
 
 
 @dataclass
@@ -832,6 +844,8 @@ class ConversationChange:
     vector: np.ndarray | None = None
     embed_model: str | None = None
     nudge_id: int | None = None
+    #: commitment: "yuki" | "user" (migration 18); None keeps an UPDATE's old owner.
+    owner: str | None = None
 
 
 @dataclass
@@ -1936,6 +1950,47 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX memory_changelog_at ON memory_changelog(at);
     ALTER TABLE knowhow ADD COLUMN origin TEXT;
     """,
+    # 18 (2026-09-27, the user's review of the Yuki window): a correction applies everywhere, to-dos
+    # apart from Yuki's own commitments, and talk not meant for Yuki kept out of memory:
+    # - correction_passes: one row per user correction the correction-apply pass
+    #   (yuki.memory.corrections) has taken up, with its state for the UI ("Updating..." -> done) and
+    #   what it changed (encrypted JSON: surface, old id, new id, old and new wording);
+    # - name_aliases: a misheard or wrong form of a name and the right one ("Barun" -> "Varun"),
+    #   from a correction; given to the journal and extraction models and to speech recognition;
+    # - conversation_facts.owner: who a commitment belongs to - "yuki" (Yuki promised or was handed it)
+    #   or "user" (the user's own plan or to-do, said to Yuki or on a call); NULL on older rows until
+    #   the conversation worker judges them;
+    # - conversation_turns.addressed: who a voice turn was said to ("yuki" | "others"), from voice's
+    #   turn_closed; NULL when not known (typed turns are to Yuki).
+    # Additive only, like 2-17.
+    """
+    CREATE TABLE correction_passes (
+        correction_id     INTEGER PRIMARY KEY,     -- the portrait_facts row of kind correction
+        status            TEXT NOT NULL,           -- queued | applying | done | failed | skipped
+        queued_at         REAL NOT NULL,
+        started_at        REAL,
+        finished_at       REAL,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        changes_ciphertext TEXT,                   -- JSON list of what changed where
+        cost_usd          REAL NOT NULL DEFAULT 0,
+        error             TEXT,
+        updated_at        REAL NOT NULL
+    );
+    CREATE INDEX correction_passes_status ON correction_passes(status, queued_at);
+    CREATE TABLE name_aliases (
+        id                INTEGER PRIMARY KEY,
+        heard_key         TEXT NOT NULL,           -- HMAC of the casefolded wrong form
+        heard_ciphertext  TEXT NOT NULL,
+        name_ciphertext   TEXT NOT NULL,           -- the right name
+        why_ciphertext    TEXT,                    -- "speech recognition misheard it", "a nickname", ...
+        correction_id     INTEGER,
+        created_at        REAL NOT NULL,
+        ended_at          REAL
+    );
+    CREATE INDEX name_aliases_heard ON name_aliases(heard_key);
+    ALTER TABLE conversation_facts ADD COLUMN owner TEXT;
+    ALTER TABLE conversation_turns ADD COLUMN addressed TEXT;
+    """,
 )
 
 
@@ -2907,14 +2962,29 @@ class Store:
         )
         return cur.rowcount == 1
 
-    def add_correction(self, text: str, at: float | None = None) -> int:
-        """Store a user-confirmed correction (kind ``correction``, origin ``user``, confidence 1)."""
+    def add_correction(self, text: str, at: float | None = None, *, apply: bool = True) -> int:
+        """Store a user-confirmed correction (kind ``correction``, origin ``user``, confidence 1).
+
+        ``apply``: queue the correction-apply pass for it in the same transaction (migration 18,
+        :mod:`yuki.memory.corrections`: every place the corrected thing appears is superseded with corrected
+        wording within minutes). False for a correction that only closes something (a loop marked done).
+        """
         now = time.time()
         when = float(at) if at is not None else now
-        return self._write(lambda conn: self._insert_fact(
-            conn, kind=CORRECTION_KIND, subject="", text=text, valid_from=when, source_ids=(),
-            confidence=1.0, origin="user", run_id=None, now=now,
-        ))
+
+        def op(conn: sqlite3.Connection) -> int:
+            fact_id = self._insert_fact(
+                conn, kind=CORRECTION_KIND, subject="", text=text, valid_from=when, source_ids=(),
+                confidence=1.0, origin="user", run_id=None, now=now,
+            )
+            self._queue_pass(conn, fact_id, now, status="queued" if apply else "skipped")
+            return fact_id
+
+        return self._write(op)
+
+    def _queue_pass(self, conn: sqlite3.Connection, correction_id: int, now: float, status: str = "queued") -> None:
+        conn.execute("INSERT OR IGNORE INTO correction_passes(correction_id, status, queued_at, updated_at)"
+                     " VALUES (?,?,?,?)", (int(correction_id), status, now, now))
 
     def commit_portrait_changes(
         self, run_id: int | None, changes: Sequence[FactChange], *, until_journal_id: int | None = None
@@ -3896,7 +3966,8 @@ class Store:
             try:
                 conn.execute(
                     "INSERT INTO conversation_turns(id, session_id, request_id, at, user_ciphertext,"
-                    " reply_ciphertext, actions_ciphertext, outcome, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " reply_ciphertext, actions_ciphertext, outcome, created_at, addressed)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     row,
                 )
                 return True
@@ -3954,6 +4025,7 @@ class Store:
     def add_turn(
         self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None = None,
         actions: Sequence[str] = (), outcome: str | None = None, *, busy_timeout_s: float = 0.008,
+        addressed: str | None = None,
     ) -> int:
         """Store one exchange (encrypted) for the conversation worker; returns its id.
 
@@ -3964,6 +4036,8 @@ class Store:
         longer, the row goes to a background thread that retries and the id is
         returned at once (ids come from a microsecond clock, so they are known
         before the write lands). Raises only on encryption/argument errors.
+        ``addressed``: who a voice turn was said to ("yuki" | "others", from voice's ``turn_closed``);
+        a turn said to others is stored for the record but never extracted (migration 18).
         """
         now = time.time()
         acts = [" ".join(str(a).split()) for a in (actions or ()) if str(a).strip()]
@@ -3971,7 +4045,7 @@ class Store:
             self._next_turn_id(), str(session_id or ""), _request_key(request_id), float(at),
             self.cipher.encrypt(user_text or ""), self._enc(reply_text),
             self.cipher.encrypt(json.dumps(acts, ensure_ascii=False)) if acts else None,
-            outcome or None, now,
+            outcome or None, now, addressed if addressed in ("yuki", "others") else None,
         ]
         with self._deferred_lock:
             queued = bool(self._deferred_turns)
@@ -3999,6 +4073,7 @@ class Store:
             actions=[str(a) for a in actions] if isinstance(actions, list) else [], outcome=r["outcome"],
             extracted=bool(r["extracted"]), attempts=r["extract_attempts"], summary_id=r["summary_id"],
             created_at=r["created_at"], score=score,
+            addressed=r["addressed"] if "addressed" in r.keys() else None,
         )
 
     def turns_pending(self, max_attempts: int = 3, limit: int | None = None) -> list[ConversationTurn]:
@@ -4144,6 +4219,7 @@ class Store:
             expired_at=r["expired_at"], superseded_by=r["superseded_by"],
             end_note=self._dec(r["end_note_ciphertext"]), score=score,
             nudge_id=r["nudge_id"] if "nudge_id" in r.keys() else None,
+            owner=r["owner"] if "owner" in r.keys() else None,
         )
 
     def conversation_facts(
@@ -4196,13 +4272,13 @@ class Store:
                       batch_id: int | None) -> int:
         cur = conn.execute(
             "INSERT INTO conversation_facts(kind, subject_ciphertext, text_ciphertext, quote_ciphertext, status,"
-            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id)"
-            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?)",
+            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id, owner)"
+            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?)",
             (
                 ch.kind, self._enc(ch.subject or ""), self.cipher.encrypt(ch.text),
                 self._enc(ch.quote) if ch.quote else None, float(ch.at if ch.at is not None else now),
                 ch.due_at, json.dumps([int(i) for i in ch.source_turn_ids]), ch.origin or "model", now, batch_id,
-                ch.nudge_id,
+                ch.nudge_id, ch.owner if ch.kind == "commitment" and ch.owner in COMMITMENT_OWNERS else None,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -4229,11 +4305,13 @@ class Store:
             at = float(ch.at) if ch.at is not None else now
             if ch.op in ("UPDATE", "INVALIDATE"):
                 old = conn.execute(
-                    "SELECT id FROM conversation_facts WHERE id=? AND status='active'", (ch.fact_id,)
+                    "SELECT id, owner FROM conversation_facts WHERE id=? AND status='active'", (ch.fact_id,)
                 ).fetchone()
                 if old is None:
                     out.append((False, None))
                     continue
+                if ch.op == "UPDATE" and ch.owner is None:
+                    ch.owner = old["owner"]   # a new version keeps whose it is unless it says otherwise
             if ch.op == "ADD":
                 out.append((True, self._insert_cfact(conn, ch, now, batch_id)))
             elif ch.op == "UPDATE":
@@ -4241,7 +4319,7 @@ class Store:
                 self._end_cfact(conn, int(ch.fact_id), "superseded", at, now, superseded_by=new_id, note=ch.end_note)
                 out.append((True, new_id))
             elif ch.op == "INVALIDATE":
-                status = ch.end_as if ch.end_as in ("done", "revoked") else "revoked"
+                status = ch.end_as if ch.end_as in ("done", "revoked", "dropped", "wrong") else "revoked"
                 self._end_cfact(conn, int(ch.fact_id), status, at, now, note=ch.end_note)
                 out.append((True, None))
             else:
@@ -4252,15 +4330,20 @@ class Store:
         self, kind: str, text: str, *, quote: str | None = None, subject: str = "", origin: str = "user",
         source_turn_ids: Sequence[int] = (), due_at: float | None = None, at: float | None = None,
         vector: np.ndarray | None = None, embed_model: str | None = None, supersedes: int | None = None,
+        owner: str | None = None, end_note: str | None = None,
     ) -> int:
-        """Write one active fact now; with ``supersedes``, end that fact (bi-temporal) in the same transaction."""
+        """Write one active fact now; with ``supersedes``, end that fact (bi-temporal) in the same transaction.
+
+        ``owner`` (a commitment): "yuki" | "user"; an update keeps the old owner when None.
+        ``end_note``: why the superseded version ended (e.g. "corrected: the user said ...").
+        """
         if kind not in CONVERSATION_FACT_KINDS:
             raise ValueError(f"unknown conversation fact kind {kind!r}")
         now = time.time()
         ch = ConversationChange(
             "UPDATE" if supersedes is not None else "ADD", supersedes, kind, subject, text, quote, due_at,
             list(source_turn_ids), float(at) if at is not None else now, origin=origin, vector=vector,
-            embed_model=embed_model,
+            embed_model=embed_model, owner=owner, end_note=end_note,
         )
 
         def op(conn: sqlite3.Connection) -> int:
@@ -4525,11 +4608,38 @@ class Store:
 
     def complete_todo(self, todo_id: int, *, at: float | None = None) -> bool:
         """Mark an open user to-do done; False if it was not open."""
+        return self.end_todo(todo_id, "done", at=at)
+
+    def end_todo(self, todo_id: int, status: str, *, at: float | None = None) -> bool:
+        """End an open user to-do as ``done``, ``dropped`` (not needed) or ``wrong`` (migration 18); False if it
+        was not open. Only ``open`` to-dos are listed, reminded of or shown to the coach."""
+        if status not in TODO_END_STATUSES:
+            raise ValueError(f"cannot end a to-do as {status!r}")
         now = float(at) if at is not None else time.time()
         return self._write(lambda conn: conn.execute(
-            "UPDATE todos SET status='done', done_at=?, updated_at=? WHERE id=? AND status='open'",
-            (now, now, int(todo_id)),
+            "UPDATE todos SET status=?, done_at=?, updated_at=? WHERE id=? AND status='open'",
+            (status, now, now, int(todo_id)),
         ).rowcount == 1)
+
+    def supersede_todo(self, todo_id: int, text: str, *, at: float | None = None) -> int | None:
+        """Replace an open user to-do's wording (a correction): the old row ends as ``superseded``, a new open row
+        with the same due takes its place, in one transaction. Returns the new id, or None if it was not open."""
+        now = float(at) if at is not None else time.time()
+
+        def op(conn: sqlite3.Connection) -> int | None:
+            row = conn.execute("SELECT * FROM todos WHERE id=? AND status='open'", (int(todo_id),)).fetchone()
+            if row is None:
+                return None
+            new_id = int(conn.execute(
+                "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at)"
+                " VALUES (?,?,?,'open',?,?)",
+                (self.cipher.encrypt(text), row["due_at"], row["due_all_day"], row["created_at"], now),
+            ).lastrowid)
+            conn.execute("UPDATE todos SET status='superseded', done_at=?, updated_at=? WHERE id=?",
+                         (now, now, int(todo_id)))
+            return new_id
+
+        return self._write(op)
 
     def complete_open_loop(self, loop_id: int, *, at: float | None = None) -> bool:
         """The user says an open loop is done: in one transaction the loop row becomes ``done``
@@ -4950,6 +5060,7 @@ class Store:
                 " updated_at=? WHERE id=?",
                 (float(at), self.cipher.encrypt(words), fact_id, now, row["id"]),
             )
+            self._queue_pass(conn, fact_id, now)   # an answer can fix a name everywhere ("Himanth is Hemanth")
             return fact_id
         if outcome not in ("skipped", "never"):
             raise ValueError(f"outcome must be answered, skipped or never, not {outcome!r}")
@@ -5866,6 +5977,200 @@ class Store:
                  "fact_ids": json.loads(r["fact_ids"] or "[]"), "new_fact_ids": json.loads(r["new_fact_ids"] or "[]"),
                  "cites": json.loads(r["cites"] or "[]"), "text": self.cipher.decrypt(r["text_ciphertext"])}
                 for r in rows]
+
+    # -- corrections applied everywhere, name aliases (migration 18; yuki.memory.corrections) -------------
+
+    def queue_correction_pass(self, correction_id: int, *, at: float | None = None) -> None:
+        """Queue the correction-apply pass for one user correction (idempotent: a queued, running or finished
+        pass is left alone; a failed one is queued again)."""
+        now = float(at) if at is not None else time.time()
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO correction_passes(correction_id, status, queued_at, updated_at) VALUES (?,?,?,?)"
+            " ON CONFLICT(correction_id) DO UPDATE SET status='queued', updated_at=excluded.updated_at"
+            " WHERE correction_passes.status='failed'",
+            (int(correction_id), "queued", now, now)))
+
+    def correction_pass(self, correction_id: int) -> dict[str, Any] | None:
+        """The pass of one correction: ``{correction_id, status, queued_at, started_at, finished_at, attempts,
+        changes: [...], cost_usd, error}``, or None when none was queued."""
+        rows = self._query("SELECT * FROM correction_passes WHERE correction_id=?", (int(correction_id),))
+        if not rows:
+            return None
+        r = rows[0]
+        try:
+            changes = json.loads(self._dec(r["changes_ciphertext"]) or "[]")
+        except ValueError:
+            changes = []
+        return {"correction_id": r["correction_id"], "status": r["status"], "queued_at": r["queued_at"],
+                "started_at": r["started_at"], "finished_at": r["finished_at"], "attempts": r["attempts"],
+                "changes": changes if isinstance(changes, list) else [], "cost_usd": r["cost_usd"] or 0.0,
+                "error": r["error"]}
+
+    def corrections_to_apply(self, *, max_attempts: int = 3, since: TimeArg = None,
+                             retry_after_s: float = 600.0) -> list[int]:
+        """Correction ids whose pass is queued, oldest first; also one cut short (``applying`` for longer than
+        ``retry_after_s``: its run died) or failed under ``max_attempts`` at least ``retry_after_s`` ago.
+        ``since``: also user corrections written at or after it that were never queued (a correction written
+        by a process running older code)."""
+        stale = time.time() - float(retry_after_s)
+        ids = [r["correction_id"] for r in self._query(
+            "SELECT correction_id FROM correction_passes WHERE status='queued'"
+            " OR (status='applying' AND started_at < ?) OR (status='failed' AND attempts < ? AND updated_at < ?)"
+            " ORDER BY queued_at", (stale, int(max_attempts), stale))]
+        if (s := _ts(since)) is not None:
+            ids += [r["id"] for r in self._query(
+                "SELECT f.id FROM portrait_facts f LEFT JOIN correction_passes c ON c.correction_id=f.id"
+                " WHERE f.kind=? AND f.origin='user' AND f.created_at >= ? AND c.correction_id IS NULL ORDER BY f.id",
+                (CORRECTION_KIND, s))]
+        return list(dict.fromkeys(ids))
+
+    def start_correction_pass(self, correction_id: int, *, at: float | None = None) -> None:
+        now = float(at) if at is not None else time.time()
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO correction_passes(correction_id, status, queued_at, started_at, attempts, updated_at)"
+            " VALUES (?,'applying',?,?,1,?) ON CONFLICT(correction_id) DO UPDATE SET status='applying',"
+            " started_at=excluded.started_at, attempts=correction_passes.attempts+1, updated_at=excluded.updated_at",
+            (int(correction_id), now, now, now)))
+
+    def finish_correction_pass(self, correction_id: int, status: str, *, changes: Sequence[dict[str, Any]] = (),
+                               cost_usd: float = 0.0, error: str | None = None, at: float | None = None) -> None:
+        """Record how a pass ended (``done`` | ``failed``), what it changed and what it cost."""
+        now = float(at) if at is not None else time.time()
+        self._write(lambda conn: conn.execute(
+            "UPDATE correction_passes SET status=?, finished_at=?, changes_ciphertext=?, cost_usd=cost_usd+?,"
+            " error=?, updated_at=? WHERE correction_id=?",
+            (status, now, self.cipher.encrypt(json.dumps(list(changes), ensure_ascii=False, default=str)),
+             float(cost_usd or 0.0), error, now, int(correction_id))))
+
+    def alias_key(self, heard: str) -> str:
+        return self.cipher.digest("alias", " ".join((heard or "").casefold().split()))
+
+    def add_alias(self, heard: str, name: str, *, why: str | None = None, correction_id: int | None = None,
+                  at: float | None = None) -> int | None:
+        """Record that ``heard`` (a misheard or wrong form) is really ``name``; an earlier alias of the same heard
+        form ends (the newest correction wins). None when the two are the same or one is empty."""
+        heard, name = " ".join((heard or "").split()), " ".join((name or "").split())
+        if not heard or not name or heard.casefold() == name.casefold():
+            return None
+        now = float(at) if at is not None else time.time()
+        key = self.alias_key(heard)
+
+        def op(conn: sqlite3.Connection) -> int:
+            conn.execute("UPDATE name_aliases SET ended_at=? WHERE heard_key=? AND ended_at IS NULL", (now, key))
+            return int(conn.execute(
+                "INSERT INTO name_aliases(heard_key, heard_ciphertext, name_ciphertext, why_ciphertext, correction_id,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (key, self.cipher.encrypt(heard), self.cipher.encrypt(name), self._enc(why) if why else None,
+                 correction_id, now)).lastrowid)
+
+        return self._write(op)
+
+    def aliases(self, *, include_ended: bool = False) -> list[dict[str, Any]]:
+        """Name aliases, oldest first: ``{id, heard, name, why, correction_id, at, ended_at}``."""
+        sql = "SELECT * FROM name_aliases" + ("" if include_ended else " WHERE ended_at IS NULL") + " ORDER BY id"
+        return [{"id": r["id"], "heard": self.cipher.decrypt(r["heard_ciphertext"]),
+                 "name": self.cipher.decrypt(r["name_ciphertext"]), "why": self._dec(r["why_ciphertext"]),
+                 "correction_id": r["correction_id"], "at": r["created_at"], "ended_at": r["ended_at"]}
+                for r in self._query(sql)]
+
+    def supersede_journal_facts(self, call: ModelCall, items: Sequence[tuple[int, str | None, np.ndarray | None]],
+                                *, embed_model: str | None = None) -> list[tuple[int, int | None]]:
+        """Corrected versions of journal facts: each ``(journal id, new wording, vector)`` becomes a new row with
+        the old one's time, thread, app, importance, nature, provenance and taint, and the old row is
+        superseded by this pass's batch (kept; every journal reader leaves it out). One transaction with the
+        batch row. Returns ``(old id, new id | None when the old one was already superseded)``."""
+
+        def op(conn: sqlite3.Connection) -> list[tuple[int, int | None]]:
+            batch_id = self._insert_batch(conn, call, 0, len(items))
+            out: list[tuple[int, int | None]] = []
+            now = time.time()
+            for old_id, text, vec in items:
+                row = conn.execute("SELECT * FROM journal WHERE id=? AND superseded_at IS NULL", (int(old_id),)).fetchone()
+                if row is None:
+                    out.append((int(old_id), None))
+                    continue
+                if text is None:   # retired: wrong, with no corrected version (kept, superseded by this batch)
+                    conn.execute("UPDATE journal SET superseded_at=?, superseded_by=? WHERE id=?",
+                                 (now, batch_id, int(old_id)))
+                    out.append((int(old_id), None))
+                    continue
+                cur = conn.execute(
+                    "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
+                    " by_yuki, nature, milestone, source_ciphertext, tainted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["at"], row["thread_id"], row["app"], row["host"], self.cipher.encrypt(text), row["importance"],
+                     batch_id, now, row["by_yuki"], row["nature"], row["milestone"], row["source_ciphertext"],
+                     row["tainted"]))
+                new_id = int(cur.lastrowid)
+                if vec is not None:
+                    self._put_vec(conn, "journal_vec", "journal_id", new_id, vec, embed_model)
+                conn.execute("UPDATE journal SET superseded_at=?, superseded_by=? WHERE id=?", (now, batch_id, int(old_id)))
+                out.append((int(old_id), new_id))
+            return out
+
+        return self._write(op)
+
+    def supersede_episode(self, episode_id: int, text: str, *, vector: np.ndarray | None = None,
+                          embed_model: str | None = None) -> int | None:
+        """A corrected version of one current episode (same span, window, aggregates and run); the old one
+        expires, superseded by it. Returns the new id, or None when it was no longer current."""
+
+        def op(conn: sqlite3.Connection) -> int | None:
+            row = conn.execute("SELECT * FROM episodes WHERE id=? AND expired_at IS NULL", (int(episode_id),)).fetchone()
+            if row is None:
+                return None
+            now = time.time()
+            new_id = int(conn.execute(
+                "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext,"
+                " aggregates_ciphertext, run_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (row["started_at"], row["ended_at"], row["window_start"], row["window_end"], row["final"],
+                 self.cipher.encrypt(text), row["aggregates_ciphertext"], row["run_id"], now)).lastrowid)
+            if vector is not None:
+                self._put_vec(conn, "episode_vec", "episode_id", new_id, vector, embed_model)
+            conn.execute("UPDATE episodes SET expired_at=?, superseded_by=? WHERE id=?", (now, new_id, int(episode_id)))
+            return new_id
+
+        return self._write(op)
+
+    def supersede_question(self, question_id: int, subject: str, question: str, evidence: str | None, *,
+                           vector: np.ndarray | None = None, embed_model: str | None = None) -> int | None:
+        """A corrected version of an open or asked question (everything else kept: status, card, sources); the
+        old one is dropped. Returns the new id, or None when it was not open or asked."""
+
+        def op(conn: sqlite3.Connection) -> int | None:
+            row = conn.execute("SELECT * FROM questions WHERE id=? AND status IN ('open','asked')",
+                               (int(question_id),)).fetchone()
+            if row is None:
+                return None
+            now = time.time()
+            if not question:   # retired: the question itself rests on something wrong
+                conn.execute("UPDATE questions SET status='dropped', updated_at=? WHERE id=?", (now, int(question_id)))
+                return None
+            new_id = int(conn.execute(
+                "INSERT INTO questions(at, created_at, kind, subject_ciphertext, subject_key, question_ciphertext,"
+                " evidence_ciphertext, reason_ciphertext, importance, origin, source_ids, fact_ids, status, seen,"
+                " nudge_id, asked_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["at"], now, row["kind"], self.cipher.encrypt(subject), question_subject_key(self.cipher, subject),
+                 self.cipher.encrypt(question), self._enc(evidence) if evidence else row["evidence_ciphertext"],
+                 row["reason_ciphertext"], row["importance"], row["origin"], row["source_ids"], row["fact_ids"],
+                 row["status"], row["seen"], row["nudge_id"], row["asked_at"], now)).lastrowid)
+            if vector is not None:
+                self._put_vec(conn, "question_vec", "question_id", new_id, vector, embed_model)
+            conn.execute("UPDATE questions SET status='dropped', updated_at=? WHERE id=?", (now, int(question_id)))
+            return new_id
+
+        return self._write(op)
+
+    def set_commitment_owners(self, owners: Sequence[tuple[int, str]]) -> int:
+        """Record whose each commitment is (``(id, "yuki" | "user")``), on rows that have no owner yet."""
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for fid, owner in owners:
+                if owner in COMMITMENT_OWNERS:
+                    n += conn.execute("UPDATE conversation_facts SET owner=? WHERE id=? AND kind='commitment'"
+                                      " AND owner IS NULL", (owner, int(fid))).rowcount
+            return n
+
+        return self._write(op) if owners else 0
 
     def prune(self, older_than_days: float = 30) -> int:
         """Delete captures (and stale latest texts) older than the TTL; returns captures deleted.

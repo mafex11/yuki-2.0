@@ -26,7 +26,8 @@ NOTE_MS = 8000
 #: An error or a note may widen the pill up to this, so the reason can be read.
 NOTE_MAX_WIDTH = 520
 
-#: state -> (label, dot colour).
+#: state -> (label, the colour of the faint wash on the pill's clear glass). No coloured dot (2026-09-27):
+#: the state is in its words; the wash only hints at it.
 LOOK: dict[str, tuple[str, QColor]] = {
     "starting": ("Starting voice…", QColor(170, 176, 190)),
     "listening": ("Listening", ACCENT),
@@ -37,6 +38,8 @@ LOOK: dict[str, tuple[str, QColor]] = {
     "error": ("Voice error", QColor(255, 120, 120)),
     "note": ("Voice", QColor(170, 176, 190)),
 }
+#: How strong that wash is (alpha of the state colour over the glass).
+WASH_ALPHA = 0.10
 
 
 class VoicePill(GlassWindow):
@@ -47,18 +50,32 @@ class VoicePill(GlassWindow):
         self.setObjectName("YukiVoicePill")
         self.setFixedSize(PILL_WIDTH + 2 * self.SHADOW, PILL_HEIGHT + 2 * self.SHADOW)
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 28, self.SHADOW, self.SHADOW + 12, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 16, self.SHADOW)
         self.label = QLabel(self)
         self.label.setFont(ui_font(9))
         self.label.setTextFormat(Qt.TextFormat.PlainText)
-        self.label.setStyleSheet("color: rgba(238,240,245,230);")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
-        self._dot = ACCENT
+        self._dot = ACCENT   # the state's colour: a faint wash of the glass (the name is kept for callers)
+        self.restyle()
+        from yuki.ui.window.widgets import attach_tips
+
+        attach_tips(self, self.theme)   # its devices tooltip is clear glass too
         self._fade = QTimer(self)
         self._fade.setSingleShot(True)
         self._fade.timeout.connect(self.fade_out)
         self._devices = ""
         self._width = PILL_WIDTH
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        from yuki.ui.glass import text_halo
+
+        self.glass_density = "clear"
+        self.label.setStyleSheet(f"color: {self.ink_css('text')};")
+        text_halo(self.label, self.theme().dark)
+        wash = QColor(self._dot)
+        wash.setAlphaF(WASH_ALPHA)
+        self.glass_tint = wash
 
     def set_devices(self, text: str) -> None:
         """The devices voice uses now (``Mic: … · Speaker: …``), shown as the pill's tooltip."""
@@ -95,7 +112,8 @@ class VoicePill(GlassWindow):
         elif self._devices:
             self.setToolTip(self._devices)
         self._set_width(width)
-        self.label.setText(self.label.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, width - 44))
+        self.label.setText(self.label.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, width - 36))
+        self.restyle()
         self.update()
         if not self.isVisible() or self.closing:
             self.fade_in(self.anchor())
@@ -103,12 +121,3 @@ class VoicePill(GlassWindow):
             self.move(self.anchor())
         if state in ("error", "note"):
             self._fade.start(NOTE_MS)
-
-    def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        panel = QRectF(self.panel_rect())
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._dot)
-        painter.drawEllipse(QRectF(panel.left() + 12, panel.center().y() - 4, 8, 8))

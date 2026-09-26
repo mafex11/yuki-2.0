@@ -310,8 +310,11 @@ def test_call_talk_is_neither_answered_nor_kept_nor_counted() -> None:
     obs.on_frame(BotStoppedSpeakingFrame())
     obs.on_frame(LLMFullResponseEndFrame())
     obs.close()
-    kept = [t["user_text"] for t in memory.turns]
-    assert kept == ["Yuki, pause the music", "Yuki, what time is it?"]
+    # v3.5: every turn is logged, marked with who it was for; memory never extracts the "others" ones.
+    kept = [(t["user_text"], t["addressed"]) for t in memory.turns]
+    assert kept == [("Yuki, pause the music", "yuki"), ("bro did you see that clutch", "others"),
+                    ("what are we doing after this?", "others"), ("haha no way", "others"),
+                    ("Yuki, what time is it?", "yuki")]
     assert obs.totals["for_others"] == 3 and obs.exchanges == 2
 
 
@@ -328,6 +331,7 @@ def test_outside_a_call_a_quiet_turn_is_still_kept() -> None:
     obs.on_frame(LLMFullResponseEndFrame())
     obs.close()
     assert [t["user_text"] for t in memory.turns] == ["hmm"] and obs.totals["for_others"] == 0
+    assert memory.turns[0]["addressed"] == "others"  # v3.5: a quiet reply to their words = not said to Yuki
 
 
 def test_the_replay_after_a_wake_keeps_the_words_and_drops_the_waiting() -> None:

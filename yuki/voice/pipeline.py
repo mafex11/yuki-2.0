@@ -344,6 +344,68 @@ def one_stop_per_turn(base: type) -> type:
     return OneStopPerTurn
 
 
+#: A word recognized with less confidence than this is named to the mouth (measured 2026-09-27 on 44 clips:
+#: misheard names 0.40-0.74, e.g. "harsh" 0.40, "Hemish" 0.48, "Varez" 0.49; words of clear commands mostly
+#: >= 0.9, a few 0.64-0.86).
+LOW_WORD_CONFIDENCE = 0.7
+#: A heard word (or two adjacent ones) this similar to a keyterm, without being it, is named as sounding close
+#: (measured: "Hemish" / "harsh" / "Hemant" 0.83-0.92 and "hey meant" 0.67 against Hemanth, "Komala" 0.83
+#: against Komal, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every name). A
+#: similarity measure, no word list.
+NEAR_TERM_RATIO = 0.65
+
+
+def heard_note(words: Any, keyterms: list[str]) -> tuple[str | None, int, int]:
+    """What speech recognition was unsure of in a final transcript, for the mouth: ``(note, low, near)``.
+
+    ``words`` is Flux's TurnInfo word list (``{"word", "confidence"}``); ``keyterms`` the names memory
+    holds. The note names the words below :data:`LOW_WORD_CONFIDENCE` and the heard words that sound
+    close to a keyterm without being it; ``None`` when there is nothing to say. Measured signals only:
+    the mouth decides from them and the meaning whether to ask back.
+    """
+    import difflib
+
+    items = [w for w in (words or []) if isinstance(w, dict) and str(w.get("word") or "").strip()]
+
+    def key(text: str) -> str:
+        return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+    low = [(str(w["word"]).strip(" ,.?!"), float(w["confidence"])) for w in items
+           if isinstance(w.get("confidence"), (int, float)) and float(w["confidence"]) < LOW_WORD_CONFIDENCE]
+    terms = {key(t): t for t in keyterms if len(key(t)) >= 4}
+    near: list[tuple[str, str]] = []
+    spoken = [str(w["word"]).strip(" ,.?!") for w in items]
+    # Words that are a known name, alone or joined with the next ("eleven labs"), are not near misses.
+    exact = {i for i, w in enumerate(spoken) if key(w) in terms}
+    exact |= {j for i in range(len(spoken) - 1) if key(spoken[i] + spoken[i + 1]) in terms for j in (i, i + 1)}
+    def closest(k: str) -> str | None:
+        # The same first sound and most of the letters: misheard names keep their start ("Hemish", "hey
+        # meant" for Hemanth, "cloud" for Claude); a word that merely contains a name's letters does not
+        # ("after" in "Father"). Measures of the two strings, no word list.
+        best = max((t for t in terms if t[:1] == k[:1] and k not in t and t not in k),
+                   key=lambda t: difflib.SequenceMatcher(None, k, t).ratio(), default=None)
+        return best if best and difflib.SequenceMatcher(None, k, best).ratio() >= NEAR_TERM_RATIO else None
+
+    flagged: set[int] = set()
+    for size in (1, 2):  # single words first; a pair only when neither of its words was named alone
+        for i in range(len(spoken) - size + 1):
+            window = spoken[i:i + size]
+            k = key(" ".join(window))
+            if (len(k) < 5 or k in terms or any(j in exact or j in flagged for j in range(i, i + size))
+                    or (size == 2 and any(len(key(w)) < 3 for w in window))):
+                continue
+            best = closest(k)
+            if best:
+                near.append((" ".join(window), terms[best]))
+                flagged.update(range(i, i + size))
+    parts = []
+    if low:
+        parts.append("unsure of " + ", ".join(f"'{w}' ({c:.2f})" for w, c in low[:5]))
+    if near:
+        parts.append("; ".join(f"'{h}' sounds close to {t}, a name you know" for h, t in near[:3]))
+    return ("; ".join(parts) or None), len(low), len(near)
+
+
 def keyterm_list(base: list[str], extra: list[str], cap: int) -> list[str]:
     """Speech recognition's keyterms: ``base`` then ``extra``, each once (case-insensitive), at most ``cap``."""
     out: list[str] = []
@@ -550,7 +612,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             call = hooks.call()
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call)
             params["messages"] = with_volatile(params.get("messages"), volatile_block(
-                lookup=self._yuki_lookup, desk=self._yuki_desk, call=call))
+                lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard()))
             return params
 
         async def _cancel_tool_handler(self, params: Any) -> None:
@@ -569,11 +631,67 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             params.result_callback = settle
             await super()._cancel_tool_handler(params)
 
+        async def _yuki_open(self, api_call: Any, params: Any) -> tuple[Any, Any]:
+            """Open the reply's stream and read its first event, with failover (v3.5).
+
+            The mouth had none (the reliability builder's note, 2026-09-27). As ``yuki.agent.failover``
+            does for the brain: a failure that says nothing about the request (throttled, overloaded, 5xx,
+            timeout, no connection) is retried once on the same target after a short backoff, a missing
+            model or profile (404/424) moves on at once, then the chain of ``Settings.model_fallbacks`` for
+            the mouth's model (the global profile from us-east-1, the US profile, then Sonnet). The first
+            event is read here because Bedrock often reports throttling as the stream's first event. A
+            target that worked is kept for ``failover_sticky_s``. Logged ``model_retry`` /
+            ``model_failover`` (content-free).
+            """
+            from yuki.agent.failover import adapt_params, classify
+
+            chain = [None, *hooks.fallbacks()]
+            start = hooks.sticky_index(len(chain))
+            last: BaseException | None = None
+            for index in range(start, len(chain)):
+                target = chain[index]
+                for attempt in range(2 if index == 0 else 1):
+                    try:
+                        if target is None:
+                            response = await super()._create_message_stream(api_call, params)
+                        else:
+                            client = hooks.client_for(target.get("region"))
+                            response = await client.beta.messages.create(**adapt_params(params, target["model"]))
+                        stream = response.__aiter__()
+                        try:
+                            first = await stream.__anext__()
+                        except StopAsyncIteration:
+                            first = None
+                        hooks.model_ok(index, target)
+                        return stream, first
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - classified from the SDK's own types
+                        last = exc
+                        kind = classify(exc)
+                        if kind == "fatal":
+                            raise
+                        hooks.model_problem(index, target, exc, kind)
+                        if kind == "retry" and attempt == 0 and index == 0:
+                            await asyncio.sleep(0.4)
+                            continue
+                        break
+            assert last is not None
+            raise last
+
         async def _create_message_stream(self, api_call: Any, params: Any) -> Any:
             call = self._yuki_call
             if call is not None:
                 call.sent = time.monotonic()
-            response = await super()._create_message_stream(api_call, params)
+            stream, first = await self._yuki_open(api_call, params)
+
+            async def events() -> Any:
+                if first is not None:
+                    yield first
+                async for event in stream:
+                    yield event
+
+            response = events()
             if call is None:
                 return response
             call.opened = time.monotonic()
@@ -670,6 +788,8 @@ class _Turn:
     call: bool = False                   # the user was in a voice call (call mode)
     counted: bool = False                # counted as an exchange with Yuki
     cut: bool = False                    # the user spoke again before this turn's reply was heard
+    heard_low: int = 0                   # words recognition was unsure of (below LOW_WORD_CONFIDENCE)
+    heard_near: int = 0                  # heard words that sound close to a keyterm without being it
 
 
 class TurnObserver:
@@ -732,6 +852,10 @@ class TurnObserver:
         self.on_chat: Callable[[dict[str, Any]], None] | None = None
         #: The output transport: a word Yuki says counts as heard when it leaves this processor.
         self.output_processor: Any = None
+        #: What recognition was unsure of in the latest final transcript (:func:`heard_note`), for the mouth.
+        self.heard: str | None = None
+        #: The names memory holds (the conversation's keyterms): a heard word close to one is named.
+        self.keyterms: list[str] = []
         self._said: list[str] = []
         self._said_turn: str | None = None
 
@@ -911,7 +1035,7 @@ class TurnObserver:
             "mouth_cost_usd": round(cost, 6) if cost is not None else None,
             "tts_chars": turn.tts_chars, "tts_cost_usd": tts_cost,
             "tool_calls": ";".join(turn.tools), "interrupted": turn.interrupted, "error": turn.error,
-            "cut_by_user": turn.cut,
+            "cut_by_user": turn.cut, "heard_low": turn.heard_low, "heard_near": turn.heard_near,
             # stage by stage (docs/VOICE.md §14)
             "eos_to_eot_ms": ms(turn.speech_end, turn.eot_at),
             "eos_to_eager_ms": ms(turn.speech_end, turn.eager_at),
@@ -933,6 +1057,7 @@ class TurnObserver:
             "eager": bool(c and turn.transcript_at and c.entered < turn.transcript_at),
         }
         others = self.for_others(turn, reply)
+        addressed = None
         if turn.trigger == "user":
             addressed = ("others" if others or (not reply and "stay_quiet" in turn.tools and not turn.counted)
                          else "yuki")
@@ -949,14 +1074,16 @@ class TurnObserver:
         self.totals["tts_chars"] += turn.tts_chars
         if self.log is not None:
             self.log.turn(row)
-        if self.memory is not None and (turn.user_text or reply) and not others:
-            # Talk to the people on a call is not a conversation with Yuki: it is not kept (the
-            # call memory has the user's side of the call, with their consent, on its own terms).
+        if self.memory is not None and (turn.user_text or reply):
+            # Every turn is logged, marked with who it was addressed to (v3.5, the memory builder's relay):
+            # talk the mouth judged was for someone else (the people on a call, dictation to another app)
+            # is stored as "others" and never extracted into memory; the thinker is never handed it either
+            # (``quiet_answered``).
             try:
                 self.memory.log_turn(
                     request_id=f"voice-{self.session}-{turn.n}", at=time.time(),
                     user_text=turn.user_text, reply_text=reply,
-                    actions=[f"{name} (by voice)" for name in turn.tools], outcome="voice",
+                    actions=[f"{name} (by voice)" for name in turn.tools], outcome="voice", addressed=addressed,
                 )
             except Exception as exc:  # noqa: BLE001 - memory never breaks voice
                 if self.log is not None:
@@ -966,7 +1093,8 @@ class TurnObserver:
 
     def on_frame(self, frame: Any) -> None:  # noqa: C901 - one switch over frame types
         from pipecat.frames.frames import (
-            BotStartedSpeakingFrame, BotStoppedSpeakingFrame, ErrorFrame, FunctionCallInProgressFrame,
+            BotStartedSpeakingFrame, BotStoppedSpeakingFrame, EagerTranscriptionFrame, ErrorFrame,
+            FunctionCallInProgressFrame,
             InterruptionFrame, LLMContextFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
             MetricsFrame, TranscriptionFrame, TTSAudioRawFrame, TTSStartedFrame, TTSTextFrame,
             UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
@@ -986,9 +1114,15 @@ class TurnObserver:
             if self.turn is not None and self.turn.tts_audio is None:
                 self.turn.tts_audio = now
             return
+        if isinstance(frame, EagerTranscriptionFrame):
+            # A speculative reply starts from these words: what recognition was unsure of in them (v3.5).
+            result = getattr(frame, "result", None)
+            self.heard = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms)[0]
+            return
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
             self._user_started_at = now
+            self.heard = None  # a new turn: the last one's doubts are not about these words
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
             if (self.turn is not None and self.turn.trigger == "user" and self.turn.first_audio is None
@@ -1011,6 +1145,9 @@ class TurnObserver:
             self.chat({"type": "user_utterance", "text": turn.user_text, "ts": time.time(), "turn_id": self.turn_id()})
             turn.transcript_at = now
             turn.speech_end, turn.eos_source = self._end_of_speech(now)
+            result = getattr(frame, "result", None)
+            self.heard, turn.heard_low, turn.heard_near = heard_note(
+                result.get("words") if isinstance(result, dict) else None, self.keyterms)
             self._last_words, self._words_at = "", None
             turn.eot_at = now  # Flux pushes the final transcript at its end of turn
             turn.eager_at, self._eager_at = self._eager_at, None
@@ -1164,9 +1301,45 @@ class _Hooks:
                          after_request_ms=round((call.early_say - call.sent) * 1000) if call.sent and call.early_say
                          else None)
 
+    # -- the mouth's model failover (v3.5) ----------------------------------------
+
+    def fallbacks(self) -> list[dict[str, Any]]:
+        s = self.c.settings
+        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(s.voice_mouth_model, [])
+                if isinstance(t, dict) and t.get("model")]
+
+    def sticky_index(self, size: int) -> int:
+        index, until = getattr(self.c, "_failover_sticky", (0, 0.0))
+        return index if 0 < index < size and time.monotonic() < until else 0
+
+    def client_for(self, region: str | None) -> Any:
+        region = region or self.c.settings.aws_region
+        clients = self.c.__dict__.setdefault("_failover_clients", {})
+        if region not in clients:
+            clients[region] = bedrock_client(region)
+        return clients[region]
+
+    def model_problem(self, index: int, target: dict[str, Any] | None, exc: BaseException, kind: str) -> None:
+        where = "primary" if target is None else f"{target.get('model')}@{target.get('region') or 'home'}"
+        self.c.log.event("model_retry" if kind == "retry" and index == 0 else "model_failover", target=where,
+                         kind=kind, status=getattr(exc, "status_code", None), error=type(exc).__name__)
+
+    def model_ok(self, index: int, target: dict[str, Any] | None) -> None:
+        if index:
+            sticky_s = float(getattr(self.c.settings, "failover_sticky_s", 300.0))
+            self.c._failover_sticky = (index, time.monotonic() + sticky_s)
+            self.c.log.event("model_failover_ok", target=f"{target.get('model')}@{target.get('region') or 'home'}")
+
     def speculation(self, op: str, calls: int) -> None:
         """An eager reply's tool calls were held, released on the confirmed turn, or dropped."""
         self.c.log.event("speculation", op=op, calls=calls)
+
+    def heard(self) -> str | None:
+        """What recognition was unsure of in the latest user words, for a call answering them (else ``None``)."""
+        call = getattr(self.c._llm, "_yuki_call", None) if getattr(self.c, "_llm", None) is not None else None
+        if call is not None and not call.user_turn:
+            return None
+        return self.c.observer.heard
 
     def call(self) -> str | None:
         """The app of the voice call the user is in (call mode), else ``None``."""
@@ -1265,6 +1438,8 @@ class Conversation:
             call_mode=lambda: bool(self.call_app),
         )
         self.observer.on_chat = on_chat
+        self.observer.keyterms = keyterm_list(["Yuki", *settings.user_names], self.keyterms,
+                                              settings.voice_keyterms_max)
         self.worker: Any = None
         self.started_at = time.monotonic()
         self._extra_observers = list(extra_observers or [])
@@ -1374,7 +1549,7 @@ class Conversation:
                 system_instruction=MOUTH_PROMPT,
             ),
         )
-        llm.register_function("tell_yuki", self.bridge.tell_yuki, cancel_on_interruption=False,
+        llm.register_function("tell_yuki", self._tell_or_hold, cancel_on_interruption=False,
                               cancellable_by_llm=True, timeout_secs=None)
         llm.register_function("check_progress", self.bridge.check_progress)
         llm.register_function("more_of_result", self.bridge.more_of_result)
@@ -1391,7 +1566,8 @@ class Conversation:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
             for tool in HAND_TOOLS:
-                llm.register_function(tool["name"], hands.handle, cancel_on_interruption=False, timeout_secs=30)
+                llm.register_function(tool["name"], self._hand_or_hold, cancel_on_interruption=False,
+                                      timeout_secs=30)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
         if provider == "deepgram":
@@ -1501,6 +1677,7 @@ class Conversation:
     def _gate_state(self) -> dict[str, Any]:
         state = self.observer.live_state()
         state["busy_tools"] = self.bridge.busy_tools
+        state["call_mode"] = bool(self.call_app)  # the user is in a voice call (the attention gate; v3.5)
         state["jobs_open"] = self.bridge.open_voice_jobs()
         if self._voice_activity is not None:
             since, last = self._voice_activity()
@@ -1688,6 +1865,43 @@ class Conversation:
                            cache_read_tokens=getattr(usage, "cache_read_input_tokens", None))
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.log.event("warm", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    def _held(self, name: str) -> bool:
+        """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it."""
+        from yuki.voice.hands import AUDIO_HANDS
+
+        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+        spoke = call is not None and call.first_text is not None and call.user_turn
+        return bool(spoke and self.observer.heard and name not in AUDIO_HANDS)
+
+    async def _hold(self, params: Any) -> None:
+        self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
+                       held="asked_first")
+        await params.result_callback({"held": (
+            "Not done yet: speech recognition was unsure of their words and you spoke with this call. If your "
+            "words asked them something, call stay_quiet now and wait for their answer, then call it again. If "
+            "they asked nothing, call it again now.")})
+
+    async def _tell_or_hold(self, params: Any) -> None:
+        """tell_yuki, held like a hand when the mouth asked and handed over in one reply on doubtful words."""
+        if self._held("tell_yuki"):
+            await self._hold(params)
+            return
+        await self.bridge.tell_yuki(params)
+
+    async def _hand_or_hold(self, params: Any) -> None:
+        """A hand, unless recognition was unsure of the user's words and the mouth spoke with the call.
+
+        Measured 2026-09-27 (clarify replay, 4 of 6 runs): "close the cloud tabs" got "The Claude tabs, three
+        and four?" and the close in the same reply, before the answer. A window hand called with words while
+        the latest words were doubtful (the Speech line) is held, not run (hand-offs too): its report tells
+        the mouth to wait for the answer if it asked (stay_quiet), else to call it again, so nothing is
+        lost. Sound hands touch no window and run. State only (the note, the stream, which hand), never what was said.
+        """
+        if self._held(params.function_name):
+            await self._hold(params)
+            return
+        await self.bridge.hands.handle(params)
 
     async def _end_after_speech(self, max_s: float = 6.0) -> None:
         """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on)."""

@@ -788,7 +788,7 @@ class MemoryClient:
 
     def log_turn(
         self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None,
-        actions: list[str], outcome: str,
+        actions: list[str], outcome: str, addressed: str | None = None,
     ) -> int:
         """Store one exchange between the user and Yuki; returns its turn id (0 if it could not be stored).
 
@@ -805,6 +805,8 @@ class MemoryClient:
         session once it ends (30 minutes without an exchange, or a new
         session id). Fast (well under 20 ms; the write waits at most 8 ms for
         the database, else a background writer finishes it) and never raises.
+        ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others");
+        a turn said to others is kept for the record and never extracted (no rule, to-do or fact).
         """
         try:
             # A key or password the user pastes is used by the agent in the moment (it has the words in its
@@ -812,7 +814,8 @@ class MemoryClient:
             user_text = secret_filter.redact_text(user_text or "")
             reply_text = secret_filter.redact_text(reply_text) if reply_text else reply_text
             actions = [secret_filter.redact_text(str(a)) for a in (actions or ())]
-            turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions, outcome)
+            turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions, outcome,
+                                          addressed=addressed)
         except Exception as exc:
             self.last_turn_error = f"{type(exc).__name__}: {exc}"
             return 0
@@ -831,7 +834,7 @@ class MemoryClient:
             if text is None:
                 return None
             due = f"due {datetime.fromtimestamp(f.due_at):%Y-%m-%d %H:%M}".replace(" 00:00", "") if f.due_at else ""
-            said = "said in a call" if f.origin == "call" else "asked"
+            said = "said in a call" if f.origin == "call" else "said" if f.owner == "user" else "asked"
             dates = ", ".join(x for x in (due, f"{said} {_day(f.valid_from)}") if x)
             return f"- [commit:{f.id}] {text} ({dates})"   # the to-do id todo done takes
         if text is None and quote is None:
@@ -864,8 +867,9 @@ class MemoryClient:
         headings = {
             "rule": "Rules the user set for Yuki:",
             "preference": "The user's preferences about how Yuki talks or works:",
-            "commitment": "Open commitments (what Yuki is to do later):",
-            "call": "What the user said they would do, in calls (their own words):",
+            "commitment": "Yuki's own commitments (what Yuki promised or was asked to do later):",
+            "call": ("The user's own to-dos (their plans and work, not Yuki's: bring one up only when they ask about "
+                     "their plans, never offer to do one):"),
             "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
                       "everything; forget_rule takes these ids too):"),
         }
@@ -873,7 +877,9 @@ class MemoryClient:
         def group(f: ConversationFact) -> str:
             if f.kind == "feedback" or (f.kind == "preference" and cards.get(f.id) is not None):
                 return "coach"
-            return "call" if f.kind == "commitment" and f.origin == "call" else f.kind
+            if f.kind == "commitment" and (f.origin == "call" or f.owner == "user"):
+                return "call"   # the user's own to-do, from a call or a chat: never Yuki's promise
+            return f.kind
 
         def render(chosen: list[tuple[ConversationFact, str]]) -> str:
             lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
@@ -1822,6 +1828,86 @@ class MemoryClient:
             "WHERE started_at >= ? AND state = 'present' GROUP BY k ORDER BY t DESC LIMIT ?",
             (u - days * 86400.0, int(limit)))
         return {str(r["k"]).casefold(): i for i, r in enumerate(rows) if r["k"]}
+
+    # ======================================================================================================
+    # Added 2026-09-27 for the Yuki window (the user's review): corrections applied everywhere, to-dos apart
+    # from Yuki's promises, name aliases. For the UI builder; nothing here calls a model.
+    # ======================================================================================================
+
+    #: What the UI shows for a correction's pass (``correction_passes.status`` -> state).
+    _CORRECTION_STATES = {"queued": "updating", "applying": "updating", "done": "done", "failed": "failed",
+                          "skipped": "done"}
+
+    def correction_status(self, ref: Any) -> dict:
+        """Where one correction stands: ``{"id", "state", "changed", "changes", "queued_at", "finished_at",
+        "error"}``.
+
+        ``ref``: the id :meth:`correct_portrait` (or :meth:`answer_question`'s ``correction_id``) returned.
+        ``state``: ``"updating"`` while the service applies it everywhere (portrait facts, open loops,
+        Yuki's commitments and the user's to-dos, journal facts, episodes, questions, persona; usually
+        within a minute or two), then ``"done"`` (refresh the pages), ``"failed"`` (the portrait still folds
+        it at its next render), or ``"none"`` (no such correction, or one written before corrections were
+        applied everywhere). ``changes``: ``[{"surface", "op": "rewrite" | "retire", "old", "new"}]`` of the
+        places it changed; ``changed``: how many. Never raises.
+        """
+        try:
+            cid = int(str(ref).strip().strip("[]").split(":")[-1].lstrip("F"))
+            row = self.store.correction_pass(cid)
+        except Exception:
+            return {"id": ref, "state": "none", "changed": 0, "changes": [], "queued_at": None, "finished_at": None,
+                    "error": None}
+        if row is None:
+            return {"id": cid, "state": "none", "changed": 0, "changes": [], "queued_at": None, "finished_at": None,
+                    "error": None}
+        changes = [{"surface": c.get("surface"), "op": c.get("op"), "old": c.get("old"), "new": c.get("new")}
+                   for c in row["changes"] if c.get("ok", True)]
+        return {"id": cid, "state": self._CORRECTION_STATES.get(row["status"], row["status"]),
+                "changed": len(changes), "changes": changes, "queued_at": _iso(row["queued_at"]),
+                "finished_at": _iso(row["finished_at"]), "error": row["error"]}
+
+    def end_todo(self, ref: str, how: str = "done") -> str | None:
+        """End one to-do by its id (``"todo:3"``, ``"commit:5"``, ``"loop:12"``, as :meth:`todos` gives it).
+
+        ``how``: ``"done"``, ``"not_needed"`` (the user does not need it any more) or ``"wrong"`` (captured
+        by mistake: never a real to-do; the conversation extractor is shown it so the like is not captured
+        again). Ended items leave :meth:`todos`, the coach and the reminders. Returns the id, or ``None``
+        when nothing open has that id or ``how`` is unknown. Never raises. :meth:`complete_todo` is
+        ``end_todo(ref, "done")``.
+        """
+        from yuki.memory.nudges import end_item
+
+        status = {"done": "done", "not_needed": "dropped", "wrong": "wrong"}.get(str(how or "").strip())
+        if status is None:
+            return None
+        try:
+            return end_item(self.store, ref, status)
+        except Exception:
+            return None
+
+    def aliases(self) -> list[dict]:
+        """Names the user corrected: ``[{"heard": "Barun", "name": "Varun", "why", "since"}]``, oldest first."""
+        try:
+            return [{"heard": a["heard"], "name": a["name"], "why": a["why"], "since": _iso(a["at"])}
+                    for a in self.store.aliases()]
+        except Exception:
+            return []
+
+    def speech_names(self, limit: int = 50) -> list[str]:
+        """Names speech recognition should expect (Deepgram keyterms): the right names of the user's
+        corrections first, then the portrait's people and the short names of their work and interests.
+        A misheard form is never included (it would teach recognition the mistake). Never raises."""
+        try:
+            from yuki.voice.keyterms import NAME_KINDS, terms_from_facts
+
+            base = terms_from_facts(self.store.portrait_facts(NAME_KINDS, include_corrections=False), (), limit)
+        except Exception:
+            base = []
+        heard = {a["heard"].casefold() for a in self.aliases()}
+        out: list[str] = []
+        for name in [a["name"] for a in self.aliases()] + base:
+            if name and name.casefold() not in heard and name.casefold() not in {n.casefold() for n in out}:
+                out.append(name)
+        return out[: max(0, int(limit))]
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",

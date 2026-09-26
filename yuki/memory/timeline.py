@@ -1104,6 +1104,10 @@ class TimelineRecorder:
         #: the last time (monotonic) the app was seen holding the device.
         self._meeting_sites: dict[str, str] = {}
         self._hold_seen: dict[str, float] = {}
+        #: Gaming with voice chat (yuki.memory.avsignals.gaming_with_voice): the last judgement for the
+        #: stretch in front, ``(id(stretch), when, gaming)``, and the GPU reader (tests pass a stub).
+        self._gaming_cache: tuple[int, float, bool] | None = None
+        self._gpu_fn: Callable[..., Any] | None = None
         #: The last stretches (start, end, app key, page host), to find the page that was in front when
         #: an app took the microphone.
         self._recent: list[tuple[float, float, str, str | None]] = []
@@ -1797,6 +1801,8 @@ class TimelineRecorder:
         key = app_key(st.proc) or ""
         if rules.never(key, st.seen_host):
             return None
+        if st.fullscreen and self._gaming_voice(st, h, now):
+            return None   # a full-screen game's own voice chat: gaming, not a meeting
         site = self._meeting_sites.get(key)
         if site is None:
             if now - h.since < rules.hold_s:
@@ -1816,6 +1822,34 @@ class TimelineRecorder:
         if st.seen_host is not None:
             return None   # the meeting is an app without pages; this is one of its pages? not the meeting
         return rules.name_for(key, st.proc_app or key)
+
+    def _gaming_voice(self, st: _Stretch, holder: Any, now: float) -> bool:
+        """The microphone holder is this full-screen stretch's app drawing like a game (measured).
+
+        Judged at most every 30 s per stretch; the first "gaming" of a stretch is logged
+        (``timeline_gaming_voice``, content-free) and counted (``gaming_voice``).
+        """
+        cached = self._gaming_cache
+        if cached is not None and cached[0] == id(st) and now - cached[1] < 30.0:
+            return cached[2]
+        from yuki.memory.avsignals import gaming_with_voice, gpu_share
+
+        pids: list[int] = []
+        try:
+            pid = int(self._w._window_pid(st.hwnd) or 0)
+            if pid:
+                pids.append(pid)
+        except Exception:
+            pass
+        camera = tuple(self._av.camera) if self._av is not None else ()
+        gaming, facts = gaming_with_voice(holder, fullscreen=st.fullscreen, shows_page=st.seen_host is not None,
+                                          camera=camera, pids=pids, gpu_fn=self._gpu_fn or gpu_share)
+        first = gaming and not (cached is not None and cached[0] == id(st) and cached[2])
+        self._gaming_cache = (id(st), now, gaming)
+        if first:
+            self.counters["gaming_voice"] += 1
+            self._log("timeline_gaming_voice", app=app_key(st.proc) or "", **facts)
+        return gaming
 
     def _as_meeting(self, st: _Stretch, service: str) -> None:
         """Turn ``st`` into a meeting row: the app and service, the site's host - never a title or path."""

@@ -39,6 +39,10 @@ from datetime import datetime
 from typing import Any, Iterable, Iterator
 
 from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
+from yuki.agent.failover import FailoverClient
+from yuki.agent.loopguard import EXEMPT as LOOP_EXEMPT, LoopBreaker, signature as call_signature
+from yuki.agent.subagents import HelperTeam, report_text
+from yuki.agent.untrusted import EXTERNAL_TEXT_TOOLS, new_nonce, source_for, wrap, wrap_blocks
 from yuki.agent.memory import (
     MemoryAccess,
     default_memory,
@@ -54,6 +58,7 @@ from yuki.agent.tools import (
     CONTROL_TOOLS,
     FINISHES_FIELD,
     MEMORY_TOOLS,
+    RISK_FIELD,
     PERCEPTION_TOOLS,
     Backend,
     Dispatcher,
@@ -103,6 +108,9 @@ _NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self", "say"
 #: Longest one-line action summary kept for memory and the collapsed request.
 _ACTION_LINE_CHARS = 160
 
+#: How the loop breaker's rethink note reaches the model (:mod:`yuki.agent.loopguard`).
+BREAKER_LABEL = "[Yuki's loop breaker, not the user]"
+
 #: How a correction the user added mid-task reaches the model (:meth:`Agent.steer`):
 #: framed as theirs, so it reads as the user's words and not as a tool's output.
 STEER_LABEL = "[The user added while you were working]"
@@ -141,6 +149,9 @@ class _Turn:
     #: mark that the action completes the request); the request ends with the last one
     #: once every call of the response has succeeded.
     finishing: list[str] = field(default_factory=list)
+    #: Calls held for the user's confirmation (declared irreversible, not asked for): not failures
+    #: for the loop breaker.
+    gated: set[str] = field(default_factory=set)
 
     def record(self, tool_use_id: str, block: dict[str, Any]) -> None:
         """Store one result block, noting whether it is an error."""
@@ -282,6 +293,18 @@ class Agent:
         #: Token of the "Yuki is acting" marker published for this request
         #: (from its first action tool until the request ends), else None.
         self._acting_token: str | None = None
+        #: The loop breaker (yuki.agent.loopguard), reset every request.
+        self._breaker = LoopBreaker(
+            repeats=int(getattr(self.settings, "loop_breaker_repeats", 3)),
+            failed_steps=int(getattr(self.settings, "loop_breaker_failed_steps", 4)),
+            max_trips=int(getattr(self.settings, "loop_breaker_max_trips", 2)),
+        )
+        #: The breaker's hard-stop note has reached the model (the next action attempt ends the request).
+        self._breaker_stop_sent = False
+        #: This request's fence code for untrusted text (yuki.agent.untrusted).
+        self._nonce = new_nonce()
+        #: ``(tool, signature)`` of irreversible calls the user was asked about this request.
+        self._confirmed: set[tuple[str, str]] = set()
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None``
         #: while one is running). Read by the UI to label the finished card.
@@ -307,11 +330,18 @@ class Agent:
         """
         with self._client_lock:
             if self._client is None:
-                import anthropic
-
-                region = self.settings.aws_region or os.environ["AWS_REGION"]
-                self._client = anthropic.AnthropicBedrock(aws_region=region)
+                # Bedrock with retries and failover to the configured backups (yuki.agent.failover);
+                # every retry and failover lands in this session's log.
+                self._client = FailoverClient.from_settings(self.settings, log=self.logger.log)
             return self._client
+
+    def _used_model(self, requested: str) -> str:
+        """The model the last call on this thread actually used (a failover may have switched it)."""
+        used = getattr(self._client, "last_model", None)
+        try:
+            return (used() if callable(used) else None) or requested
+        except Exception:
+            return requested
 
     # -- warm-up -----------------------------------------------------------
 
@@ -612,6 +642,10 @@ class Agent:
         self._waited_s = 0.0
         self._model_calls = 0
         self._call_history = {}
+        self._breaker.reset()
+        self._breaker_stop_sent = False
+        self._nonce = new_nonce()
+        self._confirmed = set()
         self._request_text = request
         self._requests += 1
         self._actions = []
@@ -983,6 +1017,17 @@ class Agent:
                 if stop_reason == "max_tokens":
                     self._skip_truncated(response, turn)
                 blocks, names = yield from self._run_tools(tool_uses, turn)
+                breaker_blocks, stop_now = self._breaker_step(turn)
+                if stop_now:
+                    # The hard stop was already given and the brain still reached for an action.
+                    overview, facts = self._capture_overview()
+                    self.context.add_tool_results(blocks, overview, tool_names=names, self_facts=facts)
+                    message = ("I stopped: the same thing kept failing and I could not find another way. "
+                               "Tell me how you want to go on.")
+                    self.logger.log("loop_breaker", op="ended_request", trips=len(self._breaker.trips))
+                    self.logger.error(message)
+                    yield ErrorEvent(message)
+                    return
                 if not turn.finished and turn.finishing and not turn.failed and not turn.stop_after:
                     # The brain marked an action as finishing the request and every call of
                     # the response succeeded: that is its done, with no extra round trip.
@@ -1001,7 +1046,8 @@ class Agent:
                 view = None if turn.finished else self._auto_view(turn)
                 overview, facts = self._capture_overview()
                 self.context.add_tool_results(
-                    blocks + steers, overview, tool_names=names, self_facts=facts, window_view=view
+                    blocks + breaker_blocks + steers, overview, tool_names=names, self_facts=facts,
+                    window_view=view,
                 )
                 if turn.finished:
                     self.logger.final(turn.finished[0])
@@ -1040,6 +1086,104 @@ class Agent:
         message = f"Gave up after {self.settings.max_steps} steps without finishing."
         self.logger.error(message)
         yield ErrorEvent(message)
+
+    def _breaker_step(self, turn: _Turn) -> tuple[list[dict[str, Any]], bool]:
+        """Count this step for the loop breaker; ``(note blocks for the next message, end the request now)``.
+
+        Calls held for the user's confirmation are not counted. A trip adds the breaker's note
+        (framed as Yuki's, not the user's); once the hard-stop note has been sent, a step that
+        still reached for an action ends the request.
+        """
+        ids = [i for i, n in turn.names.items() if n not in LOOP_EXEMPT and i not in turn.gated]
+        failures = sum(1 for i in ids if (turn.results.get(i) or {}).get("is_error"))
+        if self._breaker_stop_sent and ids:
+            return [], True
+        trip = self._breaker.end_step(len(ids), failures)
+        if trip is not None:
+            self.logger.log("loop_breaker", op="trip", reason=trip.reason, tool=trip.tool, summary=trip.summary,
+                            count=trip.count, trips=len(self._breaker.trips))
+        note = self._breaker.take_note()
+        if not note:
+            return [], False
+        if self._breaker.exhausted:
+            self._breaker_stop_sent = True
+        self.logger.log("loop_breaker", op="note", text=note, exhausted=self._breaker.exhausted)
+        return [{"type": "text", "text": f"{BREAKER_LABEL}: {note}"}], False
+
+    def _risk_check(self, name: str, tool_input: dict[str, Any]) -> tuple[str, str | None]:
+        """``("run", None)``, ``("confirm", question)`` or ``("refuse", why)`` for one action.
+
+        The brain declares the risk (``risk``: reversible, user_asked, effect); the code only
+        enforces the declaration: irreversible and not asked for -> the user confirms first, once
+        per exact call per request. run_powershell must carry a declaration.
+        """
+        if name not in ACTION_TOOL_NAMES:
+            return "run", None
+        risk = tool_input.get(RISK_FIELD)
+        if risk is None:
+            if name == "run_powershell":
+                return "refuse", ("Not run: run_powershell needs its risk declared (reversible, user_asked, "
+                                  "effect). Call it again with that field.")
+            return "run", None
+        if not isinstance(risk, dict) or not isinstance(risk.get("reversible"), bool):
+            return "refuse", "Not run: risk must be an object with reversible (true/false), user_asked and effect."
+        if risk["reversible"] or risk.get("user_asked") is True:
+            return "run", None
+        if (name, call_signature(tool_input)) in self._confirmed:
+            return "run", None
+        effect = " ".join(str(risk.get("effect") or "").split()) or f"this {name} call"
+        return "confirm", f"This can't be undone: {effect}. Should I go ahead?"
+
+    def _run_helpers(self, tool_input: dict[str, Any]) -> Any:
+        """Run the read-only helper team (``spawn_helpers``), yielding a :class:`HelperStep` per step.
+
+        Returns (``yield from``) the tool's outcome: the helpers' reports. Their model calls are
+        priced into this request (``requests.csv``) and each helper's whole run is logged as
+        ``helper_run``. Cancelling the request stops the helpers at their next step.
+        """
+        started = time.perf_counter()
+        tasks = [" ".join(str(t).split()) for t in (tool_input.get("tasks") or []) if str(t).strip()]
+        if not tasks:
+            return ToolOutcome(name="spawn_helpers", ok=False, summary="no tasks given",
+                               content=[{"type": "text", "text": "tasks must list 1-4 instructions."}])
+        team = HelperTeam(client=self.client, backend=getattr(self.dispatcher, "backend", None),
+                          memory=self.memory, settings=self.settings, nonce=self._nonce)
+        team.start(tasks)
+        limit = float(getattr(self.settings, "helpers_timeout_s", 45.0)) + 30.0
+        end = time.monotonic() + limit
+        while True:
+            if self._cancelled.is_set():
+                team.cancelled.set()
+            try:
+                step = team.events.get(timeout=0.1)
+            except queue.Empty:
+                if not team.alive() or time.monotonic() >= end:
+                    break
+                continue
+            yield step
+        if team.alive():
+            team.cancelled.set()
+            for r in team.results:
+                if r.stopped == "running":
+                    r.stopped, r.error = "time", "did not finish in time"
+        results = list(team.results)
+        for r in results:
+            for model, usage in r.usage:
+                self._account_response(model, usage)
+            self.logger.log("helper_run", index=r.index, task=r.task, ok=r.ok, stopped=r.stopped, error=r.error,
+                            calls=r.calls, tools=r.tools, input_tokens=r.input_tokens, elapsed_s=r.elapsed_s,
+                            usage=[{"model": m, "usage": _as_plain(u)} for m, u in r.usage],
+                            transcript=r.transcript, report=r.report)
+        done = sum(1 for r in results if r.ok)
+        elapsed = time.perf_counter() - started
+        return ToolOutcome(
+            name="spawn_helpers", ok=done > 0,
+            summary=f"{done} of {len(results)} helpers reported in {elapsed:.1f} s",
+            content=[{"type": "text", "text": report_text(results)}],
+            payload={"helpers": [{"index": r.index, "task": r.task, "ok": r.ok, "stopped": r.stopped,
+                                  "calls": r.calls, "tools": r.tools, "elapsed_s": r.elapsed_s} for r in results]},
+            elapsed_ms=elapsed * 1000,
+        )
 
     def _cancel_event(self) -> ErrorEvent:
         """Record a cancellation in the transcript and build the event for it."""
@@ -1144,6 +1288,53 @@ class Agent:
             turn.stop_after = True
             return
 
+        # The loop breaker refuses a call that already failed the same way too often, and every
+        # action once it has stopped the request's actions (yuki.agent.loopguard).
+        refused = self._breaker.refuse(name, tool_input)
+        if refused is None:
+            decision, detail = self._risk_check(name, tool_input)
+            if decision == "refuse":
+                refused = detail
+        else:
+            decision, detail = "refuse", refused
+            self.logger.log("loop_breaker", op="refused", tool=name, input=tool_input)
+        if refused is not None:
+            turn.record(tool_id, self._skip(tool_id, name, refused))
+            self._note_action(name, False, refused)
+            yield ToolResult(name, False, refused)
+            turn.stop_after = True
+            return
+        if decision == "confirm":
+            # Declared irreversible and not asked for: the user confirms first (the ask_user card).
+            question = str(detail)
+            turn.gated.add(tool_id)
+            self.logger.log("risk_gate", op="ask", tool=name, input=tool_input, question=question)
+            self.logger.ask_user(question)
+            self._awaiting_answer = True
+            self._pending_answer = None
+            asked_at = time.monotonic()
+            yield AskUser(question)  # generator pauses here
+            self._waited_s += time.monotonic() - asked_at
+            self._awaiting_answer = False
+            answer, self._pending_answer = self._pending_answer, None
+            if answer is None:
+                text = "Not run: it can't be undone and the user did not answer whether to go ahead."
+            else:
+                self.logger.user_answer(answer)
+                self._confirmed.add((name, call_signature(tool_input)))
+                text = (f"Not run yet: you declared it irreversible and not asked for, so the user was asked "
+                        f"'{question}' and answered: '{answer}'. If that is a yes, make this exact call again "
+                        f"and it will run; if not, do not run it and go on as they said.")
+            self.logger.log("risk_gate", op="answered" if answer is not None else "no_answer", tool=name,
+                            answer=answer)
+            self.logger.tool_result(name, ok=False, summary=text, result={"held": True, "answer": answer},
+                                    elapsed_ms=0.0, tool_use_id=tool_id)
+            self._note_action(name, False, f"held for confirmation: {question} -> {answer}")
+            yield ToolResult(name, False, text)
+            turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True))
+            turn.stop_after = True
+            return
+
         if name in ACTION_TOOL_NAMES:
             self._acting_start()
         dispatched = time.perf_counter()
@@ -1151,9 +1342,23 @@ class Agent:
             turn.early += 1
             if turn.first_early_at is None:
                 turn.first_early_at = dispatched
-        outcome = self._dispatch(name, tool_input)
+        if name == "spawn_helpers" and (self.tool_names is None or name in self.tool_names):
+            outcome = yield from self._run_helpers(tool_input)
+        else:
+            outcome = self._dispatch(name, tool_input)
         self._tool_s += time.perf_counter() - dispatched
         self._tool_counts[name] += 1
+        # Text written outside Yuki (pages, windows, files, command output, memory) is fenced as
+        # untrusted data with this request's code (yuki.agent.untrusted).
+        if name in EXTERNAL_TEXT_TOOLS and (outcome.ok or name == "run_powershell"):
+            outcome.content = wrap_blocks(list(outcome.content), source=source_for(name, tool_input),
+                                          nonce=self._nonce)
+        if name not in CONTROL_TOOLS:
+            trip = self._breaker.observe(name, tool_input, outcome.ok, outcome.summary,
+                                         perception=name in PERCEPTION_TOOLS)
+            if trip is not None:
+                self.logger.log("loop_breaker", op="trip", reason=trip.reason, tool=trip.tool,
+                                summary=trip.summary, count=trip.count, trips=len(self._breaker.trips))
 
         if outcome.kind == "ask_user":
             question = outcome.control_input["question"]
@@ -1255,8 +1460,11 @@ class Agent:
         model order is kept exactly as :meth:`_run_tools` would keep it.
         ``done`` never counts as earlier: it is evaluated last anyway.
         """
-        if str(getattr(block, "name", "")) in _DEFERRED_TOOLS:
+        name = str(getattr(block, "name", ""))
+        if name in _DEFERRED_TOOLS or name == "spawn_helpers":
             return False
+        if self._risk_check(name, dict(getattr(block, "input", {}) or {}))[0] != "run":
+            return False   # a confirmation or a refusal waits for the end of the stream
         if turn.stop_after or turn.failed or self._cancelled.is_set():
             return False
         for earlier in seen:
@@ -1417,6 +1625,9 @@ class Agent:
             return message, facts_text
         self._overview_s += time.perf_counter() - looked
         self._overview_payload = payload
+        # window titles come from apps and web pages: fenced like any other outside text
+        text = wrap(text, source="the window list (window titles are written by apps and web pages)",
+                    nonce=self._nonce)
         if isinstance(payload, dict):
             payload = {**payload, "self_facts": facts}
         self.logger.perception(
@@ -1773,7 +1984,10 @@ class Agent:
             raise
         latency_ms = (time.perf_counter() - started) * 1000
         self._model_s += max(latency_ms / 1000 - in_stream_s, 0.0)
-        self._account_response(params["model"], getattr(response, "usage", None))
+        used_model = self._used_model(params["model"])
+        if used_model != params["model"]:
+            self.logger.log("model_used", requested=params["model"], used=used_model)
+        self._account_response(used_model, getattr(response, "usage", None))
         # The request went through, so its cache entry exists: the next prune
         # measures "before the breakpoint" against this one.
         self.context.commit_breakpoint()
@@ -1905,7 +2119,8 @@ class Agent:
         reads = f"{view.reads} read{'' if view.reads == 1 else 's'}"
         text = (
             f"Window after your actions: {source}, read automatically after {name} "
-            f"({reads} in {view.elapsed_ms:.0f} ms; {view.reason}).\n{view.text}"
+            f"({reads} in {view.elapsed_ms:.0f} ms; {view.reason}).\n"
+            + wrap(view.text, source=f"the window {hwnd} (its on-screen text)", nonce=self._nonce)
         )
         self.logger.perception(
             "auto_view",

@@ -205,6 +205,11 @@ V35_CLIPS = [
     ("t_ram", "What's using so much RAM right now?"),
     ("t_close2", "And close the ElevenLabs tab."),
     ("t_off", "Okay, thanks. You can turn off the voice then."),
+    # v3.5 clarify: what recognition gets wrong, as it came out live (said as heard), and the answers
+    ("g_cloud", "Close the cloud tabs on Chrome."),
+    ("g_yes", "Yeah, the Claude ones."),
+    ("g_niche", "Tell hey meant on WhatsApp to call me."),
+    ("g_yes2", "Yes, Hemanth."),
 ]
 NAMES_VOICES = [("deepgram", "aura-2-arcas-en"), ("deepgram", "aura-2-orion-en"), ("elevenlabs", "TX3LPaxmHKxFdv7VOQHJ")]
 NAMES_CLIPS = [

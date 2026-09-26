@@ -73,8 +73,12 @@ def memory_keyterms(memory: Any, *, limit: int = 50, timeout_s: float = 1.5) -> 
         return [], {"terms": 0, "error": "no memory"}
 
     def read(client: Any) -> list[str]:
-        store = client.store
-        return terms_from_facts(store.portrait_facts(NAME_KINDS, include_corrections=False), (), limit)
+        # MemoryClient.speech_names (v3.5): the right names of the user's corrections first (a misheard form
+        # such as "Barun" is never included), then the portrait's people and names. Older clients: the facts.
+        names = getattr(client, "speech_names", None)
+        if callable(names):
+            return list(names(limit))
+        return terms_from_facts(client.store.portrait_facts(NAME_KINDS, include_corrections=False), (), limit)
 
     try:
         terms = memory.call("speech keyterms", read, timeout_s=timeout_s)

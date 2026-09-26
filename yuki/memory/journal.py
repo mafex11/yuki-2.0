@@ -1022,10 +1022,9 @@ class JournalWorker:
     @property
     def client(self) -> Any:
         if self._client is None:
-            import anthropic
+            from yuki.agent.failover import make_client   # backup model / region when Bedrock errors
 
-            region = self.settings.aws_region or os.environ["AWS_REGION"]
-            self._client = anthropic.AnthropicBedrock(aws_region=region)
+            self._client = make_client(self.settings, log=self._log)
         return self._client
 
     def user_names(self) -> list[str]:
@@ -1423,6 +1422,7 @@ class JournalWorker:
             out.append(ConversationChange(
                 "ADD", None, "commitment", f"call ({app}): {subject}" if subject else f"call ({app})", text, quote,
                 parse_due(str(item.get("due") or "")), [], sources[index].at, origin="call",
+                owner="user",   # the user's own plan, said on a call: a to-do of theirs, never Yuki's promise
             ))
         return out, rejected
 
@@ -1487,6 +1487,7 @@ class JournalWorker:
                 continue
             src = sources[index]
             where = source_of(src, thread, sources, index)
+            self._attention_check(now)
             checkin = NudgeCheckin(at=now, trigger="request", outcome="reminder", model=self.model,
                                    reason=f"standing request R{rid} matched: {str(item.get('why') or '')[:200]}")
             nudge = NewNudge(kind="reminder", text=message[:300], trigger="request", ref=f"request:{rid}",
@@ -1500,8 +1501,31 @@ class JournalWorker:
                 nudge_id, outcome = None, f"error: {type(exc).__name__}"
             if nudge_id is not None:
                 self.signal_nudge()
+                self._attention_record()
             out.append({"request": rid, "outcome": outcome, "nudge_id": nudge_id})
         return out
+
+    def _attention_check(self, now: float) -> None:
+        """The shared gates' decision for a standing-request card, logged. The card is written either way: the
+        user asked to be told, the match is seen once, and the card waits in the queue for the UI (which holds
+        it while another card is up); the store's own cooldown and budgets limit how often one fires."""
+        try:
+            from yuki.core.attention import shared
+
+            d = shared().check("standing_request", urgent=True, now=now, facts={})
+            if not d.allowed:
+                self._log("journal_request_attention", reason=d.reason)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _attention_record() -> None:
+        try:
+            from yuki.core.attention import shared
+
+            shared().record("standing_request")
+        except Exception:
+            pass
 
     def signal_nudge(self) -> None:
         """Wake the UI for a new card (only for the database the UI reads: the default one)."""

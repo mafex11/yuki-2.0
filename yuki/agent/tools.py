@@ -34,7 +34,7 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
     {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
-     "activity"}
+     "activity", "read_file", "fetch_url"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -729,19 +729,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Keeping your to-do list",
         "description": (
             "Add to, complete or list the user's to-do list (open loops from memory, "
-            "Yuki's promises and things the user added)."
+            "Yuki's promises, the user's own to-dos and things the user added). When the user says one "
+            "is not needed any more, end it as not_needed; when they say it was never a to-do (captured "
+            "by mistake), as wrong."
         ),
         "input_schema": _obj(
             {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "done", "list"],
-                    "description": "add a to-do, mark one done, or list the open ones.",
+                    "enum": ["add", "done", "not_needed", "wrong", "list"],
+                    "description": "add a to-do, mark one done, not needed or wrong (captured by mistake), "
+                    "or list the open ones.",
                 },
                 "text": {
                     "type": "string",
-                    "description": "add: the to-do, in one short line. done: the item's id "
-                    "exactly as shown in brackets (e.g. todo:3, commit:5, loop:12); list "
+                    "description": "add: the to-do, in one short line. done, not_needed, wrong: the "
+                    "item's id exactly as shown in brackets (e.g. todo:3, commit:5, loop:12); list "
                     "first when you do not have it.",
                 },
                 "due": {
@@ -751,6 +754,60 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
             },
             ["action"],
+        ),
+    },
+    {
+        "name": "read_file",
+        "label": "Reading a file",
+        "description": (
+            "Read a text file on this PC (a document, notes, code, a log, a transcript): its text, "
+            "or the part from start_line on. Only reads; nothing is opened on screen. Binary files "
+            "are refused; very long files are clipped and the result says where to continue."
+        ),
+        "input_schema": _obj(
+            {
+                "path": {"type": "string", "description": "Full path of the file."},
+                "start_line": {"type": "integer", "description": "First line to return (1 = the start)."},
+            },
+            ["path"],
+        ),
+    },
+    {
+        "name": "fetch_url",
+        "label": "Reading a web page",
+        "description": (
+            "Download a web address in the background and return the page's text (title and "
+            "readable text, no scripts), without opening a browser or touching the screen. For "
+            "reading or checking something online; open_url is for showing it to the user."
+        ),
+        "input_schema": _obj(
+            {"url": {"type": "string", "description": "An http or https address."}},
+            ["url"],
+        ),
+    },
+    {
+        "name": "spawn_helpers",
+        "label": "Asking helpers",
+        "description": (
+            "Run 1-4 helpers at the same time, each on its own task with a fresh context, and get "
+            "their short reports back. Helpers can only look and read - memory (recall, activity), "
+            "files, web addresses, windows and tabs - never click, type, switch or run anything, so "
+            "they cannot disturb the desktop. Use them to gather several things at once: context "
+            "from memory for a complex question, reading several files or pages, summarising a long "
+            "transcript, checking a few things in parallel. Each task must stand alone (a helper "
+            "sees nothing of this conversation): say exactly what to find and what to report."
+        ),
+        "input_schema": _obj(
+            {
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": "One self-contained instruction per helper.",
+                },
+            },
+            ["tasks"],
         ),
     },
 ]
@@ -799,8 +856,51 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "app_volume",
 )
 
-for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each action's schema
+#: The brain's own declaration of what an action risks (``risk``): whether it can be undone and
+#: whether the user asked for exactly this. The code enforces one thing on it, never its own
+#: reading of the command: an action declared irreversible that the user did not ask for is not
+#: run until the user confirms (``Agent._risk_gate``, the ask_user card). Required on
+#: run_powershell (commands can change anything), optional on the other actions.
+RISK_FIELD = "risk"
+RISK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Your judgement of this action, before it runs. reversible is false when its effect cannot "
+        "be undone from here: files deleted outright (not to the Recycle Bin), a closed window or "
+        "killed program losing unsaved work, a message, email or post sent, a purchase or payment, "
+        "settings or data overwritten with no copy. Reading, listing, opening, focusing, switching, "
+        "scrolling and typing into a field without sending are reversible."
+    ),
+    "properties": {
+        "reversible": {"type": "boolean"},
+        "user_asked": {
+            "type": "boolean",
+            "description": "true only when the user explicitly asked for this very effect in this request.",
+        },
+        "effect": {
+            "type": "string",
+            "description": "In a few plain words for the user: what it changes and what would be lost.",
+        },
+    },
+    "required": ["reversible", "user_asked", "effect"],
+    "additionalProperties": False,
+}
+
+for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional fields on each action's schema
     TOOLS_BY_NAME[_name]["input_schema"]["properties"][FINISHES_FIELD] = FINISHES_SCHEMA
+    TOOLS_BY_NAME[_name]["input_schema"]["properties"][RISK_FIELD] = RISK_SCHEMA
+TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", RISK_FIELD]
+
+#: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
+AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
+
+#: What a read-only helper (yuki.agent.subagents) may use: looks and reads only. Enforced in code
+#: twice: the helper is only shown these, a call to anything else is refused without running, and
+#: its backend exposes only the reading functions.
+HELPER_TOOLS: tuple[str, ...] = (
+    "look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
+    "read_file", "fetch_url",
+)
 
 #: Actions after which the loop attaches a fresh read of the window acted on to
 #: the next turn (see :meth:`Dispatcher.window_view`), so the model does not
@@ -2136,6 +2236,78 @@ class Dispatcher:
             return self._from_action("open_url", self.backend.open_url(url, app=app))
         return self._from_action("open_url", self.backend.open_url(url))
 
+    # -- reading without the screen ------------------------------------------
+
+    #: Most characters of a file or page handed to the model in one result.
+    READ_MAX_CHARS = 60_000
+    #: Most bytes of a web page downloaded, and how long the download may take.
+    FETCH_MAX_BYTES = 3_000_000
+    FETCH_TIMEOUT_S = 12.0
+
+    def _do_read_file(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """A text file's contents (clipped), read in-process: nothing opens, nothing changes."""
+        from pathlib import Path
+
+        started = time.perf_counter()
+        path = Path(self._need_str(tool_input, "path").strip().strip('"'))
+        start_line = max(1, self._opt_int(tool_input, "start_line", 1))
+        if not path.is_file():
+            raise ToolError(f"no such file: {path}")
+        raw = path.read_bytes()[: self.READ_MAX_CHARS * 4 + 4096]
+        if b"\x00" in raw[:8192]:
+            raise ToolError(f"{path.name} is a binary file, not text")
+        text = raw.decode("utf-8-sig", errors="replace")
+        lines = text.splitlines()
+        body = "\n".join(lines[start_line - 1:])
+        clipped = len(body) > self.READ_MAX_CHARS
+        if clipped:
+            body = body[: self.READ_MAX_CHARS]
+            next_line = start_line + body.count("\n") + 1
+            body += f"\n[clipped: continue with start_line={next_line}]"
+        size = path.stat().st_size
+        summary = f"{len(body)} chars of {path.name} ({size} bytes)" + (" (clipped)" if clipped else "")
+        return ToolOutcome(
+            name="read_file", ok=True, summary=summary,
+            content=[{"type": "text", "text": f"file {path} ({size} bytes), from line {start_line}:\n{body}"}],
+            payload={"path": str(path), "bytes": size, "start_line": start_line, "chars": len(body),
+                     "clipped": clipped},
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _do_fetch_url(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """A web page's title and readable text, downloaded in the background (no browser, no screen)."""
+        import urllib.request
+        from urllib.parse import urlparse
+
+        started = time.perf_counter()
+        url = self._need_str(tool_input, "url").strip()
+        if urlparse(url).scheme not in ("http", "https"):
+            raise ToolError(f"only http and https addresses can be fetched, got {url!r}")
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Yuki reader)"})
+        with urllib.request.urlopen(request, timeout=self.FETCH_TIMEOUT_S) as response:  # noqa: S310 - scheme checked
+            status = getattr(response, "status", 200)
+            ctype = response.headers.get_content_type() or ""
+            charset = response.headers.get_content_charset() or "utf-8"
+            raw = response.read(self.FETCH_MAX_BYTES)
+            final = response.geturl()
+        decoded = raw.decode(charset, errors="replace")
+        if ctype in ("text/html", "application/xhtml+xml"):
+            title, text = html_text(decoded)
+        elif ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
+            title, text = "", decoded
+        else:
+            raise ToolError(f"{final} is {ctype or 'not text'}, not a page that can be read as text")
+        clipped = len(text) > self.READ_MAX_CHARS
+        text = text[: self.READ_MAX_CHARS] + ("\n[clipped]" if clipped else "")
+        summary = f'{len(text)} chars of "{title or final}"' + (" (clipped)" if clipped else "")
+        return ToolOutcome(
+            name="fetch_url", ok=200 <= int(status) < 400, summary=summary,
+            content=[{"type": "text", "text": f"{final} (HTTP {status}) {title}\n{text}"}],
+            payload={"url": url, "final_url": final, "status": status, "content_type": ctype,
+                     "chars": len(text), "clipped": clipped},
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
     # -- tabs --------------------------------------------------------------
 
     #: Budget of the brain's strip read (the voice's own read keeps its 0.2 s).
@@ -2244,6 +2416,58 @@ class Dispatcher:
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
+
+
+def html_text(markup: str) -> tuple[str, str]:
+    """``(title, readable text)`` of an HTML document: text nodes outside script/style, blocks on new lines.
+
+    Parsing a fixed machine format (HTML), not judging content.
+    """
+    from html.parser import HTMLParser
+
+    class _Text(HTMLParser):
+        SKIP = {"script", "style", "noscript", "template", "svg", "head"}
+        BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article",
+                 "header", "footer", "pre", "blockquote", "table", "ul", "ol"}
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+            self.title = ""
+            self._skip = 0
+            self._in_title = False
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            if tag == "title":
+                self._in_title = True
+            elif tag in self.SKIP:
+                self._skip += 1
+            elif tag in self.BLOCK:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag == "title":
+                self._in_title = False
+            elif tag in self.SKIP and self._skip:
+                self._skip -= 1
+            elif tag in self.BLOCK:
+                self.parts.append("\n")
+
+        def handle_data(self, data: str) -> None:
+            if self._in_title:
+                self.title += data
+            elif not self._skip:
+                self.parts.append(data)
+
+    parser = _Text()
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:  # noqa: BLE001 - a broken page still gives what was read
+        pass
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    text = "\n".join(line for line in lines if line)
+    return " ".join(parser.title.split()), text
 
 
 def _tree_signature(tree: Any) -> tuple[str, int, bool, int]:

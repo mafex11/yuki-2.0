@@ -60,8 +60,9 @@ MEMORY_END = "[End of attached context]"
 #: (:func:`split_standing`, ``yuki.agent.prompt.rules_text``). This block travels as its
 #: own block, the last thing before the user's words (``ContextManager.add_request``).
 COMMITMENTS_LABEL = (
-    "[Open commitments, from Yuki's conversations with the user: what Yuki is to do later, and "
-    "what the user said they would do. Yuki's are Yuki's to keep; the user's are background.]"
+    "[Open commitments and to-dos, from Yuki's conversations with the user and their calls: Yuki's own "
+    "commitments are Yuki's to keep; the user's own to-dos are their work and background for you, never "
+    "your promises.]"
 )
 
 #: Last line of the same block.
@@ -453,6 +454,7 @@ class MemoryAccess:
         actions: list[str],
         outcome: str,
         on_done: Callable[[dict[str, Any]], None] | None = None,
+        addressed: str | None = None,
     ) -> bool:
         """Queue one exchange for ``MemoryClient.log_turn``. Returns at once.
 
@@ -469,6 +471,8 @@ class MemoryAccess:
             actions: One line per thing Yuki did.
             outcome: ``final``, ``error``, ``cancelled`` or ``abandoned``.
             on_done: Result callback; exceptions from it are swallowed.
+            addressed: Who a voice turn was said to ("yuki" | "others", voice's ``turn_closed``); a turn
+                said to others is kept but never extracted into rules, to-dos or facts.
 
         Returns:
             ``False`` when memory is not installed (nothing queued).
@@ -483,6 +487,7 @@ class MemoryAccess:
             "reply_text": reply_text,
             "actions": list(actions),
             "outcome": outcome,
+            "addressed": addressed,
         }
         with self._turn_lock:
             self._turns_pending += 1
@@ -516,6 +521,7 @@ class MemoryAccess:
                     turn["actions"],
                     turn["outcome"],
                     timeout_s=TURN_LOG_TIMEOUT_S,
+                    **({"addressed": turn["addressed"]} if turn.get("addressed") else {}),
                 )
                 if not report["row"]:
                     # log_turn never raises: it returns 0 and keeps the reason.
@@ -734,6 +740,10 @@ class MemoryAccess:
     def complete_todo(self, ref: str, *, timeout_s: float = TOOL_TIMEOUT_S) -> Any:
         """``MemoryClient.complete_todo``: what was completed, or ``None``. Raises :class:`MemoryUnavailable`."""
         return self.call_method("complete_todo", ref, timeout_s=timeout_s)
+
+    def end_todo(self, ref: str, how: str, *, timeout_s: float = TOOL_TIMEOUT_S) -> Any:
+        """``MemoryClient.end_todo``: ``how`` = done | not_needed | wrong; the id, or ``None``."""
+        return self.call_method("end_todo", ref, how, timeout_s=timeout_s)
 
     def pending_nudges(self, *, timeout_s: float = TRAY_TIMEOUT_S) -> list[dict[str, Any]]:
         """``MemoryClient.pending_nudges``, rows as dicts. Raises :class:`MemoryUnavailable`."""
@@ -1026,9 +1036,9 @@ class MemoryAccess:
     def _todo(self, tool_input: dict[str, Any]) -> ToolOutcome:
         """``list`` is a look (``ok=False`` when it cannot be made); ``add``/``done`` are writes."""
         action = _opt_text(tool_input, "action")
-        if action not in ("add", "done", "list"):
+        if action not in ("add", "done", "not_needed", "wrong", "list"):
             raise _BadInput(
-                f"'action' must be one of add, done, list, got {tool_input.get('action')!r}"
+                f"'action' must be one of add, done, not_needed, wrong, list, got {tool_input.get('action')!r}"
             )
         if action == "list":
             try:
@@ -1062,10 +1072,13 @@ class MemoryAccess:
                 payload={"action": action, "saved": True, "id": row, "text": text, "due": due},
             )
         try:
-            completed = self.complete_todo(text)
+            completed = self.complete_todo(text) if action == "done" else self.end_todo(text, action)
         except MemoryUnavailable as exc:
             return _not_saved("todo", exc, {"action": action, "text": text})
-        if completed:
+        if completed and action != "done":
+            how = "not needed" if action == "not_needed" else "captured by mistake"
+            reply, summary = f"Taken off the list as {how}: {completed}", f"to-do {how}"
+        elif completed:
             reply, summary = f"Marked done: {completed}", "to-do done"
         else:
             reply = (
@@ -1247,6 +1260,7 @@ def commitments_block_text(commitments: str | None) -> str | None:
 TODO_SOURCES = {
     "loop": "open loop memory noticed",
     "commitment": "Yuki promised",
+    "chat": "the user told Yuki: their own to-do, not Yuki's promise",
     "call": "the user said it on a call: their own plan",
     "user": "the user added",
 }

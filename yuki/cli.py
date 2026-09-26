@@ -30,12 +30,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the REPL.
 
     Args:
-        argv: Unused; present so this can serve as a console-script entry point.
+        argv: Command-line arguments (default ``sys.argv[1:]``). ``cost today`` and ``doctor`` are
+            one-shot commands; anything else (or nothing) starts the REPL.
 
     Returns:
         Process exit code.
     """
-    del argv
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["cost"]:
+        return _cost(args[1:])
+    if args[:1] == ["doctor"]:
+        return _doctor(args[1:])
     console = Console(soft_wrap=True)
     settings = Settings()
     logger = SessionLogger(settings.sessions_dir, console=console)
@@ -65,6 +70,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.close()
         console.print(f"[dim]log: {logger.path}[/dim]")
     return 0
+
+
+def _cost(args: list[str]) -> int:
+    """``yuki cost today [--json]`` (or ``yuki cost YYYY-MM-DD``): the day's AI spend, agent + voice + memory."""
+    import json
+    from datetime import date
+
+    from yuki.core.cost import format_spend, today_spend
+
+    settings = Settings()
+    which = next((a for a in args if not a.startswith("--")), "today")
+    day = None if which == "today" else date.fromisoformat(which)
+    spend = today_spend(settings, day=day)
+    if "--json" in args:
+        print(json.dumps(spend.as_dict(), indent=2))
+    else:
+        print(format_spend(spend, getattr(settings, "daily_cost_alert_usd", None)))
+    return 0
+
+
+def _doctor(args: list[str]) -> int:
+    """``yuki doctor [--offline] [--json]``: the health checklist; exit code 1 when something failed."""
+    from yuki.core.doctor import FAIL, format_report, report_json, run_checks
+
+    results = run_checks(Settings(), offline="--offline" in args)
+    print(report_json(results) if "--json" in args else format_report(results))
+    return 1 if any(c.status == FAIL for c in results) else 0
 
 
 def _command(line: str, agent: Agent, console: Console) -> bool:

@@ -604,12 +604,21 @@ def in_quiet_hours(at: float, config: NudgeConfig) -> bool:
 class Item:
     ref: str                          # loop:12 | commit:5 | todo:3
     text: str
-    source: str                       # loop | commitment | call (the user's own words on a call) | user
+    #: loop | commitment (Yuki's own promise) | chat (the user's own to-do, said to Yuki) | call (the user's
+    #: own words on a call) | user (a to-do the user added)
+    source: str
     due_at: float | None
     all_day: bool
-    status: str                       # open | done
+    status: str                       # open | done | dropped (not needed) | wrong (captured by mistake)
     evidence: str | None
     since: float
+    #: Whose it is (migration 18): "yuki" (Yuki promised or was handed it) or "user" (the user's own to-do).
+    owner: str = "user"
+
+
+#: What each source is, for the API and the UI: Yuki's commitments apart from the user's to-dos.
+SOURCE_LABELS = {"commitment": "Yuki's promise", "chat": "your to-do, told to Yuki", "call": "your to-do, said on a call",
+                 "user": "your to-do", "loop": "open loop"}
 
 
 def _is_midnight(at: float) -> bool:
@@ -654,14 +663,17 @@ def todo_items(store: Store, *, include_done: bool = False, now: float | None = 
         if f.status == "done" and (f.valid_to or 0.0) < done_since:
             continue
         evidence = None
+        users = f.origin == "call" or f.owner == "user"   # the user's own to-do, not Yuki's promise
         if f.quote and f.origin == "call":   # the user's own words in a call (yuki.memory.calls)
             evidence = f"the user said in a call on {datetime.fromtimestamp(f.valid_from):%Y-%m-%d}: \"{f.quote}\""
         elif f.quote:
-            evidence = f"the user asked on {datetime.fromtimestamp(f.valid_from):%Y-%m-%d}: \"{f.quote}\""
+            said = "said" if users else "asked"
+            evidence = f"the user {said} on {datetime.fromtimestamp(f.valid_from):%Y-%m-%d}: \"{f.quote}\""
+        source = "call" if f.origin == "call" else "chat" if f.owner == "user" else "commitment"
         items.append(Item(
-            f"commit:{f.id}", f.text, "call" if f.origin == "call" else "commitment", f.due_at,
+            f"commit:{f.id}", f.text, source, f.due_at,
             f.due_at is not None and _is_midnight(f.due_at), "open" if f.status == "active" else "done", evidence,
-            f.valid_from,
+            f.valid_from, owner="user" if users else "yuki",
         ))
     for t in store.todos(("open", "done") if include_done else ("open",), done_since=done_since):
         items.append(Item(f"todo:{t.id}", t.text, "user", t.due_at, t.due_all_day, t.status, None, t.created_at))
@@ -678,7 +690,8 @@ def todo_items(store: Store, *, include_done: bool = False, now: float | None = 
 def item_dict(item: Item) -> dict[str, Any]:
     """The API shape of one to-do."""
     return {"id": item.ref, "text": item.text, "source": item.source, "due": _due_iso(item),
-            "status": item.status, "evidence": item.evidence, "since": _iso(item.since)}
+            "status": item.status, "evidence": item.evidence, "since": _iso(item.since),
+            "owner": item.owner, "label": SOURCE_LABELS.get(item.source, item.source)}
 
 
 def _parse_ref(ref: str) -> tuple[str, int] | None:
@@ -696,17 +709,40 @@ def complete_item(store: Store, ref: str, *, now: float | None = None) -> str | 
     shown (docs/research/no-pattern-audit.md F): no text is matched here. None
     when ``ref`` is not an id or the item is not open.
     """
+    return end_item(store, ref, "done", now=now)
+
+
+#: How each way of ending an item reads in memory: the note kept on a commitment, and the correction an
+#: open loop's portrait fact gets (so later runs do not re-open it from old evidence).
+END_NOTES = {
+    "done": ("the user marked it done", "The user said this is done and no longer pending: {text}"),
+    "dropped": ("the user said it is not needed", "The user said this is not needed any more: {text}"),
+    "wrong": ("the user said it was captured by mistake, never a real to-do",
+              "The user said this was captured by mistake and was never pending: {text}"),
+}
+
+
+def end_item(store: Store, ref: str, status: str = "done", *, now: float | None = None) -> str | None:
+    """End one item by its id ("loop:12", "commit:5", "todo:3") as ``done``, ``dropped`` (not needed) or
+    ``wrong`` (captured by mistake); returns the id, or None when ``ref`` is not an id, the item is not open
+    or ``status`` is not one of those. No text is matched: the caller (the UI's buttons, the agent's tool)
+    names the item by its id. Ended items leave the list, the coach and the reminders; a wrong capture is
+    shown to the conversation extractor among the recently ended items, so the like is not captured again.
+    """
+    if status not in END_NOTES:
+        return None
     now = time.time() if now is None else float(now)
     parsed = _parse_ref(ref)
     if parsed is None:
         return None
     kind, number = parsed
+    note, correction = END_NOTES[status]
     if kind == "todo":
-        ok = store.complete_todo(number, at=now)
+        ok = store.end_todo(number, status, at=now)
     elif kind == "commit":
         fact = store.conversation_fact(number)
         ok = fact is not None and fact.kind == "commitment" and store.end_conversation_fact(
-            number, "done", at=now, note="the user marked it done")
+            number, status, at=now, note=note)
     else:
         loops = {l.id: l for l in store.open_loops("open")}
         loop = loops.get(number)
@@ -715,7 +751,7 @@ def complete_item(store: Store, ref: str, *, now: float | None = None) -> str | 
             # the user's word, through the portrait's own path: the render follows it at once and the
             # next run folds it in (so the loop is not re-added from old evidence); re-render soon
             text, _ = _split_loop(loop.text)
-            store.add_correction(f"The user said this is done and no longer pending: {text}", at=now)
+            store.add_correction(correction.format(text=text), at=now, apply=False)
             try:
                 path = flag_path(store.path, REFRESH_FLAG)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1350,7 +1386,8 @@ def _todo_lines(items: Sequence[Item], now: float, safe: Callable[[Any, int], st
             due = (f", due {rel} ({when:%A %Y-%m-%d})" if item.all_day
                    else f", due {rel} ({when:%A %Y-%m-%d %H:%M})")
         src = {"loop": "open loop", "commitment": "Yuki's commitment", "user": "added by the user",
-               "call": "the user's own words on a call: their plan, not Yuki's promise"}.get(item.source, item.source)
+               "call": "the user's own words on a call: their plan, not Yuki's promise",
+               "chat": "the user's own to-do, told to Yuki: their plan, not Yuki's promise"}.get(item.source, item.source)
         ev = f"; evidence: {safe(item.evidence, 200)}" if item.evidence else ""
         lines.append(f"- [{item.ref}] {safe(item.text, 300)} ({src}{due}, since "
                      f"{datetime.fromtimestamp(item.since):%Y-%m-%d}{ev})")
@@ -1753,9 +1790,13 @@ class NudgeWorker:
         clock: Callable[[], float] = time.time,
         event_name: str = NUDGE_EVENT_NAME,
         log: Any = None,
+        attention: Any = None,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
 
+        #: The shared anti-spam gates (yuki.core.attention): the service passes the process-wide instance;
+        #: otherwise (tests, a replay) a private one on this worker's clock.
+        self._att = attention
         self.store = store
         self.db_path = Path(db_path) if db_path is not None else store.path
         self._fixed_config = config
@@ -1803,10 +1844,9 @@ class NudgeWorker:
     @property
     def client(self) -> Any:
         if self._client is None:
-            import anthropic
+            from yuki.agent.failover import make_client   # backup model / region when Bedrock errors
 
-            region = self.settings.aws_region or os.environ["AWS_REGION"]
-            self._client = anthropic.AnthropicBedrock(aws_region=region)
+            self._client = make_client(self.settings, log=self._log)
         return self._client
 
     def _log(self, type: str, **fields: Any) -> None:
@@ -1978,23 +2018,70 @@ class NudgeWorker:
         due = self._due_items(now, config, items)
         # Back after time away: one card. The welcome back goes first and carries what is due; while
         # it waits for a settled, calm moment nothing else is shown.
-        resumed = self._resume(now, config, view, items, due)
+        resumed = self._resume(now, config, view, items, due) if self._allowed(now, config, "coach") else None
         if resumed is not None:
             if isinstance(resumed, dict):
-                done.append(resumed)
+                done.append(self._delivered("coach", resumed, now))
             return done
-        sent = self._send_due(now, config, due)
+        urgent = any(how == "remind" for _item, how in due)
+        sent = self._send_due(now, config, due) if due and self._allowed(now, config, "reminder", urgent) else None
         if sent is not None:
-            done.append(sent)
+            done.append(self._delivered("reminder", sent, now))
             return done
-        asked = self._question(now, config, view)
+        asked = self._question(now, config, view) if self._allowed(now, config, "question") else None
         if asked is not None:
-            done.append(asked)
+            done.append(self._delivered("question", asked, now))
             return done
-        result = self._checkin(now, config, view, items)
+        result = self._checkin(now, config, view, items) if self._allowed(now, config, "coach") else None
         if result is not None:
-            done.append(result)
+            done.append(self._delivered("coach", result, now))
         return done
+
+    # -- the shared attention gates (yuki.core.attention) ---------------------------------
+
+    def _attention(self, now: float, config: "NudgeConfig") -> Any:
+        """The process-wide :class:`~yuki.core.attention.Attention`, told this coach's quiet hours and card gap,
+        and which card is on screen: the newest card the UI marked shown and nobody has reacted to yet
+        (within the card gap). The UI records both in the database; this process reads them."""
+        att = self._att
+        if att is None:
+            from yuki.core.attention import Attention
+
+            att = self._att = Attention(clock=self.clock)
+        att.quiet_start, att.quiet_end = config.quiet_start, config.quiet_end
+        att.card_gap_s = config.card_gap_min * 60.0
+        try:
+            up = [n for n in self.store.nudges(now - config.card_gap_min * 60.0, now + 1.0)
+                  if n.shown_at is not None and not n.reaction]
+        except Exception:
+            up = []
+        if up:
+            att.card_shown(f"nudge:{up[-1].id}")
+        else:
+            att.card_closed()
+        return att
+
+    def _allowed(self, now: float, config: "NudgeConfig", channel: str, urgent: bool = False) -> bool:
+        """Whether the shared gates let ``channel`` show a card now. The coach's own gates (quiet hours,
+        meeting, full screen, away) have already passed, so no measured facts are passed again."""
+        try:
+            decision = self._attention(now, config).check(channel, urgent=urgent, now=now, facts={})
+        except Exception:
+            return True
+        if not decision.allowed:
+            self._log("nudge_attention", channel=channel, urgent=urgent, reason=decision.reason,
+                      retry_at=decision.retry_at)
+        return decision.allowed
+
+    def _delivered(self, channel: str, result: dict[str, Any], now: float) -> dict[str, Any]:
+        """A card was written: count it against the shared gates (budget, cooldown, card gap)."""
+        att = getattr(self, "_att", None)
+        if att is not None and isinstance(result, dict) and result.get("nudge_id"):
+            try:
+                att.record(channel, now=now)
+            except Exception:
+                pass
+        return result
 
     # -- picking up after the PC was off -----------------------------------------------
 
@@ -2294,7 +2381,7 @@ class NudgeWorker:
             at = self._remind_at(item, config)
             if now - at > late or self.store.reminded(item.ref, item.due_at):
                 continue
-            if item.source == "call":
+            if item.source in ("call", "chat"):   # the user's own plan: Yuki asks before it reminds
                 if at - now >= config.confirm_lead_min * 60.0:
                     out.append((item, "confirm"))
             elif at <= now:
@@ -2325,6 +2412,8 @@ class NudgeWorker:
         due = (f"{datetime.fromtimestamp(item.due_at):%A %Y-%m-%d} (no time given)" if item.all_day
                else f"{datetime.fromtimestamp(item.due_at):%A %Y-%m-%d %H:%M}")
         kind = {"commitment": "what Yuki promised to do for the user", "user": "a to-do the user added",
+                "chat": "the user's own plan, told to Yuki: a plan of theirs, not Yuki's promise; nothing is "
+                        "scheduled yet",
                 "call": "the user's own words on a call: a plan of theirs, not Yuki's promise; nothing is scheduled "
                         "yet"}.get(item.source, item.source)
         data = "\n".join([

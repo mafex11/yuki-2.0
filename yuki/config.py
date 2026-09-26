@@ -110,6 +110,32 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
 #: (checked 2026-09-25), so this is a setting, not a constant in code.
 DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
+#: The same models through the US inference profiles (a failover target, yuki.agent.failover).
+for _alias, _rates in (("sonnet", DEFAULT_PRICING[MODEL_ALIASES["sonnet"]]),
+                       ("opus", DEFAULT_PRICING[MODEL_ALIASES["opus"]])):
+    DEFAULT_PRICING[f"us.anthropic.claude-{_alias}-5"] = dict(_rates)
+
+#: Failover chains (``Settings.model_fallbacks``): the same model in another region first (the
+#: global profile from us-east-1, then the US profile), then a sibling model. Thinking blocks of
+#: the primary are ignored by a sibling (the API drops another model's blocks), so a switch
+#: mid-task is safe; Haiku takes no effort or adaptive thinking, so no chain switches *to* Haiku.
+DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
+    MODEL_ALIASES["sonnet"]: [
+        {"model": MODEL_ALIASES["sonnet"], "region": "us-east-1"},
+        {"model": "us.anthropic.claude-sonnet-5", "region": "us-east-1"},
+        {"model": MODEL_ALIASES["opus"], "region": None},
+    ],
+    MODEL_ALIASES["opus"]: [
+        {"model": MODEL_ALIASES["opus"], "region": "us-east-1"},
+        {"model": MODEL_ALIASES["sonnet"], "region": None},
+    ],
+    DEFAULT_VOICE_MOUTH_MODEL: [
+        {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": "us-east-1"},
+        {"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1"},
+        {"model": MODEL_ALIASES["sonnet"], "region": None},
+    ],
+}
+
 
 @dataclass
 class Settings:
@@ -356,6 +382,39 @@ class Settings:
     voice_keyterms_max: int = 50
     voice_prewarm: bool = True
     voice_prewarm_delay_s: float = 20.0
+    # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --
+    #: Model failover (yuki.agent.failover): per model id, the targets tried after it keeps failing
+    #: (throttled, 5xx, overloaded, timed out, unreachable, model or profile not found), in order:
+    #: the same model through another region or inference profile first, then a sibling model.
+    #: Each is ``{"model": id, "region": region or None (the primary's)}``.
+    model_fallbacks: dict[str, list[dict[str, str | None]]] = field(
+        default_factory=lambda: {k: [dict(t) for t in v] for k, v in DEFAULT_FALLBACKS.items()})
+    #: Retries on one target before moving on, and the backoff (seconds, doubled each time, capped;
+    #: a ``retry-after`` the service sends is honoured up to the cap).
+    model_retries: int = 2
+    model_retry_base_s: float = 0.6
+    model_retry_max_s: float = 4.0
+    #: Seconds without a byte before a model call counts as timed out, and to connect.
+    model_timeout_s: float = 90.0
+    model_connect_timeout_s: float = 10.0
+    #: After a failover worked, stay on that target this long before trying the primary again.
+    failover_sticky_s: float = 300.0
+    #: Loop breaker (yuki.agent.loopguard): the same failing result this many times trips it; this many
+    #: steps in a row with every call failed trips it; after this many trips only ask_user/done may run.
+    loop_breaker_repeats: int = 3
+    loop_breaker_failed_steps: int = 4
+    loop_breaker_max_trips: int = 2
+    #: Daily model spend (agent + voice + memory) above which one notice is shown and logged.
+    daily_cost_alert_usd: float = 3.0
+    #: Read-only helpers (yuki.agent.subagents): model, effort ("" = none sent), output cap per call,
+    #: model calls per helper, wall seconds per helper, input tokens per helper, most at once.
+    helpers_model: str = DEFAULT_VOICE_MOUTH_MODEL
+    helpers_effort: str = ""
+    helpers_max_tokens: int = 1200
+    helpers_max_turns: int = 6
+    helpers_timeout_s: float = 45.0
+    helpers_max_input_tokens: int = 60000
+    helpers_max: int = 4
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)

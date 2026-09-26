@@ -29,6 +29,16 @@ Public API::
         .stats() -> dict                      # reads, ms (content-free)
     Holder(app, packaged, path, since).key / .matches(process_key=, exe=, ids=)
     own_executables() -> frozenset[str];  display_name(holder) -> str
+    gaming_with_voice(holder, *, fullscreen, shows_page, camera, pids, gpu_fn=gpu_share) -> (bool, facts)
+    foreground_fullscreen() -> dict | None;  gpu_share(pids) -> float | None
+
+**Gaming with voice is not a meeting** (the 26 Sept Valorant case): a game's own voice chat holds
+the microphone and plays sound, exactly like a call. What tells them apart is measured too: the
+microphone holder is the **full-screen app in front**, it shows no web page, it does not hold the
+camera, and it **draws like a game** - its own share of the GPU's compute (NVML, last 10 s) is at
+least :data:`GAME_GPU_SHARE`. A full-screen meeting or video barely uses the GPU's compute and stays
+a meeting; without a GPU reading, full screen + microphone + no camera + no page counts as gaming.
+A call in another app (Discord in the background) is untouched.
 """
 
 from __future__ import annotations
@@ -410,4 +420,90 @@ def display_name(holder: Holder) -> str:
     return _names[key]
 
 
-__all__ = ["AvSignals", "AvSnapshot", "Holder", "own_executables", "display_name"]
+# ---------------------------------------------------------------------------
+# Gaming with voice chat: the full-screen app in front, drawing like a game
+# ---------------------------------------------------------------------------
+
+#: A full-screen app in front whose own GPU compute share (percent, NVML, mean of the last 10 s) is
+#: at least this is drawing like a game. Measured signal, not an app list.
+GAME_GPU_SHARE = 15.0
+
+_gpu: Any = None
+_gpu_lock = threading.Lock()
+
+
+def gpu_share(pids: Iterable[int]) -> float | None:
+    """The summed GPU compute share (%) of these processes over the last 10 s; ``None`` when unknown."""
+    global _gpu
+    wanted = {int(p) for p in pids if p}
+    if not wanted:
+        return None
+    try:
+        with _gpu_lock:
+            if _gpu is None:
+                from yuki.memory.calls import Gpu   # NVML, silent when there is no NVIDIA driver
+
+                _gpu = Gpu()
+            shares = _gpu.process_utilization(10.0)
+    except Exception:
+        return None
+    if shares is None:
+        return None
+    return float(sum(v for pid, v in shares.items() if pid in wanted))
+
+
+def gaming_with_voice(holder: Holder, *, fullscreen: bool, shows_page: bool, camera: Iterable[Holder] = (),
+                      pids: Iterable[int] = (), gpu_fn: Callable[[Iterable[int]], float | None] = gpu_share,
+                      ) -> tuple[bool, dict[str, Any]]:
+    """Whether the microphone ``holder`` is a full-screen game in front with voice chat (not a meeting).
+
+    Args:
+        holder: The microphone holder that is the app in front.
+        fullscreen: The window in front is full screen (``watcher.is_fullscreen_front``).
+        shows_page: The window in front shows a web page (a meeting site in a full-screen browser).
+        camera: The camera holders now (a camera in use means a meeting or a video call).
+        pids: The processes of the window in front (its GPU share is read for these).
+        gpu_fn: Reads the GPU share (tests pass a stub).
+
+    Returns:
+        ``(gaming, facts)``; ``facts`` says why (content-free), for the log.
+    """
+    facts: dict[str, Any] = {"fullscreen": bool(fullscreen), "page": bool(shows_page)}
+    if not fullscreen or shows_page:
+        return False, facts
+    if any(c.key == holder.key for c in camera):
+        facts["camera"] = True
+        return False, facts
+    share = None
+    try:
+        share = gpu_fn(list(pids))
+    except Exception:
+        share = None
+    facts["gpu_share"] = None if share is None else round(share, 1)
+    if share is None:
+        return True, facts
+    return share >= GAME_GPU_SHARE, facts
+
+
+def foreground_fullscreen() -> dict[str, Any] | None:
+    """The window in front when it is full screen: ``{"hwnd", "pid", "exe"}``; ``None`` otherwise."""
+    try:
+        user32 = ctypes.WinDLL("user32")
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if not hwnd:
+            return None
+        from yuki.memory.watcher import is_fullscreen_front
+
+        if not is_fullscreen_front(hwnd):
+            return None
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+        exe, _family = _pid_identity(int(pid.value)) if pid.value else ("", "")
+        return {"hwnd": hwnd, "pid": int(pid.value), "exe": exe}
+    except Exception:
+        return None
+
+
+__all__ = ["AvSignals", "AvSnapshot", "Holder", "own_executables", "display_name", "GAME_GPU_SHARE",
+           "gpu_share", "gaming_with_voice", "foreground_fullscreen"]

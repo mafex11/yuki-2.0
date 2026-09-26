@@ -488,7 +488,10 @@ def run(args: argparse.Namespace) -> int:
                     return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen")),
                             "acting": _acting_mod.current(db_path) is not None}
 
+                from yuki.core.attention import shared as shared_attention
+
                 nudges = NudgeWorker(store, db_path=db_path, privacy=privacy, locked_fn=session_locked,
+                                     attention=shared_attention(),
                                      live_fn=live_state, log=log)
                 nudges_thread = threading.Thread(
                     target=_guarded(nudges.run, log, "nudges"), args=(stop, pause_path),

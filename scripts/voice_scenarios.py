@@ -656,6 +656,20 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                  ScriptLine(clip("t_ram"), "t_ram", after_s=1.0, wait_for=settled()),
                  ScriptLine(clip("t_close2"), "t_close2", after_s=0.8, wait_for=reply_done()),
                  ScriptLine(clip("t_off"), "t_off", after_s=1.0, wait_for=settled())]
+    elif scenario == "clarify":
+        # v3.5: misheard commands get a question, the answer completes them, clear ones get none. The
+        # names memory would give as keyterms (test data standing in for the portrait's people).
+        from yuki.voice.offline import TabsDesk
+
+        desk = TabsDesk(timeline=timeline)
+        box["desk"] = desk
+        box["keyterms"] = ["Hemanth", "Varun", "Komal", "Jatin", "Claude", "ElevenLabs", "Corvana"]
+        runtime = TimedBrain([[(1.5, "tool", ("launch_app", {"query": "WhatsApp"})),
+                               (3.0, "done", "Sent Hemanth: call me.")]] * 3, timeline)
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [ScriptLine(clip("g_cloud"), "g_cloud", after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
+            for n in ("g_yes", "g_niche", "g_yes2", "t_volume", "n_chrome", "t_close2")]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -725,7 +739,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"unknown scenario {scenario}")
 
     bridge = VoiceBridge(runtime, vlog, foreground=lambda: None, settings=settings,
-                         **({"hands_backend": desk} if scenario in ("latency926", "tabs926") else {}))
+                         **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
     box["bridge"] = bridge
     if args.dump_mouth:
         # Test report only: the tail of every request the mouth sends (what it was shown).
@@ -776,7 +790,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 memory=memory, mouth_memory=box["mouth_memory"], log=vlog, speech_end=speech_end,
                 voice_activity=voice_activity,
                 on_state=lambda s, d: states.append((time.monotonic(), s)), session=scenario,
-                extra_observers=[timeline.observer()],
+                extra_observers=[timeline.observer()], keyterms=box.get("keyterms"),
             )
             box["conv"] = conv
             for line in lines:
@@ -855,7 +869,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
-    if scenario in ("latency926", "tabs926"):
+    if scenario in ("latency926", "tabs926", "clarify"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -934,7 +948,7 @@ def summary(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
-                                         "latency926", "tabs926", "all"))
+                                         "latency926", "tabs926", "clarify", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

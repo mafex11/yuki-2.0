@@ -472,3 +472,70 @@ def test_the_thinker_has_hover_and_app_volume_as_actions() -> None:
     desk.app_volume = mixer.app_volume
     outcome = Dispatcher(desk)._do_app_volume({"app": "chrome", "change": -30})
     assert outcome.ok and mixer.levels["chrome.exe"] == 70.0
+
+
+def test_heard_note_names_doubtful_words_and_near_names_only() -> None:
+    from yuki.voice.mouth import volatile_block
+    from yuki.voice.pipeline import heard_note
+
+    names = ["Hemanth", "Claude", "ElevenLabs", "Father", "Komal"]
+
+    def words(text: str, low: dict[str, float] | None = None) -> list[dict]:
+        return [{"word": w, "confidence": (low or {}).get(w, 0.99)} for w in text.split()]
+
+    note, low, near = heard_note(words("Tell hey meant on WhatsApp to call me."), names)
+    assert near == 1 and "'hey meant' sounds close to Hemanth" in note
+    note, low, near = heard_note(words("Send harsh message on WhatsApp.", {"harsh": 0.40}), names)
+    assert low == 1 and "'harsh' (0.40)" in note and "Hemanth" in note
+    for clear in ("Close the Claude tabs and the eleven labs tab as well.", "Increase the system volume a bit.",
+                  "So after the compaction this will stay in your memory."):
+        assert heard_note(words(clear), names)[0] is None, clear  # a clear command gets no note
+    block = volatile_block(heard="'cloud' sounds close to Claude, a name you know")["text"]
+    assert "Speech recognition on their latest words: 'cloud'" in block and "Speech" not in volatile_block()["text"]
+
+
+def test_mouth_fails_over_to_the_next_profile_and_logs_it() -> None:
+    import anthropic
+    import httpx
+
+    from yuki.voice.mouth import MouthMemory
+    from yuki.voice.pipeline import _layered_service
+
+    class Base:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            self.calls = 0
+
+        async def _create_message_stream(self, api_call: Any, params: Any) -> Any:
+            self.calls += 1  # the primary: throttled every time
+            raise anthropic.RateLimitError("slow down", response=httpx.Response(
+                429, request=httpx.Request("POST", "https://bedrock")), body=None)
+
+    async def backup_stream() -> Any:
+        yield SimpleNamespace(type="message_start")
+
+    used: list[Any] = []
+    events: list[tuple] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
+
+        async def create(self, **params: Any) -> Any:
+            used.append(params["model"])
+            return backup_stream()
+
+    hooks = SimpleNamespace(
+        fallbacks=lambda: [{"model": "us.anthropic.claude-haiku", "region": "us-east-1"}],
+        sticky_index=lambda n: 0, client_for=lambda region: Client(),
+        model_problem=lambda i, t, e, k: events.append(("problem", i, k)),
+        model_ok=lambda i, t: events.append(("ok", i)))
+
+    async def main() -> None:
+        llm = _layered_service(Base, MouthMemory(), hooks)()
+        llm._yuki_call = None
+        stream = await llm._create_message_stream(None, {"model": "global.haiku", "stream": True})
+        got = [e async for e in stream]
+        assert llm.calls == 2 and used == ["us.anthropic.claude-haiku"] and got[0].type == "message_start"
+        assert events == [("problem", 0, "retry"), ("problem", 0, "retry"), ("ok", 1)]
+
+    asyncio.run(main())

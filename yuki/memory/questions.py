@@ -171,7 +171,16 @@ def known_text(store: Store, safe: Callable[[Any, int], str], *, cap: int = KNOW
         facts = store.portrait_facts() if with_facts else []
     except Exception:
         return ""
+    try:
+        aliases = store.aliases()   # migration 18: names the user corrected ("Barun" is Varun)
+    except Exception:
+        aliases = []
     lines: list[str] = []
+    for a in aliases:
+        if relevant(a["heard"]) or relevant(a["name"]):
+            why = f", {safe(a['why'], 80)}" if a.get("why") else ""
+            lines.append(f"- \"{safe(a['heard'], 60)}\" is {safe(a['name'], 60)} (the user's correction{why}): "
+                         f"write the person or thing as {safe(a['name'], 60)}")
     for q in answered:
         if relevant(q.subject):
             lines.append(f"- {safe(q.subject, 80)}: the user said \"{safe(q.answer, 240)}\" (asked "

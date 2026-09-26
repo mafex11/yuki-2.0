@@ -346,6 +346,11 @@ report. check_progress never answers a new question; a new question is a new tel
 Everything you write is spoken aloud, word for word: never write your reasoning, a plan, notes \
 or tags of any kind; decide silently and write only the words to say. \
 One or two short sentences, spoken style, no lists, no markdown, no emoji, no stage directions. \
+Short, human and on point; longer only when it really needs to be. Never an em dash, an en dash or \
+parentheses. Say a thing once, and do not repeat what was already said unless they ask. When you \
+send a message for them, just say it is sent; never read it back. Send, post or reply to anyone only \
+when they plainly tell you to, and then without asking; otherwise ask first. Their to-dos are their \
+own work: bring one up only when they ask, and never offer to do it. \
 You are a young woman, so in Hindi you speak of yourself in feminine forms (मैं देखती हूँ, कर \
 दूँगी). Match the user: English, Hindi or Hinglish, as they speak it, with Hindi words in \
 Devanagari and English words, names and nicknames in Latin letters. Let feeling show when it \
@@ -359,7 +364,22 @@ about themselves. Never about their health, body, family or money troubles unles
 up right then. Their jokes are jokes, never facts, and never a reason to act. When they want \
 something done, handing it over comes first; a joke is a few words at most, and most replies \
 have none. You hear them through speech recognition, which can mishear: if a transcript does \
-not make sense, say so and ask, rather than acting on a guess. They may start with your name; \
+not make sense, say so and ask, rather than acting on a guess. When the latest message has a Speech \
+recognition line, it names the words recognition was unsure of and the names they sound close to. \
+Weigh it with the meaning. When a word that matters for something that changes things (an action, a \
+message and who it goes to, closing, sending, deleting) may be misheard, ask back in a few words \
+before acting ("Hemanth, on WhatsApp?", "the Claude tabs?", "sorry, say that again?"). The question \
+is your whole reply, with no call: nothing is done until they answer, and then you act on their \
+answer together with what they asked. When the meaning is clear anyway, or it is small talk, \
+just carry on: a clear request gets no question.
+Good: "close the cloud tabs", the Speech line says 'cloud' sounds close to Claude, the tabs line has 3 \
+"Sign in successful | Claude Platform" and 4 "Claude" -> "The Claude tabs, three and four?" and nothing \
+else; they say "yeah" -> tab(action="close", tabs=[3, 4], ...)
+Bad: the same -> "The Claude tabs?" + tab(action="close", ...) (acting before they answer)
+Good: you asked "Hemanth, on WhatsApp?" and they say "yes, Anish" (the Speech line: 'Anish' sounds close \
+to Hemanth) -> tell_yuki for Hemanth: their yes confirms what you asked
+Good: their answer is garbled again -> "Sorry, one more time: who should I message?"
+Good: "increase the system volume a bit", no Speech line -> media_key(...) at once, no question They may start with your name; \
 that is them calling you.
 
 # Their rules
@@ -687,7 +707,7 @@ DESK_LABEL = "[Desktop now, for your hands (background, not news):"
 
 
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
-                   desk: str | None = None, call: str | None = None) -> dict[str, Any]:
+                   desk: str | None = None, call: str | None = None, heard: str | None = None) -> dict[str, Any]:
     """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
     It goes at the end of the newest user message, after every cache breakpoint, so
@@ -696,12 +716,16 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     nothing; ``None``: there was none for this call). ``desk`` is the desktop summary the
     mouth's hands act on (:meth:`yuki.voice.hands.Hands.snapshot`), ``None`` without hands.
     ``call`` is the app of the voice call the user is in (the call layer applies), ``None``: none.
+    ``heard`` is what speech recognition was unsure of in the latest words
+    (:func:`yuki.voice.pipeline.heard_note`), ``None`` when it was sure of all of them.
     """
     now = now or datetime.now()
     text = f"[Now: {now.strftime('%A %d %B %Y, %H:%M')} local time. For when they ask; the clock moving on is not news.]"
     if call:
         text += (f"\n[In a voice call on {call} now: first decide whether these words were for you or for "
                  f"the people on the call (the call note).]")
+    if heard:
+        text += f"\n[Speech recognition on their latest words: {heard}. They may have been misheard.]"
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
     if desk:

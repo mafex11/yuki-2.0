@@ -16,7 +16,9 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
    timeline has a meeting row in front. A call is an app that has held the
    microphone for ``hold_s`` while it also plays sound or holds the camera,
    an app the user listed in ``[calls] apps`` holding the microphone, or a
-   meeting row. It ends once its app has let go of the microphone (and no
+   meeting row. A full-screen game in front using its own voice chat is not a
+   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`); Discord
+   or any other app holding the microphone meanwhile still is. It ends once its app has let go of the microphone (and no
    meeting row is in front) for ``end_grace_s``.
 2. **Ask, every call.** A ``calls`` row with status ``asking`` and the named
    event ``Local\\YukiCallReady`` for the UI, which shows a glass card
@@ -63,7 +65,15 @@ from typing import Any
 
 import numpy as np
 
-from yuki.memory.avsignals import AvSignals, Holder, display_name, own_executables
+from yuki.memory.avsignals import (
+    AvSignals,
+    Holder,
+    display_name,
+    foreground_fullscreen,
+    gaming_with_voice,
+    gpu_share,
+    own_executables,
+)
 from yuki.memory.store import (
     CALL_OPEN_STATUSES,
     CALL_READY_EVENT,
@@ -1328,6 +1338,8 @@ class CallWorker:
         headphones_fn: Callable[[CallConfig], tuple[bool, dict]] = headphones_now,
         source_factory: Callable[[CallConfig, str | None], Any] | None = None,
         config: CallConfig | None = None,
+        foreground_fn: Callable[[], dict | None] = foreground_fullscreen,
+        gpu_fn: Callable[..., float | None] = gpu_share,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
 
@@ -1337,6 +1349,11 @@ class CallWorker:
         self._config = config
         self._log_fn = log
         self.meeting_fn = meeting_fn
+        #: The full-screen window in front (``{"hwnd", "pid", "exe"}`` or None) and the GPU share reader:
+        #: a full-screen game with voice chat is not a call (yuki.memory.avsignals.gaming_with_voice).
+        self.foreground_fn = foreground_fn
+        self.gpu_fn = gpu_fn
+        self._gaming_logged: set[str] = set()
         #: The measured facts (shared with the timeline in the service). Holders are read again only when
         #: Windows changed a ConsentStore key or every ``holders_backstop_s``; a poll between is a cached read.
         #: ``holders_fn`` (a stub of the microphone holders alone, no sound out, no camera) is the old test hook.
@@ -1457,11 +1474,28 @@ class CallWorker:
             h for h in held_long
             if h.key not in cameras and h.key not in cfg.apps and h.key not in (meeting_key, going))}
         out: list[tuple[str, str, str | None, str]] = []
+        front: dict | None = None
+        front_read = False
         for h in mic:
             key = h.key
             if not key:
                 continue
             measured = h in held_long and (key in playing or key in cameras)
+            if measured and key != meeting_key and key != going:
+                if not front_read:
+                    front_read = True
+                    try:
+                        front = self.foreground_fn()
+                    except Exception:
+                        front = None
+                if front and h.matches(exe=str(front.get("exe") or "")):
+                    gaming, facts = gaming_with_voice(h, fullscreen=True, shows_page=False, camera=snap.camera,
+                                                      pids=[int(front.get("pid") or 0)], gpu_fn=self.gpu_fn)
+                    if gaming:
+                        measured = False   # a full-screen game's own voice chat: gaming, not a call
+                        if key not in self._gaming_logged:
+                            self._gaming_logged.add(key)
+                            self._log("call_skipped_gaming", app=key, **facts)
             if key in cfg.apps or key == meeting_key or measured:
                 service = (meeting or {}).get("service") if key == meeting_key else None
                 out.append((key, "mic", service, cfg.name_of(key, service or display_name(h))))
