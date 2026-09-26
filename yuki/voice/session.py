@@ -129,6 +129,21 @@ class VoiceSession(QObject):
     wake_changed = Signal(bool)
     #: ``"Mic: … · Speaker: …"``: the devices voice is using (the pill's and tray's tooltip).
     devices_changed = Signal(str)
+    #: The chat UI's events (v3.5, docs/VOICE.md §12), queued into the GUI thread. Words, for the screen only.
+    #: ``(text, ts, turn_id)``: a final transcript (``turn_closed`` in ``chat_event`` later says whether it was
+    #: addressed to Yuki or to someone else).
+    user_utterance = Signal(str, float, str)
+    #: ``(turn_id, text_so_far, final, interrupted)``: Yuki's words as they become audible; on a barge-in the
+    #: last one is ``final`` and ``interrupted``, cut at what was heard.
+    assistant_speech = Signal(str, str, bool, bool)
+    #: ``(turn_id, name, args_summary, ok, result_summary, ms)``: one of the talker's hands finished.
+    hand_step = Signal(str, str, str, bool, str, int)
+    #: ``(job_id, state, summary)``: a thinker job was submitted / running / step / waiting_for_answer /
+    #: done / failed / cancelled.
+    job_event = Signal(int, str, str)
+    #: Every one of the above as a dict ``{"type": "user_utterance" | "assistant_speech" | "hand_step" |
+    #: "job_event" | "turn_closed", ...}``, for a UI that wants one stream.
+    chat_event = Signal(object)
     _devices_seen = Signal(object)
     _watch_start = Signal()
     _wake_heard = Signal(float, float)
@@ -157,6 +172,7 @@ class VoiceSession(QObject):
         # temp folder in tests and the offline harness (their turns must never mix with the user's).
         self.log = VoiceLog(settings.voice_log_dir, settings.voice_log_dir.parent / "voice_turns.csv")
         self.bridge = VoiceBridge(runtime, self.log, settings=settings)
+        self.bridge.on_job_event = self._job_event
         self._prefs_path = prefs_path
         prefs = load_prefs(prefs_path)
         self.wake_enabled = bool(prefs.get("wake", settings.voice_wake))
@@ -205,9 +221,35 @@ class VoiceSession(QObject):
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        """App start: listen for the name unless the user turned that off (it is on by default). Nothing else starts."""
+        """App start: listen for the name unless the user turned that off (it is on by default).
+
+        With the wake word on and ``voice_prewarm``, the conversation's code is loaded in the background
+        a little later (:meth:`prewarm`), so the first "Yuki" is not a cold start.
+        """
         if self.wake_enabled:
             self._apply_wake()
+            if self.settings.voice_prewarm:
+                from PySide6.QtCore import QTimer
+
+                QTimer.singleShot(int(self.settings.voice_prewarm_delay_s * 1000), self.prewarm)
+
+    def prewarm(self) -> None:
+        """Load what a conversation needs, off the GUI thread, once per app run (docs/VOICE.md §26, v3.5).
+
+        Live 2026-09-26 the first "Yuki" after start-up took 8.5 s to reach speech recognition: 2.9 s
+        importing Pipecat and the services, then 5.6 s more on the voice thread for the imports, the
+        TLS set-up and the one-off checks the build does. Here, in the background: the imports, the
+        stream decoders the first reply would load, the TTS can-speak check (one request, cached for
+        the app run), the TLS context and the services' addresses, and the volume mixer's COM. No
+        connection is kept open (a speech-recognition socket costs money while open); a warm
+        conversation opens its three connections in ~1.2 s. Logged as ``prewarm`` (ms, RSS).
+        """
+        if getattr(self, "_prewarmed", False) or self.in_conversation:
+            return
+        self._prewarmed = True
+        settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
+        log = self.log
+        self._prewarm_job = _background(lambda: _prewarm(settings, log), "yuki-voice-prewarm")
 
     def toggle_conversation(self, via: str = "hotkey") -> None:
         if self.in_conversation:
@@ -560,6 +602,27 @@ class VoiceSession(QObject):
         self._stop_listener()
         self._close_mic()
 
+    # -- the chat UI (docs/VOICE.md §12) ---------------------------------------------------
+
+    def _chat(self, event: dict[str, Any]) -> None:
+        """A chat event from the voice thread: the typed signal and the one-stream signal (both queued)."""
+        kind = event.get("type")
+        if kind == "user_utterance":
+            self.user_utterance.emit(str(event.get("text") or ""), float(event.get("ts") or 0.0),
+                                     str(event.get("turn_id") or ""))
+        elif kind == "assistant_speech":
+            self.assistant_speech.emit(str(event.get("turn_id") or ""), str(event.get("text") or ""),
+                                       bool(event.get("final")), bool(event.get("interrupted")))
+        elif kind == "hand_step":
+            self.hand_step.emit(str(event.get("turn_id") or ""), str(event.get("name") or ""),
+                                str(event.get("args") or ""), bool(event.get("ok")), str(event.get("result") or ""),
+                                int(event.get("ms") or 0))
+        self.chat_event.emit(dict(event))
+
+    def _job_event(self, job_id: int, state: str, summary: str) -> None:
+        self.job_event.emit(int(job_id), state, summary)
+        self.chat_event.emit({"type": "job_event", "job_id": int(job_id), "state": state, "summary": summary})
+
     # -- never silent (docs/VOICE.md §16) ---------------------------------------------
 
     def notice(self, text: str) -> bool:
@@ -765,7 +828,16 @@ class VoiceSession(QObject):
         speaker = None
         self._guard = None
         settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
-        importer = _background(_import_pipeline, "yuki-voice-import")
+        prewarming = getattr(self, "_prewarm_job", None)
+        # A prewarm still importing is waited for rather than raced (two threads importing anthropic at
+        # once deadlocked once, pipeline.run); otherwise the modules are loaded here (instant when warm).
+        importer = (prewarming if prewarming is not None and not prewarming.done()
+                    else _background(_import_pipeline, "yuki-voice-import"))
+        # Names and terms from memory for speech recognition (docs/VOICE.md §9), read alongside the rest.
+        from yuki.voice.keyterms import memory_keyterms
+
+        keyterms_job = _background(lambda: memory_keyterms(self.memory, limit=settings.voice_keyterms_max),
+                                   "yuki-voice-keyterms")
         try:
             mic = self._ensure_mic()
             mark("mic")
@@ -804,6 +876,10 @@ class VoiceSession(QObject):
                 self.log.event("voice_id", state="refused_fallback", note=facts.get("tts_note"))
             mouth_memory = fetch_memory(self.memory)
             mark("memory")
+            try:
+                keyterms, keyterm_facts = keyterms_job.result(timeout=1.6)
+            except Exception as exc:  # noqa: BLE001 - recognition works without them
+                keyterms, keyterm_facts = [], {"terms": 0, "error": type(exc).__name__}
             importer.result()
             mark("imported")
             from pipecat.transports.base_transport import TransportParams
@@ -822,7 +898,8 @@ class VoiceSession(QObject):
                 voice_activity=lambda: (mic.stats.voiced_since, mic.stats.last_voiced),
                 on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
                 tts_provider=facts.get("tts_provider"), call_app=call_app,
-                on_closing=self._closing.emit, extra_observers=list(self.extra_observers),
+                on_closing=self._closing.emit, extra_observers=list(self.extra_observers), keyterms=keyterms,
+                on_chat=self._chat,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
             if facts.get("tts_note"):
@@ -843,7 +920,7 @@ class VoiceSession(QObject):
                            mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
                            tts_note=facts.get("tts_note"),
                            tts_model=self.settings.voice_tts_model, tts_voice_set=bool(settings.voice_tts_voice),
-                           memory=mouth_memory.facts(), timings_ms=dict(timings))
+                           memory=mouth_memory.facts(), keyterms=keyterm_facts, timings_ms=dict(timings))
             reason = asyncio.run(conversation.run())
             timings["kept_s"] = round(mic_input.kept_s, 2)
             timings["replayed_s"] = round(mic_input.replayed_s, 2)
@@ -876,6 +953,11 @@ class VoiceSession(QObject):
                            stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
                            timings_ms=dict(timings))
             self._thread_done.emit(reason, error)
+            if settings.voice_tts_provider == "elevenlabs":
+                # What this conversation spoke counts against the month: read the quota again for the next one.
+                from yuki.voice.pipeline import elevenlabs_quota
+
+                _background(lambda: elevenlabs_quota(refresh=True), "yuki-voice-quota")
 
 
 def _background(fn: Any, name: str) -> Any:
@@ -895,14 +977,89 @@ def _background(fn: Any, name: str) -> Any:
 
 
 def _import_pipeline() -> None:
-    """Import Pipecat and the pipeline's services off the voice thread (3.6-5.5 s cold, measured),
-    while the devices open and the checks run. Loaded once per app run; voice-off never gets here."""
+    """Import Pipecat and every service the pipeline builds, off the voice thread (3.6-5.5 s cold,
+    measured), while the devices open and the checks run. Loaded once per app run; voice-off never
+    gets here. Everything ``Conversation`` imports is here, so nothing is imported on the voice loop."""
     import yuki.voice.transport  # noqa: F401 - Pipecat's transports
+    from pipecat.adapters.schemas.function_schema import FunctionSchema  # noqa: F401
     from pipecat.pipeline.pipeline import Pipeline  # noqa: F401
     from pipecat.pipeline.worker import PipelineWorker  # noqa: F401
     from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair  # noqa: F401
     from pipecat.services.anthropic.llm import AnthropicLLMService  # noqa: F401
     from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService  # noqa: F401
+    from pipecat.services.deepgram.tts import DeepgramTTSService  # noqa: F401
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService  # noqa: F401
+    from pipecat.utils.context.llm_context_summarization import LLMAutoContextSummarizationConfig  # noqa: F401
+    from pipecat.workers.runner import WorkerRunner  # noqa: F401
+
+    import yuki.voice.grounding  # noqa: F401
+    import yuki.voice.narrator  # noqa: F401
+    import yuki.voice.pipeline  # noqa: F401
+
+
+def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
+    """The background prewarm (see :meth:`VoiceSession.prewarm`). Never raises; returns what it did."""
+    import socket
+    import ssl
+
+    started = time.perf_counter()
+    facts: dict[str, Any] = {}
+
+    def rss_mb() -> float | None:
+        try:
+            import psutil
+
+            return round(psutil.Process().memory_info().rss / 1_048_576, 1)
+        except Exception:  # noqa: BLE001
+            return None
+
+    facts["rss_before_mb"] = rss_mb()
+    steps: list[tuple[str, Any]] = [("imports", _import_pipeline)]
+
+    def decoders() -> None:
+        from yuki.voice.pipeline import _preimport, quiet_pipecat_logging
+
+        quiet_pipecat_logging(settings.voice_log_dir)
+        _preimport()
+
+    def checks() -> None:
+        from yuki.voice.pipeline import preflight
+
+        preflight(settings, need_headphones=False)
+
+    def network() -> None:
+        ssl.create_default_context()
+        for host in ("api.deepgram.com", "api.elevenlabs.io", f"bedrock-runtime.{settings.aws_region}.amazonaws.com"):
+            try:
+                socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            except OSError:
+                pass
+
+    def mixer() -> None:
+        from yuki.actions.app_volume import audio_apps
+
+        audio_apps()
+
+    def quota() -> None:
+        from yuki.voice.pipeline import elevenlabs_quota
+
+        if settings.voice_tts_provider == "elevenlabs":
+            left = elevenlabs_quota(refresh=True)
+            facts["tts_quota_left"] = left[0] if left else None
+
+    steps += [("decoders", decoders), ("checks", checks), ("network", network), ("mixer", mixer), ("quota", quota)]
+    for name, step in steps:
+        t = time.perf_counter()
+        try:
+            step()
+            facts[f"{name}_ms"] = round((time.perf_counter() - t) * 1000)
+        except Exception as exc:  # noqa: BLE001 - only an optimisation
+            facts[f"{name}_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    facts["rss_after_mb"] = rss_mb()
+    facts["ms"] = round((time.perf_counter() - started) * 1000)
+    if log is not None:
+        log.event("prewarm", **facts)
+    return facts
 
 
 def _plain_error(text: str) -> str:

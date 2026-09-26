@@ -35,6 +35,61 @@ LastWriteTime        Length Name
 """
 
 
+class _FakeSessionVolume:
+    """An app session's ISimpleAudioVolume, in memory (tests only)."""
+
+    def __init__(self, mixer: "MixerStub", app: str) -> None:
+        self.mixer, self.app = mixer, app
+
+    def SetMasterVolume(self, level: float, _ctx: Any) -> None:  # noqa: N802 - the COM names
+        self.mixer.levels[self.app] = round(float(level) * 100.0, 1)
+
+    def GetMasterVolume(self) -> float:  # noqa: N802
+        return self.mixer.levels[self.app] / 100.0
+
+    def SetMute(self, mute: bool, _ctx: Any) -> None:  # noqa: N802
+        self.mixer.muted[self.app] = bool(mute)
+
+    def GetMute(self) -> bool:  # noqa: N802
+        return self.mixer.muted.get(self.app, False)
+
+
+class MixerStub:
+    """A pretend Windows volume mixer and system volume: the per-app volume action runs its real logic on
+    these in-memory sessions, so tests never reach the real mixer (rule 7)."""
+
+    def __init__(self, levels: dict[str, float] | None = None, playing: set[str] | None = None,
+                 system: float = 45.0) -> None:
+        self.levels = dict(levels or {"chrome.exe": 100.0, "Spotify.exe": 40.0})
+        self.muted: dict[str, bool] = {}
+        self.playing = set(playing if playing is not None else {"chrome.exe"})
+        self.system = system
+        self.changes: list[tuple[str, float | None, bool | None]] = []
+
+    def master_volume(self) -> dict[str, Any]:
+        return {"level": float(self.system), "muted": False}
+
+    def _sessions(self) -> list[Any]:
+        from yuki.actions.app_volume import AppSession
+
+        return [AppSession(app=a, pid=100 + i, level=lv, muted=self.muted.get(a, False),
+                           state="active" if a in self.playing else "inactive", device="Speakers (stub)",
+                           volume=_FakeSessionVolume(self, a)) for i, (a, lv) in enumerate(self.levels.items())]
+
+    def audio_apps(self) -> list[dict[str, Any]]:
+        return [{"app": s.app, "level": s.level, "muted": s.muted, "playing": s.state == "active", "sessions": 1}
+                for s in sorted(self._sessions(), key=lambda s: (s.state != "active", s.app))]
+
+    def app_volume(self, app: str, *, level: float | None = None, change: float | None = None,
+                   mute: bool | None = None) -> Any:
+        from yuki.actions.app_volume import set_app_volume
+
+        result = set_app_volume(app, level=level, change=change, mute=mute, _sessions=self._sessions,
+                                _system=self.master_volume)
+        self.changes.append((app, result.details.get("after"), mute))
+        return result
+
+
 @dataclass
 class StubResult:
     """An :class:`~yuki.actions.ActionResult`-shaped success."""
@@ -129,6 +184,17 @@ class StubDesktop:
 
     def window_action(self, hwnd: int, action: str) -> StubResult:
         return self._act("window_action", f"window {hwnd} is now {action}d", hwnd, action)
+
+    def hover(self, x: int, y: int, **kwargs: Any) -> StubResult:
+        return self._act("hover", f"the pointer is at ({x},{y}); nothing new appeared near it", x, y, **kwargs)
+
+    def app_volume(self, app: str, **kwargs: Any) -> StubResult:
+        result = self._act("app_volume", f"{app}'s own volume set (stub)", app, **kwargs)
+        result.details = {"verified": True}
+        return result
+
+    def audio_apps(self) -> list[dict[str, Any]]:
+        return []
 
 
 class BrowserDesk(StubDesktop):
@@ -373,6 +439,101 @@ class BrowserDesk(StubDesktop):
                            expect_hwnd=expect_hwnd)
         result.summary += self._keys((key,), times)
         return result
+
+
+class TabsDesk(BrowserDesk):
+    """Chrome with the tabs of the live session of 2026-09-26 21:22-21:31 (tests only).
+
+    Each tab has an identity that survives moves (as UIA's RuntimeId does); ``tab(hwnd, id, action)``
+    selects or closes one by it, as :func:`yuki.actions.tabs.tab_action` does; Ctrl+W closes the tab
+    showing, whatever it is, and Ctrl+Shift+T brings back the most recently closed one, as Chrome does.
+    ``closed`` records every tab that went, in order, so a test can say which ones were closed.
+    """
+
+    LIVE_TABS = [
+        ("Inbox (12) - sam.k@example.com - Corvana Mail", "https://mail.google.com/mail/u/0/#inbox"),
+        ("Your secure link to Claude.ai is here - sam.k@example.com - Corvana Mail",
+         "https://mail.google.com/mail/u/0/#inbox/FMfcg"),
+        ("Sign in successful | Claude Platform", "https://platform.claude.com/login/success"),
+        ("Claude", "https://claude.ai/new"),
+        ("Wasureranneyo - Nannmonee Music Video - YouTube", "https://www.youtube.com/watch?v=nannmonee&list=PL1"),
+        ("Settings | ElevenLabs", "https://elevenlabs.io/app/settings"),
+        ("- YouTube", "https://www.youtube.com/watch?v=E9U9wLU_dQI"),  # "This video isn't available anymore"
+    ]
+
+    def __init__(self, timeline: Any = None, action_delay_s: float = 0.05) -> None:
+        super().__init__(era="after", timeline=timeline, action_delay_s=action_delay_s)
+        self.tabs = [{"name": n, "url": u, "scroll": 0.0, "titled_at": 0.0, "id": f"42.2492528.4.{i}"}
+                     for i, (n, u) in enumerate(self.LIVE_TABS)]
+        self.selected = 4  # the playlist video, playing
+        self.closed: list[dict[str, Any]] = []
+        self._next_id = 100
+
+        self.mixer = MixerStub({"chrome.exe": 100.0, "Discord.exe": 70.0}, playing={"chrome.exe"})
+        self.mixer.master_volume = self.master_volume  # the system volume is this desk's own
+
+    def activity_facts(self) -> dict[str, Any]:
+        facts = super().activity_facts()
+        facts["media"] = [{"app_id": "Chrome", "status": "playing" if self.playing else "paused",
+                           "title": "Wasureranneyo - Nannmonee Music Video", "artist": "Nannmonee", "current": True}]
+        return facts
+
+    def audio_apps(self) -> list[dict[str, Any]]:
+        return self.mixer.audio_apps()
+
+    def app_volume(self, app: str, **kwargs: Any) -> Any:
+        self._act("app_volume", "", app, **kwargs)
+        return self.mixer.app_volume(app, **kwargs)
+
+    def master_volume(self) -> dict[str, Any]:
+        return {"level": round(self.volume, 1), "muted": False}
+
+    def read_tabs(self, hwnd: int, **_: Any) -> Any:
+        from yuki.perception.tabs import Tab, TabStrip
+
+        if int(hwnd) != self.CHROME:
+            return TabStrip(hwnd=int(hwnd))
+        return TabStrip(hwnd=self.CHROME, tabs=[
+            Tab(index=i + 1, name=self.tab_name(i), selected=i == self.selected, tab_id=t["id"],
+                bounds=(60 + i * 220, 0, 60 + (i + 1) * 220, self.TAB_BAR_BOTTOM)) for i, t in enumerate(self.tabs)],
+            nodes=40, ms=3.0)
+
+    def _close_at(self, i: int) -> dict[str, Any]:
+        tab = self.tabs.pop(i)
+        self.closed.append(tab)
+        if self.selected >= len(self.tabs) or self.selected > i:
+            self.selected = max(0, self.selected - 1)
+        return tab
+
+    def tab(self, hwnd: int, tab_id: str, action: str) -> StubResult:
+        result = self._act("tab", "", hwnd, tab_id, action)
+        i = next((k for k, t in enumerate(self.tabs) if t["id"] == str(tab_id).strip("[]")), None)
+        if i is None:
+            result.ok, result.summary = False, f"window {hwnd} has no tab with id {tab_id} now; nothing was done"
+            result.details = {"verified": False}
+            return result
+        name = self.tabs[i]["name"]
+        if action == "close":
+            self._close_at(i)
+            result.summary = f"closed tab \"{name}\" [{tab_id}]; the strip, read again, has {len(self.tabs)} tabs"
+        else:
+            self.selected = i
+            result.summary = f"tab \"{name}\" [{tab_id}] is now the one showing"
+        result.details = {"verified": True, "tabs_after": [t["name"] for t in self.tabs]}
+        return result
+
+    def _keys(self, keys: tuple[str, ...], times: int = 1) -> str:
+        if keys == ("ctrl", "w") and self.tabs:
+            tab = self._close_at(self.selected)
+            return f"; closed the tab showing, \"{tab['name']}\""
+        if keys == ("ctrl", "shift", "t") and self.closed:
+            tab = dict(self.closed.pop())
+            tab["id"] = f"42.2492528.4.{self._next_id}"  # a restored tab is a new element
+            self._next_id += 1
+            self.tabs.append(tab)
+            self.selected = len(self.tabs) - 1
+            return f"; reopened \"{tab['name']}\""
+        return super()._keys(keys, times)
 
 
 # ---------------------------------------------------------------------------

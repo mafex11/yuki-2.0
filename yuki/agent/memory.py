@@ -85,7 +85,7 @@ RESUME_LABEL = (
 #: Budget guards on those two sections. Memory promises about 1200 and 4000
 #: characters; these only stop a misbehaving memory from flooding a request,
 #: and a cut is logged.
-STANDING_MAX_CHARS = 2400
+STANDING_MAX_CHARS = 4200
 RESUME_MAX_CHARS = 4500
 
 #: Most open to-dos attached to one request, and the longest line of one.
@@ -121,6 +121,22 @@ KNOWHOW_EMBED_WAIT_S = 0.6
 
 #: Most journal facts one ``recall`` returns.
 RECALL_LIMIT = 15
+
+#: Fast memory (``MemoryClient.relevant``): most items in the block, and the longest a request waits for
+#: its message's embedding (shared with the know-how lookup: one round trip over the service's pipe).
+RELEVANT_LIMIT = 4
+RELEVANT_TEXT_CHARS = 320
+
+#: Heading of the fast-memory block, placed right before the user's words (``commitments`` slot). In the
+#: request's messages, never the system prompt: it changes every message, and the cached system layers
+#: (core, profile, rules) must not.
+RELEVANT_LABEL = (
+    "[Memories that may bear on this message, found by similarity to it: background, each line starting "
+    "with where and when it came from. Use one only when it fits. When they ask what something from these is, "
+    "or to explain it, your answer says where and when it came from and what was said (\"you said on the "
+    "Discord call Friday around 4:26 that ...\", \"you told me tonight ...\"), not only the gist.]"
+)
+RELEVANT_END = "[End of memories]"
 
 #: ``recall`` result kinds that come from past conversations with the user:
 #: one exchange (``chat``) or one session's summary (``session``).
@@ -178,6 +194,12 @@ class MemoryContext:
     todos: list[dict[str, Any]] = field(default_factory=list)
     #: When the user's day at the PC began (``MemoryClient.day_context``), for "this morning" / "today".
     day: str | None = None
+    #: The few memories bearing on this request's words (``MemoryClient.relevant``), with provenance.
+    relevant: list[dict[str, Any]] = field(default_factory=list)
+    #: Yuki's own "how Yuki talks" block (``MemoryClient.yuki_persona``), for the profile layer and the mouth.
+    persona: str | None = None
+    #: Wall time of the fast-memory lookup (embedding + ranking), ms.
+    relevant_ms: float = 0.0
     truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
@@ -569,6 +591,7 @@ class MemoryAccess:
         query: str,
         resume: bool = False,
         timeout_s: float = CONTEXT_TIMEOUT_S,
+        previous: str | None = None,
     ) -> MemoryContext:
         """Portrait, know-how, standing context and (asked for) resume context. Never raises.
 
@@ -626,6 +649,24 @@ class MemoryAccess:
                 try:
                     value = self.call_method("day_context", timeout_s=max(deadline - time.perf_counter(), 0.05))
                     result.day = value.strip() if isinstance(value, str) and value.strip() else None
+                except MemoryUnavailable:
+                    pass
+            if query and query.strip() and "relevant" not in self._absent:
+                # the message's vector was just made for the know-how lookup: this costs the ranking only
+                t0 = time.perf_counter()
+                remaining = max(deadline - time.perf_counter(), 0.05)
+                try:
+                    rows = self.call_method("relevant", query, limit=RELEVANT_LIMIT,
+                                            embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), previous=previous,
+                                            timeout_s=remaining)
+                    result.relevant = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+                except MemoryUnavailable:
+                    pass
+                result.relevant_ms = round((time.perf_counter() - t0) * 1000, 1)
+            if "yuki_persona" not in self._absent:
+                try:
+                    value = self.call_method("yuki_persona", timeout_s=max(deadline - time.perf_counter(), 0.05))
+                    result.persona = value.strip() if isinstance(value, str) and value.strip() else None
                 except MemoryUnavailable:
                     pass
             if resume and "resume_context" not in self._absent:
@@ -783,6 +824,8 @@ class MemoryAccess:
                 outcome = self._todo(tool_input)
             elif name == "answer_question":
                 outcome = self._answer_question(tool_input, request)
+            elif name == "watch_for":
+                outcome = self._watch_for(tool_input, request)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -795,19 +838,34 @@ class MemoryAccess:
         since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
         until = _parse_when(tool_input.get("until"), "until", end_of_day=True)
         app = _opt_text(tool_input, "app")
+        with_time = tool_input.get("with_time_use") is True
+        if with_time and since is None:
+            raise _BadInput("'with_time_use' needs 'since' (and usually 'until'): the window the question is about")
         asked = {"query": query, "since": tool_input.get("since"),
-                 "until": tool_input.get("until"), "app": app}
+                 "until": tool_input.get("until"), "app": app, "with_time_use": with_time}
+
+        def look(c: Any) -> tuple[Any, Any, Any]:
+            rows = c.recall(query, since=since, until=until, app=app, limit=RECALL_LIMIT)
+            if not with_time:
+                return rows, None, None
+            return (rows, c.activity(since=since, until=until, group_by="app", limit=ACTIVITY_ITEMS),
+                    c.episodes(since=since, until=until, limit=ACTIVITY_EPISODES))
+
         try:
-            rows = self.call(
-                "recall",
-                lambda c: c.recall(query, since=since, until=until, app=app, limit=RECALL_LIMIT),
-                timeout_s=TOOL_TIMEOUT_S,
-            )
+            rows, usage, episodes = self.call("recall", look, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             text = f"Memory could not be searched: {exc}"
             return _fail("recall", text, {"asked": asked, "error": str(exc)})
         facts = [row for row in (rows or []) if isinstance(row, dict)]
         text = format_recall(facts, query=query, since=since, until=until, app=app)
+        if with_time:
+            # one reconciled answer for "when / how long / what did I do then": what was said and seen
+            # (above) next to the measured time use of the same window, calls included (below)
+            text += ("\n\nMeasured time use in the same window (the timeline: apps in front, calls with their real "
+                     "start and end, background use, and episodes). Reconcile it with the facts above: the facts "
+                     "say what was said and seen, this says when and for how long.\n"
+                     + format_activity(usage if isinstance(usage, dict) else {},
+                                       [e for e in (episodes or []) if isinstance(e, dict)]))
         episodes = sum(1 for row in facts if row.get("kind") == "episode")
         talks = sum(1 for row in facts if row.get("kind") in CONVERSATION_KINDS)
         plain = len(facts) - episodes - talks
@@ -819,10 +877,59 @@ class MemoryAccess:
         return ToolOutcome(
             name="recall",
             ok=True,
-            summary=f"{summary} for \"{query[:60]}\"",
+            summary=f"{summary} for \"{query[:60]}\"" + (" with time use" if with_time else ""),
             content=[{"type": "text", "text": text}],
-            payload={"asked": asked, "facts": facts},
+            payload={"asked": asked, "facts": facts, **({"activity": usage, "episodes": episodes} if with_time else {})},
         )
+
+    def _watch_for(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
+        """Save, list or cancel a standing request ("tell me when Varun replies"): the user's own words are checked."""
+        action = _opt_text(tool_input, "action") or "add"
+        if action not in ("add", "list", "cancel"):
+            raise _BadInput(f"'action' must be add, list or cancel, got {action!r}")
+        if action == "list":
+            try:
+                rows = self.call_method("standing_requests", timeout_s=TOOL_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                return _fail("watch_for", f"Standing requests could not be read: {exc}", {"error": str(exc)})
+            rows = [r for r in (rows or []) if isinstance(r, dict)]
+            text = ("No open standing requests." if not rows else "Open standing requests:\n" + "\n".join(
+                f"- [{r['ref']}] {r['condition']} (asked {_when(datetime.fromtimestamp(r['created_at']).isoformat())})"
+                for r in rows))
+            return ToolOutcome(name="watch_for", ok=True, summary=f"{len(rows)} open", content=[{"type": "text", "text": text}],
+                               payload={"action": action, "requests": rows})
+        if action == "cancel":
+            ref = _need_text(tool_input, "request")
+            try:
+                ended = self.call_method("cancel_standing_request", ref, timeout_s=TOOL_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                return _not_saved("watch_for", exc, {"action": action, "request": ref})
+            text = f"Stopped watching: {ref}" if ended else f"{ref} is not an open standing request; nothing changed."
+            return ToolOutcome(name="watch_for", ok=True, summary="cancelled" if ended else "nothing to cancel",
+                               content=[{"type": "text", "text": text}], payload={"action": action, "saved": bool(ended)})
+        condition = _need_text(tool_input, "condition")
+        quote = _need_text(tool_input, "quote")
+        if request is not None:
+            from yuki.memory.conversations import own_words, quote_in
+
+            if not quote_in(quote, own_words(request)) and not quote_in(quote, request):
+                raise _BadInput(
+                    "'quote' must be the user's own words asking for it, copied exactly from their message, not a paraphrase"
+                )
+        repeat = tool_input.get("repeat") is True
+        days = tool_input.get("days")
+        days = float(days) if isinstance(days, (int, float)) and not isinstance(days, bool) and days > 0 else None
+        try:
+            ref = self.call_method("add_standing_request", condition, quote, request=request, repeat=repeat,
+                                   days=days, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _not_saved("watch_for", exc, {"action": action, "condition": condition})
+        text = (f"Watching for it ({ref}): {condition}. Memory checks what comes in and puts one card on screen when "
+                f"it happens{', every time' if repeat else ''}.")
+        return ToolOutcome(name="watch_for", ok=True, summary="standing request saved",
+                           content=[{"type": "text", "text": text}],
+                           payload={"action": action, "saved": True, "ref": ref, "condition": condition, "quote": quote,
+                                    "repeat": repeat, "days": days})
 
     def _activity(self, tool_input: dict[str, Any]) -> ToolOutcome:
         since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
@@ -1230,8 +1337,33 @@ def format_recall(
             lines.append(f"{_when(row.get('at'))}-{end[-5:] if end != '(undated)' else '?'} [episode] {fact}")
             continue
         where = ", ".join(str(v) for v in (row.get("app"), row.get("host")) if v)
-        lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}{_NATURE_MARKS.get(row.get('nature'), '')}")
+        mark = _NATURE_MARKS.get(row.get("nature"), "")
+        if row.get("other_ai"):
+            mark += " [text for or from another AI tool - not a fact about the user]"
+        source = " ".join(str(row.get("source") or "").split())
+        lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}{mark}"
+                     + (f"\n    from: {source}" if source else ""))
     return "\n".join(lines)
+
+
+def relevant_block_text(items: list[dict[str, Any]]) -> str | None:
+    """The fast-memory block: one line per item with its date, then where it came from. ``None`` for none."""
+    lines = []
+    for row in items or []:
+        text = " ".join(str(row.get("text") or "").split())
+        if not text:
+            continue
+        if len(text) > RELEVANT_TEXT_CHARS:
+            text = text[: RELEVANT_TEXT_CHARS - 1].rstrip() + "…"
+        kind = {"portrait": "memory", "fact": "fact", "commitment": "commitment", "episode": "episode"}.get(
+            str(row.get("kind")), "memory")
+        mark = _NATURE_MARKS.get(row.get("nature"), "")
+        source = " ".join(str(row.get("source") or "").split())
+        # where and when first: the model echoes the framing it reads, and this is what it must say
+        lines.append(f"- ({source}) [{kind}] {text}{mark}" if source else f"- [{kind}] {text}{mark}")
+    if not lines:
+        return None
+    return f"{RELEVANT_LABEL}\n" + "\n".join(lines) + f"\n{RELEVANT_END}"
 
 
 #: How a recalled journal item that is not a plain fact is marked (yuki.memory.personality).

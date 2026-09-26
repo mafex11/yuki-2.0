@@ -270,6 +270,12 @@ class Settings:
             after Yuki has been quiet this long (a real pause), never after its result.
         voice_hands: Give the mouth its own single-step desktop tools (docs/VOICE.md §5.6).
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
+        voice_keyterms_max: At most this many names and terms from memory are given to speech
+            recognition as keyterms per conversation (docs/VOICE.md §9, v3.5).
+        voice_prewarm: With the wake word on, load the conversation's code (Pipecat, the services)
+            and do the one-off checks in the background after start-up, so the first "Yuki" is
+            heard at once (docs/VOICE.md §26, v3.5). Costs RAM while idle.
+        voice_prewarm_delay_s: How long after start-up the prewarm begins.
     """
 
     model: str = DEFAULT_MODEL
@@ -312,7 +318,7 @@ class Settings:
     voice_stt_model: str = "flux-general-multi"
     voice_stt_languages: tuple[str, ...] = ("en", "hi")
     voice_eot_threshold: float = 0.7
-    voice_eager_eot_threshold: float | None = None
+    voice_eager_eot_threshold: float | None = 0.4
     voice_eot_timeout_ms: int = 5000
     voice_mouth_model: str = DEFAULT_VOICE_MOUTH_MODEL
     voice_mouth_max_tokens: int = 400
@@ -347,6 +353,9 @@ class Settings:
     voice_progress_pause_s: float = 8.0
     voice_hands: bool = True
     voice_desk_wait_ms: float = 250.0
+    voice_keyterms_max: int = 50
+    voice_prewarm: bool = True
+    voice_prewarm_delay_s: float = 20.0
 
     def __post_init__(self) -> None:
         self.model = resolve_model(self.model)

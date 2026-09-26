@@ -350,7 +350,12 @@ def _hands_desk(timeline: Timeline) -> Any:
                 self.playing = not self.playing
             if key in ("volumedown", "volume_down"):
                 self.volume -= 2 * times
+            if key in ("volumeup", "volume_up"):
+                self.volume += 2 * times
             return result
+
+        def master_volume(self) -> dict[str, Any]:
+            return {"level": float(self.volume), "muted": False}
 
         def scroll(self, x: int, y: int, *, dy: int = 0, dx: int = 0, expect_hwnd: Any = None,
                    **kwargs: Any) -> StubResult:
@@ -600,6 +605,57 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         lines = [ScriptLine(clip("c_hello"), "c_hello", after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=0.8, wait_for=settled())
             for n in ("c_tab", "c_scroll", "c_newtab", "c_back", "c_newone", "c_again", "c_thanks")]
+    elif scenario == "latency926":
+        # The live session of 2026-09-26 20:52 (v3.5 latency): small talk, a hand-off, a hand, a question
+        # for the thinker, thanks and a system-volume key. A timed stand-in thinker (a step at 1.5 s, done
+        # at 3 s): the point is how soon Yuki is heard and the job starts after the user stops talking.
+        runtime = TimedBrain([[(1.5, "tool", ("look_at_window", {"hwnd": 0x3003})), (3.0, "done", "Done, sent it.")],
+                              [(1.5, "tool", ("recall", {"query": "CLI setup"})),
+                               (3.0, "done", "It's the CLI access with MCP for the Corvana product.")]] * 3,
+                             timeline)
+        desk = _hands_desk(timeline)
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [ScriptLine(clip("n_hello"), "n_hello", after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
+            for n in ("n_working", "n_hemanth", "n_chrome", "n_cli", "n_thanks", "n_sysvol")]
+    elif scenario == "tabs926":
+        # The live session of 2026-09-26 21:22-21:31 on a stub Chrome with the same tabs: dictation to
+        # another app, "close the Claude tabs and the ElevenLabs one", the YouTube volume, "you closed my
+        # video, bring it back" (seeded: the video was closed), a window hand while the thinker works,
+        # and "you can turn off the voice then".
+        from yuki.voice.offline import TabsDesk
+
+        desk = TabsDesk(timeline=timeline)
+        box["desk"] = desk
+        runtime = TimedBrain([[(1.5, "tool", ("system_facts", {})), (2.5, "tool", ("read_tabs", {"hwnd": 0x3003})),
+                               (9.0, "done", "You're at 88% RAM; Chrome is the biggest, then Claude and Discord.")]] * 3,
+                             timeline)
+        settled = lambda: _settled(box)  # noqa: E731
+        seeded: dict[str, bool] = {}
+
+        def close_video_first() -> Any:
+            ready = settled()
+
+            def check() -> bool:
+                if not ready():
+                    return False
+                if not seeded:
+                    seeded["done"] = True
+                    video = next(t for t in desk.tabs if t["name"].startswith("Wasureranneyo"))
+                    desk.tab(desk.CHROME, video["id"], "close")
+                    box["bridge"].actions.add("your hand", f"tab window={desk.CHROME} action=close",
+                                              f'closed tab "{video["name"]}" [{video["id"]}]', ok=True, verified=True)
+                    timeline.add("seed", what="the video tab was closed by an earlier hand")
+                return True
+            return check
+
+        lines = [ScriptLine(clip("d_dictate"), "d_dictate", after_s=1.0),
+                 ScriptLine(clip("t_close"), "t_close", after_s=2.5),
+                 ScriptLine(clip("t_volume"), "t_volume", after_s=1.0, wait_for=settled()),
+                 ScriptLine(clip("t_back"), "t_back", after_s=1.0, wait_for=close_video_first()),
+                 ScriptLine(clip("t_ram"), "t_ram", after_s=1.0, wait_for=settled()),
+                 ScriptLine(clip("t_close2"), "t_close2", after_s=0.8, wait_for=reply_done()),
+                 ScriptLine(clip("t_off"), "t_off", after_s=1.0, wait_for=settled())]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -668,7 +724,9 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
-    bridge = VoiceBridge(runtime, vlog, foreground=lambda: None, settings=settings)
+    bridge = VoiceBridge(runtime, vlog, foreground=lambda: None, settings=settings,
+                         **({"hands_backend": desk} if scenario in ("latency926", "tabs926") else {}))
+    box["bridge"] = bridge
     if args.dump_mouth:
         # Test report only: the tail of every request the mouth sends (what it was shown).
         import yuki.voice.pipeline as pipeline_module
@@ -797,6 +855,22 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
+    if scenario in ("latency926", "tabs926"):
+        if "desk" in box:
+            timeline.add("desk", **box["desk"].desk_state(timeline.t0))
+            report["timeline"] = timeline.events
+        report["hands"] = hands_metrics(report, [ln.label for ln in lines])
+        ends = report["speech_ends"]
+        for row in report["hands"]:
+            eos = ends.get(row["line"])
+            nxt = [e["t"] for e in timeline.events if e["kind"] == "line" and eos is not None and e["t"] > eos]
+            subs = [e["t"] for e in timeline.events if e["kind"] == "brain" and e.get("event") == "submitted"
+                    and eos is not None and e["t"] >= eos and (not nxt or e["t"] < nxt[0])]
+            row["submit_ms"] = round((subs[0] - eos) * 1000) if subs else None
+        if "desk" in box:
+            report["closed_tabs"] = [t["name"] for t in box["desk"].closed]
+            report["tabs_left"] = [t["name"] for t in box["desk"].tabs]
+            report["app_volumes"] = dict(box["desk"].mixer.levels)
     if scenario in ("hands", "hands3"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
@@ -860,7 +934,7 @@ def summary(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
-                                         "all"))
+                                         "latency926", "tabs926", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

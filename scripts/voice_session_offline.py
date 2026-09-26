@@ -107,6 +107,13 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
 
         return check
 
+    def prewarmed() -> Any:
+        """True once the session's background prewarm has finished (v3.5: the first wake after it)."""
+        def check() -> bool:
+            job = getattr(session, "_prewarm_job", None)
+            return job is not None and job.done()
+        return check
+
     names: list[str] = []
     if scenario == "echo":
         script = [(clip("k_nice"), 1.0, None)]
@@ -125,11 +132,16 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         names = [n for n, _a, _w in lines]
     elif scenario == "latency":
         gap = 0.35
-        lines = [("k_name", 1.0, None), ("k_pause_cmd", gap, None), ("k_name", 1.0, no_conversation(1.5)),
-                 ("k_pause_cmd", gap, None)]
+        first = prewarmed() if args.prewarm else None
+        if args.one_breath:
+            # "Yuki, pause the music." in one breath, twice (v3.5): the words right after the name.
+            lines = [("k_pause", args.first_after, first), ("k_pause", 1.0, no_conversation(1.5))]
+        else:
+            lines = [("k_name", 1.0, first), ("k_pause_cmd", gap, None), ("k_name", 1.0, no_conversation(1.5)),
+                     ("k_pause_cmd", gap, None)]
         script = [(clip(n), after, wait) for n, after, wait in lines]
         names = [n for n, _a, _w in lines]
-        box["name_end_s"] = speech_end_offset(clip("k_name"))
+        box["name_end_s"] = speech_end_offset(clip("k_name"))  # "Yuki" said alone; in k_pause it ends about as soon
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
@@ -166,6 +178,8 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     session.wake_enabled = True
     t_start = time.monotonic()
     session.start()
+    if args.prewarm:
+        session.prewarm()
 
     def poll() -> None:
         mic = mics[0] if mics else None
@@ -205,7 +219,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     if scenario == "latency" and mic is not None:
         rows = []
         for i, (a, heard) in enumerate(wakes):
-            k = 0 if i == 0 else 2
+            k = (0 if i == 0 else 1) if args.one_breath else (0 if i == 0 else 2)
             if k >= len(mic.lines):
                 break
             word_end = mic.lines[k]["started_at"] + box["name_end_s"]
@@ -214,6 +228,18 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 row.update({f"heard_to_{key}_ms": v for key, v in timings[i].items() if isinstance(v, (int, float))
                             and key != "replayed_s"})
                 row["replayed_s"] = timings[i].get("replayed_s")
+            # The request's own end (the last line of this wake): when it was transcribed and acted on.
+            last = mic.lines[k + (0 if args.one_breath else 1)] if k + (0 if args.one_breath else 1) < len(mic.lines) else None
+            if last is not None:
+                said_end = last["started_at"] + speech_end_offset(clip(names[k + (0 if args.one_breath else 1)])) - t0
+                nxt = heard + 60
+                heard_t = [e["t"] for e in timeline.events if e["kind"] == "user" and e["t"] > said_end - 0.2]
+                acted = [e["t"] for e in timeline.events if e["kind"] == "action" and e["t"] > said_end - 0.2]
+                row["request_end_to_transcript_ms"] = round((heard_t[0] - said_end) * 1000) if heard_t else None
+                row["request_end_to_action_ms"] = round((acted[0] - said_end) * 1000) if acted else None
+                row["heard"] = [e["text"] for e in timeline.events if e["kind"] == "user"
+                                and said_end - 3 < e["t"] < said_end + 15]
+                del nxt
             rows.append(row)
         report["latency"] = rows
     out = args.out / f"{scenario}-{variant}.json"
@@ -260,6 +286,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--idle", type=float, default=8.0)
     ap.add_argument("--call-idle", dest="call_idle", type=float, default=10.0)
     ap.add_argument("--max-s", dest="max_s", type=float, default=120.0)
+    ap.add_argument("--first-after", dest="first_after", type=float, default=1.0,
+                    help="latency --one-breath: seconds of room before the first line")
+    ap.add_argument("--prewarm", action="store_true", help="latency: prewarm in the background before the first wake")
+    ap.add_argument("--one-breath", dest="one_breath", action="store_true",
+                    help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     report = run(args.scenario, args)

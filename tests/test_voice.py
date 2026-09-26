@@ -968,7 +968,7 @@ def test_hands_act_only_on_windows_they_were_shown() -> None:
     ok, report, _ = hands._run("window", {"window": 0x1002, "action": "minimize"})
     assert ok and desk.calls[-1][0] == "window_action"
     ok, report, _ = hands._run("press_keys", {"window": 0x1001, "keys": ["k"]})
-    assert ok and desk.calls[-1] == ("press", ("k",), {"times": 1, "expect_hwnd": 0x1001})  # guarded
+    assert not ok and "no hand called" in report  # v3.5: the talker has no keyboard (blind Ctrl+W, 26 Sept)
     ok, report, _ = hands._run("media_key", {"key": "playpause"})
     assert ok and "media: Spotify now paused (was Spotify playing)" in report  # the measured effect
     ok, report, _ = hands._run("scroll", {"window": 0x1001, "direction": "down", "amount": 3})

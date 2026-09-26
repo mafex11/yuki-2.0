@@ -38,8 +38,8 @@ from yuki.config import Settings
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, get_key
 from yuki.voice.hands import HAND_TOOLS
 from yuki.voice.mouth import (
-    CHECK_PROGRESS, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, mouth_system_blocks,
-    volatile_block,
+    CHECK_PROGRESS, END_CONVERSATION, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
+    mouth_system_blocks, volatile_block,
 )
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
@@ -168,6 +168,44 @@ def elevenlabs_can_speak(settings: Settings, voice: str | None = None) -> tuple[
     return result
 
 
+#: The ElevenLabs characters left this month, as last read: ``(remaining, limit, read at)`` (monotonic).
+_TTS_QUOTA: dict[str, tuple[int, int, float]] = {}
+#: Below this many characters left, a conversation speaks with the fallback voice (a reply is ~50-300).
+QUOTA_FLOOR_CHARS = 400
+#: How long a quota read is trusted before the next check reads it again (s).
+QUOTA_TRUST_S = 600.0
+
+
+def elevenlabs_quota(refresh: bool = False) -> tuple[int, int] | None:
+    """``(characters left, limit)`` of the ElevenLabs account this month, or ``None`` when it cannot be read.
+
+    Live 2026-09-26 the free tier's 10,000 characters ran out: every reply then came back with no audio,
+    Pipecat gave the TTS up after three ("can no longer do its job") and Yuki went silent, while the
+    one-character can-speak check still passed. Read from the account's subscription (content-free),
+    cached for :data:`QUOTA_TRUST_S`; never raises.
+    """
+    import time as _time
+
+    cached = _TTS_QUOTA.get("elevenlabs")
+    if cached and not refresh and _time.monotonic() - cached[2] < QUOTA_TRUST_S:
+        return cached[0], cached[1]
+    key = get_key(ELEVENLABS)
+    if not key:
+        return None
+    import json
+    import urllib.request
+
+    try:
+        req = urllib.request.Request("https://api.elevenlabs.io/v1/user/subscription", headers={"xi-api-key": key})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read()[:20000].decode("utf-8", "replace"))
+        used, limit = int(data.get("character_count") or 0), int(data.get("character_limit") or 0)
+    except Exception:  # noqa: BLE001 - a scoped key may not read it: then only the can-speak check applies
+        return None
+    _TTS_QUOTA["elevenlabs"] = (max(0, limit - used), limit, _time.monotonic())
+    return max(0, limit - used), limit
+
+
 def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, Any]:
     """Check what a conversation needs before opening anything. Raises :class:`VoiceUnavailable`.
 
@@ -181,6 +219,10 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
         raise VoiceUnavailable("Voice needs DEEPGRAM_API_KEY (a Windows user environment variable).")
     if settings.voice_tts_provider == "elevenlabs":
         ok, reason = elevenlabs_can_speak(settings)
+        quota = elevenlabs_quota()
+        if ok and quota is not None and quota[0] < QUOTA_FLOOR_CHARS:
+            ok, reason = False, f"its monthly characters are used up ({quota[0]} of {quota[1]} left)"
+            facts["tts_quota_left"] = quota[0]
         default = DEFAULT_VOICES["elevenlabs"]
         if not ok and reason.startswith("voice:") and (settings.voice_tts_voice or default) != default:
             # That voice is refused (e.g. a library voice on the free plan): this conversation
@@ -234,6 +276,84 @@ class LlmCall:
     desk_ms: float | None = None        # capturing it (fresh) or its age (previous)
     desk_chars: int = 0
     desk_tabs_ms: float | None = None   # reading the foreground window's tabs for it
+    early_say: float | None = None      # a call's say_first went to the voice while the call was being written
+
+
+#: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
+SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation"})
+
+
+def early_words(partial_json: str) -> str | None:
+    """The ``say_first`` value of a tool call whose arguments are still streaming, once that string is whole.
+
+    The mouth writes ``say_first`` first (its schema asks it to); the moment its string is complete in
+    the streamed JSON it can be spoken, while the rest of the call is still being written (v3.5,
+    docs/VOICE.md §5.2). Parsing the call's own JSON: ``None`` until the value is complete, or when
+    the arguments have no ``say_first``.
+    """
+    import json
+
+    key = partial_json.find('"say_first"')
+    if key < 0:
+        return None
+    colon = partial_json.find(":", key + len('"say_first"'))
+    if colon < 0:
+        return None
+    start = colon + 1
+    while start < len(partial_json) and partial_json[start] in " \t\r\n":
+        start += 1
+    if start >= len(partial_json) or partial_json[start] != '"':
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(partial_json, start)
+    except ValueError:
+        return None  # the string is not complete yet
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def one_stop_per_turn(base: type) -> type:
+    """``base`` (Pipecat's ``EagerUserTurnStopStrategy``) resolving each user turn's end once.
+
+    Found 2026-09-26 with Pipecat's debug log (eager end of turn on, the latency926 replay): Flux's
+    proposed turn stop and the stop strategy's transcript timer resolve the same turn within a
+    millisecond. The eager strategy awaits inside its resolution (stopping its speculation timer), so
+    the second call found no speculation and ran a second inference, whose turn-stop frame released
+    the speculative reply, and the first call then judged the speculation "missed" and ran a third:
+    two or three replies to one "Hello?" (and two answers to "what's the CLI setup?", one without the
+    thinker). Here the resolutions are serialized and a turn is resolved once; the next turn's start
+    re-arms it. Plumbing: when a turn ends, not what was said.
+    """
+
+    class OneStopPerTurn(base):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._yuki_lock = asyncio.Lock()
+            self._yuki_resolved = False
+
+        async def handle_user_turn_started(self) -> None:
+            self._yuki_resolved = False
+            await super().handle_user_turn_started()
+
+        async def trigger_user_turn_stopped(self, **kwargs: Any) -> None:
+            async with self._yuki_lock:
+                if self._yuki_resolved:
+                    return
+                self._yuki_resolved = True
+                await super().trigger_user_turn_stopped(**kwargs)
+
+    return OneStopPerTurn
+
+
+def keyterm_list(base: list[str], extra: list[str], cap: int) -> list[str]:
+    """Speech recognition's keyterms: ``base`` then ``extra``, each once (case-insensitive), at most ``cap``."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in [*base, *extra]:
+        term = " ".join(str(term or "").split())
+        if term and term.casefold() not in seen:
+            seen.add(term.casefold())
+            out.append(term)
+    return out[: max(1, cap)]
 
 
 def with_volatile(messages: Any, block: dict[str, Any]) -> Any:
@@ -357,14 +477,55 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             super().__init__(*args, **kwargs)
             #: Tool call ids of replies that said words before calling (see ``chronological``).
             self._yuki_spoke: set[str] = set()
+            #: Tool call ids whose say_first was spoken while the call was still being written (v3.5).
+            self._yuki_early: set[str] = set()
+            #: Tool calls of a speculative reply (eager end of turn), run when the turn is confirmed.
+            self._yuki_held_calls: list[Any] | None = None
 
         async def run_function_calls(self, function_calls: Any) -> None:
+            if function_calls and self._speculation_gate.is_speculating:
+                # A reply to an eager end of turn wants a tool. Pipecat withdraws the whole reply and
+                # asks again after the committed turn (a second call: the latency eager was for).
+                # Here the calls wait, as the reply's words wait in the gate: they run the moment the
+                # turn is confirmed and are dropped with the words if it is withdrawn (v3.5).
+                self._yuki_held_calls = list(function_calls)
+                hooks.speculation("held_calls", len(function_calls))
+                return
             call = self._yuki_call
             if call is not None and call.first_text is not None:
                 self._yuki_spoke.update(str(fc.tool_call_id) for fc in function_calls)
             await super().run_function_calls(function_calls)
 
+        async def push_frame(self, frame: Any, direction: Any = None) -> None:
+            from pipecat.frames.frames import EagerEndOfTurnCancelFrame, InterruptionFrame, UserStoppedSpeakingFrame
+            from pipecat.processors.frame_processor import FrameDirection
+
+            direction = FrameDirection.DOWNSTREAM if direction is None else direction
+            await super().push_frame(frame, direction)
+            held = self._yuki_held_calls
+            if held is None or direction != FrameDirection.DOWNSTREAM:
+                return
+            if isinstance(frame, UserStoppedSpeakingFrame):
+                # The turn is confirmed: the gate has just released the reply's words; its calls follow.
+                self._yuki_held_calls = None
+                hooks.speculation("released_calls", len(held))
+                self.create_task(self.run_function_calls(held), "yuki-held-calls")
+            elif isinstance(frame, (EagerEndOfTurnCancelFrame, InterruptionFrame)):
+                self._yuki_held_calls = None
+                hooks.speculation("dropped_calls", len(held))
+
+        async def _yuki_say_early(self, call: LlmCall, tool_id: str, words: str) -> None:
+            """Speak a call's say_first now, while the rest of the call is still being written."""
+            from pipecat.frames.frames import TTSSpeakFrame
+
+            self._yuki_early.add(tool_id)
+            self._yuki_spoke.add(tool_id)  # its words go before the call in the context (chronological)
+            call.early_say = time.monotonic()
+            await self.push_frame(TTSSpeakFrame(text=words))
+            hooks.early_said(call, len(words))
+
         async def _process_context(self, context: Any) -> None:
+            self._yuki_held_calls = None  # a new inference: whatever an older speculation held is void
             call = LlmCall(entered=time.monotonic())
             self._yuki_call = call
             try:
@@ -418,6 +579,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             call.opened = time.monotonic()
 
             async def timed() -> Any:
+                tool_id, args, said = None, "", True
                 async for event in response:
                     now = time.monotonic()
                     if call.first_event is None:
@@ -427,6 +589,17 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         call.first_content = now
                     if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
                         call.first_text = now
+                    if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
+                        tool_id, args = str(event.content_block.id), ""
+                        said = getattr(event.content_block, "name", "") not in SAY_FIRST_TOOLS
+                    elif (kind == "content_block_delta" and not said and tool_id is not None
+                          and hasattr(event.delta, "partial_json")):
+                        args += event.delta.partial_json or ""
+                        words = early_words(args)
+                        if words is not None:
+                            said = True
+                            if call.first_text is None:  # a reply that already spoke keeps its own words
+                                await self._yuki_say_early(call, tool_id, words)
                     yield event
 
             return timed()
@@ -486,6 +659,7 @@ class _Turn:
     tts_audio: float | None = None
     first_audio: float | None = None
     action_at: float | None = None       # a hand's action went out (v3.3: end of speech -> action)
+    handoff_at: float | None = None      # a tell_yuki call started: the job is submitted now (v3.5)
     reply: list[str] = field(default_factory=list)
     spoken: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
@@ -495,6 +669,7 @@ class _Turn:
     error: str | None = None
     call: bool = False                   # the user was in a voice call (call mode)
     counted: bool = False                # counted as an exchange with Yuki
+    cut: bool = False                    # the user spoke again before this turn's reply was heard
 
 
 class TurnObserver:
@@ -550,15 +725,62 @@ class TurnObserver:
         self.last_exchange: float | None = None
         #: When the mouth's last reply stream ended (its tool calls start just after it).
         self.last_response_end = 0.0
+        #: The state to show when nobody is talking and nothing is being generated: "working" only while
+        #: a job really runs, else "listening" (set by the conversation; v3.5, the pill bug of 26 Sept).
+        self.idle_state: Callable[[], str] = lambda: "listening"
+        #: ``(event dict)``: the chat UI's events (words: for the screen, never the log; v3.5). Set by the session.
+        self.on_chat: Callable[[dict[str, Any]], None] | None = None
+        #: The output transport: a word Yuki says counts as heard when it leaves this processor.
+        self.output_processor: Any = None
+        self._said: list[str] = []
+        self._said_turn: str | None = None
 
     def as_observer(self) -> Any:
         outer = self
 
         class _Obs(self._base):
             async def on_push_frame(self, data: Any) -> None:
+                outer.on_played(data)
                 outer.on_frame(data.frame)
 
         return _Obs()
+
+    # -- the chat UI's events (docs/VOICE.md §12) --------------------------------------
+
+    def turn_id(self) -> str:
+        """The id of the turn now open (``<session>-<n>``), for the chat UI."""
+        return f"{self.session}-{self.turn.n if self.turn is not None else self._n}"
+
+    def chat(self, event: dict[str, Any]) -> None:
+        if self.on_chat is not None:
+            try:
+                self.on_chat(event)
+            except Exception:  # noqa: BLE001 - the screen never breaks voice
+                pass
+
+    def on_played(self, data: Any) -> None:
+        """Yuki's words as they leave the output (audible), and where speech ended or was cut."""
+        if self.on_chat is None:
+            return
+        from pipecat.frames.frames import BotStoppedSpeakingFrame, InterruptionFrame, TTSTextFrame
+
+        frame = data.frame
+        if isinstance(frame, TTSTextFrame) and self.output_processor is not None \
+                and getattr(data, "source", None) is self.output_processor:
+            turn = self.turn_id()
+            if turn != self._said_turn:
+                self._said, self._said_turn = [], turn
+            self._said.append(frame.text or "")
+            self.chat({"type": "assistant_speech", "turn_id": turn, "text": " ".join(w.strip() for w in self._said
+                                                                                      if w.strip()),
+                       "final": False, "interrupted": False})
+        elif isinstance(frame, (BotStoppedSpeakingFrame, InterruptionFrame)) and self._said:
+            if isinstance(frame, InterruptionFrame) and not self.bot_speaking:
+                return
+            self.chat({"type": "assistant_speech", "turn_id": self._said_turn,
+                       "text": " ".join(w.strip() for w in self._said if w.strip()), "final": True,
+                       "interrupted": isinstance(frame, InterruptionFrame)})
+            self._said = []
 
     # -- live state (the narrator gate) -------------------------------------------
 
@@ -683,11 +905,13 @@ class TurnObserver:
             "tts_ttfb_ms": round(turn.tts_ttfb * 1000, 1) if turn.tts_ttfb is not None else None,
             "eos_to_first_audio_ms": ms(turn.speech_end, turn.first_audio),
             "eos_to_action_ms": ms(turn.speech_end, turn.action_at),
+            "eos_to_handoff_ms": ms(turn.speech_end, turn.handoff_at),
             "mouth_input_tokens": usage["input_tokens"], "mouth_cache_read_tokens": usage["cache_read_tokens"],
             "mouth_cache_write_tokens": usage["cache_write_tokens"], "mouth_output_tokens": usage["output_tokens"],
             "mouth_cost_usd": round(cost, 6) if cost is not None else None,
             "tts_chars": turn.tts_chars, "tts_cost_usd": tts_cost,
             "tool_calls": ";".join(turn.tools), "interrupted": turn.interrupted, "error": turn.error,
+            "cut_by_user": turn.cut,
             # stage by stage (docs/VOICE.md §14)
             "eos_to_eot_ms": ms(turn.speech_end, turn.eot_at),
             "eos_to_eager_ms": ms(turn.speech_end, turn.eager_at),
@@ -703,11 +927,17 @@ class TurnObserver:
             "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
             "llm_api_ttft_ms": ms(c.sent, c.first_content) if c else None,
             "llm_first_text_ms": ms(c.sent, c.first_text) if c else None,
+            "llm_early_say_ms": ms(c.sent, c.early_say) if c else None,
             "text_to_tts_ms": ms(c.first_text if c else None, turn.tts_started),
             "tts_audio_to_speaking_ms": ms(turn.tts_audio, turn.first_audio),
             "eager": bool(c and turn.transcript_at and c.entered < turn.transcript_at),
         }
         others = self.for_others(turn, reply)
+        if turn.trigger == "user":
+            addressed = ("others" if others or (not reply and "stay_quiet" in turn.tools and not turn.counted)
+                         else "yuki")
+            self.chat({"type": "turn_closed", "turn_id": f"{self.session}-{turn.n}", "addressed": addressed,
+                       "replied": bool(reply), "cut_by_user": turn.cut})
         if turn.call:
             row["call_mode"] = True
             if turn.trigger == "user":
@@ -761,6 +991,11 @@ class TurnObserver:
             self._user_started_at = now
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
+            if (self.turn is not None and self.turn.trigger == "user" and self.turn.first_audio is None
+                    and self.owes_reply):
+                # They went on talking before hearing a reply (a pause inside what they were saying): that
+                # reply is dropped and the next one answers everything (logged: silent turns, 26 Sept).
+                self.turn.cut = True
             if self.grounder is not None:
                 self.grounder.new_turn()
             if self.hands is not None:
@@ -773,6 +1008,7 @@ class TurnObserver:
         elif isinstance(frame, TranscriptionFrame):
             turn = self._open("user")
             turn.user_text = frame.text or ""
+            self.chat({"type": "user_utterance", "text": turn.user_text, "ts": time.time(), "turn_id": self.turn_id()})
             turn.transcript_at = now
             turn.speech_end, turn.eos_source = self._end_of_speech(now)
             self._last_words, self._words_at = "", None
@@ -780,6 +1016,8 @@ class TurnObserver:
             turn.eager_at, self._eager_at = self._eager_at, None
             if self.grounder is not None:
                 self.grounder.final(turn.user_text)  # before the aggregator hands the context over
+            if self.hands is not None:
+                self.hands.new_user_turn()  # a hand halted by a wrong effect may act again
             pending, self._pending_call = self._pending_call, None
             if pending is not None and pending.entered >= self._user_started_at:
                 turn.llm = pending  # the eager (speculative) reply, confirmed by this transcript
@@ -808,6 +1046,8 @@ class TurnObserver:
                 self.turn.responses += 1
             if self.turn is not None and not "".join(self.turn.reply).strip() and not self.bot_speaking:
                 self.owes_reply_since = None  # a turn that only called a tool: nothing to wait for
+                if self.state == "thinking":
+                    self.set_state(self.idle_state())  # stay_quiet, a hand, a hand-off: not "Thinking" forever
             self._activity()
         elif isinstance(frame, LLMTextFrame):
             if self.turn is not None:
@@ -823,6 +1063,8 @@ class TurnObserver:
             if self.turn is not None and call not in self._calls:
                 self._calls.add(call)
                 self.turn.tools.append(frame.function_name)
+                if frame.function_name == "tell_yuki" and self.turn.handoff_at is None:
+                    self.turn.handoff_at = now
                 if frame.function_name != "stay_quiet":
                     self._took_part(now)
         elif isinstance(frame, BotStartedSpeakingFrame):
@@ -837,7 +1079,7 @@ class TurnObserver:
             self.last_bot_stop = now
             self.last_exchange = now
             self.owes_reply_since = None
-            self.set_state("listening")
+            self.set_state(self.idle_state())
             self._activity()
         elif isinstance(frame, InterruptionFrame):
             if self.turn is not None and self.bot_speaking:
@@ -916,6 +1158,16 @@ class _Hooks:
     def call_started(self, call: LlmCall) -> None:
         self.c.observer.call_started(call)
 
+    def early_said(self, call: LlmCall, chars: int) -> None:
+        """A call's say_first went to the voice while the call was being written (content-free log)."""
+        self.c.log.event("early_say", chars=chars,
+                         after_request_ms=round((call.early_say - call.sent) * 1000) if call.sent and call.early_say
+                         else None)
+
+    def speculation(self, op: str, calls: int) -> None:
+        """An eager reply's tool calls were held, released on the confirmed turn, or dropped."""
+        self.c.log.event("speculation", op=op, calls=calls)
+
     def call(self) -> str | None:
         """The app of the voice call the user is in (call mode), else ``None``."""
         return self.c.call_app
@@ -982,8 +1234,11 @@ class Conversation:
                  log: Any, speech_end: Callable[[], float | None], on_state: Callable[[str, str], None],
                  session: str, extra_observers: list[Any] | None = None, tts_provider: str | None = None,
                  voice_activity: Callable[[], tuple[float, float]] | None = None, call_app: str | None = None,
-                 on_closing: Callable[[str], None] | None = None) -> None:
+                 on_closing: Callable[[str], None] | None = None, keyterms: list[str] | None = None,
+                 on_chat: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.settings = settings
+        #: Names and terms from memory that speech recognition is told to expect (v3.5, docs/VOICE.md §9).
+        self.keyterms = list(keyterms or [])
         self.call_app = call_app
         self._on_closing = on_closing
         #: When speech recognition was connected (the idle clocks start there, not while connecting).
@@ -1009,6 +1264,7 @@ class Conversation:
             on_state=on_state, tts_provider=self.tts_provider, activity=self._on_activity,
             call_mode=lambda: bool(self.call_app),
         )
+        self.observer.on_chat = on_chat
         self.worker: Any = None
         self.started_at = time.monotonic()
         self._extra_observers = list(extra_observers or [])
@@ -1088,7 +1344,7 @@ class Conversation:
             settings=DeepgramFluxSTTService.Settings(
                 model=s.voice_stt_model, language_hints=hints, eot_threshold=s.voice_eot_threshold,
                 eager_eot_threshold=s.voice_eager_eot_threshold, eot_timeout_ms=s.voice_eot_timeout_ms,
-                keyterm=["Yuki", *s.user_names],
+                keyterm=keyterm_list(["Yuki", *s.user_names], self.keyterms, s.voice_keyterms_max),
             ),
         )
         obs = self.observer
@@ -1123,10 +1379,14 @@ class Conversation:
         llm.register_function("check_progress", self.bridge.check_progress)
         llm.register_function("more_of_result", self.bridge.more_of_result)
         llm.register_function("stay_quiet", self.bridge.stay_quiet)
+        llm.register_function("end_conversation", self.bridge.end_conversation)
         hands = getattr(self.bridge, "hands", None)
         if hands is not None:
             hands.on_action = self.observer.hand_acted
             self.observer.hands = hands
+            hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
+                "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name, "args": what, "ok": ok,
+                "result": report, "ms": ms})
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
@@ -1173,6 +1433,7 @@ class Conversation:
                                                   and llm._yuki_call.first_text is not None)
         # The say_first words spoken for a silent hand-over belong before its call, too.
         self.bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
+        self.bridge.said_early = lambda call_id: str(call_id) in llm._yuki_early
         self._llm_context: Any = None
         # Whether the mouth run now calling a tool was the user's turn (not a result's).
         self.bridge.user_turn = lambda: bool(getattr(llm, "_yuki_call", None) is None or llm._yuki_call.user_turn)
@@ -1181,7 +1442,7 @@ class Conversation:
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
-            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, *hand_tools)
+            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, *hand_tools)
         ])
         self._tools = tools
         context = LLMContext(tools=tools)
@@ -1190,10 +1451,17 @@ class Conversation:
         # builds Pipecat's local ones, which load the Smart Turn ONNX model and onnxruntime
         # (measured 2026-09-25: imported in every conversation, never used), before Flux's
         # recommendation replaces them.
+        strategies = stt.recommended_user_turn_strategies(enable_interruptions=True)
+        if self.settings.voice_eager_eot_threshold is not None:
+            from pipecat.turns.user_stop.eager_user_turn_stop_strategy import EagerUserTurnStopStrategy
+
+            eager = [x for x in strategies.stop if isinstance(x, EagerUserTurnStopStrategy)]
+            if eager:
+                strategies.stop = [one_stop_per_turn(EagerUserTurnStopStrategy)(
+                    match_policy=eager[0].match_policy, speculation_timeout=eager[0]._speculation_timeout)]
         user_agg, assistant_agg = LLMContextAggregatorPair(
             context,
-            user_params=LLMUserAggregatorParams(
-                user_turn_strategies=stt.recommended_user_turn_strategies(enable_interruptions=True)),
+            user_params=LLMUserAggregatorParams(user_turn_strategies=strategies),
             # Summaries by size only: Pipecat's default also summarises every 20 messages, and
             # each hand or hand-off adds three, so a 4-minute live conversation (2026-09-25) was
             # summarised twice by the mouth's model, losing what was done.
@@ -1210,8 +1478,9 @@ class Conversation:
                                                  or id(message) in quiet_answered(context.get_messages()))
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._stt_connected)
-        pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, self.transport.output(),
-                             assistant_agg])
+        output = self.transport.output()
+        self.observer.output_processor = output
+        pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, output, assistant_agg])
         self.worker = PipelineWorker(
             pipeline,
             params=PipelineParams(enable_metrics=True, enable_usage_metrics=True,
@@ -1272,10 +1541,13 @@ class Conversation:
             self.grounder.warm()
             self.observer.grounder = self.grounder
         self.bridge.attach(self._loop)
+        self.bridge.on_jobs_changed = self._activity.set
+        self.observer.idle_state = lambda: "working" if self.bridge.open_voice_jobs() else "listening"
         self.bridge.announce = self._announce
         self.bridge.gate = self.gate
         self.bridge.progress_answerer = self._progress_answer
         self.bridge.on_remembered = self._refresh_rules
+        self.bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
         # While Deepgram connects (2-3 s), off the loop; done long before the first reply. Started
@@ -1417,6 +1689,22 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.log.event("warm", error=f"{type(exc).__name__}: {str(exc)[:200]}")
 
+    async def _end_after_speech(self, max_s: float = 6.0) -> None:
+        """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on)."""
+        started = time.monotonic()
+        heard = False
+        while time.monotonic() - started < max_s:
+            obs = self.observer
+            heard = heard or obs.bot_speaking
+            if heard and not obs.bot_speaking:
+                break
+            if not heard and time.monotonic() - started > 2.0:
+                break  # no goodbye was spoken
+            await asyncio.sleep(0.05)
+        self.log.event("session", state="end_asked", session=self.session, waited_ms=round(
+            (time.monotonic() - started) * 1000))
+        self._set_stop("user_asked")
+
     async def _refresh_rules(self) -> None:
         """Re-read the user's standing rules after a spoken rule was saved (off the loop, bounded).
 
@@ -1487,8 +1775,10 @@ class Conversation:
                 limit = s.voice_hold_max_s if owed else self.idle_limit()
                 remaining = limit - (now - last)
                 wait = None if busy else max(0.05, remaining)
-            if owed and not busy:
-                obs.set_state("working")
+            if not busy and not obs.owes_reply and obs.state in ("thinking", "working", "listening"):
+                # The pill says "Working on it" only while a job really runs (queued or running); a
+                # result folded in silently, a cancelled job or a stay_quiet leaves it "Listening".
+                obs.set_state(obs.idle_state())
             if self._stop.is_set() or obs.fatal:
                 break
             if not busy and remaining <= 0:

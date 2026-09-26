@@ -186,6 +186,41 @@ V34_YUKI_CLIPS = [
 ]
 
 
+#: v3.5 (2026-09-26 live sessions): the latency replay, the tabs / volume / dictation replay, in the user's voice
+#: stand-in; and the names memory holds, in three voices, for the keyterms measurement (docs/VOICE.md §9, §27).
+V35_USER = ("deepgram", "aura-2-arcas-en")
+V35_CLIPS = [
+    ("n_hello", "Hello."),
+    ("n_working", "Nothing much. I'm just working right now."),
+    ("n_hemanth", "Tell Hemanth on WhatsApp, ask him when he will join Discord."),
+    ("n_chrome", "Switch back to the Chrome browser."),
+    ("n_cli", "What's the CLI setup?"),
+    ("n_thanks", "Nothing much as of now. Thank you."),
+    ("n_sysvol", "Increase the system volume a bit."),
+    ("d_dictate", "So like you have to do everything right now, and then make it as like a document, so that "
+                  "after the compaction this will stay in your memory, and you won't lose any of it."),
+    ("t_close", "Yuki, close the Claude tabs on Chrome, and the ElevenLabs tab as well."),
+    ("t_volume", "Reduce the YouTube volume a little bit."),
+    ("t_back", "You closed my YouTube video tab. Bring it back."),
+    ("t_ram", "What's using so much RAM right now?"),
+    ("t_close2", "And close the ElevenLabs tab."),
+    ("t_off", "Okay, thanks. You can turn off the voice then."),
+]
+NAMES_VOICES = [("deepgram", "aura-2-arcas-en"), ("deepgram", "aura-2-orion-en"), ("elevenlabs", "TX3LPaxmHKxFdv7VOQHJ")]
+NAMES_CLIPS = [
+    ("m_hemanth", "Send Hemanth a message on WhatsApp."),
+    ("m_varun", "I'm waiting for Varun's document approval."),
+    ("m_cli", "What's the CLI setup?"),
+    ("m_komal", "Did Komal reply on Slack?"),
+    ("m_bhaskar", "Tell Bhaskar and Malini I'm running late."),
+    ("m_corvana", "Open the Corvana dashboard."),
+    ("m_claude", "Close the Claude tabs."),
+    ("m_jatin", "Ask Jatin to review the pull request."),
+    ("m_hemanth2", "Is Hemanth on Discord right now?"),
+    ("m_ezra", "Check what Ezra said in the DM."),
+]
+
+
 class Budget:
     def __init__(self) -> None:
         self.chars: dict[str, int] = {}
@@ -361,13 +396,24 @@ def plan(which: str) -> list[dict]:
             for name, text in clips:
                 items.append({"set": "v34", "name": name, "language": "en", "text": text, "provider": provider,
                               "voice": voice, "wake": "yuki" in text.lower()})
+    if which in ("v35", "all"):
+        provider, voice = V35_USER
+        for name, text in V35_CLIPS:
+            items.append({"set": "v35", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": "yuki" in text.lower()})
+    if which in ("names",):
+        for provider, voice in NAMES_VOICES:
+            tag = voice.replace("aura-2-", "").replace("-en", "")[:6]
+            for name, text in NAMES_CLIPS:
+                items.append({"set": "names", "name": f"{name}__{tag}", "language": "en", "text": text,
+                              "provider": provider, "voice": voice, "wake": False})
     return items
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "all"))
+    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

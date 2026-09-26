@@ -45,7 +45,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
     {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
-     "answer_question"}
+     "answer_question", "watch_for"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -397,7 +397,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "Show or close one tab of a window's tab strip, by the tab's id from "
             "read_tabs (never by its title: a tab that is no longer there is reported, "
             "not swapped for another). The result says whether the effect was seen and "
-            "lists the tabs the strip has after it, read again."
+            "lists the tabs the strip has after it, read again. A tab that was closed comes "
+            "back with the browser's own reopen (hotkey ctrl+shift+t in that window), then "
+            "read_tabs to check by its title that it is the one wanted; never rebuild a closed "
+            "tab's address from memory or search for it again."
         ),
         "input_schema": _obj(
             {
@@ -410,6 +413,50 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
             },
             ["hwnd", "tab", "action"],
+        ),
+    },
+    {
+        "name": "hover",
+        "label": "Pointing at something",
+        "description": (
+            "Put the mouse pointer on an element (or x and y) without clicking, for controls "
+            "that only appear while the pointer is over something: YouTube's volume slider "
+            "shows on hover over the volume button, where a click would mute. The result "
+            "says what appeared near the pointer; the window is read again after it, so the "
+            "new control has an element id to act on. The pointer stays there."
+        ),
+        "input_schema": _obj(
+            {
+                "element": _ELEMENT,
+                "read": _READ,
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "expect_hwnd": _GUARD,
+            },
+        ),
+    },
+    {
+        "name": "app_volume",
+        "label": "Changing an app's volume",
+        "description": (
+            "One app's own volume in the Windows volume mixer (what the Volume Mixer's slider "
+            "for that app sets), e.g. only Chrome, so only the YouTube video playing in it, "
+            "or only Spotify; the system volume and every other app stay as they are. It works "
+            "through Windows' audio sessions: no window is focused, clicked or switched and no "
+            "script runs, so a game in front stays in front. When the user means one app's "
+            "sound, this is the way, rather than the volume keys (the whole PC) or a player's "
+            "own control. Without level, change or mute it lists the apps with sound and their "
+            "levels. The result is read back: the level before and after, and the system "
+            "volume untouched."
+        ),
+        "input_schema": _obj(
+            {
+                "app": {"type": "string",
+                        "description": "The app's process name as the mixer lists it (chrome.exe), or its name."},
+                "change": {"type": "number", "description": "Points to move it by, e.g. -20."},
+                "level": {"type": "number", "description": "Or the level to set, 0-100."},
+                "mute": {"type": "boolean", "description": "Mute (true) or unmute (false) the app."},
+            },
         ),
     },
     {
@@ -442,7 +489,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "that finish the job is the normal thing to do, not a gamble: if one of "
             "them fails your message is discarded and you get the results back to "
             "react to instead. You can never end up having claimed something that "
-            "did not happen."
+            "did not happen. When the user had to correct how you did it before it "
+            "worked, or you had to work out the way, call remember_how in this same "
+            "turn too: what worked, and what your first try did instead."
         ),
         "input_schema": _obj(
             {
@@ -480,7 +529,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "watched, read, and who said what to them — and your past conversations "
             "with them, for anything you need to know about their past activity, "
             "people, plans or what the two of you discussed. Returns the matching "
-            "facts and exchanges as dated lines."
+            "facts and exchanges as dated lines, each with where it came from (the app, "
+            "call or chat, when, and the words said when there are some). For a question "
+            "about when, how long, a day or a stretch of time ('last Friday afternoon', "
+            "'last week', 'how long was I on the call'), give since and until for that "
+            "window and with_time_use: the measured time use of the same window (apps, "
+            "calls with their real start and end, episodes) comes back with the facts, to "
+            "reconcile into one answer."
         ),
         "input_schema": _obj(
             {
@@ -500,6 +555,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "description": "Only facts from this application, as recall results "
                     "name it.",
                 },
+                "with_time_use": {
+                    "type": "boolean",
+                    "description": "Also return the measured time use of since-until "
+                    "(needs since): for when, how long and what-did-I-do-then questions.",
+                },
             },
             ["query"],
         ),
@@ -510,7 +570,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Save a short procedure that worked on this PC, so next time you can do "
             "it directly — e.g. how an app accepts a URL, where something lives. "
-            "Only record what you actually confirmed."
+            "Call it in the turn a task worked after the user corrected how you did it, "
+            "or after you had to find the way: what worked, and what not to do if your "
+            "first try did something else. Only record what you actually confirmed."
         ),
         "input_schema": _obj(
             {
@@ -561,6 +623,33 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
             },
             ["question", "outcome"],
+        ),
+    },
+    {
+        "name": "watch_for",
+        "label": "Keeping an eye out",
+        "description": (
+            "A standing request: the user asks you to tell them when something happens "
+            "(\"tell me when Varun replies\", \"let me know when the build email comes\"). "
+            "Save it with add in that same turn: memory checks everything new that comes in "
+            "against it and puts one card on screen when it happens. list shows the open ones; "
+            "cancel ends one the user no longer wants."
+        ),
+        "input_schema": _obj(
+            {
+                "action": {"type": "string", "enum": ["add", "list", "cancel"],
+                           "description": "add (default), list, or cancel."},
+                "condition": {"type": "string",
+                              "description": "add: what to watch for, in plain words that name who and what "
+                              "(\"Varun replies to the user, on Slack or anywhere\")."},
+                "quote": {"type": "string",
+                          "description": "add: the user's own words asking for it, copied exactly from their message."},
+                "repeat": {"type": "boolean",
+                           "description": "add: true only when they want it every time, not just the next time."},
+                "days": {"type": "number", "description": "add: how many days to keep watching, when they said."},
+                "request": {"type": "string", "description": "cancel: its id as list shows it, e.g. request:3."},
+            },
+            ["action"],
         ),
     },
     {
@@ -706,6 +795,8 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "run_powershell",
     "open_url",
     "tab",
+    "hover",
+    "app_volume",
 )
 
 for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each action's schema
@@ -717,7 +808,7 @@ for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each act
 #: ``run_powershell`` is not here: it acts on the system, not on a window. A list
 #: of names for plumbing, not a rule about what the model should do.
 AUTO_VIEW_TOOLS: frozenset[str] = frozenset(
-    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab"}
+    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab", "hover"}
 )
 
 #: How long a window's element count and covered area must hold still before the
@@ -1009,6 +1100,10 @@ class Backend(Protocol):
     # Optional too: what the user is engaged in (see
     # :func:`yuki.perception.system.activity_facts`), and its warm-up.
     def activity_facts(self) -> dict[str, Any]: ...  # pragma: no cover - protocol only
+    # Optional too (v3.5): a pointer move that reports what appeared, and one app's own volume.
+    def hover(self, x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") -> Any: ...  # pragma: no cover
+    def app_volume(self, app: str, *, level: float | None = None, change: float | None = None,
+                   mute: bool | None = None) -> Any: ...  # pragma: no cover - protocol only
     def warm_activity(self) -> None: ...  # pragma: no cover - protocol only
 
 
@@ -1096,6 +1191,26 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.actions.tabs").tab_action(hwnd, tab_id, action)
+
+    def hover(self, x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") -> Any:
+        """:func:`yuki.actions.hover.hover`: the pointer onto a point, and what appeared there."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.hover").hover(x, y, expect_hwnd=expect_hwnd, label=label)
+
+    def app_volume(self, app: str, *, level: float | None = None, change: float | None = None,
+                   mute: bool | None = None) -> Any:
+        """:func:`yuki.actions.app_volume.set_app_volume`: one app's own volume in the mixer, read back."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.app_volume").set_app_volume(
+            app, level=level, change=change, mute=mute)
+
+    def audio_apps(self) -> list[dict[str, Any]]:
+        """:func:`yuki.actions.app_volume.audio_apps`: the apps with sound and their own levels, read-only."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.app_volume").audio_apps()
 
     def master_volume(self) -> dict[str, Any] | None:
         """:func:`yuki.perception.audio.master_volume`: the output volume, read-only."""
@@ -2001,6 +2116,16 @@ class Dispatcher:
                 self._need_str(tool_input, "command"), timeout_s=self.tool_timeout_s
             ),
         )
+
+    def _do_hover(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        x, y, guard, label = self._point(tool_input)
+        return self._labelled(self._from_action("hover", self.backend.hover(x, y, expect_hwnd=guard, label=label)),
+                              label)
+
+    def _do_app_volume(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        from yuki.actions.app_volume import run_tool
+
+        return self._from_action("app_volume", run_tool(tool_input, set_volume=self.backend.app_volume))
 
     def _do_open_url(self, tool_input: dict[str, Any]) -> ToolOutcome:
         url = self._need_str(tool_input, "url")

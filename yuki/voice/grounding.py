@@ -58,6 +58,31 @@ class Lookup:
     done: threading.Event = field(default_factory=threading.Event)
 
 
+#: Know-how lines shown with the lookup: how things were done right on this PC (v3.5).
+KNOWHOW_LINES = 2
+
+
+def _lookup(client: Any, text: str, keep: int) -> list[dict[str, Any]]:
+    """What memory holds for ``text``: the relevant memories (fast memory, ranked by similarity, importance
+    and recency, each with its provenance) and the nearest know-how, else ``recall``'s life kinds.
+
+    v3.5: know-how is how a task was done right on this PC, often a lesson from the user's correction
+    ("the YouTube volume is the app's own volume, not the volume keys"); the talker sees it before it
+    picks a hand (the memory builder's relay, 2026-09-26).
+    """
+    relevant = getattr(client, "relevant", None)
+    if not callable(relevant):
+        hits = client.recall(text, limit=RECALL_LIMIT, embed_wait_s=EMBED_WAIT_S)
+        return [h for h in (hits or []) if h.get("kind") in LIFE_KINDS][:keep]
+    facts = [{"kind": h.get("kind"), "fact": h.get("text"), "at": h.get("at"), "nature": h.get("nature")}
+             for h in (relevant(text, limit=keep, embed_wait_s=EMBED_WAIT_S) or []) if h.get("text")]
+    try:
+        howto = client.knowhow(None, text, limit=KNOWHOW_LINES, embed_wait_s=EMBED_WAIT_S)
+    except Exception:  # noqa: BLE001 - the facts are enough
+        howto = []
+    return facts + [{"kind": "know-how", "fact": line} for line in howto or []]
+
+
 def _when(iso: str | None, now: datetime) -> str:
     if not iso:
         return ""
@@ -213,9 +238,8 @@ class Grounder:
             lookup.done.set()
             return
         try:
-            hits = self.memory.call("voice_grounding", lambda c: c.recall(
-                lookup.text, limit=RECALL_LIMIT, embed_wait_s=EMBED_WAIT_S), timeout_s=2.0)
-            lookup.facts = [h for h in (hits or []) if h.get("kind") in LIFE_KINDS][: self.keep]
+            lookup.facts = self.memory.call("voice_grounding", lambda c: _lookup(c, lookup.text, self.keep),
+                                            timeout_s=2.0)
         except Exception as exc:  # noqa: BLE001
             lookup.error = f"{type(exc).__name__}: {str(exc)[:120]}"
         lookup.ms = (time.perf_counter() - lookup.started) * 1000

@@ -38,6 +38,17 @@ goes into :class:`ActionLog`; its lines are in the mouth's desktop block and in
 every request handed to the thinker (:func:`yuki.voice.mouth.brain_request`).
 An opened page records which tab it is (place, name, window).
 
+**No blind keys, one actor, stop on a wrong effect (v3.5).** Live 2026-09-26 21:25-21:31 the
+talker pressed Ctrl+W to close "the Claude tabs" on whatever tab was showing, closed the
+user's video three times and Gmail once, "undid" with Ctrl+Shift+T into the wrong tabs, and
+repeated, while a thinker job worked in the same Chrome window. Now: the talker has no
+free keyboard hand; a tab is closed only through the ``tab`` hand, by the identity of the
+tab it was shown (UIA RuntimeId), verified gone; a closed tab comes back only through the
+browser's own reopen, verified by title against the tab that was closed; after a hand whose
+report does not show the effect, the talker's hands stop until the user speaks again; and
+while a thinker job runs on the worker (which has hands), only the audio hands (media keys,
+an app's volume) act, since they touch no window.
+
 The desktop summary (:meth:`Hands.snapshot`) is the brain's own overview
 (``format_overview``) plus the media sessions, the foreground window's tabs and
 the action log, captured off the event loop for every mouth call and put in the
@@ -74,7 +85,11 @@ _TABS_FRESH_S = 20.0
 _MOUTH_ACTION_LINES = 4
 
 #: Hands that act at once, with no words before them.
-INSTANT_HANDS = ("press_keys", "media_key", "scroll", "window", "tab")
+INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab")
+#: Hands that touch no window (sound only): they may act while the thinker works on the desktop.
+AUDIO_HANDS = ("media_key", "app_volume")
+#: How long a reopened tab may take to show its title (the browser restores it at once, the page after).
+_REOPEN_WAIT_S = 3.0
 
 _WINDOW = {
     "type": "integer",
@@ -107,32 +122,23 @@ _DONE_LINE = {
 }
 _NOW = (" Instant: call it with no words before it, the call alone; its done line is what the user hears, "
         "once it is verified.")
+#: The spoken acknowledgement of a slow hand (open_url, open_app), said the moment it is written (v3.5).
+_SAY_FIRST = {
+    "type": "string",
+    "description": ("Write this first: the few words said out loud as it starts (\"Opening it.\"), spoken the "
+                    "moment you write them. Call the hand alone, with no words before it."),
+}
 
 #: The hands' schemas (Pipecat standard function schema fields).
 HAND_TOOLS: list[dict[str, Any]] = [
     {
-        "name": "press_keys",
-        "description": (
-            "Your hand: press one key or one shortcut in one window, e.g. ['k'] to pause or play a YouTube "
-            "video, ['space'], ['f5'], ['alt', 'left']. The window is brought to the front first if it is "
-            "not; the keys are sent only while it is in front and ready. One step only. Its report comes back "
-            "to you (a key has no verdict). Instant: call it with no words before it, the call alone; then say "
-            "what its report shows."
-        ),
-        "properties": {
-            "window": _WINDOW,
-            "keys": {"type": "array", "items": {"type": "string"},
-                     "description": "One key, or a shortcut's keys in order (pyautogui names)."},
-            "times": {"type": "integer", "description": "Press it this many times (default 1)."},
-        },
-        "required": ["window", "keys"],
-    },
-    {
         "name": "media_key",
         "description": (
-            "Your hand: a media or volume key for the whole PC. playpause, nexttrack, prevtrack and stop act "
-            "on the media session the desktop block marks as the one media keys act on; volumeup / "
-            "volumedown move the volume 2% per press. Verified from the session's status or the volume." + _NOW
+            "Your hand: a media key, or the SYSTEM volume. playpause, nexttrack, prevtrack and stop act on the "
+            "media session the desktop block marks as the one media keys act on. volumeup / volumedown / "
+            "volumemute change the system volume: the whole PC's output, every app at once, 2% per press. "
+            "For one app's own volume (only YouTube in Chrome, only Spotify) use app_volume instead. Verified "
+            "from the session's status or the system volume." + _NOW
         ),
         "properties": {
             "key": {"type": "string", "enum": list(MEDIA_KEYS)},
@@ -140,6 +146,25 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "say_when_done": _DONE_LINE,
         },
         "required": ["key", "say_when_done"],
+    },
+    {
+        "name": "app_volume",
+        "description": (
+            "Your hand: ONE APP's own volume in the Windows volume mixer, e.g. only Chrome (so only the YouTube "
+            "video in it) or only Spotify; the system volume and every other app stay as they are. The app "
+            "volumes line of the desktop block lists the apps with sound and their levels: name the app as it "
+            "shows there. Nothing on the screen is touched (no window is focused or clicked), so a game in "
+            "front stays in front. Verified by reading the app's level back." + _NOW
+        ),
+        "properties": {
+            "app": {"type": "string", "description": "The app as the app volumes line names it, e.g. chrome.exe."},
+            "change": {"type": "integer",
+                       "description": "Points to move it by: e.g. -20 for 'a bit quieter', 30 for 'much louder'."},
+            "level": {"type": "integer", "description": "Or the level to set, 0-100."},
+            "mute": {"type": "boolean", "description": "Optional: true mutes the app, false unmutes it."},
+            "say_when_done": _DONE_LINE,
+        },
+        "required": ["app", "say_when_done"],
     },
     {
         "name": "scroll",
@@ -174,39 +199,51 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "tab",
         "description": (
-            "Your hand: show one tab of a window's tab strip (a browser tab), from the tabs line of the "
-            "desktop block: its number there. Verified: the tab reports itself selected. Only a tab on that "
-            "line; which tab holds what inside its page is the thinker's." + _NOW
+            "Your hand for a window's tab strip (a browser's tabs), from the tabs line of the desktop block. "
+            "show: make one tab the one showing. close: close exactly the tabs you name by their numbers on "
+            "that line; each is found by its identity (never whichever tab is active) and verified gone. "
+            "reopen: bring back the tab most recently closed, with the browser's own reopen; verified only "
+            "when the restored tab's title is the one in expect (the closed tab's title, from the done lines). "
+            "Only tabs on that line; which tab holds what inside its page is the thinker's." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
-            "tab": {"type": "integer", "description": "The tab's number on the tabs line (from 1, left to right)."},
+            "action": {"type": "string", "enum": ["show", "close", "reopen"], "description": "Default show."},
+            "tab": {"type": "integer",
+                    "description": "show / close: the tab's number on the tabs line (from 1, left to right)."},
+            "tabs": {"type": "array", "items": {"type": "integer"},
+                     "description": "close: several tabs' numbers at once, each one the user named."},
+            "named": {"type": "string",
+                      "description": "close: the user's own words that name each tab you close (\"the Claude tabs\")."},
+            "expect": {"type": "string", "description": "reopen: the title of the tab that was closed."},
             "say_when_done": _DONE_LINE,
         },
-        "required": ["window", "tab", "say_when_done"],
+        "required": ["window", "say_when_done"],
     },
     {
         "name": "open_url",
         "description": (
             "Your hand: open a web address, in the app they named (e.g. 'Google Chrome') or else their "
             "default browser. A browser that is open opens it in a new tab of its own, so never press a "
-            "new-tab key first. Verified once the page is at the address and has its title (seconds), so a "
-            "few words first."
+            "new-tab key first. Verified once the page is at the address and has its title (seconds), so "
+            "say_first is heard while it opens."
         ),
         "properties": {
+            "say_first": _SAY_FIRST,
             "url": {"type": "string", "description": "The full address, e.g. https://www.youtube.com"},
             "app": {"type": "string", "description": "Optional: the app to open it in, as the Start menu names it."},
             "say_when_done": _DONE_LINE,
         },
-        "required": ["url", "say_when_done"],
+        "required": ["say_first", "url", "say_when_done"],
     },
     {
         "name": "open_app",
         "description": ("Your hand: open (or bring up) an app by its Start menu name, e.g. 'Spotify'. Verified once "
-                        "its window is in front (a second or more), so a few words first."),
-        "properties": {"name": {"type": "string", "description": "The app's name as they said it."},
+                        "its window is in front (a second or more), so say_first is heard while it opens."),
+        "properties": {"say_first": _SAY_FIRST,
+                       "name": {"type": "string", "description": "The app's name as they said it."},
                        "say_when_done": _DONE_LINE},
-        "required": ["name", "say_when_done"],
+        "required": ["say_first", "name", "say_when_done"],
     },
 ]
 HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
@@ -223,6 +260,8 @@ class Snapshot:
     bounds: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
     #: The tabs shown: ``{hwnd: [name of tab 1, name of tab 2, ...]}``.
     tabs: dict[int, list[str]] = field(default_factory=dict)
+    #: Their identities (UIA RuntimeId text; "" when the provider gives none), in the same order.
+    tab_ids: dict[int, list[str]] = field(default_factory=dict)
     tabs_ms: float | None = None
     at: float = 0.0
     ms: float = 0.0
@@ -314,9 +353,18 @@ class Hands:
         self.bridge: Any = None
         #: ``(sent_at)``: a hand's action went out (the turn log's end of speech -> action).
         self.on_action: Any = None
+        #: ``(name, what, ok, report, ms)``: a hand finished (the chat UI's tool step; set by the conversation).
+        self.on_step: Any = None
         #: ``{hwnd: (window title, action log version, strip, read at)}``: tabs read ahead.
         self._tabs: dict[int, tuple[str, int, Any, float]] = {}
         self._prefetching = False
+        #: Set when a hand that touches a window did not show its effect: the talker's window hands then
+        #: stop until the user speaks again (re-read, tell them, or hand it over; never repeat blindly).
+        self.halted: str | None = None
+
+    def new_user_turn(self) -> None:
+        """The user spoke: the talker may use its hands again (after telling them what happened)."""
+        self.halted = None
 
     # -- the desktop summary ------------------------------------------------------
 
@@ -340,6 +388,9 @@ class Hands:
                 media = ""
             if media:
                 parts.append(media)
+            audio = self._audio_line()
+            if audio:
+                parts.append(audio)
             titles = {int(w["hwnd"]): str(w.get("title") or "") for w in windows if w.get("hwnd") is not None}
             tabs = self._tabs_line(snap, titles.get(snap.foreground or 0, ""))
             if tabs:
@@ -355,6 +406,18 @@ class Hands:
             if not snap.error:
                 self.last = snap
         return snap
+
+    def _audio_line(self) -> str:
+        """The apps with sound on the output and their own (mixer) volume, one line ("" without it)."""
+        read = getattr(self.backend, "audio_apps", None)
+        if not callable(read):
+            return ""
+        try:
+            from yuki.actions.app_volume import audio_line
+
+            return audio_line(read())
+        except Exception:  # noqa: BLE001 - the windows are the part that matters
+            return ""
 
     def _tabs_line(self, snap: Snapshot, title: str) -> str:
         """The foreground window's tabs, recorded on ``snap``: read ahead when still good, else now (bounded)."""
@@ -379,6 +442,7 @@ class Hands:
         if not getattr(strip, "tabs", None):
             return ""
         snap.tabs[snap.foreground] = [t.name for t in strip.tabs]
+        snap.tab_ids[snap.foreground] = [getattr(t, "tab_id", "") or "" for t in strip.tabs]
         return tabs_line(strip)
 
     def _keep_tabs(self, hwnd: int, title: str, strip: Any) -> None:
@@ -434,6 +498,8 @@ class Hands:
         name = params.function_name
         args = params.arguments if isinstance(params.arguments, dict) else {}
         started = time.monotonic()
+        if args.get("say_first") and self.bridge is not None:
+            await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
         if self.bridge is not None:
             self.bridge.busy_tools += 1
@@ -459,6 +525,11 @@ class Hands:
         confirmed = ok and verified is True and name != "press_keys"
         speak = bool(line) and confirmed
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified)
+        if self.on_step is not None:
+            try:
+                self.on_step(name, _what(name, args), bool(ok and verified is not False), report[:400], ms)
+            except Exception:  # noqa: BLE001 - the screen never breaks a hand
+                pass
         if self.log is not None:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            done_line=speak, **{k: v for k, v in facts.items()
@@ -507,87 +578,122 @@ class Hands:
         except Exception:  # noqa: BLE001
             return None
 
+    def _guard_desk(self, name: str) -> None:
+        """Refuse a window hand while the thinker works on the desktop, or after a wrong effect."""
+        if name in AUDIO_HANDS:
+            return
+        busy = self.bridge.desk_job() if self.bridge is not None and hasattr(self.bridge, "desk_job") else None
+        if busy:
+            raise _Refused(f"the thinker is working on the desktop right now ({busy}); two hands at once would "
+                           f"collide, so nothing was done. Tell the user it will be done after that, or pass it to "
+                           f"the running task with tell_yuki intent follow_up")
+        if self.halted:
+            raise _Refused(f"your last hand did not show the effect it was for ({self.halted}); your hands stay "
+                           f"still until the user speaks again. Nothing was done. Tell them in a few words what the "
+                           f"report showed, or hand it to the thinker with the state; never repeat it blindly")
+
     def _run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
         """Blocking: validate, act through the backend, verify, return ``(ok, report, facts)``."""
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         try:
-            if name == "press_keys":
-                hwnd = self._window(args)
-                keys = [str(k) for k in (args.get("keys") or []) if str(k).strip()]
-                if not keys:
-                    raise _Refused("no keys given")
-                times = max(1, min(int(args.get("times") or 1), 20))
-                lead = self._front(hwnd)
-                before = self._media_status()
-                facts["sent_at"] = time.monotonic()
-                if len(keys) == 1:
-                    result = self.backend.press(keys[0], times=times, expect_hwnd=hwnd)
-                else:
-                    result = self.backend.hotkey(*keys, expect_hwnd=hwnd)
-                ok, report, facts = self._report(result, lead, facts)
-                if ok and before is not None:
-                    # A fact for the mouth to read (a key may be meant for anything, so no verdict).
-                    report += "; " + self._media_after(before)[1]
-                return ok, report, facts
-            if name == "media_key":
-                key = str(args.get("key") or "")
-                if key not in MEDIA_KEYS:
-                    raise _Refused(f"unknown media key {key!r} ({', '.join(MEDIA_KEYS)})")
-                times = max(1, min(int(args.get("times") or 1), 50))
-                before = self._media_status() if key in _TRANSPORT_KEYS else None
-                volume = self._volume() if key in _VOLUME_KEYS else None
-                facts["sent_at"] = time.monotonic()
-                result = self.backend.press(key, times=times)
-                ok, report, facts = self._report(result, "", facts)
-                if ok and before is not None:
-                    changed, words = self._media_after(before)
-                    report += "; " + words
-                    facts["verified"] = changed
-                elif ok and volume is not None:
-                    changed, words = self._volume_after(volume)
-                    report += "; " + words
-                    facts["verified"] = changed
-                return ok, report, facts
-            if name == "scroll":
-                hwnd = self._window(args)
-                direction = str(args.get("direction") or "down")
-                notches = max(1, min(int(args.get("amount") or 5), 50))
-                lead = self._front(hwnd)
-                x, y = self._scroll_point(hwnd)
-                facts["sent_at"] = time.monotonic()
-                result = self.backend.scroll(x, y, dy=notches if direction == "up" else -notches, expect_hwnd=hwnd)
-                ok, report, facts = self._report(result, lead, facts)
-                facts["verified"] = _detail(result, "verified")
-                return ok, report, facts
-            if name == "window":
-                hwnd = self._window(args)
-                action = str(args.get("action") or "")
-                act = getattr(self.backend, "window_action", None)
-                if not callable(act):
-                    raise _Refused("this desktop has no window hand")
-                facts["sent_at"] = time.monotonic()
-                ok, report, facts = self._report(act(hwnd, action), "", facts)
-                # window_action's ok is the new state observed (focus: the window in front).
-                facts["verified"] = ok
-                return ok, report, facts
-            if name == "tab":
-                return self._tab(args, facts)
-            if name == "open_url":
-                return self._open_url(args, facts)
-            if name == "open_app":
-                query = str(args.get("name") or "").strip()
-                if not query:
-                    raise _Refused("no app name given")
-                facts["sent_at"] = time.monotonic()
-                ok, report, facts = self._report(self.backend.launch_app(query), "", facts)
-                # launch_app's ok is its window found and in front, ready for input.
-                facts["verified"] = ok
-                return ok, report, facts
-            raise _Refused(f"no hand called {name!r}")
+            self._guard_desk(name)
+            ok, report, facts = self._act(name, args, facts)
+            if name not in AUDIO_HANDS and not (ok and facts.get("verified") is True):
+                self.halted = f"{name}: {report[:160]}"
+            return ok, report, facts
         except _Refused as exc:
             return False, str(exc), facts
 
+    def _act(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
+        """One hand, through the backend (raises :class:`_Refused` before doing anything it will not do)."""
+        if name == "media_key":
+            key = str(args.get("key") or "")
+            if key not in MEDIA_KEYS:
+                raise _Refused(f"unknown media key {key!r} ({', '.join(MEDIA_KEYS)})")
+            times = max(1, min(int(args.get("times") or 1), 50))
+            before = self._media_status() if key in _TRANSPORT_KEYS else None
+            volume = self._volume() if key in _VOLUME_KEYS else None
+            facts["sent_at"] = time.monotonic()
+            result = self.backend.press(key, times=times)
+            ok, report, facts = self._report(result, "", facts)
+            if ok and before is not None:
+                changed, words = self._media_after(before)
+                report += "; " + words
+                facts["verified"] = changed
+            elif ok and volume is not None:
+                changed, words = self._volume_after(volume)
+                report += "; " + words
+                facts["verified"] = changed
+            return ok, report, facts
+        if name == "scroll":
+            hwnd = self._window(args)
+            direction = str(args.get("direction") or "down")
+            notches = max(1, min(int(args.get("amount") or 5), 50))
+            lead = self._front(hwnd)
+            x, y = self._scroll_point(hwnd)
+            facts["sent_at"] = time.monotonic()
+            result = self.backend.scroll(x, y, dy=notches if direction == "up" else -notches, expect_hwnd=hwnd)
+            ok, report, facts = self._report(result, lead, facts)
+            facts["verified"] = _detail(result, "verified")
+            return ok, report, facts
+        if name == "window":
+            hwnd = self._window(args)
+            action = str(args.get("action") or "")
+            act = getattr(self.backend, "window_action", None)
+            if not callable(act):
+                raise _Refused("this desktop has no window hand")
+            facts["sent_at"] = time.monotonic()
+            ok, report, facts = self._report(act(hwnd, action), "", facts)
+            # window_action's ok is the new state observed (focus: the window in front).
+            facts["verified"] = ok
+            return ok, report, facts
+        if name == "tab":
+            return self._tab(args, facts)
+        if name == "app_volume":
+            return self._app_volume(args, facts)
+        if name == "open_url":
+            return self._open_url(args, facts)
+        if name == "open_app":
+            query = str(args.get("name") or "").strip()
+            if not query:
+                raise _Refused("no app name given")
+            facts["sent_at"] = time.monotonic()
+            ok, report, facts = self._report(self.backend.launch_app(query), "", facts)
+            # launch_app's ok is its window found and in front, ready for input.
+            facts["verified"] = ok
+            return ok, report, facts
+        raise _Refused(f"no hand called {name!r}")
+
+    def _app_volume(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        act = getattr(self.backend, "app_volume", None)
+        if not callable(act):
+            raise _Refused("this desktop has no app volume hand")
+        app = str(args.get("app") or "").strip()
+        if not app:
+            raise _Refused("name the app as the app volumes line shows it")
+
+        def number(key: str) -> float | None:
+            try:
+                return float(args[key]) if args.get(key) is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        mute = args.get("mute") if isinstance(args.get("mute"), bool) else None
+        level, change = number("level"), number("change")
+        if level is None and change is None and mute is None:
+            raise _Refused("give change (points), level (0-100) or mute")
+        facts["sent_at"] = time.monotonic()
+        result = act(app, level=level, change=change, mute=mute)
+        ok, report, facts = self._report(result, "", facts)
+        facts["verified"] = bool(_detail(result, "verified")) if ok else False
+        return ok, report, facts
+
     def _tab(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        action = str(args.get("action") or "show")
+        if action == "close":
+            return self._tab_close(args, facts)
+        if action == "reopen":
+            return self._tab_reopen(args, facts)
         hwnd = self._window(args)
         select = getattr(self.backend, "select_tab", None)
         if not callable(select):
@@ -607,6 +713,84 @@ class Hands:
         if ok and self._foreground() != hwnd:
             report = self._front(hwnd) + report
         return ok, report, facts
+
+    def _tab_close(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """Close exactly the tabs named by their numbers on the tabs line, each by its identity."""
+        hwnd = self._window(args)
+        act = getattr(self.backend, "tab", None)
+        if not callable(act):
+            raise _Refused("this desktop cannot close a tab by its identity; hand it to the thinker")
+        numbers = [args.get("tab")] if args.get("tab") is not None else []
+        numbers += list(args.get("tabs") or [])
+        try:
+            wanted = sorted({int(n) for n in numbers})
+        except (TypeError, ValueError):
+            raise _Refused("give the tabs' numbers from the tabs line") from None
+        with self._lock:
+            names = list(self.last.tabs.get(hwnd) or [])
+            ids = list(self.last.tab_ids.get(hwnd) or [])
+        if not wanted:
+            raise _Refused("name the tab (or tabs) to close by the numbers on the tabs line; nothing was closed")
+        if not str(args.get("named") or "").strip():
+            raise _Refused("say in named which of the user's words name each tab to close; a tab their words do "
+                           "not name is never closed. Nothing was closed")
+        if any(not 1 <= n <= len(names) for n in wanted):
+            raise _Refused(f"not every tab {wanted} of window {hwnd} is on the tabs line you were shown; nothing "
+                           f"was closed")
+        if any(not ids[n - 1] for n in wanted):
+            raise _Refused("those tabs have no identity to close them by; hand it to the thinker. Nothing was closed")
+        facts["sent_at"] = time.monotonic()
+        closed, failed, lines = [], [], []
+        for n in wanted:
+            result = act(hwnd, ids[n - 1], "close")
+            good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
+            (closed if good else failed).append(names[n - 1])
+            lines.append(str(getattr(result, "summary", "")))
+            facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
+        facts["verified"] = bool(closed) and not failed
+        report = "; ".join(lines)
+        if closed:
+            report = ("closed, each by its identity and verified gone: " + ", ".join(f'"{x}"' for x in closed)
+                      + (f"; NOT closed: {', '.join(repr(x) for x in failed)}" if failed else "") + f". ({report})")
+        return bool(closed) and not failed, report, facts
+
+    def _tab_reopen(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """The browser's own reopen of its most recently closed tab, verified against the title wanted."""
+        hwnd = self._window(args)
+        read = getattr(self.backend, "read_tabs", None)
+        expect = str(args.get("expect") or "").strip()
+        if not callable(read):
+            raise _Refused("this desktop cannot read its tabs to check a reopened one; hand it to the thinker")
+        if not expect:
+            raise _Refused("give expect: the title of the tab that was closed (the done lines have it)")
+        before = read(hwnd, budget_s=0.4)
+        seen = {(getattr(t, "tab_id", "") or t.name) for t in getattr(before, "tabs", [])}
+        lead = self._front(hwnd)
+        facts["sent_at"] = time.monotonic()
+        result = self.backend.hotkey("ctrl", "shift", "t", expect_hwnd=hwnd)
+        ok, report, facts = self._report(result, lead, facts)
+        if not ok:
+            facts["verified"] = False
+            return False, report, facts
+        deadline = time.monotonic() + _REOPEN_WAIT_S
+        tab = None
+        while True:
+            strip = read(hwnd, budget_s=0.3)
+            new = [t for t in getattr(strip, "tabs", []) if (getattr(t, "tab_id", "") or t.name) not in seen]
+            tab = next((t for t in new if t.selected), new[0] if new else None)
+            if (tab is not None and same_tab(expect, tab.name)) or time.monotonic() >= deadline:
+                break
+            time.sleep(_POLL_S * 2)
+        if tab is None:
+            facts["verified"] = False
+            return False, f"pressed the browser's reopen, but no tab came back in {_REOPEN_WAIT_S:g} s", facts
+        right = same_tab(expect, tab.name)
+        facts["verified"] = right
+        where = f"tab {tab.index} of {len(getattr(strip, 'tabs', []))}, \"{tab.name}\""
+        if right:
+            return True, f"reopened the most recently closed tab (the browser's own reopen): {where}, the one wanted", facts
+        return False, (f"the browser's reopen brought back {where}, which is NOT the one wanted (\"{expect}\"); it is "
+                       f"left as it is"), facts
 
     def _open_url(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         url = str(args.get("url") or "").strip()
@@ -721,6 +905,22 @@ class Hands:
         return ok, lead + str(getattr(result, "summary", "")), facts
 
 
+def same_tab(expected: str, name: str) -> bool:
+    """Whether a tab's title is the one expected: most of the expected title's words are in it.
+
+    Titles drift while a page lives (a notification count, a memory note, the video now playing),
+    so equality is too strict and "contains" too loose. A measure of overlap, no word list.
+    """
+    def words(text: str) -> list[str]:
+        clean = "".join(ch.casefold() if ch.isalnum() else " " for ch in text or "")
+        return [w for w in clean.split() if len(w) >= 3 and not w.isdigit()]
+
+    want, have = words(expected), set(words(name))
+    if not want or not have:
+        return False
+    return sum(1 for w in want if w in have) / len(want) >= 0.6
+
+
 def _detail(result: Any, key: str) -> Any:
     details = getattr(result, "details", None)
     return details.get(key) if isinstance(details, dict) else None
@@ -738,7 +938,8 @@ def _is_address(text: str) -> bool:
 def _what(name: str, args: dict[str, Any]) -> str:
     """One line naming a hand's action from its arguments (for the shared action log)."""
     parts = [name]
-    for key in ("window", "tab", "action", "direction", "amount", "key", "keys", "times", "url", "app", "name"):
+    for key in ("window", "tab", "action", "direction", "amount", "key", "keys", "times", "url", "app", "name",
+                "level", "change", "mute"):
         if args.get(key) not in (None, "", []):
             parts.append(f"{key}={args[key]}")
     return " ".join(str(p) for p in parts)
@@ -757,4 +958,43 @@ def hands_backend(runtime: Any) -> Any:
     worker = getattr(runtime, "worker", None)
     agent = getattr(worker, "agent", None)
     dispatcher = getattr(agent, "dispatcher", None)
-    return getattr(dispatcher, "backend", None)
+    backend = getattr(dispatcher, "backend", None)
+    return with_app_volume(backend)
+
+
+class _AppVolumeBackend:
+    """The real desktop backend plus the per-app volume (:mod:`yuki.actions.app_volume`), for a backend
+    that does not have it yet. Everything else is the backend's own."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    @staticmethod
+    def app_volume(app: str, **kwargs: Any) -> Any:
+        from yuki.actions.app_volume import set_app_volume
+
+        return set_app_volume(app, **kwargs)
+
+    @staticmethod
+    def audio_apps() -> list[dict[str, Any]]:
+        from yuki.actions.app_volume import audio_apps
+
+        return audio_apps()
+
+
+def with_app_volume(backend: Any) -> Any:
+    """``backend``, able to set one app's own volume: the real desktop backend gets it from
+    :mod:`yuki.actions.app_volume` when it has no ``app_volume`` of its own; any other backend (a
+    test's stub) is returned as it is, so a stub never reaches the real mixer (rule 7)."""
+    if backend is None:
+        return None
+    try:
+        from yuki.agent.tools import _LazyRealBackend
+    except Exception:  # noqa: BLE001
+        return backend
+    if isinstance(backend, _LazyRealBackend) and "app_volume" not in type(backend).__dict__:
+        return _AppVolumeBackend(backend)
+    return backend

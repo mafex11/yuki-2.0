@@ -172,7 +172,7 @@ def test_instant_hands_are_called_without_words_and_the_slow_ones_with() -> None
     for tool in HAND_TOOLS:
         says = "no words before it" in tool["description"]
         assert says == (tool["name"] in INSTANT_HANDS), tool["name"]
-    assert "call it alone, with no words before it" in MOUTH_PROMPT
+    assert "made alone, with no words written before it" in MOUTH_PROMPT  # v3.5: every call, say_first carries words
     assert "A repeat" in MOUTH_PROMPT and "A tab is not a window" in MOUTH_PROMPT
 
 

@@ -44,6 +44,7 @@ from yuki.agent.memory import (
     default_memory,
     commitments_block_text,
     memory_block_text,
+    relevant_block_text,
     split_standing,
 )
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
@@ -268,6 +269,8 @@ class Agent:
         self._portrait_sent: tuple[str, int] | None = None
         #: Requests this conversation has started (1 on the first).
         self._requests = 0
+        #: The previous request's words (fast memory also searches them: a follow-up names nothing itself).
+        self._previous_request: str | None = None
         #: The profile and rules layers of the system prompt for the request being handled
         #: (``prompt.system_blocks``), set by ``_memory_context``; ``None`` when memory had
         #: nothing (then the layer is left out).
@@ -681,6 +684,7 @@ class Agent:
             self._log_turn(
                 request, reply=reply, outcome=outcome, at=started_epoch
             )
+            self._previous_request = request
             self._end_request(request, reply=reply, outcome=outcome, at=started_at)
 
     # -- per-request accounting --------------------------------------------
@@ -1497,10 +1501,11 @@ class Agent:
         self._profile_layer = profile_text(self.settings.user_names, None)
         self._rules_layer = None
         try:
-            fetched = self.memory.context(app=app, query=request, resume=first and not lean)
+            fetched = self.memory.context(app=app, query=request, resume=first and not lean,
+                                          previous=self._previous_request)
             rest, personality = _split_personality(fetched.portrait)
             rules, commitments = split_standing(fetched.standing)
-            self._profile_layer = profile_text(self.settings.user_names, personality)
+            self._profile_layer = profile_text(self.settings.user_names, personality, fetched.persona)
             if fetched.source != "unavailable":
                 self._rules_layer = rules_text(rules or "")
             background = replace(fetched, portrait=None if lean else ((rest or "").strip() or None),
@@ -1514,6 +1519,11 @@ class Agent:
                 repeated = self._portrait_sent[1]
             text = memory_block_text(background, repeated_turn=repeated)
             standing = commitments_block_text(commitments)
+            # fast memory: the few memories bearing on these words, right before them (a volatile block in
+            # the request's messages, like the commitments: the cached system layers never change for it)
+            relevant = relevant_block_text(fetched.relevant)
+            if relevant:
+                standing = f"{relevant}\n\n{standing}" if standing else relevant
         except Exception as exc:  # memory must never break a request
             self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
             self._memory_info = {
@@ -1539,6 +1549,9 @@ class Agent:
             "truncated": list(fetched.truncated),
             "knowhow_lines": len(fetched.knowhow) if text else 0,
             "todo_lines": len(fetched.todos) if text else 0,
+            "relevant_items": len(fetched.relevant),
+            "relevant_ms": fetched.relevant_ms,
+            "persona_chars": len(fetched.persona or ""),
             "lookup_ms": elapsed_ms,
         }
         self.logger.log(
@@ -1559,6 +1572,10 @@ class Agent:
             truncated=list(fetched.truncated),
             knowhow_lines=len(fetched.knowhow),
             todo_lines=len(fetched.todos),
+            relevant=[{"kind": r.get("kind"), "id": r.get("id"), "cosine": r.get("cosine"), "score": r.get("score")}
+                      for r in fetched.relevant],
+            relevant_ms=fetched.relevant_ms,
+            persona_chars=len(fetched.persona or ""),
             memory_session=getattr(self.memory, "session_id", None),
             app=app,
             error=fetched.error,

@@ -56,6 +56,19 @@ VOICED_OVER_FLOOR = 4.0
 VOICED_MIN_DBFS = -62.0
 
 
+def voiced_threshold(floor: float, absolute: float, minimum: float) -> float:
+    """The level (RMS, linear) a block needs to count as voiced, given the room's floor.
+
+    Well above the floor always (``VOICED_OVER_FLOOR``, +12 dB); the absolute level (-42 dBFS)
+    lowers that only for a quiet room, never below twice the floor (+6 dB). Live 2026-09-26 the
+    M-Audio interface's input sat at a -32 dBFS floor, above the absolute level, so every block
+    counted as voiced: no end-of-speech timing, no silence squeezed out of the replay after a wake
+    (9.8 s kept, 9.0 s replayed), and the raw-sound gate saw one endless stretch. Measurement only.
+    """
+    relative = max(minimum, floor * VOICED_OVER_FLOOR)
+    return max(min(absolute, relative), floor * 2.0, minimum)
+
+
 #: PortAudio streams this process has open (mic and speakers). PortAudio reads the device
 #: list once, when it starts; after a device change or the PC waking from sleep an index
 #: can point at a device that is gone. It can only be re-read with no stream open.
@@ -355,7 +368,7 @@ class SharedMic:
             st.floor = max(level, 1e-6)
         else:
             st.floor += (level - st.floor) * 0.002  # rises over ~10 s of steady sound
-        if level >= min(self._voiced_floor, max(self._voiced_min, st.floor * VOICED_OVER_FLOOR)):
+        if level >= voiced_threshold(st.floor, self._voiced_floor, self._voiced_min):
             st.voiced_blocks += 1
             if at - st.last_voiced > 0.5:
                 st.voiced_since = at
