@@ -123,7 +123,7 @@ void main() {
     float rim = exp(-d / max(vShadow.w, 0.35));
     float glint = pow(max(facing, 0.0), 2.0) + 0.55 * pow(max(-facing, 0.0), 2.0);
     float sheen = pow(sin(tilt), 3.0) * u;
-    col += vOptics.y * (rim * (vExtra.z + (1.0 - vExtra.z) * glint) + 0.22 * sheen * (0.25 + 0.75 * glint));
+    col += vOptics.y * (rim * (vExtra.z + (1.0 - vExtra.z) * glint) + 0.07 * sheen * glint);   // a faint catch-light, not a white outline
     float inner = vShadow.z * exp(-d / (bezel * 0.55)) * (0.5 - 0.5 * facing);
     col *= 1.0 - inner;
     col = clamp(col, 0.0, 1.0);

@@ -165,7 +165,7 @@ def pack(shapes: Sequence[Shape]) -> bytes:
         if corner > 2.0:   # a squircle corner looks smaller than a circle of the same radius
             radius = min(half, radius * (1.0 + 0.28 * (corner - 2.0)))
         bezel = min(o.bezel * k, half)
-        height = min(o.height * k, half * 0.9)      # small droplets stay lenses, not mirrors
+        height = min(o.height * k, half * 1.15)     # small droplets bend hard but stay lenses
         tr, tg, tb, ta = _tint(o.tint, s.tint)
         c = s.clip if s.clip is not None else QRectF(-1e6, -1e6, 2e6, 2e6)
         a[i] = (r.x(), r.y(), r.width(), r.height(),
