@@ -3,8 +3,8 @@
 Every item shows its source ("You told Yuki · yesterday", "Seen in Discord ·
 25 Sep"). **Why?** folds open the journal entries it rests on. **Not right**
 folds open a composer: the user says what is true in their own words, which
-phase 2 sends through ``MemoryClient.correct_portrait`` (a user-origin
-correction the portrait folds in within about a minute), phrased as
+goes through ``MemoryClient.correct_portrait`` (a user-origin correction the
+portrait folds in within about a minute), phrased as
 ``About "<subject>" (memory had: "<text>"), the user said in their own words:
 "<words>"`` so the fold knows which fact it answers. Jokes wear a Joke chip and
 never read as facts; what Yuki may have misheard sits in its own card.
@@ -17,6 +17,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
+from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, second_person
 from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
@@ -57,46 +58,87 @@ def _evidence(item: Item) -> list[tuple[str, str, str]]:
     return out
 
 
-def _row(t: Theme, item: Item, expand: str | None, compose: str | None, *, leading: QWidget | None = None,
-         title: bool = True) -> ItemRow:
-    return ItemRow(t, item.ref, item.title if title else "", item.short, item.source, tags=item.tags,
-                   leading=leading, evidence=_evidence(item), show_evidence=item.ref == expand,
-                   composer=item.ref == compose,
-                   placeholder=f"e.g. “{item.title} is my friend from college”" if item.kind == "person" else "")
+def _row(t: Theme, item: Item, expand: str | None, compose: str | None, act: Actions, *,
+         leading: QWidget | None = None, title: bool = True) -> ItemRow:
+    row = ItemRow(t, item.ref, item.title if title else "", item.short, item.source, tags=item.tags,
+                  leading=leading, evidence=_evidence(item), show_evidence=item.ref == expand,
+                  composer=item.ref == compose,
+                  placeholder=f"e.g. “{item.title} is my friend from college”" if item.kind == "person" else "")
+    row.correct.connect(lambda _ref, words, it=item: act.correct_item(it, words))
+    row.forget.connect(lambda _ref, it=item: act.forget_item(it))
+    return row
+
+
+def _more(t: Theme, panel: Panel, rows: list[QWidget], limit: int, total: int) -> None:
+    """Rows past ``limit`` start hidden; the panel's "All N" pill shows them (and "Fewer" hides them)."""
+    if total <= limit:
+        return
+    pill = Pill(t, f"All {total}", style="quiet", size="small")
+    for r in rows[limit:]:
+        r.setVisible(False)
+
+    def toggle() -> None:
+        show = not rows[limit].isVisible()
+        for r in rows[limit:]:
+            r.setVisible(show)
+        pill.setText("Fewer" if show else f"All {total}")
+        pill.updateGeometry()
+
+    pill.clicked.connect(toggle)
+    head = panel.body.itemAt(0)
+    if head is not None and head.layout() is not None:
+        head.layout().addWidget(pill, 0, Qt.AlignmentFlag.AlignTop)
 
 
 def _list_panel(t: Theme, title: str, subtitle: str, glyph: str, items: list[Item], expand: str | None,
-                compose: str | None, *, limit: int = 4, more: bool = True) -> Panel:
-    panel = Panel(t, title, subtitle, glyph=glyph,
-                  right=Pill(t, f"All {len(items)}", style="quiet", size="small") if more and len(items) > limit else None)
+                compose: str | None, act: Actions, *, limit: int = 4) -> Panel:
+    panel = Panel(t, title, subtitle, glyph=glyph)
     panel.body.setSpacing(SPACE["s"])
-    shown = items[:limit]
-    for i, it in enumerate(shown):
+    rows: list[QWidget] = []
+    for i, it in enumerate(items):
+        box = QWidget()
+        box.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(SPACE["s"])
         if i:
-            panel.body.addWidget(Divider(t))
-        panel.body.addWidget(_row(t, it, expand, compose))
-    if not shown:
+            lay.addWidget(Divider(t))
+        lay.addWidget(_row(t, it, expand, compose, act))
+        panel.body.addWidget(box)
+        rows.append(box)
+    _more(t, panel, rows, limit, len(items))
+    if not items:
         panel.body.addWidget(text_label(t, "Nothing yet.", "callout", "text_3"))
     return panel
 
 
-def _people(t: Theme, view: MeView, expand: str | None, compose: str | None) -> Panel:
-    panel = Panel(t, "People", "Friends, family and colleagues, and what Yuki knows about each.", glyph="people",
-                  right=Pill(t, f"All {len(view.people)}", style="quiet", size="small"))
+def _people(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
+    panel = Panel(t, "People", "Friends, family and colleagues, and what Yuki knows about each.", glyph="people")
     panel.body.setSpacing(SPACE["s"])
     palette = t.series
     # the ones the user told Yuki about first, then the expanded / composing examples, then the rest
     order = sorted(view.people, key=lambda i: (0 if i.ref == expand else 1 if i.ref == compose else
                                                2 if "you" in i.tags else 3, -i.since))
-    for n, it in enumerate(order[:7]):
+    rows: list[QWidget] = []
+    for n, it in enumerate(order):
+        box = QWidget()
+        box.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(SPACE["s"])
         if n:
-            panel.body.addWidget(Divider(t))
+            lay.addWidget(Divider(t))
         color = palette[sum(map(ord, it.title)) % len(palette)]
-        panel.body.addWidget(_row(t, it, expand, compose, leading=Avatar(t, it.title, color)))
+        lay.addWidget(_row(t, it, expand, compose, act, leading=Avatar(t, it.title, color)))
+        panel.body.addWidget(box)
+        rows.append(box)
+    _more(t, panel, rows, 7, len(order))
+    if not order:
+        panel.body.addWidget(text_label(t, "Nobody yet.", "callout", "text_3"))
     return panel
 
 
-def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None) -> Panel:
+def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
     panel = Panel(t, "Personality", "How you talk, what you care about, your running jokes and your stories. "
                                     "A joke is kept as a joke, never as a fact.", glyph="emoji")
     panel.body.setSpacing(SPACE["s"])
@@ -110,44 +152,54 @@ def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None
         first = False
         panel.body.addWidget(text_label(t, title, "caption_strong", "text_2"))
         for it in items[:3]:
-            panel.body.addWidget(_row(t, it, expand, compose, title=False))
+            panel.body.addWidget(_row(t, it, expand, compose, act, title=False))
     return panel
 
 
-def _unsure(t: Theme, view: MeView) -> Panel:
+def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
     panel = Panel(t, "Not sure Yuki heard these right", "From calls, where words can be misheard. Yuki won't treat "
                   "them as facts until you say.", glyph="question")
     panel.body.setSpacing(SPACE["s"])
     for i, it in enumerate(view.unsure[:3]):
         if i:
             panel.body.addWidget(Divider(t))
-        row = QVBoxLayout()
-        row.setSpacing(4)
-        row.addWidget(text_label(t, it.short, "callout", "text", wrap=True))
-        foot = QHBoxLayout()
-        foot.setSpacing(6)
-        foot.addWidget(text_label(t, it.source, "caption", "text_3"))
-        foot.addStretch(1)
-        foot.addWidget(Pill(t, "That's right", glyph="check", style="quiet", size="small"))
-        foot.addWidget(Pill(t, "Not right", glyph="edit", style="quiet", size="small"))
-        row.addLayout(foot)
-        panel.body.addLayout(row)
+        row = ItemRow(t, it.ref, "", it.short, it.source, tags=[], evidence=_evidence(it),
+                      placeholder="Say what was really said, or what's true")
+        row.correct.connect(lambda _ref, words, item=it: act.correct_item(item, words))
+        row.forget.connect(lambda _ref, item=it: act.forget_item(item))
+        right = Pill(t, "That's right", glyph="check", style="quiet", size="small")
+
+        def confirmed(_c: bool = False, item: Item = it, pill: Pill = right) -> None:
+            act.confirm_item(item)
+            pill.setText("Confirmed")
+            pill.setEnabled(False)
+            pill.updateGeometry()
+
+        right.clicked.connect(confirmed)
+        panel.body.addWidget(row)
+        line = QHBoxLayout()
+        line.addStretch(1)
+        line.addWidget(right)
+        panel.body.addLayout(line)
     if not view.unsure:
         panel.body.addWidget(text_label(t, "Nothing unclear this week.", "callout", "text_3"))
     return panel
 
 
-def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | None = None) -> QWidget:
+def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | None = None,
+          act: Actions = NOOP) -> QWidget:
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
     col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
     col.setSpacing(SPACE["l"])
     when = f"updated {day_label(view.portrait_at)} {hm(view.portrait_at)}" if view.portrait_at else "not written yet"
+    refresh = Pill(t, f"Portrait {when}", glyph="history", style="quiet")
+    refresh.setToolTip("Rebuild it now from what Yuki has seen")
+    refresh.clicked.connect(act.refresh_portrait)
     col.addWidget(page_header(
         t, "Me", "What Yuki understands about you. Tap Why? to see where something came from, or Not right to "
-                 "put it right in your own words.",
-        [Pill(t, f"Portrait {when}", glyph="history", style="quiet")]))
+                 "put it right in your own words.", [refresh]))
     if view.questions_open:
         banner = Glass(t, level="raised", radius=20, padding=SPACE["m"], tint=_soft(t.kind("question"), t))
         row = QHBoxLayout()
@@ -156,8 +208,9 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
                                                    f"{view.questions_open} questions") +
                                  " about people it doesn't know yet.", "body", "text"))
         row.addStretch(1)
-        row.addWidget(Pill(t, "Answer on the Yuki page", glyph="next", style="tinted", tint=t.kind("question"),
-                           size="small"))
+        go = Pill(t, "Answer on the Yuki page", glyph="next", style="tinted", tint=t.kind("question"), size="small")
+        go.clicked.connect(lambda: act.navigate("yuki"))
+        row.addWidget(go)
         banner.body.addLayout(row)
         col.addWidget(banner)
 
@@ -166,19 +219,19 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     left = QVBoxLayout()
     left.setSpacing(SPACE["l"])
     left.addWidget(_list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
-                               expand, compose, limit=3))
+                               expand, compose, act, limit=3))
     left.addWidget(_list_panel(t, "On your plate", "What you owe people, and what they owe you.", "flag",
-                               view.on_your_plate, expand, compose, limit=4))
-    left.addWidget(_list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose,
+                               view.on_your_plate, expand, compose, act, limit=4))
+    left.addWidget(_list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose, act,
                                limit=3))
     left.addWidget(_list_panel(t, "Routines", "Patterns in how your days go.", "history", view.routines,
-                               expand, compose, limit=2))
+                               expand, compose, act, limit=2))
     left.addStretch(1)
     right = QVBoxLayout()
     right.setSpacing(SPACE["l"])
-    right.addWidget(_people(t, view, expand, compose))
-    right.addWidget(_personality(t, view, expand, compose))
-    right.addWidget(_unsure(t, view))
+    right.addWidget(_people(t, view, expand, compose, act))
+    right.addWidget(_personality(t, view, expand, compose, act))
+    right.addWidget(_unsure(t, view, act))
     right.addStretch(1)
     grid.addLayout(left, 1)
     grid.addLayout(right, 1)

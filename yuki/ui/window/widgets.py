@@ -269,6 +269,12 @@ class Chip(QWidget):
         p.end()
 
 
+def _glass_changed(widget: QWidget) -> None:
+    from yuki.ui.window.glasscache import notify_glass
+
+    notify_glass(widget)
+
+
 class Toggle(QAbstractButton):
     """An on/off switch: a glass track, the knob a bright glass bead; accent when on."""
 
@@ -279,6 +285,7 @@ class Toggle(QAbstractButton):
         self.setChecked(on)
         self.setFixedSize(46, 28)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggled.connect(lambda _on: _glass_changed(self))
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
@@ -328,9 +335,11 @@ class Segmented(QWidget):
         x = event.position().x() - 4
         for opt, w in zip(self.options, self._widths):
             if x < w:
-                self.current = opt
-                self.update()
-                self.changed.emit(opt)
+                if opt != self.current:
+                    self.current = opt
+                    self.update()
+                    _glass_changed(self)
+                    self.changed.emit(opt)
                 return
             x -= w
 
@@ -352,16 +361,44 @@ class Segmented(QWidget):
 
 
 class Dropdown(QAbstractButton):
-    """A glass pill that shows the chosen value and a chevron (the list opens in a popover)."""
+    """A glass pill that shows the chosen value and a chevron; a click opens the choices.
+
+    ``options``: ``[(label, value), ...]`` or a callable returning them (read when opened, e.g. the
+    devices plugged in now). ``changed(value)`` when the user picks one.
+    """
+
+    changed = Signal(object)
 
     def __init__(self, t: Theme, value: str, *, width: int = 300, glyph: str | None = None,
+                 options: Sequence[tuple[str, object]] | Callable[[], Sequence[tuple[str, object]]] | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.t, self.glyph = t, glyph
+        self.t, self.glyph, self.options = t, glyph, options
         self.setText(value)
         self.setFont(font("callout"))
         self.setFixedSize(width, CONTROL_H["regular"] + 4)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clicked.connect(self._open)
+
+    def _open(self) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        opts = self.options() if callable(self.options) else self.options
+        if not opts:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_css(self.t))
+        for label, value in opts:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(label == self.text())
+            act.triggered.connect(lambda _c=False, lab=label, v=value: self._pick(lab, v))
+        menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+
+    def _pick(self, label: str, value: object) -> None:
+        self.setText(label)
+        self.update()
+        self.changed.emit(value)
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
@@ -553,12 +590,18 @@ class ItemRow(QWidget):
     Layout: an optional leading widget (avatar), the title and chips, the text, a
     source line ("Seen in Discord · yesterday"), then two quiet pills: **Why?**
     (the evidence folds open under it) and **Not right** (a composer folds open:
-    the user says what is true in their own words; phase 2 sends it through
-    ``MemoryClient.correct_portrait`` as their own correction).
+    the user says what is true in their own words, or "It's just wrong, forget
+    it"). The folds are built the first time they open.
+
+    Signals:
+        why: ``(ref)`` the evidence was opened.
+        correct: ``(ref, words)`` the user's own correction.
+        forget: ``(ref)`` "It's just wrong, forget it".
     """
 
     why = Signal(str)
     correct = Signal(str, str)
+    forget = Signal(str)
 
     def __init__(self, t: Theme, ref: str, title: str, text: str, source: str, *, tags: Sequence[str] = (),
                  leading: QWidget | None = None, evidence: Sequence[tuple[str, str, str]] = (),
@@ -566,6 +609,8 @@ class ItemRow(QWidget):
                  actions: bool = True, title_role: str = "body_strong", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t, self.ref = t, ref
+        self._evidence_rows = list(evidence)
+        self._placeholder = placeholder
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, SPACE["xs"], 0, SPACE["xs"])
@@ -574,6 +619,7 @@ class ItemRow(QWidget):
             outer.addWidget(leading, 0, Qt.AlignmentFlag.AlignTop)
         col = QVBoxLayout()
         col.setSpacing(4)
+        self._col = col
         head = QHBoxLayout()
         head.setSpacing(6)
         if title:
@@ -582,48 +628,104 @@ class ItemRow(QWidget):
             head.addWidget(Chip(t, tag))
         head.addStretch(1)
         col.addLayout(head)
-        col.addWidget(text_label(t, text, "callout", "text", wrap=True))
+        col.addWidget(text_label(t, text, "callout", "text", wrap=True, selectable=True))
         foot = QHBoxLayout()
         foot.setSpacing(6)
         foot.addWidget(icon_label(t, "history", t.text_3, "icon_small"))
         foot.addWidget(text_label(t, source, "caption", "text_3"))
         foot.addStretch(1)
+        self.why_pill: Pill | None = None
+        self.wrong_pill: Pill | None = None
         if actions:
-            why = Pill(t, "Hide why" if show_evidence else "Why?", style="quiet", size="small")
-            why.clicked.connect(lambda: self.why.emit(self.ref))
-            wrong = Pill(t, "Not right", glyph="edit", style="tinted" if composer else "quiet", size="small",
-                         tint=t.kind("question") if composer else None)
-            foot.addWidget(why)
-            foot.addWidget(wrong)
+            self.why_pill = Pill(t, "Why?", style="quiet", size="small")
+            self.why_pill.clicked.connect(self.toggle_evidence)
+            self.why_pill.setVisible(bool(evidence))
+            self.wrong_pill = Pill(t, "Not right", glyph="edit", style="quiet", size="small")
+            self.wrong_pill.clicked.connect(self.toggle_composer)
+            foot.addWidget(self.why_pill)
+            foot.addWidget(self.wrong_pill)
         col.addLayout(foot)
+        self._ev_box: QWidget | None = None
+        self._composer: QWidget | None = None
+        self.field: TextPill | None = None
+        self.done_note: QLabel | None = None
+        outer.addLayout(col, 1)
         if show_evidence and evidence:
+            self.toggle_evidence()
+        if composer:
+            self.toggle_composer()
+
+    def toggle_evidence(self) -> None:
+        t = self.t
+        if self._ev_box is None:
             ev = Glass(t, level="inset", radius=RADIUS["row"], padding=SPACE["m"])
             ev.body.setSpacing(6)
             ev.body.addWidget(text_label(t, "Why Yuki thinks this", "caption_strong", "text_2"))
-            for when, where, words in evidence:
+            for when, where, words in self._evidence_rows:
                 line = QHBoxLayout()
                 line.setSpacing(SPACE["s"])
                 stamp = text_label(t, f"{when} · {where}", "caption", "text_3")
                 stamp.setFixedWidth(150)
                 line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
-                line.addWidget(text_label(t, words, "caption", "text_2", wrap=True), 1)
+                line.addWidget(text_label(t, words, "caption", "text_2", wrap=True, selectable=True), 1)
                 ev.body.addLayout(line)
-            col.addWidget(ev)
-        if composer:
+            self._ev_box = ev
+            self._col.insertWidget(self._col.count() if self._composer is None else self._col.count() - 1, ev)
+            ev.setVisible(False)
+        show = not self._ev_box.isVisible()
+        self._ev_box.setVisible(show)
+        if self.why_pill is not None:
+            self.why_pill.setText("Hide why" if show else "Why?")
+            self.why_pill.updateGeometry()
+        if show:
+            self.why.emit(self.ref)
+
+    def toggle_composer(self) -> None:
+        t = self.t
+        if self._composer is None:
             box = Glass(t, level="inset", radius=RADIUS["row"] + 4, padding=SPACE["m"])
             box.body.setSpacing(SPACE["s"])
             box.body.addWidget(text_label(t, "Tell Yuki what's right, in your own words. It will fix this and "
                                              "remember it came from you.", "caption", "text_2", wrap=True))
-            field_ = TextPill(t, placeholder or "e.g. “Elina is my friend”", action="Tell Yuki", height=38)
-            field_.submitted.connect(lambda words: self.correct.emit(self.ref, words))
-            box.body.addWidget(field_)
+            self.field = TextPill(t, self._placeholder or "e.g. “Elina is my friend”", action="Tell Yuki", height=38)
+            self.field.submitted.connect(self._send)
+            box.body.addWidget(self.field)
             row = QHBoxLayout()
-            row.addWidget(Pill(t, "It's just wrong, forget it", style="quiet", size="small"))
+            forget = Pill(t, "It's just wrong, forget it", style="quiet", size="small")
+            forget.clicked.connect(lambda: self._sent(self.forget.emit, self.ref))
+            row.addWidget(forget)
             row.addStretch(1)
-            row.addWidget(Pill(t, "Cancel", style="quiet", size="small"))
+            cancel = Pill(t, "Cancel", style="quiet", size="small")
+            cancel.clicked.connect(self.toggle_composer)
+            row.addWidget(cancel)
             box.body.addLayout(row)
-            col.addWidget(box)
-        outer.addLayout(col, 1)
+            self._composer = box
+            self._col.addWidget(box)
+            box.setVisible(False)
+        show = not self._composer.isVisible()
+        self._composer.setVisible(show)
+        if self.wrong_pill is not None:
+            self.wrong_pill.style = "tinted" if show else "quiet"
+            self.wrong_pill.tint = t.kind("question") if show else None
+            self.wrong_pill.update()
+        if show and self.field is not None:
+            self.field.edit.setFocus()
+
+    def _send(self, words: str) -> None:
+        words = " ".join((words or "").split())
+        if words:
+            self._sent(lambda ref: self.correct.emit(ref, words), self.ref)
+
+    def _sent(self, emit: Callable[[str], object], ref: str) -> None:
+        emit(ref)
+        if self._composer is not None:
+            self._composer.setVisible(False)
+        if self.wrong_pill is not None:
+            self.wrong_pill.setText("Sent to Yuki")
+            self.wrong_pill.style = "quiet"
+            self.wrong_pill.setEnabled(False)
+            self.wrong_pill.updateGeometry()
+            self.wrong_pill.update()
 
 
 class SettingRow(QWidget):
@@ -675,6 +777,117 @@ def page_header(t: Theme, title: str, subtitle: str, right: Sequence[QWidget] = 
     for r in right:
         row.addWidget(r, 0, Qt.AlignmentFlag.AlignVCenter)
     return w
+
+
+class GlassSlider(QWidget):
+    """A glass track with a bead; ``value`` 0..2 (1 = as designed). ``committed(value)`` when let go.
+
+    Nothing is re-rendered while it is dragged: the glass follows once the bead is released.
+    """
+
+    committed = Signal(float)
+
+    def __init__(self, t: Theme, value: float = 1.0, *, width: int = 200, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t = t
+        self.value = max(0.0, min(2.0, float(value)))
+        self.setFixedSize(width, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._drag = False
+
+    def _set_from(self, x: float) -> None:
+        span = max(1.0, self.width() - 24)
+        self.value = max(0.0, min(2.0, (x - 12) / span * 2.0))
+        self.update()
+
+    def mousePressEvent(self, e: object) -> None:  # noqa: D102
+        self._drag = True
+        self._set_from(e.position().x())
+
+    def mouseMoveEvent(self, e: object) -> None:  # noqa: D102
+        if self._drag:
+            self._set_from(e.position().x())
+
+    def mouseReleaseEvent(self, e: object) -> None:  # noqa: D102
+        if self._drag:
+            self._drag = False
+            self._set_from(e.position().x())
+            self.committed.emit(round(self.value, 2))
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        t = self.t
+        track = QRectF(12, self.height() / 2 - 3, self.width() - 24, 6)
+        paint_glass(p, track, 3, t.level("inset"), shadow=False, painted=True)
+        filled = QRectF(track.left(), track.top(), track.width() * self.value / 2.0, track.height())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(t.accent)
+        p.drawPath(rounded(filled, 3))
+        mid = track.left() + track.width() / 2
+        p.setPen(QPen(t.text_3, 1.0))
+        p.drawLine(int(mid), int(track.top() - 4), int(mid), int(track.bottom() + 4))
+        x = track.left() + track.width() * self.value / 2.0
+        knob = QRectF(x - 10, self.height() / 2 - 10, 20, 20)
+        paint_glass(p, knob, 10, t.level("lens"), painted=True)
+        p.end()
+
+
+class Toast(QWidget):
+    """A short glass note at the bottom of the window ("Told Yuki. It will fix this.")."""
+
+    def __init__(self, t: Theme, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.t = t
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._text = ""
+        self._tone = ""
+        self._timer = None
+        self.hide()
+
+    def show_text(self, text: str, *, tone: str = "", ms: int = 3200) -> None:
+        from PySide6.QtCore import QTimer
+
+        self._text, self._tone = text, tone
+        fm = QFontMetrics(font("callout"))
+        w = min(self.parentWidget().width() - 80, fm.horizontalAdvance(text) + 56)
+        self.resize(w, 40)
+        par = self.parentWidget()
+        self.move((par.width() - w) // 2 + 100, par.height() - 64)
+        self.raise_()
+        self.show()
+        self.update()
+        if self._timer is None:
+            self._timer = QTimer(self)
+            self._timer.setSingleShot(True)
+            self._timer.timeout.connect(self.hide)
+        self._timer.start(ms)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        tint = None
+        if self._tone:
+            tint = QColor(self.t.kind(self._tone) if self._tone in self.t.kinds else self.t.status.get(self._tone,
+                                                                                                     self.t.accent))
+            tint.setAlphaF(0.14)
+        paint_glass(p, r, r.height() / 2, self.t.level("raised"), tint=tint, painted=True)
+        p.setPen(self.t.text)
+        p.setFont(font("callout"))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
+
+
+def menu_css(t: Theme) -> str:
+    """A menu in the window's colours (a popup is its own native window: it gets plain frosted glass)."""
+    bg = QColor(t.fallback_top)
+    bg.setAlpha(250)
+    return (f"QMenu {{ background: {css(bg)}; color: {css(t.text)}; border: 1px solid {css(t.baseline)};"
+            " border-radius: 10px; padding: 6px; }"
+            f"QMenu::item {{ padding: 6px 22px 6px 24px; border-radius: 6px; }}"
+            f"QMenu::item:selected {{ background: {css(t.accent_soft)}; }}"
+            f"QMenu::separator {{ height: 1px; background: {css(t.grid)}; margin: 4px 8px; }}")
 
 
 Callback = Callable[..., object]

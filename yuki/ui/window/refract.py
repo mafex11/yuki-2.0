@@ -478,6 +478,14 @@ class Compositor:
         self.last_gpu_ms = cb.lastCompletedGpuTime() * 1000.0
         return self.last_gpu_ms
 
+    def trim(self) -> None:
+        """Free the canvas-sized textures and uploaded images (kept: the device, shaders and pipelines)."""
+        self._drop_images(set())
+        for r in self._tex + self._rt:
+            r.destroy()
+        self._tex, self._rt, self._srbs = [], [], {}
+        self._size = None
+
     def release(self) -> None:
         """Destroy every GPU resource (and the QRhi when it is ours)."""
         self._drop_images(set())
@@ -626,6 +634,9 @@ class _Collector:
         optics = self.theme.optics.get(level.name) or self.theme.optics["regular"]
         if floating:   # over busy content: frosted more, so what sits on it stays readable
             optics = self.theme.optics.get("popover", optics)
+        from yuki.ui.lens import scaled_optics
+
+        optics = scaled_optics(optics)   # the user's "Glass bending" and "Blur"
         if clip is not None and shadow and optics.shadow > 0:
             # a clip that hugs the shape is the widget's own bounds: let the shadow out past it
             m = (optics.shadow_blur * 2 + abs(optics.shadow_y) + 2) * scale
@@ -668,9 +679,25 @@ class _Collector:
 COLLECTOR = _Collector()
 
 
+class _Live:
+    """The live window (phase 2): its refracted glass is a cached image painted under the widgets.
+
+    While ``on``, :func:`yuki.ui.window.glass.paint_glass` paints nothing for a level the glass
+    setting refracts (it is already in the cached image) and paints the rest as crisp flat glass.
+    """
+
+    on = False
+
+
+LIVE = _Live()
+
+
 def collecting() -> bool:
-    """True while shapes are being recorded (widgets then draw glass, not flat stand-ins, for their controls)."""
-    return COLLECTOR.active
+    """True while glass controls are real glass (recording shapes, or the live window with the Full
+    setting): widgets then draw droplets, not flat stand-ins, for their controls."""
+    from yuki.ui.lens import policy
+
+    return (COLLECTOR.active or LIVE.on) and policy().mode == "full"
 
 
 # -- composing widgets over a base ----------------------------------------------------------------

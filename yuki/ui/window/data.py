@@ -5,10 +5,9 @@ file, ``voice.json``, the Run key). Nothing calls a model or writes. Each
 builder is called on a worker thread when a page opens and hands the page a
 dataclass; the page only paints it.
 
-Phase-1 note: a few reads go one level below ``MemoryClient`` (the day's raw
-timeline rows, journal entries by id, conversation facts, the latest session's
-turns, a 14-day per-app ranking for stable lane colours). Phase 2 moves them
-behind ``MemoryClient`` methods (see docs/UI-window.md, "Phase 2").
+Every read goes through ``MemoryClient`` (phase 2 added the window's own reads:
+``day_timeline``, ``journal_entries``, ``journal_by_ids``,
+``portrait_facts_with_evidence``, ``rules``, ``recent_turns``, ``app_colors``).
 """
 
 from __future__ import annotations
@@ -236,21 +235,17 @@ class DayView:
 MAX_LANES = 7
 
 
-def _lane_key(row: Any) -> tuple[str, str]:
-    if row.withheld and not row.app:
+def _lane_key(row: dict[str, Any]) -> tuple[str, str]:
+    if row["withheld"] and not row["app"]:
         return "other", "Other apps"
-    key = row.process or (row.app or "").casefold() or "other"
-    return key, row.app or row.process or "Other apps"
+    key = row["process"] or (row["app"] or "").casefold() or "other"
+    return key, row["app"] or row["process"] or "Other apps"
 
 
-def _color_ranks(store: Any, until: float, days: int = 14) -> dict[str, int]:
+def _color_ranks(memory: Any, until: float, days: int = 14) -> dict[str, int]:
     """Lane colour = the app's rank by time over the last ``days`` (stable across days)."""
     try:
-        rows = store._query(
-            "SELECT COALESCE(process, app) k, SUM(COALESCE(active_s,0)+COALESCE(passive_s,0)) t FROM timeline "
-            "WHERE started_at >= ? AND state = 'present' GROUP BY k ORDER BY t DESC LIMIT 8",
-            (until - days * 86400.0,))
-        return {str(r["k"]).casefold(): i for i, r in enumerate(rows) if r["k"]}
+        return memory.app_colors(until=until, days=days)
     except Exception:
         return {}
 
@@ -259,34 +254,33 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
     """The whole Today page for ``day`` (read-only)."""
     from yuki.memory.store import POWER_STATES
 
-    store = memory.store
     now = time.time() if now is None else now
     since = datetime.combine(day, datetime.min.time()).timestamp()
     until = since + 86400.0
     end = min(until, now)
-    rows = sorted(store.timeline_between(since, until), key=lambda r: r.started_at)
+    rows = memory.day_timeline(since, until)
     act = memory.activity(since=since, until=until, group_by="app", limit=50)
 
     segments: list[Segment] = []
     lanes: dict[str, Lane] = {}
     covered: list[tuple[float, float]] = []
     for r in rows:
-        s, e = max(r.started_at, since), min(r.ended_at, end)
+        s, e = max(r["start"], since), min(r["end"], end)
         if e <= s:
             continue
         covered.append((s, e))
-        if r.state in POWER_STATES:
+        if r["state"] in POWER_STATES:
             continue
-        frac = (e - s) / max(1e-6, r.ended_at - r.started_at)
-        present = ((r.active_s or 0.0) + (r.passive_s or 0.0)) * frac if r.state == "present" else 0.0
+        frac = (e - s) / max(1e-6, r["end"] - r["start"])
+        present = (r["active_s"] + r["passive_s"]) * frac if r["state"] == "present" else 0.0
         key, label = _lane_key(r)
         lane = lanes.setdefault(key, Lane(key, label))
-        if r.state == "present":
+        if r["state"] == "present":
             lane.present_s += present
-            lane.fullscreen_s += (e - s) if r.fullscreen else 0.0
-            lane.voice_s += (e - s) if r.meeting else 0.0
-        segments.append(Segment(s, e, key, r.state, present, bool(r.fullscreen), bool(r.meeting),
-                                bool(r.withheld), bool(getattr(r, "by_yuki", False)), r.title, r.host))
+            lane.fullscreen_s += (e - s) if r["fullscreen"] else 0.0
+            lane.voice_s += (e - s) if r["meeting"] else 0.0
+        segments.append(Segment(s, e, key, r["state"], present, bool(r["fullscreen"]), bool(r["meeting"]),
+                                bool(r["withheld"]), bool(r["by_yuki"]), r["title"], r["host"]))
 
     ranked = sorted((ln for ln in lanes.values() if ln.key != "other"), key=lambda ln: -ln.present_s)
     top = ranked[:MAX_LANES]
@@ -303,7 +297,7 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
         if seg.state == "present" and seg.lane != prev:
             (lanes.get(seg.lane) or other).visits += 1 if seg.lane in top_keys else 0
         prev = seg.lane if seg.state == "present" else prev
-    ranks = _color_ranks(store, until)
+    ranks = _color_ranks(memory, until)
     for ln in top:
         ln.color = ranks.get(ln.key.casefold())
     # an app outside the 14-day top 8 takes a free slot rather than grey, while slots remain
@@ -334,9 +328,7 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
                           [(epoch(d["start"]) or 0.0, epoch(d["end"]) or 0.0) for d in c.get("drops", [])],
                           float(c.get("seconds") or 0.0)))
 
-    journal = store.journal_between(since, until)
-    facts = [{"id": j.id, "at": j.at, "app": j.app, "text": j.fact, "nature": j.nature, "importance": j.importance,
-              "by_yuki": j.by_yuki, "milestone": j.milestone} for j in journal]
+    facts = memory.journal_entries(since, until)
     milestones = [f for f in facts if f["milestone"]]
     sessions = _sessions(memory, since, until, segments, facts, {ln.key: ln.label for ln in lane_list})
 
@@ -465,31 +457,26 @@ def _source_line(origin: str, since: float, evidence: list[Evidence], today: dat
 
 
 def build_me(memory: Any, *, today: date | None = None) -> MeView:
-    store = memory.store
-    facts = store.portrait_facts(include_corrections=False)
-    ids = sorted({i for f in facts for i in f.source_ids})
-    entries = {j.id: j for j in store.journal_by_ids(ids)} if ids else {}
+    facts = memory.portrait_facts_with_evidence()
 
-    def item(f: Any) -> Item:
-        ev = [Evidence(entries[i].at, entries[i].app, entries[i].fact, entries[i].nature)
-              for i in f.source_ids if i in entries]
-        ev.sort(key=lambda e: -e.at)
+    def item(f: dict[str, Any]) -> Item:
+        ev = [Evidence(e["at"], e["app"], e["text"], e["nature"]) for e in f["evidence"]]
         tags = []
-        if f.aspect == "joke":
+        if f["aspect"] == "joke":
             tags.append("joke")
-        if f.aspect == "story":
+        if f["aspect"] == "story":
             tags.append("story")
-        if f.origin == "user":
+        if f["origin"] == "user":
             tags.append("you")
-        elif f.confidence is not None and f.confidence < UNSURE_BELOW:
+        elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
             tags.append("unsure")
-        text = second_person(f.text)
-        return Item(f"fact:{f.id}", f.subject, text, first_sentence(text, 180), f.kind, f.aspect, f.origin,
-                    f.valid_from, f.confidence, _source_line(f.origin, f.valid_from, ev, today), tags, ev)
+        text = second_person(f["text"])
+        return Item(f["ref"], f["subject"], text, first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
+                    f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev)
 
     by_kind: dict[str, list[Item]] = defaultdict(list)
     for f in facts:
-        by_kind[f.kind].append(item(f))
+        by_kind[f["kind"]].append(item(f))
     for items in by_kind.values():
         items.sort(key=lambda i: (i.origin != "user", -(i.confidence or 0.5), -i.since))
     personality: dict[str, list[Item]] = {k: [] for k in ASPECT_TITLES}
@@ -498,18 +485,19 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
     # things said that may be misheard: the journal's "uncertain" items of the last week
     week = time.time() - 7 * 86400.0
     unsure = []
-    for j in store.journal_between(week, None):
-        if j.nature == "uncertain":
-            text = second_person(j.fact)
-            unsure.append(Item(f"journal:{j.id}", j.app, text, first_sentence(text, 180), "journal", None, "model",
-                               j.at, None, f"Heard in {'a call' if j.app.startswith('call') else j.app} · "
-                               f"{day_label(j.at, today=today)}", ["unclear"],
-                               [Evidence(j.at, j.app, j.fact, j.nature)]))
-    portrait = store.latest_portrait()
+    for j in memory.journal_entries(week, None):
+        if j["nature"] == "uncertain":
+            text = second_person(j["text"])
+            app = j["app"] or ""
+            where = "a call" if app.startswith("call") else app
+            unsure.append(Item(f"journal:{j['id']}", app, text, first_sentence(text, 180), "journal", None, "model",
+                               j["at"], None, f"Heard in {where} · {day_label(j['at'], today=today)}", ["unclear"],
+                               [Evidence(j["at"], app, j["text"], j["nature"])]))
+    portrait_at = epoch(memory.status().get("portrait_updated_at"))
     open_q = len(memory.questions(statuses=("open", "asked"), limit=50))
     return MeView(by_kind.get("work", []), by_kind.get("interest", []), by_kind.get("behaviour", []),
                   by_kind.get("person", []), personality, unsure[-4:], by_kind.get("open_loop", []),
-                  by_kind.get("preference", []), portrait.at if portrait else None, open_q)
+                  by_kind.get("preference", []), portrait_at, open_q)
 
 
 # -- Yuki: its side ------------------------------------------------------------------
@@ -543,13 +531,7 @@ TALK = [
 
 
 def build_yuki(memory: Any) -> YukiView:
-    store = memory.store
-    rules = []
-    for f in store.conversation_facts():
-        if f.kind in ("rule", "preference") and f.status == "active":
-            rules.append({"ref": f"rule:{f.id}", "kind": f.kind, "text": f.text, "quote": f.quote,
-                          "at": f.valid_from, "origin": f.origin})
-    rules.sort(key=lambda r: r["at"])
+    rules = memory.rules()
     todos = memory.todos(include_done=False)
     promised = [t for t in todos if t["source"] == "commitment"]
     reminding = [t for t in todos if t["source"] == "call"]
@@ -625,15 +607,9 @@ class ChatView:
 
 
 def build_chat(memory: Any, *, limit: int = 6) -> ChatView:
-    store = memory.store
-    latest = store.latest_turn()
-    turns: list[dict[str, Any]] = []
-    started = None
-    if latest is not None:
-        for t in store.turns_for_session(latest.session_id, limit=limit):
-            turns.append({"at": t.at, "user": t.user_text, "reply": t.reply_text or "", "outcome": t.outcome,
-                          "actions": t.actions})
-        started = turns[0]["at"] if turns else None
+    turns = [{"at": t["at"], "user": t["user"], "reply": t["reply"], "outcome": t["outcome"], "actions": t["actions"]}
+             for t in memory.recent_turns(limit=limit)]
+    started = turns[0]["at"] if turns else None
     since = (started or time.time()) - 3600.0
     nudges = [n for n in memory.recent_nudges(hours=48) if (epoch(n.get("shown_at")) or 0) >= since]
     return ChatView(turns, nudges, started)

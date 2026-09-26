@@ -48,6 +48,7 @@ from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import StatusStrip, describe_summary, describe_tool
 from yuki.ui.uilog import UiLog
+from yuki.ui.window_host import WindowHost
 from yuki.voice.indicator import VoicePill
 from yuki.voice.session import VoiceSession
 
@@ -208,6 +209,10 @@ class YukiUi(QObject):
         self.voice.devices_changed.connect(self.voice_pill.set_devices)
         self.calls.changed.connect(self.voice.on_call_status)
         runtime_signals.said.connect(self._on_said)
+        # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
+        self.window_host = WindowHost(self)
+        self.overlay.attach_thread(self.window_host.model)
+        self.voice_pill.theme_mode = "dark"   # its label is light text until the voice side uses GlassWindow.ink
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -225,6 +230,7 @@ class YukiUi(QObject):
         self.nudges.start()
         self.calls.start()
         self.voice.start()
+        self.window_host.start()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -239,6 +245,7 @@ class YukiUi(QObject):
         lifetime, and keeps remembering while Yuki is closed.
         """
         self.ui_log.event("stop")
+        self.window_host.stop()
         self.voice.shutdown()
         self.voice_pill.hide()
         self.nudges.stop()
@@ -294,6 +301,7 @@ class YukiUi(QObject):
             lane_name, request_id = self._question
             self._question = None
             self.runtime.answer(lane_name, text)
+            self.window_host.user_answer(request_id, text)
             card = self.overlay.add_card(text)
             self.cards[request_id] = card
             self.overlay.expand_input()
@@ -311,6 +319,7 @@ class YukiUi(QObject):
         if note:
             request = f"{request}\n\n{note}"
         lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
+        self.window_host.user_message(request_id, text)
         self.cards[request_id] = self.overlay.add_card(text)
         self.overlay.expand_input()
         self.ui_log.event(
@@ -751,6 +760,9 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     show = QAction("Show", menu)
     show.triggered.connect(ui.show_overlay)
     menu.addAction(show)
+    open_window = QAction("Open Yuki window", menu)
+    open_window.triggered.connect(lambda _checked=False: ui.window_host.open_window())
+    menu.addAction(open_window)
 
     # Voice: a conversation now (headphones or speakers, docs/VOICE.md §11), and the wake word (remembered).
     voice_item = QAction(f"Voice ({ui.bindings.get('voice') or 'no hotkey'})", menu, checkable=True)
@@ -903,8 +915,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
 
     tray.setContextMenu(menu)
     refresh_ticks()
-    tray.activated.connect(
-        lambda reason: ui.show_overlay()
+    tray.activated.connect(   # a left click opens the Yuki window (its own process)
+        lambda reason: ui.window_host.open_window()
         if reason == QSystemTrayIcon.ActivationReason.Trigger
         else None
     )

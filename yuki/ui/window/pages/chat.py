@@ -1,121 +1,108 @@
-"""Chat: type to Yuki in the window. The same runtime as the Alt+Shift overlay (phase 2 wires
-``AgentRuntime.submit`` and its signals); nudges Yuki sent sit in the conversation where they happened."""
+"""Chat: the live conversation with Yuki, the same thread as the Alt+Shift overlay and voice.
+
+Every message is its own bubble the moment it is sent, typed here, in the
+overlay, or said out loud; Yuki's replies stream in as they are spoken, with a
+"worked for 12 s · 5 steps" fold under each response listing what it did.
+Typing here goes to yuki-ui's runtime over the window's pipe; when Yuki isn't
+running the page says so and keeps what was typed.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime
+from typing import Any
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
-from yuki.ui.window.data import ChatView, epoch
+from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.glass import paint_glass
-from yuki.ui.window.theme import SPACE, Theme
-from yuki.ui.window.widgets import Glass, Pill, TextPill, page_header, scroll, text_label
-
-KIND_TITLES = {"praise": "Nice one", "nudge": "Check-in", "reminder": "Reminder", "review": "Your week",
-               "resume": "Welcome back", "question": "Getting to know you"}
+from yuki.ui.window.theme import SPACE, Theme, css, font
+from yuki.ui.window.widgets import Glass, Pill, page_header, text_label
 
 
-class _Bubble(QWidget):
-    """A message: the user's in an accent-tinted lens on the right, Yuki's in raised glass on the left."""
+class _InputPill(QWidget):
+    """A glass pill around a multi-line input (Enter sends, Shift+Enter adds a line) and a send button."""
 
-    def __init__(self, t: Theme, text: str, meta: str, *, mine: bool) -> None:
+    def __init__(self, t: Theme, act: Actions) -> None:
         super().__init__()
-        self.t, self.mine = t, mine
+        from yuki.ui.overlay import AskInput
+
+        self.t = t
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        col = QVBoxLayout(self)
-        col.setContentsMargins(16, 10, 16, 10)
-        col.setSpacing(2)
-        col.addWidget(text_label(t, text, "body", "text", wrap=True))
-        col.addWidget(text_label(t, meta, "caption", "text_3"))
-        self.setMaximumWidth(560)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 10, 8, 10)
+        row.setSpacing(SPACE["s"])
+        self.edit = AskInput()
+        self.edit.setFont(font("body"))
+        self.edit.setPlaceholderText("Ask Yuki anything, or tell it what to do…")
+        self.edit.setStyleSheet(f"QPlainTextEdit {{ background: transparent; color: {css(t.text)}; border: none;"
+                                f" selection-background-color: {css(t.accent_soft)}; }}")
+        pal = self.edit.palette()
+        pal.setColor(pal.ColorRole.PlaceholderText, t.text_3)
+        self.edit.setPalette(pal)
+        self.edit.setMaximumHeight(self.edit.preferred_height())
+        self.edit.wants_height.connect(lambda h: (self.edit.setMaximumHeight(h), self.edit.setMinimumHeight(h)))
+        self.edit.setMinimumHeight(self.edit.preferred_height())
+        row.addWidget(self.edit, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.send = Pill(t, glyph="send", style="accent")
+        self.send.setToolTip("Send (Enter)")
+        row.addWidget(self.send, 0, Qt.AlignmentFlag.AlignBottom)
+        self.act = act
+        self.edit.submitted.connect(self._submit)
+        self.send.clicked.connect(lambda: self._submit(self.edit.toPlainText().strip()))
+
+    def _submit(self, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            self.act.submit(text)
+            self.edit.clear()
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        if self.mine:
-            paint_glass(p, r, 20, self.t.level("lens"), tint=self.t.accent_soft, shadow=False)
-        else:
-            paint_glass(p, r, 20, self.t.level("raised"), shadow=False)
+        paint_glass(p, r, min(26.0, r.height() / 2), self.t.level("control"), shadow=False, painted=True)
         p.end()
 
 
-def _clean(text: str) -> str:
-    # a request can carry an appended context block ("\n\n[Replying to ...]"): show what the user typed
-    return (text or "").split("\n\n[")[0].strip()
+def build(t: Theme, model: Any, *, act: Actions = NOOP, connected: bool = True) -> QWidget:
+    """``model``: the window's replica of the chat thread (:class:`~yuki.ui.chat_model.ChatModel`)."""
+    from yuki.ui.chatview import ChatThreadView
 
-
-def build(t: Theme, view: ChatView) -> QWidget:
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
     col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
     col.setSpacing(SPACE["m"])
-    col.addWidget(page_header(t, "Chat", "Type to Yuki here. It's the same Yuki as Alt+Shift and your voice, and "
-                                         "it remembers this conversation.",
-                              [Pill(t, "New chat", glyph="edit", style="quiet")]))
-    items: list[tuple[float, str, dict]] = [(tu["at"], "turn", tu) for tu in view.turns]
-    items += [(epoch(n.get("shown_at")) or epoch(n.get("at")) or 0.0, "nudge", n) for n in view.nudges]
-    items.sort(key=lambda x: x[0])
-    convo_box = Glass(t, level="inset", radius=26, padding=SPACE["xs"])
-    inner = QWidget()
-    lay = QVBoxLayout(inner)
-    lay.setContentsMargins(SPACE["m"], SPACE["m"], SPACE["m"], SPACE["m"])
-    lay.setSpacing(SPACE["s"])
-
-    if items:
-        first = datetime.fromtimestamp(items[0][0])
-        day = text_label(t, f"{first:%A} {first.day} {first:%B}", "caption_strong", "text_3")
-        day.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(day)
-    for at, kind, it in items:
-        stamp = datetime.fromtimestamp(at).strftime("%H:%M")
-        if kind == "nudge":
-            card = Glass(t, level="raised", radius=18, padding=SPACE["m"], tint=_tint(t, it["kind"]))
-            card.setMaximumWidth(560)
-            card.body.setSpacing(3)
-            head = QHBoxLayout()
-            head.addWidget(text_label(t, f"{KIND_TITLES.get(it['kind'], 'Yuki')} · {stamp}", "caption_strong",
-                                      it["kind"] if it["kind"] in t.kinds else "text_2"))
-            head.addStretch(1)
-            card.body.addLayout(head)
-            card.body.addWidget(text_label(t, it["text"], "callout", "text", wrap=True))
-            row = QHBoxLayout()
-            row.addWidget(card)
-            row.addStretch(1)
-            lay.addLayout(row)
-            continue
-        user = _clean(it["user"])
-        if user:
-            row = QHBoxLayout()
-            row.addStretch(1)
-            row.addWidget(_Bubble(t, user, f"You · {stamp}" + (" · by voice" if it["outcome"] == "voice" else ""),
-                                  mine=True))
-            lay.addLayout(row)
-        if it["reply"]:
-            row = QHBoxLayout()
-            row.addWidget(_Bubble(t, it["reply"], f"Yuki · {stamp}", mine=False))
-            row.addStretch(1)
-            lay.addLayout(row)
-    lay.insertStretch(0, 1)   # few messages sit at the bottom, like any chat
-    area = scroll(inner)
-    area.setObjectName("chat_scroll")
-    convo_box.body.addWidget(area)
-    col.addWidget(convo_box, 1)
-    field = TextPill(t, "Ask Yuki anything, or tell it what to do…", action_glyph="send", height=52)
+    stop = Pill(t, "Stop", glyph="close", style="danger", size="small")
+    stop.setToolTip("Stop what Yuki is doing (Alt+Shift+X)")
+    stop.clicked.connect(act.cancel)
+    stop.setVisible(False)
+    note = ("Type to Yuki here. It's the same Yuki as Alt+Shift and your voice: everything said or typed shows up "
+            "here as it happens.")
+    if not connected:
+        note = "Yuki isn't running right now, so it can't answer. Start it from the Start menu and this fills in."
+    col.addWidget(page_header(t, "Chat", note, [stop]))
+    box = Glass(t, level="regular", radius=26, padding=SPACE["xs"])   # frosted panel glass: text reads over it
+    thread = ChatThreadView(model, lambda: t, max_bubble=620)
+    thread.reply_nudge.connect(act.reply_nudge)
+    box.body.addWidget(thread)
+    col.addWidget(box, 1)
+    field = _InputPill(t, act)
+    field.setEnabled(connected)
     col.addWidget(field)
     hint = text_label(t, "Enter sends · Shift+Enter for a new line · Alt+Shift+X stops what Yuki is doing",
                       "caption", "text_3")
     hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
     col.addWidget(hint)
+
+    def sync_running(*_a: object) -> None:
+        stop.setVisible(any(i.running for i in model.items[-20:] if i.kind == "assistant"))
+
+    unsub = model.subscribe(lambda what, item: sync_running())
+    sync_running()
+    page.thread = thread  # type: ignore[attr-defined]
+    page.field = field  # type: ignore[attr-defined]
+    listeners = [unsub, thread._unsub]   # plain Python: safe to call once the widgets are gone
+    page.destroyed.connect(lambda *_: [f() for f in listeners])
     return page
-
-
-def _tint(t: Theme, kind: str):
-    from PySide6.QtGui import QColor
-
-    c = QColor(t.kind(kind))
-    c.setAlphaF(0.10 if not t.dark else 0.14)
-    return c

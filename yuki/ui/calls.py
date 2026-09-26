@@ -118,7 +118,7 @@ class CallConsentCard(GlassWindow):
     answered = Signal(object, str)
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=14)
+        super().__init__(activates=False, radius=20)
         self.setObjectName("YukiCallConsentCard")
         self.call: dict[str, Any] | None = None
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
@@ -127,23 +127,20 @@ class CallConsentCard(GlassWindow):
         column.setSpacing(5)
 
         self.title = QLabel("Yuki · call", self)
+        self.title.setIndent(14)   # the dot is painted in front of it
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
-        self.title.setStyleSheet(f"color: rgb({CALL_ACCENT.red()},{CALL_ACCENT.green()},{CALL_ACCENT.blue()});")
         column.addWidget(self.title)
         self.question = QLabel(self)
         self.question.setFont(ui_font(11, weight=QFont.Weight.DemiBold))
         self.question.setWordWrap(True)
-        self.question.setStyleSheet("color: rgba(238,240,245,245);")
         column.addWidget(self.question)
         self.detail = QLabel(self)
         self.detail.setFont(ui_font(9))
         self.detail.setWordWrap(True)
-        self.detail.setStyleSheet("color: rgba(238,240,245,160);")
         column.addWidget(self.detail)
         self.note = QLabel(self)
         self.note.setFont(ui_font(9))
         self.note.setWordWrap(True)
-        self.note.setStyleSheet(f"color: rgb({WAIT_ACCENT.red()},{WAIT_ACCENT.green()},{WAIT_ACCENT.blue()});")
         column.addWidget(self.note)
         for label in (self.title, self.question, self.detail, self.note):
             label.setTextFormat(Qt.TextFormat.PlainText)
@@ -172,25 +169,27 @@ class CallConsentCard(GlassWindow):
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
         self._timeout.timeout.connect(lambda: self._answer("none"))
+        self.restyle()
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        call = self.ink("call")
+        self.title.setStyleSheet(f"color: rgb({call.red()},{call.green()},{call.blue()});")
+        self.question.setStyleSheet(f"color: {self.ink_css('text')};")
+        self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
+        self.note.setStyleSheet(f"color: {self.ink_css('nudge')};")
+        self.yes_button.setStyleSheet(self.button_css("tinted", call))
+        for button in (self.no_button, self.never_button, self.always_button):
+            button.setStyleSheet(self.button_css("quiet"))
+        wash = QColor(call)
+        wash.setAlphaF(0.07 if not self.theme().dark else 0.10)
+        self.glass_tint = wash
 
     def _button(self, text: str, *, primary: bool, small: bool = False) -> QPushButton:
         button = QPushButton(text, self)
         button.setFont(ui_font(8 if small else 9))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # the card never takes the keyboard
-        if primary:
-            a = CALL_ACCENT
-            button.setStyleSheet(
-                f"QPushButton {{ color: rgb({a.red()},{a.green()},{a.blue()});"
-                f" background: rgba({a.red()},{a.green()},{a.blue()},34);"
-                f" border: 1px solid rgba({a.red()},{a.green()},{a.blue()},90); border-radius: 8px; padding: 3px 14px; }}"
-                f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},64); }}")
-        else:
-            button.setStyleSheet(
-                "QPushButton { color: rgba(238,240,245,170); background: transparent;"
-                f" border: 1px solid rgba(255,255,255,26); border-radius: 8px; padding: {2 if small else 3}px 12px; }}"
-                "QPushButton:hover { color: rgba(238,240,245,240); background: rgba(255,255,255,18); }")
-        return button
+        return button   # styled as a pill in restyle()
 
     def set_call(self, call: dict[str, Any]) -> None:
         """Fill the card for one call and size it (no showing)."""
@@ -247,17 +246,22 @@ class CallConsentCard(GlassWindow):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        panel = QRectF(self.panel_rect())
+        dot = self.ink("call")
+        g = self.title.geometry()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(CALL_ACCENT)
-        painter.drawRoundedRect(QRectF(panel.left() + 7, panel.top() + 12, 3, panel.height() - 24), 1.5, 1.5)
+        halo = QColor(dot)
+        halo.setAlphaF(0.22)
+        painter.setBrush(halo)
+        painter.drawEllipse(QRectF(g.left() - 16, g.center().y() - 6, 12, 12))
+        painter.setBrush(dot)
+        painter.drawEllipse(QRectF(g.left() - 13, g.center().y() - 3, 6, 6))
 
 
 class CallIndicator(GlassWindow):
     """The small "Remembering your side · Zoom" pill (or "Waiting for headphones"). Never takes focus."""
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=12)
+        super().__init__(activates=False, radius=INDICATOR_HEIGHT // 2)
         self.setObjectName("YukiCallIndicator")
         self.setFixedSize(INDICATOR_WIDTH + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
         row = QHBoxLayout(self)
@@ -265,14 +269,17 @@ class CallIndicator(GlassWindow):
         self.label = QLabel(self)
         self.label.setFont(ui_font(9))
         self.label.setTextFormat(Qt.TextFormat.PlainText)
-        self.label.setStyleSheet("color: rgba(238,240,245,225);")
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
         self._dot = CALL_ACCENT
         self.call: dict[str, Any] | None = None
+        self.restyle()
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        self.label.setStyleSheet(f"color: {self.ink_css('text')};")
 
     def set_call(self, call: dict[str, Any]) -> None:
         self.call = call
-        self._dot = WAIT_ACCENT if call.get("status") == "waiting_headphones" else CALL_ACCENT
+        self._dot = self.ink("nudge") if call.get("status") == "waiting_headphones" else self.ink("call")
         self.label.setText(indicator_text(call))
         self.update()
 
@@ -290,7 +297,7 @@ class CallIndicator(GlassWindow):
         panel = QRectF(self.panel_rect())
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(self._dot)
-        painter.drawEllipse(QRectF(panel.left() + 11, panel.center().y() - 4, 8, 8))
+        painter.drawEllipse(QRectF(panel.left() + 13, panel.center().y() - 4, 8, 8))
 
 
 class CallController(QObject):

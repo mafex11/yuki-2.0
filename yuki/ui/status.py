@@ -160,9 +160,15 @@ class Spinner(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0)
-        painter.setPen(QPen(QColor(255, 255, 255, 34), 2.0))
+        host = self.window()
+        track, accent = QColor(255, 255, 255, 34), ACCENT
+        if hasattr(host, "theme"):   # a glass surface: the theme's colours
+            t = host.theme()
+            track = QColor(t.baseline)
+            accent = QColor(t.accent)
+        painter.setPen(QPen(track, 2.0))
         painter.drawEllipse(rect)
-        pen = QPen(ACCENT, 2.0)
+        pen = QPen(accent, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.drawArc(rect, int(-self._angle * 16), int(-110 * 16))
@@ -195,12 +201,12 @@ class StatusStrip(GlassWindow):
     """
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=14)
+        super().__init__(activates=False, radius=STRIP_HEIGHT // 2)
         self.setObjectName("YukiStatusStrip")
         self.setFixedSize(STRIP_WIDTH + 2 * self.SHADOW, STRIP_HEIGHT + 2 * self.SHADOW)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 16, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 20, self.SHADOW, self.SHADOW + 22, self.SHADOW)
         row.setSpacing(12)
 
         self.spinner = Spinner(self)
@@ -208,22 +214,24 @@ class StatusStrip(GlassWindow):
 
         self.label = ElidedLabel(self)
         self.label.setFont(ui_font(11))
-        self.label.setStyleSheet(
-            f"color: rgba({TEXT_PRIMARY.red()},{TEXT_PRIMARY.green()},{TEXT_PRIMARY.blue()},235);"
-        )
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
 
         #: Dim time/steps/cost suffix, shown only with a final message.
         self.meta = QLabel(self)
         self.meta.setFont(ui_font(9))
         self.meta.setTextFormat(Qt.TextFormat.PlainText)
-        self.meta.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
         self.meta.setVisible(False)
         row.addWidget(self.meta, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._linger = QTimer(self)
         self._linger.setSingleShot(True)
         self._linger.timeout.connect(self.fade_out)
+        self._tone = "final"
+        self.restyle()
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        self.label.setStyleSheet(f"color: {self.ink_css('error' if self._tone == 'error' else 'text')};")
+        self.meta.setStyleSheet(f"color: {self.ink_css('text_3')};")
 
     def anchor(self) -> QPoint:
         """Top-left to sit at: bottom-right of the primary screen's work area."""
@@ -243,6 +251,8 @@ class StatusStrip(GlassWindow):
         """
         self._linger.stop()
         self.meta.setVisible(False)
+        self._tone = "final"
+        self.restyle()
         self.label.setText(text)
         self.spinner.start()
         self.spinner.setVisible(True)
@@ -259,8 +269,8 @@ class StatusStrip(GlassWindow):
         self.label.setText(text)
         self.spinner.stop()
         self.spinner.setVisible(False)
-        colour = "255,150,150" if tone == "error" else "238,240,245"
-        self.label.setStyleSheet(f"color: rgba({colour},235);")
+        self._tone = tone
+        self.restyle()
         self.fade_in(self.anchor())
         self._linger.start(FINAL_LINGER_MS)
 

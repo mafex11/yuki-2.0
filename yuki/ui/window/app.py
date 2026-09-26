@@ -1,0 +1,824 @@
+"""The Yuki window's process: memory, the pipe to yuki-ui, the pages, and what every button does.
+
+``pythonw -m yuki.ui.window`` (the tray icon's click) runs :func:`main`: one
+window per session (a second start brings the first forward), built on open,
+gone -- process and all -- on close, so it costs nothing while closed.
+
+* **Reads** go straight through :class:`~yuki.memory.api.MemoryClient`, on
+  background threads: a page shows "Reading your memory…" and fills in when its
+  data arrives. Today re-reads itself each minute while it shows today.
+* **Writes** go through the same client (corrections in the user's own words,
+  answers, rule removal by id, erasing call audio, call preferences, pause),
+  the settings files (:mod:`yuki.ui.window.settings_io`, :mod:`yuki.ui.ui_settings`)
+  and the Run key.
+* **What only the running tray has** -- chat, the voice session's wake word and
+  devices, the model and effort, the live thread -- goes over the pipe
+  (:mod:`yuki.ui.window_ipc`). When yuki-ui is not running the window still
+  works; chat says so, and voice choices are written to ``voice.json`` for its
+  next start.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import os
+import sys
+import threading
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable
+
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
+
+from yuki.ui.window.actions import Actions, correction_text
+
+MUTEX_NAME = "Local\\YukiWindowSingleInstance"
+FOCUS_EVENT = "Local\\YukiWindowFocus"
+#: Today re-reads itself this often while it shows today.
+TODAY_REFRESH_MS = 60_000
+#: While yuki-ui is not answering, look for it again this often.
+RECONNECT_MS = 10_000
+
+
+class _Bridge(QObject):
+    """Background threads hand results to the GUI thread through these."""
+
+    run = Signal(object)
+    event = Signal(object)
+
+
+class WindowApp(Actions):
+    """The controller. ``memory``: an open MemoryClient; ``db_path``: its database (the pipe's name)."""
+
+    def __init__(self, memory: Any, *, db_path: Path | None = None, page: str = "today", connect: bool = True,
+                 ui_path: Path | None = None, real_db: Path | None = None) -> None:
+        from yuki.ui import ui_settings
+        from yuki.ui.chat_model import ChatModel
+        from yuki.ui.window.refract import LIVE
+
+        self.memory = memory
+        self.db_path = db_path
+        self.real_db = real_db
+        self.ui_path = ui_path
+        self.ui = ui_settings.apply_policy(ui_settings.load(ui_path))
+        LIVE.on = self.ui.glass != "off"
+        self.model = ChatModel()
+        self.state: dict[str, Any] = {}
+        self.connected = False
+        self.client: Any = None
+        self.day = date.today()
+        self._bridge = _Bridge()
+        self._bridge.run.connect(lambda fn: fn())
+        self._bridge.event.connect(self._on_event)
+        self._views: dict[str, Any] = {}
+        self._loading: set[str] = set()
+        self._status: Any = None
+        self._reply_to: dict | None = None
+        self._devices: tuple[float, dict] | None = None
+        self._want_connect = connect
+        self._closing = False
+        self.t = self._theme()
+        self.win = self._make_window(page)
+        self._today_timer = QTimer()
+        self._today_timer.setInterval(TODAY_REFRESH_MS)
+        self._today_timer.timeout.connect(self._refresh_today)
+        self._reconnect = QTimer()
+        self._reconnect.setInterval(RECONNECT_MS)
+        self._reconnect.timeout.connect(self._connect_bg)
+        try:
+            from PySide6.QtGui import QGuiApplication
+
+            QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._on_system_theme())
+        except Exception:
+            pass
+
+    # -- the window -------------------------------------------------------------------------------
+
+    def _theme(self) -> Any:
+        from yuki.ui.window.backdrop import system_prefers_dark
+        from yuki.ui.window.theme import theme
+
+        mode = self.ui.appearance
+        if mode not in ("dark", "light"):
+            mode = "dark" if system_prefers_dark() else "light"
+        return theme(mode)
+
+    def _make_window(self, page: str) -> Any:
+        from yuki.ui.window.live import LiveWindow
+
+        win = LiveWindow(self.t, current=page)
+        win.navigated.connect(self._on_navigate)
+        win.closing.connect(self._on_close)
+        return win
+
+    def show(self, *, offscreen: bool = False) -> None:
+        win = self.win
+        g = self.ui.window
+        if g and not offscreen:
+            rect = QRect(*g)
+            screen = win.screen()
+            if screen is not None and screen.virtualGeometry().intersects(rect):
+                win.setGeometry(rect)
+        if offscreen:
+            win.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            win.show()
+        else:
+            win.showMaximized() if self.ui.maximized else win.show()
+            win.make_native(dwm_backdrop=self.ui.glass == "off")
+            win.raise_()
+            win.activateWindow()
+        self.load(win.current)
+        self.load("status")          # the sidebar's footer and badges
+        if self._want_connect:
+            self._connect_bg()
+
+    def _on_navigate(self, key: str) -> None:
+        if key not in self._views or key in ("status", "chat"):
+            self.load(key)
+        if key == "today" and self.day == date.today():
+            self._today_timer.start()
+        else:
+            self._today_timer.stop()
+
+    def _on_close(self) -> None:
+        from yuki.ui import ui_settings
+
+        self._closing = True
+        self._today_timer.stop()
+        self._reconnect.stop()
+        win = self.win
+        try:
+            g = win.normalGeometry() if win.isMaximized() else win.geometry()
+            if not win.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen):
+                ui_settings.update(self.ui_path, window=[g.x(), g.y(), g.width(), g.height()],
+                                   maximized=win.isMaximized())
+        except Exception:
+            pass
+        if self.client is not None:
+            self.client.close()
+
+    def _rebuild_window(self) -> None:
+        """The theme changed: a fresh window in its place (every widget holds its theme)."""
+        old = self.win
+        page, geo, maxed = old.current, old.geometry(), old.isMaximized()
+        offscreen = old.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        self.t = self._theme()
+        self.win = self._make_window(page)
+        self.win.wallpaper_base = old.wallpaper_base
+        self.win.setGeometry(geo)
+        try:
+            old.closing.disconnect(self._on_close)
+        except Exception:
+            pass
+        old.hide()
+        old.deleteLater()
+        if offscreen:
+            self.win.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            self.win.show()
+        else:
+            self.win.showMaximized() if maxed else self.win.show()
+            self.win.make_native(dwm_backdrop=self.ui.glass == "off")
+        for key in list(self._views):
+            self._build(key)
+        self._sync_footer()
+
+    def _on_system_theme(self) -> None:
+        if self.ui.appearance == "system" and self._theme().name != self.t.name:
+            self._rebuild_window()
+
+    # -- loading ----------------------------------------------------------------------------------
+
+    def bg(self, work: Callable[[], Any], then: Callable[[Any], None] | None = None, *,
+           failed: str | None = None) -> None:
+        """Run ``work`` off the GUI thread; ``then(result)`` back on it (or a toast saying it failed)."""
+        def run() -> None:
+            try:
+                result = work()
+            except Exception as exc:
+                msg = failed or f"That didn't work: {type(exc).__name__}"
+                self._bridge.run.emit(lambda: self.toast(msg, "error"))
+                return
+            if then is not None:
+                self._bridge.run.emit(lambda: then(result))
+
+        threading.Thread(target=run, name="yuki-window-work", daemon=True).start()
+
+    def load(self, key: str) -> None:
+        """Read a page's data in the background, then (re)build it."""
+        from yuki.ui.window import data as D
+
+        if key in self._loading:
+            return
+        self._loading.add(key)
+        memory, day = self.memory, self.day
+
+        def work() -> Any:
+            if key == "today":
+                return D.build_day(memory, day)
+            if key == "me":
+                return D.build_me(memory)
+            if key == "yuki":
+                return D.build_yuki(memory)
+            if key == "status":
+                return D.build_status(memory, real_db=self.real_db)
+            if key == "settings":
+                return D.build_settings(memory)
+            if key == "chat":
+                return self._chat_history()
+            return None
+
+        def then(view: Any) -> None:
+            self._loading.discard(key)
+            self._views[key] = view
+            if key == "status":
+                self._status = view
+                self._sync_footer()
+            self._build(key)
+
+        def run() -> None:
+            try:
+                view = work()
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                self._bridge.run.emit(lambda: (self._loading.discard(key), self.toast(f"Couldn't read memory: {err}",
+                                                                                      "error")))
+                return
+            self._bridge.run.emit(lambda: then(view))
+
+        threading.Thread(target=run, name=f"yuki-window-load-{key}", daemon=True).start()
+
+    def _build(self, key: str) -> None:
+        """Build a page's widgets from its data (GUI thread) and put it in the window."""
+        from yuki.ui.window.pages import chat, me, settings, status, today, yuki_page
+
+        t, view, win = self.t, self._views.get(key), self.win
+        if key == "today":
+            if view is None:
+                return
+            old = win.page_widget("today")
+            chart = getattr(old, "chart", None)
+            zoom = chart.view if chart is not None and chart.is_zoomed and chart.day.day == view.day else None
+            selected = getattr(old, "selected", None) if chart is not None and chart.day.day == view.day else None
+            if selected is None and view.sessions:
+                selected = len(view.sessions) - 1
+            widget = today.build(t, view, selected=selected, today=view.day == date.today(), act=self, view=zoom)
+        elif key == "me" and view is not None:
+            widget = me.build(t, view, act=self)
+        elif key == "yuki" and view is not None:
+            widget = yuki_page.build(t, view, act=self)
+        elif key == "status" and view is not None:
+            widget = status.build(t, view, act=self)
+        elif key == "settings" and view is not None:
+            widget = settings.build(t, view, act=self, ui=self.ui, connected=self.connected if self._want_connect
+                                    else None)
+        elif key == "chat":
+            if view and not self.model.items:
+                self.model.prepend_history(view)
+            widget = chat.build(t, self.model, act=self, connected=self.connected)
+            win.set_page(key, widget, scrolls=False)
+            return
+        else:
+            return
+        win.set_page(key, widget)
+
+    def _refresh_today(self) -> None:
+        if self.win.current == "today" and self.day == date.today() and not self._closing:
+            self.load("today")
+
+    def _chat_history(self) -> list[Any]:
+        """Earlier exchanges, when the live thread is empty: the latest session log (with every tool step),
+        else memory's turns; and the coach's recent cards, in time order."""
+        from yuki.ui.chat_model import Item, history_from_session_log
+
+        items: list[Item] = []
+        logs = Path(__file__).resolve().parents[3] / "logs" / "sessions"
+        try:
+            today = datetime.now().strftime("%Y%m%d")
+            workers = sorted(logs.glob(f"{today}-*-worker.jsonl"), key=lambda p: p.stat().st_mtime)
+            if workers:
+                items = history_from_session_log(workers[-1], limit=20)
+        except OSError:
+            items = []
+        if not items:
+            for n, turn in enumerate(self.memory.recent_turns(limit=12)):
+                from yuki.ui.chat_model import Step, clean_request
+
+                user = clean_request(turn["user"])
+                if user:
+                    items.append(Item(f"m:{turn['id']}:u", "user", turn["at"], text=user, source="history"))
+                reply = Item(f"m:{turn['id']}:a", "assistant", turn["at"], text=turn["reply"], source="history")
+                reply.steps = [Step(f"m:{turn['id']}:{i}", "tool", a, a.replace("_", " "), turn["at"],
+                                    ended=turn["at"], ok=True) for i, a in enumerate(turn["actions"] or [])]
+                items.append(reply)
+        try:
+            for nudge in self.memory.recent_nudges(hours=12):
+                at = _epoch(nudge.get("shown_at")) or _epoch(nudge.get("at")) or time.time()
+                items.append(Item(f"nudge:{nudge.get('id')}", "nudge", at, text=" ".join(str(nudge.get("text") or "")
+                                                                                        .split()),
+                                  source="coach", nudge=nudge, reply_state="replied" if nudge.get("reaction") ==
+                                  "replied" else "open"))
+        except Exception:
+            pass
+        return sorted(items, key=lambda i: i.at)
+
+    def _sync_footer(self) -> None:
+        st = self._status
+        voice = self.state.get("voice_state")
+        listening = bool(self.state.get("wake", st.wake_on if st else True))
+        detail = {"listening": "Listening", "hearing": "Hearing you", "thinking": "Thinking", "speaking":
+                  "Speaking", "working": "Working on it"}.get(voice or "", "")
+        remembering = bool(st and st.service_running and not st.paused)
+        foot = f"${st.cost_today:.2f} on memory today" if st else ""
+        self.win.sidebar.set_footer(listening or bool(detail), remembering, foot, voice_detail=detail,
+                                    connected=self.connected or not self._want_connect)
+        if st is not None:
+            badges = {}
+            if st.questions_waiting:
+                badges["yuki"] = str(len(st.questions_waiting))
+            waiting = (st.calls_waiting or {}).get("calls", 0)
+            if waiting:
+                badges["status"] = str(waiting)
+            self.win.sidebar.set_badges(badges)
+
+    # -- the pipe ---------------------------------------------------------------------------------
+
+    def _connect_bg(self) -> None:
+        if self._closing or self.connected:
+            return
+
+        def run() -> None:
+            from yuki.ui.window_ipc import WindowClient, auth_key, pipe_name
+
+            try:
+                key, address = auth_key(self.memory.store.cipher), pipe_name(self.memory.store.path)
+            except Exception:
+                return
+            client = WindowClient(key, address, on_event=self._bridge.event.emit,
+                                  on_closed=lambda: self._bridge.run.emit(self._on_disconnected))
+            if client.connect(1.5):
+                self._bridge.run.emit(lambda: self._on_connected(client))
+            else:
+                self._bridge.run.emit(lambda: self._reconnect.start() if not self._closing else None)
+
+        threading.Thread(target=run, name="yuki-window-connect", daemon=True).start()
+
+    def _on_connected(self, client: Any) -> None:
+        self.client = client
+        self.connected = True
+        self._reconnect.stop()
+        self._snapshot_seen = False
+        threading.Thread(target=lambda: client.request("hello"), daemon=True).start()
+        self._sync_footer()
+
+    def _on_disconnected(self) -> None:
+        was = self.connected
+        self.connected = False
+        self.client = None
+        if was and not self._closing:
+            self._sync_footer()
+            self._reconnect.start()
+            if "chat" in self._views:
+                self._build("chat")
+
+    def _on_event(self, msg: dict) -> None:
+        kind = msg.get("ev")
+        if kind == "snapshot":
+            self._snapshot_seen = True
+            snap = msg.get("snapshot") or {}
+            if snap.get("items"):
+                self.model.load_snapshot(snap)
+            self.state.update(msg.get("state") or {})
+            self._sync_footer()
+            if "chat" in self._views:
+                self._build("chat")
+            if "settings" in self._views:
+                self._build("settings")
+        elif kind == "chat" and getattr(self, "_snapshot_seen", False):
+            ev = msg.get("event")
+            if isinstance(ev, dict):
+                self.model.apply(ev)
+        elif kind == "state":
+            self.state.update({k: v for k, v in msg.items() if k != "ev"})
+            self._sync_footer()
+        elif kind == "focus":
+            win = self.win
+            if win.isMinimized():
+                win.showNormal()
+            win.raise_()
+            win.activateWindow()
+            if msg.get("page"):
+                self.navigate(str(msg["page"]))
+
+    def _ask(self, op: str, then: Callable[[dict], None] | None = None, *, offline: Callable[[], None] | None = None,
+             **args: Any) -> None:
+        """An op for yuki-ui; ``offline`` runs instead when it is not running."""
+        client = self.client
+        if client is None:
+            if offline is not None:
+                offline()
+            else:
+                self.toast("Yuki isn't running, so that can't change right now.", "warning")
+            return
+
+        def work() -> dict:
+            reply = client.request(op, **args)
+            if not reply or not reply.get("ok"):
+                raise RuntimeError((reply or {}).get("error") or "no answer")
+            return reply
+
+        self.bg(work, then, failed="Yuki didn't answer. Try again in a moment.")
+
+    # -- Actions: navigation and feedback -------------------------------------------------------------
+
+    def navigate(self, page: str) -> None:
+        self.win.show_page(page)
+        self._on_navigate(page)
+
+    def toast(self, text: str, tone: str = "") -> None:
+        try:
+            self.win.toast.t = self.t
+            self.win.toast.show_text(text, tone=tone)
+        except RuntimeError:
+            pass
+
+    # -- Today ------------------------------------------------------------------------------------------
+
+    def day_shift(self, days: int) -> None:
+        new = self.day + timedelta(days=days)
+        if new > date.today():
+            return
+        self.day = new
+        self.load("today")
+        self._on_navigate("today")
+
+    def day_today(self) -> None:
+        self.day = date.today()
+        self.load("today")
+        self._on_navigate("today")
+
+    def day_menu(self, anchor: Any) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        from yuki.ui.window.widgets import menu_css
+
+        menu = QMenu(self.win)
+        menu.setStyleSheet(menu_css(self.t))
+        today = date.today()
+        for n in range(14):
+            d = today - timedelta(days=n)
+            label = "Today" if n == 0 else "Yesterday" if n == 1 else f"{d:%A} {d.day} {d:%b}"
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(d == self.day)
+            act.triggered.connect(lambda _c=False, dd=d: self._set_day(dd))
+        menu.popup(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _set_day(self, d: date) -> None:
+        self.day = d
+        self.load("today")
+        self._on_navigate("today")
+
+    # -- Me -----------------------------------------------------------------------------------------------
+
+    def _correct(self, item: Any, words: str, done: str) -> None:
+        text = correction_text(item.title or "this", item.text, words)
+        self.bg(lambda: self.memory.correct_portrait(text), lambda _id: self.toast(done, "praise"),
+                failed="Couldn't save that. Memory didn't answer.")
+
+    def correct_item(self, item: Any, words: str) -> None:
+        self._correct(item, words, "Told Yuki. It will put this right within a minute.")
+
+    def forget_item(self, item: Any) -> None:
+        self._correct(item, "It's just wrong, forget it", "Told Yuki to forget it.")
+
+    def confirm_item(self, item: Any) -> None:
+        self._correct(item, "That's right", "Thanks. Yuki will treat it as true now.")
+
+    def refresh_portrait(self) -> None:
+        self.bg(self.memory.refresh_portrait, lambda _r: self.toast("Rebuilding your portrait. It takes a minute or two."))
+
+    # -- Yuki ---------------------------------------------------------------------------------------------
+
+    def revoke_rule(self, ref: str) -> None:
+        def then(rid: int) -> None:
+            self.toast("Removed. Yuki stops following it now." if rid else "That rule was already gone.",
+                       "praise" if rid else "")
+            self.load("yuki")
+        self.bg(lambda: self.memory.revoke_rule(ref), then)
+
+    def add_rule(self, text: str) -> None:
+        def then(_rid: int) -> None:
+            self.toast("Got it. Yuki follows that from now on.", "praise")
+            self.load("yuki")
+        self.bg(lambda: self.memory.remember_rule(text), then)
+
+    def answer_question(self, ref: str, words: str) -> None:
+        def then(result: dict) -> None:
+            ok = bool(result.get("saved"))
+            self.toast("Thanks. Yuki will remember that, marked as from you." if ok else
+                       f"Couldn't save it: {result.get('why') or 'no reason given'}", "praise" if ok else "warning")
+            self.load("yuki")
+            self._views.pop("me", None)
+        self.bg(lambda: self.memory.answer_question(ref, words), then)
+
+    def skip_question(self, ref: str, never: bool) -> None:
+        self.bg(lambda: self.memory.skip_question(ref, never=never),
+                lambda _r: (self.toast("Yuki won't ask about that again." if never else "Skipped."), self.load("status")))
+
+    # -- Status ---------------------------------------------------------------------------------------------
+
+    def erase_calls(self) -> None:
+        def then(n: int) -> None:
+            self.toast(f"Erased the waiting call audio ({n} piece{'s' if n != 1 else ''}).", "praise")
+            self.load("status")
+        self.bg(self.memory.erase_call_audio, then)
+
+    def stop_call(self) -> None:
+        self.bg(self.memory.stop_call, lambda _r: (self.toast("Stopped remembering this call."), self.load("status")))
+
+    def snooze(self, minutes: int) -> None:
+        done = (lambda _r=None: (self.toast("Coach is back on." if minutes == 0 else "Quiet. No check-ins until then."),
+                                 self.load("status")))
+        if self.client is not None:
+            self._ask("snooze", done, minutes=minutes)
+        else:
+            self.bg(lambda: self.memory.snooze_nudges(minutes), done)
+
+    def start_memory(self) -> None:
+        def offline() -> None:
+            from yuki.ui.memory import memory_service_command
+
+            try:
+                import subprocess
+
+                subprocess.Popen(memory_service_command(), creationflags=0x00000008 | 0x00000200,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.toast("Starting memory…")
+            except Exception as exc:
+                self.toast(f"Couldn't start memory: {type(exc).__name__}", "error")
+            QTimer.singleShot(4000, lambda: self.load("status"))
+        self._ask("ensure_memory", lambda _r: (self.toast("Starting memory…"),
+                                                QTimer.singleShot(4000, lambda: self.load("status"))), offline=offline)
+
+    # -- Settings -------------------------------------------------------------------------------------------
+
+    def set_paused(self, paused: bool) -> None:
+        self.bg(lambda: self.memory.set_paused(paused),
+                lambda _r: (self.toast("Memory paused." if paused else "Remembering again."), self.load("status"),
+                            self._views.pop("settings", None)))
+
+    def _voice(self, changes: dict[str, Any], done: str) -> None:
+        from yuki.ui.window import settings_io
+
+        def offline() -> None:
+            self.bg(lambda: settings_io.write_voice_prefs(changes),
+                    lambda _r: self.toast(done + " (used when Yuki next starts)"))
+
+        def then(reply: dict) -> None:
+            self.state.update(reply.get("state") or {})
+            self.toast(done)
+            self._sync_footer()
+        self._ask("voice_set", then, offline=offline, **changes)
+
+    def set_wake(self, on: bool) -> None:
+        self._voice({"wake": bool(on)}, "Listening for “Yuki”." if on else "Stopped listening for “Yuki”.")
+        self._views.pop("status", None)
+
+    def set_device(self, kind: str, name: str | None) -> None:
+        key = "mic" if kind == "capture" else "speaker"
+        self._voice({key: name}, f"{'Microphone' if key == 'mic' else 'Speaker'}: {name or 'System default'}.")
+
+    def device_options(self, kind: str) -> list[tuple[str, Any]]:
+        found: dict[str, Any] = {}
+        cached = self._devices
+        if cached is not None and time.monotonic() - cached[0] < 5.0:
+            found = cached[1]
+        elif self.client is not None:
+            reply = self.client.request("devices", wait_s=3.0) or {}
+            found = reply.get("devices") or {}
+            self._devices = (time.monotonic(), found)
+        else:
+            try:
+                from yuki.voice.audio import audio_devices
+
+                found = audio_devices()
+            except Exception:
+                found = {}
+        default = found.get(f"default_{kind}")
+        opts: list[tuple[str, Any]] = [("System default" + (f" ({default})" if default else ""), None)]
+        opts += [(name, name) for name in found.get(kind, []) or []]
+        return opts
+
+    def set_voice_id(self, voice_id: str) -> None:
+        self._voice({"tts_voice": voice_id}, "Yuki's voice saved." if voice_id else "Back to the default voice.")
+
+    def _privacy(self, table: str, key: str, value: Any, done: str, reload: bool = False) -> None:
+        from yuki.ui.window import settings_io
+
+        def then(_r: Any) -> None:
+            self.toast(done)
+            if reload:
+                self.load("settings")
+            self._views.pop("status", None)
+        self.bg(lambda: settings_io.update_privacy(table, key, value), then,
+                failed="Couldn't save that to the privacy file.")
+
+    def set_coach(self, on: bool) -> None:
+        self._privacy("nudges", "enabled", bool(on), "Check-ins on." if on else "Check-ins off.")
+
+    def set_quiet(self, start: str, end: str) -> None:
+        from yuki.ui.window import settings_io
+
+        def work() -> None:
+            settings_io.update_privacy("nudges", "quiet_start", start)
+            settings_io.update_privacy("nudges", "quiet_end", end)
+        self.bg(work, lambda _r: self.toast(f"Quiet from {start} to {end}."))
+
+    def set_questions(self, on: bool) -> None:
+        self._privacy("nudges", "questions_enabled", bool(on), "Questions on." if on else "No more questions.")
+
+    def set_call_pref(self, app: str, decision: str | None) -> None:
+        word = {"always": "Always remember", "never": "Never remember"}.get(decision or "", "Ask each time")
+        self.bg(lambda: self.memory.set_call_pref(app, decision), lambda _r: self.toast(f"{app}: {word.lower()}."))
+
+    def add_blocked(self, kind: str, value: str) -> None:
+        from yuki.ui.window import settings_io
+
+        value = " ".join((value or "").split())
+        if not value:
+            return
+
+        def work() -> None:
+            settings_io.set_blocked(kind, settings_io.blocked(kind) + [value])
+        self.bg(work, lambda _r: (self.toast(f"Yuki won't look at {value}."), self.load("settings")))
+
+    def remove_blocked(self, kind: str, value: str) -> None:
+        from yuki.ui.window import settings_io
+
+        def work() -> None:
+            settings_io.set_blocked(kind, [v for v in settings_io.blocked(kind) if v.casefold() != value.casefold()])
+        self.bg(work, lambda _r: (self.toast(f"{value} isn't blocked any more."), self.load("settings")))
+
+    def set_startup(self, on: bool) -> None:
+        from yuki.ui import startup
+
+        self.bg(lambda: startup.set_enabled(bool(on)),
+                lambda now_on: (self.toast("Yuki starts with Windows." if now_on else "Yuki won't start with Windows."),
+                                self._views.pop("status", None)))
+
+    def _ui(self, **changes: Any) -> None:
+        """Save a look setting, apply it here at once, and tell yuki-ui (overlay, cards, pill, strip)."""
+        from yuki.ui import lens, ui_settings
+        from yuki.ui.window.refract import LIVE
+
+        before = self.ui
+        self.ui = ui_settings.update(self.ui_path, **changes)
+        ui_settings.apply_policy(self.ui)
+        LIVE.on = self.ui.glass != "off"
+        if self.ui.glass == "off":
+            lens.release()
+        if self.client is not None:
+            threading.Thread(target=lambda: self.client and self.client.request("ui_settings"), daemon=True).start()
+        if self.ui.appearance != before.appearance and self._theme().name != self.t.name:
+            self._rebuild_window()
+            return
+        if (before.glass == "off") != (self.ui.glass == "off"):
+            self.win.set_backdrop(self.ui.glass == "off")
+        if (before.glass == "full") != (self.ui.glass == "full"):
+            for key in list(self._views):   # controls switch between glass droplets and crisp painted pills
+                if key != "settings":
+                    self._build(key)
+        self.win.forget_glass()
+
+    def set_appearance(self, mode: str) -> None:
+        self._ui(appearance=mode)
+
+    def set_glass(self, mode: str) -> None:
+        self._ui(glass=mode)
+        self.toast({"off": "Glass off: simple panels.", "light": "Light glass.", "full": "Full glass."}.get(mode, ""))
+
+    def set_bend(self, value: float) -> None:
+        self._ui(bend=value)
+
+    def set_blur(self, value: float) -> None:
+        self._ui(blur=value)
+
+    def set_reduce_motion(self, on: bool) -> None:
+        self._ui(reduce_motion=bool(on))
+
+    def set_model(self, alias: str) -> None:
+        self._ask("model", lambda r: self.toast(f"Model: {alias.capitalize()}."), model=alias)
+
+    def set_effort(self, level: str) -> None:
+        self._ask("effort", lambda r: self.toast(f"Effort: {level}."), effort=level)
+
+    def open_logs(self) -> None:
+        def offline() -> None:
+            logs = Path(__file__).resolve().parents[3] / "logs" / "sessions"
+            try:
+                os.startfile(str(logs))  # type: ignore[attr-defined]
+            except OSError:
+                self.toast("Couldn't open the logs folder.", "error")
+        self._ask("open_logs", None, offline=offline)
+
+    # -- Chat -------------------------------------------------------------------------------------------------
+
+    def submit(self, text: str) -> None:
+        nudge, self._reply_to = self._reply_to, None
+        args: dict[str, Any] = {"text": text}
+        if nudge is not None:
+            args["nudge"] = nudge
+        self._ask("submit", None, offline=lambda: self.toast("Yuki isn't running, so it can't answer yet.",
+                                                             "warning"), **args)
+
+    def cancel(self) -> None:
+        self._ask("cancel", lambda _r: self.toast("Stopping."))
+
+    def reply_nudge(self, nudge: dict) -> None:
+        self._reply_to = nudge
+        page = self.win.page_widget("chat")
+        field = getattr(page, "field", None)
+        if field is not None:
+            field.edit.setPlaceholderText("Your reply to Yuki's card…")
+            field.edit.setFocus()
+
+
+def _epoch(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+# -- the process ----------------------------------------------------------------------------------------
+
+
+def _single_instance() -> int | None:
+    """Hold the window's mutex; ``None`` when another window runs (it is asked to come forward)."""
+    k = ctypes.windll.kernel32
+    k.CreateMutexW.restype = ctypes.c_void_p
+    handle = k.CreateMutexW(None, False, MUTEX_NAME)
+    if not handle:
+        return None
+    if k.GetLastError() == 183:   # ERROR_ALREADY_EXISTS
+        k.CloseHandle(ctypes.c_void_p(handle))
+        k.OpenEventW.restype = ctypes.c_void_p
+        ev = k.OpenEventW(0x0002, False, FOCUS_EVENT)   # EVENT_MODIFY_STATE
+        if ev:
+            k.SetEvent(ctypes.c_void_p(ev))
+            k.CloseHandle(ctypes.c_void_p(ev))
+        return None
+    return int(handle)
+
+
+def _watch_focus(on_focus: Callable[[], None]) -> None:
+    """A second start sets the event: this window comes forward (one waiting thread, no polling)."""
+    k = ctypes.windll.kernel32
+    k.CreateEventW.restype = ctypes.c_void_p
+    ev = k.CreateEventW(None, False, False, FOCUS_EVENT)
+    if not ev:
+        return
+
+    def wait() -> None:
+        while True:
+            if k.WaitForSingleObject(ctypes.c_void_p(ev), 0xFFFFFFFF) == 0:
+                on_focus()
+
+    threading.Thread(target=wait, name="yuki-window-focus", daemon=True).start()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m yuki.ui.window")
+    ap.add_argument("--db", type=Path, default=None, help="memory database (default: the user's)")
+    ap.add_argument("--page", default="today")
+    args = ap.parse_args(argv)
+    handle = _single_instance()
+    if handle is None:
+        return 0
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(_Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("Yuki")
+    app.setQuitOnLastWindowClosed(True)
+    from yuki.memory.api import MemoryClient
+    from yuki.memory.store import default_db_path
+
+    db = args.db or default_db_path()
+    memory = MemoryClient.open(db)
+    controller = WindowApp(memory, db_path=db, page=args.page if args.page in
+                           ("today", "me", "yuki", "status", "chat", "settings") else "today", real_db=db)
+    focus = _Bridge()
+    focus.run.connect(lambda fn: fn())
+    _watch_focus(lambda: focus.run.emit(lambda: controller._on_event({"ev": "focus"})))
+    controller.show()
+    try:
+        return int(app.exec())
+    finally:
+        memory.close()

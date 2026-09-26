@@ -8,6 +8,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
+from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import DayView, dur, episode_gist, first_sentence, hm, second_person
 from yuki.ui.window.glass import hatch, rounded
 from yuki.ui.window.theme import SPACE, Theme, font
@@ -185,7 +186,8 @@ def _time_per_app(t: Theme, day: DayView) -> Panel:
 
 
 def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: float | None = None,
-          today: bool = False) -> QWidget:
+          today: bool = False, act: Actions = NOOP, view: tuple[float, float] | None = None) -> QWidget:
+    """The page. ``view``: a zoom to restore (the page is rebuilt each minute while it shows today)."""
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
@@ -197,12 +199,24 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     picker.body.setSpacing(0)
     prow = QHBoxLayout()
     prow.setSpacing(2)
-    prow.addWidget(Pill(t, glyph="prev", size="regular"))
-    prow.addWidget(Pill(t, f"{d:%a} {d.day} {d:%b}", glyph="calendar", size="regular"))
-    prow.addWidget(Pill(t, glyph="next", size="regular"))
+    prev = Pill(t, glyph="prev", size="regular")
+    prev.setToolTip("The day before")
+    prev.clicked.connect(lambda: act.day_shift(-1))
+    cal = Pill(t, f"{d:%a} {d.day} {d:%b}", glyph="calendar", size="regular")
+    cal.setToolTip("Pick a day")
+    cal.clicked.connect(lambda: act.day_menu(cal))
+    nxt = Pill(t, glyph="next", size="regular")
+    nxt.setToolTip("The day after")
+    nxt.setEnabled(not today)
+    nxt.clicked.connect(lambda: act.day_shift(1))
+    prow.addWidget(prev)
+    prow.addWidget(cal)
+    prow.addWidget(nxt)
     picker.body.addLayout(prow)
     title = "Today" if today else f"{d:%A}, {d.day} {d:%B}"
-    col.addWidget(page_header(t, title, day.summary, [picker, Pill(t, "Today", style="accent")]))
+    back = Pill(t, "Today", style="accent" if not today else "quiet")
+    back.clicked.connect(act.day_today)
+    col.addWidget(page_header(t, title, day.summary, [picker, back]))
 
     tiles = QHBoxLayout()
     tiles.setSpacing(SPACE["m"])
@@ -220,12 +234,27 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
                              f"{len(day.sessions)} sessions", glyph="history"))
     col.addLayout(tiles)
 
+    right = QWidget()
+    right.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    rrow = QHBoxLayout(right)
+    rrow.setContentsMargins(0, 0, 0, 0)
+    rrow.setSpacing(SPACE["s"])
+    reset = Pill(t, "Whole day", glyph="history", style="quiet", size="small")
+    reset.setToolTip("Zoomed in: scroll to zoom, drag across to pick a stretch, double-click for the whole day")
+    reset.setVisible(False)
+    rrow.addWidget(reset)
+    rrow.addWidget(_Legend(t))
     chart_panel = Panel(t, "Your day, app by app",
-                        "The line follows the app in front. Hover for what you were doing; click a session.",
-                        right=_Legend(t), glyph="wave")
+                        "The line follows the app in front. Hover for what you were doing; click a session; scroll "
+                        "or drag across it to zoom.", right=right, glyph="wave")
     chart = TimelineChart(t, day)
     chart.set_selected(selected)
     chart.set_hover(hover_at)
+    if view is not None:
+        chart.set_view(*view)
+        reset.setVisible(chart.is_zoomed)
+    chart.zoomed.connect(reset.setVisible)
+    reset.clicked.connect(chart.reset_zoom)
     chart_panel.body.addWidget(chart)
     col.addWidget(chart_panel)
 
@@ -237,6 +266,20 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     bottom.setAlignment(Qt.AlignmentFlag.AlignTop)
     col.addLayout(bottom)
     col.addStretch(1)
+
+    holder = {"details": details}
+
+    def pick(index: int) -> None:   # the details panel follows the chosen session, in place
+        new = _details(t, day, index)
+        old = holder["details"]
+        bottom.replaceWidget(old, new)
+        bottom.setStretchFactor(new, 3)
+        old.deleteLater()
+        holder["details"] = new
+        page.selected = index  # type: ignore[attr-defined]
+
+    chart.session_clicked.connect(pick)
     page.chart = chart  # type: ignore[attr-defined]
+    page.selected = selected  # type: ignore[attr-defined]
     return page
 

@@ -24,7 +24,7 @@ Usage::
 Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory.conversations)::
 
     memory.log_turn(session_id, request_id, at, user_text, reply_text, actions, outcome) -> int
-    memory.standing_context() -> str                  # active rules/preferences + open commitments, <= 1,200 chars
+    memory.standing_context() -> str                  # rules/preferences/feedback (<= 2,400) + commitments (<= 1,200)
     memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
     memory.remember_rule(text, source_turn=None, supersedes=None) -> int   # immediate, the user's words;
                                                              # supersedes a near-duplicate (or the given id)
@@ -55,6 +55,15 @@ The weekly review (written by the service, yuki.memory.review)::
     memory.run_weekly_review()                             # flag file; the service writes one now (non-blocking)
     memory.recall(...)                                     # also kind "review"
 
+Fast memory, provenance, Yuki's persona, standing requests (docs/MEMORY.md, "Fast memory")::
+
+    memory.relevant(query, limit=4, embed_wait_s=None) -> list[dict]   # the few memories bearing on a message,
+                                                   # each with its provenance line; the same vector as knowhow()
+    memory.yuki_persona() -> str | None            # "how Yuki talks", for the agent's profile layer and the mouth
+    memory.add_standing_request(condition, quote, request=None, repeat=False, days=None) -> "request:N"
+    memory.standing_requests() -> list[dict];  memory.cancel_standing_request(ref) -> bool
+    memory.memory_diary(limit=50) -> list[dict]    # what dreaming and the persona pass changed, newest first
+
 Calls, just the user's side (the service's call worker, yuki.memory.calls)::
 
     memory.call_status() -> {"call": {...} | None, "recording": bool}   # wait on Local\\YukiCallReady
@@ -77,6 +86,7 @@ from typing import Any
 import numpy as np
 
 from yuki.memory import secret_filter
+from yuki.memory.provenance import describe as describe_source
 from yuki.memory.store import (
     PAUSE_FLAG,
     REFRESH_FLAG,
@@ -93,6 +103,12 @@ from yuki.memory.store import (
     signal_turns,
 )
 
+#: A standing request fires once, or (asked for every time) at most this many cards; cards of one
+#: request at least this far apart; open for this many days unless the user says otherwise.
+REQUEST_REPEAT_FIRES = 5
+REQUEST_COOLDOWN_S = 30 * 60.0
+REQUEST_DAYS = 14.0
+
 #: Know-how for the same app whose embedding is at least this close to a new
 #: entry is treated as the same procedure restated, and superseded by it.
 KNOWHOW_DUPLICATE_COSINE = 0.85
@@ -101,6 +117,11 @@ KNOWHOW_DUPLICATE_COSINE = 0.85
 RULE_DUPLICATE_COSINE = 0.85
 #: Hard budgets (characters, ~4 per token) of the blocks Yuki attaches to requests.
 STANDING_CONTEXT_CHARS = 1_200
+#: The user's rules, preferences and coach feedback have their own budget, apart from the commitments:
+#: every one of them is the user's own instruction and must be on every request with the id forget_rule
+#: takes. With one shared 1,200 cap, five long rules pushed the "don't nudge me" preference out, so when
+#: the user said "you can nudge me again" (2026-09-26 22:15) Yuki had no id to withdraw it by.
+STANDING_RULES_CHARS = 2_400
 #: The coach's state in the standing context (its own budget, after the capped part).
 COACH_CONTEXT_CHARS = 600
 #: The coach's state is shown when it looked this many times in the last COACH_QUIET_S and said nothing.
@@ -212,6 +233,10 @@ class MemoryClient:
         #: Why the last :meth:`log_turn` returned 0 (content-free), or ``None``.
         self.last_turn_error: str | None = None
         self._nudge_section: Any = None
+        #: ``(query, vector)`` of the last message embedded: :meth:`knowhow` and :meth:`relevant` share it.
+        self._query_vecs: dict[str, np.ndarray] = {}
+        self._relevant_index: Any = None
+        self._relevant_lock = threading.Lock()
 
     @classmethod
     def open(cls, path: str | Path | None = None) -> "MemoryClient":
@@ -254,12 +279,22 @@ class MemoryClient:
 
         A caller on a request's path passes a short ``wait_s`` and goes on without the vector
         rather than waiting for a model to load (the service's embedder is used when it runs).
+        The last text's vector is kept, so the know-how and fast-memory lookups of one request
+        embed its words once.
         """
+        cached = self._query_vecs.get(text)
+        if cached is not None:
+            return cached
         try:
             vecs = self.embedder.embed([text], wait_s)
         except Exception:
             return None
-        return None if vecs is None or len(vecs) == 0 else vecs[0]
+        vec = None if vecs is None or len(vecs) == 0 else vecs[0]
+        if vec is not None:
+            if len(self._query_vecs) >= 8:   # the last few messages: the current one and its predecessor
+                self._query_vecs.pop(next(iter(self._query_vecs)))
+            self._query_vecs[text] = vec
+        return vec
 
     def _journal_app_names(self, app: str) -> list[str]:
         """Display names the journal may carry for ``app`` (a display name or a process name).
@@ -306,14 +341,17 @@ class MemoryClient:
         stored as a portrait fact of kind ``correction`` with origin ``user`` and
         confidence 1.0. The next render follows it over anything inferred; the
         next portrait run folds it into the facts it concerns (superseding the
-        contradicted ones) and retires it. Also asks the service for a
-        re-render soon (same flag as :meth:`refresh_portrait`).
+        contradicted ones) and retires it. Also asks the service for a render
+        (:meth:`rerender_portrait`: the render run folds pending corrections into the facts
+        first, one small call), not a full refresh: a refresh re-read the whole journal since the
+        last run and audited again (2026-09-26: $0.34 + $0.71 for one correction). Yuki sees the
+        correction at once anyway: fast memory embeds it on the next lookup.
         """
         text = secret_filter.redact_text((text or "").strip())
         if not text:
             raise ValueError("correction text is empty")
         fact_id = self.store.add_correction(text)
-        self.refresh_portrait()
+        self.rerender_portrait()
         return fact_id
 
     def refresh_portrait(self) -> None:
@@ -402,27 +440,11 @@ class MemoryClient:
             raise ValueError("know-how text is empty")
         app = app_key(app)
         vec = self._embed(text)
-        candidates = (
-            self.store.knowhow_current(app) if app else self.store.knowhow_current(None, any_app=False)
-        )
-        supersedes: int | None = None
-        best = -1.0
-        for k in candidates:
-            if k.text.casefold() == text.casefold():
-                supersedes, best = k.id, 1.0
-                break
-        if supersedes is None and vec is not None and candidates:
-            stored = self.store.knowhow_vectors([k.id for k in candidates])
-            for k in candidates:
-                other = stored.get(k.id)
-                if other is None or other.shape != vec.shape:
-                    continue
-                score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
-                if score >= KNOWHOW_DUPLICATE_COSINE and score > best:
-                    supersedes, best = k.id, score
+        supersedes = self.store.knowhow_duplicate(app, text, vec, KNOWHOW_DUPLICATE_COSINE)
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
         return self.store.add_knowhow(
-            app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes
+            app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes,
+            origin="agent",
         )
 
     # -- recall ------------------------------------------------------------
@@ -517,11 +539,14 @@ class MemoryClient:
                     "kind": "fact", "at": _iso(item.at), "until": None, "app": item.app, "host": item.host,
                     "fact": item.fact, "importance": item.importance, "score": score,
                     "nature": getattr(item, "nature", "fact"),
+                    "source": describe_source(getattr(item, "source", None), app=item.app, at=item.at),
+                    "other_ai": bool(getattr(item, "tainted", False)),
                 })
             elif key[0] == "chat":
                 out.append({
                     "kind": "chat", "at": _iso(item.at), "until": None, "app": None, "host": None,
                     "fact": self._chat_text(item), "importance": None, "score": score,
+                    "source": describe_source(None, where="a conversation with Yuki", at=item.at),
                 })
             elif key[0] == "review":
                 out.append({
@@ -534,6 +559,186 @@ class MemoryClient:
                     "host": None, "fact": item.text, "importance": None, "score": score,
                 })
         return out
+
+    # -- fast memory (yuki.memory.relevant) ------------------------------------
+
+    @property
+    def relevant_index(self) -> Any:
+        with self._relevant_lock:
+            if self._relevant_index is None:
+                from yuki.memory.relevant import RelevantIndex
+
+                self._relevant_index = RelevantIndex(self.store)
+            return self._relevant_index
+
+    def relevant(self, query: str, limit: int | None = None, embed_wait_s: float | None = None,
+                 now: float | None = None, previous: str | None = None, **tuning: Any) -> list[dict]:
+        """The few memories that bear on ``query`` (the user's message), best first, each with where it came from.
+
+        Portrait facts, journal facts, commitments and episodes of any age, ranked by the shared
+        embedder's similarity plus the importance written with each and recency
+        (:mod:`yuki.memory.relevant`). Nothing clears the bar: ``[]``. ``embed_wait_s`` bounds the
+        wait for the message's embedding (a request's path goes on without it). Each hit:
+        ``{kind: fact | portrait | commitment | episode, id, at, until, text, source, score, cosine,
+        importance, nature}``; ``source`` is the provenance line
+        (:func:`yuki.memory.provenance.describe`).
+
+        ``previous``: the conversation's previous message. A follow-up ("elaborate", "what was that?")
+        names nothing itself, so the previous message's memories are searched too, ranked
+        :data:`yuki.memory.relevant.FOLLOW_UP_DISCOUNT` below the current message's (its vector was made
+        on the previous request and is reused).
+        """
+        from yuki.memory import relevant as rel
+
+        query = (query or "").strip()
+        if not query:
+            return []
+        vec = self._embed(query, embed_wait_s)
+        if vec is None:
+            return []
+        index = self.relevant_index
+        self._embed_new_facts(embed_wait_s)
+        index.refresh()
+        n = int(limit or rel.LIMIT)
+        hits = index.search(vec, now=now, limit=n, **tuning)
+        prev = (previous or "").strip()
+        if prev and prev != query:
+            pvec = self._query_vecs.get(prev)
+            if pvec is None:
+                pvec = self._embed(prev, embed_wait_s)
+            if pvec is not None:
+                seen = {(h["kind"], h["id"]) for h in hits}
+                more = [dict(h, score=round(h["score"] - rel.FOLLOW_UP_DISCOUNT, 4), follow_up=True)
+                        for h in index.search(pvec, now=now, limit=n, **tuning) if (h["kind"], h["id"]) not in seen]
+                hits = sorted(hits + more, key=lambda h: -h["score"])[:n]
+        return [h for h in (self._relevant_item(hit) for hit in hits) if h is not None]
+
+    def _embed_new_facts(self, wait_s: float | None) -> None:
+        """Portrait facts written since the service last embedded (the user's correction a minute ago, an
+        answer, a new version) get their vector now, in one batch; usually there are none (one indexed query)."""
+        try:
+            missing = self.store.portrait_facts_without_vectors(16)
+            if not missing:
+                return
+            from yuki.memory.relevant import portrait_fact_text
+
+            vecs = self.embedder.embed([portrait_fact_text(f) for f in missing], wait_s)
+            if vecs is not None and len(vecs) == len(missing):
+                self.store.add_portrait_fact_vectors(list(zip([f.id for f in missing], vecs)),
+                                                     getattr(self.embedder, "model_name", None) or "")
+        except Exception:
+            pass
+
+    def _relevant_item(self, hit: dict) -> dict | None:
+        """Decrypt one picked item and write its provenance line."""
+        kind, item_id = hit["kind"], int(hit["id"])
+        base = {"id": item_id, "score": hit["score"], "cosine": hit["cosine"], "importance": hit["importance"]}
+        if kind == "journal":
+            e = self.store.journal_entries([item_id]).get(item_id)
+            if e is None:
+                return None
+            return {**base, "kind": "fact", "at": _iso(e.at), "until": None, "text": e.fact, "nature": e.nature,
+                    "source": describe_source(e.source, app=e.app, at=e.at)}
+        if kind == "portrait":
+            f = self.store.portrait_fact(item_id)
+            if f is None:
+                return None
+            return {**base, "kind": "portrait", "at": _iso(f.valid_from), "until": None, "text": f.text,
+                    "nature": "fact", "fact_kind": f.kind, "source": self.fact_provenance(f)}
+        if kind == "commitment":
+            c = self.store.conversation_fact(item_id)
+            if c is None:
+                return None
+            said = "said on a call" if c.origin == "call" else "said to Yuki" if c.quote else "from a conversation with Yuki"
+            quote = f': "{" ".join(c.quote.split())[:240]}"' if c.quote else ""
+            state = "open" if c.status == "active" else c.status
+            return {**base, "kind": "commitment", "at": _iso(c.valid_from), "until": None,
+                    "text": f"{c.text} ({state})", "nature": "fact",
+                    "source": f"{said}, {datetime.fromtimestamp(c.valid_from):%a %d %b %H:%M}{quote}"}
+        if kind == "episode":
+            eps = self.store.episodes_by_ids([item_id])
+            if not eps:
+                return None
+            ep = eps[0]
+            span = f"{datetime.fromtimestamp(ep.started_at):%a %d %b %H:%M}-{datetime.fromtimestamp(ep.ended_at):%H:%M}"
+            return {**base, "kind": "episode", "at": _iso(ep.started_at), "until": _iso(ep.ended_at),
+                    "text": ep.text, "nature": "fact",
+                    "source": f"episode {span}, written from the measured timeline and the journal"}
+        return None
+
+    def fact_provenance(self, fact: Any) -> str:
+        """Where a portrait fact came from: the user's own correction, or its earliest cited journal entry
+        that has words, with how many more entries back it."""
+        if getattr(fact, "origin", "") == "user" and not fact.source_ids:
+            return f"the user's own correction, {datetime.fromtimestamp(fact.valid_from):%a %d %b %H:%M}"
+        entries = self.store.journal_entries(fact.source_ids or [])
+        if not entries:
+            return f"memory's portrait, since {datetime.fromtimestamp(fact.valid_from):%a %d %b}"
+        ordered = sorted(entries.values(), key=lambda e: e.at)
+        first = next((e for e in ordered if (e.source or {}).get("quote")), ordered[0])
+        more = len(ordered) - 1
+        line = describe_source(first.source, app=first.app, at=first.at)
+        return line + (f" (and {more} more entr{'y' if more == 1 else 'ies'})" if more else "")
+
+    # -- Yuki's persona (yuki.memory.persona) ------------------------------------
+
+    def yuki_persona(self) -> str | None:
+        """The "how Yuki talks" block (written nightly from how the user reacts, evidence-cited), or ``None``.
+
+        For the agent's profile layer and the voice mouth's prompt; plain lines, no ids.
+        """
+        try:
+            items = self.store.persona_items()
+        except Exception:
+            return None
+        if not items:
+            return None
+        from yuki.memory.persona import render_persona
+
+        return render_persona(items)
+
+    # -- standing requests --------------------------------------------------------
+
+    def add_standing_request(self, condition: str, quote: str, request: str | None = None, repeat: bool = False,
+                             days: float | None = None) -> str:
+        """Save "tell me when X happens": the condition (plain words) and the user's own words asking for it.
+
+        The journal's model checks every new batch against the open ones and a match writes one
+        card (cooldown, fire budget and expiry in code: :mod:`yuki.memory.journal`). ``repeat``:
+        every time it happens (up to :data:`REQUEST_REPEAT_FIRES` cards), else once. ``days``: expiry
+        (default :data:`REQUEST_DAYS`). Returns ``"request:N"``.
+        """
+        condition = secret_filter.redact_text(" ".join((condition or "").split()))
+        quote = secret_filter.redact_text(" ".join((quote or "").split()))
+        if not condition or not quote:
+            raise ValueError("a standing request needs what to watch for and the user's words")
+        now = time.time()
+        rid = self.store.add_standing_request(
+            condition, quote, request=secret_filter.redact_text(request) if request else None,
+            max_fires=REQUEST_REPEAT_FIRES if repeat else 1, cooldown_s=REQUEST_COOLDOWN_S,
+            expires_at=now + 86400.0 * float(days if days else REQUEST_DAYS), at=now)
+        return f"request:{rid}"
+
+    def standing_requests(self, include_ended: bool = False) -> list[dict]:
+        """Open standing requests (with ``include_ended``: all), each with its ``ref``."""
+        rows = self.store.standing_requests(None if include_ended else ("open",))
+        return [{**r, "ref": f"request:{r['id']}"} for r in rows]
+
+    def cancel_standing_request(self, ref: Any) -> bool:
+        """End an open standing request by its id (``request:3``, ``3``); ``False`` when it is not an open one."""
+        text = str(ref or "").strip().strip("[]")
+        text = text.split(":", 1)[1] if text.casefold().startswith("request:") else text
+        try:
+            return self.store.end_standing_request(int(text), "cancelled")
+        except (TypeError, ValueError):
+            return False
+
+    # -- the memory diary ----------------------------------------------------------
+
+    def memory_diary(self, limit: int = 50, since: Any = None) -> list[dict]:
+        """What dreaming and the persona pass changed, newest first: ``{at, pass, action, text, fact_ids, ...}``."""
+        rows = self.store.changelog(since=_time_arg(since), limit=limit)
+        return [{**r, "at": _iso(r["at"])} for r in rows]
 
     @staticmethod
     def _reviews(fetch: Any) -> list[Any]:
@@ -678,16 +883,24 @@ class MemoryClient:
                     lines += [headings[kind], *rows]
             return "\n".join(lines)
 
-        # Over the cap, what goes first is what matters least on every request: the user's
-        # own call commitments, then Yuki's, then preferences; rules go only when nothing
-        # else is left. Oldest first within each. (Call commitments once pushed "call me
-        # captain" out of every request.)
-        drop_order = {"call": 0, "commitment": 1, "preference": 2, "coach": 3, "rule": 4}
+        # Two budgets: the user's standing instructions (rules, preferences, coach feedback) and the
+        # commitments, so neither can push the other out. Over a budget, what goes first is what
+        # matters least on every request: the user's own call commitments, then Yuki's; within the
+        # instructions, coach feedback, then preferences, rules last. Oldest first within each. (Call
+        # commitments once pushed "call me captain" out of every request; rules once pushed out the
+        # preference the user then withdrew.)
+        drop_order = {"call": 0, "commitment": 1, "coach": 2, "preference": 3, "rule": 4}
+        instructions = ("rule", "preference", "coach")
+
+        def size(chosen: list[tuple[ConversationFact, str]], part: tuple[str, ...]) -> int:
+            return len(render([c for c in chosen if group(c[0]) in part]))
+
         kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
-        while kept and len(render(kept)) > STANDING_CONTEXT_CHARS:
-            victim = min(kept, key=lambda item: (drop_order.get(group(item[0]), 0),
-                                                 item[0].valid_from, item[0].id))
-            kept.remove(victim)
+        for part, cap in ((instructions, STANDING_RULES_CHARS), (("commitment", "call"), STANDING_CONTEXT_CHARS)):
+            while any(group(c[0]) in part for c in kept) and size(kept, part) > cap:
+                victim = min((c for c in kept if group(c[0]) in part),
+                             key=lambda item: (drop_order.get(group(item[0]), 0), item[0].valid_from, item[0].id))
+                kept.remove(victim)
         text = render(kept) if kept else ""
         coach = self.coach_context()
         if coach:   # its own budget: why the coach is quiet is not a rule and never pushes one out
@@ -821,7 +1034,7 @@ class MemoryClient:
         (:meth:`rerender_portrait`).
         """
         prefix, sep, number = str(ref or "").strip().strip("[]").strip().rpartition(":")
-        if (sep and prefix.strip() not in ("rule", "feedback")) or not number.strip().isdigit():
+        if (sep and prefix.strip() not in ("rule", "preference", "feedback")) or not number.strip().isdigit():
             return 0
         wanted = int(number)
         try:
@@ -1528,6 +1741,87 @@ class MemoryClient:
             except FileNotFoundError:
                 pass
 
+
+    # -- the Yuki window's reads (yuki/ui/window, docs/UI-window.md "Phase 2") ------------------
+    # Read-only views for the window's pages; plain dicts, decrypted. Added by the window's builder.
+
+    def day_timeline(self, since: Any, until: Any = None) -> list[dict]:
+        """Timeline stretches overlapping ``[since, until)``, oldest first: the Today page's segments.
+
+        Each: ``{"start", "end", "state" (present | away | a power state), "process", "app",
+        "title", "host", "active_s", "passive_s", "withheld", "fullscreen", "meeting", "by_yuki"}``
+        (epoch seconds; ``title`` is ``None`` when privacy withheld it).
+        """
+        s, u = _time_arg(since), _time_arg(until)
+        rows = self.store.timeline_between(s, u)
+        return [{"start": r.started_at, "end": r.ended_at, "state": r.state, "process": r.process, "app": r.app,
+                 "title": r.title, "host": r.host, "active_s": r.active_s or 0.0, "passive_s": r.passive_s or 0.0,
+                 "withheld": r.withheld, "fullscreen": bool(r.fullscreen), "meeting": r.meeting,
+                 "by_yuki": bool(getattr(r, "by_yuki", False))} for r in sorted(rows, key=lambda r: r.started_at)]
+
+    @staticmethod
+    def _journal_dict(j: JournalEntry) -> dict:
+        return {"id": j.id, "at": j.at, "app": j.app, "text": j.fact, "nature": j.nature, "importance": j.importance,
+                "by_yuki": bool(j.by_yuki), "milestone": bool(j.milestone)}
+
+    def journal_entries(self, since: Any = None, until: Any = None) -> list[dict]:
+        """Journal facts in ``[since, until)`` (decrypted), oldest first."""
+        return [self._journal_dict(j) for j in self.store.journal_between(_time_arg(since), _time_arg(until))]
+
+    def journal_by_ids(self, ids: Any) -> list[dict]:
+        """Journal facts by id (the evidence behind a portrait fact)."""
+        wanted = sorted({int(i) for i in ids or () if str(i).isdigit() or isinstance(i, int)})
+        return [self._journal_dict(j) for j in self.store.journal_by_ids(wanted)] if wanted else []
+
+    def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
+        """The current portrait facts, each with the journal entries it rests on (newest first).
+
+        Each: ``{"id", "ref": "fact:N", "kind", "subject", "text", "aspect", "origin", "confidence",
+        "since", "evidence": [journal dict, ...]}``. Corrections waiting to be folded in are left out.
+        """
+        facts = self.store.portrait_facts(include_corrections=False)
+        ids = sorted({i for f in facts for i in f.source_ids})
+        entries = {j.id: j for j in self.store.journal_by_ids(ids)} if ids else {}
+        out = []
+        for f in facts:
+            ev = sorted((entries[i] for i in f.source_ids if i in entries), key=lambda j: -j.at)
+            out.append({"id": f.id, "ref": f"fact:{f.id}", "kind": f.kind, "subject": f.subject, "text": f.text,
+                        "aspect": f.aspect, "origin": f.origin, "confidence": f.confidence, "since": f.valid_from,
+                        "evidence": [self._journal_dict(j) for j in ev[:evidence_per_fact]]})
+        return out
+
+    def rules(self) -> list[dict]:
+        """The user's active rules and preferences, oldest first: ``{"ref": "rule:N", "id", "kind", "text",
+        "quote", "at", "origin"}``. ``ref`` is what :meth:`revoke_rule` takes."""
+        out = [{"ref": f"rule:{f.id}", "id": f.id, "kind": f.kind, "text": f.text, "quote": f.quote,
+                "at": f.valid_from, "origin": f.origin}
+               for f in self.store.conversation_facts(("rule", "preference"))]
+        return sorted(out, key=lambda r: r["at"])
+
+    def recent_turns(self, limit: int = 40, session_id: str | None = None) -> list[dict]:
+        """The latest exchanges with Yuki (the given conversation session, else the newest one), oldest first.
+
+        Each: ``{"id", "session_id", "request_id", "at", "user", "reply", "actions", "outcome"}``.
+        """
+        if session_id is None:
+            latest = self.store.latest_turn()
+            if latest is None:
+                return []
+            session_id = latest.session_id
+        turns = self.store.turns_for_session(session_id, limit=max(1, int(limit)))
+        return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
+                 "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
+                 "outcome": t.outcome} for t in turns]
+
+    def app_colors(self, until: Any = None, days: float = 14.0, limit: int = 8) -> dict[str, int]:
+        """Each app's rank by time in front over the last ``days`` (0 = most): the window gives an app the
+        same lane colour every day. Keys are the timeline's ``process`` (else the app name), lower-cased."""
+        u = _time_arg(until) or time.time()
+        rows = self.store._query(
+            "SELECT COALESCE(process, app) k, SUM(COALESCE(active_s,0)+COALESCE(passive_s,0)) t FROM timeline "
+            "WHERE started_at >= ? AND state = 'present' GROUP BY k ORDER BY t DESC LIMIT ?",
+            (u - days * 86400.0, int(limit)))
+        return {str(r["k"]).casefold(): i for i, r in enumerate(rows) if r["k"]}
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",

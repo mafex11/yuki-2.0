@@ -24,6 +24,12 @@ into one session, the same code weaves through every switch.
 
 Hover shows a card for the stretch under the pointer; the page gets
 ``hovered(t)`` and ``session_clicked(index)``.
+
+Zoom (phase 2): the mouse wheel zooms around the pointer, dragging across the
+plot zooms into that range, double-click (or Esc) goes back to the whole day,
+the arrow keys move a zoomed view and +/- zoom from the keyboard. Clicking a
+lane's name highlights that app (the others dim); click it again to clear.
+``zoomed(bool)`` says whether the view is zoomed in.
 """
 
 from __future__ import annotations
@@ -59,9 +65,32 @@ class _Run:
     t1: float
 
 
+#: The narrowest zoom (seconds across the plot).
+MIN_SPAN_S = 10 * 60.0
+
+
+def axis_step(span: float) -> int:
+    """The axis label step for a view ``span`` seconds wide: at most about a dozen labels."""
+    for step in (300, 600, 900, 1800, 3600, 7200, 10800):
+        if span / step <= 12:
+            return step
+    return 14400
+
+
+def axis_start(a: float, step: int) -> float:
+    """The first label at or before ``a`` on a round local time for ``step``."""
+    d = datetime.fromtimestamp(a).replace(second=0, microsecond=0)
+    minutes = d.hour * 60 + d.minute
+    q = step // 60
+    d = d.replace(hour=(minutes - minutes % q) // 60 % 24, minute=(minutes - minutes % q) % 60)
+    return d.timestamp()
+
+
 class TimelineChart(QWidget):
     hovered = Signal(float)
     session_clicked = Signal(int)
+    zoomed = Signal(bool)
+    lane_clicked = Signal(str)
 
     def __init__(self, t: "Theme", day: DayView, *, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -75,11 +104,17 @@ class TimelineChart(QWidget):
         # the view: from the hour the day at the PC began to the end of the day (or now)
         start_hour = datetime.fromtimestamp(first).replace(minute=0, second=0, microsecond=0).timestamp()
         self.view = (max(day.since, start_hour), day.until if day.end >= day.until - 60 else day.end + 1800)
+        self.full_view = self.view
         self.hover_t: float | None = None
         self.selected: int | None = None
+        self.highlight: str | None = None
         self._runs: list[_Run] = []
         self._ticks: list[tuple[str, float]] = []
         self._cache_w = -1
+        self._cache_view = self.view
+        self._drag_from: float | None = None
+        self._drag_to: float | None = None
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
     # -- geometry ----------------------------------------------------------------------
 
@@ -127,9 +162,10 @@ class TimelineChart(QWidget):
 
     def _compute(self) -> None:
         r = self.plot_rect()
-        if self._cache_w == int(r.width()):
+        if self._cache_w == int(r.width()) and self._cache_view == self.view:
             return
         self._cache_w = int(r.width())
+        self._cache_view = self.view
         n = max(1, int(r.width() / BUCKET_PX))
         a, b = self.view
         span = (b - a) / n
@@ -189,7 +225,67 @@ class TimelineChart(QWidget):
         self.selected = index
         self.update()
 
+    # zoom
+
+    @property
+    def is_zoomed(self) -> bool:
+        return self.view != self.full_view
+
+    def set_view(self, a: float, b: float) -> None:
+        fa, fb = self.full_view
+        span = max(MIN_SPAN_S, min(b - a, fb - fa))
+        a = max(fa, min(a, fb - span))
+        new = (a, a + span)
+        if new == self.view:
+            return
+        self.view = new
+        self.update()
+        from yuki.ui.window.glasscache import notify_glass
+
+        notify_glass(self)   # capsules moved (they are glass in Full): the page re-renders once it settles
+        self.zoomed.emit(self.is_zoomed)
+
+    def zoom_at(self, at: float, factor: float) -> None:
+        a, b = self.view
+        self.set_view(at - (at - a) * factor, at + (b - at) * factor)
+
+    def reset_zoom(self) -> None:
+        self.set_view(*self.full_view)
+
+    def wheelEvent(self, e: object) -> None:  # noqa: D102
+        dy = e.angleDelta().y()
+        if not dy or e.position().x() < GUTTER:
+            e.ignore()   # the page scrolls
+            return
+        self.zoom_at(self.t_of(e.position().x()), 0.8 if dy > 0 else 1.25)
+        e.accept()
+
+    def keyPressEvent(self, e: object) -> None:  # noqa: D102
+        a, b = self.view
+        step = (b - a) * 0.2
+        key = e.key()
+        if key == Qt.Key.Key_Left:
+            self.set_view(a - step, b - step)
+        elif key == Qt.Key.Key_Right:
+            self.set_view(a + step, b + step)
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.zoom_at((a + b) / 2, 0.8)
+        elif key == Qt.Key.Key_Minus:
+            self.zoom_at((a + b) / 2, 1.25)
+        elif key == Qt.Key.Key_Escape:
+            self.reset_zoom()
+        else:
+            super().keyPressEvent(e)
+
+    def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:  # noqa: D102
+        if e.position().x() >= GUTTER:
+            self.reset_zoom()
+
     def mouseMoveEvent(self, e: QMouseEvent) -> None:  # noqa: D102
+        if self._drag_from is not None:
+            self._drag_to = self.t_of(max(GUTTER, e.position().x()))
+            self.update()
+            return
         if e.position().x() >= GUTTER:
             self.set_hover(self.t_of(e.position().x()))
             self.hovered.emit(self.hover_t)
@@ -200,10 +296,34 @@ class TimelineChart(QWidget):
         self.set_hover(None)
 
     def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: D102
+        x = e.position().x()
+        if x < GUTTER:   # a lane's name: highlight that app
+            for i, ln in enumerate(self.lanes):
+                y = self.y_lanes() + i * LANE_H
+                if y <= e.position().y() < y + LANE_H:
+                    self.highlight = None if self.highlight == ln.key else ln.key
+                    self.update()
+                    self.lane_clicked.emit(self.highlight or "")
+                    return
+            return
+        self._drag_from, self._drag_to = self.t_of(x), None
+
+    def mouseReleaseEvent(self, e: QMouseEvent) -> None:  # noqa: D102
+        start, end = self._drag_from, self._drag_to
+        self._drag_from = self._drag_to = None
+        if start is None:
+            return
+        if end is not None and abs(self.x_of(end) - self.x_of(start)) > 6:
+            self.set_view(min(start, end), max(start, end))
+            return
+        self.update()
         at = self.t_of(e.position().x())
         for i, s in enumerate(self.day.sessions):
             if s.start <= at < s.end:
                 self.set_selected(i)
+                from yuki.ui.window.glasscache import notify_glass
+
+                notify_glass(self)
                 self.session_clicked.emit(i)
                 return
 
@@ -220,7 +340,14 @@ class TimelineChart(QWidget):
         self._paint_calls(p)
         self._paint_line(p)
         self._paint_axis(p)
-        if self.hover_t is not None:
+        if self._drag_from is not None and self._drag_to is not None:
+            x0, x1 = sorted((self.x_of(self._drag_from), self.x_of(self._drag_to)))
+            sel = QColor(self.t.accent)
+            sel.setAlphaF(0.14)
+            p.setPen(QPen(self.t.accent, 1.0))
+            p.setBrush(sel)
+            p.drawRoundedRect(QRectF(x0, self.y_calls() - 4, x1 - x0, self.y_axis() - self.y_calls() + 4), 6, 6)
+        elif self.hover_t is not None:
             self._paint_hover(p)
         p.end()
 
@@ -233,14 +360,15 @@ class TimelineChart(QWidget):
         for i in range(len(self.lanes) + 1):
             y = self.y_lanes() + i * LANE_H
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-        # hour grid
+        # time grid (hours, finer when zoomed in)
         a, b = self.view
-        hour = datetime.fromtimestamp(a).replace(minute=0, second=0, microsecond=0).timestamp()
+        step = axis_step(b - a) if (b - a) < 6 * 3600 else 3600
+        hour = axis_start(a, step)
         while hour <= b:
             x = self.x_of(hour)
             if r.left() <= x <= r.right():
                 p.drawLine(QPointF(x, top), QPointF(x, bottom))
-            hour += 3600
+            hour += step
         if self.selected is not None and 0 <= self.selected < len(self.day.sessions):
             s = self.day.sessions[self.selected]
             col = QRectF(self.x_of(s.start), self.y_calls() - 4, self.x_of(s.end) - self.x_of(s.start),
@@ -285,8 +413,8 @@ class TimelineChart(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(c)
             p.drawRoundedRect(QRectF(8, y + LANE_H / 2 - 5, 10, 10), 3, 3)
-            p.setFont(font("callout"))
-            p.setPen(t.text)
+            p.setFont(font("body_strong" if self.highlight == ln.key else "callout"))
+            p.setPen(t.text if self.highlight in (None, ln.key) else t.text_3)
             fm = QFontMetrics(p.font())
             name = fm.elidedText(ln.label, Qt.TextElideMode.ElideRight, GUTTER - 86)
             p.drawText(QRectF(26, y, GUTTER - 86, LANE_H), Qt.AlignmentFlag.AlignVCenter, name)
@@ -428,11 +556,16 @@ class TimelineChart(QWidget):
                 continue
             y = self.lane_y(run.state)
             rect = QRectF(run.x0, y - 5, max(4.0, run.x1 - run.x0), 10)
+            if self.highlight is not None and run.state != self.highlight:
+                p.setOpacity(0.25)
+            else:
+                p.setOpacity(1.0)
             ring = QColor(255, 255, 255, 200) if not t.dark else QColor(20, 22, 28, 220)
             # a surface ring only where it cannot swallow the mark (a quick visit is a few px wide)
             p.setPen(QPen(ring, 1.5) if rect.width() >= 12 else Qt.PenStyle.NoPen)
             p.setBrush(self.lane_color(run.state))
             p.drawRoundedRect(rect, 5, 5)
+        p.setOpacity(1.0)
         # voice on: a thin call-coloured strip under the capsule
         c = t.kind("call")
         for key, x0, x1 in voice:
@@ -459,8 +592,8 @@ class TimelineChart(QWidget):
         p.setPen(QPen(t.baseline, 1.0))
         p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
         a, b = self.view
-        step = 3600 * (2 if (b - a) > 10 * 3600 else 1)
-        hour = datetime.fromtimestamp(a).replace(minute=0, second=0, microsecond=0).timestamp()
+        step = axis_step(b - a)
+        hour = axis_start(a, step)
         p.setFont(font("caption"))
         p.setPen(t.text_3)
         while hour <= b + 1:

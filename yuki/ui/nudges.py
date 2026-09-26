@@ -412,7 +412,7 @@ class NudgeCard(GlassWindow):
     never_ask = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
-        super().__init__(activates=False, radius=14)
+        super().__init__(activates=False, radius=20)
         self.setObjectName("YukiNudgeCard")
         self.nudge: dict[str, Any] | None = None
         self._accent = ACCENT
@@ -422,7 +422,7 @@ class NudgeCard(GlassWindow):
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
 
         column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 18, self.SHADOW + 12, self.SHADOW + 14, self.SHADOW + 10)
+        column.setContentsMargins(self.SHADOW + 18, self.SHADOW + 12, self.SHADOW + 14, self.SHADOW + 12)
         column.setSpacing(4)
 
         header = QHBoxLayout()
@@ -430,11 +430,11 @@ class NudgeCard(GlassWindow):
         self.title = QLabel(self)
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
         self.title.setTextFormat(Qt.TextFormat.PlainText)
+        header.addSpacing(14)   # the kind's dot is painted here
         header.addWidget(self.title)
         self.when = QLabel(self)
         self.when.setFont(ui_font(9))
         self.when.setTextFormat(Qt.TextFormat.PlainText)
-        self.when.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
         header.addWidget(self.when)
         header.addStretch(1)
         column.addLayout(header)
@@ -443,7 +443,6 @@ class NudgeCard(GlassWindow):
         self.body.setFont(ui_font(11))
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.TextFormat.PlainText)
-        self.body.setStyleSheet("color: rgba(238,240,245,240);")
         column.addWidget(self.body)
 
         buttons = QHBoxLayout()
@@ -466,6 +465,7 @@ class NudgeCard(GlassWindow):
         self._linger.timeout.connect(self._on_expire)
         #: True while the pointer is on the card and its clock is stopped.
         self._paused = False
+        self.restyle()
 
     def _button(self, text: str) -> QPushButton:
         button = QPushButton(text, self)
@@ -475,23 +475,27 @@ class NudgeCard(GlassWindow):
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         return button
 
+    def _kind_ink(self) -> QColor:
+        """The card's kind colour, from the design system when it knows the kind (tuned per theme)."""
+        kind = str((self.nudge or {}).get("kind") or "")
+        t = self.theme()
+        return QColor(t.kinds[kind]) if kind in t.kinds else QColor(self._accent)
+
     def _style_buttons(self) -> None:
-        a = self._accent
-        self.reply_button.setStyleSheet(
-            f"QPushButton {{ color: rgb({a.red()},{a.green()},{a.blue()});"
-            f" background: rgba({a.red()},{a.green()},{a.blue()},34);"
-            f" border: 1px solid rgba({a.red()},{a.green()},{a.blue()},90);"
-            " border-radius: 8px; padding: 3px 12px; }"
-            f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},64); }}"
-        )
-        quiet = (
-            "QPushButton { color: rgba(238,240,245,170); background: transparent;"
-            " border: 1px solid rgba(255,255,255,26); border-radius: 8px; padding: 3px 12px; }"
-            "QPushButton:hover { color: rgba(238,240,245,240); background: rgba(255,255,255,18); }"
-        )
+        a = self._kind_ink()
+        self.reply_button.setStyleSheet(self.button_css("tinted", a))
+        quiet = self.button_css("quiet")
         self.dismiss_button.setStyleSheet(quiet)
         self.never_button.setStyleSheet(quiet)
         self.title.setStyleSheet(f"color: rgb({a.red()},{a.green()},{a.blue()});")
+        wash = QColor(a)
+        wash.setAlphaF(0.07 if not self.theme().dark else 0.10)
+        self.glass_tint = wash   # the kind is a tint of the glass and a dot, not a bar
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
+        self.body.setStyleSheet(f"color: {self.ink_css('text')};")
+        self._style_buttons()
 
     # -- content -----------------------------------------------------------
 
@@ -508,7 +512,7 @@ class NudgeCard(GlassWindow):
         text = _squash(nudge.get("text"))
         self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger_for(text)
-        self._style_buttons()
+        self.restyle()
         width = CARD_WIDTH + 2 * self.SHADOW
         wanted = self.layout().totalHeightForWidth(width) if self.layout().hasHeightForWidth() else (
             self.layout().sizeHint().height()
@@ -554,10 +558,15 @@ class NudgeCard(GlassWindow):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        panel = QRectF(self.panel_rect())
+        dot = self._kind_ink()
+        centre = self.title.geometry().center()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._accent)
-        painter.drawRoundedRect(QRectF(panel.left() + 7, panel.top() + 12, 3, panel.height() - 24), 1.5, 1.5)
+        halo = QColor(dot)
+        halo.setAlphaF(0.22)
+        painter.setBrush(halo)
+        painter.drawEllipse(QRectF(centre.x() - self.title.width() / 2 - 16, centre.y() - 6, 12, 12))
+        painter.setBrush(dot)
+        painter.drawEllipse(QRectF(centre.x() - self.title.width() / 2 - 13, centre.y() - 3, 6, 6))
 
     # -- pointer: reading it pauses the fade, leaving starts it over --------
 

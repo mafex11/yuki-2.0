@@ -17,6 +17,13 @@ bottom; scrolling up stops that following until the user is back at the bottom.
 
 The overlay never decides anything about the request -- it hands the text to
 :mod:`yuki.ui.runtime` and renders what comes back.
+
+**Thread mode** (:meth:`Overlay.attach_thread`, phase 2): the card stack gives way
+to the live chat thread (:class:`yuki.ui.chatview.ChatThreadView` over the tray's
+:class:`~yuki.ui.chat_model.ChatModel`), the same thread the Yuki window shows: a
+bubble per message, typed or spoken, Yuki's replies streaming in, and each
+response's steps. The card calls keep working (they return :class:`ThreadCard`
+stand-ins), so the controller in :mod:`yuki.ui.app` is unchanged.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from typing import Any, Literal
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
+    QObject,
     QPoint,
     QPropertyAnimation,
     QRectF,
@@ -399,8 +407,12 @@ class Overlay(GlassWindow):
     opened = Signal()
 
     def __init__(self) -> None:
-        super().__init__(activates=True, radius=16)
+        super().__init__(activates=True, radius=28)
         self.setObjectName("YukiOverlay")
+        #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
+        self.thread: Any = None
+        self._thread_model: Any = None
+        self._proxies: list[ThreadCard] = []
 
         outer = QVBoxLayout(self)
         margin = self.SHADOW + PAD
@@ -459,6 +471,74 @@ class Overlay(GlassWindow):
         self._grace_timer.setSingleShot(True)
         self._grace_timer.setInterval(FOCUS_GRACE_MS)
         self._grace_timer.timeout.connect(self._end_focus_grace)
+        self.restyle()
+
+    # -- look (Liquid Glass, docs/UI-window.md) ------------------------------
+
+    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+        if not hasattr(self, "input"):
+            return
+        sel = self.theme().accent_soft
+        self.input.setStyleSheet(
+            "QPlainTextEdit { background: transparent;"
+            f" color: {self.ink_css('text')};"
+            f" selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},{max(90, sel.alpha())});"
+            " border: none; padding: 0px; }")
+        pal = self.input.palette()
+        pal.setColor(pal.ColorRole.PlaceholderText, self.ink("text_3"))
+        self.input.setPalette(pal)
+        if self.thread is not None:
+            self.thread.restyle()
+
+    def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
+        super().paintEvent(event)
+        if self.input.maximumHeight() <= 0:
+            return
+        from yuki.ui.window.glass import paint_glass
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.input.geometry()).adjusted(-12, -7, 12, 7)
+        paint_glass(painter, r, r.height() / 2 if r.height() < 60 else 22, self.theme().level("control"),
+                    shadow=False, painted=True)
+        painter.end()
+
+    # -- thread mode (the live chat thread) ------------------------------------
+
+    def attach_thread(self, model: Any) -> None:
+        """Show the live chat thread instead of the card stack (see the module docstring)."""
+        if self.thread is not None:
+            return
+        from yuki.ui.chatview import ChatThreadView
+
+        self._thread_model = model
+        self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 70,
+                                     margins=(0, 2, 4, 2), parent=self)
+        self.thread.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.thread.content_resized.connect(self.fit)
+        self.thread.reply_nudge.connect(self._on_thread_reply)
+        self._scroll.setVisible(False)
+        self.layout().insertWidget(0, self.thread)
+        self.fit()
+
+    def _on_thread_reply(self, nudge: object) -> None:
+        card = self.nudge_card(nudge.get("id")) if isinstance(nudge, dict) else None
+        if card is None and isinstance(nudge, dict):
+            card = self._proxy("nudge", nudge=nudge)
+        if card is not None:
+            card.reply_clicked.emit(card.nudge)
+
+    def _proxy(self, tone: str, *, nudge: dict[str, Any] | None = None, at: float | None = None) -> "ThreadCard":
+        model = self._thread_model
+
+        def reply_state(state: str) -> None:
+            if nudge is not None and model is not None:
+                model.apply({"type": "nudge_state", "id": nudge.get("id"), "state": state})
+
+        card = ThreadCard(tone, at=at, nudge=nudge, on_reply_state=reply_state)
+        self._proxies.append(card)
+        del self._proxies[:-100]
+        return card
 
     # -- geometry ----------------------------------------------------------
 
@@ -483,11 +563,18 @@ class Overlay(GlassWindow):
         Keeps the top-left fixed. Past the cap the stack scrolls and the input
         stays where it is, below it.
         """
-        content = self._cards.sizeHint().height() if self.cards() else 0
-        stack = min(content, self.max_cards_height())
-        if self._scroll.height() != stack or self._scroll.isVisible() != (stack > 0):
-            self._scroll.setFixedHeight(stack)
-            self._scroll.setVisible(stack > 0)
+        if self.thread is not None:
+            content = self.thread.content_height() if self._thread_model.items else 0
+            stack = min(content, self.max_cards_height())
+            if self.thread.height() != stack or self.thread.isVisible() != (stack > 0):
+                self.thread.setFixedHeight(stack)
+                self.thread.setVisible(stack > 0)
+        else:
+            content = self._cards.sizeHint().height() if self.cards() else 0
+            stack = min(content, self.max_cards_height())
+            if self._scroll.height() != stack or self._scroll.isVisible() != (stack > 0):
+                self._scroll.setFixedHeight(stack)
+                self._scroll.setVisible(stack > 0)
         width = PANEL_WIDTH + 2 * self.SHADOW
         height = self.layout().sizeHint().height()
         if (self.width(), self.height()) != (width, height):
@@ -497,6 +584,8 @@ class Overlay(GlassWindow):
 
     def scroll_to_latest(self) -> None:
         """Follow the newest card again and bring the bottom of the stack into view."""
+        if self.thread is not None:
+            self.thread.scroll_to_latest()
         self._follow = True
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
@@ -517,10 +606,12 @@ class Overlay(GlassWindow):
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: D102 - Qt override
         # The wheel scrolls the stack wherever it is turned over the panel (margins,
         # the gap above the input), not only over the cards themselves.
-        if self._scroll.isVisible() and not self._forwarding_wheel:
+        area = self.thread.area if self.thread is not None else self._scroll
+        shown = self.thread.isVisible() if self.thread is not None else self._scroll.isVisible()
+        if shown and not self._forwarding_wheel:
             self._forwarding_wheel = True
             try:
-                QApplication.sendEvent(self._scroll.verticalScrollBar(), event)
+                QApplication.sendEvent(area.verticalScrollBar(), event)
             finally:
                 self._forwarding_wheel = False
             event.accept()
@@ -598,6 +689,8 @@ class Overlay(GlassWindow):
 
     def cards(self) -> list[ReplyCard]:
         """The cards currently in the stack, oldest first."""
+        if self.thread is not None:
+            return list(self._proxies)  # type: ignore[arg-type]
         widgets = (
             self._cards.itemAt(index).widget() for index in range(self._cards.count())
         )
@@ -622,6 +715,9 @@ class Overlay(GlassWindow):
         Returns:
             The new card, so the caller can fill it in when the answer arrives.
         """
+        if self.thread is not None:   # the thread shows the exchange from the chat model
+            self.scroll_to_latest()
+            return self._proxy(tone)  # type: ignore[return-value]
         card = ReplyCard(prompt, body, tone=tone, accent=accent, parent=self._content)
         self._cards.addWidget(card)
         self._watch(card)
@@ -654,6 +750,10 @@ class Overlay(GlassWindow):
         existing = self.nudge_card(nudge.get("id"))
         if existing is not None:
             return existing
+        if self.thread is not None:
+            self._thread_model.apply({"type": "nudge", "nudge": nudge, "at": at})
+            self.scroll_to_latest()
+            return self._proxy("nudge", nudge=nudge, at=at)  # type: ignore[return-value]
         cards = self.cards()
         index = next((i for i, c in enumerate(cards) if c.at > at), len(cards))
         if index == 0 and len(cards) >= MAX_CARDS:
@@ -692,6 +792,9 @@ class Overlay(GlassWindow):
 
     def clear_cards(self) -> None:
         """Remove every card immediately."""
+        if self.thread is not None:
+            self._proxies.clear()
+            return
         for card in self.cards():
             self._cards.removeWidget(card)
             card.deleteLater()
@@ -727,3 +830,36 @@ class Overlay(GlassWindow):
         """Collapse the input and hand the text to the controller."""
         self.collapse_input()
         self.submitted.emit(text)
+
+
+class ThreadCard(QObject):
+    """What the card calls return in thread mode: the exchange itself is drawn from the chat model.
+
+    It keeps the card interface the controller uses (``set_body``, ``set_meta``,
+    ``set_reply_state``, ``reply_clicked``, ``nudge``, ``tone``, ``at``).
+    """
+
+    reply_clicked = Signal(object)
+    content_changed = Signal()
+
+    def __init__(self, tone: str, *, at: float | None = None, nudge: dict[str, Any] | None = None,
+                 on_reply_state: Any = None) -> None:
+        super().__init__()
+        self.tone = tone
+        self.at = at if at is not None else time.time()
+        self.nudge = nudge
+        self._on_reply_state = on_reply_state
+
+    def set_body(self, text: str, *, tone: str | None = None) -> None:
+        if tone is not None:
+            self.tone = tone
+
+    def set_meta(self, text: str) -> None:
+        del text
+
+    def set_reply_state(self, state: str) -> None:
+        if self._on_reply_state is not None:
+            self._on_reply_state(state)
+
+    def dismiss(self) -> None:
+        pass

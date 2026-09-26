@@ -7,9 +7,10 @@ from datetime import datetime
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
+from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import YukiView, day_label, epoch, second_person
 from yuki.ui.window.theme import SPACE, Theme
-from yuki.ui.window.widgets import Chip, Divider, Glass, Panel, Pill, icon_label, page_header, text_label
+from yuki.ui.window.widgets import Chip, Divider, Glass, Panel, Pill, TextPill, icon_label, page_header, text_label
 
 
 def _bullets(t: Theme, panel: Panel, lines: list[str], glyph: str) -> None:
@@ -39,7 +40,29 @@ def _due(value) -> str:
     return f"due {day_label(at)} {datetime.fromtimestamp(at):%H:%M}" if at else ""
 
 
-def build(t: Theme, view: YukiView) -> QWidget:
+def _composer(t: Theme, placeholder: str, action: str, on_send, *, hint: str = "") -> Glass:
+    """An inline "say it in your words" box (hidden until its pill opens it)."""
+    box = Glass(t, level="inset", radius=18, padding=SPACE["m"])
+    box.body.setSpacing(SPACE["s"])
+    if hint:
+        box.body.addWidget(text_label(t, hint, "caption", "text_2", wrap=True))
+    field = TextPill(t, placeholder, action=action, height=38)
+
+    def send(text: str) -> None:
+        text = " ".join((text or "").split())
+        if text:
+            on_send(text)
+            field.edit.clear()
+            box.setVisible(False)
+
+    field.submitted.connect(send)
+    box.body.addWidget(field)
+    box.field = field  # type: ignore[attr-defined]
+    box.setVisible(False)
+    return box
+
+
+def build(t: Theme, view: YukiView, *, act: Actions = NOOP) -> QWidget:
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
@@ -58,10 +81,14 @@ def build(t: Theme, view: YukiView) -> QWidget:
     top.addWidget(talk, 1)
     col.addLayout(top)
 
+    add = Pill(t, "Add a rule", glyph="edit", style="quiet", size="small")
     rules = Panel(t, "Your rules for Yuki", "In your own words. Yuki follows these every time. Remove one and it "
-                                             "stops at once.", glyph="shield",
-                  right=Pill(t, "Add a rule", glyph="edit", style="quiet", size="small"))
+                                             "stops at once.", glyph="shield", right=add)
     rules.body.setSpacing(SPACE["s"])
+    new_rule = _composer(t, "e.g. “always answer me in one line”", "Add", act.add_rule,
+                         hint="Say the rule the way you'd say it to Yuki.")
+    add.clicked.connect(lambda: (new_rule.setVisible(not new_rule.isVisible()), new_rule.field.edit.setFocus()))
+    rules.body.addWidget(new_rule)
     for i, r in enumerate(view.rules):
         if i:
             rules.body.addWidget(Divider(t))
@@ -70,15 +97,26 @@ def build(t: Theme, view: YukiView) -> QWidget:
         c = QVBoxLayout()
         c.setSpacing(3)
         if r["kind"] == "rule":
-            c.addWidget(text_label(t, f"“{r['quote'] or r['text']}”", "body", "text", wrap=True))
+            c.addWidget(text_label(t, f"“{r['quote'] or r['text']}”", "body", "text", wrap=True, selectable=True))
             c.addWidget(text_label(t, f"You said this {_when(r['at'])}", "caption", "text_3"))
         else:
-            c.addWidget(text_label(t, second_person(r["text"]), "body", "text", wrap=True))
+            c.addWidget(text_label(t, second_person(r["text"]), "body", "text", wrap=True, selectable=True))
             c.addWidget(text_label(t, f"From what you said {_when(r['at'])}: “{r['quote']}”", "caption", "text_3",
                                    wrap=True))
         row.addLayout(c, 1)
-        row.addWidget(Pill(t, "Remove", glyph="delete", style="quiet", size="small"), 0, Qt.AlignmentFlag.AlignTop)
+        remove = Pill(t, "Remove", glyph="delete", style="quiet", size="small")
+
+        def removed(_c: bool = False, ref: str = r["ref"], pill: Pill = remove) -> None:
+            pill.setEnabled(False)
+            pill.setText("Removing…")
+            act.revoke_rule(ref)
+
+        remove.clicked.connect(removed)
+        row.addWidget(remove, 0, Qt.AlignmentFlag.AlignTop)
         rules.body.addLayout(row)
+    if not view.rules:
+        rules.body.addWidget(text_label(t, "No rules yet. Tell Yuki one any time, here or out loud.", "callout",
+                                        "text_3"))
     col.addWidget(rules)
 
     mid = QHBoxLayout()
@@ -87,7 +125,7 @@ def build(t: Theme, view: YukiView) -> QWidget:
                                                       "so it's faster next time.", glyph="bulb")
     if view.knowhow:
         for k in view.knowhow[:6]:
-            learned.body.addWidget(text_label(t, k, "callout", "text", wrap=True))
+            learned.body.addWidget(text_label(t, k, "callout", "text", wrap=True, selectable=True))
     else:
         empty = Glass(t, level="inset", radius=16, padding=SPACE["m"])
         empty.body.addWidget(text_label(t, "Nothing yet.", "body_strong", "text_2"))
@@ -116,6 +154,8 @@ def build(t: Theme, view: YukiView) -> QWidget:
             if due:
                 row.addWidget(text_label(t, due, "caption", "text_3"), 0, Qt.AlignmentFlag.AlignTop)
             promises.body.addLayout(row)
+    if not view.promised and not view.reminding:
+        promises.body.addWidget(text_label(t, "Nothing promised right now.", "callout", "text_3"))
     promises.body.addStretch(1)
     mid.addWidget(learned, 1)
     mid.addWidget(promises, 1)
@@ -129,16 +169,27 @@ def build(t: Theme, view: YukiView) -> QWidget:
         for q in view.waiting:
             card = Glass(t, level="inset", radius=18, padding=SPACE["m"])
             card.body.setSpacing(6)
-            card.body.addWidget(text_label(t, q["question"].replace("the user", "you"), "body_strong"))
+            card.body.addWidget(text_label(t, q["question"].replace("the user", "you"), "body_strong", wrap=True))
             if q.get("evidence"):
                 card.body.addWidget(text_label(t, f"Why it asks: {second_person(q['evidence'])}", "caption",
                                                "text_3", wrap=True))
+            answer_box = _composer(t, "Your answer, in your words", "Tell Yuki",
+                                   lambda words, ref=q["id"]: act.answer_question(ref, words))
             row = QHBoxLayout()
             row.addStretch(1)
-            row.addWidget(Pill(t, "Don't ask", style="quiet", size="small"))
-            row.addWidget(Pill(t, "Skip", style="quiet", size="small"))
-            row.addWidget(Pill(t, "Answer", glyph="edit", style="tinted", tint=t.kind("question"), size="small"))
+            never = Pill(t, "Don't ask", style="quiet", size="small")
+            never.clicked.connect(lambda _c=False, ref=q["id"], box=card: (act.skip_question(ref, True),
+                                                                           box.setVisible(False)))
+            skip = Pill(t, "Skip", style="quiet", size="small")
+            skip.clicked.connect(lambda _c=False, ref=q["id"], box=card: (act.skip_question(ref, False),
+                                                                          box.setVisible(False)))
+            answer = Pill(t, "Answer", glyph="edit", style="tinted", tint=t.kind("question"), size="small")
+            answer.clicked.connect(lambda _c=False, box=answer_box: (box.setVisible(True), box.field.edit.setFocus()))
+            row.addWidget(never)
+            row.addWidget(skip)
+            row.addWidget(answer)
             card.body.addLayout(row)
+            card.body.addWidget(answer_box)
             qs.body.addWidget(card)
     if view.asked:
         qs.body.addWidget(text_label(t, "Asked before", "caption_strong", "text_2"))
@@ -149,12 +200,14 @@ def build(t: Theme, view: YukiView) -> QWidget:
             c.setSpacing(2)
             c.addWidget(text_label(t, q["question"].replace("the user", "you"), "callout", "text", wrap=True))
             if q.get("answer"):
-                c.addWidget(text_label(t, f"You: “{q['answer']}”", "caption", "text_2", wrap=True))
+                c.addWidget(text_label(t, f"You: “{q['answer']}”", "caption", "text_2", wrap=True, selectable=True))
             row.addLayout(c, 1)
             word = {"answered": "Answered", "skipped": "Skipped", "never": "Won't ask", "asked": "Asked"}
             row.addWidget(text_label(t, f"{word.get(q['status'], q['status'])} {_when(q['answered_at'] or q['at'])}",
                                      "caption", "text_3"), 0, Qt.AlignmentFlag.AlignTop)
             qs.body.addLayout(row)
+    if not view.waiting and not view.asked:
+        qs.body.addWidget(text_label(t, "No questions right now.", "callout", "text_3"))
     col.addWidget(qs)
     col.addStretch(1)
     return page
