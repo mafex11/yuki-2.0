@@ -40,11 +40,23 @@ from typing import Any
 ACTING_FILE = "acting.json"
 ACTING_EVENT_PREFIX = "Local\\YukiMemoryActing"
 DB_FILENAME = "memory.db"
+#: An entry not refreshed for this long is stale and ignored, even while its process lives: the
+#: agent refreshes it on every action, and the longest worker request measured in 108 real ones
+#: (logs/sessions, 2026-09-22..26) took 65 s. On 2026-09-25 an end that failed once left a marker
+#: standing 53 minutes, and the user's own activity was tagged as Yuki's all that time.
+MAX_AGE_S = 600.0
+#: A write that meets a sharing violation (another process reading the file) is tried again:
+#: waits between attempts, in seconds (bounded; the whole retry takes under half a second).
+WRITE_RETRY_S = (0.02, 0.05, 0.1, 0.25)
 
 _lock = threading.Lock()
 
 
 def _default_db_path() -> Path:
+    # the same override as yuki.memory.store.default_memory_dir (not imported: this module stays light)
+    override = os.environ.get("YUKI_MEMORY_DIR")
+    if override:
+        return Path(override) / DB_FILENAME
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "Yuki" / "memory" / DB_FILENAME
 
@@ -105,15 +117,35 @@ def _read_raw(path: Path) -> list[dict[str, Any]]:
 
 def _write_raw(path: Path, items: list[dict[str, Any]]) -> None:
     if not items:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        def unlink() -> None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        _retry(unlink)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"requests": items, "updated_at": time.time()}, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    _retry(lambda: os.replace(tmp, path))
+
+
+def _retry(op) -> None:
+    """Run a file operation, again after a short wait while Windows reports a sharing violation.
+
+    A reader (the service's 2 s poll, another Yuki process) holding the file open for a
+    moment makes ``os.replace`` / ``unlink`` fail with PermissionError; that was the one
+    failed end of 2026-09-25 18:55 that left the marker standing.
+    """
+    for wait in (*WRITE_RETRY_S, None):
+        try:
+            op()
+            return
+        except PermissionError:
+            if wait is None:
+                raise
+            time.sleep(wait)
 
 
 def _signal(db_path: str | Path | None) -> bool:
@@ -142,8 +174,11 @@ def begin(db_path: str | Path | None, token: str, request: str, *, lane: str = "
         request = redact_text(request or "")
         path = acting_path(db_path)
         with _lock:
-            items = [i for i in _read_raw(path) if i.get("token") != token and _pid_alive(int(i.get("pid") or 0))]
-            items.append({"token": token, "request": request, "started_at": time.time(), "lane": lane,
+            now = time.time()
+            before = {i.get("token"): i for i in _read_raw(path)}
+            items = [i for i in before.values() if i.get("token") != token and _live(i, now)]
+            started = float((before.get(token) or {}).get("started_at") or now)
+            items.append({"token": token, "request": request, "started_at": started, "seen_at": now, "lane": lane,
                           "pid": os.getpid()})
             _write_raw(path, items)
         _signal(db_path)
@@ -158,7 +193,8 @@ def end(db_path: str | Path | None, token: str) -> bool:
         path = acting_path(db_path)
         with _lock:
             before = _read_raw(path)
-            items = [i for i in before if i.get("token") != token and _pid_alive(int(i.get("pid") or 0))]
+            now = time.time()
+            items = [i for i in before if i.get("token") != token and _live(i, now)]
             if len(items) != len(before) or not items:
                 _write_raw(path, items)
         _signal(db_path)
@@ -167,17 +203,42 @@ def end(db_path: str | Path | None, token: str) -> bool:
         return False
 
 
+def _live(item: dict[str, Any], now: float) -> bool:
+    """An entry still counts: its process lives and it was refreshed within :data:`MAX_AGE_S`."""
+    try:
+        seen = float(item.get("seen_at") or item.get("started_at") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return now - seen <= MAX_AGE_S and _pid_alive(int(item.get("pid") or 0))
+
+
+def stale(db_path: str | Path | None, now: float | None = None) -> list[dict[str, Any]]:
+    """Entries whose process still lives but that were not refreshed within :data:`MAX_AGE_S` (a leaked end)."""
+    now = time.time() if now is None else float(now)
+    out = []
+    for i in _read_raw(acting_path(db_path)):
+        try:
+            seen = float(i.get("seen_at") or i.get("started_at") or 0.0)
+            if now - seen > MAX_AGE_S and _pid_alive(int(i.get("pid") or 0)):
+                out.append({"token": str(i.get("token")), "lane": str(i.get("lane") or ""), "age_s": round(now - seen)})
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def current(db_path: str | Path | None) -> Acting | None:
     """The request Yuki is acting on now (the newest if several), or ``None``.
 
     Entries whose process has exited are ignored (an agent that died
-    mid-request never leaves the marker standing).
+    mid-request never leaves the marker standing), and so are entries not
+    refreshed for :data:`MAX_AGE_S` (an end that failed never holds it longer).
     """
     live = []
+    now = time.time()
     for i in _read_raw(acting_path(db_path)):
         try:
             pid = int(i.get("pid") or 0)
-            if not _pid_alive(pid):
+            if not _live(i, now):
                 continue
             live.append(Acting(token=str(i["token"]), request=str(i.get("request") or ""),
                                started_at=float(i.get("started_at") or 0.0), lane=str(i.get("lane") or ""),
@@ -219,4 +280,5 @@ class ActingEvent:
             self._handle = None
 
 
-__all__ = ["ACTING_FILE", "Acting", "ActingEvent", "acting_event_name", "acting_path", "begin", "current", "end"]
+__all__ = ["ACTING_FILE", "MAX_AGE_S", "Acting", "ActingEvent", "acting_event_name", "acting_path", "begin", "current",
+           "end", "stale"]

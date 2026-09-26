@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+_P_RUNTIME_ID = 30000
 _P_CONTROL_TYPE = 30003
 _P_NAME = 30005
 _P_BOUNDING_RECT = 30001
@@ -36,12 +37,27 @@ MAX_DEPTH = 16
 
 @dataclass
 class Tab:
-    """One tab of a strip (``index`` counts from 1, left to right)."""
+    """One tab of a strip (``index`` counts from 1, left to right).
+
+    ``tab_id`` is the TabItem's UIA RuntimeId as ``"42.1234.4.567"``: the provider's own
+    identity of that tab for as long as it lives, whatever its title or place (``""`` when
+    the provider gives none). The brain's ``tab`` tool acts on a tab by it, never by its title.
+    """
 
     index: int
     name: str
     selected: bool
     bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
+    tab_id: str = ""
+
+
+def runtime_id_text(value: Any) -> str:
+    """A cached RuntimeId (an array of ints) as ``"42.1234.4.567"``; ``""`` when there is none."""
+    try:
+        parts = [int(part) for part in value] if value is not None else []
+    except Exception:  # noqa: BLE001 - a provider that gave something else
+        return ""
+    return ".".join(str(part) for part in parts)
 
 
 @dataclass
@@ -74,7 +90,7 @@ def _rect(value: Any) -> tuple[int, int, int, int]:
 def walk_tabs(automation: Any, hwnd: int, deadline: float) -> tuple[list[tuple[Tab, Any]], int, bool]:
     """``([(tab, element)], nodes visited, complete)`` for ``hwnd``'s tab strip (blocking, bounded)."""
     request = automation.CreateCacheRequest()
-    for prop in (_P_CONTROL_TYPE, _P_NAME, _P_BOUNDING_RECT, _P_SELECTION_ITEM_IS_SELECTED):
+    for prop in (_P_CONTROL_TYPE, _P_NAME, _P_BOUNDING_RECT, _P_SELECTION_ITEM_IS_SELECTED, _P_RUNTIME_ID):
         request.AddProperty(prop)
     request.TreeScope = _TREE_SCOPE_ELEMENT
     condition = automation.ControlViewCondition
@@ -114,7 +130,16 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float) -> tuple[list[tuple[T
     if not groups:
         return [], nodes, complete
     strip = max(groups.values(), key=len)
-    return [(Tab(index=i + 1, name=n, selected=s, bounds=b), e) for i, (n, s, b, e) in enumerate(strip)], nodes, complete
+    return [(Tab(index=i + 1, name=n, selected=s, bounds=b, tab_id=_tab_id(e)), e)
+            for i, (n, s, b, e) in enumerate(strip)], nodes, complete
+
+
+def _tab_id(element: Any) -> str:
+    """The TabItem's cached RuntimeId as text (``""`` when the provider gives none)."""
+    try:
+        return runtime_id_text(element.GetCachedPropertyValue(_P_RUNTIME_ID))
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _on_uia_thread(job: Any, budget_s: float, name: str) -> tuple[dict, bool]:
@@ -161,3 +186,24 @@ def tabs_line(strip: TabStrip, *, limit: int = 20, name_chars: int = 60) -> str:
     more = f"; +{len(strip.tabs) - limit} more" if len(strip.tabs) > limit else ""
     return (f"tabs of [{strip.hwnd}] ({len(strip.tabs)}, * = the one showing): " + "; ".join(items) + more)
 
+
+
+def format_tabs(strip: TabStrip) -> str:
+    """The strip for the brain's ``read_tabs``: one line per tab with its id, place and full name.
+
+    The id (``[42.1234.4.567]``) is what the ``tab`` tool takes: a tab is acted on by its
+    identity, never by its title (a title is cut short in the strip, and many pages never
+    say which site they are on).
+    """
+    if not strip.tabs:
+        if strip.error:
+            return f"could not read the tabs of window {strip.hwnd}: {strip.error}"
+        return f"window {strip.hwnd} shows no tabs" + ("" if strip.complete else " (the read was cut short)")
+    head = f"window {strip.hwnd}: {len(strip.tabs)} tabs, left to right (* = the one showing)"
+    if not strip.complete:
+        head += "; the read was cut short, there may be more"
+    lines = [head]
+    for tab in strip.tabs:
+        ident = f"[{tab.tab_id}]" if tab.tab_id else "[no id: this window gives its tabs none]"
+        lines.append(f"- {ident} {tab.index}{'*' if tab.selected else ''} \"{tab.name}\"")
+    return "\n".join(lines)

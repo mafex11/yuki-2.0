@@ -63,6 +63,18 @@ IDLE_UNLOAD_S = 300.0
 THREADS = 2
 
 
+def _shared_models_dir() -> Path:
+    """Where the model files are cached: memory's real folder even under ``YUKI_MEMORY_DIR``.
+
+    The model is public, read-only data, not memory: a test run or a harness pointed at a
+    temp memory folder shares the cache instead of downloading the model again.
+    """
+    if os.environ.get("YUKI_MEMORY_DIR"):
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "Yuki" / "memory" / "models"
+    return default_memory_dir() / "models"
+
+
 def _dir_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
@@ -79,7 +91,7 @@ class Embedder:
         self._reaper: threading.Timer | None = None
         self.loads = 0
         self.unloads = 0
-        self.models_dir = Path(models_dir) if models_dir else default_memory_dir() / "models"
+        self.models_dir = Path(models_dir) if models_dir else _shared_models_dir()
         self._model: Any = None
         self._load_lock = threading.Lock()
         self._run_lock = threading.Lock()

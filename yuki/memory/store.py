@@ -263,8 +263,16 @@ DB_FILENAME = "memory.db"
 TimeArg = float | int | datetime | None
 
 
+#: Environment override of memory's default folder (tests and harnesses point it at a temp dir,
+#: so nothing that forgets to pass a path can write into the real memory; tests/conftest.py).
+MEMORY_DIR_ENV = "YUKI_MEMORY_DIR"
+
+
 def default_memory_dir() -> Path:
-    """``%LOCALAPPDATA%\\Yuki\\memory``."""
+    """``%LOCALAPPDATA%\\Yuki\\memory``, or ``%YUKI_MEMORY_DIR%`` when that is set."""
+    override = os.environ.get(MEMORY_DIR_ENV)
+    if override:
+        return Path(override)
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "Yuki" / "memory"
 
@@ -469,6 +477,8 @@ class JournalEntry:
     #: What the item is (yuki.memory.personality.NATURES): fact | trait | story | humor | uncertain.
     #: Rows recorded before natures existed read as "fact".
     nature: str = "fact"
+    #: The extractor judged it records something the user finished, shipped, merged, fixed or sent.
+    milestone: bool = False
 
 
 @dataclass
@@ -485,6 +495,7 @@ class NewFact:
     embed_model: str | None = None
     by_yuki: bool = False
     nature: str = "fact"
+    milestone: bool = False
 
 
 @dataclass
@@ -726,11 +737,14 @@ class EpisodeRecord:
 
 #: Kinds of conversation facts (``conversation_facts.kind``). ``rule`` and
 #: ``preference`` are the user's own words about how Yuki should talk or
-#: behave; ``commitment`` is something Yuki is to do later. ``fact`` is reserved:
-#: durable facts about the user from conversations go to the journal instead.
-CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "fact")
+#: behave; ``commitment`` is something Yuki is to do later. ``feedback`` is what the
+#: user said back to one of Yuki's cards (``nudge_id``), or about the coach's cards in
+#: general: it bears on that kind of card, never on everything Yuki says (a "stfu" to a
+#: wrong call-back is not a gag on the coach). ``fact`` is reserved: durable facts about
+#: the user from conversations go to the journal instead.
+CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback", "fact")
 #: The kinds the conversation worker maintains (and ``standing_context`` shows).
-STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment")
+STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback")
 #: ``conversation_facts.status``: active (a rule in force, an open commitment) or how it ended.
 CONVERSATION_FACT_STATUSES: tuple[str, ...] = ("active", "done", "revoked", "superseded")
 
@@ -779,6 +793,8 @@ class ConversationFact:
     superseded_by: int | None
     end_note: str | None             # the words or reason that ended it
     score: float | None = None
+    #: feedback: the card (``nudges.id``) the user was replying to; None for feedback on the coach in general.
+    nudge_id: int | None = None
 
 
 @dataclass
@@ -803,6 +819,7 @@ class ConversationChange:
     origin: str = "model"
     vector: np.ndarray | None = None
     embed_model: str | None = None
+    nudge_id: int | None = None
 
 
 @dataclass
@@ -887,6 +904,8 @@ class NudgeRecord:
     shown_at: float | None
     reaction: str | None
     reacted_at: float | None
+    #: What the user wrote back when they replied to the card (their words), if known.
+    reply: str | None = None
 
 
 @dataclass
@@ -906,6 +925,8 @@ class NudgeCheckin:
     latency_ms: float = 0.0
     stop_reason: str | None = None
     error: str | None = None
+    #: The coach's one-line why, for every outcome (none included): stored encrypted.
+    reason: str | None = None
 
 
 @dataclass
@@ -1825,6 +1846,21 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX portrait_audits_at ON portrait_audits(at);
     """,
+    # 16: the coach listens (docs/research/coach-and-answers-review.md): a reply to one of
+    # Yuki's cards is feedback about that kind of card, not a global rule - a conversation
+    # fact of kind 'feedback' carries the card it answered (nudge_id); the user's reply is
+    # kept on the card itself (reply, encrypted) so the coach reads their words, not a
+    # count; every check-in keeps the coach's one-line why (reason, encrypted), so the agent
+    # can say why the coach went quiet; a journal fact the extractor judged to record
+    # something the user finished, shipped, merged, fixed or sent is a milestone, which
+    # wakes the coach. Additive only, like 2-15.
+    """
+    ALTER TABLE conversation_facts ADD COLUMN nudge_id INTEGER;
+    ALTER TABLE nudges ADD COLUMN reply_ciphertext TEXT;
+    ALTER TABLE nudge_checkins ADD COLUMN reason_ciphertext TEXT;
+    ALTER TABLE journal ADD COLUMN milestone INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX journal_milestone ON journal(milestone, at);
+    """,
 )
 
 
@@ -2391,11 +2427,11 @@ class Store:
         nature = getattr(fact, "nature", None)
         cur = conn.execute(
             "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
-            " by_yuki, nature) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " by_yuki, nature, milestone) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 float(fact.at), fact.thread_id, fact.app or "", fact.host, self.cipher.encrypt(fact.fact),
                 int(fact.importance), batch_id, time.time(), int(bool(getattr(fact, "by_yuki", False))),
-                nature if nature in JOURNAL_NATURES else "fact",
+                nature if nature in JOURNAL_NATURES else "fact", int(bool(getattr(fact, "milestone", False))),
             ),
         )
         journal_id = int(cur.lastrowid)
@@ -2520,6 +2556,7 @@ class Store:
             fact=self.cipher.decrypt(r["fact_ciphertext"]), importance=r["importance"],
             batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in keys else False,
             nature=nature if nature in JOURNAL_NATURES else "fact",
+            milestone=bool(r["milestone"]) if "milestone" in keys else False,
         )
 
     def search_journal(
@@ -3978,6 +4015,7 @@ class Store:
             source_turn_ids=sources, origin=r["origin"] or "model", created_at=r["created_at"],
             expired_at=r["expired_at"], superseded_by=r["superseded_by"],
             end_note=self._dec(r["end_note_ciphertext"]), score=score,
+            nudge_id=r["nudge_id"] if "nudge_id" in r.keys() else None,
         )
 
     def conversation_facts(
@@ -4030,12 +4068,13 @@ class Store:
                       batch_id: int | None) -> int:
         cur = conn.execute(
             "INSERT INTO conversation_facts(kind, subject_ciphertext, text_ciphertext, quote_ciphertext, status,"
-            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id)"
-            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?)",
+            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id)"
+            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?)",
             (
                 ch.kind, self._enc(ch.subject or ""), self.cipher.encrypt(ch.text),
                 self._enc(ch.quote) if ch.quote else None, float(ch.at if ch.at is not None else now),
                 ch.due_at, json.dumps([int(i) for i in ch.source_turn_ids]), ch.origin or "model", now, batch_id,
+                ch.nudge_id,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -4400,6 +4439,7 @@ class Store:
             reason=self._dec(r["reason_ciphertext"]), inputs=inputs if isinstance(inputs, dict) else {},
             ref=r["ref"], due_at=r["due_at"], checkin_id=r["checkin_id"], shown_at=r["shown_at"],
             reaction=r["reaction"], reacted_at=r["reacted_at"],
+            reply=self._dec(r["reply_ciphertext"]) if "reply_ciphertext" in r.keys() else None,
         )
 
     def record_checkin(self, checkin: NudgeCheckin, nudge: NewNudge | None = None, *,
@@ -4418,10 +4458,11 @@ class Store:
             c = checkin
             cur = conn.execute(
                 "INSERT INTO nudge_checkins(at, trigger, outcome, model, input_chars, input_tokens, output_tokens,"
-                " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error, reason_ciphertext)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (c.at, c.trigger, c.outcome, c.model, c.input_chars, c.input_tokens, c.output_tokens,
-                 c.cache_write_tokens, c.cache_read_tokens, c.cost_usd, c.latency_ms, c.stop_reason, c.error),
+                 c.cache_write_tokens, c.cache_read_tokens, c.cost_usd, c.latency_ms, c.stop_reason, c.error,
+                 self._enc(c.reason) if c.reason else None),
             )
             checkin_id = int(cur.lastrowid)
             nudge_id = None
@@ -4478,15 +4519,23 @@ class Store:
         rows = self._query("SELECT * FROM nudges WHERE id=?", (int(nudge_id),))
         return self._nudge(rows[0]) if rows else None
 
-    def react_to_nudge(self, nudge_id: int, reaction: str, *, at: float | None = None) -> bool:
+    def react_to_nudge(self, nudge_id: int, reaction: str, *, at: float | None = None,
+                       reply: str | None = None) -> bool:
         """Record what the user did with a nudge; ``shown`` also sets ``shown_at`` (first time only).
 
         A later reaction replaces an earlier one (shown -> dismissed); ``shown``
-        never replaces a real reaction. False if the nudge does not exist.
+        never replaces a real reaction. ``reply``: with ``replied``, what the user
+        wrote back (their words, encrypted), so the coach reads the reply itself.
+        False if the nudge does not exist.
         """
         if reaction not in NUDGE_REACTIONS:
             raise ValueError(f"reaction must be one of {NUDGE_REACTIONS}, not {reaction!r}")
         now = float(at) if at is not None else time.time()
+        if reaction == "replied" and reply and reply.strip():
+            words = " ".join(reply.split())[:2000]
+            return self._write(lambda conn: conn.execute(
+                "UPDATE nudges SET shown_at=coalesce(shown_at, ?), reaction='replied', reacted_at=?,"
+                " reply_ciphertext=? WHERE id=?", (now, now, self._enc(words), int(nudge_id))).rowcount == 1)
         if reaction == "shown":
             sql = ("UPDATE nudges SET shown_at=coalesce(shown_at, ?),"
                    " reaction=CASE WHEN reaction IS NULL OR reaction='expired' THEN 'shown' ELSE reaction END,"
@@ -4507,8 +4556,73 @@ class Store:
             (time.time(), float(before), *kinds),
         ).rowcount)
 
+    def nudge_replied_near(self, at: float, within_s: float = 15.0) -> NudgeRecord | None:
+        """The card the user pressed Reply on at about ``at`` (its ``replied`` reaction within ``within_s``).
+
+        Plumbing on two measured times: the UI records the reply the moment the
+        user sends it, and the agent logs the exchange with the same start time.
+        """
+        rows = self._query(
+            "SELECT * FROM nudges WHERE reaction='replied' AND reacted_at BETWEEN ? AND ?"
+            " ORDER BY abs(reacted_at - ?) LIMIT 1", (float(at) - within_s, float(at) + within_s, float(at)))
+        return self._nudge(rows[0]) if rows else None
+
+    def turn_near(self, at: float, within_s: float = 15.0) -> ConversationTurn | None:
+        """The exchange that started closest to ``at`` within ``within_s`` (the one a card reply became)."""
+        rows = self._query(
+            "SELECT * FROM conversation_turns WHERE at BETWEEN ? AND ? ORDER BY abs(at - ?) LIMIT 1",
+            (float(at) - within_s, float(at) + within_s, float(at)))
+        return self._turn(rows[0]) if rows else None
+
+    def milestones_since(self, after_id: int, since: TimeArg) -> list[tuple[int, float]]:
+        """``(journal id, at)`` of milestone facts (not Yuki's own, not superseded) newer than ``after_id``
+        and dated at or after ``since``, oldest first: content-free, for the coach's moment trigger."""
+        try:
+            rows = self._query(
+                "SELECT id, at FROM journal WHERE milestone=1 AND by_yuki=0 AND superseded_at IS NULL"
+                " AND id > ? AND at >= ? ORDER BY at, id", (int(after_id), _ts(since) or 0.0))
+        except sqlite3.OperationalError:   # a database before migration 16
+            return []
+        return [(int(r["id"]), float(r["at"])) for r in rows]
+
+    def fact_card(self, fact: ConversationFact) -> NudgeRecord | None:
+        """The card a conversation fact answers: its ``nudge_id``, else the card its source exchange replied to.
+
+        A rule or preference extracted before feedback existed (the 2026-09-25 "stfu")
+        is found through its exchange: the card whose Reply was pressed at that
+        moment (:meth:`nudge_replied_near`). ``None`` for an item said in plain chat.
+        """
+        if fact.nudge_id:
+            return self.nudge(int(fact.nudge_id))
+        if fact.kind not in ("rule", "preference", "feedback") or not fact.source_turn_ids:
+            return None
+        for turn in self.turns_by_ids(fact.source_turn_ids):
+            card = self.nudge_replied_near(turn.at)
+            if card is not None:
+                return card
+        return None
+
+    def checkin_reasons(self, since: TimeArg = None, limit: int = 20) -> list[dict[str, Any]]:
+        """The newest check-ins since ``since`` with the coach's why (decrypted), oldest first."""
+        params: list[Any] = []
+        sql = "SELECT id, at, trigger, outcome, reason_ciphertext FROM nudge_checkins"
+        if (s := _ts(since)) is not None:
+            sql += " WHERE at >= ?"
+            params.append(s)
+        sql += " ORDER BY at DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        try:
+            rows = self._query(sql, params)
+        except sqlite3.OperationalError:   # a database before migration 16
+            return []
+        return [{"id": r["id"], "at": r["at"], "trigger": r["trigger"], "outcome": r["outcome"],
+                 "reason": self._dec(r["reason_ciphertext"])} for r in reversed(rows)]
+
     def reminded(self, ref: str, due_at: float | None) -> bool:
-        """Whether a reminder for this item and due time was already written."""
+        """Whether a reminder for this item and due time was already written (or folded into another card)."""
+        folded = self.nudge_state(f"reminded:{ref}:{int(due_at) if due_at is not None else 'none'}")
+        if folded is not None:
+            return True
         if due_at is None:
             rows = self._query("SELECT 1 FROM nudges WHERE kind='reminder' AND ref=? AND due_at IS NULL LIMIT 1", (ref,))
         else:
@@ -4956,6 +5070,20 @@ class Store:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
+        return [self._call(r) for r in self._query(sql, params)]
+
+    def calls_overlapping(self, since: TimeArg = None, until: TimeArg = None) -> list[CallRecord]:
+        """Calls overlapping ``[since, until)``, oldest first: detected before ``until`` and not
+        ended by ``since`` (a row with no ``ended_at`` is still going). Content-free; see
+        :mod:`yuki.memory.callspans` for calls merged across service restarts."""
+        clauses, params = [], []
+        if (u := _ts(until)) is not None:
+            clauses.append("detected_at < ?")
+            params.append(u)
+        if (s := _ts(since)) is not None:
+            clauses.append("(ended_at IS NULL OR ended_at > ?)")
+            params.append(s)
+        sql = "SELECT * FROM calls" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY detected_at, id"
         return [self._call(r) for r in self._query(sql, params)]
 
     def answer_call(self, call_id: int, answer: str, *, by: str = "card", at: float | None = None) -> bool:

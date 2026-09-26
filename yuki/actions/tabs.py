@@ -7,6 +7,10 @@ action. The effect is read back (a condition poll, bounded): the tab reports
 itself selected. ``ok`` is True only then; the result names the tab, its place
 and the window's title now. A tab list that changed since the caller saw it (the
 name at that place is not the one it expected) is refused, never guessed at.
+
+:func:`tab_action` is the brain's hand (the agent's ``tab`` tool): a tab found by its
+identity (its UIA RuntimeId, :attr:`yuki.perception.tabs.Tab.tab_id`), selected or closed,
+and the strip read again afterwards so what is said about it rests on that read.
 """
 
 from __future__ import annotations
@@ -111,3 +115,153 @@ def select_tab(hwnd: int, index: int, *, expect_name: str | None = None) -> Acti
                             f"(window title now \"{title}\")")
     how = shared.get("how") or "no way to select it was accepted"
     return finish(False, f"asked {where} to show ({how}), but it is not the selected tab after {WATCH_S:g} s")
+
+
+# ---------------------------------------------------------------------------
+# The brain's tab hand: a tab by its identity (UIA RuntimeId), never its title
+# ---------------------------------------------------------------------------
+
+_P_CONTROL_TYPE = 30003
+#: Control type of a Button: a TabItem's own close control is its Button child.
+_BUTTON = 50000
+_TREE_SCOPE_CHILDREN = 2
+_TREE_SCOPE_ELEMENT = 1
+#: How long a closed tab is watched for leaving the strip (strip re-reads, a condition poll).
+CLOSE_WATCH_S = 1.5
+#: Bound on one tab action: find, act, watch, re-read the strip.
+ACTION_BUDGET_S = 4.0
+TAB_ACTIONS = ("select", "close")
+
+
+def _close_control(automation: Any, element: Any) -> Any:
+    """The TabItem's own close control: its single Button child. ``None`` unless there is exactly one."""
+    request = automation.CreateCacheRequest()
+    request.AddProperty(_P_CONTROL_TYPE)
+    request.TreeScope = _TREE_SCOPE_ELEMENT
+    try:
+        children = element.FindAllBuildCache(_TREE_SCOPE_CHILDREN, automation.ControlViewCondition, request)
+        items = [children.GetElement(i) for i in range(children.Length)]
+        buttons = [c for c in items if int(c.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0) == _BUTTON]
+    except Exception:  # noqa: BLE001 - a tab that went away mid-read
+        return None
+    return buttons[0] if len(buttons) == 1 else None
+
+
+def _invoke(element: Any, module: Any) -> bool:
+    try:
+        raw = element.GetCurrentPattern(_PATTERN_INVOKE)
+        if not raw:
+            return False
+        raw.QueryInterface(module.IUIAutomationInvokePattern).Invoke()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _rows(found: list[tuple[Any, Any]]) -> list[dict[str, Any]]:
+    return [{"index": t.index, "id": t.tab_id, "name": t.name, "selected": t.selected} for t, _e in found]
+
+
+def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
+    """Select or close the tab of ``hwnd``'s strip whose identity is ``tab_id``, then re-read the strip.
+
+    ``tab_id`` is a :attr:`yuki.perception.tabs.Tab.tab_id` from a read of the strip (the
+    TabItem's UIA RuntimeId): the tab is found by it, whatever its title or place now, and
+    one that is no longer there is reported, never replaced by another. ``select`` asks it
+    to show (as :func:`select_tab`) and watches it report itself selected; ``close`` invokes
+    its own close control (its single Button child; with none or several nothing is done)
+    and watches it leave the strip. Either way the strip is read again at the end and
+    ``details["tabs_after"]`` lists what is there now, so what is said about it rests on
+    that read. ``ok`` only when the effect was seen. Cursor and keyboard are untouched.
+    """
+    from yuki.actions.input import _Pending
+    from yuki.perception.tabs import walk_tabs
+    from yuki.perception.tree import _uia_core
+    from yuki.perception.windows import window_info
+
+    started = time.perf_counter()
+    tab_id = str(tab_id or "").strip().strip("[]").strip()
+    details: dict[str, Any] = {"hwnd": int(hwnd), "tab_id": tab_id, "action": action}
+
+    def finish(ok: bool, summary: str) -> ActionResult:
+        return ActionResult(ok=ok, summary=summary, details=details,
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0)
+
+    if action not in TAB_ACTIONS:
+        return finish(False, f"unknown tab action {action!r}: use one of {', '.join(TAB_ACTIONS)}")
+    if not tab_id:
+        return finish(False, "no tab id given: read the tabs first and pass one of their ids")
+
+    def job(automation: Any, shared: dict) -> None:
+        found, nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.25)
+        shared["count"], shared["nodes"] = len(found), nodes
+        match = next(((t, e) for t, e in found if t.tab_id and t.tab_id == tab_id), None)
+        if match is None:
+            shared["after"] = _rows(found)
+            return
+        tab, element = match
+        shared["tab"] = {"index": tab.index, "id": tab.tab_id, "name": tab.name, "was_selected": tab.selected}
+        module = _uia_core()
+        if action == "select":
+            if tab.selected:
+                shared["how"], shared["seen"] = "already showing", True
+            else:
+                shared["how"] = _select(element, module)
+                deadline = time.monotonic() + WATCH_S
+                while shared["how"] and time.monotonic() < deadline:
+                    try:
+                        if bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED)):
+                            shared["seen"] = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        break
+                    time.sleep(POLL_S)
+        else:
+            control = _close_control(automation, element)
+            if control is None:
+                shared["no_control"] = True
+            elif _invoke(control, module):
+                shared["how"] = "its close control"
+                deadline = time.monotonic() + CLOSE_WATCH_S
+                while time.monotonic() < deadline:
+                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3)
+                    if not any(t.tab_id == tab_id for t, _e in now):
+                        shared["seen"] = True
+                        break
+                    time.sleep(POLL_S)
+        after, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2)
+        shared["after"], shared["after_complete"] = _rows(after), complete
+
+    pending = _Pending(job, "yuki-tab-action", ACTION_BUDGET_S)
+    shared = pending.wait()
+    tab = shared.get("tab") or {}
+    after = list(shared.get("after") or [])
+    details.update({"count": shared.get("count"), "nodes": shared.get("nodes"), "tab": tab or None,
+                    "how": shared.get("how"), "verified": bool(shared.get("seen")), "tabs_after": after,
+                    "tabs_after_complete": bool(shared.get("after_complete", True))})
+    if shared.get("error"):
+        return finish(False, f"could not read the tabs of window {hwnd}: {shared['error']}")
+    if pending.timed_out and not tab:
+        return finish(False, f"the tabs of window {hwnd} did not answer within {ACTION_BUDGET_S:g} s")
+    if not shared.get("count"):
+        return finish(False, f"window {hwnd} shows no tabs")
+    if not tab:
+        return finish(False, f"window {hwnd} has no tab with id {tab_id} now (closed, or the strip changed); "
+                             f"nothing was done; its {len(after)} tabs now are listed below")
+    where = f"tab \"{tab['name']}\" [{tab_id}]"
+    if action == "select":
+        if not shared.get("seen"):
+            how = shared.get("how") or "no way to select it was accepted"
+            return finish(False, f"asked {where} to show ({how}), but it is not the selected tab after {WATCH_S:g} s")
+        info = window_info(int(hwnd))
+        details["title"] = info.title if info else ""
+        already = shared.get("how") == "already showing"
+        return finish(True, f"{where} is {'already' if already else 'now'} the one showing "
+                            f"(window title now \"{details['title']}\")")
+    if shared.get("no_control"):
+        return finish(False, f"{where} has no single close control of its own; nothing was closed")
+    if not shared.get("how"):
+        return finish(False, f"{where}: its close control did not accept the request; nothing was closed")
+    if not shared.get("seen"):
+        return finish(False, f"asked {where} to close, but it is still in the strip after {CLOSE_WATCH_S:g} s")
+    return finish(True, f"closed {where}; the strip, read again, has {len(after)} tabs")

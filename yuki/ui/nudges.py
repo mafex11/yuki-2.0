@@ -942,7 +942,7 @@ class NudgeController(QObject):
         self.ui_log.event(
             "nudge_replied", id=nudge.get("id"), request_id=request_id, lane=lane, text=text
         )
-        self.ack(nudge, "replied")
+        self.ack(nudge, "replied", reply=text)   # the coach reads the reply itself, not a count
 
     def reply_abandoned(self, nudge: dict[str, Any]) -> None:
         """The overlay closed before the user sent a reply to ``nudge``."""
@@ -950,14 +950,17 @@ class NudgeController(QObject):
         self.ack(nudge, "dismissed")
         self.try_show()
 
-    def ack(self, nudge: dict[str, Any], reaction: str) -> threading.Thread:
-        """``ack_nudge(id, reaction)`` off the GUI thread; logs ``nudge_ack``."""
+    def ack(self, nudge: dict[str, Any], reaction: str, *, reply: str | None = None) -> threading.Thread:
+        """``ack_nudge(id, reaction)`` off the GUI thread; logs ``nudge_ack``. ``reply``: what the user wrote back."""
         nudge_id = nudge.get("id")
         self._set_reaction(nudge_id, reaction)
 
         def work() -> None:
             try:
-                self.memory.ack_nudge(nudge_id, reaction)
+                if reply:
+                    self.memory.ack_nudge(nudge_id, reaction, reply=reply)
+                else:
+                    self.memory.ack_nudge(nudge_id, reaction)
                 self._logged.emit("nudge_ack", {"id": nudge_id, "reaction": reaction, "ok": True})
             except (MemoryUnavailable, ValueError) as exc:
                 self._logged.emit(

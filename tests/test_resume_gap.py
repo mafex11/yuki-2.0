@@ -153,9 +153,11 @@ class StubClient:
         name = request["tool_choice"]["name"]
         self.calls.append(name)
         if name == "welcome_back":
-            data = {"reason": "stub", "say": "resume", "text": "Morning, you were on the resume fix.", "mentions": []}
+            data = {"reason": "stub", "say": "resume", "detail": "the resume fix", "evidence": ["NOW"],
+                    "text": "Morning, you were on the resume fix.", "mentions": []}
         elif name == "coach_decision":
-            data = {"reason": "stub", "say": "none", "is_break_suggestion": False, "text": None, "mentions": []}
+            data = {"reason": "stub", "say": "none", "is_break_suggestion": False, "detail": "", "evidence": [],
+                    "mentions": []}
         else:
             data = {"reason": "stub", "say": "none", "text": None}
         block = SimpleNamespace(type="tool_use", name=name, input=data)

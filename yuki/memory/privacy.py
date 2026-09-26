@@ -33,7 +33,10 @@ _INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff"
 
 
 def user_config_path() -> Path:
-    """``%LOCALAPPDATA%\\Yuki\\memory\\privacy.toml``."""
+    """``%LOCALAPPDATA%\\Yuki\\memory\\privacy.toml`` (under ``%YUKI_MEMORY_DIR%`` when that is set)."""
+    override = os.environ.get("YUKI_MEMORY_DIR")
+    if override:
+        return Path(override) / "privacy.toml"
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "Yuki" / "memory" / "privacy.toml"
 

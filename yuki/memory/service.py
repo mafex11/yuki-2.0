@@ -712,12 +712,17 @@ def _follow_acting(
     from yuki.memory import acting as _acting
 
     current_token: str | None = None
+    leaked: set[str] = set()
     while not stop.is_set():
         event.wait(2.0)
         if stop.is_set():
             break
         try:
             now = _acting.current(db_path)
+            for entry in _acting.stale(db_path):   # an end that never came: ignored, and said once
+                if entry["token"] not in leaked:
+                    leaked.add(entry["token"])
+                    log("acting_leak", lane=entry["lane"], age_s=entry["age_s"])
         except Exception:
             now = None
         token = now.token if now is not None else None

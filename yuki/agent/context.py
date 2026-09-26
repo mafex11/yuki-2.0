@@ -789,7 +789,7 @@ class ContextManager:
         if name == "look_at_desktop":
             return _DESKTOP_KEY
         tool_input = self._tool_inputs.get(tool_use_id, {})
-        if name in ("look_at_window", "read_page"):
+        if name in ("look_at_window", "read_page", "read_tabs"):
             hwnd = tool_input.get("hwnd")
             try:
                 hwnd = int(hwnd)

@@ -203,24 +203,41 @@ entropy_min_length = 24
 entropy_min_bits = 3.5
 
 [nudges]
-# The coach (yuki.memory.nudges): short check-ins while you are at the PC -
-# praise, a nudge back to what you were doing, a break suggestion - and
-# reminders of to-dos that are due.  What to say is the model's call; these
-# are only when it may speak.  (Not privacy rules, but they live here so all
+# The coach (yuki.memory.nudges): a well-timed break nudge after a long session,
+# rarely a call-back when work has turned into something else for a while, one
+# welcome back when you return, and reminders of to-dos that are due.  No praise.
+# What to say is the model's call; these are only when it may speak.  (Not privacy rules, but they live here so all
 # of memory's knobs are in one file.)  A missing key keeps its default.
 enabled = true
 # Local quiet hours: nothing at all between these times (wraps midnight).
 quiet_start = "00:30"
 quiet_end = "08:00"
-# At most one praise or nudge per this many minutes (reminders are exempt).
+# At most one nudge or welcome back per this many minutes (reminders are exempt).
 budget_min = 30
-# After a nudge, this many later switches of activity may still get a short
-# acknowledgement ("good, keep going") inside the budget - never a second nudge.
-follow_ups = 2
-# A routine look this often while you are at the PC (the coach also looks
-# when you switch to something new and stay on it for transition_hold_s).
+# A routine look this often while you are at the PC (the coach also looks when a
+# long session gives way to another, when something you finished lands in the
+# journal, and at the first calm moment after a game).  The welcome back waits
+# until you have settled into something for transition_hold_s.
 periodic_min = 15
 transition_hold_s = 90
+# Sessions: a hop to another app shorter than this stays part of the session it
+# interrupts (an hour of a game with 3-5 minute hops to a chat is one session).
+session_excursion_min = 5
+# No look at all before you have been at the PC this long; a break nudge goes at
+# most once per session and break_gap_min apart.
+break_consider_min = 45
+break_gap_min = 60
+# A call-back only once a new session has held this long, with journal facts about it.
+callback_after_min = 15
+# Cards (nudges, the welcome back, questions, a call plan's reminder offer) at
+# least this far apart; a to-do due at an exact time is reminded on time.
+card_gap_min = 10
+# A plan you said on a call is offered as a reminder only while its moment is at
+# least this far ahead.
+confirm_lead_min = 30
+# After a meeting, it is held open while its app still plays sound (Meet drops
+# the microphone on mute), for at most this many minutes after the microphone.
+meeting_hold_min = 30
 # Model calls at least this far apart, and at most this many per hour.
 min_gap_s = 90
 max_calls_per_hour = 12
@@ -250,7 +267,8 @@ resume_before_min = 90
 # guessing (who someone is to you, what a name is, whose task something is), it
 # asks you on a "Getting to know you" card instead - the most important first, at
 # a calm moment (not in a call, a meeting, full screen, quiet hours or a snooze),
-# at most one per question_gap_min minutes and questions_per_day a day, only of
+# at most one per question_gap_min minutes of your time at the PC (counted from
+# the last question or from when you sat down) and questions_per_day a day, only of
 # importance question_min_importance (1-10) or more, and only about what memory
 # saw in the last question_max_age_days days.
 questions_enabled = true
@@ -356,10 +374,14 @@ pause_s = 0.7
 # GPU averaged at or under defer_gpu_max_util % (no sample over defer_gpu_spike_util)
 # and kept defer_vram_free_mb free
 # (VRAM counts: a game left open holds it even when idle), and the CPU stayed
-# under defer_cpu_max_percent on average; and you are away (no input for defer_idle_min
-# minutes, or the session is locked) or it is night (defer_night, local time).
-# It stops after the chunk in hand when you come back (input within
-# defer_back_idle_s; not at night), a call or a game starts, or memory is paused.
+# under defer_cpu_max_percent on average. Then it runs if you are away (no input for
+# defer_idle_min minutes, or the session is locked), if it is night (defer_night,
+# local time), or, with defer_when_present, while you are at the PC ("process it when
+# no GPU is being used"). It stops after the chunk in hand when a call or a game starts
+# (full screen, or other programs using more than defer_gpu_others_max_util % of the GPU
+# on average over defer_others_window_s, or leaving under defer_vram_min_free_running_mb
+# of VRAM), or memory is paused. Without defer_when_present it also stops when you come
+# back (input within defer_back_idle_s; not at night); with it, it carries on.
 defer_check_s = 60
 defer_idle_min = 5
 defer_night = ["01:00", "07:00"]
@@ -367,8 +389,12 @@ defer_gpu_max_util = 25      # average % over the quiet window (the desktop alon
 defer_gpu_spike_util = 60    # and no single sample above this
 defer_gpu_quiet_min = 3
 defer_vram_free_mb = 2500
-defer_cpu_max_percent = 40
+defer_cpu_max_percent = 75   # average %; the worker is on the GPU at below-normal priority
 defer_back_idle_s = 20
+defer_when_present = true
+defer_gpu_others_max_util = 25
+defer_others_window_s = 30
+defer_vram_min_free_running_mb = 300
 # Audio never waits longer than this (days), and the spool never grows past
 # this (MB, ~11 MB per hour of speech); past either the oldest is deleted.
 spool_max_age_days = 7

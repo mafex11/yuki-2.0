@@ -85,7 +85,7 @@ RESUME_LABEL = (
 #: Budget guards on those two sections. Memory promises about 1200 and 4000
 #: characters; these only stop a misbehaving memory from flooding a request,
 #: and a cut is logged.
-STANDING_MAX_CHARS = 1600
+STANDING_MAX_CHARS = 2400
 RESUME_MAX_CHARS = 4500
 
 #: Most open to-dos attached to one request, and the longest line of one.
@@ -176,6 +176,8 @@ class MemoryContext:
     standing: str | None = None
     resume: str | None = None
     todos: list[dict[str, Any]] = field(default_factory=list)
+    #: When the user's day at the PC began (``MemoryClient.day_context``), for "this morning" / "today".
+    day: str | None = None
     truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
@@ -620,6 +622,12 @@ class MemoryAccess:
                 except MemoryUnavailable as exc:
                     if "todos" not in self._absent:
                         result.error = result.error or str(exc)
+            if "day_context" not in self._absent:
+                try:
+                    value = self.call_method("day_context", timeout_s=max(deadline - time.perf_counter(), 0.05))
+                    result.day = value.strip() if isinstance(value, str) and value.strip() else None
+                except MemoryUnavailable:
+                    pass
             if resume and "resume_context" not in self._absent:
                 try:
                     result.resume = self.resume(
@@ -691,8 +699,9 @@ class MemoryAccess:
         rows = self.call_method("pending_nudges", timeout_s=timeout_s)
         return [dict(row) for row in (rows or []) if isinstance(row, dict)]
 
-    def ack_nudge(self, nudge_id: Any, reaction: str, *, timeout_s: float = TRAY_TIMEOUT_S) -> Any:
-        """``MemoryClient.ack_nudge``.
+    def ack_nudge(self, nudge_id: Any, reaction: str, *, reply: str | None = None,
+                  timeout_s: float = TRAY_TIMEOUT_S) -> Any:
+        """``MemoryClient.ack_nudge`` (``reply``: with ``replied``, what the user wrote back on the card).
 
         Raises:
             ValueError: ``reaction`` is not one of :data:`NUDGE_REACTIONS`.
@@ -700,6 +709,12 @@ class MemoryAccess:
         """
         if reaction not in NUDGE_REACTIONS:
             raise ValueError(f"reaction must be one of {', '.join(NUDGE_REACTIONS)}, got {reaction!r}")
+        if reply:
+            try:
+                return self.call_method("ack_nudge", nudge_id, reaction, reply=reply, timeout_s=timeout_s)
+            except MemoryUnavailable as exc:
+                if not isinstance(exc.__cause__, TypeError):   # an older memory without reply: ack without it
+                    raise
         return self.call_method("ack_nudge", nudge_id, reaction, timeout_s=timeout_s)
 
     def snooze_nudges(self, minutes: int, *, timeout_s: float = TRAY_TIMEOUT_S) -> Any:
@@ -1055,7 +1070,8 @@ def memory_block_text(
     ):
         return None
     now = now or datetime.now()
-    parts = [f"Now: {now.strftime('%A %d %B %Y, %H:%M')} local time."]
+    parts = [f"Now: {now.strftime('%A %d %B %Y, %H:%M')} local time."
+             + (f" {' '.join(context.day.split())}" if context.day else "")]
     if context.portrait:
         if repeated_turn is not None:
             parts.append(
@@ -1124,6 +1140,7 @@ def commitments_block_text(commitments: str | None) -> str | None:
 TODO_SOURCES = {
     "loop": "open loop memory noticed",
     "commitment": "Yuki promised",
+    "call": "the user said it on a call: their own plan",
     "user": "the user added",
 }
 
@@ -1292,10 +1309,12 @@ def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> st
             if item.get("longest_s") else "longest -"
         )
         line = (
-            f"- {item.get('label')}{where}: {_duration(item.get('present_s'))} "
+            f"- {item.get('label')}{where}: in front {_duration(item.get('present_s'))} "
             f"(active {_duration(item.get('active_s'))}{'; ' + ', '.join(extra) if extra else ''}), "
             f"{visits} visit{'' if visits == 1 else 's'}, {longest}"
         )
+        if (item.get("call_s") or 0) >= 60:
+            line += f"; in a call {_duration(item['call_s'])} (in front or not)"
         titles = [t for t in item.get("titles") or [] if t.get("title")]
         if titles and group_by != "page":
             line += "; " + "; ".join(f"\"{' '.join(t['title'].split())[:80]}\" {_duration(t.get('present_s'))}"
@@ -1303,9 +1322,7 @@ def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> st
         lines.append(line)
     for pair in usage.get("interleaving") or []:
         lines.append(f"Back and forth: {pair.get('a')} <-> {pair.get('b')}, {pair.get('switches')} switches.")
-    media = usage.get("background_media") or []
-    if media:
-        lines.append("Background media: " + ", ".join(f"{m.get('app')} {_duration(m.get('seconds'))}" for m in media))
+    lines += _calls_lines(usage)
     lines += power_lines
     if episodes:
         lines.append("Episodes:")
@@ -1318,6 +1335,42 @@ def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> st
     else:
         lines.append("No episodes written for this time yet (they are written hourly and at breaks).")
     return "\n".join(lines)
+
+
+def _calls_lines(usage: dict[str, Any]) -> list[str]:
+    """Meetings, calls and background use of an ``activity`` result, as lines (none when there are none).
+
+    Time "in" an app can be three things, reported apart: its window in front (the items),
+    a call or meeting in it (in front or not), and playing in the background.
+    """
+    lines: list[str] = []
+    meetings = [m for m in usage.get("meetings") or [] if isinstance(m, dict)]
+    if meetings:
+        lines.append("Meetings (the meeting app in front, using the microphone):")
+        for m in meetings[:8]:
+            where = m.get("label") or "?"
+            if m.get("app") and m.get("app") != where:
+                where += f" in {m['app']}"
+            line = f"- {where} {_clock(m.get('start'))}-{_clock(m.get('end'))}, in front {_duration(m.get('in_front_s'))}"
+            if (m.get("mic_s") or 0) >= 30:
+                line += f", microphone on {_duration(m['mic_s'])}"
+            lines.append(line)
+    calls = [c for c in usage.get("calls") or [] if isinstance(c, dict)]
+    if calls:
+        lines.append("Calls (an app using the microphone, in front or not; start and end even outside this time):")
+        for c in calls[:8]:
+            text = " ".join(str(c.get("text") or "").split())
+            if not text:
+                end = "still going" if c.get("ongoing") else _when(c.get("end"))
+                text = f"{c.get('app')} call from {_when(c.get('start'))} to {end}: {_duration(c.get('seconds'))}"
+            lines.append(f"- {text}")
+    parts = [f"{m.get('app')} playing {_duration(m.get('seconds'))}" for m in usage.get("background_media") or []
+             if isinstance(m, dict)]
+    parts += [f"{b.get('app')} in a call {_duration(b.get('seconds'))}" for b in usage.get("background") or []
+              if isinstance(b, dict)]
+    if parts:
+        lines.append("Background (while other apps were in front): " + ", ".join(parts) + ".")
+    return lines
 
 
 def _when(value: Any) -> str:

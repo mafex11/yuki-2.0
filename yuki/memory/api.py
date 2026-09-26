@@ -101,6 +101,11 @@ KNOWHOW_DUPLICATE_COSINE = 0.85
 RULE_DUPLICATE_COSINE = 0.85
 #: Hard budgets (characters, ~4 per token) of the blocks Yuki attaches to requests.
 STANDING_CONTEXT_CHARS = 1_200
+#: The coach's state in the standing context (its own budget, after the capped part).
+COACH_CONTEXT_CHARS = 600
+#: The coach's state is shown when it looked this many times in the last COACH_QUIET_S and said nothing.
+COACH_QUIET_S = 3 * 3600.0
+COACH_QUIET_LOOKS = 4
 RESUME_CONTEXT_CHARS = 4_000
 RESUME_EXCHANGES = 6
 #: Reciprocal-rank-fusion constant for merging vector and keyword hits.
@@ -627,10 +632,11 @@ class MemoryClient:
         if text is None and quote is None:
             return None
         # the id forget_rule takes: the model picks the rule, no words are matched (no-pattern audit F)
+        ident = f"feedback:{f.id}" if f.kind == "feedback" else f"rule:{f.id}"
         if text is None or (quote and normalize_quote(quote) == normalize_quote(text)):
-            return f'- [rule:{f.id}] "{quote}" (the user\'s words, {_day(f.valid_from)})'
+            return f'- [{ident}] "{quote}" (the user\'s words, {_day(f.valid_from)})'
         words = f' Their words: "{quote}"' if quote else ""
-        return f"- [rule:{f.id}] {text}{words} ({_day(f.valid_from)})"
+        return f"- [{ident}] {text}{words} ({_day(f.valid_from)})"
 
     def standing_context(self) -> str:
         """The user's active rules and preferences for Yuki, and Yuki's open commitments, as one block.
@@ -646,6 +652,7 @@ class MemoryClient:
         """
         try:
             facts = self.store.conversation_facts(STANDING_KINDS)
+            cards = {f.id: self.store.fact_card(f) for f in facts if f.kind in ("preference", "feedback")}
             items = [(f, line) for f in facts if (line := self._standing_line(f))]
         except Exception:
             return ""
@@ -654,14 +661,18 @@ class MemoryClient:
             "preference": "The user's preferences about how Yuki talks or works:",
             "commitment": "Open commitments (what Yuki is to do later):",
             "call": "What the user said they would do, in calls (their own words):",
+            "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
+                      "everything; forget_rule takes these ids too):"),
         }
 
         def group(f: ConversationFact) -> str:
+            if f.kind == "feedback" or (f.kind == "preference" and cards.get(f.id) is not None):
+                return "coach"
             return "call" if f.kind == "commitment" and f.origin == "call" else f.kind
 
         def render(chosen: list[tuple[ConversationFact, str]]) -> str:
             lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
-            for kind in ("rule", "preference", "commitment", "call"):
+            for kind in ("rule", "preference", "coach", "commitment", "call"):
                 rows = [line for f, line in chosen if group(f) == kind]
                 if rows:
                     lines += [headings[kind], *rows]
@@ -671,13 +682,18 @@ class MemoryClient:
         # own call commitments, then Yuki's, then preferences; rules go only when nothing
         # else is left. Oldest first within each. (Call commitments once pushed "call me
         # captain" out of every request.)
-        drop_order = {"call": 0, "commitment": 1, "preference": 2, "rule": 3}
+        drop_order = {"call": 0, "commitment": 1, "preference": 2, "coach": 3, "rule": 4}
         kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
         while kept and len(render(kept)) > STANDING_CONTEXT_CHARS:
             victim = min(kept, key=lambda item: (drop_order.get(group(item[0]), 0),
                                                  item[0].valid_from, item[0].id))
             kept.remove(victim)
-        return render(kept) if kept else ""
+        text = render(kept) if kept else ""
+        coach = self.coach_context()
+        if coach:   # its own budget: why the coach is quiet is not a rule and never pushes one out
+            text = (text + "\n" if text else "[Standing rules and open commitments, from Yuki's conversations "
+                    "with the user]\n") + coach
+        return text
 
     def resume_context(self, within_hours: float = 6.0) -> str | None:
         """Where the latest conversation left off, when it ended within ``within_hours``; else ``None``.
@@ -805,11 +821,11 @@ class MemoryClient:
         (:meth:`rerender_portrait`).
         """
         prefix, sep, number = str(ref or "").strip().strip("[]").strip().rpartition(":")
-        if (sep and prefix.strip() != "rule") or not number.strip().isdigit():
+        if (sep and prefix.strip() not in ("rule", "feedback")) or not number.strip().isdigit():
             return 0
         wanted = int(number)
         try:
-            candidates = self.store.conversation_facts(("rule", "preference"))
+            candidates = self.store.conversation_facts(("rule", "preference", "feedback"))
         except Exception:
             return 0
         target: ConversationFact | None = next((f for f in candidates if f.id == wanted), None)
@@ -854,7 +870,19 @@ class MemoryClient:
                         "titles": [{"title", "present_s"}]}],      # most time first, at most ``limit``
              "interleaving": [{"a", "b", "switches"}],             # back and forth between two activities
              "background_media": [{"app", "seconds"}],
+             "meetings": [{"label", "app", "host", "start", "end", "seconds", "in_front_s", "mic_s", ...}],
+             "calls": [{"app", "process", "start", "end", "ongoing", "seconds", "window_s", "in_front_s",
+                        "background_s", "meanwhile", "drops", "power", "text", ...}],
+             "background": [{"app", "kind": "call", "seconds"}],   # in a call while not in front
              "power": [{"kind": "off" | "asleep" | "unknown", "start", "end", "seconds", "source"}]}
+
+        ``calls`` (yuki.memory.callspans): every call overlapping the window - an
+        app using the microphone, in front or not - merged across memory-service
+        restarts and short drops, with its real start and end even outside the
+        window (``window_s`` is the part inside it), the time its app was in front
+        and what else was in front meanwhile; ``text`` is one plain line for it.
+        The item of a call's app gets ``call_s`` (call time inside the window);
+        ``background`` is call time its app spent behind other windows.
 
         ``power`` (and ``totals.off_s`` / ``asleep_s`` / ``unknown_s``) is the
         PC's own history from Windows (yuki.memory.power): shut down, asleep, or
@@ -873,17 +901,71 @@ class MemoryClient:
         if group_by not in ("app", "site", "page"):
             raise ValueError(f"group_by must be 'app', 'site' or 'page', not {group_by!r}")
         s, u = self._window(since, until)
-        agg = aggregate(self.store.timeline_between(s, u), s, u, group_by, limit=max(1, int(limit)))
+        rows = self.store.timeline_between(s, u)
+        agg = aggregate(rows, s, u, group_by, limit=max(1, int(limit)))
         agg["since"], agg["until"] = _iso(s), _iso(u)
         totals = agg["totals"]
         totals["first_at"], totals["last_at"] = _iso(totals["first_at"]), _iso(totals["last_at"])
+        self._add_calls(agg, rows, s, u, group_by)
         for item in agg["items"]:
             item.pop("key", None)
             for k in ("longest_start", "longest_end", "first_at", "last_at"):
                 item[k] = _iso(item[k])
         for span in agg.get("power", []):
             span["start"], span["end"] = _iso(span["start"]), _iso(span["end"])
+        for span in agg.get("meetings", []):
+            span["start"], span["end"] = _iso(span["start"]), _iso(span["end"])
         return agg
+
+    def _add_calls(self, agg: dict, rows: list, since: float, until: float, group_by: str) -> None:
+        """``calls``, ``background`` and the items' ``call_s`` (yuki.memory.callspans); never raises."""
+        from collections import Counter
+
+        from yuki.memory.callspans import call_spans, describe_call
+        from yuki.memory.timeline import group_of
+
+        agg["calls"], agg["background"] = [], []
+        try:
+            now = time.time()
+            spans = call_spans(self.store, since, until, now=now)
+        except Exception:
+            return
+        by_process: dict[str, list[dict]] = {}
+        background: dict[str, float] = {}
+        for sp in spans:
+            by_process.setdefault(sp["process"], []).append(sp)
+            background[sp["app"]] = background.get(sp["app"], 0.0) + sp["window_background_s"]
+            call = dict(sp, text=describe_call(sp, now=now, window=True))
+            call["start"], call["end"] = _iso(sp["start"]), _iso(sp["end"])
+            for part in (*call["drops"], *call["power"]):
+                part["start"], part["end"] = _iso(part["start"]), _iso(part["end"])
+            agg["calls"].append(call)
+        agg["background"] = [{"app": a, "kind": "call", "seconds": round(v, 1)}
+                             for a, v in sorted(background.items(), key=lambda kv: -kv[1]) if v >= 60]
+        # the item a call's app is counted under at this grouping: where its own rows spent most time
+        # during its calls (Discord's own window; for a call in a browser tab, its meeting rows)
+        for process, calls in by_process.items():
+            call_s = sum(sp["window_s"] for sp in calls)
+            keys: Counter = Counter()
+            for r in rows:
+                if r.state == "present" and (r.process or app_key(r.app)) == process and any(
+                        r.ended_at > sp["start"] and r.started_at < sp["end"] for sp in calls):
+                    keys[group_of(r, group_by)[0]] += (r.active_s or 0.0) + (r.passive_s or 0.0) + 1.0
+            for key, _ in keys.most_common():
+                item = next((i for i in agg["items"] if i.get("key") == key), None)
+                if item is not None:
+                    item["call_s"] = round(item.get("call_s", 0.0) + call_s, 1)
+                    break
+
+    def current_calls(self) -> list[dict]:
+        """The calls going on now (an app using the microphone, merged across memory-service restarts):
+        ``[{"app", "process", "service", "since": ISO, "seconds"}]``, oldest first. Never raises."""
+        from yuki.memory.callspans import open_calls
+
+        try:
+            return [dict(c, since=_iso(c["since"])) for c in open_calls(self.store)]
+        except Exception:
+            return []
 
     def episodes(self, since=None, until=None, limit: int = 50) -> list[dict]:
         """Episodes overlapping ``[since, until)`` (default today), oldest first.
@@ -1095,7 +1177,7 @@ class MemoryClient:
         except Exception:
             return []
 
-    def ack_nudge(self, nudge_id: int, reaction: str) -> None:
+    def ack_nudge(self, nudge_id: int, reaction: str, reply: str | None = None) -> None:
         """Record what happened to a nudge: ``"shown"`` | ``"dismissed"`` | ``"replied"`` | ``"snoozed"``.
 
         ``shown`` when it appears on screen (it leaves :meth:`pending_nudges`);
@@ -1107,7 +1189,8 @@ class MemoryClient:
         gets their counts for its Relationship section. Raises ``ValueError``
         for another reaction; an unknown id is ignored.
         """
-        self.store.react_to_nudge(int(nudge_id), str(reaction))
+        words = secret_filter.redact_text(reply) if reply else None
+        self.store.react_to_nudge(int(nudge_id), str(reaction), reply=words)
 
     def snooze_nudges(self, minutes: int) -> None:
         """No check-ins and no reminders for ``minutes`` from now (a due reminder waits, it is not lost);
@@ -1139,6 +1222,83 @@ class MemoryClient:
         except Exception:
             pass
         return out
+
+    def coach_context(self, now: float | None = None) -> str:
+        """Why Yuki's coach is quiet or what shapes it, as a few lines for the agent; ``""`` when unremarkable.
+
+        Content-free counts plus the coach's own one-line reasons (``nudge_checkins``,
+        encrypted): the last card, how many looks said nothing since, and the latest
+        reasons - so "no messages from you, what happened?" gets the real answer (on
+        2026-09-25 the answer was a one-word reply read as a rule). Only when the coach
+        has been silent through several looks in the last hours, or has not run at all
+        while the user was around. Hard cap :data:`COACH_CONTEXT_CHARS`.
+        """
+        now = time.time() if now is None else float(now)
+        try:
+            since = now - COACH_QUIET_S
+            checks = [c for c in self.store.checkin_reasons(since, limit=60)
+                      if c["trigger"] not in ("reminder", "review", "question", "confirm", "resume")]
+            last = self.store.nudges(until=now + 1.0, kinds=("praise", "nudge", "resume", "reminder", "question"),
+                                     limit=1)
+            quiet = self.store.nudge_state("quiet_until")
+        except Exception:
+            return ""
+        lines: list[str] = []
+        if quiet is not None:
+            try:
+                if float(quiet) > now:
+                    lines.append(f"- The coach is snoozed until {datetime.fromtimestamp(float(quiet)):%H:%M}.")
+            except ValueError:
+                pass
+        silent = [c for c in checks if (c["outcome"] == "none" or c["outcome"].startswith(("suppressed", "skipped")))
+                  and (not last or c["at"] > last[-1].at)]   # the looks since the last card that said nothing
+        if len(silent) >= COACH_QUIET_LOOKS:
+            when = (f"the last card was {last[-1].kind} at {datetime.fromtimestamp(last[-1].at):%a %H:%M}" if last
+                    else "no card yet")
+            said = [c for c in silent if c["reason"]][-3:]
+            lines.append(f"- The coach looked {len(silent)} times in the last {COACH_QUIET_S / 3600:.0f} h and said "
+                         f"nothing ({when})" + (". Its latest reasons:" if said else "."))
+            for c in said:
+                lines.append(f"  - {datetime.fromtimestamp(c['at']):%H:%M} {_clip_sentences(c['reason'], 220) or ''}")
+        if not lines:
+            return ""
+        head = "Yuki's coach (the cards it puts on screen by itself) right now:"
+        text = "\n".join([head, *lines])
+        while len(text) > COACH_CONTEXT_CHARS and len(lines) > 1:
+            lines.pop()
+            text = "\n".join([head, *lines])
+        return text[:COACH_CONTEXT_CHARS]
+
+    def day_context(self, now: float | None = None) -> str | None:
+        """When the user's day at the PC began: the end of their last long break (``None`` when unknown).
+
+        "This morning" and "today" mean since they sat down, not since midnight (on
+        2026-09-25 "how have I been doing since this morning?" counted the 00:00-05:00
+        VALORANT night as morning). Measured by the welcome back's own rule
+        (:func:`yuki.memory.nudges.presence_sessions`: the first settled stretch after a
+        break of ``resume_after_h``); the model decides what their words mean.
+        """
+        now = time.time() if now is None else float(now)
+        try:
+            from yuki.memory.nudges import NudgeConfig, presence_sessions
+            from yuki.memory.timeline import _clip, format_duration
+
+            cfg = NudgeConfig()
+            since = now - 36 * 3600.0
+            clips = _clip([r for r in self.store.timeline_states(since, now) if not r.by_yuki], since, now)
+            sessions = [x for x in presence_sessions(clips, cfg) if x.settled]
+            start, gap = None, 0.0
+            for i, x in enumerate(sessions):
+                g = x.start - (sessions[i - 1].end if i else since)
+                if g >= cfg.resume_after_h * 3600.0:
+                    start, gap = x.start, g
+        except Exception:
+            return None
+        if start is None:
+            return None
+        day = datetime.fromtimestamp(start)
+        return (f"The user's day at the PC began {day:%A %H:%M}, after {format_duration(gap)} away; \"this morning\" "
+                f"and \"today\" in their words mean since then, not since midnight.")
 
     # -- the weekly review (yuki.memory.review) --------------------------------
 

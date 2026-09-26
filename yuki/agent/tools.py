@@ -33,7 +33,8 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: hygiene (:mod:`yuki.agent.context`) to decide what may be stubbed once stale.
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
-    {"look_at_desktop", "look_at_window", "read_page", "take_screenshot", "system_facts", "recall", "activity"}
+    {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
+     "activity"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -142,6 +143,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "web-based app window, including parts scrolled out of view, with its "
             "title and address. Use it to read, summarise or find information on a "
             "page; use look_at_window when you need elements to click or type into."
+        ),
+        "input_schema": _obj(
+            {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
+            ["hwnd"],
+        ),
+    },
+    {
+        "name": "read_tabs",
+        "label": "Reading the tabs",
+        "description": (
+            "List a window's own tabs (a browser's tab strip), left to right: each tab's id, "
+            "its full name and which one is showing. Tabs are identified by that id, not by "
+            "their title: the tab tool takes it."
         ),
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
@@ -377,6 +391,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "tab",
+        "label": "Switching tab",
+        "description": (
+            "Show or close one tab of a window's tab strip, by the tab's id from "
+            "read_tabs (never by its title: a tab that is no longer there is reported, "
+            "not swapped for another). The result says whether the effect was seen and "
+            "lists the tabs the strip has after it, read again."
+        ),
+        "input_schema": _obj(
+            {
+                "hwnd": {"type": "integer", "description": "The window whose tab it is."},
+                "tab": {"type": "string", "description": "The tab's id, as read_tabs lists it in brackets."},
+                "action": {
+                    "type": "string",
+                    "enum": ["select", "close"],
+                    "description": "select: make it the tab showing. close: close it.",
+                },
+            },
+            ["hwnd", "tab", "action"],
+        ),
+    },
+    {
         "name": "note_to_self",
         "label": "Making a note",
         "description": (
@@ -550,13 +586,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "forget_rule",
         "label": "Dropping that rule",
-        "description": "Drop a standing instruction the user has withdrawn.",
+        "description": "Drop a standing instruction, preference or piece of coach feedback the user has withdrawn.",
         "input_schema": _obj(
             {
                 "text": {
                     "type": "string",
-                    "description": "The id of the rule they withdrew, exactly as the standing "
-                    "rules list shows it in brackets, e.g. rule:12.",
+                    "description": "The id of the rule, preference or coach feedback they withdrew, "
+                    "exactly as the standing block shows it in brackets, e.g. rule:12 or feedback:7.",
                 }
             },
             ["text"],
@@ -569,7 +605,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "How the user spent their time: time per app, site or page, visits, "
             "longest stretches, away time, and episode summaries of what they were "
             "doing. Use it whenever they ask what they did or how long: the window "
-            "in front says nothing about whether they were actually at the PC."
+            "in front says nothing about whether they were actually at the PC. Time in "
+            "an app is reported three ways, apart: its window in front, calls in it "
+            "(an app using the microphone, in front or not, with the call's real start "
+            "and end), and background use."
         ),
         "input_schema": _obj(
             {
@@ -578,7 +617,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "description": "Earliest local date or date-time, ISO format, e.g. "
                     "2026-09-20 or 2026-09-20T18:00. Default: the start of today. Set it "
                     "to cover what they mean: a session still going at 00:30 began "
-                    "yesterday, so a question about it needs a since before midnight.",
+                    "yesterday, so a question about it needs a since before midnight; "
+                    "\"this morning\" or \"today\" starts when their day at the PC began, "
+                    "as the memory block says.",
                 },
                 "until": {
                     "type": "string",
@@ -664,6 +705,7 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "scroll",
     "run_powershell",
     "open_url",
+    "tab",
 )
 
 for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each action's schema
@@ -675,7 +717,7 @@ for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional field on each act
 #: ``run_powershell`` is not here: it acts on the system, not on a window. A list
 #: of names for plumbing, not a rule about what the model should do.
 AUTO_VIEW_TOOLS: frozenset[str] = frozenset(
-    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll"}
+    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab"}
 )
 
 #: How long a window's element count and covered area must hold still before the
@@ -956,6 +998,10 @@ class Backend(Protocol):
     # Optional (the voice's hands, yuki.voice.hands): minimize / maximize / restore / close /
     # focus one window, verified. A backend without it simply has no such hand.
     def window_action(self, hwnd: int, action: str) -> Any: ...  # pragma: no cover - protocol only
+    # Optional (the brain's read_tabs and tab tools): a window's own tab strip (a TabStrip whose
+    # tabs carry their UIA RuntimeId as tab_id), and one tab selected or closed by that id.
+    def read_tabs(self, hwnd: int, *, budget_s: float = 0.2) -> Any: ...  # pragma: no cover - protocol only
+    def tab(self, hwnd: int, tab_id: str, action: str) -> Any: ...  # pragma: no cover - protocol only
 
     # Optional, and not part of the architecture contract: a backend without it
     # simply never gets pre-warmed. See :meth:`Dispatcher.prewarm_shell`.
@@ -1043,6 +1089,13 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.actions.tabs").select_tab(hwnd, index, expect_name=expect_name)
+
+    def tab(self, hwnd: int, tab_id: str, action: str) -> Any:
+        """:func:`yuki.actions.tabs.tab_action`: the brain's ``tab`` tool. Named as the tool, like every
+        action, so a look-only backend (``HandsBlockedBackend``) refuses it by that name."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.tabs").tab_action(hwnd, tab_id, action)
 
     def master_volume(self) -> dict[str, Any] | None:
         """:func:`yuki.perception.audio.master_volume`: the output volume, read-only."""
@@ -1957,6 +2010,61 @@ class Dispatcher:
         if app and app.strip():
             return self._from_action("open_url", self.backend.open_url(url, app=app))
         return self._from_action("open_url", self.backend.open_url(url))
+
+    # -- tabs --------------------------------------------------------------
+
+    #: Budget of the brain's strip read (the voice's own read keeps its 0.2 s).
+    TABS_READ_S = 1.0
+
+    def _do_read_tabs(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """A window's tab strip with each tab's id (its UIA RuntimeId), full name and place. A look."""
+        hwnd = self._need_int(tool_input, "hwnd")
+        read = getattr(self.backend, "read_tabs", None)
+        if not callable(read):
+            raise ToolError("this backend cannot read a window's tabs")
+        from yuki.perception.tabs import format_tabs
+
+        started = time.perf_counter()
+        strip = read(hwnd, budget_s=self.TABS_READ_S)
+        payload = _plain(strip)
+        tabs = list(getattr(strip, "tabs", None) or [])
+        error = getattr(strip, "error", None)
+        ok = bool(tabs) or not error
+        summary = (f"{len(tabs)} tab{'' if len(tabs) == 1 else 's'}" if tabs
+                   else (f"could not read the tabs: {error}" if error else "no tabs"))
+        return ToolOutcome(
+            name="read_tabs",
+            ok=ok,
+            summary=summary,
+            content=[{"type": "text", "text": format_tabs(strip)}],
+            payload=payload if isinstance(payload, dict) else {"result": payload},
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _do_tab(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """Select or close one tab by its id; the result carries the strip as read again after it."""
+        hwnd = self._need_int(tool_input, "hwnd")
+        tab_id = self._need_str(tool_input, "tab").strip().strip("[]").strip()
+        action = self._need_str(tool_input, "action")
+        if action not in ("select", "close"):
+            raise ToolError(f"'action' must be select or close, got {action!r}")
+        act = getattr(self.backend, "tab", None)
+        if not callable(act):
+            raise ToolError("this backend cannot act on a window's tabs")
+        result = act(hwnd, tab_id, action)
+        outcome = self._from_action("tab", result)
+        details = getattr(result, "details", {}) or {}
+        after = details.get("tabs_after") if isinstance(details, dict) else None
+        if isinstance(after, list):
+            lines = [f"Tabs of window {hwnd} now, read again after it (* = the one showing):"]
+            lines += [f"- [{t.get('id') or 'no id'}] {t.get('index')}{'*' if t.get('selected') else ''} "
+                      f"\"{t.get('name')}\"" for t in after if isinstance(t, dict)]
+            if not after:
+                lines.append("(none read)")
+            if isinstance(details, dict) and details.get("tabs_after_complete") is False:
+                lines.append("(that read was cut short; read_tabs again to be sure)")
+            outcome.content = [{"type": "text", "text": f"{outcome.summary}\n" + "\n".join(lines)}]
+        return outcome
 
     # -- control tools -----------------------------------------------------
 

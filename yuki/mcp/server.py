@@ -306,7 +306,7 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
         group_by: Annotated[Literal["site", "app", "page"], Field(
             description="Group time by website (apps without a page count as the app), by app, or by page/window title.")] = "site",
     ) -> str:
-        """How the user spent time on the PC, measured from the window in front: time per site, app or page, visits, longest stretches, switching, background media and meetings."""
+        """How the user spent time on the PC, measured from the window in front: time per site, app or page, visits, longest stretches, switching, background media and meetings; plus calls (an app using the microphone, in front or not, merged across restarts) with the time the call app was in front. Time "in" an app can mean its window in front, a call in it, or it playing in the background: these are reported apart."""
 
         def body() -> tuple[str, Window | None]:
             window = resolve_range(since, until, default_today=True)
@@ -483,6 +483,8 @@ def _format_activity(agg: dict[str, Any], window: Window, group_by: str) -> str:
             detail.append(f"longest {_dur(item['longest_s'])} ({_clock(item.get('longest_start'))}-"
                           f"{_clock(item.get('longest_end'))})")
         detail.append(f"first {_clock(item.get('first_at'))}, last {_clock(item.get('last_at'))}")
+        if (item.get("call_s") or 0) >= 60:
+            detail.append(f"in a call {_dur(item['call_s'])} (in front or not)")
         lines.append(f"{head}: " + "; ".join(detail))
         titles = [f'"{_one_line(x.get("title"))}" {_dur(x.get("present_s"))}' for x in item.get("titles") or []
                   if x.get("title") and x.get("title") != label]
@@ -499,6 +501,13 @@ def _format_activity(agg: dict[str, Any], window: Window, group_by: str) -> str:
         lines.append(f"Meeting: {m.get('label')} {fmt_span(_parse_iso(m.get('start')), _parse_iso(m.get('end')))}"
                      + (f" in {where}" if where else "")
                      + f", in front {_dur(m.get('in_front_s'))}, microphone on {_dur(m.get('mic_s'))}")
+    calls = [c for c in agg.get("calls") or [] if isinstance(c, dict)]
+    if calls:
+        lines.append("Calls (an app using the microphone, in front or not; start and end even outside this range):")
+        lines += [f"- {_one_line(c.get('text'))}" for c in calls[:8] if c.get("text")]
+    if agg.get("background"):
+        lines.append("In a call while other apps were in front: " + "; ".join(
+            f"{b['app']} {_dur(b['seconds'])}" for b in agg["background"]))
     words = {"off": "PC off", "asleep": "PC asleep", "unknown": "PC stopped without a clean shutdown"}
     for p in agg.get("power") or []:
         if (p.get("seconds") or 0) >= 60:

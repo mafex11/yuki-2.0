@@ -36,6 +36,9 @@ _PATH_KEYS = (
 
 
 def user_path() -> Path:
+    override = os.environ.get("YUKI_MEMORY_DIR")   # tests and harnesses (yuki.memory.store.MEMORY_DIR_ENV)
+    if override:
+        return Path(override) / "extract_profiles.toml"
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "Yuki" / "memory" / "extract_profiles.toml"
 

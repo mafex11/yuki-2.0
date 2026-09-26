@@ -853,29 +853,37 @@ class Agent:
         """Before the request's first action on the desktop: tell memory that what
         appears on screen from now until the request ends is Yuki's doing, at
         the user's request (:meth:`MemoryAccess.acting_begin`). Plumbing: it
-        changes nothing about what the agent does; never raises."""
-        if self._acting_token is not None:
-            return
-        token = f"{self.lane}-{self.logger.session_id}-{self._requests}"
+        changes nothing about what the agent does; never raises. Every later action of
+        the request refreshes the marker (memory ignores one not refreshed for
+        ``yuki.memory.acting.MAX_AGE_S``, so an end that fails can never hold it long)."""
+        refresh = self._acting_token is not None
+        token = self._acting_token or f"{self.lane}-{self.logger.session_id}-{self._requests}"
         try:
             begin = getattr(self.memory, "acting_begin", None)
             published = bool(begin(token, self._request_text or "", lane=self.lane)) if callable(begin) else False
         except Exception:
             published = False
         self._acting_token = token
-        self.logger.log("memory_acting", state="begin", token=token, published=published)
+        if not refresh or not published:
+            self.logger.log("memory_acting", state="refresh" if refresh else "begin", token=token,
+                            published=published)
 
     def _acting_done(self) -> None:
         """The request ended: withdraw the marker, if one was published. Never raises."""
         token, self._acting_token = self._acting_token, None
         if token is None:
             return
-        try:
-            end = getattr(self.memory, "acting_end", None)
-            withdrawn = bool(end(token)) if callable(end) else False
-        except Exception:
-            withdrawn = False
-        self.logger.log("memory_acting", state="end", token=token, withdrawn=withdrawn)
+        withdrawn = False
+        for _ in range(2):   # the marker file retries sharing violations itself; one more try on top
+            try:
+                end = getattr(self.memory, "acting_end", None)
+                withdrawn = bool(end(token)) if callable(end) else False
+            except Exception:
+                withdrawn = False
+            if withdrawn or not callable(getattr(self.memory, "acting_end", None)):
+                break
+        self.logger.log("memory_acting", state="end", token=token, withdrawn=withdrawn,
+                        **({} if withdrawn else {"leak": "memory drops it once it is stale"}))
 
     def _note_action(self, name: str, ok: bool, summary: str) -> None:
         """Add one line to this request's actions (not for looks, done or the note)."""
@@ -1428,8 +1436,18 @@ class Agent:
         except Exception as exc:  # the origin must never break a request
             self.logger.error(f"activity facts failed: {type(exc).__name__}: {exc}", exc=exc)
             facts = {"errors": {"activity": f"{type(exc).__name__}: {exc}"}}
+        calls: list[dict[str, Any]] = []
+        if facts.get("microphone"):
+            # a call memory knows is going on (merged across its restarts): "on a Discord call since
+            # 13:20", not Windows' microphone start time (reset by a reboot or a rejoin)
+            try:
+                fetch = getattr(self.memory, "call_method", None)
+                found = fetch("current_calls", timeout_s=1.0) if callable(fetch) else None
+                calls = [c for c in (found or []) if isinstance(c, dict)]
+            except Exception:
+                calls = []
         try:
-            text = _origin_text(self._overview_payload, facts, origin_hwnd=origin_hwnd)
+            text = _origin_text(self._overview_payload, facts, origin_hwnd=origin_hwnd, calls=calls)
         except Exception as exc:
             self.logger.error(f"request origin failed: {type(exc).__name__}: {exc}", exc=exc)
             text = None
@@ -1957,7 +1975,8 @@ def _foreground_app(overview: Any) -> str | None:
 
 
 def _origin_text(
-    overview: Any, facts: dict[str, Any], *, origin_hwnd: int | None = None
+    overview: Any, facts: dict[str, Any], *, origin_hwnd: int | None = None,
+    calls: list[dict[str, Any]] | None = None,
 ) -> str:
     """The request-origin line: what was in front, media, microphone and camera.
 
@@ -1965,6 +1984,9 @@ def _origin_text(
     them. The window comes from the overview's plain data (the hwnd the model
     can pass to ``focus_window``); ``facts`` is
     :func:`yuki.perception.system.activity_facts` (or a stub's equivalent).
+    ``calls``: memory's calls going on now (``MemoryClient.current_calls``); a
+    microphone user that is one of them reads "on a Discord call since 13:20
+    (8h16m)" (identity: the holder's image name against the call's process).
     """
     overview = overview if isinstance(overview, dict) else {}
     windows = [w for w in overview.get("windows") or [] if isinstance(w, dict)]
@@ -2022,6 +2044,11 @@ def _origin_text(
         parts.append("media: " + ("; ".join(sessions) if sessions else "none"))
 
     own_image = os.path.basename(sys.executable).lower()
+    open_calls: dict[str, dict[str, Any]] = {}
+    if calls:
+        from yuki.memory.store import app_key   # memory's own process identity ("Discord.exe" -> "discord")
+
+        open_calls = {str(c.get("process")): c for c in calls if c.get("process")}
     for fact, label in (("microphone", "microphone"), ("camera", "camera")):
         if fact in errors:
             parts.append(f"{label}: unknown ({errors[fact]})")
@@ -2033,13 +2060,36 @@ def _origin_text(
             app = str(user.get("app") or "?")
             since = user.get("since")
             text = app
-            if isinstance(since, (int, float)) and since > 0:
+            call = open_calls.get(app_key(app) or "") if fact == "microphone" and open_calls else None
+            if call is not None:
+                text = f"{app}, on a {call.get('app') or app} call"
+                started = _call_since(call.get("since"))
+                if started is not None:
+                    seconds = call.get("seconds")
+                    elapsed = (float(seconds) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+                               else max(0.0, time.time() - started.timestamp()))
+                    text += (f" since {started.strftime('%H:%M')} "
+                             f"({int(elapsed // 3600)}h{int(elapsed % 3600 // 60):02d}m)")
+            elif isinstance(since, (int, float)) and since > 0:
                 text += f" since {datetime.fromtimestamp(since).strftime('%H:%M')}"
             if app.lower() == own_image:
                 text += " (the program you run as)"
             users.append(text)
         parts.append(f"{label} in use by {', '.join(users)}" if users else f"{label} not in use")
     return "When the user asked: " + "; ".join(parts) + "."
+
+
+def _call_since(value: Any) -> datetime | None:
+    """A call's start from ``current_calls`` (ISO local time, or epoch seconds), naive local; else ``None``."""
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(float(value))
+        if isinstance(value, str) and value.strip():
+            stamp = datetime.fromisoformat(value.strip())
+            return stamp.astimezone().replace(tzinfo=None) if stamp.tzinfo else stamp
+    except (OverflowError, OSError, ValueError):
+        return None
+    return None
 
 
 def _block_confirmed(event: Any) -> bool:

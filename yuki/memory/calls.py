@@ -299,6 +299,10 @@ class Gpu:
     class _Util(ctypes.Structure):
         _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
+    class _ProcUtil(ctypes.Structure):
+        _fields_ = [("pid", ctypes.c_uint), ("timeStamp", ctypes.c_ulonglong), ("smUtil", ctypes.c_uint),
+                    ("memUtil", ctypes.c_uint), ("encUtil", ctypes.c_uint), ("decUtil", ctypes.c_uint)]
+
     class _Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
@@ -320,6 +324,26 @@ class Gpu:
             return None
         self._dll.nvmlDeviceGetMemoryInfo(self._handle, ctypes.byref(mem))
         return {"gpu_util": int(util.gpu), "vram_used_mb": round(mem.used / 2**20), "vram_total_mb": round(mem.total / 2**20)}
+
+    def process_utilization(self, since_s: float = 10.0) -> dict[int, float] | None:
+        """Each process's share of the GPU's compute (SM %, mean of NVML's samples over the last
+        ``since_s``), ``{pid: percent}``; ``None`` when NVML or the driver cannot say. Content-free."""
+        if self._dll is None:
+            return None
+        import time as _time
+
+        last = ctypes.c_ulonglong(int((_time.time() - since_s) * 1e6))
+        count = ctypes.c_uint(0)
+        ret = self._dll.nvmlDeviceGetProcessUtilization(self._handle, None, ctypes.byref(count), last)
+        if ret not in (0, 7) or not count.value:   # 7: NVML_ERROR_INSUFFICIENT_SIZE (the size query)
+            return {} if ret in (0, 7) else None
+        samples = (self._ProcUtil * count.value)()
+        if self._dll.nvmlDeviceGetProcessUtilization(self._handle, samples, ctypes.byref(count), last) != 0:
+            return None
+        acc: dict[int, list[int]] = {}
+        for s in samples[:count.value]:
+            acc.setdefault(int(s.pid), []).append(int(s.smUtil))
+        return {pid: sum(v) / len(v) for pid, v in acc.items()}
 
 
 # ---------------------------------------------------------------------------
