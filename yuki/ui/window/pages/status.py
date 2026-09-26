@@ -1,4 +1,10 @@
-"""Status: everything Yuki is doing or waiting on, in plain words, each with the one action it needs."""
+"""Status: what Yuki is doing or waiting on, in a few plain words each, and nothing to set.
+
+Status only (2026-09-27): memory remembering your day, calls waiting to be remembered, a call going on,
+questions waiting, the coach, whether Yuki listens for its name, and today's cost. The settings that used
+to sit here (listening for "Yuki", Start with Windows) live in Settings. Each card is a capsule with a short
+title, one short line under it and at most the one action it needs, as a big glass button.
+"""
 
 from __future__ import annotations
 
@@ -9,35 +15,39 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import StatusView, day_label, dur, hm
+from yuki.ui.window.data import StatusView, dur, first_sentence, hm, plain, second_person
 from yuki.ui.window.theme import SPACE, Theme
-from yuki.ui.window.widgets import Glass, Pill, Toggle, icon_label, page_header, text_label
+from yuki.ui.window.widgets import Glass, Pill, icon_label, page_header, text_label
+
+#: A status card's height; its ends are fully round (a capsule).
+CARD_H = 84
 
 
 def _row(t: Theme, tone: QColor | None, glyph: str, title: str, text: str, actions: list[QWidget]) -> Glass:
-    """One status line. The title says the state in words; something that needs the user (``tone``) gets a
-    faint wash of that colour on its glass instead of a coloured dot."""
+    """One status card: a capsule with the state in a short title, one short line, and its action. Something
+    that needs the user (``tone``) gets a faint wash of that colour on its glass instead of a coloured dot."""
     wash = None
     if tone is not None:
         wash = QColor(tone)
         wash.setAlphaF(0.07 if not t.dark else 0.10)
-    card = Glass(t, level="regular", radius=22, padding=SPACE["l"], tint=wash)
+    card = Glass(t, level="regular", radius=999, padding=0, tint=wash)   # radius past half the height: a capsule
+    card.setMinimumHeight(CARD_H)
+    card.body.setContentsMargins(18, 14, 22, 14)
     row = QHBoxLayout()
-    row.setSpacing(SPACE["m"])
-    icon = Glass(t, level="inset", radius=18, padding=0)
-    icon.setFixedSize(40, 40)
+    row.setSpacing(SPACE["m"] + 2)
+    icon = Glass(t, level="inset", radius=999, padding=0)
+    icon.setFixedSize(52, 52)
     lab = icon_label(t, glyph, t.text_2, "icon_large")
     lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
     icon.body.addWidget(lab)
-    row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+    row.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
     col = QVBoxLayout()
-    col.setSpacing(3)
-    head = QHBoxLayout()
-    head.setSpacing(4)
-    head.addWidget(text_label(t, title, "headline"))
-    head.addStretch(1)
-    col.addLayout(head)
-    col.addWidget(text_label(t, text, "callout", "text_2", wrap=True))
+    col.setSpacing(2)
+    col.addStretch(1)
+    col.addWidget(text_label(t, title, "headline"))
+    if text:
+        col.addWidget(text_label(t, text, "caption", "text_3", wrap=True))
+    col.addStretch(1)
     row.addLayout(col, 1)
     for a in actions:
         row.addWidget(a, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -52,7 +62,7 @@ def _pill(t: Theme, text: str, on_click, **kw) -> Pill:
 
 
 def _confirm_pill(t: Theme, text: str, sure: str, on_click, **kw) -> Pill:
-    """A pill that asks once ("Erase it" -> "Erase — sure?") and acts on the second click within 4 s."""
+    """A pill that asks once ("Erase" -> "Sure? Tap again") and acts on the second click within 4 s."""
     pill = Pill(t, text, **kw)
     armed = {"on": False}
     timer = QTimer(pill)
@@ -99,85 +109,56 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     waiting_calls = (v.calls_waiting or {}).get("calls", 0)
     waiting = waiting_calls + len(v.questions_waiting)
     if not v.service_running:
-        lead = "Memory isn't running, so Yuki can't remember today. Start it below."
+        lead = "Memory isn't running, so today isn't being remembered."
     elif waiting:
-        lead = f"Everything is running. {waiting} thing{'s' if waiting != 1 else ''} waiting, none of it urgent."
+        lead = f"All running. {waiting} thing{'s' if waiting != 1 else ''} waiting, nothing urgent."
     else:
-        lead = "Everything is running and nothing is waiting on you."
+        lead = "All running. Nothing is waiting on you."
     col.addWidget(page_header(t, "Status", lead))
 
     if v.service_running and not v.paused:
-        last = f"last look {hm(v.last_capture_at)}" if v.last_capture_at else "nothing seen yet today"
-        col.addWidget(_row(t, good, "history", "Remembering your day",
-                           f"{v.captures_today} things seen and {v.facts_today} facts written today, {last}. "
-                           f"Your portrait was updated {day_label(v.portrait_at)} {hm(v.portrait_at)}."
-                           if v.portrait_at else f"{v.captures_today} things seen today, {last}.",
-                           [_pill(t, "Pause memory", lambda: act.set_paused(True), glyph="pause", style="glass",
-                                  size="small")]))
+        seen = f"{v.captures_today:,} things seen, {v.facts_today:,} facts written today"
+        col.addWidget(_row(t, good, "history", "Remembering your day", seen,
+                           [_pill(t, "Pause", lambda: act.set_paused(True), glyph="pause")]))
     elif v.paused:
-        col.addWidget(_row(t, warn, "pause", "Memory is paused", "Nothing on your screen is being remembered. "
-                           "What you type to Yuki still is.",
+        col.addWidget(_row(t, warn, "pause", "Memory is paused", "Nothing on your screen is remembered",
                            [_pill(t, "Resume", lambda: act.set_paused(False), glyph="play", style="accent")]))
     else:
-        col.addWidget(_row(t, bad, "warning", "Memory isn't running", "Yuki normally restarts it within two "
-                           "minutes. If this stays, start it now.",
-                           [_pill(t, "Start memory", act.start_memory, style="accent")]))
+        col.addWidget(_row(t, bad, "warning", "Memory isn't running", "Yuki restarts it within two minutes",
+                           [_pill(t, "Start", act.start_memory, style="accent")]))
 
     if waiting_calls:
         w = v.calls_waiting
-        oldest = datetime.fromtimestamp(v.oldest_wait_at) if v.oldest_wait_at else None
-        since = f" The oldest is from {day_label(v.oldest_wait_at)} {oldest:%H:%M}." if oldest else ""
         col.addWidget(_row(t, warn, "mic", f"{waiting_calls} call{'s' if waiting_calls != 1 else ''} waiting to "
                                               "be remembered",
-                           f"{dur(w['minutes'] * 60)} of your own voice, kept encrypted on this PC. Yuki turns it "
-                           f"into memory when the PC is free, never while you play or are on a call.{since}",
-                           [_confirm_pill(t, "Erase it", "Erase — sure?", act.erase_calls, glyph="delete",
-                                          style="danger", size="small")]))
+                           f"{dur(w['minutes'] * 60)} of your voice, kept on this PC until it's free",
+                           [_confirm_pill(t, "Erase", "Sure? Tap again", act.erase_calls, glyph="delete",
+                                          style="danger")]))
     if v.call_now:
+        recording = v.call_now.get("status") == "recording"
         col.addWidget(_row(t, t.kind("call"), "phone", f"On a {v.call_now['app']} call",
-                           "Remembering only your side, only your microphone." if v.call_now.get("status") ==
-                           "recording" else "Not remembering this call.",
-                           [_pill(t, "Stop remembering", act.stop_call, style="glass", size="small")]
-                           if v.call_now.get("status") == "recording" else []))
+                           "Only your side is remembered" if recording else "This call isn't remembered",
+                           [_pill(t, "Stop", act.stop_call, glyph="close")] if recording else []))
     if v.questions_waiting:
         q = v.questions_waiting[0]
-        more = f" and {len(v.questions_waiting) - 1} more" if len(v.questions_waiting) > 1 else ""
-        col.addWidget(_row(t, t.kind("question"), "question", "A question for you" if not more else
-                           f"{len(v.questions_waiting)} questions for you",
-                           f"“{q['question'].replace('the user', 'you')}”{more} Yuki asks at a calm moment, or you can "
-                           "answer it now.",
+        n = len(v.questions_waiting)
+        col.addWidget(_row(t, t.kind("question"), "question", "A question for you" if n == 1 else
+                           f"{n} questions for you", first_sentence(plain(second_person(q["question"])), 90),
                            [_pill(t, "Answer", lambda: act.navigate("yuki"), glyph="edit", style="tinted",
-                                  tint=t.kind("question"), size="small")]))
+                                  tint=t.kind("question"))]))
 
-    today = v.nudges_today
-    said = ", ".join(f"{n} {word}{'s' if n != 1 else ''}" for word, n in
-                     (("check-in", today.get("nudge", 0) + today.get("praise", 0)),
-                      ("reminder", today.get("reminder", 0)), ("welcome back", today.get("resume", 0)),
-                      ("question", today.get("question", 0))) if n)
     if v.quiet_until:
         col.addWidget(_row(t, warn, "moon", f"Coach is quiet until {hm(v.quiet_until)}",
-                           "No check-ins or reminders until then. A due reminder waits; it isn't lost.",
-                           [_pill(t, "Turn back on", lambda: act.snooze(0), style="accent", size="small")]))
+                           "Reminders wait, none are lost",
+                           [_pill(t, "Turn back on", lambda: act.snooze(0), style="accent")]))
     else:
-        col.addWidget(_row(t, good, "heart", "Coach is on",
-                           f"Quiet hours {v.quiet_hours[0]}–{v.quiet_hours[1]}. Today: {said or 'nothing yet'}.",
-                           [_pill(t, "Quiet 1 hour", lambda: act.snooze(60), glyph="moon", size="small"),
-                            _pill(t, "Until tomorrow", lambda: act.snooze(minutes_until(6)), size="small")]))
-    col.addWidget(_row(t, None, "mic",
-                       "Listening for “Yuki”" if v.wake_on else "Not listening for “Yuki”",
-                       f"Say “Yuki” or press Ctrl+Alt+Y. Mic: {v.mic}. Speaker: {v.speaker}. "
-                       "Nothing is sent anywhere until you say its name.",
-                       [_pill(t, "Turn off" if v.wake_on else "Turn on", lambda: act.set_wake(not v.wake_on),
-                              size="small")]))
-    col.addWidget(_row(t, None, "money", f"${v.cost_today:.2f} today",
-                       "What remembering cost today: reading your screen into facts, your portrait, the story "
-                       "of your day, your chats with Yuki and the coach (list prices).", []))
-    if v.start_with_windows is not None:
-        sw = Toggle(t, bool(v.start_with_windows))
-        sw.toggled.connect(act.set_startup)
-        col.addWidget(_row(t, None, "power",
-                           "Starts with Windows" if v.start_with_windows else "Doesn't start with Windows",
-                           "Yuki and its memory come up when you sign in." if v.start_with_windows else
-                           "Start Yuki yourself from the Start menu.", [sw]))
+        start, end = v.quiet_hours
+        quiet = f"Quiet from {start} to {end}" if start != end else "No quiet hours"
+        col.addWidget(_row(t, good, "heart", "Coach is on", quiet,
+                           [_pill(t, "Quiet 1 hour", lambda: act.snooze(60), glyph="moon"),
+                            _pill(t, "Until tomorrow", lambda: act.snooze(minutes_until(6)))]))
+    col.addWidget(_row(t, None, "wave", "Say “Yuki” to start" if v.wake_on else "Voice is off",
+                       "Nothing leaves this PC until you say it" if v.wake_on else "Turn it on in Settings", []))
+    col.addWidget(_row(t, None, "money", f"${v.cost_today:.2f} today", "What remembering cost today", []))
     col.addStretch(1)
     return page

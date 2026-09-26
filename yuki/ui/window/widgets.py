@@ -11,13 +11,14 @@ from __future__ import annotations
 import time
 from typing import Callable, Sequence
 
-from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMenu,
     QScrollArea,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from yuki.ui.window.glass import paint_glass, rounded
-from yuki.ui.window.theme import CONTROL_H, ICON, RADIUS, SPACE, Theme, css, font
+from yuki.ui.window.theme import CONTROL_H, ICON, RADIUS, SPACE, Theme, css, font, variable_font
 
 # -- text ------------------------------------------------------------------------------
 
@@ -117,15 +118,28 @@ class Panel(Glass):
                  parent: QWidget | None = None) -> None:
         super().__init__(t, level=level, padding=padding, parent=parent)
         if title:
+            # the icon sits on the title's first line, top left, never centred against a long subtitle; a
+            # control on the right (a taller pill) lines up with that same line
             head = QHBoxLayout()
-            head.setSpacing(SPACE["s"])
+            head.setSpacing(SPACE["s"] + 2)
+            line_h = QFontMetrics(font("headline")).height()
+            lift = max(0, ((right.sizeHint().height() if right is not None else 0) - line_h) // 2)
             if glyph:
-                head.addWidget(icon_label(t, glyph, t.text_2))
+                ic = icon_label(t, glyph, t.text_2)
+                ic.setFixedSize(20, line_h)
+                ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                wrap = QVBoxLayout()
+                wrap.setContentsMargins(0, lift, 0, 0)
+                wrap.addWidget(ic)
+                wrap.addStretch(1)
+                head.addLayout(wrap)
             col = QVBoxLayout()
-            col.setSpacing(1)
+            col.setSpacing(2)
+            col.setContentsMargins(0, lift, 0, 0)
             col.addWidget(text_label(t, title, "headline"))
             if subtitle:
                 col.addWidget(text_label(t, subtitle, "caption", "text_3", wrap=True))
+            col.addStretch(1)
             head.addLayout(col, 1)
             if right is not None:
                 head.addWidget(right, 0, Qt.AlignmentFlag.AlignTop)
@@ -162,8 +176,42 @@ def scroll(widget: QWidget) -> QScrollArea:
 # -- controls --------------------------------------------------------------------------
 
 
+def paint_button(p: QPainter, r: QRectF, t: Theme, style: str = "glass", tint: QColor | None = None, *,
+                 hover: bool = False, down: bool = False, enabled: bool = True) -> QColor:
+    """A button's glass body (2026-09-27): a raised, lit pill with a soft shadow under it, clearly a button
+    and never a flat tag. Returns the ink for its label. ``style``: glass | quiet (the same glass, a quieter
+    label) | accent (blue glass) | tinted (``tint`` washed into the glass) | danger."""
+    wash = None
+    if style == "accent":
+        level = t.level("button_accent")
+        ink = QColor(t.accent_ink)
+    elif style in ("tinted", "danger"):
+        c = QColor(t.kind("error") if style == "danger" else (tint or t.accent))
+        wash = QColor(c)
+        wash.setAlphaF(0.16 if not t.dark else 0.24)
+        level = t.level("button")
+        ink = c.darker(135) if not t.dark else c.lighter(130)
+    else:
+        level = t.level("button")
+        ink = QColor(t.text_2 if style == "quiet" else t.text)
+    paint_glass(p, r, r.height() / 2, level, tint=wash, shadow=enabled and not down, painted=True)
+    if enabled and (hover or down):   # a breath more light under the pointer, a touch darker pressed
+        over = QColor(255, 255, 255) if not down else QColor(0, 0, 0)
+        over.setAlphaF((0.07 if t.dark else 0.20) if not down else 0.10)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(over)
+        p.drawPath(rounded(r, r.height() / 2))
+    if not enabled:
+        ink = QColor(t.text_3)
+    return ink
+
+
 class Pill(QAbstractButton):
-    """A pill button. ``style``: glass | accent | quiet | tinted (``tint`` colour) | danger."""
+    """A button: a rounded glass pill (:func:`paint_button`). ``style``: glass | accent | quiet | tinted
+    (``tint`` colour) | danger."""
+
+    #: The glass sits this far inside the widget (left, top, right, bottom), so its soft shadow has room.
+    INSET = (3, 2, 3, 4)
 
     def __init__(self, t: Theme, text: str = "", *, glyph: str | None = None, style: str = "glass",
                  size: str = "regular", tint: QColor | None = None, parent: QWidget | None = None) -> None:
@@ -171,16 +219,20 @@ class Pill(QAbstractButton):
         self.t, self.style, self.size_name, self.tint, self.glyph = t, style, size, tint, glyph
         self.setText(text)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(font("caption_strong" if size == "small" else "callout"))
+        self.setFont(variable_font(13 if size == "small" else 14, "Semibold"))
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def _pad(self) -> int:
+        return 16 if self.size_name == "small" else 20
 
     def sizeHint(self) -> QSize:  # noqa: D102
         h = CONTROL_H[self.size_name]
+        left, top, right, bottom = self.INSET
         fm = QFontMetrics(self.font())
         w = fm.horizontalAdvance(self.text()) if self.text() else 0
-        pad = 14 if self.size_name == "small" else 18
-        icon = (16 + (6 if self.text() else 0)) if self.glyph else 0
-        return QSize(max(h, w + icon + 2 * pad) if self.text() else h, h)
+        icon = (16 + (7 if self.text() else 0)) if self.glyph else 0
+        body = max(h, w + icon + 2 * self._pad()) if self.text() else h
+        return QSize(body + left + right, h + top + bottom)
 
     def enterEvent(self, e: object) -> None:  # noqa: D102
         self.update()
@@ -193,34 +245,12 @@ class Pill(QAbstractButton):
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        t = self.t
-        # every button is clear glass (2026-09-27): the style is only its tint, never a solid block
-        if self.style == "accent":
-            paint_glass(p, r, r.height() / 2, t.level("accent"))
-            ink = QColor(t.accent_ink)
-        elif self.style in ("tinted", "danger"):
-            c = QColor(t.kind("error") if self.style == "danger" else (self.tint or t.accent))
-            wash = QColor(c)
-            wash.setAlphaF(0.12 if not t.dark else 0.18)
-            paint_glass(p, r, r.height() / 2, t.level("control"), tint=wash, shadow=False)
-            ink = c.darker(125) if not t.dark else c.lighter(125)
-        elif self.style == "quiet":
-            paint_glass(p, r, r.height() / 2, t.level("inset"), shadow=False)
-            ink = t.text_2
-        else:
-            paint_glass(p, r, r.height() / 2, t.level("control"))
-            ink = t.text
-        if self.underMouse() and self.isEnabled():   # hover: a breath more light, painted (never re-rendered)
-            wash = QColor(t.text)
-            wash.setAlphaF(0.05 if not t.dark else 0.07)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(wash)
-            p.drawPath(rounded(r, r.height() / 2))
-        if not self.isEnabled():
-            ink = QColor(t.text_3)
+        left, top, right, bottom = self.INSET
+        r = QRectF(self.rect()).adjusted(left, top, -right, -bottom)
+        ink = paint_button(p, r, self.t, self.style, self.tint, hover=self.underMouse(), down=self.isDown(),
+                           enabled=self.isEnabled())
         p.setPen(ink)
-        pad = 14 if self.size_name == "small" else 18
+        pad = self._pad()
         x = r.left() + pad if self.text() else r.center().x() - 8
         if self.glyph:
             p.setFont(font("icon_small" if self.size_name == "small" else "icon"))
@@ -231,18 +261,19 @@ class Pill(QAbstractButton):
             else:
                 p.drawText(QRectF(x, r.top(), gw, r.height()), Qt.AlignmentFlag.AlignCenter,
                            ICON.get(self.glyph, self.glyph))
-                x += gw + 6
+                x += gw + 7
         if self.text():
             p.setFont(self.font())
-            p.drawText(QRectF(x, r.top(), r.right() - x - pad + 2, r.height()),
+            p.drawText(QRectF(x, r.top(), r.right() - x - pad + 4, r.height()),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
         p.end()
 
 
 class Chip(QWidget):
-    """A small tag: a word on a faint glass wash of a kind's colour (joke, unsure, you, story, unclear...).
+    """A small tag: a word on a faint glass wash of a kind's colour.
 
-    No coloured dot (2026-09-27: dots read as generic AI UI); the word and the wash carry it.
+    No longer shown anywhere (2026-09-27: the user reads tags and badges as generic AI UI); what a tag said is
+    now plain secondary text (:func:`tag_words`). Kept for older callers.
     """
 
     WORDS = {"joke": "Joke", "story": "Story", "you": "You said", "unsure": "Not sure", "unclear": "May be misheard",
@@ -276,6 +307,17 @@ class Chip(QWidget):
         p.end()
 
 
+#: What each old tag says, as plain secondary text beside an item's source ("" = nothing to add: the
+#: section or the source line already says it).
+TAG_WORDS = {"joke": "Said as a joke", "story": "", "you": "", "unsure": "Yuki isn't sure",
+             "unclear": "May be misheard", "call": "", "live": "", "updating": "Updating"}
+
+
+def tag_words(tags: Sequence[str]) -> str:
+    """The plain words for an item's tags, joined (no chips)."""
+    return " · ".join(w for w in (TAG_WORDS.get(tag, "") for tag in tags) if w)
+
+
 def _glass_changed(widget: QWidget) -> None:
     from yuki.ui.window.glasscache import notify_glass
 
@@ -290,7 +332,7 @@ class Toggle(QAbstractButton):
         self.t = t
         self.setCheckable(True)
         self.setChecked(on)
-        self.setFixedSize(46, 28)
+        self.setFixedSize(58, 34)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggled.connect(lambda _on: _glass_changed(self))
 
@@ -299,10 +341,10 @@ class Toggle(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         # the track is clear glass (a blue-hued wash when on), the knob a clear glass bead on it
-        paint_glass(p, r, r.height() / 2, self.t.level("accent" if self.isChecked() else "inset"), shadow=False)
-        d = r.height() - 6
-        x = r.right() - d - 3 if self.isChecked() else r.left() + 3
-        knob = QRectF(x, r.top() + 3, d, d)
+        paint_glass(p, r, r.height() / 2, self.t.level("accent" if self.isChecked() else "control"), shadow=False)
+        d = r.height() - 8
+        x = r.right() - d - 4 if self.isChecked() else r.left() + 4
+        knob = QRectF(x, r.top() + 4, d, d)
         paint_glass(p, knob, d / 2, self.t.level("bead"))
         p.end()
 
@@ -375,6 +417,12 @@ class Dropdown(QAbstractButton):
 
         opts = self.options() if callable(self.options) else self.options
         if not opts:
+            return
+        if len(opts) > ListPopup.ROWS:   # a long list (the quiet-hour times): a compact picker that scrolls
+            popup = ListPopup(self.t, [(label, value) for label, value in opts], self.text(), width=self.width())
+            popup.picked.connect(self._pick)
+            popup.open_below(self)
+            self._popup = popup
             return
         menu = GlassMenu(self.t, self)
         menu.setMinimumWidth(self.width())
@@ -517,19 +565,11 @@ class NavItem(QAbstractButton):
         p.setFont(font("body_strong" if self.isChecked() else "body"))
         p.drawText(QRectF(r.left() + 46, r.top(), r.width() - 60, r.height()), Qt.AlignmentFlag.AlignVCenter,
                    self.text())
-        if self.badge:   # a count on a faint glass wash, never a solid block
-            p.setFont(font("micro"))
-            fm = QFontMetrics(p.font())
-            w = max(20, fm.horizontalAdvance(self.badge) + 12)
-            b = QRectF(r.right() - w - 10, r.center().y() - 10, w, 20)
-            c = QColor(self.t.kind("question"))
-            wash = QColor(c)
-            wash.setAlphaF(0.14 if not self.t.dark else 0.22)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(wash)
-            p.drawPath(rounded(b, 10))
-            p.setPen(c.darker(130) if not self.t.dark else c.lighter(125))
-            p.drawText(b, Qt.AlignmentFlag.AlignCenter, self.badge)
+        if self.badge:   # a count in plain secondary text (no badge: 2026-09-27)
+            p.setFont(font("caption"))
+            p.setPen(self.t.text_3)
+            p.drawText(QRectF(r.right() - 44, r.top(), 32, r.height()),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, self.badge)
         p.end()
 
 
@@ -612,17 +652,16 @@ class ItemRow(QWidget):
         self._head = head
         if title:
             head.addWidget(text_label(t, title, title_role))
-        for tag in tags:
-            head.addWidget(Chip(t, tag))
         head.addStretch(1)
+        self._tag_words = tag_words(tags)
         self.text_label = text_label(t, text, "callout", "text", wrap=True, selectable=True)
         col.addWidget(self.text_label)
         self.was_label: QLabel | None = None
         foot = QHBoxLayout()
         foot.setSpacing(6)
         col.addLayout(foot)
-        foot.addWidget(icon_label(t, "history", t.text_3, "icon_small"))
-        self.source_label = text_label(t, source, "caption", "text_3")
+        self.source_label = text_label(t, " · ".join(x for x in (source, self._tag_words) if x), "caption",
+                                       "text_3")
         foot.addWidget(self.source_label)
         foot.addStretch(1)
         self.why_pill: Pill | None = None
@@ -661,23 +700,20 @@ class ItemRow(QWidget):
         words = " ".join(str(pending.get("words") or "").split())
         when = datetime.fromtimestamp(float(pending.get("at") or 0) or time.time()).strftime("%H:%M")
         late = bool(pending.get("late"))
-        chip_text = {"correct": "Updating…", "forget": "Forgetting…", "confirm": "Confirmed"}.get(kind, "Updating…")
+        state = {"correct": "Updating", "forget": "Forgetting", "confirm": "Confirmed"}.get(kind, "Updating")
         if late and kind != "confirm":
-            chip_text = "Still updating"
-        if self._state_chip is None:
-            self._state_chip = Chip(t, "updating", chip_text)
-            self._head.insertWidget(max(0, self._head.count() - 1), self._state_chip)
+            state = "Still updating"
         if kind == "correct" and words:
             self.text_label.setText(f"You said: “{words}”")
             if self.was_label is None:
                 self.was_label = text_label(t, "", "caption", "text_3", wrap=True)
                 self._col.insertWidget(self._col.indexOf(self.text_label) + 1, self.was_label)
             self.was_label.setText(f"Yuki had: {self._text}")
-            note = "Yuki is putting this right" if not late else "Yuki hasn't applied this yet; it will"
-            self.source_label.setText(f"You corrected this at {when} · {note}")
+            note = "Yuki is putting this right" if not late else "Yuki hasn't applied this yet, it will"
+            self.source_label.setText(f"{state} · You corrected this at {when} · {note}")
         elif kind == "forget":
             self.text_label.setStyleSheet(f"color: {css(t.text_3)}; background: transparent;")
-            self.source_label.setText(f"You said this is wrong at {when} · Yuki is forgetting it")
+            self.source_label.setText(f"{state} · You said this is wrong at {when}")
         elif kind == "confirm":
             self.source_label.setText(f"You confirmed this at {when}")
         if self.wrong_pill is not None:
@@ -758,7 +794,11 @@ class ItemRow(QWidget):
 
 
 class SettingRow(QWidget):
-    """A settings line: glyph, a plain-language label with a hint under it, the control on the right."""
+    """A settings line: glyph, a plain-language label with a hint under it, the control on the right.
+
+    The glyph sits top left on the label's first line; when the control is taller than that line, the glyph
+    and the label move down so the label's line and the control share one centre (never a glyph floating in
+    the middle of a tall row)."""
 
     def __init__(self, t: Theme, glyph: str, label: str, hint: str, control: QWidget | None,
                  parent: QWidget | None = None) -> None:
@@ -767,17 +807,26 @@ class SettingRow(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 6, 0, 6)
         row.setSpacing(SPACE["m"])
+        line_h = QFontMetrics(font("body")).height()
+        lift = max(0, ((control.sizeHint().height() if control is not None else 0) - line_h) // 2)
         ic = icon_label(t, glyph, t.text_2)
-        ic.setFixedWidth(22)
-        row.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+        ic.setFixedSize(22, line_h)
+        ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left = QVBoxLayout()
+        left.setContentsMargins(0, lift, 0, 0)
+        left.addWidget(ic)
+        left.addStretch(1)
+        row.addLayout(left)
         col = QVBoxLayout()
-        col.setSpacing(1)
+        col.setSpacing(2)
+        col.setContentsMargins(0, lift, 0, 0)
         col.addWidget(text_label(t, label, "body"))
         if hint:
             col.addWidget(text_label(t, hint, "caption", "text_3", wrap=True))
+        col.addStretch(1)
         row.addLayout(col, 1)
         if control is not None:
-            row.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(control, 0, Qt.AlignmentFlag.AlignTop)
 
 
 def section_title(t: Theme, text: str, note: str = "") -> QWidget:
@@ -1479,3 +1528,318 @@ class Shimmer(QWidget):
 
 
 Callback = Callable[..., object]
+
+
+# -- a compact scrolling picker (long lists: the quiet-hour times) ----------------------------------------
+
+
+class _ListRow(QAbstractButton):
+    """One choice in a :class:`ListPopup`: its words, a soft wash under the pointer and on the current one."""
+
+    def __init__(self, t: Theme, text: str, current: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.current = t, current
+        self.setText(text)
+        self.setFont(font("callout" if not current else "body_strong"))
+        self.setFixedHeight(ListPopup.ROW_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(4, 1, -4, -1)
+        if self.current or self.underMouse():
+            wash = QColor(self.t.accent_soft if self.current else self.t.grid)
+            if not self.current:
+                wash.setAlphaF(min(1.0, wash.alphaF() * 1.8))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(wash)
+            p.drawPath(rounded(r, r.height() / 2))
+        p.setPen(self.t.text if self.current or self.underMouse() else self.t.text_2)
+        p.setFont(self.font())
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+        p.end()
+
+
+class ListPopup(QWidget):
+    """A small glass popup with a scrolling list, opened under a control and scrolled to its current value.
+    Replaces a menu for a long list (48 quiet-hour times made a screen-tall menu). ``picked(label, value)``."""
+
+    picked = Signal(str, object)
+    #: Rows shown at once; a longer list scrolls.
+    ROWS = 8
+    ROW_H = 32
+
+    def __init__(self, t: Theme, options: Sequence[tuple[str, object]], current: str, *, width: int = 140) -> None:
+        super().__init__(None, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.t = t
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        self.area = QScrollArea(self)
+        self.area.setFrameShape(QFrame.Shape.NoFrame)
+        self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.area.setWidgetResizable(True)
+        self.area.setStyleSheet(scroll_css(True))
+        self.area.viewport().setAutoFillBackground(False)
+        inner = QWidget()
+        inner.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self._current_row: QWidget | None = None
+        for label, value in options:
+            row = _ListRow(t, label, label == current, inner)
+            row.clicked.connect(lambda _c=False, lab=label, v=value: self._choose(lab, v))
+            col.addWidget(row)
+            if label == current:
+                self._current_row = row
+        self.area.setWidget(inner)
+        smooth(self.area)
+        outer.addWidget(self.area)
+        shown = min(self.ROWS, max(1, len(options)))
+        self.resize(max(width, 110), shown * self.ROW_H + 12)
+
+    def open_below(self, anchor: QWidget) -> None:
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QGuiApplication
+
+        pos = anchor.mapToGlobal(QPoint(0, anchor.height() + 4))
+        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            if pos.y() + self.height() > area.bottom():
+                pos.setY(anchor.mapToGlobal(QPoint(0, 0)).y() - self.height() - 4)
+        self.move(pos)
+        self.show()
+        if self._current_row is not None:   # the current value in the middle of the list
+            bar = self.area.verticalScrollBar()
+            bar.setValue(max(0, self._current_row.y() - (self.area.viewport().height() - self.ROW_H) // 2))
+
+    def _choose(self, label: str, value: object) -> None:
+        self.picked.emit(label, value)
+        self.close()
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        under = QColor(self.t.bg)
+        under.setAlphaF(0.55)   # a list to read over the page: denser than a menu's glass
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(under)
+        p.drawPath(rounded(r, 16))
+        paint_floating(p, r, 16, self.t, None, shadow=False)
+        p.end()
+
+
+# -- a shortcut you set by pressing it -------------------------------------------------------------------
+
+
+#: Qt's key codes for the modifiers, and the word each one is written as in a combo ("alt+shift").
+_MOD_KEYS = {Qt.Key.Key_Control: "ctrl", Qt.Key.Key_Alt: "alt", Qt.Key.Key_Shift: "shift", Qt.Key.Key_Meta: "win",
+             Qt.Key.Key_AltGr: "alt"}
+#: Keys without a printable character, as :mod:`yuki.ui.hotkey` names them.
+_KEY_WORDS = {Qt.Key.Key_Space: "space", Qt.Key.Key_Tab: "tab", Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter",
+              Qt.Key.Key_Insert: "insert", Qt.Key.Key_Delete: "delete", Qt.Key.Key_Home: "home",
+              Qt.Key.Key_End: "end", Qt.Key.Key_PageUp: "pageup", Qt.Key.Key_PageDown: "pagedown",
+              Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down", Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
+              Qt.Key.Key_Pause: "pause", Qt.Key.Key_Print: "printscreen", Qt.Key.Key_Backspace: "backspace"}
+_MOD_ORDER = ("ctrl", "alt", "shift", "win")
+
+
+def combo_words(combo: str) -> str:
+    """``"alt+shift"`` as a person writes it: ``"Alt + Shift"``."""
+    names = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "space": "Space", "enter": "Enter",
+             "pageup": "Page Up", "pagedown": "Page Down", "printscreen": "Print Screen", "backspace": "Backspace"}
+    parts = [x for x in combo.lower().split("+") if x]
+    return " + ".join(names.get(x, x.upper() if len(x) <= 3 else x.capitalize()) for x in parts)
+
+
+class KeyCapture(QAbstractButton):
+    """A glass field showing a shortcut; click it and press the keys you want. A key with modifiers
+    ("ctrl+alt+k") or two or more modifiers alone, released together ("alt+shift"), is taken; Esc cancels.
+    ``captured(combo)`` with the combo in :mod:`yuki.ui.hotkey`'s spelling."""
+
+    captured = Signal(str)
+
+    def __init__(self, t: Theme, combo: str, *, width: int = 200, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.combo = t, combo
+        self.listening = False
+        self._mods: set[str] = set()
+        self._peak: set[str] = set()
+        self.setFont(variable_font(14, "Semibold"))
+        self.setFixedSize(width, CONTROL_H["regular"] + 6)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.clicked.connect(self._start)
+
+    def _start(self) -> None:
+        self.listening = True
+        self._mods, self._peak = set(), set()
+        self.setFocus()
+        self.grabKeyboard()
+        self.update()
+
+    def _stop(self) -> None:
+        self.listening = False
+        self.releaseKeyboard()
+        self.update()
+
+    def focusOutEvent(self, e: object) -> None:  # noqa: D102
+        if self.listening:
+            self._stop()
+        super().focusOutEvent(e)
+
+    def keyPressEvent(self, e: object) -> None:  # noqa: D102
+        if not self.listening:
+            super().keyPressEvent(e)
+            return
+        key = e.key()
+        if key == Qt.Key.Key_Escape and not self._mods:
+            self._stop()
+            return
+        if key in _MOD_KEYS:
+            self._mods.add(_MOD_KEYS[key])
+            self._peak |= self._mods
+            self.update()
+            return
+        word = _KEY_WORDS.get(key)
+        if word is None and Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+            word = f"f{int(key) - int(Qt.Key.Key_F1) + 1}"
+        if word is None:
+            text = (e.text() or "").strip().lower()
+            if not text and 0x20 < int(key) < 0x7F:
+                text = chr(int(key)).lower()
+            word = text if len(text) == 1 else None
+        if word is None or not self._mods:   # a shortcut needs a modifier: a plain key would fire while typing
+            return
+        self._finish("+".join([m for m in _MOD_ORDER if m in self._mods] + [word]))
+
+    def keyReleaseEvent(self, e: object) -> None:  # noqa: D102
+        if not self.listening:
+            super().keyReleaseEvent(e)
+            return
+        key = e.key()
+        if key in _MOD_KEYS:
+            self._mods.discard(_MOD_KEYS[key])
+            if not self._mods and len(self._peak) >= 2:   # modifiers alone, released together: a chord
+                self._finish("+".join(m for m in _MOD_ORDER if m in self._peak))
+            elif not self._mods:
+                self._peak = set()
+            self.update()
+
+    def _finish(self, combo: str) -> None:
+        self.combo = combo
+        self._stop()
+        self.captured.emit(combo)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(3, 2, -3, -4)
+        paint_button(p, r, self.t, "tinted" if self.listening else "glass", self.t.accent, hover=self.underMouse())
+        if self.listening:
+            live = " + ".join(combo_words(m) for m in _MOD_ORDER if m in self._mods)
+            text, ink = (live + " + …" if live else "Press your shortcut…"), self.t.text
+        else:
+            text, ink = combo_words(self.combo) or "Not set", self.t.text
+        p.setPen(ink)
+        p.setFont(self.font())
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+
+
+# -- masonry: cards of their own height, in balanced columns ----------------------------------------------
+
+
+class Masonry(QLayout):
+    """Cards in columns, each exactly as tall as its content, each placed in the column that is shortest so
+    far (so the columns end close together). ``columns`` at most; fewer when a column would be narrower than
+    ``min_col``. Height-for-width, so a scroll area sizes the page right."""
+
+    def __init__(self, parent: QWidget | None = None, *, columns: int = 2, spacing: int = SPACE["l"],
+                 min_col: int = 360) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self.columns, self.min_col = columns, min_col
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:  # noqa: D102, N802
+        w = item.widget()
+        if w is not None and w.layout() is not None:
+            # a card's own layout would pin its minimum to the height of its text wrapped at the narrowest
+            # width; here each card gets exactly its height for the column's width
+            w.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self._items.append(item)
+
+    def count(self) -> int:  # noqa: D102
+        return len(self._items)
+
+    def itemAt(self, i: int):  # noqa: D102, N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int):  # noqa: D102, N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: D102, N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: D102, N802
+        return True
+
+    def heightForWidth(self, w: int) -> int:  # noqa: D102, N802
+        return self._place(QRect(0, 0, w, 0), move=False)
+
+    def setGeometry(self, rect) -> None:  # noqa: D102, N802
+        super().setGeometry(rect)
+        self._place(rect, move=True)
+
+    def sizeHint(self) -> QSize:  # noqa: D102, N802
+        return QSize(self.min_col * self.columns, self.heightForWidth(self.min_col * self.columns))
+
+    def minimumSize(self) -> QSize:  # noqa: D102, N802
+        return QSize(self.min_col, 0)
+
+    def _place(self, rect, *, move: bool) -> int:
+        sp = self.spacing()
+        w = rect.width()
+        n = max(1, min(self.columns, (w + sp) // (self.min_col + sp)))
+        col_w = max(1, (w - (n - 1) * sp) // n)
+        heights = [0] * n
+        moved = False
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            c = heights.index(min(heights))
+            w = item.widget()
+            if w is not None:
+                h = w.heightForWidth(col_w) if w.hasHeightForWidth() else w.sizeHint().height()
+            else:
+                h = item.heightForWidth(col_w) if item.hasHeightForWidth() else item.sizeHint().height()
+            if move:
+                geo = QRect(rect.x() + c * (col_w + sp), rect.y() + heights[c], col_w, h)
+                if w is not None:
+                    if w.geometry() != geo:
+                        w.setGeometry(geo)
+                        moved = True
+                else:
+                    item.setGeometry(geo)
+            heights[c] += h + sp
+        if moved and self.parentWidget() is not None:   # the page's cached glass follows the cards
+            _glass_changed(self.parentWidget())
+        return max(0, max(heights) - sp)
+

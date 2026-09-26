@@ -4,16 +4,26 @@ call cards, the call indicator and the voice pill.
 Each is a frameless, translucent, always-on-top tool window with rounded
 corners and a soft shadow that fades and slides when it appears.
 
-The look is Liquid Glass (docs/UI-window.md). Since 2026-09-27 every surface
-is **clear glass** over the real desktop: the window is per-pixel transparent,
-the panel is a light smoke (:attr:`Theme.surface_fill`), the v3 catch-light
-on its lit edge, a soft shadow, and no outline and no dark block. Nothing is
-refracted here: Windows gives no app the desktop's pixels without a screen
-capture, and the old stand-in (the wallpaper picture) showed the wallpaper
-even over other windows. So there is no render, no image and no GPU device
-for these surfaces in any glass setting; painting one costs a few fills.
-(The glass setting still shapes the window's own glass; see
-:mod:`yuki.ui.window.live`.)
+The look is Liquid Glass (docs/UI-window.md), and it follows the glass setting
+live (2026-09-27, round 4: "the floating surfaces show no glass at all"):
+
+* **Off** -- clean and transparent: the window is per-pixel transparent, the
+  panel a light smoke (:attr:`Theme.surface_fill`) and a soft shadow; no edge
+  light, no outline, no dark block. A few fills.
+* **Light** -- the panel holds a soft backdrop of its own (the smoke with two
+  faint pools of colour, the surface's tint and a second hue, and a sheen), and
+  its rim refracts that backdrop on the CPU (:func:`yuki.ui.lens.render_light`):
+  the edge bends and catches the light like a thick lens. Windows gives no app
+  the desktop's pixels without a screen capture, so the soft backdrop is what
+  there is to bend.
+* **Full** -- the same backdrop through the GPU shader: stronger bending,
+  colour fringes at the rim, a droplet for a pill (loads the graphics driver in
+  yuki-ui, about 50 MB).
+
+Rendered like a static picture: once per size, theme, tint and setting, on the
+shared glass thread (:func:`glass_worker`), then only composited; moving or
+fading a surface re-renders nothing. "Transparency" scales the smoke, in every
+mode.
 
 Light and dark follow Windows' app mode (or the Appearance setting). Text
 colours come from :meth:`GlassWindow.ink` so a surface reads on both.
@@ -47,6 +57,7 @@ from PySide6.QtCore import (
     QObject,
     QParallelAnimationGroup,
     QPoint,
+    QPointF,
     QPropertyAnimation,
     QRect,
     QRectF,
@@ -100,11 +111,12 @@ IDLE_RELEASE_MS = 20_000
 
 
 def ui_font(size: int = 11, *, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """The system UI font at a given point size (Segoe UI Variable on Windows 11)."""
-    font = QFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont))
-    font.setPointSize(size)
-    font.setWeight(weight)
-    return font
+    """The UI font at a given point size: Segoe UI Variable with its real weights and optical size (the same
+    as the window's type, :func:`yuki.ui.window.theme.variable_font`), Segoe UI on older Windows."""
+    from yuki.ui.window.theme import variable_font
+
+    word = "Semibold" if weight >= QFont.Weight.DemiBold else ("Light" if weight <= QFont.Weight.Light else "Regular")
+    return variable_font(size * 4 / 3, word)
 
 
 # -- appearance: theme and glass setting, shared by every surface in this process -----------------------
@@ -343,22 +355,30 @@ class GlassWindow(QWidget):
     def button_css(self, style: str = "quiet", accent: QColor | None = None) -> str:
         """A pill button's style sheet: ``quiet`` (outlined) or ``tinted`` (the accent's wash)."""
         t = self.theme()
-        # clear glass pills: a faint wash, no outline (2026-09-27)
+        # rounded glass buttons (2026-09-27): a lit glass body, lighter at the top, a faint shade at the bottom
+        # edge; bigger than before and clearly buttons
+        top, bottom = QColor(255, 255, 255), QColor(255, 255, 255)
         if style == "tinted":
             a = QColor(accent or t.accent)
-            ink = a.lighter(125) if t.dark else a.darker(125)
-            return (f"QPushButton {{ color: {_css(ink)}; background: rgba({a.red()},{a.green()},{a.blue()},"
-                    f"{48 if t.dark else 32}); border: none;"
-                    " border-radius: 11px; padding: 3px 14px; min-height: 18px; }"
-                    f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},{80 if t.dark else 56}); }}"
-                    f"QPushButton:disabled {{ color: {_css(t.text_3)}; background: transparent; }}")
-        wash = QColor(t.text)
-        wash.setAlphaF(0.08 if t.dark else 0.06)
-        hover = QColor(t.text)
-        hover.setAlphaF(0.14 if t.dark else 0.10)
-        return (f"QPushButton {{ color: {_css(t.text_2)}; background: {_css(wash)}; border: none;"
-                " border-radius: 11px; padding: 3px 14px; min-height: 18px; }"
-                f"QPushButton:hover {{ color: {_css(t.text)}; background: {_css(hover)}; }}"
+            ink = a.lighter(130) if t.dark else a.darker(135)
+            top, bottom = QColor(a), QColor(a)
+            top.setAlphaF(0.34 if t.dark else 0.22)
+            bottom.setAlphaF(0.22 if t.dark else 0.14)
+        else:
+            ink = t.text
+            top.setAlphaF(0.16 if t.dark else 0.95)
+            bottom.setAlphaF(0.08 if t.dark else 0.80)
+        rim = QColor(255, 255, 255) if t.dark else QColor(16, 24, 48)
+        rim.setAlphaF(0.07 if t.dark else 0.12)
+        hi = QColor(top)
+        hi.setAlphaF(min(1.0, top.alphaF() + (0.08 if t.dark else 0.05)))
+        grad = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_css(top)}, stop:1 {_css(bottom)})")
+        grad_hi = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_css(hi)}, stop:1 {_css(top)})")
+        return (f"QPushButton {{ color: {_css(ink)}; background: {grad}; border: none;"
+                f" border-bottom: 1px solid {_css(rim)}; border-radius: 15px; padding: 5px 18px;"
+                " min-height: 20px; font-weight: 600; }"
+                f"QPushButton:hover {{ background: {grad_hi}; }}"
+                f"QPushButton:pressed {{ background: {_css(bottom)}; }}"
                 f"QPushButton:disabled {{ color: {_css(t.text_3)}; background: transparent; }}")
 
     def restyle(self) -> None:
@@ -369,11 +389,14 @@ class GlassWindow(QWidget):
         for w in list(cls._instances):
             try:
                 w._glass = None
+                w._glass_wanted = None
                 w._shadow_pixmap = None
                 w.restyle()
                 w.update()
+                for child in w.findChildren(QWidget):   # painted children (bubbles, buttons) follow at once
+                    child.update()
                 if w.isVisible():
-                    w._request_glass()
+                    w._want_glass()
             except RuntimeError:   # the C++ side is gone
                 pass
 
@@ -387,6 +410,17 @@ class GlassWindow(QWidget):
         """The panel's corner radius; a short panel (the voice pill, the strip) is a pill: fully round."""
         h = self.panel_rect().height()
         return h / 2 if h <= 60 else float(self.radius)
+
+    def _surface_key(self) -> tuple:
+        """What the rendered panel depends on (never its place: nothing behind it is read)."""
+        from yuki.ui import lens
+
+        panel = self.panel_rect()
+        pol = lens.policy()
+        tint = self.glass_tint.rgba() if self.glass_tint is not None else 0
+        return (panel.width(), panel.height(), round(self.devicePixelRatioF(), 3), self.theme().name,
+                round(self.panel_radius(), 1), self.glass_density, tint, pol.mode, round(pol.bend, 3),
+                round(pol.blur, 3), round(pol.transparency, 3))
 
     def _level(self) -> Any:
         """Clear surface glass: the theme's smoke, the raised level's catch-light, a soft shadow that fades
@@ -406,12 +440,29 @@ class GlassWindow(QWidget):
 
     def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
         del event
-        from yuki.ui.window.glass import paint_glass
+        from yuki.ui import lens
+        from yuki.ui.window.glass import paint_glass, paint_shadow, rounded
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        paint_glass(painter, QRectF(self.panel_rect()), self.panel_radius(), self._level(), tint=self.glass_tint,
-                    painted=True)
+        level = self._level()
+        panel = QRectF(self.panel_rect())
+        radius = self.panel_radius()
+        mode = lens.policy().mode
+        key = self._surface_key()
+        img = self._glass[1] if self._glass is not None and self._glass[0] == key else None
+        if mode == "off" or img is None:
+            # Off: clean and transparent (no edge light). Light / Full before the first render: the same smoke
+            # with its catch-light, so nothing flashes while the glass is made
+            paint_glass(painter, panel, radius, level, tint=self.glass_tint, painted=True, edge=mode != "off")
+            if mode != "off" and img is None:
+                self._want_glass()
+            return
+        paint_shadow(painter, panel, radius, level)
+        painter.save()
+        painter.setClipPath(rounded(panel, radius))
+        painter.drawImage(QPointF(0, 0), img)
+        painter.restore()
 
     # -- the refracted panel (Light / Full) -------------------------------------
 
@@ -427,11 +478,61 @@ class GlassWindow(QWidget):
                 pol.mode, pol.bend, pol.blur, _wallpaper_stamp())
 
     def _want_glass(self) -> None:
-        """Nothing to render since 2026-09-27 (clear glass is painted); kept for callers."""
+        """The panel's glass is out of date: render it once the size has settled (at once the first time)."""
+        from yuki.ui import lens
+
+        if lens.policy().mode == "off" or not self.isVisible():
+            return
+        key = self._surface_key()
+        if key == self._glass_wanted or (self._glass is not None and self._glass[0] == key):
+            return
+        self._settle.start(0 if self._glass is None else SETTLE_MS)
 
     def _request_glass(self) -> None:
-        """Kept for older callers and tests: surfaces are painted, so there is nothing to render."""
-        self._glass = None
+        """Render the panel's glass for its current size, theme and setting, on the glass thread."""
+        from yuki.ui import lens
+
+        if lens.policy().mode == "off" or not self.isVisible():
+            return
+        key = self._surface_key()
+        if key == self._glass_wanted or (self._glass is not None and self._glass[0] == key):
+            return
+        self._glass_wanted = key
+        spec = self._surface_spec()
+        ref = weakref.ref(self)
+
+        def deliver(img: Any) -> None:
+            me = ref()
+            if me is None or img is None:
+                return
+            try:
+                if me._glass_wanted != key:
+                    return   # superseded while it rendered
+                me._glass, me._glass_wanted = (key, img), None
+                me.update()
+            except RuntimeError:
+                pass
+
+        glass_worker().submit(lambda: render_surface(**spec), deliver)
+
+    def _surface_spec(self) -> dict:
+        """Everything :func:`render_surface` needs, read on the GUI thread."""
+        from yuki.ui import lens
+
+        t = self.theme()
+        return {"theme": t, "size": (self.width(), self.height()), "panel": QRectF(self.panel_rect()),
+                "radius": self.panel_radius(), "dpr": self.devicePixelRatioF(),
+                "fill": QColor(lens.scaled_level(self._level()).fill),
+                "tint": QColor(self.glass_tint) if self.glass_tint is not None else None,
+                "mode": lens.policy().mode}
+
+    def showEvent(self, event: object) -> None:  # noqa: D102 - Qt override
+        super().showEvent(event)
+        self._want_glass()
+
+    def resizeEvent(self, event: object) -> None:  # noqa: D102 - Qt override
+        super().resizeEvent(event)
+        self._want_glass()
 
     def _shadow(self) -> QPixmap:   # kept for subclasses that paint their own frame
         ratio = self.devicePixelRatioF()
@@ -544,6 +645,108 @@ class GlassWindow(QWidget):
             self._closing = False
             self.hide()
             self.faded_out.emit()
+
+
+# -- the surface's glass picture (Light / Full) -------------------------------------------------------------
+
+#: How strong the soft backdrop inside a surface is, per mode.
+SURFACE_BACKDROP = {"light": 1.0, "full": 1.3}
+
+
+def surface_backdrop(t: Any, w: float, h: float, fill: QColor, tint: QColor | None, strength: float) -> QImage:
+    """What a floating surface's glass bends (logical px, ``w`` x ``h``, the panel only): its smoke, two faint
+    pools of colour (the surface's tint, or the accent, from the top left; a second hue from the bottom right)
+    and a soft sheen down from the top. Nothing behind the surface can be read, so this is what bends."""
+    from PySide6.QtCore import QPointF as P
+    from PySide6.QtGui import QBrush, QLinearGradient, QRadialGradient
+
+    img = QImage(max(1, int(w)), max(1, int(h)), QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.fillRect(QRectF(0, 0, w, h), fill)
+    big = max(w, h)
+    first = QColor(tint) if tint is not None and tint.alpha() else QColor(t.accent)
+    second = QColor(t.kind("review"))
+    for color, cx, cy, r, a in ((first, w * 0.12, h * 0.05, big * 0.75, 0.34 if t.dark else 0.24),
+                                (second, w * 0.95, h * 1.05, big * 0.65, 0.26 if t.dark else 0.18)):
+        c = QColor(color)
+        c.setAlphaF(min(1.0, a * strength))
+        g = QRadialGradient(P(cx, cy), r)
+        g.setColorAt(0.0, c)
+        clear = QColor(c)
+        clear.setAlpha(0)
+        g.setColorAt(1.0, clear)
+        p.fillRect(QRectF(0, 0, w, h), QBrush(g))
+    sheen = QLinearGradient(P(0, 0), P(0, min(h, 90.0)))
+    sheen.setColorAt(0.0, QColor(255, 255, 255, int((22 if t.dark else 60) * strength)))
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(0, 0, w, h), QBrush(sheen))
+    p.end()
+    return img
+
+
+def render_surface(*, theme: Any, size: tuple[int, int], panel: QRectF, radius: float, dpr: float, fill: QColor,
+                   tint: QColor | None, mode: str) -> QImage | None:
+    """A floating surface's panel glass for its whole window (device px): the soft backdrop inside the panel,
+    its rim refracted -- Light on the CPU, Full on the GPU. Runs on the glass thread."""
+    from yuki.ui import lens
+    from yuki.ui.window.refract import Shape
+
+    if mode not in SURFACE_BACKDROP or panel.width() < 4 or panel.height() < 4:
+        return None
+    t = theme
+    W, H = max(1, int(round(size[0] * dpr))), max(1, int(round(size[1] * dpr)))
+    base = QImage(W, H, QImage.Format.Format_ARGB32_Premultiplied)
+    base.fill(Qt.GlobalColor.transparent)
+    back = surface_backdrop(t, panel.width() * dpr, panel.height() * dpr, fill, tint, SURFACE_BACKDROP[mode])
+    p = QPainter(base)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    rect = QRectF(panel.x() * dpr, panel.y() * dpr, panel.width() * dpr, panel.height() * dpr)
+    from yuki.ui.window.glass import rounded
+
+    p.setClipPath(rounded(rect, radius * dpr))
+    p.drawImage(rect.topLeft(), back)
+    p.end()
+    short = panel.height() <= 60
+    optics = t.optics["control" if short else "raised"]
+    # the smoke carries legibility: the lens adds no tint or tone squeeze of its own, and no shadow (painted)
+    from dataclasses import replace as _replace
+
+    optics = _replace(optics, tint=QColor(0, 0, 0, 0), tone=(0.0, 1.0), shadow=0.0, blur=0.0,
+                      specular=min(1.0, optics.specular * 1.8), bezel=min(optics.bezel, 30.0) if not short
+                      else optics.bezel)
+    optics = lens.scaled_optics(optics)
+    optics = _replace(optics, tint=QColor(0, 0, 0, 0), tone=(0.0, 1.0))
+    shape = Shape(rect, radius * dpr, optics, dpr, None, None, False, 0, False, None)
+    if mode == "full":
+        out = lens.render(base, [("glass", [shape])], "full")
+        out = _keep_alpha(out, base)
+    else:
+        out = lens.render_light(base, [[shape]], shadows=False)
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
+def _keep_alpha(out: QImage, base: QImage) -> QImage:
+    """The GPU pass composites onto an opaque canvas; a surface must stay as see-through as its smoke. The
+    refracted colours come back premultiplied (the base texture is), so the base's own alpha is put back,
+    raised only where the rim light adds more than the smoke had."""
+    import numpy as np
+
+    from yuki.ui.lens import _view
+
+    o = out.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    b = base.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    if o.size() != b.size():
+        return o
+    ov, bv = _view(o), _view(b)
+    alpha = np.maximum(bv[..., 3], ov[..., :3].max(axis=2))
+    alpha[bv[..., 3] == 0] = 0
+    ov[..., 3] = alpha
+    np.minimum(ov[..., :3], alpha[..., None], out=ov[..., :3])
+    o.setDevicePixelRatio(out.devicePixelRatio())
+    return o
 
 
 _STAMP: list[float] = [0.0, -10.0]   # value, when it was read

@@ -200,7 +200,7 @@ def test_glass_setting_decides_what_is_refracted_and_what_is_painted(qapp):
             paint_glass(p, QRectF(100, 20, 60, 26), 13, t.level("control"), painted=True)   # a chat bubble
             p.end()
             shapes = COLLECTOR.end()
-            got = {"regular" if s.optics is t.optics["regular"] else "control" for s in shapes}
+            got = {s.level.name for s in shapes}   # optics are scaled by the settings; the level says which
             assert got == expect, mode
     finally:
         lens.set_policy(saved)

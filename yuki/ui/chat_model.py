@@ -39,6 +39,8 @@ from typing import Any, Callable
 MAX_ITEMS = 1000
 #: A step's result line is kept to this many characters.
 RESULT_CHARS = 240
+#: The agent's closing tool: its input is the reply, shown in the bubble, never as a step of the fold.
+CLOSING_TOOLS = frozenset({"done"})
 
 
 @dataclass
@@ -84,6 +86,7 @@ class Item:
     turn: str | None = None            # the voice turn it belongs to ("<session>-<n>")
     question: str = ""                 # what Yuki asked (status question)
     ended_at: float | None = None      # when the response settled
+    thinking: str = ""                 # the thinking summary written so far (one muted line while it thinks)
 
     # -- derived ------------------------------------------------------------------------------
 
@@ -97,25 +100,32 @@ class Item:
             return self.expanded
         return self.running
 
+    def real_steps(self) -> list[Step]:
+        """The steps that did something: not the progress lines, and not the closing ``done`` call (the reply
+        itself), so a plain answer has none and shows no fold."""
+        return [s for s in self.steps if s.kind != "say" and not (s.kind == "tool" and s.name in CLOSING_TOOLS)]
+
     def work_seconds(self, now: float | None = None) -> float:
-        """How long it worked: from the first step (or the bubble) to the last step's end (or now)."""
-        if not self.steps:
-            return 0.0
+        """How long it worked: from when the message was sent (the response's bubble is made then) to when it
+        settled (or now); a response with no bubble time falls back to its first step."""
         now = time.time() if now is None else now
-        start = min(s.started for s in self.steps)
+        starts = [self.at] + [s.started for s in self.steps]
+        start = min(starts)
         if self.running:
             return max(0.0, now - start)
         ends = [s.ended if s.ended is not None else s.started for s in self.steps]
-        end = max(ends + ([self.ended_at] if self.ended_at else []))
+        end = max(ends + ([self.ended_at] if self.ended_at else []) + [start])
         return max(0.0, end - start)
 
     def work_line(self, now: float | None = None) -> str:
         """``worked for 12 s · 5 steps`` (``working · 3 steps`` while it runs)."""
-        n = len([s for s in self.steps if s.kind != "say"])
+        n = len(self.real_steps())
         steps = f"{n} step{'s' if n != 1 else ''}"
         secs = self.work_seconds(now)
         if self.running:
             return f"working {fmt_seconds(secs)} · {steps}"
+        if secs < 0.5:   # no timing kept (an exchange read back from memory): the steps alone, never "0 s"
+            return steps
         return f"worked for {fmt_seconds(secs)} · {steps}"
 
     def to_dict(self) -> dict[str, Any]:
@@ -310,6 +320,27 @@ class ChatModel:
         self._voice_job[job] = key
         self._changed(item)
 
+    def _on_partial(self, ev: dict[str, Any], at: float) -> None:
+        """The reply (or the thinking) as it is written: the words stream into the bubble; the thinking shows
+        as one muted line until the first words arrive. A voice job speaks instead, so it is left alone."""
+        job = ev.get("job")
+        if not isinstance(job, int) or job in self._voice_job:
+            return
+        text = str(ev.get("text") or "")
+        item = self._assistant_for_job(job, at)
+        if item.status not in ("pending", "running", "streaming"):
+            return
+        if ev.get("what") == "reply":
+            item.text = text
+            item.thinking = ""
+            item.status = "streaming"
+        elif ev.get("what") == "thinking" and not item.text:
+            lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+            item.thinking = lines[-1] if lines else ""
+        else:
+            return
+        self._changed(item)
+
     def _on_tool_called(self, ev: dict[str, Any], at: float) -> None:
         job = ev.get("job")
         if not isinstance(job, int):
@@ -319,6 +350,9 @@ class ChatModel:
         if item is None:
             return
         name = str(ev.get("name") or "tool")
+        if item.status == "streaming" and name not in CLOSING_TOOLS:
+            # the words shown so far belonged to a reply the turn went past (it kept working): start clean
+            item.text, item.status = "", "running"
         n = sum(1 for s in item.steps if s.job == job and s.kind == "tool")
         item.steps.append(Step(f"tool:{job}:{n}", "tool", name, str(ev.get("label") or name), at,
                                depth=1 if voice else 0, job=job))
@@ -429,6 +463,7 @@ class ChatModel:
             return
         item = self._assistant_for_job(job, at)
         item.text = text or item.text
+        item.thinking = ""
         item.status = "failed" if failed else "done"
         item.ended_at = at
         for s in item.steps:

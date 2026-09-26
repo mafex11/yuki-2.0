@@ -73,6 +73,38 @@ def first_sentence(text: str, limit: int = 160) -> str:
     return cut + "…"
 
 
+def plain(text: str) -> str:
+    """Text as a clean sentence for the window (2026-09-27: "no em dashes, no parentheses, no technical
+    noise"). Presentation only, character by character: a dash between words becomes a comma, an aside in
+    parentheses or brackets is left out (the full text stays behind Why?), a machine name joined with
+    underscores reads as words ("focus_window" -> "focus window"), and spacing is tidied."""
+    t = " ".join((text or "").split())
+    for dash in (" — ", "—", " – ", " - "):
+        t = t.replace(dash, ", ")
+    out: list[str] = []
+    depth = 0
+    for ch in t:
+        if ch in "([":
+            depth += 1
+            continue
+        if ch in ")]" and depth:
+            depth -= 1
+            continue
+        if not depth:
+            out.append(ch)
+    t = "".join(out)
+    words = []
+    for w in t.split(" "):
+        core = w.strip(".,;:!?")
+        if "_" in core and core.replace("_", "").isalnum():
+            w = w.replace("_", " ")
+        words.append(w)
+    t = " ".join(" ".join(words).split())
+    for a, b in ((" ,", ","), (" .", "."), (" ;", ";"), (" :", ":"), (",,", ","), (", .", "."), (",.", ".")):
+        t = t.replace(a, b)
+    return t.strip(" ,;")
+
+
 _EPISODE_TIME = re.compile(r"^\s*\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}\s*(\([^)]*\))?\s*:\s*", re.UNICODE)
 
 
@@ -435,6 +467,7 @@ class MeView:
     preferences: list[Item]
     portrait_at: float | None
     questions_open: int
+    todos: list["Todo"] = field(default_factory=list)   # the user's own to-dos (memory's owner "user"), on Me
 
 
 #: The portrait's personality aspects, as the page names them.
@@ -469,7 +502,7 @@ def portrait_item(f: dict[str, Any], today: date | None = None) -> Item:
         tags.append("you")
     elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
         tags.append("unsure")
-    text = second_person(f["text"])
+    text = plain(second_person(f["text"]))
     return Item(f["ref"], f["subject"], text, first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
                 f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev)
 
@@ -489,7 +522,7 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
     unsure = []
     for j in memory.journal_entries(week, None):
         if j["nature"] == "uncertain":
-            text = second_person(j["text"])
+            text = plain(second_person(j["text"]))
             app = j["app"] or ""
             where = "a call" if app.startswith("call") else app
             unsure.append(Item(f"journal:{j['id']}", app, text, first_sentence(text, 180), "journal", None, "model",
@@ -497,9 +530,10 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
                                [Evidence(j["at"], app, j["text"], j["nature"])]))
     portrait_at = epoch(memory.status().get("portrait_updated_at"))
     open_q = len(memory.questions(statuses=("open", "asked"), limit=50))
+    todos, _promises = read_todos(memory)
     return MeView(by_kind.get("work", []), by_kind.get("interest", []), by_kind.get("behaviour", []),
                   by_kind.get("person", []), personality, unsure[-4:], by_kind.get("open_loop", []),
-                  by_kind.get("preference", []), portrait_at, open_q)
+                  by_kind.get("preference", []), portrait_at, open_q, todos)
 
 
 # -- Yuki: its side ------------------------------------------------------------------
@@ -519,6 +553,51 @@ class Todo:
 
 
 @dataclass
+class Learned:
+    """One thing Yuki learned to do on this PC, as the window shows it: a short title and a plain line."""
+
+    title: str
+    line: str
+    app: str = ""
+
+
+def learned_items(memory: Any, limit: int = 10) -> list[Learned]:
+    """Know-how as short, plain entries. The title is what the user asked for, in their words; the line is
+    the first sentence of how it was done, without the "Not: ..." note of what failed (memory's own fixed
+    format, ``conversations.knowhow_from``) and without machine names. Memory keeps no display title yet
+    (asked for: a model-written ``title`` and ``summary`` per entry)."""
+    try:
+        rows = memory.store.knowhow_current(None, any_app=True)[:limit]
+    except Exception:
+        return []
+    out: list[Learned] = []
+    for k in rows:
+        how = (k.text or "").split(" Not: ", 1)[0]
+        line = first_sentence(plain(how), 140)
+        ask = (k.source_request or "").split(" [backfill:", 1)[0]
+        ask = first_sentence(plain(ask), 60).rstrip(".!?")
+        app = (k.app or "").strip()
+        title = (ask[:1].upper() + ask[1:]) if ask else (app.capitalize() if app else "On this PC")
+        out.append(Learned(title, line, app))
+    return out
+
+
+def read_todos(memory: Any) -> tuple[list["Todo"], list["Todo"]]:
+    """(the user's own to-dos, what Yuki itself said it would do), open ones, soonest due first."""
+    todos, promises = [], []
+    for t in memory.todos(include_done=False):
+        source, quote = _todo_source(t)
+        text = plain(second_person(str(t.get("text") or "")))
+        # memory says whose it is ("owner", 2026-09-27); an older memory without it: Yuki's own promises
+        # were its "commitment" source
+        owner = str(t.get("owner") or ("yuki" if t.get("source") == "commitment" else "user"))
+        item = Todo(str(t.get("id")), first_sentence(text, 200), source, plain(quote), _due_label(t.get("due")), t,
+                    owner)
+        (promises if owner == "yuki" else todos).append(item)
+    return todos, promises
+
+
+@dataclass
 class YukiView:
     talk: list[str]                     # how Yuki talks to this user: the portrait's reply-style section
     talk_at: float | None               # when that was last written (the portrait)
@@ -526,7 +605,7 @@ class YukiView:
     picked_up: list[Item]               # from how the user talks with people: talk, humour, openness
     todos: list[Todo]                   # the user's own to-dos (memory's owner "user")
     promises: list[Todo]                # what Yuki itself promised to do (owner "yuki"), shown apart
-    knowhow: list[str]
+    knowhow: list[Any]                  # Learned entries (short title and a plain line)
     waiting: list[dict[str, Any]]       # questions waiting to be asked
     asked: list[dict[str, Any]]         # asked, with the answer if any
 
@@ -564,7 +643,8 @@ def _todo_source(t: dict[str, Any]) -> tuple[str, str]:
         return f"Yuki promised in a chat · {when}", quote
     if src == "user":
         return f"You added it · {when}", ""
-    return (second_person(ev)[:1].upper() + second_person(ev)[1:] if ev else f"Seen in your day · {when}"), ""
+    ev = plain(second_person(ev))
+    return (ev[:1].upper() + ev[1:] if ev else f"Seen in your day · {when}"), ""
 
 
 def _due_label(value: Any) -> str:
@@ -579,29 +659,22 @@ def _due_label(value: Any) -> str:
 
 def build_yuki(memory: Any, *, today: date | None = None) -> YukiView:
     portrait = memory.portrait_text()
-    talk = [second_person(s) for s in sentences(portrait_section(portrait, "Relationship"))]
+    talk = [plain(second_person(s)) for s in sentences(portrait_section(portrait, "Relationship"))]
     persona_block = memory.yuki_persona() or ""
-    persona = [ln.strip().lstrip("-").strip() for ln in persona_block.split("\n") if ln.strip().lstrip("-").strip()]
+    persona = [plain(ln.strip().lstrip("-").strip()) for ln in persona_block.split("\n")
+               if ln.strip().lstrip("-").strip()]
     picked: list[Item] = []
     for f in memory.portrait_facts_with_evidence():
         if f["kind"] == "personality" and f["aspect"] in ("talk", "people", "joke"):
             picked.append(portrait_item(f, today))
     order = {"talk": 0, "people": 1, "joke": 2}
     picked.sort(key=lambda i: (order.get(i.aspect or "", 3), -(i.confidence or 0.5)))
-    todos, promises = [], []
-    for t in memory.todos(include_done=False):
-        source, quote = _todo_source(t)
-        text = second_person(str(t.get("text") or ""))
-        # memory says whose it is ("owner", 2026-09-27); an older memory without it: Yuki's own promises
-        # were its "commitment" source
-        owner = str(t.get("owner") or ("yuki" if t.get("source") == "commitment" else "user"))
-        item = Todo(str(t.get("id")), first_sentence(text, 200), source, quote, _due_label(t.get("due")), t, owner)
-        (promises if owner == "yuki" else todos).append(item)
+    todos, promises = read_todos(memory)
     qs = memory.questions(limit=30)
     waiting = [q for q in qs if q["status"] in ("open",)]
     asked = [q for q in qs if q["status"] in ("asked", "answered", "skipped", "never")]
     talk_at = epoch(memory.status().get("portrait_updated_at"))
-    return YukiView(talk, talk_at, persona, picked, todos, promises, memory.knowhow(limit=20), waiting, asked[:6])
+    return YukiView(talk, talk_at, persona, picked, todos, promises, learned_items(memory), waiting, asked[:6])
 
 
 # -- Status ---------------------------------------------------------------------------

@@ -46,6 +46,8 @@ from yuki.ui.window.window import PAGES, _Orb
 CAPTION_H = 44
 #: After a move, how long the window must be still before its floor is re-rendered for the new place.
 MOVE_SETTLE_MS = 250
+#: Room above each page's content for the caption buttons that float over it (logical px).
+PAGE_TOP = 40
 
 
 class CaptionButton(QAbstractButton):
@@ -146,16 +148,18 @@ class LiveSidebar(Glass):
         while lay.count():
             it = lay.takeAt(0)
             if it.widget() is not None:
+                it.widget().hide()   # gone at once: a label left until deleteLater would overlap the new one
                 it.widget().deleteLater()
             elif it.layout() is not None:
                 sub = it.layout()
                 while sub.count():
                     w = sub.takeAt(0).widget()
                     if w is not None:
+                        w.hide()
                         w.deleteLater()
         # state in words (no coloured dots): what is on reads plainly, what is off reads dimmer, and the
         # footer's glass takes a faint warm wash while something is off
-        rows = [(listening, voice_detail or "Listening for “Yuki”", "Voice is off"),
+        rows = [(listening, voice_detail or "Say “Yuki” to start", "Voice is off"),
                 (remembering, "Remembering your day", "Memory paused")]
         if not connected:
             rows.insert(0, (False, "", "Yuki isn't running"))
@@ -179,7 +183,7 @@ class _Loading(QWidget):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         col = QVBoxLayout(self)
-        col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
+        col.setContentsMargins(SPACE["xl"], SPACE["l"] + PAGE_TOP, SPACE["xl"], SPACE["xl"])
         col.setSpacing(SPACE["l"])
         col.addWidget(text_label(t, title, "large_title", parent=self))
         col.addWidget(text_label(t, "Reading your memory…", "callout", "text_3", parent=self))
@@ -220,21 +224,27 @@ class LiveWindow(QWidget):
         self._deferred_gen: dict[str, int] = {}
         self.wallpaper_base: Callable[[], QImage | None] | None = None   # unused since 2026-09-27 (kept for callers)
 
+        # The pages run the window's full height (the caption buttons float over their top band), so the soft
+        # backdrop under a scrolled page never meets the window's own at a seam; only the sidebar has margins.
         row = QHBoxLayout(self)
-        row.setContentsMargins(SPACE["m"], SPACE["m"], 0, SPACE["m"])
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
         self.sidebar = LiveSidebar(t, current=current)
         self.sidebar.navigate.connect(self._on_nav)
         self.sidebar_glass = GlassPage(self.sidebar, self)
         self.sidebar_glass.setFixedWidth(SIDEBAR_W - SPACE["m"])
-        row.addWidget(self.sidebar_glass)
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(0)
-        top = QHBoxLayout()
+        side = QVBoxLayout()
+        side.setContentsMargins(SPACE["m"], SPACE["m"], 0, SPACE["m"])
+        side.addWidget(self.sidebar_glass)
+        row.addLayout(side)
+        self.stack = QStackedWidget()
+        self.stack.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        row.addWidget(self.stack, 1)
+        self.caption = QWidget(self)
+        self.caption.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        top = QHBoxLayout(self.caption)
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(0)
-        top.addStretch(1)
         self.min_button = CaptionButton(t, "min")
         self.max_button = CaptionButton(t, "max")
         self.close_button = CaptionButton(t, "close")
@@ -243,11 +253,7 @@ class LiveWindow(QWidget):
         self.close_button.clicked.connect(self.close)
         for b in (self.min_button, self.max_button, self.close_button):
             top.addWidget(b)
-        right.addLayout(top)
-        self.stack = QStackedWidget()
-        self.stack.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        right.addWidget(self.stack, 1)
-        row.addLayout(right, 1)
+        self.caption.setFixedSize(46 * 3, 32)
         self.slots: dict[str, QWidget] = {}
         self.glass_pages: dict[str, GlassPage] = {}
         for key, _glyph, label in PAGES:
@@ -259,6 +265,7 @@ class LiveWindow(QWidget):
             self.slots[key] = holder
             self.stack.addWidget(holder)
         self.toast = Toast(t, self)
+        self.caption.raise_()
         self.show_page(current)
         attach_tips(self, lambda: self.t)
 
@@ -288,7 +295,7 @@ class LiveWindow(QWidget):
             if isinstance(w, QScrollArea):
                 old_value = w.verticalScrollBar().value()
             w.deleteLater()
-        page = GlassPage(widget, self)
+        page = GlassPage(widget, self, top=PAGE_TOP)
         self.glass_pages[key] = page
         if scrolls:
             area = scroll(page)
@@ -378,6 +385,30 @@ class LiveWindow(QWidget):
 
         return lens.policy().see_through and self._dwm
 
+    # -- the soft backdrop the glass bends ------------------------------------------------------------
+
+    def backdrop_strength(self) -> float:
+        """How strong the soft backdrop is: 0 with the glass Off or See-through (the plain background)."""
+        from yuki.ui import lens
+
+        pol = lens.policy()
+        if self.see_through():
+            return 0.0
+        return lens.MODE_BACKDROP.get(pol.mode, 0.0)
+
+    def split_x(self) -> float:
+        """Where the pages begin (window x): the pages' backdrop and the sidebar's both fade to nothing here."""
+        return float(self.stack.mapTo(self, QPoint(0, 0)).x()) if self.stack.width() else float(SIDEBAR_W)
+
+    def backdrop_key(self) -> tuple:
+        return (self.width(), self.height(), round(self.split_x()), round(self.backdrop_strength(), 3), self.t.name)
+
+    def bloom(self, area: QRectF) -> QImage | None:
+        """The soft backdrop under ``area`` (window coordinates, as if unscrolled), or None."""
+        from yuki.ui.window.glass import bloom_field
+
+        return bloom_field(self.t, self.backdrop_strength(), area, self.width(), self.height(), self.split_x())
+
     def forget_glass(self) -> None:
         """A glass or background setting changed: every cached picture is made again."""
         for page in list(self.glass_pages.values()) + [self.sidebar_glass]:
@@ -397,10 +428,17 @@ class LiveWindow(QWidget):
             paint_backdrop(p, r, self.t, None, dwm=True)
         else:
             paint_backdrop(p, r, self.t, None, solid=True)
+            field = self.bloom(r)
+            if field is not None:
+                from yuki.ui.window.glass import paint_bloom
+
+                paint_bloom(p, r, field, r, QRectF(_e.rect()))
         p.end()
 
     def resizeEvent(self, e: Any) -> None:  # noqa: D102
         super().resizeEvent(e)
+        self.caption.move(self.width() - self.caption.width(), 0)
+        self.caption.raise_()
         if self.toast.isVisible():
             self.toast.hide()
 

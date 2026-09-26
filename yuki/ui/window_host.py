@@ -61,6 +61,10 @@ class WindowHost(QObject):
         helper_step = getattr(rt, "helper_step", None)
         if helper_step is not None:
             helper_step.connect(self._on_helper_step)
+        partial = getattr(rt, "partial", None)
+        if partial is not None:   # the reply / thinking as it is written: the chat never looks dead
+            partial.connect(lambda lane, job, what, text: self.emit({"type": "partial", "job": job, "what": what,
+                                                                     "text": text}))
         rt.said.connect(lambda lane, job, text: self.emit({"type": "said", "job": job, "text": text}))
         rt.asked.connect(lambda lane, job, q: self.emit({"type": "asked", "job": job, "question": q}))
         rt.finished.connect(lambda lane, job, text: self.emit({"type": "finished", "job": job, "text": text}))
@@ -311,6 +315,12 @@ class WindowHost(QObject):
                 from yuki.ui.glass import reload_appearance
 
                 reload_appearance()
+                keys = getattr(ui, "reload_hotkeys", None)
+                if keys is not None:   # the "Open Yuki anywhere" shortcut may have changed
+                    try:
+                        keys()
+                    except Exception:
+                        pass
                 overlay = ui.overlay
                 if getattr(overlay, "thread", None) is not None:
                     overlay.thread.restyle()

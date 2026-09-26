@@ -6,8 +6,14 @@ folds open a composer: the user says what is true in their own words, which
 goes through ``MemoryClient.correct_portrait`` (a user-origin correction the
 portrait folds in within about a minute), phrased as
 ``About "<subject>" (memory had: "<text>"), the user said in their own words:
-"<words>"`` so the fold knows which fact it answers. Jokes wear a Joke chip and
-never read as facts; what Yuki may have misheard sits in its own card.
+"<words>"`` so the fold knows which fact it answers. A joke says so in plain
+secondary text and never reads as a fact (no chips: 2026-09-27); what Yuki may
+have misheard sits in its own card.
+
+**Your to-dos** is the one list of what the user owes people and what they are
+waiting on (memory's ``todos()``, owner "user"), with Done / Not needed / Not
+mine. It replaced "On your plate" (the portrait's open loops: the same items)
+and moved here from the Yuki page (2026-09-27).
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, second_person
+from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, plain, second_person
 from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
     Avatar,
@@ -52,9 +58,9 @@ def _evidence(item: Item) -> list[tuple[str, str, str]]:
     for e in item.evidence[:4]:
         d = datetime.fromtimestamp(e.at)
         where = "a call" if e.app.startswith("call") else e.app
-        text = first_sentence(second_person(e.text), 200)
+        text = first_sentence(plain(second_person(e.text)), 200)
         if e.nature in ("humor", "uncertain"):
-            text = f"[{'joke' if e.nature == 'humor' else 'may be misheard'}] {text}"
+            text = f"{'Said as a joke' if e.nature == 'humor' else 'May be misheard'}: {text}"
         out.append((f"{d.day} {d:%b} {d:%H:%M}", where, text))
     return out
 
@@ -146,7 +152,7 @@ def _people(t: Theme, view: MeView, expand: str | None, compose: str | None, act
 
 def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
     panel = Panel(t, "Personality", "How you talk, what you care about, your running jokes and your stories. "
-                                    "A joke is kept as a joke, never as a fact.", glyph="emoji")
+                                    "A joke stays a joke, never a fact.", glyph="emoji")
     panel.body.setSpacing(SPACE["s"])
     first = True
     for aspect, title in ASPECT_TITLES.items():
@@ -212,7 +218,7 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     refresh.clicked.connect(act.refresh_portrait)
     col.addWidget(page_header(
         t, "Me", "What Yuki understands about you. Tap Why? to see where something came from, or Not right to "
-                 "put it right in your own words.", [refresh]))
+                 "fix it in your own words.", [refresh]))
     if view.questions_open:
         banner = Glass(t, level="raised", radius=20, padding=SPACE["m"], tint=_soft(t.kind("question"), t))
         row = QHBoxLayout()
@@ -239,8 +245,7 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     left_parts = [
         lambda: _list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
                             expand, compose, act, limit=3),
-        lambda: _list_panel(t, "On your plate", "What you owe people, and what they owe you.", "flag",
-                            view.on_your_plate, expand, compose, act, limit=4),
+        lambda: _todo_list(t, view, act),
         lambda: _list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose, act,
                             limit=3),
         lambda: _list_panel(t, "Routines", "Patterns in how your days go.", "history", view.routines,
@@ -276,6 +281,12 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
 
     page.deferred = [f for pair in zip_longest(*columns) for f in pair if f is not None]  # type: ignore[attr-defined]
     return page
+
+
+def _todo_list(t: Theme, view: MeView, act: Actions) -> Panel:
+    from yuki.ui.window.pages.yuki_page import todos_panel
+
+    return todos_panel(t, list(getattr(view, "todos", []) or []), act)
 
 
 def _soft(c, t: Theme):

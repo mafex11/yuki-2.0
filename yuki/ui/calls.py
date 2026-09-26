@@ -185,7 +185,7 @@ class CallConsentCard(GlassWindow):
 
     def _button(self, text: str, *, primary: bool, small: bool = False) -> QPushButton:
         button = QPushButton(text, self)
-        button.setFont(ui_font(8 if small else 9))
+        button.setFont(ui_font(9 if small else 10, weight=QFont.Weight.DemiBold))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # the card never takes the keyboard
         return button   # styled as a pill in restyle()

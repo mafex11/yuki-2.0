@@ -27,7 +27,7 @@ Liquid Glass is a translucent sheet that sits *on* the content behind it:
   pill (radius = half its height). The window itself keeps Windows 11's own
   corners and frame so snapping, the taskbar and Alt+Tab behave as usual.
 
-Type is Segoe UI Variable (Display optical size for titles, Text for body),
+Type is Segoe UI Variable with its real weight and optical-size axes (:func:`variable_font`),
 falling back to Segoe UI. Everything is in logical pixels.
 """
 
@@ -47,7 +47,7 @@ SPACE = {"xxs": 2, "xs": 4, "s": 8, "m": 12, "l": 16, "xl": 24, "xxl": 32, "xxxl
 RADIUS = {"window": 12, "panel": 24, "card": 20, "row": 14, "chip": 9, "tooltip": 16}
 
 #: Control heights (pills).
-CONTROL_H = {"small": 26, "regular": 32, "large": 40, "input": 44}
+CONTROL_H = {"small": 32, "regular": 38, "large": 44, "input": 46}
 
 #: Motion (milliseconds). Glass moves softly: a short spring-like ease out.
 MOTION = {"fast": 120, "regular": 180, "slow": 260}
@@ -229,6 +229,12 @@ def _light() -> Theme:
                                   rgba(16, 24, 48, 0.08), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.16), 30, 10),
             "floor": GlassLevel(rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
                                 rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(20, 30, 60, 0.0), 0, 0),
+            # buttons (2026-09-27): a raised glass body, lit from the top, with a soft shadow under it, so a
+            # button never reads as a flat tag
+            "button": GlassLevel(rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.70), rgba(255, 255, 255, 1.0),
+                                 rgba(16, 24, 48, 0.13), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.22), 6, 2),
+            "button_accent": GlassLevel(rgba(47, 111, 228, 0.17), rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 1.0),
+                                        rgba(47, 111, 228, 0.34), rgba(0, 0, 0, 0.0), rgba(30, 80, 200, 0.24), 6, 2),
         },
         optics={
             # Clear lenses, not bubbles: the edge is carried by the bending itself, with only a faint
@@ -318,6 +324,10 @@ def _dark() -> Theme:
                                   rgba(255, 255, 255, 0.04), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 30, 10),
             "floor": GlassLevel(rgba(0, 0, 0, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
                                 rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.0), 0, 0),
+            "button": GlassLevel(rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.36),
+                                 rgba(255, 255, 255, 0.07), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.55), 6, 2),
+            "button_accent": GlassLevel(rgba(93, 155, 255, 0.32), rgba(255, 255, 255, 0.13), rgba(210, 228, 255, 0.50),
+                                        rgba(93, 155, 255, 0.20), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 6, 2),
         },
         optics={
             # dark glass: the same geometry, a dimmer range, an even fainter catch-light
@@ -356,10 +366,14 @@ def _dark() -> Theme:
 
 
 def _named(t: Theme) -> Theme:
-    """Each glass level learns its own key, so the refraction path can find its optics."""
+    """Each glass level learns its own key, so the refraction path can find its optics (a button bends light
+    like a control droplet; the main button like the accent one)."""
     from dataclasses import replace
 
-    return replace(t, glass={k: replace(v, name=k) for k, v in t.glass.items()})
+    optics = dict(t.optics)
+    optics.setdefault("button", optics["control"])
+    optics.setdefault("button_accent", optics["accent"])
+    return replace(t, glass={k: replace(v, name=k) for k, v in t.glass.items()}, optics=optics)
 
 
 LIGHT = _named(_light())
@@ -393,6 +407,8 @@ TYPE: dict[str, tuple[int, str, str]] = {
 
 _WEIGHTS = {"Light": QFont.Weight.Light, "Regular": QFont.Weight.Normal, "Semibold": QFont.Weight.DemiBold,
             "Bold": QFont.Weight.Bold}
+#: The weight axis value of each weight word (Segoe UI Variable is a variable font: 300-700).
+_WGHT = {"Light": 300.0, "Regular": 400.0, "Semibold": 600.0, "Bold": 700.0}
 
 
 @lru_cache(maxsize=None)
@@ -400,37 +416,53 @@ def _families() -> frozenset[str]:
     return frozenset(QFontDatabase.families())
 
 
-def font(role: str) -> QFont:
-    """The font for a type role (see :data:`TYPE`).
+def variable_font(px: float, weight: str = "Regular") -> QFont:
+    """Segoe UI Variable at ``px`` pixels with a real weight and optical size (its ``wght`` / ``opsz`` axes).
 
-    Windows' own font database lists "Segoe UI Variable Display" / "... Text" as
-    families; FreeType (the offscreen platform) lists one "Segoe UI Variable"
-    family whose styles carry the optical size ("Semibold Display"). Both are
-    handled; Segoe UI is the fallback.
+    Measured 2026-09-27 on this PC (Qt 6.11, DirectWrite): asking the "Segoe UI Variable Text" family for
+    ``DemiBold`` renders the Bold instance, and the named "... Semibold" families render Regular glyphs;
+    only the variable axes give the true Semibold. The optical size follows the size in points (small text
+    gets the open, sturdier "Text/Small" shapes; titles the tighter "Display" ones). Segoe UI when the
+    variable font is missing (Windows 10).
     """
-    size, weight, optical = TYPE[role]
     families = _families()
+    if "Segoe UI Variable" in families:
+        f = QFont("Segoe UI Variable")
+        f.setPixelSize(max(1, int(round(px))))
+        f.setVariableAxis(QFont.Tag("wght"), _WGHT.get(weight, 400.0))
+        f.setVariableAxis(QFont.Tag("opsz"), max(8.0, min(36.0, px * 0.75)))
+        f.setWeight(_WEIGHTS.get(weight, QFont.Weight.Normal))
+        return f
+    f = QFont("Segoe UI")
+    f.setPixelSize(max(1, int(round(px))))
+    f.setWeight(_WEIGHTS.get(weight, QFont.Weight.Normal))
+    return f
+
+
+def rich_font(px: float = 14) -> QFont:
+    """The font for rich text (a formatted reply): Segoe UI Variable by its family name, without fixed axes,
+    so a span's ``font-weight:600`` picks the real Semibold (fixed axes would pin every span to Regular)."""
+    f = QFont("Segoe UI Variable" if "Segoe UI Variable" in _families() else "Segoe UI")
+    f.setPixelSize(max(1, int(round(px))))
+    return f
+
+
+def font(role: str) -> QFont:
+    """The font for a type role (see :data:`TYPE`): Segoe UI Variable with its real weights
+    (:func:`variable_font`), Segoe Fluent Icons for glyphs."""
+    size, weight, _optical = TYPE[role]
     if role.startswith("icon"):
-        f = QFont("Segoe Fluent Icons" if "Segoe Fluent Icons" in families else "Segoe MDL2 Assets")
+        f = QFont("Segoe Fluent Icons" if "Segoe Fluent Icons" in _families() else "Segoe MDL2 Assets")
         f.setPixelSize(size)
         return f
-    native = f"Segoe UI Variable {optical}"
-    if native in families:
-        f = QFont(native)
-        f.setWeight(_WEIGHTS[weight])
-    elif "Segoe UI Variable" in families:
-        f = QFont("Segoe UI Variable")
-        style = f"{weight} {optical}" if weight != "Regular" else f"Regular {optical}"
-        if style in QFontDatabase.styles("Segoe UI Variable"):
-            f.setStyleName(style)
-        else:
-            f.setWeight(_WEIGHTS[weight])
-    else:
-        f = QFont("Segoe UI")
-        f.setWeight(_WEIGHTS[weight])
-    f.setPixelSize(size)
-    f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
-    return f
+    return variable_font(size, weight)
+
+
+def app_font() -> QFont:
+    """The application's default font (every plain Qt widget: buttons, menus, inputs). By family, without
+    fixed axes: an app font with axes would be inherited by every rich-text label and pin its bold spans to
+    Regular (measured 2026-09-27)."""
+    return rich_font(14)
 
 
 #: Segoe Fluent Icons code points used by the window (Windows 11's icon font).

@@ -184,6 +184,17 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def split_question(text: str) -> tuple[str, str]:
+    """A question card's text as (the question, what it rests on): the words up to the first question mark
+    lead, bold and bright; the rest reads under it, small and dim. Presentation only: the whole text shows
+    either way, and a text with no question mark before its end stays one piece."""
+    text = " ".join((text or "").split())
+    i = text.find("?")
+    if 0 < i < len(text) - 1:
+        return text[: i + 1], text[i + 1:].strip()
+    return text, ""
+
+
 def linger_for(text: Any) -> int:
     """How long a card with ``text`` stays up untouched, in ms.
 
@@ -443,6 +454,13 @@ class NudgeCard(GlassWindow):
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.TextFormat.PlainText)
         column.addWidget(self.body)
+        #: A question card: what the question rests on, small and dim under the bold question.
+        self.detail = QLabel(self)
+        self.detail.setFont(ui_font(9))
+        self.detail.setWordWrap(True)
+        self.detail.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail.setVisible(False)
+        column.addWidget(self.detail)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
@@ -468,7 +486,7 @@ class NudgeCard(GlassWindow):
 
     def _button(self, text: str) -> QPushButton:
         button = QPushButton(text, self)
-        button.setFont(ui_font(9))
+        button.setFont(ui_font(10, weight=QFont.Weight.DemiBold))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         # The card never takes the keyboard; nor may its buttons.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -494,6 +512,7 @@ class NudgeCard(GlassWindow):
     def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
         self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.body.setStyleSheet(f"color: {self.ink_css('text')};")
+        self.detail.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self._style_buttons()
 
     # -- content -----------------------------------------------------------
@@ -509,7 +528,16 @@ class NudgeCard(GlassWindow):
         self.never_button.setVisible(question)
         self.when.setText(when_label(nudge.get("at")))
         text = _squash(nudge.get("text"))
-        self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
+        if question:   # the question leads, bold and bright; what it rests on sits under it, small and dim
+            asked, rest = split_question(text)
+            self.body.setFont(ui_font(11, weight=QFont.Weight.DemiBold))
+            self.body.setText(asked)
+            self.detail.setText(rest)
+            self.detail.setVisible(bool(rest))
+        else:
+            self.body.setFont(ui_font(11))
+            self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
+            self.detail.setVisible(False)
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger_for(text)
         self.restyle()
         width = CARD_WIDTH + 2 * self.SHADOW

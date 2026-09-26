@@ -71,7 +71,7 @@ class GlassPage(QWidget):
         host: The live window (it gives the theme, the floor picture and the page's place in it).
     """
 
-    def __init__(self, content: QWidget, host: Any) -> None:
+    def __init__(self, content: QWidget, host: Any, *, top: int = 0) -> None:
         super().__init__()
         from PySide6.QtWidgets import QVBoxLayout
 
@@ -79,7 +79,7 @@ class GlassPage(QWidget):
         self.content = content
         self._host = weakref.ref(host)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(0, top, 0, 0)   # ``top``: room for the caption buttons floating over the page
         lay.addWidget(content)
         self._image: QImage | None = None
         self._shadows: list[Any] = []
@@ -139,7 +139,7 @@ class GlassPage(QWidget):
         self._collecting = True
         COLLECTOR.begin(host.t, "below")
         try:
-            self.content.render(scratch)
+            self.content.render(scratch, self.content.pos())   # below the caption room (``top``)
         finally:
             shapes = COLLECTOR.end()
             self._collecting = False
@@ -160,7 +160,7 @@ class GlassPage(QWidget):
                       round(s.radius), s.depth, id(s.optics), s.tint.rgba() if s.tint is not None else 0,
                       (round(s.clip.x()), round(s.clip.y()), round(s.clip.width()), round(s.clip.height()))
                       if s.clip is not None else None) for s in shapes),
-               self.width(), self.height(), host.t.name, pol)
+               self.width(), self.height(), host.t.name, pol, host.backdrop_key())
         if sig == self._sig or sig == self._pending:
             STATS.skipped += 1
             return
@@ -169,12 +169,23 @@ class GlassPage(QWidget):
             self._image, self._shadows, self._sig, self._pending = None, [], sig, None
             self.update()
             return
-        # Full: the page's glass refracts the plain background and, depth by depth, the glass under it.
-        # Light / Off (and See-through): the same shapes painted flat, once, over nothing (the window's own
-        # background shows through the clear glass)
+        # What the glass bends: the window's soft backdrop under this page (Light / Full), or nothing (Off, and
+        # See-through, where DWM's blur of the desktop is behind and no app can read it). Full refracts every
+        # depth on the GPU (dispersion, droplet pills); Light refracts the large glass on the CPU and paints the
+        # small glass crisp; Off paints every shape flat, once.
         gpu = pol.gpu
         base = QImage(int(self.width() * dpr), int(self.height() * dpr), QImage.Format.Format_ARGB32_Premultiplied)
-        base.fill(host.t.bg if gpu else Qt.GlobalColor.transparent)
+        field = self.backdrop()
+        if field is not None:
+            base.fill(host.t.bg)
+            from yuki.ui.window.glass import paint_bloom
+
+            bp = QPainter(base)
+            bp.scale(dpr, dpr)
+            paint_bloom(bp, QRectF(0, 0, self.width(), self.height()), field[0], field[1])
+            bp.end()
+        else:
+            base.fill(host.t.bg if gpu else Qt.GlobalColor.transparent)
         top = [s for s in shapes if s.depth == 0]
         depths = sorted({s.depth for s in shapes})
         layers = [("glass", [s for s in shapes if s.depth == d]) for d in depths]
@@ -182,9 +193,16 @@ class GlassPage(QWidget):
         ref = weakref.ref(self)
         collect_ms = (time.perf_counter() - started) * 1000
 
+        refract_light = mode == "light" and field is not None
+
         def work() -> QImage:
             t0 = time.perf_counter()
-            img = lens.render(base, layers, "full") if gpu else lens.render_flat(base, layers)
+            if gpu:
+                img = lens.render(base, layers, "full")
+            elif refract_light:
+                img = lens.render_light_mixed(base, [shapes_ for _k, shapes_ in layers])
+            else:
+                img = lens.render_flat(base, layers)
             out = mask(img, top)
             STATS.last_ms = (time.perf_counter() - t0) * 1000 + collect_ms
             STATS.total_ms += STATS.last_ms
@@ -206,6 +224,17 @@ class GlassPage(QWidget):
 
         glass_worker().submit(work, deliver)
 
+    def backdrop(self) -> tuple[QImage, QRectF] | None:
+        """The window's soft backdrop under this page (``(field, area)``, see
+        :func:`yuki.ui.window.glass.bloom_field`), or None (Off, See-through)."""
+        host = self._host()
+        if host is None:
+            return None
+        ox, oy = host.page_offset(self)
+        area = QRectF(ox, oy, self.width(), self.height())
+        field = host.bloom(area)
+        return (field, area) if field is not None else None
+
     # -- painting ----------------------------------------------------------------------------------
 
     def paintEvent(self, e: Any) -> None:  # noqa: D102
@@ -214,6 +243,11 @@ class GlassPage(QWidget):
         if self.opaque_bg is not None:
             bg = QPainter(self)
             bg.fillRect(e.rect(), self.opaque_bg)
+            field = self.backdrop()
+            if field is not None:
+                from yuki.ui.window.glass import paint_bloom
+
+                paint_bloom(bg, QRectF(self.rect()), field[0], field[1], QRectF(e.rect()))
             bg.end()
         if self._image is None:
             return

@@ -49,11 +49,11 @@ def test_a_sent_correction_shows_the_users_words_as_updating(qapp):
     row.field.submitted.emit("Elsa is my friend from college")
     assert got == [("fact:7", "Elsa is my friend from college")]
     assert "Elsa is my friend from college" in row.text_label.text()
-    assert row._state_chip is not None and row._state_chip.text == "Updating…"
+    assert row.source_label.text().startswith("Updating")      # plain words, no chip (round 4)
     assert "Elsa is a colleague" in row.was_label.text()          # the old text is shown as the old text
     late = ItemRow(theme("dark"), "fact:8", "Bro", "x", "y", pending={"kind": "correct", "words": "w", "at": 1,
                                                                         "late": True})
-    assert late._state_chip.text == "Still updating"
+    assert late.source_label.text().startswith("Still updating")
 
 
 def test_pending_corrections_persist_and_resolve_when_memory_applies_them(qapp, tmp_path, monkeypatch):

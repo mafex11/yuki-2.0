@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 
 from yuki.ui.chat_model import ChatModel, Item, Step, fmt_seconds
 from yuki.ui.window.glass import paint_glass, rounded
-from yuki.ui.window.theme import ICON, SPACE, Theme, css, font
+from yuki.ui.window.theme import ICON, SPACE, Theme, css, font, rich_font
 
 #: Bubbles built at once (the newest); older ones are built on demand.
 WINDOW = 60
@@ -51,9 +51,10 @@ KIND_TITLES = {"praise": "Nice one", "nudge": "Check-in", "reminder": "Reminder"
 def _label(t: Theme, text: str, role: str, ink: QColor, *, wrap: bool = True, select: bool = True,
            markdown: bool = False) -> QLabel:
     lab = QLabel()
-    lab.setFont(font(role))
+    # a formatted reply is rich text (yuki.ui.markdown); its font leaves the weight free for bold spans
+    lab.setFont(rich_font(font(role).pixelSize()) if markdown else font(role))
     lab.setStyleSheet(f"color: {css(ink)}; background: transparent;")
-    lab.setTextFormat(Qt.TextFormat.MarkdownText if markdown else Qt.TextFormat.PlainText)
+    lab.setTextFormat(Qt.TextFormat.RichText if markdown else Qt.TextFormat.PlainText)
     lab.setText(text)
     lab.setWordWrap(wrap)
     if wrap:
@@ -127,13 +128,29 @@ class _Tiny(QAbstractButton):
 
 
 class _Spin(QWidget):
-    """A small arc that turns while a step runs (a Qt timer shared through the view's tick)."""
+    """A small arc that turns while something runs. It turns on its own timer (about 16 frames a second)
+    only while it is shown; hidden, it costs nothing."""
 
     def __init__(self, t: Theme, size: int = 12) -> None:
         super().__init__()
         self.t = t
         self.setFixedSize(size, size)
         self.angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(60)
+        self._timer.timeout.connect(self._turn)
+
+    def _turn(self) -> None:
+        self.angle = (self.angle + 24) % 360
+        self.update()
+
+    def showEvent(self, e: object) -> None:  # noqa: D102
+        super().showEvent(e)
+        self._timer.start()
+
+    def hideEvent(self, e: object) -> None:  # noqa: D102
+        super().hideEvent(e)
+        self._timer.stop()
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
@@ -262,7 +279,10 @@ class _Steps(QWidget):
         self.rows_box.setVisible(open_)
         if not open_:
             return
-        sig = tuple((s.key, s.ended, s.ok, s.result, s.label) for s in item.steps)
+        from yuki.ui.chat_model import CLOSING_TOOLS
+
+        shown = [s for s in item.steps if not (s.kind == "tool" and s.name in CLOSING_TOOLS)]
+        sig = tuple((s.key, s.ended, s.ok, s.result, s.label) for s in shown)
         if sig == self._sig:
             return
         self._sig = sig
@@ -270,7 +290,7 @@ class _Steps(QWidget):
             w = self.rows.takeAt(0).widget()
             if w is not None:
                 w.deleteLater()
-        self._rows = [_StepRow(self.t, s, now) for s in item.steps]
+        self._rows = [_StepRow(self.t, s, now) for s in shown]
         for r in self._rows:
             self.rows.addWidget(r)
 
@@ -335,8 +355,17 @@ class _ItemWidget(QWidget):
             self.reply.clicked.connect(lambda: self.reply_nudge.emit(item.nudge))
             head.addWidget(self.reply)
             self.bubble.body.addLayout(head)
-            self.text = _label(t, item.text, "callout", t.text)
-            self.bubble.body.addWidget(self.text)
+            if kind == "question":   # the question bold and bright; what it rests on small and dim under it
+                from yuki.ui.nudges import split_question
+
+                asked, rest = split_question(item.text)
+                self.text = _label(t, asked, "body_strong", t.text)
+                self.bubble.body.addWidget(self.text)
+                if rest:
+                    self.bubble.body.addWidget(_label(t, rest, "caption", t.text_3))
+            else:
+                self.text = _label(t, item.text, "callout", t.text)
+                self.bubble.body.addWidget(self.text)
             self.row.addWidget(self.bubble)
             self.row.addStretch(1)
             return
@@ -348,6 +377,20 @@ class _ItemWidget(QWidget):
         self.steps.toggled.connect(lambda: self.toggle.emit(self.item_id))
         self.steps.setMaximumWidth(self.max_w)
         col.addWidget(self.steps)
+        # the instant a message is sent: a turning arc and "Thinking…" (or the thinking summary as it is
+        # written, one muted line) until the first words of the reply stream in
+        self.live = QWidget()
+        self.live.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        live_row = QHBoxLayout(self.live)
+        live_row.setContentsMargins(6, 4, 4, 4)
+        live_row.setSpacing(8)
+        self.live_spin = _Spin(t, 13)
+        live_row.addWidget(self.live_spin, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.live_label = _label(t, "Thinking…", "caption", t.text_3, wrap=False, select=False)
+        live_row.addWidget(self.live_label, 1)
+        self.live.setMaximumWidth(self.max_w)
+        self.live.setVisible(False)
+        col.addWidget(self.live, 0, Qt.AlignmentFlag.AlignLeft)
         self.bubble = _Bubble(t, mine=False)
         self.bubble.setMaximumWidth(self.max_w)
         self.text = _label(t, "", "body", t.text, markdown=True)
@@ -377,6 +420,10 @@ class _ItemWidget(QWidget):
         now = time.time() if now is None else now
         if item.kind == "user" and self.text is not None and self.meta is not None:
             self.text.setText(item.text + (" …" if item.status == "hearing" else ""))
+            # a short message keeps its bubble one line wide (a wrapping label would squeeze it to a column)
+            longest = max((QFontMetrics(self.text.font()).horizontalAdvance(line) for line in
+                           (item.text or " ").split("\n")), default=0)
+            self.text.setMinimumWidth(min(longest + 4, max(80, self.max_w - 30)))
             ink = t.text_2 if item.status in ("hearing", "others") else t.text
             self.text.setStyleSheet(f"color: {css(ink)}; background: transparent;")
             how = {"voice": " · said", "window": "", "overlay": "", "history": ""}.get(item.source, "")
@@ -389,14 +436,29 @@ class _ItemWidget(QWidget):
             self.reply.setEnabled(item.reply_state == "open")
         elif item.kind == "assistant" and self.text is not None and self.meta is not None:
             if self.steps is not None:
-                self.steps.setVisible(bool(item.steps))
-                if item.steps:
+                real = bool(item.real_steps())   # a plain reply (only the closing call) shows no fold
+                self.steps.setVisible(real)
+                if real:
                     self.steps.refresh(item, now)
             text = item.text
             self._raw = text
             waiting = not text and item.status in ("pending", "running", "streaming")
-            self.bubble.setVisible(bool(text) or waiting or item.status == "failed")
-            self.text.setText(text if text else ("…" if waiting else ""))
+            self.live.setVisible(waiting)
+            if waiting:
+                line = " ".join((item.thinking or "").split())
+                if len(line) > 110:
+                    line = line[:108].rsplit(" ", 1)[0] + "…"
+                busy = any(st.running for st in item.real_steps())
+                self.live_label.setText(line or ("Working…" if busy else "Thinking…"))
+            self.bubble.setVisible(bool(text) or item.status == "failed")
+            if text and item.source != "voice":   # typed replies are Markdown: summary, bullets, bold, code
+                from yuki.ui.markdown import to_html
+
+                self.text.setText(to_html(text, t, px=font("body").pixelSize()))
+            else:   # spoken replies are plain words, shown as they were said
+                import html as _html
+
+                self.text.setText(_html.escape(text).replace("\n", "<br>") if text else "")
             tone = {"failed": "error", "question": "question", "interrupted": "interrupted"}.get(item.status, "")
             if self.bubble.tone != tone:
                 self.bubble.tone = tone

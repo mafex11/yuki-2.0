@@ -81,6 +81,7 @@ from yuki.log.events import (
     _as_plain,
 )
 from yuki.log.requests import TOKEN_KEYS, append_request_row, usage_tokens
+from yuki.agent.stream_partial import stream_partial
 
 
 #: The API's limit on ``cache_control`` breakpoints in one request.
@@ -1947,8 +1948,12 @@ class Agent:
                 with self.client.messages.stream(**params) as stream:
                     seen: list[Any] = []
                     pending: Any = None
+                    live: dict[str, Any] = {}   # the reply / thinking so far, for the chat (stream_partial)
                     for event in stream:
                         kind = getattr(event, "type", None)
+                        part = stream_partial(event, live)
+                        if part is not None:
+                            yield part
                         if pending is not None and kind in (
                             "content_block_start",
                             "message_delta",

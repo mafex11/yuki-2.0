@@ -38,11 +38,15 @@ class UiSettings:
     window: list[int] | None = None     # x, y, w, h of the window when it last closed
     maximized: bool = False
     background: str = DEFAULT_BACKGROUND   # solid (black / white) | see-through (DWM's blur of the desktop)
+    transparency: float = 1.0           # "Transparency": 0..2, how see-through every glass is (1 = as designed)
+    open_hotkey: str = ""               # "Open Yuki anywhere": the overlay's shortcut ("" = the built-in default)
+    quiet_last: list[str] | None = None  # the quiet hours to bring back when they are turned on again
 
     def policy(self) -> Any:
         from yuki.ui.lens import GlassPolicy
 
-        return GlassPolicy(self.glass, self.bend, self.blur, self.reduce_motion, self.background == "see-through")
+        return GlassPolicy(self.glass, self.bend, self.blur, self.reduce_motion, self.background == "see-through",
+                           self.transparency)
 
 
 def _clean(raw: dict[str, Any]) -> UiSettings:
@@ -60,11 +64,15 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     win = raw.get("window")
     win = [int(v) for v in win][:4] if isinstance(win, list) and len(win) >= 4 and all(
         isinstance(v, (int, float)) for v in win[:4]) else None
+    hotkey = " ".join(str(raw.get("open_hotkey") or "").split()).lower()
+    last = raw.get("quiet_last")
+    last = [str(v) for v in last][:2] if isinstance(last, list) and len(last) >= 2 else None
     return UiSettings(glass if glass in GLASS_MODES else d.glass, num("bend", 1.0), num("blur", 1.0),
                       bool(raw.get("reduce_motion", False)),
                       appearance if appearance in ("system", "light", "dark") else "system", win,
                       bool(raw.get("maximized", False)),
-                      background if background in BACKGROUNDS else d.background)
+                      background if background in BACKGROUNDS else d.background, num("transparency", 1.0),
+                      hotkey, last)
 
 
 def load(path: Path | None = None) -> UiSettings:

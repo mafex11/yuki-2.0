@@ -23,6 +23,22 @@ from yuki.ui import startup
 from yuki.ui.calls import CallController
 from yuki.ui.glass import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
+
+
+def user_bindings(bindings: dict[str, str]) -> dict[str, str]:
+    """``bindings`` with the user's own "Open Yuki anywhere" shortcut from the window's Settings (``ui.json``
+    ``open_hotkey``), unless ``YUKI_HOTKEY`` overrides it for a try-out."""
+    import os
+
+    if os.environ.get("YUKI_HOTKEY"):
+        return bindings
+    try:
+        from yuki.ui import ui_settings
+
+        own = ui_settings.load().open_hotkey
+    except Exception:
+        own = ""
+    return {**bindings, "toggle": own} if own else bindings
 from yuki.ui.memory import (
     STATUS_PENDING,
     HealthWindow,
@@ -205,12 +221,9 @@ class YukiUi(QObject):
         self.strip.faded_out.connect(self.nudges.try_show)
         self.overlay.faded_out.connect(self.nudges.try_show)
 
-        self.bindings = hotkey_bindings(settings)
-        self.hotkeys = HotkeyListener(self.bindings)
-        self.hotkeys.pressed.connect(self._on_hotkey)
-        self.hotkeys.failed.connect(
-            lambda action, reason: self.ui_log.event("hotkey_failed", action=action, reason=reason)
-        )
+        self._settings_for_keys = settings
+        self.bindings = user_bindings(hotkey_bindings(settings))
+        self.hotkeys = self._listen(self.bindings)
         #: Voice (docs/VOICE.md): nothing runs until the tray, the hotkey or the
         #: wake word (if the user turned it on) starts it.
         self.voice = VoiceSession(settings, self.runtime, self.runtime.memory, ui_log)
@@ -282,6 +295,25 @@ class YukiUi(QObject):
                 panel.hide()
 
     # -- input -------------------------------------------------------------
+
+    def _listen(self, bindings: dict[str, str]) -> HotkeyListener:
+        listener = HotkeyListener(bindings)
+        listener.pressed.connect(self._on_hotkey)
+        listener.failed.connect(
+            lambda action, reason: self.ui_log.event("hotkey_failed", action=action, reason=reason)
+        )
+        return listener
+
+    def reload_hotkeys(self) -> None:
+        """The user set a new "Open Yuki anywhere" shortcut in the window (``ui.json``): listen for it now."""
+        bindings = user_bindings(hotkey_bindings(self._settings_for_keys))
+        if bindings == self.bindings:
+            return
+        self.hotkeys.stop()
+        self.bindings = bindings
+        self.hotkeys = self._listen(bindings)
+        self.hotkeys.start()
+        self.ui_log.event("hotkeys_reloaded", toggle=bindings.get("toggle", ""))
 
     def _on_hotkey(self, action: str) -> None:
         """React to a global hotkey."""
@@ -1051,6 +1083,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     app = QApplication([])
     app.setApplicationName("Yuki")
     app.setQuitOnLastWindowClosed(False)
+    from yuki.ui.window.theme import app_font
+
+    app.setFont(app_font())   # Segoe UI Variable with its real weights, for the tray menu and plain widgets
 
     # Load the heavy native modules and draw the tray icon on this thread before any worker
     # thread starts. On 2026-09-25 the agent's prewarm thread was loading PIL's DLL (inside the

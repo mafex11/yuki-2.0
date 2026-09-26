@@ -113,7 +113,7 @@ def paint_glass(
     (a popover), so it refracts that content. ``painted``: always painted here, never refracted (glass
     that changes size while it streams, like a chat bubble: re-rendering it would cost every frame).
     """
-    from yuki.ui.lens import policy
+    from yuki.ui.lens import density, policy, scaled_level
     from yuki.ui.window.refract import COLLECTOR, LIVE
 
     if not painted and (COLLECTOR.active or LIVE.on) and policy().refracts(level.name):
@@ -122,6 +122,12 @@ def paint_glass(
                 return
         elif not floating:
             return   # the live window's cached glass image already has it
+    level = scaled_level(level)   # the Transparency setting: how much of the fill is laid down
+    if tint is not None:
+        m = density()
+        if abs(m - 1.0) > 1e-3:
+            tint = QColor(tint)
+            tint.setAlphaF(min(0.97, tint.alphaF() * m))
     p.save()
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     if shadow:
@@ -204,6 +210,122 @@ def paint_backdrop(p: QPainter, rect: QRectF, theme: Theme, image: QImage | None
         g.setColorAt(0.0, theme.fallback_top)
         g.setColorAt(1.0, theme.fallback_bottom)
         p.fillRect(rect, QBrush(g))
+    p.restore()
+
+
+# -- the soft backdrop the glass bends (2026-09-27) ------------------------------------------------------
+
+#: Vertical period of the backdrop's pools of colour (logical px): a long page keeps finding some.
+BLOOM_PERIOD = 1000.0
+#: Width of the fade where the pages' backdrop meets the sidebar's (logical px): both are zero at the seam.
+BLOOM_FADE = 110.0
+#: The backdrop is painted at this fraction of the size and scaled up when shown: it is nothing but soft blur.
+BLOOM_SCALE = 0.25
+
+
+def _blooms(t: Theme, strength: float, width: float, height: float, split: float):
+    """The pools of colour, in window coordinates at scroll 0: ``(colour, cx, cy, radius, side)``; ``side`` is
+    ``"right"`` (under the pages, fading out toward ``split``) or ``"left"`` (under the sidebar). Tiles down a
+    long page every :data:`BLOOM_PERIOD`."""
+    dark = t.dark
+
+    def col(c: QColor, a: float) -> QColor:
+        out = QColor(c)
+        out.setAlphaF(min(1.0, a * strength))
+        return out
+
+    accent = col(t.accent, 0.26 if dark else 0.20)
+    violet = col(t.kind("review"), 0.22 if dark else 0.17)
+    teal = col(t.kind("call"), 0.16 if dark else 0.14)
+    rose = col(t.kind("question"), 0.12 if dark else 0.12)
+    span = max(200.0, width - split)
+    out = [(col(t.accent, 0.20 if dark else 0.16), split * 0.25, min(height, 900.0) * 0.72, 260.0, "left")]
+    k, y0 = 0, 0.0
+    while y0 < height + BLOOM_PERIOD:
+        out += [(accent, split + span * (0.80 if k % 2 == 0 else 0.30), y0 + 0.16 * BLOOM_PERIOD, 0.50 * BLOOM_PERIOD,
+                 "right"),
+                (violet, split + span * (0.28 if k % 2 == 0 else 0.76), y0 + 0.60 * BLOOM_PERIOD, 0.46 * BLOOM_PERIOD,
+                 "right"),
+                (teal if k % 2 == 0 else rose, split + span * 0.97, y0 + 0.92 * BLOOM_PERIOD, 0.34 * BLOOM_PERIOD,
+                 "right")]
+        k += 1
+        y0 += BLOOM_PERIOD
+    return out
+
+
+_BLOOM_CACHE: "OrderedDict[tuple, QImage]" = OrderedDict()
+
+
+def bloom_field(t: Theme, strength: float, area: QRectF, window_w: float, window_h: float, split: float) -> QImage | None:
+    """The soft backdrop under ``area`` (window coordinates at scroll 0), at :data:`BLOOM_SCALE` of its size, or
+    None when ``strength`` is 0 (the plain background). The window's own background, each page and the sidebar
+    ask for the rectangle they cover; the pools under the pages fade to nothing at ``split`` (the sidebar's
+    edge) and the sidebar's own pool fades out before it, so no seam shows where they meet, scrolled or not.
+    Cached (a few small images)."""
+    if strength <= 0.0 or area.width() < 2 or area.height() < 2:
+        return None
+    key = (t.name, round(strength, 3), round(area.x()), round(area.y()), round(area.width()), round(area.height()),
+           round(window_w), round(window_h), round(split))
+    img = _BLOOM_CACHE.get(key)
+    if img is not None:
+        _BLOOM_CACHE.move_to_end(key)
+        return img
+    k = BLOOM_SCALE
+    w, h = max(1, int(area.width() * k + 0.5)), max(1, int(area.height() * k + 0.5))
+    img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(t.bg)
+    for side in ("left", "right"):
+        layer = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        layer.fill(Qt.GlobalColor.transparent)
+        p = QPainter(layer)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.scale(k, k)
+        p.translate(-area.x(), -area.y())
+        any_drawn = False
+        for color, cx, cy, r, where in _blooms(t, strength, window_w, max(window_h, area.bottom()), split):
+            if where != side or cy + r < area.top() or cy - r > area.bottom():
+                continue
+            g = QRadialGradient(QPointF(cx, cy), r)
+            g.setColorAt(0.0, color)
+            mid = QColor(color)
+            mid.setAlphaF(color.alphaF() * 0.45)
+            g.setColorAt(0.45, mid)
+            clear = QColor(color)
+            clear.setAlpha(0)
+            g.setColorAt(1.0, clear)
+            p.fillRect(QRectF(cx - r, cy - r, 2 * r, 2 * r), QBrush(g))
+            any_drawn = True
+        if any_drawn:   # zero at the seam between the sidebar's backdrop and the pages'
+            fade = QLinearGradient(QPointF(split - BLOOM_FADE if side == "left" else split, 0),
+                                   QPointF(split if side == "left" else split + BLOOM_FADE, 0))
+            fade.setColorAt(0.0, QColor(0, 0, 0, 255 if side == "left" else 0))
+            fade.setColorAt(1.0, QColor(0, 0, 0, 0 if side == "left" else 255))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.fillRect(QRectF(area.x() - 1, area.y() - 1, area.width() + 2, area.height() + 2), QBrush(fade))
+        p.end()
+        if any_drawn:
+            q = QPainter(img)
+            q.drawImage(0, 0, layer)
+            q.end()
+    _BLOOM_CACHE[key] = img
+    while len(_BLOOM_CACHE) > 12:
+        _BLOOM_CACHE.popitem(last=False)
+    return img
+
+
+def paint_bloom(p: QPainter, target: QRectF, field: QImage, area: QRectF, exposed: QRectF | None = None) -> None:
+    """Paint ``field`` (made by :func:`bloom_field` for ``area``) scaled to ``target``; only ``exposed`` (in
+    ``target``'s coordinates) when given, so a scroll step paints just the strip it uncovers."""
+    k = BLOOM_SCALE
+    if exposed is None:
+        exposed = target
+    part = exposed.intersected(target)
+    if part.isEmpty():
+        return
+    src = QRectF((part.x() - target.x()) * k, (part.y() - target.y()) * k, part.width() * k, part.height() * k)
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    p.drawImage(part, field, src)
     p.restore()
 
 

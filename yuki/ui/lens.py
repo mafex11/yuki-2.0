@@ -22,7 +22,15 @@ Three settings (``%LOCALAPPDATA%\\Yuki\\ui.json``, :mod:`yuki.ui.ui_settings`):
   released with the window's process.
 
 "Glass bending" scales how far the rim bends light (the lens height) and "Blur"
-scales the frost, for both Light and Full.
+scales the frost, for both Light and Full; Full bends further than Light
+(:data:`MODE_BEND`). "Transparency" (2026-09-27) scales how see-through every
+glass is: the fill, the tint and the legibility range of each level, in every
+mode, on every surface (:func:`density`, :func:`scaled_level`).
+
+What the glass bends in the window is its soft backdrop (a few very soft pools
+of colour under the pages, :func:`yuki.ui.window.glass.bloom_field`), and on the
+floating surfaces the soft backdrop inside the panel: a plain black or white
+background has nothing that could visibly bend.
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ class GlassPolicy:
     blur: float = 1.0           # 0..2: frost
     reduce_motion: bool = False
     see_through: bool = False   # the window shows DWM's blur of the desktop instead of its plain background
+    transparency: float = 1.0   # 0..2: how see-through the glass is (1 = as designed)
 
     def refracts(self, level: str | None) -> bool:
         """Whether page glass of ``level`` is part of its page's cached picture (it always is: drawn on a
@@ -84,12 +93,44 @@ def set_policy(p: GlassPolicy) -> None:
         _POLICY = p
 
 
+#: How far each mode bends light, on top of "Glass bending": Full is the strongest refraction.
+MODE_BEND = {"off": 0.0, "light": 0.9, "full": 1.3}
+#: The soft backdrop's strength per mode (0: the plain background, nothing to bend).
+MODE_BACKDROP = {"off": 0.0, "light": 1.0, "full": 1.35}
+
+
+def density(p: GlassPolicy | None = None) -> float:
+    """How much of each glass level's fill and tint is laid down: 1 as designed, up to 1.9 at Transparency 0
+    (nearly opaque frost), down to 0.12 at Transparency 2 (almost clear)."""
+    t = min(2.0, max(0.0, float((p or _POLICY).transparency)))
+    return 1.0 + (1.0 - t) * 0.9 if t <= 1.0 else max(0.12, 1.0 - (t - 1.0) * 0.88)
+
+
+def _alpha(c: QColor, m: float, cap: float = 0.97) -> QColor:
+    out = QColor(c)
+    out.setAlphaF(min(cap, max(0.0, c.alphaF() * m)))
+    return out
+
+
+def scaled_level(level: Any, p: GlassPolicy | None = None) -> Any:
+    """``level`` (a :class:`~yuki.ui.window.theme.GlassLevel`) with the Transparency setting applied."""
+    m = density(p)
+    if abs(m - 1.0) < 1e-3:
+        return level
+    return replace(level, fill=_alpha(level.fill, m))
+
+
 def scaled_optics(o: Any, p: GlassPolicy | None = None) -> Any:
-    """``o`` (a :class:`~yuki.ui.window.theme.Optics`) with the bending and blur settings applied."""
+    """``o`` (a :class:`~yuki.ui.window.theme.Optics`) with the bending, blur and transparency settings and the
+    mode's own strength applied."""
     p = p or _POLICY
-    if p.bend == 1.0 and p.blur == 1.0:
-        return o
-    return replace(o, height=o.height * max(0.0, p.bend), blur=o.blur * max(0.0, p.blur))
+    m = density(p)
+    bend = max(0.0, p.bend) * MODE_BEND.get(p.mode, 1.0)
+    lo, hi = float(o.tone[0]), float(o.tone[1])
+    lo2 = min(0.9, lo * m)
+    hi2 = max(lo2 + 0.05, min(1.0, 1.0 - (1.0 - hi) * m))
+    return replace(o, height=o.height * bend, blur=o.blur * max(0.0, p.blur), tint=_alpha(o.tint, m),
+                   tone=(lo2, hi2))
 
 
 # -- geometry: the signed distance field of a rounded rectangle / squircle ----------------------------
@@ -508,6 +549,37 @@ def _refract_band(img: QImage, s: Any, source: _Source) -> None:
         alpha[edge] = alpha[edge] * c2 + (prev >> 24).astype(np.float32) * (1.0 - c2)
     c = col.astype(np.uint32)
     out32[di] = (np.clip(alpha + 0.5, 0, 255).astype(np.uint32) << 24) | (c[:, 2] << 16) | (c[:, 1] << 8) | c[:, 0]
+
+
+#: With Light, a glass shape at least this many logical px on its short side is refracted on the CPU (its rim
+#: band); smaller ones (pills, toggles, rows) are painted crisp: a rim a few pixels wide bends nothing visible.
+LIGHT_MIN_PX = 56
+
+
+def render_light_mixed(base: QImage, depths: Sequence[Sequence[Any]]) -> QImage:
+    """The Light page picture: depth by depth, the large glass refracted on the CPU (:func:`render_light`) and
+    the small glass painted flat over it, so each depth still bends the ones below. Shadows are left to the
+    caller (:class:`~yuki.ui.window.glasscache.GlassPage` paints them outside the glass)."""
+    from yuki.ui.window.glass import paint_glass
+
+    out = base.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    out.setDevicePixelRatio(1.0)
+    for shapes in depths:
+        big = [s for s in shapes if min(s.rect.width(), s.rect.height()) >= LIGHT_MIN_PX * s.scale]
+        small = [s for s in shapes if s not in big and s.level is not None]
+        if big:
+            out = render_light(out, [big], shadows=False)
+        if small:
+            p = QPainter(out)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for s in small:
+                p.save()
+                if s.clip is not None:
+                    p.setClipRect(s.clip)
+                paint_glass(p, s.rect, s.radius, s.level, tint=s.tint, shadow=False, painted=True)
+                p.restore()
+            p.end()
+    return out
 
 
 # -- one entry point for both modes ----------------------------------------------------------------------

@@ -17,20 +17,24 @@ from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import SettingsView
 from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
-    Chip,
     Divider,
     Dropdown,
     Glass,
     GlassSlider,
+    KeyCapture,
     Panel,
     Pill,
     Segmented,
     SettingRow,
     TextPill,
     Toggle,
+    combo_words,
     page_header,
     text_label,
 )
+
+#: The overlay's shortcut when the user has not set one (``Settings.ui_hotkey``).
+DEFAULT_OPEN_HOTKEY = "alt+shift"
 
 #: Quiet-hour choices, every half hour.
 TIMES = tuple(f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30))
@@ -42,19 +46,11 @@ def _voice_name(voice_id: str) -> str:
 
 
 def _chip_remove(t: Theme, text: str, on_remove) -> QWidget:
-    """A blocked app or site: its name, and an x to take it off the list."""
-    box = QWidget()
-    box.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    row = QHBoxLayout(box)
-    row.setContentsMargins(0, 0, 0, 0)
-    row.setSpacing(0)
-    row.addWidget(Chip(t, "you", text))
-    x = Pill(t, glyph="close", style="quiet", size="small")
+    """A blocked app or site: a button with its name and a cross; pressing it takes it off the list."""
+    x = Pill(t, f"{text}  ✕", style="quiet", size="small")
     x.setToolTip(f"Stop blocking {text}")
-    x.setFixedSize(22, 22)
     x.clicked.connect(lambda _c=False: on_remove())
-    row.addWidget(x)
-    return box
+    return x
 
 
 def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = NOOP, ui: Any = None,
@@ -98,8 +94,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     vid.setFixedWidth(250)
     vid.submitted.connect(lambda text: act.set_voice_id(text.strip()))
     voice.body.addWidget(SettingRow(t, "chat", "Yuki's voice", _voice_name(v.voice_id), vid))
-    voice.body.addWidget(SettingRow(t, "link", "Shortcut", "Press to start or stop talking.",
-                                    Pill(t, "Ctrl + Alt + Y", style="quiet", size="small")))
+    voice.body.addWidget(SettingRow(t, "link", "Talk shortcut", "Press Ctrl + Alt + Y to start or stop talking.",
+                                    None))
     left.addWidget(voice)
 
     # -- coach
@@ -108,19 +104,40 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     coach_on = Toggle(t, v.coach_on)
     coach_on.toggled.connect(act.set_coach)
     coach.body.addWidget(SettingRow(t, "heart", "Check-ins and reminders", "", coach_on))
+    # quiet hours: a switch to turn them off (memory reads equal start and end as none), and two compact
+    # pickers that scroll (a menu of 48 times filled the screen)
+    quiet_on = v.quiet_start != v.quiet_end
+    last = (ui.quiet_last or [v.quiet_start, v.quiet_end]) if not quiet_on else [v.quiet_start, v.quiet_end]
+    if last[0] == last[1]:
+        last = ["00:30", "08:00"]
+    q_toggle = Toggle(t, quiet_on)
+    coach.body.addWidget(SettingRow(t, "moon", "Quiet hours", "Nothing at all during these hours.", q_toggle))
     quiet = QWidget()
+    quiet.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     qrow = QHBoxLayout(quiet)
-    qrow.setContentsMargins(0, 0, 0, 0)
-    qrow.setSpacing(6)
+    qrow.setContentsMargins(34, 0, 0, 4)
+    qrow.setSpacing(8)
     times = [(x, x) for x in TIMES]
-    q_start = Dropdown(t, v.quiet_start, width=96, options=times)
-    q_end = Dropdown(t, v.quiet_end, width=96, options=times)
+    q_start = Dropdown(t, last[0], width=110, options=times)
+    q_end = Dropdown(t, last[1], width=110, options=times)
     q_start.changed.connect(lambda value: act.set_quiet(str(value), q_end.text()))
     q_end.changed.connect(lambda value: act.set_quiet(q_start.text(), str(value)))
+    qrow.addWidget(text_label(t, "From", "callout", "text_2"))
     qrow.addWidget(q_start)
-    qrow.addWidget(text_label(t, "to", "caption", "text_3"))
+    qrow.addWidget(text_label(t, "to", "callout", "text_2"))
     qrow.addWidget(q_end)
-    coach.body.addWidget(SettingRow(t, "moon", "Quiet hours", "Nothing at all during these hours.", quiet))
+    qrow.addStretch(1)
+    coach.body.addWidget(quiet)
+    quiet.setVisible(quiet_on)
+
+    def quiet_toggled(on: bool) -> None:
+        quiet.setVisible(on)
+        if on:
+            act.set_quiet(q_start.text(), q_end.text())
+        else:
+            act.set_quiet_enabled(False)
+
+    q_toggle.toggled.connect(quiet_toggled)
     questions = Toggle(t, v.questions_on)
     questions.toggled.connect(act.set_questions)
     coach.body.addWidget(SettingRow(t, "question", "Questions about people and things",
@@ -133,12 +150,31 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     startup.toggled.connect(act.set_startup)
     general.body.addWidget(SettingRow(t, "power", "Start with Windows", "Yuki and its memory start when you sign in.",
                                       startup))
-    general.body.addWidget(SettingRow(t, "link", "Open Yuki anywhere", "", Pill(t, "Alt + Shift", style="quiet",
-                                                                                 size="small")))
+    hot = KeyCapture(t, ui.open_hotkey or DEFAULT_OPEN_HOTKEY, width=190)
+    hot.setToolTip("Click, then press the keys you want, like Ctrl + Space, or two modifiers such as Alt + Shift")
+    hot.captured.connect(act.set_open_hotkey)
+    reset = Pill(t, "Default", style="quiet", size="small")
+    reset.setToolTip(f"Back to {combo_words(DEFAULT_OPEN_HOTKEY)}")
+
+    def reset_hotkey() -> None:
+        hot.combo = DEFAULT_OPEN_HOTKEY
+        hot.update()
+        act.set_open_hotkey("")
+
+    reset.clicked.connect(reset_hotkey)
+    hbox_w = QWidget()
+    hbox_w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    hrow = QHBoxLayout(hbox_w)
+    hrow.setContentsMargins(0, 0, 0, 0)
+    hrow.setSpacing(6)
+    hrow.addWidget(hot)
+    hrow.addWidget(reset, 0, Qt.AlignmentFlag.AlignVCenter)
+    general.body.addWidget(SettingRow(t, "link", "Open Yuki anywhere", "Click the box, then press your shortcut.",
+                                      hbox_w))
     left.addWidget(general)
 
     # -- appearance (the look, ui.json)
-    look = Panel(t, "Appearance", "How Yuki looks: the window, the Alt+Shift box, the cards and the voice pill.",
+    look = Panel(t, "Appearance", "How Yuki looks everywhere: this window, the chat box, the cards and the pills.",
                  glyph="sparkle")
     mode = Segmented(t, ("System", "Light", "Dark"), ui.appearance.capitalize(), small=True)
     mode.changed.connect(lambda word: act.set_appearance(word.lower()))
@@ -151,9 +187,9 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
                                    "the window, blurred by Windows.", background))
     glass = Segmented(t, tuple(GLASS_WORDS.values()), GLASS_WORDS.get(ui.glass, "Light"), small=True)
     look.body.addWidget(SettingRow(t, "bulb", "Glass effect",
-                                   "Off: clear glass, nothing bends. Light: glass floating over the app (hover "
-                                   "cards, menus, tooltips) bends what's under it, drawn once and kept. Full: every "
-                                   "card and button bends light too (uses the graphics card).", glass))
+                                   "Off is plain and clear. Light bends light at the edge of every card, cheaply. "
+                                   "Full bends the most, with colour at the edges, and uses the graphics card.",
+                                   glass))
     sliders = QWidget()
     sliders.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     look.body.addWidget(sliders)   # parented before anything shows it (a parentless shown widget is a window)
@@ -168,6 +204,9 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     srow.addWidget(SettingRow(t, "cloud", "Blur", "How frosted the glass is.", blur))
     if ui.glass == "off":
         sliders.hide()
+    clear = GlassSlider(t, ui.transparency, width=200)
+    clear.committed.connect(act.set_transparency)
+    look.body.addWidget(SettingRow(t, "globe", "Transparency", "How see-through the glass is.", clear))
 
     def glass_changed(word: str) -> None:
         mode_key = next((k for k, w in GLASS_WORDS.items() if w == word), "light")

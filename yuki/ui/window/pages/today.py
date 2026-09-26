@@ -9,12 +9,11 @@ from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import DayView, dur, episode_gist, first_sentence, hm, second_person
+from yuki.ui.window.data import DayView, dur, episode_gist, first_sentence, hm, plain, second_person
 from yuki.ui.window.glass import hatch, rounded
 from yuki.ui.window.theme import SPACE, Theme, font
 from yuki.ui.window.timeline import TimelineChart
 from yuki.ui.window.widgets import (
-    Chip,
     Divider,
     Glass,
     Panel,
@@ -196,7 +195,7 @@ def _details(t: Theme, day: DayView, index: int | None) -> Panel:
         stamp = text_label(t, text[:11].replace("-", "–"), "caption", "text_3")
         stamp.setFixedWidth(84)
         line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
-        line.addWidget(text_label(t, episode_gist(text, 230), "callout", "text", wrap=True), 1)
+        line.addWidget(text_label(t, plain(episode_gist(text, 230)), "callout", "text", wrap=True), 1)
         panel.body.addLayout(line)
     noticed = [f for f in s.facts if f["importance"] >= 4 and not f["by_yuki"]]
     noticed.sort(key=lambda f: (-f["importance"], f["at"]))
@@ -209,11 +208,10 @@ def _details(t: Theme, day: DayView, index: int | None) -> Panel:
             stamp = text_label(t, f"{hm(f['at'])} · {f['app']}", "caption", "text_3")
             stamp.setFixedWidth(120)
             line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
-            line.addWidget(text_label(t, first_sentence(second_person(f["text"]), 170), "caption", "text", wrap=True), 1)
-            if f["nature"] == "humor":
-                line.addWidget(Chip(t, "joke"), 0, Qt.AlignmentFlag.AlignTop)
-            elif f["nature"] == "story":
-                line.addWidget(Chip(t, "story"), 0, Qt.AlignmentFlag.AlignTop)
+            words = first_sentence(plain(second_person(f["text"])), 170)
+            if f["nature"] == "humor":   # plain words, no tag (2026-09-27)
+                words = f"Said as a joke: {words}"
+            line.addWidget(text_label(t, words, "caption", "text", wrap=True), 1)
             panel.body.addLayout(line)
     panel.body.addStretch(1)
     return panel

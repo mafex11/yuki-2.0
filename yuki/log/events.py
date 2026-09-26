@@ -101,7 +101,18 @@ class Say:
     kind: Literal["say"] = "say"
 
 
-AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent
+@dataclass(frozen=True)
+class Partial:
+    """What is being written right now, for the chat (yuki.agent.stream_partial): ``what`` is ``reply`` (the
+    reply so far) or ``thinking`` (the thinking summary so far). Not logged; the finished text still comes
+    as :class:`Final`."""
+
+    what: str
+    text: str
+    kind: Literal["partial"] = "partial"
+
+
+AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent | Partial
 
 #: Every event type name that may appear in a session JSONL file. Anything
 #: :meth:`SessionLogger.log` is called with should be in here, so a reader can

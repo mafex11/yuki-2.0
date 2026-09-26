@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtWidgets import QWidget
 
 from yuki.ui.window.actions import Actions, correction_text
 
@@ -346,8 +347,8 @@ class WindowApp(Actions):
         st = self._status
         voice = self.state.get("voice_state")
         listening = bool(self.state.get("wake", st.wake_on if st else True))
-        detail = {"listening": "Listening", "hearing": "Hearing you", "thinking": "Thinking", "speaking":
-                  "Speaking", "working": "Working on it"}.get(voice or "", "")
+        detail = {"hearing": "Hearing you", "thinking": "Thinking", "speaking": "Speaking",
+                  "working": "Working on it"}.get(voice or "", "")
         remembering = bool(st and st.service_running and not st.paused)
         foot = f"${st.cost_today:.2f} on memory today" if st else ""
         self.win.sidebar.set_footer(listening or bool(detail), remembering, foot, voice_detail=detail,
@@ -695,7 +696,10 @@ class WindowApp(Actions):
             words = {"done": "Marked done.", "not_needed": "Taken off your list.",
                      "wrong": "Removed, and Yuki was told it wasn't yours."}[how]
             self.toast(words if got else "That one was already closed.", "praise" if got else "")
-            self.load("yuki")
+            # the row already shows what happened; the pages read the list afresh next time they open
+            for key in ("me", "yuki"):
+                if key != self.win.current:
+                    self._views.pop(key, None)
 
         self.bg(work, then, failed="Couldn't change that. Memory didn't answer.")
 
@@ -801,12 +805,32 @@ class WindowApp(Actions):
         self._privacy("nudges", "enabled", bool(on), "Check-ins on." if on else "Check-ins off.")
 
     def set_quiet(self, start: str, end: str) -> None:
+        from yuki.ui import ui_settings
         from yuki.ui.window import settings_io
 
         def work() -> None:
             settings_io.update_privacy("nudges", "quiet_start", start)
             settings_io.update_privacy("nudges", "quiet_end", end)
-        self.bg(work, lambda _r: self.toast(f"Quiet from {start} to {end}."))
+        if start != end:   # remembered, so turning quiet hours off and on again brings these back
+            self.ui = ui_settings.update(self.ui_path, quiet_last=[start, end])
+        self.bg(work, lambda _r: (self.toast(f"Quiet from {start} to {end}." if start != end else
+                                             "No quiet hours."), self._views.pop("status", None)))
+
+    def set_quiet_enabled(self, on: bool) -> None:
+        """Quiet hours off: memory's coach reads an equal start and end as none (``in_quiet_hours``)."""
+        from yuki.ui.window import data as D
+
+        nudges = D.read_privacy().get("nudges", {})
+        start, end = str(nudges.get("quiet_start", "00:30")), str(nudges.get("quiet_end", "08:00"))
+        if on:
+            last = self.ui.quiet_last or ["00:30", "08:00"]
+            self.set_quiet(str(last[0]), str(last[1]))
+        else:
+            if start != end:
+                from yuki.ui import ui_settings
+
+                self.ui = ui_settings.update(self.ui_path, quiet_last=[start, end])
+            self.set_quiet(start, start)
 
     def set_questions(self, on: bool) -> None:
         self._privacy("nudges", "questions_enabled", bool(on), "Questions on." if on else "No more questions.")
@@ -858,18 +882,20 @@ class WindowApp(Actions):
             return
         if before.background != self.ui.background:
             self.win.set_backdrop(self.ui.background == "see-through")
-        if (before.glass == "full") != (self.ui.glass == "full"):
-            for key in list(self._views):   # controls switch between glass droplets and crisp painted pills
-                if key != "settings":
-                    self._build(key)
         self.win.forget_glass()
+        from yuki.ui.window.glass import SHADOWS
+
+        SHADOWS.clear()
+        for w in self.win.findChildren(QWidget):   # everything painted directly follows the new look at once
+            w.update()
 
     def set_appearance(self, mode: str) -> None:
         self._ui(appearance=mode)
 
     def set_glass(self, mode: str) -> None:
         self._ui(glass=mode)
-        self.toast({"off": "Glass off: simple panels.", "light": "Light glass.", "full": "Full glass."}.get(mode, ""))
+        self.toast({"off": "Glass off: plain and clear.", "light": "Light glass: the edges bend light.",
+                    "full": "Full glass: the strongest bending."}.get(mode, ""))
 
     def set_background(self, mode: str) -> None:
         self._ui(background=mode)
@@ -881,6 +907,26 @@ class WindowApp(Actions):
 
     def set_blur(self, value: float) -> None:
         self._ui(blur=value)
+
+    def set_transparency(self, value: float) -> None:
+        self._ui(transparency=value)
+
+    def set_open_hotkey(self, combo: str) -> None:
+        """The overlay's shortcut, saved in ``ui.json``; yuki-ui re-registers it at once (over the pipe)."""
+        from yuki.ui.hotkey import HotkeyError, chord_modifiers, parse_combo
+        from yuki.ui.window.widgets import combo_words
+
+        combo = (combo or "").strip().lower()
+        if combo and chord_modifiers(combo) is None:
+            try:
+                parse_combo(combo)
+            except (HotkeyError, OSError) as exc:
+                self.toast(f"That shortcut can't be used: {exc}", "error")
+                return
+        self._ui(open_hotkey=combo)
+        shown = combo_words(combo or "alt+shift")
+        self.toast(f"Open Yuki anywhere: {shown}." if self.client is not None else
+                   f"Saved: {shown}. It works once Yuki is running.")
 
     def set_reduce_motion(self, on: bool) -> None:
         self._ui(reduce_motion=bool(on))
@@ -983,6 +1029,9 @@ def main(argv: list[str] | None = None) -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(_Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Yuki")
+    from yuki.ui.window.theme import app_font
+
+    app.setFont(app_font())   # Segoe UI Variable with its real weights, for every plain widget too
     app.setQuitOnLastWindowClosed(True)
     from yuki.memory.api import MemoryClient
     from yuki.memory.store import default_db_path

@@ -58,6 +58,7 @@ from yuki.log.events import (
     Say,
     SessionLogger,
     Thinking,
+    Partial,
     ToolCall,
     ToolResult,
 )
@@ -333,7 +334,9 @@ class Lane(QThread):
                 runtime.failed.emit(self.name, job.id, f"{type(exc).__name__}: {exc}")
                 break
 
-            if isinstance(event, Thinking):
+            if isinstance(event, Partial):
+                runtime.partial.emit(self.name, job.id, event.what, event.text)
+            elif isinstance(event, Thinking):
                 runtime.thought.emit(self.name, job.id, event.text)
             elif isinstance(event, ToolCall):
                 if allowed is not None and event.name not in allowed:
@@ -441,6 +444,8 @@ class AgentRuntime(QObject):
     handed_off = Signal(int, int, int)
     steer_unread = Signal(str, int, list)
     helper_step = Signal(str, int, int, str, str, bool)
+    #: ``(lane, job, what, text)``: the reply or the thinking written so far (``what``: reply | thinking), live
+    partial = Signal(str, int, str, str)
     notice = Signal(str, str)
 
     def __init__(
