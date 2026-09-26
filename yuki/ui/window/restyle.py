@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.data import epoch
 from yuki.ui.window.glass import paint_glass, rounded
+from yuki.ui.window.refract import collecting
 from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import Pill, TextPill, text_label
 
@@ -67,6 +68,10 @@ class GlassSurface(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = self.panel()
+        if collecting():   # real glass: the GPU refracts what is behind; nothing to paint here
+            paint_glass(p, r, self.radius, self.t.level(self.level), tint=self.tint)
+            p.end()
+            return
         from dataclasses import replace
 
         from yuki.ui.window.glass import paint_shadow

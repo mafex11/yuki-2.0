@@ -21,7 +21,8 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QRadialGradient
 from PySide6.QtWidgets import QHBoxLayout, QStackedWidget, QVBoxLayout, QWidget
 
-from yuki.ui.window.glass import paint_backdrop
+from yuki.ui.window.glass import paint_backdrop, paint_glass
+from yuki.ui.window.refract import collecting
 from yuki.ui.window.theme import SIDEBAR_W, SPACE, WINDOW_SIZE, Theme, font
 from yuki.ui.window.widgets import Dot, Glass, NavItem, text_label
 
@@ -184,7 +185,12 @@ class YukiWindow(QWidget):
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        paint_backdrop(p, QRectF(self.rect()), self.t, self._backdrop, offset=self._offset, dwm=self._dwm)
+        if collecting():   # real glass: the window is a sheet the wallpaper is refracted through
+            from yuki.ui.window.theme import RADIUS
+
+            paint_glass(p, QRectF(self.rect()), RADIUS["window"], self.t.level("floor"))
+        else:
+            paint_backdrop(p, QRectF(self.rect()), self.t, self._backdrop, offset=self._offset, dwm=self._dwm)
         p.end()
 
     def closeEvent(self, event: object) -> None:  # noqa: D102

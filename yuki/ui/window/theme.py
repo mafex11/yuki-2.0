@@ -86,6 +86,39 @@ class GlassLevel:
     shadow: QColor           # shadow colour (alpha = strongest point)
     shadow_blur: int         # px
     shadow_y: int            # px
+    name: str = ""           # the level's key in Theme.glass (set by _named)
+
+
+def _clear() -> QColor:
+    return QColor(255, 255, 255, 0)
+
+
+@dataclass(frozen=True)
+class Optics:
+    """How one glass level bends light: the refraction shader's inputs (logical px).
+
+    See :mod:`yuki.ui.window.refract` for what each number does to the picture.
+    """
+
+    height: float                 # glass thickness: how far the rim bends what is behind (px)
+    bezel: float                  # width of the curved rim (px); >= half the short side makes a droplet
+    curvature: float = 1.0        # rim steepness (scales the profile's slope)
+    chroma: float = 0.12          # dispersion: red bends this fraction less than green, blue more
+    blur: float = 0.0             # frost (px); Liquid Glass is mostly clear
+    tint: QColor = field(default_factory=_clear)   # straight-alpha wash over the refracted light
+    tone: tuple[float, float] = (0.0, 1.0)         # legibility range the light is squeezed into
+    saturation: float = 1.15      # vibrancy
+    magnify: float = 0.0          # whole-lens zoom toward the centre (droplets)
+    specular: float = 0.6         # rim light intensity
+    light_angle: float = 125.0    # where the light comes from, degrees counter-clockwise from +x
+    rim_width: float = 1.1        # px
+    rim_floor: float = 0.3        # share of the rim light that goes all the way round
+    inner_shadow: float = 0.06    # depth: darkening inside the rim, away from the light
+    lift: float = 0.0             # uniform brightening of the sheet
+    shadow: float = 0.0           # drop shadow strength (0-1)
+    shadow_blur: float = 24.0     # px
+    shadow_y: float = 8.0         # px
+    corner: float = 2.0           # 2 = circular corners; higher = continuous (squircle) corners
 
 
 @dataclass(frozen=True)
@@ -119,6 +152,8 @@ class Theme:
     unrecorded: QColor
     # glass levels
     glass: dict[str, GlassLevel] = field(default_factory=dict)
+    # how each glass level refracts (the GPU path, yuki.ui.window.refract)
+    optics: dict[str, Optics] = field(default_factory=dict)
     # scene (mockups only): the simulated wallpaper
     wallpaper: tuple[tuple[QColor, float, float, float], ...] = ()
     wallpaper_base: tuple[QColor, QColor] = (QColor(0, 0, 0), QColor(0, 0, 0))
@@ -174,6 +209,46 @@ def _light() -> Theme:
                                  rgba(255, 255, 255, 0.55), rgba(30, 40, 70, 0.10), rgba(30, 44, 90, 0.20), 34, 12),
             "lens": GlassLevel(rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.60), rgba(255, 255, 255, 1.0),
                                rgba(255, 255, 255, 0.70), rgba(47, 111, 228, 0.22), rgba(47, 90, 180, 0.22), 18, 6),
+            "control": GlassLevel(rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 1.0),
+                                  rgba(255, 255, 255, 0.55), rgba(30, 40, 70, 0.10), rgba(30, 44, 90, 0.12), 10, 3),
+            "accent": GlassLevel(hexa("#2f6fe4"), rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.55),
+                                 rgba(255, 255, 255, 0.25), rgba(20, 60, 160, 0.20), rgba(30, 80, 200, 0.28), 12, 4),
+            "floor": GlassLevel(rgba(246, 247, 251, 0.64), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.6),
+                                rgba(255, 255, 255, 0.2), rgba(0, 0, 0, 0.12), rgba(20, 30, 60, 0.24), 36, 14),
+        },
+        optics={
+            # the window: a thick sheet the desktop is seen through, frosted just enough for text
+            "floor": Optics(height=26, bezel=36, curvature=1.4, chroma=0.18, blur=2.5, tint=rgba(250, 251, 255, 0.30),
+                            tone=(0.40, 1.0), saturation=1.35, specular=0.75, rim_width=1.2, rim_floor=0.35,
+                            inner_shadow=0.04, shadow=0.30, shadow_blur=40, shadow_y=16, corner=2.0),
+            # panels and the sidebar: clear glass with a broad rim that bends what is behind
+            "regular": Optics(height=26, bezel=28, curvature=1.5, chroma=0.24, blur=0.8,
+                              tint=rgba(255, 255, 255, 0.18), tone=(0.14, 1.0), saturation=1.3, specular=0.9,
+                              rim_floor=0.35, inner_shadow=0.05, shadow=0.16, shadow_blur=30, shadow_y=10, corner=2.6),
+            # cards, popovers: a little thicker and brighter
+            "raised": Optics(height=24, bezel=24, curvature=1.5, chroma=0.26, blur=0.8, tint=rgba(255, 255, 255, 0.28),
+                             tone=(0.16, 1.0), saturation=1.3, specular=1.0, rim_floor=0.35, inner_shadow=0.05,
+                             shadow=0.20, shadow_blur=30, shadow_y=12, corner=2.6),
+            # rows inside a panel: thin glass, a narrow rim
+            "inset": Optics(height=11, bezel=13, curvature=1.4, chroma=0.18, blur=0.5, tint=rgba(255, 255, 255, 0.18),
+                            tone=(0.10, 1.0), saturation=1.25, specular=0.65, rim_width=0.9, inner_shadow=0.05,
+                            shadow=0.0, corner=2.6),
+            # pills and fields: droplets, curved across their whole height
+            "control": Optics(height=14, bezel=999, curvature=1.6, chroma=0.30, blur=0.0,
+                              tint=rgba(255, 255, 255, 0.20), tone=(0.08, 1.0), saturation=1.35, magnify=0.06,
+                              specular=1.0, rim_floor=0.4, inner_shadow=0.05, shadow=0.12, shadow_blur=10, shadow_y=3),
+            # the selected pill: the brightest droplet
+            "lens": Optics(height=16, bezel=999, curvature=1.7, chroma=0.32, blur=0.0, tint=rgba(255, 255, 255, 0.34),
+                           tone=(0.12, 1.0), saturation=1.35, magnify=0.09, specular=1.0, rim_floor=0.45,
+                           inner_shadow=0.04, shadow=0.16, shadow_blur=14, shadow_y=4),
+            # popovers over busy content (the timeline's hover card): frosted more, for reading
+            "popover": Optics(height=22, bezel=20, curvature=1.5, chroma=0.22, blur=7.0, tint=rgba(255, 255, 255, 0.62),
+                              tone=(0.30, 1.0), saturation=1.3, specular=1.0, rim_floor=0.35, inner_shadow=0.04,
+                              shadow=0.22, shadow_blur=30, shadow_y=12, corner=2.6),
+            # the main action: glass flooded with the accent
+            "accent": Optics(height=14, bezel=999, curvature=1.6, chroma=0.26, tint=hexa("#2f6fe4", 0.78),
+                             tone=(0.0, 1.0), saturation=1.3, magnify=0.06, specular=0.9, rim_floor=0.4,
+                             inner_shadow=0.08, shadow=0.22, shadow_blur=12, shadow_y=4),
         },
         wallpaper_base=(hexa("#dfe8f7"), hexa("#f3e9f1")),
         wallpaper=(
@@ -212,6 +287,39 @@ def _dark() -> Theme:
                                  rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.48), 36, 14),
             "lens": GlassLevel(rgba(93, 155, 255, 0.24), rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.50),
                                rgba(255, 255, 255, 0.16), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.40), 18, 6),
+            "control": GlassLevel(rgba(62, 66, 80, 0.58), rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.38),
+                                  rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.50), rgba(0, 0, 0, 0.30), 10, 3),
+            "accent": GlassLevel(hexa("#3d7fe8"), rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.45),
+                                 rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.40), 12, 4),
+            "floor": GlassLevel(rgba(20, 22, 28, 0.66), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.22),
+                                rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.50), 36, 14),
+        },
+        optics={
+            # dark glass: the same geometry, a dimmer range, gentler highlights (bright spec reads gaudy on dark)
+            "floor": Optics(height=26, bezel=36, curvature=1.4, chroma=0.16, blur=2.5, tint=rgba(16, 18, 26, 0.28),
+                            tone=(0.0, 0.50), saturation=1.3, specular=0.45, rim_width=1.2, rim_floor=0.35,
+                            inner_shadow=0.10, shadow=0.55, shadow_blur=40, shadow_y=16, corner=2.0),
+            "regular": Optics(height=26, bezel=28, curvature=1.5, chroma=0.22, blur=0.8, tint=rgba(40, 44, 56, 0.20),
+                              tone=(0.0, 0.86), saturation=1.3, specular=0.55, rim_floor=0.35, inner_shadow=0.12,
+                              shadow=0.34, shadow_blur=30, shadow_y=10, corner=2.6),
+            "raised": Optics(height=24, bezel=24, curvature=1.5, chroma=0.24, blur=0.8, tint=rgba(60, 64, 80, 0.26),
+                             tone=(0.0, 0.90), saturation=1.3, specular=0.6, rim_floor=0.35, inner_shadow=0.12,
+                             shadow=0.42, shadow_blur=30, shadow_y=12, corner=2.6),
+            "inset": Optics(height=11, bezel=13, curvature=1.4, chroma=0.16, blur=0.5, tint=rgba(255, 255, 255, 0.04),
+                            tone=(0.0, 0.95), saturation=1.25, specular=0.4, rim_width=0.9, inner_shadow=0.10,
+                            shadow=0.0, corner=2.6),
+            "control": Optics(height=14, bezel=999, curvature=1.6, chroma=0.28, tint=rgba(255, 255, 255, 0.07),
+                              tone=(0.0, 1.0), saturation=1.35, magnify=0.06, specular=0.7, rim_floor=0.4,
+                              inner_shadow=0.10, shadow=0.30, shadow_blur=10, shadow_y=3),
+            "lens": Optics(height=16, bezel=999, curvature=1.7, chroma=0.30, tint=rgba(93, 155, 255, 0.16),
+                           tone=(0.0, 1.0), saturation=1.35, magnify=0.09, specular=0.75, rim_floor=0.45,
+                           inner_shadow=0.08, shadow=0.34, shadow_blur=14, shadow_y=4),
+            "popover": Optics(height=22, bezel=20, curvature=1.5, chroma=0.20, blur=7.0, tint=rgba(40, 44, 58, 0.66),
+                              tone=(0.0, 0.80), saturation=1.3, specular=0.6, rim_floor=0.35, inner_shadow=0.12,
+                              shadow=0.45, shadow_blur=30, shadow_y=12, corner=2.6),
+            "accent": Optics(height=14, bezel=999, curvature=1.6, chroma=0.24, tint=hexa("#3d7fe8", 0.78),
+                             tone=(0.0, 1.0), saturation=1.3, magnify=0.06, specular=0.65, rim_floor=0.4,
+                             inner_shadow=0.10, shadow=0.36, shadow_blur=12, shadow_y=4),
         },
         wallpaper_base=(hexa("#0b1226"), hexa("#140c24")),
         wallpaper=(
@@ -222,8 +330,15 @@ def _dark() -> Theme:
     )
 
 
-LIGHT = _light()
-DARK = _dark()
+def _named(t: Theme) -> Theme:
+    """Each glass level learns its own key, so the refraction path can find its optics."""
+    from dataclasses import replace
+
+    return replace(t, glass={k: replace(v, name=k) for k, v in t.glass.items()})
+
+
+LIGHT = _named(_light())
+DARK = _named(_dark())
 
 
 def theme(name: str) -> Theme:

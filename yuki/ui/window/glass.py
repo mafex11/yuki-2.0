@@ -103,9 +103,18 @@ def paint_shadow(p: QPainter, rect: QRectF, radius: float, level: GlassLevel) ->
 
 def paint_glass(
     p: QPainter, rect: QRectF, radius: float, level: GlassLevel, *,
-    tint: QColor | None = None, shadow: bool = True, edge: bool = True,
+    tint: QColor | None = None, shadow: bool = True, edge: bool = True, floating: bool = False,
 ) -> None:
-    """One glass shape (see the module docstring). ``tint`` washes the fill with a colour."""
+    """One glass shape (see the module docstring). ``tint`` washes the fill with a colour.
+
+    While :data:`yuki.ui.window.refract.COLLECTOR` is active the shape is recorded for the GPU (real
+    refraction) and nothing is painted here. ``floating``: the shape lies over content painted before it
+    (a popover), so it refracts that content.
+    """
+    from yuki.ui.window.refract import COLLECTOR
+
+    if COLLECTOR.active and COLLECTOR.add(p, rect, radius, level, tint, shadow, floating):
+        return
     p.save()
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     if shadow:

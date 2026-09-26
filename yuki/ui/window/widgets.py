@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from yuki.ui.window.glass import paint_glass, rounded
+from yuki.ui.window.refract import collecting
 from yuki.ui.window.theme import CONTROL_H, ICON, RADIUS, SPACE, Theme, css, font
 
 # -- text ------------------------------------------------------------------------------
@@ -176,7 +177,20 @@ class Pill(QAbstractButton):
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         t = self.t
         ink = t.text
-        if self.style == "accent":
+        if collecting():   # real glass: every pill is a droplet; the style is its tint
+            if self.style == "accent":
+                paint_glass(p, r, r.height() / 2, t.level("accent"))
+                ink = t.text_on_accent
+            elif self.style in ("tinted", "danger"):
+                c = QColor(t.status["critical"] if self.style == "danger" else (self.tint or t.accent))
+                wash = QColor(c)
+                wash.setAlphaF(0.16 if not t.dark else 0.22)
+                paint_glass(p, r, r.height() / 2, t.level("control"), tint=wash)
+                ink = c.darker(115) if not t.dark else c.lighter(125)
+            else:
+                paint_glass(p, r, r.height() / 2, t.level("control"), shadow=self.style != "quiet")
+                ink = t.text if self.style == "glass" else t.text_2
+        elif self.style == "accent":
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(t.accent)
             p.drawPath(rounded(r, r.height() / 2))
@@ -270,7 +284,9 @@ class Toggle(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        if self.isChecked():
+        if self.isChecked() and collecting():
+            paint_glass(p, r, r.height() / 2, self.t.level("accent"), shadow=False)
+        elif self.isChecked():
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(self.t.accent)
             p.drawPath(rounded(r, r.height() / 2))
@@ -282,6 +298,10 @@ class Toggle(QAbstractButton):
         d = r.height() - 6
         x = r.right() - d - 3 if self.isChecked() else r.left() + 3
         knob = QRectF(x, r.top() + 3, d, d)
+        if collecting():   # the knob is a glass bead on the track
+            paint_glass(p, knob, d / 2, self.t.level("lens"))
+            p.end()
+            return
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 40))
         p.drawEllipse(knob.translated(0, 1.2))
@@ -347,7 +367,7 @@ class Dropdown(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, r.height() / 2, self.t.level("raised"), shadow=False)
+        paint_glass(p, r, r.height() / 2, self.t.level("control" if collecting() else "raised"), shadow=False)
         x = r.left() + 14
         if self.glyph:
             p.setFont(font("icon_small"))
@@ -401,7 +421,9 @@ class TextPill(QWidget):
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, r.height() / 2, self.t.level("raised" if self.height() >= 40 else "inset"), shadow=False)
+        big = self.height() >= 40
+        level = ("control" if big else "inset") if collecting() else ("raised" if big else "inset")
+        paint_glass(p, r, r.height() / 2, self.t.level(level), shadow=False)
         p.end()
 
 

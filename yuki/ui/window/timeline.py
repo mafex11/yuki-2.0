@@ -510,7 +510,7 @@ class TimelineChart(QWidget):
         left = x + 14 if x + 14 + w < self.width() - 4 else x - 14 - w
         top = max(4.0, min(y_anchor - h / 2, self.height() - h - 4))
         card = QRectF(left, top, w, h)
-        paint_glass(p, card, 16, t.level("raised"))
+        paint_glass(p, card, 16, t.level("raised"), floating=True)   # refracts the lanes under it
         y = card.top() + 12
         p.setFont(font("body_strong"))
         p.setPen(t.text)
