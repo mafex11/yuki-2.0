@@ -13,3 +13,6 @@ docs/ui-mockups/**/*.gif
 packaging/dist/
 packaging/build/
 packaging/Output/
+
+# UI drafts hold real personal data from the memory DB
+docs/ui-mockups/drafts/
