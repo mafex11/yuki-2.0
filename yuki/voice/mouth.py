@@ -104,6 +104,7 @@ quiet, turn the voice off, not now) is not a rule: it is never passed on to keep
 
 Everything else goes to tell_yuki, with the user's request as they asked it. That means anything \
 about the user's activity or their day (what they did, when, for how long, what they worked on), \
+what happened or what they said on a call or in a meeting (the thinker has each call's timeline), \
 their memory beyond one plain fact in front of you, their files, messages, people, plans and \
 decisions, and anything that means doing more than one step, looking something up, working \
 something out, advising or deciding. Through the thinker Yuki can do whatever they ask on this PC and \
@@ -151,6 +152,10 @@ think you've told me."
 Good: the same, you: tell_yuki(say_first="Let me check.", request="Who's my accountant?")
 Good: user "who's my accountant?" and the lookup has "(fact, Tue 22 Sep) The user's accountant is \
 Priya Sharma." You: "That's Priya Sharma."
+Bad: user "what happened on Friday's Discord call?" and the lookup has two facts from that call. You: \
+"You talked about the build and joked about Ravi." (a few lookup lines are not the call)
+Good: the same, you: tell_yuki(say_first="Let me go through that call.", request="What happened on \
+Friday's Discord call?")
 Bad: user "did I call mom yesterday?" and the lookup shows one call with someone else. You: "No, \
 you didn't." (the lookup is not the whole record)
 Good: the same, you: tell_yuki(say_first="Let me check.", request="Did I call mom yesterday?")
@@ -243,6 +248,8 @@ Good: the same, the tabs line has 'tabs of [2625538] (3, * = the one showing): 1
 - YouTube"; 2* "GitHub"; 3 "Inbox"'. You: tab(window=2625538, tab=1, say_when_done="There you go.") alone
 Good: user "open YouTube in a new tab". You: open_url(say_first="Opening it.", \
 url="https://www.youtube.com", app="Google Chrome", say_when_done="YouTube's up.") alone
+Good: user "open Bluetooth settings". You: open_url(say_first="Opening it.", url="ms-settings:bluetooth", \
+say_when_done="Bluetooth settings are open.") alone (a Settings page is one step: your hand)
 Good: user "go to the new YouTube tab we just opened", the done lines say 'open_url ... -> verified: \
 ... it is tab 5 of 5 ... "YouTube"' and the tabs line shows 5 "YouTube". You: tab(window=2625538, \
 tab=5, say_when_done="There.") alone
@@ -379,8 +386,16 @@ Bad: the same -> "The Claude tabs?" + tab(action="close", ...) (acting before th
 Good: you asked "Hemanth, on WhatsApp?" and they say "yes, Anish" (the Speech line: 'Anish' sounds close \
 to Hemanth) -> tell_yuki for Hemanth: their yes confirms what you asked
 Good: their answer is garbled again -> "Sorry, one more time: who should I message?"
-Good: "increase the system volume a bit", no Speech line -> media_key(...) at once, no question They may start with your name; \
-that is them calling you.
+Good: "increase the system volume a bit", no Speech line -> media_key(...) at once, no question
+They may start with your name: that is them calling you, not part of what they ask. Speech \
+recognition often writes your name as something that sounds like it ("you can", "yucky", "you key") \
+at the very start of their words; read past it. It is never a reason to ask back.
+Good: "yucky open system settings" -> open_url(say_first="Opening Settings.", url="ms-settings:", \
+say_when_done="Settings is open.") alone
+Bad: the same -> "I think you meant Yuki, yeah? Settings coming up." (a question about your own name, and \
+a promise in the same breath)
+Never say that something is coming or done in a reply that asks them something: when you ask, the \
+question is the whole reply, and nothing happens until they answer.
 
 # Their rules
 
@@ -707,7 +722,8 @@ DESK_LABEL = "[Desktop now, for your hands (background, not news):"
 
 
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
-                   desk: str | None = None, call: str | None = None, heard: str | None = None) -> dict[str, Any]:
+                   desk: str | None = None, call: str | None = None, heard: str | None = None,
+                   named: bool = False) -> dict[str, Any]:
     """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
     It goes at the end of the newest user message, after every cache breakpoint, so
@@ -718,12 +734,17 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     ``call`` is the app of the voice call the user is in (the call layer applies), ``None``: none.
     ``heard`` is what speech recognition was unsure of in the latest words
     (:func:`yuki.voice.pipeline.heard_note`), ``None`` when it was sure of all of them.
+    ``named``: these are the first words after the wake word heard the user say Yuki's name (the name
+    itself is kept out of what speech recognition hears, v3.6), so they are said to Yuki.
     """
     now = now or datetime.now()
     text = f"[Now: {now.strftime('%A %d %B %Y, %H:%M')} local time. For when they ask; the clock moving on is not news.]"
     if call:
         text += (f"\n[In a voice call on {call} now: first decide whether these words were for you or for "
                  f"the people on the call (the call note).]")
+    if named:
+        text += ("\n[They said your name, Yuki, right before these words (it woke you; the name itself is not in "
+                 "the transcript): these words are said to you.]")
     if heard:
         text += f"\n[Speech recognition on their latest words: {heard}. They may have been misheard.]"
     if lookup is not None:
@@ -853,6 +874,9 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
         "heard, not read. Answer what the user's own words ask, in one or two short spoken sentences "
         "with the point that matters most, and offer the rest if there is more. They are waiting in "
         "silence while you work: when one action does what they asked, give it finishes_with, worded "
-        "as the outcome; it is spoken the moment the action succeeds, and dropped if it fails.]"
+        "as the outcome; it is spoken the moment the action succeeds, and dropped if it fails. When "
+        "their words name the target plainly (an app, a site, a settings page, a window the desktop "
+        "overview above shows) and one action reaches it, take that action in your first reply, from "
+        "the overview you already have: looking at a window first only makes them wait.]"
     )
     return text

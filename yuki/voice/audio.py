@@ -74,6 +74,12 @@ def voiced_threshold(floor: float, absolute: float, minimum: float) -> float:
 #: can point at a device that is gone. It can only be re-read with no stream open.
 _OPEN_STREAMS = 0
 _STREAMS_LOCK = threading.Lock()
+#: Held while PortAudio's device list is re-read and while a stream is opened from it (v3.6). A re-read
+#: (``sd._terminate`` / ``sd._initialize``) renumbers the devices; one that ran between another thread's
+#: ``find_device`` and its stream open made that open fail with "Invalid device" (the installed app's
+#: first voice start, 2026-09-27; every retry worked). Re-entrant: the session re-reads the list while
+#: holding the mic closed and reopens it inside.
+_PA_LOCK = threading.RLock()
 
 
 def _stream_opened(delta: int) -> None:
@@ -86,7 +92,7 @@ def refresh_devices() -> bool:
     """Re-read PortAudio's device list (after a device change or sleep); only when no stream is open."""
     import sounddevice as sd
 
-    with _STREAMS_LOCK:
+    with _PA_LOCK, _STREAMS_LOCK:
         if _OPEN_STREAMS:
             return False
         try:
@@ -262,6 +268,10 @@ class SharedMic:
             return facts
 
     def _open(self, sd: Any, name: str | None) -> dict[str, Any]:
+        with _PA_LOCK:  # the device list must not be re-read between finding the device and opening it
+            return self._open_locked(sd, name)
+
+    def _open_locked(self, sd: Any, name: str | None) -> dict[str, Any]:
         index, facts = find_device(sd, kind="input", name=name)
         info = sd.query_devices(index if index is not None else sd.default.device[0])
         self.device_used = str(info["name"])
@@ -414,6 +424,10 @@ class Speaker:
             return self._open()
 
     def _open(self) -> dict[str, Any]:
+        with _PA_LOCK:  # the device list must not be re-read between finding the device and opening it
+            return self._open_locked()
+
+    def _open_locked(self) -> dict[str, Any]:
         import sounddevice as sd
 
         index, facts = find_device(sd, kind="output", name=self.device)

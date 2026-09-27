@@ -382,6 +382,29 @@ def _hands_desk(timeline: Timeline) -> Any:
     return HandsDesk()
 
 
+def _settings_desk(timeline: Timeline) -> Any:
+    """The hands desk plus Windows' Settings app: ``ms-settings:`` addresses open a Settings window (v3.6).
+
+    As the real ``open_url`` reports it when Settings was not open: a new window of the handler appeared and
+    is in front (``details["hwnd"]``). Test code only: never touches the real machine.
+    """
+    desk = _hands_desk(timeline)
+    web = desk.open_url
+
+    def open_url(url: str, *, app: str | None = None, **kwargs: Any) -> Any:
+        if not str(url).lower().startswith("ms-settings:"):
+            return web(url, app=app, **kwargs)
+        result = desk._act("open_url", f"opened {url} with the default handler; window 20485 "
+                           f"(ApplicationFrameHost.exe) \"Settings\" appeared and is in the foreground", url, app=app)
+        desk.win[0x5005] = {"process_name": "ApplicationFrameHost.exe", "title": "Settings", "state": "normal"}
+        desk.front = 0x5005
+        result.details = {"url": url, "handler": "", "hwnd": 0x5005, "window_reason": "a new window of it appeared"}
+        return result
+
+    desk.open_url = open_url
+    return desk
+
+
 def _settled(conv_box: dict[str, Any], quiet_s: float = 1.5) -> Any:
     """A condition: nothing is being said or owed (no job open, nothing held, no tool in flight) for ``quiet_s``."""
     state = {"since": None}
@@ -491,6 +514,8 @@ def _real_brain(settings: Settings, memory: Any, timeline: Timeline, desk: Any =
         getattr(runtime, name).connect(
             lambda *a, n=name: timeline.add("brain", event=n, job=a[1],
                                             detail=[x for x in a[2:] if not isinstance(x, bool)]))
+    # When a lane picks a request up (within ms of the bridge's submit): end of speech -> job submitted.
+    runtime.started.connect(lambda lane, job, _request: timeline.add("brain", event="submitted", job=job, lane=lane))
     return runtime, desk
 
 
@@ -670,6 +695,15 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         lines = [ScriptLine(clip("g_cloud"), "g_cloud", after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
             for n in ("g_yes", "g_niche", "g_yes2", "t_volume", "n_chrome", "t_close2")]
+    elif scenario == "parallel927":
+        # v3.6, the user's test of 2026-09-27 04:45-04:48: small talk, a Settings page (the talker's own hand),
+        # "check my Bluetooth settings" and a two-step task for the thinker, a question the talker answers, thanks.
+        # The real thinker (Sonnet) on a stub desk with a Settings app; per-line timings and costs in the report.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_settings_desk(timeline))
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [ScriptLine(clip("p_hello"), "p_hello", after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
+            for n in ("p_bt_open", "p_bt_check", "p_display", "p_twostep", "p_lofi", "p_notes", "p_time", "p_thanks")]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -869,7 +903,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
-    if scenario in ("latency926", "tabs926", "clarify"):
+    if scenario in ("latency926", "tabs926", "clarify", "parallel927"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -948,7 +982,7 @@ def summary(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
-                                         "latency926", "tabs926", "clarify", "all"))
+                                         "latency926", "tabs926", "clarify", "parallel927", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

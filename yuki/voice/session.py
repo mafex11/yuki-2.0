@@ -52,8 +52,10 @@ REOPEN_LOG_EVERY = 20
 #: Where the tray's voice choices are remembered.
 PREFS_PATH = Path.home() / "AppData" / "Local" / "Yuki" / "voice.json"
 
-#: How much audio from before the wake word's end is replayed into the conversation
-#: (the name itself; the spotter fires as it ends).
+#: How much audio from before the spotter's batch is replayed into the conversation when the spotter
+#: could not say where the name ended (the name itself is then replayed with the words after it).
+#: With the name's end known (v3.6, :attr:`yuki.voice.wake.WakeListener.name_end`), only what was said
+#: after the name is replayed, so the name never reaches speech recognition.
 WAKE_PREROLL_S = 1.2
 
 #: Environment variable that sets the ElevenLabs voice id (the tray's "Voice id…" wins over it).
@@ -146,7 +148,7 @@ class VoiceSession(QObject):
     chat_event = Signal(object)
     _devices_seen = Signal(object)
     _watch_start = Signal()
-    _wake_heard = Signal(float, float)
+    _wake_heard = Signal(float, float, float)
     _thread_state = Signal(str, str)
     _thread_done = Signal(str, str)
     _closing = Signal(str)
@@ -192,7 +194,7 @@ class VoiceSession(QObject):
         self._closing.connect(self._on_closing)
         #: A conversation decided to end and is tearing down (the wake word listens again).
         self.closing = False
-        self._pending_wake: tuple[float, float] | None = None
+        self._pending_wake: tuple[float, float, float] | None = None
         #: When each failure reason was last announced with a tone (``notice``).
         self._noticed: dict[str, float] = {}
         self._reopen_failures = 0
@@ -258,24 +260,29 @@ class VoiceSession(QObject):
             self.start_conversation(via)
 
     def start_conversation(self, via: str = "tray", *, wake_at: float | None = None,
-                           heard_at: float | None = None) -> bool:
+                           heard_at: float | None = None, name_end: float | None = None) -> bool:
         """Start a conversation. A no-op (``False``) when one is already on.
 
-        ``wake_at`` is when the audio batch with the name began (the words from just before
-        it on are replayed); ``heard_at`` when the spotter heard it (the timings start there).
-        A tray or hotkey start keeps what is said from the press on the same way.
+        ``name_end`` is when the words said after the name began (the spotter's own token times):
+        what was said from there on is replayed into speech recognition, and the name is not (v3.6).
+        Without it, ``wake_at`` (when the audio batch with the name began) is used, with the name.
+        ``heard_at`` is when the spotter heard it (the timings start there). A tray or hotkey start
+        keeps what is said from the press on the same way.
         """
         if self.in_conversation:
             return False
         session = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         started = heard_at if heard_at is not None else time.monotonic()
-        listen_from = (wake_at - WAKE_PREROLL_S) if wake_at is not None else time.monotonic()
+        if name_end:
+            listen_from = name_end
+        else:
+            listen_from = (wake_at - WAKE_PREROLL_S) if wake_at is not None else time.monotonic()
         self.closing = False
         self._set_state("starting", via)
         if self._listener is not None:
             self._listener.pause()
         self._thread = threading.Thread(target=self._thread_main,
-                                        args=(session, via, listen_from, started, self.call_app),
+                                        args=(session, via, listen_from, started, self.call_app, bool(name_end)),
                                         name="yuki-voice", daemon=True)
         self._thread.start()
         self.conversation_changed.emit(True)
@@ -382,7 +389,17 @@ class VoiceSession(QObject):
         factory = self.speaker_factory or Speaker
         target = self._output_target(chosen)
         speaker = factory(24_000, target)
-        facts = speaker.open()
+        try:
+            facts = speaker.open()
+        except Exception as exc:  # noqa: BLE001 - PortAudio's list may predate this output (or it changed): re-read once
+            # The installed app's first voice start after a launch failed here with "Invalid device" and every
+            # retry worked (2026-09-27): PortAudio reads its device list once, at start, which can be before the
+            # output (a Bluetooth headset) is up; its old default index then points at nothing. Re-read, retry.
+            self.log.event("device", kind="render", state="open_retry", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+            speaker.close()
+            self._refresh_audio_devices()
+            speaker = factory(24_000, target)
+            facts = speaker.open()
         refreshed = False
         if target and not facts.get("found", True):
             speaker.close()
@@ -714,7 +731,7 @@ class VoiceSession(QObject):
             s = self.settings
             self._listener = WakeListener(
                 mic, lambda: WakeSpotter(threshold=s.voice_wake_threshold, boost=s.voice_wake_boost),
-                on_wake=lambda at, _kw: self._wake_heard.emit(at, time.monotonic()), log=self.log,
+                on_wake=lambda at, _kw: self._wake_heard.emit(at, time.monotonic(), self._name_end()), log=self.log,
             )
             self._listener.start()
             self.log.event("wake", state="listening", during_call=self.call_active)
@@ -732,15 +749,21 @@ class VoiceSession(QObject):
                            cpu_pct_one_core=round(100 * listener.decode_s / heard, 3) if heard else None,
                            near_misses=listener.near_misses)
 
-    def _on_wake_heard(self, at: float, heard_at: float = 0.0) -> None:
+    def _name_end(self) -> float:
+        """Where the words after the name began, for the wake just heard (0.0: not known). On the wake thread."""
+        listener = self._listener
+        end = getattr(listener, "name_end", None) if listener is not None else None
+        return float(end) if end else 0.0
+
+    def _on_wake_heard(self, at: float, heard_at: float = 0.0, name_end: float = 0.0) -> None:
         if not self._wake_allowed():
             return
         if self.in_conversation:
             if self.closing:  # the last one is tearing down: this wake starts the next one right after
-                self._pending_wake = (at, heard_at or time.monotonic())
+                self._pending_wake = (at, heard_at or time.monotonic(), name_end)
                 self.log.event("wake", state="pending")
             return
-        self.start_conversation("wake", wake_at=at, heard_at=heard_at or None)
+        self.start_conversation("wake", wake_at=at, heard_at=heard_at or None, name_end=name_end or None)
 
     def _on_closing(self, reason: str) -> None:
         """The conversation decided to end: listen for the name again during its teardown."""
@@ -775,7 +798,7 @@ class VoiceSession(QObject):
         if error:
             self.notice(error)  # after the wake state, so the pill keeps the reason
         elif pending is not None and time.monotonic() - pending[1] < PENDING_WAKE_S and self._wake_allowed():
-            self.start_conversation("wake", wake_at=pending[0], heard_at=pending[1])
+            self.start_conversation("wake", wake_at=pending[0], heard_at=pending[1], name_end=pending[2] or None)
 
     def _echo_guard(self, mode: str, output: str | None, speaker: Any, mic: Any) -> Any:
         """The conversation's echo guard for ``mode``, with the canceller loading off this thread."""
@@ -805,7 +828,7 @@ class VoiceSession(QObject):
         return guard
 
     def _thread_main(self, session: str, via: str, listen_from: float, started: float,
-                     call_app: str | None) -> None:
+                     call_app: str | None, name_cut: bool = False) -> None:
         """The ``yuki-voice`` thread: devices and the wake's acknowledgement first, then (with the
         Pipecat import running alongside) the checks and memory, then the pipeline on its own loop.
 
@@ -824,6 +847,7 @@ class VoiceSession(QObject):
             timings[name] = round((time.monotonic() - started) * 1000)
 
         mark("thread")
+        timings["replay_from_ms"] = round((listen_from - started) * 1000)  # negative: from before the spotter fired
         reason, error = "error", ""
         speaker = None
         self._guard = None
@@ -902,6 +926,8 @@ class VoiceSession(QObject):
                 on_chat=self._chat,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
+            # What recognition hears starts after the name: the mouth is told its first words were said to it.
+            conversation.woken_by_name = via == "wake" and name_cut
             if facts.get("tts_note"):
                 self._thread_state.emit("starting", facts["tts_note"])
             self._conversation = conversation
@@ -995,12 +1021,17 @@ def _import_pipeline() -> None:
     import yuki.voice.grounding  # noqa: F401
     import yuki.voice.narrator  # noqa: F401
     import yuki.voice.pipeline  # noqa: F401
+    from yuki.voice.pipeline import shared_ssl_context, use_shared_tls
+
+    # The TLS context every service connection uses, built here off the voice loop (v3.6: built per
+    # connection on the loop it stalled the loop 2.8 s live, reading the Windows certificate store).
+    shared_ssl_context()
+    use_shared_tls()
 
 
 def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
     """The background prewarm (see :meth:`VoiceSession.prewarm`). Never raises; returns what it did."""
     import socket
-    import ssl
 
     started = time.perf_counter()
     facts: dict[str, Any] = {}
@@ -1028,7 +1059,9 @@ def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
         preflight(settings, need_headphones=False)
 
     def network() -> None:
-        ssl.create_default_context()
+        from yuki.voice.pipeline import shared_ssl_context
+
+        shared_ssl_context()  # the one TLS context conversations use (built off every event loop)
         for host in ("api.deepgram.com", "api.elevenlabs.io", f"bedrock-runtime.{settings.aws_region}.amazonaws.com"):
             try:
                 socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)

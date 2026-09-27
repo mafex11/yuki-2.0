@@ -84,6 +84,49 @@ MODELS: dict[str, KwsModel] = {
 }
 DEFAULT_MODEL = "gigaspeech-3.3M"
 
+#: Where the words after the name begin, relative to the spotter's time for the name's last token
+#: (seconds; the model emits a token on a 40 ms frame, usually a little after the sound ends).
+#: Measured 2026-09-27 (v3.6) on 22 one-breath clips ("Yuki, open Chrome.", "Yuki open settings.",
+#: four Aura voices) cut there and sent to Flux: at -0.08 and -0.04 s the name was never in the
+#: transcript and the first word was kept in 21 of 22 (one voice's "open" heard as "hoping" at every
+#: cut); at -0.16 s pieces of the name came through ("key.", "Hopen", "he paused"); from +0.08 s on the
+#: first word was cut ("the music", "and settings").
+NAME_END_OFFSET_S = -0.06
+
+
+def ensure_model(key: str = DEFAULT_MODEL, base: Path = MODELS_DIR,
+                 progress: "Callable[[int, int], None] | None" = None) -> Path:
+    """Download and unpack the wake-word model once (the installed app's first run; ~18 MB).
+
+    ``progress(done_bytes, total_bytes)`` while downloading. Returns the model folder. An existing
+    model is left alone. (``scripts/voice_models.py`` does the same for a dev checkout.)
+    """
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    spec = MODELS[key]
+    target = spec.path(base)
+    if (target / spec.encoder).exists():
+        return target
+    base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "model.tar.bz2"
+        with urllib.request.urlopen(spec.url, timeout=60) as response, archive.open("wb") as fh:  # noqa: S310
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = response.read(1 << 16)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        with tarfile.open(archive, "r:bz2") as tar:
+            tar.extractall(base, filter="data")
+    return target
+
 
 class WakeSpotter:
     """A streaming spotter for "Yuki": feed 16 kHz float32 audio, get ``True`` when it is heard.
@@ -125,24 +168,47 @@ class WakeSpotter:
         self._stream = self._kws.create_stream()
         #: Competing variants heard instead of the name (a false wake avoided), for the log.
         self.near_misses = 0
+        #: The monotonic time of the current stream's first sample (``None``: not known; set by ``feed``).
+        self._t0: float | None = None
+        #: When the words after the name began (monotonic), for the last name heard: the spotter's own
+        #: time for the name's last token plus :data:`NAME_END_OFFSET_S`. ``None`` when not known.
+        self.name_end: float | None = None
 
-    def feed(self, samples: np.ndarray) -> str | None:
-        """Push audio; returns ``"YUKI"`` when the name is heard, else ``None`` (a competing variant counts as none)."""
+    def feed(self, samples: np.ndarray, at: float | None = None) -> str | None:
+        """Push audio; returns ``"YUKI"`` when the name is heard, else ``None`` (a competing variant counts as none).
+
+        ``at`` is the monotonic time of ``samples``' first sample. With it, a hit also sets
+        :attr:`name_end`: where the words said after the name begin, from the model's own token times
+        (so speech recognition can be given only what came after the name, v3.6).
+        """
+        if self._t0 is None and at is not None:
+            self._t0 = at
         self._stream.accept_waveform(RATE, samples)
         heard = None
         while self._kws.is_ready(self._stream):
             self._kws.decode_stream(self._stream)
-            result = self._kws.get_result(self._stream)
-            if result:
-                if result == self.WAKE:
-                    heard = result
+            result = self._kws.keyword_spotter.get_result(self._stream)
+            keyword = (result.keyword or "").strip()
+            if keyword:
+                if keyword == self.WAKE:
+                    heard = keyword
+                    times = list(result.timestamps or [])
+                    self.name_end = (self._t0 + times[-1] + NAME_END_OFFSET_S
+                                     if times and self._t0 is not None else None)
                 else:
                     self.near_misses += 1
-                self._kws.reset_stream(self._stream)
+                # A fresh stream after any result: its token times start again from the next sample
+                # (after ``reset_stream`` they drift by the audio still buffered), so the next hit's
+                # time is exact.
+                self._stream = self._kws.create_stream()
+                self._t0 = None if at is None else at + samples.size / RATE
+                if heard:
+                    break
         return heard
 
     def reset(self) -> None:
         self._stream = self._kws.create_stream()
+        self._t0 = None
 
 
 class WakeListener:
@@ -182,6 +248,10 @@ class WakeListener:
         self.heard_s = 0.0  # all audio seen, gated or not
         self.near_misses = 0  # sound-alikes the spotter heard instead of the name
         self.errors = 0  # batches the spotter failed on (logged; listening goes on)
+        #: For the last wake: when the words after the name began (monotonic; the spotter's own token
+        #: times, :data:`NAME_END_OFFSET_S`), or ``None`` when the spotter could not tell. Set before
+        #: ``on_wake`` is called (v3.6: speech recognition gets only what was said after the name).
+        self.name_end: float | None = None
 
     @property
     def running(self) -> bool:
@@ -237,12 +307,20 @@ class WakeListener:
         import collections
 
         blocks_per_chunk = self.BATCH_BLOCKS
-        preroll: collections.deque[np.ndarray] = collections.deque(maxlen=self.PREROLL_BLOCKS // blocks_per_chunk)
+        preroll: collections.deque[tuple[np.ndarray, float]] = collections.deque(
+            maxlen=self.PREROLL_BLOCKS // blocks_per_chunk)  # (samples, when they began)
         levels: collections.deque[float] = collections.deque(maxlen=250)  # the last 5 s of 20 ms block levels
         floor = self.GATE_MIN_RMS
         quiet = self.GATE_HOLD_BLOCKS + 1  # blocks since the last loud one (the gate starts closed)
         was_paused = False
         decoding = False  # the gate is open and the spotter has been fed since it opened
+        # A spotter that takes the batch's start time reports where the name ended (a test's stand-in may not).
+        import inspect
+
+        try:
+            timed = "at" in inspect.signature(spotter.feed).parameters
+        except (TypeError, ValueError):
+            timed = False
         while True:
             item = self._q.get()
             if item is None:
@@ -271,15 +349,16 @@ class WakeListener:
                     # echo) cost the name right after it: measured 2 of 5 hits without, see §11.
                     spotter.reset()
                     decoding = False
-                preroll.append(samples)
+                preroll.append((samples, at))
                 continue
             decoding = True
             if preroll:
-                samples = np.concatenate([*preroll, samples])  # the gate just opened: the word's start is here
+                # The gate just opened: the word's start is here (and the batch begins where the pre-roll does).
+                samples, at = np.concatenate([*(p for p, _ in preroll), samples]), preroll[0][1]
                 preroll.clear()
             started = time.perf_counter()
             try:
-                heard = spotter.feed(samples)
+                heard = spotter.feed(samples, at) if timed else spotter.feed(samples)
             except Exception as exc:  # noqa: BLE001 - one bad batch must not end listening for good
                 self.errors += 1
                 if self._log is not None and self.errors in (1, 10, 100):
@@ -291,7 +370,11 @@ class WakeListener:
             self.near_misses = spotter.near_misses
             self.audio_s += samples.size / RATE
             if heard:
+                end = getattr(spotter, "name_end", None) if timed else None
+                self.name_end = float(end) if end is not None else None
                 if self._log is not None:
-                    self._log.event("wake", state="heard", keyword=heard, model=spotter.model)
+                    self._log.event("wake", state="heard", keyword=heard, model=spotter.model,
+                                    name_end_before_hit_ms=(round((time.monotonic() - self.name_end) * 1000)
+                                                            if self.name_end is not None else None))
                 spotter.reset()
                 self._on_wake(at, heard)

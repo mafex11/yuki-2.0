@@ -162,7 +162,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     states: list[tuple[float, str, str]] = []
     session.state_changed.connect(lambda s, d: states.append((time.monotonic(), s, d)))
     wakes: list[tuple[float, float]] = []
-    session._wake_heard.connect(lambda at, heard: wakes.append((at, heard)))
+    session._wake_heard.connect(lambda at, heard, *_: wakes.append((at, heard)))
     convs: list[tuple[float, bool]] = []
     timings: list[dict[str, Any]] = []
 

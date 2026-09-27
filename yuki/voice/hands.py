@@ -224,9 +224,11 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "name": "open_url",
         "description": (
             "Your hand: open a web address, in the app they named (e.g. 'Google Chrome') or else their "
-            "default browser. A browser that is open opens it in a new tab of its own, so never press a "
-            "new-tab key first. Verified once the page is at the address and has its title (seconds), so "
-            "say_first is heard while it opens."
+            "default browser, or an address Windows opens itself, like a Settings page (ms-settings:bluetooth, "
+            "ms-settings:display, ms-settings: for Settings' home). A browser that is open opens it in a new tab "
+            "of its own, so never press a new-tab key first. A web page is verified once it is at the address "
+            "and has its title, anything else once its window is in front (seconds), so say_first is heard while "
+            "it opens."
         ),
         "properties": {
             "say_first": _SAY_FIRST,
@@ -803,6 +805,13 @@ class Hands:
         details = getattr(result, "details", None) or {}
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
+        if ok and not details.get("page_targets") and "page_verified" not in details:
+            # Not a web page (a Settings page, a folder, a file): what can be verified is that its window came
+            # up in front (v3.6; live 2026-09-27 "open Bluetooth settings" went to the thinker instead). The
+            # report says which window; with none seen (the handler's window was already in front and kept its
+            # title), it stays unverified and says so.
+            facts["verified"] = True if hwnd else None
+            return ok, report, facts
         if not ok or details.get("page_verified") is not True:
             facts["verified"] = False if details.get("page_verified") is False else None
             return ok, report, facts

@@ -124,6 +124,9 @@ class Item:
     drop: Callable[[], None] | None = None
     at: float = field(default_factory=time.monotonic)
     user_turn: int = 0
+    #: The item speaks itself when delivered (the thinker's own finishing line, said by code, v3.6): it
+    #: never runs the mouth, so in a batch the mouth runs for the last item that does not.
+    self_spoken: bool = False
 
 
 class NarratorGate:
@@ -234,6 +237,11 @@ class NarratorGate:
             return "user_sound", now + 0.1
         if s.get("bot_speaking") or s.get("generating"):
             return "bot_busy", None
+        if s.get("speech_pending"):
+            # Words are on their way to the voice but not audible yet (the TTS is starting): Yuki is
+            # about to speak. Live 2026-09-27 04:47:30 a result was handed over in this gap and its turn
+            # was said right after the stale progress line that was just starting.
+            return "bot_busy", now + 0.2
         if s.get("owes_reply"):
             return "owes_reply", None
         if s.get("busy_tools"):
@@ -320,8 +328,10 @@ class NarratorGate:
             batch.sort(key=lambda i: (RANKS.get(i.kind, 0), i.at))
             self.stats["turns"] += 1
             self.stats["merged"] += max(0, len(batch) - 1)
+            # The mouth runs once, for the last item that does not speak itself.
+            runner = max((n for n, i in enumerate(batch) if not i.self_spoken), default=-1)
             for n, item in enumerate(batch):
-                last = n == len(batch) - 1
+                last = n == runner
                 try:
                     await item.deliver(last, False)
                     self.stats["delivered"] += 1
