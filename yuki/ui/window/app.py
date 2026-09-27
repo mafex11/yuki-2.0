@@ -313,7 +313,7 @@ class WindowApp(Actions):
         from yuki.ui.chat_model import Item, history_from_session_log
 
         items: list[Item] = []
-        logs = Path(__file__).resolve().parents[3] / "logs" / "sessions"
+        logs = _sessions_dir()
         try:
             today = datetime.now().strftime("%Y%m%d")
             workers = sorted(logs.glob(f"{today}-*-worker.jsonl"), key=lambda p: p.stat().st_mtime)
@@ -939,7 +939,7 @@ class WindowApp(Actions):
 
     def open_logs(self) -> None:
         def offline() -> None:
-            logs = Path(__file__).resolve().parents[3] / "logs" / "sessions"
+            logs = _sessions_dir()
             try:
                 os.startfile(str(logs))  # type: ignore[attr-defined]
             except OSError:
@@ -966,6 +966,13 @@ class WindowApp(Actions):
         if field is not None:
             field.edit.setPlaceholderText("Your reply to Yuki's card…")
             field.edit.setFocus()
+
+
+def _sessions_dir() -> Path:
+    """``logs/sessions`` of this installation (the project's in dev, ``%LOCALAPPDATA%/Yuki`` installed)."""
+    from yuki.core.paths import logs_dir
+
+    return logs_dir() / "sessions"
 
 
 def _epoch(value: Any) -> float | None:

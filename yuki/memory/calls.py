@@ -826,27 +826,11 @@ class _DecodeGuard:
 
 
 def _add_cuda_dirs() -> list[str]:
-    """Make cuBLAS/cuDNN findable for CTranslate2: the CUDA toolkit's bin and NVIDIA pip wheels' bin dirs."""
-    added = []
-    candidates = []
-    cuda = os.environ.get("CUDA_PATH")
-    if cuda:
-        candidates.append(Path(cuda) / "bin")
-    try:
-        import nvidia  # type: ignore[import-not-found]
+    """Make cuBLAS/cuDNN findable for CTranslate2 (:func:`yuki.core.cuda.add_dll_dirs`: pip nvidia-* wheels,
+    the frozen build, ``%LOCALAPPDATA%/Yuki/cuda``, the CUDA toolkit), on ``PATH`` too."""
+    from yuki.core.cuda import add_dll_dirs
 
-        for base in getattr(nvidia, "__path__", []):
-            candidates += [p / "bin" for p in Path(base).iterdir() if (p / "bin").is_dir()]
-    except Exception:
-        pass
-    for path in candidates:
-        if path.is_dir():
-            try:
-                os.add_dll_directory(str(path))
-                added.append(str(path))
-            except OSError:
-                pass
-    return added
+    return add_dll_dirs()
 
 
 class FasterWhisperBackend:

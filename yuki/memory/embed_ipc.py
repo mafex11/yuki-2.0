@@ -18,6 +18,11 @@ held a brain request 2.3-3.9 s).
   (the know-how lookup on a request's path) gets ``None`` instead of waiting
   for a load, so it goes on without.
 
+Both ends embed with the model the database's vectors are made with
+(:func:`yuki.memory.embed.active_model`, read from the same database file, so they
+agree across a re-embed's flip); every reply names the model its vectors came from,
+and the client tags what it stores with it.
+
 Security: the pipe is local only (``PIPE_REJECT_REMOTE_CLIENTS``), its DACL
 grants only this Windows user, and both ends prove they hold a key derived
 from memory's DPAPI-protected data key (``multiprocessing.connection``'s HMAC
@@ -126,6 +131,8 @@ class EmbedServer:
         self._key = auth_key(cipher)
         self._embedder = embedder or _process_embedder
         self._log = log
+        if embedder is None:
+            _follow_database(db_path)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._listener: Any = None
@@ -241,6 +248,22 @@ def _process_embedder() -> Any:
     return get_embedder()
 
 
+def _follow_database(db_path: str | Path | None) -> None:
+    """The process-wide embedder embeds with the model this database's vectors are made with.
+
+    The server and every client read it from the same database (``embed_state.active_model``),
+    so they agree; a vector served over the pipe also says its model (``model`` in the reply).
+    """
+    if db_path is None:
+        return
+    try:
+        from yuki.memory.embed import use_database
+
+        use_database(db_path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Yuki's side
 # ---------------------------------------------------------------------------
@@ -264,6 +287,8 @@ class EmbedClient:
         self.address = pipe_name(db_path)
         self._key = auth_key(cipher)
         self._local_factory = local or _process_embedder
+        if local is None:
+            _follow_database(db_path)
         self._conn: Any = None
         self._lock = threading.Lock()
         self._ids = 0

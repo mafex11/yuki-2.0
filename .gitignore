@@ -8,3 +8,8 @@ docs/voice-samples/
 # UI mockups: large, and they show real memory (private)
 docs/ui-mockups/**/*.png
 docs/ui-mockups/**/*.gif
+
+# Windows app build output (packaging/build.ps1)
+packaging/dist/
+packaging/build/
+packaging/Output/

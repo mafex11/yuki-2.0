@@ -462,6 +462,10 @@ def session_locked() -> bool:
 
 _VENV_ROOT = Path(sys.prefix).resolve()
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+#: The frozen build's program folder (Yuki.exe, yuki-cli.exe); the project itself in dev.
+from yuki.core.paths import app_dir as _app_dir   # noqa: E402 - stdlib-only helper
+
+_APP_ROOT = _app_dir().resolve()
 
 
 @dataclass(frozen=True)
@@ -526,7 +530,8 @@ class _ProcessCache:
                     parent = parent.parent()
             except (psutil.Error, OSError):
                 pass
-            own = any(p and (_under(p, _VENV_ROOT) or _under(p, _PROJECT_ROOT)) for p in chain)
+            own = any(p and (_under(p, _VENV_ROOT) or _under(p, _PROJECT_ROOT) or _under(p, _APP_ROOT))
+                      for p in chain)
         if exe not in self._descriptions:
             self._descriptions[exe] = _file_description(exe) if exe else ""
         stem = name[:-4] if name.lower().endswith(".exe") else name

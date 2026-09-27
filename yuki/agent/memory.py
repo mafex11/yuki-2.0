@@ -148,6 +148,15 @@ ACTIVITY_GROUPS = ("site", "app", "page")
 ACTIVITY_ITEMS = 15
 ACTIVITY_EPISODES = 20
 
+#: ``calls``: how far back it looks when no since is given. ``call_timeline``: the most characters of timeline
+#: one result carries (the rest is asked for with since; the 25 Sept Discord day, 13 h with 2 h of speech, is
+#: ~53k characters, ~13k tokens, and is read whole), and exact transcript lines per page.
+CALLS_DEFAULT_DAYS = 7
+TIMELINE_MAX_CHARS = 60_000
+TRANSCRIPT_PAGE_LINES = 60
+#: A gap between two timeline blocks at least this long is shown as a stretch where nothing was said.
+TIMELINE_QUIET_S = 20 * 60.0
+
 #: Bound on the memory lookup at the start of a request (portrait and know-how
 #: together). The request goes on without memory past it.
 CONTEXT_TIMEOUT_S = 3.0
@@ -830,6 +839,10 @@ class MemoryAccess:
                 outcome = self._forget_rule(tool_input)
             elif name == "activity":
                 outcome = self._activity(tool_input)
+            elif name == "calls":
+                outcome = self._calls(tool_input)
+            elif name == "call_timeline":
+                outcome = self._call_timeline(tool_input)
             elif name == "todo":
                 outcome = self._todo(tool_input)
             elif name == "answer_question":
@@ -976,6 +989,59 @@ class MemoryAccess:
             content=[{"type": "text", "text": text}],
             payload={"asked": asked, "activity": usage, "episodes": episodes},
         )
+
+    def _calls(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """The calls and meetings in a time range (``MemoryClient.calls_in``), rows of one session merged."""
+        since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
+        until = _parse_when(tool_input.get("until"), "until", end_of_day=True)
+        if since is None:
+            since = (until or datetime.now()) - timedelta(days=CALLS_DEFAULT_DAYS)
+        if until is not None and since >= until:
+            raise _BadInput("'since' must be before 'until'")
+        asked = {"since": tool_input.get("since"), "until": tool_input.get("until")}
+        try:
+            rows = self.call_method("calls_in", since=since, until=until, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("calls", f"Calls could not be read: {exc}", {"asked": asked, "error": str(exc)})
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        text = format_calls(rows, since=since, until=until)
+        return ToolOutcome(name="calls", ok=True, summary=f"{len(rows)} call{'' if len(rows) == 1 else 's'}",
+                           content=[{"type": "text", "text": text}], payload={"asked": asked, "calls": rows})
+
+    def _call_timeline(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """One call's timeline digest, or with ``words`` a page of its exact transcript."""
+        raw = tool_input.get("call")
+        if isinstance(raw, bool) or not isinstance(raw, (str, int)) or not str(raw).strip():
+            raise _BadInput("'call' must be the call's id as calls or recall shows it, e.g. call:16")
+        since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
+        until = _parse_when(tool_input.get("until"), "until", end_of_day=True)
+        if since is not None and until is not None and since >= until:
+            raise _BadInput("'since' must be before 'until'")
+        words = tool_input.get("words") is True
+        page = tool_input.get("page")
+        page = int(page) if isinstance(page, (int, float)) and not isinstance(page, bool) and page >= 1 else 1
+        asked = {"call": raw, "since": tool_input.get("since"), "until": tool_input.get("until"), "words": words,
+                 "page": page}
+        try:
+            if words:
+                result = self.call_method("call_transcript", raw, since=since, until=until, page=page,
+                                          per_page=TRANSCRIPT_PAGE_LINES, timeout_s=TOOL_TIMEOUT_S)
+            else:
+                result = self.call_method("call_timeline", raw, since=since, until=until, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("call_timeline", f"The call could not be read: {exc}", {"asked": asked, "error": str(exc)})
+        if not isinstance(result, dict):
+            return _fail("call_timeline", f"No call {raw} in memory: take the id from calls or recall.",
+                         {"asked": asked, "error": "no_such_call"})
+        if words:
+            text = format_call_transcript(result)
+            summary = f"page {result.get('page')} of {result.get('pages')}, {len(result.get('lines') or [])} lines"
+        else:
+            text = format_call_timeline(result)
+            blocks = result.get("blocks") or []
+            summary = f"{len(blocks)} block{'' if len(blocks) == 1 else 's'} of {result.get('app') or 'the call'}"
+        return ToolOutcome(name="call_timeline", ok=True, summary=summary, content=[{"type": "text", "text": text}],
+                           payload={"asked": asked, "call": result})
 
     def _remember_how(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
         text = _need_text(tool_input, "text")
@@ -1338,6 +1404,7 @@ def format_recall(
     if not facts:
         return f"No facts in memory match {', '.join(scope)}."
     lines = [f"{len(facts)} result{'' if len(facts) == 1 else 's'} from memory for {', '.join(scope)}:"]
+    calls: list[str] = []
     for row in facts:
         fact = " ".join(str(row.get("fact") or "").split())
         if row.get("kind") in CONVERSATION_KINDS:
@@ -1357,7 +1424,193 @@ def format_recall(
         source = " ".join(str(row.get("source") or "").split())
         lines.append(f"{_when(row.get('at'))}{f' [{where}]' if where else ''} {fact}{mark}"
                      + (f"\n    from: {source}" if source else ""))
+        if row.get("call") and row["call"] not in calls:
+            calls.append(str(row["call"]))
+    if calls:
+        lines.append(f"Some of these were heard on calls whose full timeline is in memory ({', '.join(calls)}): "
+                     "for what happened on a call, and when, open it with call_timeline rather than answering "
+                     "from these facts alone.")
     return "\n".join(lines)
+
+
+#: Said once in every call result: whose words these are (docs/MEMORY.md, "Calls: just my side").
+CALL_SIDE_NOTE = ("Only the user's own microphone is ever recorded: this is their side of the call; nobody "
+                  "else's words are known.")
+
+
+def _stamp(value: Any) -> datetime | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    return value if isinstance(value, datetime) else None
+
+
+def _span_text(start: Any, end: Any) -> str:
+    """``Fri 2026-09-25 13:20 to Sat 02:33`` (the end's day only when it differs)."""
+    a, b = _stamp(start), _stamp(end)
+    if a is None:
+        return "(undated)"
+    if b is None:
+        return f"{_when(a)} (still going)"
+    tail = b.strftime("%H:%M") if b.date() == a.date() else b.strftime("%a %H:%M")
+    return f"{_when(a)} to {tail}"
+
+
+def _call_head(c: dict[str, Any]) -> str:
+    ids = c.get("call_ids") or []
+    if not c.get("ref"):   # a meeting the timeline measured with no call row: its hours only
+        name = c.get("service") or c.get("app") or "a meeting"
+        app = c.get("app")
+        where = f" in {app}" if app and app != name else ""
+        return (f"[meeting, no transcript] {name}{where}, {_span_text(c.get('start'), c.get('end'))} "
+                f"({_duration(c.get('seconds'))}; the app held the microphone in front, but nothing of it was "
+                "recorded)")
+    rows = f"call row {ids[0]}" if len(ids) == 1 else f"one session, call rows {ids[0]}-{ids[-1]}"
+    head = f"[{c.get('ref')}] {c.get('app') or 'a call'}"
+    if c.get("service") and c.get("service") != c.get("app"):
+        head += f" ({c['service']})"
+    head += f", {_span_text(c.get('start'), None if c.get('ongoing') else c.get('end'))}"
+    head += f" ({rows}; on the call {_duration(c.get('seconds'))}"
+    if c.get("recorded"):
+        head += f"; the user spoke about {_duration(c.get('speech_s'))}"
+    else:
+        head += "; their side was not recorded"
+    return head + ")"
+
+
+def _row_states(c: dict[str, Any]) -> str:
+    """``timeline written for rows 16-21`` / ``row 22: audio waiting to be transcribed``, grouped by state."""
+    groups: dict[str, list[int]] = {}
+    for r in c.get("rows") or []:
+        groups.setdefault(str(r.get("state") or ""), []).append(int(r.get("call_id")))
+    parts = []
+    for state, ids in groups.items():
+        which = f"row {ids[0]}" if len(ids) == 1 else f"rows {', '.join(str(i) for i in ids)}"
+        parts.append(f"{state} ({which})")
+    return "; ".join(parts)
+
+
+def format_calls(calls: list[dict[str, Any]], *, since: datetime | None = None, until: datetime | None = None) -> str:
+    """The ``calls`` tool's text: one entry per call or meeting (a session's rows merged), with its gist."""
+    scope = " ".join(p for p in (f"since {_when(since)}" if since else "", f"before {_when(until)}" if until else "")
+                     if p)
+    if not calls:
+        return f"No calls or meetings in memory {scope or 'in that time'}. {CALL_SIDE_NOTE}"
+    lines = [f"{len(calls)} call{'' if len(calls) == 1 else 's'} or meeting{'' if len(calls) == 1 else 's'} "
+             f"{scope} (rows of one continuous session merged). {CALL_SIDE_NOTE}"]
+    for c in calls:
+        lines.append(f"- {_call_head(c)}")
+        gists = [g.get("gist") for g in c.get("gists") or [] if g.get("gist")]
+        if gists:
+            lines.append("  gist: " + " | ".join(gists))
+        states = _row_states(c)
+        if states:
+            lines.append(f"  {states}")
+    lines.append("Open one with call_timeline and its id for what happened when.")
+    return "\n".join(lines)
+
+
+def format_call_timeline(t: dict[str, Any]) -> str:
+    """The ``call_timeline`` text, already in the shape a written answer takes: the call, whose side it is, the
+    gists, then stretch by stretch (its time range and topics as a heading line), one line per moment with its
+    time, and the quiet hours between stretches."""
+    out = [_call_head(t), CALL_SIDE_NOTE]
+    if t.get("since") or t.get("until"):
+        out.append(f"Only the part {_span_text(t.get('since') or t.get('start'), t.get('until') or t.get('end'))}.")
+    gists = [g.get("gist") for g in t.get("gists") or [] if g.get("gist")]
+    if gists:
+        out.append("Gist: " + " | ".join(gists))
+    groups = t.get("stretches")
+    blocks = t.get("blocks") or []
+    if groups is None:   # a result without stretches: each block is its own
+        groups = [{"start": b.get("start"), "end": b.get("end"), "topics": [b.get("topic") or ""],
+                   "lines": b.get("lines") or []} for b in blocks]
+    if not groups:
+        out.append("No timeline lines for this call" + (" in that part." if t.get("since") or t.get("until") else ".")
+                   + f" State: {_row_states(t)}.")
+    else:
+        out.append(f"Timeline in {len(groups)} stretch{'' if len(groups) == 1 else 'es'}: each stretch's time range "
+                   "and topics, then its moments (one line each, time first), each with the details under it "
+                   "(local times; [joke] lines are humour, [uncertain] ones possibly misheard):")
+    size = sum(len(x) for x in out)
+    first = _stamp(groups[0]["start"]) if groups else None
+    first_day = first.date() if first else None
+
+    def hm(stamp: datetime) -> str:
+        return stamp.strftime("%H:%M") if first_day is None or stamp.date() == first_day else stamp.strftime("%a %H:%M")
+
+    prev_end: datetime | None = None
+    for i, g in enumerate(groups):
+        start, end = _stamp(g.get("start")), _stamp(g.get("end"))
+        if start is None:
+            continue
+        chunk = []
+        if prev_end is not None and (start - prev_end).total_seconds() >= TIMELINE_QUIET_S:
+            chunk.append(f"(nothing said {hm(prev_end)}-{hm(start)})")
+        topics = [x for x in g.get("topics") or [] if x]
+        chunk.append(f"{hm(start)}-{hm(end or start)}" + (f": {'; '.join(topics[:8])}" if topics else ""))
+        # the moments of the stretch: its blocks (a moment line: the block's time and topic), details under each
+        moments = [b for b in blocks if start <= (_stamp(b.get("start")) or start) <= (end or start)]
+        if not moments:
+            moments = [{"start": g.get("start"), "topic": "", "lines": g.get("lines") or []}]
+        for b in moments:
+            at_b = _stamp(b.get("start"))
+            if b.get("topic"):
+                chunk.append(f"  {hm(at_b) if at_b else '?'} {b['topic']}")
+            for ln in b.get("lines") or []:
+                at = _stamp(ln.get("at"))
+                mark = {"humor": " [joke]", "uncertain": " [uncertain]", "story": " [a story they told]"}.get(
+                    str(ln.get("nature")), "")
+                chunk.append(f"      {hm(at) if at else '?'} {ln.get('text')}{mark}")
+        text = "\n".join(chunk)
+        if size + len(text) > TIMELINE_MAX_CHARS:
+            out.append(f"[Timeline cut here for length: {len(groups) - i} more stretches from {hm(start)}. Call "
+                       f"call_timeline again with since={start.strftime('%Y-%m-%dT%H:%M')} for the rest.]")
+            break
+        out.append(text)
+        size += len(text)
+        prev_end = end or start
+    missing = [r for r in t.get("rows") or [] if r.get("state") not in ("timeline written", "nothing worth a line")]
+    if missing and groups:
+        out.append("Not in this timeline: " + "; ".join(
+            f"row {r.get('call_id')} {_span_text(r.get('start'), r.get('end'))}: {r.get('state')}" for r in missing))
+    kept = t.get("words_kept_until")
+    out.append("The exact words: call_timeline with words=true (since/until for a stretch)"
+               + (f", kept until {_when(kept)}." if kept else "; they are past the 30-day limit and gone."))
+    return "\n".join(out)
+
+
+def format_call_transcript(t: dict[str, Any]) -> str:
+    """One page of a call's exact transcript: time, words, and marks for unclear lines and repeated loops."""
+    lines = t.get("lines") or []
+    head = (f"The user's exact words on the {t.get('app') or ''} call [{t.get('ref')}] "
+            f"{_span_text(t.get('since') or t.get('start'), t.get('until') or t.get('end'))}, as the speech "
+            f"recogniser heard them (noisy; Hindi often in Devanagari): page {t.get('page')} of {t.get('pages')}, "
+            f"{t.get('total')} lines in all. {CALL_SIDE_NOTE}")
+    if not lines:
+        return head + "\nNo words stored for this stretch (nothing said, or past the 30-day limit)."
+    out = [head]
+    if t.get("loops_left_out"):
+        out.append(f"{t['loops_left_out']} exact repeats of a recent line (the recogniser looping on noise) are "
+                   "left out; the line they repeat says how many times.")
+    for ln in lines:
+        at = _stamp(ln.get("at"))
+        marks = []
+        if ln.get("unclear"):
+            marks.append("unclear")
+        if ln.get("repeats"):
+            marks.append(f"repeated {ln['repeats']}x, likely noise")
+        if ln.get("to_yuki") == "yes":
+            marks.append("said to Yuki, not the call")
+        elif ln.get("to_yuki"):
+            marks.append("Yuki was listening: maybe said to Yuki")
+        tail = f" [{', '.join(marks)}]" if marks else ""
+        out.append(f"{at.strftime('%H:%M:%S') if at else '?'} {ln.get('text')}{tail}")
+    if int(t.get("page") or 1) < int(t.get("pages") or 1):
+        out.append(f"[More: page={int(t.get('page') or 1) + 1}]")
+    return "\n".join(out)
 
 
 def relevant_block_text(items: list[dict[str, Any]]) -> str | None:

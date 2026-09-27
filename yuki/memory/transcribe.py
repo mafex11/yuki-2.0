@@ -399,8 +399,9 @@ class TranscribeScheduler:
     def _start(self, now: float, why: str, waiting: dict[str, Any]) -> None:
         self._signal_stop(False)
         self._others.clear()
-        argv = [sys.executable, "-m", "yuki.memory.transcribe", "--db", str(self.db_path),
-                "--stop-event", stop_event_name(self.db_path)]
+        from yuki.core.procs import TRANSCRIBER, module_command
+
+        argv = module_command(TRANSCRIBER, "--db", str(self.db_path), "--stop-event", stop_event_name(self.db_path))
         path = getattr(self._privacy, "path", None)
         if path:
             argv += ["--privacy", str(path)]
@@ -614,7 +615,9 @@ def main(argv: list[str] | None = None) -> int:
     from yuki.memory.privacy import PrivacyConfig
     from yuki.memory.timeline import PrivacySection
 
-    log_dir = PROJECT_ROOT / "logs" / "memory"
+    from yuki.core.paths import logs_dir
+
+    log_dir = logs_dir() / "memory"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"transcribe-{datetime.now():%Y%m%d}.jsonl"
 
@@ -623,6 +626,12 @@ def main(argv: list[str] | None = None) -> int:
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False, default=_as_plain) + "\n")
 
+    # cuBLAS/cuDNN folders (pip nvidia-* wheels, the frozen build, %LOCALAPPDATA%\Yuki\cuda, CUDA_PATH)
+    # before ctranslate2 loads: Windows never searches site-packages\nvidia\*\bin by itself.
+    from yuki.core.cuda import add_dll_dirs, has_cublas
+
+    dll_dirs = add_dll_dirs()
+    log("transcribe_dll_dirs", dirs=len(dll_dirs), cublas=has_cublas())
     handle = None
     if args.stop_event:
         k = ctypes.windll.kernel32

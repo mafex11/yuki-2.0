@@ -28,6 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
+from yuki.core.paths import logs_dir as _logs_dir
+
 from pydantic import Field
 
 from mcp.server.mcpserver import MCPServer
@@ -59,6 +61,8 @@ front and for how long, and episode narratives of what the user was doing;
 - the user's conversations with Yuki: exchanges, session summaries, and the standing rules the user set;
 - a one-page portrait of the user (work, interests, people, routines, preferences, personality, open \
 loops), rebuilt nightly from the facts;
+- the user's calls and meetings: when, and a timeline of what the user said on each (only the user's own \
+microphone is ever recorded, never anyone else);
 - procedures that worked on this PC (know-how);
 - a weekly review of the user's last seven days (time use against the week before, focus, what got done \
 and what is open), written on Sunday evenings.
@@ -444,6 +448,63 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
 
             return run("get_weekly_review", {"week": week}, body)
 
+    # -- get_calls / get_call_timeline (only when the memory API offers them) -
+
+    if callable(getattr(MemoryClient, "calls_in", None)):
+
+        @server.tool(title="Get calls", annotations=READ_ONLY, structured_output=False)
+        def get_calls(
+            since: Annotated[str | None, Field(description=f"{SINCE_HELP} Default: the last 7 days.")] = None,
+            until: Annotated[str | None, Field(description=f"{UNTIL_HELP} Default: now.")] = None,
+        ) -> str:
+            """The user's calls and meetings (Discord, Google Meet, Zoom, Teams, WhatsApp, any app using the microphone for a call): app, start and end, how long the user spoke, whether their side was recorded, and a one-line gist. Rows of one continuous session are merged. Only the user's own microphone is ever recorded. Open one with get_call_timeline."""
+
+            def body() -> tuple[str, Window | None]:
+                from datetime import timedelta
+
+                from yuki.agent.memory import format_calls
+
+                window = resolve_range(since, until, default_today=False)
+                if window.start is None:
+                    window = Window((window.end or local_now()) - timedelta(days=7), window.end or local_now())
+                client = memory.client()
+                calls = client.calls_in(since=window.since_ts, until=window.until_ts)
+                text = format_calls(calls, since=window.start.replace(tzinfo=None) if window.start else None,
+                                    until=window.end.replace(tzinfo=None) if window.end else None)
+                return f"{describe(window)}\n{text}", window
+
+            return run("get_calls", {"since": since, "until": until}, body)
+
+        @server.tool(title="Get call timeline", annotations=READ_ONLY, structured_output=False)
+        def get_call_timeline(
+            call: Annotated[str, Field(description="The call's id as get_calls or search_memory shows it, e.g. call:16.")],
+            since: Annotated[str | None, Field(description=f"Only the part of the call from here. {_FORMS}")] = None,
+            until: Annotated[str | None, Field(description=f"Only the part of the call before this. {_FORMS}")] = None,
+            words: Annotated[bool, Field(description="true: the user's exact words (noisy speech recognition) instead of the timeline.")] = False,
+            page: Annotated[int, Field(ge=1, description="words only: which page of lines.")] = 1,
+        ) -> str:
+            """What happened on one call or meeting, timeline-wise, from the user's side only: stretches of the call with their time ranges and topics, then one dated line per moment (what the user said, asked, decided, planned, joked about). With words=true, a page of the user's exact words (kept 30 days; loops, unclear lines and speech said to Yuki are marked)."""
+
+            def body() -> tuple[str, Window | None]:
+                from yuki.agent.memory import format_call_timeline, format_call_transcript
+
+                window = resolve_range(since, until, default_today=False)
+                client = memory.client()
+                if words:
+                    result = client.call_transcript(call, since=window.since_ts, until=window.until_ts,
+                                                    page=int(page), per_page=60)
+                else:
+                    result = client.call_timeline(call, since=window.since_ts, until=window.until_ts)
+                if not result:
+                    raise ToolError(f"No call {call} in memory: take the id from get_calls.")
+                start, end = _parse_iso(result.get("start")), _parse_iso(result.get("end"))
+                span = Window(start, end) if start and end else window
+                text = format_call_transcript(result) if words else format_call_timeline(result)
+                return f"{describe(span)}\n{text}", span
+
+            return run("get_call_timeline", {"call": call, "since": since, "until": until,
+                                             "words": words or None, "page": page if words else None}, body)
+
     return server, memory
 
 
@@ -562,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="yuki-mcp", description="Read-only MCP server over Yuki's memory (stdio).")
     parser.add_argument("--db", type=Path, default=None,
                         help=f"memory database (default: {default_db_path()})")
-    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "logs" / "mcp",
+    parser.add_argument("--log-dir", type=Path, default=_logs_dir() / "mcp",
                         help="directory for the content-free call log (default: %(default)s)")
     parser.add_argument("--no-log", action="store_true", help="write no call log")
     args = parser.parse_args(argv)

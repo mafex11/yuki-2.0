@@ -67,7 +67,10 @@ user's own speech kept - encrypted, in the spool - until the deferred
 transcriber (:mod:`yuki.memory.transcribe`, thread ``yuki-memory-transcribe``)
 finds the PC free and turns it into text of kind ``my_call_side`` in a
 below-normal process of its own. This process never loads a speech model or
-uses the GPU. The ``paused`` flag stops both at once.
+uses the GPU. The ``paused`` flag stops both at once. Once a call's words are
+journaled, :mod:`yuki.memory.calldigest` (thread ``yuki-memory-calldigest``)
+writes its timeline digest with Haiku, never while a call is open or something
+is full screen.
 """
 
 from __future__ import annotations
@@ -266,7 +269,9 @@ def run(args: argparse.Namespace) -> int:
     stop = threading.Event()
     keep_alive = _install_stop_handlers(stop)
     session_id = "memory-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-    log = _Log(SessionLogger(PROJECT_ROOT / "logs", session_id=session_id, quiet=True), verbose=args.verbose)
+    from yuki.core.paths import logs_dir
+
+    log = _Log(SessionLogger(logs_dir(), session_id=session_id, quiet=True), verbose=args.verbose)
     meter = _ProcessMeter()
     started = time.monotonic()
     watcher: Watcher | None = None
@@ -554,6 +559,22 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:
                 log("error", where="transcribe_start", error=f"{type(exc).__name__}: {exc}")
                 transcriber = None
+            if not args.no_journal:
+                try:   # call timeline digests: Haiku, after a call's words land; never during a call or a game
+                    from yuki.memory.calldigest import CallDigestWorker
+
+                    def digest_fullscreen() -> dict[str, Any]:
+                        tl = timeline
+                        st = tl.stats() if tl is not None and tl.alive else {}
+                        return {"fullscreen": bool(st.get("fullscreen"))}
+
+                    call_digest = CallDigestWorker(store, live_fn=digest_fullscreen, log=log)
+                    threading.Thread(
+                        target=_guarded(call_digest.run, log, "calldigest"), args=(stop, pause_path),
+                        name="yuki-memory-calldigest", daemon=True,
+                    ).start()
+                except Exception as exc:
+                    log("error", where="calldigest_start", error=f"{type(exc).__name__}: {exc}")
 
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
@@ -779,7 +800,9 @@ def _install_crash_log() -> None:
     import traceback
 
     try:
-        path = PROJECT_ROOT / "logs" / "memory-crash.log"
+        from yuki.core.paths import logs_dir
+
+        path = logs_dir() / "memory-crash.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         crash_file = open(path, "a", encoding="utf-8", buffering=1)  # kept open for faulthandler
     except OSError:

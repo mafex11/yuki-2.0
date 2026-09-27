@@ -3,7 +3,7 @@
 Each helper gets one self-contained task, a fresh context (it sees nothing of the conversation),
 a short system prompt of its own, the cheaper model (``Settings.helpers_model``) and a subset of
 tools that only look and read (:data:`yuki.agent.tools.HELPER_TOOLS`): memory (``recall``,
-``activity``), files (``read_file``), web addresses (``fetch_url``), windows and tabs
+``activity``, ``calls``, ``call_timeline``), files (``read_file``), web addresses (``fetch_url``), windows and tabs
 (``look_at_desktop``, ``look_at_window``, ``read_page``, ``read_tabs``). They report back in a few
 lines and the brain goes on.
 
@@ -49,7 +49,8 @@ READ_ONLY_BACKEND: frozenset[str] = frozenset({
 
 HELPER_SYSTEM = (
     "You are a helper for Yuki, a personal assistant on the user's Windows PC. Yuki gives you one task. "
-    "You can only look and read: the memory of the user's past activity, chats and calls (recall, activity), "
+    "You can only look and read: the memory of the user's past activity, chats and calls (recall, activity, "
+    "calls, call_timeline: for what happened on a call, list it with calls and read its timeline), "
     "files, web addresses, and the windows and tabs on screen. You cannot click, type, open, close or change "
     "anything, and you cannot ask the user. Gather what the task needs with as few calls as you can (several "
     "calls in one turn save time), then reply with a short plain report of what you found: the facts with "

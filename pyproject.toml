@@ -20,6 +20,7 @@ dependencies = [
     "pyside6>=6.11.2",
     "pywin32>=312",
     "rich>=15.0.0",
+    "sentencepiece>=0.2.1",
     "sherpa-onnx==1.13.8",
     "sherpa-onnx-core==1.13.8",
     "sounddevice>=0.5.6",
@@ -32,6 +33,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+]
+# The Windows app build (packaging/build.ps1, .github/workflows/build.yml): `uv sync --group build`.
+build = [
+    "pyinstaller>=6.16",
 ]
 
 [project.scripts]

@@ -39,12 +39,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def windowless_python() -> Path:
-    """``pythonw.exe`` of this environment (the venv's, when running from it)."""
-    here = Path(sys.executable)
-    for candidate in (here.with_name("pythonw.exe"), PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"):
-        if candidate.exists():
-            return candidate
-    return here
+    """``pythonw.exe`` of this environment (the venv's, when running from it); ``Yuki.exe`` in the
+    installed app, also when asked from ``yuki-cli.exe`` (:func:`yuki.core.procs.interpreter`)."""
+    from yuki.core.procs import interpreter
+
+    return interpreter()
 
 
 def launch_command(python: Path | None = None) -> str:

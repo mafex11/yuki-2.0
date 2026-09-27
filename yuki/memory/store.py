@@ -218,6 +218,14 @@ Calls, just the user's side (yuki.memory.calls; MemoryClient.call_status / answe
         # journal facts + the user's own commitments (conversation facts, origin "call") in one transaction
     call_event_name(db_path);  CALL_READY_EVENT;  signal_event(name)
 
+Call timeline digests (migration 19, yuki.memory.calldigest)::
+
+    store.call_side_captures(call_id) -> [{"id", "at", "journaled", "data"}]   # the call's words, decrypted
+    store.call_digest_candidates(max_attempts=3, journaled_only=True, include_done=False) -> [{"call_id", "app", "capture_ids"}]
+    store.claim_call_digest(call_id, app=, capture_ids=, owner=) -> bool
+    store.save_call_digest(call_id, app=, capture_ids=, status=, gist=, blocks=, ...) / fail_call_digest(...)
+    store.call_digests(ids) -> {id: {...}};  store.call_digest(id);  store.digested_call_threads() -> {thread_id: call_id}
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
@@ -1991,6 +1999,67 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE conversation_facts ADD COLUMN owner TEXT;
     ALTER TABLE conversation_turns ADD COLUMN addressed TEXT;
     """,
+    # 19 (2026-09-27, "what happened on my Discord call on Friday" got four lines): one timeline digest per
+    # call row (yuki.memory.calldigest), written by Haiku from the call's my_call_side captures once they
+    # land: time blocks the model cut where the talk moved, each with short English lines of what the user
+    # said, asked, decided, planned or joked about, each dated by the utterance it rests on; plus a one-line
+    # gist. Encrypted, never pruned (the transcript it was made from goes with the 30-day capture TTL).
+    # capture_ids says which captures it read, so a call that gains words is digested again. Additive only.
+    """
+    CREATE TABLE call_digests (
+        call_id           INTEGER PRIMARY KEY REFERENCES calls(id),
+        app               TEXT NOT NULL,
+        started_at        REAL,                    -- first utterance of the call
+        ended_at          REAL,                    -- end of its last utterance
+        speech_s          REAL NOT NULL DEFAULT 0, -- the user's speech: utterance seconds added up
+        utterances        INTEGER NOT NULL DEFAULT 0,
+        kept              INTEGER NOT NULL DEFAULT 0,  -- utterances shown to the model (exact repeats left out)
+        capture_ids       TEXT NOT NULL,           -- JSON: the my_call_side captures it was written from
+        status            TEXT NOT NULL,           -- running | ok | empty | failed
+        gist_ciphertext   TEXT,                    -- one line: what the call was mostly about, the user's side
+        blocks_ciphertext TEXT,                    -- JSON [{start, end, first, last, topic, lines: [{at, text, nature}]}]
+        model             TEXT,
+        requests          INTEGER NOT NULL DEFAULT 0,
+        input_tokens      INTEGER NOT NULL DEFAULT 0,
+        output_tokens     INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd          REAL NOT NULL DEFAULT 0,
+        latency_ms        REAL NOT NULL DEFAULT 0,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        error             TEXT,
+        claimed_by        TEXT,                    -- the process writing it while status = running
+        claimed_at        REAL,
+        created_at        REAL NOT NULL,
+        updated_at        REAL NOT NULL
+    );
+    CREATE INDEX call_digests_started ON call_digests(started_at);
+    CREATE INDEX call_digests_updated ON call_digests(updated_at);
+    """,
+    # 20 (2026-09-27, the smaller embedder): a change of embedding model is a background re-embed
+    # (yuki.memory.reembed), never a mix. embed_state holds the model the stored vectors are made with
+    # ("active_model"; read by yuki.memory.embed.active_model, so every process embeds with it), the one
+    # being moved to ("target_model") and a "generation" bumped at each flip (in-memory vector caches
+    # reload on it). vec_next holds the target model's vectors while the old model keeps serving: one per
+    # (vector table, row), with a digest of the old vector it replaces (a row re-embedded meanwhile is
+    # done again). The flip copies them over in one transaction and empties it. Additive only.
+    """
+    CREATE TABLE embed_state (
+        key             TEXT PRIMARY KEY,        -- active_model | target_model | generation | flipped_at | ...
+        value           TEXT NOT NULL,
+        updated_at      REAL NOT NULL
+    );
+    CREATE TABLE vec_next (
+        tbl             TEXT NOT NULL,           -- the vector table: journal_vec, episode_vec, ...
+        item_id         INTEGER NOT NULL,        -- that table's row id
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL,           -- encrypted float32[dim], L2-normalised
+        src_digest      TEXT NOT NULL,           -- digest of the replaced vector's ciphertext when embedded
+        created_at      REAL NOT NULL,
+        PRIMARY KEY (tbl, item_id)
+    );
+    """,
 )
 
 
@@ -3493,11 +3562,14 @@ class Store:
             "SELECT coalesce(sum(cost_usd), 0) FROM conversation_batches WHERE at >= ?", (s,))[0][0]
         nudge_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM nudge_checkins WHERE at >= ?", (s,))[0][0]
         review_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM weekly_reviews WHERE at >= ?", (s,))[0][0]
+        digest_cost = self._query("SELECT coalesce(sum(cost_usd), 0) FROM call_digests WHERE updated_at >= ?",
+                                  (s,))[0][0]
         return {
             "captures": int(captures), "facts": int(facts), "last_capture_at": last,
             "journal_cost_usd": float(journal_cost or 0.0), "portrait_cost_usd": float(portrait_cost or 0.0),
             "episode_cost_usd": float(episode_cost or 0.0), "conversation_cost_usd": float(conversation_cost or 0.0),
             "nudge_cost_usd": float(nudge_cost or 0.0), "review_cost_usd": float(review_cost or 0.0),
+            "call_digest_cost_usd": float(digest_cost or 0.0),
         }
 
     # -- timeline ------------------------------------------------------------
@@ -5652,6 +5724,171 @@ class Store:
             return batch_id, new_ids
 
         return self._write(op)
+
+    # -- call timeline digests (migration 19, yuki.memory.calldigest) --------------
+
+    def call_side_captures(self, call_id: int) -> list[dict[str, Any]]:
+        """The ``my_call_side`` captures of one call, oldest first: ``{"id", "at", "journaled", "data"}``, ``data``
+        being the decrypted capture JSON (``{"call_id", "app", "start", "end", "final", "utterances": [...]}``).
+        Empty once the captures are past the 30-day TTL."""
+        rows = self._query(
+            "SELECT c.id, c.at, c.journal_batch_id, c.delta_ciphertext FROM captures c"
+            " JOIN calls k ON k.thread_id = c.thread_id WHERE k.id=? AND c.kind=? ORDER BY c.at, c.id",
+            (int(call_id), CALL_SIDE_KIND))
+        out = []
+        for r in rows:
+            try:
+                data = json.loads(self.cipher.decrypt(r["delta_ciphertext"]) or "{}")
+            except (ValueError, TypeError):
+                data = {}
+            out.append({"id": int(r["id"]), "at": r["at"], "journaled": r["journal_batch_id"] is not None,
+                        "data": data if isinstance(data, dict) else {}})
+        return out
+
+    def call_digest_candidates(self, *, max_attempts: int = 3, stale_s: float = 900.0, now: float | None = None,
+                               journaled_only: bool = True, include_done: bool = False) -> list[dict[str, Any]]:
+        """Ended calls whose words landed and whose digest is missing, failed (under ``max_attempts``) or written
+        from other captures than the call has now; oldest first: ``{"call_id", "app", "capture_ids"}``.
+        ``journaled_only``: wait until the journal has read every capture (the journal goes first).
+        ``include_done``: every ended call that still has its words (a forced re-write). Content-free."""
+        now = time.time() if now is None else float(now)
+        marks = ",".join("?" * len(CALL_OPEN_STATUSES))
+        rows = self._query(
+            "SELECT k.id AS call_id, k.app, group_concat(c.id) AS ids,"
+            " sum(CASE WHEN c.journal_batch_id IS NULL THEN 1 ELSE 0 END) AS unjournaled,"
+            " d.status, d.capture_ids AS digested, d.attempts, d.claimed_at"
+            " FROM calls k JOIN captures c ON c.thread_id = k.thread_id AND c.kind = ?"
+            " LEFT JOIN call_digests d ON d.call_id = k.id"
+            f" WHERE k.status NOT IN ({marks}) GROUP BY k.id ORDER BY k.detected_at, k.id",
+            (CALL_SIDE_KIND, *CALL_OPEN_STATUSES))
+        out = []
+        for r in rows:
+            ids = sorted(int(x) for x in str(r["ids"] or "").split(",") if x)
+            if not ids or (journaled_only and r["unjournaled"]):
+                continue
+            try:
+                done = sorted(int(x) for x in json.loads(r["digested"] or "[]"))
+            except (ValueError, TypeError):
+                done = []
+            same = done == ids and not include_done
+            if r["status"] in ("ok", "empty") and same:
+                continue
+            if r["status"] == "failed" and same and int(r["attempts"] or 0) >= max_attempts:
+                continue
+            if r["status"] == "running" and (r["claimed_at"] or 0.0) > now - stale_s:
+                continue
+            out.append({"call_id": int(r["call_id"]), "app": r["app"] or "", "capture_ids": ids})
+        return out
+
+    def claim_call_digest(self, call_id: int, *, app: str, capture_ids: Sequence[int], owner: str,
+                          stale_s: float = 900.0, now: float | None = None) -> bool:
+        """Mark one call's digest as being written by ``owner`` (a process tag); False when another writer holds
+        a fresh claim. A digest already there keeps its blocks until the new one is saved; new captures reset
+        the attempts."""
+        now = time.time() if now is None else float(now)
+        ids = json.dumps(sorted(int(i) for i in capture_ids))
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT status, claimed_by, claimed_at, capture_ids FROM call_digests WHERE call_id=?",
+                               (int(call_id),)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO call_digests(call_id, app, capture_ids, status, claimed_by, claimed_at,"
+                             " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                             (int(call_id), app or "", ids, "running", owner, now, now, now))
+                return True
+            if (row["status"] == "running" and row["claimed_by"] != owner
+                    and (row["claimed_at"] or 0.0) > now - stale_s):
+                return False
+            reset = row["capture_ids"] != ids
+            conn.execute("UPDATE call_digests SET status='running', claimed_by=?, claimed_at=?, updated_at=?,"
+                         " attempts=CASE WHEN ? THEN 0 ELSE attempts END WHERE call_id=?",
+                         (owner, now, now, int(reset), int(call_id)))
+            return True
+
+        return bool(self._write(op))
+
+    def save_call_digest(
+        self, call_id: int, *, app: str, capture_ids: Sequence[int], status: str, gist: str | None,
+        blocks: Sequence[dict[str, Any]], started_at: float | None, ended_at: float | None, speech_s: float,
+        utterances: int, kept: int, model: str | None, usage: dict[str, int] | None = None, requests: int = 0,
+        cost_usd: float | None = None, latency_ms: float = 0.0,
+    ) -> None:
+        """Store a call's digest (``status`` ok, or empty when the call held nothing worth a line), encrypted;
+        the cost is added to what earlier attempts cost."""
+        usage = usage or {}
+        now = time.time()
+        ids = json.dumps(sorted(int(i) for i in capture_ids))
+        values = (app or "", started_at, ended_at, float(speech_s or 0.0), int(utterances), int(kept), ids, status,
+                  self._enc(gist) if gist else None, self.cipher.encrypt(json.dumps(list(blocks), ensure_ascii=False)),
+                  model, int(requests), int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+                  int(usage.get("cache_write_tokens") or 0), int(usage.get("cache_read_tokens") or 0),
+                  float(cost_usd or 0.0), float(latency_ms or 0.0))
+
+        def op(conn: sqlite3.Connection) -> None:
+            if conn.execute("SELECT 1 FROM call_digests WHERE call_id=?", (int(call_id),)).fetchone() is None:
+                conn.execute("INSERT INTO call_digests(call_id, app, capture_ids, status, created_at, updated_at)"
+                             " VALUES (?,?,?,?,?,?)", (int(call_id), app or "", ids, status, now, now))
+            conn.execute(
+                "UPDATE call_digests SET app=?, started_at=?, ended_at=?, speech_s=?, utterances=?, kept=?,"
+                " capture_ids=?, status=?, gist_ciphertext=?, blocks_ciphertext=?, model=?, requests=?,"
+                " input_tokens=?, output_tokens=?, cache_write_tokens=?, cache_read_tokens=?,"
+                " cost_usd=cost_usd+?, latency_ms=?, error=NULL, claimed_by=NULL, claimed_at=NULL, updated_at=?"
+                " WHERE call_id=?", (*values, now, int(call_id)))
+
+        self._write(op)
+
+    def fail_call_digest(self, call_id: int, *, capture_ids: Sequence[int], error: str, model: str | None = None,
+                         requests: int = 0, cost_usd: float | None = None) -> None:
+        """A digest attempt failed: count it (a call is given up after its attempts), keep any older blocks."""
+        now = time.time()
+        ids = json.dumps(sorted(int(i) for i in capture_ids))
+        self._write(lambda conn: conn.execute(
+            "UPDATE call_digests SET status='failed', attempts=attempts+1, error=?, capture_ids=?, model=?,"
+            " requests=?, cost_usd=cost_usd+?, claimed_by=NULL, claimed_at=NULL, updated_at=? WHERE call_id=?",
+            (str(error)[:500], ids, model, int(requests), float(cost_usd or 0.0), now, int(call_id))))
+
+    def call_digests(self, call_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """The digests of these call rows, decrypted: ``{call_id: {"call_id", "app", "status", "gist", "blocks",
+        "started_at", "ended_at", "speech_s", "utterances", "kept", "capture_ids", "model", "cost_usd",
+        "updated_at"}}``; rows without one are left out. ``blocks`` is ``[]`` until a first digest is written."""
+        ids = sorted({int(i) for i in call_ids})
+        if not ids:
+            return {}
+        rows = self._query(f"SELECT * FROM call_digests WHERE call_id IN ({','.join('?' * len(ids))})", ids)
+        out = {}
+        for r in rows:
+            try:
+                blocks = json.loads(self._dec(r["blocks_ciphertext"]) or "[]")
+            except (ValueError, TypeError):
+                blocks = []
+            try:
+                captures = json.loads(r["capture_ids"] or "[]")
+            except (ValueError, TypeError):
+                captures = []
+            out[int(r["call_id"])] = {
+                "call_id": int(r["call_id"]), "app": r["app"], "status": r["status"], "gist": self._dec(r["gist_ciphertext"]),
+                "blocks": blocks if isinstance(blocks, list) else [], "started_at": r["started_at"],
+                "ended_at": r["ended_at"], "speech_s": r["speech_s"], "utterances": r["utterances"], "kept": r["kept"],
+                "capture_ids": captures, "model": r["model"], "cost_usd": r["cost_usd"], "attempts": r["attempts"],
+                "error": r["error"], "updated_at": r["updated_at"],
+            }
+        return out
+
+    def call_digest(self, call_id: int) -> dict[str, Any] | None:
+        return self.call_digests([call_id]).get(int(call_id))
+
+    def digested_call_threads(self) -> dict[int, int]:
+        """``{thread_id: call_id}`` of the calls that have a written digest (to point recall hits at it)."""
+        rows = self._query("SELECT k.thread_id, k.id FROM calls k JOIN call_digests d ON d.call_id = k.id"
+                           " WHERE k.thread_id IS NOT NULL AND d.blocks_ciphertext IS NOT NULL")
+        return {int(r[0]): int(r[1]) for r in rows}
+
+    def voice_turns(self, since: TimeArg, until: TimeArg) -> list[dict[str, Any]]:
+        """Spoken exchanges with Yuki in ``[since, until)`` (outcome ``voice``), oldest first, content-free:
+        ``{"at", "request_id", "addressed"}`` (``at`` is when the turn closed; ``addressed`` yuki | others | None)."""
+        rows = self._query("SELECT at, request_id, addressed FROM conversation_turns WHERE outcome = 'voice'"
+                           " AND at >= ? AND at < ? ORDER BY at", (_ts(since) or 0.0, _ts(until) or time.time()))
+        return [{"at": r["at"], "request_id": str(r["request_id"]), "addressed": r["addressed"]} for r in rows]
 
     # -- maintenance -------------------------------------------------------
 

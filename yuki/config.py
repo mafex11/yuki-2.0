@@ -13,6 +13,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from yuki.core.models import resolve_backend as _resolve_backend
+from yuki.core.paths import state_root as _state_root
+
 ScreenshotPolicy = Literal["never", "ask", "auto"]
 
 #: Short aliases the user (and the CLI's ``/model`` command) can type.
@@ -145,6 +148,10 @@ class Settings:
         model: Bedrock model id used for the next request. Mutable so the CLI's
             ``/model`` command can switch models mid-conversation.
         aws_region: Region passed to :class:`anthropic.AnthropicBedrock`.
+        model_backend: ``bedrock`` (AnthropicBedrock, ``AWS_BEARER_TOKEN_BEDROCK``) or ``anthropic``
+            (the Anthropic API, ``ANTHROPIC_API_KEY``); model ids stay Bedrock ids either way and
+            are translated per request (:mod:`yuki.core.models`). Default: ``YUKI_MODEL_BACKEND``,
+            then ``%LOCALAPPDATA%/Yuki/settings.json``, then whichever key is set.
         project_root: Base directory that ``log_dir`` is resolved against.
         log_dir: Directory holding one JSONL file (and one screenshot folder)
             per session.
@@ -306,7 +313,9 @@ class Settings:
 
     model: str = DEFAULT_MODEL
     aws_region: str = field(default_factory=lambda: os.environ.get("AWS_REGION", "ap-south-1"))
-    project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+    model_backend: str = field(default_factory=lambda: _resolve_backend())
+    #: Base of ``logs/``: the project in a dev checkout, ``%LOCALAPPDATA%\Yuki`` in the installed app.
+    project_root: Path = field(default_factory=lambda: _state_root())
     log_dir: Path = Path("logs/sessions")
     screenshot_policy: ScreenshotPolicy = "never"
     max_tokens: int = 8000
@@ -417,6 +426,8 @@ class Settings:
     helpers_max: int = 4
 
     def __post_init__(self) -> None:
+        if self.model_backend not in ("bedrock", "anthropic"):
+            raise ValueError(f"model_backend must be 'bedrock' or 'anthropic', not {self.model_backend!r}")
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)
         self.voice_brain_effort = resolve_effort(self.voice_brain_effort) if self.voice_brain_effort else ""

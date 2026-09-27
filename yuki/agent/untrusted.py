@@ -22,7 +22,7 @@ import secrets
 #: names, not a rule about content.
 EXTERNAL_TEXT_TOOLS: frozenset[str] = frozenset({
     "look_at_window", "read_page", "read_tabs", "run_powershell", "recall", "activity",
-    "read_file", "fetch_url", "spawn_helpers",
+    "calls", "call_timeline", "read_file", "fetch_url", "spawn_helpers",
 })
 
 BEGIN = "BEGIN_UNTRUSTED_DATA"
@@ -77,6 +77,8 @@ def source_for(name: str, tool_input: dict) -> str:
         "run_powershell": "the command's output",
         "recall": "memory (text captured from the screen, chats and calls)",
         "activity": "memory (window titles and pages seen)",
+        "calls": "memory (the user's calls and what they said on them)",
+        "call_timeline": "memory (what the user said on a call, transcribed from their microphone)",
         "read_file": f"the file {tool_input.get('path', '')}",
         "fetch_url": f"the web address {tool_input.get('url', '')}",
         "spawn_helpers": "your helpers' reports (drawn from memory, files, pages and windows)",

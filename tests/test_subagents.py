@@ -150,7 +150,7 @@ def test_helper_tool_set_is_read_only():
 
     names = {t["name"] for t in helper_tools(True)}
     assert names == {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
-                     "read_file", "fetch_url"}
+                     "calls", "call_timeline", "read_file", "fetch_url"}
     assert not names & set(ACTION_TOOL_NAMES)
     assert not names & {"remember_how", "correct_memory", "remember_rule", "forget_rule", "todo", "watch_for",
                         "spawn_helpers", "ask_user", "say"}

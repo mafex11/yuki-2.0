@@ -349,12 +349,11 @@ class WindowHost(QObject):
                 self.server.broadcast({"ev": "focus", **({"page": page} if page else {})})
             self._log("window", state="focus", pid=self.proc.pid)
             return
-        exe = Path(sys.executable)
-        pythonw = exe.with_name("pythonw.exe")
-        cmd = [str(pythonw if pythonw.exists() else exe), "-m", "yuki.ui.window"]
-        if page:
-            cmd += ["--page", page]
-        root = Path(__file__).resolve().parents[2]
+        from yuki.core.paths import app_dir
+        from yuki.core.procs import WINDOW, module_command
+
+        cmd = module_command(WINDOW, *(["--page", page] if page else []))   # Yuki.exe -m ... when installed
+        root = app_dir()
         flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         try:
             _allow_foreground(-1)

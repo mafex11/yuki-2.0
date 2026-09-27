@@ -72,6 +72,13 @@ Calls, just the user's side (the service's call worker, yuki.memory.calls)::
     memory.call_audio_waiting() -> dict | None           # "N calls waiting to be remembered"
     memory.erase_call_audio() -> int                     # "Erase waiting call audio"
     memory.call_prefs() -> list[dict];  memory.set_call_pref(app, "always" | "never" | None)
+
+What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
+
+    memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, times, speech, gists
+    memory.call_timeline(call, since=None, until=None) -> dict | None   # the session's blocks and dated lines
+    memory.call_transcript(call, since=None, until=None, page=1, per_page=60) -> dict | None   # exact words
+    memory.recall(...)            # a fact heard on a call with a digest carries "call": "call:<id>"
 """
 
 from __future__ import annotations
@@ -531,16 +538,22 @@ class MemoryClient:
 
         order = sorted(scores, key=lambda k: (-scores[k], -at(k)))[:limit]
         out = []
+        try:   # a fact heard on a call whose timeline digest exists points at it (yuki.memory.calldigest)
+            digested = self.store.digested_call_threads() if any(k[0] == "fact" for k in order) else {}
+        except Exception:
+            digested = {}
         for key in order:
             item = entries[key]
             score = round(scores[key], 5)
             if key[0] == "fact":
+                call_id = digested.get(item.thread_id) if item.thread_id is not None else None
                 out.append({
                     "kind": "fact", "at": _iso(item.at), "until": None, "app": item.app, "host": item.host,
                     "fact": item.fact, "importance": item.importance, "score": score,
                     "nature": getattr(item, "nature", "fact"),
                     "source": describe_source(getattr(item, "source", None), app=item.app, at=item.at),
                     "other_ai": bool(getattr(item, "tainted", False)),
+                    **({"call": f"call:{call_id}"} if call_id is not None else {}),
                 })
             elif key[0] == "chat":
                 out.append({
@@ -1699,6 +1712,209 @@ class MemoryClient:
         """Keep ``always``/``never`` for a call app, or forget it (``None``: ask again every call)."""
         self.store.set_call_pref(app, decision)
 
+    # -- what happened on calls and meetings (yuki.memory.calldigest) ---------------
+
+    @staticmethod
+    def call_id_of(ref: Any) -> int | None:
+        """A call row id from how the tools show it: ``call:16``, ``[call:16]``, ``16``, ``call:16-21``."""
+        text = str(ref or "").strip().strip("[]").strip()
+        if text.lower().startswith("call:"):
+            text = text[5:]
+        text = text.split("-")[0].strip()
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def _call_session(self, call_id: int) -> dict | None:
+        """The merged session (callspans) that call row ``call_id`` belongs to, or None."""
+        from yuki.memory.callspans import merged_calls
+
+        row = self.store.call_record(call_id)
+        if row is None:
+            return None
+        for span in merged_calls(self.store, row.detected_at, (row.ended_at or time.time()) + 1.0):
+            if call_id in span["call_ids"]:
+                return span
+        return None
+
+    def _session_dict(self, span: dict, rows: dict, digests: dict, waiting: dict) -> dict:
+        """One merged call for the tools: times, speech, what was recorded, digest state and gists."""
+        ids = list(span["call_ids"])
+        speech = 0.0
+        gists, parts = [], []
+        for cid in ids:
+            r, d = rows.get(cid), digests.get(cid)
+            if r is None:
+                continue
+            if d is not None and d["status"] in ("ok", "empty"):
+                speech += float(d["speech_s"] or 0.0)
+                state = "timeline written" if d["status"] == "ok" else "nothing worth a line"
+                if d.get("gist"):
+                    gists.append({"call_id": cid, "gist": d["gist"]})
+            elif r.recording_started_at is None:
+                state = ("not recorded (the user said no)" if r.consent in ("no", "never") else
+                         "not recorded (no headphones, or stopped)" if r.consent in ("yes", "always") else
+                         "not recorded (not asked or no answer)")
+            elif waiting.get(cid):
+                speech += float(r.speech_s or 0.0)
+                state = "audio waiting to be transcribed"
+            elif r.captures:
+                speech += float(r.speech_s or 0.0)
+                state = ("timeline failed" if d is not None and d["status"] == "failed"
+                         else "timeline being written" if d is not None and d["status"] == "running"
+                         else "timeline not written yet")
+            else:
+                state = "nothing said"
+            parts.append({"call_id": cid, "start": _iso(r.detected_at), "end": _iso(r.ended_at), "state": state})
+        recorded = any(rows.get(c) is not None and rows[c].recording_started_at is not None for c in ids)
+        return {
+            "ref": f"call:{ids[0]}", "call_ids": ids, "app": span["app"], "service": span.get("service"),
+            "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
+            "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
+            "recorded": recorded, "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
+            "gists": gists, "rows": parts,
+        }
+
+    def calls_in(self, since=None, until=None, limit: int = 30) -> list[dict]:
+        """The calls and meetings overlapping ``[since, until)`` (default today), oldest first, rows of one
+        continuous session merged (``yuki.memory.callspans``). Each::
+
+            {"ref": "call:16", "call_ids": [16, ..., 21], "app", "service", "start": ISO, "end": ISO,
+             "ongoing", "seconds", "speech_s" (the user's own speech), "recorded" (their side was),
+             "digested": [ids with a timeline], "gists": [{"call_id", "gist"}],
+             "rows": [{"call_id", "start", "end", "state"}]}
+
+        plus meetings the timeline measured (an app in front holding the microphone or camera) that no call
+        row covers: ``{"ref": None, "app", "service", "start", "end", "seconds", "speech_s": 0, "recorded":
+        False, "transcript": False, "rows": [], ...}`` - hours only, no transcript. Nothing about anyone else
+        is ever stored. Content-free except the gists.
+        """
+        from collections import Counter
+
+        from yuki.memory.callspans import CONTEXT_S, merged_calls
+
+        s, u = self._window(since, until)
+        spans = merged_calls(self.store, s, u, now=time.time())
+        out = []
+        if spans:
+            rows = {r.id: r for r in self.store.calls_overlapping(s - CONTEXT_S, u + CONTEXT_S)}
+            digests = self.store.call_digests(i for sp in spans for i in sp["call_ids"])
+            waiting = Counter(c["call_id"] for c in self.store.call_chunks(statuses=("spooled",)))
+            out = [dict(self._session_dict(sp, rows, digests, waiting), transcript=True) for sp in spans]
+        try:
+            out += self._uncovered_meetings(s, u, spans)
+        except Exception:
+            pass
+        out.sort(key=lambda c: c["start"] or "")
+        return out[-max(1, int(limit)):]
+
+    def _uncovered_meetings(self, since: float, until: float, spans: list[dict]) -> list[dict]:
+        """Timeline meetings (``timeline.meeting`` rows, joined as the activity output joins them) that no call
+        row of the same app or service overlaps: a meeting seen while the call worker was off or not asked."""
+        from yuki.memory.timeline import _clip, meetings
+
+        rows = [r for r in self.store.timeline_between(since, until) if r.meeting]
+        out = []
+        for m in meetings(_clip(rows, since, until)):
+            names = {m.get("label"), m.get("app")}
+            if any(sp["start"] < m["end"] and sp["end"] > m["start"]
+                   and names & {sp.get("app"), sp.get("service")} for sp in spans):
+                continue
+            out.append({"ref": None, "call_ids": [], "app": m.get("app") or m.get("label"), "service": m.get("label"),
+                        "start": _iso(m["start"]), "end": _iso(m["end"]), "ongoing": False,
+                        "seconds": m.get("seconds"), "speech_s": 0.0, "recorded": False, "transcript": False,
+                        "digested": [], "gists": [], "rows": []})
+        return out
+
+    def call_timeline(self, call: Any, since=None, until=None) -> dict | None:
+        """What happened on one call (the whole merged session the row ``call`` belongs to), timeline-wise, from
+        the user's side: :meth:`calls_in`'s fields plus ``"blocks": [{"call_id", "start", "end", "topic",
+        "lines": [{"at", "text", "nature"}]}]`` in time order (ISO times), cut to ``[since, until)`` when given,
+        and ``"words_kept_until"`` (ISO: the exact transcript's 30-day TTL; None once gone). None: no such call.
+        """
+        from collections import Counter
+
+        cid = self.call_id_of(call)
+        span = self._call_session(cid) if cid is not None else None
+        if span is None:
+            return None
+        ids = span["call_ids"]
+        rows = {i: self.store.call_record(i) for i in ids}
+        digests = self.store.call_digests(ids)
+        waiting = Counter(c["call_id"] for c in self.store.call_chunks(statuses=("spooled",)))
+        out = self._session_dict(span, rows, digests, waiting)
+        s, u = _time_arg(since), _time_arg(until)
+        blocks = []
+        for i in ids:
+            for b in (digests.get(i) or {}).get("blocks") or []:
+                if (s is not None and b["end"] < s) or (u is not None and b["start"] >= u):
+                    continue
+                lines = [ln for ln in b.get("lines") or []
+                         if (s is None or ln["at"] >= s - 60) and (u is None or ln["at"] < u)]
+                blocks.append({"call_id": i, "start": b["start"], "end": b["end"], "topic": b.get("topic") or "",
+                               "lines": lines})
+        from yuki.memory.calldigest import stretches
+
+        blocks.sort(key=lambda b: b["start"])
+        groups = stretches(blocks)
+        for b in blocks:
+            b["start"], b["end"] = _iso(b["start"]), _iso(b["end"])
+            b["lines"] = [{"at": _iso(ln["at"]), "text": ln["text"], "nature": ln.get("nature", "fact")}
+                          for ln in b["lines"]]
+        # the shape a written answer takes: stretches of the call, each with its time range, topics and moments
+        out["stretches"] = [{"start": g[0]["start"], "end": g[-1]["end"],
+                             "topics": list(dict.fromkeys(b["topic"] for b in g if b["topic"])),
+                             "lines": [ln for b in g for ln in b["lines"]]} for g in groups]
+        first = self.store._query(
+            "SELECT min(c.at) FROM captures c JOIN calls k ON k.thread_id = c.thread_id WHERE k.id IN "
+            f"({','.join('?' * len(ids))}) AND c.kind = 'my_call_side'", ids)[0][0]
+        out.update(blocks=blocks, since=_iso(s), until=_iso(u),
+                   words_kept_until=_iso(first + 30 * 86400.0) if first else None)
+        return out
+
+    def call_transcript(self, call: Any, since=None, until=None, page: int = 1, per_page: int = 60) -> dict | None:
+        """The user's exact words on one call (its merged session), as the recogniser heard them, a page at a time:
+        ``{"ref", "app", "start", "end", "since", "until", "page", "pages", "total", "loops_left_out",
+        "lines": [{"at": ISO, "call_id", "text", "lang", "unclear", "repeats"}]}``. An exact repeat of a recent
+        line (the recogniser's loop on noise) is left out and counted on the line it repeats (``repeats``);
+        ``to_yuki`` is "yes" when voice judged the line said to Yuki, "maybe" when Yuki was listening then;
+        ``unclear`` is the recogniser's own low confidence. Kept for the 30-day capture TTL. None: no such call.
+        """
+        from yuki.memory.calldigest import _same_words, prepare, yuki_spans_for
+
+        cid = self.call_id_of(call)
+        span = self._call_session(cid) if cid is not None else None
+        if span is None:
+            return None
+        s, u = _time_arg(since), _time_arg(until)
+        lines: list[dict] = []
+        loops = 0
+        for i in span["call_ids"]:
+            captures = self.store.call_side_captures(i)
+            for utt in prepare(captures, yuki_spans_for(self.store, captures)):
+                if (s is not None and utt.at < s) or (u is not None and utt.at >= u):
+                    continue
+                if utt.repeat:
+                    loops += 1
+                    words = _same_words(utt.text)
+                    for prev in reversed(lines[-4:]):
+                        if _same_words(prev["text"]) == words:
+                            prev["repeats"] += 1
+                            break
+                    continue
+                lines.append({"at": utt.at, "call_id": i, "text": utt.text[:500], "lang": utt.lang,
+                              "unclear": utt.unclear, "repeats": 0, "to_yuki": utt.to_yuki})
+        per_page = max(10, min(int(per_page or 60), 150))
+        pages = max(1, -(-len(lines) // per_page))
+        page = max(1, min(int(page or 1), pages))
+        chunk = lines[(page - 1) * per_page: page * per_page]
+        for ln in chunk:
+            ln["at"] = _iso(ln["at"])
+        return {"ref": f"call:{span['call_ids'][0]}", "app": span["app"], "start": _iso(span["start"]),
+                "end": _iso(span["end"]), "since": _iso(s), "until": _iso(u), "page": page, "pages": pages,
+                "total": len(lines), "loops_left_out": loops, "lines": chunk}
+
     # -- status and control ------------------------------------------------
 
     def status(self) -> dict:
@@ -1725,7 +1941,7 @@ class MemoryClient:
             "memory_cost_today_usd": round(
                 today["journal_cost_usd"] + today["portrait_cost_usd"] + today.get("episode_cost_usd", 0.0)
                 + today.get("conversation_cost_usd", 0.0) + today.get("nudge_cost_usd", 0.0)
-                + today.get("review_cost_usd", 0.0), 6
+                + today.get("review_cost_usd", 0.0) + today.get("call_digest_cost_usd", 0.0), 6
             ),
         }
 

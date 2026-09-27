@@ -133,7 +133,11 @@ class FailoverClient:
         log: Callable[..., Any] | None = None,
         sleep: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        regionless: bool = False,
     ) -> None:
+        #: The Anthropic API backend: one endpoint, so a region in a chain means nothing and two
+        #: entries naming the same model there are one target (``yuki.core.models``).
+        self.regionless = regionless
         self.region = region
         self._factory = factory
         self.fallbacks = fallbacks or {}
@@ -159,6 +163,7 @@ class FailoverClient:
         import os
 
         region = getattr(settings, "aws_region", None) or os.environ.get("AWS_REGION", "ap-south-1")
+        backend = getattr(settings, "model_backend", None) or "bedrock"
         if factory is None:
             read = float(getattr(settings, "model_timeout_s", 90.0))
             connect = float(getattr(settings, "model_connect_timeout_s", 10.0))
@@ -166,13 +171,14 @@ class FailoverClient:
             def factory(r: str) -> Any:
                 import anthropic
 
-                return anthropic.AnthropicBedrock(
-                    aws_region=r, max_retries=0,
-                    timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0),
-                )
+                from yuki.core.models import sync_client
+
+                return sync_client(r, backend=backend, max_retries=0,
+                                   timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0))
 
         return cls(
-            region, factory, fallbacks=getattr(settings, "model_fallbacks", None) or {},
+            region, factory, regionless=backend == "anthropic",
+            fallbacks=getattr(settings, "model_fallbacks", None) or {},
             retries=getattr(settings, "model_retries", 2), base_s=getattr(settings, "model_retry_base_s", 0.6),
             max_s=getattr(settings, "model_retry_max_s", 4.0), sticky_s=getattr(settings, "failover_sticky_s", 300.0),
             log=log,
@@ -199,13 +205,24 @@ class FailoverClient:
     def chain(self, model: str) -> list[Target]:
         """The primary target, then the configured backups (duplicates dropped)."""
         out = [Target(model, self.region)]
+        seen = {self._same(model)}
         for entry in self.fallbacks.get(model, ()) or ():
             if not isinstance(entry, dict) or not entry.get("model"):
                 continue
-            target = Target(str(entry["model"]), str(entry.get("region") or self.region))
-            if target not in out:
+            target = Target(str(entry["model"]), self.region if self.regionless
+                            else str(entry.get("region") or self.region))
+            key = self._same(target.model) if self.regionless else target
+            if target not in out and key not in seen:
                 out.append(target)
+                seen.add(key)
         return out
+
+    def _same(self, model: str) -> Any:
+        if not self.regionless:
+            return Target(model, self.region)
+        from yuki.core.models import api_model_id
+
+        return api_model_id(model)
 
     def _event(self, event_type: str, **fields: Any) -> None:
         if self._log is None:

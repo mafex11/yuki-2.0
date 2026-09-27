@@ -99,6 +99,8 @@ class RelevantIndex:
         self._kinds = {k: _Kind() for k in KINDS}
         self._episode_imp: dict[int, int] = {}
         self.last_refresh_ms = 0.0
+        #: The database's embedding generation the loaded vectors belong to (bumped when the model changes).
+        self._generation: str | None = None
 
     # -- loading -------------------------------------------------------------
 
@@ -106,6 +108,7 @@ class RelevantIndex:
         """Load rows added since the last look and drop the ones no longer live. Returns rows per kind."""
         started = time.perf_counter()
         with self._lock:
+            self._check_generation()
             live = self.store.recall_live_ids()
             for kind in KINDS:
                 k = self._kinds[kind]
@@ -147,6 +150,19 @@ class RelevantIndex:
             self._reload_portrait_importance()
             self.last_refresh_ms = round((time.perf_counter() - started) * 1000, 2)
             return {kind: len(self._kinds[kind].ids) for kind in KINDS}
+
+    def _check_generation(self) -> None:
+        """A re-embed flipped the database to another model: every loaded vector is stale, load all again."""
+        try:
+            from yuki.memory.reembed import embed_generation
+
+            generation = embed_generation(self.store)
+        except Exception:  # noqa: BLE001 - an older database: no generations
+            return
+        if self._generation is not None and generation != self._generation:
+            self._kinds = {k: _Kind() for k in KINDS}
+            self._episode_imp.clear()
+        self._generation = generation
 
     def _reload_portrait_importance(self) -> None:
         k = self._kinds["portrait"]

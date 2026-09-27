@@ -45,7 +45,9 @@ def wait_for_shell(timeout_s: float = SHELL_WAIT_S) -> float:
 
 def _note(line: str) -> None:
     try:
-        path = PROJECT_ROOT / "logs" / "ui-boot.log"
+        from yuki.core.paths import logs_dir   # %LOCALAPPDATA%\Yuki\logs in the installed app
+
+        path = logs_dir() / "ui-boot.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"{datetime.now().isoformat(timespec='seconds')} {line}\n")
@@ -59,7 +61,9 @@ def main() -> int:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
     try:
-        os.chdir(PROJECT_ROOT)
+        from yuki.core.paths import app_dir
+
+        os.chdir(app_dir())
     except OSError:
         pass
     waited = wait_for_shell()

@@ -81,6 +81,12 @@ def own_executables() -> frozenset[str]:
             stem = Path(p)
             for variant in ("python.exe", "pythonw.exe"):   # the UI runs under pythonw
                 out.add(str(stem.with_name(variant)).casefold())
+    try:   # the installed app: Yuki.exe (tray, voice) and yuki-cli.exe share one program folder
+        from yuki.core.procs import yuki_executables
+
+        out |= yuki_executables()
+    except Exception:
+        pass
     return frozenset(out)
 
 

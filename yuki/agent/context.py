@@ -796,7 +796,7 @@ class ContextManager:
             except (TypeError, ValueError):
                 pass
             return (name, str(hwnd))
-        if name in ("take_screenshot", "recall", "activity", "read_file", "fetch_url"):
+        if name in ("take_screenshot", "recall", "activity", "calls", "call_timeline", "read_file", "fetch_url"):
             # A newer recall with the same arguments supersedes an older one; a
             # recall asking anything else is a different look.
             return (name, _canonical(tool_input))

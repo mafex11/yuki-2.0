@@ -134,11 +134,18 @@ def memory_service_command() -> list[str]:
     ``python.exe`` is only a launcher that starts the real console interpreter,
     and that child gets a console of its own even when the launcher is detached:
     a visible terminal window that kills memory if the user closes it.
-    ``pythonw.exe`` is the same interpreter without a console.
+    ``pythonw.exe`` is the same interpreter without a console. In the installed app it is
+    ``Yuki.exe -m yuki.memory.service`` (:mod:`yuki.core.procs`).
     """
-    windowless = Path(sys.executable).with_name("pythonw.exe")
-    interpreter = str(windowless) if windowless.exists() else sys.executable
-    return [interpreter, "-m", "yuki.memory.service"]
+    from yuki.core.procs import SERVICE, module_command
+
+    return module_command(SERVICE)
+
+
+def _app_dir() -> Path:
+    from yuki.core.paths import app_dir
+
+    return app_dir()
 
 
 def spawn_memory_service(popen: Callable[..., Any] = subprocess.Popen) -> int:
@@ -161,7 +168,7 @@ def spawn_memory_service(popen: Callable[..., Any] = subprocess.Popen) -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
-        cwd=str(Path(__file__).resolve().parents[2]),
+        cwd=str(_app_dir()),
         startupinfo=startup,
     )
     try:

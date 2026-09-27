@@ -34,7 +34,7 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
     {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
-     "activity", "read_file", "fetch_url"}
+     "activity", "calls", "call_timeline", "read_file", "fetch_url"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -45,7 +45,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
     {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
-     "answer_question", "watch_for"}
+     "answer_question", "watch_for", "calls", "call_timeline"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -725,6 +725,61 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "calls",
+        "label": "Checking your calls",
+        "description": (
+            "List the user's calls and meetings in a time range - Discord, Google Meet, Zoom, Teams, "
+            "WhatsApp or any app that used the microphone for a call: the app, start and end, how long "
+            "the user spoke, whether their side was recorded, and a one-line gist when there is one. "
+            "Rows of one continuous session are merged into one entry. Use it for any question about "
+            "a call or meeting (what happened, what they said, when), then open the one they mean "
+            "with call_timeline."
+        ),
+        "input_schema": _obj(
+            {
+                "since": {
+                    "type": "string",
+                    "description": "Earliest local date or date-time, ISO format, e.g. 2026-09-25 or "
+                    "2026-09-25T18:00. Default: 7 days ago. A call still going after midnight began "
+                    "the day before.",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "Latest local date or date-time, same format; a date alone includes "
+                    "that whole day. Default: now.",
+                },
+            }
+        ),
+    },
+    {
+        "name": "call_timeline",
+        "label": "Going through the call",
+        "description": (
+            "What happened on one call or meeting, timeline-wise, from the user's side (only their own "
+            "microphone is ever recorded, never anyone else): the call in stretches, each a heading line "
+            "with its time range and topics, then one short line per moment starting with its time - "
+            "what the user said, asked, decided, planned and joked about. A written answer keeps exactly "
+            "that shape (heading line per stretch, then its moments with their times, picking the ones "
+            "that matter), never a paragraph per stretch; a spoken one gives the few moments that "
+            "matter. The whole session is "
+            "returned, a session split into several rows included; since and until narrow it to part "
+            "of the call. With words true it returns the user's exact words instead, as the speech "
+            "recogniser heard them (times, unclear lines and repeated recogniser loops marked), a page "
+            "at a time: for when they want exactly what they said. Exact words are kept 30 days, the "
+            "timeline longer."
+        ),
+        "input_schema": _obj(
+            {
+                "call": {"type": "string", "description": "The call's id as calls or recall shows it, e.g. call:16."},
+                "since": {"type": "string", "description": "Only from this local date-time, ISO format."},
+                "until": {"type": "string", "description": "Only before this local date-time, ISO format."},
+                "words": {"type": "boolean", "description": "true: the exact transcript lines instead of the timeline."},
+                "page": {"type": "integer", "description": "words only: which page of lines (default 1)."},
+            },
+            ["call"],
+        ),
+    },
+    {
         "name": "todo",
         "label": "Keeping your to-do list",
         "description": (
@@ -899,7 +954,7 @@ AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
 #: its backend exposes only the reading functions.
 HELPER_TOOLS: tuple[str, ...] = (
     "look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
-    "read_file", "fetch_url",
+    "calls", "call_timeline", "read_file", "fetch_url",
 )
 
 #: Actions after which the loop attaches a fresh read of the window acted on to

@@ -128,15 +128,26 @@ def check_embed_pipe() -> Check:
 # -- models and keys ----------------------------------------------------------------------------
 
 
-def check_bedrock(settings: Any) -> Check:
-    if not (os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or _user_env("AWS_BEARER_TOKEN_BEDROCK")):
-        return Check("AI models (Bedrock)", FAIL, "no Bedrock key is set", "Set the AWS_BEARER_TOKEN_BEDROCK "
-                     "user environment variable, then restart Yuki.")
+MODELS_CHECK = "AI models"
+
+
+def check_models(settings: Any) -> Check:
+    """The model service Yuki uses (``Settings.model_backend``: Bedrock or the Anthropic API), one tiny call."""
+    from yuki.core.models import get_key, key_name
+
+    backend = getattr(settings, "model_backend", "bedrock")
+    label = "Anthropic API" if backend == "anthropic" else "Bedrock"
+    key = key_name(backend)
+    if not get_key(key):
+        return Check(MODELS_CHECK, FAIL, f"no {label} key is set", f"Set the {key} user environment variable "
+                     "(or run Yuki's first-run setup again), then restart Yuki.")
     try:
         import anthropic
 
+        from yuki.core.models import sync_client
+
         region = settings.aws_region
-        client = anthropic.AnthropicBedrock(aws_region=region, max_retries=0, timeout=anthropic.Timeout(20.0, connect=8.0))
+        client = sync_client(region, backend=backend, max_retries=0, timeout=anthropic.Timeout(20.0, connect=8.0))
         started = time.perf_counter()
         client.messages.create(model=settings.voice_mouth_model, max_tokens=1,
                                messages=[{"role": "user", "content": "ping"}])
@@ -144,12 +155,18 @@ def check_bedrock(settings: Any) -> Check:
     except Exception as exc:
         status = getattr(exc, "status_code", None)
         why = f"{type(exc).__name__}{f' {status}' if status else ''}"
-        fix = ("The key may be wrong or expired: renew AWS_BEARER_TOKEN_BEDROCK." if status in (401, 403)
-               else "Check the internet connection; Yuki fails over to us-east-1 by itself when Mumbai is down.")
-        return Check("AI models (Bedrock)", FAIL, f"could not reach Bedrock ({why})", fix)
+        fix = (f"The key may be wrong or expired: renew {key}." if status in (401, 403)
+               else "Check the internet connection." + (" Yuki fails over to us-east-1 by itself when Mumbai is down."
+                                                        if backend == "bedrock" else ""))
+        return Check(MODELS_CHECK, FAIL, f"could not reach {label} ({why})", fix)
     status = OK if ms < 3000 else WARN
-    return Check("AI models (Bedrock)", status, f"reachable from {region}, {ms:.0f} ms for a tiny request",
+    where = f"{label} from {region}" if backend == "bedrock" else label
+    return Check(MODELS_CHECK, status, f"{where} reachable, {ms:.0f} ms for a tiny request",
                  "" if status == OK else "Slow right now; replies will lag. Check the connection.")
+
+
+#: The old name (the check covers either backend now).
+check_bedrock = check_models
 
 
 def _user_env(name: str) -> str | None:
@@ -307,11 +324,35 @@ def check_gpu() -> Check:
                  "" if status == OK else "Transcription waits until the GPU frees up (a game or another app is using it).")
 
 
+def _runs_this_install(command: str) -> bool:
+    """Whether a Run value starts this installation's tray (dev venv or installed app alike)."""
+    import ctypes
+
+    from yuki.core.procs import TRAY, module_of, yuki_executables
+
+    if not command:
+        return False
+    argc = ctypes.c_int()
+    shell32 = ctypes.windll.shell32
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    argv_p = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv_p:
+        return False
+    try:
+        argv = [argv_p[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv_p)
+    return (bool(argv) and module_of(argv) == TRAY
+            and str(Path(argv[0])).casefold() in yuki_executables())
+
+
 def check_startup() -> Check:
     try:
-        from yuki.ui.startup import is_current, is_enabled
+        from yuki.ui.startup import is_enabled, read_value
 
-        enabled, current = is_enabled(), is_current()
+        enabled = is_enabled()
+        current = _runs_this_install(read_value() or "")
     except Exception as exc:
         return Check("Start with Windows", WARN, f"could not read ({type(exc).__name__})")
     if not enabled:
@@ -367,7 +408,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
     checks: list[tuple[str, Callable[[], Check]]] = [
         ("Memory service", check_memory_service),
         ("Memory search (embedder)", check_embed_pipe),
-        ("AI models (Bedrock)", lambda: check_bedrock(settings)),
+        (MODELS_CHECK, lambda: check_models(settings)),
         ("Speech to text (Deepgram)", check_deepgram),
         ("Yuki's voice (ElevenLabs)", check_elevenlabs),
         ("Microphone and speakers", check_audio_devices),
@@ -379,7 +420,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Log size", lambda: check_logs(settings)),
         ("Recent crashes", lambda: check_crashes(settings)),
     ]
-    network = {"AI models (Bedrock)", "Speech to text (Deepgram)", "Yuki's voice (ElevenLabs)"}
+    network = {MODELS_CHECK, "Speech to text (Deepgram)", "Yuki's voice (ElevenLabs)"}
 
     def timed(fn: Callable[[], Check]) -> Check:
         started = time.perf_counter()

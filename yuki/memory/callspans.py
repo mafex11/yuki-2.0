@@ -25,6 +25,7 @@ This module is plumbing on those numbers (nothing decrypted, no model):
   they fall outside the window, the time in the window, the time the call app
   was in front (present time of its timeline rows, meeting rows included), what
   else was in front meanwhile, the drops and the PC's power spans inside it.
+* :func:`merged_calls` - the same merge without the timeline (listing calls, finding a row's session).
 * :func:`describe_call` - one plain line for a span.
 * :func:`open_calls` - the calls still going (the request-origin line).
 * :func:`coach_calls_text` - the coach's CALLS line.
@@ -150,6 +151,15 @@ def call_spans(store: Store, since: float, until: float, *, now: float | None = 
     return out
 
 
+def merged_calls(store: Store, since: float, until: float, *, now: float | None = None) -> list[dict[str, Any]]:
+    """The calls overlapping ``[since, until)`` merged as in :func:`call_spans`, without the timeline work:
+    ``{"app", "process", "service", "start", "end", "ongoing", "pieces", "call_ids"}`` each, oldest first
+    (epoch seconds). Content-free: for listing calls and finding the session a call row belongs to."""
+    now = time.time() if now is None else float(now)
+    rows = store.calls_overlapping(since - CONTEXT_S, until + CONTEXT_S)
+    return [dict(s) for s in _merge(rows, now) if s["start"] < until and s["end"] > since]
+
+
 def open_calls(store: Store, now: float | None = None) -> list[dict[str, Any]]:
     """The calls going on now, merged: ``{"app", "process", "service", "since", "seconds"}`` each (epoch)."""
     now = time.time() if now is None else float(now)
@@ -208,4 +218,5 @@ def coach_calls_text(store: Store, now: float) -> str | None:
     return "\n".join(lines) or None
 
 
-__all__ = ["RESTART_GAP_S", "JOIN_GAP_S", "call_spans", "open_calls", "describe_call", "coach_calls_text"]
+__all__ = ["RESTART_GAP_S", "JOIN_GAP_S", "call_spans", "merged_calls", "open_calls", "describe_call",
+           "coach_calls_text"]
