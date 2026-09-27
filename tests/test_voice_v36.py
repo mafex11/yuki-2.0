@@ -669,3 +669,202 @@ def test_open_url_hand_verifies_a_settings_page_by_its_window() -> None:
     assert ok and facts["verified"] is True
     ok, _report, facts = Hands(Desk(None))._run("open_url", {"url": "ms-settings:bluetooth"})
     assert ok and facts["verified"] is None  # no window seen: it stays unverified and says so
+
+
+# -- v3.7: faster replies, one-breath wakes, and three old bugs -------------------------------------------
+
+def test_first_clause_goes_to_the_voice_at_once_and_the_rest_by_sentence() -> None:
+    from pipecat.utils.text.base_text_aggregator import AggregationType
+    from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+
+    from yuki.voice.pipeline import clause_aggregator
+
+    async def run(tokens: list[str]) -> list[str]:
+        agg = clause_aggregator(SimpleTextAggregator)(aggregation_type=AggregationType.SENTENCE)
+        out: list[str] = []
+        for token in tokens:
+            async for item in agg.aggregate(token):
+                out.append(item.text)
+        rest = await agg.flush()
+        return out + ([f"END {rest.text}"] if rest else [])
+
+    assert asyncio.run(run(["Sure", ", one", " sec", ", I'll", " look", ". Then", " more."])) == [
+        "Sure, one sec,", "I'll look.", "END Then more."]
+    assert asyncio.run(run(["It's", " 3.5", " degrees", ". Cold."])) == ["It's 3.5 degrees.", "END Cold."]
+    assert asyncio.run(run(["Hey", ", how", " are you?"])) == ["END Hey, how are you?"]  # "Hey," alone waits
+
+
+def test_words_before_a_tool_call_are_said_when_the_call_starts() -> None:
+    from pipecat.frames.frames import AggregatedTextFrame, LLMFullResponseStartFrame, LLMTextFrame
+
+    from yuki.voice.pipeline import _clause_tts, _words_done_frame
+
+    class Base:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            from pipecat.services.tts_service import TextAggregationMode
+
+            self._text_aggregation_mode = TextAggregationMode.SENTENCE
+            self.said: list[str] = []
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            if isinstance(frame, LLMTextFrame):
+                async for item in self._text_aggregator.aggregate(frame.text):
+                    self.said.append(item.text)
+
+        async def stop_text_aggregation_metrics(self) -> None:
+            pass
+
+        async def _push_tts_frames(self, frame: Any, *a: Any) -> None:
+            assert isinstance(frame, AggregatedTextFrame)
+            self.said.append(frame.text)
+
+    async def main() -> None:
+        tts = _clause_tts(Base)()
+        await tts.process_frame(LLMFullResponseStartFrame(), None)
+        await tts.process_frame(LLMTextFrame("Let me look."), None)
+        assert tts.said == []  # a whole sentence, waiting for the next word
+        await tts.process_frame(_words_done_frame(), None)
+        assert tts.said == ["Let me look."]  # said as the call starts, not when it is written out
+
+    asyncio.run(main())
+
+
+def test_the_desktop_read_while_they_talk_serves_the_reply() -> None:
+    from yuki.voice.hands import Hands
+    from yuki.voice.offline import StubDesktop
+
+    async def main() -> None:
+        hands = Hands(StubDesktop(action_delay_s=0))
+        hands.snapshot()
+        snap, how = await hands.for_call(250)
+        assert how == "ahead" and snap is hands.last
+        hands.actions.add("your hand", "window 1 minimize", "minimized", ok=True, verified=True)
+        _snap, how = await hands.for_call(250)
+        assert how == "fresh"  # something was done on the desktop since: read again
+
+    asyncio.run(main())
+
+
+def test_pause_on_paused_music_presses_nothing_and_says_so() -> None:
+    from yuki.voice.hands import Hands
+    from yuki.voice.offline import StubDesktop
+
+    class Desk(StubDesktop):
+        def __init__(self, status: str) -> None:
+            super().__init__(action_delay_s=0)
+            self.status = status
+
+        def activity_facts(self) -> dict:
+            return {"media": [{"app_id": "Chrome", "status": self.status, "title": "x", "current": True}]}
+
+        def press(self, key: str, **kwargs: Any) -> Any:
+            self.status = "playing" if self.status == "paused" else "paused"
+            return super().press(key, **kwargs)
+
+    desk = Desk("paused")
+    ok, report, facts = Hands(desk)._run("media_key", {"key": "playpause", "want": "paused"})
+    assert ok and "already paused" in report and facts["verified"] is None and desk.calls == []
+    desk = Desk("playing")
+    ok, _report, facts = Hands(desk)._run("media_key", {"key": "playpause", "want": "paused"})
+    assert ok and facts["verified"] is True and desk.status == "paused"
+
+
+def test_short_clear_words_are_not_doubt_but_long_unsure_ones_are() -> None:
+    from yuki.voice.pipeline import heard_note
+
+    clear = [{"word": "Luke", "confidence": 0.9}, {"word": "pass", "confidence": 0.62},
+             {"word": "me", "confidence": 0.95}, {"word": "the", "confidence": 0.55},
+             {"word": "charger", "confidence": 0.97}]
+    assert heard_note(clear, [])[0] is None
+    misheard = [{"word": "Soaki", "confidence": 0.52}, {"word": "is", "confidence": 0.9},
+                {"word": "coming", "confidence": 0.9}]
+    assert "Soaki" in (heard_note(misheard, [])[0] or "")
+    garbled = [{"word": "me", "confidence": 0.31}, {"word": "OTP", "confidence": 0.9}]
+    assert "me" in (heard_note(garbled, [])[0] or "")
+
+
+def test_a_sound_alike_is_rechecked_and_the_rescue_is_not_treated_as_certain() -> None:
+    from yuki.voice.wake import WakeListener
+
+    class Spotter:
+        model = "stub"
+        WAKE = "YUKI"
+
+        def __init__(self) -> None:
+            self.near_misses = 0
+            self.batches = 0
+            self.name_end: float | None = None
+            self.near_end: float | None = None
+
+        def feed(self, samples: np.ndarray, at: float | None = None) -> str | None:
+            self.batches += 1
+            if self.batches == 3:
+                self.near_misses += 1  # "you key" won
+                self.near_end = at + 0.04
+            return None
+
+        def reset(self) -> None:
+            pass
+
+    class Check:
+        def __init__(self, verdict: bool) -> None:
+            self.verdict, self.seen = verdict, 0
+
+        def heard(self, samples: np.ndarray) -> bool:
+            self.seen = samples.size
+            return self.verdict
+
+    for verdict in (True, False):
+        mic, woke = _Mic(), []
+        listener = WakeListener(mic, Spotter, on_wake=lambda at, kw: woke.append((listener.name_end, listener.rescued)),
+                                check=Check(verdict))
+        listener.start()
+        assert listener.ready.wait(2)
+        loud = (np.sin(np.arange(320) / 3.0) * 0.3).astype(np.float32)
+        at, deadline = 70.0, time.monotonic() + 2
+        while time.monotonic() < deadline and not woke and listener.check.seen == 0:
+            mic.push(loud, at)
+            at += 0.02
+            time.sleep(0.002)
+        time.sleep(0.2)
+        listener.stop()
+        assert listener.check.seen > 0
+        if verdict:
+            assert woke and woke[0][1] is True and woke[0][0] is not None
+        else:
+            assert not woke
+
+
+def test_the_front_desk_reaches_for_hands_and_nothing_runs(tmp_path: Path) -> None:
+    """A request that needs hands while the worker is busy: the front desk calls the action, the blocked backend
+    records it (the runtime then queues it for the worker), and nothing touches the desktop."""
+    from yuki.agent.loop import Agent
+    from yuki.agent.memory import MemoryAccess
+    from yuki.agent.tools import Dispatcher
+    from yuki.log.events import SessionLogger
+    from yuki.ui.runtime import HandsBlockedBackend
+    from yuki.voice.offline import StubDesktop
+
+    def response(*blocks: Any) -> Any:
+        usage = SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
+                                cache_creation_input_tokens=0)
+        return SimpleNamespace(content=list(blocks), stop_reason="tool_use", usage=usage, id="m", model="m",
+                               role="assistant", model_dump=lambda **_: {})
+
+    calls: list[dict] = []
+    replies = [response(SimpleNamespace(type="tool_use", id="t1", name="run_powershell",
+                                        input={"command": "mkdir x", "risk": {"reversible": True, "user_asked": True,
+                                                                              "effect": "a folder"}})),
+               response(SimpleNamespace(type="tool_use", id="t2", name="done",
+                                        input={"message": "That comes right after the running task."}))]
+    client = SimpleNamespace(messages=SimpleNamespace(create=lambda **p: calls.append(p) or replies.pop(0)))
+    inner = StubDesktop(action_delay_s=0)
+    blocked = HandsBlockedBackend(inner)
+    settings = Settings(log_dir=tmp_path / "s", stream=False, requests_csv=tmp_path / "r.csv")
+    memory = MemoryAccess(open_client=lambda: (_ for _ in ()).throw(RuntimeError("no memory in tests")))
+    agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None), client=client,
+                  dispatcher=Dispatcher(blocked), tool_names=None, prewarm=False, record_requests=False,
+                  memory=memory)
+    list(agent.run("make a folder called receipts in downloads"))
+    assert "run_powershell" in {t["name"] for t in calls[0]["tools"]}  # it can reach for hands
+    assert blocked.attempted == ["run_powershell"] and inner.calls == []

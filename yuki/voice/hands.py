@@ -83,6 +83,11 @@ _TABS_BUDGET_S = 0.15
 _TABS_FRESH_S = 20.0
 #: How many action-log lines the mouth's desktop block carries (the thinker gets more).
 _MOUTH_ACTION_LINES = 4
+#: A summary read while the user was talking serves the reply if it is this recent and nothing was done on the
+#: desktop since (v3.7: waiting for a fresh one cost the reply 66 ms p50, 190 ms p90 live) ...
+_DESK_FRESH_S = 1.5
+#: ... and one is read ahead at most this often while they talk.
+_DESK_AHEAD_EVERY_S = 0.5
 
 #: Hands that act at once, with no words before them.
 INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab")
@@ -142,6 +147,10 @@ HAND_TOOLS: list[dict[str, Any]] = [
         ),
         "properties": {
             "key": {"type": "string", "enum": list(MEDIA_KEYS)},
+            "want": {"type": "string", "enum": ["playing", "paused"],
+                     "description": ("For playpause: the state they want (pause -> paused, play or resume -> playing). "
+                                     "playpause toggles, so when the session is already that way nothing is pressed "
+                                     "and the report says so.")},
             "times": {"type": "integer", "description": "Presses (default 1); e.g. 5 for 'a bit' of volume."},
             "say_when_done": _DONE_LINE,
         },
@@ -268,6 +277,8 @@ class Snapshot:
     at: float = 0.0
     ms: float = 0.0
     error: str | None = None
+    #: The action log's version when it was read (anything done on the desktop since makes it stale).
+    version: int = -1
 
 
 def media_line(facts: dict[str, Any]) -> str:
@@ -360,6 +371,8 @@ class Hands:
         #: ``{hwnd: (window title, action log version, strip, read at)}``: tabs read ahead.
         self._tabs: dict[int, tuple[str, int, Any, float]] = {}
         self._prefetching = False
+        self._desk_ahead = False
+        self._desk_ahead_at = 0.0
         #: Set when a hand that touches a window did not show its effect: the talker's window hands then
         #: stop until the user speaks again (re-read, tell them, or hand it over; never repeat blindly).
         self.halted: str | None = None
@@ -373,7 +386,7 @@ class Hands:
     def snapshot(self) -> Snapshot:
         """Capture the summary now (blocking, a few ms; call it off the event loop). Never raises."""
         started = time.perf_counter()
-        snap = Snapshot(at=time.monotonic())
+        snap = Snapshot(at=time.monotonic(), version=self.actions.version)
         try:
             text, payload, _ms = self._dispatcher.overview_text()
             windows = [w for w in (payload.get("windows") or []) if isinstance(w, dict)]
@@ -480,8 +493,37 @@ class Hands:
 
         threading.Thread(target=run, name="yuki-voice-tabs", daemon=True).start()
 
+    def prefetch_desk(self) -> None:
+        """Read the whole summary ahead while the user talks (a thread; at most every ``_DESK_AHEAD_EVERY_S``).
+
+        Returns at once. The reply's call then takes it (:meth:`for_call`) instead of waiting for a read.
+        """
+        now = time.monotonic()
+        if self._desk_ahead or now - self._desk_ahead_at < _DESK_AHEAD_EVERY_S:
+            return
+        self._desk_ahead, self._desk_ahead_at = True, now
+
+        def run() -> None:
+            try:
+                self.snapshot()
+            except Exception:  # noqa: BLE001 - only a head start
+                pass
+            finally:
+                self._desk_ahead = False
+
+        threading.Thread(target=run, name="yuki-voice-desk", daemon=True).start()
+
     async def for_call(self, wait_ms: float) -> tuple[Snapshot | None, str]:
-        """A fresh summary for one mouth call, waiting at most ``wait_ms``; else the last one (``how``)."""
+        """A fresh summary for one mouth call, waiting at most ``wait_ms``; else the last one (``how``).
+
+        A summary read ahead while the user talked is used at once when it is recent and nothing was done on
+        the desktop since (``"ahead"``).
+        """
+        with self._lock:
+            last = self.last
+        if (last.text and not last.error and last.version == self.actions.version
+                and time.monotonic() - last.at < _DESK_FRESH_S):
+            return last, "ahead"
         task = asyncio.ensure_future(asyncio.to_thread(self.snapshot))
         try:
             snap = await asyncio.wait_for(asyncio.shield(task), timeout=max(wait_ms, 1.0) / 1000.0)
@@ -615,13 +657,20 @@ class Hands:
             times = max(1, min(int(args.get("times") or 1), 50))
             before = self._media_status() if key in _TRANSPORT_KEYS else None
             volume = self._volume() if key in _VOLUME_KEYS else None
+            want = str(args.get("want") or "").strip().lower() if key == "playpause" else ""
+            if want and before is not None and before[1].lower() == want:
+                # playpause toggles: pressing it on a session already in the state they want undoes it (live, a
+                # "pause" on paused music resumed it and said "Paused."). The session's own status, read first.
+                return True, f"media: {before[0]} is already {before[1]}; nothing was pressed", facts
             facts["sent_at"] = time.monotonic()
             result = self.backend.press(key, times=times)
             ok, report, facts = self._report(result, "", facts)
             if ok and before is not None:
                 changed, words = self._media_after(before)
                 report += "; " + words
-                facts["verified"] = changed
+                now = self._media_status() if want else None
+                # With the state they want known, verified means it is in that state now, not only that it changed.
+                facts["verified"] = changed and (not want or (now is not None and now[1].lower() == want))
             elif ok and volume is not None:
                 changed, words = self._volume_after(volume)
                 report += "; " + words

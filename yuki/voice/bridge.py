@@ -674,16 +674,16 @@ class VoiceBridge(QObject):
         Live 2026-09-27 04:47:18 the first thinker call of the conversation wrote its whole 27.8k-token
         prompt (the cache had expired 9 minutes after the last request): 4.2 s to its first step instead of
         ~2.5 s. At the start of a conversation, when the worker has not called the model for ``idle_s``,
-        its own warm-up (one token out, the same system blocks and tools) runs on a thread. Costs a cache
+        its own warm-up (``Agent.warm_cache``: one token out, the same system blocks and tools) runs on a thread. Costs a cache
         write of the core layers (~$0.03-0.05) only when cold; returns whether it started one.
         """
         worker = getattr(self.runtime, "worker", None)
         agent = getattr(worker, "agent", None)
-        warm = getattr(agent, "_warm_model", None)
+        warm = getattr(agent, "warm_cache", None)
         if agent is None or not callable(warm):
             return False
-        last = max(float(getattr(agent, "_request_started", 0.0) or 0.0), self._brain_warmed_at)
-        if time.monotonic() - last < idle_s or self.brain_busy():
+        idle = float(getattr(agent, "idle_s", idle_s))
+        if min(idle, time.monotonic() - self._brain_warmed_at) < idle_s or self.brain_busy():
             return False
         self._brain_warmed_at = time.monotonic()
 

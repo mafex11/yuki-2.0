@@ -173,6 +173,8 @@ class WakeSpotter:
         #: When the words after the name began (monotonic), for the last name heard: the spotter's own
         #: time for the name's last token plus :data:`NAME_END_OFFSET_S`. ``None`` when not known.
         self.name_end: float | None = None
+        #: The same for the last sound-alike it heard instead (where the words after it began).
+        self.near_end: float | None = None
 
     def feed(self, samples: np.ndarray, at: float | None = None) -> str | None:
         """Push audio; returns ``"YUKI"`` when the name is heard, else ``None`` (a competing variant counts as none).
@@ -197,6 +199,9 @@ class WakeSpotter:
                                      if times and self._t0 is not None else None)
                 else:
                     self.near_misses += 1
+                    times = list(result.timestamps or [])
+                    self.near_end = (self._t0 + times[-1] + NAME_END_OFFSET_S
+                                     if times and self._t0 is not None else None)
                 # A fresh stream after any result: its token times start again from the next sample
                 # (after ``reset_stream`` they drift by the audio still buffered), so the next hit's
                 # time is exact.
@@ -209,6 +214,75 @@ class WakeSpotter:
     def reset(self) -> None:
         self._stream = self._kws.create_stream()
         self._t0 = None
+
+
+#: The second opinion on a sound-alike (v3.7): the phoneme model (zh-en, which spells the name as sounds, so
+#: "yucky" Y AH K IY and "Yuki" Y UW K IY differ in a vowel) re-reads the seconds around a near miss.
+CHECK_MODEL = "zh-en-3M"
+#: Its threshold. Measured 2026-09-27 through the real listener (sound gate, batches) on 72 one-breath
+#: "Yuki, <request>" clips and 90 others (36 of them sound-alikes: "yucky", "you key in", "you keep"), six Aura
+#: voices: woke on 59 -> 62 of 72, false wakes 0 -> 0 of 90. At 0.35 and 0.3 the same 62, but one and two of
+#: the "yucky" sentences woke it.
+CHECK_THRESHOLD = 0.4
+#: How much of the sound episode is kept for it (the name and what came right after).
+CHECK_WINDOW_S = 3.0
+#: It is loaded on the first near miss (1.4 s, +57 MB, measured) and let go after this long unused, so
+#: listening for the name stays at its usual footprint.
+CHECK_KEEP_S = 600.0
+
+
+class NameCheck:
+    """Re-reads a stretch of audio with the phoneme model: was the name in it? Loaded on first use (~15 MB).
+
+    Only ever run on a near miss (the main spotter heard a sound-alike), so it costs nothing while listening,
+    and let go again after :data:`CHECK_KEEP_S` unused (:meth:`release_if_idle`). ``None`` from :meth:`heard`
+    when its model is not downloaded (then there is no second opinion).
+    """
+
+    def __init__(self, base: Path = MODELS_DIR, threshold: float = CHECK_THRESHOLD) -> None:
+        self._base = base
+        self._threshold = threshold
+        self._kws: Any = None
+        self._missing = False
+        self._used = 0.0
+
+    def release_if_idle(self, now: float | None = None) -> bool:
+        """Drop the model when unused for :data:`CHECK_KEEP_S` (called by the listener's thread)."""
+        if self._kws is not None and (now if now is not None else time.monotonic()) - self._used > CHECK_KEEP_S:
+            self._kws = None
+            return True
+        return False
+
+    def _load(self) -> Any:
+        if self._kws is None and not self._missing:
+            import sherpa_onnx
+
+            spec = MODELS[CHECK_MODEL]
+            root = spec.path(self._base)
+            if not (root / spec.encoder).exists():
+                self._missing = True
+                return None
+            keywords = root / "yuki-check.txt"
+            keywords.write_text(f"{spec.keywords[0]}\n", encoding="utf-8")
+            self._kws = sherpa_onnx.KeywordSpotter(
+                tokens=str(root / "tokens.txt"), encoder=str(root / spec.encoder), decoder=str(root / spec.decoder),
+                joiner=str(root / spec.joiner), keywords_file=str(keywords), num_threads=1, max_active_paths=4,
+                keywords_score=2.0, keywords_threshold=self._threshold, num_trailing_blanks=1, provider="cpu")
+        return self._kws
+
+    def heard(self, samples: np.ndarray) -> bool | None:
+        kws = self._load()
+        if kws is None:
+            return None
+        self._used = time.monotonic()
+        stream = kws.create_stream()
+        stream.accept_waveform(RATE, samples)
+        stream.accept_waveform(RATE, np.zeros(RATE // 2, np.float32))  # its trailing blank
+        while kws.is_ready(stream):
+            kws.decode_stream(stream)
+            if kws.get_result(stream):
+                return True
+        return False
 
 
 class WakeListener:
@@ -230,8 +304,13 @@ class WakeListener:
     PREROLL_BLOCKS = 25     # 0.5 s
 
     def __init__(self, mic: SharedMic, spotter_factory: Callable[[], WakeSpotter],
-                 on_wake: Callable[[float, str], None], log: Any = None) -> None:
+                 on_wake: Callable[[float, str], None], log: Any = None, check: Any = None) -> None:
         self.mic = mic
+        #: The second opinion on a near miss (:class:`NameCheck`), or ``None`` for none.
+        self.check = check
+        #: Whether the last wake came from the second opinion (a sound-alike the phoneme model heard as the name).
+        self.rescued = False
+        self.rescues = 0
         self._factory = spotter_factory
         self._on_wake = on_wake
         self._log = log
@@ -314,6 +393,7 @@ class WakeListener:
         quiet = self.GATE_HOLD_BLOCKS + 1  # blocks since the last loud one (the gate starts closed)
         was_paused = False
         decoding = False  # the gate is open and the spotter has been fed since it opened
+        episode: collections.deque[tuple[np.ndarray, float]] = collections.deque()  # the last seconds fed
         # A spotter that takes the batch's start time reports where the name ended (a test's stand-in may not).
         import inspect
 
@@ -331,8 +411,11 @@ class WakeListener:
                 continue
             if was_paused:
                 spotter.reset()  # no half-heard word from before the conversation
+                episode.clear()
                 was_paused = False
             chunk, at = item
+            if self.check is not None and hasattr(self.check, "release_if_idle"):
+                self.check.release_if_idle()
             samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) * (1.0 / 32768.0)
             self.heard_s += samples.size / RATE
             n = samples.size // (RATE // 50)
@@ -343,6 +426,7 @@ class WakeListener:
             levels.extend(float(x) for x in rms)
             floor = float(np.percentile(levels, 10))  # the room's floor: the quiet end of the last seconds
             if quiet > self.GATE_HOLD_BLOCKS:
+                episode.clear()
                 if decoding:
                     # The sound episode is over: the next one is decoded from a fresh stream (with its
                     # pre-roll). Seconds of other speech left in the stream (a video, Yuki's residual
@@ -367,13 +451,34 @@ class WakeListener:
                 spotter.reset()
                 continue
             self.decode_s += time.perf_counter() - started
+            episode.append((samples, at))
+            while sum(p.size for p, _ in episode) > CHECK_WINDOW_S * RATE and len(episode) > 1:
+                episode.popleft()
+            near = spotter.near_misses > self.near_misses
             self.near_misses = spotter.near_misses
             self.audio_s += samples.size / RATE
+            self.rescued = False
+            if not heard and near and self.check is not None:
+                # A sound-alike won: ask the phoneme model about the same seconds (v3.7, one-breath misses).
+                started = time.perf_counter()
+                try:
+                    verdict = self.check.heard(np.concatenate([p for p, _ in episode]))
+                except Exception as exc:  # noqa: BLE001 - no second opinion then
+                    verdict = None
+                    if self._log is not None:
+                        self._log.event("wake", state="check_error", error=f"{type(exc).__name__}: {str(exc)[:120]}")
+                if self._log is not None:
+                    self._log.event("wake", state="near_miss_checked", heard=verdict,
+                                    ms=round((time.perf_counter() - started) * 1000))
+                if verdict:
+                    heard, self.rescued = spotter.WAKE, True
+                    self.rescues += 1
+                    spotter.name_end = getattr(spotter, "near_end", None)
             if heard:
                 end = getattr(spotter, "name_end", None) if timed else None
                 self.name_end = float(end) if end is not None else None
                 if self._log is not None:
-                    self._log.event("wake", state="heard", keyword=heard, model=spotter.model,
+                    self._log.event("wake", state="heard", keyword=heard, model=spotter.model, rescued=self.rescued,
                                     name_end_before_hit_ms=(round((time.monotonic() - self.name_end) * 1000)
                                                             if self.name_end is not None else None))
                 spotter.reset()

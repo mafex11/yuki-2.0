@@ -476,6 +476,20 @@ class Agent:
         )
         return True
 
+    def warm_cache(self) -> bool | None:
+        """Write the prompt cache now, the way the start-up warm-up does (one token out). Never raises.
+
+        For a caller that knows a request is likely soon after a quiet spell (voice, at the start of a
+        conversation, when the cache has expired). Returns what :meth:`_warm_model` returns.
+        """
+        self._last_warm = time.monotonic()
+        return self._warm_model()
+
+    @property
+    def idle_s(self) -> float:
+        """Seconds since this agent last started a request or warmed its cache (the prompt cache lives ~5 min)."""
+        return time.monotonic() - max(self._request_started, getattr(self, "_last_warm", 0.0))
+
     def wait_for_prewarm(self, timeout_s: float | None = None) -> bool:
         """Block until the pre-warm thread has finished (tests and diagnostics).
 

@@ -405,6 +405,14 @@ def one_stop_per_turn(base: type) -> type:
 #: misheard names 0.40-0.74, e.g. "harsh" 0.40, "Hemish" 0.48, "Varez" 0.49; words of clear commands mostly
 #: >= 0.9, a few 0.64-0.86).
 LOW_WORD_CONFIDENCE = 0.7
+#: ... but only for words of at least this many letters; a shorter word only below :data:`VERY_LOW_CONFIDENCE`.
+#: Measured 2026-09-27 (v3.7) on 100 clear utterances through flux-general-multi (six Aura voices): below 0.7,
+#: 12 of 100 turns were flagged, mostly on short words said right ("can", "the", "pass", "What", "made"), and
+#: each flag cost the reply ~2 s (its words held, a second mouth run). With the length rule 7 of 100, and 6 of
+#: those 7 were real mistranscriptions ("You can me OTP" for "you key in the OTP", "Soaki", "picoris"); the
+#: misheard names of v3.5 are all 5+ letters ("harsh" 0.40, "Hemish", "Varez", "savvy", "letter path").
+LOW_WORD_MIN_LETTERS = 5
+VERY_LOW_CONFIDENCE = 0.4
 #: A heard word (or two adjacent ones) this similar to a keyterm, without being it, is named as sounding close
 #: (measured: "Hemish" / "harsh" / "Hemant" 0.83-0.92 and "hey meant" 0.67 against Hemanth, "Komala" 0.83
 #: against Komal, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every name). A
@@ -433,8 +441,14 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False) -> 
     def key(text: str) -> str:
         return "".join(ch for ch in text.casefold() if ch.isalnum())
 
-    low = [(str(w["word"]).strip(" ,.?!"), float(w["confidence"])) for w in rated
-           if isinstance(w.get("confidence"), (int, float)) and float(w["confidence"]) < LOW_WORD_CONFIDENCE]
+    def unsure(w: dict) -> bool:
+        conf = w.get("confidence")
+        if not isinstance(conf, (int, float)):
+            return False
+        long_enough = len(key(str(w["word"]))) >= LOW_WORD_MIN_LETTERS
+        return float(conf) < (LOW_WORD_CONFIDENCE if long_enough else VERY_LOW_CONFIDENCE)
+
+    low = [(str(w["word"]).strip(" ,.?!"), float(w["confidence"])) for w in rated if unsure(w)]
     terms = {key(t): t for t in keyterms if len(key(t)) >= 4}
     near: list[tuple[str, str]] = []
     spoken = [str(w["word"]).strip(" ,.?!") for w in items]
@@ -841,6 +855,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                     if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
                         tool_id, args = str(event.content_block.id), ""
                         name = getattr(event.content_block, "name", "")
+                        if call.first_text is not None and self._yuki_words is None:
+                            # The reply's words are complete (it goes on to a call): the voice says the
+                            # sentence waiting for its lookahead now, not when the call is written (v3.7).
+                            await self.push_frame(_words_done_frame())
                         # On a doubtful turn nothing is said before the reply is judged (its words wait too).
                         said = name not in SAY_FIRST_TOOLS or self._yuki_words is not None
                         if name == "tell_yuki" and call.user_turn:
@@ -864,6 +882,120 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             return timed()
 
     return LayeredAnthropicLLMService
+
+
+#: Marks that end a reply's first clause: the voice starts on it while the rest is still being written (v3.7).
+#: A comma or colon never ends a sentence, so no lookahead is needed; "." keeps Pipecat's own sentence rule
+#: (it waits for the next word, "3.5" / "Dr.").
+CLAUSE_MARKS = frozenset(",;:!?\u0964")
+#: The first clause is said on its own once it has at least this many words ("Hey," alone waits for more).
+CLAUSE_MIN_WORDS = 2
+
+
+def clause_aggregator(base: type) -> type:
+    """Pipecat's ``SimpleTextAggregator`` that lets a reply's first clause go to the voice at once (v3.7).
+
+    Measured 2026-09-27 (offline, Aura): first text -> TTS request 255-362 ms p50, because the aggregator
+    waits for a whole sentence and then for the first letter of the next one (and for a one-sentence reply,
+    for the reply's end). Here the reply's first clause ("Hey, good morning!" / "Sure, one sec,") is handed
+    over the moment its mark and a space arrive; everything after it is aggregated by sentence as before.
+    Plumbing: where the voice may start, from punctuation of Yuki's own words.
+    """
+    from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+
+    class ClauseAggregator(base):  # type: ignore[misc, valid-type]
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._yuki_started = False
+
+        async def aggregate(self, text: str) -> Any:
+            if self._aggregation_type == AggregationType.TOKEN:
+                async for item in super().aggregate(text):
+                    yield item
+                return
+            for char in text:
+                self._text += char
+                if (not self._yuki_started and char.isspace() and len(self._text) > 1
+                        and self._text[-2] in CLAUSE_MARKS and len(self._text.split()) >= CLAUSE_MIN_WORDS):
+                    out, self._text, self._needs_lookahead = self._text.strip(" "), "", False
+                    self._yuki_started = True
+                    yield Aggregation(text=out.strip(), type=AggregationType.SENTENCE)
+                    continue
+                result = await self._check_sentence_with_lookahead(char)
+                if result:
+                    self._yuki_started = True
+                    yield result
+
+        def take_pending(self) -> Any:
+            """The words waiting for a lookahead that will not come (the reply moved on to a tool call)."""
+            text, self._text, self._needs_lookahead = self._text.strip(), "", False
+            if not text:
+                return None
+            self._yuki_started = True
+            return Aggregation(text=text, type=AggregationType.SENTENCE)
+
+        async def flush(self) -> Any:
+            self._yuki_started = False
+            return await super().flush()
+
+        async def reset(self) -> None:
+            self._yuki_started = False
+            await super().reset()
+
+        async def handle_interruption(self) -> None:
+            self._yuki_started = False
+            await super().handle_interruption()
+
+    return ClauseAggregator
+
+
+def _words_done_frame() -> Any:
+    """A frame the mouth pushes after a reply's words when the reply goes on to a tool call (v3.7)."""
+    from pipecat.frames.frames import DataFrame
+
+    global _WORDS_DONE
+    if _WORDS_DONE is None:
+        class WordsDoneFrame(DataFrame):
+            """The reply's words are complete: say what is waiting for a lookahead (a tool call follows)."""
+
+        _WORDS_DONE = WordsDoneFrame
+    return _WORDS_DONE()
+
+
+_WORDS_DONE: Any = None
+
+
+def _clause_tts(base: type) -> type:
+    """``base`` (a Pipecat TTS service) with :func:`clause_aggregator` and the words-done flush (v3.7).
+
+    Before, a reply that spoke and then called a tool ("Sure, let me look." + tell_yuki) was heard only once
+    the whole call was written: the last sentence waited for a next word that never came (live 0.7-2.1 s).
+    The mouth pushes a words-done frame (in order, after the words) when the stream turns to a tool call,
+    and what is waiting is said then.
+    """
+    from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+
+    aggregator_type = clause_aggregator(SimpleTextAggregator)
+
+    class ClauseTTS(base):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._text_aggregator = aggregator_type(aggregation_type=self._text_aggregation_mode)
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            if _WORDS_DONE is not None and isinstance(frame, _WORDS_DONE):
+                from pipecat.frames.frames import AggregatedTextFrame
+
+                take = getattr(self._text_aggregator, "take_pending", None)
+                pending = take() if callable(take) else None
+                if pending is not None:
+                    await self.stop_text_aggregation_metrics()
+                    await self._push_tts_frames(AggregatedTextFrame(pending.text, pending.type,
+                                                                    raw_text=pending.text))
+                return  # consumed here: nothing downstream needs it
+            await super().process_frame(frame, direction)
+
+    return ClauseTTS
 
 
 def quiet_pipecat_logging(log_dir: Any) -> None:
@@ -1091,6 +1223,8 @@ class TurnObserver:
             self._words_at = time.monotonic()  # when speech recognition last heard a new word
         if self.grounder is not None:
             self.grounder.interim(transcript)
+        if self.hands is not None and hasattr(self.hands, "prefetch_desk"):
+            self.hands.prefetch_desk()  # the reply's desktop block, read while they talk (v3.7)
 
     def _end_of_speech(self, now: float) -> tuple[float | None, str]:
         """When the user stopped talking this turn, and how that is known.
@@ -1783,8 +1917,8 @@ class Conversation:
         if provider == "deepgram":
             from pipecat.services.deepgram.tts import DeepgramTTSService
 
-            tts = DeepgramTTSService(api_key=get_key(DEEPGRAM) or "",
-                                     settings=DeepgramTTSService.Settings(voice=voice))
+            tts = _clause_tts(DeepgramTTSService)(api_key=get_key(DEEPGRAM) or "",
+                                                  settings=DeepgramTTSService.Settings(voice=voice))
         else:
             from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 
@@ -1796,9 +1930,9 @@ class Conversation:
                 ("speed", s.voice_tts_speed), ("stability", s.voice_tts_stability),
                 ("similarity_boost", s.voice_tts_similarity_boost), ("style", s.voice_tts_style),
                 ("use_speaker_boost", s.voice_tts_speaker_boost)) if value is not None}
-            tts = ElevenLabsTTSService(api_key=get_key(ELEVENLABS) or "",
-                                       settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model,
-                                                                              **tuning))
+            tts = _clause_tts(ElevenLabsTTSService)(
+                api_key=get_key(ELEVENLABS) or "",
+                settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model, **tuning))
         return stt, llm, tts
 
     def _build(self) -> Any:
@@ -1941,6 +2075,11 @@ class Conversation:
         warm_brain = getattr(self.bridge, "warm_brain", None)
         if callable(warm_brain):
             warm_brain()  # the thinker's prompt cache, when it has gone cold (a thread; v3.6)
+        hands = getattr(self.bridge, "hands", None)
+        if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
+            # The first reply's desktop block, read while speech recognition connects (v3.7: the first turn's
+            # call waited its whole 250 ms bound for a cold read and went without).
+            hands.prefetch_desk()
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
         # While Deepgram connects (2-3 s), off the loop; done long before the first reply. Started
@@ -2099,7 +2238,7 @@ class Conversation:
             "Not done, and the words you wrote with it were not said: speech recognition was unsure of their "
             "words (the Speech line) and you wrote words and this call together. If something that matters "
             "may be misheard, ask them now in a few words, the question alone, with no call and no promise. "
-            "If their words were clear after all, call it again now, alone.")})
+            "If their words were clear after all, call it again now, alone, with its say_first.")})
 
     async def _tell_or_hold(self, params: Any) -> None:
         """tell_yuki, held like a hand when the mouth asked and handed over in one reply on doubtful words."""

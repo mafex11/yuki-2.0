@@ -724,7 +724,7 @@ class VoiceSession(QObject):
                                overflows=self._mic.stats.overflows)
 
     def _ensure_listener(self) -> None:
-        from yuki.voice.wake import WakeListener, WakeSpotter
+        from yuki.voice.wake import NameCheck, WakeListener, WakeSpotter
 
         mic = self._ensure_mic()
         if self._listener is None or not self._listener.running:
@@ -732,6 +732,7 @@ class VoiceSession(QObject):
             self._listener = WakeListener(
                 mic, lambda: WakeSpotter(threshold=s.voice_wake_threshold, boost=s.voice_wake_boost),
                 on_wake=lambda at, _kw: self._wake_heard.emit(at, time.monotonic(), self._name_end()), log=self.log,
+                check=NameCheck(),
             )
             self._listener.start()
             self.log.event("wake", state="listening", during_call=self.call_active)
@@ -926,8 +927,11 @@ class VoiceSession(QObject):
                 on_chat=self._chat,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
-            # What recognition hears starts after the name: the mouth is told its first words were said to it.
-            conversation.woken_by_name = via == "wake" and name_cut
+            # What recognition hears starts after the name: the mouth is told its first words were said to it
+            # (not when the name was a sound-alike the second opinion heard as the name: then it judges).
+            listener = self._listener
+            conversation.woken_by_name = (via == "wake" and name_cut
+                                          and not bool(getattr(listener, "rescued", False)))
             if facts.get("tts_note"):
                 self._thread_state.emit("starting", facts["tts_note"])
             self._conversation = conversation

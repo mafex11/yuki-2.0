@@ -504,7 +504,7 @@ def _real_brain(settings: Settings, memory: Any, timeline: Timeline, desk: Any =
     front = Agent(settings, SessionLogger(settings.sessions_dir, console=None, session_id=f"{session}-frontdesk"),
                   dispatcher=Dispatcher(blocked, screenshot_policy=settings.screenshot_policy,
                                         tool_timeout_s=settings.tool_timeout_s),
-                  tool_names=LOOK_ONLY_TOOLS, extra_instructions=FRONT_DESK_INSTRUCTIONS, prewarm=False,
+                  tool_names=None, extra_instructions=FRONT_DESK_INSTRUCTIONS, prewarm=False,
                   lane="front_desk", memory=memory)
     runtime = AgentRuntime(settings, ui_log, worker_agent=worker, front_desk_agent=front,
                            front_desk_blocked=blocked, memory=memory)

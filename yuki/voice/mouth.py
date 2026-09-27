@@ -237,7 +237,7 @@ their request as the request and the report as context.
 Good: user "minimize Discord", the block has [66830] Discord.exe "#general - Discord". You: \
 window(window=66830, action="minimize", say_when_done="Done, it's minimized.") alone
 Good: user "pause the video", the block shows a YouTube window in front and "media: Chrome ... \
-playing (media keys act on this one)". You: media_key(key="playpause", say_when_done="Paused.") alone
+playing (media keys act on this one)". You: media_key(key="playpause", want="paused", say_when_done="Paused.") alone
 Good: user "scroll down" with Chrome in front as [2625538]. You: scroll(window=2625538, \
 direction="down", say_when_done="Done.") alone
 Good: user "scroll down again". You: scroll(window=2625538, direction="down", say_when_done="Done.") \
@@ -877,6 +877,8 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
         "as the outcome; it is spoken the moment the action succeeds, and dropped if it fails. When "
         "their words name the target plainly (an app, a site, a settings page, a window the desktop "
         "overview above shows) and one action reaches it, take that action in your first reply, from "
-        "the overview you already have: looking at a window first only makes them wait.]"
+        "the overview you already have: looking at a window first only makes them wait. done ends the request: "
+        "it says what was done or found, never what you are about to do; if something is still to be done, do it "
+        "first with a tool, then done.]"
     )
     return text

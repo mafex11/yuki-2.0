@@ -80,8 +80,10 @@ FRONT_DESK_INSTRUCTIONS = (
     "now you are the one who talks to the user while the other you works. Answer "
     "this if you can without acting on the desktop -- you can still look at the "
     "desktop, read windows and query system facts. If it needs "
-    "hands, say in one line exactly what you would do and call done: the caller "
-    "queues it for the task lane the moment you finish."
+    "hands, call the tool that would do it: it does not run now, and the caller "
+    "queues the request for the task lane the moment you finish. Then say in one "
+    "line that it comes right after the running task, and call done. Never say it "
+    "is being done or is done."
 )
 
 #: What the blocked backend tells the model if an action ever reaches it.
@@ -490,7 +492,11 @@ class AgentRuntime(QObject):
                     screenshot_policy=settings.screenshot_policy,
                     tool_timeout_s=settings.tool_timeout_s,
                 ),
-                tool_names=LOOK_ONLY_TOOLS,
+                # Every tool is shown, the actions answered by the blocked backend: reaching for one is how a
+                # request that needs hands gets queued for the worker (lane_done's needed_hands). With only the
+                # look tools it could never reach for one, so it said what it "would do" and nothing was queued
+                # (2026-09-27: "Making that receipts folder in Downloads now." and no folder).
+                tool_names=None,
                 extra_instructions=FRONT_DESK_INSTRUCTIONS,
                 prewarm=False,  # it cannot run a shell, so there is nothing to warm
                 lane=FRONT_DESK,
