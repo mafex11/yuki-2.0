@@ -221,3 +221,13 @@ def test_voice_side_event_shapes_job_before_speech_and_end_only_hands():
     assert m.items[-1].status == "others"
     m.apply(ev("voice_turn_closed", 3.3, turn="s1-4", addressed="yuki"))
     assert m.items[0].status == "done"
+
+
+def test_where_typed_note_is_hidden_from_the_chat() -> None:
+    """The ask-bar / chat-page note the agent gets never shows as the user's words."""
+    from yuki.ui.app import WHERE_TYPED
+    from yuki.ui.chat_model import clean_request
+
+    for note in WHERE_TYPED.values():
+        assert clean_request(f"what's on my plate?\n\n{note}") == "what's on my plate?"
+        assert clean_request(f"what's on my plate?\n\n[coach note]\n\n{note}") == "what's on my plate?"

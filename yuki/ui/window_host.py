@@ -281,7 +281,7 @@ class WindowHost(QObject):
             def send() -> None:
                 if nudge is not None:   # Reply on a card in the window: it answers that nudge, like the overlay's
                     ui._nudge_reply, ui._nudge_reply_via = nudge, "overlay"
-                ui._on_submitted(text)
+                ui._on_submitted(text, via="window")
             self._on_gui(send)
             return {}
         if op == "cancel":

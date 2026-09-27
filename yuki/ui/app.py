@@ -84,6 +84,13 @@ class _HealthBridge(QObject):
 #: Name of the mutex that keeps one Yuki UI per session.
 MUTEX_NAME = "Local\\YukiUiSingleInstance"
 
+#: Where a typed request was written, told to the agent as a bracketed note after the request
+#: (Yuki's own format, stripped for display by chat_model.clean_request).
+WHERE_TYPED = {
+    "ask_bar": "[Typed in the ask bar: a small box, so the reply is a few short sentences.]",
+    "window": "[Typed in the Yuki app's chat page: there is room for a complete answer.]",
+}
+
 _ERROR_ALREADY_EXISTS = 183
 
 
@@ -349,8 +356,12 @@ class YukiUi(QObject):
         self.overlay.open()
         self.ui_log.event("overlay", state="shown", via="menu")
 
-    def _on_submitted(self, text: str) -> None:
-        """The user pressed Enter: either an answer to a question, or a request."""
+    def _on_submitted(self, text: str, via: str = "ask_bar") -> None:
+        """The user pressed Enter: either an answer to a question, or a request.
+
+        ``via``: ``ask_bar`` (the small overlay) or ``window`` (the app's chat page). The agent is
+        told which, so a reply fits where it will be read (docs: prompt.py, reply length).
+        """
         if self._question is not None:
             lane_name, request_id = self._question
             self._question = None
@@ -372,6 +383,7 @@ class YukiUi(QObject):
         note, note_ids = self.nudges.coach_note_for(lane_guess, exclude=nudge_id)
         if note:
             request = f"{request}\n\n{note}"
+        request = f"{request}\n\n{WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])}"
         lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
         self.window_host.user_message(request_id, text)
         self.cards[request_id] = self.overlay.add_card(text)
