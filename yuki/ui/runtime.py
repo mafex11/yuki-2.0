@@ -40,7 +40,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from yuki.agent.loop import Agent
+from yuki.agent.loop import CANCELLED, WITHDRAWN, Agent
 from yuki.agent.memory import MemoryAccess, default_memory
 from yuki.agent.subagents import HelperStep
 from yuki.agent.tools import (
@@ -149,6 +149,9 @@ class Job:
     origin_hwnd: int | None = None
     #: Where the request came from: ``text`` (typed) or ``voice``. Logged only.
     source: str = "text"
+    #: A window to read and attach to the request as it starts (``Agent.run(view_hwnd=)``): the caller
+    #: said the request is about something inside it (voice: the talker's ``screen`` mark).
+    view_hwnd: int | None = None
 
 
 class Lane(QThread):
@@ -186,8 +189,8 @@ class Lane(QThread):
         self._state = threading.Lock()
         self._current: Job | None = None
         self._waiting: list[int] = []
-        #: Queued ids cancelled before they started: skipped when dequeued.
-        self._skip: set[int] = set()
+        #: Queued ids cancelled (or withdrawn) before they started, with why: skipped when dequeued.
+        self._skip: dict[int, str] = {}
 
     @property
     def allowed_tools(self) -> tuple[str, ...] | None:
@@ -214,8 +217,11 @@ class Lane(QThread):
         with self._state:
             return [i for i in self._waiting if i not in self._skip]
 
-    def cancel_job(self, job_id: int) -> str:
+    def cancel_job(self, job_id: int, reason: str = CANCELLED) -> str:
         """Cancel one job: the running one, or a queued one before it starts.
+
+        ``reason`` is :data:`~yuki.agent.loop.CANCELLED` or :data:`~yuki.agent.loop.WITHDRAWN` (a newer
+        request replaced it): a withdrawn job ends with ``withdrawn`` instead of ``failed``.
 
         Returns:
             ``running`` (cancel sent to the agent), ``queued`` (it will be
@@ -225,9 +231,9 @@ class Lane(QThread):
             running = self._current is not None and self._current.id == job_id
             queued = job_id in self._waiting and job_id not in self._skip
             if queued and not running:
-                self._skip.add(job_id)
+                self._skip[job_id] = reason
         if running:
-            self.cancel()
+            self.cancel(reason)
             return "running"
         return "queued" if queued else "unknown"
 
@@ -243,13 +249,13 @@ class Lane(QThread):
         """Hand the user's answer to a paused request."""
         self._answers.put(text)
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str = CANCELLED) -> None:
         """Cancel the request currently running on this lane.
 
-        Takes effect at the agent's next checkpoint. A request paused on a question
-        is released straight away with a cancellation answer.
+        Takes effect at the agent's next checkpoint (a streaming response is dropped at its next
+        event). A request paused on a question is released straight away with a cancellation answer.
         """
-        self.agent.cancel()
+        self.agent.cancel(reason)
         if self.agent.awaiting_answer:
             self._answers.put(None)
 
@@ -269,13 +275,16 @@ class Lane(QThread):
             with self._state:
                 if job.id in self._waiting:
                     self._waiting.remove(job.id)
-                skipped = job.id in self._skip
-                self._skip.discard(job.id)
+                skipped = self._skip.pop(job.id, None)
                 self._current = None if skipped else job
             if skipped:
                 # Cancelled while it waited: it never reaches the agent, so a
                 # cancel meant for it cannot land on the next request instead.
-                self.runtime.failed.emit(self.name, job.id, "Cancelled before it started.")
+                if skipped == WITHDRAWN:
+                    self.runtime.withdrawn.emit(self.name, job.id,
+                                                "Withdrawn before it started: replaced by a newer request.")
+                else:
+                    self.runtime.failed.emit(self.name, job.id, "Cancelled before it started.")
                 self.runtime.lane_done.emit(self.name, job.id, job.request, False, [])
                 continue
             reached_for_hands: list[str] = []
@@ -326,6 +335,7 @@ class Lane(QThread):
             model=(getattr(settings, "voice_brain_model", "") or None) if voice else None,
             thinking=None if not voice or getattr(settings, "voice_brain_thinking", True) else False,
             lean=voice and not getattr(settings, "voice_brain_portrait", True),
+            **({"view_hwnd": job.view_hwnd} if job.view_hwnd else {}),
         )
         while True:
             try:
@@ -379,10 +389,17 @@ class Lane(QThread):
             elif isinstance(event, Final):
                 runtime.finished.emit(self.name, job.id, event.text)
             elif isinstance(event, ErrorEvent):
-                runtime.failed.emit(self.name, job.id, event.text)
+                if self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == WITHDRAWN:
+                    # Replaced by the user's newer request: a quiet end, never an error (the chat shows it
+                    # cancelled; the voice says nothing of it).
+                    runtime.withdrawn.emit(self.name, job.id, event.text)
+                else:
+                    runtime.failed.emit(self.name, job.id, event.text)
 
         if self.blocked is not None:
             refused.extend(name for name in self.blocked.attempted if name not in refused)
+        if self.agent.cancelled:
+            return []  # stopped or withdrawn: a request the user dropped is never handed to the worker
         return refused
 
     def _drain_answers(self) -> None:
@@ -426,6 +443,8 @@ class AgentRuntime(QObject):
         asked: ``(lane, id, question)`` -- that lane is now paused.
         finished: ``(lane, id, text)`` -- the closing message.
         failed: ``(lane, id, text)`` -- error or cancellation.
+        withdrawn: ``(lane, id, text)`` -- the request was withdrawn because a newer request of the user's
+            replaced it (:meth:`withdraw`): it ended quietly, as cancelled, not as an error.
         queued: ``(id, request, waiting)`` -- request parked for the worker.
         summarized: ``(lane, id, summary)`` -- the request's ``request_summary``
             (time, steps, tokens, estimated cost), right after finished/failed.
@@ -451,6 +470,7 @@ class AgentRuntime(QObject):
     asked = Signal(str, int, str)
     finished = Signal(str, int, str)
     failed = Signal(str, int, str)
+    withdrawn = Signal(str, int, str)
     queued = Signal(int, str, int)
     summarized = Signal(str, int, dict)
     lane_done = Signal(str, int, str, bool, list)
@@ -585,7 +605,8 @@ class AgentRuntime(QObject):
         return bool(self._worker_outstanding)
 
     def submit(
-        self, request: str, *, origin_hwnd: int | None = None, source: str = "text"
+        self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
+        view_hwnd: int | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -598,20 +619,25 @@ class AgentRuntime(QObject):
         Args:
             request: What the user typed (or said, for ``source="voice"``).
             source: ``text`` or ``voice``; logged, never routed on.
+            lane: :data:`WORKER` to queue it for the worker even while the worker is busy (a request that
+                needs hands, or one that replaces the request being withdrawn: the front desk would only
+                look, then queue it anyway, a whole model call later). The caller's decision, never read
+                from the words.
+            view_hwnd: A window to read and attach as the request starts (see :class:`Job`).
 
         Returns:
             ``(lane name, request id)``.
         """
         request_id = next(self._ids)
-        lane = self.worker if not self.worker_busy else self.front_desk
+        lane = self.worker if (lane == WORKER or not self.worker_busy) else self.front_desk
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
         else:
             self._sources[request_id] = source  # kept if the front desk hands it to the worker
-        waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source))
+        waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
-            origin_hwnd=origin_hwnd, source=source,
+            origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
         )
         return lane.name, request_id
 
@@ -650,7 +676,7 @@ class AgentRuntime(QObject):
         self.ui_log.event("cancel", lane=WORKER, outstanding=len(self._worker_outstanding))
         self.worker.cancel()
 
-    def cancel(self, request_id: int) -> str:
+    def cancel(self, request_id: int, reason: str = CANCELLED) -> str:
         """Cancel one request by id, running or still queued, on whichever lane has it.
 
         Returns:
@@ -658,11 +684,20 @@ class AgentRuntime(QObject):
         """
         how = "unknown"
         for lane in (self.worker, self.front_desk):
-            how = lane.cancel_job(request_id)
+            how = lane.cancel_job(request_id, reason)
             if how != "unknown":
                 break
-        self.ui_log.event("cancel", id=request_id, how=how)
+        self.ui_log.event("cancel", id=request_id, how=how, reason=reason)
         return how
+
+    def withdraw(self, request_id: int) -> str:
+        """Withdraw one request because the user's newer request replaces it (running or queued).
+
+        The same stop as :meth:`cancel` (a streaming response is dropped at once, a tool in flight
+        finishes), ending with the ``withdrawn`` signal instead of ``failed``: shown as cancelled, never
+        as an error, and never spoken. Returns how, as :meth:`cancel`.
+        """
+        return self.cancel(request_id, WITHDRAWN)
 
     def steer(self, request_id: int, text: str) -> bool:
         """Pass something the user added to a running request (:meth:`Agent.steer`).

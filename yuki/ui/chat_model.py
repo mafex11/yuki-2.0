@@ -535,6 +535,34 @@ class ChatModel:
     def _on_failed(self, ev: dict[str, Any], at: float) -> None:
         self._settle(ev, at, failed=True)
 
+    def _on_withdrawn(self, ev: dict[str, Any], at: float) -> None:
+        """A request withdrawn because the user's newer one replaced it: quietly cancelled, never an error.
+
+        Its steps stop spinning with a neutral mark (ok ``None``), a voice job's step says "Cancelled", and a
+        typed reply bubble keeps what it had with a plain "Cancelled" and no error tone.
+        """
+        job = ev.get("job")
+        if not isinstance(job, int):
+            return
+        key = self._voice_job.get(job)
+        item = self._by_id.get(self._job_item.get(job, ""))
+        if item is None:
+            return
+        for s in item.steps:
+            if (s.key == key or s.job == job) and s.running:
+                s.ended, s.ok = at, None
+            if s.key == key:
+                s.result = "Cancelled: replaced by a newer request"
+        if key is None:
+            item.text = item.text or "Cancelled."
+            item.thinking = ""
+            item.status = "done"
+            item.ended_at = at
+        elif item.status == "running" and not any(st.running for st in item.steps):
+            item.status = "done"
+            item.ended_at = at
+        self._changed(item)
+
     def _on_summarized(self, ev: dict[str, Any], at: float) -> None:
         job = ev.get("job")
         item = self._by_id.get(self._job_item.get(job, "")) if isinstance(job, int) else None

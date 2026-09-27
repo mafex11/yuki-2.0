@@ -379,6 +379,26 @@ def early_words(partial_json: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def early_flag(partial_json: str, name: str) -> bool | None:
+    """A boolean field of a tool call whose arguments are still streaming, once its value is written.
+
+    Parsing the call's own JSON (v3.9: ``screen``, the first field of ``tell_yuki``, decides whether the early
+    thinker start gets the window read). ``None`` until ``true`` or ``false`` is there.
+    """
+    key = partial_json.find(f'"{name}"')
+    if key < 0:
+        return None
+    colon = partial_json.find(":", key + len(name) + 2)
+    if colon < 0:
+        return None
+    rest = partial_json[colon + 1:].lstrip(" \t\r\n")
+    if rest.startswith("true"):
+        return True
+    if rest.startswith("false"):
+        return False
+    return None
+
+
 def one_stop_per_turn(base: type) -> type:
     """``base`` (Pipecat's ``EagerUserTurnStopStrategy``) resolving each user turn's end once.
 
@@ -710,7 +730,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if isinstance(frame, UserStoppedSpeakingFrame):
                 pending, self._yuki_early_pending = self._yuki_early_pending, None
                 if pending is not None:
-                    hook("handoff_began", pending)  # the turn is confirmed: the thinker starts now
+                    call_id, screen = pending if isinstance(pending, tuple) else (pending, False)
+                    hook("handoff_began", call_id, screen)  # the turn is confirmed: the thinker starts now
             elif isinstance(frame, (EagerEndOfTurnCancelFrame, InterruptionFrame)):
                 self._yuki_early_pending = None
                 self._yuki_words = None  # a cut reply's held words are never said
@@ -768,8 +789,22 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call)
             params["messages"] = with_volatile(params.get("messages"), volatile_block(
                 lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
-                named=bool(hook("named", default=False))))
+                named=bool(hook("named", default=False)), work=hook("work", default=None)))
             return params
+
+        def _sync_cancel_tools(self) -> None:
+            """Pipecat's cancel tools, with the talker's own description of when to cancel (v3.9)."""
+            super()._sync_cancel_tools()
+            from pipecat.adapters.schemas.function_schema import FunctionSchema
+
+            from yuki.voice.mouth import CANCEL_TELL_YUKI_DESCRIPTION
+
+            tools = getattr(getattr(self, "_adapter", None), "builtin_tools", None)
+            for name in list(getattr(self, "_cancel_tool_names", ()) or ()):
+                old = tools.get(name) if isinstance(tools, dict) else None
+                if old is not None and getattr(old, "description", None) != CANCEL_TELL_YUKI_DESCRIPTION:
+                    tools[name] = FunctionSchema(name=old.name, description=CANCEL_TELL_YUKI_DESCRIPTION,
+                                                 properties=old.properties, required=old.required)
 
         async def _cancel_tool_handler(self, params: Any) -> None:
             # A successful cancel settles without another turn: the mouth says it is
@@ -854,6 +889,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
             async def timed() -> Any:
                 tool_id, args, said = None, "", True
+                early_wait = False  # a tell_yuki whose early thinker start waits for its screen field (v3.9)
                 async for event in response:
                     now = time.monotonic()
                     if call.first_event is None:
@@ -872,18 +908,22 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             await self.push_frame(_words_done_frame())
                         # On a doubtful turn nothing is said before the reply is judged (its words wait too).
                         said = name not in SAY_FIRST_TOOLS or self._yuki_words is not None
-                        if name == "tell_yuki" and call.user_turn:
-                            # The mouth has decided to hand over: the thinker starts now, on the user's own
-                            # words, while the call is still being written (v3.6); in a speculative reply,
-                            # once the turn is confirmed.
-                            if self._speculation_gate.is_speculating:
-                                self._yuki_early_pending = tool_id
-                            else:
-                                hook("handoff_began", tool_id)
-                    elif (kind == "content_block_delta" and not said and tool_id is not None
+                        # The mouth has decided to hand over: the thinker starts on the user's own words while
+                        # the call is still being written (v3.6), as soon as its first field says whether the
+                        # window in front is to be read for it (v3.9, a few tokens in).
+                        early_wait = name == "tell_yuki" and call.user_turn
+                    elif (kind == "content_block_delta" and tool_id is not None
                           and hasattr(event.delta, "partial_json")):
                         args += event.delta.partial_json or ""
-                        words = early_words(args)
+                        if early_wait:
+                            flag = early_flag(args, "screen")
+                            if flag is not None or '"say_first"' in args or '"request"' in args:
+                                early_wait = False
+                                if self._speculation_gate.is_speculating:
+                                    self._yuki_early_pending = (tool_id, bool(flag))  # once the turn is confirmed
+                                else:
+                                    hook("handoff_began", tool_id, bool(flag))
+                        words = early_words(args) if not said else None
                         if words is not None:
                             said = True
                             if call.first_text is None:  # a reply that already spoke keeps its own words
@@ -1082,6 +1122,7 @@ class _Turn:
     call: bool = False                   # the user was in a voice call (call mode)
     counted: bool = False                # counted as an exchange with Yuki
     cut: bool = False                    # the user spoke again before this turn's reply was heard
+    rerun: bool = False                  # answered again: its reply was cut and nothing was heard (v3.9)
     heard_low: int = 0                   # words recognition was unsure of (below LOW_WORD_CONFIDENCE)
     heard_near: int = 0                  # heard words that sound close to a keyterm without being it
 
@@ -1127,6 +1168,8 @@ class TurnObserver:
         self.speech_pending_since: float | None = None
         self.last_bot_stop = 0.0
         self.user_turns = 0
+        #: When the user last finished an utterance (its final transcript; v3.9, for "nobody spoke for a while").
+        self.last_user_at = 0.0
         self._user_started_at = 0.0
         self._pending_call: LlmCall | None = None
         self._eot_at: float | None = None
@@ -1485,6 +1528,7 @@ class TurnObserver:
             lang = getattr(frame, "language", None)
             turn.language = str(getattr(lang, "value", lang)) if lang else None
             self.user_turns += 1
+            self.last_user_at = now
             self.owes_reply_since = now
             self.set_state("thinking")
             self._activity()
@@ -1673,9 +1717,17 @@ class _Hooks:
         """A doubtful turn's reply made a call that is held: its words were never said (content-free log)."""
         self.c.log.event("held_words", op="dropped", frames=frames)
 
-    def handoff_began(self, call_id: str) -> None:
-        """The mouth's reply has begun a tell_yuki (its first streamed content): start the thinker now."""
-        self.c._early_handoff(call_id)
+    def handoff_began(self, call_id: str, screen: bool = False) -> None:
+        """The mouth's reply has begun a tell_yuki (its first field is written): start the thinker now."""
+        self.c._early_handoff(call_id, screen)
+
+    def work(self) -> str | None:
+        """What the thinker is doing now, for the talker's volatile block (v3.9), or ``None``."""
+        line = getattr(self.c.bridge, "work_line", None)
+        try:
+            return line() if callable(line) else None
+        except Exception:  # noqa: BLE001 - a hint only
+            return None
 
     def early_withdrawn(self) -> None:
         """The reply was cut (a barge-in, a withdrawn speculation): an early start whose call never ran is void."""
@@ -2110,6 +2162,13 @@ class Conversation:
         self.bridge.progress_answerer = self._progress_answer
         self.bridge.on_remembered = self._refresh_rules
         self.bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
+        # v3.9: the bridge binds each job to the user turn it answers, paces its "still on it" line by real
+        # silence, and says a job's own finishing line by code when no tell_yuki call carries it.
+        self.bridge.user_turns = lambda: self.observer.user_turns
+        self.bridge.quiet_for = self._quiet_for
+        self.bridge.speak = self._speak
+        self.bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
+            self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
         warm_brain = getattr(self.bridge, "warm_brain", None)
         if callable(warm_brain):
             warm_brain()  # the thinker's prompt cache, when it has gone cold (a thread; v3.6)
@@ -2130,12 +2189,14 @@ class Conversation:
         warm = asyncio.create_task(self._warm())
         watch = asyncio.create_task(self._watch(runner))
         lag = asyncio.create_task(self._lag_monitor())
+        replies = asyncio.create_task(self._reply_watch())
         try:
             await runner.run()
         finally:
             watch.cancel()
             warm.cancel()
             lag.cancel()
+            replies.cancel()
             await self.gate.stop()
             self.observer.close()
             self.bridge.closing = True
@@ -2270,10 +2331,14 @@ class Conversation:
     async def _hold(self, params: Any) -> None:
         self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
                        held="asked_first")
+        self.bridge.held_at = time.monotonic()
+        self.bridge.held_call = (params.function_name, dict(params.arguments or {}), params.context)
+        self.bridge._held_refused = False
         # The reply's words were held with it and never said (v3.6): the user heard nothing yet, so nothing
         # was promised. The mouth now asks plainly, or acts if the words were clear after all.
         await params.result_callback({"held": (
-            "Not done, and the words you wrote with it were not said: speech recognition was unsure of their "
+            "Not done: nothing was done, so never say it is done, open or playing. The words you wrote with it were "
+            "not said either: speech recognition was unsure of their "
             "words (the Speech line) and you wrote words and this call together. If something that matters "
             "may be misheard, ask them now in a few words, the question alone, with no call and no promise. "
             "If their words were clear after all, call it again now, alone, with its say_first.")})
@@ -2286,7 +2351,7 @@ class Conversation:
             return
         await self.bridge.tell_yuki(params)
 
-    def _early_handoff(self, call_id: str) -> None:
+    def _early_handoff(self, call_id: str, screen: bool = False) -> None:
         """Start the thinker on the user's words the moment the mouth's reply begins a hand-off (v3.6).
 
         The user asked for the two halves to run in parallel ("the thinker should also get the same
@@ -2302,9 +2367,15 @@ class Conversation:
             return
         from yuki.voice.bridge import heard_words
 
-        heard = heard_words(getattr(getattr(self, "_llm", None), "_yuki_context", None)
-                            or getattr(self, "_llm_context", None), skip=self.bridge.not_heard)
-        if self.bridge.begin_early(call_id, heard):
+        from yuki.voice.bridge import spoken_words
+
+        context = getattr(getattr(self, "_llm", None), "_yuki_context", None) or getattr(self, "_llm_context", None)
+        heard = heard_words(context, skip=self.bridge.not_heard)
+        try:
+            started = self.bridge.begin_early(call_id, heard, screen=screen, said=spoken_words(context))
+        except TypeError:  # a stand-in bridge without the v3.9 arguments
+            started = self.bridge.begin_early(call_id, heard)
+        if started:
             self.observer.handoff_started(time.monotonic())
 
     async def _hand_or_hold(self, params: Any) -> None:
@@ -2320,6 +2391,86 @@ class Conversation:
             await self._hold(params)
             return
         await self.bridge.hands.handle(params)
+
+    def _quiet_for(self) -> float:
+        """Seconds since anyone spoke (Yuki, or the user by the mic or a transcript); 0 while someone speaks."""
+        obs = self.observer
+        if obs.bot_speaking or obs.user_speaking or obs.generating or obs.speech_pending:
+            return 0.0
+        now = time.monotonic()
+        marks = [obs.last_bot_stop or 0.0, getattr(obs, "last_user_at", 0.0) or 0.0, self.stt_ready_at or 0.0]
+        if self._voice_activity is not None:
+            try:
+                since, last = self._voice_activity()
+                if last and now - last < self.SOUND_RECENT_S and (last - since) < self.SOUND_MAX_STRETCH_S:
+                    return 0.0
+                marks.append(last or 0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        return max(0.0, now - max(marks))
+
+    async def _speak(self, text: str) -> None:
+        """Say ``text`` now by code (no mouth run): a job's own finishing line with no tell_yuki call to carry it."""
+        llm = getattr(self, "_llm", None)
+        if llm is None or not text.strip():
+            return
+        from pipecat.frames.frames import TTSSpeakFrame
+
+        await llm.push_frame(TTSSpeakFrame(text=text.strip()))
+
+    #: Yuki spoke this recently (s): the user's next words are most likely to her (a stay_quiet on them is refused
+    #: once, v3.9).
+    EXCHANGE_LIVE_S = 20.0
+
+    #: A user turn that got nothing audible (its reply was cut by a sound that brought no words) is answered
+    #: again once the user has been quiet this long after it (s), and at least this long after its words.
+    REPLY_WATCH_QUIET_S = 0.9
+    REPLY_WATCH_AFTER_S = 1.2
+
+    def _unanswered(self) -> Any:
+        """The latest turn when it is the user's, was said to Yuki and got nothing audible, else ``None``."""
+        obs = self.observer
+        turn = obs.turn
+        if turn is None or turn.trigger != "user" or not (turn.user_text or "").strip():
+            return None
+        if turn.first_audio is not None or turn.tools or getattr(turn, "rerun", False):
+            return None  # heard something, or acted, or handed over, or already answered again
+        if not (turn.cut or turn.responses):
+            return None  # its reply may still be on its way
+        return turn
+
+    async def _reply_watch(self, every_s: float = 0.2) -> None:
+        """Every utterance said to Yuki gets an audible answer (v3.9).
+
+        Live 2026-09-27 14:17:01-14:17:10 "uke", "Yuki." and a third utterance each got a reply that was cut
+        before a sound was heard (the next words, or a start of turn that brought no words) and nothing was
+        said for ten seconds: the user thought Yuki was dead. When the newest turn is the user's, got no audio,
+        no hand, no hand-off and no stay_quiet, and the user has since been quiet (no speech, no mic sound, no
+        reply being written or spoken), the mouth runs again on the same context, once per turn. A fact about
+        the stream, never about the words.
+        """
+        from pipecat.frames.frames import LLMRunFrame
+
+        try:
+            while True:
+                await asyncio.sleep(every_s)
+                turn = self._unanswered()
+                obs = self.observer
+                if turn is None or self.worker is None or self._stop.is_set():
+                    continue
+                if obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending:
+                    continue
+                now = time.monotonic()
+                if turn.transcript_at is None or now - turn.transcript_at < self.REPLY_WATCH_AFTER_S:
+                    continue
+                if self._quiet_for() < self.REPLY_WATCH_QUIET_S:
+                    continue
+                turn.rerun = True
+                self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
+                               responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000))
+                await self.worker.queue_frame(LLMRunFrame())
+        except asyncio.CancelledError:
+            return
 
     async def _end_after_speech(self, max_s: float = 6.0) -> None:
         """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on)."""
@@ -2357,13 +2508,14 @@ class Conversation:
         self.log.event("rules_refreshed", changed=changed, chars=len(text or ""))
 
     async def _announce(self, payload: dict[str, Any], run_llm: bool = True) -> None:
-        """A result with no open tool call (a correction that came too late): into the context, said if ``run_llm``."""
+        """An item of a task no tool call carries (a hand's try passed to the thinker by code, or a correction that
+        came too late): into the context as the thinker's message, said if ``run_llm``."""
         import json
 
         from pipecat.frames.frames import LLMMessagesAppendFrame
 
         if self.worker is not None:
-            message = {"role": "developer", "content": json.dumps({"late_result": payload}, ensure_ascii=False)}
+            message = {"role": "developer", "content": json.dumps({"from_the_thinker": payload}, ensure_ascii=False)}
             await self.worker.queue_frame(LLMMessagesAppendFrame(messages=[message], run_llm=run_llm))
 
     #: In call mode, a user still talking when the call idle runs out gets this much longer

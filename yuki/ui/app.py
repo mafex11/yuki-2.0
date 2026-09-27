@@ -220,6 +220,9 @@ class YukiUi(QObject):
         runtime_signals.asked.connect(self._on_asked)
         runtime_signals.finished.connect(self._on_finished)
         runtime_signals.failed.connect(self._on_failed)
+        withdrawn = getattr(runtime_signals, "withdrawn", None)
+        if withdrawn is not None:
+            withdrawn.connect(self._on_withdrawn)
         runtime_signals.queued.connect(self._on_queued)
         runtime_signals.summarized.connect(self._on_summarized)
         # Moments the screen may have come free for a queued nudge.
@@ -495,6 +498,16 @@ class YukiUi(QObject):
 
     def _on_failed(self, lane_name: str, request_id: int, text: str) -> None:
         self._settle(lane_name, request_id, text, tone="error")
+
+    def _on_withdrawn(self, lane_name: str, request_id: int, text: str) -> None:
+        """A request replaced by the user's newer one: it ends quietly (no error card, no error strip)."""
+        self._acting.discard(request_id)
+        if self._question is not None and self._question[1] == request_id:
+            self._question = None
+        card = self.cards.pop(request_id, None)
+        if card is not None:
+            card.set_body("Cancelled: replaced by your newer request.", tone="reply")
+        self.ui_log.event("settle", id=request_id, lane=lane_name, tone="withdrawn", text=text)
 
     def _settle(self, lane_name: str, request_id: int, text: str, *, tone: str) -> None:
         """Put a closing message where the user is actually looking."""

@@ -53,6 +53,7 @@ from yuki.agent.memory import (
 )
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
+    ALL_TOOL_NAMES,
     ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
@@ -115,6 +116,36 @@ BREAKER_LABEL = "[Yuki's loop breaker, not the user]"
 #: How a correction the user added mid-task reaches the model (:meth:`Agent.steer`):
 #: framed as theirs, so it reads as the user's words and not as a tool's output.
 STEER_LABEL = "[The user added while you were working]"
+
+#: Why a run was stopped (:meth:`Agent.cancel`): the user stopped it, or it was withdrawn because
+#: the user's newer request replaced it (voice: "no, close the tab instead"). A withdrawn run ends
+#: quietly: its caller shows it as cancelled, never as an error, and nothing of it is spoken.
+CANCELLED, WITHDRAWN = "cancelled", "withdrawn"
+
+
+def written_tool_call(text: str, tools: Iterable[str]) -> str | None:
+    """The tool a reply named in the model's own tool-call markup written out as text, else ``None``.
+
+    Seen offline 2026-09-27 (voice v3.9 replays, Sonnet on Bedrock): a response whose stop reason said tool_use
+    held only a text block with ``<invoke name="click">`` and its parameters; the loop took that text for the
+    final answer, and the next requests of the conversation copied it. Parsing the markup's fixed form (the tag
+    and its ``name`` attribute), checked against this agent's real tool names; never a reading of the words.
+    """
+    start = text.find("<invoke")
+    while start >= 0:
+        head = text[start:start + 200]
+        quote = head.find('name="')
+        if quote >= 0:
+            end = head.find('"', quote + 6)
+            name = head[quote + 6:end] if end > quote else ""
+            if name in tools:
+                return name
+        start = text.find("<invoke", start + 7)
+    return None
+
+
+class _StreamCancelled(Exception):
+    """The run was cancelled while the model's response was streaming: the stream is dropped there."""
 
 
 @dataclass
@@ -252,6 +283,8 @@ class Agent:
         self._client = client
         self._client_lock = threading.Lock()
         self._cancelled = threading.Event()
+        #: Why the pending cancel was asked for (:data:`CANCELLED` or :data:`WITHDRAWN`).
+        self.cancel_reason = CANCELLED
         #: Corrections and additions the user made while a request runs
         #: (:meth:`steer`), drained at the next step boundary.
         self._steers: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -588,8 +621,12 @@ class Agent:
         self.logger.log("steer", texts=texts, count=len(texts))
         return [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str = CANCELLED) -> None:
         """Ask the run to stop. Safe to call from any thread, at any time.
+
+        ``reason`` is :data:`CANCELLED` (the user stopped it) or :data:`WITHDRAWN` (a newer
+        request of the user's replaced it): the run ends the same way, the words differ, and the
+        caller reads :attr:`cancel_reason` to show a withdrawn run quietly.
 
         The flag is a :class:`threading.Event`, so setting it needs no lock and
         is visible immediately to the thread driving the generator. That thread
@@ -599,10 +636,13 @@ class Agent:
         tool calls the model had already asked for are answered with a "not run"
         result, because the API insists on one result per call.
 
-        A request or a tool already in flight is not interrupted -- there is no
-        safe way to abort a keystroke halfway -- so cancelling lands at the next
-        checkpoint rather than instantly.
+        A tool already in flight is not interrupted -- there is no safe way to
+        abort a keystroke halfway. A model response that is streaming is dropped
+        at its next event when none of its tools has run yet (the connection is
+        closed, nothing of it is kept), so a withdrawn run frees the lane within
+        a moment instead of after the whole response.
         """
+        self.cancel_reason = WITHDRAWN if reason == WITHDRAWN else CANCELLED
         self._cancelled.set()
 
     @property
@@ -620,6 +660,7 @@ class Agent:
     def run(
         self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None,
         model: str | None = None, thinking: bool | None = None, lean: bool = False,
+        view_hwnd: int | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -643,6 +684,11 @@ class Agent:
                 resume are left out (to-dos, know-how and commitments stay). For a
                 spoken request, chosen by its source, never its words
                 (docs/VOICE.md §7).
+            view_hwnd: Read this window now and attach it to the request, element ids
+                and all, the way the view after actions is attached: for a request
+                about something inside that window (the caller's decision; voice: the
+                talker's ``screen`` mark), so the first model call can click it
+                instead of spending a whole round trip on ``look_at_window``.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -650,6 +696,7 @@ class Agent:
             :class:`~yuki.log.events.Final` or :class:`~yuki.log.events.ErrorEvent`.
         """
         self._cancelled.clear()
+        self.cancel_reason = CANCELLED
         stale = self.take_steers()
         self._pending_answer = None
         self._awaiting_answer = False
@@ -659,6 +706,7 @@ class Agent:
         self._call_history = {}
         self._breaker.reset()
         self._breaker_stop_sent = False
+        self._written_calls = 0
         self._nonce = new_nonce()
         self._confirmed = set()
         self._request_text = request
@@ -691,6 +739,13 @@ class Agent:
             overview, _ = self._capture_overview()
             origin = self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
+            # The window the request is about, read now (v3.9). With thinking off (spoken requests) it goes in
+            # as a look_at_window call already made and its result, the shape the model knows; pasted into the
+            # request instead, Sonnet wrote its first tool call out as text in several offline replays.
+            view = self._request_view(int(view_hwnd)) if view_hwnd else None
+            as_call = view is not None and self._request_thinking is False
+            if view is not None and not as_call:
+                overview = f"{overview}\n\n{view[0]}"
             memory_text, commitments_text = self._memory_context(
                 request, first=self._requests == 1, lean=self._request_lean
             )
@@ -701,12 +756,14 @@ class Agent:
                 origin_text=origin,
                 standing_text=commitments_text,
             )
+            if as_call:
+                self._add_view_call(int(view_hwnd), view[1], overview)
             drive = self._drive()
             for event in drive:
                 if isinstance(event, Final):
                     outcome, reply = "final", event.text
                 elif isinstance(event, ErrorEvent):
-                    outcome = "cancelled" if self._cancelled.is_set() else "error"
+                    outcome = self.cancel_reason if self._cancelled.is_set() else "error"
                     reply = event.text
                 yield event
         except KeyboardInterrupt:
@@ -716,7 +773,7 @@ class Agent:
         except Exception as exc:  # never let a crash escape into the REPL
             message = f"{type(exc).__name__}: {exc}"
             self.logger.error(message, exc=exc)
-            outcome = "cancelled" if self._cancelled.is_set() else "error"
+            outcome = self.cancel_reason if self._cancelled.is_set() else "error"
             reply = message
             yield ErrorEvent(message)
         finally:
@@ -987,7 +1044,13 @@ class Agent:
             # Thinking and the tools that can run early are yielded while the
             # response streams; what comes back is the complete final message.
             turn = _Turn()
-            response = yield from self._request(turn)
+            try:
+                response = yield from self._request(turn)
+            except _StreamCancelled:
+                # Cancelled (or withdrawn) while the response streamed and before any of its tools ran:
+                # the response was dropped unread, so nothing of it goes into the transcript.
+                yield self._cancel_event()
+                return
             self.context.add_assistant(response.content)
 
             stop_reason = getattr(response, "stop_reason", None)
@@ -1088,6 +1151,23 @@ class Agent:
                     "Take it into account, then finish with done.\n"
                     + "\n".join(block["text"] for block in steers)
                 )
+                continue
+            named = written_tool_call(text, self.tool_names or ALL_TOOL_NAMES) if text else None
+            if named and self._written_calls < 2:
+                # A tool call written out as text: nothing ran, and it is no answer. Said so, and one more step.
+                self._written_calls += 1
+                self.logger.log("written_tool_call", tool=named, stop_reason=stop_reason, n=self._written_calls)
+                self.context.add_note(
+                    f"Your last reply wrote a {named} call out as text, so nothing ran and nothing was said to the "
+                    f"user. Make it as a real tool call now (or finish with done if nothing is left to do)."
+                )
+                continue
+            if not text and 0 < self._written_calls < 3:
+                # An empty reply right after it was told its call was written as text: asked once more.
+                self._written_calls += 1
+                self.logger.log("written_tool_call", tool=None, stop_reason=stop_reason, n=self._written_calls)
+                self.context.add_note("Your reply was empty and nothing ran. Make the tool call now as a real tool "
+                                      "call, or finish with done.")
                 continue
             if text:
                 self.logger.final(text)
@@ -1201,7 +1281,13 @@ class Agent:
         )
 
     def _cancel_event(self) -> ErrorEvent:
-        """Record a cancellation in the transcript and build the event for it."""
+        """Record a cancellation (or a withdrawal) in the transcript and build the event for it."""
+        if self.cancel_reason == WITHDRAWN:
+            message = "Withdrawn: replaced by the user's newer request."
+            self.logger.log("withdrawn", message=message)
+            self.context.add_note("The user moved on before that request finished: it was withdrawn in favour of "
+                                  "their newer request. Do not continue it or bring it up.")
+            return ErrorEvent(message)
         message = "Cancelled by the user."
         self.logger.error(message)
         self.context.add_note("The user cancelled that request. Stop and await new instructions.")
@@ -1964,6 +2050,8 @@ class Agent:
                     pending: Any = None
                     live: dict[str, Any] = {}   # the reply / thinking so far, for the chat (stream_partial)
                     for event in stream:
+                        if self._cancelled.is_set() and not turn.handled and pending is None:
+                            raise _StreamCancelled()
                         kind = getattr(event, "type", None)
                         part = stream_partial(event, live)
                         if part is not None:
@@ -1992,6 +2080,11 @@ class Agent:
                 for block in getattr(response, "content", []) or []:
                     if getattr(block, "type", None) == "thinking":
                         yield from self._emit_thinking(block)
+        except _StreamCancelled:
+            latency_ms = (time.perf_counter() - started) * 1000
+            self._model_s += max(latency_ms / 1000 - in_stream_s, 0.0)
+            self.logger.log("stream_cancelled", reason=self.cancel_reason, after_ms=round(latency_ms, 1))
+            raise
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
             self._model_s += max(latency_ms / 1000 - in_stream_s, 0.0)
@@ -2067,6 +2160,45 @@ class Agent:
                 + (f" first_tool={first / 1000:.1f}s" if first is not None else "")
                 + "[/dim]"
             )
+
+    def _request_view(self, hwnd: int) -> tuple[str, str] | None:
+        """The window ``hwnd`` read as the request comes in (one read, element ids usable), or ``None``.
+
+        ``(framed text for the request, the fenced tree alone)``: the first is placed with the request, the
+        second is a ``look_at_window`` result (:meth:`_add_view_call`). Logged as a ``perception`` record of
+        kind ``request_view``; its time counts as ``auto_view_s``. Never raises.
+        """
+        started = time.perf_counter()
+        try:
+            view = self.dispatcher.window_view(hwnd, settle=False)
+        except Exception as exc:  # the window may have gone: the request goes on without it
+            self.logger.log("request_view_skipped", hwnd=hwnd, error=f"{type(exc).__name__}: {exc}")
+            return None
+        finally:
+            self._auto_view_s += time.perf_counter() - started
+        fenced = wrap(view.text, source=f"the window {hwnd} (its on-screen text)", nonce=self._nonce)
+        text = (
+            f"The window in front when they asked, read for you as the request came in "
+            f"({view.elapsed_ms:.0f} ms): its elements are ready to act on, so there is no need to "
+            f"look at it first.\n" + fenced
+        )
+        self.logger.perception(
+            "request_view", size_chars=len(text), elapsed_ms=(time.perf_counter() - started) * 1000,
+            payload={"hwnd": hwnd, "summary": view.summary},
+        )
+        return text, fenced
+
+    def _add_view_call(self, hwnd: int, fenced: str, overview: str) -> None:
+        """Put the window read for the request in as a ``look_at_window`` call already made, with its result."""
+        tool_id = f"toolu_yukiview{self._requests}"
+        self.context.add_assistant([{"type": "tool_use", "id": tool_id, "name": "look_at_window",
+                                     "input": {"hwnd": hwnd}}])
+        self.context.add_tool_results(
+            [self._result_block(tool_id, [{"type": "text", "text": (
+                "Read for you as the request came in (the window in front): its elements are ready to act on.\n"
+                + fenced)}])],
+            overview, tool_names={tool_id: "look_at_window"})
+        self.logger.log("request_view_call", hwnd=hwnd, tool_use_id=tool_id)
 
     # -- the view after actions ----------------------------------------------
 

@@ -100,9 +100,10 @@ def condense(text: str, *, max_sentences: int = 2, max_chars: int = 280) -> tupl
 #: Kinds of item, by what may replace what. A newer item of a job replaces that
 #: job's waiting items of a lower rank (a result makes a pending progress line
 #: pointless; a newer progress line replaces an older one).
-RANKS = {"step": 0, "queued": 0, "say": 1, "ask": 2, "final": 3}
-#: User turns an item may wait through before it is stale (``final`` uses the setting).
-STALE_AFTER = {"step": 1, "queued": 1, "say": 2}
+RANKS = {"step": 0, "queued": 0, "waiting": 0, "say": 1, "ask": 2, "final": 3}
+#: User turns an item may wait through before it is stale (``final`` uses the setting). A "still on it" line
+#: (``waiting``, v3.9) is only worth saying into the silence it was offered for.
+STALE_AFTER = {"step": 1, "queued": 1, "waiting": 1, "say": 2}
 #: Kinds said as soon as the user may be spoken to (no settle, only a short gap after Yuki's speech).
 URGENT = ("final", "ask")
 #: Kinds that are progress of a running task: said only after a real pause in Yuki's speech.

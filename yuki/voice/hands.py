@@ -112,6 +112,12 @@ _FAILED_NOTE = (
     "with the user's request as they asked it and this report as context. If the report says why nothing "
     "more can happen (already at the end), say that and stop."
 )
+#: What the talker reads when a hand's try did not take effect and code handed it to the thinker (v3.9).
+_PASSED_NOTE = (
+    "It did not take effect, so it was handed to the thinker with this report and the window already read; "
+    "the thinker is doing it now and its outcome comes back to you. Say nothing now: no retry, no other hand, no "
+    "\"let me try another way\"."
+)
 _KEYS_NOTE = (
     "The keys went out; this is what the report saw. Say in a few words what it shows happened, never "
     "more than it shows. If it shows the keys did nothing they wanted, say so and hand it to the thinker "
@@ -196,11 +202,14 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Your hand: focus (bring to the front), minimize, maximize, restore or close one whole window. "
             "A window is not a tab: this never changes which tab a browser shows (that is the tab hand). The "
-            "report says whether the window really reached that state. close is what its X button does." + _NOW
+            "report says whether the window really reached that state. close is what its X button does, and "
+            "only when the user asked to close that window (their words in named)." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
             "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "restore", "close"]},
+            "named": {"type": "string",
+                      "description": "close only: the user's own words asking to close this window."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "action", "say_when_done"],
@@ -591,6 +600,24 @@ class Hands:
             note, key = _UNCONFIRMED_NOTE, "not_verified"
         else:
             note, key = _FAILED_NOTE, "failed"
+        if (name in INSTANT_HANDS and not facts.get("refused") and not facts.get("settled")
+                and self.bridge is not None and callable(getattr(self.bridge, "escalate", None))):
+            # Tried and did not take effect (not refused, not "already so"): the thinker gets the same request
+            # now, by code, with this report and the window read; no talker run narrates the failure (v3.9).
+            try:
+                passed = await self.bridge.escalate(params, name, args, report)
+            except Exception as exc:  # noqa: BLE001 - then the talker handles the report as before
+                passed = False
+                if self.log is not None:
+                    self.log.event("hands", op=name, escalate_error=f"{type(exc).__name__}: {exc}")
+            if passed:
+                from pipecat.frames.frames import FunctionCallResultProperties
+
+                if self.log is not None:
+                    self.log.event("hands", op=name, escalated=True, call=params.tool_call_id)
+                await params.result_callback({key: report[:700], "passed_on": True, "how_to_handle_it": _PASSED_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                return
         await params.result_callback({key: report[:700], "how_to_say_it": note})
 
     def _window(self, args: dict[str, Any]) -> int:
@@ -623,7 +650,12 @@ class Hands:
             return None
 
     def _guard_desk(self, name: str) -> None:
-        """Refuse a window hand while the thinker works on the desktop, or after a wrong effect."""
+        """Refuse a window hand while the thinker works on the desktop; refuse any hand after a wrong effect."""
+        if self.halted and name in AUDIO_HANDS:
+            # v3.9: sound hands halt too (live 14:18 a failed stop key was followed by a playpause the talker
+            # chose itself, then a hand-off: three spoken lines for one pause).
+            raise _Refused(f"your last hand did not show the effect it was for ({self.halted}); your hands stay "
+                           f"still until the user speaks again, and the thinker already has it. Nothing was done")
         if name in AUDIO_HANDS:
             return
         busy = self.bridge.desk_job() if self.bridge is not None and hasattr(self.bridge, "desk_job") else None
@@ -642,10 +674,11 @@ class Hands:
         try:
             self._guard_desk(name)
             ok, report, facts = self._act(name, args, facts)
-            if name not in AUDIO_HANDS and not (ok and facts.get("verified") is True):
+            if not (ok and facts.get("verified") is True) and not facts.get("settled"):
                 self.halted = f"{name}: {report[:160]}"
             return ok, report, facts
         except _Refused as exc:
+            facts["refused"] = True  # nothing was done: the talker says why (never handed over by code)
             return False, str(exc), facts
 
     def _act(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
@@ -658,9 +691,18 @@ class Hands:
             before = self._media_status() if key in _TRANSPORT_KEYS else None
             volume = self._volume() if key in _VOLUME_KEYS else None
             want = str(args.get("want") or "").strip().lower() if key == "playpause" else ""
+            if key in _TRANSPORT_KEYS and before is None:
+                # No media session shows what is playing (a video in a browser that just started often has none
+                # yet; live 2026-09-27 14:18 "media: none" while YouTube played): a key could be neither aimed nor
+                # checked, and a blind toggle can undo what they want. Nothing is pressed; the thinker uses the
+                # page's own control (v3.9).
+                facts["verified"] = False
+                return False, ("no media session shows what is playing, so a media key could not be aimed or "
+                               "checked; nothing was pressed"), facts
             if want and before is not None and before[1].lower() == want:
                 # playpause toggles: pressing it on a session already in the state they want undoes it (live, a
                 # "pause" on paused music resumed it and said "Paused."). The session's own status, read first.
+                facts["settled"] = True
                 return True, f"media: {before[0]} is already {before[1]}; nothing was pressed", facts
             facts["sent_at"] = time.monotonic()
             result = self.backend.press(key, times=times)
@@ -686,10 +728,19 @@ class Hands:
             result = self.backend.scroll(x, y, dy=notches if direction == "up" else -notches, expect_hwnd=hwnd)
             ok, report, facts = self._report(result, lead, facts)
             facts["verified"] = _detail(result, "verified")
+            if _detail(result, "at_end") or any(isinstance(x, dict) and x.get("at_end")
+                                                for x in (_detail(result, "scrolls") or [])):
+                facts["settled"] = True  # already at the end: nothing more can happen, nothing to hand over
             return ok, report, facts
         if name == "window":
             hwnd = self._window(args)
             action = str(args.get("action") or "")
+            if action == "close" and not str(args.get("named") or "").strip():
+                # A whole window holds everything in it: closed only when the user asked for exactly that
+                # (live 14:20 the talker offered to close all of Chrome because one tab would not close).
+                raise _Refused("closing a whole window is only for when the user asked to close that window: put "
+                               "their words asking for it in named. Nothing was closed; if a tab would not close, "
+                               "the thinker handles it")
             act = getattr(self.backend, "window_action", None)
             if not callable(act):
                 raise _Refused("this desktop has no window hand")

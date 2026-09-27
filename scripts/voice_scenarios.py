@@ -64,7 +64,7 @@ class Timeline:
                 from pipecat.frames.frames import (
                     BotStartedSpeakingFrame, BotStoppedSpeakingFrame, FunctionCallInProgressFrame,
                     FunctionCallResultFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
-                    TranscriptionFrame,
+                    TranscriptionFrame, TTSSpeakFrame,
                 )
 
                 frame = data.frame
@@ -73,6 +73,8 @@ class Timeline:
                 tl._seen.add(frame.id)
                 if isinstance(frame, TranscriptionFrame):
                     tl.add("user", text=frame.text)
+                elif isinstance(frame, TTSSpeakFrame):
+                    tl.add("yuki_code", text=frame.text)  # words said by code (a done line, a say_first)
                 elif isinstance(frame, LLMFullResponseStartFrame):
                     tl._reply = {"text": ""}
                     tl.add("reply_start")
@@ -405,6 +407,127 @@ def _settings_desk(timeline: Timeline) -> Any:
     return desk
 
 
+def _youtube_desk(timeline: Timeline) -> Any:
+    """Chrome on YouTube, as in the live session of 2026-09-27 14:16-14:22 (v3.9). Test code only.
+
+    Two tabs: mail, and YouTube's home page with a list of videos (the "Make Up My Mind" mix among them). A video
+    link clicked opens its watch page in that tab and it plays; the player's own Play/Pause button and the k key
+    toggle it; Ctrl+W and the tab hand close tabs as Chrome does. Like live, the media session does not show the
+    video playing ("media: none"), so the media keys cannot be aimed or checked and do nothing to it.
+    """
+    from yuki.voice.offline import StubResult, TabsDesk
+
+    home = ["Mix - Make Up My Mind - Stellar Blade: BLOOD RAIN Official Trailer OST",
+            "Joji - Glimpse of Us (Official Video)", "lofi hip hop radio - beats to relax/study to",
+            "Stellar Blade OST - Full Soundtrack", "Joji - SLOW DANCING IN THE DARK (Official Video)"]
+
+    class YouTubeDesk(TabsDesk):
+        def __init__(self) -> None:
+            super().__init__(timeline=timeline, action_delay_s=0.05)
+            self.tabs = [
+                {"name": "Inbox (12) - Corvana Mail", "url": "https://mail.google.com/mail/u/0/#inbox",
+                 "scroll": 0.0, "titled_at": 0.0, "id": "42.2492528.4.0", "page": ("mail", "")},
+                {"name": "YouTube", "url": "https://www.youtube.com/", "scroll": 0.0, "titled_at": 0.0,
+                 "id": "42.2492528.4.1", "page": ("home", "")},
+                {"name": "YouTube", "url": "https://www.youtube.com/", "scroll": 0.0, "titled_at": 0.0,
+                 "id": "42.2492528.4.2", "page": ("home", "")},
+            ]
+            self.selected = 2
+            self.state[self.SPOTIFY] = "closed"  # live: Chrome in front, no Spotify
+            self.playing = False
+            self.media_visible = False
+            self._links: list[tuple[tuple[int, int], str, str]] = []
+
+        def _page(self) -> tuple[str, str]:
+            return self.tabs[self.selected].get("page", ("other", "")) if self.tabs else ("none", "")
+
+        def activity_facts(self) -> dict[str, Any]:
+            facts = super().activity_facts()
+            kind, what = self._page()
+            facts["media"] = ([{"app_id": "Chrome", "status": "playing" if self.playing else "paused", "title": what,
+                                "current": True}] if self.media_visible and kind == "watch" else [])
+            return facts
+
+        def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
+            tree = super().get_window_tree(hwnd, **kw)
+            if int(hwnd) != self.CHROME or not self.tabs:
+                return tree
+            elements = tree["elements"]
+            self._links = []
+            kind, what = self._page()
+
+            def add(role: str, name: str, center: tuple[int, int], action: str, arg: str = "") -> None:
+                x, y = center
+                elements.append({"id": len(elements), "role": role, "name": name, "depth": 6,
+                                 "bounds": (x - 150, y - 40, x + 150, y + 40), "center": center,
+                                 "is_interactive": True})
+                self._links.append((center, action, arg))
+
+            if kind == "watch":
+                add("Button", "Pause (k)" if self.playing else "Play (k)", (200, 980), "toggle")
+                for i, name in enumerate(n for n in home if n != what):
+                    add("Hyperlink", name, (1600, 300 + 150 * i), "watch", name)
+            elif kind in ("home", "results"):
+                videos = home if kind == "home" else [n for n in home if what.lower().split()[0] in n.lower()] + home
+                for i, name in enumerate(dict.fromkeys(videos)):
+                    add("Hyperlink", name, (700 + 400 * (i % 2), 300 + 250 * (i // 2)), "watch", name)
+            tree["first_pass_elements"] = len(elements)
+            return tree
+
+        def click(self, x: int, y: int, **kwargs: Any) -> StubResult:
+            hit = next(((c, a, n) for c, a, n in self._links if abs(c[0] - int(x)) <= 150 and abs(c[1] - int(y)) <= 40),
+                       None)
+            if hit is None or self.front != self.CHROME:
+                return super().click(x, y, **kwargs)
+            result = self._act("click", "", x, y, **kwargs)
+            _c, action, name = hit
+            tab = self.tabs[self.selected]
+            if action == "toggle":
+                self.playing = not self.playing
+                result.summary = f"clicked Button at ({x},{y}); the player is now {'playing' if self.playing else 'paused'}"
+                return result
+            before = tab["name"]
+            tab.update(name=f"{name} - YouTube", url="https://www.youtube.com/watch?v=" + str(abs(hash(name)) % 10**6),
+                       page=("watch", name), titled_at=0.0)
+            self.playing = True
+            result.summary = (f'clicked Hyperlink "{name}" at ({x},{y}); the page changed from "{before}" to '
+                              f'"{tab["name"]}" (youtube.com/watch)')
+            return result
+
+        def open_url(self, url: str, *, app: str | None = None, **kw: Any) -> StubResult:
+            time.sleep(2.4)  # live 14:17:54-57: an open_url in Chrome took 2.5 s (a stand-in for its duration)
+            result = super().open_url(url, app=app, **kw)
+            tab = self.tabs[-1]
+            tab["id"] = f"42.2492528.4.{self._next_id}"
+            self._next_id += 1
+            if "search_query=" in url:
+                query = url.split("search_query=", 1)[1].split("&")[0].replace("+", " ")
+                tab.update(name=f"{query} - YouTube", page=("results", query))
+            elif "youtube" in url:
+                tab.update(page=("home", ""))
+            return result
+
+        def _keys(self, keys: tuple[str, ...], times: int = 1) -> str:
+            kind, _what = self._page()
+            if keys in (("k",), ("space",)) and kind == "watch" and self.front == self.CHROME:
+                for _ in range(times):
+                    self.playing = not self.playing
+                return f"; the player is now {'playing' if self.playing else 'paused'}"
+            if keys in (("playpause",), ("stop",)):
+                return ""  # no media session sees the video: the key goes nowhere (as live)
+            if keys == ("ctrl", "w") and self.tabs and kind == "watch":
+                self.playing = False
+            return super()._keys(keys, times)
+
+        def tab(self, hwnd: int, tab_id: str, action: str) -> StubResult:
+            i = next((k for k, t in enumerate(self.tabs) if t["id"] == str(tab_id).strip("[]")), None)
+            if action == "close" and i is not None and self.tabs[i].get("page", ("",))[0] == "watch":
+                self.playing = False
+            return super().tab(hwnd, tab_id, action)
+
+    return YouTubeDesk()
+
+
 def _settled(conv_box: dict[str, Any], quiet_s: float = 1.5) -> Any:
     """A condition: nothing is being said or owed (no job open, nothing held, no tool in flight) for ``quiet_s``."""
     state = {"since": None}
@@ -704,6 +827,39 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         lines = [ScriptLine(clip("p_hello"), "p_hello", after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
             for n in ("p_bt_open", "p_bt_check", "p_display", "p_twostep", "p_lofi", "p_notes", "p_time", "p_thanks")]
+    elif scenario == "sync927":
+        # v3.9, the user's session of 2026-09-27 14:16-14:22 on a YouTube stub: play a song (thinker), the bare
+        # name, stop the video with no media session (the keys go nowhere), close the tab, click a mix that is on
+        # the screen, then a task with a question and a replacing correction said while it runs, thanks.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_youtube_desk(timeline))
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [
+            ScriptLine(clip("y_play"), "y_play", after_s=1.0),
+            ScriptLine(clip("y_name"), "y_name", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_pause"), "y_pause", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_close"), "y_close", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_click"), "y_click", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_lofi"), "y_lofi", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_status"), "y_status", after_s=0.2, wait_for=reply_done()),
+            ScriptLine(clip("y_replace"), "y_replace", after_s=0.2, wait_for=reply_done()),
+            ScriptLine(clip("y_thanks"), "y_thanks", after_s=1.0, wait_for=settled()),
+        ]
+    elif scenario == "screen927":
+        # v3.9, the user's addition about 14:16: "open YouTube, scroll down, scroll down, then play Make Up My Mind"
+        # must click the video on that page (no new tab, no search), and a request two visible items fit ("the Joji
+        # one", two Joji videos on the page) must be asked about, then done on the answer.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_youtube_desk(timeline))
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [
+            ScriptLine(clip("z_open"), "z_open", after_s=1.0),
+            ScriptLine(clip("z_scroll"), "z_scroll1", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("z_scroll"), "z_scroll2", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("z_scroll"), "z_scroll3", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_play"), "z_play", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("z_joji"), "z_joji", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("z_glimpse"), "z_glimpse", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_thanks"), "z_thanks", after_s=1.0, wait_for=settled()),
+        ]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -772,7 +928,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
-    bridge = VoiceBridge(runtime, vlog, foreground=lambda: None, settings=settings,
+    front = (lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") else (lambda: None)
+    bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
                          **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
     box["bridge"] = bridge
     if args.dump_mouth:
@@ -903,7 +1060,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
-    if scenario in ("latency926", "tabs926", "clarify", "parallel927"):
+    if scenario in ("latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -946,6 +1103,10 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
 
         rows = list(csv.DictReader(settings.requests_csv_path.open(encoding="utf-8")))
         report["brain_cost_usd"] = round(sum(float(r.get("cost_usd") or 0) for r in rows), 4)
+        # every thinker request: its lane, model calls, tools, time and how it ended (v3.9 measurements)
+        report["brain_requests"] = [{"lane": r.get("lane"), "request": (r.get("request") or "")[:70],
+                                     "calls": r.get("calls"), "tool_calls": r.get("tool_calls"),
+                                     "wall_s": r.get("wall_s"), "outcome": r.get("outcome")} for r in rows]
     except OSError:
         pass
     (args.out / f"{scenario}.json").write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str),
@@ -982,7 +1143,7 @@ def summary(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
-                                         "latency926", "tabs926", "clarify", "parallel927", "all"))
+                                         "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

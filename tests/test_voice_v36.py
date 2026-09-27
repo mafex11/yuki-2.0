@@ -352,8 +352,9 @@ def test_one_actor_the_talkers_window_hands_wait_while_the_thinker_runs() -> Non
         hands.bridge = bridge
         ok, report, _facts = hands._run("window", {"window": 1, "action": "minimize"})
         assert not ok and "thinker is working on the desktop" in report
-        ok, _report, _facts = hands._run("media_key", {"key": "playpause"})  # sound touches no window
-        assert ok
+        ok, report, _facts = hands._run("media_key", {"key": "playpause"})  # sound touches no window
+        # not refused by the one-actor rule (v3.9: with no media session to aim at, nothing is pressed)
+        assert "thinker is working" not in report
 
     asyncio.run(main())
 
@@ -416,10 +417,10 @@ def test_action_steps_are_never_narrated_and_passed_steps_are_dropped() -> None:
         rt.started.emit("worker", job, "x")
         rt.tool_called.emit("worker", job, "look_at_window", {"hwnd": 5})
         await _settle()
-        assert [i.kind for i in gate.pending] == ["step"]  # waiting for a pause in Yuki's speech
+        assert gate.pending == []  # v3.9: no line per step; one "still on it" line only after real silence
         rt.tool_called.emit("worker", job, "open_url", {"url": "ms-settings:bluetooth"})
         await _settle()
-        assert gate.pending == []  # past the looking step; and an action is never a progress line
+        assert gate.pending == []  # and an action is never a progress line
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -439,7 +440,8 @@ def test_the_same_step_again_keeps_its_waiting_line() -> None:
         rt.tool_called.emit("worker", job, "activity", {"since": "2026-09-27"})
         rt.tool_called.emit("worker", job, "activity", {"since": "2026-09-26"})
         await _settle()
-        assert [i.kind for i in gate.pending] == ["step"]
+        assert gate.pending == []  # v3.9: steps are not spoken; the talker's thinker line names the step
+        assert "looking at how your time went" in (bridge.work_line() or "")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

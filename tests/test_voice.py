@@ -498,9 +498,13 @@ def test_steps_come_from_real_tool_calls_paced_by_activity() -> None:
             rt.tool_called.emit("worker", job, name, inp)
         await _settle()
         steps = [r for r, _ in params.results if "progress" in r]
-        # the same tool twice is one step, note_to_self is not a step, and at most two lines
-        assert [s["progress"] for s in steps] == ["Looking at how your time went", "Remembering"]
-        assert steps[0]["about"] == "since: 2026-09-25" and steps[1]["about"] == "query: calls today"
+        # v3.9: no spoken line per step (one "still on it" line only after real silence, tests/test_voice_v39.py);
+        # the steps are real tool calls, kept for the talker's thinker line and "how's it going?"
+        assert steps == []
+        line = bridge.work_line() or ""
+        assert f"task {job}" in line and "reading a window" in line.lower()
+        log = bridge._jobs[job].log.render("running")
+        assert "Looking at how your time went" in log and "Remembering" in log and "note_to_self" not in log
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

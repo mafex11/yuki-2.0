@@ -290,7 +290,10 @@ class Settings:
             progress line may start.
         voice_stale_turns: User turns a waiting result may sit through before it
             is folded into the conversation silently instead of spoken.
-        voice_progress_lines: Most spoken progress lines per task.
+        voice_progress_lines: Most spoken "still on it" lines per task (v3.9: said only into silence).
+        voice_wait_line_s / voice_wait_again_s: Seconds of silence (nobody speaking) before a running
+            task's one "still on it" line, and before a second one (v3.9; intermediate chatter is
+            never spoken otherwise, and the outcome is said once).
         voice_result_sentences / voice_result_chars: How much of a result is
             spoken at first (the rest waits for "want the rest?").
         voice_brain_effort: The brain's ``output_config.effort`` for requests
@@ -390,6 +393,8 @@ class Settings:
     voice_cooldown_s: float = 1.5
     voice_stale_turns: int = 3
     voice_progress_lines: int = 2
+    voice_wait_line_s: float = 6.0
+    voice_wait_again_s: float = 15.0
     voice_result_sentences: int = 2
     voice_result_chars: int = 280
     voice_brain_effort: str = "low"

@@ -73,6 +73,9 @@ class WindowHost(QObject):
         rt.asked.connect(lambda lane, job, q: self.emit({"type": "asked", "job": job, "question": q}))
         rt.finished.connect(lambda lane, job, text: self.emit({"type": "finished", "job": job, "text": text}))
         rt.failed.connect(lambda lane, job, text: self.emit({"type": "failed", "job": job, "text": text}))
+        withdrawn = getattr(rt, "withdrawn", None)
+        if withdrawn is not None:   # replaced by a newer request: shown quietly cancelled, not as an error
+            withdrawn.connect(lambda lane, job, text: self.emit({"type": "withdrawn", "job": job, "text": text}))
         rt.summarized.connect(self._on_summarized)
         rt.handed_off.connect(lambda src, dst, _w: self.emit({"type": "handed_off", "from_job": src, "to_job": dst}))
         voice = ui.voice

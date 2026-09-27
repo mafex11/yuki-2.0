@@ -134,17 +134,52 @@ TAB_ACTIONS = ("select", "close")
 
 
 def _close_control(automation: Any, element: Any) -> Any:
-    """The TabItem's own close control: its single Button child. ``None`` unless there is exactly one."""
+    """The TabItem's own close control: its Button child at the tab's trailing edge. ``None`` if unsure.
+
+    One Button child is that control. A tab playing sound has a second one, the browser's sound indicator
+    (live 2026-09-27 14:18 and 14:19 both closes of a playing YouTube tab were refused as "no single close
+    control"): the close control is the one that sits last along the tab, the right-most (measured pixels, never
+    its localized name). With several buttons and no positions to tell them apart, nothing is chosen.
+    """
+    return pick_close_control(_button_children(automation, element))
+
+
+def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int, int, int, int] | None]]:
+    """``(element, (left, top, right, bottom) or None)`` of a TabItem's Button children, in tree order."""
+    from yuki.perception.tabs import _P_BOUNDING_RECT, _rect
+
     request = automation.CreateCacheRequest()
     request.AddProperty(_P_CONTROL_TYPE)
+    request.AddProperty(_P_BOUNDING_RECT)
     request.TreeScope = _TREE_SCOPE_ELEMENT
     try:
         children = element.FindAllBuildCache(_TREE_SCOPE_CHILDREN, automation.ControlViewCondition, request)
         items = [children.GetElement(i) for i in range(children.Length)]
-        buttons = [c for c in items if int(c.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0) == _BUTTON]
+        out: list[tuple[Any, tuple[int, int, int, int] | None]] = []
+        for c in items:
+            if int(c.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0) != _BUTTON:
+                continue
+            try:
+                rect = _rect(c.GetCachedPropertyValue(_P_BOUNDING_RECT))
+            except Exception:  # noqa: BLE001 - no position: still a candidate when it is the only one
+                rect = None
+            out.append((c, rect if rect and rect[2] > rect[0] and rect[3] > rect[1] else None))
+        return out
     except Exception:  # noqa: BLE001 - a tab that went away mid-read
+        return []
+
+
+def pick_close_control(buttons: list[tuple[Any, Any]]) -> Any:
+    """The close control among a tab's buttons: the only one, else the right-most by its on-screen box.
+
+    ``buttons`` are ``(element, (left, top, right, bottom) or None)``. ``None`` when there are none, or several
+    without boxes to tell them apart.
+    """
+    if len(buttons) == 1:
+        return buttons[0][0]
+    if len(buttons) < 2 or any(r is None for _b, r in buttons):
         return None
-    return buttons[0] if len(buttons) == 1 else None
+    return max(buttons, key=lambda br: br[1][2])[0]
 
 
 def _invoke(element: Any, module: Any) -> bool:

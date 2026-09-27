@@ -184,6 +184,8 @@ def collapsed_pair(record: RequestRecord) -> tuple[str, str]:
     reply = cut(record.reply) or "(no reply)"
     if record.outcome == "cancelled":
         reply = f"(cancelled) {reply}"
+    elif record.outcome == "withdrawn":
+        reply = f"(withdrawn: the user's newer request replaced it) {reply}"
     elif record.outcome in ("error", "abandoned"):
         reply = f"(ended without finishing: {record.outcome}) {reply}"
     actions = [" ".join(line.split()) for line in record.actions if str(line).strip()]
