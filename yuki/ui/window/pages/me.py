@@ -29,10 +29,11 @@ from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
     Avatar,
     Divider,
-    Glass,
+    Masonry,
+    Card,
     ItemRow,
     Panel,
-    Pill,
+    Button,
     Shimmer,
     page_header,
     text_label,
@@ -85,7 +86,7 @@ def _more(t: Theme, panel: Panel, rows: list[QWidget], limit: int, total: int) -
     """Rows past ``limit`` start hidden; the panel's "All N" pill shows them (and "Fewer" hides them)."""
     if total <= limit:
         return
-    pill = Pill(t, f"All {total}", style="quiet", size="small")
+    pill = Button(t, f"All {total}", style="outline", size="small")
     for r in rows[limit:]:
         r.setVisible(False)
 
@@ -127,7 +128,6 @@ def _list_panel(t: Theme, title: str, subtitle: str, glyph: str, items: list[Ite
 def _people(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
     panel = Panel(t, "People", "Friends, family and colleagues, and what Yuki knows about each.", glyph="people")
     panel.body.setSpacing(SPACE["s"])
-    palette = t.series
     # the ones the user told Yuki about first, then the expanded / composing examples, then the rest
     order = sorted(view.people, key=lambda i: (0 if i.ref == expand else 1 if i.ref == compose else
                                                2 if "you" in i.tags else 3, -i.since))
@@ -140,8 +140,7 @@ def _people(t: Theme, view: MeView, expand: str | None, compose: str | None, act
         lay.setSpacing(SPACE["s"])
         if n:
             lay.addWidget(Divider(t))
-        color = palette[sum(map(ord, it.title)) % len(palette)]
-        lay.addWidget(_row(t, it, expand, compose, act, leading=Avatar(t, it.title, color)))
+        lay.addWidget(_row(t, it, expand, compose, act, leading=Avatar(t, it.title)))
         panel.body.addWidget(box)
         rows.append(box)
     _more(t, panel, rows, 7, len(order))
@@ -179,9 +178,9 @@ def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
                       placeholder="Say what was really said, or what's true", pending=_PENDING.get(it.ref))
         row.correct.connect(lambda _ref, words, item=it: act.correct_item(item, words))
         row.forget.connect(lambda _ref, item=it: act.forget_item(item))
-        right = Pill(t, "That's right", glyph="check", style="quiet", size="small")
+        right = Button(t, "That's right", glyph="check", style="outline", size="small")
 
-        def confirmed(_c: bool = False, item: Item = it, pill: Pill = right) -> None:
+        def confirmed(_c: bool = False, item: Item = it, pill: Button = right) -> None:
             act.confirm_item(item)
             pill.setText("Confirmed")
             pill.setEnabled(False)
@@ -213,35 +212,28 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
     col.setSpacing(SPACE["l"])
     when = f"updated {day_label(view.portrait_at)} {hm(view.portrait_at)}" if view.portrait_at else "not written yet"
-    refresh = Pill(t, f"Portrait {when}", glyph="history", style="quiet")
+    refresh = Button(t, f"Portrait {when}", glyph="history", style="outline", size="small")
     refresh.setToolTip("Rebuild it now from what Yuki has seen")
     refresh.clicked.connect(act.refresh_portrait)
     col.addWidget(page_header(
         t, "Me", "What Yuki understands about you. Tap Why? to see where something came from, or Not right to "
                  "fix it in your own words.", [refresh]))
     if view.questions_open:
-        banner = Glass(t, level="raised", radius=20, padding=SPACE["m"], tint=_soft(t.kind("question"), t))
+        banner = Card(t, padding=SPACE["l"])
         row = QHBoxLayout()
         row.setSpacing(SPACE["s"])
         row.addWidget(text_label(t, "Yuki has " + ("a question" if view.questions_open == 1 else
                                                    f"{view.questions_open} questions") +
-                                 " about people it doesn't know yet.", "body", "text"))
-        row.addStretch(1)
-        go = Pill(t, "Answer on the Yuki page", glyph="next", style="tinted", tint=t.kind("question"), size="small")
+                                 " about people it doesn't know yet.", "body", "text", wrap=True), 1)
+        go = Button(t, "Answer on the Yuki page", glyph="next", style="default", size="small")
         go.clicked.connect(lambda: act.navigate("yuki"))
         row.addWidget(go)
         banner.body.addLayout(row)
         col.addWidget(banner)
 
-    grid = QHBoxLayout()
-    grid.setSpacing(SPACE["l"])
-    col.addLayout(grid)
-    left = QVBoxLayout()
-    left.setSpacing(SPACE["l"])
-    right = QVBoxLayout()
-    right.setSpacing(SPACE["l"])
-    grid.addLayout(left, 1)
-    grid.addLayout(right, 1)
+    grid = QWidget(page)
+    cards = Masonry(grid, columns=2, spacing=SPACE["l"], min_col=380)   # one column in a narrow window
+    col.addWidget(grid)
     left_parts = [
         lambda: _list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
                             expand, compose, act, limit=3),
@@ -257,23 +249,32 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
         lambda: _unsure(t, view, act),
     ]
     columns: list[list] = []
-    for lay, parts in ((left, left_parts), (right, right_parts)):
+    for column, parts in enumerate((left_parts, right_parts)):
         later: list = []
         for i, make in enumerate(parts):
             if i == 0 or not progressive:
-                lay.addWidget(make())
-                continue
-            holder = Shimmer(t, rows=3, height=150, parent=page)
-            lay.addWidget(holder)
-
-            def fill(make=make, holder=holder, lay=lay) -> None:
                 panel = make()
-                lay.replaceWidget(holder, panel)
-                holder.hide()
-                holder.deleteLater()
+                panel.setParent(grid)
+                cards.add(panel, column)
+                continue
+            # a holder keeps the card's place in the layout: the skeleton now, the card when it is built
+            holder = QWidget(grid)
+            hold = QVBoxLayout(holder)
+            hold.setContentsMargins(0, 0, 0, 0)
+            skeleton = Shimmer(t, rows=3, height=150, parent=holder)
+            hold.addWidget(skeleton)
+            cards.add(holder, column)
+
+            def fill(make=make, holder=holder, hold=hold, skeleton=skeleton) -> None:
+                panel = make()
+                panel.setParent(holder)
+                hold.addWidget(panel)
+                skeleton.hide()
+                skeleton.deleteLater()
+                holder.updateGeometry()
+                cards.invalidate()
 
             later.append(fill)
-        lay.addStretch(1)
         columns.append(later)
     col.addStretch(1)
     # both columns fill in together, top first
@@ -288,10 +289,3 @@ def _todo_list(t: Theme, view: MeView, act: Actions) -> Panel:
 
     return todos_panel(t, list(getattr(view, "todos", []) or []), act)
 
-
-def _soft(c, t: Theme):
-    from PySide6.QtGui import QColor
-
-    s = QColor(c)
-    s.setAlphaF(0.10 if not t.dark else 0.14)
-    return s

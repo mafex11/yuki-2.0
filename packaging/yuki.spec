@@ -38,9 +38,7 @@ vtuple = tuple(parts[:4])
 
 # -- what goes in ---------------------------------------------------------------------------------
 
-# Development-only harnesses that pull QtQuick / QtWebEngine (window tech benchmarks).
-DEV_ONLY = {"yuki.ui.window.measure"}
-hiddenimports = [m for m in collect_submodules("yuki") if m not in DEV_ONLY]
+hiddenimports = collect_submodules("yuki")
 hiddenimports += collect_submodules("winrt")              # namespace packages (media sessions)
 hiddenimports += collect_submodules("comtypes.gen")       # pre-generated UIAutomation wrappers
 hiddenimports += collect_submodules("uiautomation")
@@ -55,7 +53,7 @@ hiddenimports += collect_submodules("sentencepiece")   # the embedder's 45 MB to
 hiddenimports += ["win32timezone", "pythoncom", "pywintypes", "win32com.client", "anthropic.lib.bedrock"]
 
 datas = []
-datas += collect_data_files("yuki", includes=["**/*.toml", "**/*.qsb", "**/*.frag", "**/*.vert"])
+datas += collect_data_files("yuki", includes=["**/*.toml"])   # no shaders since the flat UI (2026-09-27)
 datas += collect_data_files("pipecat", includes=["**/*.onnx", "**/*.json", "**/*.txt"])
 datas += collect_data_files("faster_whisper")              # its Silero VAD onnx
 datas += collect_data_files("sherpa_onnx")
@@ -97,8 +95,7 @@ QT_UNUSED = [
 ]
 EXCLUDES = QT_UNUSED + [
     "tkinter", "_tkinter", "pytest", "_pytest", "IPython", "matplotlib", "numba", "llvmlite", "resampy",
-    "onnxruntime.transformers", "onnxruntime.quantization", "onnxruntime.tools", "yuki.ui.window.measure",
-    "PyInstaller",
+    "onnxruntime.transformers", "onnxruntime.quantization", "onnxruntime.tools", "PyInstaller",
 ]
 
 a = Analysis(                                     # noqa: F821

@@ -16,13 +16,14 @@ from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.glass import paint_glass
-from yuki.ui.window.theme import SPACE, Theme, css, font
-from yuki.ui.window.widgets import Glass, Pill, page_header, text_label
+from yuki.ui.window.paint import paint_ring, paint_surface
+from yuki.ui.window.theme import RADIUS, SPACE, Theme, css, font
+from yuki.ui.window.widgets import Button, Card, page_header, text_label
 
 
 class _InputPill(QWidget):
-    """A glass pill around a multi-line input (Enter sends, Shift+Enter adds a line) and a send button."""
+    """shadcn's Textarea: a bordered box around a multi-line input (Enter sends, Shift+Enter adds a line) with the
+    send button inside it, bottom right, and a subtle focus ring."""
 
     def __init__(self, t: Theme, act: Actions) -> None:
         super().__init__()
@@ -31,7 +32,7 @@ class _InputPill(QWidget):
         self.t = t
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         row = QHBoxLayout(self)
-        row.setContentsMargins(20, 10, 8, 10)
+        row.setContentsMargins(14, 10, 8, 8)
         row.setSpacing(SPACE["s"])
         self.edit = AskInput()
         self.edit.setFont(font("body"))
@@ -45,7 +46,8 @@ class _InputPill(QWidget):
         self.edit.wants_height.connect(lambda h: (self.edit.setMaximumHeight(h), self.edit.setMinimumHeight(h)))
         self.edit.setMinimumHeight(self.edit.preferred_height())
         row.addWidget(self.edit, 1, Qt.AlignmentFlag.AlignVCenter)
-        self.send = Pill(t, glyph="send", style="accent")
+        self.edit.installEventFilter(self)
+        self.send = Button(t, glyph="send", style="default", size="small")
         self.send.setToolTip("Send (Enter)")
         row.addWidget(self.send, 0, Qt.AlignmentFlag.AlignBottom)
         self.act = act
@@ -58,10 +60,24 @@ class _InputPill(QWidget):
             self.act.submit(text)
             self.edit.clear()
 
+    def eventFilter(self, obj: object, ev: object) -> bool:  # noqa: D102 - the ring follows the keyboard
+        from PySide6.QtCore import QEvent
+
+        if ev.type() in (QEvent.Type.FocusIn, QEvent.Type.FocusOut):
+            self.update()
+        return False
+
     def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtGui import QColor
+
         p = QPainter(self)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, min(26.0, r.height() / 2), self.t.level("control"), shadow=False, painted=True)
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        focused = self.edit.hasFocus()
+        paint_surface(p, r, RADIUS["card"], self.t.level("input"), border=QColor("#52525b") if focused else None)
+        if focused:
+            ring = QColor(self.t.ring)
+            ring.setAlphaF(0.35)
+            paint_ring(p, r, RADIUS["card"], ring, 2.0)
         p.end()
 
 
@@ -73,8 +89,8 @@ def build(t: Theme, model: Any, *, act: Actions = NOOP, connected: bool = True) 
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
     col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
-    col.setSpacing(SPACE["m"])
-    stop = Pill(t, "Stop", glyph="close", style="danger", size="small")
+    col.setSpacing(SPACE["l"])
+    stop = Button(t, "Stop", glyph="close", style="destructive", size="small")
     stop.setToolTip("Stop what Yuki is doing (Alt+Shift+X)")
     stop.clicked.connect(act.cancel)
     stop.setVisible(False)
@@ -83,7 +99,7 @@ def build(t: Theme, model: Any, *, act: Actions = NOOP, connected: bool = True) 
     if not connected:
         note = "Yuki isn't running right now, so it can't answer. Start it from the Start menu and this fills in."
     col.addWidget(page_header(t, "Chat", note, [stop]))
-    box = Glass(t, level="regular", radius=26, padding=SPACE["xs"])   # frosted panel glass: text reads over it
+    box = Card(t, padding=SPACE["xs"])
     thread = ChatThreadView(model, lambda: t, max_bubble=620)
     thread.reply_nudge.connect(act.reply_nudge)
     box.body.addWidget(thread)
@@ -92,7 +108,7 @@ def build(t: Theme, model: Any, *, act: Actions = NOOP, connected: bool = True) 
     field.setEnabled(connected)
     col.addWidget(field)
     hint = text_label(t, "Enter sends · Shift+Enter for a new line · Alt+Shift+X stops what Yuki is doing",
-                      "caption", "text_3")
+                      "caption", "text_2", wrap=True)
     hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
     col.addWidget(hint)
 

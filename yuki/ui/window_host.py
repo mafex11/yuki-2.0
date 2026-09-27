@@ -10,7 +10,7 @@
   user typed (:meth:`user_message`, :meth:`user_answer`). The Alt+Shift overlay
   shows this thread; the window keeps a replica over the pipe;
 * serves the window's pipe (:mod:`yuki.ui.window_ipc`): chat, voice settings,
-  model and effort, the glass settings, live state;
+  model and effort, the UI settings, live state;
 * starts the window as its own short-lived process when the tray icon is
   clicked (``pythonw -m yuki.ui.window``), or brings the running one forward.
   Closed, the window costs this process nothing.
@@ -58,6 +58,10 @@ class WindowHost(QObject):
         rt.started.connect(self._on_started)
         rt.tool_called.connect(self._on_tool_called)
         rt.tool_finished.connect(self._on_tool_finished)
+        labelled = getattr(rt, "tool_labelled", None)
+        if labelled is not None:
+            labelled.connect(lambda lane, job, name, label: self.emit({"type": "tool_label", "job": job, "name": name,
+                                                                        "label": label}))
         helper_step = getattr(rt, "helper_step", None)
         if helper_step is not None:
             helper_step.connect(self._on_helper_step)
@@ -238,7 +242,7 @@ class WindowHost(QObject):
         return box.get("value")
 
     def state(self) -> dict[str, Any]:
-        """What the window mirrors: voice, model, effort, the glass setting (GUI thread)."""
+        """What the window mirrors: voice, model, effort (GUI thread)."""
         ui = self.ui
         voice = ui.voice
         out: dict[str, Any] = {
@@ -312,7 +316,7 @@ class WindowHost(QObject):
             return {"effort": self._on_gui(lambda: ui.set_effort(str(req.get("effort") or "")))}
         if op == "ui_settings":
             def reload() -> None:
-                from yuki.ui.glass import reload_appearance
+                from yuki.ui.surface import reload_appearance
 
                 reload_appearance()
                 keys = getattr(ui, "reload_hotkeys", None)

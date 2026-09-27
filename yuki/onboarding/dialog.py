@@ -1,4 +1,4 @@
-"""The first-run setup dialog: four short steps in one calm dark window.
+"""The first-run setup dialog: four short steps in one flat dark window (shadcn's zinc dark).
 
 1. AI model (required): Anthropic API key (default) or AWS Bedrock + region, optional Test.
 2. Voice (optional): Deepgram and ElevenLabs keys, or "Skip voice for now".
@@ -9,8 +9,8 @@
 Every write goes through a parameter (``env``, ``local_dir``, ``memory_dir``) so
 tests and trial runs point at scratch locations. Slow work (the key test, the
 download) runs on plain threads and reports back through queued Qt signals.
-Colours and fonts are copied from ``yuki.ui.window.theme`` (dark) rather than
-imported, so this window does not depend on the UI package.
+Colours and fonts are copied from ``yuki.ui.window.theme`` rather than imported,
+so this window does not depend on the UI package.
 """
 
 from __future__ import annotations
@@ -42,53 +42,56 @@ from yuki.onboarding import consent as consent_mod
 from yuki.onboarding import prefs
 from yuki.onboarding.envvars import UserEnv
 
-# -- look (dark tokens from yuki.ui.window.theme) ----------------------------------------------
+# -- look (shadcn zinc dark, the tokens of yuki.ui.window.theme) ------------------------------------------
 
-BG = "#15171d"
-PANEL = "#1d2028"
-FIELD = "#0f1115"
-LINE = "rgba(255,255,255,0.10)"
-TEXT = "#f2f4f8"
-MUTED = "rgba(242,244,248,0.62)"
-ACCENT = "#5d9bff"
-ACCENT_SOFT = "rgba(93,155,255,0.20)"
-GOOD = "#76d69e"
-BAD = "#ff7b7b"
-FONT = '"Segoe UI Variable Text", "Segoe UI"'
-FONT_DISPLAY = '"Segoe UI Variable Display", "Segoe UI"'
+BG = "#09090b"
+PANEL = "#09090b"
+FIELD = "#09090b"
+LINE = "#27272a"
+MUTED_BG = "#27272a"
+TEXT = "#fafafa"
+MUTED = "#a1a1aa"
+PRIMARY = "#fafafa"
+PRIMARY_FG = "#18181b"
+RING = "#d4d4d8"
+ACCENT = PRIMARY   # links and the progress bar: monochrome
+GOOD = "#22c55e"
+BAD = "#ef4444"
+FONT = '"Inter", "Segoe UI Variable Text", "Segoe UI"'
+FONT_DISPLAY = '"Inter", "Segoe UI Variable Display", "Segoe UI"'
 
 STYLE = f"""
 QDialog {{ background: {BG}; }}
 QWidget {{ color: {TEXT}; font-family: {FONT}; font-size: 14px; }}
-QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 22px; font-weight: 600; }}
-QLabel#steps {{ color: {MUTED}; font-size: 12px; letter-spacing: 0.5px; }}
+QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 24px; font-weight: 600; }}
+QLabel#steps {{ color: {MUTED}; font-size: 12px; font-weight: 500; }}
 QLabel#body, QLabel#hint {{ color: {MUTED}; }}
-QLabel#hint {{ font-size: 12px; }}
+QLabel#hint {{ font-size: 13px; }}
 QLabel#section {{ font-weight: 600; font-size: 15px; }}
 QLabel#bad {{ color: {BAD}; }}
-QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 16px; }}
-QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 12px; padding: 9px 12px;
-            selection-background-color: {ACCENT}; }}
-QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
-QPushButton {{ background: rgba(255,255,255,0.07); border: 1px solid {LINE}; border-radius: 19px;
-              padding: 8px 18px; min-height: 20px; }}
-QPushButton:hover {{ background: rgba(255,255,255,0.12); }}
-QPushButton:disabled {{ color: rgba(242,244,248,0.30); background: rgba(255,255,255,0.03); }}
-QPushButton#primary {{ background: {ACCENT}; border: none; color: #ffffff; font-weight: 600; }}
-QPushButton#primary:hover {{ background: #74aaff; }}
-QPushButton#primary:disabled {{ background: rgba(93,155,255,0.30); color: rgba(255,255,255,0.55); }}
+QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 8px; }}
+QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 6px; padding: 7px 12px;
+            selection-background-color: #3f3f46; }}
+QLineEdit:focus {{ border: 1px solid {RING}; }}
+QPushButton {{ background: {BG}; border: 1px solid {LINE}; border-radius: 6px; padding: 7px 16px; min-height: 20px;
+              font-weight: 500; }}
+QPushButton:hover {{ background: {MUTED_BG}; }}
+QPushButton:disabled {{ color: rgba(250,250,250,0.5); background: {BG}; }}
+QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; }}
+QPushButton#primary:hover {{ background: #e4e4e7; border-color: #e4e4e7; }}
+QPushButton#primary:disabled {{ background: rgba(250,250,250,0.5); border-color: transparent;
+                                color: rgba(24,24,27,0.7); }}
 QPushButton#flat {{ background: transparent; border: none; color: {MUTED}; }}
-QPushButton#flat:hover {{ color: {TEXT}; }}
-QPushButton#small {{ padding: 6px 12px; border-radius: 14px; font-size: 12px; }}
-QPushButton#choice {{ padding: 6px 20px; border-radius: 15px; min-width: 64px; }}
-QPushButton#choice:checked {{ background: {ACCENT_SOFT}; border: 1px solid {ACCENT}; color: #ffffff;
-                              font-weight: 600; }}
+QPushButton#flat:hover {{ color: {TEXT}; background: {MUTED_BG}; }}
+QPushButton#small {{ padding: 5px 12px; font-size: 13px; }}
+QPushButton#choice {{ padding: 6px 16px; min-width: 64px; }}
+QPushButton#choice:checked {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; }}
 QRadioButton {{ spacing: 10px; font-weight: 600; }}
-QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 9px; border: 2px solid rgba(255,255,255,0.35); }}
-QRadioButton::indicator:checked {{ width: 8px; height: 8px; border: 5px solid {ACCENT}; background: #ffffff; }}
-QProgressBar {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 7px; height: 12px;
+QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px; border: 1px solid {MUTED}; }}
+QRadioButton::indicator:checked {{ width: 6px; height: 6px; border: 5px solid {PRIMARY}; background: {BG}; }}
+QProgressBar {{ background: {MUTED_BG}; border: none; border-radius: 4px; height: 8px; max-height: 8px;
                text-align: center; color: transparent; }}
-QProgressBar::chunk {{ background: {ACCENT}; border-radius: 6px; }}
+QProgressBar::chunk {{ background: {PRIMARY}; border-radius: 4px; }}
 """
 
 LINKS = {
@@ -151,7 +154,7 @@ def _label(text: str, name: str = "body", wrap: bool = True) -> QLabel:
 
 def _link(kind: str) -> QLabel:
     text, url = LINKS[kind]
-    label = QLabel(f'<a href="{url}" style="color:{ACCENT}; text-decoration:none">{text} &rarr;</a>')
+    label = QLabel(f'<a href="{url}" style="color:{ACCENT}; text-decoration:underline">{text} &rarr;</a>')
     label.setObjectName("hint")
     label.setOpenExternalLinks(True)
     return label
@@ -161,7 +164,7 @@ def _card() -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
     frame.setObjectName("card")
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(18, 16, 18, 16)
+    layout.setContentsMargins(20, 18, 20, 18)
     layout.setSpacing(8)
     return frame, layout
 
@@ -530,7 +533,7 @@ class OnboardingDialog(QDialog):
         self.key_title.setText("Bedrock API key" if bedrock else "Anthropic API key")
         self.model_key.edit.setPlaceholderText("Paste your Bedrock API key" if bedrock else "sk-ant-...")
         text, url = LINKS[self.backend]
-        self.key_link.setText(f'<a href="{url}" style="color:{ACCENT}; text-decoration:none">{text} &rarr;</a>')
+        self.key_link.setText(f'<a href="{url}" style="color:{ACCENT}; text-decoration:underline">{text} &rarr;</a>')
         self._model_edited()
 
     def _model_edited(self) -> None:

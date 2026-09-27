@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from yuki.config import MODEL_ALIASES, Settings
 from yuki.ui import startup
 from yuki.ui.calls import CallController
-from yuki.ui.glass import ACCENT
+from yuki.ui.surface import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 
 
@@ -57,7 +57,6 @@ from yuki.ui.nudges import (
     OVERLAY_NUDGES,
     NoticeCard,
     NudgeController,
-    kind_accent,
     nudge_answered,
     nudge_moment,
     nudge_reply_request,
@@ -235,7 +234,7 @@ class YukiUi(QObject):
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
         self.overlay.attach_thread(self.window_host.model)
-        #: One-off notices from the runtime (the daily cost alert) as a clear glass card, when the screen is free.
+        #: One-off notices from the runtime (the daily cost alert) as a card, when the screen is free.
         self.notice_card: NoticeCard | None = None
         self._notices: list[tuple[str, str]] = []
         self._notice_retry = QTimer(self)
@@ -587,7 +586,7 @@ class YukiUi(QObject):
             return card
         at = seen_at or nudge_moment(nudge) or time.time()
         card = self.overlay.add_nudge_card(
-            nudge, overlay_label(nudge), accent=kind_accent(nudge.get("kind")), at=at
+            nudge, overlay_label(nudge), at=at
         )
         self.ui_log.event(
             "nudge_in_overlay", id=nudge.get("id"), kind=nudge.get("kind"), via=via,
@@ -719,7 +718,7 @@ class YukiUi(QObject):
     # -- runtime notices and the health check ------------------------------
 
     def show_notice(self, kind: str, text: str) -> None:
-        """``AgentRuntime.notice``: tell the user once, in a clear glass card bottom-right. It waits while a
+        """``AgentRuntime.notice``: tell the user once, in a card bottom-right. It waits while a
         game or anything full screen is up, or while another card, the strip or the overlay has the screen."""
         self._notices.append((str(kind or ""), str(text or "")))
         self.ui_log.event("notice", kind=kind)
@@ -750,7 +749,7 @@ class YukiUi(QObject):
             self._notice_retry.stop()
 
     def show_health(self) -> None:
-        """The tray's "Health check": ``yuki doctor`` off the GUI thread, then its checklist in a glass panel."""
+        """The tray's "Health check": ``yuki doctor`` off the GUI thread, then its checklist in a panel."""
         import threading
 
         if self.health is None:
@@ -799,19 +798,19 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
         The tray icon, which the caller must keep a reference to.
     """
     tray = QSystemTrayIcon(icon or tray_icon(), app)
-    from yuki.ui.glass import current_theme
-    from yuki.ui.window.widgets import GlassMenu, menu_css
+    from yuki.ui.surface import current_theme
+    from yuki.ui.window.widgets import Menu, menu_css
 
-    menu = GlassMenu(current_theme())   # clear glass like every surface (2026-09-27)
+    menu = Menu(current_theme())   # a flat popover like every surface
 
-    def _menu_theme() -> None:   # follows Windows' app mode / the Appearance setting each time it opens
-        from yuki.ui.window.widgets import glassify
+    def _menu_theme() -> None:   # restyled each time it opens (submenus are made later)
+        from yuki.ui.window.widgets import style_menu
 
         menu.t = current_theme()
         menu.setStyleSheet(menu_css(menu.t))
-        for sub in menu.findChildren(QMenu):   # the Microphone / Speaker / model submenus: glass too
+        for sub in menu.findChildren(QMenu):   # the Microphone / Speaker / model submenus too
             if sub is not menu:
-                glassify(sub, current_theme)
+                style_menu(sub, current_theme)
 
     menu.aboutToShow.connect(_menu_theme)
 

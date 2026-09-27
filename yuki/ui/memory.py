@@ -31,7 +31,7 @@ from yuki.agent.memory import (
     due_text,
     todo_done,
 )
-from yuki.ui.glass import GlassWindow, ui_font
+from yuki.ui.surface import SurfaceWindow, ui_font
 from yuki.ui.uilog import UiLog
 
 #: Windows process-creation flags for the detached memory service.
@@ -398,8 +398,8 @@ class MemoryControl(QObject):
 
 
 class _InkBrowser(QTextBrowser):
-    """The panels' text: their HTML is written in the dark palette; on clear glass it takes the theme's
-    text and accent colours (so it reads in light mode too), keeping each line's own opacity."""
+    """The panels' text: their HTML is written with fixed colours; here it takes the theme's text colour for
+    both the body and the headings (monochrome), keeping each line's own opacity."""
 
     def __init__(self, ink: Any) -> None:
         super().__init__()
@@ -438,8 +438,8 @@ def health_html(results: list[Any]) -> str:
     return "".join(parts)
 
 
-class KnowsWindow(GlassWindow):
-    """A small read-only glass panel showing the portrait and the saved know-how.
+class KnowsWindow(SurfaceWindow):
+    """A small read-only panel (a flat popover) showing the portrait and the saved know-how.
 
     Args:
         title: The panel's heading.
@@ -449,11 +449,11 @@ class KnowsWindow(GlassWindow):
     def __init__(
         self, *, title: str = "What Yuki knows", size: tuple[int, int] = (KNOWS_WIDTH, KNOWS_HEIGHT)
     ) -> None:
-        super().__init__(activates=True, radius=16)
+        super().__init__(activates=True)
         self.setObjectName("knows")
-        margin = self.SHADOW + 18
+        margin = self.SHADOW + 20
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(margin, margin - 4, margin, margin)
+        layout.setContentsMargins(margin, margin - 6, margin - 8, margin)
         layout.setSpacing(8)
 
         header = QHBoxLayout()
@@ -486,27 +486,25 @@ class KnowsWindow(GlassWindow):
         self.restyle()
         self.show_loading()
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook: theme inks on clear glass (2026-09-27)
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
         if not hasattr(self, "body"):
             return
-        sel = self.theme().accent_soft
-        handle = self.ink("text_3")
+        from yuki.ui.window.widgets import scrollbar_css
+
+        t = self.theme()
         self.title.setStyleSheet(f"color: {self.ink_css('text')}; background: transparent;")
         self.close_button.setStyleSheet(
             f"QToolButton {{ color: {self.ink_css('text_2')}; background: transparent;"
-            " border: none; padding: 2px 6px; font-size: 13px; }"
-            f"QToolButton:hover {{ color: {self.ink_css('text')}; }}")
-        self.meta.setStyleSheet(f"color: {self.ink_css('text_3')}; background: transparent;")
+            " border: none; border-radius: 6px; padding: 4px 8px; font-size: 13px; }"
+            f"QToolButton:hover {{ color: {self.ink_css('text')}; background: #27272a; }}")
+        self.meta.setStyleSheet(f"color: {self.ink_css('text_2')}; background: transparent;")
+        sel = t.accent_soft
         self.body.setStyleSheet(
             f"QTextBrowser {{ background: transparent; color: {self.ink_css('text')};"
-            f" border: none; selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},90); }}"
-            "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }"
-            f"QScrollBar::handle:vertical {{ background: rgba({handle.red()},{handle.green()},{handle.blue()},70);"
-            " border-radius: 3px; min-height: 24px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }")
+            f" border: none; selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},255); }}"
+            + scrollbar_css(t))
 
-    def focus_target(self) -> QTextBrowser:  # noqa: D102 - GlassWindow override
+    def focus_target(self) -> QTextBrowser:  # noqa: D102 - SurfaceWindow override
         return self.body
 
     def show_loading(self) -> None:
@@ -594,7 +592,7 @@ class TodayWindow(KnowsWindow):
 
 
 class HealthWindow(KnowsWindow):
-    """The tray's "Health check": ``yuki doctor``'s checklist with fixes, as a clear glass panel. The checks
+    """The tray's "Health check": ``yuki doctor``'s checklist with fixes, as a flat panel. The checks
     run off the GUI thread (:meth:`yuki.ui.app.YukiUi.show_health`); this only shows them."""
 
     def __init__(self) -> None:

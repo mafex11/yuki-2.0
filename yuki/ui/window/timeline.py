@@ -25,8 +25,7 @@ into one session, the same code weaves through every switch.
 Hover shows a card for the stretch under the pointer (over the call band: the
 call, with its real start and end); the page gets ``hovered(t)``,
 ``session_clicked(index)`` and ``call_clicked(index)`` (a call is clickable like a
-session). The hover card is floating glass: it bends the lanes under it, rendered
-once when the pointer comes to rest (:class:`~yuki.ui.window.widgets.FloatLens`).
+session). The hover card is a flat popover (the theme's card with a 1 px border).
 
 Zoom (phase 2): the mouse wheel zooms around the pointer, dragging across the
 plot zooms into that range, double-click (or Esc) goes back to the whole day,
@@ -46,7 +45,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QMouseEvent, QPainter, QPainterP
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from yuki.ui.window.data import DayView, Segment, dur, episode_gist, hm
-from yuki.ui.window.glass import hatch, paint_glass, rounded
+from yuki.ui.window.paint import hatch, paint_shadow, paint_surface
 from yuki.ui.window.theme import ICON, Theme, font
 
 GUTTER = 168
@@ -114,10 +113,6 @@ class TimelineChart(QWidget):
         self.selected: int | None = None
         self.selected_call: int | None = None
         self.highlight: str | None = None
-        self._grabbing = False
-        from yuki.ui.window.widgets import FloatLens
-
-        self._lens = FloatLens(self, lambda: self.t, settle_ms=90)
         self._runs: list[_Run] = []
         self._ticks: list[tuple[str, float]] = []
         self._cache_w = -1
@@ -270,9 +265,6 @@ class TimelineChart(QWidget):
             return
         self.view = new
         self.update()
-        from yuki.ui.window.glasscache import notify_glass
-
-        notify_glass(self)   # capsules moved (they are glass in Full): the page re-renders once it settles
         self.zoomed.emit(self.is_zoomed)
 
     def zoom_at(self, at: float, factor: float) -> None:
@@ -350,18 +342,14 @@ class TimelineChart(QWidget):
             return
         self.update()
         at = self.t_of(e.position().x())
-        from yuki.ui.window.glasscache import notify_glass
-
         call = self.call_at(at, e.position().y())
         if call is not None:   # a call is clickable like a session: the details panel shows it
             self.set_selected_call(call)
-            notify_glass(self)
             self.call_clicked.emit(call)
             return
         for i, s in enumerate(self.day.sessions):
             if s.start <= at < s.end:
                 self.set_selected(i)
-                notify_glass(self)
                 self.session_clicked.emit(i)
                 return
 
@@ -385,7 +373,7 @@ class TimelineChart(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(sel)
             p.drawRoundedRect(QRectF(x0, self.y_calls() - 4, x1 - x0, self.y_axis() - self.y_calls() + 4), 6, 6)
-        elif self.hover_t is not None and not self._grabbing:   # a grab for the lens is what is *under* the card
+        elif self.hover_t is not None:
             self._paint_hover(p)
         p.end()
 
@@ -482,7 +470,8 @@ class TimelineChart(QWidget):
                 continue
             rect = QRectF(x0 + 1, y, x1 - x0 - 2, SESSION_H - 4)
             chosen = i == self.selected
-            paint_glass(p, rect, rect.height() / 2, t.level("lens" if chosen else "inset"), shadow=False)
+            paint_surface(p, rect, 6, t.level("selected" if chosen else "muted"),
+                          border=t.ring if chosen else None)
             c = self.lane_color(s.lane)
             if rect.width() >= 18:   # the lead app's colour as a short key, not a dot
                 p.setPen(Qt.PenStyle.NoPen)
@@ -512,10 +501,9 @@ class TimelineChart(QWidget):
             rect = QRectF(x0, y + 2, x1 - x0, CALL_H - 4)
             chosen = i == self.selected_call
             hovered = self.hover_t is not None and self.call_at(self.hover_t, self.hover_y) == i
-            wash = QColor(c)   # clear glass washed with the call colour; stronger when picked or pointed at
-            wash.setAlphaF((0.16 if not t.dark else 0.20) + (0.08 if chosen or hovered else 0.0))
-            paint_glass(p, rect, rect.height() / 2, t.level("lens" if chosen else "control"), tint=wash,
-                        shadow=False, painted=True)
+            fill = QColor(c)   # the call colour, a little stronger when picked or pointed at
+            fill.setAlphaF(0.22 + (0.12 if chosen or hovered else 0.0))
+            paint_surface(p, rect, 6, t.level("muted"), fill=fill, border=c if chosen else None)
             for d0, d1 in call.drops:   # microphone let go for a while: lighter
                 dx0, dx1 = self.x_of(d0), self.x_of(d1)
                 if dx1 - dx0 >= 1:
@@ -642,7 +630,8 @@ class TimelineChart(QWidget):
             x = self.x_of(hour)
             if r.left() - 1 <= x <= r.right() + 1:
                 label = datetime.fromtimestamp(hour).strftime("%H:%M")
-                p.drawText(QRectF(x - 24, y + 4, 48, 16), Qt.AlignmentFlag.AlignCenter, label)
+                p.drawText(QRectF(min(x - 24, self.width() - 48), y + 4, 48, 16), Qt.AlignmentFlag.AlignCenter,
+                           label)
             hour += step
         now = datetime.now().timestamp()
         if a < now < b:
@@ -671,7 +660,6 @@ class TimelineChart(QWidget):
             lines = self._call_lines(self.day.calls[call])
             y_anchor = self.y_calls() + CALL_H / 2
             dot = t.kind("call")
-            key_what: object = ("call", call)
         else:
             run = self.run_at(at)
             if run is None or run.state == "none":
@@ -679,7 +667,6 @@ class TimelineChart(QWidget):
             lines = self._hover_lines(run)
             y_anchor = self.y_away() if run.state == "away" else self.lane_y(run.state)
             dot = t.away if run.state == "away" else self.lane_color(run.state)
-            key_what = ("run", run.state, round(run.t0), round(run.t1))
         if not lines:
             return
         w = 300
@@ -695,13 +682,8 @@ class TimelineChart(QWidget):
         left = x + 14 if x + 14 + w < self.width() - 4 else x - 14 - w
         top = max(4.0, min(y_anchor - h / 2, self.height() - h - 4))
         card = QRectF(left, top, w, h)
-        # floating glass: it bends the lanes under it, rendered once when the pointer rests (then kept)
-        key = (key_what, card.toRect().getRect(), self.view, self.width(), self.selected, self.selected_call,
-               self.highlight, t.name)
-        self._lens.request(key, lambda r=card.toRect(): self._grab_under(r), 16)
-        from yuki.ui.window.widgets import paint_floating
-
-        paint_floating(p, card, 16, t, self._lens.image_for(key))
+        paint_shadow(p, card, 8, blur=8, dy=3)
+        paint_surface(p, card, 8, t.level("popover"))
         y = card.top() + 12
         p.setFont(font("body_strong"))
         p.setPen(t.text)
@@ -712,7 +694,7 @@ class TimelineChart(QWidget):
             p.setPen(t.text if role == "strong" else (t.text_2 if role == "body" else t.text_3))
             p.drawText(QRectF(card.left() + 14, y, w - 28, hh), Qt.TextFlag.TextWordWrap, text)
             y += hh + 4
-        # a small marker where the pointer meets the line (a clear bead, not a coloured dot)
+        # a small marker where the pointer meets the line
         ring = QColor(dot)
         ring.setAlphaF(0.9)
         fill = QColor(dot)
@@ -720,16 +702,6 @@ class TimelineChart(QWidget):
         p.setPen(QPen(ring, 1.5))
         p.setBrush(fill)
         p.drawEllipse(QPointF(x, y_anchor), 4.5, 4.5)
-
-    def _grab_under(self, rect: object):
-        """The chart as it looks under the hover card (without the card), for its lens."""
-        from yuki.ui.window.widgets import grab_under
-
-        self._grabbing = True
-        try:
-            return grab_under(self, rect)
-        finally:
-            self._grabbing = False
 
     def _call_lines(self, call: object) -> list[tuple[str, str]]:
         """The hover card for a call on the call band: its real times, like any other stretch."""

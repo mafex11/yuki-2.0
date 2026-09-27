@@ -12,7 +12,7 @@ glass theme, because a label's default Markdown look is a word processor's
 * lists as a narrow bullet or number column and a text column, nested lists
   indented one step, so a wrapped line lines up under its text;
 * inline code and code blocks in a monospace font on a faint wash;
-* links in the accent colour; block quotes dimmed with a thin bar.
+* links underlined in the text colour; block quotes dimmed with a thin bar.
 
 A streaming reply is rendered again on every change; a reply of a few hundred
 words takes well under a millisecond per pass. Spoken replies are plain text
@@ -52,7 +52,7 @@ def _span(text: str, fmt: QTextCharFormat, theme: Any) -> str:
         out = f'<span style="{";".join(styles)}">{out}</span>'
     if fmt.isAnchor() and fmt.anchorHref():
         color = f"color:{_css(theme.accent)};" if theme is not None else ""
-        out = f'<a href="{html.escape(fmt.anchorHref(), quote=True)}" style="{color}text-decoration:none">{out}</a>'
+        out = f'<a href="{html.escape(fmt.anchorHref(), quote=True)}" style="{color}text-decoration:underline">{out}</a>'
     return out
 
 

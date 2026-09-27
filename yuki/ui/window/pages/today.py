@@ -10,14 +10,13 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import DayView, dur, episode_gist, first_sentence, hm, plain, second_person
-from yuki.ui.window.glass import hatch, rounded
+from yuki.ui.window.paint import hatch, rounded
 from yuki.ui.window.theme import SPACE, Theme, font
 from yuki.ui.window.timeline import TimelineChart
 from yuki.ui.window.widgets import (
     Divider,
-    Glass,
     Panel,
-    Pill,
+    Button,
     StatTile,
     page_header,
     text_label,
@@ -261,31 +260,30 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     col.setSpacing(SPACE["l"])
 
     d = datetime.combine(day.day, datetime.min.time())
-    picker = Glass(t, level="raised", radius=20, padding=3)
-    picker.body.setSpacing(0)
-    prow = QHBoxLayout()
-    prow.setSpacing(2)
-    prev = Pill(t, glyph="prev", size="regular")
+    picker = QWidget()
+    prow = QHBoxLayout(picker)
+    prow.setContentsMargins(0, 0, 0, 0)
+    prow.setSpacing(6)
+    prev = Button(t, glyph="prev")
     prev.setToolTip("The day before")
     prev.clicked.connect(lambda: act.day_shift(-1))
-    cal = Pill(t, f"{d:%a} {d.day} {d:%b}", glyph="calendar", size="regular")
+    cal = Button(t, f"{d:%a} {d.day} {d:%b}", glyph="calendar")
     cal.setToolTip("Pick a day")
     cal.clicked.connect(lambda: act.day_menu(cal))
-    nxt = Pill(t, glyph="next", size="regular")
+    nxt = Button(t, glyph="next")
     nxt.setToolTip("The day after")
     nxt.setEnabled(not today)
     nxt.clicked.connect(lambda: act.day_shift(1))
     prow.addWidget(prev)
     prow.addWidget(cal)
     prow.addWidget(nxt)
-    picker.body.addLayout(prow)
     title = "Today" if today else f"{d:%A}, {d.day} {d:%B}"
-    back = Pill(t, "Today", style="accent" if not today else "quiet")
+    back = Button(t, "Today", style="default" if not today else "outline")
     back.clicked.connect(act.day_today)
     col.addWidget(page_header(t, title, day.summary, [picker, back]))
 
     tiles = QHBoxLayout()
-    tiles.setSpacing(SPACE["m"])
+    tiles.setSpacing(SPACE["l"])
     tot = day.totals
     first = hm(day.first_at) if day.first_at else "–"
     tiles.addWidget(StatTile(t, "At your PC", dur(tot["present_s"]), f"from {first}, with the line below",
@@ -305,7 +303,7 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     rrow = QHBoxLayout(right)
     rrow.setContentsMargins(0, 0, 0, 0)
     rrow.setSpacing(SPACE["s"])
-    reset = Pill(t, "Whole day", glyph="history", style="quiet", size="small")
+    reset = Button(t, "Whole day", glyph="history", style="outline", size="small")
     reset.setToolTip("Zoomed in: scroll to zoom, drag across to pick a stretch, double-click for the whole day")
     reset.setVisible(False)
     rrow.addWidget(reset)

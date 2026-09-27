@@ -39,6 +39,8 @@ from typing import Any, Callable
 MAX_ITEMS = 1000
 #: A step's result line is kept to this many characters.
 RESULT_CHARS = 240
+#: A streamed reply or thinking line shows once it has this many words (one letter alone says nothing).
+STREAM_MIN_WORDS = 3
 #: The agent's closing tool: its input is the reply, shown in the bubble, never as a step of the fold.
 CLOSING_TOOLS = frozenset({"done"})
 
@@ -117,6 +119,39 @@ class Item:
         end = max(ends + ([self.ended_at] if self.ended_at else []) + [start])
         return max(0.0, end - start)
 
+    def step_times(self, now: float | None = None) -> tuple[dict[str, float], tuple[float, bool] | None]:
+        """How long each shown step took, counted so the steps add up to the whole wait.
+
+        A tool's own run is often instant (a memory read) while the model spent seconds deciding on it, so a
+        top-level step's time runs from the end of the step before it (or from when the message was sent) to
+        its own end: the thinking before it included. Nested steps (a helper's reads, a thinker's tools under
+        a voice job) keep their own run time. The time after the last step is the tail, ``(seconds,
+        running)``: the reply being written (``None`` when there is none to show).
+
+        Returns:
+            ``({step key: seconds}, tail)``.
+        """
+        now = time.time() if now is None else now
+        shown = self.real_steps()
+        if self.source == "voice":   # voice: the steps are hands and jobs with their own clocks
+            return {st.key: st.seconds(now) for st in shown}, None
+        times: dict[str, float] = {}
+        prev = self.at
+        for st in shown:
+            if st.depth:
+                times[st.key] = st.seconds(now)
+                continue
+            end = st.ended if st.ended is not None else now
+            times[st.key] = max(0.0, end - min(st.started, prev))
+            prev = max(prev, end)
+        tail = None
+        if shown and not any(st.running for st in shown):
+            if self.running:
+                tail = (max(0.0, now - prev), True)
+            elif self.ended_at is not None and self.ended_at - prev >= 0.5:
+                tail = (self.ended_at - prev, False)
+        return times, tail
+
     def work_line(self, now: float | None = None) -> str:
         """``worked for 12 s · 5 steps`` (``working · 3 steps`` while it runs)."""
         n = len(self.real_steps())
@@ -144,6 +179,9 @@ def _turn(value: Any) -> str | None:
 
 
 def fmt_seconds(secs: float) -> str:
+    """``4 s``, ``1 min 5 s``; under a second reads ``<1 s`` (never a misleading ``0 s``)."""
+    if secs < 0.95:
+        return "<1 s"
     s = int(round(max(0.0, secs)))
     if s < 60:
         return f"{s} s"
@@ -331,12 +369,19 @@ class ChatModel:
         if item.status not in ("pending", "running", "streaming"):
             return
         if ev.get("what") == "reply":
+            # the first streamed characters alone ("R") say nothing: the "Thinking…" line stays until a few words
+            if len(text.split()) < STREAM_MIN_WORDS and not item.text:
+                return
             item.text = text
             item.thinking = ""
             item.status = "streaming"
         elif ev.get("what") == "thinking" and not item.text:
             lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
-            item.thinking = lines[-1] if lines else ""
+            readable = [ln for ln in lines if len(ln.split()) >= STREAM_MIN_WORDS]
+            line = readable[-1] if readable else ""
+            if line == item.thinking:
+                return
+            item.thinking = line
         else:
             return
         self._changed(item)
@@ -371,6 +416,19 @@ class ChatModel:
                 s.ended, s.ok = at, bool(ev.get("ok"))
                 s.result = _short(ev.get("summary"))
                 self._changed(item)
+                return
+
+    def _on_tool_label(self, ev: dict[str, Any], at: float) -> None:
+        """A finished tool's result named what it worked on (a call's app and time): its step says so."""
+        job, name, label = ev.get("job"), str(ev.get("name") or ""), str(ev.get("label") or "").strip()
+        item = self._by_id.get(self._job_item.get(job, "")) if isinstance(job, int) else None
+        if item is None or not label:
+            return
+        for st in reversed(item.steps):
+            if st.job == job and st.kind == "tool" and (not name or st.name == name):
+                if st.label != label:
+                    st.label = label
+                    self._changed(item)
                 return
 
     def _on_helper_step(self, ev: dict[str, Any], at: float) -> None:

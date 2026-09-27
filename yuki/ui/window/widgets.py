@@ -1,9 +1,14 @@
-"""The window's building blocks, all painted from :mod:`yuki.ui.window.theme` tokens.
+"""The window's building blocks: shadcn/ui components in Qt Widgets, all painted from
+:mod:`yuki.ui.window.theme` tokens.
 
-Controls are pills; containers are glass. Nothing here reads memory or knows a
-page: a widget gets a :class:`~yuki.ui.window.theme.Theme` and its content, and
-paints. Clicks come out as Qt signals the page (phase 2: the controller)
-connects to the memory calls.
+Card, Button (default / secondary / outline / ghost / destructive), Input, Switch
+(:class:`Toggle`), Tabs (:class:`Segmented`), Select (:class:`Dropdown`), a menu,
+a tooltip, a thin scrollbar, a separator (:class:`Divider`) and a skeleton
+(:class:`Shimmer`). Flat and opaque: no gradients, glow, blur or translucency.
+
+Nothing here reads memory or knows a page: a widget gets a
+:class:`~yuki.ui.window.theme.Theme` and its content, and paints. Clicks come out
+as Qt signals the page's controller connects to the memory calls.
 """
 
 from __future__ import annotations
@@ -11,8 +16,8 @@ from __future__ import annotations
 import time
 from typing import Callable, Sequence
 
-from PySide6.QtCore import QEvent, QObject, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractButton,
     QFrame,
@@ -27,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from yuki.ui.window.glass import paint_glass, rounded
+from yuki.ui.window.paint import paint_ring, paint_shadow, paint_surface, rounded
 from yuki.ui.window.theme import CONTROL_H, ICON, RADIUS, SPACE, Theme, css, font, variable_font
 
 # -- text ------------------------------------------------------------------------------
@@ -35,15 +40,23 @@ from yuki.ui.window.theme import CONTROL_H, ICON, RADIUS, SPACE, Theme, css, fon
 
 def text_label(t: Theme, text: str, role: str = "body", ink: str = "text", *, wrap: bool = False,
                selectable: bool = False, parent: QWidget | None = None) -> QLabel:
-    """A label in a type role and an ink role (``text`` | ``text_2`` | ``text_3`` | a kind name)."""
+    """A label in a type role and an ink role (``text`` | ``text_2`` | ``text_3`` | ``danger`` | a kind name).
+
+    A wrapping label never asks for more width than its container has (it wraps inside it instead)."""
     lab = QLabel(text, parent)
     lab.setFont(font(role))
-    color = getattr(t, ink, None) if ink in ("text", "text_2", "text_3", "accent") else t.kind(ink)
+    color = getattr(t, ink, None) if ink in ("text", "text_2", "text_3", "accent", "danger") else t.kind(ink)
     lab.setStyleSheet(f"color: {css(color)}; background: transparent;")
     lab.setTextFormat(Qt.TextFormat.PlainText)
     lab.setWordWrap(wrap)
     if wrap:
-        lab.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        policy = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)   # a new policy drops QLabel's own height-for-width flag
+        lab.setSizePolicy(policy)
+        # never narrower than its longest word (so no word is cut), never wider than it must be
+        fm = QFontMetrics(lab.font())
+        longest = max((fm.horizontalAdvance(w) for w in text.split()), default=0)
+        lab.setMinimumWidth(max(24, min(180, longest + 2)))
     if selectable:
         lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     return lab
@@ -90,43 +103,43 @@ def vbox(*items: QWidget | int | None, spacing: int = SPACE["s"], margins: tuple
 # -- containers ------------------------------------------------------------------------
 
 
-class Glass(QWidget):
-    """A glass container: ``level`` (inset | regular | raised | lens), a radius and padding."""
+class Card(QWidget):
+    """shadcn's Card: a flat surface with a 1 px border. ``level``: ``card`` (default) | ``muted`` (a quieter
+    inset: evidence, a composer) | ``popover``."""
 
-    def __init__(self, t: Theme, *, level: str = "regular", radius: int = RADIUS["panel"],
-                 padding: int = SPACE["l"], tint: QColor | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, t: Theme, *, level: str = "card", radius: int = RADIUS["card"], padding: int = SPACE["l"],
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.t, self.level, self.radius, self.tint = t, level, radius, tint
+        self.t, self.level, self.radius = t, level, radius
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._pad = padding
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(padding, padding, padding, padding)
         self.body.setSpacing(SPACE["m"])
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
-        paint_glass(p, QRectF(self.rect()).adjusted(1, 1, -1, -1), self.radius, self.t.level(self.level),
-                    tint=self.tint, shadow=self.level not in ("inset",))
+        paint_surface(p, QRectF(self.rect()), self.radius, self.t.level(self.level))
         p.end()
 
 
-class Panel(Glass):
-    """A titled glass panel: title, optional subtitle, optional right-hand widget, then content."""
+class Panel(Card):
+    """A titled card: title, optional description, optional right-hand widget, then content (CardHeader +
+    CardContent)."""
 
     def __init__(self, t: Theme, title: str = "", subtitle: str = "", *, right: QWidget | None = None,
-                 glyph: str | None = None, level: str = "regular", padding: int = SPACE["l"] + 2,
+                 glyph: str | None = None, level: str = "card", padding: int = SPACE["xl"],
                  parent: QWidget | None = None) -> None:
         super().__init__(t, level=level, padding=padding, parent=parent)
+        self.body.setSpacing(SPACE["l"])
         if title:
-            # the icon sits on the title's first line, top left, never centred against a long subtitle; a
-            # control on the right (a taller pill) lines up with that same line
+            # the icon sits on the title's line, top left; a control on the right lines up with that line
             head = QHBoxLayout()
             head.setSpacing(SPACE["s"] + 2)
             line_h = QFontMetrics(font("headline")).height()
             lift = max(0, ((right.sizeHint().height() if right is not None else 0) - line_h) // 2)
             if glyph:
                 ic = icon_label(t, glyph, t.text_2)
-                ic.setFixedSize(20, line_h)
+                ic.setFixedSize(18, line_h)
                 ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 wrap = QVBoxLayout()
                 wrap.setContentsMargins(0, lift, 0, 0)
@@ -134,11 +147,11 @@ class Panel(Glass):
                 wrap.addStretch(1)
                 head.addLayout(wrap)
             col = QVBoxLayout()
-            col.setSpacing(2)
+            col.setSpacing(4)
             col.setContentsMargins(0, lift, 0, 0)
-            col.addWidget(text_label(t, title, "headline"))
+            col.addWidget(text_label(t, title, "headline", wrap=True))
             if subtitle:
-                col.addWidget(text_label(t, subtitle, "caption", "text_3", wrap=True))
+                col.addWidget(text_label(t, subtitle, "caption", "text_2", wrap=True))
             col.addStretch(1)
             head.addLayout(col, 1)
             if right is not None:
@@ -146,93 +159,114 @@ class Panel(Glass):
             self.body.addLayout(head)
 
 
-def scroll_css(transparent: bool, bg: QColor | None = None) -> str:
-    """A scroll area's style: a thin scrollbar; ``transparent``: the viewport and page show what is behind,
-    else they paint ``bg`` themselves (opaque, so Qt can scroll by moving pixels)."""
-    base = ("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
-            if transparent else
-            "QScrollArea { background: transparent; border: none; }"
-            f"QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{ background: {css(bg or QColor(0, 0, 0))};"
-            " border: none; }")
-    return (base + "QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px; }"
-            "QScrollBar::handle:vertical { background: rgba(128,128,140,90); border-radius: 3px; min-height: 30px; }"
+def scrollbar_css(t: Theme) -> str:
+    """shadcn's ScrollArea bar: thin, a subtle handle that brightens under the pointer, no arrows."""
+    return ("QScrollBar:vertical { background: transparent; width: 10px; margin: 2px 2px 2px 0; }"
+            f"QScrollBar::handle:vertical {{ background: {css(t.muted)}; border-radius: 4px; min-height: 32px; }}"
+            f"QScrollBar::handle:vertical:hover {{ background: {css(t.baseline)}; }}"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }")
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+            "QScrollBar:horizontal { height: 0; }")
 
 
-def scroll(widget: QWidget) -> QScrollArea:
+def opaque(widget: QWidget, color: QColor) -> None:
+    """Paint ``widget``'s background with ``color`` from its palette (a style-sheet background is never treated
+    as opaque, so Qt could not scroll by moving pixels)."""
+    pal = widget.palette()
+    pal.setColor(QPalette.ColorRole.Window, color)
+    widget.setPalette(pal)
+    widget.setAutoFillBackground(True)
+    widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+
+
+def scroll(widget: QWidget, t: Theme | None = None) -> QScrollArea:
+    """A scroll area with the thin bar and smooth scrolling. With ``t`` the page is opaque on the theme's
+    background, so a scroll step moves the pixels already drawn and paints only the strip that comes in."""
     area = QScrollArea()
     area.setWidget(widget)
     area.setWidgetResizable(True)
     area.setFrameShape(QFrame.Shape.NoFrame)
     area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    area.setStyleSheet(scroll_css(True))
-    area.viewport().setAutoFillBackground(False)
-    widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    if t is not None:
+        opaque(area.viewport(), t.bg)
+        opaque(widget, t.bg)
+        area.verticalScrollBar().setStyleSheet(scrollbar_css(t))
+    else:
+        area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }")
+        area.viewport().setAutoFillBackground(False)
+        widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     smooth(area)
     return area
 
 
-# -- controls --------------------------------------------------------------------------
+# -- buttons ---------------------------------------------------------------------------
+
+#: The older style words, as shadcn variants.
+VARIANTS = {"glass": "secondary", "quiet": "outline", "accent": "default", "tinted": "secondary",
+            "danger": "destructive", "primary": "default"}
 
 
-def paint_button(p: QPainter, r: QRectF, t: Theme, style: str = "glass", tint: QColor | None = None, *,
-                 hover: bool = False, down: bool = False, enabled: bool = True) -> QColor:
-    """A button's glass body (2026-09-27): a raised, lit pill with a soft shadow under it, clearly a button
-    and never a flat tag. Returns the ink for its label. ``style``: glass | quiet (the same glass, a quieter
-    label) | accent (blue glass) | tinted (``tint`` washed into the glass) | danger."""
-    wash = None
-    if style == "accent":
-        level = t.level("button_accent")
-        ink = QColor(t.accent_ink)
-    elif style in ("tinted", "danger"):
-        c = QColor(t.kind("error") if style == "danger" else (tint or t.accent))
-        wash = QColor(c)
-        wash.setAlphaF(0.16 if not t.dark else 0.24)
-        level = t.level("button")
-        ink = c.darker(135) if not t.dark else c.lighter(130)
-    else:
-        level = t.level("button")
-        ink = QColor(t.text_2 if style == "quiet" else t.text)
-    paint_glass(p, r, r.height() / 2, level, tint=wash, shadow=enabled and not down, painted=True)
-    if enabled and (hover or down):   # a breath more light under the pointer, a touch darker pressed
-        over = QColor(255, 255, 255) if not down else QColor(0, 0, 0)
-        over.setAlphaF((0.07 if t.dark else 0.20) if not down else 0.10)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(over)
-        p.drawPath(rounded(r, r.height() / 2))
+def button_colors(t: Theme, variant: str, *, hover: bool = False, down: bool = False,
+                  enabled: bool = True) -> tuple[QColor, QColor, QColor]:
+    """``(fill, border, ink)`` of a shadcn button variant: ``default`` (primary) | ``secondary`` | ``outline`` |
+    ``ghost`` | ``destructive``. Hover and pressed shift the fill a step; disabled is at half opacity."""
+    v = VARIANTS.get(variant, variant)
+    clear = QColor(0, 0, 0, 0)
+    hot = hover or down
+    if v == "default":
+        fill, border, ink = QColor("#e4e4e7" if hot else "#fafafa"), clear, QColor(t.primary_fg)
+    elif v == "destructive":
+        fill, border, ink = QColor("#991b1b" if hot else t.destructive.name()), clear, QColor(t.text)
+    elif v == "outline":
+        fill, border, ink = QColor(t.muted if hot else t.bg), QColor(t.border), QColor(t.text)
+    elif v == "ghost":
+        fill, border, ink = (QColor(t.muted) if hot else clear), clear, QColor(t.text if hot else t.text_2)
+    else:   # secondary
+        fill, border, ink = QColor("#323236" if hot else t.muted.name()), clear, QColor(t.text)
     if not enabled:
-        ink = QColor(t.text_3)
+        for c in (fill, border, ink):
+            c.setAlphaF(c.alphaF() * 0.5)
+    return fill, border, ink
+
+
+def paint_button(p: QPainter, r: QRectF, t: Theme, style: str = "secondary", tint: QColor | None = None, *,
+                 hover: bool = False, down: bool = False, enabled: bool = True) -> QColor:
+    """A button's body; returns the ink for its label. ``tint`` is accepted for older callers and ignored
+    (colour is not decoration here)."""
+    del tint
+    fill, border, ink = button_colors(t, style, hover=hover, down=down, enabled=enabled)
+    paint_surface(p, r, RADIUS["control"], t.level("card"), fill=fill, border=border)
     return ink
 
 
-class Pill(QAbstractButton):
-    """A button: a rounded glass pill (:func:`paint_button`). ``style``: glass | accent | quiet | tinted
-    (``tint`` colour) | danger."""
+class Button(QAbstractButton):
+    """shadcn's Button. ``style``: ``default`` | ``secondary`` | ``outline`` | ``ghost`` | ``destructive`` (or an
+    older word, see :data:`VARIANTS`); ``size``: ``small`` (32 px) | ``regular`` (36) | ``large`` (40); a glyph
+    alone makes a square icon button."""
 
-    #: The glass sits this far inside the widget (left, top, right, bottom), so its soft shadow has room.
-    INSET = (3, 2, 3, 4)
-
-    def __init__(self, t: Theme, text: str = "", *, glyph: str | None = None, style: str = "glass",
+    def __init__(self, t: Theme, text: str = "", *, glyph: str | None = None, style: str = "outline",
                  size: str = "regular", tint: QColor | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.t, self.style, self.size_name, self.tint, self.glyph = t, style, size, tint, glyph
+        self.t, self.style, self.size_name, self.glyph = t, style, size, glyph
+        del tint
         self.setText(text)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(variable_font(13 if size == "small" else 14, "Semibold"))
+        self.setFont(variable_font(13 if size == "small" else 14, "Medium"))
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
     def _pad(self) -> int:
-        return 16 if self.size_name == "small" else 20
+        return 12 if self.size_name == "small" else 16
 
     def sizeHint(self) -> QSize:  # noqa: D102
         h = CONTROL_H[self.size_name]
-        left, top, right, bottom = self.INSET
+        if not self.text():
+            return QSize(h, h)
         fm = QFontMetrics(self.font())
-        w = fm.horizontalAdvance(self.text()) if self.text() else 0
-        icon = (16 + (7 if self.text() else 0)) if self.glyph else 0
-        body = max(h, w + icon + 2 * self._pad()) if self.text() else h
-        return QSize(body + left + right, h + top + bottom)
+        icon = (16 + 8) if self.glyph else 0
+        return QSize(fm.horizontalAdvance(self.text()) + icon + 2 * self._pad(), h)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return self.sizeHint()
 
     def enterEvent(self, e: object) -> None:  # noqa: D102
         self.update()
@@ -245,70 +279,37 @@ class Pill(QAbstractButton):
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        left, top, right, bottom = self.INSET
-        r = QRectF(self.rect()).adjusted(left, top, -right, -bottom)
-        ink = paint_button(p, r, self.t, self.style, self.tint, hover=self.underMouse(), down=self.isDown(),
+        r = QRectF(self.rect())
+        ink = paint_button(p, r, self.t, self.style, hover=self.underMouse(), down=self.isDown(),
                            enabled=self.isEnabled())
+        if self.hasFocus() and self.focusPolicy() != Qt.FocusPolicy.NoFocus and self.isEnabled():
+            ring = QColor(self.t.ring)
+            ring.setAlphaF(0.5)
+            paint_ring(p, r.adjusted(1, 1, -1, -1), RADIUS["control"], ring, 2.0)
         p.setPen(ink)
         pad = self._pad()
-        x = r.left() + pad if self.text() else r.center().x() - 8
-        if self.glyph:
+        glyph = ICON.get(self.glyph, self.glyph) if self.glyph else ""
+        if glyph and not self.text():
             p.setFont(font("icon_small" if self.size_name == "small" else "icon"))
-            gw = 16
-            if not self.text():
-                p.drawText(QRectF(r.center().x() - gw / 2, r.top(), gw, r.height()),
-                           Qt.AlignmentFlag.AlignCenter, ICON.get(self.glyph, self.glyph))
-            else:
-                p.drawText(QRectF(x, r.top(), gw, r.height()), Qt.AlignmentFlag.AlignCenter,
-                           ICON.get(self.glyph, self.glyph))
-                x += gw + 7
-        if self.text():
-            p.setFont(self.font())
-            p.drawText(QRectF(x, r.top(), r.right() - x - pad + 4, r.height()),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
-        p.end()
-
-
-class Chip(QWidget):
-    """A small tag: a word on a faint glass wash of a kind's colour.
-
-    No longer shown anywhere (2026-09-27: the user reads tags and badges as generic AI UI); what a tag said is
-    now plain secondary text (:func:`tag_words`). Kept for older callers.
-    """
-
-    WORDS = {"joke": "Joke", "story": "Story", "you": "You said", "unsure": "Not sure", "unclear": "May be misheard",
-             "call": "Call", "live": "Live", "updating": "Updating…"}
-
-    def __init__(self, t: Theme, kind: str, text: str | None = None, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.t, self.kind = t, kind
-        self.text = text or self.WORDS.get(kind, kind.capitalize())
-        self.setFont(font("micro"))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, glyph)
+            p.end()
+            return
         fm = QFontMetrics(self.font())
-        self.setFixedSize(fm.horizontalAdvance(self.text) + 18, 20)
-
-    def color(self) -> QColor:
-        k = {"unsure": "unclear", "updating": "you", "live": "you"}.get(self.kind, self.kind)
-        return QColor(self.t.kind(k))
-
-    def paintEvent(self, _event: object) -> None:  # noqa: D102
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        c = self.color()
-        fill = QColor(c)
-        fill.setAlphaF(0.12 if not self.t.dark else 0.18)
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(fill)
-        p.drawPath(rounded(r, r.height() / 2))
-        p.setPen(c.darker(135) if not self.t.dark else c.lighter(135))
+        content = fm.horizontalAdvance(self.text()) + ((16 + 8) if glyph else 0)
+        x = max(r.left() + pad, r.center().x() - content / 2)
+        if glyph:
+            p.setFont(font("icon_small"))
+            p.drawText(QRectF(x, r.top(), 16, r.height()), Qt.AlignmentFlag.AlignCenter, glyph)
+            x += 16 + 8
         p.setFont(self.font())
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text)
+        text = fm.elidedText(self.text(), Qt.TextElideMode.ElideRight, int(r.right() - x - pad + 2))
+        p.drawText(QRectF(x, r.top(), r.right() - x, r.height()),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
         p.end()
 
 
 #: What each old tag says, as plain secondary text beside an item's source ("" = nothing to add: the
-#: section or the source line already says it).
+#: section or the source line already says it). No badges (the user reads them as generic AI UI).
 TAG_WORDS = {"joke": "Said as a joke", "story": "", "you": "", "unsure": "Yuki isn't sure",
              "unclear": "May be misheard", "call": "", "live": "", "updating": "Updating"}
 
@@ -318,39 +319,42 @@ def tag_words(tags: Sequence[str]) -> str:
     return " · ".join(w for w in (TAG_WORDS.get(tag, "") for tag in tags) if w)
 
 
-def _glass_changed(widget: QWidget) -> None:
-    from yuki.ui.window.glasscache import notify_glass
-
-    notify_glass(widget)
+# -- form controls ---------------------------------------------------------------------
 
 
 class Toggle(QAbstractButton):
-    """An on/off switch: a glass track, the knob a bright glass bead; accent when on."""
+    """shadcn's Switch: a 44 x 24 track, the thumb a 20 px circle. On: a light track and a dark thumb."""
 
     def __init__(self, t: Theme, on: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t = t
         self.setCheckable(True)
         self.setChecked(on)
-        self.setFixedSize(58, 34)
+        self.setFixedSize(44, 24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggled.connect(lambda _on: _glass_changed(self))
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        # the track is clear glass (a blue-hued wash when on), the knob a clear glass bead on it
-        paint_glass(p, r, r.height() / 2, self.t.level("accent" if self.isChecked() else "control"), shadow=False)
-        d = r.height() - 8
-        x = r.right() - d - 4 if self.isChecked() else r.left() + 4
-        knob = QRectF(x, r.top() + 4, d, d)
-        paint_glass(p, knob, d / 2, self.t.level("bead"))
+        r = QRectF(self.rect())
+        on = self.isChecked()
+        track = QColor(self.t.primary if on else self.t.muted)
+        thumb = QColor(self.t.primary_fg if on else self.t.text)
+        if not self.isEnabled():
+            track.setAlphaF(0.5)
+            thumb.setAlphaF(0.5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawPath(rounded(r, r.height() / 2))
+        d = r.height() - 4
+        x = r.right() - d - 2 if on else r.left() + 2
+        p.setBrush(thumb)
+        p.drawEllipse(QRectF(x, r.top() + 2, d, d))
         p.end()
 
 
 class Segmented(QWidget):
-    """A pill of mutually exclusive options; the chosen one sits in a glass lens."""
+    """shadcn's Tabs list: mutually exclusive options on a muted track; the chosen one is a raised tab."""
 
     changed = Signal(str)
 
@@ -358,19 +362,19 @@ class Segmented(QWidget):
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t, self.options, self.current = t, list(options), current
-        self.setFont(font("caption_strong" if small else "callout"))
+        self.setFont(variable_font(13 if small else 14, "Medium"))
         fm = QFontMetrics(self.font())
-        self._widths = [fm.horizontalAdvance(o) + (22 if small else 28) for o in self.options]
-        self.setFixedSize(sum(self._widths) + 8, CONTROL_H["small" if small else "regular"] + 4)
+        self._widths = [fm.horizontalAdvance(o) + (20 if small else 24) for o in self.options]
+        self.setFixedSize(sum(self._widths) + 6, CONTROL_H["small" if small else "regular"])
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def mousePressEvent(self, event: object) -> None:  # noqa: D102
-        x = event.position().x() - 4
+        x = event.position().x() - 3
         for opt, w in zip(self.options, self._widths):
             if x < w:
                 if opt != self.current:
                     self.current = opt
                     self.update()
-                    _glass_changed(self)
                     self.changed.emit(opt)
                 return
             x -= w
@@ -378,14 +382,15 @@ class Segmented(QWidget):
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, r.height() / 2, self.t.level("inset"), shadow=False)
+        t = self.t
+        r = QRectF(self.rect())
+        paint_surface(p, r, RADIUS["card"], t.level("secondary"))
         x = r.left() + 3
         for opt, w in zip(self.options, self._widths):
             cell = QRectF(x, r.top() + 3, w, r.height() - 6)
             if opt == self.current:
-                paint_glass(p, cell, cell.height() / 2, self.t.level("lens"), shadow=True)
-            p.setPen(self.t.text if opt == self.current else self.t.text_2)
+                paint_surface(p, cell, RADIUS["control"], t.level("card"), border=QColor(0, 0, 0, 0))
+            p.setPen(t.text if opt == self.current else t.text_2)
             p.setFont(self.font())
             p.drawText(cell, Qt.AlignmentFlag.AlignCenter, opt)
             x += w
@@ -393,7 +398,7 @@ class Segmented(QWidget):
 
 
 class Dropdown(QAbstractButton):
-    """A glass pill that shows the chosen value and a chevron; a click opens the choices.
+    """shadcn's Select trigger: the chosen value and a chevron in a bordered box; a click opens the choices.
 
     ``options``: ``[(label, value), ...]`` or a callable returning them (read when opened, e.g. the
     devices plugged in now). ``changed(value)`` when the user picks one.
@@ -407,14 +412,12 @@ class Dropdown(QAbstractButton):
         super().__init__(parent)
         self.t, self.glyph, self.options = t, glyph, options
         self.setText(value)
-        self.setFont(font("callout"))
-        self.setFixedSize(width, CONTROL_H["regular"] + 4)
+        self.setFont(font("body"))
+        self.setFixedSize(width, CONTROL_H["regular"])
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clicked.connect(self._open)
 
     def _open(self) -> None:
-        from PySide6.QtWidgets import QMenu
-
         opts = self.options() if callable(self.options) else self.options
         if not opts:
             return
@@ -424,44 +427,85 @@ class Dropdown(QAbstractButton):
             popup.open_below(self)
             self._popup = popup
             return
-        menu = GlassMenu(self.t, self)
+        menu = Menu(self.t, self)
         menu.setMinimumWidth(self.width())
         for label, value in opts:
             act = menu.addAction(label)
             act.setCheckable(True)
             act.setChecked(label == self.text())
             act.triggered.connect(lambda _c=False, lab=label, v=value: self._pick(lab, v))
-        menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+        menu.popup(self.mapToGlobal(self.rect().bottomLeft() + QPoint(0, 4)))
 
     def _pick(self, label: str, value: object) -> None:
         self.setText(label)
         self.update()
         self.changed.emit(value)
 
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
+
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, r.height() / 2, self.t.level("control"), shadow=False)
-        x = r.left() + 14
+        t = self.t
+        r = QRectF(self.rect())
+        paint_surface(p, r, RADIUS["control"], t.level("input"),
+                      fill=QColor(t.subtle) if self.underMouse() else None)
+        x = r.left() + 12
         if self.glyph:
             p.setFont(font("icon_small"))
-            p.setPen(self.t.text_2)
+            p.setPen(t.text_2)
             p.drawText(QRectF(x, r.top(), 16, r.height()), Qt.AlignmentFlag.AlignCenter, ICON[self.glyph])
             x += 24
         p.setFont(self.font())
-        p.setPen(self.t.text)
+        p.setPen(t.text)
         fm = QFontMetrics(self.font())
-        text = fm.elidedText(self.text(), Qt.TextElideMode.ElideRight, int(r.right() - 34 - x))
-        p.drawText(QRectF(x, r.top(), r.right() - 34 - x, r.height()), Qt.AlignmentFlag.AlignVCenter, text)
+        text = fm.elidedText(self.text(), Qt.TextElideMode.ElideRight, int(r.right() - 32 - x))
+        p.drawText(QRectF(x, r.top(), r.right() - 32 - x, r.height()), Qt.AlignmentFlag.AlignVCenter, text)
         p.setFont(font("icon_small"))
-        p.setPen(self.t.text_3)
+        p.setPen(t.text_2)
         p.drawText(QRectF(r.right() - 30, r.top(), 18, r.height()), Qt.AlignmentFlag.AlignCenter, ICON["down"])
         p.end()
 
 
-class TextPill(QWidget):
-    """A text field in an inset glass pill, with an optional send pill on the right."""
+class _Field(QWidget):
+    """The bordered box around a line edit, with the focus ring when it holds the keyboard."""
+
+    def __init__(self, t: Theme, edit: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.edit = t, edit
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.addWidget(edit)
+        edit.installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, ev: QEvent) -> bool:  # noqa: D102
+        if ev.type() in (QEvent.Type.FocusIn, QEvent.Type.FocusOut):
+            self.update()
+        return False
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        t = self.t
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)   # room for the ring
+        focused = self.edit.hasFocus()
+        paint_surface(p, r, RADIUS["control"], t.level("input"),
+                      border=QColor("#52525b") if focused else None)
+        if focused:
+            ring = QColor(t.ring)
+            ring.setAlphaF(0.35)
+            paint_ring(p, r, RADIUS["control"], ring, 2.0)
+        p.end()
+
+
+class Input(QWidget):
+    """shadcn's Input (a bordered box, a subtle focus ring), with an optional button beside it."""
 
     submitted = Signal(str)
 
@@ -469,57 +513,52 @@ class TextPill(QWidget):
                  text: str = "", height: int = CONTROL_H["input"], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t = t
-        self.setFixedHeight(height)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedHeight(height + 4)
         row = QHBoxLayout(self)
-        row.setContentsMargins(18, 4, 5, 4)
-        row.setSpacing(SPACE["s"])
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(SPACE["s"] - 2)
         self.edit = QLineEdit(text)
         self.edit.setPlaceholderText(placeholder)
         self.edit.setFont(font("body"))
         self.edit.setFrame(False)
-        ph = QColor(t.text_3)
         self.edit.setStyleSheet(
             f"QLineEdit {{ background: transparent; color: {css(t.text)}; border: none;"
             f" selection-background-color: {css(t.accent_soft)}; }}")
         pal = self.edit.palette()
-        pal.setColor(pal.ColorRole.PlaceholderText, ph)
+        pal.setColor(pal.ColorRole.PlaceholderText, t.text_3)
         self.edit.setPalette(pal)
-        row.addWidget(self.edit, 1)
-        self.button: Pill | None = None
+        self.field = _Field(t, self.edit, self)
+        row.addWidget(self.field, 1)
+        self.button: Button | None = None
         if action or action_glyph:
-            self.button = Pill(t, action or "", glyph=action_glyph, style="accent",
-                               size="regular" if height >= 40 else "small")
-            row.addWidget(self.button)
+            self.button = Button(t, action or "", glyph=action_glyph, style="default",
+                                 size="regular" if height >= 36 else "small")
+            wrap = QVBoxLayout()
+            wrap.setContentsMargins(0, 2, 0, 2)
+            wrap.addWidget(self.button)
+            row.addLayout(wrap)
             self.button.clicked.connect(lambda: self.submitted.emit(self.edit.text()))
         self.edit.returnPressed.connect(lambda: self.submitted.emit(self.edit.text()))
 
-    def paintEvent(self, _event: object) -> None:  # noqa: D102
-        p = QPainter(self)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, r.height() / 2, self.t.level("control" if self.height() >= 40 else "inset"), shadow=False)
-        p.end()
-
 
 class Avatar(QWidget):
-    """A round initial in a soft tint (people)."""
+    """shadcn's Avatar fallback: a round initial on the muted surface (people)."""
 
-    def __init__(self, t: Theme, name: str, color: QColor, size: int = 36, parent: QWidget | None = None) -> None:
+    def __init__(self, t: Theme, name: str, size: int = 36, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.t, self.name, self.color = t, name, color
+        self.t, self.name = t, name
         self.setFixedSize(size, size)
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        fill = QColor(self.color)
-        fill.setAlphaF(0.16 if not self.t.dark else 0.22)
+        r = QRectF(self.rect())
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(fill)
+        p.setBrush(self.t.muted)
         p.drawEllipse(r)
-        p.setPen(self.color.darker(135) if not self.t.dark else self.color.lighter(130))
-        f = font("headline")
-        f.setPixelSize(int(r.height() * 0.42))
+        p.setPen(self.t.text)
+        f = variable_font(r.height() * 0.40, "Medium")
         p.setFont(f)
         initial = next((ch for ch in self.name if ch.isalnum()), "?").upper()
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, initial)
@@ -527,14 +566,14 @@ class Avatar(QWidget):
 
 
 class NavItem(QAbstractButton):
-    """A sidebar entry: glyph and word; the current page sits in a faint blue-hued glass lens."""
+    """A sidebar entry (shadcn's sidebar menu button): glyph and word; the current page on the muted fill."""
 
     def __init__(self, t: Theme, glyph: str, text: str, *, badge: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t, self.glyph, self.badge = t, glyph, badge
         self.setText(text)
         self.setCheckable(True)
-        self.setFixedHeight(40)
+        self.setFixedHeight(36)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def enterEvent(self, e: object) -> None:  # noqa: D102
@@ -548,51 +587,50 @@ class NavItem(QAbstractButton):
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        t = self.t
+        r = QRectF(self.rect())
         if self.isChecked():
-            paint_glass(p, r, r.height() / 2, self.t.level("lens"), shadow=False)
+            paint_surface(p, r, RADIUS["control"], t.level("selected"))
         elif self.underMouse():
-            wash = QColor(self.t.text)
-            wash.setAlphaF(0.04 if not self.t.dark else 0.06)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(wash)
-            p.drawPath(rounded(r, r.height() / 2))
-        ink = self.t.accent if self.isChecked() else self.t.text_2
-        p.setPen(ink)
+            paint_surface(p, r, RADIUS["control"], t.level("muted"))
+        on = self.isChecked() or self.underMouse()
+        p.setPen(t.text if on else t.text_2)
         p.setFont(font("icon"))
-        p.drawText(QRectF(r.left() + 14, r.top(), 20, r.height()), Qt.AlignmentFlag.AlignCenter, ICON[self.glyph])
-        p.setPen(self.t.text if self.isChecked() else self.t.text_2)
-        p.setFont(font("body_strong" if self.isChecked() else "body"))
-        p.drawText(QRectF(r.left() + 46, r.top(), r.width() - 60, r.height()), Qt.AlignmentFlag.AlignVCenter,
+        p.drawText(QRectF(r.left() + 10, r.top(), 18, r.height()), Qt.AlignmentFlag.AlignCenter, ICON[self.glyph])
+        p.setFont(variable_font(14, "Medium" if self.isChecked() else "Regular"))
+        p.drawText(QRectF(r.left() + 38, r.top(), r.width() - 80, r.height()), Qt.AlignmentFlag.AlignVCenter,
                    self.text())
-        if self.badge:   # a count in plain secondary text (no badge: 2026-09-27)
+        if self.badge:   # a count in plain secondary text
             p.setFont(font("caption"))
-            p.setPen(self.t.text_3)
-            p.drawText(QRectF(r.right() - 44, r.top(), 32, r.height()),
+            p.setPen(t.text_2)
+            p.drawText(QRectF(r.right() - 44, r.top(), 34, r.height()),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, self.badge)
         p.end()
 
 
-class StatTile(Glass):
-    """A small figure: label, value, and an optional note under it."""
+class StatTile(Card):
+    """A small figure card: label, value, and an optional note under it."""
 
     def __init__(self, t: Theme, label: str, value: str, note: str = "", *, glyph: str | None = None,
                  parent: QWidget | None = None) -> None:
-        super().__init__(t, level="inset", radius=RADIUS["row"] + 4, padding=SPACE["m"] + 2, parent=parent)
-        self.body.setSpacing(2)
+        super().__init__(t, padding=SPACE["l"] + 4, parent=parent)
+        self.body.setSpacing(4)
         head = QHBoxLayout()
         head.setSpacing(6)
-        if glyph:
-            head.addWidget(icon_label(t, glyph, t.text_3, "icon_small"))
-        head.addWidget(text_label(t, label, "caption", "text_2"))
+        head.addWidget(text_label(t, label, "caption_strong", "text_2"))
         head.addStretch(1)
+        if glyph:
+            head.addWidget(icon_label(t, glyph, t.text_2, "icon_small"))
         self.body.addLayout(head)
         self.body.addWidget(text_label(t, value, "numeral"))
         if note:
-            self.body.addWidget(text_label(t, note, "caption", "text_3", wrap=True))
+            self.body.addWidget(text_label(t, note, "caption", "text_2", wrap=True))
+        self.body.addStretch(1)   # top-aligned when a neighbour's note wraps onto two lines
 
 
 class Divider(QWidget):
+    """shadcn's Separator: 1 px of the border colour."""
+
     def __init__(self, t: Theme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t = t
@@ -600,18 +638,18 @@ class Divider(QWidget):
 
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
-        p.fillRect(self.rect(), self.t.grid)
+        p.fillRect(self.rect(), self.t.border)
         p.end()
 
 
 class ItemRow(QWidget):
     """One thing Yuki believes, with where it came from and the two ways to act on it.
 
-    Layout: an optional leading widget (avatar), the title and chips, the text, a
-    source line ("Seen in Discord · yesterday"), then two quiet pills: **Why?**
-    (the evidence folds open under it) and **Not right** (a composer folds open:
-    the user says what is true in their own words, or "It's just wrong, forget
-    it"). The folds are built the first time they open.
+    Layout: an optional leading widget (avatar), the title, the text, a source line
+    ("Seen in Discord · yesterday"), then two ghost buttons: **Why?** (the evidence
+    folds open under it) and **Not right** (a composer folds open: the user says what
+    is true in their own words, or "It's just wrong, forget it"). The folds are built
+    the first time they open.
 
     Signals:
         why: ``(ref)`` the evidence was opened.
@@ -646,40 +684,35 @@ class ItemRow(QWidget):
         col.setSpacing(4)
         outer.addLayout(col, 1)
         self._col = col
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        col.addLayout(head)
-        self._head = head
         if title:
-            head.addWidget(text_label(t, title, title_role))
-        head.addStretch(1)
+            col.addWidget(text_label(t, title, title_role, wrap=True))
         self._tag_words = tag_words(tags)
         self.text_label = text_label(t, text, "callout", "text", wrap=True, selectable=True)
         col.addWidget(self.text_label)
         self.was_label: QLabel | None = None
-        foot = QHBoxLayout()
-        foot.setSpacing(6)
-        col.addLayout(foot)
         self.source_label = text_label(t, " · ".join(x for x in (source, self._tag_words) if x), "caption",
-                                       "text_3")
-        foot.addWidget(self.source_label)
-        foot.addStretch(1)
-        self.why_pill: Pill | None = None
-        self.wrong_pill: Pill | None = None
+                                       "text_2", wrap=True)
+        col.addWidget(self.source_label)
+        foot = QHBoxLayout()
+        foot.setSpacing(4)
+        foot.setContentsMargins(0, 2, 0, 0)
+        self.why_pill: Button | None = None
+        self.wrong_pill: Button | None = None
         if actions:
-            self.why_pill = Pill(t, "Why?", style="quiet", size="small")
+            self.why_pill = Button(t, "Why?", style="ghost", size="small")
             self.why_pill.clicked.connect(self.toggle_evidence)
             foot.addWidget(self.why_pill)
             if not evidence:
                 self.why_pill.hide()
-            self.wrong_pill = Pill(t, "Not right", glyph="edit", style="quiet", size="small")
+            self.wrong_pill = Button(t, "Not right", glyph="edit", style="ghost", size="small")
             self.wrong_pill.clicked.connect(self.toggle_composer)
             foot.addWidget(self.wrong_pill)
+            foot.addStretch(1)
+            col.addLayout(foot)
         self._ev_box: QWidget | None = None
         self._composer: QWidget | None = None
-        self.field: TextPill | None = None
+        self.field: Input | None = None
         self.done_note: QLabel | None = None
-        self._state_chip: Chip | None = None
         if pending:
             self.set_pending(pending)
         elif show_evidence and evidence:
@@ -718,7 +751,7 @@ class ItemRow(QWidget):
             self.source_label.setText(f"You confirmed this at {when}")
         if self.wrong_pill is not None:
             self.wrong_pill.setText("Sent to Yuki")
-            self.wrong_pill.style = "quiet"
+            self.wrong_pill.style = "ghost"
             self.wrong_pill.setEnabled(False)
             self.wrong_pill.updateGeometry()
         if self._composer is not None:
@@ -727,17 +760,13 @@ class ItemRow(QWidget):
     def toggle_evidence(self) -> None:
         t = self.t
         if self._ev_box is None:
-            ev = Glass(t, level="inset", radius=RADIUS["row"], padding=SPACE["m"])
-            ev.body.setSpacing(6)
-            ev.body.addWidget(text_label(t, "Why Yuki thinks this", "caption_strong", "text_2"))
-            for when, where, words in self._evidence_rows:
-                line = QHBoxLayout()
-                line.setSpacing(SPACE["s"])
-                stamp = text_label(t, f"{when} · {where}", "caption", "text_3")
-                stamp.setFixedWidth(150)
-                line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
-                line.addWidget(text_label(t, words, "caption", "text_2", wrap=True, selectable=True), 1)
-                ev.body.addLayout(line)
+            ev = Card(t, level="muted", radius=RADIUS["card"], padding=SPACE["m"], parent=self)
+            ev.body.setSpacing(2)
+            ev.body.addWidget(text_label(t, "Why Yuki thinks this", "caption_strong", "text"))
+            for when, where, words in self._evidence_rows:   # each entry: where and when, then its words
+                ev.body.addSpacing(6)
+                ev.body.addWidget(text_label(t, f"{when} · {where}", "micro", "text_2", wrap=True))
+                ev.body.addWidget(text_label(t, words, "caption", "text", wrap=True, selectable=True))
             self._ev_box = ev
             self._col.insertWidget(self._col.count() if self._composer is None else self._col.count() - 1, ev)
             ev.setVisible(False)
@@ -752,19 +781,21 @@ class ItemRow(QWidget):
     def toggle_composer(self) -> None:
         t = self.t
         if self._composer is None:
-            box = Glass(t, level="inset", radius=RADIUS["row"] + 4, padding=SPACE["m"])
-            box.body.setSpacing(SPACE["s"])
+            box = Card(t, level="muted", radius=RADIUS["card"], padding=SPACE["m"], parent=self)
+            box.body.setSpacing(SPACE["s"] + 2)
             box.body.addWidget(text_label(t, "Tell Yuki what's right, in your own words. It will fix this and "
                                              "remember it came from you.", "caption", "text_2", wrap=True))
-            self.field = TextPill(t, self._placeholder or "e.g. “Elina is my friend”", action="Tell Yuki", height=38)
+            self.field = Input(t, self._placeholder or "e.g. “Elina is my friend”", action="Tell Yuki",
+                               height=CONTROL_H["input"])
             self.field.submitted.connect(self._send)
             box.body.addWidget(self.field)
             row = QHBoxLayout()
-            forget = Pill(t, "It's just wrong, forget it", style="quiet", size="small")
+            row.setSpacing(SPACE["s"])
+            forget = Button(t, "It's just wrong, forget it", style="outline", size="small")
             forget.clicked.connect(lambda: self._sent(self.forget.emit, self.ref))
             row.addWidget(forget)
             row.addStretch(1)
-            cancel = Pill(t, "Cancel", style="quiet", size="small")
+            cancel = Button(t, "Cancel", style="ghost", size="small")
             cancel.clicked.connect(self.toggle_composer)
             row.addWidget(cancel)
             box.body.addLayout(row)
@@ -774,8 +805,7 @@ class ItemRow(QWidget):
         show = not self._composer.isVisible()
         self._composer.setVisible(show)
         if self.wrong_pill is not None:
-            self.wrong_pill.style = "tinted" if show else "quiet"
-            self.wrong_pill.tint = t.kind("question") if show else None
+            self.wrong_pill.style = "secondary" if show else "ghost"
             self.wrong_pill.update()
         if show and self.field is not None:
             self.field.edit.setFocus()
@@ -796,21 +826,20 @@ class ItemRow(QWidget):
 class SettingRow(QWidget):
     """A settings line: glyph, a plain-language label with a hint under it, the control on the right.
 
-    The glyph sits top left on the label's first line; when the control is taller than that line, the glyph
-    and the label move down so the label's line and the control share one centre (never a glyph floating in
-    the middle of a tall row)."""
+    The glyph sits on the label's first line; when the control is taller than that line, the glyph and the
+    label move down so the label's line and the control share one centre."""
 
     def __init__(self, t: Theme, glyph: str, label: str, hint: str, control: QWidget | None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 6, 0, 6)
+        row.setContentsMargins(0, 4, 0, 4)
         row.setSpacing(SPACE["m"])
         line_h = QFontMetrics(font("body")).height()
         lift = max(0, ((control.sizeHint().height() if control is not None else 0) - line_h) // 2)
         ic = icon_label(t, glyph, t.text_2)
-        ic.setFixedSize(22, line_h)
+        ic.setFixedSize(20, line_h)
         ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left = QVBoxLayout()
         left.setContentsMargins(0, lift, 0, 0)
@@ -820,9 +849,9 @@ class SettingRow(QWidget):
         col = QVBoxLayout()
         col.setSpacing(2)
         col.setContentsMargins(0, lift, 0, 0)
-        col.addWidget(text_label(t, label, "body"))
+        col.addWidget(text_label(t, label, "body_strong", wrap=True))
         if hint:
-            col.addWidget(text_label(t, hint, "caption", "text_3", wrap=True))
+            col.addWidget(text_label(t, hint, "caption", "text_2", wrap=True))
         col.addStretch(1)
         row.addLayout(col, 1)
         if control is not None:
@@ -833,271 +862,106 @@ def section_title(t: Theme, text: str, note: str = "") -> QWidget:
     w = QWidget()
     w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     row = QHBoxLayout(w)
-    row.setContentsMargins(4, SPACE["s"], 4, 0)
+    row.setContentsMargins(0, SPACE["s"], 0, 0)
     row.addWidget(text_label(t, text, "title"))
     row.addStretch(1)
     if note:
-        row.addWidget(text_label(t, note, "caption", "text_3"))
+        row.addWidget(text_label(t, note, "caption", "text_2"))
     return w
 
 
 def page_header(t: Theme, title: str, subtitle: str, right: Sequence[QWidget] = ()) -> QWidget:
+    """A page's title (24 px, 600) and its description (14 px, muted), wrapping inside the page."""
     w = QWidget()
     w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     row = QHBoxLayout(w)
-    row.setContentsMargins(4, 0, 0, 0)
-    row.setSpacing(SPACE["s"])
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(SPACE["l"])
     col = QVBoxLayout()
-    col.setSpacing(2)
+    col.setSpacing(6)
     col.addWidget(text_label(t, title, "large_title"))
-    col.addWidget(text_label(t, subtitle, "callout", "text_2", wrap=True))
+    col.addWidget(text_label(t, subtitle, "body", "text_2", wrap=True))
     row.addLayout(col, 1)
     for r in right:
-        row.addWidget(r, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(r, 0, Qt.AlignmentFlag.AlignTop)
     return w
 
 
-class GlassSlider(QWidget):
-    """A glass track with a bead; ``value`` 0..2 (1 = as designed). ``committed(value)`` when let go.
-
-    Nothing is re-rendered while it is dragged: the glass follows once the bead is released.
-    """
-
-    committed = Signal(float)
-
-    def __init__(self, t: Theme, value: float = 1.0, *, width: int = 200, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.t = t
-        self.value = max(0.0, min(2.0, float(value)))
-        self.setFixedSize(width, 28)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._drag = False
-
-    def _set_from(self, x: float) -> None:
-        span = max(1.0, self.width() - 24)
-        self.value = max(0.0, min(2.0, (x - 12) / span * 2.0))
-        self.update()
-
-    def mousePressEvent(self, e: object) -> None:  # noqa: D102
-        self._drag = True
-        self._set_from(e.position().x())
-
-    def mouseMoveEvent(self, e: object) -> None:  # noqa: D102
-        if self._drag:
-            self._set_from(e.position().x())
-
-    def mouseReleaseEvent(self, e: object) -> None:  # noqa: D102
-        if self._drag:
-            self._drag = False
-            self._set_from(e.position().x())
-            self.committed.emit(round(self.value, 2))
-
-    def paintEvent(self, _e: object) -> None:  # noqa: D102
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        t = self.t
-        track = QRectF(12, self.height() / 2 - 3, self.width() - 24, 6)
-        paint_glass(p, track, 3, t.level("inset"), shadow=False, painted=True)
-        filled = QRectF(track.left(), track.top(), track.width() * self.value / 2.0, track.height())
-        paint_glass(p, filled, 3, t.level("accent"), shadow=False, painted=True)
-        mid = track.left() + track.width() / 2
-        p.setPen(QPen(t.text_3, 1.0))
-        p.drawLine(int(mid), int(track.top() - 4), int(mid), int(track.bottom() + 4))
-        x = track.left() + track.width() * self.value / 2.0
-        knob = QRectF(x - 10, self.height() / 2 - 10, 20, 20)
-        paint_glass(p, knob, 10, t.level("bead"), painted=True)
-        p.end()
+# -- floating: toast, menu, tooltip --------------------------------------------------------------------
 
 
 class Toast(QWidget):
-    """A short glass note at the bottom of the window ("Told Yuki. It will fix this.")."""
+    """A short note at the bottom of the window ("Told Yuki. It will fix this."): a popover card."""
+
+    #: Room around the card for its shadow (logical px).
+    MARGIN = 10
+    MAX_W = 520
 
     def __init__(self, t: Theme, parent: QWidget) -> None:
         super().__init__(parent)
         self.t = t
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._text = ""
         self._tone = ""
         self._timer = None
-        self._grabbing = False
-        self._lens = FloatLens(self, lambda: self.t, settle_ms=0)
         self.hide()
-
-    def _tint(self) -> QColor | None:
-        if not self._tone:
-            return None
-        tint = QColor(self.t.kind(self._tone) if self._tone in self.t.kinds else self.t.status.get(self._tone,
-                                                                                                 self.t.accent))
-        tint.setAlphaF(0.12)
-        return tint
 
     def show_text(self, text: str, *, tone: str = "", ms: int = 3200) -> None:
         from PySide6.QtCore import QTimer
 
         self._text, self._tone = text, tone
-        fm = QFontMetrics(font("callout"))
-        w = min(self.parentWidget().width() - 80, fm.horizontalAdvance(text) + 56)
-        self.resize(w, 40)
         par = self.parentWidget()
-        self.move((par.width() - w) // 2 + 100, par.height() - 64)
+        fm = QFontMetrics(font("body"))
+        inner = min(self.MAX_W, par.width() - 120) - 32
+        br = fm.boundingRect(QRect(0, 0, max(120, inner), 400), int(Qt.TextFlag.TextWordWrap), text)
+        m = self.MARGIN
+        w, h = br.width() + 32 + 2 * m, max(44, br.height() + 24) + 2 * m
+        self.resize(w, h)
+        offset = getattr(par, "content_left", lambda: 0)()
+        self.move(offset + (par.width() - offset - w) // 2, par.height() - h - 16)
         self.raise_()
         self.show()
         self.update()
-        # the toast floats over the page: it bends what is under it, rendered once for this place and text
-        self._lens.request((self.geometry().getRect(), text, tone), self._grab, self.height() / 2 - 1,
-                           tint=self._tint())
         if self._timer is None:
             self._timer = QTimer(self)
             self._timer.setSingleShot(True)
             self._timer.timeout.connect(self.hide)
         self._timer.start(ms)
 
-    def _grab(self):
-        par = self.parentWidget()
-        if par is None:
-            return None
-        self._grabbing = True
-        try:
-            return grab_under(par, self.geometry())
-        finally:
-            self._grabbing = False
-
     def paintEvent(self, _e: object) -> None:  # noqa: D102
-        if self._grabbing:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_floating(p, r, r.height() / 2, self.t,
-                       self._lens.image_for((self.geometry().getRect(), self._text, self._tone)), tint=self._tint())
-        p.setPen(self.t.text)
-        p.setFont(font("callout"))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._text)
+        m = self.MARGIN
+        r = QRectF(self.rect()).adjusted(m, m, -m, -m)
+        paint_shadow(p, r, RADIUS["card"], blur=8, dy=3)
+        paint_surface(p, r, RADIUS["card"], self.t.level("popover"))
+        p.setPen(self.t.danger if self._tone in ("error",) else self.t.text)
+        p.setFont(font("body"))
+        p.drawText(r.adjusted(16, 12, -16, -12), int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+                   self._text)
         p.end()
 
 
-# -- floating glass over the app's own content ----------------------------------------------------------
+def menu_css(t: Theme) -> str:
+    """A :class:`Menu`'s items (its surface is painted): shadcn's DropdownMenu item spacing and hover."""
+    return (f"QMenu {{ background: transparent; color: {css(t.text)}; border: none; padding: 5px; }}"
+            "QMenu::item { padding: 6px 24px 6px 28px; border-radius: 4px; background: transparent; }"
+            f"QMenu::item:selected {{ background: {css(t.muted)}; }}"
+            f"QMenu::item:disabled {{ color: {css(t.text_2)}; }}"
+            f"QMenu::separator {{ height: 1px; background: {css(t.border)}; margin: 4px -5px; }}"
+            "QMenu::indicator { width: 14px; height: 14px; left: 8px; }"
+            "QMenu::right-arrow { width: 10px; height: 10px; right: 8px; }")
 
 
-def grab_under(host: QWidget, rect: "QRect", margin: int = 24):
-    """What ``host`` shows under ``rect`` (host coordinates), with ``margin`` around it for the rim to bend:
-    ``(image, where the glass sits in it)``, or None. A grab of the app's own widgets, never of the screen."""
-    from PySide6.QtCore import QRect
-
-    area = QRect(rect).adjusted(-margin, -margin, margin, margin).intersected(host.rect())
-    if area.width() < 4 or area.height() < 4:
-        return None
-    img = host.grab(area).toImage()
-    return img, QRectF(QRect(rect).translated(-area.topLeft()))
+def _paint_menu(widget: QWidget, t: Theme) -> None:
+    p = QPainter(widget)
+    paint_surface(p, QRectF(widget.rect()), RADIUS["control"], t.level("popover"))
+    p.end()
 
 
-class FloatLens:
-    """Refraction for one glass shape floating over the app's own content (a hover card, a toast, a menu,
-    a tooltip): rendered once for a place and size on the glass thread, then kept and just painted.
-
-    ``request(key, grab, radius)``: ``grab()`` (GUI thread) returns ``(content, rect)`` as
-    :func:`grab_under` does. Nothing renders while the key stays the same; a new key waits ``settle_ms``
-    (the pointer coming to rest) and renders once. Off, or when nothing is under it, the caller paints the
-    same glass flat (:func:`paint_floating`).
-    """
-
-    renders = 0
-
-    def __init__(self, owner: QWidget, theme: Callable[[], Theme], *, settle_ms: int = 90) -> None:
-        from PySide6.QtCore import QTimer
-
-        self.owner, self.theme = owner, theme
-        self.key: object = None
-        self.image = None
-        self._wanted: object = None
-        self._job: tuple | None = None
-        self._timer = QTimer(owner)
-        self._timer.setSingleShot(True)
-        self._timer.setInterval(max(0, settle_ms))
-        self._timer.timeout.connect(self._run)
-
-    def image_for(self, key: object):
-        return self.image if self.key == key and key is not None else None
-
-    def forget(self) -> None:
-        self.key = self.image = self._wanted = None
-        self._timer.stop()
-
-    def request(self, key: object, grab: Callable[[], object], radius: float, *, level: str = "popover",
-                tint: QColor | None = None) -> None:
-        from yuki.ui import lens
-
-        if not lens.policy().floats_refract or key == self.key or key == self._wanted:
-            return
-        self._wanted = key
-        self._job = (grab, radius, level, tint)
-        self._timer.start()
-
-    def _run(self) -> None:
-        import weakref
-
-        from yuki.ui import lens
-        from yuki.ui.glass import glass_worker
-
-        key, job = self._wanted, self._job
-        if key is None or job is None:
-            return
-        grab, radius, level, tint = job
-        try:
-            got = grab()
-        except RuntimeError:
-            got = None
-        if not got:
-            self._wanted = None
-            return
-        content, rect = got
-        dpr = content.devicePixelRatio() or 1.0
-        t = self.theme()
-        optics = t.optics.get(level) or t.optics["popover"]
-        r_dev = QRectF(rect.x() * dpr, rect.y() * dpr, rect.width() * dpr, rect.height() * dpr)
-        ref = weakref.ref(self)
-        mode = lens.policy().mode
-
-        def work():
-            return lens.float_lens(content, r_dev, radius * dpr, optics, tint=tint, mode=mode)
-
-        def deliver(img) -> None:
-            me = ref()
-            if me is None or me._wanted != key:
-                return
-            me.key, me.image, me._wanted = key, img, None
-            FloatLens.renders += 1
-            try:
-                me.owner.update()
-            except RuntimeError:
-                pass
-
-        glass_worker().submit(work, deliver)
-
-
-def paint_floating(p: QPainter, rect: QRectF, radius: float, t: Theme, image=None, *,
-                   tint: QColor | None = None, shadow: bool = True) -> None:
-    """Floating glass: the refracted content under it when rendered (``image``), else the same glass flat."""
-    level = t.level("popover")
-    if image is None or image.isNull():
-        paint_glass(p, rect, radius, level, tint=tint, shadow=shadow, painted=True)
-        return
-    from yuki.ui.window.glass import paint_catchlight, paint_shadow
-
-    p.save()
-    if shadow:
-        paint_shadow(p, rect, radius, level)
-    p.setClipPath(rounded(rect, radius))
-    p.drawImage(rect, image)
-    p.restore()
-    p.save()
-    paint_catchlight(p, rect, radius, level)
-    p.restore()
-
-
-class GlassMenu(QMenu):
-    """A popup menu of clear glass (dropdowns, the day picker, the tray): rounded, translucent, no border;
-    over the app it bends the window's content under it, rendered once when it opens."""
+class Menu(QMenu):
+    """shadcn's DropdownMenu: a popover with a 1 px border, 6 px corners, a muted item under the pointer."""
 
     def __init__(self, t: Theme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1105,40 +969,16 @@ class GlassMenu(QMenu):
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFont(font("callout"))
+        self.setFont(font("body"))
         self.setStyleSheet(menu_css(t))
-        self._lens = FloatLens(self, lambda: self.t, settle_ms=0)
-
-    def _host(self) -> QWidget | None:
-        par = self.parentWidget()
-        return par.window() if par is not None else None
-
-    def showEvent(self, e: object) -> None:  # noqa: D102
-        super().showEvent(e)
-        host = self._host()
-        if host is None:
-            return
-        from PySide6.QtCore import QRect
-
-        local = QRect(host.mapFromGlobal(self.geometry().topLeft()), self.size())
-        self._lens.request(local.getRect(), lambda: grab_under(host, local), 12)
 
     def paintEvent(self, e: object) -> None:  # noqa: D102
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        host = self._host()
-        key = None
-        if host is not None:
-            key = (host.mapFromGlobal(self.geometry().topLeft()).x(), host.mapFromGlobal(self.geometry().topLeft()).y(),
-                   self.width(), self.height())
-        paint_floating(p, r, 12, self.t, self._lens.image_for(key), shadow=False)
-        p.end()
+        _paint_menu(self, self.t)
         super().paintEvent(e)
 
 
-class _MenuGlass(QObject):
-    """Paints clear glass under a plain QMenu's items (for submenus made with ``addMenu``)."""
+class _MenuPainter(QObject):
+    """Paints the popover surface under a plain QMenu's items (submenus made with ``addMenu``)."""
 
     def __init__(self, theme: Callable[[], Theme]) -> None:
         super().__init__()
@@ -1146,45 +986,30 @@ class _MenuGlass(QObject):
 
     def eventFilter(self, obj: QObject, ev: QEvent) -> bool:  # noqa: D102
         if ev.type() == QEvent.Type.Paint and isinstance(obj, QWidget):
-            p = QPainter(obj)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            paint_floating(p, QRectF(obj.rect()).adjusted(1, 1, -1, -1), 12, self.theme(), None, shadow=False)
-            p.end()
+            _paint_menu(obj, self.theme())
         return False
 
 
-_MENU_GLASS: list[_MenuGlass] = []
+_MENU_PAINTER: list[_MenuPainter] = []
 
 
-def glassify(menu: QMenu, theme: Callable[[], Theme]) -> None:
-    """Make an existing plain QMenu (a submenu) clear glass like :class:`GlassMenu` (once; restyled after)."""
-    if not menu.property("glass_menu"):
+def style_menu(menu: QMenu, theme: Callable[[], Theme]) -> None:
+    """Make an existing plain QMenu (a submenu) look like :class:`Menu` (once; restyled after)."""
+    if not menu.property("yuki_menu"):
         menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        if not _MENU_GLASS:
-            _MENU_GLASS.append(_MenuGlass(theme))
-        _MENU_GLASS[0].theme = theme
-        menu.installEventFilter(_MENU_GLASS[0])
-        menu.setFont(font("callout"))
-        menu.setProperty("glass_menu", True)
+        if not _MENU_PAINTER:
+            _MENU_PAINTER.append(_MenuPainter(theme))
+        _MENU_PAINTER[0].theme = theme
+        menu.installEventFilter(_MENU_PAINTER[0])
+        menu.setFont(font("body"))
+        menu.setProperty("yuki_menu", True)
     menu.setStyleSheet(menu_css(theme()))
 
 
-def menu_css(t: Theme) -> str:
-    """The items of a :class:`GlassMenu` (the glass itself is painted): no background, no border."""
-    return (f"QMenu {{ background: transparent; color: {css(t.text)}; border: none; padding: 6px; }}"
-            "QMenu::item { padding: 6px 22px 6px 26px; border-radius: 8px; background: transparent; }"
-            f"QMenu::item:selected {{ background: {css(t.accent_soft)}; }}"
-            f"QMenu::item:disabled {{ color: {css(t.text_3)}; }}"
-            f"QMenu::separator {{ height: 1px; background: {css(t.grid)}; margin: 4px 10px; }}")
-
-
-# -- tooltips: clear glass, not the system's opaque box ------------------------------------------------
-
-
-class GlassTip(QWidget):
-    """The tooltip: a small floating glass pane that bends the app content under it (never focused)."""
+class Tip(QWidget):
+    """The tooltip: a small popover (never focused), wrapping at 320 px."""
 
     def __init__(self, theme: Callable[[], Theme]) -> None:
         super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
@@ -1193,15 +1018,14 @@ class GlassTip(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self._text = ""
-        self._host: QWidget | None = None
-        self._lens = FloatLens(self, theme, settle_ms=0)
 
-    def show_tip(self, text: str, gpos: object, host: QWidget | None) -> None:
-        from PySide6.QtCore import QPoint, QRect
+    def show_tip(self, text: str, gpos: object, host: QWidget | None = None) -> None:
+        from PySide6.QtCore import QPoint
         from PySide6.QtGui import QGuiApplication
 
-        self._text, self._host = text, host
-        fm = QFontMetrics(font("caption"))
+        del host
+        self._text = text
+        fm = QFontMetrics(font("micro"))
         br = fm.boundingRect(QRect(0, 0, 320, 400), int(Qt.TextFlag.TextWordWrap), text)
         self.resize(br.width() + 24, br.height() + 14)
         pos = QPoint(gpos) + QPoint(12, 20)
@@ -1212,40 +1036,28 @@ class GlassTip(QWidget):
             if pos.y() + self.height() > area.bottom():
                 pos.setY(QPoint(gpos).y() - self.height() - 8)
         self.move(pos)
-        self._lens.forget()
         self.show()
         self.update()
-        if host is not None and host.isVisible():
-            local = QRect(host.mapFromGlobal(pos), self.size())
-            self._lens.request(local.getRect(), lambda: grab_under(host, local), 10)
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         t = self.theme()
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        key = None
-        if self._host is not None:
-            try:
-                tl = self._host.mapFromGlobal(self.pos())
-                key = (tl.x(), tl.y(), self.width(), self.height())
-            except RuntimeError:
-                key = None
-        paint_floating(p, r, 10, t, self._lens.image_for(key), shadow=False)
+        r = QRectF(self.rect())
+        paint_surface(p, r, RADIUS["tooltip"], t.level("popover"))
         p.setPen(t.text)
-        p.setFont(font("caption"))
+        p.setFont(font("micro"))
         p.drawText(r.adjusted(12, 7, -12, -7), int(Qt.TextFlag.TextWordWrap), self._text)
         p.end()
 
 
 class _TipFilter(QObject):
-    """Shows :class:`GlassTip` instead of the system tooltip for the widgets it watches."""
+    """Shows :class:`Tip` instead of the system tooltip for the widgets it watches."""
 
     def __init__(self, theme: Callable[[], Theme]) -> None:
         super().__init__()
         from PySide6.QtCore import QTimer
 
-        self.tip = GlassTip(theme)
+        self.tip = Tip(theme)
         self.owner: QWidget | None = None
         self._hide = QTimer(self)
         self._hide.setSingleShot(True)
@@ -1272,20 +1084,19 @@ _TIPS: dict[str, _TipFilter] = {}
 
 
 def attach_tips(root: QWidget, theme: Callable[[], Theme]) -> None:
-    """Glass tooltips for ``root`` and every widget under it that has one (one filter per process; a
-    filter on each widget with a tooltip, not on the whole application, so other events cost nothing)."""
+    """Flat tooltips for ``root`` and every widget under it that has one (one filter per process; a filter on
+    each widget with a tooltip, not on the whole application, so other events cost nothing)."""
     f = _TIPS.get("tips")
     if f is None:
         f = _TIPS["tips"] = _TipFilter(theme)
     f.tip.theme = theme
-    f.tip._lens.theme = theme
-    if not root.property("glass_tip"):   # the root always (its tooltip may be set later, e.g. the voice pill)
+    if not root.property("yuki_tip"):   # the root always (its tooltip may be set later, e.g. the voice pill)
         root.installEventFilter(f)
-        root.setProperty("glass_tip", True)
+        root.setProperty("yuki_tip", True)
     for w in root.findChildren(QWidget):
-        if w.toolTip() and not w.property("glass_tip"):
+        if w.toolTip() and not w.property("yuki_tip"):
             w.installEventFilter(f)
-            w.setProperty("glass_tip", True)
+            w.setProperty("yuki_tip", True)
 
 
 # -- smooth scrolling ---------------------------------------------------------------------------------
@@ -1457,8 +1268,8 @@ def smooth(area: QScrollArea) -> SmoothScroller:
 
 
 class Shimmer(QWidget):
-    """A placeholder while a page or a section loads: faint glass blocks with a soft light sweeping over
-    them. Its timer runs only while it is shown; it is deleted when the real content takes its place."""
+    """shadcn's Skeleton: a card of muted blocks that pulse gently while a section loads. Its timer runs only
+    while it is shown; it is deleted when the real content takes its place."""
 
     def __init__(self, t: Theme, *, rows: int = 3, height: int = 150, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1471,7 +1282,7 @@ class Shimmer(QWidget):
         self._clock = QElapsedTimer()
         self._clock.start()
         self._timer = QTimer(self)
-        self._timer.setInterval(33)
+        self._timer.setInterval(66)
         self._timer.timeout.connect(self.update)
 
     def sizeHint(self) -> QSize:  # noqa: D102
@@ -1479,9 +1290,9 @@ class Shimmer(QWidget):
 
     def showEvent(self, e: object) -> None:  # noqa: D102
         super().showEvent(e)
-        from yuki.ui import lens
+        from yuki.ui import ui_settings
 
-        if not lens.policy().reduce_motion:
+        if not ui_settings.current().reduce_motion:
             self._timer.start()
 
     def hideEvent(self, e: object) -> None:  # noqa: D102
@@ -1489,41 +1300,25 @@ class Shimmer(QWidget):
         self._timer.stop()
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
-        from PySide6.QtCore import QPointF
-        from PySide6.QtGui import QBrush, QLinearGradient
+        import math
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         t = self.t
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_glass(p, r, RADIUS["panel"], t.level("regular"), shadow=False, painted=True)
-        base = QColor(t.text)
-        base.setAlphaF(0.06 if not t.dark else 0.08)
-        blocks = [QRectF(r.left() + 20, r.top() + 20, r.width() * 0.34, 14)]
-        y = r.top() + 50
+        r = QRectF(self.rect())
+        paint_surface(p, r, RADIUS["card"], t.level("card"))
+        block = QColor(t.muted)
+        phase = (self._clock.elapsed() % 2000) / 2000.0
+        block.setAlphaF(0.75 + 0.25 * math.cos(phase * 2 * math.pi))   # animate-pulse
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(block)
+        p.drawPath(rounded(QRectF(r.left() + 24, r.top() + 24, r.width() * 0.34, 14), 4))
+        y = r.top() + 54
         for i in range(self.rows):
-            if y + 12 > r.bottom() - 12:
+            if y + 12 > r.bottom() - 16:
                 break
-            blocks.append(QRectF(r.left() + 20, y, (r.width() - 40) * (0.92 - 0.17 * (i % 3)), 11))
+            p.drawPath(rounded(QRectF(r.left() + 24, y, (r.width() - 48) * (0.92 - 0.17 * (i % 3)), 11), 4))
             y += 24
-        path = None
-        for b in blocks:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(base)
-            p.drawPath(rounded(b, b.height() / 2))
-            path = rounded(b, b.height() / 2) if path is None else path.united(rounded(b, b.height() / 2))
-        # the sweep: a soft band of light crossing every block, once every 1.4 s
-        phase = (self._clock.elapsed() % 1400) / 1400.0
-        x = r.left() - r.width() * 0.3 + phase * r.width() * 1.6
-        g = QLinearGradient(QPointF(x - 120, 0), QPointF(x + 120, 0))
-        hi = QColor(255, 255, 255, 0)
-        g.setColorAt(0.0, hi)
-        mid = QColor(255, 255, 255, 90 if t.dark else 200)
-        g.setColorAt(0.5, mid)
-        g.setColorAt(1.0, hi)
-        if path is not None:
-            p.setClipPath(path)
-            p.fillRect(r, QBrush(g))
         p.end()
 
 
@@ -1534,13 +1329,13 @@ Callback = Callable[..., object]
 
 
 class _ListRow(QAbstractButton):
-    """One choice in a :class:`ListPopup`: its words, a soft wash under the pointer and on the current one."""
+    """One choice in a :class:`ListPopup`: its words, the muted fill under the pointer and on the current one."""
 
     def __init__(self, t: Theme, text: str, current: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t, self.current = t, current
         self.setText(text)
-        self.setFont(font("callout" if not current else "body_strong"))
+        self.setFont(variable_font(14, "Medium" if current else "Regular"))
         self.setFixedHeight(ListPopup.ROW_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1556,22 +1351,22 @@ class _ListRow(QAbstractButton):
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(4, 1, -4, -1)
+        r = QRectF(self.rect())
         if self.current or self.underMouse():
-            wash = QColor(self.t.accent_soft if self.current else self.t.grid)
-            if not self.current:
-                wash.setAlphaF(min(1.0, wash.alphaF() * 1.8))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(wash)
-            p.drawPath(rounded(r, r.height() / 2))
-        p.setPen(self.t.text if self.current or self.underMouse() else self.t.text_2)
+            paint_surface(p, r, 4, self.t.level("selected"))
+        p.setPen(self.t.text)
         p.setFont(self.font())
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+        p.drawText(r.adjusted(10, 0, -10, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.text())
+        if self.current:
+            p.setFont(font("icon_small"))
+            p.drawText(r.adjusted(0, 0, -10, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                       ICON["check"])
         p.end()
 
 
 class ListPopup(QWidget):
-    """A small glass popup with a scrolling list, opened under a control and scrolled to its current value.
+    """A small popover with a scrolling list, opened under a control and scrolled to its current value.
     Replaces a menu for a long list (48 quiet-hour times made a screen-tall menu). ``picked(label, value)``."""
 
     picked = Signal(str, object)
@@ -1586,12 +1381,13 @@ class ListPopup(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setContentsMargins(4, 4, 4, 4)
         self.area = QScrollArea(self)
         self.area.setFrameShape(QFrame.Shape.NoFrame)
         self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.area.setWidgetResizable(True)
-        self.area.setStyleSheet(scroll_css(True))
+        self.area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent;"
+                                " border: none; }" + scrollbar_css(t))
         self.area.viewport().setAutoFillBackground(False)
         inner = QWidget()
         inner.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -1609,7 +1405,7 @@ class ListPopup(QWidget):
         smooth(self.area)
         outer.addWidget(self.area)
         shown = min(self.ROWS, max(1, len(options)))
-        self.resize(max(width, 110), shown * self.ROW_H + 12)
+        self.resize(max(width, 110), shown * self.ROW_H + 8)
 
     def open_below(self, anchor: QWidget) -> None:
         from PySide6.QtCore import QPoint
@@ -1633,14 +1429,7 @@ class ListPopup(QWidget):
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        under = QColor(self.t.bg)
-        under.setAlphaF(0.55)   # a list to read over the page: denser than a menu's glass
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(under)
-        p.drawPath(rounded(r, 16))
-        paint_floating(p, r, 16, self.t, None, shadow=False)
+        paint_surface(p, QRectF(self.rect()), RADIUS["control"], self.t.level("popover"))
         p.end()
 
 
@@ -1668,7 +1457,7 @@ def combo_words(combo: str) -> str:
 
 
 class KeyCapture(QAbstractButton):
-    """A glass field showing a shortcut; click it and press the keys you want. A key with modifiers
+    """An outlined field showing a shortcut; click it and press the keys you want. A key with modifiers
     ("ctrl+alt+k") or two or more modifiers alone, released together ("alt+shift"), is taken; Esc cancels.
     ``captured(combo)`` with the combo in :mod:`yuki.ui.hotkey`'s spelling."""
 
@@ -1680,8 +1469,8 @@ class KeyCapture(QAbstractButton):
         self.listening = False
         self._mods: set[str] = set()
         self._peak: set[str] = set()
-        self.setFont(variable_font(14, "Semibold"))
-        self.setFixedSize(width, CONTROL_H["regular"] + 6)
+        self.setFont(variable_font(14, "Medium"))
+        self.setFixedSize(width, CONTROL_H["regular"])
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.clicked.connect(self._start)
@@ -1746,16 +1535,28 @@ class KeyCapture(QAbstractButton):
         self._stop()
         self.captured.emit(combo)
 
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
+
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(3, 2, -3, -4)
-        paint_button(p, r, self.t, "tinted" if self.listening else "glass", self.t.accent, hover=self.underMouse())
+        t = self.t
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        paint_button(p, r, t, "outline", hover=self.underMouse() and not self.listening)
         if self.listening:
+            ring = QColor(t.ring)
+            ring.setAlphaF(0.5)
+            paint_ring(p, r, RADIUS["control"], ring, 2.0)
             live = " + ".join(combo_words(m) for m in _MOD_ORDER if m in self._mods)
-            text, ink = (live + " + …" if live else "Press your shortcut…"), self.t.text
+            text, ink = (live + " + …" if live else "Press your shortcut…"), t.text_2 if not live else t.text
         else:
-            text, ink = combo_words(self.combo) or "Not set", self.t.text
+            text, ink = combo_words(self.combo) or "Not set", t.text
         p.setPen(ink)
         p.setFont(self.font())
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
@@ -1768,15 +1569,25 @@ class KeyCapture(QAbstractButton):
 class Masonry(QLayout):
     """Cards in columns, each exactly as tall as its content, each placed in the column that is shortest so
     far (so the columns end close together). ``columns`` at most; fewer when a column would be narrower than
-    ``min_col``. Height-for-width, so a scroll area sizes the page right."""
+    ``min_col``, down to one column in a narrow window (nothing is ever clipped). Height-for-width, so a scroll
+    area sizes the page right.
+
+    :meth:`add` puts a card in a chosen column instead (a page whose columns have a meaning); in one column
+    the first column's cards come first, then the second's."""
 
     def __init__(self, parent: QWidget | None = None, *, columns: int = 2, spacing: int = SPACE["l"],
                  min_col: int = 360) -> None:
         super().__init__(parent)
         self._items: list = []
+        self._pref: dict[int, int] = {}
         self.columns, self.min_col = columns, min_col
         self.setSpacing(spacing)
         self.setContentsMargins(0, 0, 0, 0)
+
+    def add(self, widget: QWidget, column: int) -> None:
+        """Add ``widget`` to ``column`` (0-based)."""
+        self.addWidget(widget)
+        self._pref[id(self._items[-1])] = column
 
     def addItem(self, item) -> None:  # noqa: D102, N802
         w = item.widget()
@@ -1793,7 +1604,11 @@ class Masonry(QLayout):
         return self._items[i] if 0 <= i < len(self._items) else None
 
     def takeAt(self, i: int):  # noqa: D102, N802
-        return self._items.pop(i) if 0 <= i < len(self._items) else None
+        if not 0 <= i < len(self._items):
+            return None
+        item = self._items.pop(i)
+        self._pref.pop(id(item), None)
+        return item
 
     def expandingDirections(self):  # noqa: D102, N802
         return Qt.Orientation(0)
@@ -1820,11 +1635,14 @@ class Masonry(QLayout):
         n = max(1, min(self.columns, (w + sp) // (self.min_col + sp)))
         col_w = max(1, (w - (n - 1) * sp) // n)
         heights = [0] * n
-        moved = False
-        for item in self._items:
+        order = self._items
+        if self._pref and n == 1:
+            order = sorted(self._items, key=lambda it: self._pref.get(id(it), 0))   # stable: column, then order
+        for item in order:
             if item.isEmpty():
                 continue
-            c = heights.index(min(heights))
+            pref = self._pref.get(id(item))
+            c = min(pref, n - 1) if pref is not None and n > 1 else heights.index(min(heights))
             w = item.widget()
             if w is not None:
                 h = w.heightForWidth(col_w) if w.hasHeightForWidth() else w.sizeHint().height()
@@ -1835,11 +1653,7 @@ class Masonry(QLayout):
                 if w is not None:
                     if w.geometry() != geo:
                         w.setGeometry(geo)
-                        moved = True
                 else:
                     item.setGeometry(geo)
             heights[c] += h + sp
-        if moved and self.parentWidget() is not None:   # the page's cached glass follows the cards
-            _glass_changed(self.parentWidget())
         return max(0, max(heights) - sp)
-

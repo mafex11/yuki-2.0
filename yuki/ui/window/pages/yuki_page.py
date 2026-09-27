@@ -32,11 +32,11 @@ from yuki.ui.window.data import ASPECT_TITLES, Todo, YukiView, day_label, epoch,
 from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
     Divider,
-    Glass,
+    Card,
     Masonry,
     Panel,
-    Pill,
-    TextPill,
+    Button,
+    Input,
     icon_label,
     page_header,
     tag_words,
@@ -53,13 +53,13 @@ def _when(value) -> str:
 
 
 def _composer(t: Theme, placeholder: str, action: str, on_send, *, hint: str = "",
-              parent: QWidget | None = None) -> Glass:
+              parent: QWidget | None = None) -> Card:
     """An inline "say it in your words" box (hidden until its pill opens it)."""
-    box = Glass(t, level="inset", radius=18, padding=SPACE["m"], parent=parent)
+    box = Card(t, level="muted", padding=SPACE["m"], parent=parent)
     box.body.setSpacing(SPACE["s"])
     if hint:
         box.body.addWidget(text_label(t, hint, "caption", "text_2", wrap=True))
-    field = TextPill(t, placeholder, action=action, height=38)
+    field = Input(t, placeholder, action=action, height=38)
 
     def send(text: str) -> None:
         text = " ".join((text or "").split())
@@ -155,15 +155,15 @@ def _todo_row(t: Theme, todo: Todo, act: Actions, parent: QWidget, *, wrong_word
     actions.setSpacing(6)
     lay.addLayout(actions)
     actions.addStretch(1)
-    done = Pill(t, "Done", glyph="check", style="glass", size="small")
-    not_needed = Pill(t, "Not needed", style="quiet", size="small")
-    wrong = Pill(t, wrong_word, style="quiet", size="small")
+    done = Button(t, "Done", glyph="check", style="secondary", size="small")
+    not_needed = Button(t, "Not needed", style="outline", size="small")
+    wrong = Button(t, wrong_word, style="outline", size="small")
     wrong.setToolTip("Captured by mistake. Yuki takes it off and learns not to capture the like again.")
     pills = (done, not_needed, wrong)
     for pill, how in ((done, "done"), (not_needed, "not_needed"), (wrong, "wrong")):
         actions.addWidget(pill)
 
-        def clicked(_c: bool = False, how: str = how, pill: Pill = pill) -> None:
+        def clicked(_c: bool = False, how: str = how, pill: Button = pill) -> None:
             for p in pills:
                 p.setEnabled(False)
             pill.setText({"done": "Done ✓", "not_needed": "Removed", "wrong": "Removed"}[how])
@@ -180,7 +180,7 @@ TODOS_SHOWN = 6
 
 def todos_panel(t: Theme, todos: list[Todo], act: Actions) -> Panel:
     """The user's to-dos, with Done / Not needed / Not mine (on the Me page since 2026-09-27)."""
-    more = Pill(t, f"All {len(todos)}", style="quiet", size="small")
+    more = Button(t, f"All {len(todos)}", style="outline", size="small")
     panel = Panel(t, "Your to-dos", "What you said you'd do, or what people are waiting on. Yuki reminds you, "
                   "you tick them off.", glyph="flag", right=more)
     panel.body.setSpacing(SPACE["s"])
@@ -247,7 +247,7 @@ def _learned(t: Theme, view: YukiView) -> Panel:
             if k.app:
                 col.addWidget(text_label(t, f"In {k.app[:1].upper() + k.app[1:]}", "caption", "text_3"))
     else:
-        empty = Glass(t, level="inset", radius=16, padding=SPACE["m"], parent=panel)
+        empty = Card(t, level="muted", padding=SPACE["m"], parent=panel)
         empty.body.addWidget(text_label(t, "Nothing yet.", "body_strong", "text_2"))
         empty.body.addWidget(text_label(t, "When Yuki finds a way that works here, say hovering YouTube's volume "
                                            "button to reach the slider, it keeps it and shows it here.", "caption",
@@ -263,7 +263,7 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
     if view.waiting:
         qs.body.addWidget(text_label(t, "Waiting to ask", "caption_strong", "text_2"))
         for q in view.waiting:
-            card = Glass(t, level="inset", radius=18, padding=SPACE["m"], parent=qs)
+            card = Card(t, level="muted", padding=SPACE["m"], parent=qs)
             qs.body.addWidget(card)
             card.body.setSpacing(6)
             # the question leads: larger, semibold, full-strength ink; why it asks sits under it, small and dim
@@ -276,13 +276,13 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
             row.addStretch(1)
             answer_box = _composer(t, "Your answer, in your words", "Tell Yuki",
                                    lambda words, ref=q["id"]: act.answer_question(ref, words), parent=card)
-            never = Pill(t, "Don't ask", style="quiet", size="small")
+            never = Button(t, "Don't ask", style="outline", size="small")
             never.clicked.connect(lambda _c=False, ref=q["id"], box=card: (act.skip_question(ref, True),
                                                                            box.setVisible(False)))
-            skip = Pill(t, "Skip", style="quiet", size="small")
+            skip = Button(t, "Skip", style="outline", size="small")
             skip.clicked.connect(lambda _c=False, ref=q["id"], box=card: (act.skip_question(ref, False),
                                                                           box.setVisible(False)))
-            answer = Pill(t, "Answer", glyph="edit", style="tinted", tint=t.kind("question"), size="small")
+            answer = Button(t, "Answer", glyph="edit", style="default", size="small")
             answer.clicked.connect(lambda _c=False, box=answer_box: (box.setVisible(True), box.field.edit.setFocus()))
             row.addWidget(never)
             row.addWidget(skip)

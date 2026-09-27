@@ -1,34 +1,26 @@
-"""Yuki's design system: Liquid Glass adapted to Windows 11, in code.
+"""Yuki's design system: shadcn/ui's dark zinc theme, flat, in code.
 
-One module holds every visual decision the Yuki window and the restyled
-surfaces (overlay, nudge and question cards, voice pill, status strip) make:
-colour tokens for light and dark, the type scale, spacing, corner radii, the
-glass material levels and motion. Widgets never invent a colour or a size;
-they ask the :class:`Theme` for a role.
+One module holds every visual decision the Yuki window and yuki-ui's floating
+surfaces (overlay, cards, voice pill, call pill, strip, tray menu) make: colour
+tokens, the type scale, spacing, corner radii and control sizes. Widgets never
+invent a colour or a size; they ask the :class:`Theme` for a role.
 
-The material
-------------
-Liquid Glass is a translucent sheet that sits *on* the content behind it:
+The look (2026-09-27, replacing Liquid Glass at the user's request: "just use
+simple shadcn ui everywhere"): dark only, flat, opaque.
 
-* **Backdrop.** On a real desktop the window asks DWM for a system backdrop
-  (``DWMWA_SYSTEMBACKDROP_TYPE``: Acrylic for the window, Mica as the calm
-  alternative, see :mod:`yuki.ui.window.backdrop`); DWM blurs what is behind
-  at no cost to this process. Offscreen, or when Windows' transparency effects
-  are off, the same look is painted: a blurred copy of a backdrop image under a
-  tint (:func:`yuki.ui.window.glass.paint_backdrop`), or a plain tinted
-  gradient.
-* **Glass levels** (:class:`GlassLevel`), from quiet to prominent: ``inset``
-  (rows inside a panel), ``regular`` (panels), ``raised`` (floating controls,
-  cards, popovers) and ``lens`` (the selected pill: accent-tinted, brightest
-  edge). Each level is a fill, a top sheen, a specular edge (bright at the top
-  left, a faint rim at the bottom right), a hairline outline for definition and
-  a soft shadow.
-* **Shape.** Very round: panels 24 px, cards 20 px, rows 14 px, every control a
-  pill (radius = half its height). The window itself keeps Windows 11's own
-  corners and frame so snapping, the taskbar and Alt+Tab behave as usual.
+* **Colour.** shadcn's zinc dark tokens: background ``#09090b``; cards and
+  popovers the same colour with a 1 px ``#27272a`` border; muted surfaces and
+  hover ``#27272a`` / ``#18181b``; text ``#fafafa``, muted text ``#a1a1aa``; the
+  primary button ``#fafafa`` on ``#18181b`` ink; destructive red; a ``#d4d4d8``
+  focus ring. No gradients, glow, blur or translucency.
+* **Shape.** ``--radius: 0.5rem``: cards 8 px, buttons and inputs 6 px, the
+  switch and avatars fully round.
+* **Type.** Inter when installed, else Segoe UI Variable (with its real weight
+  and optical-size axes), else Segoe UI: 14 px body, 12-13 px muted captions,
+  600-weight headings.
+* **Spacing.** A 4 px scale; pages and cards use 16 / 24 px.
 
-Type is Segoe UI Variable with its real weight and optical-size axes (:func:`variable_font`),
-falling back to Segoe UI. Everything is in logical pixels.
+Everything is in logical pixels.
 """
 
 from __future__ import annotations
@@ -38,23 +30,23 @@ from functools import lru_cache
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase
 
-# -- spacing, radii, motion -------------------------------------------------------
+# -- spacing, radii, sizes ---------------------------------------------------------
 
 #: The 4-px spacing scale.
 SPACE = {"xxs": 2, "xs": 4, "s": 8, "m": 12, "l": 16, "xl": 24, "xxl": 32, "xxxl": 48}
 
-#: Corner radii. Controls are pills: their radius is half their height.
-RADIUS = {"window": 12, "panel": 24, "card": 20, "row": 14, "chip": 9, "tooltip": 16}
+#: Corner radii (shadcn ``--radius: 0.5rem``: ``rounded-lg`` 8, ``rounded-md`` 6, ``rounded-sm`` 4).
+RADIUS = {"window": 8, "panel": 8, "card": 8, "row": 6, "control": 6, "chip": 4, "tooltip": 6}
 
-#: Control heights (pills).
-CONTROL_H = {"small": 32, "regular": 38, "large": 44, "input": 46}
+#: Control heights (shadcn Button ``sm`` 32, default 36, ``lg`` 40; Input 36).
+CONTROL_H = {"small": 32, "regular": 36, "large": 40, "input": 36}
 
-#: Motion (milliseconds). Glass moves softly: a short spring-like ease out.
-MOTION = {"fast": 120, "regular": 180, "slow": 260}
+#: Motion (milliseconds): short and plain.
+MOTION = {"fast": 120, "regular": 150, "slow": 200}
 
 #: Window geometry (logical px).
 WINDOW_SIZE = (1280, 840)
-SIDEBAR_W = 216
+SIDEBAR_W = 232
 
 
 def rgba(r: int, g: int, b: int, a: float = 1.0) -> QColor:
@@ -75,73 +67,42 @@ def css(c: QColor) -> str:
 
 
 @dataclass(frozen=True)
-class GlassLevel:
-    """One level of the glass material (see the module docstring)."""
+class Surface:
+    """A flat surface: its fill and its 1 px border (transparent: none)."""
 
     fill: QColor
-    sheen: QColor            # top-down highlight inside the shape (fades out by ~45%)
-    edge: QColor             # specular edge, top left
-    rim: QColor              # faint rim light, bottom right
-    outline: QColor          # hairline outside the edge, for definition
-    shadow: QColor           # shadow colour (alpha = strongest point)
-    shadow_blur: int         # px
-    shadow_y: int            # px
-    name: str = ""           # the level's key in Theme.glass (set by _named)
-
-
-def _clear() -> QColor:
-    return QColor(255, 255, 255, 0)
-
-
-@dataclass(frozen=True)
-class Optics:
-    """How one glass level bends light: the refraction shader's inputs (logical px).
-
-    See :mod:`yuki.ui.window.refract` for what each number does to the picture.
-    """
-
-    height: float                 # glass thickness: how far the rim bends what is behind (px)
-    bezel: float                  # width of the curved rim (px); >= half the short side makes a droplet
-    curvature: float = 1.0        # rim steepness (scales the profile's slope)
-    chroma: float = 0.12          # dispersion: red bends this fraction less than green, blue more
-    blur: float = 0.0             # frost (px); Liquid Glass is mostly clear
-    tint: QColor = field(default_factory=_clear)   # straight-alpha wash over the refracted light
-    tone: tuple[float, float] = (0.0, 1.0)         # legibility range the light is squeezed into
-    saturation: float = 1.15      # vibrancy
-    magnify: float = 0.0          # whole-lens zoom toward the centre (droplets)
-    specular: float = 0.6         # rim light intensity
-    light_angle: float = 125.0    # where the light comes from, degrees counter-clockwise from +x
-    rim_width: float = 1.1        # px
-    rim_floor: float = 0.3        # share of the rim light that goes all the way round
-    inner_shadow: float = 0.06    # depth: darkening inside the rim, away from the light
-    lift: float = 0.0             # uniform brightening of the sheet
-    shadow: float = 0.0           # drop shadow strength (0-1)
-    shadow_blur: float = 24.0     # px
-    shadow_y: float = 8.0         # px
-    corner: float = 2.0           # 2 = circular corners; higher = continuous (squircle) corners
+    border: QColor
+    name: str = ""
 
 
 @dataclass(frozen=True)
 class Theme:
-    """Every colour role, for one appearance (light or dark)."""
+    """Every colour role."""
 
     name: str
     dark: bool
-    # the window: tint laid over the (DWM or painted) backdrop, and the opaque fallback
-    window_tint: QColor
-    fallback_top: QColor
-    fallback_bottom: QColor
+    # shadcn tokens
+    bg: QColor               # --background
+    card: QColor             # --card / --popover
+    border: QColor           # --border / --input
+    muted: QColor            # --muted / --secondary / --accent (hover)
+    subtle: QColor           # a quieter muted surface (#18181b): hover on a card, insets
+    ring: QColor             # --ring
+    primary: QColor          # --primary
+    primary_fg: QColor       # --primary-foreground
+    destructive: QColor      # --destructive (a button's fill)
+    danger: QColor           # destructive text (errors in words)
     # text
-    text: QColor
-    text_2: QColor           # secondary
-    text_3: QColor           # muted: captions, axis labels
+    text: QColor             # --foreground
+    text_2: QColor           # --muted-foreground
+    text_3: QColor           # captions a step quieter
     text_on_accent: QColor
-    # accents
+    # accents (monochrome: the selection, the spinner, links)
     accent: QColor
-    accent_soft: QColor
+    accent_soft: QColor      # text selection, a menu item under the pointer
     kinds: dict[str, QColor]
     status: dict[str, QColor]
-    # data
+    # data (the timeline's lanes)
     series: tuple[QColor, ...]
     series_other: QColor
     grid: QColor
@@ -150,25 +111,15 @@ class Theme:
     off_fill: QColor
     off_hatch: QColor
     unrecorded: QColor
-    # glass levels
-    glass: dict[str, GlassLevel] = field(default_factory=dict)
-    # how each glass level refracts (the GPU path, yuki.ui.window.refract)
-    optics: dict[str, Optics] = field(default_factory=dict)
-    # ink for text on the accent glass (the primary button): readable on a faint blue wash
-    accent_ink: QColor = field(default_factory=lambda: QColor(255, 255, 255))
-    # the window's plain background (2026-09-27: black in dark, white in light; no wallpaper)
-    bg: QColor = field(default_factory=lambda: QColor(0, 0, 0))
-    # floating surfaces over the desktop (overlay, cards, strip, pill): clear glass, a light smoke only
-    surface_fill: QColor = field(default_factory=lambda: QColor(18, 20, 26, 87))
-    # scene (mockups only): the simulated wallpaper
-    wallpaper: tuple[tuple[QColor, float, float, float], ...] = ()
-    wallpaper_base: tuple[QColor, QColor] = (QColor(0, 0, 0), QColor(0, 0, 0))
+    surfaces: dict[str, Surface] = field(default_factory=dict)
 
-    def level(self, name: str) -> GlassLevel:
-        return self.glass[name]
+    def level(self, name: str) -> Surface:
+        """A surface by role: ``card`` | ``popover`` | ``muted`` | ``input`` | ``selected`` | ``primary`` |
+        ``secondary`` | ``sidebar``."""
+        return self.surfaces.get(name) or self.surfaces["card"]
 
     def kind(self, name: str | None) -> QColor:
-        return self.kinds.get(str(name or ""), self.accent)
+        return self.kinds.get(str(name or ""), self.text_2)
 
     def series_color(self, index: int | None) -> QColor:
         if index is None or index < 0 or index >= len(self.series):
@@ -176,239 +127,90 @@ class Theme:
         return self.series[index]
 
 
-# The categorical order is the validated reference palette (dataviz skill,
-# references/palette.md), checked again against Yuki's glass surfaces:
-# light #eef1f6 and dark #23252c both pass every hard gate; four light slots are
-# under 3:1, so every lane carries a visible text label (the relief rule).
-_SERIES_LIGHT = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
+# The timeline's categorical lane colours: the validated reference palette's dark slots (dataviz skill,
+# references/palette.md). Data, not decoration: every lane also carries a text label.
 _SERIES_DARK = ("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767")
 
-#: Status colours are reserved (never a series) and always ship with an icon + words.
-_STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a", "critical": "#d03b3b"}
-
-
-def _light() -> Theme:
-    return Theme(
-        name="light", dark=False,
-        bg=hexa("#ffffff"), surface_fill=rgba(250, 250, 252, 0.50), accent_ink=hexa("#1d4fb8"),
-        window_tint=rgba(246, 247, 251, 0.64),
-        fallback_top=hexa("#f4f6fb"), fallback_bottom=hexa("#e9edf5"),
-        text=rgba(14, 16, 22), text_2=rgba(14, 16, 22, 0.64), text_3=rgba(14, 16, 22, 0.44),
-        text_on_accent=rgba(255, 255, 255),
-        accent=hexa("#2f6fe4"), accent_soft=hexa("#2f6fe4", 0.14),
-        kinds={
-            "praise": hexa("#1f9d5c"), "nudge": hexa("#d9822b"), "reminder": hexa("#2f6fe4"),
-            "review": hexa("#7a55d6"), "resume": hexa("#2a8fd6"), "question": hexa("#d64f93"),
-            "joke": hexa("#b0469b"), "unclear": hexa("#b7791f"), "you": hexa("#2f6fe4"),
-            "call": hexa("#1a9a8a"), "error": hexa("#d03b3b"),
-        },
-        status={k: hexa(v) for k, v in _STATUS.items()},
-        series=tuple(hexa(v) for v in _SERIES_LIGHT), series_other=hexa("#8a8f9c"),
-        grid=rgba(14, 16, 22, 0.07), baseline=rgba(14, 16, 22, 0.16),
-        away=rgba(14, 16, 22, 0.30), off_fill=rgba(20, 24, 36, 0.07), off_hatch=rgba(20, 24, 36, 0.16),
-        unrecorded=rgba(20, 24, 36, 0.04),
-        # 2026-09-27: clear glass on a plain white window. No solid blocks and no white outline: a faint
-        # wash, a catch-light on the lit edge (white, seen where the wash is), a faint shade on the far
-        # edge for definition, and a soft shadow. The selection and the main action are a blue-hued wash.
-        glass={
-            "inset": GlassLevel(rgba(16, 24, 48, 0.035), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
-                                rgba(16, 24, 48, 0.07), rgba(0, 0, 0, 0.0), rgba(30, 40, 80, 0.0), 0, 0),
-            "regular": GlassLevel(rgba(16, 24, 48, 0.022), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
-                                  rgba(16, 24, 48, 0.06), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.10), 28, 8),
-            "raised": GlassLevel(rgba(16, 24, 48, 0.03), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
-                                 rgba(16, 24, 48, 0.07), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.14), 32, 10),
-            "lens": GlassLevel(rgba(47, 111, 228, 0.09), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
-                               rgba(47, 111, 228, 0.20), rgba(0, 0, 0, 0.0), rgba(47, 90, 180, 0.10), 14, 4),
-            "control": GlassLevel(rgba(16, 24, 48, 0.045), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
-                                  rgba(16, 24, 48, 0.08), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.08), 8, 2),
-            "accent": GlassLevel(rgba(47, 111, 228, 0.14), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.95),
-                                 rgba(47, 111, 228, 0.28), rgba(0, 0, 0, 0.0), rgba(30, 80, 200, 0.12), 10, 3),
-            "bead": GlassLevel(rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
-                               rgba(16, 24, 48, 0.12), rgba(0, 0, 0, 0.0), rgba(20, 30, 60, 0.22), 6, 1),
-            "popover": GlassLevel(rgba(252, 252, 254, 0.80), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 1.0),
-                                  rgba(16, 24, 48, 0.08), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.16), 30, 10),
-            "floor": GlassLevel(rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
-                                rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(20, 30, 60, 0.0), 0, 0),
-            # buttons (2026-09-27): a raised glass body, lit from the top, with a soft shadow under it, so a
-            # button never reads as a flat tag
-            "button": GlassLevel(rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.70), rgba(255, 255, 255, 1.0),
-                                 rgba(16, 24, 48, 0.13), rgba(0, 0, 0, 0.0), rgba(30, 44, 90, 0.22), 6, 2),
-            "button_accent": GlassLevel(rgba(47, 111, 228, 0.17), rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 1.0),
-                                        rgba(47, 111, 228, 0.34), rgba(0, 0, 0, 0.0), rgba(30, 80, 200, 0.24), 6, 2),
-        },
-        optics={
-            # Clear lenses, not bubbles: the edge is carried by the bending itself, with only a faint
-            # catch-light on the lit side (specular low, rim thin, almost none of it all the way round).
-            # the window: a thick sheet the desktop is seen through, frosted just enough for text
-            "floor": Optics(height=34, bezel=48, curvature=1.5, chroma=0.16, blur=2.5, tint=rgba(250, 251, 255, 0.30),
-                            tone=(0.40, 1.0), saturation=1.35, specular=0.22, rim_width=0.8, rim_floor=0.08,
-                            inner_shadow=0.03, shadow=0.30, shadow_blur=40, shadow_y=16, corner=2.0),
-            # panels and the sidebar: clear glass with a wide rim that bends what is behind
-            "regular": Optics(height=36, bezel=42, curvature=1.6, chroma=0.21, blur=0.8,
-                              tint=rgba(16, 24, 48, 0.022), tone=(0.14, 1.0), saturation=1.3, specular=0.25,
-                              rim_width=0.7, rim_floor=0.08, inner_shadow=0.04, shadow=0.16, shadow_blur=30, shadow_y=10,
-                              corner=2.6),
-            # cards: a little thicker and brighter
-            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.22, blur=0.8, tint=rgba(16, 24, 48, 0.03),
-                             tone=(0.16, 1.0), saturation=1.3, specular=0.28, rim_width=0.7, rim_floor=0.08,
-                             inner_shadow=0.04, shadow=0.20, shadow_blur=30, shadow_y=12, corner=2.6),
-            # rows inside a panel: thin glass, a narrow rim
-            "inset": Optics(height=15, bezel=18, curvature=1.5, chroma=0.16, blur=0.5, tint=rgba(16, 24, 48, 0.035),
-                            tone=(0.10, 1.0), saturation=1.25, specular=0.18, rim_width=0.6, rim_floor=0.06,
-                            inner_shadow=0.04, shadow=0.0, corner=2.6),
-            # pills and fields: clear droplets, curved across their whole height
-            "control": Optics(height=18, bezel=999, curvature=1.8, chroma=0.25, blur=0.0,
-                              tint=rgba(16, 24, 48, 0.045), tone=(0.06, 1.0), saturation=1.35, magnify=0.07,
-                              specular=0.25, rim_width=0.6, rim_floor=0.08, inner_shadow=0.04, shadow=0.10,
-                              shadow_blur=10, shadow_y=3),
-            # the selected pill: the clearest, strongest lens
-            "lens": Optics(height=20, bezel=999, curvature=1.9, chroma=0.3, blur=0.0, tint=rgba(47, 111, 228, 0.09),
-                           tone=(0.10, 1.0), saturation=1.35, magnify=0.10, specular=0.30, rim_width=0.6,
-                           rim_floor=0.08, inner_shadow=0.03, shadow=0.14, shadow_blur=14, shadow_y=4),
-            # popovers over busy content (the timeline's hover card): frosted more, for reading
-            "popover": Optics(height=30, bezel=28, curvature=1.6, chroma=0.2, blur=7.0, tint=rgba(255, 255, 255, 0.62),
-                              tone=(0.30, 1.0), saturation=1.3, specular=0.25, rim_width=0.7, rim_floor=0.08,
-                              inner_shadow=0.03, shadow=0.22, shadow_blur=30, shadow_y=12, corner=2.6),
-            # the main action: glass flooded with the accent
-            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.24, tint=rgba(47, 111, 228, 0.14),
-                             tone=(0.0, 1.0), saturation=1.3, magnify=0.07, specular=0.25, rim_width=0.6,
-                             rim_floor=0.08, inner_shadow=0.06, shadow=0.22, shadow_blur=12, shadow_y=4),
-        },
-        wallpaper_base=(hexa("#dfe8f7"), hexa("#f3e9f1")),
-        wallpaper=(
-            (hexa("#8fb7ff", 0.85), 0.18, 0.22, 0.42), (hexa("#f7b2c8", 0.75), 0.82, 0.18, 0.38),
-            (hexa("#ffd59a", 0.65), 0.70, 0.86, 0.40), (hexa("#a9e5d4", 0.70), 0.12, 0.88, 0.36),
-            (hexa("#c3b3ff", 0.70), 0.50, 0.50, 0.30),
-        ),
-    )
+#: Status colours are reserved (never a series) and always ship with words.
+_STATUS = {"good": "#22c55e", "warning": "#f59e0b", "serious": "#f97316", "critical": "#ef4444"}
 
 
 def _dark() -> Theme:
+    bg = hexa("#09090b")
+    border = hexa("#27272a")
+    muted = hexa("#27272a")
+    subtle = hexa("#18181b")
+    text, text_2, text_3 = hexa("#fafafa"), hexa("#a1a1aa"), hexa("#8b8b94")
+    clear = QColor(0, 0, 0, 0)
     return Theme(
         name="dark", dark=True,
-        bg=hexa("#000000"), surface_fill=rgba(18, 20, 26, 0.34), accent_ink=rgba(255, 255, 255),
-        window_tint=rgba(20, 22, 28, 0.66),
-        fallback_top=hexa("#1d2028"), fallback_bottom=hexa("#15171d"),
-        text=rgba(245, 246, 250), text_2=rgba(245, 246, 250, 0.66), text_3=rgba(245, 246, 250, 0.44),
-        text_on_accent=rgba(255, 255, 255),
-        accent=hexa("#5d9bff"), accent_soft=hexa("#5d9bff", 0.20),
+        bg=bg, card=bg, border=border, muted=muted, subtle=subtle, ring=hexa("#d4d4d8"),
+        primary=hexa("#fafafa"), primary_fg=hexa("#18181b"), destructive=hexa("#7f1d1d"), danger=hexa("#ef4444"),
+        text=text, text_2=text_2, text_3=text_3, text_on_accent=hexa("#18181b"),
+        accent=hexa("#fafafa"), accent_soft=hexa("#3f3f46"),
+        # monochrome by default; colour only where it carries meaning (an error, a warning, a call on the map)
         kinds={
-            "praise": hexa("#76d69e"), "nudge": hexa("#ffbe6e"), "reminder": hexa("#7eb4ff"),
-            "review": hexa("#c4a0ff"), "resume": hexa("#8cc8ff"), "question": hexa("#ffa0cd"),
-            "joke": hexa("#e59ad6"), "unclear": hexa("#f0c05a"), "you": hexa("#7eb4ff"),
-            "call": hexa("#5fd4c2"), "error": hexa("#ff7b7b"),
+            "praise": text_2, "nudge": text_2, "reminder": text_2, "review": text_2, "resume": text_2,
+            "question": text_2, "joke": text_2, "you": text_2, "unclear": hexa("#f59e0b"),
+            "warning": hexa("#f59e0b"), "call": hexa("#14b8a6"), "error": hexa("#ef4444"),
         },
         status={k: hexa(v) for k, v in _STATUS.items()},
-        series=tuple(hexa(v) for v in _SERIES_DARK), series_other=hexa("#7c8190"),
-        grid=rgba(255, 255, 255, 0.06), baseline=rgba(255, 255, 255, 0.14),
-        away=rgba(255, 255, 255, 0.32), off_fill=rgba(0, 0, 0, 0.26), off_hatch=rgba(255, 255, 255, 0.10),
-        unrecorded=rgba(255, 255, 255, 0.03),
-        # 2026-09-27: clear glass on a plain black window: a faint white wash, a catch-light on the lit
-        # edge only (no outline all the way round), the selection and the main action a blue-hued wash.
-        glass={
-            "inset": GlassLevel(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.13),
-                                rgba(255, 255, 255, 0.03), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.0), 0, 0),
-            "regular": GlassLevel(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.17),
-                                  rgba(255, 255, 255, 0.035), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.45), 30, 10),
-            "raised": GlassLevel(rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.20),
-                                 rgba(255, 255, 255, 0.045), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 34, 12),
-            "lens": GlassLevel(rgba(93, 155, 255, 0.16), rgba(255, 255, 255, 0.0), rgba(185, 210, 255, 0.30),
-                               rgba(93, 155, 255, 0.10), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.30), 14, 4),
-            "control": GlassLevel(rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.18),
-                                  rgba(255, 255, 255, 0.04), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.30), 8, 2),
-            "accent": GlassLevel(rgba(93, 155, 255, 0.24), rgba(255, 255, 255, 0.0), rgba(200, 220, 255, 0.32),
-                                 rgba(93, 155, 255, 0.14), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.35), 10, 3),
-            "bead": GlassLevel(rgba(255, 255, 255, 0.30), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.55),
-                               rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.40), 6, 1),
-            "popover": GlassLevel(rgba(30, 32, 40, 0.86), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.18),
-                                  rgba(255, 255, 255, 0.04), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 30, 10),
-            "floor": GlassLevel(rgba(0, 0, 0, 0.0), rgba(255, 255, 255, 0.0), rgba(255, 255, 255, 0.0),
-                                rgba(255, 255, 255, 0.0), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.0), 0, 0),
-            "button": GlassLevel(rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.36),
-                                 rgba(255, 255, 255, 0.07), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.55), 6, 2),
-            "button_accent": GlassLevel(rgba(93, 155, 255, 0.32), rgba(255, 255, 255, 0.13), rgba(210, 228, 255, 0.50),
-                                        rgba(93, 155, 255, 0.20), rgba(0, 0, 0, 0.0), rgba(0, 0, 0, 0.50), 6, 2),
+        series=tuple(hexa(v) for v in _SERIES_DARK), series_other=hexa("#71717a"),
+        grid=border, baseline=hexa("#3f3f46"),
+        away=rgba(255, 255, 255, 0.32), off_fill=rgba(255, 255, 255, 0.03), off_hatch=rgba(255, 255, 255, 0.10),
+        unrecorded=rgba(255, 255, 255, 0.025),
+        surfaces={
+            "card": Surface(bg, border),
+            "popover": Surface(bg, border),
+            "sidebar": Surface(bg, clear),
+            "muted": Surface(subtle, clear),
+            "input": Surface(bg, border),
+            "selected": Surface(muted, clear),
+            "secondary": Surface(muted, clear),
+            "primary": Surface(hexa("#fafafa"), clear),
         },
-        optics={
-            # dark glass: the same geometry, a dimmer range, an even fainter catch-light
-            "floor": Optics(height=34, bezel=48, curvature=1.5, chroma=0.14, blur=2.5, tint=rgba(16, 18, 26, 0.28),
-                            tone=(0.0, 0.50), saturation=1.3, specular=0.14, rim_width=0.8, rim_floor=0.08,
-                            inner_shadow=0.08, shadow=0.55, shadow_blur=40, shadow_y=16, corner=2.0),
-            "regular": Optics(height=36, bezel=42, curvature=1.6, chroma=0.19, blur=0.8, tint=rgba(255, 255, 255, 0.055),
-                              tone=(0.0, 0.86), saturation=1.3, specular=0.16, rim_width=0.7, rim_floor=0.08,
-                              inner_shadow=0.10, shadow=0.34, shadow_blur=30, shadow_y=10, corner=2.6),
-            "raised": Optics(height=32, bezel=34, curvature=1.6, chroma=0.2, blur=0.8, tint=rgba(255, 255, 255, 0.075),
-                             tone=(0.0, 0.90), saturation=1.3, specular=0.18, rim_width=0.7, rim_floor=0.08,
-                             inner_shadow=0.10, shadow=0.42, shadow_blur=30, shadow_y=12, corner=2.6),
-            "inset": Optics(height=15, bezel=18, curvature=1.5, chroma=0.14, blur=0.5, tint=rgba(255, 255, 255, 0.04),
-                            tone=(0.0, 0.95), saturation=1.25, specular=0.12, rim_width=0.6, rim_floor=0.06,
-                            inner_shadow=0.08, shadow=0.0, corner=2.6),
-            "control": Optics(height=18, bezel=999, curvature=1.8, chroma=0.23, tint=rgba(255, 255, 255, 0.07),
-                              tone=(0.0, 1.0), saturation=1.35, magnify=0.07, specular=0.16, rim_width=0.6,
-                              rim_floor=0.08, inner_shadow=0.08, shadow=0.28, shadow_blur=10, shadow_y=3),
-            "lens": Optics(height=20, bezel=999, curvature=1.9, chroma=0.28, tint=rgba(93, 155, 255, 0.16),
-                           tone=(0.0, 1.0), saturation=1.35, magnify=0.10, specular=0.20, rim_width=0.6,
-                           rim_floor=0.08, inner_shadow=0.06, shadow=0.32, shadow_blur=14, shadow_y=4),
-            "popover": Optics(height=30, bezel=28, curvature=1.6, chroma=0.18, blur=7.0, tint=rgba(40, 44, 58, 0.66),
-                              tone=(0.0, 0.80), saturation=1.3, specular=0.16, rim_width=0.7, rim_floor=0.08,
-                              inner_shadow=0.10, shadow=0.45, shadow_blur=30, shadow_y=12, corner=2.6),
-            "accent": Optics(height=18, bezel=999, curvature=1.8, chroma=0.22, tint=rgba(93, 155, 255, 0.24),
-                             tone=(0.0, 1.0), saturation=1.3, magnify=0.07, specular=0.16, rim_width=0.6,
-                             rim_floor=0.08, inner_shadow=0.08, shadow=0.34, shadow_blur=12, shadow_y=4),
-        },
-        wallpaper_base=(hexa("#0b1226"), hexa("#140c24")),
-        wallpaper=(
-            (hexa("#2c5fd8", 0.85), 0.22, 0.30, 0.45), (hexa("#8a3fd1", 0.70), 0.80, 0.20, 0.40),
-            (hexa("#1b8fb8", 0.55), 0.70, 0.85, 0.42), (hexa("#d0508a", 0.45), 0.10, 0.90, 0.34),
-            (hexa("#3a3fb0", 0.60), 0.50, 0.55, 0.30),
-        ),
     )
 
 
 def _named(t: Theme) -> Theme:
-    """Each glass level learns its own key, so the refraction path can find its optics (a button bends light
-    like a control droplet; the main button like the accent one)."""
     from dataclasses import replace
 
-    optics = dict(t.optics)
-    optics.setdefault("button", optics["control"])
-    optics.setdefault("button_accent", optics["accent"])
-    return replace(t, glass={k: replace(v, name=k) for k, v in t.glass.items()}, optics=optics)
+    return replace(t, surfaces={k: replace(v, name=k) for k, v in t.surfaces.items()})
 
 
-LIGHT = _named(_light())
 DARK = _named(_dark())
 
 
-def theme(name: str) -> Theme:
-    """``"light"`` or ``"dark"``."""
-    return DARK if name == "dark" else LIGHT
+def theme(name: str = "dark") -> Theme:
+    """The theme. Yuki is dark only (2026-09-27); the name is accepted for older callers and ignored."""
+    del name
+    return DARK
 
 
 # -- type ------------------------------------------------------------------------
 
-#: role -> (pixel size, weight word, optical size). Calm hierarchy: one large
-#: title per page, section titles, body, and small captions; nothing in between.
-TYPE: dict[str, tuple[int, str, str]] = {
-    "large_title": (30, "Semibold", "Display"),
-    "title": (20, "Semibold", "Display"),
-    "numeral": (24, "Semibold", "Display"),
-    "headline": (15, "Semibold", "Text"),
-    "body": (14, "Regular", "Text"),
-    "body_strong": (14, "Semibold", "Text"),
-    "callout": (13, "Regular", "Text"),
-    "caption": (12, "Regular", "Text"),
-    "caption_strong": (12, "Semibold", "Text"),
-    "micro": (11, "Semibold", "Small"),
-    "icon": (16, "Regular", ""),
-    "icon_small": (13, "Regular", ""),
-    "icon_large": (20, "Regular", ""),
+#: role -> (pixel size, weight word). shadcn's scale: one 24 px page title, 18 px section titles, 15 px card
+#: titles, 14 px body, 13 px muted captions.
+TYPE: dict[str, tuple[int, str]] = {
+    "large_title": (24, "Semibold"),
+    "title": (18, "Semibold"),
+    "numeral": (24, "Semibold"),
+    "headline": (15, "Semibold"),
+    "body": (14, "Regular"),
+    "body_strong": (14, "Semibold"),
+    "callout": (14, "Regular"),
+    "caption": (13, "Regular"),
+    "caption_strong": (13, "Semibold"),
+    "micro": (12, "Medium"),
+    "icon": (16, "Regular"),
+    "icon_small": (13, "Regular"),
+    "icon_large": (18, "Regular"),
 }
 
-_WEIGHTS = {"Light": QFont.Weight.Light, "Regular": QFont.Weight.Normal, "Semibold": QFont.Weight.DemiBold,
-            "Bold": QFont.Weight.Bold}
-#: The weight axis value of each weight word (Segoe UI Variable is a variable font: 300-700).
-_WGHT = {"Light": 300.0, "Regular": 400.0, "Semibold": 600.0, "Bold": 700.0}
+_WEIGHTS = {"Light": QFont.Weight.Light, "Regular": QFont.Weight.Normal, "Medium": QFont.Weight.Medium,
+            "Semibold": QFont.Weight.DemiBold, "Bold": QFont.Weight.Bold}
+#: The weight axis value of each weight word (variable fonts).
+_WGHT = {"Light": 300.0, "Regular": 400.0, "Medium": 500.0, "Semibold": 600.0, "Bold": 700.0}
 
 
 @lru_cache(maxsize=None)
@@ -416,41 +218,44 @@ def _families() -> frozenset[str]:
     return frozenset(QFontDatabase.families())
 
 
-def variable_font(px: float, weight: str = "Regular") -> QFont:
-    """Segoe UI Variable at ``px`` pixels with a real weight and optical size (its ``wght`` / ``opsz`` axes).
-
-    Measured 2026-09-27 on this PC (Qt 6.11, DirectWrite): asking the "Segoe UI Variable Text" family for
-    ``DemiBold`` renders the Bold instance, and the named "... Semibold" families render Regular glyphs;
-    only the variable axes give the true Semibold. The optical size follows the size in points (small text
-    gets the open, sturdier "Text/Small" shapes; titles the tighter "Display" ones). Segoe UI when the
-    variable font is missing (Windows 10).
-    """
+@lru_cache(maxsize=None)
+def family() -> str:
+    """The UI family: Inter when installed, else Segoe UI Variable, else Segoe UI."""
     families = _families()
-    if "Segoe UI Variable" in families:
-        f = QFont("Segoe UI Variable")
-        f.setPixelSize(max(1, int(round(px))))
+    for name in ("Inter", "Inter Variable", "Segoe UI Variable"):
+        if name in families:
+            return name
+    return "Segoe UI"
+
+
+def variable_font(px: float, weight: str = "Regular") -> QFont:
+    """The UI font at ``px`` pixels in a real weight.
+
+    Segoe UI Variable gets its ``wght`` / ``opsz`` axes (measured 2026-09-27 on this PC, Qt 6.11 DirectWrite:
+    asking the family for ``DemiBold`` renders Bold, and only the axes give the true Semibold); Inter and Segoe
+    UI get the plain weight.
+    """
+    name = family()
+    f = QFont(name)
+    f.setPixelSize(max(1, int(round(px))))
+    if name == "Segoe UI Variable":
         f.setVariableAxis(QFont.Tag("wght"), _WGHT.get(weight, 400.0))
         f.setVariableAxis(QFont.Tag("opsz"), max(8.0, min(36.0, px * 0.75)))
-        f.setWeight(_WEIGHTS.get(weight, QFont.Weight.Normal))
-        return f
-    f = QFont("Segoe UI")
-    f.setPixelSize(max(1, int(round(px))))
     f.setWeight(_WEIGHTS.get(weight, QFont.Weight.Normal))
     return f
 
 
 def rich_font(px: float = 14) -> QFont:
-    """The font for rich text (a formatted reply): Segoe UI Variable by its family name, without fixed axes,
-    so a span's ``font-weight:600`` picks the real Semibold (fixed axes would pin every span to Regular)."""
-    f = QFont("Segoe UI Variable" if "Segoe UI Variable" in _families() else "Segoe UI")
+    """The font for rich text (a formatted reply): the family without fixed axes, so a span's
+    ``font-weight:600`` picks the real Semibold (fixed axes would pin every span to Regular)."""
+    f = QFont(family())
     f.setPixelSize(max(1, int(round(px))))
     return f
 
 
 def font(role: str) -> QFont:
-    """The font for a type role (see :data:`TYPE`): Segoe UI Variable with its real weights
-    (:func:`variable_font`), Segoe Fluent Icons for glyphs."""
-    size, weight, _optical = TYPE[role]
+    """The font for a type role (see :data:`TYPE`); Segoe Fluent Icons for glyphs."""
+    size, weight = TYPE[role]
     if role.startswith("icon"):
         f = QFont("Segoe Fluent Icons" if "Segoe Fluent Icons" in _families() else "Segoe MDL2 Assets")
         f.setPixelSize(size)
@@ -459,29 +264,29 @@ def font(role: str) -> QFont:
 
 
 def app_font() -> QFont:
-    """The application's default font (every plain Qt widget: buttons, menus, inputs). By family, without
-    fixed axes: an app font with axes would be inherited by every rich-text label and pin its bold spans to
+    """The application's default font (every plain Qt widget: menus, inputs). By family, without fixed
+    axes: an app font with axes would be inherited by every rich-text label and pin its bold spans to
     Regular (measured 2026-09-27)."""
     return rich_font(14)
 
 
 #: Segoe Fluent Icons code points used by the window (Windows 11's icon font).
 ICON = {
-    "today": "",      # clock
-    "me": "",         # contact
-    "yuki": "",       # robot
-    "status": "",     # diagnostic
-    "chat": "",       # message
-    "settings": "",
-    "prev": "", "next": "", "down": "",
-    "calendar": "", "mic": "", "speaker": "", "phone": "",
-    "info": "", "edit": "", "delete": "", "people": "",
-    "heart": "", "bulb": "", "shield": "", "globe": "",
-    "power": "", "moon": "", "question": "", "check": "",
-    "close": "", "send": "", "search": "", "more": "",
-    "work": "", "game": "", "code": "", "music": "",
-    "headphones": "", "pause": "", "play": "", "cloud": "",
-    "money": "", "sparkle": "", "history": "", "pin": "",
-    "wave": "", "link": "", "warning": "", "lock": "",
-    "flag": "", "emoji": "", "book": "", "star": "",
+    "today": "\ue823",      # clock
+    "me": "\ue77b",         # contact
+    "yuki": "\ue99a",       # robot
+    "status": "\ue9d9",     # diagnostic
+    "chat": "\ue8bd",       # message
+    "settings": "\ue713",
+    "prev": "\ue76b", "next": "\ue76c", "down": "\ue70d",
+    "calendar": "\ue787", "mic": "\ue720", "speaker": "\ue767", "phone": "\ue717",
+    "info": "\ue946", "edit": "\ue70f", "delete": "\ue74d", "people": "\ue716",
+    "heart": "\ueb51", "bulb": "\uea80", "shield": "\uea18", "globe": "\ue774",
+    "power": "\ue7e8", "moon": "\ue708", "question": "\ue897", "check": "\ue73e",
+    "close": "\ue711", "send": "\ue724", "search": "\ue721", "more": "\ue712",
+    "work": "\ue821", "game": "\ue7fc", "code": "\ue943", "music": "\uec4f",
+    "headphones": "\ue7f6", "pause": "\ue769", "play": "\ue768", "cloud": "\ue753",
+    "money": "\ue825", "sparkle": "\ue945", "history": "\ue81c", "pin": "\ue718",
+    "wave": "\ue9e9", "link": "\ue71b", "warning": "\ue7ba", "lock": "\ue72e",
+    "flag": "\ue7c1", "emoji": "\ue76e", "book": "\ue82d", "star": "\ue734",
 }

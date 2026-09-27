@@ -346,6 +346,15 @@ class Lane(QThread):
                 runtime.tool_called.emit(self.name, job.id, event.name, dict(event.input))
             elif isinstance(event, ToolResult):
                 runtime.tool_finished.emit(self.name, job.id, event.name, event.ok, event.summary)
+                if event.ok and event.payload:
+                    from yuki.ui.status import describe_result
+
+                    try:
+                        better = describe_result(event.name, None, event.payload)
+                    except Exception:   # presentation only: never in the way of the run
+                        better = ""
+                    if better:
+                        runtime.tool_labelled.emit(self.name, job.id, event.name, better)
             elif isinstance(event, AskUser):
                 self._drain_answers()
                 runtime.asked.emit(self.name, job.id, event.question)
@@ -412,6 +421,8 @@ class AgentRuntime(QObject):
         thought: ``(lane, id, text)``
         tool_called: ``(lane, id, name, input)``
         tool_finished: ``(lane, id, name, ok, summary)``
+        tool_labelled: ``(lane, id, name, label)`` -- a finished tool's result named what it worked on
+            (a call's app and time): a plainer line for its step.
         asked: ``(lane, id, question)`` -- that lane is now paused.
         finished: ``(lane, id, text)`` -- the closing message.
         failed: ``(lane, id, text)`` -- error or cancellation.
@@ -436,6 +447,7 @@ class AgentRuntime(QObject):
     thought = Signal(str, int, str)
     tool_called = Signal(str, int, str, dict)
     tool_finished = Signal(str, int, str, bool, str)
+    tool_labelled = Signal(str, int, str, str)
     asked = Signal(str, int, str)
     finished = Signal(str, int, str)
     failed = Signal(str, int, str)

@@ -36,8 +36,8 @@ from PySide6.QtWidgets import (
 )
 
 from yuki.ui.chat_model import ChatModel, Item, Step, fmt_seconds
-from yuki.ui.window.glass import paint_glass, rounded
-from yuki.ui.window.theme import ICON, SPACE, Theme, css, font, rich_font
+from yuki.ui.window.paint import paint_surface, rounded
+from yuki.ui.window.theme import ICON, RADIUS, SPACE, Theme, css, font, rich_font
 
 #: Bubbles built at once (the newest); older ones are built on demand.
 WINDOW = 60
@@ -95,17 +95,15 @@ class _Tiny(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         ink = QColor(self.ink or self.t.text_2)
-        if self.pill:   # a faint glass wash of its colour, no outline
-            wash = QColor(ink)
-            wash.setAlphaF(0.18 if self.t.dark else 0.12)
-            p.setBrush(wash)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawPath(rounded(r, r.height() / 2))
+        if self.pill:
+            ink = QColor(self.t.text)
+        if self.pill:   # an outline button (small)
+            paint_surface(p, r, RADIUS["control"], self.t.level("input"),
+                          fill=QColor(self.t.muted) if self.underMouse() else None)
         elif self.underMouse():
-            hover = QColor(self.t.grid)
-            p.setBrush(hover)
+            p.setBrush(self.t.muted)
             p.setPen(Qt.PenStyle.NoPen)
-            p.drawPath(rounded(r, 6))
+            p.drawPath(rounded(r, 4))
         if not self.isEnabled():
             ink = QColor(self.t.text_3)
         p.setPen(ink)
@@ -166,38 +164,31 @@ class _Spin(QWidget):
 
 
 class _Bubble(QWidget):
-    """A message's glass: the user's a faint blue-hued glass on the right, Yuki's clear glass on the left.
-    Both are painted (a streaming bubble changes size every word: it is never re-rendered), with the v3
-    catch-light on the lit edge and no outline."""
+    """A message: the user's on the secondary fill on the right, Yuki's on the quieter muted fill on the left;
+    flat, 8 px corners. An error keeps its fill and gets a red border (the words say what failed)."""
 
     def __init__(self, t: Theme, *, mine: bool, tone: str = "") -> None:
         super().__init__()
         self.t, self.mine, self.tone = t, mine, tone
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(14, 9, 14, 9)
-        self.body.setSpacing(3)
+        self.body.setContentsMargins(14, 10, 14, 10)
+        self.body.setSpacing(4)
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         t = self.t
-        if self.mine:
-            paint_glass(p, r, 18, t.level("lens"), shadow=False, painted=True)
-        else:
-            tint = None
-            if self.tone in ("error", "question", "interrupted"):
-                tint = QColor(t.kind("error" if self.tone == "error" else "question" if self.tone == "question"
-                                     else "unclear"))
-                tint.setAlphaF(0.10 if not t.dark else 0.14)
-            paint_glass(p, r, 18, t.level("raised"), tint=tint, shadow=False, painted=True)
+        r = QRectF(self.rect())
+        level = t.level("secondary" if self.mine else "muted")
+        paint_surface(p, r, RADIUS["card"], level, border=t.destructive if self.tone == "error" else None)
         p.end()
 
 
 class _StepRow(QWidget):
-    """One tool call or action: status, what it did, its short result, how long."""
+    """One tool call or action: status, what it did, its short result, how long (the time it took from the
+    step before, the model's thinking included: :meth:`~yuki.ui.chat_model.Item.step_times`)."""
 
-    def __init__(self, t: Theme, step: Step, now: float) -> None:
+    def __init__(self, t: Theme, step: Step, now: float, secs: float | None = None) -> None:
         super().__init__()
         self.t = t
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -229,16 +220,15 @@ class _StepRow(QWidget):
         self.result.setMinimumWidth(0)
         self.result.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         row.addWidget(self.result, 1)
-        self.secs = _label(t, "" if step.kind == "say" else fmt_seconds(step.seconds(now)), "caption", t.text_3,
+        shown = step.seconds(now) if secs is None else secs
+        self.secs = _label(t, "" if step.kind == "say" else fmt_seconds(shown), "caption", t.text_3,
                            wrap=False, select=False)
         row.addWidget(self.secs, 0, Qt.AlignmentFlag.AlignRight)
         self.step = step
 
-    def tick(self, now: float) -> None:
+    def tick(self, now: float, secs: float | None = None) -> None:
         if self.spin is not None:
-            self.spin.angle = (self.spin.angle + 40) % 360
-            self.spin.update()
-            self.secs.setText(fmt_seconds(self.step.seconds(now)))
+            self.secs.setText(fmt_seconds(self.step.seconds(now) if secs is None else secs))
 
     def resizeEvent(self, e: object) -> None:  # noqa: D102 - elide the result to what fits
         super().resizeEvent(e)
@@ -282,23 +272,32 @@ class _Steps(QWidget):
         from yuki.ui.chat_model import CLOSING_TOOLS
 
         shown = [s for s in item.steps if not (s.kind == "tool" and s.name in CLOSING_TOOLS)]
-        sig = tuple((s.key, s.ended, s.ok, s.result, s.label) for s in shown)
+        times, tail = item.step_times(now)
+        sig = (tuple((s.key, s.ended, s.ok, s.result, s.label) for s in shown), tail is not None and tail[1],
+               tail is not None)
         if sig == self._sig:
+            self.tick(item, now)
             return
         self._sig = sig
         while self.rows.count():
             w = self.rows.takeAt(0).widget()
             if w is not None:
                 w.deleteLater()
-        self._rows = [_StepRow(self.t, s, now) for s in shown]
+        self._rows = [_StepRow(self.t, s, now, times.get(s.key)) for s in shown]
+        if tail is not None:   # after the last tool: the reply being written (so the times add up)
+            seconds, running = tail
+            last = Step("tail", "tool", "reply", "Writing the reply", now - seconds,
+                        ended=None if running else now, ok=None if running else True)
+            self._rows.append(_StepRow(self.t, last, now, seconds))
         for r in self._rows:
             self.rows.addWidget(r)
 
     def tick(self, item: Item, now: float) -> None:
         self.head.setText(item.work_line(now))
         self.head.updateGeometry()
+        times, tail = item.step_times(now)
         for r in self._rows:
-            r.tick(now)
+            r.tick(now, tail[0] if r.step.key == "tail" and tail is not None else times.get(r.step.key))
 
 
 class _ItemWidget(QWidget):
@@ -376,6 +375,7 @@ class _ItemWidget(QWidget):
         self.steps = _Steps(t)
         self.steps.toggled.connect(lambda: self.toggle.emit(self.item_id))
         self.steps.setMaximumWidth(self.max_w)
+        self.steps.setMinimumWidth(min(self.max_w, 460))   # the times line up in a column on the right
         col.addWidget(self.steps)
         # the instant a message is sent: a turning arc and "Thinking…" (or the thinking summary as it is
         # written, one muted line) until the first words of the reply stream in
@@ -443,7 +443,9 @@ class _ItemWidget(QWidget):
             text = item.text
             self._raw = text
             waiting = not text and item.status in ("pending", "running", "streaming")
-            self.live.setVisible(waiting)
+            _times, tail = item.step_times(now)
+            # the fold's own last line says the reply is being written: no second "Thinking…" under it
+            self.live.setVisible(waiting and not (tail is not None and tail[1] and not item.thinking))
             if waiting:
                 line = " ".join((item.thinking or "").split())
                 if len(line) > 110:
@@ -535,14 +537,10 @@ class ChatThreadView(QWidget):
     # -- building -------------------------------------------------------------------------------
 
     def _style(self) -> None:
-        t = self.theme()
-        handle = "rgba(255,255,255,70)" if t.dark else "rgba(20,24,36,60)"
-        self.area.setStyleSheet(
-            "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: transparent; width: 6px; margin: 2px 0 2px 0; }"
-            f"QScrollBar::handle:vertical {{ background: {handle}; border-radius: 3px; min-height: 24px; }}"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }")
+        from yuki.ui.window.widgets import scrollbar_css
+
+        self.area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
+                                + scrollbar_css(self.theme()))
 
     def restyle(self) -> None:
         """The theme changed: build every visible bubble again in the new colours."""

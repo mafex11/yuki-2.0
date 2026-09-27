@@ -36,12 +36,12 @@ from ctypes import wintypes
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QEnterEvent, QFont, QGuiApplication, QPainter
+from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QEnterEvent, QFont, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
-from yuki.ui.glass import ACCENT, TEXT_DIM, GlassWindow, ui_font
+from yuki.ui.surface import SurfaceWindow, ui_font
 from yuki.ui.memory import local_moment
 from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
@@ -84,15 +84,7 @@ COACH_NOTE_REASON_CHARS = 200
 #: Reactions after which a nudge counts as answered (no implicit reply to it).
 ANSWERED_REACTIONS: frozenset[str] = frozenset({"replied", "dismissed", "snoozed"})
 
-#: Accent colour and heading per nudge kind.
-KIND_ACCENTS: dict[str, QColor] = {
-    "praise": QColor(118, 214, 158),
-    "nudge": QColor(255, 190, 110),
-    "reminder": ACCENT,
-    "review": QColor(196, 160, 255),
-    "resume": QColor(140, 200, 255),
-    "question": QColor(255, 160, 205),
-}
+#: Heading per nudge kind.
 KIND_TITLES: dict[str, str] = {
     "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
     "resume": "Welcome back", "question": "Getting to know you",
@@ -115,11 +107,6 @@ BUSY_NOTIFICATION_STATES: frozenset[int] = frozenset({1, 2, 3, 4})
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_TIMEOUT = 0x00000102
 _WAIT_FAILED = 0xFFFFFFFF
-
-
-def kind_accent(kind: Any) -> QColor:
-    """The accent colour for a nudge kind (an unknown kind gets the default accent)."""
-    return KIND_ACCENTS.get(str(kind or ""), ACCENT)
 
 
 def kind_title(kind: Any) -> str:
@@ -399,7 +386,7 @@ class NudgeWatcher(QObject):
         self.arrived.emit(rows, why)
 
 
-class NudgeCard(GlassWindow):
+class NudgeCard(SurfaceWindow):
     """One nudge, bottom-right: heading, text, Reply and Dismiss. Never takes focus.
 
     The whole text always shows (wrapped, never cut). It stays up for
@@ -423,25 +410,24 @@ class NudgeCard(GlassWindow):
     never_ask = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
-        super().__init__(activates=False, radius=20)
+        super().__init__(activates=False)
         self.setObjectName("YukiNudgeCard")
         self.nudge: dict[str, Any] | None = None
-        self._accent = ACCENT
         self._fixed_linger = linger_ms
         #: The linger of the nudge now up (set by :meth:`set_nudge`).
         self.linger_ms = linger_ms if linger_ms is not None else CARD_LINGER_BASE_MS
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
 
         column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 18, self.SHADOW + 12, self.SHADOW + 14, self.SHADOW + 12)
-        column.setSpacing(4)
+        column.setContentsMargins(self.SHADOW + 16, self.SHADOW + 14, self.SHADOW + 16, self.SHADOW + 14)
+        column.setSpacing(6)
 
         header = QHBoxLayout()
         header.setSpacing(8)
         self.title = QLabel(self)
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
         self.title.setTextFormat(Qt.TextFormat.PlainText)
-        header.addWidget(self.title)   # the kind is in its word and a faint wash of the glass (no dot)
+        header.addWidget(self.title)   # the kind is in its word
         self.when = QLabel(self)
         self.when.setFont(ui_font(9))
         self.when.setTextFormat(Qt.TextFormat.PlainText)
@@ -492,24 +478,14 @@ class NudgeCard(GlassWindow):
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         return button
 
-    def _kind_ink(self) -> QColor:
-        """The card's kind colour, from the design system when it knows the kind (tuned per theme)."""
-        kind = str((self.nudge or {}).get("kind") or "")
-        t = self.theme()
-        return QColor(t.kinds[kind]) if kind in t.kinds else QColor(self._accent)
-
     def _style_buttons(self) -> None:
-        a = self._kind_ink()
-        self.reply_button.setStyleSheet(self.button_css("tinted", a))
-        quiet = self.button_css("quiet")
+        self.reply_button.setStyleSheet(self.button_css("default"))
+        quiet = self.button_css("outline")
         self.dismiss_button.setStyleSheet(quiet)
         self.never_button.setStyleSheet(quiet)
-        self.title.setStyleSheet(f"color: rgb({a.red()},{a.green()},{a.blue()});")
-        wash = QColor(a)
-        wash.setAlphaF(0.07 if not self.theme().dark else 0.10)
-        self.glass_tint = wash   # the kind is a faint tint of the glass and its title's colour
+        self.title.setStyleSheet(f"color: {self.ink_css('text')};")
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.body.setStyleSheet(f"color: {self.ink_css('text')};")
         self.detail.setStyleSheet(f"color: {self.ink_css('text_3')};")
@@ -520,7 +496,6 @@ class NudgeCard(GlassWindow):
     def set_nudge(self, nudge: dict[str, Any]) -> None:
         """Fill the card for one nudge and size it to its text (no showing)."""
         self.nudge = nudge
-        self._accent = kind_accent(nudge.get("kind"))
         self.title.setText(kind_title(nudge.get("kind")))
         question = str(nudge.get("kind") or "") == "question"
         self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
@@ -545,7 +520,6 @@ class NudgeCard(GlassWindow):
             self.layout().sizeHint().height()
         )
         self.setFixedHeight(max(CARD_MIN_HEIGHT + 2 * self.SHADOW, wanted))
-        self._shadow_pixmap = None
         self.update()
 
     def anchor(self) -> QPoint:
@@ -637,8 +611,8 @@ class NudgeCard(GlassWindow):
 
 
 class NoticeCard(NudgeCard):
-    """A one-off notice from the runtime (``AgentRuntime.notice``: the daily cost alert), as the same clear
-    glass card as a nudge: its heading, the text, one "OK". Nothing is acknowledged to memory; it is not a
+    """A one-off notice from the runtime (``AgentRuntime.notice``: the daily cost alert), as the same card as a
+    nudge: its heading, the text, one "OK". Nothing is acknowledged to memory; it is not a
     nudge. Shown by :meth:`yuki.ui.app.YukiUi.show_notice` when the screen is free."""
 
     TITLES = {"cost": "Today's spend", "doctor": "Health check"}

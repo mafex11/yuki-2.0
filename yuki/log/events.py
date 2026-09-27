@@ -20,7 +20,7 @@ import hashlib
 import json
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TextIO
@@ -59,6 +59,8 @@ class ToolResult:
     ok: bool
     summary: str
     kind: Literal["tool_result"] = "tool_result"
+    #: The tool's structured result (for the UI to name what it worked on); not compared or printed.
+    payload: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

@@ -28,12 +28,12 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter
+from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
-from yuki.ui.glass import ACCENT, GlassWindow, ui_font
+from yuki.ui.surface import SurfaceWindow, ui_font
 from yuki.ui.nudges import BUSY_NOTIFICATION_STATES, NudgeWatcher, notification_state
 from yuki.ui.status import STRIP_HEIGHT, STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
@@ -45,8 +45,6 @@ FALLBACK_POLL_S = 20.0
 #: While a call is on, look this often too (the indicator follows the status).
 ACTIVE_POLL_MS = 10_000
 
-CALL_ACCENT = QColor(255, 122, 122)
-WAIT_ACCENT = QColor(255, 190, 110)
 CARD_WIDTH = STRIP_WIDTH
 INDICATOR_WIDTH = 236
 INDICATOR_HEIGHT = 34
@@ -107,7 +105,7 @@ class CallWatcher(NudgeWatcher):
         self.arrived.emit(status if isinstance(status, dict) else {}, why)
 
 
-class CallConsentCard(GlassWindow):
+class CallConsentCard(SurfaceWindow):
     """The consent card: the question, what is and is not recorded, four answers. Never takes focus.
 
     Signals:
@@ -118,13 +116,13 @@ class CallConsentCard(GlassWindow):
     answered = Signal(object, str)
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=20)
+        super().__init__(activates=False)
         self.setObjectName("YukiCallConsentCard")
         self.call: dict[str, Any] | None = None
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
         column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 18, self.SHADOW + 12, self.SHADOW + 14, self.SHADOW + 12)
-        column.setSpacing(5)
+        column.setContentsMargins(self.SHADOW + 16, self.SHADOW + 14, self.SHADOW + 16, self.SHADOW + 14)
+        column.setSpacing(6)
 
         self.title = QLabel("Yuki · call", self)
         self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
@@ -170,18 +168,14 @@ class CallConsentCard(GlassWindow):
         self._timeout.timeout.connect(lambda: self._answer("none"))
         self.restyle()
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
-        call = self.ink("call")
-        self.title.setStyleSheet(f"color: rgb({call.red()},{call.green()},{call.blue()});")
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
+        self.title.setStyleSheet(f"color: {self.ink_css('text_2')};")
         self.question.setStyleSheet(f"color: {self.ink_css('text')};")
         self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
-        self.note.setStyleSheet(f"color: {self.ink_css('nudge')};")
-        self.yes_button.setStyleSheet(self.button_css("tinted", call))
+        self.note.setStyleSheet(f"color: {self.ink_css('warning')};")
+        self.yes_button.setStyleSheet(self.button_css("default"))
         for button in (self.no_button, self.never_button, self.always_button):
-            button.setStyleSheet(self.button_css("quiet"))
-        wash = QColor(call)
-        wash.setAlphaF(0.07 if not self.theme().dark else 0.10)
-        self.glass_tint = wash
+            button.setStyleSheet(self.button_css("outline"))
 
     def _button(self, text: str, *, primary: bool, small: bool = False) -> QPushButton:
         button = QPushButton(text, self)
@@ -209,7 +203,6 @@ class CallConsentCard(GlassWindow):
         lay = self.layout()
         wanted = lay.totalHeightForWidth(width) if lay.hasHeightForWidth() else lay.sizeHint().height()
         self.setFixedHeight(max(120 + 2 * self.SHADOW, wanted))
-        self._shadow_pixmap = None
         self.update()
 
     def anchor(self, *, above: int = 0) -> QPoint:
@@ -241,37 +234,29 @@ class CallConsentCard(GlassWindow):
         if call is not None:
             self.answered.emit(call, answer)
 
-class CallIndicator(GlassWindow):
+class CallIndicator(SurfaceWindow):
     """The small "Remembering your side · Zoom" pill (or "Waiting for headphones"). Never takes focus.
 
-    Clear glass like every surface (2026-09-27): the state is in its words, with a faint wash of the call's
-    colour (or the waiting colour) on the glass; no coloured dot, no dark block, no border.
+    A flat popover like every surface: the state is in its words; waiting is said in the warning colour.
     """
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=INDICATOR_HEIGHT // 2)
+        super().__init__(activates=False)
         self.setObjectName("YukiCallIndicator")
         self.setFixedSize(INDICATOR_WIDTH + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 14, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 14, self.SHADOW, self.SHADOW + 14, self.SHADOW)
         self.label = QLabel(self)
-        self.label.setFont(ui_font(9))
+        self.label.setFont(ui_font(9, weight=QFont.Weight.Medium))
         self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
         self.call: dict[str, Any] | None = None
         self.restyle()
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
-        from yuki.ui.glass import text_halo
-
-        self.glass_density = "clear"
-        self.label.setStyleSheet(f"color: {self.ink_css('text')};")
-        text_halo(self.label, self.theme().dark)
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
         waiting = (self.call or {}).get("status") == "waiting_headphones"
-        wash = QColor(self.ink("nudge" if waiting else "call"))
-        wash.setAlphaF(0.08 if not self.theme().dark else 0.12)
-        self.glass_tint = wash
+        self.label.setStyleSheet(f"color: {self.ink_css('warning' if waiting else 'text')};")
 
     def set_call(self, call: dict[str, Any]) -> None:
         self.call = call

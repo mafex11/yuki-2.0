@@ -30,8 +30,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
-from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
 
 from yuki.ui.window.actions import Actions, correction_text
 
@@ -66,14 +65,12 @@ class WindowApp(Actions):
                  ui_path: Path | None = None, real_db: Path | None = None) -> None:
         from yuki.ui import ui_settings
         from yuki.ui.chat_model import ChatModel
-        from yuki.ui.window.refract import LIVE
 
         self.memory = memory
         self.db_path = db_path
         self.real_db = real_db
         self.ui_path = ui_path
-        self.ui = ui_settings.apply_policy(ui_settings.load(ui_path))
-        LIVE.on = True   # page glass is always a cached picture (flat in Light / Off, GPU in Full)
+        self.ui = ui_settings.load(ui_path)
         self.model = ChatModel()
         self.state: dict[str, Any] = {}
         self.connected = False
@@ -105,23 +102,13 @@ class WindowApp(Actions):
         self._pending_timer.timeout.connect(self._check_pending)
         if self.pending:
             self._pending_timer.start()
-        try:
-            from PySide6.QtGui import QGuiApplication
-
-            QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._on_system_theme())
-        except Exception:
-            pass
 
     # -- the window -------------------------------------------------------------------------------
 
     def _theme(self) -> Any:
-        from yuki.ui.window.backdrop import system_prefers_dark
         from yuki.ui.window.theme import theme
 
-        mode = self.ui.appearance
-        if mode not in ("dark", "light"):
-            mode = "dark" if system_prefers_dark() else "light"
-        return theme(mode)
+        return theme()
 
     def _make_window(self, page: str) -> Any:
         from yuki.ui.window.live import LiveWindow
@@ -144,7 +131,7 @@ class WindowApp(Actions):
             win.show()
         else:
             win.showMaximized() if self.ui.maximized else win.show()
-            win.make_native(dwm_backdrop=self.ui.background == "see-through")
+            win.make_native()
             win.raise_()
             win.activateWindow()
         self.load(win.current)
@@ -177,34 +164,6 @@ class WindowApp(Actions):
             pass
         if self.client is not None:
             self.client.close()
-
-    def _rebuild_window(self) -> None:
-        """The theme changed: a fresh window in its place (every widget holds its theme)."""
-        old = self.win
-        page, geo, maxed = old.current, old.geometry(), old.isMaximized()
-        offscreen = old.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
-        self.t = self._theme()
-        self.win = self._make_window(page)
-        self.win.setGeometry(geo)
-        try:
-            old.closing.disconnect(self._on_close)
-        except Exception:
-            pass
-        old.hide()
-        old.deleteLater()
-        if offscreen:
-            self.win.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-            self.win.show()
-        else:
-            self.win.showMaximized() if maxed else self.win.show()
-            self.win.make_native(dwm_backdrop=self.ui.background == "see-through")
-        for key in list(self._views):
-            self._build(key)
-        self._sync_footer()
-
-    def _on_system_theme(self) -> None:
-        if self.ui.appearance == "system" and self._theme().name != self.t.name:
-            self._rebuild_window()
 
     # -- loading ----------------------------------------------------------------------------------
 
@@ -479,9 +438,9 @@ class WindowApp(Actions):
         self._on_navigate("today")
 
     def day_menu(self, anchor: Any) -> None:
-        from yuki.ui.window.widgets import GlassMenu
+        from yuki.ui.window.widgets import Menu
 
-        menu = GlassMenu(self.t, anchor)
+        menu = Menu(self.t, anchor)
         today = date.today()
         for n in range(14):
             d = today - timedelta(days=n)
@@ -865,51 +824,12 @@ class WindowApp(Actions):
                                 self._views.pop("status", None)))
 
     def _ui(self, **changes: Any) -> None:
-        """Save a look setting, apply it here at once, and tell yuki-ui (overlay, cards, pill, strip)."""
-        from yuki.ui import lens, ui_settings
-        from yuki.ui.window.refract import LIVE
+        """Save a UI setting and tell yuki-ui (the overlay's shortcut, motion)."""
+        from yuki.ui import ui_settings
 
-        before = self.ui
         self.ui = ui_settings.update(self.ui_path, **changes)
-        ui_settings.apply_policy(self.ui)
-        LIVE.on = True   # page glass is always a cached picture (flat in Light / Off, GPU in Full)
-        if self.ui.glass == "off":
-            lens.release()
         if self.client is not None:
             threading.Thread(target=lambda: self.client and self.client.request("ui_settings"), daemon=True).start()
-        if self.ui.appearance != before.appearance and self._theme().name != self.t.name:
-            self._rebuild_window()
-            return
-        if before.background != self.ui.background:
-            self.win.set_backdrop(self.ui.background == "see-through")
-        self.win.forget_glass()
-        from yuki.ui.window.glass import SHADOWS
-
-        SHADOWS.clear()
-        for w in self.win.findChildren(QWidget):   # everything painted directly follows the new look at once
-            w.update()
-
-    def set_appearance(self, mode: str) -> None:
-        self._ui(appearance=mode)
-
-    def set_glass(self, mode: str) -> None:
-        self._ui(glass=mode)
-        self.toast({"off": "Glass off: plain and clear.", "light": "Light glass: the edges bend light.",
-                    "full": "Full glass: the strongest bending."}.get(mode, ""))
-
-    def set_background(self, mode: str) -> None:
-        self._ui(background=mode)
-        self.toast("See-through: your desktop shows, blurred, behind Yuki." if mode == "see-through" else
-                   "Plain background.")
-
-    def set_bend(self, value: float) -> None:
-        self._ui(bend=value)
-
-    def set_blur(self, value: float) -> None:
-        self._ui(blur=value)
-
-    def set_transparency(self, value: float) -> None:
-        self._ui(transparency=value)
 
     def set_open_hotkey(self, combo: str) -> None:
         """The overlay's shortcut, saved in ``ui.json``; yuki-ui re-registers it at once (over the pipe)."""

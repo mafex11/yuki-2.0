@@ -146,14 +146,12 @@ def test_call_band_hover_and_click_and_the_call_row_in_a_session(qapp):
                                                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     assert clicked == [0] and chart.selected_call == 0
     # the session's details list the call as a row, with no "On a Discord call" badge
-    from yuki.ui.window.widgets import Chip
-
     panel = today._details(theme("dark"), day, 0)
     from PySide6.QtWidgets import QLabel
 
     labels = [lab.text() for lab in panel.findChildren(QLabel)]
     assert any(t.startswith("Discord call · ongoing") for t in labels), labels
-    assert not any("On a Discord call" in c.text for c in panel.findChildren(Chip))
+    assert not any("On a Discord call" in t for t in labels)
     page.close()
 
 
@@ -257,20 +255,23 @@ def test_helper_steps_show_under_the_response_labelled_as_helpers():
     assert not head.running and tool.depth == 1 and tool.name == "recall"
 
 
-def test_surfaces_are_clear_glass_with_no_dot(qapp):
+def test_pills_say_their_state_in_words_with_no_dot(qapp):
     from yuki.ui.calls import CallIndicator
     from yuki.voice.indicator import VoicePill
 
     ind = CallIndicator()
     ind.set_call({"app": "Discord", "status": "recording"})
-    assert ind.glass_tint is not None and ind.glass_tint.alphaF() < 0.2        # a faint wash, not a block
-    lvl = ind._level()
-    assert lvl.outline.alpha() == 0 and lvl.fill.alphaF() <= 0.6               # clear glass, no border
+    assert "Discord" in ind.label.text()
+    waiting = CallIndicator()
+    waiting.set_call({"app": "Zoom", "status": "waiting_headphones"})
+    assert "245,158,11" in waiting.label.styleSheet()                     # waiting: said in the warning colour
     pill = VoicePill()
     pill.show_state("speaking")
-    assert pill.label.text() == "Speaking" and pill.glass_tint.alphaF() < 0.2
-    ind.close()
-    pill.close()
+    assert pill.label.text() == "Speaking" and "250,250,250" in pill.label.styleSheet()
+    pill.show_state("error", "The microphone is in use")
+    assert pill.label.text().startswith("The microphone") and "239,68,68" in pill.label.styleSheet()
+    for w in (ind, waiting, pill):
+        w.close()
 
 
 def test_notice_card_shows_a_runtime_notice(qapp):

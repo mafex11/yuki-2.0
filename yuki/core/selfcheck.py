@@ -27,16 +27,6 @@ def _qt() -> str:
     return f"Qt ok, plugins at {plugins}, platform {app.platformName()}"
 
 
-def _shaders() -> str:
-    from importlib import resources
-
-    names = [p.name for p in resources.files("yuki.ui.window").joinpath("shaders").iterdir()]
-    qsb = [n for n in names if n.endswith(".qsb")]
-    if len(qsb) < 4:
-        raise FileNotFoundError(f"shaders missing: {names}")
-    return f"{len(qsb)} .qsb shaders"
-
-
 def _tomls() -> str:
     import tomllib
 
@@ -182,7 +172,7 @@ def _crypto() -> str:
 
 
 CHECKS: list[tuple[str, Callable[[], str]]] = [
-    ("qt", _qt), ("shaders", _shaders), ("toml defaults", _tomls), ("onnxruntime", _onnxruntime),
+    ("qt", _qt), ("toml defaults", _tomls), ("onnxruntime", _onnxruntime),
     ("silero vad", _silero), ("sherpa-onnx", _sherpa), ("ctranslate2", _ctranslate2),
     ("faster-whisper", _faster_whisper), ("livekit", _livekit), ("pipecat", _pipecat), ("portaudio", _audio),
     ("pyav", _av), ("winrt", _winrt), ("uia/pywin32", _uia), ("embedder", _embedder),

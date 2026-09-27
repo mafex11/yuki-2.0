@@ -102,8 +102,11 @@ def _user32():
     return ctypes.windll.user32
 
 
-def make_native_frame(hwnd: int) -> bool:
-    """Give a Qt frameless window back its Windows frame behaviour (see the module docstring)."""
+def make_native_frame(hwnd: int, *, border: object = None) -> bool:
+    """Give a Qt frameless window back its Windows frame behaviour (see the module docstring).
+
+    Also dark title-bar semantics (``DWMWA_USE_IMMERSIVE_DARK_MODE``) and, when ``border`` (a QColor) is given,
+    Windows 11's 1 px window border in that colour (``DWMWA_BORDER_COLOR``), so the edge matches the cards."""
     if sys.platform != "win32":
         return False
     try:
@@ -121,6 +124,11 @@ def make_native_frame(hwnd: int) -> bool:
         dwm.DwmExtendFrameIntoClientArea(wintypes.HWND(hwnd), ctypes.byref(margins))
         pref = ctypes.c_int(2)   # DWMWCP_ROUND
         dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 33, ctypes.byref(pref), ctypes.sizeof(pref))
+        dark = ctypes.c_int(1)   # DWMWA_USE_IMMERSIVE_DARK_MODE
+        dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        if border is not None:   # DWMWA_BORDER_COLOR, a COLORREF (0x00BBGGRR)
+            ref = ctypes.c_uint(border.red() | (border.green() << 8) | (border.blue() << 16))
+            dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 34, ctypes.byref(ref), ctypes.sizeof(ref))
         u.SetWindowPos(wintypes.HWND(hwnd), None, 0, 0, 0, 0,
                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
         return True

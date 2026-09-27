@@ -5,8 +5,8 @@ submit collapses the input, a card grows in where the input used to be, and a
 fresh (empty) input expands below it. The card fills in when the answer arrives
 and grows to fit. :data:`MAX_CARDS` cards stay visible; older ones fade away.
 
-Memory's nudges live in the same stack (tone ``nudge``: tinted in their
-kind's accent, labelled ``Yuki · 14:32 · nudge``, with their own Reply), each
+Memory's nudges live in the same stack (tone ``nudge``: labelled
+``Yuki · 14:32 · nudge``, with their own Reply), each
 placed by the time the user saw it, so the stack reads as one conversation.
 
 The card stack sits in a scroll area whose height follows its content up to
@@ -42,7 +42,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QPainter, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeyEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -56,14 +56,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from yuki.ui.glass import (
+from yuki.ui.surface import (
     ANIM_MS,
     CARD_BG,
     CARD_BORDER,
     ERROR_BG,
     ERROR_BORDER,
     TEXT_DIM,
-    GlassWindow,
+    TEXT_PRIMARY,
+    SurfaceWindow,
     ui_font,
 )
 
@@ -71,7 +72,7 @@ from yuki.ui.glass import (
 PANEL_WIDTH = 620
 
 #: Padding inside the panel.
-PAD = 14
+PAD = 16
 
 #: How many cards (requests, replies and nudges together) stay on screen.
 MAX_CARDS = 5
@@ -81,13 +82,12 @@ MAX_CARDS = 5
 #: screen, so stack + input end well above the taskbar at any screen size.
 MAX_CARDS_FRACTION = 0.55
 
-#: The stack's scrollbar: thin, translucent, only there when it can scroll.
+#: The stack's scrollbar: thin, only there when it can scroll (shadcn's ScrollArea).
 SCROLL_STYLE = (
     "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
-    "QScrollBar:vertical { background: transparent; width: 6px; margin: 2px 0 2px 0; }"
-    "QScrollBar::handle:vertical { background: rgba(238,240,245,70); border-radius: 3px;"
-    " min-height: 24px; }"
-    "QScrollBar::handle:vertical:hover { background: rgba(238,240,245,120); }"
+    "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px 0 2px 0; }"
+    "QScrollBar::handle:vertical { background: #27272a; border-radius: 4px; min-height: 24px; }"
+    "QScrollBar::handle:vertical:hover { background: #3f3f46; }"
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
     "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
 )
@@ -131,8 +131,8 @@ class AskInput(QPlainTextEdit):
         self.setStyleSheet(
             "QPlainTextEdit {"
             "  background: transparent;"
-            "  color: rgba(238,240,245,255);"
-            "  selection-background-color: rgba(126,180,255,90);"
+            "  color: #fafafa;"
+            "  selection-background-color: #3f3f46;"
             "  border: none; padding: 0px;"
             "}"
         )
@@ -173,11 +173,10 @@ class ReplyCard(QWidget):
         prompt: What the user asked, shown dim above the body. Empty for a card
             that is only a message (a question, or an error with no request).
         body: Initial body text; empty means "still working".
-        tone: Colour treatment. ``context`` is something Yuki said first (a
-            nudge being replied to), marked with a bar in ``accent``.
-            ``nudge`` is one of memory's nudges in the conversation: tinted in
-            ``accent``, its label in the accent, and a Reply of its own.
-        accent: Colour of the ``context`` bar / the ``nudge`` tint.
+        tone: ``context`` is something Yuki said first (a nudge being replied
+            to); ``nudge`` is one of memory's nudges in the conversation, with
+            a Reply of its own; ``error`` gets a red border.
+        accent: Kept for callers; the look is monochrome.
         at: When the card's moment happened (epoch s; now by default): the
             stack is kept in this order.
         nudge: The nudge a ``nudge`` card shows.
@@ -216,32 +215,24 @@ class ReplyCard(QWidget):
         self._prompt = QLabel(prompt, self)
         self._prompt.setFont(ui_font(10))
         self._prompt.setWordWrap(True)
-        self._prompt.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
+        self._prompt.setStyleSheet(f"color: {TEXT_DIM.name()};")
         self._prompt.setVisible(bool(prompt))
         self.reply_button: QPushButton | None = None
         if tone == "nudge":
-            a = QColor(accent or QColor(126, 180, 255))
+            from yuki.ui.surface import button_css
+
             self._prompt.setFont(ui_font(9))
             self._prompt.setTextFormat(Qt.TextFormat.PlainText)
-            self._prompt.setStyleSheet(f"color: rgba({a.red()},{a.green()},{a.blue()},230);")
             header = QHBoxLayout()
             header.setContentsMargins(0, 0, 0, 0)
             header.setSpacing(8)
             header.addWidget(self._prompt, 1)
             self.reply_button = QPushButton("Reply", self)
-            self.reply_button.setFont(ui_font(9))
+            self.reply_button.setFont(ui_font(9, weight=QFont.Weight.Medium))
             self.reply_button.setCursor(Qt.CursorShape.PointingHandCursor)
             # A click must leave the keyboard in the input below.
             self.reply_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.reply_button.setStyleSheet(
-                f"QPushButton {{ color: rgb({a.red()},{a.green()},{a.blue()});"
-                f" background: rgba({a.red()},{a.green()},{a.blue()},26);"
-                f" border: 1px solid rgba({a.red()},{a.green()},{a.blue()},80);"
-                " border-radius: 7px; padding: 1px 10px; }"
-                f"QPushButton:hover {{ background: rgba({a.red()},{a.green()},{a.blue()},60); }}"
-                "QPushButton:disabled { color: rgba(238,240,245,120); background: transparent;"
-                " border: 1px solid rgba(255,255,255,20); }"
-            )
+            self.reply_button.setStyleSheet(button_css("outline"))
             self.reply_button.clicked.connect(lambda: self.reply_clicked.emit(self.nudge))
             header.addWidget(self.reply_button, 0, Qt.AlignmentFlag.AlignVCenter)
             layout.addLayout(header)
@@ -254,14 +245,14 @@ class ReplyCard(QWidget):
         self._body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         # Selecting text with the mouse must not pull the keyboard out of the input.
         self._body.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._body.setStyleSheet("color: rgba(238,240,245,255);")
+        self._body.setStyleSheet(f"color: {TEXT_PRIMARY.name()};")
         layout.addWidget(self._body)
 
         #: Dim time/steps/cost line under a finished reply; hidden until set.
         self._meta = QLabel("", self)
         self._meta.setFont(ui_font(9))
         self._meta.setTextFormat(Qt.TextFormat.PlainText)
-        self._meta.setStyleSheet(f"color: rgba(238,240,245,{TEXT_DIM.alpha()});")
+        self._meta.setStyleSheet(f"color: {TEXT_DIM.name()};")
         self._meta.setVisible(False)
         layout.addWidget(self._meta)
 
@@ -367,31 +358,12 @@ class ReplyCard(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         error = self.tone == "error"
-        if self.tone == "nudge":
-            tint = QColor(self.accent or QColor(126, 180, 255))
-            border = QColor(tint)
-            tint.setAlpha(22)
-            border.setAlpha(70)
-            painter.setBrush(tint)
-            painter.setPen(QPen(border, 1.0))
-        else:
-            painter.setBrush(ERROR_BG if error else CARD_BG)
-            painter.setPen(Qt.PenStyle.NoPen)   # clear glass: no outline (2026-09-27)
-        if self.tone == "nudge":
-            painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(rect, 10, 10)
-        if self.tone in ("question", "context", "nudge"):
-            bar = QColor(self.accent or QColor(126, 180, 255)) if self.tone != "question" else (
-                QColor(126, 180, 255)
-            )
-            bar.setAlpha(180 if self.tone == "question" else 200)
-            painter.setPen(QPen(bar, 2.0))
-            painter.drawLine(
-                rect.left() + 1.0, rect.top() + 8.0, rect.left() + 1.0, rect.bottom() - 8.0
-            )
+        painter.setBrush(ERROR_BG if error else CARD_BG)
+        painter.setPen(QPen(ERROR_BORDER if error else CARD_BORDER, 1.0))
+        painter.drawRoundedRect(rect, 8, 8)
 
 
-class Overlay(GlassWindow):
+class Overlay(SurfaceWindow):
     """The overlay window.
 
     Signals:
@@ -409,7 +381,7 @@ class Overlay(GlassWindow):
     opened = Signal()
 
     def __init__(self) -> None:
-        super().__init__(activates=True, radius=28)
+        super().__init__(activates=True, radius=8)
         self.setObjectName("YukiOverlay")
         #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
         self.thread: Any = None
@@ -419,7 +391,7 @@ class Overlay(GlassWindow):
         outer = QVBoxLayout(self)
         margin = self.SHADOW + PAD
         outer.setContentsMargins(margin, margin, margin, margin)
-        outer.setSpacing(10)
+        outer.setSpacing(20)
 
         # The card stack scrolls inside a capped area; the input below it never moves off screen.
         self._content = QWidget()
@@ -478,16 +450,16 @@ class Overlay(GlassWindow):
         self._grace_timer.timeout.connect(self._end_focus_grace)
         self.restyle()
 
-    # -- look (Liquid Glass, docs/UI-window.md) ------------------------------
+    # -- look (flat shadcn, docs/UI-window.md) --------------------------------
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         if not hasattr(self, "input"):
             return
         sel = self.theme().accent_soft
         self.input.setStyleSheet(
             "QPlainTextEdit { background: transparent;"
             f" color: {self.ink_css('text')};"
-            f" selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},{max(90, sel.alpha())});"
+            f" selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},{sel.alpha()});"
             " border: none; padding: 0px; }")
         pal = self.input.palette()
         pal.setColor(pal.ColorRole.PlaceholderText, self.ink("text_3"))
@@ -497,15 +469,14 @@ class Overlay(GlassWindow):
 
     def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
         super().paintEvent(event)
-        if self.input.maximumHeight() <= 0:
+        shown = self.thread.isVisible() if self.thread is not None else self._scroll.isVisible()
+        if self.input.maximumHeight() <= 0 or not shown:
             return
-        from yuki.ui.window.glass import paint_glass
-
+        # a separator between the conversation and the input, edge to edge (shadcn's Command)
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.input.geometry()).adjusted(-12, -7, 12, 7)
-        paint_glass(painter, r, r.height() / 2 if r.height() < 60 else 22, self.theme().level("control"),
-                    shadow=False, painted=True)
+        panel = self.panel_rect()
+        y = self.input.geometry().top() - 11
+        painter.fillRect(QRectF(panel.left() + 1, y, panel.width() - 2, 1), self.theme().border)
         painter.end()
 
     # -- thread mode (the live chat thread) ------------------------------------
@@ -635,7 +606,7 @@ class Overlay(GlassWindow):
 
     # -- show / hide -------------------------------------------------------
 
-    def focus_target(self) -> QWidget:  # noqa: D102 - GlassWindow hook
+    def focus_target(self) -> QWidget:  # noqa: D102 - SurfaceWindow hook
         return self.input
 
     def open(self) -> None:
@@ -644,7 +615,7 @@ class Overlay(GlassWindow):
         The grace period is armed before anything is shown, so the activation
         messages of the hand-over cannot reach :meth:`changeEvent` as a "user
         clicked away". :meth:`fade_in` then shows the window and takes the
-        foreground at once (:meth:`GlassWindow.take_focus`), focusing the input
+        foreground at once (:meth:`SurfaceWindow.take_focus`), focusing the input
         before the first animation frame.
         """
         coming_up = not self.isVisible() or self.closing
@@ -740,7 +711,7 @@ class Overlay(GlassWindow):
         card.content_changed.connect(self.scroll_to_latest)
 
     def add_nudge_card(
-        self, nudge: dict[str, Any], label: str, *, accent: QColor, at: float
+        self, nudge: dict[str, Any], label: str, *, accent: QColor | None = None, at: float
     ) -> ReplyCard | None:
         """Put one of memory's nudges in the stack, in time order, and animate it in.
 

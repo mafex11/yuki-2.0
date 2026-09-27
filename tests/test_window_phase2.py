@@ -1,5 +1,6 @@
-"""The Yuki window, phase 2: settings writers, the glass, the frameless chrome, pages offscreen, the overlay's
-thread, and yuki-ui's translation of the voice side's chat events. Offscreen only (rule 7)."""
+"""The Yuki window, phase 2: settings writers, the frameless chrome, pages offscreen (nothing clipped in a
+narrow window), the overlay's thread, and yuki-ui's translation of the voice side's chat events. Offscreen only
+(rule 7)."""
 
 from __future__ import annotations
 
@@ -97,29 +98,20 @@ def test_voice_prefs_written_directly_only_as_a_merge(tmp_path):
     assert prefs == {"tts_voice": "abc", "wake": False, "speaker_device": "Headphones"}
 
 
-def test_ui_settings_round_trip_clamps_and_keeps_unknown_keys(tmp_path):
+def test_ui_settings_round_trip_keeps_unknown_keys(tmp_path):
     import json
 
     from yuki.ui import ui_settings
 
     path = tmp_path / "ui.json"
-    path.write_text(json.dumps({"future_key": 3, "glass": "FULL", "bend": 7}), encoding="utf-8")
+    path.write_text(json.dumps({"future_key": 3, "window": [1, 2, 3, 4, 5], "open_hotkey": "  Ctrl+Space "}),
+                    encoding="utf-8")
     s = ui_settings.load(path)
-    assert (s.glass, s.bend, s.blur, s.appearance) == ("full", 2.0, 1.0, "system")
-    s = ui_settings.update(path, glass="nonsense", blur=0.4, reduce_motion=True, not_a_setting=1)
-    assert (s.glass, s.blur, s.reduce_motion) == (ui_settings.DEFAULT_GLASS, 0.4, True)
+    assert (s.window, s.open_hotkey, s.reduce_motion) == ([1, 2, 3, 4], "ctrl+space", False)
+    s = ui_settings.update(path, reduce_motion=True, not_a_setting=1)
+    assert s.reduce_motion is True
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["future_key"] == 3 and "not_a_setting" not in raw
-    pol = s.policy()
-    # 2026-09-27: the window's background is plain, so page glass is a cached GPU picture only in Full (and
-    # not See-through); Light and Full both bend what floats over the app's own content
-    # every page's glass is a cached picture (drawn on a change, then composited): on the GPU only in Full
-    assert pol.refracts("regular") and ui_settings.UiSettings(glass="off").policy().refracts("regular")
-    assert pol.gpu == (s.glass == "full") and ui_settings.UiSettings(glass="full").policy().gpu
-    assert not ui_settings.UiSettings(glass="full", background="see-through").policy().gpu
-    assert ui_settings.UiSettings(glass="light").policy().floats_refract
-    assert not ui_settings.UiSettings(glass="off").policy().floats_refract
-    assert ui_settings.update(path, background="nonsense").background == "solid"
 
 
 # -- the frameless chrome --------------------------------------------------------------------------------
@@ -144,68 +136,6 @@ def test_hit_test_edges_caption_and_snap_layout_button():
     assert ht(-1, 5) == 0
 
 
-# -- the Light glass (CPU) ---------------------------------------------------------------------------------
-
-
-def test_light_glass_bends_the_rim_and_reuses_its_displacement_map(qapp):
-    import numpy as np
-    from PySide6.QtCore import QRectF, QSize
-
-    from yuki.ui import lens
-    from yuki.ui.window.proof import pattern
-    from yuki.ui.window.refract import Shape
-    from yuki.ui.window.theme import theme
-
-    t = theme("light")
-    base = pattern(QSize(300, 200), 1.0)
-    shape = Shape(QRectF(40, 40, 200, 120), 24, t.optics["regular"], 1.0, None, None, False)
-    lens.BANDS.clear()
-    first = lens.render_light(base, [[shape]], shadows=False)
-    misses = lens.BANDS.misses
-    second = lens.render_light(base, [[shape]], shadows=False)
-    assert lens.BANDS.misses == misses and lens.BANDS.hits >= 1      # computed once per shape size
-
-    def arr(img):
-        b = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine() // 4, 4)
-        return b[:, : img.width(), :3].astype(int)
-
-    a, b0, c = arr(first), arr(base.convertToFormat(first.format())), arr(second)
-    assert (a == c).all()                                              # same input, same picture
-    assert (a[5:30, 5:30] == b0[5:30, 5:30]).all()                     # outside the glass: untouched
-    assert np.abs(a[44:60, 60:220] - b0[44:60, 60:220]).mean() > 10    # the rim bends and lights
-    inner, under = a[90:110, 120:160].mean(), b0[90:110, 120:160].mean()
-    assert inner > under                                               # light glass never darker than its tone floor
-
-
-def test_glass_setting_decides_what_is_refracted_and_what_is_painted(qapp):
-    from PySide6.QtCore import QRectF
-    from PySide6.QtGui import QImage, QPainter
-
-    from yuki.ui import lens
-    from yuki.ui.window.glass import paint_glass
-    from yuki.ui.window.refract import COLLECTOR
-    from yuki.ui.window.theme import theme
-
-    t = theme("dark")
-    img = QImage(200, 100, QImage.Format.Format_ARGB32_Premultiplied)
-    saved = lens.policy()
-    try:
-        both = {"regular", "control"}   # recorded for the page's cached picture in every mode; the bubble never
-        for mode, expect in (("full", both), ("light", both), ("off", both)):
-            lens.set_policy(lens.GlassPolicy(mode))
-            COLLECTOR.begin(t)
-            p = QPainter(img)
-            paint_glass(p, QRectF(10, 10, 180, 80), 20, t.level("regular"))
-            paint_glass(p, QRectF(20, 20, 60, 26), 13, t.level("control"))
-            paint_glass(p, QRectF(100, 20, 60, 26), 13, t.level("control"), painted=True)   # a chat bubble
-            p.end()
-            shapes = COLLECTOR.end()
-            got = {s.level.name for s in shapes}   # optics are scaled by the settings; the level says which
-            assert got == expect, mode
-    finally:
-        lens.set_policy(saved)
-
-
 # -- pages, offscreen --------------------------------------------------------------------------------------
 
 
@@ -216,7 +146,7 @@ def test_every_page_builds_and_paints_on_an_empty_memory(qapp, tmp_path):
     from yuki.ui.chat_model import ChatModel
     from yuki.ui.window import data as D
     from yuki.ui.window.pages import chat, me, settings, status, today, yuki_page
-    from yuki.ui.window.phase2 import demo_thread, grab
+    from yuki.ui.window.shots import demo_thread, grab
     from yuki.ui.window.theme import theme
 
     memory = MemoryClient.open(tmp_path / "memory.db")
@@ -239,6 +169,41 @@ def test_every_page_builds_and_paints_on_an_empty_memory(qapp, tmp_path):
             img = grab(w)
             assert img.width() == 1000 and not img.isNull(), key
             w.close()
+    finally:
+        memory.close()
+
+
+def test_pages_never_ask_for_more_width_than_the_smallest_window(qapp, tmp_path):
+    """The window's smallest size (900 px) leaves the pages 668 px: every page fits, so nothing is clipped at
+    the edges (the cards go to one column instead, and text wraps inside them)."""
+    from datetime import date
+
+    from yuki.memory.api import MemoryClient
+    from yuki.ui.chat_model import ChatModel
+    from yuki.ui.window import data as D
+    from yuki.ui.window.live import LiveWindow
+    from yuki.ui.window.pages import chat, me, settings, status, today, yuki_page
+    from yuki.ui.window.shots import demo_thread
+    from yuki.ui.window.theme import theme
+
+    memory = MemoryClient.open(tmp_path / "memory.db")
+    try:
+        t = theme()
+        win = LiveWindow(t)
+        room = 900 - win.sidebar.width()
+        model = ChatModel()
+        demo_thread(model)
+        pages = {
+            "today": today.build(t, D.build_day(memory, date.today()), today=True),
+            "me": me.build(t, D.build_me(memory), progressive=False),
+            "yuki": yuki_page.build(t, D.build_yuki(memory)),
+            "status": status.build(t, D.build_status(memory)),
+            "settings": settings.build(t, D.build_settings(memory), advanced=True),
+            "chat": chat.build(t, model, connected=False),
+        }
+        for key, w in pages.items():
+            assert w.minimumSizeHint().width() <= room, (key, w.minimumSizeHint().width(), room)
+        win.close()
     finally:
         memory.close()
 

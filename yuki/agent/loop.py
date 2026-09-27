@@ -1450,7 +1450,7 @@ class Agent:
 
         self._log_outcome(outcome, tool_use_id=tool_id)
         self._note_action(name, outcome.ok, outcome.summary)
-        yield ToolResult(outcome.name, outcome.ok, outcome.summary)
+        yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload)
         finishing = tool_input.get(FINISHES_FIELD) if name in ACTION_TOOL_NAMES else None
         if outcome.ok and isinstance(finishing, str) and finishing.strip():
             turn.finishing.append(finishing.strip())

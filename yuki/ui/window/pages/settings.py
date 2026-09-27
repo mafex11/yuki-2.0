@@ -3,7 +3,7 @@
 Where each one is saved: voice (wake word, microphone, speaker, voice id) through
 yuki-ui into ``voice.json``; the coach, quiet hours and blocked apps and sites in
 ``privacy.toml``; calls in memory (``set_call_pref``); Start with Windows in the
-Run key; the look (appearance, glass, motion) in ``ui.json``.
+Run key; motion and the overlay's shortcut in ``ui.json``.
 """
 
 from __future__ import annotations
@@ -19,14 +19,14 @@ from yuki.ui.window.theme import SPACE, Theme
 from yuki.ui.window.widgets import (
     Divider,
     Dropdown,
-    Glass,
-    GlassSlider,
+    Card,
     KeyCapture,
+    Masonry,
     Panel,
-    Pill,
+    Button,
     Segmented,
     SettingRow,
-    TextPill,
+    Input,
     Toggle,
     combo_words,
     page_header,
@@ -38,7 +38,6 @@ DEFAULT_OPEN_HOTKEY = "alt+shift"
 
 #: Quiet-hour choices, every half hour.
 TIMES = tuple(f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30))
-GLASS_WORDS = {"off": "Off", "light": "Light", "full": "Full"}
 
 
 def _voice_name(voice_id: str) -> str:
@@ -47,7 +46,7 @@ def _voice_name(voice_id: str) -> str:
 
 def _chip_remove(t: Theme, text: str, on_remove) -> QWidget:
     """A blocked app or site: a button with its name and a cross; pressing it takes it off the list."""
-    x = Pill(t, f"{text}  ✕", style="quiet", size="small")
+    x = Button(t, f"{text}  ✕", style="outline", size="small")
     x.setToolTip(f"Stop blocking {text}")
     x.clicked.connect(lambda _c=False: on_remove())
     return x
@@ -70,12 +69,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
         note += " Yuki isn't running, so voice and model changes are saved for its next start."
     col.addWidget(page_header(t, "Settings", note))
 
-    grid = QHBoxLayout()
-    grid.setSpacing(SPACE["l"])
-    left = QVBoxLayout()
-    left.setSpacing(SPACE["l"])
-    right = QVBoxLayout()
-    right.setSpacing(SPACE["l"])
+    grid = QWidget(page)
+    cards = Masonry(grid, columns=2, spacing=SPACE["l"], min_col=400)   # one column in a narrow window
 
     # -- voice
     voice = Panel(t, "Voice", "Talk to Yuki with headphones on.", glyph="headphones")
@@ -90,13 +85,14 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     spk = Dropdown(t, v.speaker, width=250, options=lambda: act.device_options("render"))
     spk.changed.connect(lambda name: act.set_device("render", name))
     voice.body.addWidget(SettingRow(t, "speaker", "Speaker", "", spk))
-    vid = TextPill(t, "ElevenLabs voice id (empty: the default)", action="Save", text=v.voice_id, height=34)
+    vid = Input(t, "ElevenLabs voice id (empty: the default)", action="Save", text=v.voice_id, height=34)
     vid.setFixedWidth(250)
     vid.submitted.connect(lambda text: act.set_voice_id(text.strip()))
     voice.body.addWidget(SettingRow(t, "chat", "Yuki's voice", _voice_name(v.voice_id), vid))
     voice.body.addWidget(SettingRow(t, "link", "Talk shortcut", "Press Ctrl + Alt + Y to start or stop talking.",
                                     None))
-    left.addWidget(voice)
+    voice.setParent(grid)
+    cards.add(voice, 0)
 
     # -- coach
     coach = Panel(t, "Coach", "Short check-ins, reminders and a nudge when you've been at it too long.",
@@ -142,7 +138,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     questions.toggled.connect(act.set_questions)
     coach.body.addWidget(SettingRow(t, "question", "Questions about people and things",
                                     "Yuki asks instead of guessing, a few times a day at most.", questions))
-    left.addWidget(coach)
+    coach.setParent(grid)
+    cards.add(coach, 0)
 
     # -- general
     general = Panel(t, "General", "", glyph="settings")
@@ -153,7 +150,7 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     hot = KeyCapture(t, ui.open_hotkey or DEFAULT_OPEN_HOTKEY, width=190)
     hot.setToolTip("Click, then press the keys you want, like Ctrl + Space, or two modifiers such as Alt + Shift")
     hot.captured.connect(act.set_open_hotkey)
-    reset = Pill(t, "Default", style="quiet", size="small")
+    reset = Button(t, "Default", style="outline", size="small")
     reset.setToolTip(f"Back to {combo_words(DEFAULT_OPEN_HOTKEY)}")
 
     def reset_hotkey() -> None:
@@ -171,54 +168,13 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     hrow.addWidget(reset, 0, Qt.AlignmentFlag.AlignVCenter)
     general.body.addWidget(SettingRow(t, "link", "Open Yuki anywhere", "Click the box, then press your shortcut.",
                                       hbox_w))
-    left.addWidget(general)
 
-    # -- appearance (the look, ui.json)
-    look = Panel(t, "Appearance", "How Yuki looks everywhere: this window, the chat box, the cards and the pills.",
-                 glyph="sparkle")
-    mode = Segmented(t, ("System", "Light", "Dark"), ui.appearance.capitalize(), small=True)
-    mode.changed.connect(lambda word: act.set_appearance(word.lower()))
-    look.body.addWidget(SettingRow(t, "sparkle", "Light or dark", "System follows Windows.", mode))
-    background = Segmented(t, ("Plain", "See-through"),
-                           "See-through" if ui.background == "see-through" else "Plain", small=True)
-    background.changed.connect(lambda word: act.set_background("see-through" if word == "See-through" else "solid"))
-    look.body.addWidget(SettingRow(t, "globe", "Background",
-                                   "Plain: black in dark, white in light. See-through: your desktop shows behind "
-                                   "the window, blurred by Windows.", background))
-    glass = Segmented(t, tuple(GLASS_WORDS.values()), GLASS_WORDS.get(ui.glass, "Light"), small=True)
-    look.body.addWidget(SettingRow(t, "bulb", "Glass effect",
-                                   "Off is plain and clear. Light bends light at the edge of every card, cheaply. "
-                                   "Full bends the most, with colour at the edges, and uses the graphics card.",
-                                   glass))
-    sliders = QWidget()
-    sliders.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    look.body.addWidget(sliders)   # parented before anything shows it (a parentless shown widget is a window)
-    srow = QVBoxLayout(sliders)
-    srow.setContentsMargins(0, 0, 0, 0)
-    srow.setSpacing(2)
-    bend = GlassSlider(t, ui.bend, width=200)
-    bend.committed.connect(act.set_bend)
-    srow.addWidget(SettingRow(t, "wave", "Glass bending", "How strongly the edges bend light.", bend))
-    blur = GlassSlider(t, ui.blur, width=200)
-    blur.committed.connect(act.set_blur)
-    srow.addWidget(SettingRow(t, "cloud", "Blur", "How frosted the glass is.", blur))
-    if ui.glass == "off":
-        sliders.hide()
-    clear = GlassSlider(t, ui.transparency, width=200)
-    clear.committed.connect(act.set_transparency)
-    look.body.addWidget(SettingRow(t, "globe", "Transparency", "How see-through the glass is.", clear))
-
-    def glass_changed(word: str) -> None:
-        mode_key = next((k for k, w in GLASS_WORDS.items() if w == word), "light")
-        sliders.setVisible(mode_key != "off")
-        act.set_glass(mode_key)
-
-    glass.changed.connect(glass_changed)
     motion = Toggle(t, ui.reduce_motion)
     motion.toggled.connect(act.set_reduce_motion)
-    look.body.addWidget(SettingRow(t, "pause", "Reduce motion", "No sliding or fading: things just appear.", motion))
-    left.addWidget(look)
-    left.addStretch(1)
+    general.body.addWidget(SettingRow(t, "pause", "Reduce motion", "No sliding or fading: things just appear.",
+                                      motion))
+    general.setParent(grid)
+    cards.add(general, 0)
 
     # -- calls
     calls = Panel(t, "Calls", "Yuki can remember your own side of a call: only your microphone, only with "
@@ -232,7 +188,8 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
         calls.body.addWidget(SettingRow(t, "phone", pref.get("name") or pref["app"], "", seg))
     calls.body.addWidget(text_label(t, "Every other app: Yuki asks at the start of each call.", "caption", "text_3",
                                     wrap=True))
-    right.addWidget(calls)
+    calls.setParent(grid)
+    cards.add(calls, 1)
 
     # -- privacy
     privacy = Panel(t, "Privacy", "", glyph="shield")
@@ -251,30 +208,33 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
         brow.setSpacing(6)
         for name in items[:6]:
             brow.addWidget(_chip_remove(t, name, lambda k=kind, n=name: act.remove_blocked(k, n)))
-        add_pill = Pill(t, add, glyph="edit", style="quiet", size="small")
+        add_pill = Button(t, add, glyph="edit", style="outline", size="small")
         brow.addWidget(add_pill)
         privacy.body.addWidget(SettingRow(t, glyph, label, "None added yet." if not items else "", box))
-        entry = TextPill(t, hint, action="Block", height=34)
+        entry = Input(t, hint, action="Block", height=34)
         entry.setVisible(False)
         entry.submitted.connect(lambda text, k=kind, e=entry: (act.add_blocked(k, text.strip()), e.setVisible(False))
                                 if text.strip() else None)
         add_pill.clicked.connect(lambda _c=False, e=entry: (e.setVisible(not e.isVisible()), e.edit.setFocus()))
         privacy.body.addWidget(entry)
-    always = Glass(t, level="inset", radius=16, padding=SPACE["m"])
-    always.body.addWidget(text_label(t, "Always private, whatever you choose", "caption_strong", "text_2"))
+    always = Card(t, level="muted", padding=SPACE["m"])
+    always.body.setSpacing(4)
+    always.body.addWidget(text_label(t, "Always private, whatever you choose", "caption_strong", "text"))
     always.body.addWidget(text_label(t, "Password managers, banking and sign-in pages, password fields, private "
-                                        "browser windows, and what's said or shown in meetings.", "caption", "text_3",
+                                        "browser windows, and what's said or shown in meetings.", "caption", "text_2",
                                      wrap=True))
     privacy.body.addWidget(always)
-    right.addWidget(privacy)
+    privacy.setParent(grid)
+    cards.add(privacy, 1)
 
     # -- advanced
-    adv = Glass(t, level="regular", radius=24, padding=SPACE["l"])
+    adv = Card(t, padding=SPACE["xl"])
+    adv.body.setSpacing(SPACE["l"])
     head = QHBoxLayout()
+    head.setSpacing(SPACE["s"])
     head.addWidget(text_label(t, "Advanced", "headline"))
-    head.addWidget(text_label(t, "for tinkering; the defaults are fine", "caption", "text_3"))
-    head.addStretch(1)
-    fold = Pill(t, glyph="down" if advanced else "next", style="quiet", size="small")
+    head.addWidget(text_label(t, "for tinkering; the defaults are fine", "caption", "text_2"), 1)
+    fold = Button(t, glyph="down" if advanced else "next", style="ghost", size="small")
     head.addWidget(fold)
     adv.body.addLayout(head)
     inner = QWidget()
@@ -289,7 +249,7 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     effort.changed.connect(lambda word: act.set_effort(word.lower()))
     ilay.addWidget(SettingRow(t, "bulb", "Thinking effort", "More effort: better on hard tasks, slower and "
                               "costlier.", effort))
-    logs = Pill(t, "Open logs folder", size="small")
+    logs = Button(t, "Open logs folder", size="small")
     logs.clicked.connect(act.open_logs)
     ilay.addWidget(SettingRow(t, "book", "Logs", "", logs))
     if not advanced:
@@ -301,11 +261,9 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
         fold.update()
 
     fold.clicked.connect(toggle_fold)
-    right.addWidget(adv)
-    right.addStretch(1)
+    adv.setParent(grid)
+    cards.add(adv, 1)
 
-    grid.addLayout(left, 1)
-    grid.addLayout(right, 1)
-    col.addLayout(grid)
+    col.addWidget(grid)
     col.addStretch(1)
     return page

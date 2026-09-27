@@ -26,11 +26,11 @@ from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
 from yuki.agent.tools import tool_label
-from yuki.ui.glass import ACCENT, TEXT_DIM, TEXT_PRIMARY, GlassWindow, ui_font
+from yuki.ui.surface import ACCENT, SurfaceWindow, ui_font
 
 #: Size of the panel (excluding the shadow margin), in logical pixels.
 STRIP_WIDTH = 360
-STRIP_HEIGHT = 56
+STRIP_HEIGHT = 48
 
 #: Gap between the panel and the screen edges.
 STRIP_MARGIN = 24
@@ -40,13 +40,16 @@ FINAL_LINGER_MS = 4000
 
 
 def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit: int = 44) -> str:
-    """One line of present-tense status text for a tool call.
+    """One line of present-tense status text for a tool call, in plain words.
 
     The phrase is the tool's own ``label`` (``hotkey`` -> ``Pressing a shortcut``),
     with its most descriptive argument appended when there is one
-    (``Opening an app — spotify``). A name the registry has never heard of reads
-    "Working" (every registered tool has a label). Purely presentational: nothing
-    here changes what runs.
+    (``Opening an app — spotify``). Dates and date-times in the arguments (ISO, the
+    tools' fixed format) read as a person says them (``Checking your calls on 26 Sep``,
+    ``… since yesterday``); Yuki's own record ids (``call:23``) mean nothing to the
+    user and are left out (the result names the thing, :func:`describe_result`). A
+    name the registry has never heard of reads "Working". Purely presentational:
+    nothing here changes what runs.
 
     Args:
         name: Tool name exactly as the model called it.
@@ -57,8 +60,90 @@ def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit:
         A single line, no trailing punctuation except an ellipsis.
     """
     phrase = tool_label(name) or "Working"
-    detail = _detail(tool_input or {}, limit=limit)
-    return f"{phrase} — {detail}" if detail else f"{phrase}…"
+    args = tool_input or {}
+    dates = [(k, d) for k, v in args.items() if (d := _iso(v)) is not None]
+    rest = {k: v for k, v in args.items() if _iso(v) is None and not _record_id(v)}
+    detail = _detail(rest, limit=limit)
+    line = f"{phrase} — {detail}" if detail else phrase
+    when = _when_words(dates)
+    if when:
+        line = f"{line} {when}"
+    return line if (detail or when) else f"{phrase}…"
+
+
+def describe_result(name: str, tool_input: dict[str, Any] | None, payload: Any) -> str:
+    """A better line for a finished step when its result names what it worked on, else ``""``.
+
+    A call read from memory (the result's ``call``: its app and start) reads ``Reading yesterday's 22:09
+    Discord call``. Built from the result's structured fields only."""
+    del name, tool_input
+    call = payload.get("call") if isinstance(payload, dict) else None
+    if not isinstance(call, dict):
+        return ""
+    app = str(call.get("app") or "").strip()
+    start = _iso(call.get("start"))
+    if not app or start is None:
+        return ""
+    from datetime import date
+
+    days = (date.today() - start.date()).days
+    hm = start.strftime("%H:%M")
+    if days == 0:
+        return f"Reading today's {hm} {app} call"
+    if days == 1:
+        return f"Reading yesterday's {hm} {app} call"
+    if 1 < days < 7:
+        return f"Reading {start:%A}'s {hm} {app} call"
+    return f"Reading the {app} call of {start.day} {start:%b}, {hm}"
+
+
+def _iso(value: Any) -> Any:
+    """A date or date-time from an ISO string (the tools' fixed format), else None."""
+    from datetime import date, datetime
+
+    if not isinstance(value, str) or not value[:4].isdigit() or len(value) < 10:
+        return None
+    try:
+        return datetime.fromisoformat(value.strip())
+    except ValueError:
+        try:
+            d = date.fromisoformat(value.strip()[:10])
+            return datetime(d.year, d.month, d.day)
+        except ValueError:
+            return None
+
+
+def _record_id(value: Any) -> bool:
+    """Yuki's own record ids, ``<kind>:<number>`` (``call:23``, ``fact:7``): a fixed internal format."""
+    if not isinstance(value, str) or ":" not in value:
+        return False
+    kind, _sep, number = value.strip().partition(":")
+    return kind.isalpha() and number.isdigit()
+
+
+def _day_words(d: Any, *, time_too: bool = True) -> str:
+    from datetime import date
+
+    days = (date.today() - d.date()).days
+    day = "today" if days == 0 else "yesterday" if days == 1 else f"{d.day} {d:%b}"
+    return f"{day} {d:%H:%M}" if time_too and (d.hour, d.minute) != (0, 0) else day
+
+
+def _when_words(dates: list[tuple[str, Any]]) -> str:
+    """``on 26 Sep``, ``since yesterday``, ``from 25 Sep to today``, from the ISO dates of a call's arguments."""
+    if not dates:
+        return ""
+    if len(dates) == 1:
+        key, d = dates[0]
+        words = _day_words(d)
+        if key in ("since", "until", "before", "after"):
+            return f"{key} {words}"
+        return words if words.startswith(("today", "yesterday")) else f"on {words}"
+    (_ka, a), (_kb, b) = sorted(dates[:2], key=lambda kd: kd[1])
+    if a.date() == b.date():
+        words = _day_words(a, time_too=False)
+        return words if words in ("today", "yesterday") else f"on {words}"
+    return f"from {_day_words(a)} to {_day_words(b)}"
 
 
 def _detail(tool_input: dict[str, Any], *, limit: int) -> str:
@@ -162,7 +247,7 @@ class Spinner(QWidget):
         rect = QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0)
         host = self.window()
         track, accent = QColor(255, 255, 255, 34), ACCENT
-        if hasattr(host, "theme"):   # a glass surface: the theme's colours
+        if hasattr(host, "theme"):   # a surface: the theme's colours
             t = host.theme()
             track = QColor(t.baseline)
             accent = QColor(t.accent)
@@ -193,20 +278,20 @@ class ElidedLabel(QLabel):
         )
 
 
-class StatusStrip(GlassWindow):
-    """Bottom-right glass strip showing the current step, then the final word.
+class StatusStrip(SurfaceWindow):
+    """Bottom-right strip showing the current step, then the final word.
 
     It never takes focus: it appears while the user is doing something else, and
     stealing the keyboard mid-game would be unforgivable.
     """
 
     def __init__(self) -> None:
-        super().__init__(activates=False, radius=STRIP_HEIGHT // 2)
+        super().__init__(activates=False)
         self.setObjectName("YukiStatusStrip")
         self.setFixedSize(STRIP_WIDTH + 2 * self.SHADOW, STRIP_HEIGHT + 2 * self.SHADOW)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 20, self.SHADOW, self.SHADOW + 22, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 16, self.SHADOW)
         row.setSpacing(12)
 
         self.spinner = Spinner(self)
@@ -229,18 +314,9 @@ class StatusStrip(GlassWindow):
         self._tone = "final"
         self.restyle()
 
-    def restyle(self) -> None:  # noqa: D102 - GlassWindow hook (theme changed)
-        from yuki.ui.glass import text_halo
-
-        self.glass_density = "clear"
-        text_halo(self.label, self.theme().dark)
-        self.label.setStyleSheet(f"color: {self.ink_css('error' if self._tone == 'error' else 'text')};")
-        self.meta.setStyleSheet(f"color: {self.ink_css('text_3')};")
-        wash = None
-        if self._tone == "error":   # an error is said in words, with a faint red wash on the clear glass
-            wash = QColor(self.ink("error"))
-            wash.setAlphaF(0.08 if not self.theme().dark else 0.12)
-        self.glass_tint = wash
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
+        self.label.setStyleSheet(f"color: {self.ink_css('danger' if self._tone == 'error' else 'text')};")
+        self.meta.setStyleSheet(f"color: {self.ink_css('text_2')};")
         self.update()
 
     def anchor(self) -> QPoint:
@@ -273,7 +349,7 @@ class StatusStrip(GlassWindow):
 
         Args:
             text: The message.
-            tone: ``final`` or ``error``; errors are tinted red.
+            tone: ``final`` or ``error``; an error is said in red.
         """
         self.meta.setVisible(False)
         self.label.setText(text)
