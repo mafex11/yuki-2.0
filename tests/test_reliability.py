@@ -643,8 +643,8 @@ def test_doctor_report_and_offline_run(monkeypatch):
     monkeypatch.setattr(doctor, "check_crashes", lambda s: doctor.Check("Recent crashes", doctor.WARN, "2 tracebacks",
                                                                        "Send the file."))
     results = doctor.run_checks(Settings(), offline=True)
-    assert len(results) == 13 and results[0].status == doctor.FAIL
-    assert [r.status for r in results if r.name.startswith(("AI models", "Speech", "Yuki's voice"))] == ["skip"] * 3
+    assert len(results) == 14 and results[0].status == doctor.FAIL
+    assert [r.status for r in results if r.name.startswith(("AI models", "Speech", "Yuki's voice"))] == ["skip"] * 4
     report = doctor.format_report(results)
     assert "[FAIL] Memory service: not running" in report and "fix: Restart Yuki." in report
     assert report.endswith("1 problem, 1 warning.")

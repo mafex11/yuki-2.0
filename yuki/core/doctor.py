@@ -1,7 +1,7 @@
 """``yuki doctor``: one health check of everything Yuki needs, in plain words, with fixes.
 
 Each check reads and reports; none changes anything (no restart, no repair, no audio opened, no
-window touched). Network checks (Bedrock, Deepgram, ElevenLabs) make one tiny request each and
+window touched). Network checks (Bedrock, Deepgram, Gemini voice, ElevenLabs) make one tiny request each and
 can be skipped (``--offline``). Checks run in parallel, each with its own time limit, so one slow
 answer never holds up the list.
 
@@ -215,8 +215,79 @@ def check_deepgram() -> Check:
                  "" if status == OK else "Top up Deepgram soon or voice stops understanding you.")
 
 
-def check_elevenlabs() -> Check:
+def _voice_choice(settings: Any) -> dict[str, str]:
+    """The voice conversations use: the settings, with ``voice.json``'s choices on top (as voice applies them)."""
+    choice = {"provider": str(getattr(settings, "voice_tts_provider", "gemini") or "gemini"),
+              "model": str(getattr(settings, "voice_gemini_model", "gemini-3.8-flash-lite-tts")),
+              "voice": str(getattr(settings, "voice_gemini_voice", "Leda"))}
+    try:
+        prefs = json.loads((_local() / "voice.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prefs = {}
+    if isinstance(prefs, dict):
+        for key, name in (("tts_provider", "provider"), ("gemini_model", "model"), ("gemini_voice", "voice")):
+            if isinstance(prefs.get(key), str) and prefs[key].strip():
+                choice[name] = prefs[key].strip()
+    choice["provider"] = choice["provider"].lower()
+    return choice
+
+
+GEMINI_CHECK = "Yuki's voice (Gemini)"
+
+
+def check_gemini_voice(settings: Any = None) -> Check:
+    """The Gemini voice: the key, one tiny spoken request, and how soon its first audio came."""
+    choice = _voice_choice(settings)
+    in_use = choice["provider"] == "gemini"
+    key = os.environ.get("GOOGLE_API_KEY") or _user_env("GOOGLE_API_KEY")
+    if not key:
+        if not in_use:
+            return Check(GEMINI_CHECK, OK, f"not in use (Yuki speaks with {choice['provider']})")
+        return Check(GEMINI_CHECK, WARN, "no Google key: Yuki speaks with Deepgram's plainer voice",
+                     "Set GOOGLE_API_KEY (a Gemini API key from aistudio.google.com), then restart Yuki.")
+    model, voice = choice["model"], choice["voice"]
+    body = json.dumps({"contents": [{"parts": [{"text": "Hi."}]}],
+                       "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
+                           "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}).encode()
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse",
+        data=body, method="POST", headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+    started = time.perf_counter()
+    first = None
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - fixed https URL
+            for line in response:
+                if b"inlineData" in line:
+                    first = time.perf_counter() - started
+                    break
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            return Check(GEMINI_CHECK, FAIL, "the Google key is refused",
+                         "Make a new key at aistudio.google.com and set GOOGLE_API_KEY.")
+        if exc.code == 404:
+            return Check(GEMINI_CHECK, FAIL, f"the model {model} is not available to this key",
+                         "Check the model name in voice settings.")
+        if exc.code == 429:
+            return Check(GEMINI_CHECK, WARN, "the Gemini voice quota is used up for now: Yuki falls back to "
+                         "Deepgram's English voice", "Wait for the quota to reset or raise it in AI Studio.")
+        return Check(GEMINI_CHECK, WARN, f"Gemini answered {exc.code}", "Try again later.")
+    except Exception as exc:  # noqa: BLE001
+        return Check(GEMINI_CHECK, WARN, f"could not reach Gemini ({type(exc).__name__})", "Check the network.")
+    if first is None:
+        return Check(GEMINI_CHECK, WARN, "Gemini answered without audio", "Try again later.")
+    where = f"{voice} on {model}" + ("" if in_use else f" (not in use: Yuki speaks with {choice['provider']})")
+    if first > 2.5:
+        return Check(GEMINI_CHECK, WARN, f"{where}, first audio slow ({first:.1f} s)",
+                     "Replies will start late; try again later.")
+    return Check(GEMINI_CHECK, OK, f"{where}, first audio in {first:.1f} s")
+
+
+def check_elevenlabs(settings: Any = None) -> Check:
     key = os.environ.get("ELEVENLABS_API_KEY") or _user_env("ELEVENLABS_API_KEY")
+    in_use = _voice_choice(settings)["provider"] == "elevenlabs"
+    if not in_use:
+        return Check("Yuki's voice (ElevenLabs)", OK, "not in use (an option in voice settings)"
+                     + ("" if key else "; no key set"))
     if not key:
         return Check("Yuki's voice (ElevenLabs)", WARN, "no ElevenLabs key: Yuki speaks with Deepgram's voice",
                      "Set ELEVENLABS_API_KEY for the usual voice.")
@@ -410,7 +481,8 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Memory search (embedder)", check_embed_pipe),
         (MODELS_CHECK, lambda: check_models(settings)),
         ("Speech to text (Deepgram)", check_deepgram),
-        ("Yuki's voice (ElevenLabs)", check_elevenlabs),
+        (GEMINI_CHECK, lambda: check_gemini_voice(settings)),
+        ("Yuki's voice (ElevenLabs)", lambda: check_elevenlabs(settings)),
         ("Microphone and speakers", check_audio_devices),
         ("Wake word model", check_wake_model),
         ("Disk space for call audio", check_spool_disk),
@@ -420,7 +492,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Log size", lambda: check_logs(settings)),
         ("Recent crashes", lambda: check_crashes(settings)),
     ]
-    network = {MODELS_CHECK, "Speech to text (Deepgram)", "Yuki's voice (ElevenLabs)"}
+    network = {MODELS_CHECK, "Speech to text (Deepgram)", GEMINI_CHECK, "Yuki's voice (ElevenLabs)"}
 
     def timed(fn: Callable[[], Check]) -> Check:
         started = time.perf_counter()

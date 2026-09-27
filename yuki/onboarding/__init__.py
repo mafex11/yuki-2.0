@@ -17,7 +17,8 @@ Where things go:
 * keys -> user environment variables only (``HKCU\\Environment``, REG_SZ, plus
   this process's ``os.environ``): ``ANTHROPIC_API_KEY`` or
   ``AWS_BEARER_TOKEN_BEDROCK`` + ``AWS_REGION``, ``DEEPGRAM_API_KEY``,
-  ``ELEVENLABS_API_KEY`` (:mod:`yuki.onboarding.envvars`);
+  ``GOOGLE_API_KEY`` (Yuki's Gemini voice; ``ELEVENLABS_API_KEY`` stays an option set by hand)
+  (:mod:`yuki.onboarding.envvars`);
 * backend choice -> ``%LOCALAPPDATA%\\Yuki\\settings.json`` ``model_backend``
   (:mod:`yuki.onboarding.prefs`);
 * privacy consent -> memory's ``paused`` flag and ``[calls] enabled`` in
@@ -39,6 +40,7 @@ BEDROCK_KEY = "AWS_BEARER_TOKEN_BEDROCK"
 AWS_REGION = "AWS_REGION"
 DEEPGRAM_KEY = "DEEPGRAM_API_KEY"
 ELEVENLABS_KEY = "ELEVENLABS_API_KEY"
+GOOGLE_KEY = "GOOGLE_API_KEY"
 #: Either of these lets Yuki think.
 MODEL_KEYS = (BEDROCK_KEY, ANTHROPIC_KEY)
 DEFAULT_REGION = "ap-south-1"

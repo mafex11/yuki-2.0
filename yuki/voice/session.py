@@ -81,6 +81,13 @@ TTS_PREFS = {"tts_speed": "voice_tts_speed", "tts_stability": "voice_tts_stabili
              "tts_speaker_boost": "voice_tts_speaker_boost"}
 
 
+#: ``voice.json`` keys that choose the voice and the Gemini voice's settings (text values).
+VOICE_TEXT_PREFS = {"tts_provider": "voice_tts_provider", "gemini_voice": "voice_gemini_voice",
+                    "gemini_model": "voice_gemini_model", "gemini_style": "voice_gemini_style"}
+#: The voices ``tts_provider`` may name.
+PROVIDERS = ("gemini", "elevenlabs", "deepgram")
+
+
 def conversation_settings(settings: Settings, prefs: dict[str, Any]) -> Settings:
     """The settings one conversation runs with: the voice id and voice settings from ``voice.json`` applied."""
     from dataclasses import replace
@@ -90,6 +97,12 @@ def conversation_settings(settings: Settings, prefs: dict[str, Any]) -> Settings
         value = prefs.get(key)
         if isinstance(value, bool) if name == "voice_tts_speaker_boost" else isinstance(value, (int, float)):
             over[name] = value
+    for key, name in VOICE_TEXT_PREFS.items():
+        value = prefs.get(key)
+        if isinstance(value, str) and (value.strip() or name == "voice_gemini_style"):
+            if name == "voice_tts_provider" and value.strip().lower() not in PROVIDERS:
+                continue
+            over[name] = value.strip().lower() if name == "voice_tts_provider" else value.strip()
     return replace(settings, **over)
 
 
@@ -949,7 +962,9 @@ class VoiceSession(QObject):
                            stt=self.settings.voice_stt_model,
                            mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
                            tts_note=facts.get("tts_note"),
-                           tts_model=self.settings.voice_tts_model, tts_voice_set=bool(settings.voice_tts_voice),
+                           tts_model=(settings.voice_gemini_model if facts.get("tts_provider") == "gemini"
+                                      else self.settings.voice_tts_model),
+                           tts_voice_set=bool(settings.voice_tts_voice),
                            memory=mouth_memory.facts(), keyterms=keyterm_facts, timings_ms=dict(timings))
             reason = asyncio.run(conversation.run())
             timings["kept_s"] = round(mic_input.kept_s, 2)
@@ -1066,7 +1081,8 @@ def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
         from yuki.voice.pipeline import shared_ssl_context
 
         shared_ssl_context()  # the one TLS context conversations use (built off every event loop)
-        for host in ("api.deepgram.com", "api.elevenlabs.io", f"bedrock-runtime.{settings.aws_region}.amazonaws.com"):
+        for host in ("api.deepgram.com", "generativelanguage.googleapis.com", "api.elevenlabs.io",
+                     f"bedrock-runtime.{settings.aws_region}.amazonaws.com"):
             try:
                 socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
             except OSError:

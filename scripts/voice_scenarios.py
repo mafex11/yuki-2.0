@@ -994,7 +994,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--clips", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--db", type=Path, help="a COPY of memory.db (it is copied again into a temp folder)")
-    ap.add_argument("--tts", default="deepgram", choices=("deepgram", "elevenlabs"))
+    ap.add_argument("--tts", default="deepgram", choices=("deepgram", "elevenlabs", "gemini"))
     ap.add_argument("--voice", default="")
     ap.add_argument("--idle", type=float, default=8.0)
     ap.add_argument("--max-s", dest="max_s", type=float, default=240.0)

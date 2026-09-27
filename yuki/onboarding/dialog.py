@@ -99,6 +99,7 @@ LINKS = {
     "bedrock": ("Bedrock API keys in the AWS console", "https://console.aws.amazon.com/bedrock/home#/api-keys"),
     "deepgram": ("Get a Deepgram key", "https://console.deepgram.com/"),
     "elevenlabs": ("Get an ElevenLabs key", "https://elevenlabs.io/app/settings/api-keys"),
+    "google": ("Get a Gemini API key", "https://aistudio.google.com/apikey"),
 }
 
 STEP_NAMES = ("AI model", "Voice", "Privacy", "Download")
@@ -374,7 +375,8 @@ class OnboardingDialog(QDialog):
         col.setSpacing(12)
         for attr, kind, name, why in (
             ("deepgram_key", "deepgram", "Deepgram", "Hears you: turns your voice into text."),
-            ("elevenlabs_key", "elevenlabs", "ElevenLabs", "Gives Yuki its voice. Without it Yuki uses a plainer one."),
+            ("google_key", "google", "Google Gemini", "Gives Yuki its voice, with laughs and sighs. Without it "
+             "Yuki uses a plainer one."),
         ):
             card, box = _card()
             box.addWidget(_label(name, "section"))
@@ -500,7 +502,7 @@ class OnboardingDialog(QDialog):
     def skip(self) -> None:
         if self.step == 1:
             self.deepgram_key.setText("")
-            self.elevenlabs_key.setText("")
+            self.google_key.setText("")
             self._go(2)
         elif self.step == 3:
             self.skipped.add("download")
@@ -593,7 +595,7 @@ class OnboardingDialog(QDialog):
                 self.env.set(ob.AWS_REGION, self.region.text().strip())
             else:
                 self.env.set(ob.ANTHROPIC_KEY, self.model_key.text())
-            voice = [(ob.DEEPGRAM_KEY, self.deepgram_key.text()), (ob.ELEVENLABS_KEY, self.elevenlabs_key.text())]
+            voice = [(ob.DEEPGRAM_KEY, self.deepgram_key.text()), (ob.GOOGLE_KEY, self.google_key.text())]
             for name, value in voice:
                 if value:
                     self.env.set(name, value)

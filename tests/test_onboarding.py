@@ -28,7 +28,7 @@ SCRATCH_KEY = SCRATCH_PARENT + r"\Environment"
 FAKE_ANTHROPIC = "sk-ant-api03-TESTKEY-not-real-0123456789abcdefghijklmnop"
 FAKE_BEDROCK = "ABSKtestbedrocktoken-not-real-0123456789"
 FAKE_DEEPGRAM = "dg-test-not-real-0123456789abcdef"
-FAKE_ELEVEN = "sk_eleven_test_not_real_0123456789"
+FAKE_GOOGLE = "AIza_google_test_not_real_0123456789"
 
 
 def _delete_tree(root: int, path: str) -> None:
@@ -69,7 +69,7 @@ def test_existing_user_with_a_key_is_never_asked(present, tmp_path):
 
 
 def test_voice_keys_alone_do_not_count():
-    keys = {ob.DEEPGRAM_KEY: "a", ob.ELEVENLABS_KEY: "b"}
+    keys = {ob.DEEPGRAM_KEY: "a", ob.ELEVENLABS_KEY: "b", ob.GOOGLE_KEY: "c"}
     assert ob.needs_onboarding(get_key=keys.get) is True
 
 
@@ -271,7 +271,7 @@ def test_dialog_anthropic_full_run(qapp, scratch_env, tmp_path):
     d.next()
     assert d.step == 1
     d.deepgram_key.setText(FAKE_DEEPGRAM)
-    d.elevenlabs_key.setText(FAKE_ELEVEN)
+    d.google_key.setText(FAKE_GOOGLE)
     d.next()
     assert d.step == 2 and not d.next_btn.isEnabled()      # explicit choice required
     d.ambient_choice.set_value(True)
@@ -287,7 +287,7 @@ def test_dialog_anthropic_full_run(qapp, scratch_env, tmp_path):
 
     assert scratch_env.get(ob.ANTHROPIC_KEY) == FAKE_ANTHROPIC
     assert scratch_env.get(ob.DEEPGRAM_KEY) == FAKE_DEEPGRAM
-    assert scratch_env.get(ob.ELEVENLABS_KEY) == FAKE_ELEVEN
+    assert scratch_env.get(ob.GOOGLE_KEY) == FAKE_GOOGLE
     assert scratch_env.get(ob.BEDROCK_KEY) is None
     assert prefs.load_prefs(local) == {"model_backend": "anthropic"}
     marker = ob.load_marker(local)
@@ -296,7 +296,7 @@ def test_dialog_anthropic_full_run(qapp, scratch_env, tmp_path):
     assert not (memory / "paused").exists()
     assert tomllib.loads((memory / "privacy.toml").read_text(encoding="utf-8"))["calls"]["enabled"] is False
     text = _all_text(tmp_path)
-    for secret in (FAKE_ANTHROPIC, FAKE_DEEPGRAM, FAKE_ELEVEN):
+    for secret in (FAKE_ANTHROPIC, FAKE_DEEPGRAM, FAKE_GOOGLE):
         assert secret not in text                     # no key in any file written
 
 

@@ -14,6 +14,7 @@ import os
 
 DEEPGRAM = "DEEPGRAM_API_KEY"
 ELEVENLABS = "ELEVENLABS_API_KEY"
+GOOGLE = "GOOGLE_API_KEY"
 
 
 def _from_registry(name: str) -> str | None:

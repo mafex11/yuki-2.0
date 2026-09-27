@@ -254,8 +254,16 @@ class Settings:
             Flux's end-of-turn settings (eager off: ``None``).
         voice_mouth_model: Bedrock model id of the fast mouth.
         voice_mouth_max_tokens: Output ceiling for one spoken reply.
-        voice_tts_provider: ``elevenlabs`` or ``deepgram`` (Aura-2, English only).
-        voice_tts_model / voice_tts_voice: The provider's model and voice id
+        voice_tts_provider: ``gemini`` (Gemini TTS, the default since 2026-09-27: voice Leda, sound
+            tags and a per-turn style the mouth chooses), ``elevenlabs`` or ``deepgram`` (Aura-2,
+            English only). ``voice.json`` ``tts_provider`` wins.
+        voice_gemini_model / voice_gemini_voice: The Gemini TTS model and prebuilt voice
+            (``voice.json`` ``gemini_model`` / ``gemini_voice`` win).
+        voice_gemini_style: A baseline delivery style sent with every reply the mouth gives no style
+            of its own (``""``: none; ``voice.json`` ``gemini_style`` wins).
+        voice_gemini_first_audio_s: A Gemini request with no audio by then is said by the fallback
+            voice, and so is the rest of that conversation (measured first audio ~1.0-1.3 s).
+        voice_tts_model / voice_tts_voice: The ElevenLabs (or Aura) model and voice id
             (empty: the provider's default in :mod:`yuki.voice.pipeline`).
         voice_tts_fallback: Provider used when the main one cannot speak (its
             key is missing or lacks permission); ``""`` = no fallback, voice
@@ -357,7 +365,11 @@ class Settings:
     voice_eot_timeout_ms: int = 5000
     voice_mouth_model: str = DEFAULT_VOICE_MOUTH_MODEL
     voice_mouth_max_tokens: int = 400
-    voice_tts_provider: str = "elevenlabs"
+    voice_tts_provider: str = "gemini"
+    voice_gemini_model: str = "gemini-3.8-flash-lite-tts"
+    voice_gemini_voice: str = "Leda"
+    voice_gemini_style: str = ""
+    voice_gemini_first_audio_s: float = 3.0
     voice_tts_model: str = "eleven_flash_v2_5"
     voice_tts_voice: str = ""
     voice_tts_fallback: str = "deepgram"
@@ -368,7 +380,7 @@ class Settings:
     voice_tts_speaker_boost: bool | None = None
     voice_usd_per_stt_min: float = 0.0078
     voice_usd_per_1k_tts_chars: dict[str, float] = field(
-        default_factory=lambda: {"elevenlabs": 0.05, "deepgram": 0.030}
+        default_factory=lambda: {"elevenlabs": 0.05, "deepgram": 0.030, "gemini": 0.010}
     )
     voice_grounding: bool = True    # on again 2026-09-25: the service's embedder over its pipe (tray ~210 MB in a conversation); off by itself when no service answers
     voice_grounding_wait_ms: float = 60.0

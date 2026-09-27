@@ -2,7 +2,7 @@
 
 ``audio in -> Deepgram Flux (transcript + end of turn) -> user aggregator ->
 mouth (Haiku on Bedrock; async tell_yuki, check_progress, more_of_result) ->
-TTS (ElevenLabs or Deepgram Aura) -> audio out -> assistant aggregator``
+TTS (Gemini, voice Leda; or ElevenLabs / Deepgram Aura) -> audio out -> assistant aggregator``
 
 :class:`Conversation` builds it and runs it on the calling asyncio loop (the
 voice thread's; never the Qt thread), with the conversation's
@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from yuki.config import Settings
-from yuki.voice.keys import DEEPGRAM, ELEVENLABS, get_key
+from yuki.voice.expressive import strip_tags
+from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.hands import HAND_TOOLS
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
@@ -274,6 +275,16 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
     facts: dict[str, Any] = {"tts_provider": settings.voice_tts_provider}
     if not get_key(DEEPGRAM):
         raise VoiceUnavailable("Voice needs DEEPGRAM_API_KEY (a Windows user environment variable).")
+    if settings.voice_tts_provider == "gemini":
+        from yuki.voice.gemini_tts import gemini_status
+
+        ok, reason = gemini_status(get_key(GOOGLE), settings.voice_gemini_model)
+        if not ok:
+            if settings.voice_tts_fallback:
+                facts["tts_provider"] = settings.voice_tts_fallback
+                facts["tts_note"] = f"The Gemini voice can't speak ({reason}); using the {settings.voice_tts_fallback} voice"
+            else:
+                raise VoiceUnavailable(f"Voice can't speak: Gemini {reason}.")
     if settings.voice_tts_provider == "elevenlabs":
         ok, reason = elevenlabs_can_speak(settings)
         quota = elevenlabs_quota()
@@ -916,7 +927,9 @@ def clause_aggregator(base: type) -> type:
             for char in text:
                 self._text += char
                 if (not self._yuki_started and char.isspace() and len(self._text) > 1
-                        and self._text[-2] in CLAUSE_MARKS and len(self._text.split()) >= CLAUSE_MIN_WORDS):
+                        and self._text[-2] in CLAUSE_MARKS and len(self._text.split()) >= CLAUSE_MIN_WORDS
+                        and self._text.count("[") <= self._text.count("]")  # not inside a [style: a, b] mark
+                        and self._text.count("<") <= self._text.count(">")):
                     out, self._text, self._needs_lookahead = self._text.strip(" "), "", False
                     self._yuki_started = True
                     yield Aggregation(text=out.strip(), type=AggregationType.SENTENCE)
@@ -965,8 +978,11 @@ def _words_done_frame() -> Any:
 _WORDS_DONE: Any = None
 
 
-def _clause_tts(base: type) -> type:
+def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
     """``base`` (a Pipecat TTS service) with :func:`clause_aggregator` and the words-done flush (v3.7).
+
+    ``strip_marks``: the voice cannot make Gemini's sounds or styles (Aura, ElevenLabs Flash), so the
+    mouth's marks (:mod:`yuki.voice.expressive`) are cut out of what it is sent; the words stay.
 
     Before, a reply that spoke and then called a tool ("Sure, let me look." + tell_yuki) was heard only once
     the whole call was written: the last sentence waited for a next word that never came (live 0.7-2.1 s).
@@ -994,6 +1010,11 @@ def _clause_tts(base: type) -> type:
                                                                     raw_text=pending.text))
                 return  # consumed here: nothing downstream needs it
             await super().process_frame(frame, direction)
+
+        def _prepare_text_for_tts(self, text: str) -> str:
+            if strip_marks:
+                text = strip_tags(text) or " "
+            return super()._prepare_text_for_tts(text)
 
     return ClauseTTS
 
@@ -1176,7 +1197,7 @@ class TurnObserver:
             turn = self.turn_id()
             if turn != self._said_turn:
                 self._said, self._said_turn = [], turn
-            self._said.append(frame.text or "")
+            self._said.append(strip_tags(frame.text or ""))
             self.chat({"type": "assistant_speech", "turn_id": turn, "text": " ".join(w.strip() for w in self._said
                                                                                       if w.strip()),
                        "final": False, "interrupted": False})
@@ -1308,7 +1329,8 @@ class TurnObserver:
         }
         usage["input_tokens"] = max(0, usage["input_tokens"])
         cost = self.settings.estimate_cost(self.settings.voice_mouth_model, usage)
-        reply = "".join(turn.spoken).strip() or "".join(turn.reply).strip()
+        # What memory and the chat keep is the words: the voice's marks (<sigh>, <style: ...>) are cut out.
+        reply = strip_tags("".join(turn.spoken).strip() or "".join(turn.reply).strip())
         if not turn.tts_chars and turn.first_audio is not None:
             turn.tts_chars = len(reply)  # the service reported no usage: what was sent to it
         tts_rate = self.settings.voice_usd_per_1k_tts_chars.get(self._tts_provider)
@@ -1904,7 +1926,7 @@ class Conversation:
             hands.on_action = self.observer.hand_acted
             self.observer.hands = hands
             hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
-                "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name, "args": what, "ok": ok,
+                "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name, "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok,
                 "result": report, "ms": ms})
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
@@ -1914,11 +1936,27 @@ class Conversation:
                                       timeout_secs=30)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
-        if provider == "deepgram":
+        if provider == "gemini":
+            from yuki.voice.gemini_tts import service_class
+
+            log = self.log
+            session = self.session
+
+            def tts_log(event: str, **facts: Any) -> None:
+                if log is not None:
+                    log.event(event, session=session, **facts)
+
+            fallback_key = get_key(DEEPGRAM) if s.voice_tts_fallback == "deepgram" else None
+            tts = _clause_tts(service_class())(
+                api_key=get_key(GOOGLE) or "", model=s.voice_gemini_model, voice=s.voice_gemini_voice,
+                style=s.voice_gemini_style, first_audio_timeout_s=s.voice_gemini_first_audio_s,
+                fallback_key=fallback_key, fallback_voice=DEFAULT_VOICES["deepgram"], log=tts_log,
+                ssl=shared_ssl_context())
+        elif provider == "deepgram":
             from pipecat.services.deepgram.tts import DeepgramTTSService
 
-            tts = _clause_tts(DeepgramTTSService)(api_key=get_key(DEEPGRAM) or "",
-                                                  settings=DeepgramTTSService.Settings(voice=voice))
+            tts = _clause_tts(DeepgramTTSService, strip_marks=True)(
+                api_key=get_key(DEEPGRAM) or "", settings=DeepgramTTSService.Settings(voice=voice))
         else:
             from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 
@@ -1930,7 +1968,7 @@ class Conversation:
                 ("speed", s.voice_tts_speed), ("stability", s.voice_tts_stability),
                 ("similarity_boost", s.voice_tts_similarity_boost), ("style", s.voice_tts_style),
                 ("use_speaker_boost", s.voice_tts_speaker_boost)) if value is not None}
-            tts = _clause_tts(ElevenLabsTTSService)(
+            tts = _clause_tts(ElevenLabsTTSService, strip_marks=True)(
                 api_key=get_key(ELEVENLABS) or "",
                 settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model, **tuning))
         return stt, llm, tts
