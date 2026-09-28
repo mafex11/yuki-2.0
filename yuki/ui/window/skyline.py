@@ -201,6 +201,8 @@ class Moment:
     calls: list[Any] = field(default_factory=list)
     noticed: list[str] = field(default_factory=list)
     call_index: int = -1
+    #: What you were doing, in full: (its times when the stretch has several episodes, else "", the words)
+    story: list[tuple[str, str]] = field(default_factory=list)
 
 
 def moment_at(day: Any, at: float) -> Moment:
@@ -224,16 +226,20 @@ def moment_at(day: Any, at: float) -> Moment:
         else:
             title = f"Mostly {_lane_label(day, lead)}, {_minutes(apps[0][1])} of the 60 minutes"
     noticed = []
+    story: list[tuple[str, str]] = []
     if sess is not None:
-        from yuki.ui.window.data import first_sentence, plain, second_person
+        from yuki.ui.window.data import episode_span, episode_text, plain, second_person
 
         facts = [f for f in sess.facts if f.get("importance", 0) >= 4 and not f.get("by_yuki")]
         facts.sort(key=lambda f: (-f.get("importance", 0), f.get("at", 0)))
         for f in facts[:2]:
-            words = first_sentence(plain(second_person(f["text"])), 150)
+            words = plain(second_person(f["text"]))           # in full: the panel wraps, never cuts
             noticed.append(f"Said as a joke: {words}" if f.get("nature") == "humor" else words)
+        several = len(sess.episodes) > 1
+        story = [(episode_span(text) if several else "", episode_text(text)) for text in sess.episodes]
+        story = [(when, words) for when, words in story if words]
     return Moment(at, start, end, kind, title, _lane_label(day, lead) if lead else "", apps, present, calls,
-                  noticed)
+                  noticed, story=story)
 
 
 def call_moment(day: Any, index: int) -> Moment:

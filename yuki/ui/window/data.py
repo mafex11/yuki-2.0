@@ -109,10 +109,27 @@ _EPISODE_TIME = re.compile(r"^\s*\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}\s*(\([^)
 
 
 def episode_gist(text: str, limit: int = 90) -> str:
-    """An episode's first sentence without its ``HH:MM-HH:MM:`` prefix, capitalised."""
+    """An episode's first sentence without its ``HH:MM-HH:MM:`` prefix, capitalised (a label: the session's
+    title). The words a user reads in full come from :func:`episode_text`."""
     body = _EPISODE_TIME.sub("", text or "").strip()
     s = first_sentence(body, limit)
     return s[:1].upper() + s[1:] if s else s
+
+
+def episode_text(text: str) -> str:
+    """An episode in full, as the window shows it: without its ``HH:MM-HH:MM:`` prefix, plain, capitalised,
+    never shortened (2026-09-28, the user: the hovered moment "cuts off with '...'")."""
+    s = plain(second_person(_EPISODE_TIME.sub("", text or "").strip()))   # "the user was" -> "you were"
+    return s[:1].upper() + s[1:] if s else s
+
+
+_EPISODE_SPAN = re.compile(r"^\s*(\d{1,2}:\d{2})\s*[-\u2013]\s*(\d{1,2}:\d{2})")
+
+
+def episode_span(text: str) -> str:
+    """"11:03 to 11:52" from an episode's prefix; "" when it has none."""
+    m = _EPISODE_SPAN.match(text or "")
+    return f"{m.group(1)} to {m.group(2)}" if m else ""
 
 
 # Portrait and journal text is written about "the user" (third person). The

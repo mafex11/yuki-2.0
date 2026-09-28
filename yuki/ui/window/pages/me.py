@@ -30,7 +30,7 @@ from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, plain, second_person
+from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, hm, plain, second_person
 from yuki.ui.window.theme import PAGE_PAD, RADIUS, SPACE, Theme, variable_font
 from yuki.ui.window.pages.fold import SHOWN, fold_panel, one_line
 from yuki.ui.window.widgets import (
@@ -117,7 +117,7 @@ def _evidence(item: Item) -> list[tuple[str, str, str]]:
     for e in item.evidence[:4]:
         d = datetime.fromtimestamp(e.at)
         where = "a call" if e.app.startswith("call") else e.app
-        text = first_sentence(plain(second_person(e.text)), 200)
+        text = plain(second_person(e.text))   # the evidence in full (it sits in the open row, wrapped)
         if e.nature in ("humor", "uncertain"):
             text = f"{'Said as a joke' if e.nature == 'humor' else 'May be misheard'}: {text}"
         out.append((f"{d.day} {d:%b} {d:%H:%M}", where, text))

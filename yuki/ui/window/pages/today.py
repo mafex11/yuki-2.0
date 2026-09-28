@@ -29,8 +29,13 @@ from yuki.ui.window.skyline import Moment, Skyline, apps_line, call_moment
 from yuki.ui.window.theme import PAGE_PAD, RADIUS, Theme, variable_font
 from yuki.ui.window.widgets import Card, DotDisplay, Key, Masonry, NavCard, page_header, text_label
 
-#: The moment panel's height (fixed: hovering never moves the page).
+#: The moment panel's least height, and its most: it is as tall as the day's longest stretch needs (worked out
+#: once per width, so hovering never moves the page); a longer one scrolls inside it.
 MOMENT_H = 100
+MOMENT_MAX_H = 340
+#: The slot's height by (the day, the width): worked out once, after the page's first paint; a rebuild of the
+#: same day (a refresh, a snapshot) starts at the right height at once.
+_SLOTS: dict[tuple, int] = {}
 
 
 def clock(seconds: float) -> str:
@@ -40,27 +45,40 @@ def clock(seconds: float) -> str:
 
 
 class MomentPanel(QWidget):
-    """What the picked moment was: its start on a small dot-matrix display, the stretch in words, the apps,
-    and what Yuki noticed. Painted text, updated in place (no widgets are made or laid out on a hover); a
-    click (``clicked``) asks for the details."""
+    """What the picked moment was, in full: its start on a small dot-matrix display, what you were doing (every
+    episode of the stretch, wrapped, never cut), what Yuki noticed, and the apps with their times. Painted
+    text laid out once per moment and width (QStaticText, cached), so a hover only repaints. Its slot in the
+    page is fixed per width: enough for the day's longest stretch (``fit``: the moments to size for), at most
+    :data:`MOMENT_MAX_H`, so hovering never moves the page; the card painted in it is as tall as the moment
+    needs, and a longer one scrolls inside with the wheel. With the details open (:meth:`lock`) the slot hugs
+    the card, so they sit right under it. A click on the card (``clicked``) asks for the details."""
 
     from PySide6.QtCore import Signal as _Signal
 
     clicked = _Signal()
 
-    def __init__(self, t: Theme, parent: QWidget | None = None) -> None:
+    def __init__(self, t: Theme, parent: QWidget | None = None, *, fit=None, fit_key=None) -> None:
         super().__init__(parent)
         self.t = t
         self.moment: Moment | None = None
         self._hot = self._down = False
+        self._fit = fit
+        self._fit_key = fit_key
+        self._fit_w = -1
+        self._fit_due = False
+        self._reserve = MOMENT_H           # the slot: the day's longest stretch at this width
+        self._locked: int | None = None    # the slot while the details are open (the card's height then)
+        self._layouts: dict[tuple, tuple[list, float]] = {}
+        self._offset = 0.0
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedHeight(MOMENT_H)
         self.setMinimumWidth(320)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
         self.setToolTip("What you were doing then, and what Yuki noticed")
 
     def enterEvent(self, e: object) -> None:  # noqa: D102
-        self._hot = True
+        self._hot = self.card_rect().contains(e.position())
         self.update()
         super().enterEvent(e)
 
@@ -69,7 +87,17 @@ class MomentPanel(QWidget):
         self.update()
         super().leaveEvent(e)
 
+    def mouseMoveEvent(self, e: object) -> None:  # noqa: D102 - the card lights, not the empty slot under it
+        hot = self.card_rect().contains(e.position())
+        if hot != self._hot:
+            self._hot = hot
+            self.setCursor(Qt.CursorShape.PointingHandCursor if hot else Qt.CursorShape.ArrowCursor)
+            self.update()
+
     def mousePressEvent(self, e: object) -> None:  # noqa: D102
+        if not self.card_rect().contains(e.position()):
+            e.ignore()
+            return
         self._down = True
         self.update()
 
@@ -77,69 +105,182 @@ class MomentPanel(QWidget):
         if self._down:
             self._down = False
             self.update()
-            if self.rect().contains(e.position().toPoint()):
+            if self.card_rect().contains(e.position()):
                 self.clicked.emit()
 
+    def card_rect(self) -> QRectF:
+        """The painted card: as tall as the moment needs, within the slot."""
+        r = QRectF(self.rect())
+        if self._locked is not None:
+            return r
+        need = self._layout(self.moment, self._text_width())[1]
+        r.setHeight(min(r.height(), max(float(MOMENT_H), need)))
+        return r
+
+    def lock(self, on: bool) -> None:
+        """The details opened (the slot hugs the card, so they sit right under it) or closed (the slot is the
+        day's longest stretch again)."""
+        self._locked = int(self.card_rect().height() + 0.999) if on else None
+        self._apply_height()
+
+    def _apply_height(self) -> None:
+        h = self._locked if self._locked is not None else self._reserve
+        if h != self.height():
+            self.setFixedHeight(h)
+
+    @staticmethod
+    def _key(m: Moment | None) -> tuple:
+        return (None,) if m is None else (m.kind, m.start, m.end, m.call_index, m.title)
+
     def set_moment(self, m: Moment | None) -> None:
+        if self._key(m) != self._key(self.moment):
+            self._offset = 0.0
         self.moment = m
         self.update()
 
     def lines(self) -> tuple[str, str, str, str]:
-        """(the time, the title, the apps line, the note) the panel shows."""
+        """(the time, what you were doing, the apps line, what Yuki noticed): the panel's words, in full."""
         m = self.moment
         if m is None:
             return "", "Hover the day to see what you were doing", "", ""
         from yuki.ui.window.data import plain
 
         stamp = datetime.fromtimestamp(m.start).strftime("%H:%M")
-        title = plain(m.title or m.lead)
+        title = " ".join(words for _when, words in m.story) or plain(m.title or m.lead)
         apps = apps_line(m) if m.kind != "empty" else f"from {datetime.fromtimestamp(m.start):%H:%M} to " \
                                                         f"{datetime.fromtimestamp(m.end):%H:%M}"
-        note = ". ".join(m.noticed[:2])
+        note = " ".join(m.noticed)
         return stamp, title, apps, note
 
+    # -- layout: once per moment and width ------------------------------------------------------------------
+
+    def _text_width(self, width: float | None = None) -> float:
+        return max(120.0, (self.width() if width is None else width) - 18 - 78 - 18 - 6)
+
+    def _layout(self, m: Moment | None, width: float) -> tuple[list, float]:
+        """([(y, static text, font, colour)], content height) for ``m`` at text width ``width`` (cached)."""
+        from PySide6.QtGui import QStaticText, QTransform
+
+        key = (self._key(m), int(width))
+        got = self._layouts.get(key)
+        if got is not None:
+            return got
+        t = self.t
+        saved, self.moment = self.moment, m
+        try:
+            _stamp, title, apps, _note = self.lines()
+        finally:
+            self.moment = saved
+        blocks: list[tuple[str, str, float, str]] = []     # (words, style, gap after, colour)
+        story = m.story if m is not None else []
+        if story:
+            for when, words in story:
+                if when:
+                    blocks.append((when, "label", 2, "text_3"))
+                blocks.append((words, "lead", 8, "text"))
+        else:
+            blocks.append((title, "lead", 8, "text"))
+        noticed = m.noticed if m is not None else []
+        if noticed:
+            blocks.append(("Yuki noticed", "label", 2, "text_3"))
+            blocks += [(n, "note", 6, "text_2") for n in noticed]
+            blocks[-1] = blocks[-1][:2] + (8,) + blocks[-1][3:]
+        if apps:
+            blocks.append((apps, "apps", 0, "text_3"))
+        fonts = {"lead": variable_font(14.5, "Regular"), "note": variable_font(13.5, "Regular"),
+                 "apps": variable_font(13, "Regular"), "label": variable_font(12, "Regular")}
+        out, y = [], 0.0
+        for words, style, gap, ink in blocks:
+            st = QStaticText(words)
+            st.setTextFormat(Qt.TextFormat.PlainText)
+            st.setTextWidth(width)
+            st.prepare(QTransform(), fonts[style])
+            out.append((y, st, fonts[style], QColor(getattr(t, ink))))
+            y += st.size().height() + gap
+        got = (out, y + 14 + 14)
+        if len(self._layouts) > 160:
+            self._layouts.clear()
+        self._layouts[key] = got
+        return got
+
+    def _fit_height(self) -> None:
+        """The panel's slot for this width: the tallest of the day's stretches, within the bounds (about 40 ms
+        for a full day, so it runs after the first paint; remembered per day and width)."""
+        self._fit_due = False
+        w = self.width()
+        if w == self._fit_w:
+            return
+        self._fit_w = w
+        tw = self._text_width(w)
+        need = [self._layout(m, tw)[1] for m in (self._fit() if self._fit else [])]
+        self._reserve = int(min(MOMENT_MAX_H, max([MOMENT_H] + [int(x + 0.999) for x in need])))
+        if self._fit_key is not None:
+            _SLOTS[(self._fit_key, w)] = self._reserve
+        self._apply_height()
+
+    def resizeEvent(self, e: object) -> None:  # noqa: D102
+        super().resizeEvent(e)
+        w = self.width()
+        if w == self._fit_w:
+            return
+        known = _SLOTS.get((self._fit_key, w)) if self._fit_key is not None else None
+        if known is not None:
+            self._fit_w, self._reserve = w, known
+            self._apply_height()
+        elif self._fit is not None and not self._fit_due:
+            from PySide6.QtCore import QTimer
+
+            self._fit_due = True
+            QTimer.singleShot(0, self._fit_height)
+
+    def _overflow(self) -> float:
+        return max(0.0, self._layout(self.moment, self._text_width())[1] - self.card_rect().height())
+
+    def wheelEvent(self, e: object) -> None:  # noqa: D102 - a long moment scrolls inside; else the page does
+        over = self._overflow() if self.card_rect().contains(e.position()) else 0.0
+        dy = e.pixelDelta().y() or e.angleDelta().y() / 120 * 48
+        new = max(0.0, min(over, self._offset - dy))
+        if over <= 0 or new == self._offset:
+            e.ignore()
+            return
+        self._offset = new
+        self.update()
+        e.accept()
+
     def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtCore import QPointF
+
         t = self.t
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(0, 1 if self._down else 0, 0, 0)
+        r = self.card_rect().adjusted(0, 1 if self._down else 0, 0, 0)
         paint_surface(p, r, RADIUS["display"], t.level("display"),
                       fill=QColor(t.panel) if self._hot and not self._down else None,
                       border=QColor(t.faint) if self._hot else None)
-        stamp, title, apps, note = self.lines()
-        x0 = r.left() + 18 + 78
+        stamp = datetime.fromtimestamp(self.moment.start).strftime("%H:%M") if self.moment is not None else ""
         if stamp:
             paint_dots(p, QRectF(r.left() + 18, r.top() + 14, 78, 26), stamp, 22, t.accent)
-        tf = variable_font(14.5, "Regular")
-        p.setFont(tf)
-        p.setPen(t.text)
-        fm = QFontMetrics(tf)
-        width = int(r.right() - 18 - x0)
-        y = r.top() + 14
-        # the title: two lines at most, then an ellipsis
-        br = fm.boundingRect(0, 0, width, 400, int(Qt.TextFlag.TextWordWrap), title)
-        if br.height() > fm.lineSpacing() * 2 + 2:
-            words, keep = title.split(), ""
-            for w in words:
-                trial = (keep + " " + w).strip()
-                if fm.boundingRect(0, 0, width, 400, int(Qt.TextFlag.TextWordWrap), trial + "…").height() > \
-                        fm.lineSpacing() * 2 + 2:
-                    break
-                keep = trial
-            title = keep + "…"
-            br = fm.boundingRect(0, 0, width, 400, int(Qt.TextFlag.TextWordWrap), title)
-        p.drawText(QRectF(x0, y, width, br.height() + 2), int(Qt.TextFlag.TextWordWrap), title)
-        y += br.height() + 7
-        sf = variable_font(13, "Regular")
-        p.setFont(sf)
-        sfm = QFontMetrics(sf)
-        p.setPen(t.text_3)
-        for line in (apps, note):
-            if not line or y + sfm.height() > r.bottom() - 8:
+        blocks, total = self._layout(self.moment, self._text_width())
+        over = max(0.0, total - r.height())
+        self._offset = min(self._offset, over)
+        x0 = r.left() + 18 + 78
+        p.save()
+        p.setClipRect(QRectF(x0 - 2, r.top() + 6, r.width() - 18 - 78 - 12, r.height() - 12))
+        top = r.top() + 14 - self._offset
+        for y, st, f, ink in blocks:
+            if top + y > r.bottom() or top + y + st.size().height() < r.top():
                 continue
-            p.drawText(QRectF(x0, y, width, sfm.height()), Qt.AlignmentFlag.AlignLeft,
-                       sfm.elidedText(line, Qt.TextElideMode.ElideRight, width))
-            y += sfm.lineSpacing() + 3
+            p.setFont(f)
+            p.setPen(ink)
+            p.drawStaticText(QPointF(x0, top + y), st)
+        p.restore()
+        if over > 0:   # a thin thumb: there is more below (the wheel scrolls it)
+            track = r.adjusted(0, 12, 0, -12)
+            th = max(24.0, track.height() * r.height() / total)
+            ty = track.top() + (track.height() - th) * (self._offset / over)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t.faint))
+            p.drawRoundedRect(QRectF(r.right() - 9, ty, 3, th), 1.5, 1.5)
         p.end()
 
 
@@ -223,8 +364,9 @@ class _Click(QObject):
 
 
 def _details(t: Theme, m: Moment, day: DayView) -> Card:
-    """What the picked stretch was, in full: what you were doing (the episodes) and what Yuki noticed."""
-    from yuki.ui.window.data import episode_gist, first_sentence, hm, plain, second_person
+    """What the panel above leaves out (it already says what you were doing, in full): everything Yuki noticed
+    in the stretch, with its time, in full."""
+    from yuki.ui.window.data import hm, plain, second_person
 
     card = Card(t, level="muted", padding=0)
     card.body.setContentsMargins(18, 14, 18, 14)
@@ -232,15 +374,12 @@ def _details(t: Theme, m: Moment, day: DayView) -> Card:
     sess = next((s for s in day.sessions if s.start == m.start), None)
     rows = []
     if sess is not None:
-        rows = [(text[:11].replace("-", " to "), plain(episode_gist(text, 200))) for text in sess.episodes[:4]]
-        noticed = [f for f in sess.facts if f.get("importance", 0) >= 4 and not f.get("by_yuki")]
+        noticed = [f for f in sess.facts if f.get("importance", 0) >= 3 and not f.get("by_yuki")]
         noticed.sort(key=lambda f: f.get("at", 0))
-        rows += [(hm(f["at"]), ("Said as a joke: " if f.get("nature") == "humor" else "") +
-                  first_sentence(plain(second_person(f["text"])), 170)) for f in noticed[:4]]
-    if m.kind == "call":
-        rows += [("", line) for line in m.noticed]
+        rows = [(hm(f["at"]), ("Said as a joke: " if f.get("nature") == "humor" else "") +
+                 plain(second_person(f["text"]))) for f in noticed[:12]]
     if not rows:
-        rows = [("", "Nothing more was written about this stretch.")]
+        rows = [("", "Yuki noticed nothing more in this stretch.")]
     for when, words in rows:
         line = QHBoxLayout()
         line.setSpacing(12)
@@ -356,7 +495,11 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     chart = Skyline(t, day)
     col.addWidget(chart)
     col.addSpacing(8)
-    panel = MomentPanel(t)
+    # sized once per width for the day's longest stretch (and its calls), so a hover never moves the page
+    panel = MomentPanel(t, fit=lambda: [chart.moment(s.start) for s in day.sessions] +
+                        [call_moment(day, i) for i in range(len(day.calls))],
+                        fit_key=(day.day, len(day.sessions), len(day.calls), day.sessions[-1].end if day.sessions
+                                 else 0.0))
     col.addWidget(panel)
     details_box = QVBoxLayout()
     details_box.setContentsMargins(0, 8, 0, 0)
@@ -383,6 +526,7 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
             held["card"].hide()
             held["card"].deleteLater()
             held["card"] = None
+            panel.lock(False)
 
     def toggle_details() -> None:   # the moment in full, folded under its panel
         if held["card"] is not None:
@@ -392,6 +536,7 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
             return
         held["card"] = _details(t, panel.moment, day)
         held["card"].setParent(page)
+        panel.lock(True)
         details_box.addWidget(held["card"])
 
     def pick_longest(kind: str) -> None:

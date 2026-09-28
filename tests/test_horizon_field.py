@@ -157,7 +157,7 @@ def test_hover_and_click_pick_a_moment_and_the_land_is_drawn_once(qapp):
                                                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     assert pinned and chart.pinned == pinned[0] and page.at == pinned[0] and page.selected == 0
     stamp, title, apps, _note = panel.lines()
-    assert stamp == "20:00" and title == "Coding the skyline" and apps.endswith("from 20:00 to 21:30")
+    assert stamp == "20:00" and title == "Coding" and apps.endswith("from 20:00 to 21:30")   # the episode, in full
     chart.resize(900, chart.height())                      # a new size draws the land again, once
     chart.repaint()
     assert chart.land_builds == 2
@@ -351,7 +351,7 @@ def test_a_page_placeholder_sits_in_the_pages_own_slot_and_the_moment_panel_neve
     for m in (None, moment_at(day, day.since + 20.2 * 3600), moment_at(day, day.since + 3 * 3600)):
         panel.set_moment(m)
         if m is not None:
-            m.title = m.title * (8 if m.kind == "session" else 1)          # a very long title still fits two lines
+            m.title = m.title * (8 if m.kind == "session" else 1)          # a very long one scrolls inside
         sizes.add((panel.height(), panel.sizeHint().height(), panel.minimumHeight()))
     assert {s[0] for s in sizes} == {MOMENT_H}
     win.close()
@@ -580,3 +580,87 @@ def test_rows_prefer_memorys_model_written_title_and_summary():
 
     todos, _p = D.read_todos(_Mem())
     assert todos[0].title == "Test the MCP server" and todos[0].text.startswith("Must build")
+
+
+def test_the_hovered_moment_says_everything_wrapped_and_only_the_panel_scrolls(qapp):
+    """2026-09-28, the user: hovering the graph "doesn't show the entire summary ... it cuts off with '...'"."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication
+
+    from yuki.ui.window.pages import today
+    from yuki.ui.window.pages.today import MOMENT_H, MOMENT_MAX_H
+    from yuki.ui.window.theme import theme
+
+    def wheel_down() -> QWheelEvent:
+        return QWheelEvent(QPointF(50, 50), QPointF(50, 50), QPoint(0, 0), QPoint(0, -120), Qt.MouseButton.NoButton,
+                           Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+
+    day = _day()
+    long_ep = ("20:00-20:50: Worked on the Corvana project in Zen (16 min active across 19 visits), with frequent "
+               "context-switching to review pull request #2794 on GitHub. Also used Warp terminal for agent harness "
+               "work, checked font candidates for Yuki's UI redesign, and browsed Notion databases for the Demo Fair.")
+    day.sessions[0].episodes = [long_ep, "20:50-21:30: Fixed the call band and wrote its tests. " * 3]
+    page = today.build(theme(), day)
+    page.resize(1200, 900)
+    page.show()
+    pump(qapp, 0.05)
+    panel = page.moment_panel
+    panel.set_moment(page.chart.moment(day.since + 20.2 * 3600))
+    _stamp, words, _apps, note = panel.lines()
+    assert "browsed Notion databases for the Demo Fair." in words and "wrote its tests" in words   # every episode
+    assert "\u2026" not in words + note
+    assert [w for w, _t in panel.moment.story] == ["20:00 to 20:50", "20:50 to 21:30"]
+    fitted = panel.height()
+    assert MOMENT_H < fitted <= MOMENT_MAX_H                   # grown for the day's longest stretch
+    for hour in (3.0, 20.3, 21.8, 12.0):                        # and it stays that size while hovering
+        panel.set_moment(page.chart.moment(day.since + hour * 3600))
+        panel.repaint()
+        assert panel.height() == fitted
+    # a moment longer than the most scrolls inside the panel; a short one hands the wheel to the page
+    m = page.chart.moment(day.since + 20.2 * 3600)
+    m.story = [("", long_ep[13:] * 6)]
+    m.title = "long"
+    panel.set_moment(m)
+    panel.repaint()
+    ev = wheel_down()
+    QApplication.sendEvent(panel, ev)
+    assert ev.isAccepted() and panel._offset > 0 and panel.height() == fitted
+    panel.set_moment(page.chart.moment(day.since + 3 * 3600))
+    ev = wheel_down()
+    QApplication.sendEvent(panel, ev)
+    assert not ev.isAccepted() and panel._offset == 0
+    builds = len(panel._layouts)
+    for _ in range(5):                                          # hovering back and forth lays nothing out again
+        panel.set_moment(page.chart.moment(day.since + 20.2 * 3600))
+        panel.repaint()
+    assert len(panel._layouts) <= builds + 1
+    page.close()
+
+
+def test_a_row_whose_head_is_shortened_opens_to_its_words_in_full(qapp):
+    from PySide6.QtWidgets import QLabel
+
+    from yuki.ui.window.theme import theme
+    from yuki.ui.window.widgets import FoldRow
+
+    t = theme()
+    words = ("Is the Corvana pitch on Thursday at the Demo Fair, or was that moved to the week after because "
+             "Komal is away? " * 2).strip()
+    row = FoldRow(t, words, "", "waiting", full=words)
+    row.resize(360, 60)
+    row.show()
+    pump(qapp, 0.05)
+    row.head.repaint()
+    assert row.head.cut                                        # it did not fit on one line
+    row.toggle()
+    assert row.is_open
+    assert words in [w.text() for w in row.body_widget.findChildren(QLabel)]
+    short = FoldRow(t, "Short", "", "", full="Short")          # a head that fits opens to nothing more
+    short.resize(600, 60)
+    short.show()
+    pump(qapp, 0.05)
+    short.head.repaint()
+    assert not short.head.cut and short.ensure_body() is None
+    row.close()
+    short.close()

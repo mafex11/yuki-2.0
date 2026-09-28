@@ -2171,6 +2171,9 @@ class _FoldHead(QAbstractButton):
         self.t, self.title, self.line, self.meta = t, title, line, meta
         self.initial, self.led = initial, led
         self.open = False
+        #: True when the last paint had to shorten the title or the line to fit (the row then opens to them in
+        #: full: FoldRow's ``full``).
+        self.cut = False
         self.setCheckable(False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(self.H_TWO if (title and line) else self.H_ONE)
@@ -2183,6 +2186,9 @@ class _FoldHead(QAbstractButton):
 
     def minimumSizeHint(self) -> QSize:  # noqa: D102
         return QSize(200, self.height())
+
+    def cut_changed(self) -> None:
+        """``cut`` changed (the row sets this hook)."""
 
     def enterEvent(self, e: object) -> None:  # noqa: D102
         self.update()
@@ -2221,22 +2227,29 @@ class _FoldHead(QAbstractButton):
         w = r.right() - chev - meta_w - x
         tf = variable_font(14, "Semibold" if self.line else "Regular")
         lf = variable_font(13, "Regular")
+        cut = False
         if self.title and self.line:
             p.setFont(tf)
             p.setPen(t.text)
-            p.drawText(QRectF(x, r.top() + 6, w, 20), Qt.AlignmentFlag.AlignVCenter,
-                       QFontMetrics(tf).elidedText(self.title, Qt.TextElideMode.ElideRight, int(w)))
+            shown = QFontMetrics(tf).elidedText(self.title, Qt.TextElideMode.ElideRight, int(w))
+            cut |= shown != self.title
+            p.drawText(QRectF(x, r.top() + 6, w, 20), Qt.AlignmentFlag.AlignVCenter, shown)
             p.setFont(lf)
             p.setPen(t.text_2)
-            p.drawText(QRectF(x, r.top() + 26, w, 20), Qt.AlignmentFlag.AlignVCenter,
-                       QFontMetrics(lf).elidedText(self.line, Qt.TextElideMode.ElideRight, int(w)))
+            shown = QFontMetrics(lf).elidedText(self.line, Qt.TextElideMode.ElideRight, int(w))
+            cut |= shown != self.line
+            p.drawText(QRectF(x, r.top() + 26, w, 20), Qt.AlignmentFlag.AlignVCenter, shown)
         else:
             words = self.title or self.line
             f = tf if self.title else lf
             p.setFont(f)
             p.setPen(t.text if self.title else t.text_2)
-            p.drawText(QRectF(x, r.top(), w, r.height()), Qt.AlignmentFlag.AlignVCenter,
-                       QFontMetrics(f).elidedText(words, Qt.TextElideMode.ElideRight, int(w)))
+            shown = QFontMetrics(f).elidedText(words, Qt.TextElideMode.ElideRight, int(w))
+            cut |= shown != words
+            p.drawText(QRectF(x, r.top(), w, r.height()), Qt.AlignmentFlag.AlignVCenter, shown)
+        if cut != self.cut:
+            self.cut = cut
+            self.cut_changed()
         if self.meta:
             p.setFont(mf)
             p.setPen(t.text_3)
@@ -2262,10 +2275,13 @@ class FoldRow(QWidget):
 
     def __init__(self, t: Theme, title: str, line: str = "", meta: str = "", *, body: Callable[[], QWidget] | None
                  = None, initial: str = "", led: str | None = None, trailing: QWidget | None = None,
-                 expanded: bool = False, parent: QWidget | None = None) -> None:
+                 expanded: bool = False, full: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t = t
         self._make_body = body
+        #: The head's words in full: when the head has to shorten them to fit, the row opens to them (on top
+        #: of its body, if it has one), so nothing a user would read is only ever seen with "…".
+        self.full = full
         self.body_widget: QWidget | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.col = QVBoxLayout(self)
@@ -2275,6 +2291,7 @@ class FoldRow(QWidget):
         line_row.setContentsMargins(0, 0, 0, 0)
         line_row.setSpacing(8)
         self.head = _FoldHead(t, title, line, meta, initial=initial, led=led, parent=self)
+        self.head.cut_changed = self._cut_changed  # type: ignore[method-assign]
         self.head.clicked.connect(self.toggle)
         line_row.addWidget(self.head, 1)
         if trailing is not None:
@@ -2290,9 +2307,25 @@ class FoldRow(QWidget):
     def is_open(self) -> bool:
         return self.body_widget is not None and not self.body_widget.isHidden()
 
+    def _cut_changed(self) -> None:
+        if self._make_body is None and self.body_widget is None:
+            self.head.setCursor(Qt.CursorShape.PointingHandCursor if self.head.cut and self.full
+                                else Qt.CursorShape.ArrowCursor)
+
     def ensure_body(self) -> QWidget | None:
-        if self.body_widget is None and self._make_body is not None:
-            w = self._make_body()
+        spell = bool(self.full) and self.head.cut
+        if self.body_widget is None and (self._make_body is not None or spell):
+            if spell:   # the words the head had to shorten, in full, above the body
+                w = QWidget()
+                w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                inner = QVBoxLayout(w)
+                inner.setContentsMargins(0, 0, 0, 0)
+                inner.setSpacing(8)
+                inner.addWidget(text_label(self.t, self.full, "body", "text", wrap=True, selectable=True))
+                if self._make_body is not None:
+                    inner.addWidget(self._make_body())
+            else:
+                w = self._make_body()
             w.setParent(self)
             wrap = QWidget(self)
             wrap.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)

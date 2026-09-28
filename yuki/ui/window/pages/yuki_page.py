@@ -79,8 +79,8 @@ def _empty(t: Theme, text: str, parent: QWidget | None = None) -> Card:
 
 
 def _talk(t: Theme, view: YukiView) -> Panel:
-    rows = [FoldRow(t, "", one_line(line, 110), "", body=lines_body(t, [(line, "")]) if len(line) > 100 else None)
-            for line in view.talk]
+    rows = [FoldRow(t, "", one_line(line, 110), "", body=lines_body(t, [(line, "")]) if len(line) > 100 else None,
+                    full=line) for line in view.talk]
     when = f"From your portrait, updated {day_label(view.talk_at)} {hm(view.talk_at)}" if view.talk_at else ""
     headline = (f"{len(rows)} things about your reply style. {when}".strip() if rows else
                 "Nothing about your reply style yet")
@@ -164,7 +164,8 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
     rows: list[QWidget] = []
     for i, q in enumerate(view.waiting):
         ref: list = [None]
-        row = FoldRow(t, plain(second_person(q["question"])), "", "waiting", led="on",
+        words = plain(second_person(q["question"]))
+        row = FoldRow(t, words, "", "waiting", led="on", full=words,
                       body=lambda q=q, ref=ref: _question_body(t, q, act, ref), expanded=i == 0)
         ref[0] = row
         rows.append(row)
@@ -172,10 +173,10 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
     for q in view.asked[:6]:
         status = f"{word.get(q['status'], q['status'])} {day_label(epoch(q['answered_at'] or q['at']) or 0)}"
         answer = q.get("answer")
-        rows.append(FoldRow(t, plain(second_person(q["question"])),
-                            f"You: “{one_line(answer, 90)}”" if answer else "", status.strip(),
+        words = plain(second_person(q["question"]))
+        rows.append(FoldRow(t, words, f"You: “{one_line(answer, 90)}”" if answer else "", status.strip(),
                             body=lines_body(t, [(f"You: “{answer}”", "")]) if answer and len(answer) > 90
-                            else None))
+                            else None, full=words + (f"\n\nYou: “{answer}”" if answer and len(answer) <= 90 else "")))
     n_wait, n_asked = len(view.waiting), len(view.asked)
     headline = ", ".join(x for x in (f"{n_wait} waiting for you" if n_wait else "",
                                      f"{n_asked} asked before" if n_asked else "") if x) or "No questions right now"
