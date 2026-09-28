@@ -187,6 +187,29 @@ def find(module: str | None = None, *, include_db_runs: bool = False) -> list[An
     return out
 
 
+def _own_child(child: Any) -> bool:
+    """Whether a child process is part of Yuki itself (a Yuki module, or a process whose image is inside
+    Yuki's own install or checkout), not an app Yuki started for the user."""
+    try:
+        argv = child.cmdline() or []
+        exe = child.exe() or ""
+    except Exception:
+        return False
+    if is_yuki_process(argv, exe):
+        return True
+    image = str(Path(exe)).casefold() if exe else ""
+    return bool(image) and any(_under(image, root) for root in _own_roots())
+
+
+def _own_roots() -> list[Path]:
+    import sys
+
+    roots = [PROJECT_ROOT]
+    if is_frozen():
+        roots.append(Path(sys.executable).parent)
+    return roots
+
+
 def stop(modules: Iterable[str], *, timeout_s: float = 10.0) -> list[int]:
     """Terminate the running processes of ``modules`` (and their children); returns the pids ended."""
     import psutil
@@ -197,7 +220,10 @@ def stop(modules: Iterable[str], *, timeout_s: float = 10.0) -> list[int]:
             targets[proc.pid] = proc
             try:
                 for child in proc.children(recursive=True):
-                    targets[child.pid] = child
+                    # Only Yuki's own children (the window, the transcriber, a helper python). An app Yuki
+                    # launched for the user (Chrome, WhatsApp, a game) is a child too, and must never be ended.
+                    if _own_child(child):
+                        targets[child.pid] = child
             except psutil.Error:
                 pass
     for proc in targets.values():
