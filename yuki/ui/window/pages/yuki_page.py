@@ -110,8 +110,8 @@ def _personality(t: Theme, view: YukiView) -> Panel:
 
 
 def _learned(t: Theme, view: YukiView) -> Panel:
-    rows = [FoldRow(t, k.title, one_line(k.line, 100), (k.app[:1].upper() + k.app[1:]) if k.app else "",
-                    body=lines_body(t, [(k.line, f"In {k.app[:1].upper() + k.app[1:]}" if k.app else "")]))
+    rows = [FoldRow(t, k.title, one_line(k.line, 100), k.app,   # the app's own name (data.learned_items)
+                    body=lines_body(t, [(k.line, f"In {k.app}" if k.app else "")]))
             for k in view.knowhow[:10]]
     headline = f"{len(rows)} ways that worked on this PC" if rows else "Nothing yet"
     panel = fold_panel(t, "Learned to do", headline, rows, shown=3, empty="")

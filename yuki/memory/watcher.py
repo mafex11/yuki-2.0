@@ -462,6 +462,7 @@ def session_locked() -> bool:
 
 _VENV_ROOT = Path(sys.prefix).resolve()
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from yuki.core import appnames as _appnames   # noqa: E402 - the one app-name resolver
 #: The frozen build's program folder (Yuki.exe, yuki-cli.exe); the project itself in dev.
 from yuki.core.paths import app_dir as _app_dir   # noqa: E402 - stdlib-only helper
 
@@ -473,21 +474,8 @@ class ProcessFacts:
     pid: int
     process_name: str  # "chrome.exe"
     exe: str
-    app_name: str  # FileDescription ("Google Chrome"), else the image name's stem
+    app_name: str  # the app's own name (yuki.core.appnames: "Google Chrome", "WhatsApp" for WhatsApp.Root.exe)
     is_own: bool  # a Yuki process: this one, or one run by Yuki's interpreter
-
-
-def _file_description(exe: str) -> str:
-    try:
-        pairs = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")
-        for lang, codepage in pairs or []:
-            key = f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription"
-            value = win32api.GetFileVersionInfo(exe, key)
-            if value and str(value).strip():
-                return str(value).strip()
-    except Exception:
-        pass
-    return ""
 
 
 def _under(path: str, root: Path) -> bool:
@@ -500,7 +488,6 @@ def _under(path: str, root: Path) -> bool:
 class _ProcessCache:
     def __init__(self) -> None:
         self._facts: dict[int, tuple[float, ProcessFacts]] = {}
-        self._descriptions: dict[str, str] = {}
 
     def get(self, pid: int) -> ProcessFacts:
         cached = self._facts.get(pid)
@@ -532,10 +519,7 @@ class _ProcessCache:
                 pass
             own = any(p and (_under(p, _VENV_ROOT) or _under(p, _PROJECT_ROOT) or _under(p, _APP_ROOT))
                       for p in chain)
-        if exe not in self._descriptions:
-            self._descriptions[exe] = _file_description(exe) if exe else ""
-        stem = name[:-4] if name.lower().endswith(".exe") else name
-        facts = ProcessFacts(pid, name, exe, self._descriptions[exe] or stem, own)
+        facts = ProcessFacts(pid, name, exe, _appnames.name_for_exe(exe, pid=pid, image=name), own)
         if len(self._facts) > 512:
             self._facts.clear()
         self._facts[pid] = (created, facts)

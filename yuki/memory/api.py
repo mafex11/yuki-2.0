@@ -206,20 +206,6 @@ def _time_arg(value: Any) -> float | None:
     raise TypeError(f"unsupported time argument {value!r}")
 
 
-def _file_description(exe: str) -> str:
-    """An executable's FileDescription ("Google Chrome"): what the watcher records as the app name."""
-    try:
-        import win32api
-
-        for lang, codepage in win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation") or []:
-            value = win32api.GetFileVersionInfo(exe, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription")
-            if value and str(value).strip():
-                return str(value).strip()
-    except Exception:
-        pass
-    return ""
-
-
 def service_running(db_path: str | Path | None = None) -> bool:
     """Whether a ``yuki-memory`` service holds its mutex for this database (this session)."""
     kernel32 = ctypes.windll.kernel32
@@ -310,24 +296,31 @@ class MemoryClient:
         """Display names the journal may carry for ``app`` (a display name or a process name).
 
         The name as given, its :func:`app_key` form ("spotify" matches the app
-        "Spotify"), and the FileDescription of any running process with that
-        image name ("chrome.exe" -> "Google Chrome"; found names are cached).
-        Journal facts are also matched through ``threads.process``.
+        "Spotify"), every name memory stored for that app before
+        (:func:`yuki.core.appnames.aliases`: "WhatsApp.Root" for "WhatsApp"), and
+        the name of any running process with that image name ("chrome.exe" ->
+        "Google Chrome"; found names are cached). Journal facts are also matched
+        through ``threads.process``.
         """
+        from yuki.core import appnames
+
         key = app_key(app) or ""
         names = {app.strip(), key} | self._app_names.get(key, set())
         try:
             import psutil
 
-            for proc in psutil.process_iter(["name", "exe"]):
+            for proc in psutil.process_iter(["pid", "name", "exe"]):
                 if app_key(proc.info.get("name")) == key and proc.info.get("exe"):
-                    desc = _file_description(proc.info["exe"])
-                    if desc:
-                        self._app_names.setdefault(key, set()).add(desc)
-                        names.add(desc)
+                    name = appnames.name_for_exe(proc.info["exe"], pid=proc.info.get("pid"),
+                                                 image=proc.info.get("name") or "")
+                    if name:
+                        self._app_names.setdefault(key, set()).add(name)
+                        names.add(name)
                         break
         except Exception:
             pass
+        for name in list(names):
+            names |= appnames.aliases(name)
         return sorted(n for n in names if n)
 
     # -- portrait ----------------------------------------------------------

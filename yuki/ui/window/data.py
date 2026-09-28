@@ -651,6 +651,19 @@ class Learned:
     app: str = ""
 
 
+def _app_name_of_key(key: str | None) -> str:
+    """Know-how keys an app by its process ("whatsapp.root"): the app's own name ("WhatsApp")."""
+    key = (key or "").strip()
+    if not key:
+        return ""
+    try:
+        from yuki.core import appnames
+
+        return appnames.name_for_key(key)
+    except Exception:
+        return key
+
+
 def learned_items(memory: Any, limit: int = 10) -> list[Learned]:
     """Know-how as short, plain entries. The title is what the user asked for, in their words; the line is
     the first sentence of how it was done, without the "Not: ..." note of what failed (memory's own fixed
@@ -666,8 +679,8 @@ def learned_items(memory: Any, limit: int = 10) -> list[Learned]:
         line = first_sentence(plain(how), 140)
         ask = (k.source_request or "").split(" [backfill:", 1)[0]
         ask = first_sentence(plain(ask), 60).rstrip(".!?")
-        app = (k.app or "").strip()
-        title = (ask[:1].upper() + ask[1:]) if ask else (app.capitalize() if app else "On this PC")
+        app = _app_name_of_key(k.app)
+        title = (ask[:1].upper() + ask[1:]) if ask else (app or "On this PC")
         # memory's own short title and one-line summary, when it has written them
         out.append(Learned(short_field(k, "title") or title, short_field(k, "summary") or line, app))
     return out

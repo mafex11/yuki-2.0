@@ -379,51 +379,19 @@ class AvSignals:
             w.close()
 
 
-_names: dict[str, str] = {}
-
-
 def display_name(holder: Holder) -> str:
-    """The app's own name for a card or a timeline row: its FileDescription ("Google Chrome"), a packaged
-    app's Start menu name, else its image name's stem / package name (cached)."""
-    key = holder.path.casefold() if holder.path else holder.app.casefold()
-    if key in _names:
-        return _names[key]
-    name = ""
-    if holder.path:
-        try:
-            import win32api
+    """The app's own name for a card or a timeline row (:mod:`yuki.core.appnames`, cached there): a desktop
+    app's from its executable ("Discord", "VALORANT"), a packaged app's from its package ("WhatsApp")."""
+    from yuki.core import appnames
 
-            for lang, codepage in win32api.GetFileVersionInfo(holder.path, "\\VarFileInfo\\Translation") or []:
-                value = win32api.GetFileVersionInfo(holder.path,
-                                                    f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription")
-                if value and str(value).strip():
-                    name = str(value).strip()
-                    break
-        except Exception:
-            pass
-        name = name or Path(holder.path).stem
-    elif holder.packaged:
-        index = None
-        try:
-            from yuki.perception import windows
-
-            index = windows.start_menu_index()
-            fam = holder.app.casefold()
-            if index is not None:
-                # an AUMID is "<family>_<publisher id>!<app>"
-                entry = next((e for appid, e in index.by_appid.items()
-                              if appid.split("!", 1)[0].split("_", 1)[0] == fam), None)
-                name = entry.name if entry is not None else ""
-        except Exception:
-            pass
-        if index is None:   # the Start menu is still being read: do not keep the fallback
-            return holder.app.rsplit(".", 1)[-1] or holder.app
-        # a package family name is "Publisher.Name": the part after the publisher's prefix
-        name = name or holder.app.rsplit(".", 1)[-1]
-    else:
-        name = Path(holder.app).stem
-    _names[key] = name or holder.app
-    return _names[key]
+    try:
+        if holder.path:
+            return appnames.name_for_exe(holder.path, image=Path(holder.path).name) or holder.app
+        if holder.packaged:
+            return appnames.name_for_package(holder.app) or holder.app
+        return appnames.name_for_key(holder.app) or holder.app
+    except Exception:
+        return holder.app
 
 
 # ---------------------------------------------------------------------------

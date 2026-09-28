@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import time as _time
 from collections import Counter
-from functools import lru_cache
 
 from yuki.memory.extract import profiles as _profiles
 from yuki.memory.extract import query, timeparse
@@ -72,23 +71,14 @@ _DOC_MIN_CHARS = 200
 _DOC_MIN_AREA = 0.3
 
 
-@lru_cache(maxsize=256)
 def _app_name(process_name: str, pid: int) -> str:
-    """FileDescription of the process image ("Slack", "Zen"), else the image stem."""
-    stem = process_name[:-4] if process_name.lower().endswith(".exe") else process_name
-    try:
-        import psutil
-        import win32api
+    """The app's own name ("Slack", "WhatsApp" for WhatsApp.Root.exe): :mod:`yuki.core.appnames`."""
+    from yuki.core import appnames
 
-        exe = psutil.Process(pid).exe()
-        pairs = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")
-        for lang, codepage in pairs or []:
-            value = win32api.GetFileVersionInfo(exe, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription")
-            if value and str(value).strip():
-                return str(value).strip()
+    try:
+        return appnames.name_for_pid(pid, process_name) if pid else appnames.prettify(process_name)
     except Exception:
-        pass
-    return stem
+        return appnames.prettify(process_name)
 
 
 def _pid(hwnd: int) -> int:

@@ -538,7 +538,14 @@ class Hands:
                 except TypeError:  # a stand-in backend without the keyword arguments
                     tree = read(front)
                 names = names_from_tree(tree)
-                app = str(win.get("process_name") or win.get("app") or "").removesuffix(".exe")
+                image = str(win.get("process_name") or win.get("app") or "")
+                try:   # the app's own name, as it may be spoken ("WhatsApp", not "WhatsApp.Root")
+                    from yuki.core import appnames
+
+                    app = (appnames.name_for_pid(int(win["pid"]), image) if win.get("pid")
+                           else appnames.name_for_key(image))
+                except Exception:  # noqa: BLE001 - a hint only
+                    app = image.removesuffix(".exe")
                 with self._lock:
                     changed = names != self.screen_names or front != self.screen_hwnd
                     self.screen_names, self.screen_app, self.screen_hwnd = names, app, front

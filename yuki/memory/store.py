@@ -264,6 +264,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from yuki.core.appnames import shown as _shown   # stored app names as they read now ("WhatsApp.Root" -> "WhatsApp")
 from yuki.memory.crypto import FieldCipher, load_or_create_key
 from yuki.memory.secret_filter import redact_utterances
 
@@ -2348,7 +2349,7 @@ class Store:
             return None
         r = rows[0]
         return ThreadInfo(
-            id=r["id"], app=r["app"], host=r["host"], title=self._dec(r["title_ciphertext"]) or "",
+            id=r["id"], app=_shown(r["app"], r["process"]), host=r["host"], title=self._dec(r["title_ciphertext"]) or "",
             url=self._dec(r["url_ciphertext"]), first_seen=r["first_seen"], last_seen=r["last_seen"],
             scope=self._dec(r["scope_ciphertext"]), kind=r["kind"],
         )
@@ -2817,7 +2818,7 @@ class Store:
         keys = r.keys()
         nature = r["nature"] if "nature" in keys else None
         return JournalEntry(
-            id=r["id"], at=r["at"], thread_id=r["thread_id"], app=r["app"], host=r["host"],
+            id=r["id"], at=r["at"], thread_id=r["thread_id"], app=_shown(r["app"]), host=r["host"],
             fact=self.cipher.decrypt(r["fact_ciphertext"]), importance=r["importance"],
             batch_id=r["batch_id"], score=score, by_yuki=bool(r["by_yuki"]) if "by_yuki" in keys else False,
             nature=nature if nature in JOURNAL_NATURES else "fact",
@@ -3426,18 +3427,20 @@ class Store:
         # What Yuki put on screen for the user (by_yuki) is not the user's routine.
         cwhere = where + (" AND " if where else " WHERE ") + "c.by_yuki = 0"
         for r in self._query(
-            "SELECT c.at, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id" + cwhere, params
+            "SELECT c.at, t.app, t.process, t.host FROM captures c JOIN threads t ON t.id = c.thread_id" + cwhere,
+            params,
         ):
             slot = int(r["at"] // slot_s)
-            apps.setdefault(r["app"] or "", set()).add(slot)
+            app = _shown(r["app"] or "", r["process"])
+            apps.setdefault(app, set()).add(slot)
             if r["host"]:
-                hosts.setdefault((r["app"] or "", r["host"]), set()).add(slot)
+                hosts.setdefault((app, r["host"]), set()).add(slot)
         hwhere = where.replace("c.at", "h.at")
         hwhere += (" AND " if hwhere else " WHERE ") + (
             "h.outcome IN ('captured','deduplicated','unchanged','no_new_text','empty') AND coalesce(h.app,'') != ''"
         )
         for r in self._query("SELECT h.at, h.app FROM health h" + hwhere, params):
-            apps.setdefault(r["app"], set()).add(int(r["at"] // slot_s))
+            apps.setdefault(_shown(r["app"]), set()).add(int(r["at"] // slot_s))
         return {"apps": apps, "hosts": hosts, "slot_s": slot_s}
 
     # -- know-how ----------------------------------------------------------
@@ -3720,7 +3723,8 @@ class Store:
             other = {}
         return TimelineRow(
             id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], state=r["state"], process=r["process"],
-            app=r["app"], title=self._dec(r["title_ciphertext"]), host=r["host"], path=self._dec(r["path_ciphertext"]),
+            app=_shown(r["app"], r["process"]), title=self._dec(r["title_ciphertext"]), host=r["host"],
+            path=self._dec(r["path_ciphertext"]),
             page_key=r["page_key"], active_s=r["active_s"], passive_s=r["passive_s"], away_s=r["away_s"],
             media_s=r["media_s"], media_other=other, withheld=r["withheld"], segments=r["segments"],
             fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
@@ -3759,7 +3763,7 @@ class Store:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         return [TimelineRow(
             id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], state=r["state"], process=r["process"],
-            app=r["app"], host=r["host"], page_key=r["page_key"], active_s=r["active_s"] or 0.0,
+            app=_shown(r["app"], r["process"]), host=r["host"], page_key=r["page_key"], active_s=r["active_s"] or 0.0,
             passive_s=r["passive_s"] or 0.0, away_s=r["away_s"] or 0.0, media_s=r["media_s"] or 0.0,
             withheld=r["withheld"], fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
             by_yuki=bool(r["by_yuki"]), source=r["source"],
@@ -5116,10 +5120,11 @@ class Store:
             params.append(u)
         params.append(int(limit))
         rows = self._query(
-            "SELECT c.at, c.kind, c.delta_ciphertext, t.app, t.host FROM captures c JOIN threads t ON t.id = c.thread_id"
+            "SELECT c.at, c.kind, c.delta_ciphertext, t.app, t.process, t.host FROM captures c"
+            " JOIN threads t ON t.id = c.thread_id"
             " WHERE " + " AND ".join(clauses) + " ORDER BY c.at DESC, c.id DESC LIMIT ?", params,
         )
-        return [{"at": r["at"], "app": r["app"], "host": r["host"], "kind": r["kind"],
+        return [{"at": r["at"], "app": _shown(r["app"], r["process"]), "host": r["host"], "kind": r["kind"],
                  "text": self.cipher.decrypt(r["delta_ciphertext"])} for r in reversed(rows)]
 
     # -- questions for the user (yuki.memory.questions) ----------------------------
@@ -5458,7 +5463,7 @@ class Store:
 
     def _call(self, r: sqlite3.Row) -> CallRecord:
         return CallRecord(
-            id=r["id"], app=r["app"], process=r["process"], service=r["service"], via=r["via"],
+            id=r["id"], app=_shown(r["app"], r["process"]), process=r["process"], service=r["service"], via=r["via"],
             detected_at=r["detected_at"], ended_at=r["ended_at"], status=r["status"], consent=r["consent"],
             consent_by=r["consent_by"], consent_at=r["consent_at"], output_form_factor=r["output_form_factor"],
             output_device=r["output_device"], headphones=None if r["headphones"] is None else bool(r["headphones"]),
@@ -5621,7 +5626,8 @@ class Store:
         self._write(lambda conn: self._set_call_pref(conn, key, decision, name, time.time()))
 
     def call_prefs(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self._query("SELECT app, decision, name, updated_at FROM call_prefs ORDER BY app")]
+        return [{**dict(r), "name": _shown(r["name"], r["app"]) if r["name"] else r["name"]}
+                for r in self._query("SELECT app, decision, name, updated_at FROM call_prefs ORDER BY app")]
 
     def add_call_side(
         self, call_id: int, *, app: str, process: str | None, started_at: float, ended_at: float,
@@ -5928,7 +5934,7 @@ class Store:
                 continue
             if r["status"] == "running" and (r["claimed_at"] or 0.0) > now - stale_s:
                 continue
-            out.append({"call_id": int(r["call_id"]), "app": r["app"] or "", "capture_ids": ids})
+            out.append({"call_id": int(r["call_id"]), "app": _shown(r["app"] or ""), "capture_ids": ids})
         return out
 
     def claim_call_digest(self, call_id: int, *, app: str, capture_ids: Sequence[int], owner: str,
@@ -6017,7 +6023,8 @@ class Store:
             except (ValueError, TypeError):
                 captures = []
             out[int(r["call_id"])] = {
-                "call_id": int(r["call_id"]), "app": r["app"], "status": r["status"], "gist": self._dec(r["gist_ciphertext"]),
+                "call_id": int(r["call_id"]), "app": _shown(r["app"]), "status": r["status"],
+                "gist": self._dec(r["gist_ciphertext"]),
                 "blocks": blocks if isinstance(blocks, list) else [], "started_at": r["started_at"],
                 "ended_at": r["ended_at"], "speech_s": r["speech_s"], "utterances": r["utterances"], "kept": r["kept"],
                 "capture_ids": captures, "model": r["model"], "cost_usd": r["cost_usd"], "attempts": r["attempts"],
@@ -6613,7 +6620,7 @@ class Store:
         )
         return {
             "count": total["n"], "avg_ms": total["avg_ms"], "max_ms": total["max_ms"], "chars": total["chars"] or 0,
-            "by_app": [dict(r) for r in by_app],
+            "by_app": [{**dict(r), "app": _shown(r["app"])} for r in by_app],
             "by_outcome": {r["outcome"]: r["n"] for r in by_outcome},
         }
 
