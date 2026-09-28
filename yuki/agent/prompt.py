@@ -376,6 +376,13 @@ def rules_text(rules: str | None) -> str | None:
     return f"{RULES_LABEL}\n{body}\n{RULES_END}"
 
 
+#: The cache marker of the stable layers (tools, core, profile, rules): kept an hour, not five minutes (v3.11).
+#: Bedrock's Claude models take ``ttl: "1h"`` (measured 2026-09-28 on Haiku 4.5, Sonnet 5, Opus 5): Yuki's voice
+#: keeps its halves warm between conversations with one cheap read an hour instead of one every few minutes. A
+#: write costs 2x the input price instead of 1.25x; reads refresh it. The moving conversation marker stays 5 min.
+STABLE_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
+
+
 def system_blocks(
     *,
     cacheable: bool = True,
@@ -420,5 +427,5 @@ def system_blocks(
             layers.append(block)
     if cacheable:
         for block in layers:
-            block["cache_control"] = {"type": "ephemeral"}
+            block["cache_control"] = dict(STABLE_CACHE_CONTROL)
     return blocks

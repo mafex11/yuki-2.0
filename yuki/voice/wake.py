@@ -175,6 +175,8 @@ class WakeSpotter:
         self.name_end: float | None = None
         #: The same for the last sound-alike it heard instead (where the words after it began).
         self.near_end: float | None = None
+        #: Samples fed to the current stream (its own clock: the model's token times count these).
+        self._fed = 0
 
     def feed(self, samples: np.ndarray, at: float | None = None) -> str | None:
         """Push audio; returns ``"YUKI"`` when the name is heard, else ``None`` (a competing variant counts as none).
@@ -186,34 +188,50 @@ class WakeSpotter:
         if self._t0 is None and at is not None:
             self._t0 = at
         self._stream.accept_waveform(RATE, samples)
+        self._fed += int(samples.size)
         heard = None
         while self._kws.is_ready(self._stream):
             self._kws.decode_stream(self._stream)
             result = self._kws.keyword_spotter.get_result(self._stream)
             keyword = (result.keyword or "").strip()
             if keyword:
+                times = list(result.timestamps or [])
+                end = self._wall(times[-1], at, samples.size) if times else None
                 if keyword == self.WAKE:
                     heard = keyword
-                    times = list(result.timestamps or [])
-                    self.name_end = (self._t0 + times[-1] + NAME_END_OFFSET_S
-                                     if times and self._t0 is not None else None)
+                    self.name_end = end
                 else:
                     self.near_misses += 1
-                    times = list(result.timestamps or [])
-                    self.near_end = (self._t0 + times[-1] + NAME_END_OFFSET_S
-                                     if times and self._t0 is not None else None)
+                    self.near_end = end
                 # A fresh stream after any result: its token times start again from the next sample
                 # (after ``reset_stream`` they drift by the audio still buffered), so the next hit's
                 # time is exact.
                 self._stream = self._kws.create_stream()
                 self._t0 = None if at is None else at + samples.size / RATE
+                self._fed = 0
                 if heard:
                     break
         return heard
 
+    def _wall(self, token_s: float, at: float | None, size: int) -> float | None:
+        """The monotonic time of a token the model timed at ``token_s`` of the stream, plus :data:`NAME_END_OFFSET_S`.
+
+        Counted back from the newest batch (it ends at ``at + size / RATE`` by the mic's clock), never forward from
+        the stream's first sample: the microphone's sample clock and the PC's clock drift apart, and a stream that
+        stays open while sound goes on (a video in the room, hours of it) drifts by seconds. Live 2026-09-27/28
+        the forward count put the name's end 2.2-12.9 s too early (``name_end_before_hit_ms`` 2150-12901, while a
+        stream just reset read 471-612): what was replayed to speech recognition began seconds before the name, so
+        "Yuki." came through as a turn of its own and the command waited behind seconds of old audio (v3.11).
+        """
+        if at is None:
+            return None if self._t0 is None else self._t0 + token_s + NAME_END_OFFSET_S
+        stream_now = self._fed / RATE   # the stream's own time at the end of this batch
+        return at + size / RATE - (stream_now - token_s) + NAME_END_OFFSET_S
+
     def reset(self) -> None:
         self._stream = self._kws.create_stream()
         self._t0 = None
+        self._fed = 0
 
 
 #: The second opinion on a sound-alike (v3.7): the phoneme model (zh-en, which spells the name as sounds, so

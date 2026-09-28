@@ -1113,7 +1113,9 @@ def tool_params(
         if t["name"] in allowed
     ]
     if cacheable and tools:
-        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        from yuki.agent.prompt import STABLE_CACHE_CONTROL
+
+        tools[-1] = {**tools[-1], "cache_control": dict(STABLE_CACHE_CONTROL)}
     return tools
 
 

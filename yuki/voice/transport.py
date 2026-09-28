@@ -18,7 +18,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, StartFrame
@@ -75,23 +75,46 @@ class MicInput(BaseInputTransport):
         params: Pipecat transport params (16 kHz mono in).
         backlog_since: Replay the mic's in-memory blocks from this monotonic
             time first (the words said right after the wake word).
+        dormant: Send nothing until :meth:`go_live` (v3.11: a conversation built ahead of the wake word waits
+            with no microphone subscription at all, so no audio leaves the PC and none is billed).
     """
 
-    def __init__(self, mic: SharedMic, params: TransportParams, *, backlog_since: float | None = None) -> None:
+    def __init__(self, mic: SharedMic, params: TransportParams, *, backlog_since: float | None = None,
+                 dormant: bool = False) -> None:
         super().__init__(params)
         self._mic = mic
         self._token: int | None = None
         self._backlog_since = backlog_since
+        self._dormant = dormant
+        self._loop: Any = None
         #: Seconds of audio kept since the wake, and how much of it was replayed after squeezing.
         self.kept_s = 0.0
         self.replayed_s = 0.0
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
+        # Ready first: Pipecat creates the input queue there, and a frame pushed before it fails
+        # (v3.3 replayed the kept audio before this call, so a wake-started conversation would
+        # have lost everything; found 2026-09-26 by the first end-to-end run through MicInput).
+        await self.set_transport_ready(frame)
+        if not self._dormant:
+            await self._stream(self._backlog_since)
+
+    async def go_live(self, backlog_since: float | None) -> dict[str, Any]:
+        """Start sending: the mic's kept blocks since ``backlog_since`` (the words after the name), then the live mic."""
+        if not self._dormant:
+            return {}
+        self._dormant = False
+        started = time.monotonic()
+        await self._stream(backlog_since)
+        return {"kept_s": round(self.kept_s, 2), "replayed_s": round(self.replayed_s, 2),
+                "stream_ms": round((time.monotonic() - started) * 1000, 1)}
+
+    async def _stream(self, backlog_since: float | None) -> None:
         loop = self.get_event_loop()
         pending: list[bytes] = []
         gate = threading.Lock()
-        held: list[InputAudioRawFrame] | None = [] if self._backlog_since is not None else None
+        held: list[InputAudioRawFrame] | None = [] if backlog_since is not None else None
 
         def on_block(pcm: bytes, _at: float) -> None:
             nonlocal held
@@ -106,14 +129,10 @@ class MicInput(BaseInputTransport):
                     return
             asyncio.run_coroutine_threadsafe(self.push_audio_frame(frame_), loop)
 
-        # Ready first: Pipecat creates the input queue there, and a frame pushed before it fails
-        # (v3.3 replayed the kept audio before this call, so a wake-started conversation would
-        # have lost everything; found 2026-09-26 by the first end-to-end run through MicInput).
-        await self.set_transport_ready(frame)
-        if self._backlog_since is not None:
+        if backlog_since is not None:
             # Subscribing and taking the kept audio in one step: the words said after the name
             # while the conversation was starting, then the live mic, with no block lost or doubled.
-            self._token, kept = self._mic.subscribe_from(on_block, self._backlog_since)
+            self._token, kept = self._mic.subscribe_from(on_block, backlog_since)
             self.kept_s = len(kept) * BLOCK_MS / 1000.0
             kept = squeeze_replay(kept)
             self.replayed_s = len(kept) * BLOCK_MS / 1000.0
@@ -139,8 +158,13 @@ class MicInput(BaseInputTransport):
 class SpeakerOutput(BaseOutputTransport):
     """Output transport writing to a :class:`Speaker` (blocking writes on one worker thread)."""
 
-    def __init__(self, speaker: Speaker, params: TransportParams) -> None:
+    def __init__(self, speaker: Speaker | None, params: TransportParams) -> None:
         super().__init__(params)
+        #: ``None`` until a dormant conversation is woken (v3.11: no output stream is held open while it waits, so
+        #: the PC can sleep and no audio session shows); :meth:`set_speaker` gives it the one opened then.
+        self._speaker = speaker
+
+    def set_speaker(self, speaker: Speaker) -> None:
         self._speaker = speaker
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-out")
 
@@ -149,7 +173,10 @@ class SpeakerOutput(BaseOutputTransport):
         await self.set_transport_ready(frame)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        await self.get_event_loop().run_in_executor(self._executor, self._speaker.write, frame.audio)
+        speaker = self._speaker
+        if speaker is None:
+            return True   # dormant: nothing is ever said before the wake, but never fail the pipeline on it
+        await self.get_event_loop().run_in_executor(self._executor, speaker.write, frame.audio)
         return True
 
     async def cleanup(self) -> None:

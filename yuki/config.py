@@ -316,6 +316,10 @@ class Settings:
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
         voice_keyterms_max: At most this many names and terms from memory are given to speech
             recognition as keyterms per conversation (docs/VOICE.md §9, v3.5).
+        voice_standby: Keep the next conversation built and connected, dormant, while listening for the name
+            (v3.11): speech recognition's socket open with no audio sent, the caches warm; the name wakes it at once.
+        voice_cache_refresh_s: While dormant (and the user is at the PC), the talker's and thinker's prompt caches
+            (their stable layers are kept an hour) are read again this often.
         voice_screen_terms: At most this many names on the screen in front (its list items, chats, tabs,
             links, buttons) are added to them, refreshed as the screen changes (v3.10); 0 = off.
         voice_speech_guard: Check every line with the fast model before the voice says it: never its
@@ -412,6 +416,8 @@ class Settings:
     voice_desk_wait_ms: float = 250.0
     voice_keyterms_max: int = 50
     voice_screen_terms: int = 30
+    voice_standby: bool = True
+    voice_cache_refresh_s: float = 3000.0
     voice_speech_guard: bool = True
     voice_speech_guard_timeout_s: float = 2.5
     voice_prewarm: bool = True

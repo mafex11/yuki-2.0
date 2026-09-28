@@ -533,6 +533,29 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     return ("; ".join(parts) or None), len(low), len(near) + len(fused)
 
 
+#: The user counts as at the PC when they touched the keyboard or mouse this recently (s): the dormant voice's
+#: caches are refreshed only then (an empty room costs nothing).
+PRESENT_S = 900.0
+
+
+def user_present(within_s: float = PRESENT_S) -> bool:
+    """Whether the keyboard or mouse was used in the last ``within_s`` (GetLastInputInfo: a time, not an input
+    hook; ``True`` when it cannot be read)."""
+    try:
+        import ctypes
+
+        class _Info(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        info = _Info(ctypes.sizeof(_Info), 0)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return True
+        idle_ms = (ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+        return idle_ms / 1000.0 < within_s
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def keyterm_list(base: list[str], extra: list[str], cap: int) -> list[str]:
     """Speech recognition's keyterms: ``base`` then ``extra``, each once (case-insensitive), at most ``cap``."""
     out: list[str] = []
@@ -1889,8 +1912,17 @@ class Conversation:
                  voice_activity: Callable[[], tuple[float, float]] | None = None, call_app: str | None = None,
                  on_closing: Callable[[str], None] | None = None, keyterms: list[str] | None = None,
                  on_chat: Callable[[dict[str, Any]], None] | None = None, call_evidence: str | None = None,
-                 on_quiet: Callable[[float], None] | None = None) -> None:
+                 on_quiet: Callable[[float], None] | None = None, dormant: bool = False) -> None:
         self.settings = settings
+        #: Built ahead and waiting for the name (v3.11): the pipeline runs, speech recognition is connected and the
+        #: caches are warm, but no audio is sent anywhere and nothing is said until :meth:`activate`.
+        self.dormant = dormant
+        #: Called on the voice loop once the conversation is live (built awake, or woken), for the session's timings.
+        self.on_awake: Callable[[dict[str, Any]], None] | None = None
+        #: When it was woken (monotonic), ``None`` while dormant or built awake.
+        self.woken_at: float | None = None
+        #: Whether the shared bridge is wired to this conversation (only once it is live).
+        self._bound = False
         #: Names and terms from memory that speech recognition is told to expect (v3.5, docs/VOICE.md §9).
         self.keyterms = list(keyterms or [])
         self.call_app = call_app
@@ -1985,6 +2017,182 @@ class Conversation:
             except Exception:  # noqa: BLE001 - timings only
                 pass
 
+    # -- standby (v3.11) -----------------------------------------------------------
+
+    @property
+    def ready(self) -> bool:
+        """Dormant with speech recognition connected: a wake can go live at once."""
+        stt = getattr(self, "_stt", None)
+        try:
+            connected = bool(stt is not None and stt._transport_is_active())
+        except Exception:  # noqa: BLE001
+            connected = False
+        return bool(self.dormant and self.stt_ready_at is not None and connected and not self._stop.is_set())
+
+    def activate(self, *, listen_from: float | None, woken_by_name: bool = False, call_app: str | None = None,
+                 call_evidence: str | None = None, heard_at: float | None = None) -> bool:
+        """Go live now (thread-safe): the words said since ``listen_from`` and the live mic go to speech recognition.
+
+        Returns ``False`` when it cannot (not dormant, not connected, stopping): the caller starts one cold.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed() or not self.ready:
+            return False
+        self.dormant = False   # decided now, on the caller's thread: a second wake never takes it twice
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._activate(
+            listen_from, woken_by_name, call_app, call_evidence, heard_at)))
+        return True
+
+    async def _activate(self, listen_from: float | None, woken_by_name: bool, call_app: str | None,
+                        call_evidence: str | None, heard_at: float | None) -> None:
+        now = time.monotonic()
+        self.woken_at = now
+        self.woken_by_name = woken_by_name
+        self.call_app, self.call_evidence = call_app, (call_evidence if call_app else None)
+        # The clocks of a conversation start at the wake, not when it was built.
+        self.started_at = now
+        self.stt_ready_at = now
+        self.observer.last_bot_stop = 0.0
+        self._bind_bridge()
+        stream = getattr(self.transport.input(), "go_live", None)
+        facts: dict[str, Any] = {}
+        if callable(stream):
+            facts = await stream(listen_from)
+        # The pill says "hearing" the moment their words stream (they are usually mid-sentence right after the name).
+        voiced = False
+        if self._voice_activity is not None:
+            try:
+                _since, last = self._voice_activity()
+                voiced = bool(last and now - last < 0.6)
+            except Exception:  # noqa: BLE001
+                voiced = False
+        self.observer.set_state("hearing" if voiced else "listening")
+        self._awake()
+        facts.update(wake_to_live_ms=round((time.monotonic() - heard_at) * 1000) if heard_at else None,
+                     voiced=voiced)
+        self.log.event("session", state="woken", session=self.session, **facts)
+        self._activity.set()
+
+    def _bind_bridge(self) -> None:
+        """Wire the shared bridge (and the talker's hands) to this conversation: once it is live, never while dormant."""
+        if self._bound:
+            return
+        self._bound = True
+        llm, context, summarizer = self._llm, self._llm_context, getattr(self, "_summarizer", None)
+        bridge = self.bridge
+        bridge.attach(self._loop)
+        # Whether the mouth's reply now making a tool call said anything aloud (a stream fact).
+        bridge.spoke_in_reply = lambda: bool(getattr(llm, "_yuki_call", None) is not None
+                                             and llm._yuki_call.first_text is not None)
+        # The say_first words spoken for a silent hand-over belong before its call, too.
+        bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
+        bridge.said_early = lambda call_id: str(call_id) in llm._yuki_early
+        # Whether the mouth run now calling a tool was the user's turn (not a result's).
+        bridge.user_turn = lambda: bool(getattr(llm, "_yuki_call", None) is None or llm._yuki_call.user_turn)
+        # The mouth run answers the first words after the wake word: they were said to Yuki (v3.6).
+        bridge.named_turn = lambda: _Hooks(self).named()
+        bridge.call_mode = lambda: bool(self.call_app)
+        bridge.call_evidence = lambda: self.call_evidence if self.call_app else None
+        bridge.quiet_requested = self.on_quiet
+        # The summary is a user-role message nobody said: never "what the user said" to the thinker;
+        # nor, in a call, what the mouth judged was said to the people on it (it stayed quiet).
+        bridge.not_heard = lambda message: (message is getattr(summarizer, "_summary_message", None)
+                                            or (context is not None and id(message) in quiet_answered(
+                                                context.get_messages())))
+        bridge.on_jobs_changed = self._activity.set
+        bridge.announce = self._announce
+        bridge.gate = self.gate
+        bridge.progress_answerer = self._progress_answer
+        bridge.on_remembered = self._refresh_rules
+        bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
+        # v3.9: the bridge binds each job to the user turn it answers, paces its "still on it" line by real
+        # silence, and says a job's own finishing line by code when no tell_yuki call carries it.
+        bridge.user_turns = lambda: self.observer.user_turns
+        bridge.quiet_for = self._quiet_for
+        bridge.speak = self._speak
+        bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
+            self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
+        hands = getattr(bridge, "hands", None)
+        if hands is not None:
+            hands.on_action = self.observer.hand_acted
+            hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
+                "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name,
+                "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok, "result": report, "ms": ms})
+
+    def _awake(self) -> None:
+        """What a live conversation starts with (built awake, or woken from standby): all in the background."""
+        s = self.settings
+        warm_brain = getattr(self.bridge, "warm_brain", None)
+        if callable(warm_brain):
+            try:
+                warm_brain(float(getattr(s, "voice_cache_refresh_s", 3000.0)))  # the thinker's cache, if gone cold
+            except TypeError:  # a stand-in bridge without the argument
+                warm_brain()
+        hands = getattr(self.bridge, "hands", None)
+        if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
+            hands.prefetch_desk()   # the first reply's desktop block, read while they talk
+        tts = getattr(self, "_tts", None)
+        warm = getattr(tts, "_maybe_warm", None)
+        if callable(warm) and self.woken_at is not None:   # built awake, the voice warms itself as it starts
+            try:
+                warm()   # the voice's connection, if it went idle while dormant
+            except Exception:  # noqa: BLE001 - only a head start
+                pass
+        if self.woken_at is not None and self._loop is not None:
+            # The talker's connection is cold after a quiet spell (its client lets idle connections go): one cached
+            # one-token call opens it while they are still talking, and reads the cache (keeping it warm).
+            asyncio.ensure_future(self._warm())
+        if self.on_awake is not None:
+            try:
+                self.on_awake({"woken": self.woken_at is not None})
+            except Exception:  # noqa: BLE001 - timings only
+                pass
+
+    async def _dormant_upkeep(self) -> bool:
+        """While dormant: keep speech recognition connected and the caches warm. ``False``: this standby is lost.
+
+        Nothing is sent to speech recognition (it gets no audio at all, so nothing is heard or billed); an idle
+        socket stays open on its own (measured: Flux kept one with no audio open for 15 min). A dropped socket ends
+        this standby: the session builds a fresh one in the background, never on a wake's path.
+        """
+        s = self.settings
+        refresh_s = float(getattr(s, "voice_cache_refresh_s", 3000.0))
+        stt = getattr(self, "_stt", None)
+        lost_since: float | None = None
+        last_warm = time.monotonic()
+        while self.dormant and not self._stop.is_set():
+            self._activity.clear()
+            try:
+                await asyncio.wait_for(self._activity.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            if not self.dormant or self._stop.is_set():
+                return True
+            try:
+                connected = bool(stt is None or stt._transport_is_active())
+            except Exception:  # noqa: BLE001
+                connected = False
+            now = time.monotonic()
+            if not connected and self.stt_ready_at is not None:
+                lost_since = lost_since or now
+                if now - lost_since >= 3.0:
+                    self.log.event("session", state="standby_lost", session=self.session, why="stt_closed",
+                                   dormant_s=round(now - self.started_at))
+                    return False
+            else:
+                lost_since = None
+            if now - last_warm >= refresh_s and user_present():
+                # One cached call each an hour keeps both halves warm (their stable layers have a 1 h cache).
+                last_warm = now
+                asyncio.ensure_future(self._warm())
+                warm_brain = getattr(self.bridge, "warm_brain", None)
+                if callable(warm_brain):
+                    try:
+                        warm_brain(refresh_s)
+                    except TypeError:
+                        warm_brain()
+        return True
+
     def interrupt(self) -> None:
         """Cut Yuki's current speech (the cancel hotkey). Thread-safe."""
         loop, worker = self._loop, self.worker
@@ -2033,6 +2241,11 @@ class Conversation:
         async def on_eot(_service: Any, transcript: str) -> None:
             obs.on_eot(transcript)
 
+        async def on_connected(_service: Any) -> None:
+            if self.dormant:
+                self._stt_connected()   # a standby is ready once its socket is up (no audio flows to say so)
+
+        stt.add_event_handler("on_connected", on_connected)
         stt.add_event_handler("on_update", on_update)
         stt.add_event_handler("on_eager_end_of_turn", on_eager)
         stt.add_event_handler("on_end_of_turn", on_eot)
@@ -2058,11 +2271,7 @@ class Conversation:
         llm.register_function("go_quiet", self.bridge.go_quiet)
         hands = getattr(self.bridge, "hands", None)
         if hands is not None:
-            hands.on_action = self.observer.hand_acted
-            self.observer.hands = hands
-            hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
-                "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name, "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok,
-                "result": report, "ms": ms})
+            self.observer.hands = hands   # the hands' own callbacks are bound with the bridge (_bind_bridge)
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
@@ -2133,20 +2342,8 @@ class Conversation:
 
         stt, llm, tts = self._services()
         self._llm = llm
-        # Whether the mouth's reply now making a tool call said anything aloud (a stream fact).
-        self.bridge.spoke_in_reply = lambda: bool(getattr(llm, "_yuki_call", None) is not None
-                                                  and llm._yuki_call.first_text is not None)
-        # The say_first words spoken for a silent hand-over belong before its call, too.
-        self.bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
-        self.bridge.said_early = lambda call_id: str(call_id) in llm._yuki_early
+        self._tts = tts
         self._llm_context: Any = None
-        # Whether the mouth run now calling a tool was the user's turn (not a result's).
-        self.bridge.user_turn = lambda: bool(getattr(llm, "_yuki_call", None) is None or llm._yuki_call.user_turn)
-        # The mouth run answers the first words after the wake word: they were said to Yuki (v3.6).
-        self.bridge.named_turn = lambda: _Hooks(self).named()
-        self.bridge.call_mode = lambda: bool(self.call_app)
-        self.bridge.call_evidence = lambda: self.call_evidence if self.call_app else None
-        self.bridge.quiet_requested = self.on_quiet
         hand_tools = HAND_TOOLS if (self.settings.voice_hands and getattr(self.bridge, "hands", None)) else []
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
@@ -2180,11 +2377,7 @@ class Conversation:
                     max_context_tokens=8000, max_unsummarized_messages=None)),
         )
         settle_only_when_newest(assistant_agg)
-        summarizer = getattr(assistant_agg, "_summarizer", None)
-        # The summary is a user-role message nobody said: never "what the user said" to the thinker;
-        # nor, in a call, what the mouth judged was said to the people on it (it stayed quiet).
-        self.bridge.not_heard = lambda message: (message is getattr(summarizer, "_summary_message", None)
-                                                 or id(message) in quiet_answered(context.get_messages()))
+        self._summarizer = getattr(assistant_agg, "_summarizer", None)
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._stt_connected)
         output = self.transport.output()
@@ -2251,37 +2444,19 @@ class Conversation:
             self.grounder = Grounder(self.memory, facts=s.voice_grounding_facts, log=self.log)
             self.grounder.warm()
             self.observer.grounder = self.grounder
-        self.bridge.attach(self._loop)
-        self.bridge.on_jobs_changed = self._activity.set
         self.observer.idle_state = lambda: "working" if self.bridge.open_voice_jobs() else "listening"
-        self.bridge.announce = self._announce
-        self.bridge.gate = self.gate
-        self.bridge.progress_answerer = self._progress_answer
-        self.bridge.on_remembered = self._refresh_rules
-        self.bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
-        # v3.9: the bridge binds each job to the user turn it answers, paces its "still on it" line by real
-        # silence, and says a job's own finishing line by code when no tell_yuki call carries it.
-        self.bridge.user_turns = lambda: self.observer.user_turns
-        self.bridge.quiet_for = self._quiet_for
-        self.bridge.speak = self._speak
-        self.bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
-            self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
-        warm_brain = getattr(self.bridge, "warm_brain", None)
-        if callable(warm_brain):
-            warm_brain()  # the thinker's prompt cache, when it has gone cold (a thread; v3.6)
-        hands = getattr(self.bridge, "hands", None)
-        if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
-            # The first reply's desktop block, read while speech recognition connects (v3.7: the first turn's
-            # call waited its whole 250 ms bound for a cold read and went without).
-            hands.prefetch_desk()
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
         # While Deepgram connects (2-3 s), off the loop; done long before the first reply. Started
         # after the services are built: they import anthropic, and importing it on two threads at
         # once raised an import deadlock (a stand-in-brain run, where nothing had imported it yet).
         threading.Thread(target=_preimport, name="yuki-voice-preimport", daemon=True).start()
+        if not self.dormant:
+            self._bind_bridge()   # a dormant one binds when woken: it must never take the bridge from a live one
         await runner.add_workers(worker)
-        self.observer.set_state("listening")
+        if not self.dormant:
+            self.observer.set_state("listening")
+            self._awake()   # the thinker's cache, the first desktop block (v3.6, v3.7), in the background
         self.gate.start()
         warm = asyncio.create_task(self._warm())
         watch = asyncio.create_task(self._watch(runner))
@@ -2306,9 +2481,10 @@ class Conversation:
                                **summary)
             await self.gate.stop()
             self.observer.close()
-            self.bridge.closing = True
-            self.bridge.attach(None)
-            self.bridge.announce = None
+            if self._bound:
+                self.bridge.closing = True
+                self.bridge.attach(None)
+                self.bridge.announce = None
             if self.grounder is not None:
                 unloaded = self.grounder.release(busy=self.bridge.brain_busy())
                 timings = sorted(self.grounder.timings)
@@ -2346,7 +2522,8 @@ class Conversation:
 
         try:
             while not self._stop.is_set():
-                hands.refresh_screen_names(changed)
+                if not self.dormant:   # no window reads while waiting for the name
+                    hands.refresh_screen_names(changed)
                 await asyncio.sleep(self.SCREEN_TERMS_EVERY_S)
         except asyncio.CancelledError:
             return
@@ -2383,6 +2560,10 @@ class Conversation:
         watchdog.start()
         try:
             while True:
+                if self.dormant:   # nothing runs on the loop while dormant: look once a second, measure nothing
+                    await asyncio.sleep(1.0)
+                    state["tick"] = time.monotonic() + 1.0
+                    continue
                 started = time.monotonic()
                 await asyncio.sleep(every_s)
                 state["tick"] = time.monotonic()
@@ -2614,7 +2795,7 @@ class Conversation:
 
         try:
             while True:
-                await asyncio.sleep(every_s)
+                await asyncio.sleep(every_s if not self.dormant else 1.0)
                 turn = self._unanswered()
                 obs = self.observer
                 if turn is None or self.worker is None or self._stop.is_set():
@@ -2701,6 +2882,8 @@ class Conversation:
         Yuki, however much the user goes on talking to the people on the call.
         """
         s = self.settings
+        if self.dormant and not await self._dormant_upkeep():
+            self._set_stop("standby_lost")
         last = time.monotonic()
         while True:
             obs = self.observer
@@ -2744,7 +2927,8 @@ class Conversation:
                 self._on_closing(self.reason)
             except Exception:  # noqa: BLE001 - only a hint to the session
                 pass
-        self.bridge.closing = True
+        if self._bound:
+            self.bridge.closing = True
         await runner.cancel()
 
 

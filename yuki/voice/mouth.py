@@ -1055,8 +1055,10 @@ def mouth_system_blocks(
         marked.append(block)
     if not marked:
         marked.append(blocks[0])
+    from yuki.agent.prompt import STABLE_CACHE_CONTROL
+
     for block in marked:
-        block["cache_control"] = {"type": "ephemeral"}
+        block["cache_control"] = dict(STABLE_CACHE_CONTROL)   # an hour: kept warm between conversations (v3.11)
     return blocks
 
 

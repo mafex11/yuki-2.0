@@ -12,6 +12,12 @@ States, and what each one costs:
   ``yuki-voice`` thread runs ``asyncio.run`` with the Pipecat pipeline
   (:class:`~yuki.voice.pipeline.Conversation`); Deepgram, Bedrock and the TTS
   are connected only for its length. It ends by itself when quiet.
+* **standby** (v3.11, ``voice_standby``, while listening for the name): the next conversation is built
+  ahead on a ``yuki-voice-standby`` thread and waits dormant: speech recognition's socket open with no
+  audio sent (no microphone subscription at all), the talker's and thinker's caches warm (an hour's cache,
+  read again hourly while the user is at the PC), no speaker or echo canceller held. The name wakes it: the
+  words said since the name stream at once, the speaker opens alongside. Lost or ended, the next one is built
+  in the background; with none ready, a wake starts one the v3.10 way.
 
 On speakers the conversation's :class:`~yuki.voice.echo.EchoGuard` keeps Yuki from
 hearing herself (WebRTC echo cancellation, else half duplex; docs/VOICE.md §11). In
@@ -168,6 +174,8 @@ class VoiceSession(QObject):
     _thread_state = Signal(str, str)
     _thread_done = Signal(str, str)
     _closing = Signal(str)
+    #: A standby conversation ended without being woken (``reason``; v3.11): the next one is built in the background.
+    _standby_done = Signal(str)
 
     #: The device classes (a test or the offline harness replaces them with files; rule 7).
     mic_factory: Any = None
@@ -219,6 +227,12 @@ class VoiceSession(QObject):
         self._devices_seen.connect(self._on_devices_seen)
         self._closing.connect(self._on_closing)
         self._quiet_asked.connect(self._go_quiet)
+        self._standby_done.connect(self._on_standby_done)
+        #: The conversation built ahead and waiting for the name (v3.11): its thread and the conversation.
+        self._standby_thread: threading.Thread | None = None
+        self._standby_conv: Any = None
+        self._standby_output: Any = None
+        self._standby_failures = 0
         #: A conversation decided to end and is tearing down (the wake word listens again).
         self.closing = False
         self._pending_wake: tuple[float, float, float] | None = None
@@ -245,6 +259,9 @@ class VoiceSession(QObject):
         self._quiet_timer = QTimer(self)
         self._quiet_timer.setSingleShot(True)
         self._quiet_timer.timeout.connect(self._quiet_over)
+        self._standby_timer = QTimer(self)
+        self._standby_timer.setSingleShot(True)
+        self._standby_timer.timeout.connect(self._ensure_standby)
 
     # -- public (GUI thread) ------------------------------------------------------
 
@@ -286,6 +303,8 @@ class VoiceSession(QObject):
         settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
         log = self.log
         self._prewarm_job = _background(lambda: _prewarm(settings, log), "yuki-voice-prewarm")
+        # Then the whole conversation is built and waits for the name (v3.11): the first "Yuki" goes live at once.
+        self._arm_standby(3000)
 
     def toggle_conversation(self, via: str = "hotkey") -> None:
         if self.in_conversation:
@@ -305,18 +324,29 @@ class VoiceSession(QObject):
         """
         if self.in_conversation:
             return False
-        session = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         started = heard_at if heard_at is not None else time.monotonic()
         if name_end:
             listen_from = name_end
         else:
             listen_from = (wake_at - WAKE_PREROLL_S) if wake_at is not None else time.monotonic()
         self.closing = False
+        if self._listener is not None:
+            self._listener.pause()
+        if self._wake_standby(via, listen_from, started, bool(name_end)):
+            return True
+        return self._start_cold(via, listen_from, started, bool(name_end))
+
+    def _start_cold(self, via: str, listen_from: float, started: float, name_cut: bool) -> bool:
+        """Build and start a conversation now (no standby was ready): the v3.10 path."""
+        if self.in_conversation:
+            return False
+        session = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+        self.closing = False
         self._set_state("starting", via)
         if self._listener is not None:
             self._listener.pause()
         self._thread = threading.Thread(target=self._thread_main,
-                                        args=(session, via, listen_from, started, self.call_app, bool(name_end)),
+                                        args=(session, via, listen_from, started, self.call_app, name_cut),
                                         name="yuki-voice", daemon=True)
         self._thread.start()
         self.conversation_changed.emit(True)
@@ -659,6 +689,7 @@ class VoiceSession(QObject):
 
         forget_tts_check()
         self.log.event("voice_id", state="set" if voice else "default", chars=len(voice))
+        self.rebuild_standby()   # the next conversation speaks with the new voice
 
     def on_call_status(self, status: object) -> None:
         """Memory's call status changed (``CallController.changed``): call mode on or off.
@@ -679,9 +710,9 @@ class VoiceSession(QObject):
                 self.log.event("wake", state="call_on" if active else "call_off",
                                listening=bool(self.wake_enabled and self._wake_allowed()),
                                **({"evidence": evidence} if active else {}))
-            conversation = self._conversation
-            if conversation is not None:
-                conversation.set_call(app, evidence)
+            for conversation in (self._conversation, self._standby_conv):
+                if conversation is not None:
+                    conversation.set_call(app, evidence)
             self._apply_wake()
 
     def owns(self, job_id: int) -> bool:
@@ -695,6 +726,8 @@ class VoiceSession(QObject):
 
     def shutdown(self) -> None:
         """App exit: end the conversation (bounded join), stop listening, close the mic."""
+        self._standby_timer.stop()
+        self._drop_standby("quit", wait_s=3.0)
         self.stop_conversation("quit", wait_s=5.0)
         self._stop_listener()
         self._close_mic()
@@ -769,6 +802,8 @@ class VoiceSession(QObject):
 
     def _apply_wake(self) -> None:
         if self._wake_allowed():
+            if not self.in_conversation and self._standby_conv is None and not self._standby_timer.isActive()                     and getattr(self, "_prewarmed", False):
+                self._arm_standby(2000)
             try:
                 self._ensure_listener()
                 if not self.in_conversation:
@@ -777,6 +812,7 @@ class VoiceSession(QObject):
                 self._set_state("error", f"Can't listen for 'Yuki': {exc}")
                 self.log.event("wake", state="error", error=f"{type(exc).__name__}: {exc}")
         else:
+            self._drop_standby("wake_off")
             self._stop_listener()
             if not self.in_conversation:
                 self._close_mic()
@@ -865,6 +901,7 @@ class VoiceSession(QObject):
             self._set_state(state, detail)
 
     def _on_thread_done(self, reason: str, error: str) -> None:
+        self._arm_standby(1500 if not error else 10_000)   # the next conversation waits ready for the name (v3.11)
         self._thread = None
         self._conversation = None
         self.speaker_used = None
@@ -883,6 +920,268 @@ class VoiceSession(QObject):
         elif pending is not None and time.monotonic() - pending[1] < PENDING_WAKE_S and self._wake_allowed():
             self.start_conversation("wake", wake_at=pending[0], heard_at=pending[1], name_end=pending[2] or None)
 
+    # -- standby: the conversation built ahead of the name (v3.11) --------------------------------------------------
+
+    #: Waits (ms) before building the next standby after one was lost: each failure doubles it, up to the last.
+    STANDBY_BACKOFF_MS = (5_000, 30_000, 120_000, 600_000)
+
+    def _arm_standby(self, delay_ms: int) -> None:
+        if getattr(self.settings, "voice_standby", True):
+            self._standby_timer.start(max(0, int(delay_ms)))
+
+    def _ensure_standby(self) -> None:
+        """Build the next conversation now, dormant (GUI thread): when the name is on and nothing else runs.
+
+        Everything a conversation needs is made and connected here, off the wake's path: the services, speech
+        recognition's socket (sent no audio at all while it waits), the talker's and thinker's caches. What is not
+        held while waiting: the speaker (an open output keeps the PC awake), the echo canceller's processing and the
+        microphone subscription.
+        """
+        if not getattr(self.settings, "voice_standby", True) or not self._wake_allowed():
+            return
+        if self.in_conversation or (self._standby_thread is not None and self._standby_thread.is_alive()):
+            return
+        from yuki.voice.keys import DEEPGRAM, get_key
+
+        if not get_key(DEEPGRAM):
+            return
+        session = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+        self._standby_thread = threading.Thread(target=self._standby_main, args=(session,), name="yuki-voice-standby",
+                                                daemon=True)
+        self._standby_thread.start()
+
+    def _drop_standby(self, reason: str, wait_s: float = 0.0) -> None:
+        conversation, thread = self._standby_conv, self._standby_thread
+        if conversation is not None:
+            conversation.request_stop(reason)
+        if wait_s and thread is not None:
+            thread.join(timeout=wait_s)
+
+    def _on_standby_done(self, reason: str) -> None:
+        """A standby ended unwoken: build the next one (at once after a normal end, with a backoff after a failure)."""
+        self._standby_thread = None
+        self._standby_conv = None
+        self._standby_output = None
+        if reason in ("wake_off", "quit", "rebuild"):
+            if reason == "rebuild":
+                self._arm_standby(500)
+            return
+        self._standby_failures += 1
+        wait = self.STANDBY_BACKOFF_MS[min(self._standby_failures - 1, len(self.STANDBY_BACKOFF_MS) - 1)]
+        self._arm_standby(wait)
+
+    def rebuild_standby(self) -> None:
+        """A setting it was built with changed (the voice, the microphone): the next one is built afresh."""
+        if self._standby_conv is not None:
+            self._drop_standby("rebuild")
+        else:
+            self._arm_standby(500)
+
+    def _standby_main(self, session: str) -> None:
+        """The ``yuki-voice-standby`` thread: build a dormant conversation and run it until woken or lost."""
+        from dataclasses import replace
+
+        from yuki.voice.mouth import fetch_memory
+        from yuki.voice.pipeline import preflight
+
+        started = time.monotonic()
+        reason, error = "error", ""
+        conversation = None
+        settings = conversation_settings(self.settings, load_prefs(self._prefs_path))
+        prewarming = getattr(self, "_prewarm_job", None)
+        importer = (prewarming if prewarming is not None and not prewarming.done()
+                    else _background(_import_pipeline, "yuki-voice-import"))
+        from yuki.voice.keyterms import memory_keyterms
+
+        keyterms_job = _background(lambda: memory_keyterms(self.memory, limit=settings.voice_keyterms_max),
+                                   "yuki-voice-keyterms")
+        def on_speakers() -> bool:
+            try:
+                from yuki.voice.audio import headphones_check
+
+                ok, _facts = headphones_check(settings.voice_headphone_devices,
+                                              device=self._output_target(self._resolve("render", quiet=True)))
+                return not ok
+            except Exception:  # noqa: BLE001
+                return True
+
+        if not self._aec.get("apm") and settings.voice_echo != "full" and on_speakers():
+            # The echo canceller is loaded while waiting, not on the wake (the first reply can come ~2 s after the
+            # name, before a canceller loaded then would be ready: offline 2026-09-28 Yuki heard her own answer).
+            def load_aec() -> None:
+                from yuki.voice.echo import load_apm
+
+                apm, why = load_apm()
+                if apm is not None and not self._aec.get("apm"):
+                    self._aec = {"output": None, "apm": apm, "converged": False}
+                elif apm is None:
+                    self.log.event("echo", state="aec_unavailable", why=why)
+
+            _background(load_aec, "yuki-voice-aec")
+        try:
+            mic = self._ensure_mic()
+            facts = preflight(settings, need_headphones=False)
+            if facts.get("tts_voice"):
+                settings = replace(settings, voice_tts_voice=facts["tts_voice"])
+            mouth_memory = fetch_memory(self.memory)
+            try:
+                keyterms, keyterm_facts = keyterms_job.result(timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 - recognition works without them
+                keyterms, keyterm_facts = [], {"terms": 0, "error": type(exc).__name__}
+            importer.result()
+            from pipecat.transports.base_transport import TransportParams
+
+            from yuki.voice.pipeline import Conversation
+            from yuki.voice.transport import MicInput, PairTransport, SpeakerOutput
+
+            params = TransportParams(audio_in_enabled=True, audio_in_sample_rate=16_000,
+                                     audio_out_enabled=True, audio_out_sample_rate=24_000)
+            mic_input = MicInput(mic, params, dormant=True)
+            output = SpeakerOutput(None, params)
+            box: dict[str, Any] = {}
+
+            def closing(why: str) -> None:
+                conv = box.get("conv")
+                if conv is not None and conv.woken_at is not None:
+                    self._closing.emit(why)   # only a woken one is the user's conversation
+
+            conversation = Conversation(
+                settings=settings, bridge=self.bridge, transport=PairTransport(mic_input, output), memory=self.memory,
+                mouth_memory=mouth_memory, log=self.log,
+                speech_end=lambda: mic.stats.last_voiced or None,
+                voice_activity=lambda: (mic.stats.voiced_since, mic.stats.last_voiced),
+                on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
+                tts_provider=facts.get("tts_provider"), call_app=self.call_app, on_closing=closing,
+                extra_observers=list(self.extra_observers), keyterms=keyterms, on_chat=self._chat,
+                call_evidence=self.call_evidence if self.call_app else None, on_quiet=self.go_quiet, dormant=True)
+            box["conv"] = conversation
+
+            def connected() -> None:
+                if box.get("ready"):
+                    return
+                box["ready"] = True
+                self._standby_failures = 0
+                self.log.event("standby", state="ready", session=session,
+                               built_ms=round((time.monotonic() - started) * 1000),
+                               tts=facts.get("tts_provider"), keyterms=keyterm_facts)
+
+            conversation.on_stt_connected = connected
+            self._standby_output = output
+            self._standby_conv = conversation
+            conversation._standby_meta = {"session": session, "settings": settings, "facts": facts, "mic_input": mic_input,
+                                  "mouth_memory": mouth_memory, "keyterms": keyterm_facts}
+            reason = asyncio.run(conversation.run())
+            if conversation.observer.fatal:
+                error = _plain_error(conversation.observer.fatal)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised into Qt
+            error = _plain_error(f"{type(exc).__name__}: {exc}")
+        finally:
+            woken = conversation is not None and conversation.woken_at is not None
+            if not woken:
+                self.log.event("standby", state="stop", session=session, reason=reason, error=error or None,
+                               dormant_s=round(time.monotonic() - started))
+                self._standby_done.emit(reason if not error else "error")
+            else:
+                self._finish_woken(conversation, reason, error, settings)
+
+    def _wake_standby(self, via: str, listen_from: float, started: float, name_cut: bool) -> bool:
+        """Wake the dormant conversation (GUI thread): its words stream at once, the devices open alongside."""
+        conversation = self._standby_conv
+        if conversation is None or not getattr(conversation, "ready", False):
+            return False
+        listener = self._listener
+        woken_by_name = (via == "wake" and name_cut and not bool(getattr(listener, "rescued", False)))
+        if not conversation.activate(listen_from=listen_from, woken_by_name=woken_by_name, call_app=self.call_app,
+                                     call_evidence=self.call_evidence, heard_at=started):
+            return False
+        self._thread, self._standby_thread = self._standby_thread, None
+        self._conversation, self._standby_conv = conversation, None
+        output, self._standby_output = self._standby_output, None
+        self.conversation_changed.emit(True)
+        self._set_state("hearing" if self._mic is not None and time.monotonic() - (self._mic.stats.last_voiced or 0)
+                        < 0.6 else "listening", "")
+        threading.Thread(target=self._open_for_wake, args=(conversation, output, via, listen_from, started),
+                         name="yuki-voice-wake-devices", daemon=True).start()
+        return True
+
+    def _open_for_wake(self, conversation: Any, output: Any, via: str, listen_from: float, started: float) -> None:
+        """The woken conversation's speaker and echo guard (its words already stream to speech recognition)."""
+        from yuki.voice.audio import headphones_check
+        from yuki.voice.echo import choose_mode, tone
+
+        meta = getattr(conversation, "_standby_meta", {}) or {}
+        settings = meta.get("settings") or self.settings
+        timings: dict[str, Any] = {"thread": round((time.monotonic() - started) * 1000), "stt_connected": 0,
+                                   "replay_from_ms": round((listen_from - started) * 1000), "standby": True}
+        try:
+            mic = self._ensure_mic()
+            speaker, out_facts = self._open_output(self._resolve("render"))
+            self._speaker = speaker
+            self.speaker_used = out_facts.get("device")
+            timings["speaker"] = round((time.monotonic() - started) * 1000)
+            on_headphones, heard = headphones_check(settings.voice_headphone_devices, device=out_facts.get("device"))
+            if settings.voice_require_headphones and not on_headphones:
+                speaker.close()
+                self._speaker = None
+                conversation.request_stop("error")
+                self.notice(f"Voice needs headphones: sound is going to {heard.get('device') or 'the speakers'}.")
+                return
+            mode, why = choose_mode(on_headphones, preference=settings.voice_echo)
+            guard = self._echo_guard(mode, out_facts.get("device"), speaker, mic)
+            self._guard = guard
+            mic.set_echo(guard)
+            output.set_speaker(speaker)
+            self.devices_changed.emit(self.devices_text())
+            if settings.voice_wake_chime and via == "wake":
+                threading.Thread(target=lambda: speaker.write(tone("listening"), gate=False),
+                                 name="yuki-voice-chime", daemon=True).start()
+            if self._output_note(out_facts):
+                self._thread_state.emit("note", self._output_note(out_facts))
+            timings["listening"] = round((time.monotonic() - started) * 1000)
+            self.last_timings = timings
+            facts = meta.get("facts") or {}
+            memory = meta.get("mouth_memory")
+            self.log.event("session", state="start", session=conversation.session, via=via, standby=True,
+                           mic=mic.device_used, output=out_facts.get("device"), output_found=out_facts.get("found"),
+                           output_latency_ms=out_facts.get("output_latency_ms"), headphones=heard, echo=mode,
+                           echo_why=why, call_mode=bool(self.call_app), stt=self.settings.voice_stt_model,
+                           mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
+                           memory=memory.facts() if memory is not None else None, keyterms=meta.get("keyterms"),
+                           timings_ms=dict(timings))
+        except Exception as exc:  # noqa: BLE001 - the conversation goes on without a voice; said in the pill
+            self.log.event("session", state="wake_devices_error", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            conversation.request_stop("error")
+
+    def _finish_woken(self, conversation: Any, reason: str, error: str, settings: Any) -> None:
+        """A woken standby conversation ended: the same closing as a cold one."""
+        started = conversation.woken_at or time.monotonic()
+        speaker, self._speaker = self._speaker, None
+        if speaker is not None:
+            speaker.close()
+        guard = self._guard
+        if guard is not None:
+            guard.close()
+            if guard.converged and self._aec.get("apm") is not None:
+                self._aec["converged"] = True
+            self.log.event("echo", op="summary", session=conversation.session, mode=guard.mode,
+                           effective=guard.effective, **guard.stats.facts())
+        if self._mic is not None:
+            self.log.event("mic", state="levels", **self._mic.stats.levels())
+        obs = conversation.observer
+        mic_input = (getattr(conversation, "_standby_meta", {}) or {}).get("mic_input")
+        timings = dict(self.last_timings or {})
+        if mic_input is not None:
+            timings["kept_s"] = round(mic_input.kept_s, 2)
+            timings["replayed_s"] = round(mic_input.replayed_s, 2)
+            self.last_timings = timings
+        self.log.event("session", state="stop", session=conversation.session, reason=reason, error=error or None,
+                       seconds=round(time.monotonic() - started, 1), turns=obs.totals["turns"],
+                       for_others=obs.totals.get("for_others", 0), mouth_cost_usd=round(obs.totals["mouth_cost_usd"], 5),
+                       tts_chars=obs.totals["tts_chars"],
+                       stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
+                       timings_ms=timings, standby=True)
+        self._thread_done.emit(reason, error)
+
     def _echo_guard(self, mode: str, output: str | None, speaker: Any, mic: Any) -> Any:
         """The conversation's echo guard for ``mode``, with the canceller loading off this thread."""
         from yuki.voice.echo import EchoGuard, PlaybackTimeline, load_apm
@@ -894,7 +1193,10 @@ class VoiceSession(QObject):
         guard = EchoGuard(mode, timeline, tail_s=self.settings.voice_echo_tail_ms / 1000.0,
                           input_latency_s=getattr(mic, "input_latency_s", 0.02), log=self.log)
         if mode == "aec":
-            kept = self._aec if self._aec.get("output") == output else {}
+            # A canceller loaded ahead by the standby (for no output in particular) is taken by the first one.
+            kept = self._aec if self._aec.get("output") in (output, None) else {}
+            if kept and kept.get("output") is None:
+                kept["output"] = output
             if kept.get("apm") is not None:
                 guard.attach_apm(kept["apm"])
                 guard.converged = bool(kept.get("converged"))

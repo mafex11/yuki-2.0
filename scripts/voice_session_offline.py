@@ -56,7 +56,8 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider="deepgram",
                         voice_tts_voice="aura-2-thalia-en", voice_grounding=False, voice_idle_s=args.idle,
                         voice_idle_max_s=max(args.idle, 12.0), voice_call_idle_s=args.call_idle,
-                        voice_echo=echo_pref)
+                        voice_echo=echo_pref, **({"voice_standby": False} if getattr(args, "no_standby", False)
+                                                  and "voice_standby" in Settings.__dataclass_fields__ else {}))
     manifest = {c["name"]: c for c in json.loads((args.clips / "manifest.json").read_text(encoding="utf-8"))}
 
     def clip(name: str) -> Any:
@@ -108,11 +109,23 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         return check
 
     def prewarmed() -> Any:
-        """True once the session's background prewarm has finished (v3.5: the first wake after it)."""
+        """True once the session's background prewarm has finished (v3.5: the first wake after it), and, with the
+        v3.11 standby, once the conversation built ahead is connected and waiting for the name."""
         def check() -> bool:
             job = getattr(session, "_prewarm_job", None)
-            return job is not None and job.done()
+            if job is None or not job.done():
+                return False
+            if not getattr(settings, "voice_standby", False) or not hasattr(session, "_standby_conv"):
+                return True
+            conv = session._standby_conv
+            return conv is not None and conv.ready
         return check
+
+    def standby_again(for_s: float = 1.5) -> Any:
+        """No conversation for ``for_s`` and (v3.11) the next standby waiting: a warm wake, as between two requests."""
+        gone = no_conversation(for_s)
+        ready = prewarmed()
+        return lambda: gone() and ready()
 
     names: list[str] = []
     if scenario == "echo":
@@ -133,15 +146,20 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     elif scenario == "latency":
         gap = 0.35
         first = prewarmed() if args.prewarm else None
-        if args.one_breath:
+        if args.breath:
+            # v3.11: a one-breath "Yuki <command>" clip with its true name end (recognition's word times), twice.
+            lines = [(args.breath, args.first_after, first), (args.breath, 1.0, standby_again(1.5))]
+        elif args.one_breath:
             # "Yuki, pause the music." in one breath, twice (v3.5): the words right after the name.
-            lines = [("k_pause", args.first_after, first), ("k_pause", 1.0, no_conversation(1.5))]
+            lines = [("k_pause", args.first_after, first), ("k_pause", 1.0, standby_again(1.5))]
         else:
             lines = [("k_name", 1.0, first), ("k_pause_cmd", gap, None), ("k_name", 1.0, no_conversation(1.5)),
                      ("k_pause_cmd", gap, None)]
         script = [(clip(n), after, wait) for n, after, wait in lines]
         names = [n for n, _a, _w in lines]
         box["name_end_s"] = speech_end_offset(clip("k_name"))  # "Yuki" said alone; in k_pause it ends about as soon
+        if args.breath:
+            box["name_end_s"] = float(manifest[args.breath]["name_end"])
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
@@ -219,7 +237,8 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     if scenario == "latency" and mic is not None:
         rows = []
         for i, (a, heard) in enumerate(wakes):
-            k = (0 if i == 0 else 1) if args.one_breath else (0 if i == 0 else 2)
+            one = args.one_breath or bool(args.breath)
+            k = (0 if i == 0 else 1) if one else (0 if i == 0 else 2)
             if k >= len(mic.lines):
                 break
             word_end = mic.lines[k]["started_at"] + box["name_end_s"]
@@ -229,9 +248,12 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                             and key != "replayed_s"})
                 row["replayed_s"] = timings[i].get("replayed_s")
             # The request's own end (the last line of this wake): when it was transcribed and acted on.
-            last = mic.lines[k + (0 if args.one_breath else 1)] if k + (0 if args.one_breath else 1) < len(mic.lines) else None
+            step = 0 if one else 1
+            hearing = [t for t, st, _d in states if st == "hearing" and t > heard]
+            row["name_end_to_hearing_ms"] = round((hearing[0] - word_end) * 1000) if hearing else None
+            last = mic.lines[k + step] if k + step < len(mic.lines) else None
             if last is not None:
-                said_end = last["started_at"] + speech_end_offset(clip(names[k + (0 if args.one_breath else 1)])) - t0
+                said_end = last["started_at"] + speech_end_offset(clip(names[k + step])) - t0
                 nxt = heard + 60
                 heard_t = [e["t"] for e in timeline.events if e["kind"] == "user" and e["t"] > said_end - 0.2]
                 acted = [e["t"] for e in timeline.events if e["kind"] == "action" and e["t"] > said_end - 0.2]
@@ -289,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--first-after", dest="first_after", type=float, default=1.0,
                     help="latency --one-breath: seconds of room before the first line")
     ap.add_argument("--prewarm", action="store_true", help="latency: prewarm in the background before the first wake")
+    ap.add_argument("--breath", default="", help="latency: a one-breath clip with its name_end in the manifest (v3.11)")
+    ap.add_argument("--no-standby", dest="no_standby", action="store_true", help="v3.11: build on the wake (before)")
     ap.add_argument("--one-breath", dest="one_breath", action="store_true",
                     help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
     args = ap.parse_args(argv)
