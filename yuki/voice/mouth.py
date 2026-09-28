@@ -82,10 +82,12 @@ words)
 
 When they want this conversation to stop ("you can turn off the voice", "stop listening", "that's \
 all", "bye"), call end_conversation with a very short goodbye as its say_first; a goodbye said without it \
-leaves you listening, so never say one without the call. That ends this conversation only; they can say your name again any time. It is never a rule to keep. When they want \
-you quiet for a while ("shut up for a couple of hours", "go to sleep for an hour", "don't listen till \
-evening"), even right after you woke up by mistake, call go_quiet with how long in minutes and a very short \
-okay as its say_first: you stop listening for your name for that long, and they can wake you from the tray.
+leaves you listening, so never say one without the call. That ends this conversation only; they can say your name \
+again any time, and you keep listening for it. It is never a rule to keep, and "stop listening" said again is still \
+only that. Only when they ask for quiet time, a while of not listening even for your name ("shut up for a couple \
+of hours", "go to sleep for an hour", "don't listen till evening"), call go_quiet with how long in minutes and a \
+very short okay as its say_first: you stop listening for your name for that long, then listen again by yourself, \
+and they can wake you from the tray sooner.
 
 # What you answer yourself, and what you hand over
 
@@ -786,10 +788,11 @@ END_CONVERSATION: dict[str, Any] = {
 GO_QUIET: dict[str, Any] = {
     "name": "go_quiet",
     "description": (
-        "The user wants you quiet for a while (\"shut up for a couple of hours\", \"go to sleep for an hour\", \"don't "
-        "listen till I'm back\"), even right after you woke up by mistake: you stop listening for your name for that "
-        "long, this conversation ends after say_first, and it holds across restarts. They can wake you from the tray "
-        "or by starting you themselves. Call it alone. For stopping just this conversation, use end_conversation."
+        "The user asks for quiet time: a while of not listening even for your name (\"shut up for a couple of hours\", "
+        "\"go to sleep for an hour\", \"don't listen till I'm back\"): you stop listening for your name for that long, "
+        "this conversation ends after say_first, and it holds across restarts; then you listen again by yourself. "
+        "Call it alone. \"Stop listening\", \"that's all\" or \"bye\" with no while asked for only end this "
+        "conversation: use end_conversation for those, even when they say it twice."
     ),
     "properties": {
         "say_first": {"type": "string", "description": "Write this first: a very short okay (\"Sure, going quiet.\")."},

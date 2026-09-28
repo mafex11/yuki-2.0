@@ -209,6 +209,9 @@ class VoiceSession(QObject):
         except (TypeError, ValueError):
             self.quiet_until = 0.0
         if self.quiet_until <= time.time():
+            if self.quiet_until:   # it ran out while Yuki was not running: listening again, and the note is gone
+                prefs.pop("quiet_until", None)
+                save_prefs(prefs, prefs_path)
             self.quiet_until = 0.0
         self.call_active = False
         #: The app of the voice call going on (call mode), ``None`` when there is none.
@@ -359,15 +362,29 @@ class VoiceSession(QObject):
         if wait_s and self._thread is not None:
             self._thread.join(timeout=wait_s)
 
-    def set_wake(self, enabled: bool) -> None:
-        """The tray's "Listen for 'Yuki'" switch (remembered)."""
+    def set_wake(self, enabled: bool, *, by: str = "user") -> None:
+        """The user's own "Listen for 'Yuki'" switch (the tray, the window): remembered.
+
+        Only this persists ``wake: false``: a timed quiet ("quiet for two hours") keeps a quiet-until time instead
+        and never touches it (v3.13: live 2026-09-28 a click during a quiet hour left the wake word off for good, and
+        every later start came up deaf). Turning it on also ends a quiet period: the user wants to be heard now.
+        """
         self.wake_enabled = bool(enabled)
         prefs = load_prefs(self._prefs_path)
         prefs["wake"] = self.wake_enabled
         save_prefs(prefs, self._prefs_path)
-        self.log.event("wake", state="enabled" if enabled else "disabled")
+        self.log.event("wake", state="enabled" if enabled else "disabled", by=by, quiet=self.quiet)
+        if enabled and self.quiet:
+            self._quiet_over(by=by)
         self._apply_wake()
         self.wake_changed.emit(self.wake_enabled)
+
+    @property
+    def listening_state(self) -> str:
+        """``"on"`` (listening for the name), ``"quiet"`` (a timed quiet holds) or ``"off"`` (the user switched it off)."""
+        if not self.wake_enabled:
+            return "off"
+        return "quiet" if self.quiet else "on"
 
     # -- quiet for a while (v3.10) ------------------------------------------------------
 

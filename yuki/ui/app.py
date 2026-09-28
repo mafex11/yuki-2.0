@@ -943,8 +943,17 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     ui.voice.conversation_changed.connect(show_voice)
     menu.addAction(voice_item)
     wake_item = QAction("Listen for \u2018Yuki\u2019", menu, checkable=True)
-    wake_item.setChecked(ui.voice.wake_enabled)
     wake_item.triggered.connect(lambda checked: ui.voice.set_wake(bool(checked)))
+
+    def show_wake(on: bool) -> None:
+        # v3.13: off is said plainly (it stays off across restarts until turned on here or in the window)
+        wake_item.blockSignals(True)
+        wake_item.setChecked(bool(on))
+        wake_item.setText("Listen for \u2018Yuki\u2019" if on else "Listen for \u2018Yuki\u2019 (off: Yuki can't hear you)")
+        wake_item.blockSignals(False)
+
+    ui.voice.wake_changed.connect(show_wake)
+    show_wake(ui.voice.wake_enabled)
     menu.addAction(wake_item)
     # "Go quiet for a couple of hours" (v3.10): shown while it holds, with the time it ends; clicking wakes her now.
     quiet_item = QAction("", menu)

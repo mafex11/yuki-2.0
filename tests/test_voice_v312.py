@@ -276,3 +276,66 @@ def test_the_process_listener_forwards_audio_and_reports_the_name() -> None:
     finally:
         listener.stop()
     assert not listener.running
+
+
+# -- 7. timed quiet never turns listening off for good (v3.13) ---------------------------------------------------------
+
+def _session(tmp: Path) -> Any:
+    from PySide6.QtCore import QObject
+
+    from yuki.config import Settings
+    from yuki.voice.session import VoiceSession
+
+    session = VoiceSession(Settings(log_dir=tmp / "sessions", requests_csv=tmp / "r.csv"), QObject(), None,
+                           prefs_path=tmp / "voice.json")
+    session.play_tone = lambda *a: None
+    session._ensure_listener = lambda: None   # never a real listener
+    session._stop_listener = lambda: None
+    return session
+
+
+def test_a_timed_quiet_never_persists_wake_off(tmp_path: Path) -> None:
+    import json
+
+    from PySide6.QtCore import QCoreApplication
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+    s = _session(tmp_path)
+    s.go_quiet(60)
+    app.processEvents()
+    prefs = json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))
+    assert prefs.get("wake", True) is True and prefs["quiet_until"] > time.time()
+    assert s.listening_state == "quiet" and not s._wake_allowed()
+
+
+def test_boot_after_the_quiet_ran_out_listens_again(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "voice.json").write_text(json.dumps({"wake": True, "quiet_until": time.time() - 5}), encoding="utf-8")
+    s = _session(tmp_path)
+    assert s.listening_state == "on" and s._wake_allowed()
+    assert "quiet_until" not in json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))
+
+
+def test_only_the_users_own_switch_turns_listening_off_and_turning_it_on_ends_a_quiet(tmp_path: Path) -> None:
+    import json
+
+    from PySide6.QtCore import QCoreApplication
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+    s = _session(tmp_path)
+    s.go_quiet(120)
+    app.processEvents()
+    s.set_wake(True)   # the window's key during the quiet: "listen now"
+    assert s.listening_state == "on" and not s.quiet
+    s.set_wake(False)  # the user's explicit off: remembered, said plainly
+    assert s.listening_state == "off"
+    assert json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))["wake"] is False
+    assert _session(tmp_path).listening_state == "off"   # a restart keeps the user's own off
+
+
+def test_stop_listening_alone_ends_the_conversation_and_is_never_quiet_time() -> None:
+    from yuki.voice.mouth import GO_QUIET, MOUTH_PROMPT
+
+    assert "you keep listening for it" in MOUTH_PROMPT
+    assert "use end_conversation for those" in GO_QUIET["description"]
