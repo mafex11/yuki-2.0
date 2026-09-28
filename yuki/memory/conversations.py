@@ -123,7 +123,7 @@ durable facts about the user to Yuki's journal.
 
 WHO THE USER IS: {identity} In everything you write, the user is "the user", never their name.
 
-Standing items (each has an id C<n>) are of four kinds:
+Standing items (each has an id C<n>) are of five kinds:
 - rule: a standing instruction the user gave about how Yuki should talk to them or behave, \
 meant to hold beyond the current request: what to call them, tone, language, length, format, \
 what to do or never do (without asking). Examples: "call me captain always", "keep your answers \
@@ -151,6 +151,25 @@ of the card it answers (CARD N<n> under the exchange), or 0 when it is about the
 in general; subject names the kind of card as the card shows it ("call-back after a switch", \
 "break suggestion", "reminder from a call"); text says what it tells the coach about that kind \
 of card; quote holds their words.
+- resource: one of the user's OWN things they name or use in the exchanges, that Yuki should know \
+next time without asking: their websites and portfolio, their accounts, usernames and email \
+addresses, their repos, their projects' links, their channels. "my portfolio", "my site", "my \
+email", "our repo", an address they had Yuki type into a sign-in or form for them, a page of theirs \
+Yuki opened that shows their name. Not a site or account they only visit or use (YouTube, a \
+friend's channel, a search), and never a password, code, key or card number. value is the \
+identifier itself, exactly as it is spelled: take the spelling from what actually worked - the \
+address Yuki's actions show opened (the page it landed on), the text it typed, the user's own \
+correction ("no, it's ...") - never a misheard first try the user corrected or that failed. Speech \
+recognition mishears names: when the user's words and what opened differ, what opened and the \
+user's correction win. Record each resource once, in its final form: when the user corrects it within the exchanges (a spelling, "no, not in Hindi, in English"), only the corrected one is recorded, never also the first try. text says whose it is and what it is ("The user's portfolio website is \
+janedoe.dev (https://www.janedoe.dev/, a page titled with their name)."), subject what it is, \
+only as the exchanges show it ("portfolio website", "email address"; "work email" only when they say \
+so), keyterms the one to three words speech recognition must hear \
+right when the user says it ("janedoe"), never common words. An address or name the user only \
+dictated, with nothing on screen confirming its spelling, is still recorded, spelled as you best \
+read their words. When the user gives a new or corrected one for the same thing, UPDATE it; when \
+they say it is not theirs or not in use any more, INVALIDATE it as revoked. A resource is not \
+also a journal fact.
 
 Replies to cards: when a NEW exchange answers a card (a CARD line follows it), ADD one feedback \
 item for that card (or UPDATE the feedback already recorded on the same kind of card), quoting \
@@ -190,7 +209,7 @@ pasted, quoted or asked about are not their instruction to Yuki.
 
 Call record_conversation_memory exactly once, with one operation per decision, each citing \
 in exchanges the numbers [n] of the NEW exchanges it rests on:
-- ADD: a new rule, preference or commitment the NEW exchanges establish.
+- ADD: a new rule, preference, commitment or resource the NEW exchanges establish.
 - UPDATE: an existing item (item = n of C<n>) the user restated, refined or changed ("call \
 me Kee instead"). Give the complete new text, and for a rule or preference the new quote; the \
 old version is kept as history. A near-duplicate of an existing item is an UPDATE or a NOOP, \
@@ -304,8 +323,8 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["op", "item", "kind", "subject", "text", "title", "quote", "due", "end_as",
-                                 "card", "owner", "exchanges", "reason"],
+                    "required": ["op", "item", "kind", "subject", "text", "title", "value", "keyterms", "quote",
+                                 "due", "end_as", "card", "owner", "exchanges", "reason"],
                     "properties": {
                         "op": {"type": "string", "enum": ["ADD", "UPDATE", "INVALIDATE", "NOOP"]},
                         "item": {
@@ -313,7 +332,7 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                             "description": "n of the existing item C<n> for UPDATE, INVALIDATE and NOOP; 0 for ADD.",
                         },
                         "kind": {
-                            "type": "string", "enum": ["rule", "preference", "commitment", "feedback"],
+                            "type": "string", "enum": ["rule", "preference", "commitment", "feedback", "resource"],
                             "description": "Kind of the new version (ADD, UPDATE), else of the target item.",
                         },
                         "card": {
@@ -328,6 +347,16 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                         "title": {
                             "type": "string",
                             "description": "A commitment (ADD, UPDATE): " + TITLE_FIELD + " Else \"\".",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "A resource (ADD, UPDATE): the identifier exactly as spelled, as it worked "
+                                           "(\"janedoe.dev\", \"jane@janedoe.dev\"). Else \"\".",
+                        },
+                        "keyterms": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "A resource (ADD, UPDATE): one to three words speech recognition must "
+                                           "hear right (\"janedoe\"). Else empty.",
                         },
                         "quote": {
                             "type": "string",
@@ -568,6 +597,34 @@ _EDGE = " \t\r\n\"'.,;:!?()[]{}-。、！？"
 def normalize_quote(text: str | None) -> str:
     """Casefolded, one space between words, uniform quote marks and dashes, no punctuation at the ends."""
     return " ".join((text or "").translate(_QUOTE_MAP).casefold().split()).strip(_EDGE)
+
+
+#: Appended by code to a resource whose value no exchange spells out (only dictated): its spelling is a reading.
+AS_HEARD_NOTE = "(Spelled as heard from the user's speech; nothing on screen confirmed it.)"
+
+
+def fact_embed_text(f: Any) -> str:
+    """What a conversation item is embedded as (its vector serves recall and fast memory): its text and the user's
+    words; a resource, what it is and its value ("portfolio website: janedoe.dev"), which a short request such as
+    "open my portfolio" is much closer to than to the full sentence (measured 2026-09-28 on the shared embedder:
+    cosine 0.52 against 0.30-0.41)."""
+    if getattr(f, "kind", "") == "resource" and getattr(f, "value", None):
+        return f"{(f.subject or '').strip()}: {f.value}".strip(": ")
+    return f"{f.text} {f.quote or ''}".strip()
+
+
+def resource_seen(value: str, turns: Sequence[Any]) -> bool:
+    """Whether a resource's ``value`` (the model's reading) is spelled out in the cited exchanges - the user's
+    words, Yuki's reply or its actions - letters and digits compared, case ignored ("janedoe.dev" is in
+    "showing https://www.janedoe.dev/"). A check of the model's output against its sources, as for quotes."""
+    want = "".join(ch for ch in (value or "").casefold() if ch.isalnum())
+    if not want:
+        return False
+    for t in turns:
+        blob = " ".join([t.user_text or "", t.reply_text or "", *(t.actions or [])])
+        if want in "".join(ch for ch in blob.casefold() if ch.isalnum()):
+            return True
+    return False
 
 
 def quote_in(quote: str | None, text: str | None) -> bool:
@@ -900,6 +957,8 @@ class ConversationWorker:
         if f.kind == "commitment" and f.owner:
             kind = "commitment, owner yuki" if f.owner == "yuki" else "commitment, owner user: the user's own to-do"
         line = f"C{f.id} [{kind}] subject={safe(f.subject, 120)!r} since {_local(f.valid_from, '%Y-%m-%d %H:%M')} ({who})"
+        if f.kind == "resource" and f.value:
+            line += f" value={safe(f.value, 200)!r}"
         if f.due_at is not None:
             line += f" due {_local(f.due_at, '%Y-%m-%d %H:%M (%A)')}"
         if ended and f.valid_to is not None:
@@ -1095,8 +1154,19 @@ class ConversationWorker:
             if rec.op in ("ADD", "UPDATE"):
                 kind = rec.kind
                 if kind not in STANDING_KINDS or not rec.text:
-                    reject("needs a text and a kind (rule, preference, commitment, feedback)")
+                    reject("needs a text and a kind (rule, preference, commitment, feedback, resource)")
                     continue
+                value = " ".join(str(item.get("value") or "").split()) if kind == "resource" else ""
+                keyterms: list[str] = []
+                if kind == "resource":
+                    if not value:
+                        reject("a resource needs its value")
+                        continue
+                    if not resource_seen(value, [t for t in turns if t.id not in elsewhere]):
+                        # dictated only: nothing in the exchanges spells it; kept, and said to be as heard
+                        rec.text = f"{rec.text} {AS_HEARD_NOTE}"
+                    keyterms = [" ".join(str(k).split()) for k in (item.get("keyterms") or [])
+                                if isinstance(k, str) and str(k).strip()][:3]
                 quote: str | None = rec.quote or None
                 nudge_id: int | None = None
                 if kind in ("rule", "preference", "feedback"):
@@ -1125,6 +1195,7 @@ class ConversationWorker:
                     end_note=rec.reason or None, nudge_id=nudge_id,
                     owner=rec.owner if kind == "commitment" and rec.owner in ("yuki", "user") else None,
                     title=clean_label(item.get("title"), "title") if kind == "commitment" else None,
+                    value=value or None, keyterms=keyterms,
                 ))
                 touched.add(target_id)
                 continue
@@ -1360,7 +1431,7 @@ class ConversationWorker:
                                      call.cost_usd, call.latency_ms)
             question_error = embed_questions(questions, self.embedder) if questions else None
             # embeddings: new item versions, journal facts, the turns themselves
-            embed_texts = ([f"{c.text} {c.quote or ''}".strip() for c in changes if c.op in ("ADD", "UPDATE")]
+            embed_texts = ([fact_embed_text(c) for c in changes if c.op in ("ADD", "UPDATE")]
                            + [f.fact for f in facts] + [Store.turn_text(t)[:2000] for t in turns])
             vectors, embed_error = self._embed(embed_texts)
             turn_vectors: list[tuple[int, Any]] = []
@@ -1704,7 +1775,7 @@ class ConversationWorker:
         for what, rows, text in (
             ("turn", self.store.turns_without_vectors(), lambda r: Store.turn_text(r)[:2000]),
             ("summary", self.store.summaries_without_vectors(), lambda r: r.text),
-            ("fact", self.store.conversation_facts_without_vectors(), lambda r: f"{r.text} {r.quote or ''}".strip()),
+            ("fact", self.store.conversation_facts_without_vectors(), fact_embed_text),
         ):
             if not rows:
                 continue

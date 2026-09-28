@@ -129,6 +129,9 @@ STANDING_CONTEXT_CHARS = 1_200
 #: takes. With one shared 1,200 cap, five long rules pushed the "don't nudge me" preference out, so when
 #: the user said "you can nudge me again" (2026-09-26 22:15) Yuki had no id to withdraw it by.
 STANDING_RULES_CHARS = 2_400
+#: The user's own sites, accounts and links (conversation facts of kind resource, migration 22) have their own
+#: budget: a handful of short lines, on every request, so "open my portfolio" needs no lookup.
+STANDING_RESOURCES_CHARS = 700
 #: The coach's state in the standing context (its own budget, after the capped part).
 COACH_CONTEXT_CHARS = 600
 #: The coach's state is shown when it looked this many times in the last COACH_QUIET_S and said nothing.
@@ -592,8 +595,8 @@ class MemoryClient:
         embedder's similarity plus the importance written with each and recency
         (:mod:`yuki.memory.relevant`). Nothing clears the bar: ``[]``. ``embed_wait_s`` bounds the
         wait for the message's embedding (a request's path goes on without it). Each hit:
-        ``{kind: fact | portrait | commitment | episode, id, at, until, text, source, score, cosine,
-        importance, nature}``; ``source`` is the provenance line
+        ``{kind: fact | portrait | commitment | resource | episode, id, at, until, text, source, score, cosine,
+        importance, nature}`` (a resource also has ``value``: the user's own site, account or link); ``source`` is the provenance line
         (:func:`yuki.memory.provenance.describe`).
 
         ``previous``: the conversation's previous message. A follow-up ("elaborate", "what was that?")
@@ -668,6 +671,16 @@ class MemoryClient:
             return {**base, "kind": "commitment", "at": _iso(c.valid_from), "until": None,
                     "text": f"{c.text} ({state})", "nature": "fact",
                     "source": f"{said}, {datetime.fromtimestamp(c.valid_from):%a %d %b %H:%M}{quote}"}
+        if kind == "resource":
+            c = self.store.conversation_fact(item_id)
+            if c is None or c.status != "active":
+                return None
+            value = f" ({c.value})" if c.value and c.value.casefold() not in c.text.casefold() else ""
+            quote = f': "{" ".join(c.quote.split())[:240]}"' if c.quote else ""
+            return {**base, "kind": "resource", "at": _iso(c.valid_from), "until": None, "text": c.text + value,
+                    "value": c.value, "nature": "fact",
+                    "source": f"the user's own, from a conversation with Yuki, "
+                              f"{datetime.fromtimestamp(c.valid_from):%a %d %b %H:%M}{quote}"}
         if kind == "episode":
             eps = self.store.episodes_by_ids([item_id])
             if not eps:
@@ -843,6 +856,11 @@ class MemoryClient:
 
         text = _clip_sentences(f.text, 300)
         quote = _clip_sentences(f.quote, 240) if f.quote else None
+        if f.kind == "resource":
+            if text is None:
+                return None
+            value = f.value if f.value and f.value.casefold() not in text.casefold() else ""
+            return f"- [resource:{f.id}] {text}" + (f" ({value})" if value else "")
         if f.kind == "commitment":
             if text is None:
                 return None
@@ -885,6 +903,8 @@ class MemoryClient:
                      "their plans, never offer to do one):"),
             "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
                       "everything; forget_rule takes these ids too):"),
+            "resource": ("The user's own sites, accounts and links (use them directly when the "
+                         "user names one, e.g. \"open my portfolio\"):"),
         }
 
         def group(f: ConversationFact) -> str:
@@ -896,7 +916,7 @@ class MemoryClient:
 
         def render(chosen: list[tuple[ConversationFact, str]]) -> str:
             lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
-            for kind in ("rule", "preference", "coach", "commitment", "call"):
+            for kind in ("rule", "preference", "coach", "resource", "commitment", "call"):
                 rows = [line for f, line in chosen if group(f) == kind]
                 if rows:
                     lines += [headings[kind], *rows]
@@ -908,14 +928,15 @@ class MemoryClient:
         # instructions, coach feedback, then preferences, rules last. Oldest first within each. (Call
         # commitments once pushed "call me captain" out of every request; rules once pushed out the
         # preference the user then withdrew.)
-        drop_order = {"call": 0, "commitment": 1, "coach": 2, "preference": 3, "rule": 4}
+        drop_order = {"call": 0, "commitment": 1, "coach": 2, "preference": 3, "rule": 4, "resource": 5}
         instructions = ("rule", "preference", "coach")
 
         def size(chosen: list[tuple[ConversationFact, str]], part: tuple[str, ...]) -> int:
             return len(render([c for c in chosen if group(c[0]) in part]))
 
         kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
-        for part, cap in ((instructions, STANDING_RULES_CHARS), (("commitment", "call"), STANDING_CONTEXT_CHARS)):
+        for part, cap in ((instructions, STANDING_RULES_CHARS), (("commitment", "call"), STANDING_CONTEXT_CHARS),
+                          (("resource",), STANDING_RESOURCES_CHARS)):
             while any(group(c[0]) in part for c in kept) and size(kept, part) > cap:
                 victim = min((c for c in kept if group(c[0]) in part),
                              key=lambda item: (drop_order.get(group(item[0]), 0), item[0].valid_from, item[0].id))
@@ -2117,7 +2138,8 @@ class MemoryClient:
 
     def speech_names(self, limit: int = 50) -> list[str]:
         """Names speech recognition should expect (Deepgram keyterms): the right names of the user's
-        corrections first, then the portrait's people and the short names of their work and interests.
+        corrections first, then the words of the user's own sites and accounts (:meth:`user_resources`, spelled
+        as confirmed on screen), then the portrait's people and the short names of their work and interests.
         A misheard form is never included (it would teach recognition the mistake). Never raises."""
         try:
             from yuki.voice.keyterms import NAME_KINDS, terms_from_facts
@@ -2126,11 +2148,27 @@ class MemoryClient:
         except Exception:
             base = []
         heard = {a["heard"].casefold() for a in self.aliases()}
+        resource_terms = [t for r in self.user_resources() if r["confirmed"] for t in r["keyterms"]]
         out: list[str] = []
-        for name in [a["name"] for a in self.aliases()] + base:
+        for name in [a["name"] for a in self.aliases()] + resource_terms + base:
             if name and name.casefold() not in heard and name.casefold() not in {n.casefold() for n in out}:
                 out.append(name)
         return out[: max(0, int(limit))]
+
+    def user_resources(self) -> list[dict]:
+        """The user's own sites, accounts, emails, repos and project links that memory holds (conversation facts
+        of kind resource, migration 22), oldest first: ``{"ref": "resource:N", "id", "what", "value", "text",
+        "keyterms", "confirmed", "since"}``. ``confirmed``: its spelling was seen in the exchange it came from
+        (the page that opened, the text typed), not only heard. Never raises."""
+        from yuki.memory.conversations import AS_HEARD_NOTE
+
+        try:
+            rows = self.store.conversation_facts(("resource",))
+        except Exception:
+            return []
+        return [{"ref": f"resource:{f.id}", "id": f.id, "what": f.subject, "value": f.value, "text": f.text,
+                 "keyterms": list(f.keyterms), "confirmed": AS_HEARD_NOTE not in (f.text or ""),
+                 "since": _iso(f.valid_from)} for f in rows]
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",

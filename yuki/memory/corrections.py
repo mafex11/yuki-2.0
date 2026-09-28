@@ -330,7 +330,7 @@ class CorrectionApplier:
         for f in store.portrait_facts(include_corrections=False):
             small.append(Candidate(f"P{f.id}", "P", f.id, f.text, f.subject,
                                    f"portrait fact ({f.kind}{', the user told Yuki' if f.origin == 'user' else ''})", f))
-        for f in store.conversation_facts(("rule", "preference", "commitment", "feedback")):
+        for f in store.conversation_facts(("rule", "preference", "commitment", "feedback", "resource")):
             whose = {"yuki": ", Yuki's own", "user": ", the user's to-do"}.get(f.owner or "", "")
             small.append(Candidate(f"C{f.id}", "C", f.id, f.text, f.subject, f"{f.kind}{whose}", f))
         for t in store.todos(("open",)):
@@ -514,7 +514,10 @@ class CorrectionApplier:
                         source_turn_ids=f.source_turn_ids, due_at=f.due_at, at=f.valid_from,
                         vector=vec_of.get(e["cand"].ref), embed_model=model, supersedes=f.id, owner=f.owner,
                         end_note=note,
-                        title=clean_label(e.get("label"), "title") if f.kind == "commitment" else None)
+                        title=clean_label(e.get("label"), "title") if f.kind == "commitment" else None,
+                        # a corrected resource keeps its words in the text; its old value and keyterms may be the
+                        # very thing corrected, so they are not carried over (the next extraction restates them)
+                        value=None, keyterms=())
                     record(e, new_id)
             except Exception as exc:
                 record(e, None, False)

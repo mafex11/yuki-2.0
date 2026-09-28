@@ -51,7 +51,10 @@ SAME_AS = 0.90
 #: such as "elaborate" names nothing itself; its subject is the previous message's).
 FOLLOW_UP_DISCOUNT = 0.05
 #: Kinds in the index, and whether their recency decays.
-KINDS = ("portrait", "journal", "commitment", "episode")
+KINDS = ("portrait", "journal", "commitment", "episode", "resource")
+#: Kinds that do not age: the portrait worker keeps portrait facts current, and a resource of the user's (their
+#: site, their email) stays theirs until the conversation worker ends it.
+EVERGREEN = ("portrait", "resource")
 
 
 @dataclass
@@ -204,7 +207,7 @@ class RelevantIndex:
                 if not ok.any():
                     continue
                 imp = (k.arr["importance"] - 5.0) / 5.0
-                if kind == "portrait":
+                if kind in EVERGREEN:
                     rec = np.ones_like(cos)
                 else:
                     age_days = np.maximum(now - k.arr["at"], 0.0) / 86400.0

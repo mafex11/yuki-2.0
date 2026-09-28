@@ -67,7 +67,7 @@ def test_migration_21_is_additive_and_old_rows_wait_for_labels():
         conn.close()
         s = Store.open(db)
         try:
-            assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS) == 21
+            assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS) >= 21
             for table, col in (("portrait_facts", "summary_ciphertext"), ("conversation_facts", "title_ciphertext"),
                                ("todos", "title_ciphertext"), ("knowhow", "title_ciphertext"),
                                ("knowhow", "summary_ciphertext")):

@@ -240,6 +240,9 @@ is not a comment. When one capture gives both, write two facts: "The user watche
 their own time) and whenever no date shows.
 - In English, keeping names, titles and quotes in their original script (a Japanese \
 title stays in Japanese).
+- The user's own sites, accounts, email addresses, repos and project links, when a source shows \
+them as the user's (their signed-in account, their own page, their repo): record each with its \
+exact spelling as shown ("The user's portfolio website is janedoe.dev."), importance 6 or more.
 - Never record passwords, one-time codes, card or account numbers, or other secrets, \
 even if visible. A secret the capture already hid shows as "[password hidden]", "[API key hidden]" and the \
 like: record that one was shared or shown ("pixel.fox sent the login for a university portal"), never guess it.

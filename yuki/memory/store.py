@@ -776,9 +776,11 @@ class EpisodeRecord:
 #: general: it bears on that kind of card, never on everything Yuki says (a "stfu" to a
 #: wrong call-back is not a gag on the coach). ``fact`` is reserved: durable facts about
 #: the user from conversations go to the journal instead.
-CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback", "fact")
+#: ``resource`` (migration 22): one of the user's own sites, accounts, emails, repos or project links, with its
+#: confirmed spelling (``value``), e.g. their portfolio "janedoe.dev".
+CONVERSATION_FACT_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback", "fact", "resource")
 #: The kinds the conversation worker maintains (and ``standing_context`` shows).
-STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback")
+STANDING_KINDS: tuple[str, ...] = ("rule", "preference", "commitment", "feedback", "resource")
 #: ``conversation_facts.status``: active (a rule in force, an open commitment) or how it ended.
 CONVERSATION_FACT_STATUSES: tuple[str, ...] = ("active", "done", "revoked", "superseded", "dropped", "wrong")
 #: How the user can end one of their to-dos or one of Yuki's commitments by hand (migration 18): done,
@@ -843,6 +845,10 @@ class ConversationFact:
     owner: str | None = None
     #: commitment: its three-to-six-word title (migration 21, :mod:`yuki.memory.titles`); ``None`` until written.
     title: str | None = None
+    #: resource (migration 22): the identifier itself, as confirmed ("janedoe.dev", "jane@janedoe.dev").
+    value: str | None = None
+    #: resource: the words speech recognition must hear right ("janedoe"), model-chosen.
+    keyterms: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -872,6 +878,9 @@ class ConversationChange:
     owner: str | None = None
     #: commitment: the new version's title (migration 21); None: the titles pass writes it later.
     title: str | None = None
+    #: resource (migration 22): the identifier and the words speech recognition must hear right.
+    value: str | None = None
+    keyterms: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2092,6 +2101,14 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE todos ADD COLUMN title_ciphertext TEXT;
     ALTER TABLE knowhow ADD COLUMN title_ciphertext TEXT;
     ALTER TABLE knowhow ADD COLUMN summary_ciphertext TEXT;
+    """,
+    # 22 (2026-09-28, "open my portfolio" after the user had Yuki open devmafex.com: memory kept nothing): the
+    # user's own resources - their sites, accounts and emails, repos, project links - as conversation facts of
+    # kind "resource", with the identifier as confirmed (the URL that opened, the user's own correction) and the
+    # words speech recognition must hear right, both encrypted. Additive only.
+    """
+    ALTER TABLE conversation_facts ADD COLUMN value_ciphertext TEXT;
+    ALTER TABLE conversation_facts ADD COLUMN keyterms_ciphertext TEXT;
     """,
 )
 
@@ -4350,7 +4367,17 @@ class Store:
             nudge_id=r["nudge_id"] if "nudge_id" in r.keys() else None,
             owner=r["owner"] if "owner" in r.keys() else None,
             title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
+            value=self._dec(r["value_ciphertext"]) if "value_ciphertext" in r.keys() else None,
+            keyterms=self._keyterms(r),
         )
+
+    def _keyterms(self, r: sqlite3.Row) -> list[str]:
+        if "keyterms_ciphertext" not in r.keys() or not r["keyterms_ciphertext"]:
+            return []
+        try:
+            return [str(t) for t in json.loads(self.cipher.decrypt(r["keyterms_ciphertext"])) if str(t).strip()]
+        except (ValueError, TypeError):
+            return []
 
     def conversation_facts(
         self, kinds: Sequence[str] | None = None, statuses: Sequence[str] | None = ("active",),
@@ -4403,13 +4430,17 @@ class Store:
         cur = conn.execute(
             "INSERT INTO conversation_facts(kind, subject_ciphertext, text_ciphertext, quote_ciphertext, status,"
             " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id, owner,"
-            " title_ciphertext) VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?,?)",
+            " title_ciphertext, value_ciphertext, keyterms_ciphertext)"
+            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?,?,?,?)",
             (
                 ch.kind, self._enc(ch.subject or ""), self.cipher.encrypt(ch.text),
                 self._enc(ch.quote) if ch.quote else None, float(ch.at if ch.at is not None else now),
                 ch.due_at, json.dumps([int(i) for i in ch.source_turn_ids]), ch.origin or "model", now, batch_id,
                 ch.nudge_id, ch.owner if ch.kind == "commitment" and ch.owner in COMMITMENT_OWNERS else None,
                 self._enc(ch.title) if ch.title else None,
+                self._enc(ch.value) if ch.kind == "resource" and ch.value else None,
+                self.cipher.encrypt(json.dumps(list(ch.keyterms), ensure_ascii=False))
+                if ch.kind == "resource" and ch.keyterms else None,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -4462,6 +4493,7 @@ class Store:
         source_turn_ids: Sequence[int] = (), due_at: float | None = None, at: float | None = None,
         vector: np.ndarray | None = None, embed_model: str | None = None, supersedes: int | None = None,
         owner: str | None = None, end_note: str | None = None, title: str | None = None,
+        value: str | None = None, keyterms: Sequence[str] = (),
     ) -> int:
         """Write one active fact now; with ``supersedes``, end that fact (bi-temporal) in the same transaction.
 
@@ -4474,7 +4506,8 @@ class Store:
         ch = ConversationChange(
             "UPDATE" if supersedes is not None else "ADD", supersedes, kind, subject, text, quote, due_at,
             list(source_turn_ids), float(at) if at is not None else now, origin=origin, vector=vector,
-            embed_model=embed_model, owner=owner, end_note=end_note, title=title,
+            embed_model=embed_model, owner=owner, end_note=end_note, title=title, value=value,
+            keyterms=list(keyterms),
         )
 
         def op(conn: sqlite3.Connection) -> int:
@@ -6026,6 +6059,9 @@ class Store:
         "commitment": ("SELECT c.id, c.valid_from AS at, c.status, c.kind, v.vec_ciphertext, v.dim"
                        " FROM conversation_facts c JOIN conversation_fact_vec v ON v.fact_id = c.id"
                        " WHERE c.kind = 'commitment' AND c.status IN ('active', 'done') AND c.id > ?"),
+        "resource": ("SELECT c.id, c.valid_from AS at, c.status, c.kind, v.vec_ciphertext, v.dim"
+                     " FROM conversation_facts c JOIN conversation_fact_vec v ON v.fact_id = c.id"
+                     " WHERE c.kind = 'resource' AND c.status = 'active' AND c.id > ?"),
     }
 
     def recall_vectors(self, kind: str, after_id: int = 0) -> list[tuple[sqlite3.Row, np.ndarray]]:
@@ -6056,6 +6092,8 @@ class Store:
             "episode": {r[0] for r in self._query("SELECT id FROM episodes WHERE expired_at IS NULL")},
             "commitment": {r[0] for r in self._query(
                 "SELECT id FROM conversation_facts WHERE kind='commitment' AND status IN ('active','done')")},
+            "resource": {r[0] for r in self._query(
+                "SELECT id FROM conversation_facts WHERE kind='resource' AND status='active'")},
         }
 
     def episode_importance(self, spans: Sequence[tuple[int, float, float]]) -> dict[int, int]:
