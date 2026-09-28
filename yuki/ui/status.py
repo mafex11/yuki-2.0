@@ -1,7 +1,7 @@
 """The status strip: what Yuki is doing, bottom-right, while it has the hands.
 
-While a task runs the overlay gets out of the way and this strip takes over: a
-spinner and one line of text. The line is the tool's own one-line ``label`` from
+While a task runs the overlay gets out of the way and this strip takes over: the
+thinking line (Horizon's dotted grey wave, drifting while it works) and one line of text. The line is the tool's own one-line ``label`` from
 the registry (:func:`yuki.agent.tools.tool_label`) plus its most telling argument,
 so the phrase a user reads is written next to the tool it describes rather than
 re-derived here from its identifier. Every tool in the registry has a label
@@ -26,7 +26,8 @@ from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
 from yuki.agent.tools import tool_label
-from yuki.ui.surface import ACCENT, SurfaceWindow, ui_font
+from yuki.ui.surface import ACCENT, SurfaceWindow
+from yuki.ui.wave import Wave
 
 #: Size of the panel (excluding the shadow margin), in logical pixels.
 STRIP_WIDTH = 360
@@ -166,7 +167,7 @@ def _detail(tool_input: dict[str, Any], *, limit: int) -> str:
 
 
 def describe_summary(summary: dict[str, Any]) -> str:
-    """The short dim suffix for a finished request: ``52 s · 10 steps · 8¢``.
+    """The short dim suffix for a finished request: ``52 s, 10 steps, 8¢``.
 
     Steps are model round trips. Cost is the estimate from ``Settings.pricing``,
     left out when the model has no price. Purely presentational.
@@ -188,7 +189,7 @@ def describe_summary(summary: dict[str, Any]) -> str:
     cost = summary.get("cost_usd")
     if isinstance(cost, (int, float)):
         parts.append(_money(float(cost)))
-    return " · ".join(parts)
+    return ", ".join(parts)
 
 
 def _money(usd: float) -> str:
@@ -259,6 +260,22 @@ class Spinner(QWidget):
         painter.drawArc(rect, int(-self._angle * 16), int(-110 * 16))
 
 
+class ThinkingLine(Wave):
+    """The strip's "working" mark: the dotted thinking line; ``start`` / ``stop`` keep Spinner's calls (it
+    animates only while shown)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        host = parent
+        super().__init__("think", theme=(lambda: host.theme()) if hasattr(host, "theme") else None, size=(34, 10),
+                         parent=parent)
+
+    def start(self) -> None:
+        self.setVisible(True)
+
+    def stop(self) -> None:
+        pass
+
+
 class ElidedLabel(QLabel):
     """A label that shortens its text with an ellipsis instead of overflowing."""
 
@@ -290,20 +307,22 @@ class StatusStrip(SurfaceWindow):
         self.setObjectName("YukiStatusStrip")
         self.setFixedSize(STRIP_WIDTH + 2 * self.SHADOW, STRIP_HEIGHT + 2 * self.SHADOW)
 
+        from yuki.ui.window.theme import variable_font
+
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 16, self.SHADOW, self.SHADOW + 16, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 18, self.SHADOW, self.SHADOW + 18, self.SHADOW)
         row.setSpacing(12)
 
-        self.spinner = Spinner(self)
+        self.spinner = ThinkingLine(self)
         row.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.label = ElidedLabel(self)
-        self.label.setFont(ui_font(11))
+        self.label.setFont(variable_font(14, "Regular"))
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
 
         #: Dim time/steps/cost suffix, shown only with a final message.
         self.meta = QLabel(self)
-        self.meta.setFont(ui_font(9))
+        self.meta.setFont(variable_font(12, "Regular"))
         self.meta.setTextFormat(Qt.TextFormat.PlainText)
         self.meta.setVisible(False)
         row.addWidget(self.meta, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -316,7 +335,7 @@ class StatusStrip(SurfaceWindow):
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
         self.label.setStyleSheet(f"color: {self.ink_css('danger' if self._tone == 'error' else 'text')};")
-        self.meta.setStyleSheet(f"color: {self.ink_css('text_2')};")
+        self.meta.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.update()
 
     def anchor(self) -> QPoint:
@@ -364,7 +383,7 @@ class StatusStrip(SurfaceWindow):
         """Add the dim suffix to the final message on show (no timer restart).
 
         Args:
-            text: e.g. ``52 s · 10 steps · 8¢``; empty hides it.
+            text: e.g. ``52 s, 10 steps, 8¢``; empty hides it.
         """
         self.meta.setText(text)
         # The message label gives up the width; its resizeEvent re-elides it.

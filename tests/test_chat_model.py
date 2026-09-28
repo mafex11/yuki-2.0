@@ -32,7 +32,7 @@ def test_typed_request_bubble_first_then_steps_then_answer():
     m.apply(ev("summarized", 13.3, job=7, meta="12 s · 3 steps · 2¢"))
     assert reply.text == "Spotify's open." and reply.status == "done"
     assert not reply.expanded_now()                     # collapsed when done
-    assert reply.work_line() == "worked for 12 s · 2 steps"
+    assert reply.work_line() == "worked for 12 s, 2 steps"
     assert [(s.ok, round(s.seconds(), 1)) for s in reply.steps] == [(True, 1.0), (False, 1.7)]
     assert reply.meta == "12 s · 3 steps · 2¢"
     m.toggle(reply.id)
@@ -90,7 +90,7 @@ def test_voice_hands_and_thinker_job_nest_under_the_response():
     job = yuki.steps[1]
     assert job.ok is True and "invoice #42" in job.result
     assert yuki.text == "On it."                          # the job's result is spoken, not pasted in
-    assert yuki.work_line() == "worked for 8 s · 3 steps"
+    assert yuki.work_line() == "worked for 8 s, 3 steps"
     # Yuki speaks the result later: its own bubble, in order
     m.apply(ev("voice_reply", 9.5, turn=4, text="Found it, invoice 42 from Acme.", final=True))
     assert kinds(m)[-1] == ("assistant", "Found it, invoice 42 from Acme.")

@@ -802,7 +802,7 @@ class YukiUi(QObject):
         if self.health is not None:
             from datetime import datetime as _dt
 
-            self.health.show_checks(list(results), report, f"Checked at {_dt.now():%H:%M} · took {took:.1f} s")
+            self.health.show_checks(list(results), report, f"Checked at {_dt.now():%H:%M}, took {took:.1f} s")
         self.ui_log.event("health_check", state="done", checks=len(results),
                           problems=sum(getattr(c, "status", "") == "fail" for c in results))
 
@@ -826,7 +826,10 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     from yuki.ui.surface import current_theme
     from yuki.ui.window.widgets import Menu, menu_css
 
-    menu = Menu(current_theme())   # a flat popover like every surface
+    menu = Menu(current_theme())   # a floating panel like every surface
+    from yuki.ui.memory import MEMORY_LIVE
+
+    menu.header_led = lambda: MEMORY_LIVE[0]   # the status line's LED: lit while memory remembers
 
     def _menu_theme() -> None:   # restyled each time it opens (submenus are made later)
         from yuki.ui.window.widgets import style_menu
@@ -943,6 +946,20 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     wake_item.setChecked(ui.voice.wake_enabled)
     wake_item.triggered.connect(lambda checked: ui.voice.set_wake(bool(checked)))
     menu.addAction(wake_item)
+    # "Go quiet for a couple of hours" (v3.10): shown while it holds, with the time it ends; clicking wakes her now.
+    quiet_item = QAction("", menu)
+    quiet_item.triggered.connect(lambda _checked=False: ui.voice.wake_now())
+
+    def show_quiet(until: float) -> None:
+        import time as _time
+
+        quiet_item.setText(f"Quiet until {_time.strftime('%H:%M', _time.localtime(until))}, wake now"
+                           if until else "")
+        quiet_item.setVisible(bool(until))
+
+    ui.voice.quiet_changed.connect(show_quiet)
+    show_quiet(getattr(ui.voice, "quiet_until", 0.0) or 0.0)
+    menu.addAction(quiet_item)
 
     def choose_voice() -> None:
         from PySide6.QtWidgets import QInputDialog
@@ -1109,7 +1126,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setQuitOnLastWindowClosed(False)
     from yuki.ui.window.theme import app_font
 
-    app.setFont(app_font())   # Segoe UI Variable with its real weights, for the tray menu and plain widgets
+    app.setFont(app_font())   # Segoe UI Variable with its real weights (and Doto, Nirmala UI), for every widget
+    from yuki.ui.stall import maybe_start
+
+    maybe_start("tray")   # debug only (YUKI_STALL_WATCH=1): logs GUI stalls over 32 ms with a stack
 
     # Load the heavy native modules and draw the tray icon on this thread before any worker
     # thread starts. On 2026-09-25 the agent's prewarm thread was loading PIL's DLL (inside the

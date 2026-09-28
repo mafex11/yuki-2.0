@@ -230,16 +230,21 @@ def test_retired_glass_settings_are_ignored_and_dropped(tmp_path):
     assert raw["future_key"] == 1 and raw["open_hotkey"] == "ctrl+space"
 
 
-def test_the_theme_is_flat_dark_zinc():
-    from yuki.ui.window.theme import RADIUS, theme
+def test_the_theme_is_horizon_field_unit_dark():
+    from yuki.ui.window.theme import ACCENTS, RADIUS, theme
 
-    t = theme("light")   # dark only: any name gives the one theme
-    assert t.dark and t.bg.name() == "#09090b" and t.border.name() == "#27272a"
-    assert t.text.name() == "#fafafa" and t.text_2.name() == "#a1a1aa"
-    assert t.primary.name() == "#fafafa" and t.primary_fg.name() == "#18181b"
+    t = theme("light", accent="green")   # dark only: any name gives the one theme
+    assert t.dark and t.bg.name() == "#0b0e13" and t.card.name() == "#10141b" and t.border.name() == "#1e2632"
+    assert t.text.name() == "#e6e9ee" and t.text_2.name() == "#aeb6c2" and t.text_3.name() == "#6f7886"
+    assert t.primary.name() == "#e6e9ee" and t.primary_fg.name() == "#0b0e13"
+    assert t.accent.name() == ACCENTS["green"].lower() == "#8faf5a"
+    assert theme(accent="orange").accent.name() == "#ff5b14"
     for name, surface in t.surfaces.items():   # opaque: nothing see-through anywhere
         assert surface.fill.alpha() == 255, name
-    assert 6 <= RADIUS["control"] <= RADIUS["card"] <= 8
+    # no amber or yellow anywhere: every kind colour is monochrome, the cool call grey or the error red
+    for kind, c in t.kinds.items():
+        assert c.name() in {t.text_2.name(), t.cool.name(), t.danger.name()}, kind
+    assert RADIUS["panel"] == 12 and RADIUS["floating"] == 14 and RADIUS["display"] == 8
 
 
 def test_surfaces_paint_opaque_with_a_border(qapp):
@@ -256,7 +261,8 @@ def test_surfaces_paint_opaque_with_a_border(qapp):
     img.fill(Qt.GlobalColor.transparent)
     card.render(img)
     inner = card.panel_rect().center()
-    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#09090b"
-    edge = img.pixelColor(QPoint(card.panel_rect().left() + 40, card.panel_rect().top()))
-    assert edge.name() == "#27272a"
+    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#10141b"
+    edge = img.pixelColor(QPoint(card.panel_rect().left() + 60, card.panel_rect().top()))
+    assert edge.name() == "#222a36"
+    assert card.title.text() == "" and card.wave.kind == "checkin"   # a plain check-in: its wave says it
     card.close()

@@ -1,10 +1,11 @@
 """The window base for every floating surface yuki-ui shows: the overlay, the strip, nudge, question and call
 cards, the call pill, the voice pill and the tray's panels.
 
-Each is a frameless, always-on-top tool window: a flat shadcn popover (``#09090b``
-with a 1 px ``#27272a`` border, 8 px corners, a soft shadow) that fades and slides
-a few pixels when it appears. Opaque: whatever is behind it never shows through,
-so text reads the same over any screen. Dark only (docs/UI-window.md).
+Each is a frameless, always-on-top tool window: a Horizon floating dialog (the navy
+panel ``#10141B`` with a 1 px ``#222A36`` line, 14 px corners, a soft shadow; pills are
+fully round) that fades and slides a few pixels when it appears. Opaque: whatever is
+behind it never shows through, so text reads the same over any screen. Dark only; the
+accent only on live and recording states (docs/UI-window.md).
 
 The shadow is painted, not a ``QGraphicsDropShadowEffect`` (graphics effects on a
 translucent top-level window are unreliable), so the window keeps a transparent
@@ -48,15 +49,24 @@ ANIM_MS = 150
 #: How far the window travels while fading, in logical pixels.
 SLIDE_PX = 6
 
-#: The tray icon's ring (the app's mark; the UI itself is monochrome).
-ACCENT = QColor(126, 180, 255)
+
+
+def accent_color() -> QColor:
+    """The user's accent (``ui.json`` ``accent``: olive green by default, or orange)."""
+    from yuki.ui.window.theme import theme
+
+    return QColor(theme().accent)
+
+
+#: The tray icon's mark: the accent as the app started (the rest of the UI reads it live).
+ACCENT = accent_color()
 #: Flat tokens for callers that paint with fixed colours (the card-stack overlay, the tray panels' HTML).
-TEXT_PRIMARY = QColor("#fafafa")
-TEXT_DIM = QColor("#a1a1aa")
-CARD_BG = QColor("#18181b")
-CARD_BORDER = QColor("#27272a")
-ERROR_BG = QColor("#450a0a")
-ERROR_BORDER = QColor("#7f1d1d")
+TEXT_PRIMARY = QColor("#E6E9EE")
+TEXT_DIM = QColor("#AEB6C2")
+CARD_BG = QColor("#161C26")
+CARD_BORDER = QColor("#222A36")
+ERROR_BG = QColor("#2A1416")
+ERROR_BORDER = QColor("#5A2A2E")
 
 
 def ui_font(size: int = 11, *, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
@@ -89,8 +99,9 @@ def _css(c: QColor) -> str:
 
 
 def button_css(style: str = "outline") -> str:
-    """A shadcn button as a style sheet: ``default`` (primary) | ``secondary`` | ``outline`` | ``ghost`` |
-    ``destructive``; the older words ``tinted`` (primary) and ``quiet`` (outline) still work."""
+    """A Horizon pill button as a style sheet: ``default`` (primary: light with dark ink) | ``outline`` |
+    ``ghost`` (words only) | ``destructive``; the older words ``tinted`` (primary) and ``quiet`` (outline)
+    still work."""
     from yuki.ui.window.widgets import button_colors
 
     t = current_theme()
@@ -100,8 +111,9 @@ def button_css(style: str = "outline") -> str:
     _f, _b, dink = button_colors(t, v, enabled=False)
     dfill = QColor(fill)
     dfill.setAlphaF(fill.alphaF() * 0.5)
+    weight = 600 if v == "default" else 400
     return (f"QPushButton {{ color: {_css(ink)}; background: {_css(fill)}; border: 1px solid {_css(border)};"
-            f" border-radius: 6px; padding: 0px 12px; min-height: 30px; font-weight: 500; }}"
+            f" border-radius: 15px; padding: 0px 14px; min-height: 28px; font-weight: {weight}; }}"
             f"QPushButton:hover {{ color: {_css(hink)}; background: {_css(hfill)}; border-color: {_css(hborder)}; }}"
             f"QPushButton:pressed {{ background: {_css(hfill)}; }}"
             f"QPushButton:disabled {{ color: {_css(dink)}; background: {_css(dfill)}; }}")
@@ -111,13 +123,13 @@ def button_css(style: str = "outline") -> str:
 
 
 class SurfaceWindow(QWidget):
-    """A frameless, flat popover window that fades and slides in and out.
+    """A frameless floating dialog (Horizon) that fades and slides in and out.
 
     Args:
         activates: True if the window should take keyboard focus when shown (the
             overlay does; the status strip must not, or it would pull focus out
             of whatever the user is doing).
-        radius: Corner radius of the panel (shadcn: 8).
+        radius: Corner radius of the panel (Horizon: 14; a pill passes half its height).
 
     Signals:
         faded_out: Emitted once the hide animation has finished and the window is
@@ -127,14 +139,14 @@ class SurfaceWindow(QWidget):
     """
 
     #: Transparent padding reserved for the painted shadow, in logical pixels.
-    SHADOW = 16
+    SHADOW = 20
 
     faded_out = Signal()
     focus_path = Signal(dict)
 
     _instances: "weakref.WeakSet[SurfaceWindow]" = weakref.WeakSet()
 
-    def __init__(self, *, activates: bool = True, radius: int = 8) -> None:
+    def __init__(self, *, activates: bool = True, radius: int = 14) -> None:
         flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool  # no taskbar button, no alt-tab entry
@@ -144,7 +156,7 @@ class SurfaceWindow(QWidget):
         if not activates:
             flags |= Qt.WindowType.WindowDoesNotAcceptFocus
         super().__init__(None, flags)
-        self.radius = min(8, radius)
+        self.radius = radius
         self._activates = activates
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)   # the rounded corners and shadow
         if not activates:
@@ -160,6 +172,32 @@ class SurfaceWindow(QWidget):
         self._anim.finished.connect(self._on_anim_finished)
         self._closing = False
         SurfaceWindow._instances.add(self)
+        self.warmed = False
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(0, self.warm)   # on the first idle turn: the first show is not a cold build
+
+    def warm(self) -> None:
+        """Make the native window, polish the style and lay out now (hidden), so the first show of this
+        surface paints within a frame of its hotkey or event."""
+        if self.warmed:
+            return
+        try:
+            self.winId()
+            self.ensurePolished()
+            for child in self.findChildren(QWidget):
+                child.ensurePolished()
+            if self.layout() is not None:
+                self.layout().activate()
+            # one render offscreen primes the glyph caches and the shadow for this size (the image is dropped)
+            from PySide6.QtGui import QImage
+
+            img = QImage(max(1, self.width()), max(1, self.height()), QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(0)
+            self.render(img)
+            self.warmed = True
+        except RuntimeError:   # gone before its first idle turn
+            pass
 
     # -- appearance ----------------------------------------------------------
 
@@ -208,7 +246,7 @@ class SurfaceWindow(QWidget):
 
         painter = QPainter(self)
         panel = QRectF(self.panel_rect())
-        paint_shadow(painter, panel, self.panel_radius(), blur=8, dy=3, color=QColor(0, 0, 0, 120))
+        paint_shadow(painter, panel, self.panel_radius(), blur=10, dy=6, color=QColor(0, 0, 0, 125))
         paint_surface(painter, panel, self.panel_radius(), self.theme().level("popover"))
         painter.end()
 

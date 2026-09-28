@@ -263,6 +263,7 @@ class DayView:
     first_at: float | None
     last_at: float | None
     lane_of_other: str = "other"
+    todos: list["Todo"] = field(default_factory=list)   # the user's open to-dos (the panel beside the moment)
 
 
 MAX_LANES = 7
@@ -378,8 +379,12 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
     longest = max(calls, key=lambda c: c.seconds, default=None)
     if longest is not None:
         summary += f" Longest call: {longest.app}, {dur(longest.seconds)}."
+    try:
+        todos, _promises = read_todos(memory)
+    except Exception:
+        todos = []
     return DayView(day, since, until, end, lane_list, segments, calls, power, gaps, sessions, totals, summary,
-                   milestones, facts, first_at, last_at)
+                   milestones, facts, first_at, last_at, todos=todos)
 
 
 def _sessions(memory: Any, since: float, until: float, segments: list[Segment], facts: list[dict[str, Any]],
@@ -450,7 +455,7 @@ class Item:
     origin: str                # user | model
     since: float
     confidence: float | None
-    source: str                # "You told Yuki · 25 Sep" / "From Discord · 25 Sep"
+    source: str                # "You told Yuki, 25 Sep" / "From Discord, 25 Sep"
     tags: list[str] = field(default_factory=list)   # joke | story | unsure | you
     evidence: list[Evidence] = field(default_factory=list)
 
@@ -481,13 +486,13 @@ UNSURE_BELOW = 0.4
 def _source_line(origin: str, since: float, evidence: list[Evidence], today: date | None) -> str:
     when = day_label(max([since] + [e.at for e in evidence]), today=today)
     if origin == "user":
-        return f"You told Yuki · {when}"
+        return f"You told Yuki, {when}"
     apps = Counter(e.app for e in evidence if e.app)
     if apps:
         where = apps.most_common(1)[0][0]
         where = "a call" if where.startswith("call") else where
-        return f"Seen in {where} · {when}"
-    return f"Yuki's reading of your week · {when}"
+        return f"Seen in {where}, {when}"
+    return f"Yuki's reading of your week, {when}"
 
 
 def portrait_item(f: dict[str, Any], today: date | None = None) -> Item:
@@ -526,7 +531,7 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
             app = j["app"] or ""
             where = "a call" if app.startswith("call") else app
             unsure.append(Item(f"journal:{j['id']}", app, text, first_sentence(text, 180), "journal", None, "model",
-                               j["at"], None, f"Heard in {where} · {day_label(j['at'], today=today)}", ["unclear"],
+                               j["at"], None, f"Heard in {where}, {day_label(j['at'], today=today)}", ["unclear"],
                                [Evidence(j["at"], app, j["text"], j["nature"])]))
     portrait_at = epoch(memory.status().get("portrait_updated_at"))
     open_q = len(memory.questions(statuses=("open", "asked"), limit=50))
@@ -545,7 +550,7 @@ class Todo:
 
     ref: str                   # "loop:12" | "commit:5" | "todo:3": what complete_todo takes
     text: str                  # second person
-    source: str                # "You said it on a call · 25 Sep" / "Komal asked in Slack · 24 Sep"
+    source: str                # "You said it on a call, 25 Sep" / "Komal asked in Slack, 24 Sep"
     quote: str                 # the user's own words, when memory kept them
     due: str                   # "due today" / ""
     raw: dict[str, Any] = field(default_factory=dict)
@@ -636,15 +641,15 @@ def _todo_source(t: dict[str, Any]) -> tuple[str, str]:
         quote = ev.split('"', 1)[1].rsplit('"', 1)[0].strip()
     src = t.get("source")
     if src == "call":
-        return f"You said it on a call · {when}", quote
+        return f"You said it on a call, {when}", quote
     if src == "chat":
-        return f"You told Yuki in a chat · {when}", quote
+        return f"You told Yuki in a chat, {when}", quote
     if src == "commitment":
-        return f"Yuki promised in a chat · {when}", quote
+        return f"Yuki promised in a chat, {when}", quote
     if src == "user":
-        return f"You added it · {when}", ""
+        return f"You added it, {when}", ""
     ev = plain(second_person(ev))
-    return (ev[:1].upper() + ev[1:] if ev else f"Seen in your day · {when}"), ""
+    return (ev[:1].upper() + ev[1:] if ev else f"Seen in your day, {when}"), ""
 
 
 def _due_label(value: Any) -> str:

@@ -6,7 +6,7 @@ fresh (empty) input expands below it. The card fills in when the answer arrives
 and grows to fit. :data:`MAX_CARDS` cards stay visible; older ones fade away.
 
 Memory's nudges live in the same stack (tone ``nudge``: labelled
-``Yuki · 14:32 · nudge``, with their own Reply), each
+``Yuki, 14:32, nudge``, with their own Reply), each
 placed by the time the user saw it, so the stack reads as one conversation.
 
 The card stack sits in a scroll area whose height follows its content up to
@@ -68,11 +68,11 @@ from yuki.ui.surface import (
     ui_font,
 )
 
-#: Width of the panel (excluding the shadow margin), in logical pixels.
-PANEL_WIDTH = 620
+#: Width of the panel (excluding the shadow margin), in logical pixels (Horizon's ask bar: 548-560).
+PANEL_WIDTH = 560
 
-#: Padding inside the panel.
-PAD = 16
+#: Padding inside the panel (sides).
+PAD = 22
 
 #: How many cards (requests, replies and nudges together) stay on screen.
 MAX_CARDS = 5
@@ -82,12 +82,12 @@ MAX_CARDS = 5
 #: screen, so stack + input end well above the taskbar at any screen size.
 MAX_CARDS_FRACTION = 0.55
 
-#: The stack's scrollbar: thin, only there when it can scroll (shadcn's ScrollArea).
+#: The stack's scrollbar: thin, only there when it can scroll.
 SCROLL_STYLE = (
     "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
     "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px 0 2px 0; }"
-    "QScrollBar::handle:vertical { background: #27272a; border-radius: 4px; min-height: 24px; }"
-    "QScrollBar::handle:vertical:hover { background: #3f3f46; }"
+    "QScrollBar::handle:vertical { background: #19212D; border-radius: 4px; min-height: 24px; }"
+    "QScrollBar::handle:vertical:hover { background: #3E4858; }"
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
     "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
 )
@@ -131,8 +131,8 @@ class AskInput(QPlainTextEdit):
         self.setStyleSheet(
             "QPlainTextEdit {"
             "  background: transparent;"
-            "  color: #fafafa;"
-            "  selection-background-color: #3f3f46;"
+            "  color: #E6E9EE;"
+            "  selection-background-color: #2A3444;"
             "  border: none; padding: 0px;"
             "}"
         )
@@ -284,7 +284,7 @@ class ReplyCard(QWidget):
         self.content_changed.emit()
 
     def set_meta(self, text: str) -> None:
-        """Show a dim footer line (``52 s · 10 steps · 8¢``) and grow to fit.
+        """Show a dim footer line (``52 s, 10 steps, 8¢``) and grow to fit.
 
         Args:
             text: The line; empty hides it.
@@ -381,7 +381,7 @@ class Overlay(SurfaceWindow):
     opened = Signal()
 
     def __init__(self) -> None:
-        super().__init__(activates=True, radius=8)
+        super().__init__(activates=True, radius=14)
         self.setObjectName("YukiOverlay")
         #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
         self.thread: Any = None
@@ -389,9 +389,9 @@ class Overlay(SurfaceWindow):
         self._proxies: list[ThreadCard] = []
 
         outer = QVBoxLayout(self)
-        margin = self.SHADOW + PAD
-        outer.setContentsMargins(margin, margin, margin, margin)
-        outer.setSpacing(20)
+        # Horizon's ask bar: the thread 20 px from the top, the input 15 px under a rule edge to edge
+        outer.setContentsMargins(self.SHADOW + PAD, self.SHADOW + 18, self.SHADOW + PAD, self.SHADOW + 15)
+        outer.setSpacing(30)
 
         # The card stack scrolls inside a capped area; the input below it never moves off screen.
         self._content = QWidget()
@@ -423,10 +423,23 @@ class Overlay(SurfaceWindow):
         bar.valueChanged.connect(self._on_scroll_value)
 
         self.input = AskInput(self)
+        from yuki.ui.window.theme import variable_font
+
+        self.input.setFont(variable_font(18, "Light", display=True))
+        self.input.setPlaceholderText("Ask Yuki")
         self.input.submitted.connect(self._on_submit)
         self.input.escaped.connect(self.dismiss)
         self.input.wants_height.connect(self._on_input_height)
-        outer.addWidget(self.input)
+        line = QHBoxLayout()
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(12)
+        line.addWidget(self.input, 1)
+        #: The shortcut that opens the ask bar, in quiet words on the right ("Alt Shift").
+        self.hint = QLabel(self)
+        self.hint.setFont(variable_font(12, "Regular"))
+        self.hint.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        line.addWidget(self.hint, 0, Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(line)
 
         self._input_effect = QGraphicsOpacityEffect(self.input)
         self._input_effect.setOpacity(1.0)
@@ -437,6 +450,7 @@ class Overlay(SurfaceWindow):
         self._input_collapse.setDuration(ANIM_MS)
         self._input_collapse.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._input_collapse.valueChanged.connect(lambda *_: self.fit())
+        self._input_collapse.valueChanged.connect(lambda *_: self.hint.setVisible(self.input.maximumHeight() > 8))
 
         self.input.setMaximumHeight(self.input.preferred_height())
         self.resize(PANEL_WIDTH + 2 * self.SHADOW, self.layout().sizeHint().height())
@@ -450,11 +464,17 @@ class Overlay(SurfaceWindow):
         self._grace_timer.timeout.connect(self._end_focus_grace)
         self.restyle()
 
-    # -- look (flat shadcn, docs/UI-window.md) --------------------------------
+    # -- look (Horizon's ask bar, docs/UI-window.md) ---------------------------
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         if not hasattr(self, "input"):
             return
+        from yuki.ui import ui_settings
+        from yuki.ui.window.widgets import combo_words
+
+        combo = combo_words(ui_settings.current().open_hotkey or "alt+shift")
+        self.hint.setText(combo.replace(" + ", " "))
+        self.hint.setStyleSheet(f"color: {self.ink_css('text_3')}; background: transparent;")
         sel = self.theme().accent_soft
         self.input.setStyleSheet(
             "QPlainTextEdit { background: transparent;"
@@ -462,7 +482,7 @@ class Overlay(SurfaceWindow):
             f" selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},{sel.alpha()});"
             " border: none; padding: 0px; }")
         pal = self.input.palette()
-        pal.setColor(pal.ColorRole.PlaceholderText, self.ink("text_3"))
+        pal.setColor(pal.ColorRole.PlaceholderText, self.ink("text_3"))   # "Ask Yuki", quiet
         self.input.setPalette(pal)
         if self.thread is not None:
             self.thread.restyle()
@@ -472,11 +492,11 @@ class Overlay(SurfaceWindow):
         shown = self.thread.isVisible() if self.thread is not None else self._scroll.isVisible()
         if self.input.maximumHeight() <= 0 or not shown:
             return
-        # a separator between the conversation and the input, edge to edge (shadcn's Command)
+        # a rule between the conversation and the input, edge to edge
         painter = QPainter(self)
         panel = self.panel_rect()
-        y = self.input.geometry().top() - 11
-        painter.fillRect(QRectF(panel.left() + 1, y, panel.width() - 2, 1), self.theme().border)
+        y = self.input.geometry().top() - 15
+        painter.fillRect(QRectF(panel.left() + 1, y, panel.width() - 2, 1), self.theme().float_sep)
         painter.end()
 
     # -- thread mode (the live chat thread) ------------------------------------
@@ -488,8 +508,8 @@ class Overlay(SurfaceWindow):
         from yuki.ui.chatview import ChatThreadView
 
         self._thread_model = model
-        self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 70,
-                                     margins=(0, 2, 4, 2), parent=self)
+        self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 8,
+                                     margins=(0, 2, 2, 2), look="overlay", parent=self)
         self.thread.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.thread.content_resized.connect(self.fit)
         self.thread.reply_nudge.connect(self._on_thread_reply)
@@ -717,7 +737,7 @@ class Overlay(SurfaceWindow):
 
         Args:
             nudge: The nudge (kept on the card as ``card.nudge``).
-            label: The small label (``Yuki · 14:32 · nudge``).
+            label: The small label (``Yuki, 14:32, nudge``).
             accent: Its kind's colour.
             at: When the user saw it (epoch s): where it goes in the stack.
 

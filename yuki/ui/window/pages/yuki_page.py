@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import ASPECT_TITLES, Todo, YukiView, day_label, epoch, hm, plain, second_person
-from yuki.ui.window.theme import SPACE, Theme
+from yuki.ui.window.theme import PAGE_PAD, SPACE, Theme
 from yuki.ui.window.widgets import (
     Divider,
     Card,
@@ -77,31 +77,43 @@ def _composer(t: Theme, placeholder: str, action: str, on_send, *, hint: str = "
 
 def _line(t: Theme, panel: Panel, text: str, glyph: str, *, note: str = "") -> None:
     row = QHBoxLayout()
-    row.setSpacing(SPACE["s"])
+    row.setSpacing(10)
+    row.setContentsMargins(0, 4, 0, 4)
     panel.body.addLayout(row)
-    row.addWidget(icon_label(t, glyph, t.text_3, "icon_small"), 0, Qt.AlignmentFlag.AlignTop)
+    ic = icon_label(t, glyph, t.text_3, "icon_small")
+    ic.setFixedWidth(12)
+    ic.setContentsMargins(0, 3, 0, 0)
+    row.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
     col = QVBoxLayout()
-    col.setSpacing(1)
+    col.setSpacing(4)
     row.addLayout(col, 1)
-    col.addWidget(text_label(t, text, "callout", "text", wrap=True, selectable=True))
+    col.addWidget(text_label(t, text, "body", "text", wrap=True, selectable=True))
     if note:
-        col.addWidget(text_label(t, note, "caption", "text_3", wrap=True))
+        col.addWidget(text_label(t, note, "micro", "text_3", wrap=True))
+
+
+def _empty(t: Theme, text: str, parent: QWidget | None = None) -> Card:
+    """An empty state: a glass inset with a plain sentence (the mockups' ``.empty``)."""
+    box = Card(t, level="muted", padding=0, parent=parent)
+    box.body.setContentsMargins(16, 14, 16, 14)
+    box.body.addWidget(text_label(t, text, "body", "text_2", wrap=True))
+    return box
 
 
 def _talk(t: Theme, view: YukiView) -> Panel:
-    panel = Panel(t, "How Yuki talks to you", "Your reply style, from what you've told Yuki and how you talk to it.",
-                  glyph="chat")
+    panel = Panel(t, "How Yuki talks to you", "Your reply style and rules of your own, from what you've told Yuki "
+                  "and how you talk to it.", glyph="chat")
     panel.body.setSpacing(SPACE["s"])
     if view.talk:
         for line in view.talk:
             _line(t, panel, line, "chat")
         when = f"{day_label(view.talk_at)} {hm(view.talk_at)}" if view.talk_at else ""
-        panel.body.addWidget(text_label(t, f"From your portrait · updated {when}" if when else "From your portrait",
-                                        "caption", "text_3"))
+        panel.body.addWidget(text_label(t, f"From your portrait, updated {when}" if when else "From your portrait",
+                                        "micro", "text_3"))
     else:
-        panel.body.addWidget(text_label(t, "Nothing about your reply style yet. Tell Yuki how you like replies, "
-                                           "short, no emoji, swear back, whatever, and it shows here.",
-                                        "callout", "text_3", wrap=True))
+        panel.body.addWidget(_empty(t, "Nothing about your reply style yet. Tell Yuki how you like replies, "
+                                       "“keep it short”, “no emoji”, “swear back”, "
+                                       "and it shows here.", panel))
     return panel
 
 
@@ -110,16 +122,17 @@ def _personality(t: Theme, view: YukiView) -> Panel:
                   "Yuki. Jokes stay jokes.", glyph="emoji")
     panel.body.setSpacing(SPACE["s"])
     if view.persona:
-        panel.body.addWidget(text_label(t, "How Yuki is with you", "caption_strong", "text_2"))
         for line in view.persona:
-            _line(t, panel, line, "sparkle", note="Learned from how you reacted to Yuki")
+            _line(t, panel, line, "like", note="Learned from how you reacted to Yuki")
     groups: dict[str, list] = {}
     for it in view.picked_up:
         groups.setdefault(it.aspect or "talk", []).append(it)
     if groups:
         if view.persona:
+            panel.body.addSpacing(4)
             panel.body.addWidget(Divider(t))
-        panel.body.addWidget(text_label(t, "What it picked up from how you talk", "caption_strong", "text_2"))
+            panel.body.addSpacing(4)
+        panel.body.addWidget(text_label(t, "What it picked up from how you talk", "caption", "text_3"))
     for aspect in ("talk", "people", "joke"):
         for it in groups.get(aspect, [])[:3]:
             row = QHBoxLayout()
@@ -128,10 +141,10 @@ def _personality(t: Theme, view: YukiView) -> Panel:
             col = QVBoxLayout()
             col.setSpacing(1)
             row.addLayout(col, 1)
-            col.addWidget(text_label(t, it.short, "callout", "text", wrap=True, selectable=True))
+            col.addWidget(text_label(t, it.short, "body", "text", wrap=True, selectable=True))
             extra = tag_words([x for x in it.tags if x == "joke"])
-            col.addWidget(text_label(t, " · ".join(x for x in (ASPECT_TITLES.get(aspect, ''), it.source, extra) if x),
-                                     "caption", "text_3", wrap=True))
+            src = ". ".join(x for x in (ASPECT_TITLES.get(aspect, ""), it.source, extra) if x)
+            col.addWidget(text_label(t, src, "micro", "text_3", wrap=True))
     if not view.persona and not groups:
         panel.body.addWidget(text_label(t, "Still getting to know you. This fills in as you talk to Yuki and "
                                            "your friends.", "callout", "text_3", wrap=True))
@@ -147,15 +160,27 @@ def _todo_row(t: Theme, todo: Todo, act: Actions, parent: QWidget, *, wrong_word
     head = QHBoxLayout()
     head.setSpacing(SPACE["s"])
     lay.addLayout(head)
-    head.addWidget(text_label(t, todo.text, "body", "text", wrap=True, selectable=True), 1)
+    from yuki.ui.window.theme import variable_font
+    from yuki.ui.window.widgets import Led
+
+    words = text_label(t, todo.text, "body", "text", wrap=True, selectable=True)
+    words.setFont(variable_font(14, "Medium"))
+    head.addWidget(words, 1)
     due = todo.due[:1].upper() + todo.due[1:] if todo.due else ""
-    src = " · ".join(x for x in (due, todo.source) if x) + (f" · “{todo.quote}”" if todo.quote else "")
-    lay.addWidget(text_label(t, src, "caption", "text_3", wrap=True))
+    src = ". ".join(x for x in (due, todo.source) if x) + (f". “{todo.quote}”" if todo.quote else "")
+    srow = QHBoxLayout()
+    srow.setSpacing(4)
+    if due:
+        from yuki.ui.window.pages.today import TodoPanel
+
+        srow.addWidget(Led(t, "on" if TodoPanel.soon(todo) else "off", 7), 0, Qt.AlignmentFlag.AlignTop)
+    srow.addWidget(text_label(t, src, "micro", "text_3", wrap=True), 1)
+    lay.addLayout(srow)
     actions = QHBoxLayout()
-    actions.setSpacing(6)
+    actions.setSpacing(8)
+    actions.setContentsMargins(0, 6, 0, 0)
     lay.addLayout(actions)
-    actions.addStretch(1)
-    done = Button(t, "Done", glyph="check", style="secondary", size="small")
+    done = Button(t, "Done", glyph="check", style="default", size="small")
     not_needed = Button(t, "Not needed", style="outline", size="small")
     wrong = Button(t, wrong_word, style="outline", size="small")
     wrong.setToolTip("Captured by mistake. Yuki takes it off and learns not to capture the like again.")
@@ -171,6 +196,7 @@ def _todo_row(t: Theme, todo: Todo, act: Actions, parent: QWidget, *, wrong_word
             act.todo_close(todo.raw, how)
 
         pill.clicked.connect(clicked)
+    actions.addStretch(1)
     return box
 
 
@@ -180,7 +206,7 @@ TODOS_SHOWN = 6
 
 def todos_panel(t: Theme, todos: list[Todo], act: Actions) -> Panel:
     """The user's to-dos, with Done / Not needed / Not mine (on the Me page since 2026-09-27)."""
-    more = Button(t, f"All {len(todos)}", style="outline", size="small")
+    more = Button(t, f"All {len(todos)}", style="key", size="mini")
     panel = Panel(t, "Your to-dos", "What you said you'd do, or what people are waiting on. Yuki reminds you, "
                   "you tick them off.", glyph="flag", right=more)
     panel.body.setSpacing(SPACE["s"])
@@ -243,16 +269,19 @@ def _learned(t: Theme, view: YukiView) -> Panel:
             panel.body.addLayout(col)
             col.addWidget(text_label(t, k.title, "body_strong", "text", wrap=True))
             if k.line:
-                col.addWidget(text_label(t, k.line, "callout", "text_2", wrap=True, selectable=True))
+                col.addWidget(text_label(t, k.line, "body", "text_2", wrap=True, selectable=True))
             if k.app:
-                col.addWidget(text_label(t, f"In {k.app[:1].upper() + k.app[1:]}", "caption", "text_3"))
+                from yuki.ui.window.widgets import Led
+
+                arow = QHBoxLayout()
+                arow.setSpacing(2)
+                arow.addWidget(Led(t, "ok", 5))
+                arow.addWidget(text_label(t, f"In {k.app[:1].upper() + k.app[1:]}", "micro", "text_3"), 1)
+                col.addLayout(arow)
     else:
-        empty = Card(t, level="muted", padding=SPACE["m"], parent=panel)
-        empty.body.addWidget(text_label(t, "Nothing yet.", "body_strong", "text_2"))
-        empty.body.addWidget(text_label(t, "When Yuki finds a way that works here, say hovering YouTube's volume "
-                                           "button to reach the slider, it keeps it and shows it here.", "caption",
-                                        "text_3", wrap=True))
-        panel.body.addWidget(empty)
+        panel.body.addWidget(_empty(t, "Nothing yet. When Yuki finds a way that works here, say hovering "
+                                       "YouTube's volume button to reach the slider, it keeps it and shows it "
+                                       "here.", panel))
     return panel
 
 
@@ -261,9 +290,9 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
                                "coming from you.", glyph="question")
     qs.body.setSpacing(SPACE["s"])
     if view.waiting:
-        qs.body.addWidget(text_label(t, "Waiting to ask", "caption_strong", "text_2"))
+        qs.body.addWidget(text_label(t, "Waiting to ask", "caption", "text_3"))
         for q in view.waiting:
-            card = Card(t, level="muted", padding=SPACE["m"], parent=qs)
+            card = Card(t, level="muted", padding=14, parent=qs)
             qs.body.addWidget(card)
             card.body.setSpacing(6)
             # the question leads: larger, semibold, full-strength ink; why it asks sits under it, small and dim
@@ -289,20 +318,23 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
             row.addWidget(answer)
             card.body.addWidget(answer_box)
     if view.asked:
-        qs.body.addWidget(text_label(t, "Asked before", "caption_strong", "text_2"))
-        for q in view.asked[:4]:
+        if view.waiting:
+            qs.body.addWidget(text_label(t, "Asked before", "caption", "text_3"))
+        for i, q in enumerate(view.asked[:5]):
+            if i:
+                qs.body.addWidget(Divider(t))
             row = QHBoxLayout()
-            row.setSpacing(SPACE["m"])
+            row.setSpacing(14)
             qs.body.addLayout(row)
             c = QVBoxLayout()
-            c.setSpacing(2)
+            c.setSpacing(5)
             row.addLayout(c, 1)
             c.addWidget(text_label(t, plain(second_person(q["question"])), "body_strong", "text", wrap=True))
             if q.get("answer"):
-                c.addWidget(text_label(t, f"You: “{q['answer']}”", "caption", "text_3", wrap=True, selectable=True))
+                c.addWidget(text_label(t, f"You: “{q['answer']}”", "body", "text_2", wrap=True, selectable=True))
             word = {"answered": "Answered", "skipped": "Skipped", "never": "Won't ask", "asked": "Asked"}
-            row.addWidget(text_label(t, f"{word.get(q['status'], q['status'])} {_when(q['answered_at'] or q['at'])}",
-                                     "caption", "text_3"), 0, Qt.AlignmentFlag.AlignTop)
+            row.addWidget(text_label(t, f"{word.get(q['status'], q['status'])} {_when(q['answered_at'] or q['at'])}".strip(),
+                                     "micro", "text_3"), 0, Qt.AlignmentFlag.AlignTop)
     if not view.waiting and not view.asked:
         qs.body.addWidget(text_label(t, "No questions right now.", "callout", "text_3"))
     return qs
@@ -312,20 +344,22 @@ def build(t: Theme, view: YukiView, *, act: Actions = NOOP) -> QWidget:
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
-    col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
-    col.setSpacing(SPACE["l"])
+    col.setContentsMargins(*PAGE_PAD)
+    col.setSpacing(24)
     col.addWidget(page_header(t, "Yuki", "Yuki's side, with you: how it talks to you, its personality with you, "
-                                         "and what it learned. Your to-dos are on the Me page."))
+                                         "what it learned and what it asked. Your to-dos are on the Me page."))
     grid = QWidget(page)
     grid.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    cards = Masonry(grid, columns=2, spacing=SPACE["l"], min_col=380)
-    for make in (lambda: _talk(t, view), lambda: _personality(t, view),
-                 (lambda: _promises(t, view, act)) if view.promises else None,
-                 lambda: _learned(t, view), lambda: _questions(t, view, act)):
+    cards = Masonry(grid, columns=2, spacing=14, min_col=340)
+    # left: how it talks, what it learned, what it promised; right: its personality, its questions
+    for column, make in ((0, lambda: _talk(t, view)), (1, lambda: _personality(t, view)),
+                         (0, lambda: _learned(t, view)),
+                         (0, (lambda: _promises(t, view, act)) if view.promises else None),
+                         (1, lambda: _questions(t, view, act))):
         if make is not None:
             card = make()
             card.setParent(grid)
-            cards.addWidget(card)
+            cards.add(card, column)
     col.addWidget(grid)
     col.addStretch(1)
     return page

@@ -7,6 +7,12 @@ gone -- process and all -- on close, so it costs nothing while closed.
 * **Reads** go straight through :class:`~yuki.memory.api.MemoryClient`, on
   background threads: a page shows "Reading your memory…" and fills in when its
   data arrives. Today re-reads itself each minute while it shows today.
+* **Smooth opening.** The frame and the sidebar paint before memory is opened;
+  the last snapshot of each page (:mod:`yuki.ui.window.snapshot`, encrypted with
+  memory's key) fills the page at once, then fresh data replaces it (a page whose
+  data did not change is not rebuilt). Once Today is up, the other pages' data is
+  read in the background, so a first visit only builds widgets. Nothing on the GUI
+  thread waits on memory or the pipe.
 * **Writes** go through the same client (corrections in the user's own words,
   answers, rule removal by id, erasing call audio, call preferences, pause),
   the settings files (:mod:`yuki.ui.window.settings_io`, :mod:`yuki.ui.ui_settings`)
@@ -51,6 +57,28 @@ CONFIRM_KEEP_S = 10 * 60
 JOURNAL_KEEP_S = 8 * 86400
 
 
+#: How often Python hands the GIL between threads in the window process (s). Background reads (memory
+#: decryption, the device list) are pure Python: at the default 5 ms a busy worker delays the GUI thread by
+#: whole frames; 1 ms keeps it within one.
+SWITCH_INTERVAL_S = 0.001
+
+
+def tune_threads() -> None:
+    """Keep the GUI thread responsive while workers read memory (idempotent)."""
+    if sys.getswitchinterval() > SWITCH_INTERVAL_S:
+        sys.setswitchinterval(SWITCH_INTERVAL_S)
+
+
+def settle_heap() -> None:
+    """Once the pages' data is in: freeze the heap (the modules, the views, the widgets' wrappers) out of the
+    cyclic collector's reach, so a full collection later walks only new objects: no 100 ms pause in the
+    middle of a hover or a scroll. No collection first: a full one is itself a 150 ms pause (measured), and
+    the few cycles frozen with the rest live only as long as this short-lived process."""
+    import gc
+
+    gc.freeze()
+
+
 class _Bridge(QObject):
     """Background threads hand results to the GUI thread through these."""
 
@@ -59,13 +87,15 @@ class _Bridge(QObject):
 
 
 class WindowApp(Actions):
-    """The controller. ``memory``: an open MemoryClient; ``db_path``: its database (the pipe's name)."""
+    """The controller. ``memory``: an open MemoryClient, or ``None`` to paint the window first and hand memory
+    over later (:meth:`attach_memory`); ``db_path``: its database (the pipe's name)."""
 
     def __init__(self, memory: Any, *, db_path: Path | None = None, page: str = "today", connect: bool = True,
                  ui_path: Path | None = None, real_db: Path | None = None) -> None:
         from yuki.ui import ui_settings
         from yuki.ui.chat_model import ChatModel
 
+        tune_threads()
         self.memory = memory
         self.db_path = db_path
         self.real_db = real_db
@@ -84,8 +114,14 @@ class WindowApp(Actions):
         self._status: Any = None
         self._reply_to: dict | None = None
         self._devices: tuple[float, dict] | None = None
+        self._devices_busy = False
+        #: Pages whose view came from the snapshot (shown at once, refreshed from memory).
+        self._stale: set[str] = set()
+        self._prefetched = False
         self._want_connect = connect
         self._closing = False
+        self._started = False
+        self._shown = False
         self.t = self._theme()
         self.win = self._make_window(page)
         self._today_timer = QTimer()
@@ -116,6 +152,7 @@ class WindowApp(Actions):
         win = LiveWindow(self.t, current=page)
         win.navigated.connect(self._on_navigate)
         win.closing.connect(self._on_close)
+        win.sidebar.listen_clicked.connect(lambda: self.set_wake(not win.sidebar.listening))
         return win
 
     def show(self, *, offscreen: bool = False) -> None:
@@ -134,13 +171,105 @@ class WindowApp(Actions):
             win.make_native()
             win.raise_()
             win.activateWindow()
+        self._shown = True
+        if self.memory is not None:
+            self._start()
+
+    def attach_memory(self, memory: Any, *, db_path: Path | None = None, real_db: Path | None = None) -> None:
+        """Memory is open (the window painted before it was): read the pages now."""
+        self.memory = memory
+        if db_path is not None:
+            self.db_path = db_path
+        if real_db is not None:
+            self.real_db = real_db
+        self.pending = self._load_pending()
+        if self.pending and not self._pending_timer.isActive():
+            self._pending_timer.start()
+        if self._shown:
+            self._start()
+
+    def _start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        win = self.win
+        self._load_snapshot()
         self.load(win.current)
         self.load("status")          # the sidebar's footer and badges
         if self._want_connect:
             self._connect_bg()
 
+    # -- the snapshot: last session's pages, shown at once --------------------------------------------
+
+    def snapshot_path(self) -> Path:
+        from yuki.ui.window import snapshot
+
+        return snapshot.path_for(self.ui_path)
+
+    def _load_snapshot(self) -> None:
+        """Read the last snapshot off the GUI thread; the current page shows it until fresh data arrives."""
+        from yuki.ui.window import snapshot
+
+        cipher = getattr(getattr(self.memory, "store", None), "cipher", None)
+        if cipher is None:
+            return
+        path, db = self.snapshot_path(), str(self.db_path or "")
+
+        def then(views: dict) -> None:
+            for key, view in views.items():
+                if key in self._views or key in self._loading and key != self.win.current:
+                    continue
+                if key == "today" and self.day != date.today():
+                    continue
+                self._views[key] = view
+                self._stale.add(key)
+                if key == "status":
+                    self._status = view
+                    self._sync_footer()
+                if key == self.win.current and key not in self.win.pages:
+                    self._build(key)
+
+        self.bg(lambda: snapshot.load(path, cipher, db=db), then, failed="")
+
+    def save_snapshot(self) -> bool:
+        """Write the pages' data for the next opening (called once the window is gone)."""
+        from yuki.ui.window import snapshot
+
+        cipher = getattr(getattr(self.memory, "store", None), "cipher", None)
+        if cipher is None:
+            return False
+        views = {k: v for k, v in self._views.items() if k not in self._stale}
+        if views.get("today") is not None and getattr(views["today"], "day", None) != date.today():
+            views.pop("today")
+        return snapshot.save(self.snapshot_path(), cipher, views, db=str(self.db_path or ""))
+
+    def _prefetch(self) -> None:
+        """Once Today is up: read the other pages' data in the background (one at a time), so a first visit
+        only builds widgets."""
+        if self._prefetched or self._closing:
+            return
+        self._prefetched = True
+        self._prefetch_queue = [k for k in ("me", "yuki", "settings") if k not in self._views or k in self._stale]
+        self._prefetch_next()
+
+    def _prefetch_next(self) -> None:
+        queue = getattr(self, "_prefetch_queue", [])
+        while queue and not self._closing:
+            key = queue.pop(0)
+            if key in self._loading or (key in self._views and key not in self._stale):
+                continue
+            self._prefetching = key
+            self.load(key, build=False)
+            return
+        self._prefetching = None
+        settle_heap()   # everything is read: the steady state starts here
+
     def _on_navigate(self, key: str) -> None:
-        if key not in self._views or key in ("status", "chat"):
+        if key in self._views and key not in self.win.pages:
+            self._build(key)          # prefetched or from the snapshot: widgets only
+        # the chat page follows the live thread itself (the model): it is read again only when not built yet
+        chat_live = key == "chat" and key in self.win.pages
+        if key not in self._views or key == "status" or (key == "chat" and not chat_live) or key in self._stale:
             self.load(key)
         if key == "today" and self.day == date.today():
             self._today_timer.start()
@@ -182,11 +311,12 @@ class WindowApp(Actions):
 
         threading.Thread(target=run, name="yuki-window-work", daemon=True).start()
 
-    def load(self, key: str) -> None:
-        """Read a page's data in the background, then (re)build it."""
+    def load(self, key: str, *, build: bool = True) -> None:
+        """Read a page's data in the background, then (re)build it (``build=False``: keep the data only, built
+        when the page is first shown). A page whose data did not change is left as it is (no jump)."""
         from yuki.ui.window import data as D
 
-        if key in self._loading:
+        if key in self._loading or self.memory is None:
             return
         self._loading.add(key)
         memory, day = self.memory, self.day
@@ -208,11 +338,22 @@ class WindowApp(Actions):
 
         def then(view: Any) -> None:
             self._loading.discard(key)
+            old = self._views.get(key)
             self._views[key] = view
+            self._stale.discard(key)
             if key == "status":
                 self._status = view
                 self._sync_footer()
-            self._build(key)
+            if key == "today" and not self._prefetched:
+                QTimer.singleShot(300, self._prefetch)
+            if key == getattr(self, "_prefetching", None):   # the next page's data, one read at a time
+                self._prefetching = None
+                QTimer.singleShot(50, self._prefetch_next)
+            same = old is not None and key != "chat" and key in self.win.pages and _same(old, view)
+            if same:
+                return
+            if build or key in self.win.pages or key == self.win.current:
+                self._build(key)
 
         def run() -> None:
             try:
@@ -236,11 +377,12 @@ class WindowApp(Actions):
                 return
             old = win.page_widget("today")
             chart = getattr(old, "chart", None)
-            zoom = chart.view if chart is not None and chart.is_zoomed and chart.day.day == view.day else None
-            selected = getattr(old, "selected", None) if chart is not None and chart.day.day == view.day else None
-            if selected is None and view.sessions:
+            same_day = chart is not None and chart.day.day == view.day
+            at = getattr(old, "at", None) if same_day else None
+            selected = None
+            if at is None and view.sessions:
                 selected = len(view.sessions) - 1
-            widget = today.build(t, view, selected=selected, today=view.day == date.today(), act=self, view=zoom)
+            widget = today.build(t, view, selected=selected, at=at, today=view.day == date.today(), act=self)
         elif key == "me" and view is not None:
             widget = me.build(t, view, act=self, pending=self.pending)
             if self.pending:
@@ -250,6 +392,8 @@ class WindowApp(Actions):
         elif key == "status" and view is not None:
             widget = status.build(t, view, act=self)
         elif key == "settings" and view is not None:
+            if self._devices is None:   # yuki-ui has the list (a pipe request); else read it here once idle
+                QTimer.singleShot(0 if self.client is not None else 1500, self.refresh_devices)
             widget = settings.build(t, view, act=self, ui=self.ui, connected=self.connected if self._want_connect
                                     else None)
         elif key == "chat":
@@ -725,22 +869,41 @@ class WindowApp(Actions):
         key = "mic" if kind == "capture" else "speaker"
         self._voice({key: name}, f"{'Microphone' if key == 'mic' else 'Speaker'}: {name or 'System default'}.")
 
-    def device_options(self, kind: str) -> list[tuple[str, Any]]:
-        found: dict[str, Any] = {}
-        cached = self._devices
-        if cached is not None and time.monotonic() - cached[0] < 5.0:
-            found = cached[1]
-        elif self.client is not None:
-            reply = self.client.request("devices", wait_s=3.0) or {}
-            found = reply.get("devices") or {}
-            self._devices = (time.monotonic(), found)
-        else:
-            try:
-                from yuki.voice.audio import audio_devices
+    def refresh_devices(self) -> None:
+        """Read the audio devices off the GUI thread (yuki-ui over the pipe, else Core Audio here)."""
+        if self._devices_busy:
+            return
+        self._devices_busy = True
+        client = self.client
 
-                found = audio_devices()
+        def work() -> dict:
+            if client is not None:
+                reply = client.request("devices", wait_s=3.0) or {}
+                return reply.get("devices") or {}
+            from yuki.voice.audio import audio_devices
+
+            return audio_devices()
+
+        def then(found: dict) -> None:
+            self._devices_busy = False
+            self._devices = (time.monotonic(), found or {})
+
+        def run() -> None:
+            try:
+                found = work()
             except Exception:
                 found = {}
+            self._bridge.run.emit(lambda: then(found))
+
+        threading.Thread(target=run, name="yuki-window-devices", daemon=True).start()
+
+    def device_options(self, kind: str) -> list[tuple[str, Any]]:
+        """The devices for a menu, from the last background read (never waits: a read older than 5 s is
+        refreshed for next time)."""
+        cached = self._devices
+        found: dict[str, Any] = cached[1] if cached is not None else {}
+        if cached is None or time.monotonic() - cached[0] >= 5.0:
+            self.refresh_devices()
         default = found.get(f"default_{kind}")
         opts: list[tuple[str, Any]] = [("System default" + (f" ({default})" if default else ""), None)]
         opts += [(name, name) for name in found.get(kind, []) or []]
@@ -851,6 +1014,20 @@ class WindowApp(Actions):
     def set_reduce_motion(self, on: bool) -> None:
         self._ui(reduce_motion=bool(on))
 
+    def set_accent(self, name: str) -> None:
+        """The accent (green or orange): saved in ``ui.json``; every page and the sidebar repaint in it now,
+        and yuki-ui's floating surfaces follow over the pipe."""
+        from yuki.ui.window.theme import ACCENTS, theme
+
+        if name not in ACCENTS:
+            return
+        self._ui(accent=name)
+        self.t = theme(accent=name)
+        self.win.set_theme(self.t)
+        for key in list(self._views):
+            if key in self.win.pages:
+                self._build(key)
+
     def set_model(self, alias: str) -> None:
         self._ask("model", lambda r: self.toast(f"Model: {alias.capitalize()}."), model=alias)
 
@@ -886,6 +1063,14 @@ class WindowApp(Actions):
         if field is not None:
             field.edit.setPlaceholderText("Your reply to Yuki's card…")
             field.edit.setFocus()
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Whether two page views say the same (dataclass equality; anything odd counts as changed)."""
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
 
 
 def _sessions_dir() -> Path:
@@ -958,20 +1143,37 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Yuki")
     from yuki.ui.window.theme import app_font
 
-    app.setFont(app_font())   # Segoe UI Variable with its real weights, for every plain widget too
+    app.setFont(app_font())   # Segoe UI Variable with its real weights (and Doto, Nirmala UI) for every widget
     app.setQuitOnLastWindowClosed(True)
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import default_db_path
+    from yuki.ui.stall import maybe_start
 
-    db = args.db or default_db_path()
-    memory = MemoryClient.open(db)
-    controller = WindowApp(memory, db_path=db, page=args.page if args.page in
-                           ("today", "me", "yuki", "status", "chat", "settings") else "today", real_db=db)
+    maybe_start("window")
+    # the frame and the sidebar paint first; memory (a heavy import and the database) opens on a worker thread
+    controller = WindowApp(None, db_path=args.db, page=args.page if args.page in
+                           ("today", "me", "yuki", "status", "chat", "settings") else "today", real_db=args.db)
     focus = _Bridge()
     focus.run.connect(lambda fn: fn())
     _watch_focus(lambda: focus.run.emit(lambda: controller._on_event({"ev": "focus"})))
     controller.show()
+    opened: dict[str, Any] = {}
+
+    def open_memory() -> None:
+        try:
+            from yuki.memory.api import MemoryClient
+            from yuki.memory.store import default_db_path
+
+            db = args.db or default_db_path()
+            opened["memory"] = MemoryClient.open(db)
+            focus.run.emit(lambda: controller.attach_memory(opened["memory"], db_path=db, real_db=db))
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            focus.run.emit(lambda: controller.toast(f"Couldn't open memory: {err}", "error"))
+
+    QTimer.singleShot(0, lambda: threading.Thread(target=open_memory, name="yuki-window-memory",
+                                                   daemon=True).start())
     try:
         return int(app.exec())
     finally:
-        memory.close()
+        if opened.get("memory") is not None:
+            controller.save_snapshot()   # the window is gone: the next opening shows these pages at once
+            opened["memory"].close()

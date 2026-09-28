@@ -3,7 +3,7 @@
 The Yuki window's Chat page and the Alt+Shift overlay both show this thread. It
 works like ChatGPT, Claude or Warp: every user message is its own bubble the
 moment it is sent (typed or spoken), Yuki's reply streams into the bubble under
-it, and a collapsible "worked for 12 s · 5 steps" section under each response
+it, and a collapsible "worked for 12 s, 5 steps" section under each response
 lists every tool call and action it ran.
 
 :class:`ChatModel` is fed plain event dicts (JSON-safe, so the same stream
@@ -153,15 +153,15 @@ class Item:
         return times, tail
 
     def work_line(self, now: float | None = None) -> str:
-        """``worked for 12 s · 5 steps`` (``working · 3 steps`` while it runs)."""
+        """``worked for 12 s, 5 steps`` (``working 4 s, 3 steps`` while it runs)."""
         n = len(self.real_steps())
         steps = f"{n} step{'s' if n != 1 else ''}"
         secs = self.work_seconds(now)
         if self.running:
-            return f"working {fmt_seconds(secs)} · {steps}"
+            return f"working {fmt_seconds(secs)}, {steps}"
         if secs < 0.5:   # no timing kept (an exchange read back from memory): the steps alone, never "0 s"
             return steps
-        return f"worked for {fmt_seconds(secs)} · {steps}"
+        return f"worked for {fmt_seconds(secs)}, {steps}"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -448,7 +448,7 @@ class ChatModel:
         head = next((s for s in item.steps if s.key == key), None)
         if state == "started" or head is None:
             if head is None:
-                head = Step(key, "helper", f"helper {index}", f"Helper {index} · {text or 'looking into it'}", at,
+                head = Step(key, "helper", f"helper {index}", f"Helper {index}, {text or 'looking into it'}", at,
                             depth=depth, job=job)
                 item.steps.append(head)
             if state == "started":

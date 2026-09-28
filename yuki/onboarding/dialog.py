@@ -1,4 +1,4 @@
-"""The first-run setup dialog: four short steps in one flat dark window (shadcn's zinc dark).
+"""The first-run setup dialog: four short steps in one dark window (Horizon x Field Unit, as the app).
 
 1. AI model (required): Anthropic API key (default) or AWS Bedrock + region, optional Test.
 2. Voice (optional): Deepgram and ElevenLabs keys, or "Skip voice for now".
@@ -10,7 +10,8 @@ Every write goes through a parameter (``env``, ``local_dir``, ``memory_dir``) so
 tests and trial runs point at scratch locations. Slow work (the key test, the
 download) runs on plain threads and reports back through queued Qt signals.
 Colours and fonts are copied from ``yuki.ui.window.theme`` rather than imported,
-so this window does not depend on the UI package.
+so this window does not depend on the UI package. The steps are four small hardware keys across the top;
+the current one's LED is lit in the accent (olive green, the default; the wizard runs before any setting).
 """
 
 from __future__ import annotations
@@ -21,7 +22,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
@@ -42,57 +44,106 @@ from yuki.onboarding import consent as consent_mod
 from yuki.onboarding import prefs
 from yuki.onboarding.envvars import UserEnv
 
-# -- look (shadcn zinc dark, the tokens of yuki.ui.window.theme) ------------------------------------------
+# -- look (Horizon x Field Unit, the tokens of yuki.ui.window.theme) ------------------------------------------
 
-BG = "#09090b"
-PANEL = "#09090b"
-FIELD = "#09090b"
-LINE = "#27272a"
-MUTED_BG = "#27272a"
-TEXT = "#fafafa"
-MUTED = "#a1a1aa"
-PRIMARY = "#fafafa"
-PRIMARY_FG = "#18181b"
-RING = "#d4d4d8"
-ACCENT = PRIMARY   # links and the progress bar: monochrome
-GOOD = "#22c55e"
-BAD = "#ef4444"
-FONT = '"Inter", "Segoe UI Variable Text", "Segoe UI"'
-FONT_DISPLAY = '"Inter", "Segoe UI Variable Display", "Segoe UI"'
+BG = "#0B0E13"
+PANEL = "#10141B"
+FIELD = "#06090D"
+LINE = "#1E2632"
+KEY = "#131821"
+KEY_ON = "#19212D"
+MUTED_BG = "#131821"
+TEXT = "#E6E9EE"
+TEXT_2 = "#AEB6C2"
+MUTED = "#6F7886"
+FAINT = "#3E4858"
+LED_OFF = "#283140"
+PRIMARY = "#E6E9EE"
+PRIMARY_FG = "#0B0E13"
+RING = "#6F7886"
+ACCENT_LED = "#8FAF5A"   # the default accent (olive green): the current step's LED only
+ACCENT = TEXT_2          # links: ink, underlined (the accent is for live states)
+GOOD = TEXT_2            # "Key works." in words, no colour
+BAD = "#E5736B"
+FONT = '"Segoe UI Variable Text", "Segoe UI", "Nirmala UI"'
+FONT_DISPLAY = '"Segoe UI Variable Display", "Segoe UI", "Nirmala UI"'
 
 STYLE = f"""
 QDialog {{ background: {BG}; }}
 QWidget {{ color: {TEXT}; font-family: {FONT}; font-size: 14px; }}
-QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 24px; font-weight: 600; }}
-QLabel#steps {{ color: {MUTED}; font-size: 12px; font-weight: 500; }}
-QLabel#body, QLabel#hint {{ color: {MUTED}; }}
-QLabel#hint {{ font-size: 13px; }}
-QLabel#section {{ font-weight: 600; font-size: 15px; }}
+QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 34px; font-weight: 300; }}
+QLabel#body {{ color: {TEXT_2}; font-size: 15px; }}
+QLabel#hint {{ color: {MUTED}; font-size: 13px; }}
+QLabel#section {{ font-family: {FONT_DISPLAY}; font-weight: 400; font-size: 18px; }}
 QLabel#bad {{ color: {BAD}; }}
-QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 8px; }}
-QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 6px; padding: 7px 12px;
-            selection-background-color: #3f3f46; }}
+QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px; }}
+QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 8px; padding: 7px 12px;
+            selection-background-color: #2A3444; }}
 QLineEdit:focus {{ border: 1px solid {RING}; }}
-QPushButton {{ background: {BG}; border: 1px solid {LINE}; border-radius: 6px; padding: 7px 16px; min-height: 20px;
-              font-weight: 500; }}
-QPushButton:hover {{ background: {MUTED_BG}; }}
-QPushButton:disabled {{ color: rgba(250,250,250,0.5); background: {BG}; }}
-QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; }}
-QPushButton#primary:hover {{ background: #e4e4e7; border-color: #e4e4e7; }}
-QPushButton#primary:disabled {{ background: rgba(250,250,250,0.5); border-color: transparent;
-                                color: rgba(24,24,27,0.7); }}
+QPushButton {{ background: transparent; color: {TEXT_2}; border: 1px solid {LINE}; border-radius: 16px;
+              padding: 6px 16px; min-height: 20px; font-size: 13px; }}
+QPushButton:hover {{ background: {KEY}; color: {TEXT}; }}
+QPushButton:disabled {{ color: {FAINT}; background: transparent; }}
+QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 600; }}
+QPushButton#primary:hover {{ background: #CDD2D9; border-color: #CDD2D9; }}
+QPushButton#primary:disabled {{ background: #3E4858; border-color: transparent; color: #1E2632; }}
 QPushButton#flat {{ background: transparent; border: none; color: {MUTED}; }}
-QPushButton#flat:hover {{ color: {TEXT}; background: {MUTED_BG}; }}
+QPushButton#flat:hover {{ color: {TEXT}; background: {KEY}; }}
 QPushButton#small {{ padding: 5px 12px; font-size: 13px; }}
 QPushButton#choice {{ padding: 6px 16px; min-width: 64px; }}
-QPushButton#choice:checked {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; }}
+QPushButton#choice:checked {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 600; }}
 QRadioButton {{ spacing: 10px; font-weight: 600; }}
-QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px; border: 1px solid {MUTED}; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px; border: 1px solid {MUTED}; background: {FIELD}; }}
 QRadioButton::indicator:checked {{ width: 6px; height: 6px; border: 5px solid {PRIMARY}; background: {BG}; }}
-QProgressBar {{ background: {MUTED_BG}; border: none; border-radius: 4px; height: 8px; max-height: 8px;
+QProgressBar {{ background: {KEY}; border: 1px solid {LINE}; border-radius: 4px; height: 8px; max-height: 8px;
                text-align: center; color: transparent; }}
-QProgressBar::chunk {{ background: {PRIMARY}; border-radius: 4px; }}
+QProgressBar::chunk {{ background: {TEXT_2}; border-radius: 3px; }}
 """
+
+
+class StepKeys(QWidget):
+    """The four steps as small hardware keys, the current one lit (its LED in the accent), done ones with a
+    quiet LED. No numbers: each key says its step."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        super().__init__()
+        self.names = names
+        self.current = 0
+        self.setFixedHeight(40)
+
+    def set_current(self, index: int) -> None:
+        self.current = index
+        self.update()
+
+    def text(self) -> str:   # what it says, for tests and screen readers
+        return ", ".join(("now: " if i == self.current else "") + n for i, n in enumerate(self.names))
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        f = QFont("Segoe UI Variable")
+        f.setFamilies(["Segoe UI Variable", "Segoe UI", "Nirmala UI"])
+        f.setPixelSize(12)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        x = 0.0
+        for i, name in enumerate(self.names):
+            w = fm.horizontalAdvance(name) + 40
+            r = QRectF(x, 2, w, 34)
+            on = i == self.current
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(LINE))
+            p.drawRoundedRect(r, 8, 8)
+            p.setBrush(QColor(KEY_ON if on else KEY))
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -2), 7, 7)
+            led = ACCENT_LED if on else (TEXT_2 if i < self.current else LED_OFF)
+            p.setBrush(QColor(led))
+            p.drawEllipse(QPointF(r.left() + 14, r.center().y() - 0.5), 2.6, 2.6)
+            p.setPen(QColor(TEXT if on else MUTED))
+            p.drawText(r.adjusted(24, 0, -8, -2), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+            x += w + 8
+        p.end()
+
 
 LINKS = {
     "anthropic": ("Get a key at console.anthropic.com", "https://console.anthropic.com/settings/keys"),
@@ -165,7 +216,7 @@ def _card() -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
     frame.setObjectName("card")
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(20, 18, 20, 18)
+    layout.setContentsMargins(22, 20, 22, 20)
     layout.setSpacing(8)
     return frame, layout
 
@@ -268,13 +319,14 @@ class OnboardingDialog(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 22)
         outer.setSpacing(6)
-        self.steps_label = _label("", "steps", wrap=False)
+        self.steps_label = StepKeys(STEP_NAMES)
         self.title = _label("", "title")
         self.subtitle = _label("", "body")
         outer.addWidget(self.steps_label)
+        outer.addSpacing(14)
         outer.addWidget(self.title)
         outer.addWidget(self.subtitle)
-        outer.addSpacing(10)
+        outer.addSpacing(12)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._model_page())
@@ -454,10 +506,7 @@ class OnboardingDialog(QDialog):
 
     def _go(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        self.steps_label.setText("&nbsp;&nbsp;&middot;&nbsp;&nbsp;".join(
-            (f"<b style='color:{TEXT}'>{i + 1}&nbsp;&nbsp;{name}</b>" if i == index else f"{i + 1}&nbsp;&nbsp;{name}")
-            for i, name in enumerate(STEP_NAMES)))
-        self.steps_label.setTextFormat(Qt.TextFormat.RichText)
+        self.steps_label.set_current(index)
         self.title.setText(self.TITLES[index][0])
         self.subtitle.setText(self.TITLES[index][1])
         self._show_error("")

@@ -1,12 +1,13 @@
-"""The live Yuki window: frameless Windows 11 chrome, a sidebar, one page at a time, flat shadcn dark.
+"""The live Yuki window: frameless Windows 11 chrome, a sidebar of hardware keys, one page at a time.
 
-Built by :mod:`yuki.ui.window.app` in the window's own process and destroyed
-with it. The window is opaque ``#09090b``; the sidebar sits on the same colour
-behind a 1 px border; pages are flat cards on it (docs/UI-window.md).
+Built by :mod:`yuki.ui.window.app` in the window's own process and destroyed with it. The window is opaque
+navy-charcoal ``#0B0E13``; the sidebar (Field Unit) is a column of 60 px keys, each with a status LED (lit in
+the accent on the current page), and the listening key at the bottom (lit while Yuki listens); pages are
+Horizon's flat navy modules (docs/UI-window.md).
 
-Chrome (:mod:`yuki.ui.window.chrome`): drag from the sidebar's head or any empty
-part of the top band, resize from the edges, Aero Snap, Windows 11's snap
-layouts on the maximise button, double-click the top to maximise.
+Chrome (:mod:`yuki.ui.window.chrome`): drag from the top of the sidebar or any empty part of the top band,
+resize from the edges, Aero Snap, Windows 11's snap layouts on the maximise button, double-click the top to
+maximise.
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from yuki.ui.window.theme import ICON, RADIUS, SIDEBAR_W, SPACE, WINDOW_SIZE, Theme, font
-from yuki.ui.window.widgets import Card, NavItem, Shimmer, Toast, attach_tips, scroll, text_label
+from yuki.ui.window.theme import PAGE_PAD, SIDEBAR_W, WINDOW_SIZE, Theme, font
+from yuki.ui.window.widgets import Key, NavItem, Shimmer, Toast, attach_tips, page_header, scroll
 
 #: (key, glyph, label) of the six pages, in sidebar order.
 PAGES: tuple[tuple[str, str, str], ...] = (
@@ -38,9 +39,10 @@ PAGES: tuple[tuple[str, str, str], ...] = (
 )
 
 #: The top band that drags the window (logical px).
-CAPTION_H = 44
-#: Room above each page's content for the caption buttons that sit over it (logical px).
-PAGE_TOP = 40
+CAPTION_H = 34
+#: Room above each page's content for the caption buttons (none: they float over the page's top-right
+#: corner, above the page's own 34 px top padding, as the mockups have them).
+PAGE_TOP = 0
 
 #: Segoe Fluent Icons for the caption buttons: minimise, maximise, restore, close.
 _CAPTION_GLYPHS = {"min": "", "max": "", "restore": "", "close": ""}
@@ -70,79 +72,58 @@ class CaptionButton(QAbstractButton):
     def paintEvent(self, _e: Any) -> None:  # noqa: D102
         p = QPainter(self)
         if self.hot or self.isDown():
-            p.fillRect(self.rect(), QColor(196, 43, 28) if self.kind == "close" else self.t.muted)
-        p.setPen(QColor(255, 255, 255) if self.kind == "close" and self.hot else self.t.text_2)
-        p.setFont(font("icon_small"))
+            p.fillRect(self.rect(), QColor(196, 43, 28) if self.kind == "close" else self.t.key_on)
+        p.setPen(QColor(255, 255, 255) if self.kind == "close" and self.hot else self.t.text_3)
+        f = font("icon_small")
+        f.setPixelSize(10)
+        p.setFont(f)
         kind = "restore" if self.kind == "max" and self.window().isMaximized() else self.kind
         p.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, _CAPTION_GLYPHS[kind])
         p.end()
 
 
-class _Mark(QWidget):
-    """Yuki's mark in the sidebar's head: a light rounded square with the robot glyph (shadcn's team logo)."""
-
-    def __init__(self, t: Theme, size: int = 32) -> None:
-        super().__init__()
-        self.t = t
-        self.setFixedSize(size, size)
-
-    def paintEvent(self, _e: object) -> None:  # noqa: D102
-        from yuki.ui.window.paint import paint_surface
-
-        p = QPainter(self)
-        r = QRectF(self.rect())
-        paint_surface(p, r, RADIUS["card"], self.t.level("primary"))
-        p.setPen(self.t.primary_fg)
-        p.setFont(font("icon"))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, ICON["yuki"])
-        p.end()
-
-
 class LiveSidebar(QWidget):
-    """The sidebar: Yuki's mark, the six pages, and a live footer (voice, memory, today's cost)."""
+    """The sidebar (Field Unit): the six page keys and, at the bottom, the listening key.
+
+    Signals:
+        navigate: ``(page)`` a page key was pressed.
+        listen_clicked: the listening key was pressed (the controller turns "Yuki" listening on or off).
+    """
 
     navigate = Signal(str)
+    listen_clicked = Signal()
 
     def __init__(self, t: Theme, *, current: str = "today") -> None:
         super().__init__()
         self.t = t
         self.setFixedWidth(SIDEBAR_W)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(SPACE["m"], SPACE["m"], SPACE["m"] + 1, SPACE["m"])
-        self.body.setSpacing(2)
-        head = QHBoxLayout()
-        head.setContentsMargins(4, 4, 4, SPACE["l"])
-        head.setSpacing(SPACE["s"] + 2)
-        head.addWidget(_Mark(t))
-        col = QVBoxLayout()
-        col.setSpacing(0)
-        col.addWidget(text_label(t, "Yuki", "body_strong"))
-        col.addWidget(text_label(t, "Your PC assistant", "caption", "text_2"))
-        head.addLayout(col, 1)
+        self.body.setContentsMargins(0, 0, 1, 24)
+        self.body.setSpacing(10)
+        # the top of the sidebar drags the window (the caption band)
         self.head_box = QWidget()
-        self.head_box.setLayout(head)
+        self.head_box.setFixedHeight(14)
         self.body.addWidget(self.head_box)
-        pages = text_label(t, "Pages", "micro", "text_2")
-        pages.setContentsMargins(8, 0, 0, 4)
-        self.body.addWidget(pages)
         self.items: dict[str, NavItem] = {}
         for key, glyph, label in PAGES:
             item = NavItem(t, glyph, label)
             item.setChecked(key == current)
             item.clicked.connect(lambda _c=False, k=key: self.navigate.emit(k))
             self.items[key] = item
-            self.body.addWidget(item)
+            self.body.addWidget(item, 0, Qt.AlignmentFlag.AlignHCenter)
         self.body.addStretch(1)
-        self.foot = Card(t, padding=SPACE["m"])
-        self.foot.body.setSpacing(4)
-        self.body.addWidget(self.foot)
+        self.listen = Key(t, "mic", "Listening", led="on")
+        self.listen.clicked.connect(self.listen_clicked.emit)
+        self.body.addWidget(self.listen, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.foot = self.listen   # older callers
         self._state: tuple | None = None
+        self.listening = True
         self.set_footer(True, True, "")
 
-    def paintEvent(self, _e: object) -> None:  # noqa: D102 - the border between the sidebar and the pages
+    def paintEvent(self, _e: object) -> None:  # noqa: D102 - the rule between the sidebar and the pages
         p = QPainter(self)
         p.fillRect(self.rect(), self.t.bg)
-        p.fillRect(QRectF(self.width() - 1, 0, 1, self.height()), self.t.border)
+        p.fillRect(QRectF(self.width() - 1, 0, 1, self.height()), self.t.line2)
         p.end()
 
     def set_current(self, key: str) -> None:
@@ -150,53 +131,64 @@ class LiveSidebar(QWidget):
             item.setChecked(k == key)
 
     def set_badges(self, badges: dict[str, str]) -> None:
+        """Something waits on a page: its key's LED shows it (secondary ink; the tooltip says what)."""
+        words = {"yuki": "question", "status": "call"}
         for k, item in self.items.items():
-            if item.badge != badges.get(k, ""):
-                item.badge = badges.get(k, "")
-                item.update()
+            badge = badges.get(k, "")
+            if item.badge != badge:
+                item.set_badge(badge)
+                n = int(badge) if badge.isdigit() else 0
+                noun = words.get(k, "thing")
+                item.setToolTip(f"{n} {noun}{'s' if n != 1 else ''} waiting" if badge else "")
 
     def set_footer(self, listening: bool, remembering: bool, footnote: str, *, voice_detail: str = "",
                    connected: bool = True) -> None:
+        """The listening key: lit while Yuki listens for its name (or is in a conversation); its word says the
+        state; its tooltip says the rest (memory, today's cost)."""
         state = (listening, remembering, footnote, voice_detail, connected)
         if state == self._state:
             return
         self._state = state
-        t = self.t
-        lay = self.foot.body
-        while lay.count():
-            it = lay.takeAt(0)
-            if it.widget() is not None:
-                it.widget().hide()   # gone at once: a label left until deleteLater would overlap the new one
-                it.widget().deleteLater()
-        # state in words: what is on reads plainly, what is off reads muted
-        rows = [(listening, voice_detail or "Say “Yuki” to start", "Voice is off"),
-                (remembering, "Remembering your day", "Memory paused")]
+        self.listening = listening
         if not connected:
-            rows.insert(0, (False, "", "Yuki isn't running"))
-        for on, text_on, text_off in rows:
-            lay.addWidget(text_label(t, text_on if on else text_off, "caption_strong" if on else "caption",
-                                     "text" if on else "text_2", wrap=True))
+            word, led = "Not running", "off"
+        elif voice_detail:
+            word, led = voice_detail.split(" ")[0], "on"
+        else:
+            word, led = ("Listening", "on") if listening else ("Voice off", "off")
+        self.listen.setText(word)
+        self.listen.set_led(led)
+        if not connected:
+            first = "Yuki isn't running"
+        elif voice_detail:
+            first = voice_detail
+        elif listening:
+            first = "Say “Yuki” to start. Click to stop listening."
+        else:
+            first = "Voice is off. Click to listen for “Yuki”."
+        tip = [first, "Remembering your day" if remembering else "Memory paused"]
         if footnote:
-            lay.addWidget(text_label(t, footnote, "caption", "text_2", wrap=True))
+            tip.append(footnote)
+        self.listen.setToolTip("\n".join(tip))
+        self.listen.update()
 
 
 class _Loading(QWidget):
-    """What a page shows while its data is read (on a background thread): its title and skeleton cards where
+    """What a page shows while its data is read (on a background thread): its title and skeleton modules where
     its panels will be. Everything is a child of this widget, so nothing pops up."""
 
     def __init__(self, t: Theme, title: str) -> None:
         super().__init__()
         col = QVBoxLayout(self)
-        col.setContentsMargins(SPACE["xl"], PAGE_TOP, SPACE["xl"], SPACE["xl"])
-        col.setSpacing(SPACE["l"])
-        col.addWidget(text_label(t, title, "large_title", parent=self))
-        col.addWidget(text_label(t, "Reading your memory…", "body", "text_2", parent=self))
+        col.setContentsMargins(*PAGE_PAD)
+        col.setSpacing(24)
+        col.addWidget(page_header(t, title, "Reading your memory…"))
         grid = QHBoxLayout()
-        grid.setSpacing(SPACE["l"])
+        grid.setSpacing(14)
         col.addLayout(grid)
         for rows in ((4, 3), (3, 5)):
             column = QVBoxLayout()
-            column.setSpacing(SPACE["l"])
+            column.setSpacing(14)
             grid.addLayout(column, 1)
             for n in rows:
                 column.addWidget(Shimmer(t, rows=n, height=70 + 24 * n, parent=self))
@@ -204,7 +196,7 @@ class _Loading(QWidget):
 
 
 class Page(QWidget):
-    """Holds one page's widgets below the room the caption buttons take."""
+    """Holds one page's widgets."""
 
     def __init__(self, content: QWidget) -> None:
         super().__init__()
@@ -259,17 +251,29 @@ class LiveWindow(QWidget):
         self.caption.setFixedSize(46 * 3, 32)
         self.slots: dict[str, QWidget] = {}
         self.pages: dict[str, Page] = {}
-        for key, _glyph, label in PAGES:
+        self._labels = {key: label for key, _glyph, label in PAGES}
+        for key, _glyph, _label in PAGES:   # empty slots: a page's loading skeleton is made when first shown
             holder = QWidget()
             lay = QVBoxLayout(holder)
             lay.setContentsMargins(0, 0, 0, 0)
-            lay.addWidget(_Loading(t, label))
             self.slots[key] = holder
             self.stack.addWidget(holder)
         self.toast = Toast(t, self)
         self.caption.raise_()
         self.show_page(current)
         attach_tips(self, lambda: self.t)
+
+    def set_theme(self, t: Theme) -> None:
+        """A new accent: the chrome and the sidebar repaint in it (the controller rebuilds the pages)."""
+        self.t = t
+        self.sidebar.t = t
+        for key in [*self.sidebar.items.values(), self.sidebar.listen, self.min_button, self.max_button,
+                    self.close_button]:
+            key.t = t
+            key.update()
+        self.toast.t = t
+        self.sidebar.update()
+        self.update()
 
     # -- pages ------------------------------------------------------------------------------------
 
@@ -279,13 +283,18 @@ class LiveWindow(QWidget):
 
     def show_page(self, key: str) -> None:
         self.current = key
-        self.stack.setCurrentWidget(self.slots[key])
+        holder = self.slots[key]
+        if holder.layout().count() == 0:   # nothing built yet: its skeleton, in the page's own layout
+            holder.layout().addWidget(_Loading(self.t, self._labels[key]))
+        self.stack.setCurrentWidget(holder)
         self.sidebar.set_current(key)
 
     def set_page(self, key: str, widget: QWidget, *, scrolls: bool = True) -> Page:
-        """Put a built page in its slot (replacing what was there, keeping the scroll position)."""
+        """Put a built page in its slot (replacing what was there, keeping the scroll position). The slot does
+        not paint until the new page is laid out and scrolled back to where it was: no flash, no jump."""
         holder = self.slots[key]
         lay = holder.layout()
+        holder.setUpdatesEnabled(False)
         old_value = None
         while lay.count():
             w = lay.takeAt(0).widget()
@@ -300,9 +309,21 @@ class LiveWindow(QWidget):
             area = scroll(page, self.t)   # opaque: a scroll step moves pixels, painting only what comes in
             lay.addWidget(area)
             if old_value is not None:
-                QTimer.singleShot(0, lambda: area.verticalScrollBar().setValue(old_value))
+                lay.activate()
+                area.verticalScrollBar().setValue(old_value)
+
+                def settle(area=area, value=old_value) -> None:
+                    try:
+                        area.verticalScrollBar().setValue(value)
+                        holder.setUpdatesEnabled(True)
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(0, settle)
+            else:
+                holder.setUpdatesEnabled(True)
         else:
             lay.addWidget(page)
+            holder.setUpdatesEnabled(True)
         attach_tips(page, lambda: self.t)
         self._run_deferred(key, widget)
         return page
@@ -376,7 +397,7 @@ class LiveWindow(QWidget):
         """Called once the native window exists (after show). Rule 7: never offscreen."""
         from yuki.ui.window import chrome
 
-        self._native = chrome.make_native_frame(int(self.winId()), border=self.t.border)
+        self._native = chrome.make_native_frame(int(self.winId()), border=self.t.line2)
         self.update()
 
     def _caption_at(self, x: float, y: float) -> bool:

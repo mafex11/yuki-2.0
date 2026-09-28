@@ -2,7 +2,7 @@
 
 Every message is its own bubble the moment it is sent, typed here, in the
 overlay, or said out loud; Yuki's replies stream in as they are spoken, with a
-"worked for 12 s · 5 steps" fold under each response listing what it did.
+"worked for 12 s, 5 steps" fold under each response listing what it did.
 Typing here goes to yuki-ui's runtime over the window's pipe; when Yuki isn't
 running the page says so and keeps what was typed.
 """
@@ -16,14 +16,14 @@ from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.paint import paint_ring, paint_surface
-from yuki.ui.window.theme import RADIUS, SPACE, Theme, css, font
-from yuki.ui.window.widgets import Button, Card, page_header, text_label
+from yuki.ui.window.paint import paint_surface
+from yuki.ui.window.theme import PAGE_PAD, SPACE, Theme, css, variable_font
+from yuki.ui.window.widgets import Button, page_header
 
 
 class _InputPill(QWidget):
-    """shadcn's Textarea: a bordered box around a multi-line input (Enter sends, Shift+Enter adds a line) with the
-    send button inside it, bottom right, and a subtle focus ring."""
+    """The composer: a glass box around a multi-line input (Enter sends, Shift+Enter adds a line) with the send
+    key inside it on the right, brighter while it holds the keyboard."""
 
     def __init__(self, t: Theme, act: Actions) -> None:
         super().__init__()
@@ -32,22 +32,23 @@ class _InputPill(QWidget):
         self.t = t
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         row = QHBoxLayout(self)
-        row.setContentsMargins(14, 10, 8, 8)
+        row.setContentsMargins(18, 12, 12, 12)
         row.setSpacing(SPACE["s"])
         self.edit = AskInput()
-        self.edit.setFont(font("body"))
-        self.edit.setPlaceholderText("Ask Yuki anything, or tell it what to do…")
+        self.edit.setFont(variable_font(14.5, "Regular"))
+        self.edit.setPlaceholderText("Ask Yuki anything, or tell it what to do")
         self.edit.setStyleSheet(f"QPlainTextEdit {{ background: transparent; color: {css(t.text)}; border: none;"
                                 f" selection-background-color: {css(t.accent_soft)}; }}")
         pal = self.edit.palette()
-        pal.setColor(pal.ColorRole.PlaceholderText, t.text_3)
+        pal.setColor(pal.ColorRole.PlaceholderText, t.faint)
         self.edit.setPalette(pal)
         self.edit.setMaximumHeight(self.edit.preferred_height())
         self.edit.wants_height.connect(lambda h: (self.edit.setMaximumHeight(h), self.edit.setMinimumHeight(h)))
         self.edit.setMinimumHeight(self.edit.preferred_height())
         row.addWidget(self.edit, 1, Qt.AlignmentFlag.AlignVCenter)
         self.edit.installEventFilter(self)
-        self.send = Button(t, glyph="send", style="default", size="small")
+        self.send = Button(t, glyph="send", style="key", size="small")
+        self.send.setFixedSize(34, 30)
         self.send.setToolTip("Send (Enter)")
         row.addWidget(self.send, 0, Qt.AlignmentFlag.AlignBottom)
         self.act = act
@@ -60,7 +61,7 @@ class _InputPill(QWidget):
             self.act.submit(text)
             self.edit.clear()
 
-    def eventFilter(self, obj: object, ev: object) -> bool:  # noqa: D102 - the ring follows the keyboard
+    def eventFilter(self, obj: object, ev: object) -> bool:  # noqa: D102 - the line brightens with the keyboard
         from PySide6.QtCore import QEvent
 
         if ev.type() in (QEvent.Type.FocusIn, QEvent.Type.FocusOut):
@@ -68,16 +69,49 @@ class _InputPill(QWidget):
         return False
 
     def paintEvent(self, _e: object) -> None:  # noqa: D102
-        from PySide6.QtGui import QColor
+        p = QPainter(self)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        paint_surface(p, r, 12, self.t.level("display"), border=self.t.text_3 if self.edit.hasFocus() else None)
+        p.end()
+
+
+class _Hint(QWidget):
+    """"Enter sends, Shift Enter for a new line, Alt Shift X stops what Yuki is doing", the keys as keycaps."""
+
+    PARTS = ((("Enter",), "sends,"), (("Shift", "Enter"), "for a new line,"), (("Alt", "Shift", "X"),
+                                                                              "stops what Yuki is doing"))
+
+    def __init__(self, t: Theme) -> None:
+        super().__init__()
+        self.t = t
+        self.setFixedHeight(24)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtGui import QFontMetrics
+
+        from yuki.ui.window.paint import paint_key
 
         p = QPainter(self)
-        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
-        focused = self.edit.hasFocus()
-        paint_surface(p, r, RADIUS["card"], self.t.level("input"), border=QColor("#52525b") if focused else None)
-        if focused:
-            ring = QColor(self.t.ring)
-            ring.setAlphaF(0.35)
-            paint_ring(p, r, RADIUS["card"], ring, 2.0)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        kf, wf = variable_font(11, "Regular"), variable_font(12, "Regular")
+        kfm, wfm = QFontMetrics(kf), QFontMetrics(wf)
+        total = 0.0
+        for keys, words in self.PARTS:
+            total += sum(kfm.horizontalAdvance(k) + 14 + 4 for k in keys) + wfm.horizontalAdvance(words) + 12
+        x = max(0.0, (self.width() - total) / 2)
+        for keys, words in self.PARTS:
+            for k in keys:
+                w = kfm.horizontalAdvance(k) + 14
+                paint_key(p, QRectF(x, 2, w, 20), self.t, radius=4.0, bottom=2.0)
+                p.setFont(kf)
+                p.setPen(self.t.text_2)
+                p.drawText(QRectF(x, 2, w, 18), Qt.AlignmentFlag.AlignCenter, k)
+                x += w + 4
+            p.setFont(wf)
+            p.setPen(self.t.text_3)
+            p.drawText(QRectF(x + 2, 0, wfm.horizontalAdvance(words) + 4, 24), Qt.AlignmentFlag.AlignVCenter, words)
+            x += wfm.horizontalAdvance(words) + 12
         p.end()
 
 
@@ -88,29 +122,26 @@ def build(t: Theme, model: Any, *, act: Actions = NOOP, connected: bool = True) 
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
-    col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
-    col.setSpacing(SPACE["l"])
+    col.setContentsMargins(*PAGE_PAD)
+    col.setSpacing(0)
     stop = Button(t, "Stop", glyph="close", style="destructive", size="small")
     stop.setToolTip("Stop what Yuki is doing (Alt+Shift+X)")
     stop.clicked.connect(act.cancel)
     stop.setVisible(False)
-    note = ("Type to Yuki here. It's the same Yuki as Alt+Shift and your voice: everything said or typed shows up "
-            "here as it happens.")
+    note = "One thread with Yuki: what you type here, in the ask bar, or say out loud."
     if not connected:
         note = "Yuki isn't running right now, so it can't answer. Start it from the Start menu and this fills in."
     col.addWidget(page_header(t, "Chat", note, [stop]))
-    box = Card(t, padding=SPACE["xs"])
-    thread = ChatThreadView(model, lambda: t, max_bubble=620)
+    col.addSpacing(16)
+    thread = ChatThreadView(model, lambda: t, max_bubble=640, margins=(0, 0, 8, 8), look="window")
     thread.reply_nudge.connect(act.reply_nudge)
-    box.body.addWidget(thread)
-    col.addWidget(box, 1)
+    col.addWidget(thread, 1)
+    col.addSpacing(14)
     field = _InputPill(t, act)
     field.setEnabled(connected)
     col.addWidget(field)
-    hint = text_label(t, "Enter sends · Shift+Enter for a new line · Alt+Shift+X stops what Yuki is doing",
-                      "caption", "text_2", wrap=True)
-    hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    col.addWidget(hint)
+    col.addSpacing(10)
+    col.addWidget(_Hint(t))
 
     def sync_running(*_a: object) -> None:
         stop.setVisible(any(i.running for i in model.items[-20:] if i.kind == "assistant"))

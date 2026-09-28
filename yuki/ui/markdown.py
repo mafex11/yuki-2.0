@@ -51,7 +51,7 @@ def _span(text: str, fmt: QTextCharFormat, theme: Any) -> str:
     if styles:
         out = f'<span style="{";".join(styles)}">{out}</span>'
     if fmt.isAnchor() and fmt.anchorHref():
-        color = f"color:{_css(theme.accent)};" if theme is not None else ""
+        color = f"color:{_css(theme.text)};" if theme is not None else ""   # links in ink, underlined (the accent is for live states)
         out = f'<a href="{html.escape(fmt.anchorHref(), quote=True)}" style="{color}text-decoration:underline">{out}</a>'
     return out
 

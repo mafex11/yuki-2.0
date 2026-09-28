@@ -1,5 +1,5 @@
-"""Phase 3 of the Yuki window (2026-09-27 review): clear glass, no flashing windows, corrections that show as
-pending until applied, the call band, to-dos, smooth scrolling, helper steps and the tray's notices.
+"""Phase 3 of the Yuki window (2026-09-27 review, restyled 2026-09-28): no flashing windows, corrections that
+show as pending until applied, the call band, to-dos, smooth scrolling, helper steps and the tray's notices.
 
 Offscreen only (rule 7), on temporary databases.
 """
@@ -106,13 +106,19 @@ def test_pending_corrections_persist_and_resolve_when_memory_applies_them(qapp, 
         memory.close()
 
 
-def test_call_band_hover_and_click_and_the_call_row_in_a_session(qapp):
+def test_call_band_hover_and_click_and_the_call_row_in_a_moment(qapp):
+    """The skyline's call band (Horizon): hovering it names the call, a click picks it and the panel under the
+    chart says its real times; a picked moment lists the call as one of its apps."""
     from datetime import date, datetime
+
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
 
     from yuki.ui.window.data import Band, DayView, Lane, Segment, Session
     from yuki.ui.window.pages import today
+    from yuki.ui.window.skyline import apps_line, moment_at
     from yuki.ui.window.theme import theme
-    from yuki.ui.window.timeline import CALL_H
 
     d = date(2026, 9, 26)
     since = datetime(2026, 9, 26).timestamp()
@@ -129,29 +135,19 @@ def test_call_band_hover_and_click_and_the_call_row_in_a_session(qapp):
     page.show()
     qapp.processEvents()
     chart = page.chart
-    at = s + 3000
-    y = chart.y_calls() + CALL_H / 2
-    assert chart.call_at(at, y) == 0 and chart.call_at(at, chart.lane_y("warp")) is None
-    lines = chart._call_lines(call)
-    assert "–" in lines[0][1] and "now" in lines[0][1]                   # the hover says its times
+    x, y = chart.x_of(s + 3000), chart.TH
+    assert chart.call_at(x, y) == 0 and chart.call_at(x, chart.base - 20) is None
     clicked = []
     chart.call_clicked.connect(clicked.append)
-    from PySide6.QtCore import QPointF, Qt
-    from PySide6.QtGui import QMouseEvent
-    from PySide6.QtWidgets import QApplication
-
-    x = chart.x_of(at)
     for kind in (QMouseEvent.Type.MouseButtonPress, QMouseEvent.Type.MouseButtonRelease):
         QApplication.sendEvent(chart, QMouseEvent(kind, QPointF(x, y), QPointF(x, y), Qt.MouseButton.LeftButton,
                                                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     assert clicked == [0] and chart.selected_call == 0
-    # the session's details list the call as a row, with no "On a Discord call" badge
-    panel = today._details(theme("dark"), day, 0)
-    from PySide6.QtWidgets import QLabel
-
-    labels = [lab.text() for lab in panel.findChildren(QLabel)]
-    assert any(t.startswith("Discord call · ongoing") for t in labels), labels
-    assert not any("On a Discord call" in t for t in labels)
+    stamp, title, _apps, _note = page.moment_panel.lines()
+    assert title.startswith("Discord call") and "still going" in title and stamp == "20:10"
+    # a moment in the session lists the call as a row of its apps, in words (no badge)
+    line = apps_line(moment_at(day, s + 1200))
+    assert "Warp 1h 00m" in line and "Discord call ongoing" in line and line.endswith("from 20:00 to 21:30")
     page.close()
 
 
@@ -255,21 +251,30 @@ def test_helper_steps_show_under_the_response_labelled_as_helpers():
     assert not head.running and tool.depth == 1 and tool.name == "recall"
 
 
-def test_pills_say_their_state_in_words_with_no_dot(qapp):
+def test_pills_say_their_state_in_words_with_a_wave(qapp):
+    """The call pill: the accent recording dot, a grey wave and a dot-matrix timer; waiting for headphones: no
+    dot, no timer, said plainly (no amber). The voice pill: a wave per state, an error in red, no wave."""
+    import time as _time
+
     from yuki.ui.calls import CallIndicator
     from yuki.voice.indicator import VoicePill
 
     ind = CallIndicator()
-    ind.set_call({"app": "Discord", "status": "recording"})
-    assert "Discord" in ind.label.text()
+    ind.set_call({"app": "Discord", "status": "recording", "detected_at": _time.time() - (37 * 60 + 12)})
+    assert "Discord" in ind.label.text() and not ind.dot.isHidden()
+    assert ind.elapsed() in ("37:12", "37:13") and ind.timer_label.text in ("37:12", "37:13")
     waiting = CallIndicator()
     waiting.set_call({"app": "Zoom", "status": "waiting_headphones"})
-    assert "245,158,11" in waiting.label.styleSheet()                     # waiting: said in the warning colour
+    assert waiting.dot.isHidden() and waiting.timer_label.isHidden()
+    assert "245,158,11" not in waiting.label.styleSheet()                 # no amber anywhere
     pill = VoicePill()
     pill.show_state("speaking")
-    assert pill.label.text() == "Speaking" and "250,250,250" in pill.label.styleSheet()
+    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "230,233,238" in pill.label.styleSheet()
+    pill.show_state("thinking")
+    assert pill.wave.kind == "think"
     pill.show_state("error", "The microphone is in use")
-    assert pill.label.text().startswith("The microphone") and "239,68,68" in pill.label.styleSheet()
+    assert pill.label.text().startswith("The microphone") and pill.wave.isHidden()
+    assert "229,115,107" in pill.label.styleSheet()                        # the error red
     for w in (ind, waiting, pill):
         w.close()
 

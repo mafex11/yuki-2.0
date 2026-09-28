@@ -37,11 +37,11 @@ from datetime import datetime
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QEnterEvent, QFont, QGuiApplication
+from PySide6.QtGui import QEnterEvent, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
-from yuki.ui.surface import SurfaceWindow, ui_font
+from yuki.ui.surface import SurfaceWindow
 from yuki.ui.memory import local_moment
 from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
@@ -212,9 +212,9 @@ def nudge_answered(nudge: dict[str, Any]) -> bool:
 
 
 def overlay_label(nudge: dict[str, Any]) -> str:
-    """The small label over a nudge in the overlay: ``Yuki · 14:32 · nudge``."""
+    """The small label over a nudge in the overlay: ``Yuki, 14:32, nudge``."""
     parts = ["Yuki", when_label(nudge_moment(nudge)), str(nudge.get("kind") or "nudge")]
-    return " · ".join(part for part in parts if part)
+    return ", ".join(part for part in parts if part)
 
 
 def coach_note(nudges: list[dict[str, Any]]) -> str:
@@ -387,7 +387,9 @@ class NudgeWatcher(QObject):
 
 
 class NudgeCard(SurfaceWindow):
-    """One nudge, bottom-right: heading, text, Reply and Dismiss. Never takes focus.
+    """One nudge, bottom-right (Horizon's check-in card): a small grey wave and the time, the text, then
+    Dismiss and Reply as pills. Never takes focus. A kind other than a plain check-in says its kind in quiet
+    words beside the wave ("Weekly review"); a question leads with the question, bold.
 
     The whole text always shows (wrapped, never cut). It stays up for
     :func:`linger_for` its text; the pointer on it stops the clock, and
@@ -418,38 +420,44 @@ class NudgeCard(SurfaceWindow):
         self.linger_ms = linger_ms if linger_ms is not None else CARD_LINGER_BASE_MS
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
 
+        from yuki.ui.wave import Wave
+        from yuki.ui.window.theme import variable_font
+
         column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 16, self.SHADOW + 14, self.SHADOW + 16, self.SHADOW + 14)
-        column.setSpacing(6)
+        column.setContentsMargins(self.SHADOW + 20, self.SHADOW + 16, self.SHADOW + 20, self.SHADOW + 16)
+        column.setSpacing(10)
 
         header = QHBoxLayout()
         header.setSpacing(8)
+        self.wave = Wave("checkin", theme=self.theme, size=(120, 16), parent=self)
+        header.addWidget(self.wave, 0, Qt.AlignmentFlag.AlignVCenter)
         self.title = QLabel(self)
-        self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
+        self.title.setFont(variable_font(12, "Regular"))
         self.title.setTextFormat(Qt.TextFormat.PlainText)
-        header.addWidget(self.title)   # the kind is in its word
+        header.addWidget(self.title)   # the kind, in quiet words (none for a plain check-in)
+        header.addStretch(1)
         self.when = QLabel(self)
-        self.when.setFont(ui_font(9))
+        self.when.setFont(variable_font(12, "Regular"))
         self.when.setTextFormat(Qt.TextFormat.PlainText)
         header.addWidget(self.when)
-        header.addStretch(1)
         column.addLayout(header)
 
         self.body = QLabel(self)
-        self.body.setFont(ui_font(11))
+        self.body.setFont(variable_font(15, "Regular"))
         self.body.setWordWrap(True)
         self.body.setTextFormat(Qt.TextFormat.PlainText)
         column.addWidget(self.body)
         #: A question card: what the question rests on, small and dim under the bold question.
         self.detail = QLabel(self)
-        self.detail.setFont(ui_font(9))
+        self.detail.setFont(variable_font(13, "Regular"))
         self.detail.setWordWrap(True)
         self.detail.setTextFormat(Qt.TextFormat.PlainText)
         self.detail.setVisible(False)
         column.addWidget(self.detail)
 
         buttons = QHBoxLayout()
-        buttons.setSpacing(6)
+        buttons.setSpacing(8)
+        buttons.setContentsMargins(0, 4, 0, 0)
         buttons.addStretch(1)
         self.never_button = self._button(QUESTION_BUTTONS[2])
         self.never_button.setVisible(False)   # question cards only
@@ -471,8 +479,10 @@ class NudgeCard(SurfaceWindow):
         self.restyle()
 
     def _button(self, text: str) -> QPushButton:
+        from yuki.ui.window.theme import variable_font
+
         button = QPushButton(text, self)
-        button.setFont(ui_font(10, weight=QFont.Weight.DemiBold))
+        button.setFont(variable_font(13, "Regular"))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         # The card never takes the keyboard; nor may its buttons.
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -480,15 +490,15 @@ class NudgeCard(SurfaceWindow):
 
     def _style_buttons(self) -> None:
         self.reply_button.setStyleSheet(self.button_css("default"))
-        quiet = self.button_css("outline")
+        quiet = self.button_css("ghost")
         self.dismiss_button.setStyleSheet(quiet)
         self.never_button.setStyleSheet(quiet)
-        self.title.setStyleSheet(f"color: {self.ink_css('text')};")
+        self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.body.setStyleSheet(f"color: {self.ink_css('text')};")
-        self.detail.setStyleSheet(f"color: {self.ink_css('text_3')};")
+        self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
         self._style_buttons()
 
     # -- content -----------------------------------------------------------
@@ -496,21 +506,24 @@ class NudgeCard(SurfaceWindow):
     def set_nudge(self, nudge: dict[str, Any]) -> None:
         """Fill the card for one nudge and size it to its text (no showing)."""
         self.nudge = nudge
-        self.title.setText(kind_title(nudge.get("kind")))
+        kind = str(nudge.get("kind") or "nudge")
+        self.title.setText("" if kind == "nudge" else kind_title(kind))   # a plain check-in: the wave says it
         question = str(nudge.get("kind") or "") == "question"
         self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
         self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else "Dismiss")
         self.never_button.setVisible(question)
         self.when.setText(when_label(nudge.get("at")))
         text = _squash(nudge.get("text"))
+        from yuki.ui.window.theme import variable_font
+
         if question:   # the question leads, bold and bright; what it rests on sits under it, small and dim
             asked, rest = split_question(text)
-            self.body.setFont(ui_font(11, weight=QFont.Weight.DemiBold))
+            self.body.setFont(variable_font(15, "Semibold"))
             self.body.setText(asked)
             self.detail.setText(rest)
             self.detail.setVisible(bool(rest))
         else:
-            self.body.setFont(ui_font(11))
+            self.body.setFont(variable_font(15, "Regular"))
             self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
             self.detail.setVisible(False)
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger_for(text)

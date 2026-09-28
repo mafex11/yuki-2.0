@@ -31,7 +31,7 @@ from yuki.agent.memory import (
     due_text,
     todo_done,
 )
-from yuki.ui.surface import SurfaceWindow, ui_font
+from yuki.ui.surface import SurfaceWindow, _css, ui_font
 from yuki.ui.uilog import UiLog
 
 #: Windows process-creation flags for the detached memory service.
@@ -103,28 +103,32 @@ def minutes_until_tomorrow(now: datetime | None = None) -> int:
     return max(1, math.ceil((target - now).total_seconds() / 60.0))
 
 
+#: Whether the tray menu's status line is live (memory remembering now): its LED is lit then.
+MEMORY_LIVE: list[bool] = [False]
+
+
 def describe_memory_status(status: dict[str, Any] | None, *, installed: bool = True) -> str:
-    """The one-line status shown at the top of the tray menu.
+    """The one-line status shown at the top of the tray menu ("Remembering today, 1,204 things"); also sets
+    :data:`MEMORY_LIVE` for the line's LED.
 
     Args:
         status: ``MemoryClient.status()``, or ``None`` when it could not be read.
         installed: Whether the memory API exists at all.
     """
+    MEMORY_LIVE[0] = False
     if status is None:
-        return "Memory: unavailable" if installed else "Memory: not installed"
+        return "Memory isn't answering" if installed else "Memory isn't installed"
     if not status.get("service_running"):
-        return "Memory: not running"
+        return "Memory isn't running"
     if status.get("paused"):
-        return "Memory: paused"
+        return "Memory is paused"
+    MEMORY_LIVE[0] = True
     quiet = quiet_until(status)
-    if quiet is not None:
-        return f"Memory: watching · quiet until {quiet_label(quiet)}"
     captures = int(status.get("captures_today") or 0)
-    facts = int(status.get("facts_today") or 0)
-    return (
-        f"Memory: watching · {captures} capture{'' if captures == 1 else 's'} · "
-        f"{facts} fact{'' if facts == 1 else 's'} today"
-    )
+    line = f"Remembering today, {captures:,} thing{'' if captures == 1 else 's'}"
+    if quiet is not None:
+        line += f", quiet until {quiet_label(quiet)}"
+    return line
 
 
 def memory_service_command() -> list[str]:
@@ -428,7 +432,7 @@ def health_html(results: list[Any]) -> str:
         dim = 150 if status in ("ok", "skip") else 240
         parts.append(
             f"<p style='margin-bottom: 6px;'><span style='color: rgba(238,240,245,240);'><b>"
-            f"{html.escape(str(c.name))}</b></span> <span style='color: rgba(238,240,245,{dim});'>· "
+            f"{html.escape(str(c.name))}</b></span> <span style='color: rgba(238,240,245,{dim});'>, "
             f"{html.escape(word)}</span><br><span style='color: rgba(238,240,245,{dim});'>"
             f"{html.escape(str(c.detail))}</span>")
         if getattr(c, "fix", "") and status in ("warn", "fail"):
@@ -473,7 +477,7 @@ class KnowsWindow(SurfaceWindow):
         self.meta.setWordWrap(True)
         layout.addWidget(self.meta)
 
-        self.body = _InkBrowser(lambda: (self.ink("text"), self.ink("accent")))
+        self.body = _InkBrowser(lambda: (self.ink("text"), self.ink("text_3")))   # headings muted, never the accent
         self.body.setReadOnly(True)
         self.body.setOpenLinks(False)
         self.body.setFont(ui_font(11))
@@ -496,7 +500,7 @@ class KnowsWindow(SurfaceWindow):
         self.close_button.setStyleSheet(
             f"QToolButton {{ color: {self.ink_css('text_2')}; background: transparent;"
             " border: none; border-radius: 6px; padding: 4px 8px; font-size: 13px; }"
-            f"QToolButton:hover {{ color: {self.ink_css('text')}; background: #27272a; }}")
+            f"QToolButton:hover {{ color: {self.ink_css('text')}; background: {_css(t.muted)}; }}")
         self.meta.setStyleSheet(f"color: {self.ink_css('text_2')}; background: transparent;")
         sel = t.accent_soft
         self.body.setStyleSheet(
@@ -585,9 +589,9 @@ class TodayWindow(KnowsWindow):
             return
         groups = today_groups(rows, now=now)
         open_count = len(groups["due_soon"]) + len(groups["open"])
-        line = f"{open_count} open · {len(groups['done_today'])} done today · {now.strftime('%a %d %b, %H:%M')}"
+        line = f"{open_count} open, {len(groups['done_today'])} done today. {now.strftime('%a %d %b, %H:%M')}"
         note = getattr(self, "waiting_note", "")
-        self.meta.setText(meta or (f"{line} · {note}" if note else line))
+        self.meta.setText(meta or (f"{line}. {note}" if note else line))
         self.body.setHtml(today_html(groups, now=now))
 
 
@@ -645,7 +649,7 @@ class ReviewWindow(KnowsWindow):
 
 
 def review_meta(review: dict[str, Any]) -> str:
-    """``2026-W39 · Mon 14 Sep – Sun 20 Sep · written Sun 20 Sep, 20:12``."""
+    """``2026-W39, Mon 14 Sep – Sun 20 Sep. Written Sun 20 Sep, 20:12``."""
     parts = [str(review.get("week") or "")]
     start, end = local_moment(review.get("start")), local_moment(review.get("end"))
     if start and end:
@@ -653,7 +657,7 @@ def review_meta(review: dict[str, Any]) -> str:
     written = _stamp(review.get("written_at"))
     if written:
         parts.append(f"written {written}")
-    return " · ".join(p for p in parts if p)
+    return ". ".join(p for p in parts if p)
 
 
 def review_html(review: dict[str, Any]) -> str:
@@ -740,7 +744,7 @@ def _todo_html(row: dict[str, Any], *, done: bool, now: datetime) -> str:
     if row.get("due") and not done:
         overdue = due is not None and due < now
         label = html.escape(f"{'overdue' if overdue else 'due'} {due_text(row.get('due'))}")
-        notes.append(f"<span style='color: rgba(255,190,110,230);'>{label}</span>" if overdue else label)
+        notes.append(f"<b style='color: rgba(238,240,245,240);'>{label}</b>" if overdue else label)
     source = row.get("source")
     if source:
         notes.append(html.escape(TODO_SOURCES.get(str(source), str(source))))
@@ -753,7 +757,7 @@ def _todo_html(row: dict[str, Any], *, done: bool, now: datetime) -> str:
     lines = [f"<div style='color: {colour}; margin-top: 8px;'>{'✓ ' if done else ''}{text}</div>"]
     if notes:
         lines.append(
-            "<div style='color: rgba(238,240,245,140); font-size: 9pt;'>" + " · ".join(notes) + "</div>"
+            "<div style='color: rgba(238,240,245,140); font-size: 9pt;'>" + ", ".join(notes) + "</div>"
         )
     if evidence:
         lines.append(

@@ -29,11 +29,11 @@ import threading
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
-from yuki.ui.surface import SurfaceWindow, ui_font
+from yuki.ui.surface import SurfaceWindow
 from yuki.ui.nudges import BUSY_NOTIFICATION_STATES, NudgeWatcher, notification_state
 from yuki.ui.status import STRIP_HEIGHT, STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
@@ -47,7 +47,7 @@ ACTIVE_POLL_MS = 10_000
 
 CARD_WIDTH = STRIP_WIDTH
 INDICATOR_WIDTH = 236
-INDICATOR_HEIGHT = 34
+INDICATOR_HEIGHT = 40
 _GAP = 8
 
 HEADPHONES_NOTE = "Only with headphones, so other people's voices aren't picked up."
@@ -56,7 +56,7 @@ HEADPHONES_NOTE = "Only with headphones, so other people's voices aren't picked 
 def consent_text(call: dict[str, Any]) -> tuple[str, str, str]:
     """``(question, detail, headphones note or "")`` for a ``call_status()["call"]``."""
     app = str(call.get("app") or "this app")
-    detail = (f"{app} · only your microphone, kept encrypted and turned into text on this PC later, "
+    detail = ("Only your microphone, kept encrypted and turned into text on this PC later, "
               "when it's free. Nobody else is recorded.")
     note = ""
     if call.get("headphones") is False:
@@ -76,8 +76,8 @@ def waiting_text(waiting: Any) -> str:
 def indicator_text(call: dict[str, Any]) -> str:
     app = str(call.get("app") or "")
     if call.get("status") == "waiting_headphones":
-        return f"Waiting for headphones · {app}" if app else "Waiting for headphones"
-    return f"Remembering your side · {app}" if app else "Remembering your side"
+        return f"Waiting for headphones, {app}" if app else "Waiting for headphones"
+    return f"Remembering your side, {app}" if app else "Remembering your side"
 
 
 class CallWatcher(NudgeWatcher):
@@ -106,7 +106,8 @@ class CallWatcher(NudgeWatcher):
 
 
 class CallConsentCard(SurfaceWindow):
-    """The consent card: the question, what is and is not recorded, four answers. Never takes focus.
+    """The consent card (Horizon): a live LED and "Discord started a call", the question, what is and is not
+    recorded, No and Yes, and under a rule "Never for Discord" and "Always for Discord". Never takes focus.
 
     Signals:
         answered: ``(call, answer)`` -- ``yes`` | ``no`` | ``always`` | ``never``, or ``none``
@@ -120,44 +121,59 @@ class CallConsentCard(SurfaceWindow):
         self.setObjectName("YukiCallConsentCard")
         self.call: dict[str, Any] | None = None
         self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
-        column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 16, self.SHADOW + 14, self.SHADOW + 16, self.SHADOW + 14)
-        column.setSpacing(6)
+        from yuki.ui.window.theme import variable_font
+        from yuki.ui.window.widgets import Led
 
-        self.title = QLabel("Yuki · call", self)
-        self.title.setFont(ui_font(9, weight=QFont.Weight.DemiBold))
-        column.addWidget(self.title)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(self.SHADOW + 20, self.SHADOW + 16, self.SHADOW + 20, self.SHADOW + 12)
+        column.setSpacing(6)
+        who = QHBoxLayout()
+        who.setSpacing(6)
+        self.led = Led(self.theme(), "on", 7, parent=self)
+        who.addWidget(self.led, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.title = QLabel("A call started", self)
+        self.title.setFont(variable_font(12, "Regular"))
+        who.addWidget(self.title, 1)
+        self.when = QLabel("", self)
+        self.when.setFont(variable_font(12, "Regular"))
+        who.addWidget(self.when)
+        column.addLayout(who)
+        column.addSpacing(4)
         self.question = QLabel(self)
-        self.question.setFont(ui_font(11, weight=QFont.Weight.DemiBold))
+        self.question.setFont(variable_font(19, "Regular", display=True))
         self.question.setWordWrap(True)
         column.addWidget(self.question)
         self.detail = QLabel(self)
-        self.detail.setFont(ui_font(9))
+        self.detail.setFont(variable_font(13.5, "Regular"))
         self.detail.setWordWrap(True)
         column.addWidget(self.detail)
         self.note = QLabel(self)
-        self.note.setFont(ui_font(9))
+        self.note.setFont(variable_font(13, "Regular"))
         self.note.setWordWrap(True)
         column.addWidget(self.note)
-        for label in (self.title, self.question, self.detail, self.note):
+        for label in (self.title, self.when, self.question, self.detail, self.note):
             label.setTextFormat(Qt.TextFormat.PlainText)
-
         row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        row1.setSpacing(8)
         row1.addStretch(1)
         self.no_button = self._button("No", primary=False)
         self.yes_button = self._button("Yes", primary=True)
         row1.addWidget(self.no_button)
         row1.addWidget(self.yes_button)
-        column.addSpacing(2)
+        column.addSpacing(8)
         column.addLayout(row1)
+        column.addSpacing(8)
+        self._rule_y = 0
+        self.rule = QWidget(self)
+        self.rule.setFixedHeight(1)
+        column.addWidget(self.rule)
         row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        row2.addStretch(1)
+        row2.setSpacing(18)
         self.never_button = self._button("Never", primary=False, small=True)
         self.always_button = self._button("Always", primary=False, small=True)
         row2.addWidget(self.never_button)
         row2.addWidget(self.always_button)
+        row2.addStretch(1)
         column.addLayout(row2)
         for button, answer in ((self.yes_button, "yes"), (self.no_button, "no"),
                                (self.always_button, "always"), (self.never_button, "never")):
@@ -169,17 +185,27 @@ class CallConsentCard(SurfaceWindow):
         self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
-        self.title.setStyleSheet(f"color: {self.ink_css('text_2')};")
+        t = self.theme()
+        self.led.t = t
+        self.led.update()
+        self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
+        self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.question.setStyleSheet(f"color: {self.ink_css('text')};")
         self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
-        self.note.setStyleSheet(f"color: {self.ink_css('warning')};")
+        self.note.setStyleSheet(f"color: {self.ink_css('text')};")   # said plainly (no warning colour)
+        self.rule.setStyleSheet(f"background: {self.ink_css('text_3')};")
+        self.rule.setStyleSheet(f"background: rgba({t.float_sep.red()},{t.float_sep.green()},{t.float_sep.blue()},255);")
         self.yes_button.setStyleSheet(self.button_css("default"))
-        for button in (self.no_button, self.never_button, self.always_button):
-            button.setStyleSheet(self.button_css("outline"))
+        self.no_button.setStyleSheet(self.button_css("ghost"))
+        quiet = self.button_css("ghost").replace("padding: 0px 14px", "padding: 0px 0px")
+        for button in (self.never_button, self.always_button):
+            button.setStyleSheet(quiet)
 
     def _button(self, text: str, *, primary: bool, small: bool = False) -> QPushButton:
+        from yuki.ui.window.theme import variable_font
+
         button = QPushButton(text, self)
-        button.setFont(ui_font(9 if small else 10, weight=QFont.Weight.DemiBold))
+        button.setFont(variable_font(13, "Semibold" if primary else "Regular"))
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # the card never takes the keyboard
         return button   # styled as a pill in restyle()
@@ -188,6 +214,12 @@ class CallConsentCard(SurfaceWindow):
         """Fill the card for one call and size it (no showing)."""
         self.call = call
         question, detail, note = consent_text(call)
+        from yuki.ui.memory import local_moment
+
+        app_name = str(call.get("app") or "")
+        self.title.setText(f"{app_name} started a call" if app_name else "A call started")
+        moment = local_moment(call.get("detected_at"))
+        self.when.setText(moment.strftime("%H:%M") if moment else "")
         self.question.setText(question)
         self.detail.setText(detail)
         self.note.setText(note)
@@ -198,6 +230,7 @@ class CallConsentCard(SurfaceWindow):
         remember = bool(call.get("can_remember_choice", True))
         self.always_button.setVisible(remember)
         self.never_button.setVisible(remember)
+        self.rule.setVisible(remember)
         self.layout().activate()
         width = CARD_WIDTH + 2 * self.SHADOW
         lay = self.layout()
@@ -235,34 +268,91 @@ class CallConsentCard(SurfaceWindow):
             self.answered.emit(call, answer)
 
 class CallIndicator(SurfaceWindow):
-    """The small "Remembering your side · Zoom" pill (or "Waiting for headphones"). Never takes focus.
+    """The call pill (Horizon x Field Unit): the accent recording dot, a small grey wave, the call's running
+    time on a dot-matrix timer (37:12) and "Remembering your side, Discord". Waiting for headphones: no dot,
+    no timer, the words say it. Never takes focus.
 
-    A flat popover like every surface: the state is in its words; waiting is said in the warning colour.
-    """
+    The timer ticks once a second and the wave moves only while the pill is shown (a full-screen game hides
+    it, and then nothing runs)."""
 
     def __init__(self) -> None:
-        super().__init__(activates=False)
+        from yuki.ui.wave import Wave
+        from yuki.ui.window.theme import variable_font
+
+        super().__init__(activates=False, radius=INDICATOR_HEIGHT // 2)
         self.setObjectName("YukiCallIndicator")
         self.setFixedSize(INDICATOR_WIDTH + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
         row = QHBoxLayout(self)
-        row.setContentsMargins(self.SHADOW + 14, self.SHADOW, self.SHADOW + 14, self.SHADOW)
+        row.setContentsMargins(self.SHADOW + 14, self.SHADOW, self.SHADOW + 18, self.SHADOW)
+        row.setSpacing(11)
+        self.dot = _RecDot(self)
+        row.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.wave = Wave("call", theme=self.theme, size=(30, 14), parent=self)
+        row.addWidget(self.wave, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.timer_label = _DotTimer(self)
+        row.addWidget(self.timer_label, 0, Qt.AlignmentFlag.AlignVCenter)
         self.label = QLabel(self)
-        self.label.setFont(ui_font(9, weight=QFont.Weight.Medium))
+        self.label.setFont(variable_font(13.5, "Regular"))
         self.label.setTextFormat(Qt.TextFormat.PlainText)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
         self.call: dict[str, Any] | None = None
+        self._since: float | None = None
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._update_time)
         self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
+        self.label.setStyleSheet(f"color: {self.ink_css('text')};")
+        self.dot.update()
+        self.timer_label.update()
+
+    def elapsed(self, now: float | None = None) -> str:
+        """The call's running time: ``37:12`` (``1:02:05`` past an hour); ``""`` without a start."""
+        import time as _time
+
+        if self._since is None:
+            return ""
+        secs = max(0, int((now if now is not None else _time.time()) - self._since))
+        h, rem = divmod(secs, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+    def _update_time(self) -> None:
+        self.timer_label.set_text(self.elapsed())
+        self._fit()
+
+    def _fit(self) -> None:
+        fm = self.label.fontMetrics()
         waiting = (self.call or {}).get("status") == "waiting_headphones"
-        self.label.setStyleSheet(f"color: {self.ink_css('warning' if waiting else 'text')};")
+        width = 14 + (0 if waiting else 8 + 11) + 30 + 11 + (0 if waiting else self.timer_label.width() + 11)
+        width += fm.horizontalAdvance(self.label.text()) + 22
+        width = max(INDICATOR_WIDTH, width)
+        if width + 2 * self.SHADOW != self.width():
+            self.setFixedSize(width + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
 
     def set_call(self, call: dict[str, Any]) -> None:
+        from yuki.ui.memory import local_moment
+
         self.call = call
         self.label.setText(indicator_text(call))
+        waiting = call.get("status") == "waiting_headphones"
+        start = local_moment(call.get("detected_at") or call.get("recording_since"))
+        self._since = start.timestamp() if start is not None else None
+        self.dot.setVisible(not waiting)
+        self.timer_label.setVisible(not waiting and self._since is not None)
+        self.timer_label.set_text(self.elapsed())
+        self._fit()
         self.restyle()
         self.update()
+
+    def showEvent(self, e: object) -> None:  # noqa: D102 - the timer runs only while shown
+        super().showEvent(e)
+        self._tick.start()
+
+    def hideEvent(self, e: object) -> None:  # noqa: D102
+        super().hideEvent(e)
+        self._tick.stop()
 
     def anchor(self, *, above: int = 0) -> QPoint:
         screen = QGuiApplication.primaryScreen()
@@ -270,6 +360,53 @@ class CallIndicator(SurfaceWindow):
         x = area.right() - self.width() + self.SHADOW - STRIP_MARGIN
         y = area.bottom() - self.height() + self.SHADOW - STRIP_MARGIN - above
         return QPoint(x, y)
+
+
+class _RecDot(QWidget):
+    """The recording dot: the accent, 8 px."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setFixedSize(8, 8)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPainter
+
+        from yuki.ui.window.paint import paint_led
+
+        p = QPainter(self)
+        paint_led(p, QPointF(4, 4), self.window().theme().accent, 8)
+        p.end()
+
+
+class _DotTimer(QWidget):
+    """The running time in Doto (the colon in Segoe UI Variable Display Light)."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.text = ""
+        self.setFixedHeight(20)
+        self.set_text("00:00")
+
+    def set_text(self, text: str) -> None:
+        from yuki.ui.window.paint import dots_width
+
+        if text != self.text:
+            self.text = text
+            self.setFixedWidth(int(dots_width(text or "00:00", 16)) + 2)
+            self.update()
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QPainter
+
+        from yuki.ui.window.paint import paint_dots
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        paint_dots(p, QRectF(self.rect()), self.text, 16, self.window().theme().text)
+        p.end()
 
 
 class CallController(QObject):

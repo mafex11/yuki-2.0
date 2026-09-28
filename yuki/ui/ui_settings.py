@@ -1,4 +1,5 @@
-"""The UI's own settings: ``%LOCALAPPDATA%\\Yuki\\ui.json`` (motion, the window's place, the overlay's shortcut).
+"""The UI's own settings: ``%LOCALAPPDATA%\\Yuki\\ui.json`` (motion, the window's place, the overlay's shortcut,
+the accent colour).
 
 Written by the Yuki window's Settings page; read by the window and by yuki-ui,
 which applies a change live when the window tells it over the pipe
@@ -32,6 +33,11 @@ class UiSettings:
     maximized: bool = False
     open_hotkey: str = ""               # "Open Yuki anywhere": the overlay's shortcut ("" = the built-in default)
     quiet_last: list[str] | None = None  # the quiet hours to bring back when they are turned on again
+    accent: str = "green"               # the one accent colour: "green" (olive, default) | "orange"
+
+
+#: The accent names a settings file may hold (the colours are in :data:`yuki.ui.window.theme.ACCENTS`).
+ACCENT_NAMES = ("green", "orange")
 
 
 def _clean(raw: dict[str, Any]) -> UiSettings:
@@ -41,7 +47,9 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     hotkey = " ".join(str(raw.get("open_hotkey") or "").split()).lower()
     last = raw.get("quiet_last")
     last = [str(v) for v in last][:2] if isinstance(last, list) and len(last) >= 2 else None
-    return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last)
+    accent = str(raw.get("accent") or "green").strip().lower()
+    return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last,
+                      accent if accent in ACCENT_NAMES else "green")
 
 
 def load(path: Path | None = None) -> UiSettings:
@@ -97,4 +105,4 @@ def reload() -> UiSettings:
     return current()
 
 
-__all__ = ["UiSettings", "RETIRED", "settings_path", "load", "save", "update", "current", "reload", "replace"]
+__all__ = ["UiSettings", "RETIRED", "ACCENT_NAMES", "settings_path", "load", "save", "update", "current", "reload", "replace"]

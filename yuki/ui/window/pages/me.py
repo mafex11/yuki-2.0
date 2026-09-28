@@ -1,6 +1,6 @@
 """Me: who Yuki thinks the user is, each item with where it came from and a way to correct it.
 
-Every item shows its source ("You told Yuki · yesterday", "Seen in Discord ·
+Every item shows its source ("You told Yuki, yesterday", "Seen in Discord,
 25 Sep"). **Why?** folds open the journal entries it rests on. **Not right**
 folds open a composer: the user says what is true in their own words, which
 goes through ``MemoryClient.correct_portrait`` (a user-origin correction the
@@ -20,12 +20,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, plain, second_person
-from yuki.ui.window.theme import SPACE, Theme
+from yuki.ui.window.theme import PAGE_PAD, RADIUS, SPACE, Theme, variable_font
 from yuki.ui.window.widgets import (
     Avatar,
     Divider,
@@ -38,6 +39,57 @@ from yuki.ui.window.widgets import (
     page_header,
     text_label,
 )
+
+
+class PortraitStamp(QAbstractButton):
+    """When the portrait was rebuilt, on a small dot-matrix display ("00:13  Portrait rebuilt today"); a click
+    rebuilds it now."""
+
+    def __init__(self, t: Theme, at: float | None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.at = t, at
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(self.sizeHint())
+
+    def words(self) -> tuple[str, str, str]:
+        if not self.at:
+            return "--:--", "Portrait not", "written yet"
+        return hm(self.at), "Portrait rebuilt", day_label(self.at)
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        from PySide6.QtGui import QFontMetrics
+
+        from yuki.ui.window.paint import dots_width
+
+        stamp, a, b = self.words()
+        fm = QFontMetrics(variable_font(12.5, "Regular"))
+        return QSize(int(10 + dots_width(stamp, 20) + 12 + max(fm.horizontalAdvance(a), fm.horizontalAdvance(b)) + 14),
+                     50)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from yuki.ui.window.paint import dots_width, paint_dots, paint_surface
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect())
+        paint_surface(p, r, RADIUS["display"], self.t.level("display"),
+                      border=self.t.faint if self.underMouse() else None)
+        stamp, a, b = self.words()
+        w = paint_dots(p, QRectF(r.left() + 10, r.top(), dots_width(stamp, 20), r.height()), stamp, 20, self.t.accent)
+        p.setFont(variable_font(12.5, "Regular"))
+        p.setPen(self.t.text_3)
+        x = r.left() + 10 + w + 12
+        p.drawText(QRectF(x, r.top() + 8, r.width() - x, 17), Qt.AlignmentFlag.AlignVCenter, a)
+        p.drawText(QRectF(x, r.top() + 25, r.width() - x, 17), Qt.AlignmentFlag.AlignVCenter, b)
+        p.end()
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
 
 
 def pick_examples(view: MeView) -> tuple[str | None, str | None]:
@@ -86,7 +138,7 @@ def _more(t: Theme, panel: Panel, rows: list[QWidget], limit: int, total: int) -
     """Rows past ``limit`` start hidden; the panel's "All N" pill shows them (and "Fewer" hides them)."""
     if total <= limit:
         return
-    pill = Button(t, f"All {total}", style="outline", size="small")
+    pill = Button(t, f"All {total}", style="key", size="mini")
     for r in rows[limit:]:
         r.setVisible(False)
 
@@ -159,9 +211,9 @@ def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None
         if not items:
             continue
         if not first:
-            panel.body.addWidget(Divider(t))
+            panel.body.addSpacing(6)
         first = False
-        panel.body.addWidget(text_label(t, title, "caption_strong", "text_2"))
+        panel.body.addWidget(text_label(t, title, "caption", "text_3"))
         for it in items[:3]:
             panel.body.addWidget(_row(t, it, expand, compose, act, title=False))
     return panel
@@ -209,17 +261,16 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     page = QWidget()
     page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     col = QVBoxLayout(page)
-    col.setContentsMargins(SPACE["xl"], SPACE["l"], SPACE["xl"], SPACE["xl"])
-    col.setSpacing(SPACE["l"])
-    when = f"updated {day_label(view.portrait_at)} {hm(view.portrait_at)}" if view.portrait_at else "not written yet"
-    refresh = Button(t, f"Portrait {when}", glyph="history", style="outline", size="small")
-    refresh.setToolTip("Rebuild it now from what Yuki has seen")
+    col.setContentsMargins(*PAGE_PAD)
+    col.setSpacing(24)
+    refresh = PortraitStamp(t, view.portrait_at)
+    refresh.setToolTip("Rebuild your portrait now from what Yuki has seen")
     refresh.clicked.connect(act.refresh_portrait)
     col.addWidget(page_header(
-        t, "Me", "What Yuki understands about you. Tap Why? to see where something came from, or Not right to "
-                 "fix it in your own words.", [refresh]))
+        t, "Me", "What Yuki understands about you. Why? shows where something came from, and Not right fixes it "
+                 "in your own words.", [refresh], right_top=44))
     if view.questions_open:
-        banner = Card(t, padding=SPACE["l"])
+        banner = Card(t, level="muted", padding=SPACE["l"])
         row = QHBoxLayout()
         row.setSpacing(SPACE["s"])
         row.addWidget(text_label(t, "Yuki has " + ("a question" if view.questions_open == 1 else
@@ -232,7 +283,7 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
         col.addWidget(banner)
 
     grid = QWidget(page)
-    cards = Masonry(grid, columns=2, spacing=SPACE["l"], min_col=380)   # one column in a narrow window
+    cards = Masonry(grid, columns=2, spacing=14, min_col=340)   # one column in a narrow window
     col.addWidget(grid)
     left_parts = [
         lambda: _list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,

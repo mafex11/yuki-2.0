@@ -54,6 +54,7 @@ hiddenimports += ["win32timezone", "pythoncom", "pywintypes", "win32com.client",
 
 datas = []
 datas += collect_data_files("yuki", includes=["**/*.toml"])   # no shaders since the flat UI (2026-09-27)
+datas += collect_data_files("yuki", includes=["ui/fonts/*.ttf", "ui/fonts/*.txt"])   # Doto (SIL OFL) + licence
 datas += collect_data_files("pipecat", includes=["**/*.onnx", "**/*.json", "**/*.txt"])
 datas += collect_data_files("faster_whisper")              # its Silero VAD onnx
 datas += collect_data_files("sherpa_onnx")
