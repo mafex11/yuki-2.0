@@ -17,8 +17,9 @@ The look (2026-09-28, replacing flat shadcn at the user's request):
   used only on dot-matrix displays, live and recording states, the current or selected moment, the
   selected key and the speaking wave. No amber or yellow anywhere, no decorative dashes, no gradients,
   glass, blur or light mode.
-* **Type.** Segoe UI Variable (Display, light or regular, for titles; Text for the rest), else Segoe UI;
-  Nirmala UI as the fallback family so Devanagari never shows as boxes.
+* **Type.** IBM Plex Sans (bundled, SIL OFL: :mod:`yuki.ui.fonts`; the user's pick, round 2): titles
+  Light or Regular, body Regular, labels Medium, never a wall of bold; Nirmala UI as the fallback family so
+  Devanagari never shows as boxes. Without the bundled file, Segoe UI Variable, then Segoe UI.
 
 Everything is in logical pixels.
 """
@@ -35,9 +36,20 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase
 #: The 4-px spacing scale.
 SPACE = {"xxs": 2, "xs": 4, "s": 8, "m": 12, "l": 16, "xl": 24, "xxl": 32, "xxxl": 48}
 
-#: Corner radii: page modules 12, displays and keys 8, pill buttons fully round, floating dialogs 14.
-RADIUS = {"window": 8, "panel": 12, "card": 12, "display": 8, "key": 8, "row": 8, "control": 16, "field": 8,
-          "chip": 6, "tooltip": 8, "floating": 14, "bubble": 10}
+#: Corner radii (round 2, the user: pills fully round; squares and rectangles clearly rounded, scaled to their
+#: size). Anything pill-shaped (buttons, toggles, segmented choices, keycaps, chips) uses half its height, so
+#: it is a capsule at any size; these are the rectangles: modules and dialogs 18-20, displays and keys 16,
+#: fields 14, small keys and avatars scale down (:func:`corner`).
+RADIUS = {"window": 8, "panel": 18, "card": 18, "display": 16, "key": 16, "row": 12, "control": 999, "field": 14,
+          "chip": 999, "tooltip": 12, "floating": 20, "bubble": 16}
+
+
+def corner(w: float, h: float, radius: float | None = None) -> float:
+    """A rectangle's corner radius scaled to its size: ``radius`` (a key's 16 by default) for a large one, down
+    to about a third of the short side for a small one, never a capsule."""
+    short = min(w, h)
+    r = RADIUS["key"] if radius is None else radius
+    return max(4.0, min(r, short * 0.3))
 
 #: Control heights (the mockup's pill buttons are 30-32 px tall).
 CONTROL_H = {"small": 30, "regular": 32, "large": 36, "input": 34}
@@ -53,20 +65,22 @@ SIDEBAR_W = 96
 PAGE_PAD = (32, 34, 36, 40)
 
 #: The accent choices (Settings > General > Accent). Olive green is the default (the user, 2026-09-28:
-#: "forest green or olive green", calm and earthy, never neon); orange is the Field Unit original.
-ACCENTS: dict[str, str] = {"green": "#8FAF5A", "orange": "#FF5B14"}
+#: "forest green or olive green", then round 2: "darker, richer"; #748F42 still lights the dot-matrix digits
+#: on the near-black base); orange, deepened the same way.
+ACCENTS: dict[str, str] = {"green": "#748F42", "orange": "#E4571C"}
 DEFAULT_ACCENT = "green"
 
-#: Horizon x Field Unit tokens (mix.css).
+#: Horizon x Field Unit tokens, round 2 (the user: "make it DARK"): a near-black charcoal with only a trace of
+#: navy, panels a small step up from it (low contrast between panel and window), not grey-blue.
 PALETTE = {
-    "bg": "#0B0E13", "panel": "#10141B", "key": "#131821", "key_on": "#19212D", "line": "#1E2632",
-    "line2": "#161D27", "glass": "#06090D", "glass_border": "#1A222E", "ink": "#E6E9EE", "ink2": "#AEB6C2",
-    "mute": "#6F7886", "faint": "#3E4858", "led_off": "#283140",
-    # floating dialogs (surfaces.html)
-    "float_border": "#222A36", "float_sep": "#1B222C", "bubble": "#161C26", "menu_ink": "#D0D5DC",
-    # the skyline (today.html)
-    "cool": "#8C9BB0", "sky_far": "#131A24", "sky_near": "#222D3C", "ridge": "#6A7B92", "sky_base": "#26303E",
-    "sky_gap": "#3A4556", "tick": "#56606E", "peak": "#7D899B", "call_track": "#171E28",
+    "bg": "#07080A", "panel": "#0C0E11", "key": "#101216", "key_on": "#16191F", "line": "#181B21",
+    "line2": "#121418", "glass": "#050607", "glass_border": "#15181D", "ink": "#E4E6E9", "ink2": "#A4AAB3",
+    "mute": "#6B717B", "faint": "#393E47", "led_off": "#23272E",
+    # floating dialogs
+    "float_border": "#1B1F26", "float_sep": "#15181D", "bubble": "#13161B", "menu_ink": "#CDD1D6",
+    # the skyline
+    "cool": "#848E9C", "sky_far": "#0F1216", "sky_near": "#1A1E25", "ridge": "#5F6774", "sky_base": "#1F232A",
+    "sky_gap": "#343941", "tick": "#525862", "peak": "#747B87", "call_track": "#14171C",
     # errors are said in words, in a quiet red (never amber)
     "danger": "#E5736B", "destructive": "#3A1A1D",
 }
@@ -185,7 +199,7 @@ def _make(accent: str) -> Theme:
         ring=hexa(PALETTE["ink2"], 0.45),
         primary=P["ink"], primary_fg=P["bg"], destructive=P["destructive"], danger=P["danger"],
         text=text, text_2=text_2, text_3=text_3, text_on_accent=P["bg"],
-        accent=acc, accent_soft=hexa("#2A3444"),
+        accent=acc, accent_soft=hexa("#262B33"),
         # monochrome: the kind of a card is said in words; only an error has a colour of its own
         kinds={
             "praise": text_2, "nudge": text_2, "reminder": text_2, "review": text_2, "resume": text_2,
@@ -247,7 +261,9 @@ DARK = _cached(DEFAULT_ACCENT)
 
 # -- type ------------------------------------------------------------------------
 
-#: role -> (pixel size, weight word, display cut). Titles are Segoe UI Variable Display, light or regular.
+#: role -> (pixel size, weight word, display cut), at Segoe UI Variable's scale (a wider face is scaled by
+#: :data:`FAMILY_SCALE`). Titles Light or Regular; labels Medium ("Semibold" is Plex's Medium, see
+#: :data:`FAMILY_WEIGHTS`).
 TYPE: dict[str, tuple[int, str, bool]] = {
     "large_title": (36, "Light", True),
     "title": (18, "Regular", True),
@@ -269,14 +285,24 @@ _WEIGHTS = {"Light": QFont.Weight.Light, "Regular": QFont.Weight.Normal, "Medium
             "Semibold": QFont.Weight.DemiBold, "Bold": QFont.Weight.Bold}
 #: The weight axis value of each weight word (variable fonts).
 _WGHT = {"Light": 300.0, "Regular": 400.0, "Medium": 500.0, "Semibold": 600.0, "Bold": 700.0}
+#: Per family: how much smaller to set it than the Segoe scale above (Plex runs wider and has a taller
+#: x-height; measured on the Today and Me pages: 0.94 reads the same size and nothing clips).
+FAMILY_SCALE: dict[str, float] = {"IBM Plex Sans": 0.94}
+#: Per family: weight words set lighter (Plex's Semibold reads as bold; a label is its Medium).
+FAMILY_WEIGHTS: dict[str, dict[str, float]] = {"IBM Plex Sans": {"Semibold": 520.0, "Bold": 600.0,
+                                                                  "Light": 300.0}}
 
 
 def ensure_fonts() -> bool:
     """Doto and the fallback families, loaded once per process (:func:`yuki.ui.fonts.load_fonts`)."""
     try:
-        from yuki.ui.fonts import load_fonts
+        from yuki.ui.fonts import _LOADED, load_fonts
 
-        return load_fonts()
+        first = not _LOADED
+        ok = load_fonts()
+        if first:
+            _families.cache_clear()   # the bundled families are in the database now
+        return ok
     except Exception:
         return False
 
@@ -286,10 +312,25 @@ def _families() -> frozenset[str]:
     return frozenset(QFontDatabase.families())
 
 
-@lru_cache(maxsize=None)
+#: The UI family in use instead of the built-in (a bundled face once one is picked; the font comparison sets it).
+_FAMILY: list[str | None] = [None]
+
+
+def set_family(name: str | None) -> None:
+    """Use ``name`` (a family already in the font database) as the UI family; ``None``: the built-in."""
+    _FAMILY[0] = name or None
+
+
 def family() -> str:
-    """The UI family: Segoe UI Variable (Windows 11), else Segoe UI."""
-    return "Segoe UI Variable" if "Segoe UI Variable" in _families() else "Segoe UI"
+    """The UI family: the chosen one, else the bundled IBM Plex Sans, else Segoe UI Variable, else Segoe UI."""
+    if _FAMILY[0]:
+        return _FAMILY[0]
+    ensure_fonts()
+    fams = _families()
+    for name in ("IBM Plex Sans", "Segoe UI Variable"):
+        if name in fams:
+            return name
+    return "Segoe UI"
 
 
 def _fallbacks(name: str) -> list[str]:
@@ -307,20 +348,22 @@ def variable_font(px: float, weight: str = "Regular", *, display: bool = False) 
     name = family()
     f = QFont(name)
     f.setFamilies(_fallbacks(name))
-    f.setPixelSize(max(1, int(round(px))))
+    f.setPixelSize(max(1, int(round(px * FAMILY_SCALE.get(name, 1.0)))))
+    wght = FAMILY_WEIGHTS.get(name, {}).get(weight, _WGHT.get(weight, 400.0))
+    f.setVariableAxis(QFont.Tag("wght"), wght)   # a variable face's true weight
     if name == "Segoe UI Variable":
-        f.setVariableAxis(QFont.Tag("wght"), _WGHT.get(weight, 400.0))
         f.setVariableAxis(QFont.Tag("opsz"), 36.0 if display else max(8.0, min(20.0, px * 0.75)))
-    f.setWeight(_WEIGHTS.get(weight, QFont.Weight.Normal))
+    f.setWeight(QFont.Weight(int(wght)) if name in FAMILY_WEIGHTS else _WEIGHTS.get(weight, QFont.Weight.Normal))
     return f
 
 
 def rich_font(px: float = 14) -> QFont:
     """The font for rich text (a formatted reply): the family without fixed axes, so a span's
     ``font-weight:600`` picks the real Semibold (fixed axes would pin every span to Regular)."""
-    f = QFont(family())
-    f.setFamilies(_fallbacks(family()))
-    f.setPixelSize(max(1, int(round(px))))
+    name = family()
+    f = QFont(name)
+    f.setFamilies(_fallbacks(name))
+    f.setPixelSize(max(1, int(round(px * FAMILY_SCALE.get(name, 1.0)))))
     return f
 
 

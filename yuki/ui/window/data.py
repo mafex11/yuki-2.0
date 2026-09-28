@@ -264,6 +264,8 @@ class DayView:
     last_at: float | None
     lane_of_other: str = "other"
     todos: list["Todo"] = field(default_factory=list)   # the user's open to-dos (the panel beside the moment)
+    #: What Today's dashboard cards summarise from the other pages (:func:`dashboard_counts`).
+    counts: dict[str, Any] = field(default_factory=dict)
 
 
 MAX_LANES = 7
@@ -384,7 +386,49 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
     except Exception:
         todos = []
     return DayView(day, since, until, end, lane_list, segments, calls, power, gaps, sessions, totals, summary,
-                   milestones, facts, first_at, last_at, todos=todos)
+                   milestones, facts, first_at, last_at, todos=todos, counts=dashboard_counts(memory))
+
+
+def dashboard_counts(memory: Any) -> dict[str, Any]:
+    """The figures Today's cards show about the other pages (read-only, each on its own so one failing read
+    never blanks the rest): people Yuki knows (and their initials), questions waiting, what it learned to do,
+    and calls waiting to be remembered."""
+    out: dict[str, Any] = {"people": 0, "people_initials": [], "people_names": [], "questions": 0,
+                           "question": "", "learned": 0, "learned_top": "", "calls_waiting": 0,
+                           "calls_minutes": 0.0}
+    try:
+        people = [f for f in memory.portrait_facts_with_evidence(0) if f.get("kind") == "person"]
+        people.sort(key=lambda f: (f.get("origin") != "user", -(f.get("since") or 0)))
+        seen: list[str] = []
+        for f in people:
+            name = str(f.get("subject") or "").strip()
+            if name and name.casefold() not in {n.casefold() for n in seen}:
+                seen.append(name)
+        out["people"] = len(seen)
+        out["people_names"] = seen[:3]
+        out["people_initials"] = [next((c for c in n if c.isalnum()), "?").upper() for n in seen[:5]]
+    except Exception:
+        pass
+    try:
+        qs = memory.questions(statuses=("open",), limit=50)
+        out["questions"] = len(qs)
+        if qs:
+            out["question"] = plain(second_person(str(qs[0].get("question") or "")))
+    except Exception:
+        pass
+    try:
+        learned = learned_items(memory)
+        out["learned"] = len(learned)
+        out["learned_top"] = learned[0].title if learned else ""
+    except Exception:
+        pass
+    try:
+        waiting = memory.call_audio_waiting() or {}
+        out["calls_waiting"] = int(waiting.get("calls") or 0)
+        out["calls_minutes"] = float(waiting.get("minutes") or 0.0)
+    except Exception:
+        pass
+    return out
 
 
 def _sessions(memory: Any, since: float, until: float, segments: list[Segment], facts: list[dict[str, Any]],

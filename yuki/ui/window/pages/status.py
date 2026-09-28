@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import StatusView, day_label, dur, first_sentence, hm, plain, second_person
 from yuki.ui.window.paint import paint_led, paint_surface
-from yuki.ui.window.theme import ICON, PAGE_PAD, RADIUS, Theme, font
+from yuki.ui.window.theme import ICON, PAGE_PAD, Theme, font
 from yuki.ui.window.widgets import Button, Card, DotDisplay, Led, Masonry, page_header, text_label
 
 #: A status row's height.
@@ -37,7 +37,9 @@ class _IconKey(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect())
-        paint_surface(p, r, RADIUS["key"], self.t.level("key"))
+        from yuki.ui.window.theme import corner
+
+        paint_surface(p, r, corner(r.width(), r.height()), self.t.level("key"))
         if self.live:
             paint_led(p, QPointF(6.5, 6.5), self.t.accent, 5)
         f = font("icon")
@@ -189,6 +191,7 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     col.addLayout(displays)
     col.addSpacing(14)
 
+    named: dict[str, QWidget] = {}
     rows = QWidget(page)
     rows.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     rcol = QVBoxLayout(rows)
@@ -204,6 +207,7 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     else:
         rcol.addWidget(_row(t, "warning", "Memory isn't running", "Yuki restarts it within two minutes",
                             [_pill(t, "Start", act.start_memory, style="default")]))
+    named["memory"] = rcol.itemAt(rcol.count() - 1).widget() if rcol.count() else None
     if waiting_calls:
         w = v.calls_waiting
         rcol.addWidget(_row(t, "mic", f"{waiting_calls} call{'s' if waiting_calls != 1 else ''} waiting to "
@@ -214,12 +218,14 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     else:
         rcol.addWidget(_row(t, "mic", "No calls waiting to be remembered",
                             "A recorded call waits here, on this PC, until the GPU is free", []))
+    named["calls"] = rcol.itemAt(rcol.count() - 1).widget()
     if v.call_now:
         recording = v.call_now.get("status") == "recording"
         rcol.addWidget(_row(t, "phone", f"On a {v.call_now['app']} call",
                             "Only your side is remembered" if recording else "This call isn't remembered",
                             [_pill(t, "Stop", act.stop_call, glyph="close")] if recording else [], live=recording))
     if v.questions_waiting:
+        named["questions"] = None
         q = v.questions_waiting[0]
         n = len(v.questions_waiting)
         rcol.addWidget(_row(t, "question", "A question for you" if n == 1 else f"{n} questions for you",
@@ -249,4 +255,6 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
     cards.add(health, 1)
     col.addWidget(grid)
     col.addStretch(1)
+    named["health"] = health
+    page.sections = {k: w for k, w in named.items() if w is not None}  # type: ignore[attr-defined]
     return page

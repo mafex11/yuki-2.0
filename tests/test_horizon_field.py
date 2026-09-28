@@ -1,6 +1,7 @@
 """The Horizon x Field Unit redesign (2026-09-28): the skyline's data and its picked moment, the waves that
-stop when hidden, the accent setting, the bundled fonts, the GUI stall watchdog, the encrypted page snapshot
-and the placeholders that keep their size. Offscreen only (rule 7), temporary files only."""
+stop when hidden, the accent setting, the bundled fonts (IBM Plex Sans and Doto), the GUI stall watchdog, the
+encrypted page snapshot, the placeholders that keep their size, and round 2's dashboard cards that lead to the
+other pages and the Me/Yuki rows that fold open. Offscreen only (rule 7), temporary files only."""
 
 from __future__ import annotations
 
@@ -203,21 +204,21 @@ def test_the_accent_setting_is_saved_and_repaints_the_window(qapp, tmp_path):
     from yuki.ui.window.app import WindowApp
     from yuki.ui.window.theme import ACCENTS, DEFAULT_ACCENT, accent_name, theme
 
-    assert DEFAULT_ACCENT == "green" and ACCENTS == {"green": "#8FAF5A", "orange": "#FF5B14"}
+    assert DEFAULT_ACCENT == "green" and ACCENTS == {"green": "#748F42", "orange": "#E4571C"}
     path = tmp_path / "ui.json"
     assert ui_settings.load(path).accent == "green"                    # the default
     ui_settings.update(path, accent="orange")
     assert ui_settings.load(path).accent == "orange"
     ui_settings.update(path, accent="blue")                             # not a choice any more: back to green
     assert ui_settings.load(path).accent == "green"
-    assert accent_name("orange") == "orange" and theme(accent="orange").accent.name() == "#ff5b14"
+    assert accent_name("orange") == "orange" and theme(accent="orange").accent.name() == "#e4571c"
     memory = MemoryClient.open(tmp_path / "memory.db")
     try:
         ctrl = WindowApp(memory, db_path=tmp_path / "memory.db", connect=False, ui_path=path)
         ctrl.set_accent("orange")
         assert ui_settings.load(path).accent == "orange"
-        assert ctrl.t.accent.name() == "#ff5b14" and ctrl.win.sidebar.t.accent.name() == "#ff5b14"
-        assert all(k.t.accent.name() == "#ff5b14" for k in ctrl.win.sidebar.items.values())
+        assert ctrl.t.accent.name() == "#e4571c" and ctrl.win.sidebar.t.accent.name() == "#e4571c"
+        assert all(k.t.accent.name() == "#e4571c" for k in ctrl.win.sidebar.items.values())
         ctrl.set_accent("teal")                                          # ignored
         assert ui_settings.load(path).accent == "orange"
         ctrl.win.close()
@@ -378,3 +379,165 @@ def test_a_long_thread_paints_its_newest_bubbles_first_and_fills_in_above(qapp):
     bar = view.area.verticalScrollBar()
     assert bar.value() == bar.maximum()                           # still on the newest
     view.close()
+
+
+# -- round 2: the UI face ------------------------------------------------------------------------------------
+
+
+def test_ibm_plex_sans_is_the_bundled_ui_face_with_nirmala_after_it(qapp):
+    from PySide6.QtGui import QFontInfo
+
+    from yuki.ui import fonts
+    from yuki.ui.window import theme
+
+    assert (fonts.font_dir() / "IBMPlexSans.ttf").exists()
+    assert "SIL Open Font License" in (fonts.font_dir() / "IBMPlexSans-OFL.txt").read_text(encoding="utf-8")
+    assert fonts.load_fonts() and fonts.ui_available() and fonts.dot_available()
+    assert theme.family() == "IBM Plex Sans"
+    body = theme.font("body")
+    assert QFontInfo(body).family() == "IBM Plex Sans" and "Nirmala UI" in body.families()
+    assert body.pixelSize() == 13                                         # Plex set a step smaller (it runs wider)
+    assert theme.font("body_strong").weight() < 600                      # labels Medium, no walls of bold
+    assert QFontInfo(theme.dot_font(40)).family() == "Doto"              # the displays keep Doto
+    spec = (fonts.font_dir().parents[2] / "packaging" / "yuki.spec").read_text(encoding="utf-8")
+    assert "ui/fonts/*.ttf" in spec and "ui/fonts/*.txt" in spec
+
+
+# -- round 2: dashboard cards lead to the other pages ----------------------------------------------------------
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.went: list[tuple] = []
+
+    def __getattr__(self, name):
+        if name == "navigate":
+            return lambda page, section=None: self.went.append((page, section))
+        from yuki.ui.window.actions import NOOP
+
+        return getattr(NOOP, name)
+
+
+def test_todays_cards_lead_to_their_sections_with_hover_and_press_states(qapp):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from yuki.ui.window.pages import today
+    from yuki.ui.window.theme import theme
+
+    day = _day()
+    day.counts = {"people": 3, "people_initials": ["K", "R", "S"], "people_names": ["Komal", "Rohan", "Jatin"],
+                  "questions": 2, "question": "Who is Priya to you?", "learned": 1, "learned_top": "Pause the music",
+                  "calls_waiting": 1, "calls_minutes": 12.0}
+    act = _Recorder()
+    page = today.build(theme(), day, act=act)
+    page.resize(1200, 900)
+    page.show()
+    pump(qapp, 0.05)
+    assert set(page.cards) == {"todos", "people", "questions", "learned", "calls"}
+    for key, want in (("todos", ("me", "todos")), ("people", ("me", "people")), ("questions", ("yuki", "questions")),
+                      ("learned", ("yuki", "learned")), ("calls", ("status", "calls"))):
+        card = page.cards[key]
+        c = QPointF(card.width() / 2, card.height() / 2)
+        for kind in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            QApplication.sendEvent(card, QMouseEvent(kind, c, c, Qt.MouseButton.LeftButton,
+                                                     Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        assert act.went[-1] == want, key
+    assert page.cards["questions"].lit and not page.cards["people"].lit   # the accent only where something waits
+    # hover and press paint differently (the card lifts, then drops)
+    from yuki.ui.window.shots import grab
+
+    card = page.cards["people"]
+    rest = grab(card)
+    card.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, True)
+    hot = grab(card)
+    card.setDown(True)
+    down = grab(card)
+    assert rest != hot and hot != down
+    page.close()
+
+
+def test_navigate_to_a_section_scrolls_there_and_lights_it(qapp, tmp_path):
+    from yuki.memory.api import MemoryClient
+    from yuki.ui.window.app import WindowApp
+
+    memory = MemoryClient.open(tmp_path / "memory.db")
+    try:
+        memory.add_todo("Laminate the certificates for Bro")
+        ctrl = WindowApp(memory, db_path=tmp_path / "memory.db", page="today", connect=False,
+                         ui_path=tmp_path / "ui.json")
+        ctrl.win.resize(1000, 600)
+        ctrl.show(offscreen=True)
+        ctrl.navigate("me", "todos")
+        end = time.monotonic() + 15
+        panel = None
+        while time.monotonic() < end:
+            pump(qapp, 0.05)
+            content = ctrl.win.page_widget("me")
+            panel = (getattr(content, "sections", None) or {}).get("todos") if content is not None else None
+            if panel is not None and panel.flashing:
+                break
+        assert ctrl.win.current == "me" and panel is not None and panel.flashing
+        ctrl.win.close()
+    finally:
+        memory.close()
+
+
+# -- round 2: Me and Yuki, scannable ----------------------------------------------------------------------------
+
+
+def test_me_shows_short_rows_and_builds_the_full_text_only_when_opened(qapp):
+    from PySide6.QtWidgets import QLabel
+
+    from yuki.ui.window.data import Item, MeView
+    from yuki.ui.window.pages import me
+    from yuki.ui.window.theme import theme
+    from yuki.ui.window.widgets import FoldRow, ItemRow
+
+    long_text = "Komal is a colleague on the Corvana team who gives you corrections. " * 6
+    people = [Item(f"fact:{i}", f"Person {i}", long_text, long_text[:80], "person", None, "model", 1.7e9 - i, 0.6,
+                   "Seen in Slack, 26 Sep") for i in range(8)]
+    view = MeView([], [], [], people, {}, [], [], [], None, 0)
+    act = _Recorder()
+    page = me.build(theme(), view, act=act, pending={"fact:5": {"kind": "correct", "words": "a friend", "at": 1.0}})
+    panel = page.sections["people"]
+    rows = [r for r in panel.rows if isinstance(r, FoldRow)]
+    assert len(rows) == 8 and sum(not r.isHidden() for r in rows) == 5     # the top five; the rest behind All 8
+    assert panel.findChildren(ItemRow) == [rows[5].body_widget.inner]     # only the pending one is built (open)
+    assert rows[5].is_open and not rows[0].is_open
+    labels = " ".join(lab.text() for lab in panel.findChildren(QLabel))
+    assert "8 people" in labels                                           # a headline
+    assert all(len(r.head.line) <= 111 for r in rows)                     # one short line per row, no walls
+    rows[0].toggle()                                                     # opening a row builds its fold
+    inner = rows[0].body_widget.inner
+    assert isinstance(inner, ItemRow) and inner.wrong_pill is not None    # Not right is in the fold
+    got = []
+    inner.correct.connect(lambda ref, words: got.append(ref))
+    inner.toggle_composer()
+    inner.field.submitted.emit("my friend from college")
+    assert got == ["fact:0"]
+
+
+def test_yuki_page_sections_are_scannable_and_questions_keep_their_answers(qapp):
+    from yuki.ui.window.data import YukiView
+    from yuki.ui.window.pages import yuki_page
+    from yuki.ui.window.theme import theme
+    from yuki.ui.window.widgets import Button, FoldRow
+
+    view = YukiView([], None, ["Owns mistakes bluntly."], [], [], [], [], [
+        {"id": 7, "question": "Who is Priya to you?", "evidence": "She is on the invoice threads.", "status": "open"}],
+        [{"id": 8, "question": "Who is Jatin to you?", "status": "answered", "answer": "a friend", "answered_at": None,
+          "at": 1.7e9}])
+    skipped = []
+    act = _Recorder()
+    act.skip_question = lambda ref, never: skipped.append((ref, never))
+    page = yuki_page.build(theme(), view, act=act)
+    qs = page.sections["questions"]
+    rows = [r for r in qs.rows if isinstance(r, FoldRow)]
+    assert len(rows) == 2 and rows[0].is_open and not rows[1].is_open     # the waiting question opens itself
+    assert rows[1].head.line == "You: \u201ca friend\u201d"
+    never = next(b for b in rows[0].body_widget.findChildren(Button) if b.text() == "Don't ask")
+    never.click()
+    assert skipped == [(7, True)] and rows[0].isHidden()
+    assert set(page.sections) >= {"talk", "personality", "learned", "questions"}

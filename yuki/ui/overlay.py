@@ -86,8 +86,8 @@ MAX_CARDS_FRACTION = 0.55
 SCROLL_STYLE = (
     "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
     "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px 0 2px 0; }"
-    "QScrollBar::handle:vertical { background: #19212D; border-radius: 4px; min-height: 24px; }"
-    "QScrollBar::handle:vertical:hover { background: #3E4858; }"
+    "QScrollBar::handle:vertical { background: #16191F; border-radius: 4px; min-height: 24px; }"
+    "QScrollBar::handle:vertical:hover { background: #393E47; }"
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
     "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
 )
@@ -131,8 +131,8 @@ class AskInput(QPlainTextEdit):
         self.setStyleSheet(
             "QPlainTextEdit {"
             "  background: transparent;"
-            "  color: #E6E9EE;"
-            "  selection-background-color: #2A3444;"
+            "  color: #E4E6E9;"
+            "  selection-background-color: #262B33;"
             "  border: none; padding: 0px;"
             "}"
         )
@@ -381,7 +381,7 @@ class Overlay(SurfaceWindow):
     opened = Signal()
 
     def __init__(self) -> None:
-        super().__init__(activates=True, radius=14)
+        super().__init__(activates=True, radius=20)
         self.setObjectName("YukiOverlay")
         #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
         self.thread: Any = None

@@ -2,7 +2,7 @@
 cards, the call pill, the voice pill and the tray's panels.
 
 Each is a frameless, always-on-top tool window: a Horizon floating dialog (the navy
-panel ``#10141B`` with a 1 px ``#222A36`` line, 14 px corners, a soft shadow; pills are
+panel ``#0C0E11`` with a 1 px ``#1B1F26`` line, 20 px corners, a soft shadow; pills are
 fully round) that fades and slides a few pixels when it appears. Opaque: whatever is
 behind it never shows through, so text reads the same over any screen. Dark only; the
 accent only on live and recording states (docs/UI-window.md).
@@ -61,12 +61,12 @@ def accent_color() -> QColor:
 #: The tray icon's mark: the accent as the app started (the rest of the UI reads it live).
 ACCENT = accent_color()
 #: Flat tokens for callers that paint with fixed colours (the card-stack overlay, the tray panels' HTML).
-TEXT_PRIMARY = QColor("#E6E9EE")
-TEXT_DIM = QColor("#AEB6C2")
-CARD_BG = QColor("#161C26")
-CARD_BORDER = QColor("#222A36")
-ERROR_BG = QColor("#2A1416")
-ERROR_BORDER = QColor("#5A2A2E")
+TEXT_PRIMARY = QColor("#E4E6E9")
+TEXT_DIM = QColor("#A4AAB3")
+CARD_BG = QColor("#13161B")
+CARD_BORDER = QColor("#1B1F26")
+ERROR_BG = QColor("#221113")
+ERROR_BORDER = QColor("#4A2427")
 
 
 def ui_font(size: int = 11, *, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
@@ -129,7 +129,7 @@ class SurfaceWindow(QWidget):
         activates: True if the window should take keyboard focus when shown (the
             overlay does; the status strip must not, or it would pull focus out
             of whatever the user is doing).
-        radius: Corner radius of the panel (Horizon: 14; a pill passes half its height).
+        radius: Corner radius of the panel (20; a pill passes half its height).
 
     Signals:
         faded_out: Emitted once the hide animation has finished and the window is
@@ -146,7 +146,7 @@ class SurfaceWindow(QWidget):
 
     _instances: "weakref.WeakSet[SurfaceWindow]" = weakref.WeakSet()
 
-    def __init__(self, *, activates: bool = True, radius: int = 14) -> None:
+    def __init__(self, *, activates: bool = True, radius: int = 20) -> None:
         flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool  # no taskbar button, no alt-tab entry

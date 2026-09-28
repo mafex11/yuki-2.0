@@ -269,7 +269,7 @@ def test_pills_say_their_state_in_words_with_a_wave(qapp):
     assert "245,158,11" not in waiting.label.styleSheet()                 # no amber anywhere
     pill = VoicePill()
     pill.show_state("speaking")
-    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "230,233,238" in pill.label.styleSheet()
+    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "228,230,233" in pill.label.styleSheet()
     pill.show_state("thinking")
     assert pill.wave.kind == "think"
     pill.show_state("error", "The microphone is in use")

@@ -1,5 +1,9 @@
 """Me: who Yuki thinks the user is, each item with where it came from and a way to correct it.
 
+Round 2 (the user: "far too much text"): every section is scannable (:mod:`yuki.ui.window.pages.fold`): a
+one-line headline, the top three items as short rows (a title, one quiet line, the date), the rest behind
+"All N"; a row folds open to the full text, where it came from, **Why?** and **Not right**.
+
 Every item shows its source ("You told Yuki, yesterday", "Seen in Discord,
 25 Sep"). **Why?** folds open the journal entries it rests on. **Not right**
 folds open a composer: the user says what is true in their own words, which
@@ -19,6 +23,7 @@ and moved here from the Yuki page (2026-09-27).
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Callable
 
 from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QPainter
@@ -27,15 +32,16 @@ from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QVBoxLayout, QWidget
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import ASPECT_TITLES, Item, MeView, day_label, first_sentence, hm, plain, second_person
 from yuki.ui.window.theme import PAGE_PAD, RADIUS, SPACE, Theme, variable_font
+from yuki.ui.window.pages.fold import SHOWN, fold_panel, one_line
 from yuki.ui.window.widgets import (
+    FoldRow,
+    NavCard,
     Avatar,
     Divider,
     Masonry,
-    Card,
     ItemRow,
     Panel,
     Button,
-    Shimmer,
     page_header,
     text_label,
 )
@@ -249,13 +255,119 @@ def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
     return panel
 
 
+def _item_body(t: Theme, item: Item, act: Actions, *, expand: bool = False, compose: bool = False,
+               tags: bool = True) -> Callable[[], QWidget]:
+    """A fold's body: the whole item as an :class:`ItemRow` (text, source, Why?, Not right), built when opened."""
+    def make() -> QWidget:
+        row = ItemRow(t, item.ref, "", item.text, item.source, tags=item.tags if tags else [],
+                      evidence=_evidence(item), show_evidence=expand, composer=compose,
+                      pending=_PENDING.get(item.ref),
+                      placeholder=f"e.g. “{item.title} is my friend from college”" if item.kind == "person"
+                      else "")
+        row.correct.connect(lambda _ref, words, it=item: act.correct_item(it, words))
+        row.forget.connect(lambda _ref, it=item: act.forget_item(it))
+        return row
+    return make
+
+
+def _when(item: Item) -> str:
+    return day_label(item.since) if item.since else ""
+
+
+def _fold(t: Theme, item: Item, act: Actions, *, expand: str | None, compose: str | None,
+          initial: bool = False, title: str | None = None, line: str | None = None) -> FoldRow:
+    open_now = item.ref in (expand, compose) or item.ref in _PENDING
+    joke = "joke" in item.tags
+    meta = ("joke, " if joke else "") + _when(item)
+    row = FoldRow(t, item.title if title is None else title, one_line(item.text) if line is None else line, meta,
+                  initial=next((c for c in item.title if c.isalnum()), "?").upper() if initial else "",
+                  body=_item_body(t, item, act, expand=item.ref == expand, compose=item.ref == compose),
+                  expanded=open_now)
+    row.item = item  # type: ignore[attr-defined]
+    return row
+
+
+def counts_line(items: list[Item], one: str, many: str, *, none: str = "Nothing yet") -> str:
+    """A section's headline: how many, and how many of them you told Yuki yourself ("14 people, 5 you told
+    Yuki"); the rows under it already say which."""
+    n = len(items)
+    if not n:
+        return none
+    told = sum(1 for it in items if "you" in it.tags)
+    return f"{n} {one if n == 1 else many}" + (f", {told} you told Yuki" if told else "")
+
+
+def _section(t: Theme, title: str, items: list[Item], act: Actions, expand: str | None, compose: str | None, *,
+             one: str = "thing", many: str = "things", people: bool = False, shown: int = SHOWN,
+             none: str = "Nothing yet") -> Panel:
+    rows = [_fold(t, it, act, expand=expand, compose=compose, initial=people) for it in items]
+    return fold_panel(t, title, counts_line(items, one, many, none=none), rows, shown=shown, empty=none + ".")
+
+
+def _people(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
+    order = sorted(view.people, key=lambda i: (0 if i.ref in (expand, compose) else 2 if "you" in i.tags else 3,
+                                               -i.since))
+    return _section(t, "People", order, act, expand, compose, one="person", many="people", people=True, shown=5,
+                    none="Nobody yet")
+
+
+def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None, act: Actions) -> Panel:
+    """A few short trait lines: one per side of you first (how you talk, what you care about, running jokes,
+    stories, how you are with people), the rest behind "All N"."""
+    firsts, rest = [], []
+    for aspect, title in ASPECT_TITLES.items():
+        for n, it in enumerate(view.personality.get(aspect) or []):
+            row = _fold(t, it, act, expand=expand, compose=compose, title=title, line=one_line(it.text, 90))
+            (firsts if n == 0 else rest).append(row)
+    rows = firsts + rest
+    sides = sum(1 for a in ASPECT_TITLES if view.personality.get(a))
+    headline = f"{len(rows)} traits, across {sides} sides of you" if rows else "Still getting to know you"
+    return fold_panel(t, "Personality", headline, rows, shown=max(3, len(firsts)), empty="Still getting to know you.")
+
+
+def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
+    rows = []
+    for it in view.unsure[:4]:
+        def make(it: Item = it) -> QWidget:
+            box = QWidget()
+            box.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            col = QVBoxLayout(box)
+            col.setContentsMargins(0, 0, 0, 0)
+            row = ItemRow(t, it.ref, "", it.text, it.source, tags=[], evidence=_evidence(it),
+                          placeholder="Say what was really said, or what's true", pending=_PENDING.get(it.ref),
+                          parent=box)
+            row.correct.connect(lambda _ref, words, item=it: act.correct_item(item, words))
+            row.forget.connect(lambda _ref, item=it: act.forget_item(item))
+            col.addWidget(row)
+            right = Button(t, "That's right", glyph="check", style="outline", size="small", parent=box)
+
+            def confirmed(_c: bool = False, item: Item = it, pill: Button = right) -> None:
+                act.confirm_item(item)
+                pill.setText("Confirmed")
+                pill.setEnabled(False)
+                pill.updateGeometry()
+
+            right.clicked.connect(confirmed)
+            line = QHBoxLayout()
+            line.addWidget(right)
+            line.addStretch(1)
+            col.addLayout(line)
+            return box
+        fold = FoldRow(t, "", one_line(it.text, 120), _when(it), body=make, expanded=it.ref in _PENDING)
+        fold.item = it  # type: ignore[attr-defined]
+        rows.append(fold)
+    n = len(view.unsure)
+    headline = "Nothing unclear this week" if not n else f"{n} line{'s' if n != 1 else ''} from calls, where words " \
+                                                         "can be misheard"
+    return fold_panel(t, "Not sure Yuki heard these right", headline, rows, shown=2, empty="Nothing unclear this week.")
+
+
 def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | None = None,
           act: Actions = NOOP, pending: dict[str, dict] | None = None, progressive: bool = True) -> QWidget:
-    """The page. ``pending``: corrections not applied yet (shown as "Updating…" in the user's words).
-
-    ``progressive``: the first panel of each column is built now and the rest one per turn of the event
-    loop (``page.deferred``, run by the window), each into a shimmering placeholder already in the page.
-    """
+    """The page. ``pending``: corrections not applied yet (shown as "Updating…" in the user's words, their
+    rows open). ``progressive`` is accepted for older callers: the page's rows are painted and cheap, so it is
+    built in one go."""
+    del progressive
     _PENDING.clear()
     _PENDING.update(pending or {})
     page = QWidget()
@@ -266,77 +378,42 @@ def build(t: Theme, view: MeView, *, expand: str | None = None, compose: str | N
     refresh = PortraitStamp(t, view.portrait_at)
     refresh.setToolTip("Rebuild your portrait now from what Yuki has seen")
     refresh.clicked.connect(act.refresh_portrait)
-    col.addWidget(page_header(
-        t, "Me", "What Yuki understands about you. Why? shows where something came from, and Not right fixes it "
-                 "in your own words.", [refresh], right_top=44))
+    col.addWidget(page_header(t, "Me", "What Yuki understands about you. Open a line to see why, or to put it "
+                                       "right in your own words.", [refresh], right_top=34))
     if view.questions_open:
-        banner = Card(t, level="muted", padding=SPACE["l"])
-        row = QHBoxLayout()
-        row.setSpacing(SPACE["s"])
-        row.addWidget(text_label(t, "Yuki has " + ("a question" if view.questions_open == 1 else
-                                                   f"{view.questions_open} questions") +
-                                 " about people it doesn't know yet.", "body", "text", wrap=True), 1)
-        go = Button(t, "Answer on the Yuki page", glyph="next", style="default", size="small")
-        go.clicked.connect(lambda: act.navigate("yuki"))
-        row.addWidget(go)
-        banner.body.addLayout(row)
+        banner = NavCard(t, "Yuki has questions for you", str(view.questions_open),
+                         "Answer them on the Yuki page", lit=True, height=92)
+        banner.clicked.connect(lambda: act.navigate("yuki", "questions"))
         col.addWidget(banner)
-
     grid = QWidget(page)
+    grid.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     cards = Masonry(grid, columns=2, spacing=14, min_col=340)   # one column in a narrow window
+    from yuki.ui.window.pages.fold import todos_section
+
+    parts = (
+        ("work", 0, lambda: _section(t, "Work and projects", view.work, act, expand, compose)),
+        ("todos", 0, lambda: todos_section(t, list(getattr(view, "todos", []) or []), act)),
+        ("interests", 0, lambda: _section(t, "Interests", view.interests, act, expand, compose, one="interest",
+                                          many="interests")),
+        ("routines", 0, lambda: _section(t, "Routines", view.routines, act, expand, compose, one="pattern",
+                                         many="patterns", shown=2)),
+        ("people", 1, lambda: _people(t, view, expand, compose, act)),
+        ("personality", 1, lambda: _personality(t, view, expand, compose, act)),
+        ("unsure", 1, lambda: _unsure(t, view, act)),
+    )
+    page.sections = {}  # type: ignore[attr-defined]
+    for key, column, make in parts:
+        panel = make()
+        panel.setParent(grid)
+        cards.add(panel, column)
+        page.sections[key] = panel  # type: ignore[attr-defined]
     col.addWidget(grid)
-    left_parts = [
-        lambda: _list_panel(t, "Work and projects", "What you do, now and lately.", "work", view.work,
-                            expand, compose, act, limit=3),
-        lambda: _todo_list(t, view, act),
-        lambda: _list_panel(t, "Interests", "What you're into.", "heart", view.interests, expand, compose, act,
-                            limit=3),
-        lambda: _list_panel(t, "Routines", "Patterns in how your days go.", "history", view.routines,
-                            expand, compose, act, limit=2),
-    ]
-    right_parts = [
-        lambda: _people(t, view, expand, compose, act),
-        lambda: _personality(t, view, expand, compose, act),
-        lambda: _unsure(t, view, act),
-    ]
-    columns: list[list] = []
-    for column, parts in enumerate((left_parts, right_parts)):
-        later: list = []
-        for i, make in enumerate(parts):
-            if i == 0 or not progressive:
-                panel = make()
-                panel.setParent(grid)
-                cards.add(panel, column)
-                continue
-            # a holder keeps the card's place in the layout: the skeleton now, the card when it is built
-            holder = QWidget(grid)
-            hold = QVBoxLayout(holder)
-            hold.setContentsMargins(0, 0, 0, 0)
-            skeleton = Shimmer(t, rows=3, height=150, parent=holder)
-            hold.addWidget(skeleton)
-            cards.add(holder, column)
-
-            def fill(make=make, holder=holder, hold=hold, skeleton=skeleton) -> None:
-                panel = make()
-                panel.setParent(holder)
-                hold.addWidget(panel)
-                skeleton.hide()
-                skeleton.deleteLater()
-                holder.updateGeometry()
-                cards.invalidate()
-
-            later.append(fill)
-        columns.append(later)
     col.addStretch(1)
-    # both columns fill in together, top first
-    from itertools import zip_longest
-
-    page.deferred = [f for pair in zip_longest(*columns) for f in pair if f is not None]  # type: ignore[attr-defined]
+    page.deferred = []  # type: ignore[attr-defined]
     return page
 
 
 def _todo_list(t: Theme, view: MeView, act: Actions) -> Panel:
-    from yuki.ui.window.pages.yuki_page import todos_panel
+    from yuki.ui.window.pages.fold import todos_section
 
-    return todos_panel(t, list(getattr(view, "todos", []) or []), act)
-
+    return todos_section(t, list(getattr(view, "todos", []) or []), act)

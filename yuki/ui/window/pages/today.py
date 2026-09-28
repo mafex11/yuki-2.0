@@ -1,12 +1,17 @@
-"""Today: the day as a skyline (Horizon) under four dot-matrix totals (Field Unit), and what a picked moment was.
+"""Today: the dashboard. The day as a skyline (Horizon) under dot-matrix totals (Field Unit), cards that lead to
+the other pages, and what a picked moment was.
 
-* The header: the weekday and the date, the day's summary under it, and the Sat / Mon day keys (a click on
-  the date opens the last 14 days).
-* Four displays: at the PC (the accent), away, on calls, app switches.
+* The header: the weekday and the date, the day's summary under it, and the day keys (a click on the date
+  opens the last 14 days).
+* Four displays, each a link: at the PC (the accent; picks the day's longest stretch), away (picks the
+  longest time away), on calls (picks the longest call), app switches (your routines, on Me).
+* Cards that lead to the other pages (round 2, the user): your to-dos (Me), people (Me), questions waiting
+  (Yuki), what Yuki learned to do (Yuki), calls waiting to be remembered (Status). Each lifts under the
+  pointer and drops when pressed.
 * The skyline (:mod:`yuki.ui.window.skyline`): hover picks a moment, a click pins it, a click on the call
   band picks the call.
-* Under it, the moment panel (its start in dot-matrix, what the stretch was, its apps and what Yuki noticed)
-  and the open to-dos. Both keep their size whatever they say, so nothing below moves while hovering.
+* The moment panel: its start in dot-matrix, what the stretch was, its apps; a click folds open what you
+  were doing and what Yuki noticed. It keeps its size while hovering, so nothing below moves.
 """
 
 from __future__ import annotations
@@ -14,18 +19,18 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QEvent, QObject, QRectF, Qt
-from PySide6.QtGui import QFontMetrics, QPainter
+from PySide6.QtGui import QColor, QFontMetrics, QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import DayView
 from yuki.ui.window.paint import paint_dots, paint_led, paint_surface
-from yuki.ui.window.skyline import Moment, Skyline, apps_line, call_moment, moment_at
+from yuki.ui.window.skyline import Moment, Skyline, apps_line, call_moment
 from yuki.ui.window.theme import PAGE_PAD, RADIUS, Theme, variable_font
-from yuki.ui.window.widgets import DotDisplay, Key, page_header
+from yuki.ui.window.widgets import Card, DotDisplay, Key, Masonry, NavCard, page_header, text_label
 
 #: The moment panel's height (fixed: hovering never moves the page).
-MOMENT_H = 112
+MOMENT_H = 100
 
 
 def clock(seconds: float) -> str:
@@ -36,15 +41,44 @@ def clock(seconds: float) -> str:
 
 class MomentPanel(QWidget):
     """What the picked moment was: its start on a small dot-matrix display, the stretch in words, the apps,
-    and what Yuki noticed. Painted text, updated in place (no widgets are made or laid out on a hover)."""
+    and what Yuki noticed. Painted text, updated in place (no widgets are made or laid out on a hover); a
+    click (``clicked``) asks for the details."""
+
+    from PySide6.QtCore import Signal as _Signal
+
+    clicked = _Signal()
 
     def __init__(self, t: Theme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t = t
         self.moment: Moment | None = None
+        self._hot = self._down = False
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedHeight(MOMENT_H)
         self.setMinimumWidth(320)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("What you were doing then, and what Yuki noticed")
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self._hot = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self._hot = self._down = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e: object) -> None:  # noqa: D102
+        self._down = True
+        self.update()
+
+    def mouseReleaseEvent(self, e: object) -> None:  # noqa: D102
+        if self._down:
+            self._down = False
+            self.update()
+            if self.rect().contains(e.position().toPoint()):
+                self.clicked.emit()
 
     def set_moment(self, m: Moment | None) -> None:
         self.moment = m
@@ -68,8 +102,10 @@ class MomentPanel(QWidget):
         t = self.t
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect())
-        paint_surface(p, r, RADIUS["display"], t.level("display"))
+        r = QRectF(self.rect()).adjusted(0, 1 if self._down else 0, 0, 0)
+        paint_surface(p, r, RADIUS["display"], t.level("display"),
+                      fill=QColor(t.panel) if self._hot and not self._down else None,
+                      border=QColor(t.faint) if self._hot else None)
         stamp, title, apps, note = self.lines()
         x0 = r.left() + 18 + 78
         if stamp:
@@ -186,6 +222,36 @@ class _Click(QObject):
         return False
 
 
+def _details(t: Theme, m: Moment, day: DayView) -> Card:
+    """What the picked stretch was, in full: what you were doing (the episodes) and what Yuki noticed."""
+    from yuki.ui.window.data import episode_gist, first_sentence, hm, plain, second_person
+
+    card = Card(t, level="muted", padding=0)
+    card.body.setContentsMargins(18, 14, 18, 14)
+    card.body.setSpacing(6)
+    sess = next((s for s in day.sessions if s.start == m.start), None)
+    rows = []
+    if sess is not None:
+        rows = [(text[:11].replace("-", " to "), plain(episode_gist(text, 200))) for text in sess.episodes[:4]]
+        noticed = [f for f in sess.facts if f.get("importance", 0) >= 4 and not f.get("by_yuki")]
+        noticed.sort(key=lambda f: f.get("at", 0))
+        rows += [(hm(f["at"]), ("Said as a joke: " if f.get("nature") == "humor" else "") +
+                  first_sentence(plain(second_person(f["text"])), 170)) for f in noticed[:4]]
+    if m.kind == "call":
+        rows += [("", line) for line in m.noticed]
+    if not rows:
+        rows = [("", "Nothing more was written about this stretch.")]
+    for when, words in rows:
+        line = QHBoxLayout()
+        line.setSpacing(12)
+        stamp = text_label(t, when, "micro", "text_3")
+        stamp.setFixedWidth(96)
+        line.addWidget(stamp, 0, Qt.AlignmentFlag.AlignTop)
+        line.addWidget(text_label(t, words, "body", "text_2", wrap=True, selectable=True), 1)
+        card.body.addLayout(line)
+    return card
+
+
 def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: float | None = None,
           today: bool = False, act: Actions = NOOP, view: tuple[float, float] | None = None,
           at: float | None = None) -> QWidget:
@@ -213,36 +279,67 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
         back.setToolTip("Back to today")
         back.clicked.connect(act.day_today)
         keys.append(back)
-    head = page_header(t, f"{d:%A}", day.summary, keys, muted=f"{d.day} {d:%B}", right_top=28)
+    head = page_header(t, f"{d:%A}", day.summary, keys, muted=f"{d.day} {d:%B}", right_top=24)
     head.title_label.setToolTip("Pick a day")
     _Click(head.title_label, lambda: act.day_menu(head.title_label))
     col.addWidget(head)
-    col.addSpacing(22)
+    col.addSpacing(20)
 
+    # the day's totals: dot-matrix displays, each a link
     tot = day.totals
     row = QHBoxLayout()
     row.setSpacing(12)
-    row.addWidget(DotDisplay(t, clock(tot["present_s"]), "at the PC", px=70, ink="accent", height=112, top=18), 145)
-    row.addWidget(DotDisplay(t, clock(tot["away_s"]), "away", px=44, height=112), 100)
-    row.addWidget(DotDisplay(t, clock(tot.get("call_s", 0.0)), "on calls", px=44,
-                             ink="text" if tot.get("call_s") else "faint", height=112), 100)
-    row.addWidget(DotDisplay(t, f"{int(tot['switches'])}", "switches", px=44, height=112), 100)
+    at_pc = DotDisplay(t, clock(tot["present_s"]), "at the PC", px=64, ink="accent", height=100, top=14)
+    away = DotDisplay(t, clock(tot["away_s"]), "away", px=40, height=100, top=22)
+    calls = DotDisplay(t, clock(tot.get("call_s", 0.0)), "on calls", px=40,
+                       ink="text" if tot.get("call_s") else "faint", height=100, top=22)
+    switches = DotDisplay(t, f"{int(tot['switches'])}", "switches", px=40, height=100, top=22)
+    for w, stretch in ((at_pc, 145), (away, 100), (calls, 100), (switches, 100)):
+        row.addWidget(w, stretch)
     col.addLayout(row)
-    col.addSpacing(34)
+    col.addSpacing(12)
+
+    # cards that lead to the other pages
+    c = getattr(day, "counts", None) or {}
+    todos = list(getattr(day, "todos", []) or [])
+    grid = QWidget(page)
+    grid.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    cards = Masonry(grid, columns=5, spacing=12, min_col=128)   # five across even in the narrowest window
+    nxt_todo = next((x for x in todos if x.due), todos[0] if todos else None)
+    todo_line = "Nothing on your list" if not todos else (
+        (f"{nxt_todo.due[:1].upper()}{nxt_todo.due[1:]}: " if nxt_todo.due else "") + nxt_todo.text.rstrip("."))
+    specs = [
+        ("todos", "Your to-dos", str(len(todos)), todo_line, (), any(TodoPanel.soon(x) for x in todos),
+         lambda: act.navigate("me", "todos")),
+        ("people", "People", str(c.get("people", 0)), ", ".join(c.get("people_names") or []) or "Nobody yet",
+         tuple(c.get("people_initials") or ()), False, lambda: act.navigate("me", "people")),
+        ("questions", "Questions", str(c.get("questions", 0)),
+         c.get("question") or "None waiting", (), bool(c.get("questions")), lambda: act.navigate("yuki", "questions")),
+        ("learned", "Learned to do", str(c.get("learned", 0)), c.get("learned_top") or "Nothing yet", (), False,
+         lambda: act.navigate("yuki", "learned")),
+        ("calls", "Calls to remember", str(c.get("calls_waiting", 0)),
+         "Waiting for a free GPU" if c.get("calls_waiting") else "None waiting", (), bool(c.get("calls_waiting")),
+         lambda: act.navigate("status", "calls")),
+    ]
+    page.cards = {}  # type: ignore[attr-defined]
+    for key, title, value, line, initials, lit, go in specs:
+        card = NavCard(t, title, value, line, initials=initials, lit=lit, height=92, parent=grid)
+        card.clicked.connect(lambda _c=False, go=go: go())
+        cards.addWidget(card)
+        page.cards[key] = card  # type: ignore[attr-defined]
+    col.addWidget(grid)
+    col.addSpacing(24)
 
     chart = Skyline(t, day)
     col.addWidget(chart)
     col.addSpacing(8)
-
-    bottom = QHBoxLayout()
-    bottom.setSpacing(12)
     panel = MomentPanel(t)
-    bottom.addWidget(panel, 1)
-    todo = TodoPanel(t, list(getattr(day, "todos", []) or []))
-    todo.setFixedWidth(340)
-    bottom.addWidget(todo)
-    col.addLayout(bottom)
+    col.addWidget(panel)
+    details_box = QVBoxLayout()
+    details_box.setContentsMargins(0, 8, 0, 0)
+    col.addLayout(details_box)
     col.addStretch(1)
+    held: dict = {"card": None}
 
     def show_at(when: float) -> None:
         panel.set_moment(chart.moment(when))
@@ -256,7 +353,46 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
         m = chart.moment(when)
         page.selected = next((i for i, s in enumerate(day.sessions) if s.start == m.start), None)  # type: ignore[attr-defined]
         show_at(when)
+        close_details()
 
+    def close_details() -> None:
+        if held["card"] is not None:
+            held["card"].hide()
+            held["card"].deleteLater()
+            held["card"] = None
+
+    def toggle_details() -> None:   # the moment in full, folded under its panel
+        if held["card"] is not None:
+            close_details()
+            return
+        if panel.moment is None:
+            return
+        held["card"] = _details(t, panel.moment, day)
+        held["card"].setParent(page)
+        details_box.addWidget(held["card"])
+
+    def pick_longest(kind: str) -> None:
+        """The displays: the day's longest stretch at the PC, the longest time away, the longest call."""
+        if kind == "call" and day.calls:
+            i = max(range(len(day.calls)), key=lambda k: day.calls[k].end - day.calls[k].start)
+            chart.pin_call(i)
+            show_call(i)
+        elif kind == "present" and day.sessions:
+            s = max(day.sessions, key=lambda x: x.present_s)
+            chart.pin(s.start + 60)
+            pinned(s.start + 60)
+        elif kind == "away":
+            runs = [g for g in day.segments if g.state == "away"]
+            if runs:
+                g = max(runs, key=lambda x: x.end - x.start)
+                chart.pin((g.start + g.end) / 2)
+                pinned((g.start + g.end) / 2)
+
+    at_pc.set_link(lambda: pick_longest("present"), "Show the day's longest stretch at the PC")
+    away.set_link(lambda: pick_longest("away"), "Show the longest time away")
+    calls.set_link(lambda: pick_longest("call"), "Show the longest call")
+    switches.set_link(lambda: act.navigate("me", "routines"), "Your routines, on Me")
+    panel.clicked.connect(toggle_details)
     chart.moment_changed.connect(show_at)
     chart.moment_clicked.connect(pinned)
     chart.call_clicked.connect(show_call)
@@ -273,7 +409,9 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
         show_at(hover_at)
     page.chart = chart  # type: ignore[attr-defined]
     page.moment_panel = panel  # type: ignore[attr-defined]
+    page.toggle_details = toggle_details  # type: ignore[attr-defined]
     page.selected = selected  # type: ignore[attr-defined]
     page.at = at  # type: ignore[attr-defined]
     page.selected_call = None  # type: ignore[attr-defined]
+    page.sections = {"totals": at_pc, "day": chart}  # type: ignore[attr-defined]
     return page

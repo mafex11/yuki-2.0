@@ -71,7 +71,7 @@ class _InputPill(QWidget):
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        paint_surface(p, r, 12, self.t.level("display"), border=self.t.text_3 if self.edit.hasFocus() else None)
+        paint_surface(p, r, 18, self.t.level("display"), border=self.t.text_3 if self.edit.hasFocus() else None)
         p.end()
 
 
@@ -103,7 +103,7 @@ class _Hint(QWidget):
         for keys, words in self.PARTS:
             for k in keys:
                 w = kfm.horizontalAdvance(k) + 14
-                paint_key(p, QRectF(x, 2, w, 20), self.t, radius=4.0, bottom=2.0)
+                paint_key(p, QRectF(x, 2, w, 20), self.t, radius=10.0, bottom=2.0)   # a capsule keycap
                 p.setFont(kf)
                 p.setPen(self.t.text_2)
                 p.drawText(QRectF(x, 2, w, 18), Qt.AlignmentFlag.AlignCenter, k)

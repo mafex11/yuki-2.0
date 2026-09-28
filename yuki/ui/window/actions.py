@@ -16,7 +16,7 @@ class Actions:
     """Every action a page can ask for. Overridden by the live controller; no-ops here."""
 
     # navigation and feedback
-    def navigate(self, page: str) -> None: ...
+    def navigate(self, page: str, section: str | None = None) -> None: ...   # section: a page's ``sections`` key
     def toast(self, text: str, tone: str = "") -> None: ...
 
     # Today

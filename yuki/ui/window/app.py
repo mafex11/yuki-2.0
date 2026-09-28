@@ -405,6 +405,8 @@ class WindowApp(Actions):
         else:
             return
         win.set_page(key, widget)
+        if key == (getattr(self, "_goto", None) or (None,))[0]:
+            self._apply_goto()
 
     def _refresh_today(self) -> None:
         if self.win.current == "today" and self.day == date.today() and not self._closing:
@@ -555,9 +557,27 @@ class WindowApp(Actions):
 
     # -- Actions: navigation and feedback -------------------------------------------------------------
 
-    def navigate(self, page: str) -> None:
+    def navigate(self, page: str, section: str | None = None) -> None:
+        """Show ``page``; with ``section`` (a key of the page's ``sections``: "todos", "people", "questions",
+        "calls"...), scroll to that part of it and light it for a moment, once it is built."""
         self.win.show_page(page)
         self._on_navigate(page)
+        self._goto = (page, section) if section else None
+        self._apply_goto()
+
+    def _apply_goto(self) -> None:
+        goto = getattr(self, "_goto", None)
+        if not goto:
+            return
+        page, section = goto
+        if page != self.win.current or page not in self.win.pages:
+            return   # tried again once the page is built
+        content = self.win.page_widget(page)
+        target = (getattr(content, "sections", None) or {}).get(section)
+        if target is None:
+            return
+        self._goto = None
+        QTimer.singleShot(0, lambda: self.win.scroll_to(page, target))
 
     def toast(self, text: str, tone: str = "") -> None:
         try:

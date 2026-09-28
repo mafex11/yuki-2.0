@@ -128,14 +128,31 @@ class Card(QWidget):
         if radius is None:
             radius = RADIUS["panel"] if level == "card" else RADIUS["bubble"] if level == "muted" else RADIUS["display"]
         self.t, self.level, self.radius = t, level, radius
+        self.flashing = False
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(padding, padding, padding, padding)
         self.body.setSpacing(SPACE["m"])
 
+    def flash(self, ms: int = 1400) -> None:
+        """Light the card's line in the accent for a moment: the section a dashboard card just led to."""
+        from PySide6.QtCore import QTimer
+
+        self.flashing = True
+        self.update()
+        QTimer.singleShot(ms, self._unflash)
+
+    def _unflash(self) -> None:
+        try:
+            self.flashing = False
+            self.update()
+        except RuntimeError:
+            pass
+
     def paintEvent(self, _event: object) -> None:  # noqa: D102
         p = QPainter(self)
-        paint_surface(p, QRectF(self.rect()), self.radius, self.t.level(self.level))
+        paint_surface(p, QRectF(self.rect()), self.radius, self.t.level(self.level),
+                      border=self.t.accent_alpha(0.75) if self.flashing else None)
         p.end()
 
 
@@ -248,7 +265,7 @@ def paint_button(p: QPainter, r: QRectF, t: Theme, style: str = "outline", tint:
     v = VARIANTS.get(style, style)
     fill, border, ink = button_colors(t, v, hover=hover, down=down, enabled=enabled)
     if v == "key":
-        paint_key(p, r, t, hover=hover, down=down, radius=6.0)
+        paint_key(p, r, t, hover=hover, down=down, radius=r.height() / 2)   # a capsule key
     else:
         paint_surface(p, r, r.height() / 2, t.level("card"), fill=fill, border=border)
     return ink
@@ -575,8 +592,7 @@ class _Field(QWidget):
         t = self.t
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         focused = self.edit.hasFocus()
-        radius = r.height() / 2 if self.pill else RADIUS["field"]
-        paint_surface(p, r, radius, t.level("input"), border=QColor(t.text_3) if focused else None)
+        paint_surface(p, r, RADIUS["field"], t.level("input"), border=QColor(t.text_3) if focused else None)
         p.end()
 
 
@@ -631,7 +647,9 @@ class Avatar(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(0, 2, self.width(), self.width())
-        paint_surface(p, r, RADIUS["key"], self.t.level("key"))
+        from yuki.ui.window.theme import corner
+
+        paint_surface(p, r, corner(r.width(), r.height()), self.t.level("key"))
         p.setPen(self.t.text_2)
         p.setFont(variable_font(r.height() * 0.43, "Regular", display=True))
         initial = next((ch for ch in self.name if ch.isalnum()), "?").upper()
@@ -766,6 +784,39 @@ class DotDisplay(QWidget):
             self.value = value
             self.update()
 
+    def set_link(self, on_click: Callable[[], object], tip: str = "") -> None:
+        """Make the display a link: it lifts under the pointer, drops when pressed, and ``on_click`` runs."""
+        self._link = on_click
+        self._hot = self._down = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tip:
+            self.setToolTip(tip)
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        if getattr(self, "_link", None):
+            self._hot = True
+            self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        if getattr(self, "_link", None):
+            self._hot = self._down = False
+            self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e: object) -> None:  # noqa: D102
+        if getattr(self, "_link", None) and e.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            self.update()
+
+    def mouseReleaseEvent(self, e: object) -> None:  # noqa: D102
+        link = getattr(self, "_link", None)
+        if link and self._down:
+            self._down = False
+            self.update()
+            if self.rect().contains(e.position().toPoint()):
+                link()
+
     def color(self) -> QColor:
         return {"accent": self.t.accent, "faint": self.t.faint, "text_2": self.t.text_2}.get(self.ink, self.t.text)
 
@@ -773,7 +824,18 @@ class DotDisplay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect())
-        paint_surface(p, r, RADIUS["display"], self.t.level("display"))
+        hot, down = getattr(self, "_hot", False), getattr(self, "_down", False)
+        if down:
+            r = r.adjusted(0, 1, 0, 0)
+        paint_surface(p, r, RADIUS["display"], self.t.level("display"),
+                      fill=QColor(self.t.panel) if hot and not down else None,
+                      border=QColor(self.t.faint) if hot else None)
+        if getattr(self, "_link", None):   # a link: a small arrow in the corner, brighter under the pointer
+            f = font("icon_small")
+            f.setPixelSize(10)
+            p.setFont(f)
+            p.setPen(self.t.text_2 if hot else self.t.faint)
+            p.drawText(QRectF(r.right() - 30, r.top() + 10, 18, 16), Qt.AlignmentFlag.AlignCenter, ICON["next"])
         top = self.top if self.top is not None else (18 if self.px >= 60 else 26 if self.height() >= 108 else 16)
         px = float(self.px)
         need = dots_width(self.value, px)
@@ -832,7 +894,9 @@ class TimeDisplay(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect())
-        paint_surface(p, r, RADIUS["display"], self.t.level("display"))
+        from yuki.ui.window.theme import corner
+
+        paint_surface(p, r, corner(r.width(), r.height(), RADIUS["display"]), self.t.level("display"))
         paint_dots(p, QRectF(r.left() + 14, r.top(), r.width() - 40, r.height()), self.value, 22, self.t.accent)
         f = font("icon_small")
         f.setPixelSize(8)
@@ -1231,7 +1295,7 @@ class Toast(QWidget):
 def menu_css(t: Theme) -> str:
     """A :class:`Menu`'s items (its surface is painted): Horizon's tray menu spacing and hover."""
     return (f"QMenu {{ background: transparent; color: {css(t.menu_ink)}; border: none; padding: 8px; }}"
-            "QMenu::item { padding: 7px 24px 7px 34px; border-radius: 8px; background: transparent; }"
+            "QMenu::item { padding: 7px 24px 7px 34px; border-radius: 10px; background: transparent; }"
             f"QMenu::item:selected {{ background: {css(t.bubble)}; color: {css(t.text)}; }}"
             f"QMenu::item:disabled {{ color: {css(t.text_3)}; }}"
             f"QMenu::separator {{ height: 1px; background: {css(t.float_sep)}; margin: 5px 6px; }}"
@@ -1648,7 +1712,7 @@ class _ListRow(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect())
         if self.current or self.underMouse():
-            paint_surface(p, r, 8, self.t.level("card"), fill=QColor(self.t.bubble), border=QColor(0, 0, 0, 0))
+            paint_surface(p, r, 10, self.t.level("card"), fill=QColor(self.t.bubble), border=QColor(0, 0, 0, 0))
         p.setPen(self.t.text if self.current or self.underMouse() else self.t.menu_ink)
         p.setFont(self.font())
         p.drawText(r.adjusted(12, 0, -10, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -1894,7 +1958,7 @@ def paint_keycaps(p: QPainter, rect: QRectF, t: Theme, keys: Sequence[str], *,
             else:
                 x += 4
         w = fm.horizontalAdvance(k) + 24
-        paint_key(p, QRectF(x, y, w, height), t, hover=hover, radius=6.0, bottom=3.0)
+        paint_key(p, QRectF(x, y, w, height), t, hover=hover, radius=height / 2, bottom=3.0)   # a capsule keycap
         p.setPen(t.text)
         p.setFont(f)
         p.drawText(QRectF(x, y, w, height - 3), Qt.AlignmentFlag.AlignCenter, k)
@@ -2020,3 +2084,233 @@ class Masonry(QLayout):
                     item.setGeometry(geo)
             heights[c] += h + sp
         return max(0, max(heights) - sp)
+
+
+# -- round 2: dashboard cards and rows that fold open ------------------------------------------------------
+
+
+class NavCard(QAbstractButton):
+    """A dashboard card that leads somewhere (Today's summaries of Me, Yuki and Status): a quiet title, a
+    dot-matrix figure, one line, optional initials, and an arrow; it lifts under the pointer and drops when
+    pressed. Painted in one pass (no child widgets), so a row of them costs almost nothing."""
+
+    def __init__(self, t: Theme, title: str, value: str, line: str = "", *, initials: Sequence[str] = (),
+                 lit: bool = False, height: int = 96, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.title, self.value, self.line = t, title, value, line
+        self.initials, self.lit = list(initials)[:5], lit
+        self.setFixedHeight(height)
+        self.setMinimumWidth(128)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(f"{title}: {value}. {line}")
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        return QSize(210, self.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return QSize(128, self.height())
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        t = self.t
+        hot, down = self.underMouse(), self.isDown()
+        r = QRectF(self.rect()).adjusted(0, 1 if down else 0, 0, 0)
+        fill = QColor(t.key if hot and not down else t.panel if not down else t.glass)
+        paint_surface(p, r, RADIUS["panel"], t.level("card"), fill=fill,
+                      border=QColor(t.faint) if hot else None)
+        if self.hasFocus():
+            paint_ring(p, r.adjusted(1, 1, -1, -1), RADIUS["panel"], t.ring, 1.5)
+        x, w = r.left() + 18, r.width() - 36
+        p.setFont(variable_font(12.5, "Regular"))
+        p.setPen(t.text_3)
+        p.drawText(QRectF(x, r.top() + 14, w - 20, 18), Qt.AlignmentFlag.AlignVCenter, self.title)
+        f = font("icon_small")
+        f.setPixelSize(10)
+        p.setFont(f)
+        p.setPen(t.text_2 if hot else t.faint)
+        p.drawText(QRectF(r.right() - 32, r.top() + 14, 16, 18), Qt.AlignmentFlag.AlignCenter, ICON["next"])
+        vw = paint_dots(p, QRectF(x, r.top() + 36, w, 30), self.value, 28, t.accent if self.lit else t.text)
+        cx = x + vw + 16
+        for i, ini in enumerate(self.initials):   # people: their initials, overlapping keys
+            kr = QRectF(cx + i * 20, r.top() + 38, 26, 26)
+            if kr.right() > r.right() - 16:
+                break
+            paint_surface(p, kr, 9, t.level("key"), fill=QColor(t.key_on), border=QColor(t.bg))
+            p.setFont(variable_font(11.5, "Regular", display=True))
+            p.setPen(t.text_2)
+            p.drawText(kr, Qt.AlignmentFlag.AlignCenter, ini)
+        if self.line:
+            lf = variable_font(12.5, "Regular")
+            p.setFont(lf)
+            p.setPen(t.text_2)
+            fm = QFontMetrics(lf)
+            p.drawText(QRectF(x, r.bottom() - 28, w, 18), Qt.AlignmentFlag.AlignVCenter,
+                       fm.elidedText(self.line, Qt.TextElideMode.ElideRight, int(w)))
+        p.end()
+
+
+class _FoldHead(QAbstractButton):
+    """A fold row's head: optional initial or LED, the short title, one quiet line, the date on the right and a
+    chevron; the row lights under the pointer and drops when pressed. Painted (no labels)."""
+
+    H_ONE, H_TWO = 38, 52
+
+    def __init__(self, t: Theme, title: str, line: str, meta: str, *, initial: str = "", led: str | None = None,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t, self.title, self.line, self.meta = t, title, line, meta
+        self.initial, self.led = initial, led
+        self.open = False
+        self.setCheckable(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(self.H_TWO if (title and line) else self.H_ONE)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(200)
+        self.setToolTip(line if line and len(line) > 60 else "")
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        return QSize(320, self.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return QSize(200, self.height())
+
+    def enterEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: object) -> None:  # noqa: D102
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        t = self.t
+        r = QRectF(self.rect())
+        hot, down = self.underMouse(), self.isDown()
+        if hot or down or self.open:
+            paint_surface(p, r.adjusted(-8, 0, 8, 0), 12, t.level("card"),
+                          fill=QColor(t.glass if down else t.key if hot else t.panel), border=QColor(0, 0, 0, 0))
+        x = r.left()
+        if self.initial:
+            kr = QRectF(x, r.center().y() - 15, 30, 30)
+            paint_surface(p, kr, 10, t.level("key"))
+            p.setFont(variable_font(13, "Regular", display=True))
+            p.setPen(t.text_2)
+            p.drawText(kr, Qt.AlignmentFlag.AlignCenter, self.initial)
+            x += 42
+        elif self.led is not None:
+            paint_led(p, QPointF(x + 4, r.center().y() - (7 if self.line and self.title else 0)),
+                      {"on": t.accent, "ok": t.text_2}.get(self.led, t.led_off), 7)
+            x += 18
+        meta_w = 0
+        mf = variable_font(12, "Regular")
+        if self.meta:
+            meta_w = QFontMetrics(mf).horizontalAdvance(self.meta) + 14
+        chev = 22
+        w = r.right() - chev - meta_w - x
+        tf = variable_font(14, "Semibold" if self.line else "Regular")
+        lf = variable_font(13, "Regular")
+        if self.title and self.line:
+            p.setFont(tf)
+            p.setPen(t.text)
+            p.drawText(QRectF(x, r.top() + 6, w, 20), Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetrics(tf).elidedText(self.title, Qt.TextElideMode.ElideRight, int(w)))
+            p.setFont(lf)
+            p.setPen(t.text_2)
+            p.drawText(QRectF(x, r.top() + 26, w, 20), Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetrics(lf).elidedText(self.line, Qt.TextElideMode.ElideRight, int(w)))
+        else:
+            words = self.title or self.line
+            f = tf if self.title else lf
+            p.setFont(f)
+            p.setPen(t.text if self.title else t.text_2)
+            p.drawText(QRectF(x, r.top(), w, r.height()), Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetrics(f).elidedText(words, Qt.TextElideMode.ElideRight, int(w)))
+        if self.meta:
+            p.setFont(mf)
+            p.setPen(t.text_3)
+            p.drawText(QRectF(r.right() - chev - meta_w, r.top(), meta_w - 8, 26 if self.line and self.title else
+                              r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, self.meta)
+        f = font("icon_small")
+        f.setPixelSize(10)
+        p.setFont(f)
+        p.setPen(t.text_2 if hot else t.faint)
+        p.drawText(QRectF(r.right() - chev, r.top(), chev, r.height()), Qt.AlignmentFlag.AlignCenter,
+                   ICON["down" if self.open else "next"])
+        p.end()
+
+
+class FoldRow(QWidget):
+    """A row that folds open: a one- or two-line head (the short title and one quiet line), and under it, built
+    the first time it opens, the full body (``body()``: the text, where it came from, Why? / Not right, the
+    to-do's buttons). Keeps long text out of the page until the user asks for it.
+
+    ``trailing``: a small widget kept on the right of the head (a to-do's Done)."""
+
+    toggled = Signal(bool)
+
+    def __init__(self, t: Theme, title: str, line: str = "", meta: str = "", *, body: Callable[[], QWidget] | None
+                 = None, initial: str = "", led: str | None = None, trailing: QWidget | None = None,
+                 expanded: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.t = t
+        self._make_body = body
+        self.body_widget: QWidget | None = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.col = QVBoxLayout(self)
+        self.col.setContentsMargins(0, 0, 0, 0)
+        self.col.setSpacing(0)
+        line_row = QHBoxLayout()
+        line_row.setContentsMargins(0, 0, 0, 0)
+        line_row.setSpacing(8)
+        self.head = _FoldHead(t, title, line, meta, initial=initial, led=led, parent=self)
+        self.head.clicked.connect(self.toggle)
+        line_row.addWidget(self.head, 1)
+        if trailing is not None:
+            trailing.setParent(self)
+            line_row.addWidget(trailing, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.col.addLayout(line_row)
+        if body is None:
+            self.head.setCursor(Qt.CursorShape.ArrowCursor)
+        if expanded:
+            self.toggle()
+
+    @property
+    def is_open(self) -> bool:
+        return self.body_widget is not None and not self.body_widget.isHidden()
+
+    def ensure_body(self) -> QWidget | None:
+        if self.body_widget is None and self._make_body is not None:
+            w = self._make_body()
+            w.setParent(self)
+            wrap = QWidget(self)
+            wrap.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            lay = QVBoxLayout(wrap)
+            lay.setContentsMargins(42 if self.head.initial else 18 if self.head.led is not None else 0, 4, 0, 10)
+            lay.addWidget(w)
+            self.body_widget = wrap
+            self.body_widget.inner = w  # type: ignore[attr-defined]
+            wrap.hide()
+            self.col.addWidget(wrap)
+        return self.body_widget
+
+    def toggle(self) -> None:
+        body = self.ensure_body()
+        if body is None:
+            return
+        show = body.isHidden()
+        body.setVisible(show)
+        self.head.open = show
+        self.head.update()
+        self.toggled.emit(show)

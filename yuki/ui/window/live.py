@@ -354,6 +354,31 @@ class LiveWindow(QWidget):
 
         QTimer.singleShot(0, step)
 
+    def scroll_to(self, key: str, target: QWidget) -> None:
+        """Bring ``target`` (a section of page ``key``) to the top of the view, eased, and light it."""
+        try:
+            area = self.slots[key].findChild(QScrollArea)
+            if area is not None and area.widget() is not None:
+                y = target.mapTo(area.widget(), QPoint(0, 0)).y() - 20
+                bar = area.verticalScrollBar()
+                y = max(bar.minimum(), min(bar.maximum(), y))
+                from yuki.ui import ui_settings
+                from yuki.ui.window.widgets import smooth
+
+                if ui_settings.current().reduce_motion:
+                    bar.setValue(y)
+                else:
+                    s = smooth(area)
+                    s._touch, s.vel, s.gliding = False, 0.0, False
+                    s.target = float(y)
+                    s._start()
+            card = target if hasattr(target, "flash") else next(
+                (c for c in target.findChildren(QWidget) if hasattr(c, "flash")), None)
+            if card is not None:
+                card.flash()
+        except RuntimeError:   # the page was replaced meanwhile
+            pass
+
     def page_widget(self, key: str) -> QWidget | None:
         page = self.pages.get(key)
         return page.content if page is not None else None

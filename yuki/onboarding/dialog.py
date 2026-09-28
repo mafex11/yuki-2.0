@@ -11,7 +11,8 @@ tests and trial runs point at scratch locations. Slow work (the key test, the
 download) runs on plain threads and reports back through queued Qt signals.
 Colours and fonts are copied from ``yuki.ui.window.theme`` rather than imported,
 so this window does not depend on the UI package. The steps are four small hardware keys across the top;
-the current one's LED is lit in the accent (olive green, the default; the wizard runs before any setting).
+the current one's LED is lit in the accent (olive green #748F42, the default; the wizard runs before any
+setting).
 """
 
 from __future__ import annotations
@@ -46,53 +47,53 @@ from yuki.onboarding.envvars import UserEnv
 
 # -- look (Horizon x Field Unit, the tokens of yuki.ui.window.theme) ------------------------------------------
 
-BG = "#0B0E13"
-PANEL = "#10141B"
-FIELD = "#06090D"
-LINE = "#1E2632"
-KEY = "#131821"
-KEY_ON = "#19212D"
-MUTED_BG = "#131821"
-TEXT = "#E6E9EE"
-TEXT_2 = "#AEB6C2"
-MUTED = "#6F7886"
-FAINT = "#3E4858"
-LED_OFF = "#283140"
-PRIMARY = "#E6E9EE"
-PRIMARY_FG = "#0B0E13"
-RING = "#6F7886"
-ACCENT_LED = "#8FAF5A"   # the default accent (olive green): the current step's LED only
+BG = "#07080A"
+PANEL = "#0C0E11"
+FIELD = "#050607"
+LINE = "#181B21"
+KEY = "#101216"
+KEY_ON = "#16191F"
+MUTED_BG = "#101216"
+TEXT = "#E4E6E9"
+TEXT_2 = "#A4AAB3"
+MUTED = "#6B717B"
+FAINT = "#393E47"
+LED_OFF = "#23272E"
+PRIMARY = "#E4E6E9"
+PRIMARY_FG = "#07080A"
+RING = "#6B717B"
+ACCENT_LED = "#748F42"   # the default accent (olive green): the current step's LED only
 ACCENT = TEXT_2          # links: ink, underlined (the accent is for live states)
 GOOD = TEXT_2            # "Key works." in words, no colour
 BAD = "#E5736B"
-FONT = '"Segoe UI Variable Text", "Segoe UI", "Nirmala UI"'
-FONT_DISPLAY = '"Segoe UI Variable Display", "Segoe UI", "Nirmala UI"'
+FONT = '"IBM Plex Sans", "Segoe UI", "Nirmala UI"'   # the bundled UI face (yuki.ui.fonts), loaded by the wizard
+FONT_DISPLAY = FONT
 
 STYLE = f"""
 QDialog {{ background: {BG}; }}
-QWidget {{ color: {TEXT}; font-family: {FONT}; font-size: 14px; }}
-QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 34px; font-weight: 300; }}
-QLabel#body {{ color: {TEXT_2}; font-size: 15px; }}
+QWidget {{ color: {TEXT}; font-family: {FONT}; font-size: 13px; }}
+QLabel#title {{ font-family: {FONT_DISPLAY}; font-size: 32px; font-weight: 300; }}
+QLabel#body {{ color: {TEXT_2}; font-size: 14px; }}
 QLabel#hint {{ color: {MUTED}; font-size: 13px; }}
-QLabel#section {{ font-family: {FONT_DISPLAY}; font-weight: 400; font-size: 18px; }}
+QLabel#section {{ font-family: {FONT_DISPLAY}; font-weight: 400; font-size: 17px; }}
 QLabel#bad {{ color: {BAD}; }}
-QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px; }}
-QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 8px; padding: 7px 12px;
-            selection-background-color: #2A3444; }}
+QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 18px; }}
+QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 14px; padding: 7px 14px;
+            selection-background-color: #262B33; }}
 QLineEdit:focus {{ border: 1px solid {RING}; }}
-QPushButton {{ background: transparent; color: {TEXT_2}; border: 1px solid {LINE}; border-radius: 16px;
+QPushButton {{ background: transparent; color: {TEXT_2}; border: 1px solid {LINE}; border-radius: 17px;
               padding: 6px 16px; min-height: 20px; font-size: 13px; }}
 QPushButton:hover {{ background: {KEY}; color: {TEXT}; }}
 QPushButton:disabled {{ color: {FAINT}; background: transparent; }}
-QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 600; }}
-QPushButton#primary:hover {{ background: #CDD2D9; border-color: #CDD2D9; }}
-QPushButton#primary:disabled {{ background: #3E4858; border-color: transparent; color: #1E2632; }}
+QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 500; }}
+QPushButton#primary:hover {{ background: #C6CBD1; border-color: #C6CBD1; }}
+QPushButton#primary:disabled {{ background: #393E47; border-color: transparent; color: #181B21; }}
 QPushButton#flat {{ background: transparent; border: none; color: {MUTED}; }}
 QPushButton#flat:hover {{ color: {TEXT}; background: {KEY}; }}
 QPushButton#small {{ padding: 5px 12px; font-size: 13px; }}
 QPushButton#choice {{ padding: 6px 16px; min-width: 64px; }}
-QPushButton#choice:checked {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 600; }}
-QRadioButton {{ spacing: 10px; font-weight: 600; }}
+QPushButton#choice:checked {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 500; }}
+QRadioButton {{ spacing: 10px; font-weight: 500; }}
 QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px; border: 1px solid {MUTED}; background: {FIELD}; }}
 QRadioButton::indicator:checked {{ width: 6px; height: 6px; border: 5px solid {PRIMARY}; background: {BG}; }}
 QProgressBar {{ background: {KEY}; border: 1px solid {LINE}; border-radius: 4px; height: 8px; max-height: 8px;
@@ -121,8 +122,8 @@ class StepKeys(QWidget):
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        f = QFont("Segoe UI Variable")
-        f.setFamilies(["Segoe UI Variable", "Segoe UI", "Nirmala UI"])
+        f = QFont("IBM Plex Sans")
+        f.setFamilies(["IBM Plex Sans", "Segoe UI", "Nirmala UI"])
         f.setPixelSize(12)
         p.setFont(f)
         fm = QFontMetrics(f)
@@ -133,9 +134,9 @@ class StepKeys(QWidget):
             on = i == self.current
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(LINE))
-            p.drawRoundedRect(r, 8, 8)
+            p.drawRoundedRect(r, 17, 17)   # a capsule key
             p.setBrush(QColor(KEY_ON if on else KEY))
-            p.drawRoundedRect(r.adjusted(1, 1, -1, -2), 7, 7)
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -2), 16, 16)
             led = ACCENT_LED if on else (TEXT_2 if i < self.current else LED_OFF)
             p.setBrush(QColor(led))
             p.drawEllipse(QPointF(r.left() + 14, r.center().y() - 0.5), 2.6, 2.6)
@@ -312,9 +313,15 @@ class OnboardingDialog(QDialog):
         self._bridge.downloaded.connect(self._on_downloaded)
 
         self.setWindowTitle("Set up Yuki")
+        try:   # the bundled UI face (IBM Plex Sans) and the Devanagari fallback, before the style names them
+            from yuki.ui.fonts import load_fonts
+
+            load_fonts()
+        except Exception:
+            pass
         self.setStyleSheet(STYLE)
-        self.setMinimumWidth(620)
-        self.resize(620, 600)
+        self.setMinimumWidth(640)
+        self.resize(640, 700)   # Plex wraps a little wider than Segoe: room for the privacy text
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 22)

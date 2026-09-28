@@ -303,7 +303,7 @@ class Skyline(QWidget):
     moment_clicked = Signal(float)
     call_clicked = Signal(int)
 
-    HEIGHT = 318
+    HEIGHT = 292
     PAD = 4
     TH = 22          # the call band's line
     FOOT = 56        # room under the ground for the hour words
@@ -619,7 +619,7 @@ class Skyline(QWidget):
             fx = x + 12 if x + 12 + fw < W - 4 else x - 12 - fw
             fy = max(TH + 30, iy - 33)
             box = QRectF(fx, fy, fw, fh)
-            paint_surface(p, box, 5, t.level("display"))
+            paint_surface(p, box, 8, t.level("display"))
             paint_dots(p, box.adjusted(0, 0, 0, 0), stamp, 14, t.accent, align=Qt.AlignmentFlag.AlignHCenter)
             name = moment.lead if moment is not None and moment.lead else ""
             if name:

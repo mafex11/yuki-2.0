@@ -130,9 +130,14 @@ def hatch(p: QPainter, rect: QRectF, color: QColor, spacing: float = 6.0, width:
 
 
 def paint_key(p: QPainter, rect: QRectF, t: Theme, *, on: bool = False, hover: bool = False, down: bool = False,
-              radius: float = 8.0, bottom: float = 2.0) -> None:
+              radius: float | None = None, bottom: float = 2.0) -> None:
     """A hardware key: its face on a 1 px line, the bottom edge ``bottom`` px thick (pressed: the face drops
-    onto it). ``on``: the lit face of the selected key."""
+    onto it). ``on``: the lit face of the selected key. ``radius``: default scaled to the key's size
+    (:func:`~yuki.ui.window.theme.corner`); a capsule passes half its height."""
+    from yuki.ui.window.theme import corner
+
+    if radius is None:
+        radius = corner(rect.width(), rect.height())
     p.save()
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setPen(Qt.PenStyle.NoPen)

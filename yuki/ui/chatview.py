@@ -225,7 +225,7 @@ class _Bubble(QWidget):
         p = QPainter(self)
         r = QRectF(self.rect())
         if self.look == "overlay":
-            paint_surface(p, r, 12, t.level("card"), fill=QColor(t.bubble),
+            paint_surface(p, r, 16, t.level("card"), fill=QColor(t.bubble),
                           border=t.danger if error else QColor(0, 0, 0, 0))
         else:
             level = t.level("display" if self.mine else "card")
