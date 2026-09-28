@@ -99,7 +99,7 @@ def _personality(t: Theme, view: YukiView) -> Panel:
     for it in view.picked_up:
         joke = tag_words([x for x in it.tags if x == "joke"])
         note = ". ".join(x for x in (it.source, joke) if x)
-        rows.append(FoldRow(t, ASPECT_TITLES.get(it.aspect or "talk", ""), one_line(it.text, 100),
+        rows.append(FoldRow(t, ASPECT_TITLES.get(it.aspect or "talk", ""), it.summary or one_line(it.text, 100),
                             day_label(it.since) if it.since else "", body=lines_body(t, [(it.text, note)])))
     n_persona, n_picked = len(view.persona), len(view.picked_up)
     headline = ", ".join(x for x in (f"{n_persona} ways it is with you" if n_persona else "",

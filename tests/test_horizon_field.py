@@ -541,3 +541,42 @@ def test_yuki_page_sections_are_scannable_and_questions_keep_their_answers(qapp)
     never.click()
     assert skipped == [(7, True)] and rows[0].isHidden()
     assert set(page.sections) >= {"talk", "personality", "learned", "questions"}
+
+
+# -- round 3: Today's figures after its first paint; memory's own short titles --------------------------------
+
+
+def test_todays_cards_show_placeholders_then_their_figures_in_place(qapp):
+    from yuki.ui.window.pages import today
+    from yuki.ui.window.theme import theme
+
+    day = _day()
+    day.extras, day.todos, day.counts = False, [], {}
+    page = today.build(theme(), day)
+    card = page.cards["people"]
+    assert card.value == "–" and card.line == ""                   # a placeholder while they are read
+    page.set_extras([], {"people": 4, "people_names": ["Komal"], "people_initials": ["K"]})
+    assert page.cards["people"] is card and card.value == "4" and card.initials == ["K"]   # in place, no rebuild
+    assert day.extras and page.cards["todos"].line == "Nothing on your list"
+
+
+def test_rows_prefer_memorys_model_written_title_and_summary():
+    from yuki.ui.window import data as D
+
+    fact = {"ref": "fact:1", "kind": "person", "subject": "Komal", "text": "The user's colleague Komal gives "
+            "the user corrections in the corvana-core Slack channel and reviews dashboards.", "aspect": None,
+            "origin": "model", "confidence": 0.7, "since": 1.7e9, "evidence": [], "summary": "Corvana colleague, "
+            "reviews your dashboards"}
+    item = D.portrait_item(fact)
+    assert item.title == "Komal" and item.summary == "Corvana colleague, reviews your dashboards"
+    assert item.short == item.summary and "Slack" in item.text          # the full text stays behind the fold
+    no_summary = D.portrait_item({**fact, "summary": None})
+    assert no_summary.summary == "" and no_summary.short.startswith("Your colleague Komal")
+
+    class _Mem:
+        def todos(self, include_done=False):
+            return [{"id": 3, "text": "The user must build and thoroughly test the startup's MCP server before "
+                     "the pitch.", "title": "Test the MCP server", "source": "call", "owner": "user"}]
+
+    todos, _p = D.read_todos(_Mem())
+    assert todos[0].title == "Test the MCP server" and todos[0].text.startswith("Must build")

@@ -243,6 +243,26 @@ class WindowApp(Actions):
             views.pop("today")
         return snapshot.save(self.snapshot_path(), cipher, views, db=str(self.db_path or ""))
 
+    def _load_extras(self, day: Any) -> None:
+        """Today's card figures (to-dos, people, questions, learned, calls waiting), read after the timeline is on
+        screen, then painted into the cards in place."""
+        from yuki.ui.window import data as D
+
+        memory = self.memory
+
+        def then(got: tuple) -> None:
+            todos, counts = got
+            view = self._views.get("today")
+            if view is None or view.day != day:
+                return
+            changed = not view.extras or view.todos != todos or view.counts != counts
+            view.todos, view.counts, view.extras = todos, counts, True
+            page = self.win.page_widget("today")
+            if changed and page is not None and hasattr(page, "set_extras"):
+                page.set_extras(todos, counts)
+
+        self.bg(lambda: D.day_extras(memory), then, failed="")
+
     def _prefetch(self) -> None:
         """Once Today is up: read the other pages' data in the background (one at a time), so a first visit
         only builds widgets."""
@@ -322,8 +342,8 @@ class WindowApp(Actions):
         memory, day = self.memory, self.day
 
         def work() -> Any:
-            if key == "today":
-                return D.build_day(memory, day)
+            if key == "today":   # the timeline first; the cards' figures right after (_load_extras)
+                return D.build_day(memory, day, extras=False)
             if key == "me":
                 return D.build_me(memory)
             if key == "yuki":
@@ -339,11 +359,16 @@ class WindowApp(Actions):
         def then(view: Any) -> None:
             self._loading.discard(key)
             old = self._views.get(key)
+            if key == "today" and not view.extras and old is not None and getattr(old, "day", None) == view.day \
+                    and getattr(old, "extras", True):
+                view.todos, view.counts, view.extras = old.todos, old.counts, True   # keep the figures shown
             self._views[key] = view
             self._stale.discard(key)
             if key == "status":
                 self._status = view
                 self._sync_footer()
+            if key == "today":
+                QTimer.singleShot(0, lambda d=view.day: self._load_extras(d))
             if key == "today" and not self._prefetched:
                 QTimer.singleShot(300, self._prefetch)
             if key == getattr(self, "_prefetching", None):   # the next page's data, one read at a time

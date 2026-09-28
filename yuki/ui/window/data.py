@@ -266,6 +266,9 @@ class DayView:
     todos: list["Todo"] = field(default_factory=list)   # the user's open to-dos (the panel beside the moment)
     #: What Today's dashboard cards summarise from the other pages (:func:`dashboard_counts`).
     counts: dict[str, Any] = field(default_factory=dict)
+    #: False while ``todos`` and ``counts`` are still being read (the cards show placeholders): the window reads
+    #: the timeline first and these after Today is on screen (:func:`day_extras`).
+    extras: bool = True
 
 
 MAX_LANES = 7
@@ -286,8 +289,10 @@ def _color_ranks(memory: Any, until: float, days: int = 14) -> dict[str, int]:
         return {}
 
 
-def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
-    """The whole Today page for ``day`` (read-only)."""
+def build_day(memory: Any, day: date, *, now: float | None = None, extras: bool = True) -> DayView:
+    """The whole Today page for ``day`` (read-only). ``extras=False``: without the cards' to-dos and counts
+    (read afterwards with :func:`day_extras`: the first read of the to-dos pulls in memory's nudge module, about
+    120 ms, which Today's first paint need not wait for)."""
     from yuki.memory.store import POWER_STATES
 
     now = time.time() if now is None else now
@@ -381,12 +386,18 @@ def build_day(memory: Any, day: date, *, now: float | None = None) -> DayView:
     longest = max(calls, key=lambda c: c.seconds, default=None)
     if longest is not None:
         summary += f" Longest call: {longest.app}, {dur(longest.seconds)}."
+    todos, counts = day_extras(memory) if extras else ([], {})
+    return DayView(day, since, until, end, lane_list, segments, calls, power, gaps, sessions, totals, summary,
+                   milestones, facts, first_at, last_at, todos=todos, counts=counts, extras=extras)
+
+
+def day_extras(memory: Any) -> tuple[list["Todo"], dict[str, Any]]:
+    """(the open to-dos, :func:`dashboard_counts`): what Today's cards need besides the timeline."""
     try:
         todos, _promises = read_todos(memory)
     except Exception:
         todos = []
-    return DayView(day, since, until, end, lane_list, segments, calls, power, gaps, sessions, totals, summary,
-                   milestones, facts, first_at, last_at, todos=todos, counts=dashboard_counts(memory))
+    return todos, dashboard_counts(memory)
 
 
 def dashboard_counts(memory: Any) -> dict[str, Any]:
@@ -502,6 +513,16 @@ class Item:
     source: str                # "You told Yuki, 25 Sep" / "From Discord, 25 Sep"
     tags: list[str] = field(default_factory=list)   # joke | story | unsure | you
     evidence: list[Evidence] = field(default_factory=list)
+    #: Memory's own short line for the item (the fact's model-written ``summary``, at most eight words), shown
+    #: under its title instead of the first sentence when memory has it.
+    summary: str = ""
+
+
+def short_field(row: Any, name: str) -> str:
+    """A model-written short field (``title`` / ``summary``) from a memory row, a dict or an object, cleaned
+    for display; "" when memory has none yet."""
+    value = row.get(name) if isinstance(row, dict) else getattr(row, name, None)
+    return plain(" ".join(str(value or "").split())) if value else ""
 
 
 @dataclass
@@ -552,8 +573,10 @@ def portrait_item(f: dict[str, Any], today: date | None = None) -> Item:
     elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
         tags.append("unsure")
     text = plain(second_person(f["text"]))
-    return Item(f["ref"], f["subject"], text, first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
-                f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev)
+    summary = second_person(short_field(f, "summary"))
+    title = short_field(f, "title") or f["subject"]
+    return Item(f["ref"], title, text, summary or first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
+                f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev, summary)
 
 
 def build_me(memory: Any, *, today: date | None = None) -> MeView:
@@ -599,6 +622,7 @@ class Todo:
     due: str                   # "due today" / ""
     raw: dict[str, Any] = field(default_factory=dict)
     owner: str = "user"        # user (the user's own to-do) | yuki (something Yuki promised to do)
+    title: str = ""            # memory's model-written short title (three to six words), when it has one
 
 
 @dataclass
@@ -627,7 +651,8 @@ def learned_items(memory: Any, limit: int = 10) -> list[Learned]:
         ask = first_sentence(plain(ask), 60).rstrip(".!?")
         app = (k.app or "").strip()
         title = (ask[:1].upper() + ask[1:]) if ask else (app.capitalize() if app else "On this PC")
-        out.append(Learned(title, line, app))
+        # memory's own short title and one-line summary, when it has written them
+        out.append(Learned(short_field(k, "title") or title, short_field(k, "summary") or line, app))
     return out
 
 
@@ -641,7 +666,7 @@ def read_todos(memory: Any) -> tuple[list["Todo"], list["Todo"]]:
         # were its "commitment" source
         owner = str(t.get("owner") or ("yuki" if t.get("source") == "commitment" else "user"))
         item = Todo(str(t.get("id")), first_sentence(text, 200), source, plain(quote), _due_label(t.get("due")), t,
-                    owner)
+                    owner, second_person(short_field(t, "title")))
         (promises if owner == "yuki" else todos).append(item)
     return todos, promises
 

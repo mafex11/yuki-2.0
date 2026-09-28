@@ -279,7 +279,9 @@ def _fold(t: Theme, item: Item, act: Actions, *, expand: str | None, compose: st
     open_now = item.ref in (expand, compose) or item.ref in _PENDING
     joke = "joke" in item.tags
     meta = ("joke, " if joke else "") + _when(item)
-    row = FoldRow(t, item.title if title is None else title, one_line(item.text) if line is None else line, meta,
+    if line is None:
+        line = item.summary or one_line(item.text)   # memory's own summary when it has written one
+    row = FoldRow(t, item.title if title is None else title, line, meta,
                   initial=next((c for c in item.title if c.isalnum()), "?").upper() if initial else "",
                   body=_item_body(t, item, act, expand=item.ref == expand, compose=item.ref == compose),
                   expanded=open_now)
@@ -317,7 +319,8 @@ def _personality(t: Theme, view: MeView, expand: str | None, compose: str | None
     firsts, rest = [], []
     for aspect, title in ASPECT_TITLES.items():
         for n, it in enumerate(view.personality.get(aspect) or []):
-            row = _fold(t, it, act, expand=expand, compose=compose, title=title, line=one_line(it.text, 90))
+            row = _fold(t, it, act, expand=expand, compose=compose, title=title,
+                        line=it.summary or one_line(it.text, 90))
             (firsts if n == 0 else rest).append(row)
     rows = firsts + rest
     sides = sum(1 for a in ASPECT_TITLES if view.personality.get(a))
@@ -353,7 +356,7 @@ def _unsure(t: Theme, view: MeView, act: Actions) -> Panel:
             line.addStretch(1)
             col.addLayout(line)
             return box
-        fold = FoldRow(t, "", one_line(it.text, 120), _when(it), body=make, expanded=it.ref in _PENDING)
+        fold = FoldRow(t, "", it.summary or one_line(it.text, 120), _when(it), body=make, expanded=it.ref in _PENDING)
         fold.item = it  # type: ignore[attr-defined]
         rows.append(fold)
     n = len(view.unsure)

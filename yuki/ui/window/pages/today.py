@@ -252,6 +252,35 @@ def _details(t: Theme, m: Moment, day: DayView) -> Card:
     return card
 
 
+def card_specs(day: DayView) -> list[tuple[str, str, str, str, tuple, bool]]:
+    """(key, title, figure, line, initials, lit) of each of Today's cards; "–" while the figures are read."""
+    ready = getattr(day, "extras", True)
+    c = getattr(day, "counts", None) or {}
+    todos = list(getattr(day, "todos", []) or [])
+
+    def fig(n) -> str:
+        return str(n) if ready else "\u2013"
+
+    if not ready:
+        return [("todos", "Your to-dos", fig(0), "", (), False), ("people", "People", fig(0), "", (), False),
+                ("questions", "Questions", fig(0), "", (), False), ("learned", "Learned to do", fig(0), "", (), False),
+                ("calls", "Calls to remember", fig(0), "", (), False)]
+    nxt_todo = next((x for x in todos if x.due), todos[0] if todos else None)
+    todo_line = "Nothing on your list" if not todos else (
+        (f"{nxt_todo.due[:1].upper()}{nxt_todo.due[1:]}: " if nxt_todo.due else "") +
+        (getattr(nxt_todo, "title", "") or nxt_todo.text).rstrip("."))
+    return [
+        ("todos", "Your to-dos", str(len(todos)), todo_line, (), any(TodoPanel.soon(x) for x in todos)),
+        ("people", "People", str(c.get("people", 0)), ", ".join(c.get("people_names") or []) or "Nobody yet",
+         tuple(c.get("people_initials") or ()), False),
+        ("questions", "Questions", str(c.get("questions", 0)), c.get("question") or "None waiting", (),
+         bool(c.get("questions"))),
+        ("learned", "Learned to do", str(c.get("learned", 0)), c.get("learned_top") or "Nothing yet", (), False),
+        ("calls", "Calls to remember", str(c.get("calls_waiting", 0)),
+         "Waiting for a free GPU" if c.get("calls_waiting") else "None waiting", (), bool(c.get("calls_waiting"))),
+    ]
+
+
 def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: float | None = None,
           today: bool = False, act: Actions = NOOP, view: tuple[float, float] | None = None,
           at: float | None = None) -> QWidget:
@@ -299,34 +328,28 @@ def build(t: Theme, day: DayView, *, selected: int | None = None, hover_at: floa
     col.addLayout(row)
     col.addSpacing(12)
 
-    # cards that lead to the other pages
-    c = getattr(day, "counts", None) or {}
-    todos = list(getattr(day, "todos", []) or [])
+    # cards that lead to the other pages (their figures may arrive a moment later: set_extras)
     grid = QWidget(page)
     grid.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     cards = Masonry(grid, columns=5, spacing=12, min_col=128)   # five across even in the narrowest window
-    nxt_todo = next((x for x in todos if x.due), todos[0] if todos else None)
-    todo_line = "Nothing on your list" if not todos else (
-        (f"{nxt_todo.due[:1].upper()}{nxt_todo.due[1:]}: " if nxt_todo.due else "") + nxt_todo.text.rstrip("."))
-    specs = [
-        ("todos", "Your to-dos", str(len(todos)), todo_line, (), any(TodoPanel.soon(x) for x in todos),
-         lambda: act.navigate("me", "todos")),
-        ("people", "People", str(c.get("people", 0)), ", ".join(c.get("people_names") or []) or "Nobody yet",
-         tuple(c.get("people_initials") or ()), False, lambda: act.navigate("me", "people")),
-        ("questions", "Questions", str(c.get("questions", 0)),
-         c.get("question") or "None waiting", (), bool(c.get("questions")), lambda: act.navigate("yuki", "questions")),
-        ("learned", "Learned to do", str(c.get("learned", 0)), c.get("learned_top") or "Nothing yet", (), False,
-         lambda: act.navigate("yuki", "learned")),
-        ("calls", "Calls to remember", str(c.get("calls_waiting", 0)),
-         "Waiting for a free GPU" if c.get("calls_waiting") else "None waiting", (), bool(c.get("calls_waiting")),
-         lambda: act.navigate("status", "calls")),
-    ]
+    goes = {"todos": ("me", "todos"), "people": ("me", "people"), "questions": ("yuki", "questions"),
+            "learned": ("yuki", "learned"), "calls": ("status", "calls")}
     page.cards = {}  # type: ignore[attr-defined]
-    for key, title, value, line, initials, lit, go in specs:
+    for key, title, value, line, initials, lit in card_specs(day):
         card = NavCard(t, title, value, line, initials=initials, lit=lit, height=92, parent=grid)
-        card.clicked.connect(lambda _c=False, go=go: go())
+        card.clicked.connect(lambda _c=False, where=goes[key]: act.navigate(*where))
         cards.addWidget(card)
         page.cards[key] = card  # type: ignore[attr-defined]
+
+    def set_extras(todos: list, counts: dict) -> None:
+        """The cards' figures arrived (or changed): repaint them in place (no rebuild, nothing moves)."""
+        day.todos, day.counts, day.extras = list(todos or []), dict(counts or {}), True
+        for key, _title, value, line, initials, lit in card_specs(day):
+            c = page.cards[key]
+            c.value, c.line, c.initials, c.lit = value, line, list(initials)[:5], lit
+            c.update()
+
+    page.set_extras = set_extras  # type: ignore[attr-defined]
     col.addWidget(grid)
     col.addSpacing(24)
 

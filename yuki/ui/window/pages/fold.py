@@ -90,7 +90,7 @@ def todo_body(t: Theme, todo, act, *, wrong_word: str = "Not mine", buttons: lis
     col = QVBoxLayout(box)
     col.setContentsMargins(0, 0, 0, 0)
     col.setSpacing(6)
-    if len(todo.text) > 60:
+    if len(todo.text) > 60 or getattr(todo, "title", ""):
         col.addWidget(text_label(t, todo.text, "body", "text_2", wrap=True, selectable=True, parent=box))
     src = ". ".join(x for x in ((todo.due[:1].upper() + todo.due[1:]) if todo.due else "", todo.source) if x)
     if todo.quote:
@@ -132,7 +132,8 @@ def todo_row(t: Theme, todo, act, *, wrong_word: str = "Not mine") -> FoldRow:
     done = Button(t, "Done", glyph="check", style="default", size="small")
     buttons.append(done)
     done.clicked.connect(lambda _c=False: _close(todo, "done", done, buttons, act))
-    row = FoldRow(t, one_line(todo.text, 90), "", due, led="on" if TodoPanel.soon(todo) else "off",
+    words = getattr(todo, "title", "") or one_line(todo.text, 90)   # memory's short title when it has one
+    row = FoldRow(t, words, "", due, led="on" if TodoPanel.soon(todo) else "off",
                   trailing=done, body=lambda: todo_body(t, todo, act, wrong_word=wrong_word, buttons=buttons))
     row.todo = todo  # type: ignore[attr-defined]
     return row
