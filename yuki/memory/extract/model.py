@@ -176,3 +176,7 @@ class Extraction:
     me_names: list[str] = field(default_factory=list)
     #: Diagnostics: nodes read, ms spent reading and extracting.
     stats: dict = field(default_factory=dict)
+    #: Names of the visible controls and headings, in on-screen order (buttons, links, tabs, list rows,
+    #: headings): what the window offers, for judging what state it is in (a call joined or only its lobby;
+    #: :mod:`yuki.memory.callevidence`). Structural (UIA control types), capped; never stored.
+    controls: list[str] = field(default_factory=list)

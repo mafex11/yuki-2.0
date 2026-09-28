@@ -244,7 +244,9 @@ class NarratorGate:
             # was said right after the stale progress line that was just starting.
             return "bot_busy", now + 0.2
         if s.get("owes_reply"):
-            return "owes_reply", None
+            # Owed for at most a few seconds (it expires by time, with no frame to say so): look again soon (v3.10:
+            # a reply whose only words the spoken-line check dropped left the gate waiting for a poke forever).
+            return "owes_reply", now + 0.5
         if s.get("busy_tools"):
             return "mouth_tool", None
         # A result or a question is said as soon as the user is not talking and nothing is

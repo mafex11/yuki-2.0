@@ -142,6 +142,9 @@ class VoiceSession(QObject):
     state_changed = Signal(str, str)
     conversation_changed = Signal(bool)
     wake_changed = Signal(bool)
+    #: ``(until)``: the user asked Yuki to go quiet until this time (epoch seconds; 0.0 when awake again, v3.10).
+    quiet_changed = Signal(float)
+    _quiet_asked = Signal(float)
     #: ``"Mic: … · Speaker: …"``: the devices voice is using (the pill's and tray's tooltip).
     devices_changed = Signal(str)
     #: The chat UI's events (v3.5, docs/VOICE.md §12), queued into the GUI thread. Words, for the screen only.
@@ -191,9 +194,19 @@ class VoiceSession(QObject):
         self._prefs_path = prefs_path
         prefs = load_prefs(prefs_path)
         self.wake_enabled = bool(prefs.get("wake", settings.voice_wake))
+        #: Quiet until this time (epoch seconds; v3.10: "shut up for a couple of hours" holds across restarts): the
+        #: wake word is off until then. The tray shows it and can undo it (``wake_now``).
+        try:
+            self.quiet_until = float(prefs.get("quiet_until") or 0.0)
+        except (TypeError, ValueError):
+            self.quiet_until = 0.0
+        if self.quiet_until <= time.time():
+            self.quiet_until = 0.0
         self.call_active = False
         #: The app of the voice call going on (call mode), ``None`` when there is none.
         self.call_app: str | None = None
+        #: How sure memory is of that call: "fresh" (seen on the screen during this hold) or "stale" (v3.10).
+        self.call_evidence: str | None = None
         self.state = "off"
         self._thread: threading.Thread | None = None
         self._conversation: Any = None
@@ -205,6 +218,7 @@ class VoiceSession(QObject):
         self._thread_done.connect(self._on_thread_done)
         self._devices_seen.connect(self._on_devices_seen)
         self._closing.connect(self._on_closing)
+        self._quiet_asked.connect(self._go_quiet)
         #: A conversation decided to end and is tearing down (the wake word listens again).
         self.closing = False
         self._pending_wake: tuple[float, float, float] | None = None
@@ -228,6 +242,9 @@ class VoiceSession(QObject):
         self._device_timer.setInterval(DEVICE_WATCH_MS)
         self._device_timer.timeout.connect(self._watch_devices)
         self._watch_start.connect(self._device_timer.start)  # the mic may open on the voice thread
+        self._quiet_timer = QTimer(self)
+        self._quiet_timer.setSingleShot(True)
+        self._quiet_timer.timeout.connect(self._quiet_over)
 
     # -- public (GUI thread) ------------------------------------------------------
 
@@ -241,6 +258,10 @@ class VoiceSession(QObject):
         With the wake word on and ``voice_prewarm``, the conversation's code is loaded in the background
         a little later (:meth:`prewarm`), so the first "Yuki" is not a cold start.
         """
+        if self.quiet_until:
+            self._arm_quiet_timer()
+            self.log.event("wake", state="quiet", minutes_left=round((self.quiet_until - time.time()) / 60))
+            self.quiet_changed.emit(self.quiet_until)
         if self.wake_enabled:
             self._apply_wake()
             if self.settings.voice_prewarm:
@@ -317,6 +338,48 @@ class VoiceSession(QObject):
         self.log.event("wake", state="enabled" if enabled else "disabled")
         self._apply_wake()
         self.wake_changed.emit(self.wake_enabled)
+
+    # -- quiet for a while (v3.10) ------------------------------------------------------
+
+    @property
+    def quiet(self) -> bool:
+        """Whether the user asked Yuki to stay quiet and that time has not run out."""
+        return bool(self.quiet_until and time.time() < self.quiet_until)
+
+    def go_quiet(self, minutes: float) -> None:
+        """Stay quiet for ``minutes``: the wake word is off until then, remembered across restarts. Thread-safe."""
+        self._quiet_asked.emit(float(minutes))
+
+    def _go_quiet(self, minutes: float) -> None:
+        minutes = max(1.0, min(float(minutes), 24 * 60.0))
+        self.quiet_until = time.time() + minutes * 60.0
+        prefs = load_prefs(self._prefs_path)
+        prefs["quiet_until"] = self.quiet_until
+        save_prefs(prefs, self._prefs_path)
+        self.log.event("wake", state="quiet", minutes=round(minutes))
+        self._arm_quiet_timer()
+        self._apply_wake()
+        self.quiet_changed.emit(self.quiet_until)
+
+    def wake_now(self) -> None:
+        """The tray's "Wake Yuki now": listen for the name again before the quiet time is over."""
+        self._quiet_over(by="user")
+
+    def _quiet_over(self, by: str = "time") -> None:
+        was = self.quiet_until
+        self.quiet_until = 0.0
+        self._quiet_timer.stop()
+        prefs = load_prefs(self._prefs_path)
+        if prefs.pop("quiet_until", None) is not None:
+            save_prefs(prefs, self._prefs_path)
+        if was:
+            self.log.event("wake", state="awake", by=by)
+        self._apply_wake()
+        self.quiet_changed.emit(0.0)
+
+    def _arm_quiet_timer(self) -> None:
+        left_ms = int(max(0.0, self.quiet_until - time.time()) * 1000)
+        self._quiet_timer.start(min(left_ms, 2**31 - 1))
 
     # -- devices (tray "Microphone" / "Speaker") --------------------------------------
 
@@ -606,15 +669,19 @@ class VoiceSession(QObject):
         call = status.get("call") if isinstance(status, dict) else None
         active = call is not None
         app = (str(call.get("app") or "") or "a call app") if active else None
-        if active != self.call_active or app != self.call_app:
+        # Memory's call detector judges the screen (v3.10): "fresh" while the call was seen during this microphone
+        # hold, "stale" when only a while ago; a call the user listed themselves has no screen evidence: as fresh.
+        evidence = (str(call.get("evidence") or "fresh") if active else None)
+        if active != self.call_active or app != self.call_app or evidence != self.call_evidence:
             changed = active != self.call_active
-            self.call_active, self.call_app = active, app
+            self.call_active, self.call_app, self.call_evidence = active, app, evidence
             if changed:
                 self.log.event("wake", state="call_on" if active else "call_off",
-                               listening=bool(self.wake_enabled and self._wake_allowed()))
+                               listening=bool(self.wake_enabled and self._wake_allowed()),
+                               **({"evidence": evidence} if active else {}))
             conversation = self._conversation
             if conversation is not None:
-                conversation.set_call(app)
+                conversation.set_call(app, evidence)
             self._apply_wake()
 
     def owns(self, job_id: int) -> bool:
@@ -697,7 +764,8 @@ class VoiceSession(QObject):
     # -- wake word ------------------------------------------------------------------
 
     def _wake_allowed(self) -> bool:
-        return self.wake_enabled and (self.settings.voice_wake_during_calls or not self.call_active)
+        return (self.wake_enabled and not self.quiet
+                and (self.settings.voice_wake_during_calls or not self.call_active))
 
     def _apply_wake(self) -> None:
         if self._wake_allowed():
@@ -712,7 +780,8 @@ class VoiceSession(QObject):
             self._stop_listener()
             if not self.in_conversation:
                 self._close_mic()
-                self._set_state("off", "call" if self.wake_enabled and self.call_active else "")
+                self._set_state("off", "quiet" if self.quiet else (
+                    "call" if self.wake_enabled and self.call_active else ""))
 
     def _ensure_mic(self) -> Any:
         from yuki.voice.audio import SharedMic
@@ -937,7 +1006,7 @@ class VoiceSession(QObject):
                 on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
                 tts_provider=facts.get("tts_provider"), call_app=call_app,
                 on_closing=self._closing.emit, extra_observers=list(self.extra_observers), keyterms=keyterms,
-                on_chat=self._chat,
+                on_chat=self._chat, call_evidence=self.call_evidence if call_app else None, on_quiet=self.go_quiet,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
             # What recognition hears starts after the name: the mouth is told its first words were said to it
@@ -949,7 +1018,7 @@ class VoiceSession(QObject):
                 self._thread_state.emit("starting", facts["tts_note"])
             self._conversation = conversation
             if self.call_app != call_app:  # the call started or ended while this was starting
-                conversation.set_call(self.call_app)
+                conversation.set_call(self.call_app, self.call_evidence)
             mark("built")
             self.last_timings = timings
             self.log.event("session", state="start", session=session, via=via, mic=mic.device_used,

@@ -316,6 +316,11 @@ class Settings:
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
         voice_keyterms_max: At most this many names and terms from memory are given to speech
             recognition as keyterms per conversation (docs/VOICE.md §9, v3.5).
+        voice_screen_terms: At most this many names on the screen in front (its list items, chats, tabs,
+            links, buttons) are added to them, refreshed as the screen changes (v3.10); 0 = off.
+        voice_speech_guard: Check every line with the fast model before the voice says it: never its
+            reasoning, talk about the user, its inner workings or a repeat (yuki.voice.speechguard, v3.10).
+        voice_speech_guard_timeout_s: The check's verdict is waited for at most this long (fails open).
         voice_prewarm: With the wake word on, load the conversation's code (Pipecat, the services)
             and do the one-off checks in the background after start-up, so the first "Yuki" is
             heard at once (docs/VOICE.md §26, v3.5). Costs RAM while idle.
@@ -406,6 +411,9 @@ class Settings:
     voice_hands: bool = True
     voice_desk_wait_ms: float = 250.0
     voice_keyterms_max: int = 50
+    voice_screen_terms: int = 30
+    voice_speech_guard: bool = True
+    voice_speech_guard_timeout_s: float = 2.5
     voice_prewarm: bool = True
     voice_prewarm_delay_s: float = 20.0
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --

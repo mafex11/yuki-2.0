@@ -1653,6 +1653,9 @@ class MemoryClient:
                 "headphones": c.headphones, "form_factor": c.output_form_factor, "output_device": c.output_device,
                 "detected_at": _iso(c.detected_at), "recording_since": _iso(c.recording_started_at),
                 "ask_timeout_s": timeout, "can_remember_choice": bool(c.process),
+                # How sure the call is (yuki.memory.callevidence): "fresh" = the screen showed the joined call
+                # recently; "stale" = it did, but long ago (voice asks "was that for me?" on ambiguous words).
+                "evidence": "stale" if c.via == "screen_stale" else "fresh",
             }
             return {"call": call, "recording": c.status == "recording", "waiting": waiting}
         except Exception:

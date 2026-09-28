@@ -219,6 +219,48 @@ def extract(
     return result
 
 
+#: UIA control types whose name is something the window offers or labels (a fixed machine vocabulary).
+CONTROL_ROLES = frozenset({"Button", "SplitButton", "MenuItem", "TabItem", "Hyperlink", "CheckBox", "RadioButton",
+                           "ListItem", "DataItem", "TreeItem", "ToggleButton"})
+#: The controls list of one screen stops at this many names / characters.
+CONTROLS_MAX = 80
+CONTROLS_MAX_CHARS = 2500
+#: One control name is cut to this many characters (a row's whole preview is not needed to judge a screen).
+CONTROL_NAME_CHARS = 80
+
+
+def screen_controls(snap: Snapshot) -> list[str]:
+    """The names of the visible controls and headings of ``snap``, on-screen (pre-order) order, deduplicated.
+
+    Structural only: the element's UIA control type (:data:`CONTROL_ROLES`), whether it can be invoked, or its
+    heading level; off-screen and screen-reader-only elements are left out. Capped at :data:`CONTROLS_MAX`
+    names and :data:`CONTROLS_MAX_CHARS` characters.
+    """
+    if snap.root is None:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    chars = 0
+    for node in snap.root.walk():
+        if node.offscreen or node.sr_only:
+            continue
+        if not (node.role in CONTROL_ROLES or node.is_invokable or node.heading > 0):
+            continue
+        name = " ".join((node.name or "").split())
+        if not name:
+            continue
+        name = name[:CONTROL_NAME_CHARS]
+        key = name.casefold()
+        if key in seen:
+            continue
+        if len(out) >= CONTROLS_MAX or chars + len(name) > CONTROLS_MAX_CHARS:
+            break
+        seen.add(key)
+        out.append(name)
+        chars += len(name)
+    return out
+
+
 def extract_snapshot(
     snap: Snapshot,
     *,
@@ -228,7 +270,24 @@ def extract_snapshot(
     app: str | None = None,
     page: object | None = None,
 ) -> Extraction:
-    """Extraction from a Snapshot already read (the pure half of :func:`extract`)."""
+    """Extraction from a Snapshot already read (the pure half of :func:`extract`), with its screen controls."""
+    out = _extract_snapshot(snap, profiles=profiles, now=now, user_names=user_names, app=app, page=page)
+    try:
+        out.controls = screen_controls(snap)
+    except Exception:  # noqa: BLE001 - a hint for call detection only
+        out.controls = []
+    return out
+
+
+def _extract_snapshot(
+    snap: Snapshot,
+    *,
+    profiles: ProfileSet | None = None,
+    now: float,
+    user_names: list[str],
+    app: str | None = None,
+    page: object | None = None,
+) -> Extraction:
     profiles = profiles or _profiles.current()
     profile = profiles.for_window(process=snap.process_name, url=snap.url)
     app_name = app or (_app_name(snap.process_name, _pid(snap.hwnd)) if snap.hwnd else snap.process_name)

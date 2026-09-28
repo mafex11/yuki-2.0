@@ -118,6 +118,15 @@ _PASSED_NOTE = (
     "the thinker is doing it now and its outcome comes back to you. Say nothing now: no retry, no other hand, no "
     "\"let me try another way\"."
 )
+#: What the talker reads when the same step was called again while it ran, or an opening it just did (v3.10:
+#: live 2026-09-28 09:07:13 two open_url calls for one "open YouTube" said "Opening YouTube. Opening YouTube now.
+#: YouTube's up. YouTube's up.").
+_DUPLICATE_NOTE = (
+    "This exact step was already running or was just done for these words, so it was not done twice and nothing "
+    "more was said. Say nothing about it now."
+)
+#: A slow hand's opening (open_url, open_app) called again this soon after it was verified is the same request.
+_OPEN_REPEAT_S = 12.0
 _KEYS_NOTE = (
     "The keys went out; this is what the report saw. Say in a few words what it shows happened, never "
     "more than it shows. If it shows the keys did nothing they wanted, say so and hand it to the thinker "
@@ -385,6 +394,17 @@ class Hands:
         #: Set when a hand that touches a window did not show its effect: the talker's window hands then
         #: stop until the user speaks again (re-read, tell them, or hand it over; never repeat blindly).
         self.halted: str | None = None
+        #: The names on the screen in front (yuki.voice.screennames, v3.10): its app, its hwnd and the names, read
+        #: once per change of the window in front, its title or the action log (``refresh_screen_names``).
+        self.screen_names: list[str] = []
+        self.screen_app = ""
+        self.screen_hwnd: int | None = None
+        self._names_key: tuple | None = None
+        self._names_at = 0.0
+        self._names_busy = False
+        #: Hands running now and the slow ones done lately, by what they act on (v3.10: one step runs once).
+        self._inflight: dict[str, float] = {}
+        self._opened: dict[str, tuple[float, str]] = {}
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -419,6 +439,12 @@ class Hands:
             tabs = self._tabs_line(snap, titles.get(snap.foreground or 0, ""))
             if tabs:
                 parts.append(tabs)
+            with self._lock:
+                names, names_app, names_hwnd = list(self.screen_names), self.screen_app, self.screen_hwnd
+            if names and names_hwnd == snap.foreground:
+                from yuki.voice.screennames import screen_line
+
+                parts.append(screen_line(names_app, names))
             done = self.actions.lines(_MOUTH_ACTION_LINES, 240)
             if done:
                 parts.append("done on the desktop in this conversation (newest last):\n" + "\n".join(done))
@@ -473,6 +499,56 @@ class Hands:
         if getattr(strip, "error", None) is None:
             with self._lock:
                 self._tabs = {hwnd: (title, self.actions.version, strip, time.monotonic())}
+
+    def refresh_screen_names(self, on_change: Any = None, *, max_age_s: float = 30.0) -> None:
+        """Read the names on the screen in front again when it changed (a thread; returns at once).
+
+        Changed means another window in front, another title, or something done on the desktop since the last read
+        (or that read is older than ``max_age_s``). One bounded UI Automation read of the window in front (a few
+        hundred ms at most, off every loop), never on a reply's path. ``on_change(names)`` is called (on that
+        thread) when the list is different.
+        """
+        if self._names_busy:
+            return
+        read = getattr(self.backend, "get_window_tree", None)
+        if not callable(read):
+            return
+        self._names_busy = True
+
+        def run() -> None:
+            try:
+                _text, payload, _ms = self._dispatcher.overview_text()
+                front = int(payload["foreground_hwnd"]) if payload.get("foreground_hwnd") else None
+                if front is None:
+                    return
+                win = next((w for w in payload.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") == front),
+                           {})
+                key = (front, str(win.get("title") or ""), self.actions.version)
+                if key == self._names_key and time.monotonic() - self._names_at < max_age_s:
+                    return
+                from yuki.voice.screennames import names_from_tree
+
+                try:
+                    tree = read(front, max_elements=300, timeout_s=0.8)
+                except TypeError:  # a stand-in backend without the keyword arguments
+                    tree = read(front)
+                names = names_from_tree(tree)
+                app = str(win.get("process_name") or win.get("app") or "").removesuffix(".exe")
+                with self._lock:
+                    changed = names != self.screen_names or front != self.screen_hwnd
+                    self.screen_names, self.screen_app, self.screen_hwnd = names, app, front
+                self._names_key, self._names_at = key, time.monotonic()
+                if self.log is not None:
+                    self.log.event("screen_names", names=len(names), changed=changed)
+                if changed and on_change is not None:
+                    on_change(list(names))
+            except Exception as exc:  # noqa: BLE001 - only a hint for recognition and the talker
+                if self.log is not None:
+                    self.log.event("screen_names", error=type(exc).__name__)
+            finally:
+                self._names_busy = False
+
+        threading.Thread(target=run, name="yuki-voice-names", daemon=True).start()
 
     def prefetch(self) -> None:
         """Read the foreground window's tabs ahead, off every thread that matters (the user started talking).
@@ -551,6 +627,21 @@ class Hands:
         name = params.function_name
         args = params.arguments if isinstance(params.arguments, dict) else {}
         started = time.monotonic()
+        key = _step_key(name, args)
+        recent = self._opened.get(key) if name in ("open_url", "open_app") else None
+        if key in self._inflight or (recent is not None and started - recent[0] < _OPEN_REPEAT_S):
+            # One step runs once (v3.10): the same hand on the same target while it runs (a second mouth run on the
+            # same words), or an opening just verified, is that step, not a second one with a second done line.
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            if self.log is not None:
+                self.log.event("hands", op=name, deduped=True, running=key in self._inflight,
+                               call=params.tool_call_id)
+            await params.result_callback({"already": (recent[1][:400] if recent else "the same step is running now"),
+                                          "how_to_handle_it": _DUPLICATE_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
+        self._inflight[key] = started
         if args.get("say_first") and self.bridge is not None:
             await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
@@ -561,6 +652,7 @@ class Hands:
         except Exception as exc:  # noqa: BLE001 - a hand's crash is a failed hand
             ok, report, facts = False, f"{type(exc).__name__}: {exc}", {}
         finally:
+            self._inflight.pop(key, None)
             self.busy = max(0, self.busy - 1)
             if self.bridge is not None:
                 self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
@@ -576,6 +668,9 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
+        if confirmed and name in ("open_url", "open_app"):
+            self._opened = {k: v for k, v in self._opened.items() if started - v[0] < _OPEN_REPEAT_S}
+            self._opened[key] = (time.monotonic(), report)
         speak = bool(line) and confirmed
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified)
         if self.on_step is not None:
@@ -600,7 +695,7 @@ class Hands:
             note, key = _UNCONFIRMED_NOTE, "not_verified"
         else:
             note, key = _FAILED_NOTE, "failed"
-        if (name in INSTANT_HANDS and not facts.get("refused") and not facts.get("settled")
+        if (((name in INSTANT_HANDS and not facts.get("refused")) or facts.get("stale")) and not facts.get("settled")
                 and self.bridge is not None and callable(getattr(self.bridge, "escalate", None))):
             # Tried and did not take effect (not refused, not "already so"): the thinker gets the same request
             # now, by code, with this report and the window read; no talker run narrates the failure (v3.9).
@@ -629,7 +724,7 @@ class Hands:
         with self._lock:
             known = set(self.last.hwnds)
         if hwnd not in known:
-            raise _Refused(f"window {hwnd} is not in the desktop block you were shown; nothing was done")
+            raise _Refused(f"window {hwnd} is not in the desktop block you were shown; nothing was done", stale=True)
         return hwnd
 
     def _front(self, hwnd: int) -> str:
@@ -678,7 +773,12 @@ class Hands:
                 self.halted = f"{name}: {report[:160]}"
             return ok, report, facts
         except _Refused as exc:
-            facts["refused"] = True  # nothing was done: the talker says why (never handed over by code)
+            facts["refused"] = True  # nothing was done: the talker says why ...
+            if exc.stale:
+                # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
+                # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
+                # 2026-09-28 09:07:52 a stale tab close was narrated in two talker runs before a hand-off).
+                facts["stale"] = True
             return False, str(exc), facts
 
     def _act(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
@@ -807,7 +907,8 @@ class Hands:
         with self._lock:
             shown = list(self.last.tabs.get(hwnd) or [])
         if not 1 <= index <= len(shown):
-            raise _Refused(f"tab {index} of window {hwnd} is not on the tabs line you were shown; nothing was done")
+            raise _Refused(f"tab {index} of window {hwnd} is not on the tabs line you were shown; nothing was done",
+                           stale=True)
         facts["sent_at"] = time.monotonic()
         result = select(hwnd, index, expect_name=shown[index - 1])
         ok, report, facts = self._report(result, "", facts)
@@ -838,7 +939,7 @@ class Hands:
                            "not name is never closed. Nothing was closed")
         if any(not 1 <= n <= len(names) for n in wanted):
             raise _Refused(f"not every tab {wanted} of window {hwnd} is on the tabs line you were shown; nothing "
-                           f"was closed")
+                           f"was closed", stale=True)
         if any(not ids[n - 1] for n in wanted):
             raise _Refused("those tabs have no identity to close them by; hand it to the thinker. Nothing was closed")
         facts["sent_at"] = time.monotonic()
@@ -1055,7 +1156,27 @@ def _what(name: str, args: dict[str, Any]) -> str:
 
 
 class _Refused(Exception):
-    """A hand refused before doing anything (the message is the report)."""
+    """A hand refused before doing anything (the message is the report).
+
+    ``stale``: refused because what the talker was shown changed (a tab or window not where the desktop block
+    said): the thinker gets the request by code instead of a talker run narrating the refusal.
+    """
+
+    def __init__(self, message: str, *, stale: bool = False) -> None:
+        super().__init__(message)
+        self.stale = stale
+
+
+def _step_key(name: str, args: dict[str, Any]) -> str:
+    """What a hand acts on, for telling one step from the same step again (its words left out)."""
+    import json
+
+    keep = {k: v for k, v in (args or {}).items() if k not in ("say_first", "say_when_done", "named")}
+    if isinstance(keep.get("url"), str):
+        keep["url"] = keep["url"].strip().rstrip("/").casefold()
+    if isinstance(keep.get("name"), str):
+        keep["name"] = " ".join(keep["name"].split()).casefold()
+    return name + json.dumps(keep, sort_keys=True, default=str)
 
 
 def hands_backend(runtime: Any) -> Any:

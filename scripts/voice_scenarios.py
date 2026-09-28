@@ -64,7 +64,7 @@ class Timeline:
                 from pipecat.frames.frames import (
                     BotStartedSpeakingFrame, BotStoppedSpeakingFrame, FunctionCallInProgressFrame,
                     FunctionCallResultFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
-                    TranscriptionFrame, TTSSpeakFrame,
+                    TranscriptionFrame, TTSSpeakFrame, TTSTextFrame,
                 )
 
                 frame = data.frame
@@ -75,6 +75,8 @@ class Timeline:
                     tl.add("user", text=frame.text)
                 elif isinstance(frame, TTSSpeakFrame):
                     tl.add("yuki_code", text=frame.text)  # words said by code (a done line, a say_first)
+                elif isinstance(frame, TTSTextFrame):
+                    tl.add("yuki_heard", text=frame.text)  # words the voice really said (after their audio)
                 elif isinstance(frame, LLMFullResponseStartFrame):
                     tl._reply = {"text": ""}
                     tl.add("reply_start")
@@ -528,6 +530,277 @@ def _youtube_desk(timeline: Timeline) -> Any:
     return YouTubeDesk()
 
 
+def _zen_desk(timeline: Timeline) -> Any:
+    """The live session of 2026-09-28 09:06-09:11 (v3.10), test code only: Chrome closed at first, with a "Restore"
+    button once opened (the last session's tabs come back when it is clicked); YouTube's home page with the Sonnet 5.5
+    video among others; WhatsApp in the background with its chat list (Bro, Res, Mother, Elina...). A chat row
+    clicked opens that chat; its message list scrolls. What happened is recorded for the report (``opened_chats``).
+    """
+    base = type(_youtube_desk(timeline))
+    sonnet = "Sonnet 5.5 Next Week, GPT-7?, Qwen 4 Spotted and DeepSeek V5 Beats Astra"
+    chats = [("Bro", "Yesterday", "on my way"), ("Res", "09:02", "ok see you tomorrow"),
+             ("Mother", "08:40", "reached home?"), ("Elina", "Friday", "sent the pdf"),
+             ("rohan BAC", "06:07", "Was this you?")]
+
+    class ZenDesk(base):  # type: ignore[misc, valid-type]
+        WHATSAPP = 0x4004
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.state[self.CHROME] = "closed"
+            self.state[self.DISCORD] = "closed"
+            self.state[self.SPOTIFY] = "normal"
+            self.state[self.WHATSAPP] = "hidden"
+            self.tabs = [{"name": "New Tab", "url": "chrome://newtab/", "scroll": 0.0, "titled_at": 0.0,
+                          "id": "42.4129740.4.0.0.1", "page": ("other", "")}]
+            self.selected = 0
+            self.restored = False
+            self.media_visible = True
+            self.chat: str | None = None
+            self.chat_scroll = 100.0
+            self.opened_chats: list[str] = []
+            self.front = self.SPOTIFY
+            self._home = [sonnet, "Mix - Make Up My Mind - Stellar Blade: BLOOD RAIN Official Trailer OST",
+                          "lofi hip hop radio - beats to relax/study to", "Claude Code in 12 minutes"]
+
+        # -- windows ---------------------------------------------------------------------------------
+        def title(self, hwnd: int) -> str:
+            if int(hwnd) == self.WHATSAPP:
+                return "WhatsApp"
+            return super().title(hwnd)
+
+        def get_desktop_overview(self) -> dict[str, Any]:
+            order = [self.front] + [h for h in (self.CHROME, self.WHATSAPP, self.SPOTIFY) if h != self.front]
+            names = {self.CHROME: "chrome.exe", self.WHATSAPP: "WhatsApp.Root.exe", self.SPOTIFY: "Spotify.exe"}
+            windows = []
+            for i, h in enumerate(order):
+                if self.state.get(h) in ("closed", "hidden"):
+                    continue
+                windows.append({"hwnd": h, "process_name": names[h], "title": self.title(h),
+                                "is_foreground": h == self.front, "is_minimized": False, "pid": 100 + i,
+                                "bounds": (0, 0, 1920, 1040)})
+            return {"windows": windows, "foreground_hwnd": self.front, "cursor": self.cursor,
+                    "screen_size": (1920, 1080), "captured_at": time.time(), "monitors": [],
+                    "virtual_bounds": (0, 0, 1920, 1080)}
+
+        def launch_app(self, query: str, **kwargs: Any) -> Any:
+            from yuki.voice.offline import StubResult
+
+            q = query.casefold()
+            if "whatsapp" in q:   # test stub routing on the stub's own two apps
+                self.state[self.WHATSAPP] = "normal"
+                self.front = self.WHATSAPP
+                result = self._act("launch_app", "", query)
+                result.summary = (f"WhatsApp was running in the background with no window; its hidden window was "
+                                  f"shown: hwnd {self.WHATSAPP} (WhatsApp.Root.exe) \"WhatsApp\"; in the foreground")
+                return result
+            if "chrome" in q:
+                self.state[self.CHROME] = "normal"
+                self.front = self.CHROME
+                result = self._act("launch_app", "", query)
+                result.summary = (f"launched 'Google Chrome': hwnd {self.CHROME} (chrome.exe) \"New Tab - Google "
+                                  f"Chrome\" - new window; in the foreground and ready for input")
+                return result
+            return StubResult(ok=False, summary=f"no app called {query} on this test machine")
+
+        def activity_facts(self) -> dict[str, Any]:
+            facts = super().activity_facts()
+            facts["foreground"] = {"hwnd": self.front, "title": self.title(self.front),
+                                   "process_name": "WhatsApp.Root.exe" if self.front == self.WHATSAPP else "chrome.exe"}
+            return facts
+
+        # -- what is on the screen ---------------------------------------------------------------------
+        def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
+            if int(hwnd) == self.WHATSAPP:
+                elements: list[dict[str, Any]] = [{"id": 0, "role": "Window", "name": "WhatsApp", "depth": 0,
+                                                   "bounds": (0, 0, 1920, 1040), "center": (960, 520)}]
+                self._links = []
+
+                def add(role: str, name: str, center: tuple[int, int], depth: int, action: str = "", arg: str = "",
+                        interactive: bool = True) -> None:
+                    x, y = center
+                    elements.append({"id": len(elements), "role": role, "name": name, "depth": depth,
+                                     "bounds": (x - 200, y - 30, x + 200, y + 30), "center": center,
+                                     "is_interactive": interactive})
+                    if action:
+                        self._links.append((center, action, arg))
+
+                add("Button", "New chat", (300, 60), 2)
+                add("Edit", "Search or start a new chat", (300, 120), 2)
+                for i, (name, when, last) in enumerate(chats):
+                    y = 200 + 90 * i
+                    add("DataItem", f"{name} {when} {last}", (300, y), 3, "chat", name)
+                    add("Text", name, (250, y - 15), 4, interactive=False)
+                    add("Text", when, (480, y - 15), 4, interactive=False)
+                    add("Text", last, (300, y + 15), 4, interactive=False)
+                if self.chat:
+                    add("Group", f"Messages with {self.chat}", (1200, 500), 3, interactive=False)
+                    elements[-1]["is_scrollable"] = True
+                return {"hwnd": hwnd, "title": "WhatsApp", "process_name": "WhatsApp.Root.exe", "elements": elements,
+                        "truncated": False, "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 5.0,
+                        "passes": 1, "child_windows": 0, "first_pass_elements": len(elements)}
+            tree = super().get_window_tree(hwnd, **kw)
+            if int(hwnd) == self.CHROME and not self.restored:
+                x, y = 1860, 262
+                tree["elements"].append({"id": len(tree["elements"]), "role": "Button", "name": "Restore", "depth": 5,
+                                         "bounds": (x - 60, y - 20, x + 60, y + 20), "center": (x, y),
+                                         "is_interactive": True})
+                self._links.append(((x, y), "restore", ""))
+            return tree
+
+        def format_window_tree(self, tree: dict[str, Any]) -> str:
+            if tree.get("process_name") == "WhatsApp.Root.exe":
+                lines = [f"window {tree['hwnd']} \"WhatsApp\""]
+                for e in tree["elements"][1:]:
+                    left, top, right, bottom = e["bounds"]
+                    lines.append(f"[{e['id']}] {e['role']} \"{e['name']}\" @{left},{top} {right - left}x{bottom - top}")
+                return "\n".join(lines)
+            return super().format_window_tree(tree)
+
+        def _keys(self, keys: tuple[str, ...], times: int = 1) -> str:
+            if keys == ("playpause",) and self._page()[0] == "watch" and self.front == self.CHROME:
+                for _ in range(times):   # live 09:09:34 the media key reached YouTube (its session showed it)
+                    self.playing = not self.playing
+                return f"; the player is now {'playing' if self.playing else 'paused'}"
+            return super()._keys(keys, times)
+
+        def click(self, x: int, y: int, **kwargs: Any) -> Any:
+            hit = next(((c, a, n) for c, a, n in getattr(self, "_links", [])
+                        if abs(c[0] - int(x)) <= 200 and abs(c[1] - int(y)) <= 40), None)
+            if hit is not None and hit[1] == "chat" and self.front == self.WHATSAPP:
+                result = self._act("click", "", x, y, **kwargs)
+                self.chat, self.chat_scroll = hit[2], 100.0
+                self.opened_chats.append(hit[2])
+                result.summary = f'clicked DataItem "{hit[2]}" at ({x},{y}); the chat with {hit[2]} is open'
+                return result
+            if hit is not None and hit[1] == "restore" and self.front == self.CHROME:
+                result = self._act("click", "", x, y, **kwargs)
+                self.restored = True
+                self.tabs = [
+                    {"name": "Inbox (12) - Corvana Mail", "url": "https://mail.google.com/", "scroll": 0.0,
+                     "titled_at": 0.0, "id": "42.4129740.4.0.0.1280", "page": ("mail", "")},
+                    {"name": "Claude", "url": "https://claude.ai/", "scroll": 0.0, "titled_at": 0.0,
+                     "id": "42.4129740.4.0.0.1316", "page": ("other", "")},
+                    {"name": "Yuki mix", "url": "https://www.youtube.com/playlist?list=yuki", "scroll": 0.0,
+                     "titled_at": 0.0, "id": "42.4129740.4.0.0.1364", "page": ("other", "")},
+                    {"name": "(1558) YouTube - Memory usage - 448 MB", "url": "https://www.youtube.com/",
+                     "scroll": 0.0, "titled_at": 0.0, "id": "42.4129740.4.0.0.1517", "page": ("home", "")},
+                ]
+                self.selected = 2
+                result.summary = f"clicked Button \"Restore\" at ({x},{y}); the last session's 4 tabs came back"
+                return result
+            return super().click(x, y, **kwargs)
+
+        def scroll(self, x: int, y: int, *, dy: int = 0, dx: int = 0, expect_hwnd: Any = None, **kw: Any) -> Any:
+            if self.front == self.WHATSAPP:
+                refused = self._guard(expect_hwnd)
+                if refused:
+                    from yuki.voice.offline import StubResult
+
+                    return StubResult(ok=False, summary=refused)
+                before = self.chat_scroll
+                self.chat_scroll = min(100.0, max(0.0, before - dy * 2.0))
+                moved = self.chat_scroll != before
+                result = self._act("scroll", "", x, y, dy=dy, expect_hwnd=expect_hwnd)
+                result.ok = moved
+                where = "down" if dy < 0 else "up"
+                result.summary = (f"scrolled Group {where}: {before:.0f}% -> {self.chat_scroll:.0f}% of the way "
+                                  f"(UI Automation; the cursor was not moved)" if moved else "nothing to scroll")
+                result.details = {"verified": moved}
+                return result
+            return super().scroll(x, y, dy=dy, dx=dx, expect_hwnd=expect_hwnd, **kw)
+
+        def desk_state(self, t0: float) -> dict[str, Any]:
+            state = super().desk_state(t0)
+            state.update(chat=self.chat, opened_chats=list(self.opened_chats), whatsapp=self.state[self.WHATSAPP])
+            return state
+
+    desk = ZenDesk()
+    home = desk._home
+    import types as _types
+
+    def get_window_tree(self: Any, hwnd: int, **kw: Any) -> dict[str, Any]:  # the home page's links: this session's
+        tree = ZenDesk.get_window_tree(self, hwnd, **kw)
+        if int(hwnd) == self.CHROME and self.restored and self._page()[0] == "home":
+            kept = [e for e in tree["elements"] if not (e["role"] == "Hyperlink")]
+            self._links = [l for l in self._links if l[1] != "watch"]
+            for i, name in enumerate(home):
+                x, y = 700 + 400 * (i % 2), 300 + 250 * (i // 2)
+                kept.append({"id": len(kept), "role": "Hyperlink", "name": name, "depth": 6,
+                             "bounds": (x - 150, y - 40, x + 150, y + 40), "center": (x, y), "is_interactive": True})
+                self._links.append(((x, y), "watch", name))
+            tree["elements"] = kept
+        return tree
+
+    desk.get_window_tree = _types.MethodType(get_window_tree, desk)
+    return desk
+
+
+def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
+    """What memory's call detector says for this replay (v3.10), run offline on a temp database with stubbed device
+    holders and the real screen judge (Haiku): ``(app, evidence, facts)``.
+
+    ``kind``: ``zen`` - the live case: the Zen browser has held the microphone for an hour and plays YouTube; its
+    screen, when last seen, was YouTube's home page (no call). ``discord`` - Discord holds the microphone and its
+    window was seen a moment ago with the voice-connected panel. ``stale`` - the same panel, seen 40 minutes ago.
+    ``none`` - nothing holds the microphone.
+    """
+    import tempfile
+
+    from yuki.memory.avsignals import AvSignals
+    from yuki.memory.callevidence import CallEvidence
+    from yuki.memory.calls import CallConfig, CallWorker
+    from yuki.memory.store import Store
+
+    now = time.time()
+    tmp = Path(tempfile.mkdtemp(prefix="yuki-call928-"))
+    store = Store.open(tmp / "memory.db")
+    zen = r"C:\Program Files\Zen Browser\zen.exe"
+    discord = r"C:\Users\yukidev\AppData\Local\Discord\app-1.0.9200\Discord.exe"
+    exe = zen if kind == "zen" else discord
+    mic = [] if kind == "none" else [{"app": exe.rsplit("\\", 1)[-1], "packaged": False, "path": exe,
+                                      "since": now - 3600}]
+    signals = AvSignals(frozenset(), mic_fn=lambda: list(mic), camera_fn=list,
+                        render_fn=lambda: [{"pid": 4242, "state": "active"}] if mic else [],
+                        identity_fn=lambda pid: (exe, ""), watch=False, backstop_s=0.0, render_max_age_s=0.0)
+    evidence = CallEvidence()
+    worker = CallWorker(store, signals=signals, config=CallConfig(hold_s=15.0),
+                        headphones_fn=lambda c: (False, {"form_factor": "speakers", "device": "Speakers"}),
+                        source_factory=lambda c, app: None, evidence=evidence)
+    worker._tell_ui = lambda: None
+    worker.sites_fn = lambda key: 8 if key == "zen" else 1
+    process = exe.rsplit("\\", 1)[-1].rsplit(".", 1)[0].casefold()
+    if kind == "zen":
+        screen = {"host": "www.youtube.com", "title": "(1558) YouTube",
+                  "controls": ["Guide", "YouTube Home", "Search", "Voice search", "Create", "Notifications", "Home",
+                               "Shorts", "Subscriptions", "You", "History", sonnet_title(), "Claude Code in 12 minutes"],
+                  "at": now - 120}
+    elif kind in ("discord", "stale"):
+        screen = {"host": "discord.com", "title": "#valorant | Friends - Discord",
+                  "controls": ["Friends", "#general", "#valorant", "Voice Connected", "Valorant squad / Friends",
+                               "Disconnect", "Noise Suppression", "Turn On Camera", "Share Your Screen",
+                               "Mute", "Deafen", "User Settings"],
+                  "at": now - (2400 if kind == "stale" else 30)}
+    else:
+        screen = None
+    if screen is not None:
+        evidence.seen({"process": process, "exe": exe, "hwnd": 7, **screen})
+    worker.step(now)
+    from yuki.memory.api import MemoryClient
+
+    call = MemoryClient(store).call_status().get("call")
+    facts = {"kind": kind, "judged": evidence.stats() if hasattr(evidence, "stats") else None,
+             "call": {k: call.get(k) for k in ("app", "status", "evidence")} if call else None}
+    store.close()
+    if not call:
+        return None, None, facts
+    return str(call.get("app") or "a call app"), str(call.get("evidence") or "fresh"), facts
+
+
+def sonnet_title() -> str:
+    return "Sonnet 5.5 Next Week, GPT-7?, Qwen 4 Spotted and DeepSeek V5 Beats Astra"
+
+
 def _settled(conv_box: dict[str, Any], quiet_s: float = 1.5) -> Any:
     """A condition: nothing is being said or owed (no job open, nothing held, no tool in flight) for ``quiet_s``."""
     state = {"since": None}
@@ -678,6 +951,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         over["voice_eager_eot_threshold"] = args.eager
     if args.eot is not None:
         over["voice_eot_threshold"] = args.eot
+    if scenario == "call928":
+        over["voice_call_idle_s"] = 40.0   # the whole script is one conversation (live, "Yuki" would start another)
     if scenario in ("pauses", "wake1"):
         over["voice_hold_max_s"] = 8.0
     if args.grounding is not None:
@@ -860,6 +1135,33 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("z_glimpse"), "z_glimpse", after_s=1.0, wait_for=settled()),
             ScriptLine(clip("y_thanks"), "z_thanks", after_s=1.0, wait_for=settled()),
         ]
+    elif scenario == "zen928":
+        # v3.10, the user's session of 2026-09-28 09:06-09:11 ("it felt like talking with 2 people at the same
+        # time"): open Chrome, restore, YouTube, the second YouTube tab, close it, scroll x2, the Sonnet 5.5 video,
+        # pause, WhatsApp, the Bro chat, scroll up, the res chat. The call detector runs first on the live case (the
+        # Zen browser holding the microphone while it plays YouTube).
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_zen_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        names = ["z_chrome", "z_restore", "z_youtube", "z_tab2", "z_close2", "z_scroll", "z_again", "z_sonnet",
+                 "z_pause", "z_whatsapp", "z_bro", "z_scrollup", "z_res"]
+        lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
+    elif scenario == "call928":
+        # v3.10: on a real call (Discord's voice panel seen a moment ago), talk to friends gets silence, never a
+        # word about whom it was for; the name gets an answer.
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_zen_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        names = ["z_chrome", "c_clutch", "c_yuki", "c_hear"]
+        lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
+    elif scenario == "stale928":
+        # v3.10: the only call evidence is old: plain instructions are done with no question, only an ambiguous line
+        # gets "was that for me?", and "shut up for a couple of hours" makes Yuki go quiet (kept across restarts).
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_zen_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        names = ["z_chrome", "z_whatsapp", "z_bro", "z_scrollup", "s_ambig", "q_quiet"]
+        lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -928,9 +1230,24 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
-    front = (lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") else (lambda: None)
+    z928 = scenario in ("zen928", "call928", "stale928")
+    front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") or z928
+             else (lambda: None))
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
                          **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
+    call_app = call_evidence = None
+    if z928:
+        # What memory's call detector says (the real screen judge on stubbed device holders), unless the run forces
+        # the live case of the old code (--call Zen: the browser holding the microphone was taken for a call).
+        if args.call:
+            call_app, call_evidence = (None, None) if args.call == "none" else (args.call, args.evidence or "fresh")
+            box["call_detector"] = {"forced": args.call}
+        else:
+            kind = {"zen928": "zen", "call928": "discord", "stale928": "stale"}[scenario]
+            call_app, call_evidence, box["call_detector"] = _call_now(kind)
+        timeline.add("call_mode", app=call_app, evidence=call_evidence)
+        box["desk"] = desk
+    quiet_asked: list[float] = []
     box["bridge"] = bridge
     if args.dump_mouth:
         # Test report only: the tail of every request the mouth sends (what it was shown).
@@ -976,12 +1293,18 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                         if ln.speech_end_at and ln.speech_end_at <= now]
                 return max(ends, key=lambda x: x[1]) if ends else (0.0, 0.0)
 
+            import inspect
+
+            extra: dict[str, Any] = {}
+            accepted = inspect.signature(Conversation.__init__).parameters
+            if "call_evidence" in accepted:   # v3.10 (the before-run's code has none of these)
+                extra.update(call_evidence=call_evidence, on_quiet=quiet_asked.append)
             conv = Conversation(
                 settings=settings, bridge=bridge, transport=PairTransport(ScriptedInput(script, params), output),
                 memory=memory, mouth_memory=box["mouth_memory"], log=vlog, speech_end=speech_end,
                 voice_activity=voice_activity,
                 on_state=lambda s, d: states.append((time.monotonic(), s)), session=scenario,
-                extra_observers=[timeline.observer()], keyterms=box.get("keyterms"),
+                extra_observers=[timeline.observer()], keyterms=box.get("keyterms"), call_app=call_app, **extra,
             )
             box["conv"] = conv
             for line in lines:
@@ -1060,7 +1383,12 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
-    if scenario in ("latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927"):
+    if z928:
+        report["call_detector"] = box.get("call_detector")
+        report["quiet_asked"] = quiet_asked
+        report["z928"] = z928_metrics(report, box)
+    if scenario in ("latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927", "zen928", "call928",
+                    "stale928"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -1114,6 +1442,25 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def z928_metrics(report: dict[str, Any], box: dict[str, Any]) -> dict[str, Any]:
+    """Per request: what was heard (every spoken line, by the talker or by code), the thinker jobs it started, and the
+    spoken-line check's catches; plus the chats WhatsApp opened (v3.10 replay)."""
+    ev = report["timeline"]
+    starts = [(e["t"], e["label"]) for e in ev if e["kind"] == "line"]
+    rows = []
+    for i, (t0, label) in enumerate(starts):
+        t1 = starts[i + 1][0] if i + 1 < len(starts) else float("inf")
+        window = [e for e in ev if t0 <= e["t"] < t1]
+        heard = [e.get("text") for e in window if e["kind"] == "user"]
+        spoken = [e["text"] for e in window if e["kind"] in ("yuki_heard",)]
+        jobs = sorted({e.get("job") for e in window if e["kind"] == "brain" and e.get("event") == "submitted"})
+        tools = [e["name"] for e in window if e["kind"] == "mouth_tool"]
+        rows.append({"line": label, "heard": heard, "spoken": spoken, "jobs": jobs, "tools": tools})
+    desk = box.get("desk")
+    return {"requests": rows, "opened_chats": list(getattr(desk, "opened_chats", []) or []),
+            "chat_now": getattr(desk, "chat", None)}
+
+
 def summary(report: dict[str, Any]) -> str:
     lines = [f"== {report['scenario']} ({report['reason']}) brain ${report.get('brain_cost_usd')} "
              f"narrator {report.get('narrator')}"]
@@ -1143,7 +1490,8 @@ def summary(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
-                                         "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927", "all"))
+                                         "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927",
+                                         "zen928", "call928", "stale928", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
@@ -1161,6 +1509,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-s", dest="max_s", type=float, default=240.0)
     ap.add_argument("--eager", type=float, default=None)
     ap.add_argument("--eot", type=float, default=None)
+    ap.add_argument("--call", default="", help="zen928/call928/stale928: force the call mode (an app name, or none)")
+    ap.add_argument("--evidence", default="", help="with --call: fresh or stale")
     ap.add_argument("--dump-mouth", dest="dump_mouth", action="store_true",
                     help="put the tail of every mouth request on the timeline (the JSON report only)")
     args = ap.parse_args(argv)

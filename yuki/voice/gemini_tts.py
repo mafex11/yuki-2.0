@@ -164,6 +164,9 @@ class _Piece:
     sent_at: float = 0.0
     first_audio_ms: float | None = None
     via: str = "gemini"
+    #: The spoken-line check's verdict (yuki.voice.speechguard, v3.10), started with the piece; None: no check.
+    verdict: Any = None
+    created: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -180,6 +183,8 @@ class _Reply:
     dropped: int = 0
     lead_ms: float = 0.0
     tail_ms: float = 0.0
+    guarded: int = 0                     # pieces the spoken-line check dropped (v3.10)
+    heard: bool = False                  # some piece's audio went out
 
 
 def service_class() -> type:
@@ -223,7 +228,11 @@ def service_class() -> type:
             self._on_fallback = False        # this conversation speaks with Aura from now on
             self._used_at = 0.0              # when a request last went out (monotonic)
             self._limit = asyncio.Semaphore(PARALLEL)
-            self.stats = {"pieces": 0, "fallback_pieces": 0, "errors": 0}
+            self.stats = {"pieces": 0, "fallback_pieces": 0, "errors": 0, "guarded": 0}
+            #: The spoken-line check (yuki.voice.speechguard): a piece's audio is held until its verdict, which runs
+            #: alongside the speech request, and a dropped piece is never played nor its words kept (v3.10).
+            self._yuki_guard: Any = None
+            self._yuki_audio_gate = True
 
         def can_generate_metrics(self) -> bool:
             return True
@@ -319,6 +328,11 @@ def service_class() -> type:
             piece.pre, reply.pending_pre = reply.pending_pre, []
             if speakable(piece.text):
                 await self.start_tts_usage_metrics(strip_tags(piece.text))
+                if self._yuki_guard is not None:
+                    try:
+                        piece.verdict = self._yuki_guard.start(strip_tags(piece.text))
+                    except Exception:  # noqa: BLE001 - the check fails open
+                        piece.verdict = None
                 piece.task = self.create_task(self._fetch(reply, piece), name="gemini-piece")
             else:
                 piece.queue.put_nowait(None)  # a style mark alone: nothing to say
@@ -370,6 +384,8 @@ def service_class() -> type:
                     index += 1
                     for frame in piece.pre:
                         await self._emit(ctx, frame)
+                    checked = piece.verdict is None or self._yuki_guard is None
+                    dropped = False
                     while True:
                         try:
                             chunk = await asyncio.wait_for(piece.queue.get(), timeout=1.0)
@@ -378,7 +394,24 @@ def service_class() -> type:
                             continue
                         if chunk is None:
                             break
-                        await self._emit(ctx, TTSAudioRawFrame(chunk, SAMPLE_RATE, 1, context_id=ctx))
+                        if not checked:
+                            # Its audio is ready: the line is heard only if the check keeps it (it ran alongside).
+                            checked = True
+                            guard = self._yuki_guard
+                            wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
+                            verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
+                            self._refresh_audio_context(ctx)
+                            if not verdict.ok:
+                                dropped = True
+                                reply.guarded += 1
+                                self.stats["guarded"] += 1
+                                if piece.task is not None and not piece.task.done():
+                                    piece.task.cancel()
+                        if not dropped:
+                            reply.heard = True
+                            await self._emit(ctx, TTSAudioRawFrame(chunk, SAMPLE_RATE, 1, context_id=ctx))
+                    if dropped:
+                        continue  # never heard: its words stay out of the conversation too
                     # Its words may be added just after its request went out: give them a moment.
                     if not piece.post and not reply.closed and index == len(reply.pieces):
                         reply.wake.clear()
@@ -393,6 +426,10 @@ def service_class() -> type:
 
         async def _finish(self, reply: _Reply) -> None:
             ctx = reply.context_id
+            if reply.guarded and not reply.heard:
+                # Every piece was dropped by the spoken-line check: a breath of silence closes the reply, so it ends
+                # like any other (no "completed with no audio" error, no reply still owed).
+                await self._emit(ctx, TTSAudioRawFrame(bytes(SAMPLE_RATE // 50 * 2), SAMPLE_RATE, 1, context_id=ctx))
             for frame in reply.pending_pre:
                 await self._emit(ctx, frame)
             await self._emit(ctx, TTSStoppedFrame(context_id=ctx))

@@ -1047,7 +1047,7 @@ _CALL_COLUMNS: frozenset[str] = frozenset({
     "status", "consent", "consent_by", "consent_at", "output_form_factor", "output_device", "headphones",
     "recording_started_at", "recording_stopped_at", "stop_requested", "stop_reason", "ended_at", "thread_id",
     "chunks", "chunks_silent", "speech_s", "audio_s", "utterances", "transcribe_ms", "stt_model", "stt_device",
-    "captures",
+    "captures", "via",
 })
 
 
@@ -1059,7 +1059,7 @@ class CallRecord:
     app: str                          # display name ("Zoom", "Discord")
     process: str | None               # app_key of the process holding the microphone
     service: str | None               # meeting service when a timeline meeting row named it
-    via: str                          # mic | meeting
+    via: str                          # mic | meeting (older rows) | screen | screen_stale (the evidence)
     detected_at: float
     ended_at: float | None
     status: str                       # asking | recording | waiting_headphones | declined | unanswered | not_asked | stopped | ended
@@ -5418,8 +5418,12 @@ class Store:
             status = {"no": "declined", "never": "declined", "none": "unanswered"}.get(answer, "asking")
             conn.execute("UPDATE calls SET consent=?, consent_by=?, consent_at=?, status=?, updated_at=? WHERE id=?",
                          (answer, by, when, status, now, int(call_id)))
-            if answer in ("always", "never") and row["process"]:
-                self._set_call_pref(conn, row["process"], answer, row["app"], now)
+            # A call on a site inside a browser keeps the standing answer for that site's service (the row's
+            # service), never for the whole browser (2026-09-28: "Always" for a Google Meet call made every
+            # later microphone use of the Zen browser a call); an app's own call keeps it for the app.
+            target = app_key(row["service"]) if row["service"] else app_key(row["process"])
+            if answer in ("always", "never") and target:
+                self._set_call_pref(conn, target, answer, row["app"], now)
             return True
 
         return self._write(op)
@@ -5451,6 +5455,20 @@ class Store:
             "INSERT INTO call_prefs(app, decision, name, updated_at) VALUES (?,?,?,?)"
             " ON CONFLICT(app) DO UPDATE SET decision=excluded.decision, name=coalesce(excluded.name, name),"
             " updated_at=excluded.updated_at", (app, decision, name, now))
+
+    def sites_shown(self, process: str | None, since: TimeArg = None) -> int:
+        """How many different page hosts the timeline saw ``process`` show since ``since`` (content-free).
+
+        A browser shows many sites (measured 2026-09-28: chrome 36, zen 8, arc 6); an app built on a web view
+        shows its own one (discord, whatsapp, slack, claude: 1).
+        """
+        key = app_key(process)
+        if not key:
+            return 0
+        s = _ts(since)
+        rows = self._query("SELECT COUNT(DISTINCT host) AS n FROM timeline WHERE process=? AND host IS NOT NULL"
+                           + (" AND started_at >= ?" if s is not None else ""), (key, s) if s is not None else (key,))
+        return int(rows[0]["n"] or 0) if rows else 0
 
     def call_pref(self, app: str | None) -> str | None:
         """``always`` / ``never`` for a call app (any spelling of its process name), or None."""

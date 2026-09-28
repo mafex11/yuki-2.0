@@ -351,7 +351,7 @@ def test_a_result_after_the_user_moved_on_is_framed_as_the_earlier_request() -> 
     asyncio.run(main())
 
 
-def test_a_result_on_time_is_said_once_by_code_and_bound_to_its_request() -> None:
+def test_a_result_on_time_goes_to_the_talker_once_and_bound_to_its_request() -> None:
     async def main() -> None:
         rt, bridge = _bridge()
         bridge.user_turns = lambda: 1
@@ -366,19 +366,21 @@ def test_a_result_on_time_is_said_once_by_code_and_bound_to_its_request() -> Non
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle()
         await asyncio.wait_for(task, 1)
-        assert [f.text for f in params.pushed] == ["Paused it."]
-        result, _props = params.results[-1]
-        assert result["said"] is True and result["for_request"] == "Pause the video"
+        assert [f.text for f in params.pushed] == []  # v3.10: only the talker speaks, never code for the thinker
+        result, props = params.results[-1]
+        assert result["verified"] is True and result["for_request"] == "Pause the video" and props.run_llm is True
 
     asyncio.run(main())
 
 
 def test_one_still_on_it_line_only_into_silence() -> None:
     async def main() -> None:
-        rt, bridge = _bridge(settings=Settings(voice_wait_line_s=0.05, voice_wait_again_s=30.0))
+        rt, bridge = _bridge(settings=Settings(voice_wait_line_s=0.05, voice_wait_again_s=0.1))
         quiet = {"s": 0.0}
         bridge.quiet_for = lambda: quiet["s"]
         params = Params("Find my September invoices")
+        params.arguments["say_first"] = ""  # handed over without an acknowledgement (v3.10: else no line at all)
+        bridge.spoke_in_reply = lambda: False
         task = asyncio.create_task(bridge.tell_yuki(params))
         await _settle()
         job = rt.submitted[0][0]
@@ -392,6 +394,30 @@ def test_one_still_on_it_line_only_into_silence() -> None:
         await _settle()
         lines = [r for r, _ in params.results if "still_working_on" in r]
         assert len(lines) == 1 and lines[0]["now"] and lines[0]["for_seconds"] >= 0
+        await asyncio.sleep(0.4)
+        await _settle()
+        assert len([r for r, _ in params.results if "still_working_on" in r]) == 1  # one line, never a second
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+
+def test_an_acknowledged_job_gets_no_waiting_line_until_its_outcome() -> None:
+    """v3.10: "acknowledge once, then stay quiet until the outcome" (live 09:08:11 "Still on it, switching tabs now."
+    after "On it." sounded like a second voice)."""
+    async def main() -> None:
+        rt, bridge = _bridge(settings=Settings(voice_wait_line_s=0.05, voice_wait_again_s=0.1))
+        bridge.quiet_for = lambda: 10.0
+        params = Params("Find my September invoices")  # say_first "On it."
+        task = asyncio.create_task(bridge.tell_yuki(params))
+        await _settle()
+        job = rt.submitted[0][0]
+        rt.started.emit("worker", job, "x")
+        await asyncio.sleep(0.4)
+        await _settle()
+        assert not [r for r, _ in params.results if "still_working_on" in r]
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -553,15 +579,15 @@ def test_a_hand_that_did_not_take_is_passed_to_the_thinker_without_a_talker_run(
         job, text, kw = rt.submitted[0]
         assert kw.get("lane") == "worker" and kw.get("view_hwnd") == 42
         assert "did not take effect" in text and "play the make up my mind mix" in text
-        # the thinker's own finishing line is the one outcome, said once, by code
+        # the thinker's own finishing line is the one outcome, said once, by the talker (v3.10: never by code)
         rt.started.emit("worker", job, "x")
         rt.tool_called.emit("worker", job, "press", {"key": "k", "finishes_with": "Paused it."})
         rt.tool_finished.emit("worker", job, "press", True, "pressed k")
         rt.finished.emit("worker", job, "Paused it.")
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle(20)
-        assert spoken == ["Paused it."]
-        assert announced and announced[-1][0].get("said") is True and announced[-1][1] is False
+        assert spoken == []
+        assert announced and announced[-1][0].get("verified") is True and announced[-1][1] is True
 
     asyncio.run(main())
 

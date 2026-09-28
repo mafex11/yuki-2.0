@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from test_av_signals import DISCORD, Stubs, _facts, _recorder, _rows, _worker  # noqa: F401 - shared stubs
+from test_av_signals import DISCORD, Stubs, _facts, _recorder, _rows, _worker, shows  # noqa: F401 - shared stubs
 
 from yuki.memory.avsignals import GAME_GPU_SHARE, Holder, gaming_with_voice
 
@@ -124,6 +124,8 @@ def test_valorant_voice_is_not_a_call_but_discord_in_the_background_still_is(sto
     assert w.active is None                                  # gaming with voice: no call, no consent card
     stubs.hold("mic", DISCORD, now - 30)                     # the squad joins a Discord call
     stubs.play(4242, DISCORD)
+    shows(w, DISCORD, now - 20)                              # its voice-connected panel was seen when joining
+    shows(w, VALORANT, now + 1)                              # (a game screen showing call controls stays gaming)
     w.step(now + 5)
     assert w.active is not None and w.active.key == "discord"
 
@@ -136,6 +138,7 @@ def test_a_full_screen_call_app_with_low_gpu_stays_a_call(store):
     w = _worker(store, stubs)
     w.foreground_fn = _front(20, ZOOM)
     w.gpu_fn = lambda pids: 2.0
+    shows(w, ZOOM, now - 30)
     w.step(now)
     assert w.active is not None and w.active.key == "zoom"
 

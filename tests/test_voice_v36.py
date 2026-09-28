@@ -449,7 +449,9 @@ def test_the_same_step_again_keeps_its_waiting_line() -> None:
     asyncio.run(main())
 
 
-def test_the_thinkers_finishing_line_is_said_once_by_code() -> None:
+def test_the_thinkers_finishing_line_goes_to_the_talker_marked_verified_never_said_by_code() -> None:
+    """v3.10 (the user's design call, 2026-09-28): only the talker speaks. The thinker's verified finish is an
+    event the talker says at once and once; nothing is said by code for it."""
     from pipecat.frames.frames import TTSSpeakFrame
 
     async def main() -> None:
@@ -467,9 +469,10 @@ def test_the_thinkers_finishing_line_is_said_once_by_code() -> None:
         await _settle()
         await asyncio.wait_for(task, 1)
         spoken = [f.text for f in params.pushed if isinstance(f, TTSSpeakFrame)]
-        assert spoken == ["Bluetooth settings are open."]
+        assert spoken == []  # never by code
         result, props = params.results[-1]
-        assert result["said"] is True and props.run_llm is False  # no mouth run: nothing to reword or repeat
+        assert result["result"] == "Bluetooth settings are open." and result["verified"] is True
+        assert "said" not in result and props.run_llm is True  # the talker's turn, started at once
 
     asyncio.run(main())
 

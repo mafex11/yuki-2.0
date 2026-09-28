@@ -62,11 +62,35 @@ def store(tmp_path):
     s.close()
 
 
+#: What a joined call's screen offers (the stub judge below reads it; the real one is a model).
+IN_CALL = ("Leave call", "Mute", "Participants")
+
+
+def stub_judge(screen):
+    from yuki.memory.callevidence import Verdict
+
+    joined = "Leave call" in screen.controls or "Disconnect" in screen.controls
+    return Verdict(in_call=joined, service=screen.key.title() if joined else "")
+
+
+def evidence():
+    from yuki.memory.callevidence import CallEvidence
+
+    return CallEvidence(judge_fn=stub_judge)
+
+
+def shows(worker: CallWorker, exe: str, at: float, controls=IN_CALL, host=None, title="") -> None:
+    """The watcher read a window of ``exe`` at ``at`` showing ``controls`` (a joined call by default)."""
+    worker.evidence.seen({"process": exe.rsplit("\\", 1)[-1].rsplit(".", 1)[0].casefold(), "exe": exe, "hwnd": 1,
+                          "at": at, "host": host, "title": title, "controls": list(controls)})
+
+
 def _worker(store, stubs: Stubs, **cfg) -> CallWorker:
     config = CallConfig(**{"hold_s": 15.0, "end_grace_s": 30.0, **cfg})
     worker = CallWorker(store, signals=stubs.signals(frozenset({PYTHON.casefold()})), config=config,
                         headphones_fn=lambda c: (False, {"form_factor": "speakers", "device": "Speakers"}),
-                        source_factory=lambda c, app: pytest.fail("the microphone must not be opened"))
+                        source_factory=lambda c, app: pytest.fail("the microphone must not be opened"),
+                        evidence=evidence())
     worker._tell_ui = lambda: None   # never wake the real UI's card watcher
     return worker
 
@@ -74,14 +98,18 @@ def _worker(store, stubs: Stubs, **cfg) -> CallWorker:
 # -- calls ---------------------------------------------------------------------------------------------------
 
 
-def test_mic_plus_sound_out_is_a_call_and_the_card_asks(store):
+def test_mic_plus_sound_out_is_only_a_hint_the_screen_makes_the_call_and_the_card_asks(store):
+    """2026-09-28: the old rule (microphone + sound out = a call) took a browser playing YouTube for one."""
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", DISCORD, now - 20)
     stubs.play(4242, DISCORD)
     w = _worker(store, stubs)
     w.step(now)
-    assert w.active is not None and w.active.key == "discord" and w.active.via == "mic"
+    assert w.active is None                                  # microphone + sound: a hint, not proof
+    shows(w, DISCORD, now + 1)                               # the voice-connected screen
+    w.step(now + 2)
+    assert w.active is not None and w.active.key == "discord" and w.active.via == "screen"
     row = store.call_record(w.active.call_id)
     assert row.status == "asking" and row.consent is None   # asks every call
     assert row.app == "Discord"                              # the app's own name (image stem when no version info)
@@ -100,36 +128,41 @@ def test_mic_alone_is_not_a_call(store):
     assert w.active is None
 
 
-def test_hold_time_is_measured_from_the_consent_store(store):
+def test_a_browser_holding_the_mic_while_a_video_plays_is_not_a_call(store):
     now = time.time()
     stubs = Stubs()
-    stubs.hold("mic", CHROME, now - 5)   # a 5-second voice search with a video playing in another tab
+    stubs.hold("mic", CHROME, now - 600)   # a tab with microphone permission, a video playing in another
     stubs.play(900, CHROME)
     w = _worker(store, stubs)
-    w.step(now)
-    assert w.active is None
-    w.step(now + 11)                      # held 16 s now
-    assert w.active is not None and w.active.app == "chrome"
+    shows(w, CHROME, now - 5, controls=("Search", "Home", "Shorts"), host="www.youtube.com")
+    for t in (0, 11, 60):
+        w.step(now + t)
+        assert w.active is None
 
 
-def test_camera_with_mic_is_a_call_without_sound(store):
+def test_camera_with_mic_is_a_hint_too_and_sound_is_never_read(store):
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", CHROME, now - 30)
     stubs.hold("camera", CHROME, now - 30)
     w = _worker(store, stubs)
     w.step(now)
+    assert w.active is None               # a camera preview (a lobby) is not a joined call
+    shows(w, CHROME, now + 1, host="meet.google.com")
+    w.step(now + 2)
     assert w.active is not None and w.active.key == "chrome"
-    assert stubs.render_reads == 0        # the camera decided: sound out was never read
+    assert stubs.render_reads == 0        # sound out is no longer read at all
 
 
 def test_packaged_app_matches_by_package_family(store):
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", "", now - 40, packaged="MSTeams")
-    stubs.play(55, r"C:\Program Files\WindowsApps\MSTeams_1.0\ms-teams.exe", "MSTeams_8wekyb3d8bbwe")
+    exe = r"C:\Program Files\WindowsApps\MSTeams_1.0\ms-teams.exe"
+    stubs.play(55, exe, "MSTeams_8wekyb3d8bbwe")
     w = _worker(store, stubs)
-    w.step(now)
+    shows(w, exe, now + 1)                 # the watcher knows it as ms-teams; the holder by its package family
+    w.step(now + 2)
     assert w.active is not None and w.active.key == "msteams"
 
 
@@ -158,12 +191,13 @@ def test_call_goes_on_through_silence_and_ends_after_the_mic_is_let_go(store):
     stubs.hold("mic", DISCORD, now - 20)
     stubs.play(4242, DISCORD)
     w = _worker(store, stubs)
+    shows(w, DISCORD, now - 1)
     w.step(now)
     call_id = w.active.call_id
     stubs.render.clear()                  # nobody talks: no output stream for a while
     w.step(now + 40)
     assert w.active is not None and w.active.call_id == call_id
-    stubs.mic.clear()                     # left the call
+    stubs.mic.clear()                     # left the call: no hold, so no evidence for it
     w.step(now + 50)
     assert w.active is not None           # within end_grace_s
     w.step(now + 81)

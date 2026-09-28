@@ -364,6 +364,18 @@ def run(args: argparse.Namespace) -> int:
         if paused:
             watcher.set_paused(True)  # before start: nothing is read, not even the first window
         log("pause_flag", paused=paused, at_start=True)
+        # What the screen shows about calls: the watcher's window reads, judged for a joined call only for apps
+        # that hold the microphone (yuki.memory.callevidence); the call worker's proof of a call.
+        call_evidence = None
+        if not args.no_calls:
+            try:
+                from yuki.memory.callevidence import CallEvidence
+
+                call_evidence = CallEvidence(log=log)
+                watcher.on_screen = call_evidence.seen
+            except Exception as exc:  # calls then need the user's own [calls] apps
+                log("error", where="call_evidence", error=f"{type(exc).__name__}: {exc}")
+                call_evidence = None
         watcher.start()
 
         # Who holds the microphone and camera, and which of them plays sound: measured, shared by the
@@ -532,7 +544,7 @@ def run(args: argparse.Namespace) -> int:
                     return tl.current_meeting() if tl is not None and tl.alive else None
 
                 calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now,
-                                   signals=av_signals)
+                                   signals=av_signals, evidence=call_evidence)
                 calls_thread = threading.Thread(
                     target=_guarded(calls.run, log, "calls"), args=(stop, pause_path),
                     name="yuki-memory-calls", daemon=True,

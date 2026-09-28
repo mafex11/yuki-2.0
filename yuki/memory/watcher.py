@@ -892,6 +892,10 @@ class Watcher:
         #: service from any thread; and the last one with when it ended.
         self._acting: Any = None
         self._acting_last: tuple[Any, float] = (None, 0.0)
+        #: ``(screen)``: called on the worker thread after each extraction of a window that passed the privacy
+        #: gates, with ``{"process", "exe", "hwnd", "at", "host", "title", "controls"}`` (the visible control
+        #: names), for call detection (:class:`yuki.memory.callevidence.CallEvidence`). Must not block.
+        self.on_screen: Callable[[dict[str, Any]], None] | None = None
         #: A retry waiting for the window to settle (hook thread):
         #: ``(hwnd, deadline, content pid when armed)``.
         self._retry: tuple[int, float, int] | None = None
@@ -1556,10 +1560,27 @@ class Watcher:
             timeout_s=self.settings.capture_budget_s,
         )
         result.read_ms = (time.perf_counter() - t0) * 1000.0
+        self._tell_screen(hwnd, facts, extraction, rules)
         acting = request.acting or self._acting
         outcome, reason = self.ingest(store, extraction, request.trigger, process=facts.process_name, result=result,
                                       acting=acting)
         return done(outcome, reason)
+
+    def _tell_screen(self, hwnd: int, facts: ProcessFacts, extraction: Extraction, rules: PrivacyRules) -> None:
+        """Hand what the window offers (its control names) to ``on_screen``; never raises, never blocks."""
+        hook = self.on_screen
+        if hook is None or extraction.profile == "error":
+            return
+        try:
+            if rules.check_url(extraction.url or "") or extraction.stats.get("password_fields"):
+                return   # a blocked site or a sign-in page: nothing of it leaves the watcher
+            from yuki.memory.store import app_key, url_host
+
+            hook({"process": app_key(facts.process_name) or "", "exe": facts.exe, "hwnd": int(hwnd),
+                  "at": time.time(), "host": url_host(extraction.url), "title": extraction.title or "",
+                  "controls": list(extraction.controls or [])})
+        except Exception as exc:  # noqa: BLE001 - call detection never breaks capture
+            self._log_error("on_screen", exc)
 
     # -- extraction -> store (worker thread; also usable offline) -----------
 

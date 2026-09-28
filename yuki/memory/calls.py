@@ -8,18 +8,20 @@ else said.
 
 One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
 
-1. **Detect** (measured, no app list: :mod:`yuki.memory.avsignals`). Every
-   ``poll_s`` it reads, content-free, which apps hold the microphone and the
-   camera (the ConsentStore, re-read only when Windows changes it; Yuki's own
-   processes left out), which of them also play sound (Core Audio render
-   sessions, read only while someone holds the microphone), and whether the
-   timeline has a meeting row in front. A call is an app that has held the
-   microphone for ``hold_s`` while it also plays sound or holds the camera,
-   an app the user listed in ``[calls] apps`` holding the microphone, or a
-   meeting row. A full-screen game in front using its own voice chat is not a
-   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`); Discord
-   or any other app holding the microphone meanwhile still is. It ends once its app has let go of the microphone (and no
-   meeting row is in front) for ``end_grace_s``.
+1. **Detect: the screen is the proof, the microphone only the hint** (2026-09-28: the Zen browser held the
+   microphone for a tab while it played YouTube and was taken for a call; a Google Meet lobby counted too).
+   Every ``poll_s`` it reads, content-free, which apps hold the microphone (the ConsentStore via
+   :mod:`yuki.memory.avsignals`, re-read only when Windows changes it; Yuki's own processes left out). A
+   holder is a call only when a screen of it captured during this hold was judged to show a joined call
+   (:class:`yuki.memory.callevidence.CallEvidence`: the watcher's window reads, their visible control names
+   judged once by a small model): ``via`` "screen" while that evidence is fresh (``evidence_fresh_s``),
+   "screen_stale" after it (probably still in the call, not certain). An app the user listed in
+   ``[calls] apps`` holding the microphone is a call too (``via`` "mic"). Sound out, the camera and the
+   timeline's meeting row are hints only. A full-screen game in front using its own voice chat is not a
+   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`). It ends once the evidence is gone (the
+   app let go of the microphone, or its screen shows no call any more) for ``end_grace_s``. A call on a site
+   inside a browser (an app the timeline saw showing ``browser_sites``+ sites) is that site's: its standing
+   answer is kept for the site's service, never for the whole browser.
 2. **Ask, every call.** A ``calls`` row with status ``asking`` and the named
    event ``Local\\YukiCallReady`` for the UI, which shows a glass card
    (:mod:`yuki.ui.calls`): Yes / No / Always for <app> / Never for <app>. The
@@ -116,6 +118,13 @@ class CallConfig:
     names: tuple[tuple[str, str], ...] = ()
     #: How long an app must have held the microphone (with sound out or the camera) to be a call.
     hold_s: float = 15.0
+    #: An in-call screen stays fresh evidence this long after it was last seen (s); then the call is "stale"
+    #: (probably still going, not certain: voice asks "was that for me?" on ambiguous words).
+    evidence_fresh_s: float = 900.0
+    #: An app seen showing at least this many different sites in the last ``sites_days`` is a browser: a call
+    #: in it is its site's (the standing answer is kept for the site's service, not the browser).
+    browser_sites: int = 2
+    sites_days: float = 30.0
     poll_s: float = 5.0
     holders_backstop_s: float = 60.0
     end_grace_s: float = 30.0
@@ -216,6 +225,9 @@ class CallConfig:
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
             hold_s=max(0.0, num("hold_s", d.hold_s)),
+            evidence_fresh_s=max(30.0, num("evidence_fresh_s", d.evidence_fresh_s)),
+            browser_sites=max(2, int(num("browser_sites", d.browser_sites))),
+            sites_days=max(1.0, num("sites_days", d.sites_days)),
             poll_s=max(1.0, num("poll_s", d.poll_s)),
             holders_backstop_s=max(5.0, num("holders_backstop_s", d.holders_backstop_s)), end_grace_s=max(0.0, num("end_grace_s", d.end_grace_s)),
             ask_timeout_s=max(10.0, num("ask_timeout_s", d.ask_timeout_s)),
@@ -1324,6 +1336,8 @@ class CallWorker:
         config: CallConfig | None = None,
         foreground_fn: Callable[[], dict | None] = foreground_fullscreen,
         gpu_fn: Callable[..., float | None] = gpu_share,
+        evidence: Any = None,
+        sites_fn: Callable[[str], int] | None = None,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
 
@@ -1338,6 +1352,13 @@ class CallWorker:
         self.foreground_fn = foreground_fn
         self.gpu_fn = gpu_fn
         self._gaming_logged: set[str] = set()
+        #: What the screen shows (:class:`yuki.memory.callevidence.CallEvidence`, fed by the watcher): a
+        #: microphone holder is a call only with an in-call screen of it. ``None``: nothing is ever proof
+        #: (only the user's own ``[calls] apps`` make a call).
+        self.evidence = evidence
+        #: ``(app key) -> int``: how many sites the timeline saw the app show (a browser shows many).
+        self.sites_fn = sites_fn
+        self._sites: dict[str, tuple[float, int]] = {}
         #: The measured facts (shared with the timeline in the service). Holders are read again only when
         #: Windows changed a ConsentStore key or every ``holders_backstop_s``; a poll between is a cached read.
         #: ``holders_fn`` (a stub of the microphone holders alone, no sound out, no camera) is the old test hook.
@@ -1387,7 +1408,41 @@ class CallWorker:
         for c in self.store.calls(statuses=CALL_OPEN_STATUSES):
             self.store.update_call(c.id, status="ended", ended_at=time.time(), stop_reason="service_restart")
             n += 1
+        try:
+            self.rekey_prefs()
+        except Exception as exc:
+            self._log("error", where="calls.rekey_prefs", error=f"{type(exc).__name__}: {exc}")
         return n
+
+    def rekey_prefs(self) -> list[tuple[str, str]]:
+        """Standing answers given on a site's call inside a browser move from the browser to that service.
+
+        Before 2026-09-28 an "Always" on a Google Meet card was kept for the process (``zen``), so every later
+        microphone use of the browser was that call. A process's pref whose every card answer was given on a
+        call with a service (and the same decision) belongs to that service; idempotent, from Yuki's own rows.
+        Returns the ``(process, service)`` pairs moved.
+        """
+        moved: list[tuple[str, str]] = []
+        calls = self.store.calls()
+        for pref in self.store.call_prefs():
+            key, decision = str(pref.get("app") or ""), pref.get("decision")
+            answered = [c for c in calls if (c.process or "") == key and c.consent_by == "card"
+                        and c.consent in ("always", "never")]
+            if not answered or any(not c.service for c in answered):
+                continue
+            services = {app_key(c.service) for c in answered if c.consent == decision}
+            if len(services) != 1 or key in services:
+                continue
+            service = next(iter(services)) or ""
+            if not service:
+                continue
+            name = next((c.service for c in answered if app_key(c.service) == service), service)
+            if self.store.call_pref(service) is None:
+                self.store.set_call_pref(service, decision, name=name)
+            self.store.set_call_pref(key, None)
+            moved.append((key, service))
+            self._log("call_pref_rekeyed", process=key, to=service)
+        return moved
 
     def run(self, stop: threading.Event | None = None, pause_path: Path | None = None) -> None:
         stop = stop or self._stop
@@ -1431,13 +1486,31 @@ class CallWorker:
     def holder_reads(self) -> int:
         return int(self.signals.counters.get("holder_reads", 0))
 
-    def _candidates(self, cfg: CallConfig, now: float | None = None) -> list[tuple[str, str, str | None, str]]:
-        """``(app key, via, meeting service, display name)`` of what makes a call now; mic holders first.
+    def _is_browser(self, cfg: CallConfig, key: str, now: float) -> bool:
+        """Whether app ``key`` shows many sites (measured from the timeline, cached 10 min): a browser."""
+        if not key:
+            return False
+        hit = self._sites.get(key)
+        if hit is None or now - hit[0] > 600.0:
+            try:
+                if self.sites_fn is not None:
+                    count = int(self.sites_fn(key) or 0)
+                else:
+                    count = int(self.store.sites_shown(key, since=now - cfg.sites_days * 86400.0) or 0)
+            except Exception:
+                count = 0
+            hit = self._sites[key] = (now, count)
+        return hit[1] >= cfg.browser_sites
 
-        Measured: an app that has held the microphone for ``hold_s`` while it plays sound (an active
-        output stream) or holds the camera; an app of the user's ``[calls] apps`` holding the
-        microphone; the timeline's meeting row in front. Also sets :attr:`_held` (every microphone
-        holder now), which keeps a call going through a quiet moment.
+    def _candidates(self, cfg: CallConfig, now: float | None = None) -> list[tuple[str, str, str | None, str]]:
+        """``(app key, via, service, display name)`` of the calls going on now, per the screen.
+
+        A microphone holder is only a hint: it is a call when the screen showed it in a joined call during this
+        hold (:class:`~yuki.memory.callevidence.CallEvidence`: ``via`` "screen" while that is fresh,
+        "screen_stale" after ``evidence_fresh_s``), or when it is one of the user's own ``[calls] apps``
+        ("mic"). Sound out, the camera and the timeline's meeting row are hints only (the meeting row may name
+        the service). ``service`` is set only for a call on a site inside a browser (its standing answer is the
+        site's). Also sets :attr:`_held` (every microphone holder now).
         """
         now = time.time() if now is None else float(now)
         meeting = None
@@ -1449,14 +1522,14 @@ class CallWorker:
         snap = self.signals.read()
         mic: tuple[Holder, ...] = snap.mic
         self._held = {h.key for h in mic if h.key}
-        cameras = {h.key for h in snap.camera if h.key}
-        held_long = [h for h in mic if h.key and now - h.since >= cfg.hold_s]
-        # sound out is read only for an app that could become a call by it: not one the camera, the user's list
-        # or a meeting already makes a call, and not the call going on (its microphone keeps it going)
-        going = self.active.key if self.active is not None else None
-        playing = {h.key for h in self.signals.playing(
-            h for h in held_long
-            if h.key not in cameras and h.key not in cfg.apps and h.key not in (meeting_key, going))}
+        evidence = self.evidence
+        if evidence is not None:
+            evidence.fresh_s = cfg.evidence_fresh_s
+        if evidence is not None and self._held:
+            try:
+                evidence.judge([h for h in mic if h.key])
+            except Exception as exc:
+                self._log("error", where="calls.evidence", error=f"{type(exc).__name__}: {exc}")
         out: list[tuple[str, str, str | None, str]] = []
         front: dict | None = None
         front_read = False
@@ -1464,8 +1537,15 @@ class CallWorker:
             key = h.key
             if not key:
                 continue
-            measured = h in held_long and (key in playing or key in cameras)
-            if measured and key != meeting_key and key != going:
+            state, service = None, ""
+            if evidence is not None:
+                try:
+                    state, service = evidence.state(h, h.since, now)
+                except Exception:
+                    state, service = None, ""
+            if key not in cfg.apps and state is None:
+                continue
+            if key not in cfg.apps:
                 if not front_read:
                     front_read = True
                     try:
@@ -1476,16 +1556,20 @@ class CallWorker:
                     gaming, facts = gaming_with_voice(h, fullscreen=True, shows_page=False, camera=snap.camera,
                                                       pids=[int(front.get("pid") or 0)], gpu_fn=self.gpu_fn)
                     if gaming:
-                        measured = False   # a full-screen game's own voice chat: gaming, not a call
                         if key not in self._gaming_logged:
                             self._gaming_logged.add(key)
                             self._log("call_skipped_gaming", app=key, **facts)
-            if key in cfg.apps or key == meeting_key or measured:
-                service = (meeting or {}).get("service") if key == meeting_key else None
-                out.append((key, "mic", service, cfg.name_of(key, service or display_name(h))))
-        if meeting and meeting_key:
-            service = meeting.get("service")
-            out.append((meeting_key, "meeting", service, service or cfg.name_of(meeting_key, meeting.get("app") or "")))
+                        continue   # a full-screen game's own voice chat: gaming, not a call
+            if state is None:
+                via = "mic"
+            else:
+                via = "screen" if state == "fresh" else "screen_stale"
+            if key == meeting_key and not service:
+                service = str((meeting or {}).get("service") or "")
+            site_service: str | None = None
+            if self._is_browser(cfg, key, now):
+                site_service = service or (evidence.host_of(h) if evidence is not None else None) or None
+            out.append((key, via, site_service, cfg.name_of(key, site_service or display_name(h))))
         return out
 
     def step(self, now: float | None = None) -> None:
@@ -1499,9 +1583,15 @@ class CallWorker:
         cands = self._candidates(cfg, now)
         act = self.active
         if act is not None:
-            # a call goes on while its app holds the microphone (a quiet moment plays no sound) or is a candidate
-            if act.key in self._held or any(k == act.key for k, *_ in cands):
+            # a call goes on while the screen evidence of it holds (fresh or stale) during its microphone hold
+            mine = next((c for c in cands if c[0] == act.key), None)
+            if mine is not None:
                 act.last_seen = now
+                if mine[1] != act.via:
+                    self._log("call_evidence", call_id=act.call_id, app=act.app, via=mine[1], was=act.via)
+                    act.via = mine[1]
+                    self.store.update_call(act.call_id, via=mine[1])
+                    self._tell_ui()
             elif now - act.last_seen >= cfg.end_grace_s:
                 self._end(act, "call_ended")
                 self.active = None
@@ -1514,7 +1604,8 @@ class CallWorker:
             self._drive(cfg, act, now)
 
     def _begin(self, cfg: CallConfig, key: str, via: str, service: str | None, name: str, now: float) -> _Active:
-        pref = self.store.call_pref(key)
+        # a site's call inside a browser has its own standing answer, never the browser's (see Store.answer_call)
+        pref = self.store.call_pref(service) if service else self.store.call_pref(key)
         ok, facts = self._headphones(cfg)
         if pref == "never":
             status, consent, by = "declined", "never", "pref"
