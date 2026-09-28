@@ -115,6 +115,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
+from yuki.memory.titles import SUMMARY_FIELD as TITLES_SUMMARY_FIELD, fact_label
 from yuki.memory.personality import ASPECT_TITLES, ASPECTS, PERSONALITY_HEADING, nature_mark
 from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema
 from yuki.memory.store import (
@@ -300,6 +301,8 @@ near-duplicate. Keep one fact per person.
 - Honest about evidence: confidence (0 to 1) is how well the evidence supports the fact - \
 a single passing mention is low, repeated or explicit evidence is high. Do not state \
 guesses as facts.
+- Labelled: every ADD and UPDATE carries a summary, the few words the user's app shows for the \
+fact (see its field): the gist in plain words, never the fact cut short.
 - Rated: importance (1-10) on every ADD and UPDATE is how much the fact matters for Yuki \
 helping the user later, on the journal's scale: 1-2 trivia, 3-4 ordinary, 5-6 a clear signal \
 about their work, interests, people or who they are, 7-8 commitments, deadlines, plans, the \
@@ -388,7 +391,7 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": [
-                        "op", "fact_id", "kind", "subject", "text", "confidence", "importance",
+                        "op", "fact_id", "kind", "subject", "text", "summary", "confidence", "importance",
                         "journal_ids", "episode_ids", "based_on_facts", "reason", "loop", "aspect",
                     ],
                     "properties": {
@@ -422,6 +425,10 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                                 "ADD and UPDATE: the complete fact, one or two sentences, third person. "
                                 "INVALIDATE and NOOP: empty."
                             ),
+                        },
+                        "summary": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "description": "ADD and UPDATE: " + TITLES_SUMMARY_FIELD + " INVALIDATE and NOOP: null.",
                         },
                         "confidence": {"type": "number", "description": "0 to 1."},
                         "importance": {
@@ -1434,6 +1441,7 @@ class PortraitWorker:
                 changes.append(FactChange(
                     "ADD", None, out.kind, out.subject, out.text, 1.0 if corrections else confidence, known, at,
                     origin, corrections, episode_ids=known_episodes, aspect=aspect, importance=importance,
+                    summary=fact_label(out.kind, item),
                 ))
                 continue
             target = current.get(fact_id) if fact_id is not None else None
@@ -1483,7 +1491,7 @@ class PortraitWorker:
                     "UPDATE", fact_id, kind, out.subject or target.subject, out.text,
                     1.0 if corrections else confidence, known, latest_evidence or now,
                     "user" if corrections else "model", corrections, episode_ids=known_episodes,
-                    aspect=new_aspect, importance=importance,
+                    aspect=new_aspect, importance=importance, summary=fact_label(kind, item),
                 ))
             else:
                 changes.append(FactChange(
@@ -2720,6 +2728,10 @@ class PortraitScheduler:
         #: this moment on that no pass row covers (a process on older code wrote them) are taken up too.
         self._corrections: Any = None
         self._started_at = self.clock()
+        #: The app's short labels (yuki.memory.titles): the batched pass for items that have none, made on first
+        #: use; earliest next pass.
+        self._titler: Any = None
+        self._titles_at = 0.0
 
     def _log(self, type: str, **fields: Any) -> None:
         if self._log_fn is not None:
@@ -2796,6 +2808,9 @@ class PortraitScheduler:
                 self._log("portrait_run", kind="correct", correction=int(cid), ok=result.ok, folded=result.folded,
                           changes=len(result.changes), candidates=result.candidates, aliases=len(result.aliases),
                           cost_usd=round(result.cost_usd, 6), error=result.error)
+        # the corrected items' labels come with their rewrites; whatever is still without one (a label the
+        # judge left out or that failed its bounds, a fact the fold rewrote without one) is labelled now
+        self._titles("after a correction", gated=False)
         if ok:
             try:
                 if self.render_path.stat().st_mtime <= started:
@@ -2856,7 +2871,42 @@ class PortraitScheduler:
             return self._run(kind, reason)
         if now >= self._loop_check_at and self.worker.loop_check_pending():
             return self._check_loops(now)
+        if now >= self._titles_at:
+            return self._titles("idle")
         return None
+
+    def _titles(self, reason: str, *, gated: bool = True) -> str | None:
+        """The batched labels pass (:class:`yuki.memory.titles.Titler`) for items without their short label.
+        ``gated``: only when the user has been idle :data:`yuki.memory.titles.IDLE_S` and at most every
+        :data:`yuki.memory.titles.EVERY_S`. Logs and never raises."""
+        from yuki.memory import titles
+
+        if not hasattr(self.worker, "_call"):
+            return None
+        now = self.clock()
+        try:
+            if gated and self.idle_fn() < titles.IDLE_S:
+                return None
+            if not any(self.store.labels_missing().values()):
+                self._titles_at = now + titles.EVERY_S
+                return None
+            if self._titler is None:
+                self._titler = titles.Titler(self.worker)
+            self._titles_at = now + titles.EVERY_S
+            result = self._titler.run(reason=reason)
+        except Exception as exc:
+            self._titles_at = now + self.retry_after_s
+            self._log("error", where="portrait_titles", error=f"{type(exc).__name__}: {exc}",
+                      traceback=traceback.format_exc())
+            return None
+        if not result.pending:
+            return None
+        if not result.ok:
+            self._titles_at = now + self.retry_after_s
+        self._log("portrait_run", kind="titles", ok=result.ok, run_id=result.run_id, reason=reason,
+                  pending=result.pending, written=result.written, calls=result.calls,
+                  cost_usd=round(result.cost_usd, 6), rejected=len(result.rejected), error=result.error)
+        return "titles"
 
     def _check_loops(self, now: float) -> str | None:
         result = self.worker.check_loops()

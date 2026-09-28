@@ -614,6 +614,8 @@ class Item:
     since: float
     #: Whose it is (migration 18): "yuki" (Yuki promised or was handed it) or "user" (the user's own to-do).
     owner: str = "user"
+    #: The app's short title (migration 21, yuki.memory.titles); None until written.
+    title: str | None = None
 
 
 #: What each source is, for the API and the UI: Yuki's commitments apart from the user's to-dos.
@@ -657,7 +659,8 @@ def todo_items(store: Store, *, include_done: bool = False, now: float | None = 
     items: list[Item] = []
     for loop in store.open_loops("open"):
         text, evidence = _split_loop(loop.text)
-        items.append(Item(f"loop:{loop.id}", text, "loop", None, False, "open", evidence, loop.opened_at))
+        items.append(Item(f"loop:{loop.id}", text, "loop", None, False, "open", evidence, loop.opened_at,
+                          title=loop.title))
     statuses = ("active", "done") if include_done else ("active",)
     for f in store.conversation_facts(("commitment",), statuses):
         if f.status == "done" and (f.valid_to or 0.0) < done_since:
@@ -673,14 +676,16 @@ def todo_items(store: Store, *, include_done: bool = False, now: float | None = 
         items.append(Item(
             f"commit:{f.id}", f.text, source, f.due_at,
             f.due_at is not None and _is_midnight(f.due_at), "open" if f.status == "active" else "done", evidence,
-            f.valid_from, owner="user" if users else "yuki",
+            f.valid_from, owner="user" if users else "yuki", title=f.title,
         ))
     for t in store.todos(("open", "done") if include_done else ("open",), done_since=done_since):
-        items.append(Item(f"todo:{t.id}", t.text, "user", t.due_at, t.due_all_day, t.status, None, t.created_at))
+        items.append(Item(f"todo:{t.id}", t.text, "user", t.due_at, t.due_all_day, t.status, None, t.created_at,
+                          title=t.title))
     if include_done:
         for loop in store.open_loops_done_since(done_since):
             text, evidence = _split_loop(loop.text)
-            items.append(Item(f"loop:{loop.id}", text, "loop", None, False, "done", evidence, loop.opened_at))
+            items.append(Item(f"loop:{loop.id}", text, "loop", None, False, "done", evidence, loop.opened_at,
+                              title=loop.title))
     open_items = sorted((i for i in items if i.status == "open"),
                         key=lambda i: (i.due_at is None, i.due_at or 0.0, i.since))
     done = sorted((i for i in items if i.status != "open"), key=lambda i: -i.since)
@@ -691,7 +696,7 @@ def item_dict(item: Item) -> dict[str, Any]:
     """The API shape of one to-do."""
     return {"id": item.ref, "text": item.text, "source": item.source, "due": _due_iso(item),
             "status": item.status, "evidence": item.evidence, "since": _iso(item.since),
-            "owner": item.owner, "label": SOURCE_LABELS.get(item.source, item.source)}
+            "owner": item.owner, "label": SOURCE_LABELS.get(item.source, item.source), "title": item.title}
 
 
 def _parse_ref(ref: str) -> tuple[str, int] | None:

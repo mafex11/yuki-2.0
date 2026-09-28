@@ -59,6 +59,7 @@ import numpy as np
 from yuki.config import MODEL_ALIASES
 from yuki.memory.journal import sanitize_untrusted
 from yuki.memory.store import CORRECTION_KIND, FactChange, ModelCall, PortraitRunStats
+from yuki.memory.titles import SUMMARY_FIELD, TITLE_FIELD, clean as clean_label
 
 #: Candidates close in meaning to the correction: this many journal facts and episodes per query vector,
 #: and this many of the small surfaces (portrait facts, conversation items, to-dos, questions, persona).
@@ -144,7 +145,8 @@ is wrong, an owner, relationship, source or status they denied, a claim they cal
 such candidate return an edit:
 - rewrite: the complete corrected text with the contradicted part changed to what the user said and \
 every other word, date, number and detail kept as it was, in the item's own style and person (third \
-person, "the user"). For P and Q also give the corrected subject; else "".
+person, "the user"). For P and Q also give the corrected subject; else "". For a P, a commitment C \
+or a T also give its label: the few words the user's app shows for the corrected item (see the field).
 - retire: only when the user's words say the item itself is wrong or to forget it, and no corrected \
 version of it would be true. Never retire an E.
 Leave every other candidate out. Being about the same person or topic does not make an item wrong. \
@@ -167,7 +169,7 @@ JUDGE_TOOL: dict[str, Any] = {
         "required": ["edits"],
         "properties": {"edits": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "required": ["id", "op", "wrong", "text", "subject", "reason"],
+            "required": ["id", "op", "wrong", "text", "subject", "label", "reason"],
             "properties": {
                 "id": {"type": "string", "description": "The candidate's id as shown (J123, P45, C7, T2, E9, Q5, Y1)."},
                 "wrong": {"type": "string", "description": "The words of the candidate the user's words contradict, "
@@ -175,6 +177,10 @@ JUDGE_TOOL: dict[str, Any] = {
                 "op": {"type": "string", "enum": ["rewrite", "retire"]},
                 "text": {"type": "string", "description": "rewrite: the complete corrected text; retire: \"\"."},
                 "subject": {"type": "string", "description": "P and Q: the corrected subject; else \"\"."},
+                "label": {"type": "string", "description": (
+                    "A rewrite of a P, a commitment C or a T: the corrected item's short label for the user's app, "
+                    "from its corrected text. P: " + SUMMARY_FIELD + " A commitment C or a T: " + TITLE_FIELD
+                    + " Else \"\".")},
                 "reason": {"type": "string", "description": "A few words: what was wrong in it."},
             }}}},
     },
@@ -421,7 +427,8 @@ class CorrectionApplier:
             else:
                 seen.add(ref)
                 out.append({"cand": c, "op": op, "text": text if op == "rewrite" else None,
-                            "subject": subject or c.subject, "reason": reason})
+                            "subject": subject or c.subject, "reason": reason,
+                            "label": " ".join(str(e.get("label") or "").split()) if op == "rewrite" else ""})
         return out, rejected
 
     def _aliases(self, raw: Any, correction: Any, cands: Sequence[Candidate]) -> list[dict[str, str]]:
@@ -488,7 +495,9 @@ class CorrectionApplier:
                     fcs.append(FactChange("INVALIDATE", f.id, f.kind, f.subject, at=now))
                 else:
                     fcs.append(FactChange("UPDATE", f.id, f.kind, e["subject"] or f.subject, e["text"], f.confidence,
-                                          list(f.source_ids), now, f.origin, [], list(f.episode_ids), f.aspect, None))
+                                          list(f.source_ids), now, f.origin, [], list(f.episode_ids), f.aspect, None,
+                                          summary=clean_label(e.get("label"),
+                                                              "title" if f.kind == "open_loop" else "summary")))
             for e, (ok, new_id) in zip(portrait, store.commit_portrait_changes(run_id, fcs)):
                 record(e, new_id, ok)
                 stats.ops_update += bool(ok) and e["op"] == "rewrite"
@@ -504,7 +513,8 @@ class CorrectionApplier:
                         f.kind, e["text"], quote=f.quote, subject=e["subject"] or f.subject, origin=f.origin,
                         source_turn_ids=f.source_turn_ids, due_at=f.due_at, at=f.valid_from,
                         vector=vec_of.get(e["cand"].ref), embed_model=model, supersedes=f.id, owner=f.owner,
-                        end_note=note)
+                        end_note=note,
+                        title=clean_label(e.get("label"), "title") if f.kind == "commitment" else None)
                     record(e, new_id)
             except Exception as exc:
                 record(e, None, False)
@@ -513,7 +523,8 @@ class CorrectionApplier:
             if e["op"] == "retire":
                 record(e, None, store.end_todo(e["cand"].item_id, "wrong", at=now))
             else:
-                new_id = store.supersede_todo(e["cand"].item_id, e["text"], at=now)
+                new_id = store.supersede_todo(e["cand"].item_id, e["text"], at=now,
+                                              title=clean_label(e.get("label"), "title"))
                 record(e, new_id, new_id is not None)
         for e in [e for e in edits if e["cand"].surface == "E"]:
             new_id = store.supersede_episode(e["cand"].item_id, e["text"], vector=vec_of.get(e["cand"].ref),

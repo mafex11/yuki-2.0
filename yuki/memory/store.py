@@ -172,6 +172,8 @@ Conversations with Yuki (yuki.memory.conversations; yuki.memory.api.MemoryClient
 The coach (yuki.memory.nudges; yuki.memory.api.MemoryClient.todos / pending_nudges / ...)::
 
     store.add_todo(text, *, due_at=None, all_day=False) -> int;  store.todos(statuses=("open",), *, done_since=None)
+    store.labels_missing(surfaces=None) -> {surface: [id]}   # items without their short label (migration 21)
+    store.set_labels(surface, {id: {"title" | "summary": text}}, *, overwrite=False) -> int   # yuki.memory.titles
     store.todo(id);  store.complete_todo(id) -> bool
     store.complete_open_loop(loop_id) -> bool      # loop row done + its portrait fact invalidated, one transaction
     store.open_loops_done_since(since) -> list[OpenLoop]
@@ -578,6 +580,10 @@ class PortraitFact:
     #: 1-10, how much it matters for helping the user (migration 17): written by the model that
     #: wrote the fact, moved by the nightly dreaming pass; ``None`` for facts written before.
     importance: int | None = None
+    #: The app's scannable line for the fact (migration 21, :mod:`yuki.memory.titles`): at most eight
+    #: words, model-written with the fact (an ``open_loop``: its three-to-six-word title); ``None`` until
+    #: written (the titles pass fills it).
+    summary: str | None = None
 
 
 @dataclass
@@ -605,6 +611,8 @@ class FactChange:
     aspect: str | None = None
     #: 1-10; ``None`` on an UPDATE keeps the old version's.
     importance: int | None = None
+    #: The new version's short line (migration 21); ``None``: the titles pass writes it later.
+    summary: str | None = None
 
 
 @dataclass
@@ -654,6 +662,10 @@ class KnowHow:
     source_request: str | None
     superseded_by: int | None = None
     score: float | None = None      # cosine similarity, set by search_knowhow
+    #: Three to six words naming what it does (migration 21, :mod:`yuki.memory.titles`); ``None`` until written.
+    title: str | None = None
+    #: The way that works, in at most eight words (migration 21); ``None`` until written.
+    summary: str | None = None
 
 
 @dataclass
@@ -666,6 +678,8 @@ class OpenLoop:
     resolved_at: float | None
     portrait_fact_id: int | None
     source_ids: list[int]
+    #: Its portrait fact's short title (migration 21: the ``open_loop`` fact's summary); ``None`` until written.
+    title: str | None = None
 
 
 @dataclass
@@ -827,6 +841,8 @@ class ConversationFact:
     #: commitment (migration 18): "yuki" (what Yuki promised or was handed to do), "user" (the user's own plan
     #: or to-do), or None on older rows until the conversation worker judges them.
     owner: str | None = None
+    #: commitment: its three-to-six-word title (migration 21, :mod:`yuki.memory.titles`); ``None`` until written.
+    title: str | None = None
 
 
 @dataclass
@@ -854,6 +870,8 @@ class ConversationChange:
     nudge_id: int | None = None
     #: commitment: "yuki" | "user" (migration 18); None keeps an UPDATE's old owner.
     owner: str | None = None
+    #: commitment: the new version's title (migration 21); None: the titles pass writes it later.
+    title: str | None = None
 
 
 @dataclass
@@ -906,6 +924,8 @@ class TodoItem:
     status: str                      # open | done
     created_at: float
     done_at: float | None
+    #: Three to six words (migration 21, :mod:`yuki.memory.titles`); ``None`` until written.
+    title: str | None = None
 
 
 #: ``nudges.kind``: praise (encouragement, an acknowledgement), nudge (a call-back,
@@ -2060,7 +2080,34 @@ MIGRATIONS: tuple[str, ...] = (
         PRIMARY KEY (tbl, item_id)
     );
     """,
+    # 21 (2026-09-28, the app's Me and Yuki pages showed first sentences cut off): model-written short labels,
+    # encrypted like the text they label (yuki.memory.titles). A portrait fact's summary (at most eight words;
+    # an open_loop's is its three-to-six-word title, which its open_loops row and to-do show), a commitment's,
+    # a user to-do's and a know-how entry's title (three to six words), and a know-how entry's summary (its way,
+    # at most eight words). Written with the item by the model
+    # call that writes it where there is one, else by the batched titles pass; NULL until then. Additive only.
+    """
+    ALTER TABLE portrait_facts ADD COLUMN summary_ciphertext TEXT;
+    ALTER TABLE conversation_facts ADD COLUMN title_ciphertext TEXT;
+    ALTER TABLE todos ADD COLUMN title_ciphertext TEXT;
+    ALTER TABLE knowhow ADD COLUMN title_ciphertext TEXT;
+    ALTER TABLE knowhow ADD COLUMN summary_ciphertext TEXT;
+    """,
 )
+
+
+#: What carries a model-written short label (migration 21, :mod:`yuki.memory.titles`): surface ->
+#: (table, {label: column}, which rows are current). An open loop's title is its portrait fact's summary.
+LABEL_SURFACES: dict[str, tuple[str, dict[str, str], str]] = {
+    "fact": ("portrait_facts", {"summary": "summary_ciphertext"}, f"valid_to IS NULL AND kind != '{CORRECTION_KIND}'"),
+    "commit": ("conversation_facts", {"title": "title_ciphertext"}, "kind = 'commitment' AND status = 'active'"),
+    "todo": ("todos", {"title": "title_ciphertext"}, "status = 'open'"),
+    "knowhow": ("knowhow", {"title": "title_ciphertext", "summary": "summary_ciphertext"}, "valid_to IS NULL"),
+}
+
+#: Open loops with their title: the summary of the ``open_loop`` portrait fact each follows (migration 21).
+_LOOPS_WITH_TITLES = ("SELECT l.*, f.summary_ciphertext AS title_ciphertext FROM open_loops l"
+                      " LEFT JOIN portrait_facts f ON f.id = l.portrait_fact_id")
 
 
 def _ts(value: TimeArg) -> float | None:
@@ -2975,6 +3022,7 @@ class Store:
             run_id=r["run_id"], episode_ids=episodes,
             aspect=(r["aspect"] if "aspect" in r.keys() and r["aspect"] in PERSONALITY_ASPECTS else None),
             importance=(int(r["importance"]) if "importance" in r.keys() and r["importance"] is not None else None),
+            summary=self._dec(r["summary_ciphertext"]) if "summary_ciphertext" in r.keys() else None,
         )
 
     def portrait_facts(
@@ -3007,17 +3055,19 @@ class Store:
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
         source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
         episode_ids: Sequence[int] = (), aspect: str | None = None, importance: int | None = None,
+        summary: str | None = None,
     ) -> int:
         cur = conn.execute(
             "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
-            " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect, importance)"
-            " VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
+            " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect, importance,"
+            " summary_ciphertext) VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)",
             (
                 kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
                 json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
                 json.dumps([int(i) for i in episode_ids]) if episode_ids else None,
                 aspect if kind == "personality" and aspect in PERSONALITY_ASPECTS else None,
                 None if importance is None else min(10, max(1, int(importance))),
+                self._enc(summary) if summary else None,
             ),
         )
         return int(cur.lastrowid)
@@ -3093,7 +3143,7 @@ class Store:
                         conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
                         source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
                         run_id=run_id, now=now, episode_ids=ch.episode_ids, aspect=ch.aspect,
-                        importance=importance,
+                        importance=importance, summary=ch.summary,
                     )
                 if old is not None:
                     self._end_fact(conn, old["id"], at, now, new_id)
@@ -3380,6 +3430,8 @@ class Store:
             id=r["id"], app=r["app"], text=self.cipher.decrypt(r["text_ciphertext"]), valid_from=r["valid_from"],
             valid_to=r["valid_to"], source_request=self._dec(r["source_request_ciphertext"]),
             superseded_by=r["superseded_by"], score=score,
+            title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
+            summary=self._dec(r["summary_ciphertext"]) if "summary_ciphertext" in r.keys() else None,
         )
 
     def add_knowhow(
@@ -3393,6 +3445,8 @@ class Store:
         supersedes: int | None = None,
         at: float | None = None,
         origin: str | None = None,
+        title: str | None = None,
+        summary: str | None = None,
     ) -> int:
         """Write a know-how entry; with ``supersedes``, end that entry (bi-temporal) in the same transaction.
 
@@ -3408,8 +3462,10 @@ class Store:
         def op(conn: sqlite3.Connection) -> int:
             cur = conn.execute(
                 "INSERT INTO knowhow(app, task_kind, text_ciphertext, valid_from, valid_to,"
-                " source_request_ciphertext, created_at, origin) VALUES (?,NULL,?,?,NULL,?,?,?)",
-                (key, self.cipher.encrypt(text), when, self._enc(source_request), now, origin),
+                " source_request_ciphertext, created_at, origin, title_ciphertext, summary_ciphertext)"
+                " VALUES (?,NULL,?,?,NULL,?,?,?,?,?)",
+                (key, self.cipher.encrypt(text), when, self._enc(source_request), now, origin,
+                 self._enc(title) if title else None, self._enc(summary) if summary else None),
             )
             new_id = int(cur.lastrowid)
             if vector is not None:
@@ -3515,16 +3571,17 @@ class Store:
             id=r["id"], person=self._dec(r["person_ciphertext"]), text=self.cipher.decrypt(r["text_ciphertext"]),
             status=r["status"], opened_at=r["opened_at"], resolved_at=r["resolved_at"],
             portrait_fact_id=r["portrait_fact_id"], source_ids=sources,
+            title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
         )
 
     def open_loops(self, status: str | None = "open") -> list[OpenLoop]:
         """Open loops with this status (``None`` = all), oldest first."""
-        sql = "SELECT * FROM open_loops"
+        sql = _LOOPS_WITH_TITLES
         params: list[Any] = []
         if status is not None:
-            sql += " WHERE status = ?"
+            sql += " WHERE l.status = ?"
             params.append(status)
-        return [self._loop(r) for r in self._query(sql + " ORDER BY opened_at, id", params)]
+        return [self._loop(r) for r in self._query(sql + " ORDER BY l.opened_at, l.id", params)]
 
     def add_open_loop(
         self, person: str | None, text: str, *, opened_at: float | None = None,
@@ -4292,6 +4349,7 @@ class Store:
             end_note=self._dec(r["end_note_ciphertext"]), score=score,
             nudge_id=r["nudge_id"] if "nudge_id" in r.keys() else None,
             owner=r["owner"] if "owner" in r.keys() else None,
+            title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
         )
 
     def conversation_facts(
@@ -4344,13 +4402,14 @@ class Store:
                       batch_id: int | None) -> int:
         cur = conn.execute(
             "INSERT INTO conversation_facts(kind, subject_ciphertext, text_ciphertext, quote_ciphertext, status,"
-            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id, owner)"
-            " VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?)",
+            " valid_from, valid_to, due_at, source_turn_ids, origin, created_at, batch_id, nudge_id, owner,"
+            " title_ciphertext) VALUES (?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?,?)",
             (
                 ch.kind, self._enc(ch.subject or ""), self.cipher.encrypt(ch.text),
                 self._enc(ch.quote) if ch.quote else None, float(ch.at if ch.at is not None else now),
                 ch.due_at, json.dumps([int(i) for i in ch.source_turn_ids]), ch.origin or "model", now, batch_id,
                 ch.nudge_id, ch.owner if ch.kind == "commitment" and ch.owner in COMMITMENT_OWNERS else None,
+                self._enc(ch.title) if ch.title else None,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -4402,7 +4461,7 @@ class Store:
         self, kind: str, text: str, *, quote: str | None = None, subject: str = "", origin: str = "user",
         source_turn_ids: Sequence[int] = (), due_at: float | None = None, at: float | None = None,
         vector: np.ndarray | None = None, embed_model: str | None = None, supersedes: int | None = None,
-        owner: str | None = None, end_note: str | None = None,
+        owner: str | None = None, end_note: str | None = None, title: str | None = None,
     ) -> int:
         """Write one active fact now; with ``supersedes``, end that fact (bi-temporal) in the same transaction.
 
@@ -4415,7 +4474,7 @@ class Store:
         ch = ConversationChange(
             "UPDATE" if supersedes is not None else "ADD", supersedes, kind, subject, text, quote, due_at,
             list(source_turn_ids), float(at) if at is not None else now, origin=origin, vector=vector,
-            embed_model=embed_model, owner=owner, end_note=end_note,
+            embed_model=embed_model, owner=owner, end_note=end_note, title=title,
         )
 
         def op(conn: sqlite3.Connection) -> int:
@@ -4647,16 +4706,19 @@ class Store:
         return TodoItem(
             id=r["id"], text=self.cipher.decrypt(r["text_ciphertext"]), due_at=r["due_at"],
             due_all_day=bool(r["due_all_day"]), status=r["status"], created_at=r["created_at"], done_at=r["done_at"],
+            title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
         )
 
     def add_todo(self, text: str, *, due_at: float | None = None, all_day: bool = False,
-                 at: float | None = None) -> int:
-        """Store a to-do the user added (encrypted); returns its id."""
+                 at: float | None = None, title: str | None = None) -> int:
+        """Store a to-do the user added (encrypted); returns its id. ``title``: its short title when a model
+        wrote one with it (else the titles pass writes it, :mod:`yuki.memory.titles`)."""
         now = float(at) if at is not None else time.time()
         return self._write(lambda conn: int(conn.execute(
-            "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at)"
-            " VALUES (?,?,?,'open',?,?)",
-            (self.cipher.encrypt(text), float(due_at) if due_at is not None else None, int(bool(all_day)), now, now),
+            "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at, title_ciphertext)"
+            " VALUES (?,?,?,'open',?,?,?)",
+            (self.cipher.encrypt(text), float(due_at) if due_at is not None else None, int(bool(all_day)), now, now,
+             self._enc(title) if title else None),
         ).lastrowid))
 
     def todos(self, statuses: Sequence[str] | None = ("open",), *, done_since: TimeArg = None) -> list[TodoItem]:
@@ -4693,9 +4755,11 @@ class Store:
             (status, now, now, int(todo_id)),
         ).rowcount == 1)
 
-    def supersede_todo(self, todo_id: int, text: str, *, at: float | None = None) -> int | None:
+    def supersede_todo(self, todo_id: int, text: str, *, at: float | None = None,
+                       title: str | None = None) -> int | None:
         """Replace an open user to-do's wording (a correction): the old row ends as ``superseded``, a new open row
-        with the same due takes its place, in one transaction. Returns the new id, or None if it was not open."""
+        with the same due (and ``title``, the new wording's, when given) takes its place, in one transaction.
+        Returns the new id, or None if it was not open."""
         now = float(at) if at is not None else time.time()
 
         def op(conn: sqlite3.Connection) -> int | None:
@@ -4703,15 +4767,51 @@ class Store:
             if row is None:
                 return None
             new_id = int(conn.execute(
-                "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at)"
-                " VALUES (?,?,?,'open',?,?)",
-                (self.cipher.encrypt(text), row["due_at"], row["due_all_day"], row["created_at"], now),
+                "INSERT INTO todos(text_ciphertext, due_at, due_all_day, status, created_at, updated_at,"
+                " title_ciphertext) VALUES (?,?,?,'open',?,?,?)",
+                (self.cipher.encrypt(text), row["due_at"], row["due_all_day"], row["created_at"], now,
+                 self._enc(title) if title else None),
             ).lastrowid)
             conn.execute("UPDATE todos SET status='superseded', done_at=?, updated_at=? WHERE id=?",
                          (now, now, int(todo_id)))
             return new_id
 
         return self._write(op)
+
+    # -- short labels for the app (migration 21, yuki.memory.titles) ---------------------------------------
+
+    def labels_missing(self, surfaces: Sequence[str] | None = None) -> dict[str, list[int]]:
+        """``{surface: ids}`` of current items still without their short label(s) (:data:`LABEL_SURFACES`),
+        oldest first. Plumbing on NULL columns: nothing is decrypted."""
+        out: dict[str, list[int]] = {}
+        for surface, (table, cols, where) in LABEL_SURFACES.items():
+            if surfaces is not None and surface not in surfaces:
+                continue
+            empty = " OR ".join(f"{c} IS NULL" for c in cols.values())
+            out[surface] = [int(r[0]) for r in self._query(
+                f"SELECT id FROM {table} WHERE {where} AND ({empty}) ORDER BY id")]
+        return out
+
+    def set_labels(self, surface: str, labels: dict[int, dict[str, str]], *, overwrite: bool = False) -> int:
+        """Write short labels (encrypted): ``labels`` is ``{item id: {"title" | "summary": text}}`` for one
+        surface of :data:`LABEL_SURFACES`. Without ``overwrite`` a label another writer stored meanwhile is kept.
+        Returns how many labels were written."""
+        table, cols, _where = LABEL_SURFACES[surface]
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for item_id, fields in labels.items():
+                for name, text in fields.items():
+                    col = cols.get(name)
+                    text = " ".join(str(text or "").split())
+                    if col is None or not text:
+                        continue
+                    guard = "" if overwrite else f" AND {col} IS NULL"
+                    n += conn.execute(f"UPDATE {table} SET {col}=? WHERE id=?{guard}",
+                                      (self.cipher.encrypt(text), int(item_id))).rowcount
+            return n
+
+        return int(self._write(op))
 
     def complete_open_loop(self, loop_id: int, *, at: float | None = None) -> bool:
         """The user says an open loop is done: in one transaction the loop row becomes ``done``
@@ -4735,8 +4835,8 @@ class Store:
     def open_loops_done_since(self, since: TimeArg) -> list[OpenLoop]:
         """Loops closed as done or resolved at or after ``since``, oldest first."""
         return [self._loop(r) for r in self._query(
-            "SELECT * FROM open_loops WHERE status IN ('done','resolved') AND resolved_at >= ?"
-            " ORDER BY resolved_at, id", (_ts(since) or 0.0,),
+            _LOOPS_WITH_TITLES + " WHERE l.status IN ('done','resolved') AND l.resolved_at >= ?"
+            " ORDER BY l.resolved_at, l.id", (_ts(since) or 0.0,),
         )]
 
     def _nudge(self, r: sqlite3.Row) -> NudgeRecord:

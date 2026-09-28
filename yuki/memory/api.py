@@ -1227,6 +1227,8 @@ class MemoryClient:
         Each item::
 
             {"id": "loop:12" | "commit:5" | "todo:3", "text": str,
+             "title": str | None,        # the app's three-to-six-word title (migration 21, model-written;
+                                         # None until written)
              "source": "loop" | "commitment" | "user",
              "due": ISO local time with offset ("2026-09-25T15:00:00+05:30"), or a
                     date "2026-09-25" when no time was given, or None,
@@ -2001,8 +2003,10 @@ class MemoryClient:
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
         """The current portrait facts, each with the journal entries it rests on (newest first).
 
-        Each: ``{"id", "ref": "fact:N", "kind", "subject", "text", "aspect", "origin", "confidence",
-        "since", "evidence": [journal dict, ...]}``. Corrections waiting to be folded in are left out.
+        Each: ``{"id", "ref": "fact:N", "kind", "subject", "text", "summary", "aspect", "origin", "confidence",
+        "since", "evidence": [journal dict, ...]}``. ``summary`` is the app's short line for the fact (at most
+        eight words; an open loop's is its title), model-written (migration 21, yuki.memory.titles), ``None``
+        until written. Corrections waiting to be folded in are left out.
         """
         facts = self.store.portrait_facts(include_corrections=False)
         ids = sorted({i for f in facts for i in f.source_ids})
@@ -2011,7 +2015,7 @@ class MemoryClient:
         for f in facts:
             ev = sorted((entries[i] for i in f.source_ids if i in entries), key=lambda j: -j.at)
             out.append({"id": f.id, "ref": f"fact:{f.id}", "kind": f.kind, "subject": f.subject, "text": f.text,
-                        "aspect": f.aspect, "origin": f.origin, "confidence": f.confidence, "since": f.valid_from,
+                        "summary": f.summary, "aspect": f.aspect, "origin": f.origin, "confidence": f.confidence, "since": f.valid_from,
                         "evidence": [self._journal_dict(j) for j in ev[:evidence_per_fact]]})
         return out
 

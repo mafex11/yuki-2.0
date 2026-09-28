@@ -73,6 +73,7 @@ from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, _calendar, sanitize_untrusted, user_identity
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
 from yuki.memory.provenance import chat_source
+from yuki.memory.titles import KNOWHOW_SUMMARY_FIELD, KNOWHOW_TITLE_FIELD, TITLE_FIELD, clean as clean_label
 from yuki.memory.questions import (
     QUESTION_GUIDANCE,
     embed_questions,
@@ -212,7 +213,9 @@ For every operation give all fields; use 0 for item on an ADD and for card unles
 feedback on a card, "" for fields that do not apply. owner: for a commitment (ADD, UPDATE) "yuki" or \
 "user" as above; "" for every other kind. text is one self-contained sentence: for a rule or preference what Yuki should do or \
 avoid ("Call the user \\"babe\\"."), for a commitment what Yuki is to do and when, with an \
-absolute date ("Remind the user about the PR review on Friday 2026-09-25."). due is when a \
+absolute date ("Remind the user about the PR review on Friday 2026-09-25."); a commitment's \
+title is the few words the user's app shows for it ("Remind you about the PR review"), "" for every \
+other kind. due is when a \
 commitment is due, "YYYY-MM-DD HH:MM" or "YYYY-MM-DD" when no time was given, "" when no \
 date. Turn relative dates ("tomorrow", "on Friday", "tonight") into absolute ones counting \
 from the date of the exchange that says them and reading the weekday and date off the \
@@ -301,7 +304,7 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["op", "item", "kind", "subject", "text", "quote", "due", "end_as",
+                    "required": ["op", "item", "kind", "subject", "text", "title", "quote", "due", "end_as",
                                  "card", "owner", "exchanges", "reason"],
                     "properties": {
                         "op": {"type": "string", "enum": ["ADD", "UPDATE", "INVALIDATE", "NOOP"]},
@@ -321,6 +324,10 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                         "text": {
                             "type": "string",
                             "description": "ADD and UPDATE: the complete item, one sentence. INVALIDATE and NOOP: \"\".",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "A commitment (ADD, UPDATE): " + TITLE_FIELD + " Else \"\".",
                         },
                         "quote": {
                             "type": "string",
@@ -386,10 +393,12 @@ RECORD_CONVERSATION_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["app", "text", "avoid", "quote", "exchanges"],
+                    "required": ["app", "text", "title", "summary", "avoid", "quote", "exchanges"],
                     "properties": {
                         "app": {"type": "string", "description": "Process name (chrome.exe), or \"\"."},
                         "text": {"type": "string", "description": "What to do next time: the way that worked."},
+                        "title": {"type": "string", "description": KNOWHOW_TITLE_FIELD},
+                        "summary": {"type": "string", "description": KNOWHOW_SUMMARY_FIELD},
                         "avoid": {"type": "string",
                                   "description": "What Yuki's own earlier steps did instead that did not work, and what "
                                                  "each of those steps actually did as its result shows (the control it "
@@ -1115,6 +1124,7 @@ class ConversationWorker:
                     parse_due(rec.due) if kind == "commitment" else None, [t.id for t in cited], at,
                     end_note=rec.reason or None, nudge_id=nudge_id,
                     owner=rec.owner if kind == "commitment" and rec.owner in ("yuki", "user") else None,
+                    title=clean_label(item.get("title"), "title") if kind == "commitment" else None,
                 ))
                 touched.add(target_id)
                 continue
@@ -1221,7 +1231,9 @@ class ConversationWorker:
             else:
                 app = str(item.get("app") or "").strip() or None
                 out.append({"app": app, "text": text, "quote": quote, "turns": [t.id for t in cited],
-                            "at": max(t.at for t in cited), "request": own_words(cited[0].user_text)})
+                            "at": max(t.at for t in cited), "request": own_words(cited[0].user_text),
+                            "title": clean_label(item.get("title"), "title"),
+                            "summary": clean_label(item.get("summary"), "summary")})
         return out, rejected
 
     @staticmethod
@@ -1500,7 +1512,8 @@ class ConversationWorker:
                 ids.append(self.store.add_knowhow(
                     item["app"], text, source_request=secret_filter.redact_text(item.get("request") or "") or None,
                     vector=vec, embed_model=getattr(self._embedder, "model_name", None) if vec is not None else None,
-                    supersedes=supersedes, at=item.get("at"), origin="conversation"))
+                    supersedes=supersedes, at=item.get("at"), origin="conversation",
+                    title=item.get("title"), summary=item.get("summary")))
             except Exception:
                 continue
         return ids

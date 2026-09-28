@@ -69,6 +69,7 @@ from collections.abc import Sequence
 from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
+from yuki.memory.titles import TITLE_FIELD as _TITLE_FIELD, clean as _clean_label
 from yuki.memory.embed import Embedder, get_embedder
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
 from yuki.memory.provenance import source_of
@@ -551,7 +552,7 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "quote", "due", "source", "subject"],
+                    "required": ["text", "title", "quote", "due", "source", "subject"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -570,6 +571,7 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                         },
                         "source": {"type": "integer", "description": "Number of the utterance the quote is from."},
                         "subject": {"type": "string", "description": "Short label (\"deck for Varun\")."},
+                        "title": {"type": "string", "description": _TITLE_FIELD},
                     },
                 },
             },
@@ -1423,6 +1425,7 @@ class JournalWorker:
                 "ADD", None, "commitment", f"call ({app}): {subject}" if subject else f"call ({app})", text, quote,
                 parse_due(str(item.get("due") or "")), [], sources[index].at, origin="call",
                 owner="user",   # the user's own plan, said on a call: a to-do of theirs, never Yuki's promise
+                title=_clean_label(item.get("title"), "title"),
             ))
         return out, rejected
 
