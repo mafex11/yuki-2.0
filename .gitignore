@@ -17,3 +17,6 @@ packaging/Output/
 # UI drafts hold real personal data from the memory DB
 docs/ui-mockups/drafts/
 docs/ui-mockups/horizon-field/fonts/
+
+# Mobbin reference boards: third-party screenshots, keep local
+docs/ui-mockups/mobbin/
