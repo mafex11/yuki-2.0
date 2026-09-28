@@ -496,8 +496,13 @@ class WakeListener:
                 end = getattr(spotter, "name_end", None) if timed else None
                 self.name_end = float(end) if end is not None else None
                 if self._log is not None:
+                    now = time.monotonic()
                     self._log.event("wake", state="heard", keyword=heard, model=spotter.model, rescued=self.rescued,
-                                    name_end_before_hit_ms=(round((time.monotonic() - self.name_end) * 1000)
-                                                            if self.name_end is not None else None))
+                                    name_end_before_hit_ms=(round((now - self.name_end) * 1000)
+                                                            if self.name_end is not None else None),
+                                    # how far decoding ran behind the microphone (the batch's end to now), and the
+                                    # batches still waiting: a spotter starved of CPU shows here (v3.12)
+                                    behind_ms=round((now - at - samples.size / RATE) * 1000),
+                                    queued=self._q.qsize())
                 spotter.reset()
                 self._on_wake(at, heard)

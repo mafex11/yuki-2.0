@@ -140,7 +140,7 @@ class TimedBrain(QObject):
         self._timer.start(50)
         self._live: list[dict[str, Any]] = []
 
-    def submit(self, text: str, *, origin_hwnd: Any = None, source: str = "text") -> tuple[str, int]:
+    def submit(self, text: str, *, origin_hwnd: Any = None, source: str = "text", **_: Any) -> tuple[str, int]:
         self._id += 1
         job = self._id
         self.requests.append(text)
@@ -928,6 +928,21 @@ def _since_result_spoken(timeline: Timeline, after: str) -> Any:
     return check
 
 
+def _since_result_started(timeline: Timeline, box: dict[str, Any], secs: float) -> Any:
+    """A condition: Yuki has been speaking a result turn for ``secs`` (the moment to speak over her)."""
+    state = {"since": None}
+
+    def check() -> bool:
+        finals = [e for e in timeline.events if e["kind"] == "to_mouth" and e.get("final") and e["name"] == "tell_yuki"]
+        conv = box.get("conv")
+        if not finals or conv is None or not conv.observer.bot_speaking:
+            state["since"] = None
+            return False
+        state["since"] = state["since"] or time.monotonic()
+        return time.monotonic() - state["since"] >= secs
+    return check
+
+
 def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     from voice_offline import Sampler, _reply_done  # noqa: F401 - the shared harness
 
@@ -1162,6 +1177,52 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         names = ["z_chrome", "z_whatsapp", "z_bro", "z_scrollup", "s_ambig", "q_quiet"]
         lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
+    elif scenario == "live1326":
+        # v3.12, the user's session of 2026-09-28 13:26-13:32 on the YouTube stub: open YouTube, scroll three times
+        # ("on every scroll it says done"), two requests said back to back (the first one's outcome must not answer the
+        # second), and "Ok, stop listening." (the conversation ends).
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_youtube_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=1.5)  # noqa: E731
+        lines = [
+            ScriptLine(clip("m_youtube"), "m_youtube", after_s=1.0),
+            ScriptLine(clip("m_scroll"), "m_scroll", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("m_again"), "m_again1", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("m_again"), "m_again2", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("m_lofi"), "m_lofi", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("m_joji"), "m_joji", after_s=0.3, wait_for=reply_done()),
+            ScriptLine(clip("m_stop"), "m_stop", after_s=1.0, wait_for=settled()),
+        ]
+    elif scenario in ("cut_side", "cut_instead", "cut_stop"):
+        # v3.12: an explanation cut by a side comment (a brief reaction, then the rest from where it was cut, not
+        # repeated), by a correction (the rest dropped, the new thing done) and by "stop" (silence).
+        explanation = ("Prompt caching keeps the long fixed part of a request, the instructions and the tools, on the "
+                       "server after the first call. The first call writes that part once and pays a little extra "
+                       "for it. Every call after that within the cache's lifetime reads it instead of sending it "
+                       "again, which makes it about ten times cheaper and noticeably faster to the first word. "
+                       "That is why a warm conversation answers quicker than the first one of the day.")
+        runtime = TimedBrain([[(1.5, "done", "YouTube's open.")]] if scenario == "cut_instead"
+                             else [[(1.0, "done", explanation)]], timeline)
+        box["cut_desk"] = True
+
+        def speaking_for(secs: float) -> Any:
+            state = {"since": None}
+
+            def check() -> bool:
+                conv = box.get("conv")
+                if conv is None or not conv.observer.bot_speaking:
+                    state["since"] = None
+                    return False
+                state["since"] = state["since"] or time.monotonic()
+                return time.monotonic() - state["since"] >= secs
+            return check
+
+        second = {"cut_side": "m_side", "cut_instead": "m_instead", "cut_stop": "m_enough"}[scenario]
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        lines = [
+            ScriptLine(clip("m_explain"), "m_explain", after_s=1.0),
+            ScriptLine(clip(second), second, after_s=0.0, wait_for=speaking_for(4.0)),
+            ScriptLine(clip("m_yeah"), "end_pad", after_s=12.0, wait_for=settled()),
+        ][:2] + ([] if scenario == "cut_stop" else [])
     elif scenario == "talk":
         runtime, desk = _real_brain(settings, memory, timeline)
         lines = [
@@ -1230,7 +1291,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
-    z928 = scenario in ("zen928", "call928", "stale928")
+    z928 = scenario in ("zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead", "cut_stop")
     front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") or z928
              else (lambda: None))
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
@@ -1242,11 +1303,14 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         if args.call:
             call_app, call_evidence = (None, None) if args.call == "none" else (args.call, args.evidence or "fresh")
             box["call_detector"] = {"forced": args.call}
+        elif scenario not in ("zen928", "call928", "stale928"):
+            box["call_detector"] = {"none": True}
         else:
             kind = {"zen928": "zen", "call928": "discord", "stale928": "stale"}[scenario]
             call_app, call_evidence, box["call_detector"] = _call_now(kind)
         timeline.add("call_mode", app=call_app, evidence=call_evidence)
-        box["desk"] = desk
+        if desk is not None:
+            box["desk"] = desk
     quiet_asked: list[float] = []
     box["bridge"] = bridge
     if args.dump_mouth:
@@ -1491,7 +1555,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
                                          "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927",
-                                         "zen928", "call928", "stale928", "all"))
+                                         "zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead",
+                                         "cut_stop", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

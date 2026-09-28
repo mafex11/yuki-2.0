@@ -101,6 +101,8 @@ _WINDOW = {
     "description": "The window's hwnd, the [number] on its line in the desktop block of the latest user message.",
 }
 _SAID_NOTE = "It worked, verified, and your done line was said. Do not say it again."
+#: A verified hand whose done line was left empty (v3.12: "on every scroll it says done, it's very repetitive").
+_SILENT_NOTE = "It worked, verified, and, as you chose, nothing was said: they can see it. Say nothing now."
 _UNCONFIRMED_NOTE = (
     "The report does not show that it took effect. Say so honestly in a few words from the report, never "
     "that it is done. If the report says why nothing more can happen (already at the end, already showing), "
@@ -136,8 +138,11 @@ _KEYS_NOTE = (
 _DONE_LINE = {
     "type": "string",
     "description": (
-        "The few words to say the moment the report verifies it worked, e.g. \"Done, it's minimized.\". "
-        "Said only then, by the hand; if it did not work you get the report instead."
+        "The few words to say the moment the report verifies it worked, e.g. \"Done, it's minimized.\"; said only "
+        "then, by the hand (if it did not work you get the report instead). Or \"\" to say nothing when it worked: "
+        "when they can see the effect happen and there is nothing to add, above all a simple step again (\"scroll "
+        "down\", \"again\", the next tab): a person helping would just do it. It is never silent when it did not "
+        "work or reached the end: then you get the report and say so."
     ),
 }
 _NOW = (" Instant: call it with no words before it, the call alone; its done line is what the user hears, "
@@ -682,6 +687,12 @@ class Hands:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            done_line=speak, **{k: v for k, v in facts.items()
                                                if isinstance(v, (int, float, bool)) or v is None})
+        if confirmed and not line:
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            await params.result_callback({"done": report[:700], "said": "", "how_to_handle_it": _SILENT_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         if speak:
             from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 

@@ -805,6 +805,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             from pipecat.frames.frames import TTSSpeakFrame
 
             self._yuki_early.add(tool_id)
+            if hook("may_ack", default=True) is False:
+                return   # an acknowledgement was said for these words already (v3.12): this one stays unsaid
+            hook("acked")
             self._yuki_spoke.add(tool_id)  # its words go before the call in the context (chronological)
             call.early_say = time.monotonic()
             await self.push_frame(TTSSpeakFrame(text=words))
@@ -842,7 +845,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                                                    call_evidence=hook("call_evidence", default=None))
             params["messages"] = with_volatile(params.get("messages"), volatile_block(
                 lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
-                named=bool(hook("named", default=False)), work=hook("work", default=None)))
+                named=bool(hook("named", default=False)), work=hook("work", default=None),
+                cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False))))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -952,6 +956,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         call.first_content = now
                     if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
                         call.first_text = now
+                        if call.user_turn:
+                            hook("acked")   # the reply's own words answer them: no second acknowledgement
                     if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
                         tool_id, args = str(event.content_block.id), ""
                         name = getattr(event.content_block, "name", "")
@@ -1055,6 +1061,17 @@ def clause_aggregator(base: type) -> type:
     return ClauseAggregator
 
 
+def drop_unfinished_marks(text: str) -> str:
+    """``text`` without a sound or style mark left open at its end (``"Sure [lau"``, a lone ``"["``): a reply cut at a
+    stream boundary or a tool call never sends half a mark to the voice (v3.12). Plumbing on the marks' own syntax."""
+    out = text or ""
+    for left, right in (("[", "]"), ("<", ">")):
+        at = out.rfind(left)
+        if at >= 0 and out.find(right, at) < 0:
+            out = out[:at]
+    return out
+
+
 def _words_done_frame() -> Any:
     """A frame the mouth pushes after a reply's words when the reply goes on to a tool call (v3.7)."""
     from pipecat.frames.frames import DataFrame
@@ -1098,6 +1115,9 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
             self._yuki_guard = guard
 
         async def _push_tts_frames(self, src_frame: Any, *args: Any, **kwargs: Any) -> None:
+            text = str(getattr(src_frame, "text", "") or "")
+            if text.strip() and not drop_unfinished_marks(text).strip(" .,;:!?-"):
+                return   # a lone "[" or a mark cut off at a stream boundary: never a sound (live 13:32:34 "[")
             guard = getattr(self, "_yuki_guard", None)
             if guard is not None and not getattr(self, "_yuki_audio_gate", False):
                 # A voice without an audio gate (Aura, ElevenLabs): the line is checked before it is sent.
@@ -1120,6 +1140,7 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
             await super().process_frame(frame, direction)
 
         def _prepare_text_for_tts(self, text: str) -> str:
+            text = drop_unfinished_marks(text) or " "
             if strip_marks:
                 text = strip_tags(text) or " "
             return super()._prepare_text_for_tts(text)
@@ -1194,6 +1215,8 @@ class _Turn:
     heard_low: int = 0                   # words recognition was unsure of (below LOW_WORD_CONFIDENCE)
     heard_near: int = 0                  # heard words that sound close to a keyterm without being it
     guarded: int = 0                     # lines the spoken-line check kept from being said (v3.10)
+    audible: list[str] = field(default_factory=list)   # words as they left the output: really heard (v3.12)
+    audible_at: float | None = None      # when the last of them left it
 
 
 class TurnObserver:
@@ -1279,6 +1302,40 @@ class TurnObserver:
         self.guard: Any = None
         #: Names on the screen in front (yuki.voice.screennames, v3.10): a heard word close to one is named too.
         self.screen_terms: list[str] = []
+        #: The last reply the user spoke over: what they heard and what was not said (v3.12), for the talker.
+        self.last_cut: dict[str, Any] | None = None
+
+    def cut_for_now(self) -> dict[str, str] | None:
+        """The last reply they spoke over, as they heard it (v3.12), for the first user turn after it; else ``None``."""
+        cut = self.last_cut
+        if cut is None or self.user_turns > int(cut.get("turn", 0)) + 1:
+            return None
+        return {"heard": cut["heard"], "unsaid": cut["unsaid"]}
+
+    #: Words a second of Yuki's voice carries (measured on Gemini Leda replies, 2026-09-28: 2.4-2.9): how much of the
+    #: sentence being played when they spoke they heard (a sentence's words leave the output only after all of it).
+    WORDS_PER_S = 2.6
+
+    def _note_cut(self, turn: "_Turn", now: float) -> None:
+        """A reply was spoken over: keep what was heard and what was not said (v3.12).
+
+        Heard: the sentences whose audio played to the end (their words left the output), plus the part of the one
+        playing when they spoke, estimated from how long it had played. Not said: the rest of what was written.
+        """
+        done = strip_tags("".join(turn.audible)).split()
+        written = strip_tags("".join(turn.reply)).split()
+        if written[:len(done)] != done:
+            written = done + [w for w in written if w not in done]
+        since = turn.audible_at or turn.first_audio or now
+        partial = max(0, int((now - since) * self.WORDS_PER_S))
+        heard = written[:len(done) + partial]
+        unsaid = written[len(heard):]
+        if not unsaid:
+            return
+        self.last_cut = {"heard": " ".join(heard), "unsaid": " ".join(unsaid), "turn": self.user_turns}
+        if self.log is not None:
+            self.log.event("interrupted", heard_words=len(heard), unsaid_words=len(unsaid), whole_words=len(done),
+                           estimated_words=min(partial, len(heard) - len(done)))
 
     def guarded(self) -> None:
         """The spoken-line check kept a line of this turn from being said (the turn log keeps what was heard).
@@ -1315,11 +1372,15 @@ class TurnObserver:
 
     def on_played(self, data: Any) -> None:
         """Yuki's words as they leave the output (audible), and where speech ended or was cut."""
-        if self.on_chat is None:
-            return
         from pipecat.frames.frames import BotStoppedSpeakingFrame, InterruptionFrame, TTSTextFrame
 
         frame = data.frame
+        if (isinstance(frame, TTSTextFrame) and self.turn is not None and self.output_processor is not None
+                and getattr(data, "source", None) is self.output_processor):
+            self.turn.audible.append(strip_tags(frame.text or "") + " ")
+            self.turn.audible_at = time.monotonic()
+        if self.on_chat is None:
+            return
         if isinstance(frame, TTSTextFrame) and self.output_processor is not None \
                 and getattr(data, "source", None) is self.output_processor:
             turn = self.turn_id()
@@ -1675,6 +1736,8 @@ class TurnObserver:
             self.set_state("speaking")
             self._activity()
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            if self.turn is not None and self.turn.interrupted:
+                self._note_cut(self.turn, now)
             self.bot_speaking = False
             self.speech_pending_since = None
             self.last_bot_stop = now
@@ -1838,6 +1901,27 @@ class _Hooks:
         """The app of the voice call the user is in (call mode), else ``None``."""
         return self.c.call_app
 
+    def after_goodbye(self) -> bool:
+        c = self.c
+        call = getattr(getattr(c, "_llm", None), "_yuki_call", None)
+        return bool(getattr(c, "after_goodbye", False) and (call is None or call.user_turn) and c.observer.user_turns <= 1)
+
+    def may_ack(self) -> bool:
+        fn = getattr(self.c.bridge, "may_ack", None)
+        return bool(fn()) if callable(fn) else True
+
+    def acked(self) -> None:
+        fn = getattr(self.c.bridge, "acked", None)
+        if callable(fn):
+            fn()
+
+    def cut(self) -> dict[str, str] | None:
+        """What they heard of the reply they spoke over, and what was not said yet (the first user turn after it)."""
+        call = getattr(getattr(self.c, "_llm", None), "_yuki_call", None)
+        if call is not None and not call.user_turn:
+            return None
+        return self.c.observer.cut_for_now()
+
     def call_evidence(self) -> str | None:
         """How sure memory is of that call: ``"fresh"`` or ``"stale"`` (v3.10), ``None`` without a call."""
         return self.c.call_evidence if self.c.call_app else None
@@ -1923,6 +2007,9 @@ class Conversation:
         self.woken_at: float | None = None
         #: Whether the shared bridge is wired to this conversation (only once it is live).
         self._bound = False
+        #: Woken by the name moments after the user ended the last conversation (v3.12): the talker judges whether
+        #: it was for her (their talk may just mention her), and stays quiet unless it plainly was.
+        self.after_goodbye = False
         #: Names and terms from memory that speech recognition is told to expect (v3.5, docs/VOICE.md §9).
         self.keyterms = list(keyterms or [])
         self.call_app = call_app

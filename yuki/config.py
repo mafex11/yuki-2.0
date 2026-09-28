@@ -316,6 +316,8 @@ class Settings:
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
         voice_keyterms_max: At most this many names and terms from memory are given to speech
             recognition as keyterms per conversation (docs/VOICE.md §9, v3.5).
+        voice_wake_process: Run the wake-word listener in its own process (v3.12), so the app's other
+            threads never hold it back; in-process when that cannot start.
         voice_standby: Keep the next conversation built and connected, dormant, while listening for the name
             (v3.11): speech recognition's socket open with no audio sent, the caches warm; the name wakes it at once.
         voice_cache_refresh_s: While dormant (and the user is at the PC), the talker's and thinker's prompt caches
@@ -417,6 +419,7 @@ class Settings:
     voice_keyterms_max: int = 50
     voice_screen_terms: int = 30
     voice_standby: bool = True
+    voice_wake_process: bool = True
     voice_cache_refresh_s: float = 3000.0
     voice_speech_guard: bool = True
     voice_speech_guard_timeout_s: float = 2.5

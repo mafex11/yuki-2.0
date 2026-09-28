@@ -302,6 +302,8 @@ class VoiceBridge(QObject):
         #: the conversation; a stay_quiet on the user's words then is refused once (v3.9, never silent).
         self.in_exchange: Callable[[], bool] | None = None
         self._quiet_refused_turn = -1
+        #: The user turn an acknowledgement was last said for (v3.12: one per request).
+        self._acked_turn = -1
         #: The mouth's own one-step hands (docs/VOICE.md §5.6), over the brain's backend, and what
         #: they and the thinker did on the desktop (shared with the mouth and every hand-off).
         from yuki.voice.hands import ActionLog, Hands, hands_backend as _brain_backend
@@ -646,8 +648,12 @@ class VoiceBridge(QObject):
         spoke = self.spoke_in_reply() if self.spoke_in_reply is not None else True
         if spoke or not words:
             return
+        if not self.may_ack():
+            self._log("bridge", op="ack_skipped", call=params.tool_call_id, why="already_acknowledged")
+            return
         from pipecat.frames.frames import TTSSpeakFrame
 
+        self.acked()
         await params.llm.push_frame(TTSSpeakFrame(text=words))
         if self.mark_spoken is not None:
             self.mark_spoken(params.tool_call_id)
@@ -703,6 +709,12 @@ class VoiceBridge(QObject):
 
                 async def final(run_llm: bool, stale: bool, kind=kind, head=head, rest=rest,
                                 delivered=delivered, late=late, verified=verified) -> None:
+                    if not stale and kind == "done" and self._newer_request(job):
+                        # A newer request of theirs is open or done: this outcome is not what they wait for now
+                        # (live 13:30:37 "Add another account." was answered with "Accounts list is expanded."). It
+                        # goes into the conversation unsaid; the screen shows it anyway (v3.12).
+                        stale, run_llm = True, False
+                        self._log("bridge", op="outcome_folded", job_id=job.job_id, why="newer_request")
                     if run_llm and not stale and not late:
                         # An owed result is always said; a late one (they said more since) may be let go.
                         self.said_owed_at = time.monotonic()
@@ -968,10 +980,11 @@ class VoiceBridge(QObject):
             # of the transcript): the words were for Yuki. Measured offline 2026-09-27, "Pause the music." cut
             # after the name got stay_quiet 3 of 12 times. A fact about the conversation, not about the words.
             self._log("bridge", op="quiet", refused="named")
-            await params.result_callback({"not_quiet": "They said your name right before these words: they were "
+            await params.result_callback({"not_quiet": "They said your name right before these words: most likely "
                                           "said to you. Reply now in a few words: do what they asked, or say "
                                           "plainly why there is nothing to do. Never say it is done when "
-                                          "nothing was done."})
+                                          "nothing was done. Only if the words plainly talk about you to someone "
+                                          "else (\"I had a long talk with Yuki\"), call stay_quiet again."})
             return
         spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         held = self.held_at
@@ -1321,6 +1334,34 @@ class VoiceBridge(QObject):
 
     # -- v3.9: binding, waiting lines, escalation, replacement ---------------------------------------------
 
+    def _newer_request(self, job: Job) -> bool:
+        """Whether the user asked for something newer (a voice job handed over after this one's words) that is open or
+        just finished: this one's outcome is then not what they are waiting for."""
+        now = time.monotonic()
+        with self._lock:
+            others = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
+        return any(o is not job and o.source == "voice" and not o.remember and o.user_turn > job.user_turn
+                   and (o.state in OPEN_STATES or (o.finished_at and now - o.finished_at < RECENT_S))
+                   for o in others)
+
+    # -- one acknowledgement per request (v3.12) --------------------------------------------------
+
+    def may_ack(self) -> bool:
+        """Whether an acknowledgement may still be said for the user's current words (one per request: live 13:31:31
+        "My bad, opening DevMafex now. Opening it. Let me open that for you." were three for one)."""
+        try:
+            turn = int(self.user_turns()) if self.user_turns is not None else -1
+        except Exception:  # noqa: BLE001
+            turn = -1
+        return turn < 0 or turn != self._acked_turn
+
+    def acked(self) -> None:
+        """Something was said for the user's current words (an acknowledgement or the reply's own words)."""
+        try:
+            self._acked_turn = int(self.user_turns()) if self.user_turns is not None else -1
+        except Exception:  # noqa: BLE001
+            pass
+
     def _moved_on(self, job: Job) -> bool:
         """Whether the user has said more since this job was handed over (its result is then a late one)."""
         if self.user_turns is None:
@@ -1516,6 +1557,9 @@ class VoiceBridge(QObject):
 
                 async def deliver(run_llm: bool, stale: bool, kind=kind, head=head, rest=rest,
                                   late=late, verified=verified) -> None:
+                    if not stale and kind == "done" and self._newer_request(job):
+                        stale, run_llm = True, False
+                        self._log("bridge", op="outcome_folded", job_id=job.job_id, why="newer_request")
                     if run_llm and not stale and not late:
                         self.said_owed_at = time.monotonic()
                     await announce(result_payload(kind, head, more=bool(rest), held_back=stale,

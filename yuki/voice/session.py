@@ -847,13 +847,29 @@ class VoiceSession(QObject):
         mic = self._ensure_mic()
         if self._listener is None or not self._listener.running:
             s = self.settings
-            self._listener = WakeListener(
-                mic, lambda: WakeSpotter(threshold=s.voice_wake_threshold, boost=s.voice_wake_boost),
-                on_wake=lambda at, _kw: self._wake_heard.emit(at, time.monotonic(), self._name_end()), log=self.log,
-                check=NameCheck(),
-            )
-            self._listener.start()
-            self.log.event("wake", state="listening", during_call=self.call_active)
+            on_wake = lambda at, _kw: self._wake_heard.emit(at, time.monotonic(), self._name_end())  # noqa: E731
+            listener = None
+            if getattr(s, "voice_wake_process", True) and self.mic_factory is None:
+                # The spotter in its own process (v3.12): it never waits for the app's other threads. In-process
+                # only when that cannot start (and in tests and the offline harness, with a pretend mic).
+                try:
+                    from yuki.voice.wakeproc import ProcessWakeListener
+
+                    listener = ProcessWakeListener(mic, on_wake, self.log, threshold=s.voice_wake_threshold,
+                                                   boost=s.voice_wake_boost)
+                    listener.start()
+                except Exception as exc:  # noqa: BLE001 - the in-process listener then
+                    self.log.event("wake", state="process_failed", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                    listener = None
+            if listener is None:
+                listener = WakeListener(
+                    mic, lambda: WakeSpotter(threshold=s.voice_wake_threshold, boost=s.voice_wake_boost),
+                    on_wake=on_wake, log=self.log, check=NameCheck(),
+                )
+                listener.start()
+            self._listener = listener
+            self.log.event("wake", state="listening", during_call=self.call_active,
+                           process=type(listener).__name__ != "WakeListener")
         if self.in_conversation and not self.closing:
             self._listener.pause()
         else:
@@ -900,7 +916,16 @@ class VoiceSession(QObject):
         if self.in_conversation:
             self._set_state(state, detail)
 
+    #: After the user ended a conversation ("stop listening"), a wake this soon is judged, not taken as addressed
+    #: (v3.12: live 13:32:22 his "I had a long talk with, uh, Yuki" woke it seconds after "Ok, stop listening").
+    AFTER_GOODBYE_S = 90.0
+
+    def _after_goodbye(self) -> bool:
+        return time.monotonic() - getattr(self, "_goodbye_at", -1e9) < self.AFTER_GOODBYE_S
+
     def _on_thread_done(self, reason: str, error: str) -> None:
+        if reason == "user_asked":
+            self._goodbye_at = time.monotonic()
         self._arm_standby(1500 if not error else 10_000)   # the next conversation waits ready for the name (v3.11)
         self._thread = None
         self._conversation = None
@@ -1090,7 +1115,9 @@ class VoiceSession(QObject):
         if conversation is None or not getattr(conversation, "ready", False):
             return False
         listener = self._listener
-        woken_by_name = (via == "wake" and name_cut and not bool(getattr(listener, "rescued", False)))
+        woken_by_name = (via == "wake" and name_cut and not bool(getattr(listener, "rescued", False))
+                         and not self._after_goodbye())
+        conversation.after_goodbye = via == "wake" and self._after_goodbye()
         if not conversation.activate(listen_from=listen_from, woken_by_name=woken_by_name, call_app=self.call_app,
                                      call_evidence=self.call_evidence, heard_at=started):
             return False
@@ -1314,7 +1341,8 @@ class VoiceSession(QObject):
             # What recognition hears starts after the name: the mouth is told its first words were said to it
             # (not when the name was a sound-alike the second opinion heard as the name: then it judges).
             listener = self._listener
-            conversation.woken_by_name = (via == "wake" and name_cut
+            conversation.after_goodbye = via == "wake" and self._after_goodbye()
+            conversation.woken_by_name = (via == "wake" and name_cut and not self._after_goodbye()
                                           and not bool(getattr(listener, "rescued", False)))
             if facts.get("tts_note"):
                 self._thread_state.emit("starting", facts["tts_note"])
