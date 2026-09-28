@@ -19,8 +19,15 @@ holds the piece's *audio* until the verdict (``GeminiTTSService`` in :mod:`yuki.
 first audio takes ~1.0-1.3 s while the check takes ~0.6-0.9 s, so a kept line is heard as soon as it would have
 been. A dropped piece is never played and its words never reach the conversation's context (the TTS releases a
 piece's words only after its audio), so the talker does not see itself saying it and copy it. Other voices check
-the text before sending it (a short wait, only on the fallback voices). The check fails open: an error, or no
-verdict within ``timeout_s``, lets the line through (logged).
+the text before sending it (a short wait, only on the fallback voices).
+
+**Fails closed (v3.13).** Live 2026-09-29 01:26 a stray word after "Bye" was answered aloud with the talker's own
+notes ("I was asked to stop listening a moment ago. These words ... are incomplete..."). Now a line longer than
+:data:`FREE_WORDS` is heard only on the check's SAY: no verdict within ``timeout_s``, or an error, drops it (a
+short plain line still goes out). Once a piece of a reply is caught, the rest of that reply is dropped too (the
+voice's player, :mod:`yuki.voice.gemini_tts`). A reply's first piece is checked even when short, and the check
+is told it starts a reply: a sentence's tail spoken on its own ("or a tab you had open in Warp before?", the
+unsaid rest of a cut question, live 01:30) is a ``fragment``.
 
 Logs are content-free: ``speech_guard`` with ``op`` caught / timeout / error, the reason, the characters and the
 milliseconds; a ``summary`` at the end of the conversation.
@@ -42,7 +49,7 @@ FREE_WORDS = 3
 #: The lines said in the last this many seconds are shown to the check (a repeat in other words).
 REPEAT_S = 20.0
 #: What the check may answer when it drops a line.
-REASONS = ("reasoning", "about_user", "internals", "repeat")   # "repeat": the exact-repeat check, never the model
+REASONS = ("reasoning", "about_user", "internals", "fragment", "repeat")   # "repeat": the exact-repeat check
 
 GUARD_PROMPT = """\
 You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud to the user. The line \
@@ -52,24 +59,33 @@ speaks TO them: short, natural, about what is being done, what was found, or a q
 DROP the line when it is any of these:
 - reasoning: thinking out loud, its own deliberation, plan or judgement about what to do or whom the words were \
 for ("Those words were for me, so I'll switch tabs.", "Let me check what they meant.", "I need to see what's on \
-the screen to find the button.", "I'll stay quiet.", "That sounds like dictation, not for me."), or a note \
-to itself: their request echoed back as a command, not said to them (they said "close the second YouTube tab" -> \
-"Close the second YouTube tab.")
+the screen to find the button.", "I'll stay quiet.", "That sounds like dictation, not for me."), commentary on \
+the user's words or on what it was told instead of an answer ("I was asked to stop listening a moment ago.", \
+"These words are incomplete, just the start of a sentence in Hindi.", "There's no clear request here, so I'm \
+staying quiet.", "That was probably not meant for me."), or a note to itself: their request echoed back as a \
+command, an order said to no one, neither a question to them nor what Yuki is doing (they said "close the second \
+YouTube tab" -> "Close the second YouTube tab."; "in warp window open the llm os chat" -> "In Warp, open the LLMOS \
+chat."; but "Open Warp?" asks them and "Opening it." says what Yuki does: both SAY)
 - about_user: talking ABOUT the user instead of to them ("They're on a voice call on Zen.", "The user wants the \
 second tab.", "He asked for YouTube.")
 - internals: Yuki's inner workings: the thinker, handing over, speech recognition, transcripts, tools, call mode, \
 ids, numbered tabs or windows ("Let me hand this to the thinker.", "Speech recognition was unsure of that word.", \
-"Tab 9 is YouTube and tab 10 is the one showing.", "The tab tool refused.")
+"Was that Hindi, or did the speech recognition mix it up?", "Tab 9 is YouTube and tab 10 is the one showing.", \
+"The tab tool refused.")
+- fragment: only when the line STARTS a reply (you are told so): not a whole thing to say on its own but the \
+tail of a sentence never said ("or a tab you had open in Warp before?", "or is the sidebar open right now?", \
+"or something else?", "and the second one too."). A short whole reply is no fragment ("On it.", "Yes.", \
+"Which one?", "Done, it's open.", "Bye!").
 
-SAY everything else: acknowledgements ("Sure, opening it."), outcomes ("Closed it.", "Got it, the Bro chat's \
-open."), questions to the user ("Sorry, which chat?", "The Claude tabs?"), what was found, small talk, jokes, \
+SAY everything else: acknowledgements ("Sure, opening it."), outcomes, failures too ("Closed it.", "Got it, the \
+Bro chat's open.", "That click opened a different tab.", "Couldn't find it on the screen."), questions to the user ("Sorry, which chat?", "The Claude tabs?"), what was found, small talk, jokes, \
 sympathy, a goodbye, in any language ("Kal subah standup hai."). Asking the user what they meant is fine; \
 explaining your own doubts is not. Speech recognition mishears the user, so a name in the line may differ from \
 their words ("open the rest chat" -> "Opened Res's chat."): that is still an outcome. Saying something again is \
-not your concern here. Drop only what is clearly one of the three; when unsure, SAY.
+not your concern here. Drop only what is clearly one of the four; when unsure, SAY.
 
-Answer with exactly one word, SAY, or DROP followed by a colon and one reason word: reasoning, about_user or \
-internals. Nothing else."""
+Answer with exactly one word, SAY, or DROP followed by a colon and one reason word: reasoning, about_user, \
+internals or fragment. Nothing else."""
 
 
 @dataclass
@@ -138,8 +154,11 @@ class SpeechGuard:
     def _recent(self, now: float) -> list[str]:
         return list(self._turn_lines[-4:])
 
-    def start(self, text: str) -> "asyncio.Future[Verdict]":
-        """Begin checking ``text`` now; returns a future verdict (on the running loop)."""
+    def start(self, text: str, *, first: bool = False) -> "asyncio.Future[Verdict]":
+        """Begin checking ``text`` now; returns a future verdict (on the running loop).
+
+        ``first``: the piece starts a reply (checked even when short: a fragment often is).
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Verdict] = loop.create_future()
         now = time.monotonic()
@@ -154,19 +173,19 @@ class SpeechGuard:
         said = self._recent(now)
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
-        if len(norm.split()) <= FREE_WORDS:
+        if len(norm.split()) <= FREE_WORDS and not first:
             self.stats["free"] += 1
             self.heard(text)   # short lines go straight out: remember them for the repeat check now
             fut.set_result(Verdict(True, by="free"))
             return fut
         self._pending.add(norm)
-        task = loop.create_task(self._check(text, said, fut, written))
+        task = loop.create_task(self._check(text, said, fut, written, first))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return fut
 
     async def _check(self, text: str, said: list[str], fut: "asyncio.Future[Verdict]",
-                     written: list[str] | None = None) -> None:
+                     written: list[str] | None = None, first: bool = False) -> None:
         started = time.monotonic()
         user = ""
         if self.context is not None:
@@ -176,16 +195,16 @@ class SpeechGuard:
                 user = ""
         verdict: Verdict
         try:
-            answer = await self._ask(text, said, user, written or [])
+            answer = await self._ask(text, said, user, written or [], first)
             ok, why = parse_verdict(answer)
             verdict = Verdict(ok, why, by="model")
         except asyncio.CancelledError:
             if not fut.done():
-                fut.set_result(Verdict(True, by="error"))
+                fut.set_result(Verdict(self.short(text), "unchecked", by="error"))
             raise
-        except Exception as exc:  # noqa: BLE001 - fail open: the line is said
+        except Exception as exc:  # noqa: BLE001 - closed for a long line, open for a short one (v3.13)
             self.stats["errors"] += 1
-            verdict = Verdict(True, by="error")
+            verdict = Verdict(self.short(text), "unchecked", by="error")
             self._log(op="error", error=type(exc).__name__)
         verdict.ms = round((time.monotonic() - started) * 1000)
         self.stats["checked"] += 1
@@ -193,7 +212,8 @@ class SpeechGuard:
         if not fut.done():
             fut.set_result(verdict)
 
-    async def _ask(self, text: str, said: list[str], user: str, written: list[str] | None = None) -> str:
+    async def _ask(self, text: str, said: list[str], user: str, written: list[str] | None = None,
+                   first: bool = False) -> str:
         if self.judge is not None:
             result = self.judge(text, said, user)
             return await result if asyncio.iscoroutine(result) else str(result)
@@ -201,7 +221,9 @@ class SpeechGuard:
         just = [x for x in (written or []) if x not in said[-4:]][-3:]
         pieces = (f"\nWritten just before it (not heard, or dropped): " + " / ".join(f'"{x}"' for x in just)) if just else ""
         content = (f"The user's latest words: \"{user or '(none)'}\"\nLines Yuki said just before: {before}{pieces}\n"
-                   f"The line to check (it may be the rest of a sentence begun just before): \"{text}\"")
+                   + ("This line STARTS a new reply: nothing of it was written before it.\n"
+                      f"The line to check: \"{text}\"" if first else
+                      f"The line to check (it may be the rest of a sentence begun just before): \"{text}\""))
         response = await self.client.messages.create(model=self.model, max_tokens=8, system=GUARD_PROMPT,
                                                      messages=[{"role": "user", "content": content}])
         usage = getattr(response, "usage", None)
@@ -218,9 +240,10 @@ class SpeechGuard:
         try:
             verdict = await asyncio.wait_for(asyncio.shield(fut), timeout=wait) if not fut.done() else fut.result()
         except asyncio.TimeoutError:
+            # Fails closed for anything but a short plain line (v3.13): an unchecked long line is never heard.
             self.stats["timeouts"] += 1
-            self._log(op="timeout", chars=len(text), waited_ms=round(wait * 1000))
-            verdict = Verdict(True, by="timeout")
+            self._log(op="timeout", chars=len(text), waited_ms=round(wait * 1000), said=self.short(text))
+            verdict = Verdict(self.short(text), "unchecked", by="timeout")
         self._pending.discard(_norm(text))
         if verdict.ok:
             if verdict.by != "free":
@@ -234,6 +257,23 @@ class SpeechGuard:
             except Exception:  # noqa: BLE001
                 pass
         return verdict
+
+    @staticmethod
+    def short(text: str) -> bool:
+        """A line of at most :data:`FREE_WORDS` words (said even unchecked: too short to carry reasoning)."""
+        return len(_norm(text).split()) <= FREE_WORDS
+
+    def drop_rest(self, text: str) -> Verdict:
+        """A later piece of a reply one of whose pieces was caught: dropped unheard (v3.13), logged and reported."""
+        self._pending.discard(_norm(text))
+        self.stats["caught"] += 1
+        self._log(op="caught", why="rest_of_reply", by="reply", chars=len(text), ms=0)
+        if self.on_drop is not None:
+            try:
+                self.on_drop()
+            except Exception:  # noqa: BLE001
+                pass
+        return Verdict(False, "rest_of_reply", by="reply")
 
     async def allows(self, text: str) -> bool:
         """Check ``text`` and wait for the verdict (the fallback voices, which check before sending)."""

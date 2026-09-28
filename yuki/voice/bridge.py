@@ -718,6 +718,8 @@ class VoiceBridge(QObject):
                     if run_llm and not stale and not late:
                         # An owed result is always said; a late one (they said more since) may be let go.
                         self.said_owed_at = time.monotonic()
+                    if run_llm and not stale:
+                        self._outcome_said(job)
                     await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                                 request=job.request, late=late, verified=verified),
                                                  properties=FunctionCallResultProperties(run_llm=run_llm))
@@ -1012,7 +1014,7 @@ class VoiceBridge(QObject):
         # With only old evidence of a call (or none), plain instructions are for Yuki (v3.10, the user's rule).
         sure_call = in_call and evidence != "stale"
         if (by_user and not sure_call and not spoke and self.in_exchange is not None and self.in_exchange()
-                and turn != self._quiet_refused_turn):
+                and turn != self._quiet_refused_turn and not self._answer_on_its_way()):
             # They are in a live exchange with Yuki (she spoke moments ago) and this is their turn: it is almost
             # always said to her (offline 2026-09-27 "Thanks." got silence). Refused once per turn; a second
             # stay_quiet is the mouth's considered judgement (dictation, someone in the room). State only.
@@ -1344,6 +1346,27 @@ class VoiceBridge(QObject):
                    and (o.state in OPEN_STATES or (o.finished_at and now - o.finished_at < RECENT_S))
                    for o in others)
 
+    def _answer_on_its_way(self) -> bool:
+        """A hand is acting or a task is running for them now (not one waiting for their answer): its outcome will
+        be said, so their "Yeah." meanwhile needs no words of its own (v3.13: live 01:26:55 "Yeah." after "Open
+        Warp?" got its stay_quiet refused while the hand was opening Warp: "Warp is open. Warp's up.")."""
+        if self.busy_tools > 0:
+            return True
+        with self._lock:
+            jobs = list(self._jobs.values())
+        if any(j.state == WAITING for j in jobs):
+            return False   # a question of Yuki's is open: their words may be its answer
+        return any(j.source == "voice" and not j.remember and j.state in (QUEUED, RUNNING) for j in jobs)
+
+    def _outcome_said(self, job: Job) -> None:
+        """The outcome of what they asked last is being said: no acknowledgement may come after it (v3.13)."""
+        try:
+            turn = int(self.user_turns()) if self.user_turns is not None else -1
+        except Exception:  # noqa: BLE001
+            return
+        if turn >= 0 and job.user_turn == turn:
+            self._acked_turn = turn
+
     # -- one acknowledgement per request (v3.12) --------------------------------------------------
 
     def may_ack(self) -> bool:
@@ -1427,7 +1450,13 @@ class VoiceBridge(QObject):
             return None
         names = list(snap.tabs.get(snap.foreground) or [])
         ids = list(snap.tab_ids.get(snap.foreground) or [])
+        recent = list(getattr(hands, "screen_titles", None) or []) if getattr(hands, "screen_hwnd", None) \
+            == snap.foreground else []
         if not names or len(ids) != len(names) or not any(ids):
+            if recent:
+                # An app that draws its own interface (v3.13): no tab items to read, but its titles are its tabs.
+                return (f"window [{snap.foreground}] exposes no tabs to read; the titles it had recently (its tabs or "
+                        f"sessions, most used first): " + "; ".join(f'"{t[:90]}"' for t in recent))
             return None
         rows = [f'{i} [{tid}] "{name[:90]}"' for i, (name, tid) in enumerate(zip(names, ids), 1) if tid]
         return f"tabs of window [{snap.foreground}], left to right, with their ids: " + "; ".join(rows)
@@ -1562,6 +1591,8 @@ class VoiceBridge(QObject):
                         self._log("bridge", op="outcome_folded", job_id=job.job_id, why="newer_request")
                     if run_llm and not stale and not late:
                         self.said_owed_at = time.monotonic()
+                    if run_llm and not stale:
+                        self._outcome_said(job)
                     await announce(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                   request=job.request, late=late, verified=verified),
                                    run_llm and not stale)

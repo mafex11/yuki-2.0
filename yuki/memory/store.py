@@ -3746,6 +3746,17 @@ class Store:
             "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
         )]
 
+    def timeline_of(self, process: str, since: TimeArg = None) -> list[TimelineRow]:
+        """One app's stretches (``process`` = its ``app_key``) ending after ``since``, oldest first (decrypted): only
+        its rows are decrypted (v3.13, the voice's recent titles of the window in front)."""
+        where, params = " WHERE process = ?", [process]
+        if (s := _ts(since)) is not None:
+            where += " AND ended_at > ?"
+            params.append(s)
+        return [self._timeline_row(r) for r in self._query(
+            "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
+        )]
+
     def timeline_states(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
         """Like :meth:`timeline_between` but content-free and cheap: nothing is decrypted.
 

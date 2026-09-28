@@ -159,6 +159,10 @@ class WindowInfo:
     #: ``GetWindow(GW_OWNER)``: the window that owns this one (a dialog's
     #: parent window), or None for an unowned top-level window.
     owner_hwnd: int | None = None
+    #: ``IsZoomed``: maximized (it fills its monitor's work area, title bar and taskbar still shown).
+    is_maximized: bool = False
+    #: Full screen: it covers its whole monitor with no caption (F11, a video, a game). Not the same as maximized.
+    is_fullscreen: bool = False
 
 
 @dataclass
@@ -396,7 +400,34 @@ def _window_info(hwnd: int, foreground: int) -> WindowInfo:
         bounds=(left, top, right, bottom),
         is_enabled=is_enabled(hwnd),
         owner_hwnd=owner_of(hwnd) or None,
+        is_maximized=_is_zoomed(hwnd),
+        is_fullscreen=_covers_monitor_without_caption(hwnd, (left, top, right, bottom)),
     )
+
+
+def _is_zoomed(hwnd: int) -> bool:
+    try:
+        return bool(_user32.IsZoomed(hwnd))
+    except Exception:
+        return False
+
+
+def _covers_monitor_without_caption(hwnd: int, rect: tuple[int, int, int, int]) -> bool:
+    """Full screen, measured: the window covers its whole monitor (not only the work area) and has no caption."""
+    try:
+        import win32con
+
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE) & 0xFFFFFFFF
+        if style & win32con.WS_CAPTION == win32con.WS_CAPTION:
+            return False
+        import win32api
+
+        monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+        m_left, m_top, m_right, m_bottom = win32api.GetMonitorInfo(monitor)["Monitor"]
+        left, top, right, bottom = rect
+        return left <= m_left and top <= m_top and right >= m_right and bottom >= m_bottom
+    except Exception:
+        return False
 
 
 def list_windows() -> list[WindowInfo]:
@@ -1195,6 +1226,10 @@ def format_overview(o: DesktopOverview) -> str:
             else f"@{left},{top} {right - left}x{bottom - top}"
         )
         flags = " FOREGROUND" if w.is_foreground else ""
+        if not w.is_minimized and getattr(w, "is_fullscreen", False):
+            flags += " FULL SCREEN"
+        elif not w.is_minimized and getattr(w, "is_maximized", False):
+            flags += " MAXIMIZED (not full screen)"
         if w.hwnd in blockers:
             dialog, title = blockers[w.hwnd]
             flags += f' BLOCKED by [{dialog}] "{title}"'

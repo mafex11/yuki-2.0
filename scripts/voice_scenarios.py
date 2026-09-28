@@ -736,6 +736,215 @@ def _zen_desk(timeline: Timeline) -> Any:
     return desk
 
 
+WARP_TITLES = ["Corvana pull request 2781", "LLM OS agent harness revamp", "yuki voice v3.13", "Deploy runbook"]
+
+
+def _warp_desk(timeline: Timeline, *, warp_open: bool = False, launch_s: float = 5.0) -> Any:
+    """The live session of 2026-09-29 01:25-01:32 (v3.13), test code only: Chrome in front; Warp closed at first (it
+    takes ``launch_s`` to open, live 6.3 s). Warp draws its own interface: UI Automation shows its title bar's
+    buttons and nothing else, so its tabs (``WARP_TITLES``, in its left sidebar) are only known by its window title.
+    Ctrl+Tab / Ctrl+PageDown go to the next tab, Ctrl+Shift+Tab / Ctrl+PageUp back, Ctrl+1..9 to one; a click in the
+    sidebar picks the row under it. It opens maximized (not full screen); F11 toggles full screen (the window then
+    covers the whole monitor), maximize / restore work as on Windows. PowerShell runs and changes nothing here.
+    What happened is recorded for the report (``desk_state``).
+    """
+    from yuki.voice.offline import BrowserDesk, StubResult
+
+    try:   # the overview's window state marks exist from v3.13 on (the before-run's code has none)
+        from yuki.perception.windows import WindowInfo
+
+        marks = "is_fullscreen" in getattr(WindowInfo, "__dataclass_fields__", {})
+    except Exception:  # noqa: BLE001
+        marks = False
+
+    class WarpDesk(BrowserDesk):
+        WARP = 0x5050
+        SIDEBAR_TOP, ROW_H = 120, 44
+
+        def __init__(self) -> None:
+            super().__init__(timeline=timeline, action_delay_s=0.05)
+            self.tabs = [{"name": "Deploy Corvana Agent · Workflow runs · Corvana/corvana", "scroll": 0.0,
+                          "url": "https://github.com/Corvana/corvana/actions", "titled_at": 0.0}]
+            self.selected = 0
+            self.state = {self.CHROME: "normal", self.WARP: "normal" if warp_open else "closed"}
+            self.front = self.WARP if warp_open else self.CHROME
+            self.mode = "maximized"   # Warp's window: normal | maximized | fullscreen
+            self.warp_tab = 0
+            self.tab_history: list[str] = []
+            self.modes: list[str] = []
+
+        def title(self, hwnd: int) -> str:
+            if int(hwnd) == self.WARP:
+                name = WARP_TITLES[self.warp_tab]
+                return f"✳ {name}" if self.warp_tab == 0 else name
+            return f"{self.tabs[self.selected]['name']} - Google Chrome"
+
+        def _bounds(self, hwnd: int) -> tuple[int, int, int, int]:
+            if int(hwnd) == self.WARP:
+                return {"fullscreen": (0, 0, 1920, 1080), "maximized": (0, 0, 1920, 1040),
+                        "normal": (240, 120, 1680, 940)}[self.mode]
+            return (0, 0, 1920, 1040)
+
+        def get_desktop_overview(self) -> dict[str, Any]:
+            order = [self.front] + [h for h in (self.CHROME, self.WARP) if h != self.front]
+            names = {self.CHROME: "chrome.exe", self.WARP: "warp.exe"}
+            windows = []
+            for i, h in enumerate(order):
+                if self.state.get(h) == "closed":
+                    continue
+                windows.append({"hwnd": h, "process_name": names[h], "title": self.title(h), "pid": 100 + i,
+                                "is_foreground": h == self.front, "is_minimized": False, "bounds": self._bounds(h),
+                                "is_maximized": h == self.WARP and self.mode == "maximized" or h == self.CHROME,
+                                "is_fullscreen": h == self.WARP and self.mode == "fullscreen"})
+            return {"windows": windows, "foreground_hwnd": self.front, "cursor": self.cursor,
+                    "screen_size": (1920, 1080), "captured_at": time.time(), "monitors": [],
+                    "virtual_bounds": (0, 0, 1920, 1080)}
+
+        def format_overview(self, overview: dict[str, Any]) -> str:
+            lines = [f"screen space 1920x1080 @0,0 (one screen) | cursor {tuple(overview['cursor'])}"]
+            for w in overview["windows"]:
+                left, top, right, bottom = w["bounds"]
+                mark = " FOREGROUND" if w["is_foreground"] else ""
+                if marks:
+                    mark += (" FULL SCREEN" if w.get("is_fullscreen") else
+                             " MAXIMIZED (not full screen)" if w.get("is_maximized") else "")
+                lines.append(f"[{w['hwnd']}] {w['process_name']} \"{w['title']}\" @{left},{top} "
+                             f"{right - left}x{bottom - top}{mark}")
+            return "\n".join(lines)
+
+        def activity_facts(self) -> dict[str, Any]:
+            return {"media": [], "microphone": [], "camera": [],
+                    "foreground": {"hwnd": self.front, "title": self.title(self.front),
+                                   "process_name": "warp.exe" if self.front == self.WARP else "chrome.exe"}}
+
+        def read_tabs(self, hwnd: int, **kw: Any) -> Any:
+            from yuki.perception.tabs import TabStrip
+
+            if int(hwnd) == self.WARP:
+                return TabStrip(hwnd=int(hwnd))   # no tab strip in its tree
+            return super().read_tabs(hwnd, **kw)
+
+        def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
+            if int(hwnd) != self.WARP:
+                return super().get_window_tree(hwnd, **kw)
+            left, top, right, _bottom = self._bounds(hwnd)
+            caption = "Restore" if self.mode == "maximized" else "Maximize"
+            elements = [{"id": 0, "role": "Window", "name": self.title(hwnd), "depth": 0,
+                         "bounds": self._bounds(hwnd), "center": ((left + right) // 2, 500)}]
+            if self.mode != "fullscreen":
+                for i, name in enumerate(("Minimize", caption, "Close")):
+                    x = right - 150 + 50 * i
+                    elements.append({"id": len(elements), "role": "Button", "name": name, "depth": 1,
+                                     "bounds": (x - 25, top, x + 25, top + 30), "center": (x, top + 12),
+                                     "is_interactive": True})
+            return {"hwnd": hwnd, "title": self.title(hwnd), "process_name": "warp.exe", "elements": elements,
+                    "truncated": False, "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 4.0,
+                    "passes": 1, "child_windows": 0, "first_pass_elements": len(elements)}
+
+        def format_window_tree(self, tree: dict[str, Any]) -> str:
+            if tree.get("process_name") != "warp.exe":
+                return super().format_window_tree(tree)
+            lines = [f"window {tree['hwnd']} \"{tree['title']}\""]
+            for e in tree["elements"][1:]:
+                left, top, right, bottom = e["bounds"]
+                lines.append(f"[{e['id']}] {e['role']} \"{e['name']}\" @{left},{top} {right - left}x{bottom - top}")
+            return "\n".join(lines)
+
+        # -- actions ---------------------------------------------------------------------------------------
+        def _set_mode(self, mode: str) -> None:
+            self.mode = mode
+            self.modes.append(mode)
+
+        def _set_tab(self, i: int) -> None:
+            self.warp_tab = i % len(WARP_TITLES)
+            self.tab_history.append(WARP_TITLES[self.warp_tab])
+
+        def launch_app(self, query: str, **kwargs: Any) -> Any:
+            if "warp" in query.casefold():   # test stub routing on the stub's own app
+                result = self._act("launch_app", "", query)
+                if self.state[self.WARP] == "closed":
+                    time.sleep(launch_s)   # live: 6.3 s until its window was ready
+                    self.state[self.WARP] = "normal"
+                self.front = self.WARP
+                result.summary = (f"launched 'Warp': hwnd {self.WARP} (warp.exe) \"{self.title(self.WARP)}\" - new "
+                                  f"window from a new process; in the foreground, but no control in it had keyboard "
+                                  f"focus, so typing into it may lose characters")
+                return result
+            return StubResult(ok=False, summary=f"no app called {query} on this test machine")
+
+        def window_action(self, hwnd: int, action: str, **kw: Any) -> Any:
+            if int(hwnd) != self.WARP:
+                return super().window_action(hwnd, action, **kw)
+            result = self._act("window_action", "", hwnd, action)
+            name = f"warp.exe \"{self.title(self.WARP)}\""
+            if action == "maximize":
+                self._set_mode("maximized")
+                result.summary = f"{name} is now maximized" + (" (not full screen)" if marks else "")
+            elif action == "fullscreen":
+                self._set_mode("fullscreen")
+                result.summary = f"{name} is now full screen (F11)"
+            elif action == "restore":
+                self._set_mode("normal")
+                result.summary = f"{name} is now restored"
+            elif action == "focus":
+                result.summary = f"focused hwnd {self.WARP} (warp.exe) \"{self.title(self.WARP)}\"; ready for input"
+            else:
+                result.ok, result.summary = False, f"{action} is not done in this test"
+            self.front = self.WARP
+            return result
+
+        def focus_window(self, hwnd: int, **kw: Any) -> Any:
+            if int(hwnd) == self.WARP:
+                return self.window_action(hwnd, "focus")
+            self.front = int(hwnd)
+            return super().focus_window(hwnd, **kw)
+
+        def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any:
+            result = self._act("run_powershell", "", command[:60])
+            result.summary = "powershell exit 0 in 1999 ms; stdout 'True'"   # live: it moved nothing it could see
+            return result
+
+        def _keys(self, keys: tuple[str, ...], times: int = 1) -> str:
+            if self.front != self.WARP:
+                return super()._keys(keys, times)
+            k = tuple(x.casefold() for x in keys)
+            before = self.title(self.WARP)
+            for _ in range(times):
+                if k == ("f11",):
+                    self._set_mode("maximized" if self.mode == "fullscreen" else "fullscreen")
+                elif k in (("ctrl", "tab"), ("ctrl", "pagedown"), ("ctrl", "pgdn")):
+                    self._set_tab(self.warp_tab + 1)
+                elif k in (("ctrl", "shift", "tab"), ("ctrl", "pageup"), ("ctrl", "pgup")):
+                    self._set_tab(self.warp_tab - 1)
+                elif len(k) == 2 and k[0] == "ctrl" and k[1].isdigit() and 1 <= int(k[1]) <= len(WARP_TITLES):
+                    self._set_tab(int(k[1]) - 1)
+            after = self.title(self.WARP)
+            return f"; window title now \"{after}\"" if after != before else ""
+
+        def click(self, x: int, y: int, **kwargs: Any) -> Any:
+            if self.front != self.WARP:
+                return super().click(x, y, **kwargs)
+            result = self._act("click", "", x, y, **kwargs)
+            left, top, right, _b = self._bounds(self.WARP)
+            if self.mode != "fullscreen" and top <= y <= top + 30 and right - 175 <= x <= right - 75:
+                if x >= right - 125:
+                    self._set_mode("normal" if self.mode == "maximized" else "maximized")
+            elif left <= x <= left + 320 and y >= top + self.SIDEBAR_TOP:
+                row = (y - top - self.SIDEBAR_TOP) // self.ROW_H
+                if row < len(WARP_TITLES):
+                    self._set_tab(row)
+            result.summary = (f"clicked at ({x},{y}), target element unknown; foreground still warp.exe "
+                              f"\"{self.title(self.WARP)}\" (hwnd {self.WARP})")
+            return result
+
+        def desk_state(self, t0: float) -> dict[str, Any]:
+            return {"front": self.front, "warp": self.state[self.WARP], "mode": self.mode,
+                    "warp_tab": WARP_TITLES[self.warp_tab], "tab_history": list(self.tab_history),
+                    "modes": list(self.modes)}
+
+    return WarpDesk()
+
+
 def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
     """What memory's call detector says for this replay (v3.10), run offline on a temp database with stubbed device
     holders and the real screen judge (Haiku): ``(app, evidence, facts)``.
@@ -1192,6 +1401,21 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("m_joji"), "m_joji", after_s=0.3, wait_for=reply_done()),
             ScriptLine(clip("m_stop"), "m_stop", after_s=1.0, wait_for=settled()),
         ]
+    elif scenario == "warp929":
+        # v3.13, the user's session of 2026-09-29 01:25-01:32 on the Warp stub: "Open w a r p" (spelled), "Yeah."
+        # while the hand is still opening it (one outcome, not two), "Make Warp full screen" (maximized is not full
+        # screen), "Yeah. Nice." (chit-chat: no task), the sidebar tab heard as "LLM OS rigid hardness" (its title is
+        # among Warp's recent titles in the --db copy's timeline), "Bye.".
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_warp_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        lines = [
+            ScriptLine(clip("w_open"), "w_open", after_s=1.0),
+            ScriptLine(clip("w_yeah"), "w_yeah", after_s=0.4, wait_for=reply_done()),
+            ScriptLine(clip("w_full"), "w_full", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("w_nice"), "w_nice", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("w_tab"), "w_tab", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("w_bye"), "w_bye", after_s=1.0, wait_for=settled()),
+        ]
     elif scenario in ("cut_side", "cut_instead", "cut_stop"):
         # v3.12: an explanation cut by a side comment (a brief reaction, then the rest from where it was cut, not
         # repeated), by a correction (the rest dropped, the new thing done) and by "stop" (silence).
@@ -1291,7 +1515,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
-    z928 = scenario in ("zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead", "cut_stop")
+    z928 = scenario in ("zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead", "cut_stop",
+                        "warp929")
     front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") or z928
              else (lambda: None))
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
@@ -1556,7 +1781,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
                                          "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927",
                                          "zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead",
-                                         "cut_stop", "all"))
+                                         "cut_stop", "warp929", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)

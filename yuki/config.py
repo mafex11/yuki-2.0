@@ -304,7 +304,8 @@ class Settings:
         voice_final_gap_s: The narrator's pause after Yuki's own speech before a
             result or a question is said (progress lines keep ``voice_cooldown_s``).
         voice_brain_thinking: Thinking for spoken requests (off: ``thinking`` is
-            disabled for them; typed ones keep adaptive thinking).
+            disabled for them; typed ones keep adaptive thinking). v3.13: on (adaptive) with
+            effort medium; measured in docs/VOICE.md (v3.13).
         voice_brain_portrait: Attach the rest of the portrait and the resume to a
             spoken request's memory block (off: the profile and rules layers only,
             plus to-dos, know-how and commitments).
@@ -408,8 +409,9 @@ class Settings:
     voice_wait_again_s: float = 15.0
     voice_result_sentences: int = 2
     voice_result_chars: int = 280
-    voice_brain_effort: str = "low"
-    voice_brain_thinking: bool = False
+    # v3.13 (the user's call, measured on the Warp stub: full screen 4/4 vs 1/4 at low with thinking off)
+    voice_brain_effort: str = "medium"
+    voice_brain_thinking: bool = True
     voice_brain_portrait: bool = False
     voice_brain_model: str = ""
     voice_final_gap_s: float = 0.3

@@ -86,14 +86,20 @@ def test_guard_catches_two_copies_of_one_line_written_back_to_back() -> None:
     asyncio.run(main())
 
 
-def test_guard_fails_open_on_error_and_on_timeout() -> None:
+def test_guard_fails_closed_for_a_long_line_and_open_for_a_short_one() -> None:
+    # v3.13: an unchecked long line is never heard (live 01:26 the talker's notes were); a short one still is.
     async def main() -> None:
         broken = _guard(fail=True)
         line = "Let me find that chat for you now."
-        assert (await broken.decide(broken.start(line), line)).ok and broken.stats["errors"] == 1
-        slow = _guard({line: "DROP: reasoning"}, delay=1.0)
+        verdict = await broken.decide(broken.start(line), line)
+        assert not verdict.ok and verdict.by == "error" and broken.stats["errors"] == 1
+        assert (await broken.decide(broken.start("On it."), "On it.")).ok   # short: free, never waits
+        slow = _guard({line: "SAY"}, delay=1.0)
         verdict = await slow.decide(slow.start(line), line, wait_s=0.1)
-        assert verdict.ok and verdict.by == "timeout" and slow.stats["timeouts"] == 1
+        assert not verdict.ok and verdict.by == "timeout" and slow.stats["timeouts"] == 1
+        short = _guard({"Opening it.": "SAY"}, delay=1.0)
+        verdict = await short.decide(short.start("Opening it.", first=True), "Opening it.", wait_s=0.1)
+        assert verdict.ok and verdict.by == "timeout"   # a reply's short first words: checked, but open
 
     asyncio.run(main())
 
@@ -134,9 +140,11 @@ def test_gemini_holds_a_pieces_audio_for_its_verdict_and_drops_its_words_too() -
             down, _ = await run_test(tts, frames_to_send=frames, start_timeout=10)
             words = [f.text for f in down if isinstance(f, TTSTextFrame)]
             assert not any("words were for me" in w for w in words)  # never in the conversation's record
-            assert any("Opening WhatsApp" in w for w in words)
-            assert _levels(down) == [1000 + 37 * len("Opening WhatsApp now, one sec.")]  # only the kept piece heard
-            assert tts.stats["guarded"] == 2
+            # v3.13: once a piece of a reply is caught, the rest of that reply goes unheard too (live 01:26:32 three of
+            # four pieces of the talker's notes passed the check one by one)
+            assert not any("Opening WhatsApp" in w for w in words)
+            assert _levels(down) == []
+            assert tts.stats["guarded"] == 3
 
     asyncio.run(main())
 
@@ -323,7 +331,7 @@ def test_the_talkers_desktop_block_lists_the_names_in_front() -> None:
     while not got and time.monotonic() < deadline:
         time.sleep(0.02)
     assert got == [["Res", "Bro"]]
-    assert "names on the screen in WhatsApp.Root" in hands.snapshot().text
+    assert "names on the screen in WhatsApp (" in hands.snapshot().text   # its spoken name (9774da6)
 
 
 # -- D. calls: evidence decides how sure the talker is -----------------------------------------------------

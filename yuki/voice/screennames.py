@@ -101,8 +101,10 @@ def screen_line(app: str, names: list[str]) -> str:
     if not names:
         return ""
     where = f" in {app}" if app else ""
-    return (f"names on the screen{where} (items, chats, links, buttons you can see; speech recognition may mishear "
-            f"them): " + "; ".join(names))
+    # v3.13: no "speech recognition" here (the talker echoed such words aloud); an app that draws its own interface
+    # (Warp) shows no items, so its recent window titles (its tabs) stand in for them.
+    return (f"names on the screen{where} (items, chats, links, buttons you can see, or for an app that shows none, "
+            f"its recent tab titles; their words may be a mishearing of one): " + "; ".join(names))
 
 
 __all__ = ["names_from_tree", "screen_line", "CAP", "ITEM_ROLES"]

@@ -184,6 +184,9 @@ class _Reply:
     lead_ms: float = 0.0
     tail_ms: float = 0.0
     guarded: int = 0                     # pieces the spoken-line check dropped (v3.10)
+    #: A piece of this reply was caught (not as a repeat): its later pieces are dropped unheard too (v3.13), so
+    #: no reply is heard with a hole in it, and no reasoning goes on after its first sentence was stopped.
+    tainted: bool = False
     heard: bool = False                  # some piece's audio went out
 
 
@@ -329,8 +332,10 @@ def service_class() -> type:
             if speakable(piece.text):
                 await self.start_tts_usage_metrics(strip_tags(piece.text))
                 if self._yuki_guard is not None:
+                    # The reply's first words are checked even when short: a fragment is (v3.13).
+                    first = not any(speakable(p.text) for p in reply.pieces)
                     try:
-                        piece.verdict = self._yuki_guard.start(strip_tags(piece.text))
+                        piece.verdict = self._yuki_guard.start(strip_tags(piece.text), first=first)
                     except Exception:  # noqa: BLE001 - the check fails open
                         piece.verdict = None
                 piece.task = self.create_task(self._fetch(reply, piece), name="gemini-piece")
@@ -398,10 +403,14 @@ def service_class() -> type:
                             # Its audio is ready: the line is heard only if the check keeps it (it ran alongside).
                             checked = True
                             guard = self._yuki_guard
-                            wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
-                            verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
+                            if reply.tainted and callable(getattr(guard, "drop_rest", None)):
+                                verdict = guard.drop_rest(strip_tags(piece.text))
+                            else:
+                                wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
+                                verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
                             self._refresh_audio_context(ctx)
                             if not verdict.ok:
+                                reply.tainted = reply.tainted or verdict.by != "repeat"
                                 dropped = True
                                 reply.guarded += 1
                                 self.stats["guarded"] += 1

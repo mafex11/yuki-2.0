@@ -2321,6 +2321,54 @@ _SHOW_COMMANDS = {"minimize": win32con.SW_MINIMIZE, "maximize": win32con.SW_MAXI
                   "restore": win32con.SW_RESTORE}
 #: Bound on the wait for a window to reach the state it was asked for (a condition poll).
 _STATE_WAIT_S = 1.0
+#: Bound on the wait for a window to go full screen after its F11 (a condition poll).
+_FULLSCREEN_WAIT_S = 1.5
+
+
+def _is_zoomed(hwnd: int) -> bool:
+    """Maximized (``IsZoomed``). pywin32's win32gui has no IsZoomed: live 2026-09-29 every maximize by the voice's
+    window hand failed with an AttributeError."""
+    return bool(_user32.IsZoomed(hwnd))
+
+
+def _is_fullscreen(hwnd: int) -> bool:
+    """Full screen, measured: the window covers its whole monitor with no caption (not the same as maximized)."""
+    from yuki.perception.windows import _covers_monitor_without_caption
+
+    try:
+        return _covers_monitor_without_caption(hwnd, tuple(win32gui.GetWindowRect(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _fullscreen(hwnd: int, name: str, details: dict, finish) -> ActionResult:  # noqa: ANN001
+    """F11, the common full-screen key, then a check that the window really covers its monitor (v3.13).
+
+    Live 2026-09-29 "make Warp full screen" was answered "Warp's full screen" after a maximize: maximized is not
+    full screen. ``ok`` only when full screen was observed; otherwise the report says what the window is now.
+    """
+    details["was_fullscreen"] = _is_fullscreen(hwnd)
+    if details["was_fullscreen"]:
+        return finish(True, f"{name} is already full screen", details)
+    if _user32.GetForegroundWindow() != hwnd:
+        focused = focus_window(hwnd)
+        if not getattr(focused, "ok", False):
+            return finish(False, f"{name}: could not bring it to the front for its full-screen key: "
+                                 f"{getattr(focused, 'summary', '')}", details)
+    from yuki.actions.input import hotkey
+
+    pressed = hotkey("f11", expect_hwnd=hwnd)
+    details["key"] = getattr(pressed, "summary", "")
+    if not getattr(pressed, "ok", False):
+        return finish(False, f"{name}: F11 not sent: {details['key']}", details)
+    deadline = time.monotonic() + _FULLSCREEN_WAIT_S
+    while not _is_fullscreen(hwnd) and time.monotonic() < deadline:
+        time.sleep(_POLL_S)
+    if _is_fullscreen(hwnd):
+        return finish(True, f"{name} is now full screen (F11)", details)
+    now = "maximized, not full screen" if _is_zoomed(hwnd) else "not full screen"
+    return finish(False, f"{name}: pressed F11, still {now} after {_FULLSCREEN_WAIT_S:g} s (this app may use its "
+                         f"own full-screen command)", details)
 #: Bound on the wait for a window asked to close to go away (it may ask to save first).
 _CLOSE_WAIT_S = 2.0
 
@@ -2346,15 +2394,17 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     details: dict = {"hwnd": hwnd, "action": action}
     if action == "focus":
         return focus_window(hwnd)
-    if action not in (*_SHOW_COMMANDS, "close"):
-        return finish(False, f"unknown window action {action!r} (minimize, maximize, restore, close, focus)",
-                      details)
+    if action not in (*_SHOW_COMMANDS, "close", "fullscreen"):
+        return finish(False, f"unknown window action {action!r} (minimize, maximize, fullscreen, restore, close, "
+                             f"focus)", details)
     if not win32gui.IsWindow(hwnd):
         return finish(False, f"hwnd {hwnd} is not a window (it may have closed)", details)
     info = window_info(hwnd)
     name = f"{info.process_name} \"{info.title}\"" if info else f"hwnd {hwnd}"
     details.update(title=info.title if info else "", process_name=info.process_name if info else "",
-                   was_minimized=bool(win32gui.IsIconic(hwnd)), was_maximized=bool(win32gui.IsZoomed(hwnd)))
+                   was_minimized=bool(win32gui.IsIconic(hwnd)), was_maximized=bool(_is_zoomed(hwnd)))
+    if action == "fullscreen":
+        return _fullscreen(hwnd, name, details, finish)
     if action == "close":
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         deadline = time.monotonic() + _CLOSE_WAIT_S
@@ -2366,7 +2416,7 @@ def window_action(hwnd: int, action: str) -> ActionResult:
                              f"something, e.g. to save)", details)
 
     def reached() -> bool:
-        iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(win32gui.IsZoomed(hwnd))
+        iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(_is_zoomed(hwnd))
         return {"minimize": iconic, "maximize": zoomed and not iconic, "restore": not iconic and not zoomed}[action]
 
     already = reached()
@@ -2378,7 +2428,10 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     state = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"}[action]
     if reached():
         front = _user32.GetForegroundWindow() == hwnd
-        return finish(True, f"{name} is {'already ' if already else 'now '}{state}"
+        # Maximized is not full screen (v3.13): the report says which it is, so neither voice claims the other.
+        full = " and full screen" if action == "maximize" and _is_fullscreen(hwnd) else (
+            " (not full screen)" if action == "maximize" else "")
+        return finish(True, f"{name} is {'already ' if already else 'now '}{state}{full}"
                             + ("; in the foreground" if front else ""), details)
     return finish(False, f"{name}: asked to be {state}, not {state} after {_STATE_WAIT_S:g} s", details)
 

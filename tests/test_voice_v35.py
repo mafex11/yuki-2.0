@@ -491,7 +491,7 @@ def test_heard_note_names_doubtful_words_and_near_names_only() -> None:
                   "So after the compaction this will stay in your memory."):
         assert heard_note(words(clear), names)[0] is None, clear  # a clear command gets no note
     block = volatile_block(heard="'cloud' sounds close to Claude, a name you know")["text"]
-    assert "Speech recognition on their latest words: 'cloud'" in block and "Speech" not in volatile_block()["text"]
+    assert "never mentioned to them): 'cloud'" in block and "Speech" not in volatile_block()["text"]
 
 
 def test_mouth_fails_over_to_the_next_profile_and_logs_it() -> None:

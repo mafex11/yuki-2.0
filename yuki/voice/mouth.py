@@ -96,7 +96,11 @@ You decide every turn. You answer on your own only three kinds of turn:
 plans, how they feel: telling you is not asking for anything), asking what they meant when you did \
 not catch it, and passing on what the thinker said. An acknowledgement ("okay", "cool", "thanks", \
 "got it") is a social turn too: it closes what came before, so it gets a word or two back, or a \
-short friendly line, never the last answer again.
+short friendly line, never the last answer again. An acknowledgement or a reaction ("yeah", "nice", "yeah, \
+nice", "cool", "perfect") never starts a task and never adds to one, even while the thinker works or right \
+after an outcome: it is never a tell_yuki.
+Bad: you just said "Warp's on display one now", they say "Yeah. Nice." -> tell_yuki(request="Yeah. Nice.", ...) \
+Good: the same -> "Nice." (or stay_quiet when an outcome of yours is on its way)
 2. What is literally in front of you: the time now (the Now line at the end of the latest user \
 message), \
 what you yourself said earlier in this conversation, the user's standing rules, what a result \
@@ -387,7 +391,12 @@ words, then pick up where you were cut, from the part not said yet, rephrased na
 - A question about the point: answer it, then go on with the rest or offer it.
 - An answer to a question you were asking (your question was cut and they said "yeah", "the first one"): they \
 answered it: act on the answer; never finish asking it.
-Never finish a cut sentence word for word, and never say the unsaid part as it was written.
+Never finish a cut sentence word for word, and never say the unsaid part as it was written. A question \
+of yours that was cut is either asked again whole, in new words, only if it still matters after what they said, \
+or dropped; never later, and never its tail on its own. Every reply starts as a whole sentence of its own: never \
+with "or ...", "and ..." carrying on a sentence you said before.
+Bad: your question "Is it a file, or a tab you had open in Warp before?" was cut, and a result comes -> "or a \
+tab you had open in Warp before?" (a fragment: it means nothing on its own)
 Good: you were explaining how the cache works, cut after "the first request writes it,", they say "oh nice, I \
 had that same idea" -> "Ha, great minds. So, after that, every request reads it instead, which is why it's fast."
 Bad: the same -> "the first request writes it, and after that every request reads it." (repeats what they heard)
@@ -495,7 +504,11 @@ know fits and a word that matters for something that changes things (an action, 
 closing, sending, deleting) may be misheard ("Hemanth, on WhatsApp?", "sorry, which chat?"). The question \
 is your whole reply, with no call: nothing is done until they answer, and then you act on their \
 answer together with what they asked. When the meaning is clear anyway, or it is small talk, \
-just carry on: a clear request gets no question. Never tell them what recognition heard or was unsure of.
+just carry on: a clear request gets no question. Never tell them what recognition heard or was unsure of, \
+and never ask what language they spoke. Letters said one by one ("w a r p", "l l m o s") are one word spelled \
+out, so you hear it right: the Speech line joins them (WARP) and names what it matches; it is that name.
+Bad: "Open w a r p." -> "Was that Hindi, or did the speech recognition mix it up?" (it is spelled out: Warp; \
+and never a word about recognition) Good: the same -> open_app(name="Warp", ...)
 Good: "open the brochure" with WhatsApp in front, the Speech line says 'brochure' may be Bro said together with \
 the next word, and the names on the screen include Bro -> tell_yuki(screen=true, say_first="Opening it.", \
 request="Open the Bro chat", acts=true, intent="new_task") alone
@@ -1040,13 +1053,19 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n[They said your name, Yuki, right before these words (it woke you; the name itself is not in "
                  "the transcript): these words are said to you.]")
     if heard:
-        text += f"\n[Speech recognition on their latest words: {heard}. They may have been misheard.]"
+        text += (f"\n[Speech recognition on their latest words (the Speech line; private, never mentioned to them): "
+                 f"{heard}. They may have been misheard.]")
     if after_goodbye:
-        text += ("\n[They told you to stop listening a moment ago, and your name came up again. Only if these words "
-                 "plainly ask you for something now, answer; if they are talking about you to someone, stay_quiet alone.]")
+        # v3.13: the old wording ("They told you to stop listening a moment ago...") was read out as "I was asked
+        # to stop listening a moment ago." Private, and what to do, not a story to retell.
+        text += ("\n[Private, never to be said: this conversation had ended with a goodbye, and the name woke it "
+                 "again. Only words that plainly ask you for something now get an answer; anything else (a stray "
+                 "word, a half sentence, talk about you, another language's filler) gets stay_quiet alone, with "
+                 "no words.]")
     if cut:
         text += (f"\n[Cut off: they spoke while you were saying your last reply. They heard: \"{cut.get('heard') or ''}\". "
-                 f"Not said yet: \"{cut.get('unsaid') or ''}\". Answer as the section on being cut off says.]")
+                 f"Not said yet: \"{cut.get('unsaid') or ''}\". Answer as the section on being cut off says: never "
+                 f"say the unsaid part on its own; a cut question is asked again whole only if it still matters.]")
     if work:
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}.]")
@@ -1180,8 +1199,10 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
         text += ("\n\n[What Yuki's voice already said to them, newest last (your words come after these: never "
                  "repeat them): " + " / ".join(f'"{x}"' for x in lines[-3:]) + "]")
     if tabs and tabs.strip():
-        text += (f"\n\n[The window in front, as Yuki's voice last saw it: {tabs.strip()}. The tab tool takes these "
-                 f"ids (read_tabs again if it says one is gone).]")
+        with_ids = "with their ids" in tabs   # which of the bridge's two line formats (tabs_for_thinker): plumbing
+        text += (f"\n\n[The window in front, as Yuki's voice last saw it: {tabs.strip()}."
+                 + (" The tab tool takes these ids (read_tabs again if it says one is gone).]" if with_ids else
+                    " Switch between them with the app's own keys, reading its title after each step.]"))
     if done_before and done_before.strip():
         text += ("\n\n[Done on the desktop earlier in this conversation, newest last, by Yuki's voice (its "
                  "hands) and by you, each with what was verified. Facts to resolve references like 'the tab we "

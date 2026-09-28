@@ -222,7 +222,7 @@ def test_a_half_written_mark_never_reaches_the_voice() -> None:
 def test_a_wake_right_after_a_goodbye_is_judged_not_taken_as_addressed() -> None:
     from yuki.voice.mouth import MOUTH_PROMPT, volatile_block
 
-    assert "stop listening a moment ago" in volatile_block(after_goodbye=True)["text"]
+    assert "this conversation had ended with a goodbye" in volatile_block(after_goodbye=True)["text"]   # v3.13 wording
     assert "never say one without the call" in MOUTH_PROMPT
     assert "I had a long talk" in MOUTH_PROMPT   # talk about Yuki is not calling her
 

@@ -214,14 +214,16 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "window",
         "description": (
-            "Your hand: focus (bring to the front), minimize, maximize, restore or close one whole window. "
+            "Your hand: focus (bring to the front), minimize, maximize, fullscreen, restore or close one whole "
+            "window. Maximized fills the screen but keeps its title bar and the taskbar; fullscreen (F11) covers the "
+            "whole monitor: when they say full screen, it is fullscreen, never maximize. "
             "A window is not a tab: this never changes which tab a browser shows (that is the tab hand). The "
             "report says whether the window really reached that state. close is what its X button does, and "
             "only when the user asked to close that window (their words in named)." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
-            "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "restore", "close"]},
+            "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close"]},
             "named": {"type": "string",
                       "description": "close only: the user's own words asking to close this window."},
             "say_when_done": _DONE_LINE,
@@ -402,6 +404,8 @@ class Hands:
         #: The names on the screen in front (yuki.voice.screennames, v3.10): its app, its hwnd and the names, read
         #: once per change of the window in front, its title or the action log (``refresh_screen_names``).
         self.screen_names: list[str] = []
+        #: Of those, the window's recent titles (its tabs), when its tree gave almost nothing (v3.13).
+        self.screen_titles: list[str] = []
         self.screen_app = ""
         self.screen_hwnd: int | None = None
         self._names_key: tuple | None = None
@@ -505,7 +509,12 @@ class Hands:
             with self._lock:
                 self._tabs = {hwnd: (title, self.actions.version, strip, time.monotonic())}
 
-    def refresh_screen_names(self, on_change: Any = None, *, max_age_s: float = 30.0) -> None:
+    #: A window whose tree gives fewer names than this draws its own interface (a GPU terminal): its recent titles
+    #: (its tabs) are what can be named in it (v3.13).
+    FEW_NAMES = 3
+
+    def refresh_screen_names(self, on_change: Any = None, *, max_age_s: float = 30.0,
+                             titles: Any = None) -> None:
         """Read the names on the screen in front again when it changed (a thread; returns at once).
 
         Changed means another window in front, another title, or something done on the desktop since the last read
@@ -531,7 +540,7 @@ class Hands:
                 key = (front, str(win.get("title") or ""), self.actions.version)
                 if key == self._names_key and time.monotonic() - self._names_at < max_age_s:
                     return
-                from yuki.voice.screennames import names_from_tree
+                from yuki.voice.screennames import LIST_ROLES, names_from_tree
 
                 try:
                     tree = read(front, max_elements=300, timeout_s=0.8)
@@ -539,6 +548,20 @@ class Hands:
                     tree = read(front)
                 names = names_from_tree(tree)
                 image = str(win.get("process_name") or win.get("app") or "")
+                recent: list[str] = []
+                # No list, tree or tab items at all (a browser shows its tabs as TabItems: its titles are pages, not
+                # tabs), and next to no names: the app draws its own interface.
+                drawn = not any(str((e.get("role") if isinstance(e, dict) else getattr(e, "role", "")) or "")
+                                in LIST_ROLES for e in ((tree.get("elements") if isinstance(tree, dict)
+                                                         else getattr(tree, "elements", None)) or []))
+                if len(names) < self.FEW_NAMES and drawn and titles is not None and image:
+                    # Live 2026-09-29: Warp's sidebar tab "LLM OS agent harness revamp" was heard as "LLM OS rigid
+                    # hardness" and never found: Warp exposes no items, but its tabs were its titles all evening.
+                    try:
+                        recent = [t for t in (titles(image) or []) if t][:12]
+                    except Exception:  # noqa: BLE001 - a hint only
+                        recent = []
+                    names = list(dict.fromkeys([*names, *recent]))
                 try:   # the app's own name, as it may be spoken ("WhatsApp", not "WhatsApp.Root")
                     from yuki.core import appnames
 
@@ -549,6 +572,7 @@ class Hands:
                 with self._lock:
                     changed = names != self.screen_names or front != self.screen_hwnd
                     self.screen_names, self.screen_app, self.screen_hwnd = names, app, front
+                    self.screen_titles = recent
                 self._names_key, self._names_at = key, time.monotonic()
                 if self.log is not None:
                     self.log.event("screen_names", names=len(names), changed=changed)

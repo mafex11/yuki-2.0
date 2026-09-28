@@ -5,7 +5,10 @@ files carry no words at all: timings, sizes, token counts, costs, languages,
 states and errors. ``logs/voice/voice-YYYYMMDD.jsonl`` gets every event,
 ``logs/voice_turns.csv`` one row per turn (what ``scripts/voice_latency.py``
 reads). Written from the voice thread, the wake thread and the GUI thread, so
-every write takes a lock.
+every write takes a lock. A write asked for on the voice loop's own thread (an
+asyncio loop running there) goes to one small writer thread instead (v3.13: live
+2026-09-29 one append stalled the voice loop 1.7 s while the disk was busy); other
+threads write at once. ``flush()`` waits for the writer.
 
 Turn fields (all milliseconds unless named otherwise; ``None`` when a stage
 did not happen, e.g. no speech in a turn the mouth opened to speak a result):
@@ -39,8 +42,10 @@ the first time a row with the new set is written, so every file has one header.
 
 from __future__ import annotations
 
+import atexit
 import csv
 import json
+import queue
 import threading
 import time
 from datetime import datetime
@@ -113,15 +118,63 @@ class VoiceLog:
         self.log_dir = Path(log_dir)
         self.turns_csv = Path(turns_csv) if turns_csv else self.log_dir.parent / "voice_turns.csv"
         self._lock = threading.Lock()
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._writer: threading.Thread | None = None
+        self._queued = 0
+        self._drained = threading.Condition()
 
     def _jsonl_path(self) -> Path:
         return self.log_dir / f"voice-{datetime.now():%Y%m%d}.jsonl"
+
+    @staticmethod
+    def _on_loop() -> bool:
+        """Whether this thread runs an asyncio loop now (the voice loop): its writes must never wait on the disk."""
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def _later(self, write: Any) -> None:
+        with self._drained:
+            self._queued += 1
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(target=self._write_loop, name="yuki-voice-log", daemon=True)
+                self._writer.start()
+                atexit.register(self.flush)
+        self._queue.put(write)
+
+    def _write_loop(self) -> None:
+        while True:
+            write = self._queue.get()
+            try:
+                write()
+            except Exception:  # noqa: BLE001 - logging must never take voice down
+                pass
+            with self._drained:
+                self._queued -= 1
+                if self._queued <= 0:
+                    self._drained.notify_all()
+
+    def flush(self, timeout_s: float = 2.0) -> None:
+        """Wait (bounded) until every write handed to the writer thread is on disk."""
+        with self._drained:
+            self._drained.wait_for(lambda: self._queued <= 0, timeout=timeout_s)
 
     def event(self, event_type: str, **fields: Any) -> dict[str, Any]:
         """Write one event. Callers pass no user or model text, only facts about it."""
         record = {"ts": round(time.time(), 3), "at": datetime.now().isoformat(timespec="milliseconds"),
                   "type": event_type, **fields}
         line = json.dumps(record, ensure_ascii=False, default=str)
+        if self._on_loop():
+            self._later(lambda: self._append(line))
+        else:
+            self._append(line)
+        return record
+
+    def _append(self, line: str) -> None:
         with self._lock:
             try:
                 self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -129,13 +182,18 @@ class VoiceLog:
                     fh.write(line + "\n")
             except OSError:
                 pass  # logging must never take voice down
-        return record
 
     def turn(self, row: dict[str, Any]) -> None:
         """One finished turn: a ``turn`` event and a CSV row (missing columns stay empty)."""
         self.event("turn", **row)
         values = {key: row.get(key) for key in TURN_COLUMNS}
         values["timestamp"] = values["timestamp"] or datetime.now().isoformat(timespec="seconds")
+        if self._on_loop():
+            self._later(lambda: self._row(values))
+        else:
+            self._row(values)
+
+    def _row(self, values: dict[str, Any]) -> None:
         with self._lock:
             try:
                 self.turns_csv.parent.mkdir(parents=True, exist_ok=True)

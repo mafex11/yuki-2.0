@@ -468,6 +468,10 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     ``screen``: the names on the screen in front (v3.10: its chats, tabs, links): a heard word close to one of
     them is named with it, and an unsure word that begins with a known name ("brochure" for "Bro chat", live
     2026-09-28) is named as that name run together with the next word. String measures, no word list.
+
+    Letters said one by one (v3.13: "Open w a r p." heard as five words, answered "Was that Hindi?") are one word
+    spelled out: a run of two or more one-letter words is joined (WARP) and named with the keyterm or screen name
+    it is, or begins, or is closest to. Measured on the words' own lengths, no word list.
     """
     import difflib
 
@@ -522,7 +526,30 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
             if best:
                 near.append((" ".join(window), terms[best]))
                 flagged.update(range(i, i + size))
+    spelled: list[tuple[str, str, str | None]] = []
+    run: list[str] = []
+    for w in [*spoken, ""]:
+        if len(w) == 1 and w.isalpha():
+            run.append(w)
+            continue
+        if len(run) >= 2:
+            joined = "".join(run)
+            k = key(joined)
+            names = {key(t): t for t in [*keyterms, *(screen or [])] if len(key(t)) >= 3}
+            match = names.get(k)
+            if match is None:
+                # A name it begins ("l l m o s" and "LLM OS agent harness revamp"), else the closest one.
+                ratio = lambda t: difflib.SequenceMatcher(None, k, t[:len(k)] if len(t) > len(k) else t).ratio()
+                best = max(names, key=ratio, default=None)
+                if best is not None and ratio(best) >= NEAR_TERM_RATIO:
+                    match = names[best]
+            spelled.append((" ".join(run), joined.upper(), match))
+        run = []
     parts = []
+    if spelled:
+        parts.append("; ".join(f"'{h}' is a word spelled out letter by letter: {w}"
+                               + (f", which is {m}" if m and key(m) == key(w) else f", most likely {m}" if m else "")
+                               for h, w, m in spelled[:2]))
     if low:
         parts.append("unsure of " + ", ".join(f"'{w}' ({c:.2f})" for w, c in low[:5]))
     if near:
@@ -530,7 +557,9 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                                                                    else "a name you know") for h, t in near[:3]))
     if fused:
         parts.append("; ".join(f"'{h}' may be {t} said together with the next word" for h, t in fused[:2]))
-    return ("; ".join(parts) or None), len(low), len(near) + len(fused)
+    # A spelled word that is a known name exactly is no doubt (nothing to ask): only the others count.
+    unsure_spelled = sum(1 for _h, w, m in spelled if not (m and key(m) == key(w)))
+    return ("; ".join(parts) or None), len(low), len(near) + len(fused) + unsure_spelled
 
 
 #: The user counts as at the PC when they touched the keyboard or mouse this recently (s): the dormant voice's
@@ -1289,6 +1318,8 @@ class TurnObserver:
         self.output_processor: Any = None
         #: What recognition was unsure of in the latest final transcript (:func:`heard_note`), for the mouth.
         self.heard: str | None = None
+        #: The note carries no doubt, only a fact (a name spelled out letter by letter, v3.13): nothing is held for it.
+        self.heard_plain = False
         #: The names memory holds (the conversation's keyterms): a heard word close to one is named.
         self.keyterms: list[str] = []
         #: Whether the words being transcribed now begin right where the wake word's name was cut off (the
@@ -1630,13 +1661,14 @@ class TurnObserver:
         if isinstance(frame, EagerTranscriptionFrame):
             # A speculative reply starts from these words: what recognition was unsure of in them (v3.5).
             result = getattr(frame, "result", None)
-            self.heard = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
-                                    cut_before=self.cut_before(), screen=self.screen_terms)[0]
+            note, low, near = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
+                                         cut_before=self.cut_before(), screen=self.screen_terms)
+            self.heard, self.heard_plain = note, bool(note and not (low or near))
             return
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
             self._user_started_at = now
-            self.heard = None  # a new turn: the last one's doubts are not about these words
+            self.heard, self.heard_plain = None, False  # a new turn: the last one's doubts are not about these
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
             if (self.turn is not None and self.turn.trigger == "user" and self.turn.first_audio is None
@@ -1663,6 +1695,7 @@ class TurnObserver:
             self.heard, turn.heard_low, turn.heard_near = heard_note(
                 result.get("words") if isinstance(result, dict) else None, self.keyterms,
                 cut_before=self.cut_before(), screen=self.screen_terms)
+            self.heard_plain = bool(self.heard and not (turn.heard_low or turn.heard_near))
             self.last_user_text = turn.user_text
             if self.guard is not None:
                 self.guard.new_turn()
@@ -2607,10 +2640,31 @@ class Conversation:
             except RuntimeError:  # the loop closed in between
                 pass
 
+        memory = self.memory
+        cache: dict[str, tuple[float, list[str]]] = {}
+
+        def titles(process: str) -> list[str]:
+            """The app's recent window titles from memory's timeline (cached a minute; bounded; never raises)."""
+            hit = cache.get(process)
+            if hit is not None and time.monotonic() - hit[0] < 60.0:
+                return hit[1]
+            got: list[str] = []
+            if memory is not None and hasattr(memory, "call"):
+                try:
+                    got = list(memory.call("recent titles", lambda c: c.recent_titles(process, hours=12.0, limit=12),
+                                           timeout_s=1.0) or [])
+                except Exception:  # noqa: BLE001
+                    got = []
+            cache[process] = (time.monotonic(), got)
+            return got
+
         try:
             while not self._stop.is_set():
                 if not self.dormant:   # no window reads while waiting for the name
-                    hands.refresh_screen_names(changed)
+                    try:
+                        hands.refresh_screen_names(changed, titles=titles)
+                    except TypeError:  # a stand-in without the keyword
+                        hands.refresh_screen_names(changed)
                 await asyncio.sleep(self.SCREEN_TERMS_EVERY_S)
         except asyncio.CancelledError:
             return
@@ -2755,7 +2809,8 @@ class Conversation:
             return decided[str(call_id)]  # decided once, when the reply ended (its words went with that decision)
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
         spoke = call is not None and call.first_text is not None and call.user_turn
-        return bool(spoke and self.observer.heard and name not in AUDIO_HANDS)
+        return bool(spoke and self.observer.heard and not getattr(self.observer, "heard_plain", False)
+                    and name not in AUDIO_HANDS)
 
     async def _hold(self, params: Any) -> None:
         self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
@@ -2792,7 +2847,7 @@ class Conversation:
         is complete). Exactly one side acts: from here the thinker owns the request, and the talker's window
         hands wait while it runs (``VoiceBridge.desk_job``).
         """
-        if self.observer.heard or self.bridge.has_open_voice_job():
+        if (self.observer.heard and not getattr(self.observer, "heard_plain", False)) or self.bridge.has_open_voice_job():
             return
         from yuki.voice.bridge import heard_words
 

@@ -2129,6 +2129,34 @@ class MemoryClient:
         except Exception:
             return []
 
+    def recent_titles(self, process: str, *, hours: float = 12.0, limit: int = 15) -> list[str]:
+        """The distinct window titles an app had in front recently, most used first (its tabs, sessions, documents),
+        from the timeline (privacy-filtered where it was recorded). For voice (v3.13): an app that draws its own
+        interface (a GPU terminal like Warp) exposes no items to UI Automation, but its tabs are its titles, so the
+        names the user says can still be heard right and found. Never raises."""
+        import unicodedata
+
+        from yuki.memory.store import app_key
+
+        key = app_key(process) or ""
+        if not key:
+            return []
+        try:
+            rows = self.store.timeline_of(key, time.time() - float(hours) * 3600.0)
+        except Exception:
+            return []
+        weight: dict[str, float] = {}
+        for r in rows:
+            if (r.process or "") != key or not r.title:
+                continue
+            title = " ".join(str(r.title).split())
+            # a status glyph an app puts before its title (a spinner, a mark: Unicode symbols) is not part of the name
+            while title and unicodedata.category(title[0])[0] in "SPZ":
+                title = title[1:].lstrip()
+            if title:
+                weight[title] = weight.get(title, 0.0) + float((r.active_s or 0) + (r.passive_s or 0) + 1)
+        return [t for t, _w in sorted(weight.items(), key=lambda kv: -kv[1])][: max(0, int(limit))]
+
     def speech_names(self, limit: int = 50) -> list[str]:
         """Names speech recognition should expect (Deepgram keyterms): the right names of the user's
         corrections first, then the words of the user's own sites and accounts (:meth:`user_resources`, spelled
