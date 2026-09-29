@@ -142,6 +142,14 @@ def test_window_runs_from_the_return_and_a_short_break_does_not_hide_it(store):
 # -- the whole tick, with a stub model ---------------------------------------------------
 
 
+def cited(request: dict) -> list[str]:
+    """The first journal id the request offers ("[J12]"), as a real answer would cite it (test-only parsing)."""
+    text = str(request["messages"][0]["content"])
+    start = text.find("[J")
+    end = text.find("]", start)
+    return [text[start + 1:end]] if start >= 0 and end > start else []
+
+
 class StubClient:
     """Answers welcome_back with a message, coach_decision with none."""
 
@@ -153,7 +161,7 @@ class StubClient:
         name = request["tool_choice"]["name"]
         self.calls.append(name)
         if name == "welcome_back":
-            data = {"reason": "stub", "say": "resume", "detail": "the resume fix", "evidence": ["NOW"],
+            data = {"reason": "stub", "say": "resume", "detail": "the resume fix", "evidence": ["NOW", *cited(request)],
                     "text": "Morning, you were on the resume fix.", "mentions": []}
         elif name == "coach_decision":
             data = {"reason": "stub", "say": "none", "is_break_suggestion": False, "detail": "", "evidence": [],
@@ -178,6 +186,7 @@ def ticks(worker: NudgeWorker, start: float, end: float, step: float = 60.0) -> 
 def test_worker_welcomes_back_once_after_a_night_away(store):
     with tempfile.TemporaryDirectory() as logs:
         present(store, at("20:00", -1), at("05:00"))
+        store.add_journal(at("04:30"), None, "Warp", "The user was fixing the resume trigger.", 6)
         away(store, at("05:00"), at("09:00"))
         present(store, at("09:00"), at("11:00"))
         client = StubClient()
@@ -194,6 +203,8 @@ def test_worker_welcomes_back_once_after_a_night_away(store):
 
 def test_worker_short_breaks_never_welcome(store):
     with tempfile.TemporaryDirectory() as logs:
+        store.add_journal(at("08:30", -1), None, "Warp", "The user was fixing the resume trigger.", 6)
+        present(store, at("08:00", -1), at("09:00", -1))
         present(store, at("09:00"), at("10:00"))
         present(store, at("10:10"), at("12:30"))
         present(store, at("13:15"), at("18:00"))

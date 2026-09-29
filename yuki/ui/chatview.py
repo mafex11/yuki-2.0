@@ -55,7 +55,7 @@ FIRST = 8
 BACKFILL = 2
 
 KIND_TITLES = {"praise": "Nice one", "nudge": "Check-in", "reminder": "Reminder", "review": "Weekly review",
-               "resume": "Welcome back", "question": "Getting to know you"}
+               "resume": "Welcome back", "question": "Getting to know you", "notice": "Noticed"}
 
 
 def _label(t: Theme, text: str, role: str, ink: QColor, *, wrap: bool = True, select: bool = True,
@@ -395,6 +395,8 @@ class _ItemWidget(QWidget):
     """One row of the thread: a user bubble, a response (steps + text), a nudge or a notice."""
 
     reply_nudge = Signal(object)
+    #: ``(nudge)`` -- Do it on a card with an offer (yuki.ui.nudges.offer_request).
+    do_nudge = Signal(object)
     toggle = Signal(str)
 
     def __init__(self, t: Theme, item: Item, max_w: int, look: str = "window") -> None:
@@ -447,8 +449,12 @@ class _ItemWidget(QWidget):
             head = QHBoxLayout()
             head.setSpacing(8)
             head.addWidget(Wave("checkin", theme=lambda: t, size=(34, 10)), 0, Qt.AlignmentFlag.AlignVCenter)
+            from yuki.ui.nudges import card_offer, card_title
+
             joiner = " at " if overlay else ", "
-            when = _label(t, f"{KIND_TITLES.get(kind, 'Yuki')}{joiner}{_stamp(item.at)}", "micro", t.text_3,
+            title = card_title(nudge) if kind == "notice" else KIND_TITLES.get(kind, "Yuki")
+            missed = ", missed while you were away" if nudge.get("missed") else ""
+            when = _label(t, f"{title}{joiner}{_stamp(item.at)}{missed}", "micro", t.text_3,
                           wrap=False, select=False)
             when.setFont(variable_font(11.5, "Regular"))
             head.addWidget(when)
@@ -467,8 +473,17 @@ class _ItemWidget(QWidget):
                 if overlay:
                     self.text.setFont(variable_font(14, "Regular"))
                 self.bubble.body.addWidget(self.text)
+                if card_offer(nudge):   # what Do it will run, in its own words
+                    from yuki.ui.nudges import offer_line
+
+                    self.bubble.body.addWidget(_label(t, offer_line(nudge), "caption", t.text_3))
             acts = QHBoxLayout()
             acts.setSpacing(12)
+            self.do: _Tiny | None = None
+            if card_offer(nudge) and kind != "question":   # the card's offer: run it as the user's instruction
+                self.do = _Tiny(t, "Do it")
+                self.do.clicked.connect(lambda: self.do_nudge.emit(item.nudge))
+                acts.addWidget(self.do)
             self.reply = _Tiny(t, "Reply")
             self.reply.clicked.connect(lambda: self.reply_nudge.emit(item.nudge))
             acts.addWidget(self.reply)
@@ -568,9 +583,14 @@ class _ItemWidget(QWidget):
                 how = ", said to others on the call"
             self.meta.setText(f"You, {_stamp(item.at)}{how}")
         elif item.kind == "nudge" and hasattr(self, "reply"):
-            self.reply.setText({"open": "Reply", "replying": "Replying…", "replied": "Replied"}.get(item.reply_state,
-                                                                                                   "Reply"))
-            self.reply.setEnabled(item.reply_state == "open")
+            state = item.reply_state
+            if (item.nudge or {}).get("reaction") == "accepted" and state == "open":
+                state = "accepted"
+            self.reply.setText({"open": "Reply", "replying": "Replying…", "replied": "Replied"}.get(state, "Reply"))
+            self.reply.setEnabled(state == "open")
+            if getattr(self, "do", None) is not None:
+                self.do.setText("Done" if state == "accepted" else "Do it")
+                self.do.setEnabled(state == "open")
         elif item.kind == "assistant" and self.text is not None and self.meta is not None:
             if self.steps is not None:
                 real = bool(item.real_steps())   # a plain reply (only the closing call) shows no fold
@@ -627,9 +647,11 @@ class ChatThreadView(QWidget):
 
     Signals:
         reply_nudge: ``(nudge)`` -- Reply on a nudge in the thread.
+        do_nudge: ``(nudge)`` -- Do it on a card with an offer.
     """
 
     reply_nudge = Signal(object)
+    do_nudge = Signal(object)
     content_resized = Signal()
 
     def __init__(self, model: ChatModel, theme: Callable[[], Theme], *, max_bubble: int = 560,
@@ -753,6 +775,7 @@ class ChatThreadView(QWidget):
     def _make(self, item: Item) -> _ItemWidget:
         w = _ItemWidget(self.theme(), item, self.max_bubble, self.look)
         w.reply_nudge.connect(self.reply_nudge.emit)
+        w.do_nudge.connect(self.do_nudge.emit)
         w.toggle.connect(self.model.toggle)
         self._widgets[item.id] = w
         from yuki.ui.window.widgets import attach_tips

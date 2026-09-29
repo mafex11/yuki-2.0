@@ -1332,7 +1332,10 @@ class MemoryClient:
 
     @staticmethod
     def _nudge_dict(n: Any) -> dict:
-        return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref}
+        inputs = n.inputs if isinstance(getattr(n, "inputs", None), dict) else {}
+        offer = " ".join(str(inputs.get("offer") or "").split()) or None
+        return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
+                "trigger": n.trigger, "offer": offer}
 
     # -- questions for the user (yuki.memory.questions) -----------------------------
 
@@ -1392,7 +1395,9 @@ class MemoryClient:
         """Nudges the service wrote that the UI has not shown yet, oldest first.
 
         Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder" |
-        "review" | "resume", "text": str, "reason": str | None}`` (``resume``:
+        "review" | "resume" | "question" | "notice", "text": str, "reason": str | None, "ref", "trigger",
+        "offer": str | None}`` (``notice``: an observation card, yuki.memory.presence, ``trigger`` its channel;
+        ``offer``: the instruction its "Do it" button sends to the agent as the user's own words; ``resume``:
         picking up after the PC was off or asleep; it expires like a praise). ``text`` is what to show
         the user (one or two short sentences, already in their register and
         following their rules); ``reason`` is the coach's one-line why, for a
@@ -1409,7 +1414,7 @@ class MemoryClient:
             from yuki.memory.nudges import NudgeConfig
             from yuki.memory.timeline import PrivacySection
 
-            window = NudgeConfig().deliver_within_min
+            window, notice_window = NudgeConfig().deliver_within_min, NudgeConfig().presence_deliver_min
             try:   # the user's [nudges] table, read only (the service applies the same window)
                 from types import SimpleNamespace
 
@@ -1418,12 +1423,14 @@ class MemoryClient:
                 if self._nudge_section is None:
                     self._nudge_section = PrivacySection(SimpleNamespace(path=user_config_path()), "nudges",
                                                          NudgeConfig.from_dict)
-                window = self._nudge_section.get().deliver_within_min
+                cfg = self._nudge_section.get()
+                window, notice_window = cfg.deliver_within_min, cfg.presence_deliver_min
             except Exception:
                 pass
-            cutoff = time.time() - window * 60.0
+            now = time.time()
+            cutoff, notice_cutoff = now - window * 60.0, now - notice_window * 60.0
             return [self._nudge_dict(n) for n in self.store.nudges(pending=True)
-                    if n.kind in ("reminder", "review") or n.at >= cutoff]
+                    if n.kind in ("reminder", "review") or n.at >= (notice_cutoff if n.kind == "notice" else cutoff)]
         except Exception:
             return []
 
@@ -1434,17 +1441,23 @@ class MemoryClient:
         ``"reaction": "shown" | "dismissed" | "replied" | "snoozed"``
         (``shown``: it was on screen and nothing more, e.g. a card that faded
         unread). Never-shown ones (pending or expired) are left out. For the
-        UI's history of what Yuki said. Never raises.
+        UI's history of what Yuki said. An observation card (kind ``notice``) that expired before the screen was
+        free is in it too, with ``"missed": True`` and no ``shown_at``: it stays reachable, never shown as new.
+        Never raises.
         """
         try:
             since = time.time() - max(0.0, float(hours)) * 3600.0
-            return [{**self._nudge_dict(n), "shown_at": _iso(n.shown_at), "reaction": n.reaction}
-                    for n in self.store.nudges(since=since) if n.shown_at is not None]
+            return [{**self._nudge_dict(n), "shown_at": _iso(n.shown_at), "reaction": n.reaction,
+                     **({"missed": True} if n.shown_at is None else {})}
+                    for n in self.store.nudges(since=since)
+                    if n.shown_at is not None or (n.kind == "notice" and n.reaction == "expired")]
         except Exception:
             return []
 
     def ack_nudge(self, nudge_id: int, reaction: str, reply: str | None = None) -> None:
-        """Record what happened to a nudge: ``"shown"`` | ``"dismissed"`` | ``"replied"`` | ``"snoozed"``.
+        """Record what happened to a nudge: ``"shown"`` | ``"dismissed"`` | ``"replied"`` | ``"snoozed"`` |
+        ``"accepted"`` ("Do it" on the card's offer: it ran as the user's instruction) | ``"less"`` ("Less of
+        these": feedback on that kind of card, read by its budget and by COACH FEEDBACK; never a mute of others).
 
         ``shown`` when it appears on screen (it leaves :meth:`pending_nudges`);
         then, if the user acts on it, ``dismissed`` / ``replied`` / ``snoozed``
@@ -1472,7 +1485,8 @@ class MemoryClient:
         "reminder": n}}`` - nudges written since local midnight.
         """
         out: dict[str, Any] = {"quiet_until": None, "last_nudge_at": None,
-                               "today": {"praise": 0, "nudge": 0, "reminder": 0, "resume": 0, "question": 0}}
+                               "today": {"praise": 0, "nudge": 0, "reminder": 0, "resume": 0, "question": 0,
+                                         "notice": 0}}
         try:
             now = time.time()
             quiet = self.store.nudge_state("quiet_until")
@@ -1502,8 +1516,10 @@ class MemoryClient:
         now = time.time() if now is None else float(now)
         try:
             since = now - COACH_QUIET_S
+            from yuki.memory.nudges import PRESENCE_TRIGGERS
+
             checks = [c for c in self.store.checkin_reasons(since, limit=60)
-                      if c["trigger"] not in ("reminder", "review", "question", "confirm", "resume")]
+                      if c["trigger"] not in ("reminder", "review", "question", "confirm", "resume", *PRESENCE_TRIGGERS)]
             last = self.store.nudges(until=now + 1.0, kinds=("praise", "nudge", "resume", "reminder", "question"),
                                      limit=1)
             quiet = self.store.nudge_state("quiet_until")

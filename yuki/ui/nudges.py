@@ -18,6 +18,14 @@ faded after :func:`linger_for` its text, or it was delivered into the open
 overlay), ``dismissed``, ``replied`` or ``snoozed``. Memory decides what a
 nudge says and when; nothing here reads its text.
 
+A card that carries an offer (``offer``: the observation cards of
+``yuki.memory.presence`` and the welcome back may end with one) shows **Do it**,
+**Not now** and, on an observation card, **Less of these**. Do it acknowledges
+``accepted`` and hands the offer to the agent as the user's own instruction
+(:func:`offer_request`, ``do_requested``); nothing runs without that press. Not
+now is ``dismissed``; Less of these is ``less`` (feedback on that kind of card:
+memory gives that kind fewer cards, nothing else changes).
+
 While the overlay is open, nudges go into its conversation instead of the
 corner (the ``in_overlay`` signal), and when it opens the recent ones
 (:data:`OVERLAY_RECENT_HOURS`, via ``recent_nudges()``) come back as cards, so
@@ -82,13 +90,22 @@ COACH_NOTE_TEXT_CHARS = 400
 COACH_NOTE_REASON_CHARS = 200
 
 #: Reactions after which a nudge counts as answered (no implicit reply to it).
-ANSWERED_REACTIONS: frozenset[str] = frozenset({"replied", "dismissed", "snoozed"})
+ANSWERED_REACTIONS: frozenset[str] = frozenset({"replied", "dismissed", "snoozed", "accepted", "less"})
 
 #: Heading per nudge kind.
 KIND_TITLES: dict[str, str] = {
     "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
-    "resume": "Welcome back", "question": "Getting to know you",
+    "resume": "Welcome back", "question": "Getting to know you", "notice": "Noticed",
 }
+#: An observation card's heading by its channel (the nudge's ``trigger``, yuki.memory.presence).
+NOTICE_TITLES: dict[str, str] = {
+    "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
+    "recall": "From memory", "thread": "Your work",
+}
+#: A card with an offer: run it, not now, fewer of this kind (the last on observation cards only).
+OFFER_BUTTONS: tuple[str, str, str] = ("Do it", "Not now", "Less of these")
+#: A card with an offer stays up this much longer (there is something to decide).
+OFFER_LINGER_EXTRA_MS = 6_000
 #: A question card's buttons: answer it (opens the overlay), not now, don't ask about this.
 QUESTION_BUTTONS: tuple[str, str, str] = ("Answer", "Skip", "Don't ask")
 
@@ -112,6 +129,40 @@ _WAIT_FAILED = 0xFFFFFFFF
 def kind_title(kind: Any) -> str:
     """The small heading for a nudge kind."""
     return KIND_TITLES.get(str(kind or ""), "Yuki")
+
+
+def card_title(nudge: dict[str, Any]) -> str:
+    """The heading of one card: its kind's, or for an observation card its channel's."""
+    kind = str(nudge.get("kind") or "")
+    if kind == "notice":
+        return NOTICE_TITLES.get(str(nudge.get("trigger") or ""), KIND_TITLES["notice"])
+    return kind_title(kind)
+
+
+def card_offer(nudge: dict[str, Any] | None) -> str:
+    """The instruction a card's Do it runs (memory wrote it with the card), or ``""``."""
+    return " ".join(str((nudge or {}).get("offer") or "").split())
+
+
+def offer_line(nudge: dict[str, Any] | None) -> str:
+    """The dim line under a card with an offer: exactly what its Do it runs (``"Do it: Draft a reply ..."``)."""
+    offer = card_offer(nudge)
+    return f"{OFFER_BUTTONS[0]}: {offer}" if offer else ""
+
+
+def offer_request(nudge: dict[str, Any]) -> str:
+    """The request Do it becomes: the card as context, then its offer as the user's own instruction.
+
+    The instruction is what the user accepted by pressing the button, exactly as if they had typed
+    it; the line before it says so, so the agent's rules for plain instructions (and for anything
+    sent to other people) apply to it unchanged.
+    """
+    kind = str(nudge.get("kind") or "notice")
+    sent = when_label(nudge.get("at"))
+    text = " ".join(str(nudge.get("text") or "").split())
+    head = (f'[The user pressed "Do it" on your card (kind: {kind}){f", sent {sent}" if sent else ""}: "{text}". '
+            "The line below is their own instruction, as if they had typed it.]")
+    return f"{head}\n{card_offer(nudge)}"
 
 
 def notification_state() -> tuple[int, str]:
@@ -404,12 +455,16 @@ class NudgeCard(SurfaceWindow):
         dismissed: ``(nudge)`` -- the user pressed Dismiss.
         expired: ``(nudge)`` -- it faded on its own after :attr:`linger_ms`.
         never_ask: ``(nudge)`` -- "Don't ask" on a question card (its Dismiss reads "Skip").
+        accepted: ``(nudge)`` -- "Do it" on a card with an offer.
+        less: ``(nudge)`` -- "Less of these" on an observation card.
     """
 
     replied = Signal(object)
     dismissed = Signal(object)
     expired = Signal(object)
     never_ask = Signal(object)
+    accepted = Signal(object)
+    less = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
         super().__init__(activates=False)
@@ -461,14 +516,22 @@ class NudgeCard(SurfaceWindow):
         buttons.addStretch(1)
         self.never_button = self._button(QUESTION_BUTTONS[2])
         self.never_button.setVisible(False)   # question cards only
+        self.less_button = self._button(OFFER_BUTTONS[2])
+        self.less_button.setVisible(False)    # observation cards only
         self.dismiss_button = self._button("Dismiss")
         self.reply_button = self._button("Reply")
+        self.do_button = self._button(OFFER_BUTTONS[0])
+        self.do_button.setVisible(False)      # cards with an offer only
         self.never_button.clicked.connect(self._on_never)
+        self.less_button.clicked.connect(self._on_less)
         self.dismiss_button.clicked.connect(self._on_dismiss)
         self.reply_button.clicked.connect(self._on_reply)
+        self.do_button.clicked.connect(self._on_do)
         buttons.addWidget(self.never_button)
+        buttons.addWidget(self.less_button)
         buttons.addWidget(self.dismiss_button)
         buttons.addWidget(self.reply_button)
+        buttons.addWidget(self.do_button)
         column.addLayout(buttons)
 
         self._linger = QTimer(self)
@@ -490,9 +553,11 @@ class NudgeCard(SurfaceWindow):
 
     def _style_buttons(self) -> None:
         self.reply_button.setStyleSheet(self.button_css("default"))
+        self.do_button.setStyleSheet(self.button_css("default"))
         quiet = self.button_css("ghost")
         self.dismiss_button.setStyleSheet(quiet)
         self.never_button.setStyleSheet(quiet)
+        self.less_button.setStyleSheet(quiet)
         self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
@@ -507,11 +572,15 @@ class NudgeCard(SurfaceWindow):
         """Fill the card for one nudge and size it to its text (no showing)."""
         self.nudge = nudge
         kind = str(nudge.get("kind") or "nudge")
-        self.title.setText("" if kind == "nudge" else kind_title(kind))   # a plain check-in: the wave says it
+        self.title.setText("" if kind == "nudge" else card_title(nudge))   # a plain check-in: the wave says it
         question = str(nudge.get("kind") or "") == "question"
+        offer = bool(card_offer(nudge)) and not question
         self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
-        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else "Dismiss")
+        self.reply_button.setVisible(not offer)
+        self.do_button.setVisible(offer)
+        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else OFFER_BUTTONS[1] if offer else "Dismiss")
         self.never_button.setVisible(question)
+        self.less_button.setVisible(kind == "notice")
         self.when.setText(when_label(nudge.get("at")))
         text = _squash(nudge.get("text"))
         from yuki.ui.window.theme import variable_font
@@ -525,8 +594,11 @@ class NudgeCard(SurfaceWindow):
         else:
             self.body.setFont(variable_font(15, "Regular"))
             self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
-            self.detail.setVisible(False)
-        self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger_for(text)
+            # what Do it will run, in its own words, always in sight before the press
+            self.detail.setText(offer_line(nudge) if offer else "")
+            self.detail.setVisible(offer)
+        self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
+            linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0))
         self.restyle()
         width = CARD_WIDTH + 2 * self.SHADOW
         wanted = self.layout().totalHeightForWidth(width) if self.layout().hasHeightForWidth() else (
@@ -622,6 +694,16 @@ class NudgeCard(SurfaceWindow):
         if nudge is not None:
             self.never_ask.emit(nudge)
 
+    def _on_do(self) -> None:
+        nudge = self.close_card()
+        if nudge is not None:
+            self.accepted.emit(nudge)
+
+    def _on_less(self) -> None:
+        nudge = self.close_card()
+        if nudge is not None:
+            self.less.emit(nudge)
+
 
 class NoticeCard(NudgeCard):
     """A one-off notice from the runtime (``AgentRuntime.notice``: the daily cost alert), as the same card as a
@@ -635,6 +717,8 @@ class NoticeCard(NudgeCard):
         self.title.setText(self.TITLES.get(kind, "Yuki"))
         self.reply_button.hide()
         self.never_button.hide()
+        self.do_button.hide()
+        self.less_button.hide()
         self.dismiss_button.setText("OK")
         self._paused = False
         self.fade_in(self.anchor())
@@ -669,6 +753,8 @@ class NudgeController(QObject):
     reply_requested = Signal(object)
     in_overlay = Signal(object, str)
     recent_ready = Signal(object)
+    #: ``(nudge)`` -- Do it on a card's offer: run it as the user's instruction (the app submits it).
+    do_requested = Signal(object)
     #: ``(event name, fields)`` from worker threads, written on the GUI thread.
     _logged = Signal(str, object)
 
@@ -713,6 +799,8 @@ class NudgeController(QObject):
         self.card.dismissed.connect(self._on_dismissed)
         self.card.replied.connect(self._on_replied)
         self.card.never_ask.connect(self._on_never_ask)
+        self.card.accepted.connect(self.accept_offer)
+        self.card.less.connect(self._on_less)
         self.card.faded_out.connect(self.try_show)
         self._retry = QTimer(self)
         self._retry.setInterval(RETRY_MS)
@@ -953,6 +1041,23 @@ class NudgeController(QObject):
         self.ack(nudge, "dismissed")
         if str(nudge.get("kind") or "") == "question":
             self.question_feedback(nudge, never=False)
+
+    def accept_offer(self, nudge: dict[str, Any], via: str = "card") -> None:
+        """Do it on a card's offer (the corner card, or a card in the chat thread): acknowledged ``accepted``,
+        then handed to the app to run as the user's instruction (``do_requested``). Once per card."""
+        if not card_offer(nudge):
+            return
+        stored = self.record_delivery(nudge, via)   # the one dict per card, shared by the corner card and the thread
+        if "accepted" in (str(stored.get("reaction") or ""), str(nudge.get("reaction") or "")):
+            return
+        self.ui_log.event("nudge_accepted", id=nudge.get("id"), kind=nudge.get("kind"), via=via,
+                          trigger=nudge.get("trigger"), offer=card_offer(nudge))
+        self.ack(stored, "accepted")
+        self.do_requested.emit(stored)
+
+    def _on_less(self, nudge: dict[str, Any]) -> None:
+        self.ui_log.event("nudge_less", id=nudge.get("id"), kind=nudge.get("kind"), trigger=nudge.get("trigger"))
+        self.ack(nudge, "less")
 
     def _on_never_ask(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card_never")

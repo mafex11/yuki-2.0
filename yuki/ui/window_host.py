@@ -296,6 +296,12 @@ class WindowHost(QObject):
                 ui._on_submitted(text, via="window")
             self._on_gui(send)
             return {}
+        if op == "nudge_do":   # Do it on a card's offer in the window's chat: run it as the user's instruction
+            nudge = req.get("nudge") if isinstance(req.get("nudge"), dict) else None
+            if nudge is None or not str(nudge.get("offer") or "").strip():
+                return {"ok": False, "error": "no offer"}
+            self._on_gui(lambda: ui.nudges.accept_offer(nudge, via="window"))
+            return {}
         if op == "cancel":
             job = req.get("job")
             self._on_gui(lambda: ui.runtime.cancel(int(job)) if isinstance(job, int) else ui.runtime.cancel_worker())

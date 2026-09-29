@@ -1057,14 +1057,18 @@ class TodoItem:
 #: ``nudges.kind``: praise (encouragement, an acknowledgement), nudge (a call-back,
 #: a call-out, a break suggestion), reminder (a due to-do or commitment), review
 #: (the teaser of a new weekly review, yuki.memory.review; ``ref`` = "review:<id>")
-#: or resume (picking up after the PC was off or asleep; ``ref`` = "resume:<gap end>").
-NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review", "resume", "question")
+#: or resume (picking up after the PC was off or asleep; ``ref`` = "resume:<gap end>"), question, or notice
+#: (a plain observation, maybe with one offer, yuki.memory.presence; ``trigger`` = its channel, ``ref`` = what it
+#: was about, ``inputs.offer`` = the instruction its "Do it" runs).
+NUDGE_KINDS: tuple[str, ...] = ("praise", "nudge", "reminder", "review", "resume", "question", "notice")
 #: ``timeline.state`` of the power rows (yuki.memory.power): the PC itself was
 #: off (shutdown to start), asleep (sleep to wake) or stopped without a clean
 #: shutdown (unknown: a crash, a power cut). Not the user's stretches.
 POWER_STATES: tuple[str, ...] = ("off", "asleep", "unknown")
-#: ``nudges.reaction`` values the UI reports (``expired``: never shown in time).
-NUDGE_REACTIONS: tuple[str, ...] = ("shown", "dismissed", "replied", "snoozed")
+#: ``nudges.reaction`` values the UI reports (``expired``: never shown in time). ``accepted``: the user pressed
+#: "Do it" on the card's offer (it ran as their instruction); ``less``: "Less of these" (feedback on that kind of
+#: card: fewer of them, never a mute of the rest).
+NUDGE_REACTIONS: tuple[str, ...] = ("shown", "dismissed", "replied", "snoozed", "accepted", "less")
 
 
 @dataclass
@@ -5271,16 +5275,84 @@ class Store:
             (float(at) - within_s, float(at) + within_s, float(at)))
         return self._turn(rows[0]) if rows else None
 
-    def milestones_since(self, after_id: int, since: TimeArg) -> list[tuple[int, float]]:
+    def milestones_since(self, after_id: int, since: TimeArg, until: TimeArg = None) -> list[tuple[int, float]]:
         """``(journal id, at)`` of milestone facts (not Yuki's own, not superseded) newer than ``after_id``
-        and dated at or after ``since``, oldest first: content-free, for the coach's moment trigger."""
+        and dated at or after ``since`` (and written before ``until``, when given), oldest first: content-free,
+        for the coach's moment trigger and the observation cards (yuki.memory.presence)."""
+        sql = ("SELECT id, at FROM journal WHERE milestone=1 AND by_yuki=0 AND superseded_at IS NULL"
+               " AND id > ? AND at >= ?")
+        params: list[Any] = [int(after_id), _ts(since) or 0.0]
+        if (u := _ts(until)) is not None:
+            sql += " AND at < ? AND created_at <= ?"
+            params += [u, u]
         try:
-            rows = self._query(
-                "SELECT id, at FROM journal WHERE milestone=1 AND by_yuki=0 AND superseded_at IS NULL"
-                " AND id > ? AND at >= ? ORDER BY at, id", (int(after_id), _ts(since) or 0.0))
+            rows = self._query(sql + " ORDER BY at, id", params)
         except sqlite3.OperationalError:   # a database before migration 16
             return []
         return [(int(r["id"]), float(r["at"])) for r in rows]
+
+    def journal_vectors(self, ids: Iterable[int]) -> dict[int, np.ndarray]:
+        """The stored (decrypted) embedding of each of these journal facts that has one: ``{id: vector}``
+        (float32, as written; the recurrence signal of yuki.memory.presence compares them - no model)."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return {}
+        out: dict[int, np.ndarray] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            for r in self._query("SELECT journal_id, vec_ciphertext FROM journal_vec WHERE journal_id IN (%s)"
+                                 % ",".join("?" * len(chunk)), chunk):
+                try:
+                    out[int(r[0])] = np.frombuffer(self.cipher.decrypt_bytes(r[1]), dtype=np.float32)
+                except Exception:
+                    continue
+        return out
+
+    def closest_portrait_facts(self, vector: np.ndarray, *, limit: int = 3,
+                               min_cosine: float = 0.0) -> list[tuple[float, PortraitFact]]:
+        """The current portrait facts closest to ``vector`` by their stored embeddings, ``[(cosine, fact)]`` best
+        first (no model, no words; the observation cards' follow-up reads what the portrait settled on)."""
+        q = np.asarray(vector, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(q))
+        if qn == 0.0:
+            return []
+        q = q / qn
+        scored: list[tuple[float, int]] = []
+        for r in self._query("SELECT f.id, v.vec_ciphertext, v.dim FROM portrait_facts f JOIN portrait_fact_vec v"
+                             " ON v.fact_id = f.id WHERE f.valid_to IS NULL"):
+            if r["dim"] != q.shape[0]:
+                continue
+            v = np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+            n = float(np.linalg.norm(v))
+            if n:
+                scored.append((float(v @ q) / n, int(r["id"])))
+        scored = sorted((s for s in scored if s[0] >= min_cosine), reverse=True)[:limit]
+        out = []
+        for cos, fid in scored:
+            f = self.portrait_fact(fid)
+            if f is not None:
+                out.append((round(cos, 4), f))
+        return out
+
+    def journal_newest(self) -> tuple[int, float]:
+        """``(the newest journal id, when the newest fact was written)``: content-free, one indexed read (the
+        observation cards look again only when memory learned something new)."""
+        row = self._query("SELECT coalesce(max(id), 0), coalesce(max(created_at), 0) FROM journal")[0]
+        return int(row[0]), float(row[1])
+
+    def journal_written(self, ids: Iterable[int]) -> dict[int, float]:
+        """When each of these journal facts was written (``created_at``): content-free. A fact is dated by its
+        source, which can be hours before memory learned it (a chat's history, a call transcribed later)."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return {}
+        out: dict[int, float] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            for r in self._query("SELECT id, created_at FROM journal WHERE id IN (%s)" % ",".join("?" * len(chunk)),
+                                 chunk):
+                out[int(r[0])] = float(r[1] or 0.0)
+        return out
 
     def fact_card(self, fact: ConversationFact) -> NudgeRecord | None:
         """The card a conversation fact answers: its ``nudge_id``, else the card its source exchange replied to.
@@ -6290,6 +6362,22 @@ class Store:
 
     def call_digest(self, call_id: int) -> dict[str, Any] | None:
         return self.call_digests([call_id]).get(int(call_id))
+
+    def call_digests_ready(self, since: TimeArg = None, until: TimeArg = None) -> dict[int, float]:
+        """``{call_id: when its digest was written}`` for digests written (status ``ok``, blocks stored) in
+        ``[since, until]``: content-free, for the call-recap card (yuki.memory.presence)."""
+        clauses, params = ["status = 'ok'", "blocks_ciphertext IS NOT NULL"], []
+        if (s := _ts(since)) is not None:
+            clauses.append("updated_at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("updated_at <= ?")
+            params.append(u)
+        try:
+            rows = self._query("SELECT call_id, updated_at FROM call_digests WHERE " + " AND ".join(clauses), params)
+        except sqlite3.OperationalError:   # a database before migration 19
+            return {}
+        return {int(r[0]): float(r[1] or 0.0) for r in rows}
 
     def digested_call_threads(self) -> dict[int, int]:
         """``{thread_id: call_id}`` of the calls that have a written digest (to point recall hits at it)."""

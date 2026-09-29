@@ -57,10 +57,12 @@ from yuki.ui.nudges import (
     OVERLAY_NUDGES,
     NoticeCard,
     NudgeController,
+    card_offer,
     nudge_answered,
     nudge_moment,
     nudge_reply_request,
     notification_state,
+    offer_request,
     overlay_label,
 )
 from yuki.ui.overlay import Overlay, ReplyCard
@@ -180,6 +182,8 @@ class YukiUi(QObject):
         self.nudges.reply_requested.connect(self._on_nudge_reply)
         self.nudges.in_overlay.connect(self._on_nudge_in_overlay)
         self.nudges.recent_ready.connect(self._on_recent_nudges)
+        # Do it on a card's offer (the corner card, or a card in the chat thread): run it as the user's instruction
+        self.nudges.do_requested.connect(self._on_nudge_do)
         #: Calls, just the user's side: the consent card, the indicator and Stop.
         self.calls = CallController(
             self.runtime.memory, ui_log, covered=lambda: self.nudges.showing is not None,
@@ -205,6 +209,8 @@ class YukiUi(QObject):
         self._settled: dict[int, ReplyCard | None] = {}
 
         self.overlay.submitted.connect(self._on_submitted)
+        self.overlay.do_nudge.connect(lambda nudge: self.nudges.accept_offer(nudge, via="overlay")
+                                      if isinstance(nudge, dict) else None)
         self.overlay.dismissed.connect(self._on_overlay_dismissed)
         self.overlay.opened.connect(self._on_overlay_opened)
         # How each activation got (or failed to get) the keyboard: which step of
@@ -673,6 +679,28 @@ class YukiUi(QObject):
                 card.set_reply_state("open")
             if self._nudge_reply_via == "card":
                 self.nudges.reply_abandoned(nudge)
+
+    def _on_nudge_do(self, nudge: dict) -> None:
+        """Do it on a card's offer: its instruction goes to the agent exactly as if the user had typed it
+        (:func:`yuki.ui.nudges.offer_request`: the card as context, then their instruction). Nothing ran before
+        this press; the agent's own rules - anything sent to another person included - apply as to any request."""
+        instruction = card_offer(nudge)
+        if not instruction:
+            return
+        request = offer_request(nudge)
+        lane_guess = FRONT_DESK if self.runtime.worker_busy else WORKER   # as runtime.submit picks
+        note, note_ids = self.nudges.coach_note_for(lane_guess, exclude=nudge.get("id"))
+        if note:
+            request = f"{request}\n\n{note}"
+        request = f"{request}\n\n{WHERE_TYPED['ask_bar']}"
+        lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
+        self.window_host.user_message(request_id, instruction)
+        self.cards[request_id] = self.overlay.add_card(instruction)
+        self.nudges.mark_attached(lane_name, [nudge.get("id"), *note_ids])
+        # the card's Do it in the chat thread (here and in the window) reads Done from now on
+        self.window_host.emit({"type": "nudge_state", "id": nudge.get("id"), "state": "accepted"})
+        self.ui_log.event("nudge_offer_run", id=nudge.get("id"), kind=nudge.get("kind"), request_id=request_id,
+                          lane=lane_name, text=instruction)
 
     def snooze_nudges(self, minutes: int) -> None:
         """Quiet nudges for ``minutes`` (``0``: back on), then re-read the tray's status line."""

@@ -1101,6 +1101,10 @@ class WindowApp(Actions):
     def cancel(self) -> None:
         self._ask("cancel", lambda _r: self.toast("Stopping."))
 
+    def do_nudge(self, nudge: dict) -> None:
+        """Do it on a card's offer in the chat page: the tray runs it as the user's instruction."""
+        self._ask("nudge_do", lambda _r: self.toast("On it."), nudge=nudge)
+
     def reply_nudge(self, nudge: dict) -> None:
         self._reply_to = nudge
         page = self.win.page_widget("chat")
