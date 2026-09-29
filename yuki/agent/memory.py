@@ -99,8 +99,8 @@ TODO_LABEL = "Open to-dos on the user's list (from memory):"
 #: Most to-dos the ``todo`` tool's ``list`` shows.
 TODO_LIST_LIMIT = 30
 
-#: The reactions ``ack_nudge`` takes.
-NUDGE_REACTIONS = ("shown", "dismissed", "replied", "snoozed")
+#: The reactions ``ack_nudge`` takes (``accepted``: "Do it" on a card's offer; ``less``: "Less of these").
+NUDGE_REACTIONS = ("shown", "dismissed", "replied", "snoozed", "accepted", "less")
 
 #: How far back ``resume_context`` looks for the last session.
 RESUME_WITHIN_HOURS = 6.0

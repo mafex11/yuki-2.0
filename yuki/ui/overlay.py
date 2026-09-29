@@ -374,11 +374,13 @@ class Overlay(SurfaceWindow):
             hotkey.
         opened: The overlay came up (from hidden or fading out; not a refocus
             of an overlay already open).
+        do_nudge: ``(nudge)`` -- Do it on a card with an offer in the thread.
     """
 
     submitted = Signal(str)
     dismissed = Signal()
     opened = Signal()
+    do_nudge = Signal(object)
 
     def __init__(self) -> None:
         super().__init__(activates=True, radius=20)
@@ -513,6 +515,7 @@ class Overlay(SurfaceWindow):
         self.thread.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.thread.content_resized.connect(self.fit)
         self.thread.reply_nudge.connect(self._on_thread_reply)
+        self.thread.do_nudge.connect(self.do_nudge.emit)
         self._scroll.setVisible(False)
         self.layout().insertWidget(0, self.thread)
         self.fit()

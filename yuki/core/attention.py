@@ -5,7 +5,9 @@ hours and meeting / full-screen checks in ``yuki.memory.nudges``, the card queue
 ``yuki.ui.nudges``, the voice narrator's cooldown and settle in ``yuki.voice.narrator``. A rule
 tuned in one place silently diverged from the others. :class:`Attention` is the one place those
 rules live, per **channel** (``coach``, ``reminder``, ``standing_request``, ``question``,
-``voice_progress``, ``notice``), each with a :class:`ChannelRule`:
+``voice_progress``, ``notice``, and the observation cards of :mod:`yuki.memory.presence`: ``stuck``,
+``recap``, ``followup``, ``recall``, ``thread``, all counted together in ``presence``), each with a
+:class:`ChannelRule`:
 
 * **budget** - at most ``budget`` deliveries per ``window_s`` (rolling);
 * **cooldown** - at least ``cooldown_s`` after the channel's last delivery;
@@ -62,15 +64,34 @@ class ChannelRule:
 #: one coach card per 30 min; cards 10 min apart; reminders on time but never over another card;
 #: spoken progress at most 4 lines a minute with the narrator's 1.5 s cooldown, never gated by a
 #: full-screen game (the user is talking to Yuki) but held in a meeting.
+#:
+#: The observation cards (yuki.memory.presence, 2026-09-29: "offers on cards only", about 8-12 cards on a
+#: full day in all, spread out): each kind has its own day budget - ``notice`` (something the user just
+#: finished), ``stuck`` (something keeps failing), ``recap`` (a call's digest is ready), ``followup`` (a
+#: personal event reached its moment), ``recall`` (the screen meets something memory holds: an answer
+#: they are looking for, an open item), ``thread`` (a thread of work changed or went stale) - and all of
+#: them together go through ``presence``: at most two an hour, 25 minutes apart, so they never come in a
+#: burst. The user's "Less of these" on a kind lowers that kind's budget (the presence worker tunes it
+#: from their reactions); nothing mutes the others. Budgets start here and are counted from the stored
+#: cards (:meth:`Attention.load`), so a service restart does not reset them.
+DAY_S = 86400.0
 DEFAULT_RULES: dict[str, ChannelRule] = {
     "coach": ChannelRule(budget=1, window_s=1800.0, cooldown_s=90.0, card=True),
     "question": ChannelRule(budget=3, window_s=3600.0, cooldown_s=1200.0, card=True),
     "reminder": ChannelRule(budget=0, card=True, quiet=False),
     "standing_request": ChannelRule(budget=6, window_s=3600.0, cooldown_s=60.0, card=True, quiet=False),
-    "notice": ChannelRule(budget=2, window_s=86400.0, cooldown_s=0.0, card=True, quiet=True, fullscreen=True),
+    "notice": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=1800.0, card=True, quiet=True, fullscreen=True),
+    "stuck": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
+    "recap": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=0.0, card=True),
+    "followup": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=3 * 3600.0, card=True),
+    "recall": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
+    "thread": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=4 * 3600.0, card=True),
+    "presence": ChannelRule(budget=2, window_s=3600.0, cooldown_s=1500.0, card=True),
     "voice_progress": ChannelRule(budget=4, window_s=60.0, cooldown_s=1.5, quiet=False, fullscreen=False,
                                   meeting=True),
 }
+#: The observation channels (yuki.memory.presence), each also counted in ``presence``.
+PRESENCE_CHANNELS: tuple[str, ...] = ("notice", "stuck", "recap", "followup", "recall", "thread")
 
 
 @dataclass(frozen=True)
@@ -185,6 +206,12 @@ class Attention:
             history.append(now)
             if rule.card:
                 self._last_card = now
+
+    def load(self, channel: str, times: "list[float] | tuple[float, ...]") -> None:
+        """Replace ``channel``'s delivery history with ``times`` (epoch s), e.g. the cards of that kind the
+        database holds: a restarted process keeps its budgets. Does not move the card gap."""
+        with self._lock:
+            self._history[channel] = deque(sorted(float(t) for t in times)[-64:], maxlen=64)
 
     def card_shown(self, card_id: str) -> None:
         """A card is on screen now (one at a time)."""

@@ -201,6 +201,14 @@ class Stub:
         self.reminder = reminder or {"say": "remind", "text": "Call Asha about the flat now."}
         self.messages = SimpleNamespace(create=self.create)
 
+    @staticmethod
+    def _due(request: dict) -> list[str]:
+        """The to-do the request folds into the welcome back ("[todo:3]"), as a real answer would name it."""
+        text = str(request["messages"][0]["content"])
+        start = text.find("[todo:")
+        end = text.find("]", start)
+        return [text[start + 1:end]] if start >= 0 and end > start else []
+
     def create(self, **request):
         name = request["tool_choice"]["name"]
         self.calls.append(name)
@@ -209,7 +217,7 @@ class Stub:
                 "write_card": {**base, "text": None, **self.card},
                 "write_reminder": {"reason": "stub", "text": "", **self.reminder},
                 "welcome_back": {**base, "say": "resume", "detail": "the nudges fix", "evidence": ["NOW"],
-                                 "text": "Back on the nudges fix."}}.get(name, {})
+                                 "mentions": self._due(request), "text": "The deck for Varun is due."}}.get(name, {})
         block = SimpleNamespace(type="tool_use", name=name, input=data)
         return SimpleNamespace(content=[block], stop_reason="tool_use",
                                usage=SimpleNamespace(input_tokens=100, output_tokens=20,
@@ -372,3 +380,44 @@ def test_the_acting_marker_expires_and_its_writes_are_retried(tmp_path, monkeypa
 
     monkeypatch.setattr(acting.os, "replace", flaky)
     assert acting.begin(db, "tok2", "click", lane="worker") and acting.current(db).token == "tok2"
+
+
+# -- a break nudge only once one is due (break_after_min at the PC), once per session (2026-09-29) -----------
+
+
+def test_a_break_nudge_waits_for_ninety_minutes_hops_included(store):
+    present(store, at("09:00"), at("09:40"), "VALORANT")
+    present(store, at("09:40"), at("09:43"), "Discord")          # a hop: part of the gaming session
+    present(store, at("09:43"), at("10:40"), "VALORANT")
+    stub = Stub(decision={"say": "nudge", "is_break_suggestion": True, "detail": "VALORANT since 09:00",
+                          "evidence": ["BREAK"]},
+                card={"say": "nudge", "text": "VALORANT since 9, go stretch.", "evidence": ["BREAK"]})
+    worker = worker_for(store, stub)
+    early = worker.decide(at("10:00"), CFG, observe(store, at("10:00"), CFG), Trigger("periodic"), [])
+    assert early["outcome"] == "suppressed:break_too_soon" and "write_card" not in stub.calls
+    assert "no break nudge before 10:30" in stub_request_text(early)
+    late = worker.decide(at("10:35"), CFG, observe(store, at("10:35"), CFG), Trigger("periodic"), [])
+    assert late["outcome"] == "nudge"                             # 95 min with the Discord hop folded in
+
+
+def stub_request_text(result: dict) -> str:
+    return str(result["requests"][0]["messages"][0]["content"])
+
+
+def test_no_look_for_a_break_before_one_is_due_and_one_per_session(store):
+    present(store, at("09:00"), at("12:00"))
+    stub = Stub(decision={"say": "nudge", "is_break_suggestion": True, "detail": "Warp since 09:00",
+                          "evidence": ["BREAK"]},
+                card={"say": "nudge", "text": "Warp since 9, go stretch.", "evidence": ["BREAK"]})
+    worker = worker_for(store, stub)
+    done = ticks(worker, at("09:00"), at("10:29"))
+    assert "coach_decision" not in stub.calls                     # nothing to say before 90 min: no coach look
+    done = ticks(worker, at("10:30"), at("12:00"))
+    assert [d["outcome"] for d in done if d["outcome"] == "nudge"] == ["nudge"]
+    first = store.nudges(kinds=("nudge",))[0]
+    assert first.at >= at("10:30")
+    # a drift look in the same session never brings a second break nudge
+    view = observe(store, at("11:50"), CFG)
+    session = activity_sessions(store.timeline_states(at("09:00"), at("11:50")), at("09:00"), at("11:50"), CFG)[-1]
+    again = worker.decide(at("11:50"), CFG, view, Trigger("drift", session=session), [])
+    assert again["outcome"] == "suppressed:break_again"
