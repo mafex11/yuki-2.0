@@ -154,10 +154,12 @@ class SpeechGuard:
     def _recent(self, now: float) -> list[str]:
         return list(self._turn_lines[-4:])
 
-    def start(self, text: str, *, first: bool = False) -> "asyncio.Future[Verdict]":
+    def start(self, text: str, *, first: bool = False, known_ok: bool = False) -> "asyncio.Future[Verdict]":
         """Begin checking ``text`` now; returns a future verdict (on the running loop).
 
-        ``first``: the piece starts a reply (checked even when short: a fragment often is).
+        ``first``: the piece starts a reply (checked even when short: a fragment often is). ``known_ok``: these exact
+        short words were said SAY to as a reply's first piece before (the voice cache, v3.14): a short line then needs
+        no model, as it needs none anywhere else in a reply (the exact-repeat check still applies).
         """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Verdict] = loop.create_future()
@@ -173,7 +175,7 @@ class SpeechGuard:
         said = self._recent(now)
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
-        if len(norm.split()) <= FREE_WORDS and not first:
+        if len(norm.split()) <= FREE_WORDS and (not first or known_ok):
             self.stats["free"] += 1
             self.heard(text)   # short lines go straight out: remember them for the repeat check now
             fut.set_result(Verdict(True, by="free"))

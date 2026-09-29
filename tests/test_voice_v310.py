@@ -261,7 +261,12 @@ def test_a_refused_hand_on_a_stale_tab_goes_to_the_thinker_by_code() -> None:
         params = _hand_params("tab", {"window": 42, "action": "close", "tabs": [9], "named": "the second YouTube tab"})
         await hands.handle(params)
         result, props = params.results[-1]
-        assert result.get("passed_on") is True and _run_llm(props) is False   # no talker run narrates the refusal
+        # v3.14: nothing was said for their words yet, so one talker run says a couple of words that Yuki is on it
+        # (the note forbids narrating the refusal); already acknowledged, no run at all (below, v3.9's rule)
+        from yuki.voice.hands import _PASSED_ACK_NOTE
+
+        assert result.get("passed_on") is True and _run_llm(props) is True
+        assert result["how_to_handle_it"] == _PASSED_ACK_NOTE
         await _settle()
         assert len(rt.submitted) == 1 and rt.submitted[0][2].get("lane") == "worker"
         assert "tabs line you were shown" in rt.submitted[0][1]   # the thinker gets the report and reads afresh

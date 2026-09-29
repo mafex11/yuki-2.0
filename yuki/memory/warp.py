@@ -359,6 +359,176 @@ class WarpReader:
         return dict(self.counters)
 
 
+# ---------------------------------------------------------------------------
+# Warp's saved window and tab state: what its opaque windows hold (2026-09-29)
+# ---------------------------------------------------------------------------
+#
+# Warp draws its window with the GPU: UI Automation sees one element, so a request
+# like "open the LLM OS tab" had nothing to aim at (29 Sept: 5 questions, 3 blind
+# clicks, a cancel). Warp keeps its own session in the same database: windows
+# (position, size, which tab shows), tabs, their panes, each pane's working folder,
+# and the vertical-tab title Warp shows for it. :func:`read_session` reads only
+# those tables and columns, read-only like the command history above - never
+# ``blocks``, never output, never a command. The saved state can lag the live one
+# by up to a few minutes (Warp writes it when it changes): the window's live
+# title is the truth about the tab showing.
+
+#: The tables and columns the session read touches (and nothing else).
+_SESSION_SQL = {
+    "windows": "SELECT id, active_tab_index, window_width, window_height, origin_x, origin_y, fullscreen_state, "
+               "vertical_tabs_panel_open FROM windows ORDER BY id",
+    "tabs": "SELECT id, window_id, custom_title FROM tabs ORDER BY window_id, id",
+    "nodes": "SELECT id, tab_id FROM pane_nodes WHERE is_leaf = 1",
+    "leaves": "SELECT pane_node_id, is_focused, custom_vertical_tabs_title FROM pane_leaves",
+    "panes": "SELECT id, cwd FROM terminal_panes",
+}
+#: A saved window matches a live one when every edge is within this many px (after DPI scaling).
+MATCH_SLACK_PX = 12
+
+
+@dataclass
+class WarpTab:
+    """One tab of a Warp window, as Warp saved it."""
+
+    index: int            # 0-based place in its window's tab strip
+    title: str            # the vertical-tab title Warp keeps for it ("" when it keeps none)
+    folder: str           # the working folder of its focused pane
+    active: bool          # the tab showing when Warp saved the state
+    panes: int = 1
+
+
+@dataclass
+class WarpWindow:
+    """One Warp window, as Warp saved it."""
+
+    rect: tuple[int, int, int, int]   # left, top, right, bottom as saved
+    tabs: list[WarpTab]
+    active_tab: int
+    fullscreen: int = 0
+    vertical_tabs: bool = False
+
+
+def clean_title(title: str) -> str:
+    """A title without the status glyphs an app puts before it (a spinner, a mark: Unicode symbols,
+    punctuation, spaces - by Unicode category, a fixed machine property)."""
+    import unicodedata
+
+    text = " ".join(str(title or "").split())
+    while text and unicodedata.category(text[0])[0] in "SPZ":
+        text = text[1:].lstrip()
+    return text
+
+
+def read_session(db_path: Path | None = None, *, rules: TerminalRules | None = None) -> list[WarpWindow]:
+    """Warp's saved windows and tabs, read-only; ``[]`` when there is no database or it cannot be read.
+
+    Titles and folders holding a secret (the shared detector, then the terminal
+    entropy rule) are left out.  Never raises.
+    """
+    rules = rules or TerminalRules()
+    path = Path(db_path) if db_path else default_db_path()
+    try:
+        if not path.exists():
+            return []
+        conn = _open_ro(path)
+    except Exception:
+        return []
+    try:
+        rows = {name: conn.execute(sql).fetchall() for name, sql in _SESSION_SQL.items()}
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+    def safe(text: Any) -> str:
+        value = str(text or "").strip()
+        return "" if not value or rules.secret_reason(value) else value
+
+    tab_of_node = {int(r["id"]): int(r["tab_id"]) for r in rows["nodes"] if r["tab_id"] is not None}
+    cwd_of = {int(r["id"]): safe(r["cwd"]) for r in rows["panes"]}
+    leaves: dict[int, list[tuple[bool, str, str]]] = {}
+    for r in rows["leaves"]:
+        node = int(r["pane_node_id"])
+        tab = tab_of_node.get(node)
+        if tab is None:
+            continue
+        leaves.setdefault(tab, []).append(
+            (bool(r["is_focused"]), clean_title(safe(r["custom_vertical_tabs_title"])), cwd_of.get(node, ""))
+        )
+    tabs_of: dict[int, list[Any]] = {}
+    for r in rows["tabs"]:
+        tabs_of.setdefault(int(r["window_id"]), []).append(r)
+    out: list[WarpWindow] = []
+    for w in rows["windows"]:
+        try:
+            left, top = int(round(float(w["origin_x"]))), int(round(float(w["origin_y"])))
+            width, height = int(round(float(w["window_width"]))), int(round(float(w["window_height"])))
+        except (TypeError, ValueError):
+            continue
+        active = int(w["active_tab_index"] or 0)
+        tabs: list[WarpTab] = []
+        for index, t in enumerate(tabs_of.get(int(w["id"]), [])):
+            panes = leaves.get(int(t["id"]), [])
+            focused = next((p for p in panes if p[0]), panes[0] if panes else (False, "", ""))
+            title = clean_title(safe(t["custom_title"])) or focused[1] or next((p[1] for p in panes if p[1]), "")
+            tabs.append(WarpTab(index=index, title=title, folder=focused[2], active=index == active,
+                                panes=max(len(panes), 1)))
+        out.append(WarpWindow(rect=(left, top, left + width, top + height), tabs=tabs, active_tab=active,
+                              fullscreen=int(w["fullscreen_state"] or 0),
+                              vertical_tabs=bool(w["vertical_tabs_panel_open"])))
+    return out
+
+
+def window_for(rect: tuple[int, int, int, int], windows: list[WarpWindow],
+               scales: tuple[float, ...] = (1.0,)) -> WarpWindow | None:
+    """The saved window whose rectangle is the live window's ``rect`` (screen px), at one of ``scales``."""
+    best: tuple[int, WarpWindow] | None = None
+    for window in windows:
+        for scale in scales or (1.0,):
+            saved = tuple(int(round(v * scale)) for v in window.rect)
+            off = max(abs(a - b) for a, b in zip(saved, rect))
+            if off <= MATCH_SLACK_PX and (best is None or off < best[0]):
+                best = (off, window)
+    return best[1] if best else None
+
+
+def window_data(rect: tuple[int, int, int, int], live_title: str, *, privacy: Any = None,
+                db_path: Path | None = None, scales: tuple[float, ...] = (1.0,)) -> dict[str, Any] | None:
+    """What Warp's own saved state says about the live window at ``rect``: its tabs (title, folder, which one
+    shows), for a window UI Automation cannot see into. ``None`` when memory may not read Warp (the
+    ``[terminal]`` rules, a blocked app) or no saved window matches. The live title marks the tab showing when
+    it names one; otherwise the saved active tab is given as saved."""
+    section = PrivacySection(privacy, "terminal", TerminalRules.from_dict)
+    rules: TerminalRules = section.get()
+    if not rules.enabled:
+        return None
+    try:
+        if privacy is not None and privacy.rules().check_app("warp.exe", "Warp"):
+            return None
+    except Exception:
+        return None
+    path = Path(db_path) if db_path else (Path(os.path.expandvars(rules.database)) if rules.database
+                                          else default_db_path())
+    windows = read_session(path, rules=rules)
+    window = window_for(rect, windows, scales)
+    if window is None:
+        return None
+    live = clean_title(live_title)
+    showing = next((t.index for t in window.tabs if t.title and live and (t.title == live or live.startswith(t.title)
+                                                                          or t.title.startswith(live))), None)
+    try:
+        saved_at = max(p.stat().st_mtime for p in (path, path.with_name(path.name + "-wal")) if p.exists())
+    except ValueError:
+        saved_at = 0.0
+    tabs = []
+    for tab in window.tabs:
+        is_showing = tab.index == showing if showing is not None else tab.active
+        tabs.append({"n": tab.index + 1, "title": live if is_showing and live else tab.title,
+                     "folder": tab.folder, "showing": is_showing, "panes": tab.panes})
+    return {"source": "Warp's own saved window state (read-only)", "saved_at": saved_at, "tabs": tabs,
+            "vertical_tabs": window.vertical_tabs, "showing_from": "title" if showing is not None else "saved"}
+
+
 def probe(
     db_path: Path | None = None, privacy: Any = None, *, settle_s: float = SETTLE_S, now: float | None = None,
 ) -> dict[str, Any]:
@@ -389,5 +559,6 @@ def probe(
     }
 
 
-__all__ = ["WarpReader", "TerminalRules", "probe", "default_db_path", "parse_warp_ts", "CHECKPOINT", "EVERY_S",
+__all__ = ["WarpReader", "TerminalRules", "WarpTab", "WarpWindow", "clean_title", "read_session", "window_data",
+           "window_for", "probe", "default_db_path", "parse_warp_ts", "CHECKPOINT", "EVERY_S",
            "SETTLE_S"]

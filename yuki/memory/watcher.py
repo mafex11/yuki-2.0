@@ -57,6 +57,7 @@ from yuki.memory import secret_filter
 from yuki.memory.extract import Extraction, extract
 from yuki.memory.extract.uia import content_pid
 from yuki.memory.privacy import PrivacyConfig, PrivacyRules
+from yuki.perception import visibility as _visibility
 from yuki.perception.windows import is_user_window
 
 # ---------------------------------------------------------------------------
@@ -134,12 +135,68 @@ class WatcherSettings:
     #: Latency samples kept for the stats.
     latency_window: int = 2000
 
+    # -- everything that can be seen, not only the window in front (2026-09-29) --
+    #: Read the other visible windows, popups, menus and notification toasts too
+    #: (on change only; docs/MEMORY.md "Watcher (capture)").
+    visible: bool = True
+    #: A window counts as on screen from this share of it not covered by windows above.
+    visible_min_share: float = 0.03
+    #: After a window event, the layout (Z-order, rectangles, visible shares) is measured again this much later.
+    layout_debounce_s: float = 0.3
+    #: A background window is read once its change events have been quiet this long, or this long after the first.
+    bg_settle_s: float = 1.0
+    bg_settle_cap_s: float = 6.0
+    #: Gap between two reads of one background window: this after a read that found something new; each read
+    #: that found nothing new doubles it, up to the maximum (the window keeps changing without saying anything).
+    bg_min_gap_s: float = 15.0
+    bg_max_gap_s: float = 300.0
+    #: Budget of background reads (popups apart): at most this many, and this much reading time, per minute.
+    #: Measured 2026-09-29: a background read costs 16-30 ms of this process's CPU on an opaque window, 90-200 ms
+    #: on a browser page, so the ceiling is ~1% of one core while every visible window keeps changing; a desktop
+    #: whose background windows are still costs a read per window per few minutes (the gap doubles).
+    bg_reads_per_min: int = 4
+    bg_read_ms_per_min: float = 1500.0
+    #: One background read's own budget (the one in front keeps capture_budget_s).
+    bg_budget_s: float = 1.0
+    #: Processes whose visible background windows get a name-change hook; one sending more than
+    #: bg_noisy_per_min events in a minute is unhooked for bg_mute_s (its windows then wait for the layout and
+    #: the backstop). Measured 2026-09-29: Task Manager alone sent ~900 a minute, costing ~0.3% of one core.
+    bg_max_processes: int = 8
+    bg_noisy_per_min: int = 300
+    bg_mute_s: float = 600.0
+    #: A window measured opaque (content coverage under 5%) is not read again for its title changes or content
+    #: events for this long (a Warp window's spinner changed its title every second: 509 empty reads in 3 h);
+    #: its title and the app's own data are followed without a UI Automation read.
+    opaque_reprobe_s: float = 600.0
+    #: Popups (menus, toasts, flyouts, dialogs that appeared): read this long after they appeared, if still
+    #: there; at most this many a minute; with this budget each.
+    popup_settle_s: float = 0.5
+    popups_per_min: int = 6
+    popup_budget_s: float = 0.8
+    #: Content changes inside the window in front that change neither its title nor its focus (a chat message
+    #: arriving): a read at most this often, doubling while reads find nothing new, up to the maximum.
+    fg_content_gap_s: float = 30.0
+    fg_content_max_s: float = 180.0
+    #: The app's own data about an opaque window (Warp's saved tabs) is read at most this often per window.
+    app_data_every_s: float = 5.0
+
 
 #: Class name of the watcher's hidden window.  The tray app stops the service
 #: with ``PostMessage(FindWindow(WINDOW_CLASS, None), WM_CLOSE)``.
 WINDOW_CLASS = "YukiMemoryWatcher"
 
-TRIGGER_RANK = {"backstop": 0, "focus": 1, "title": 2, "page": 2, "retry": 2, "resume": 3, "foreground": 3, "start": 3}
+TRIGGER_RANK = {"backstop": 0, "content": 0, "focus": 1, "title": 2, "page": 2, "retry": 2, "refresh": 2,
+                "resume": 3, "foreground": 3, "start": 3}
+#: Triggers a window measured opaque is not read for (its title and app data are followed instead).
+OPAQUE_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "title"})
+#: Triggers a window whose last read was privacy-skipped (a blocked site) is not read again for, while its
+#: title is the same ("title" and "page" always read: it may have left the site).
+BLOCKED_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "refresh"})
+#: Popups whose own element is one of these UIA control types (a fixed machine vocabulary) are shown in Now
+#: but never stored: a tooltip or a menu is what is on screen, not something that happened.
+NOW_ONLY_POPUPS = frozenset({"ToolTip", "Menu", "MenuBar"})
+#: Why a background window is read, strongest last (a merge keeps the strongest).
+BG_RANK = {"content": 0, "layout": 1, "title": 2, "shown": 3, "refresh": 4}
 #: Triggers that mean the window in front just changed: an empty read after
 #: one of them is retried once (``WatcherSettings.retry_wait_s``).
 FRESH_TRIGGERS = frozenset({"foreground", "start", "resume", "page"})
@@ -241,6 +298,16 @@ _wtsapi32.WTSQuerySessionInformationW.argtypes = [
 _wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
 
 EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_SYSTEM_MOVESIZEEND = 0x000B
+EVENT_SYSTEM_MINIMIZESTART = 0x0016
+EVENT_SYSTEM_MINIMIZEEND = 0x0017
+EVENT_OBJECT_SHOW = 0x8002
+EVENT_OBJECT_HIDE = 0x8003
+EVENT_OBJECT_CLOAKED = 0x8017
+EVENT_OBJECT_UNCLOAKED = 0x8018
+#: Events that change what is on screen (a window shown, hidden, cloaked, minimised, moved).
+SURFACE_EVENTS = frozenset({EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+                            EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED})
 EVENT_OBJECT_FOCUS = 0x8005
 EVENT_OBJECT_NAMECHANGE = 0x800C
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -265,6 +332,8 @@ WM_APP_PAGE = win32con.WM_APP + 4
 #: From the capture worker: the last read of this window (wParam) was empty
 #: right after it changed; retry it once it settles.
 WM_APP_RETRY = win32con.WM_APP + 5
+#: From the Now pipe (another thread): read this window (wParam; 0 = the one in front) again now.
+WM_APP_NOW = win32con.WM_APP + 6
 MONITOR_DEFAULTTONEAREST = 2
 QUNS_BUSY = 2
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
@@ -733,6 +802,26 @@ class _Pending:
 
 
 @dataclass
+class _BgPending:
+    """A visible window (not the one in front) or a popup waiting to be read (hook thread)."""
+
+    hwnd: int
+    reason: str      # BG_RANK key, or "popup"
+    first: float
+    last: float
+    popup: bool = False
+
+
+@dataclass
+class _BgJob:
+    hwnd: int
+    reason: str
+    popup: bool = False
+    #: Only the app's own data for an opaque window (no UI Automation read).
+    app_data_only: bool = False
+
+
+@dataclass
 class CaptureResult:
     """What one capture attempt did (content-free)."""
 
@@ -767,6 +856,12 @@ class CaptureResult:
     #: Secrets hidden before storing (:mod:`yuki.memory.secret_filter`): counts by kind, and its cost.
     secrets: dict[str, int] = field(default_factory=dict)
     secret_ms: float = 0.0
+    #: Visible, not in front (2026-09-29): the share of the window no other covers, the share of it UI
+    #: Automation shows content in (``coverage``; opaque under 5%), and elements left out as covered.
+    visible_share: float | None = None
+    coverage: float | None = None
+    opaque: bool = False
+    covered_nodes: int = 0
 
 
 def _hide_secrets(ex: Extraction, result: CaptureResult) -> Extraction:
@@ -831,6 +926,7 @@ class Watcher:
         settings: WatcherSettings | None = None,
         on_close: Callable[[], None] | None = None,
         user_names: list[str] | None = None,
+        now_board: Any = None,
     ) -> None:
         self._store_factory = store_factory
         self.privacy = privacy or PrivacyConfig()
@@ -838,6 +934,49 @@ class Watcher:
         self.settings = settings or WatcherSettings()
         self._on_close = on_close
         self._processes = _ProcessCache()
+        #: The live picture of the screen (:class:`yuki.memory.now.NowBoard`), fed by every read; ``None``: off.
+        self.now = now_board
+        # -- visible windows, popups (hook thread, except where noted) --
+        self._visible_hooks: list[int] = []
+        self._layout: Any = None
+        self._layout_due: float | None = None
+        #: Visible background windows -> their title at the last layout (what is tracked).
+        self._surf_titles: dict[int, str] = {}
+        self._surf_pids: dict[int, int] = {}
+        self._bg_pending: dict[int, _BgPending] = {}
+        #: Per window: when it was last read (monotonic) and the gap before the next read.
+        self._bg_last: dict[int, float] = {}
+        self._bg_gap: dict[int, float] = {}
+        #: Per-process name-change hooks of visible background windows, event counts this minute, mutes.
+        self._bg_hooks: dict[int, list[int]] = {}
+        self._bg_counts: Counter[int] = Counter()
+        self._bg_minute = 0.0
+        self._muted: dict[int, float] = {}
+        #: Top-level windows that appeared (show / uncloak) and when, for popups.
+        self._appeared: dict[int, float] = {}
+        #: Popups already read (hwnd -> title at the time), so one is read once while it stays up.
+        self._popups_read: dict[int, str] = {}
+        #: Windows measured opaque (hwnd -> monotonic time), written by both workers.
+        self._opaque: dict[int, float] = {}
+        self._app_data_at: dict[int, float] = {}
+        self._titles_cache: dict[str, tuple[float, list[str]]] = {}
+        self._store_ref: Any = None
+        #: Windows whose last read was privacy-skipped after reading (a blocked site): (title, why).
+        self._bg_blocked: dict[int, tuple[str, str]] = {}
+        #: The window in front: its content events since its last read (first, last) and the adaptive gap.
+        self._fg_content: tuple[float, float] | None = None
+        self._fg_content_gap: dict[int, float] = {}
+        # background worker
+        self._bg_cond = threading.Condition()
+        self._bg_queue: deque[_BgJob] = deque()
+        self._bg_worker: threading.Thread | None = None
+        self._bg_busy: _BgJob | None = None
+        #: ``(monotonic time, ms, popup)`` of the background reads of the last minute (both threads, locked).
+        self._bg_spent: deque[tuple[float, float, bool]] = deque()
+        self._bg_lock = threading.Lock()
+        self._bg_stats: Counter[str] = Counter()
+        self._layout_ms: deque[float] = deque(maxlen=200)
+        self._bg_next_due: float | None = None
         self._config_names = [n.strip() for n in (user_names or []) if n and n.strip()]
         #: Configured + learned names; loaded from the store by the worker.
         self._names: list[str] | None = None
@@ -902,6 +1041,9 @@ class Watcher:
         self._started_at = time.monotonic()
         self._worker = threading.Thread(target=self._worker_main, name="yuki-memory-capture", daemon=True)
         self._worker.start()
+        if self.settings.visible:
+            self._bg_worker = threading.Thread(target=self._bg_main, name="yuki-memory-visible", daemon=True)
+            self._bg_worker.start()
         self._hook_thread = threading.Thread(target=self._hook_main, name="yuki-memory-hooks", daemon=True)
         self._hook_thread.start()
         if not self._ready.wait(timeout_s):
@@ -919,8 +1061,13 @@ class Watcher:
             self._stopping = True
             self._request = None
             self._cond.notify_all()
+        with self._bg_cond:
+            self._bg_queue.clear()
+            self._bg_cond.notify_all()
         if self._worker is not None:
             self._worker.join(timeout_s)
+        if self._bg_worker is not None:
+            self._bg_worker.join(timeout_s)
 
     def set_paused(self, paused: bool) -> None:
         """Pause or resume capturing (the user's ``paused`` flag); safe from any thread.
@@ -967,6 +1114,15 @@ class Watcher:
         rate-limited per window by ``min_gap_s[trigger]``."""
         if self._hwnd and trigger == "page":
             _user32.PostMessageW(self._hwnd, WM_APP_PAGE, int(hwnd), 0)
+
+    def request_refresh(self, hwnd: int | None = None) -> bool:
+        """Read ``hwnd`` (``None``: the window in front) again soon - the Now pipe's ``refresh``; any thread.
+
+        Rate-limited like every trigger (a window read in the last 2 s is not read again); returns whether
+        the request was posted to the hook thread."""
+        if not self._hwnd:
+            return False
+        return bool(_user32.PostMessageW(self._hwnd, WM_APP_NOW, int(hwnd or 0), 0))
 
     @property
     def paused(self) -> bool:
@@ -1015,6 +1171,27 @@ class Watcher:
             "idle": self._idle,
             "acting": self._acting is not None,
             "backstop_interval_s": self._backstop_interval,
+            "visible": self._visible_stats(),
+        }
+
+    def _visible_stats(self) -> dict[str, Any]:
+        """Content-free counters of the visible-window reads (2026-09-29)."""
+        with self._bg_lock:
+            counts = dict(self._bg_stats)
+            spent = list(self._bg_spent)
+        layouts = sorted(self._layout_ms)
+        minute = time.monotonic() - 60.0
+        return {
+            "counts": counts,
+            "reads_last_min": sum(1 for at, _ms, popup in spent if at >= minute and not popup),
+            "popups_last_min": sum(1 for at, _ms, popup in spent if at >= minute and popup),
+            "tracked": len(self._surf_titles),
+            "hooked_processes": len(self._bg_hooks),
+            "muted_processes": len(self._muted),
+            "opaque_windows": len(self._opaque),
+            "layout_ms_p50": layouts[len(layouts) // 2] if layouts else None,
+            "layout_ms_max": layouts[-1] if layouts else None,
+            "now": self.now.sizes() if self.now is not None else None,
         }
 
     # -- logging ---------------------------------------------------------
@@ -1054,6 +1231,17 @@ class Watcher:
             )
             if not self._fg_hook:
                 raise OSError(ctypes.get_last_error(), "SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed")
+            if self.settings.visible:
+                # What is on screen changes: windows shown, hidden, cloaked, minimised, moved (system-wide,
+                # out of context; measured 2026-09-29 at ~10-25 events a minute on this desktop).
+                flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+                for low, high in ((EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+                                  (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
+                                  (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+                                  (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND)):
+                    handle = _user32.SetWinEventHook(low, high, None, self._callback, 0, 0, flags)
+                    if handle:
+                        self._visible_hooks.append(handle)
             now = time.monotonic()
             self._next_backstop = now + self._backstop_interval
             self._log("watcher_start", locked=self._locked, settings=self.settings.__dict__)
@@ -1105,6 +1293,10 @@ class Watcher:
 
     def _cleanup_hooks(self) -> None:
         self._unhook_pid()
+        self._unhook_bg()
+        for handle in self._visible_hooks:
+            _user32.UnhookWinEvent(handle)
+        self._visible_hooks = []
         if self._fg_hook:
             _user32.UnhookWinEvent(self._fg_hook)
             self._fg_hook = None
@@ -1148,6 +1340,9 @@ class Watcher:
                     self._events["retry_armed"] += 1
                     self._retry = (target, time.monotonic() + self.settings.retry_wait_s, _window_pid(target))
                 return 0
+            if msg == WM_APP_NOW:
+                self._on_refresh_request(int(wparam or 0), time.monotonic())
+                return 0
             if msg == WM_APP_STOP:
                 win32gui.DestroyWindow(hwnd)
                 return 0
@@ -1180,6 +1375,7 @@ class Watcher:
         if locked:
             self._pending = None
             self._unhook_pid()
+            self._stop_visible()
             self._health_now(0, "paused", "locked", "session")
         else:
             self._on_foreground(int(_user32.GetForegroundWindow() or 0), "resume")
@@ -1191,6 +1387,7 @@ class Watcher:
         if paused:
             self._pending = None
             self._unhook_pid()
+            self._stop_visible()
             self._log("paused", via="flag")
             self._health_now(0, "paused", "user", "pause")
         else:
@@ -1232,10 +1429,16 @@ class Watcher:
                 self._events["foreground"] += 1
                 self._on_foreground(hwnd or int(_user32.GetForegroundWindow() or 0), "foreground")
                 return
+            if event in SURFACE_EVENTS:
+                self._on_surface_event(event, hwnd, id_object, id_child)
+                return
             fg = self._fg
             if not fg or not hwnd or self._locked or self._fullscreen or self._paused:
                 return
-            if hwnd != fg and int(_user32.GetAncestor(hwnd, GA_ROOT) or 0) != fg:
+            root = hwnd if hwnd == fg else int(_user32.GetAncestor(hwnd, GA_ROOT) or 0)
+            if root != fg:
+                if event == EVENT_OBJECT_NAMECHANGE and root:
+                    self._on_bg_name(root, hwnd == root and id_object == OBJID_WINDOW and id_child == CHILDID_SELF)
                 return
             now = time.monotonic()
             self._activity_at = now
@@ -1248,14 +1451,270 @@ class Watcher:
             if event == EVENT_OBJECT_NAMECHANGE:
                 if hwnd == fg and id_object == OBJID_WINDOW and id_child == CHILDID_SELF:
                     self._events["title"] += 1
+                    if self.now is not None:
+                        self.now.note_title(fg, _window_title(fg), time.time())
                     self._arm("title", now)
                 else:
-                    self._events["content_name"] += 1  # only delays the settle
+                    self._events["content_name"] += 1  # delays the settle; a slow "content" read (below)
+                    if self.settings.visible:
+                        first = self._fg_content[0] if self._fg_content else now
+                        self._fg_content = (first, now)
+                        if self.now is not None:
+                            self.now.note_change(fg, time.time())
             elif event == EVENT_OBJECT_FOCUS:
                 self._events["focus"] += 1
                 self._arm("focus", now)
         except Exception as exc:  # never let an exception escape a ctypes callback
             self._log_error("winevent", exc)
+
+    # -- everything visible (hook thread) -----------------------------------------------
+
+    def _on_surface_event(self, event: int, hwnd: int, id_object: int, id_child: int) -> None:
+        """A top-level window was shown, hidden, (un)cloaked, (un)minimised or moved: measure the layout again."""
+        if not hwnd or id_object != OBJID_WINDOW or id_child != CHILDID_SELF:
+            return
+        if self._locked or self._paused or self._fullscreen or not self.settings.visible:
+            return
+        if event in (EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED):
+            if int(_user32.GetAncestor(hwnd, GA_ROOT) or 0) != hwnd:
+                return  # a child window: its top-level window's own events say what matters
+            self._events["surface_shown"] += 1
+            if len(self._appeared) > 256:
+                self._appeared.clear()
+            self._appeared[hwnd] = time.monotonic()
+        else:
+            self._events["surface_changed"] += 1
+        self._layout_soon(time.monotonic())
+
+    def _layout_soon(self, now: float) -> None:
+        if not self.settings.visible:
+            return
+        due = now + self.settings.layout_debounce_s
+        if self._layout_due is None or due < self._layout_due:
+            self._layout_due = due
+
+    def _on_bg_name(self, root: int, is_title: bool) -> None:
+        """A name changed in a window that is not in front: its title, or something inside it."""
+        if root not in self._surf_titles:
+            return  # not a window on screen that is being followed
+        now = time.monotonic()
+        pid = self._surf_pids.get(root, 0)
+        if now - self._bg_minute >= 60.0:
+            self._bg_minute, self._bg_counts = now, Counter()
+        self._bg_counts[pid] += 1
+        if self._bg_counts[pid] > self.settings.bg_noisy_per_min and pid in self._bg_hooks:
+            # Measured: a process that renames things all the time (Task Manager's counters) costs more
+            # in events than its windows are worth; its windows wait for the layout and the backstop.
+            self._unhook_bg_pid(pid)
+            self._muted[pid] = now + self.settings.bg_mute_s
+            self._log("visible_hook", op="muted", events_per_min=self._bg_counts[pid])
+            with self._bg_lock:
+                self._bg_stats["muted"] += 1
+            return
+        if is_title:
+            title = _window_title(root)
+            if title == self._surf_titles.get(root):
+                return
+            self._surf_titles[root] = title
+            self._events["bg_title"] += 1
+            if self.now is not None:
+                self.now.note_title(root, title, time.time())
+            self._bg_mark(root, "title", now)
+        else:
+            self._events["bg_content"] += 1
+            if self.now is not None:
+                self.now.note_change(root, time.time())
+            self._bg_mark(root, "content", now)
+
+    def _bg_mark(self, hwnd: int, reason: str, now: float, *, popup: bool = False) -> None:
+        if not self.settings.visible or self._locked or self._paused or self._fullscreen:
+            return
+        pending = self._bg_pending.get(hwnd)
+        if pending is not None:
+            pending.last = now
+            if BG_RANK.get(reason, 0) > BG_RANK.get(pending.reason, 0):
+                pending.reason = reason
+            return
+        self._bg_pending[hwnd] = _BgPending(hwnd=hwnd, reason=reason, first=now, last=now, popup=popup)
+
+    def _on_refresh_request(self, hwnd: int, now: float) -> None:
+        """The Now pipe asked for a fresh read (hook thread)."""
+        if self._locked or self._paused or self._fullscreen:
+            return
+        target = hwnd or self._fg
+        if not target:
+            return
+        with self._results_lock:
+            last = self._last_capture.get(target)
+        if last is not None and now - last < 2.0:
+            return  # read moments ago: that read is the fresh one
+        self._events["refresh"] += 1
+        if target == self._fg:
+            self._arm("refresh", now)
+        elif target in self._surf_titles:
+            self._bg_mark(target, "refresh", now)
+            pending = self._bg_pending.get(target)
+            if pending is not None:
+                pending.first = pending.last = now - self.settings.bg_settle_cap_s  # due at once
+            self._bg_last.pop(target, None)
+
+    def _stop_visible(self) -> None:
+        """Locked, paused or a full-screen app in front: nothing else is read, and no process is hooked for it."""
+        self._bg_pending.clear()
+        self._appeared.clear()
+        self._unhook_bg()
+        with self._bg_cond:
+            self._bg_queue.clear()
+
+    def _unhook_bg_pid(self, pid: int) -> None:
+        for handle in self._bg_hooks.pop(pid, []):
+            _user32.UnhookWinEvent(handle)
+
+    def _unhook_bg(self) -> None:
+        for pid in list(self._bg_hooks):
+            self._unhook_bg_pid(pid)
+
+    def _refresh_layout(self, now: float) -> None:
+        """Measure what is on screen, tell the board, and schedule reads of what appeared or changed."""
+        self._layout_due = None
+        if self._locked or self._paused or self._fullscreen or not self.settings.visible:
+            return
+        layout = _visibility.layout(foreground=self._fg or None)
+        self._layout = layout
+        self._layout_ms.append(round(layout.elapsed_ms, 2))
+        with self._bg_lock:
+            self._bg_stats["layouts"] += 1
+        share = self.settings.visible_min_share
+        visible = [s for s in layout.surfaces if s.visible_share >= share]
+        if self.now is not None:
+            self.now.set_layout(
+                [{"hwnd": s.hwnd, "kind": s.kind, "title": s.title, "rect": list(s.rect), "share": s.visible_share,
+                  "z": s.z, "pid": s.pid} for s in visible],
+                foreground=self._fg, at=time.time(), ms=layout.elapsed_ms,
+            )
+        titles: dict[int, str] = {}
+        pids: dict[int, int] = {}
+        for s in visible:
+            if s.hwnd == self._fg or s.pid == os.getpid() or self._processes.get(s.pid).is_own:
+                continue  # Yuki's own windows (the tray's cards and pills) are never read
+            if s.kind == "window":
+                titles[s.hwnd], pids[s.hwnd] = s.title, s.pid
+                before = self._surf_titles.get(s.hwnd)
+                if before is None:
+                    self._bg_mark(s.hwnd, "shown", now)
+                elif before != s.title:
+                    if self.now is not None:
+                        self.now.note_title(s.hwnd, s.title, time.time())
+                    self._bg_mark(s.hwnd, "title", now)
+            elif s.kind == "popup":
+                appeared = self._appeared.get(s.hwnd)
+                if self._popups_read.get(s.hwnd) == s.title and appeared is None:
+                    continue  # read already, still the same popup
+                if appeared is not None or s.hwnd not in self._popups_read:
+                    self._appeared.pop(s.hwnd, None)
+                    self._popups_read[s.hwnd] = s.title
+                    self._bg_mark(s.hwnd, "popup", appeared or now, popup=True)
+        on_screen = {s.hwnd for s in visible}
+        for hwnd in [h for h in self._bg_pending if h not in on_screen]:
+            del self._bg_pending[hwnd]
+        for hwnd in [h for h in self._popups_read if h not in on_screen]:
+            del self._popups_read[hwnd]
+        self._surf_titles, self._surf_pids = titles, pids
+        self._update_bg_hooks(visible, now)
+
+    def _update_bg_hooks(self, visible: list[Any], now: float) -> None:
+        """Name-change hooks for the processes of the visible background windows (largest share first)."""
+        for pid, until in list(self._muted.items()):
+            if now >= until:
+                del self._muted[pid]
+        fg_pids = set(self._hooked_pid)
+        wanted: list[int] = []
+        for s in sorted((s for s in visible if s.hwnd in self._surf_titles), key=lambda s: -s.visible_share):
+            if s.pid in fg_pids or s.pid in self._muted or s.pid in wanted:
+                continue  # the one in front has its own hooks (they route here too)
+            wanted.append(s.pid)
+            if len(wanted) >= self.settings.bg_max_processes:
+                break
+        for pid in [p for p in self._bg_hooks if p not in wanted]:
+            self._unhook_bg_pid(pid)
+        flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+        for pid in wanted:
+            if pid in self._bg_hooks:
+                continue
+            handle = _user32.SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, None,
+                                             self._callback, pid, 0, flags)
+            self._bg_hooks[pid] = [handle] if handle else []
+
+    def _bg_spent_last_min(self, now: float, *, popup: bool) -> tuple[int, float]:
+        with self._bg_lock:
+            while self._bg_spent and now - self._bg_spent[0][0] > 60.0:
+                self._bg_spent.popleft()
+            reads = [(at, ms) for at, ms, p in self._bg_spent if p == popup]
+        return len(reads), sum(ms for _at, ms in reads)
+
+    def _bg_schedule(self, now: float) -> float | None:
+        """Hand due background reads to the background worker, within budget; returns the next deadline."""
+        if not self._bg_pending:
+            return None
+        if self._locked or self._paused or self._fullscreen:
+            self._bg_pending.clear()
+            return None
+        s = self.settings
+        idle = user_idle_s() > s.idle_limit_s
+        next_due: float | None = None
+        with self._bg_cond:
+            queued = {job.hwnd for job in self._bg_queue}
+            busy = self._bg_busy.hwnd if self._bg_busy is not None else None
+            # reads handed over but not done yet count against the budget as well
+            waiting = {True: 0, False: 0}
+            for job in [*self._bg_queue, *([self._bg_busy] if self._bg_busy is not None else [])]:
+                if not job.app_data_only:
+                    waiting[job.popup] += 1
+        for hwnd, pending in list(self._bg_pending.items()):
+            if hwnd in queued or hwnd == busy:
+                continue
+            if hwnd == self._fg and not pending.popup:
+                del self._bg_pending[hwnd]  # it came to the front: read by the capture of the window in front
+                continue
+            if pending.popup:
+                due = pending.first + s.popup_settle_s
+            else:
+                with self._results_lock:
+                    read_any = self._last_capture.get(hwnd)  # also a read while it was in front
+                if pending.reason == "shown" and read_any is not None and now - read_any < s.bg_max_gap_s:
+                    del self._bg_pending[hwnd]  # it was just in front and read then: that read is on the board
+                    continue
+                quiet = pending.last + s.bg_settle_s
+                due = min(max(quiet, pending.first), pending.first + s.bg_settle_cap_s)
+                last = max((t for t in (self._bg_last.get(hwnd), read_any) if t is not None), default=None)
+                if last is not None:
+                    due = max(due, last + self._bg_gap.get(hwnd, s.bg_min_gap_s))
+            if due > now:
+                next_due = due if next_due is None else min(next_due, due)
+                continue
+            if idle and not pending.popup:
+                continue  # nobody is looking; read it when the user is back (it stays pending)
+            opaque_at = self._opaque.get(hwnd)
+            app_data_only = (not pending.popup and pending.reason != "refresh" and opaque_at is not None
+                             and time.monotonic() - opaque_at < s.opaque_reprobe_s)
+            if not app_data_only:
+                reads, ms = self._bg_spent_last_min(now, popup=pending.popup)
+                reads += waiting[pending.popup]
+                limit = s.popups_per_min if pending.popup else s.bg_reads_per_min
+                if reads >= limit or (not pending.popup and ms >= s.bg_read_ms_per_min):
+                    with self._bg_lock:
+                        self._bg_stats["over_budget"] += 1
+                    retry = now + 5.0
+                    next_due = retry if next_due is None else min(next_due, retry)
+                    continue
+            del self._bg_pending[hwnd]
+            job = _BgJob(hwnd=hwnd, reason=pending.reason, popup=pending.popup, app_data_only=app_data_only)
+            if not app_data_only:
+                waiting[pending.popup] += 1
+            with self._bg_cond:
+                self._bg_queue.append(job)
+                self._bg_cond.notify()
+        return next_due
 
     def _on_foreground(self, hwnd: int, trigger: str) -> None:
         if hwnd:
@@ -1277,10 +1736,15 @@ class Watcher:
             # Nothing from a full-screen app is read; drop its per-process hooks
             # so a game costs this process nothing but the foreground hook.
             self._unhook_pid()
+            self._stop_visible()
             self._pending = None
             return
         self._hook_pid(hwnd)
+        self._fg_content = None
+        self._bg_pending.pop(hwnd, None)  # in front now: the capture of the window in front reads it
+        self._surf_titles.pop(hwnd, None)
         self._arm(trigger, time.monotonic(), force=True)
+        self._layout_soon(time.monotonic())
 
     def _signature(self, hwnd: int) -> tuple:
         return (_window_title(hwnd), _window_rect(hwnd))
@@ -1319,6 +1783,13 @@ class Watcher:
 
     def _next_timeout_ms(self, now: float) -> int:
         deadlines = [self._next_backstop]
+        if self._layout_due is not None:
+            deadlines.append(self._layout_due)
+        if self._bg_next_due is not None:
+            deadlines.append(self._bg_next_due)
+        content_due = self._fg_content_due()
+        if content_due is not None:
+            deadlines.append(content_due)
         if self._retry is not None:
             # a condition poll (the hosted app's window appearing), bounded by the retry's deadline
             deadlines.append(min(self._retry[1], now + 0.25))
@@ -1370,6 +1841,28 @@ class Watcher:
                             pending.not_before = not_before
         if now >= self._next_backstop:
             self._backstop(now)
+        if self._layout_due is not None and now >= self._layout_due:
+            self._refresh_layout(now)
+        content_due = self._fg_content_due()
+        if content_due is not None and now >= content_due:
+            self._fg_content = None
+            if self._pending is None and self._busy is None:
+                self._arm("content", now)
+        self._bg_next_due = self._bg_schedule(now)
+
+    def _fg_content_due(self) -> float | None:
+        """When the content events of the window in front call for a read (a chat message arriving), or None."""
+        span = self._fg_content
+        if span is None or not self._fg:
+            return None
+        first, last = span
+        s = self.settings
+        due = min(max(last + s.bg_settle_s, first), first + s.bg_settle_cap_s)
+        with self._results_lock:
+            read = self._last_capture.get(self._fg)
+        if read is not None:
+            due = max(due, read + self._fg_content_gap.get(self._fg, s.fg_content_gap_s))
+        return due
 
     def _backstop(self, now: float) -> None:
         with self._results_lock:
@@ -1380,6 +1873,7 @@ class Watcher:
         elif outcome is False:
             self._backstop_interval = min(self._backstop_interval * 1.5, self.settings.backstop_max_s)
         self._next_backstop = now + self._backstop_interval
+        self._layout_soon(now)  # a maximise, a restore or a snap raises no event of its own that is hooked
         if self._fullscreen and self._fg:
             # Leaving full screen without a foreground change (F11, a video)
             # has no event of its own: re-check it here.
@@ -1398,6 +1892,8 @@ class Watcher:
 
     def _submit(self, hwnd: int, trigger: str, now: float) -> None:
         self._pending = None
+        if hwnd == self._fg:
+            self._fg_content = None  # this read covers the content events so far
         self._next_backstop = max(self._next_backstop, now + self._backstop_interval)
         request = _Request(hwnd=hwnd, trigger=trigger, title=_window_title(hwnd), requested_at=now,
                            acting=self.acting_now())
@@ -1411,6 +1907,7 @@ class Watcher:
         store: CaptureStore | None = None
         try:
             store = self._store_factory()
+            self._store_ref = store
         except BaseException as exc:
             self._log_error("store_open", exc)
         try:
@@ -1436,6 +1933,166 @@ class Watcher:
         # The store belongs to whoever made the factory (the service shares it
         # with the journal worker); it is not closed here.
 
+    # -- background worker: the other visible windows and popups ---------------------------
+
+    def _bg_main(self) -> None:
+        store: CaptureStore | None = None
+        try:
+            store = self._store_factory()
+        except BaseException as exc:
+            self._log_error("store_open_visible", exc)
+        while True:
+            with self._bg_cond:
+                while not self._bg_queue and not self._stopping:
+                    self._bg_cond.wait()
+                if self._stopping:
+                    return
+                job = self._bg_queue.popleft()
+                self._bg_busy = job
+            started = time.monotonic()
+            try:
+                result = self._capture_visible(store, job)
+            except Exception as exc:
+                self._log_error("capture_visible", exc)
+                result = CaptureResult(trigger="popup" if job.popup else f"visible:{job.reason}", outcome="failed",
+                                       reason="unexpected")
+            finally:
+                with self._bg_cond:
+                    self._bg_busy = None
+            self._record_visible(store, job, result, started)
+
+    def _capture_visible(self, store: CaptureStore | None, job: _BgJob) -> CaptureResult:
+        """Read one window that is on screen but not in front (or a popup that appeared), through the same
+        structured read, privacy gates, secret filter and store as the window in front."""
+        started = time.perf_counter()
+        result = CaptureResult(trigger="popup" if job.popup else f"visible:{job.reason}")
+        self._flush_paused_health(store)
+
+        def done(outcome: str, reason: str = "") -> CaptureResult:
+            result.outcome, result.reason = outcome, reason
+            result.ms = (time.perf_counter() - started) * 1000.0
+            return result
+
+        hwnd = job.hwnd
+        if store is None:
+            return done("failed", "store_unavailable")
+        if self._paused or self._locked or self._fullscreen:
+            return done("skipped", "paused" if self._paused else "locked" if self._locked else "fullscreen")
+        if not _user32.IsWindow(hwnd):
+            return done("skipped", "window_gone")
+        if int(_user32.GetForegroundWindow() or 0) == hwnd:
+            return done("skipped", "in_front")  # the capture of the window in front reads it
+        layout = _visibility.layout()
+        surface = layout.by_hwnd(hwnd)
+        if surface is None:
+            return done("skipped", "not_on_screen")
+        result.visible_share = surface.visible_share
+        if not job.popup and surface.visible_share < self.settings.visible_min_share:
+            return done("skipped", "covered")
+        facts = self._processes.get(_window_pid(hwnd))
+        result.app = facts.app_name
+        rules = self.privacy.rules()
+        if facts.is_own or facts.pid == os.getpid():
+            return done("skipped", "own_window")
+        title = _window_title(hwnd)
+        reason = rules.check_app(facts.process_name, facts.app_name) or rules.check_window(facts.process_name, title)
+        if reason:
+            if self.now is not None and not job.popup:
+                self.now.block(hwnd, app=facts.app_name, process=facts.process_name, reason=reason, at=time.time(),
+                               foreground=False)
+            return done("skipped", reason)
+        if job.app_data_only:
+            result.opaque = True
+            self._follow_opaque(hwnd, facts, title, foreground=False)
+            return done("skipped", "opaque")
+        blocked_as = self._bg_blocked.get(hwnd)
+        if blocked_as is not None and blocked_as[0] == title and job.reason != "refresh":
+            # its last read was a blocked site or a sign-in page, and it shows the same title: not read again
+            return done("skipped", f"{blocked_as[1]}_before")
+        if _uia_threads_alive() > self.settings.uia_backlog:
+            return done("skipped", "uia_backlog")
+        t0 = time.perf_counter()
+        result.gates_ms = (t0 - started) * 1000.0
+        hidden = None if job.popup else (lambda bounds: layout.covered(hwnd, bounds))
+        extraction = extract(
+            hwnd, now=time.time(), user_names=self.user_names(store), app=facts.app_name,
+            timeout_s=self.settings.popup_budget_s if job.popup else self.settings.bg_budget_s, hidden=hidden,
+        )
+        result.read_ms = (time.perf_counter() - t0) * 1000.0
+        result.covered_nodes = int(extraction.stats.get("covered_nodes") or 0)
+        if job.popup and self._names_blocked(extraction, rules):
+            # A popup hosted by another process (a notification toast shown by the shell) that names an app the
+            # user blocked: nothing of it is kept (their own list, matched exactly, fails safe).
+            return done("skipped", "blocked_app_named")
+        opaque = False if job.popup else self._measure_opaque(hwnd, extraction, result)
+        if opaque:
+            self._follow_opaque(hwnd, facts, title, foreground=False)
+        if job.popup and str(extraction.stats.get("root_role") or "") in NOW_ONLY_POPUPS:
+            # a tooltip or a menu: part of what is on screen now, not something to remember
+            rules_now = self.privacy.rules()
+            if not (rules_now.check_url(extraction.url or "") or extraction.stats.get("password_fields")):
+                self._now_put({"hwnd": hwnd, "foreground": False, "read_ms": result.read_ms, "popup": True,
+                               "process": facts.process_name}, _hide_secrets(extraction, result), rules_now,
+                              result.trigger, time.time(), by_yuki=False)
+            result.profile, result.kind = extraction.profile, extraction.kind
+            return done("skipped", "now_only")
+        outcome, reason = self.ingest(
+            store, extraction, result.trigger, process=facts.process_name, result=result, acting=self.acting_now(),
+            now_meta={"hwnd": hwnd, "foreground": False, "read_ms": result.read_ms, "popup": job.popup,
+                      "visible_share": surface.visible_share, "opaque": opaque, "process": facts.process_name},
+        )
+        self._note_blocked(hwnd, title, outcome, reason)
+        return done(outcome, reason)
+
+    @staticmethod
+    def _names_blocked(extraction: Extraction, rules: PrivacyRules) -> bool:
+        """Whether a line or control of the read is exactly the name of an app the privacy rules block."""
+        blocked = {n.removesuffix(".exe") for n in (*rules.blocked_processes, *rules.user_blocked_apps) if n}
+        if not blocked:
+            return False
+        pieces = [*(extraction.controls or []), *str(extraction.body or "").splitlines(),
+                  *(m.sender or "" for m in extraction.messages), extraction.title or ""]
+        return any(" ".join(p.split()).casefold() in blocked for p in pieces if p and p.strip())
+
+    def _record_visible(self, store: CaptureStore | None, job: _BgJob, result: CaptureResult, started: float) -> None:
+        """Counters, the adaptive per-window gap, the budget, the log and the health row of one background read."""
+        read = result.outcome != "skipped" or result.reason == "opaque" or result.read_ms > 0
+        now = time.monotonic()
+        with self._bg_lock:
+            self._bg_stats[f"{'popup' if job.popup else 'window'}:{result.outcome}"] += 1
+            if result.outcome != "skipped" or result.read_ms > 0:
+                self._bg_spent.append((now, result.read_ms, job.popup))
+        if not job.popup and read:
+            gap = self._bg_gap.get(job.hwnd, self.settings.bg_min_gap_s)
+            self._bg_gap[job.hwnd] = (self.settings.bg_min_gap_s if result.outcome == "captured"
+                                      else min(gap * 2.0, self.settings.bg_max_gap_s))
+            self._bg_last[job.hwnd] = now
+            if len(self._bg_last) > 256:
+                self._bg_last.clear()
+                self._bg_gap.clear()
+        with self._results_lock:
+            if result.outcome != "skipped" or result.read_ms > 0:
+                self._latency.append(result.ms)
+                self._last_capture[job.hwnd] = now
+            if result.outcome == "captured":
+                self._captured_chars += result.delta_chars
+            self._outcomes[result.outcome] += 1
+            self._triggers[result.trigger] += 1
+        self._log("capture", **result.__dict__)
+        if store is not None and result.outcome != "skipped":
+            try:
+                store.add_health(
+                    time.time(), result.app, result.trigger, result.outcome, result.reason,
+                    result.chars, round(result.ms, 1),
+                    profile=result.profile or None, kind=result.kind or None,
+                    dropped_chars=result.dropped_chars if result.profile else None,
+                    messages=result.messages if result.kind in ("conversation", "email") else None,
+                    new_messages=result.new_messages if result.kind in ("conversation", "email") else None,
+                    stats=result.stats or None,
+                )
+            except Exception as exc:
+                self._log_error("add_health", exc)
+
     def _record(self, store: CaptureStore | None, request: _Request, result: CaptureResult) -> None:
         with self._results_lock:
             if result.outcome != "skipped":
@@ -1444,12 +2101,21 @@ class Watcher:
                 self._captured_chars += result.delta_chars
             self._outcomes[result.outcome] += 1
             self._triggers[request.trigger] += 1
-            if result.outcome != "skipped":
+            if result.outcome != "skipped" or result.read_ms > 0 or result.reason == "opaque":
+                # a read that happened counts for the gaps, even when its result was then skipped (a blocked site),
+                # and so does following an opaque window's title (its spinner must not cost a pass a second)
                 self._last_capture[request.hwnd] = time.monotonic()
                 if len(self._last_capture) > 256:
                     self._last_capture.clear()
             if request.trigger == "backstop":
                 self._last_backstop_captured = result.outcome == "captured"
+            if request.trigger == "content":
+                gap = self._fg_content_gap.get(request.hwnd, self.settings.fg_content_gap_s)
+                self._fg_content_gap[request.hwnd] = (
+                    self.settings.fg_content_gap_s if result.outcome == "captured"
+                    else min(gap * 2.0, self.settings.fg_content_max_s))
+                if len(self._fg_content_gap) > 256:
+                    self._fg_content_gap.clear()
         self._log("capture", **result.__dict__)
         if self._hwnd and (
             (request.trigger in FRESH_TRIGGERS or request.trigger == "title") and result.reason == "window_busy"
@@ -1520,11 +2186,29 @@ class Watcher:
             facts.process_name, window_title
         )
         if reason:
+            if self.now is not None:
+                self.now.block(hwnd, app=facts.app_name, process=facts.process_name, reason=reason, at=time.time(),
+                               foreground=True)
             return done("skipped", reason)
         if rules.pause_when_fullscreen and is_fullscreen_front(hwnd):
             if self._hwnd:
                 _user32.PostMessageW(self._hwnd, WM_APP_REFRESH, 0, 0)
             return done("skipped", "fullscreen")
+        blocked_as = self._bg_blocked.get(hwnd)
+        if (request.trigger in BLOCKED_SKIP_TRIGGERS and blocked_as is not None and blocked_as[0] == window_title):
+            # Its last read was a blocked site or a sign-in page (known only after reading), and it still shows
+            # the same title: a meeting page in front was read again on every focus change (0.5-2 s each).
+            result.app = facts.app_name
+            return done("skipped", f"{blocked_as[1]}_before")
+        opaque_at = self._opaque.get(hwnd)
+        if (request.trigger in OPAQUE_SKIP_TRIGGERS and opaque_at is not None
+                and time.monotonic() - opaque_at < self.settings.opaque_reprobe_s):
+            # Measured opaque minutes ago (its tree is its frame): its title is followed, and the app's own
+            # data when a reader for it exists, without reading it again.
+            result.app = facts.app_name
+            result.opaque = True
+            self._follow_opaque(hwnd, facts, window_title, foreground=True)
+            return done("skipped", "opaque")
         if _uia_threads_alive() > self.settings.uia_backlog:
             return done("skipped", "uia_backlog")
         if rules.skip_when_password_focused and self._probe is not None:
@@ -1545,10 +2229,120 @@ class Watcher:
         )
         result.read_ms = (time.perf_counter() - t0) * 1000.0
         self._tell_screen(hwnd, facts, extraction, rules)
+        opaque = self._measure_opaque(hwnd, extraction, result)
+        if opaque:
+            self._follow_opaque(hwnd, facts, window_title, foreground=True)
         acting = request.acting or self._acting
         outcome, reason = self.ingest(store, extraction, request.trigger, process=facts.process_name, result=result,
-                                      acting=acting)
+                                      acting=acting,
+                                      now_meta={"hwnd": hwnd, "foreground": True, "read_ms": result.read_ms,
+                                                "visible_share": 1.0, "opaque": opaque, "process": facts.process_name})
+        self._note_blocked(hwnd, window_title, outcome, reason)
         return done(outcome, reason)
+
+    def _note_blocked(self, hwnd: int, title: str, outcome: str, reason: str) -> None:
+        """Remember a read the privacy gates skipped after reading (a blocked site, a sign-in page), by title."""
+        if outcome == "skipped" and reason and reason != "window_busy":
+            if len(self._bg_blocked) > 256:
+                self._bg_blocked.clear()
+            self._bg_blocked[hwnd] = (title, reason)
+        else:
+            self._bg_blocked.pop(hwnd, None)
+
+    # -- opaque windows and the app's own data --------------------------------------------
+
+    #: Hours of the timeline the recent titles of an opaque app's windows come from, how many, how often.
+    RECENT_TITLES_H = 12.0
+    RECENT_TITLES_MAX = 10
+    RECENT_TITLES_EVERY_S = 60.0
+
+    def _recent_titles(self, process: str) -> list[str]:
+        """The distinct titles an app's windows had in front lately, most used first (memory's timeline,
+        privacy-filtered where it was recorded): for an app that shows no items, its tabs are its titles."""
+        store = getattr(self, "_store_ref", None)
+        read = getattr(store, "timeline_of", None)
+        if not callable(read) or not process:
+            return []
+        cached = self._titles_cache.get(process)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self.RECENT_TITLES_EVERY_S:
+            return cached[1]
+        try:
+            from yuki.memory.store import app_key
+            from yuki.memory.warp import clean_title
+
+            key = app_key(process) or ""
+            weight: dict[str, float] = {}
+            for row in read(key, time.time() - self.RECENT_TITLES_H * 3600.0):
+                if (getattr(row, "process", "") or "") != key or not getattr(row, "title", ""):
+                    continue
+                title = clean_title(str(row.title))
+                if title:
+                    weight[title] = weight.get(title, 0.0) + float((row.active_s or 0) + (row.passive_s or 0) + 1)
+            titles = [t for t, _w in sorted(weight.items(), key=lambda kv: -kv[1])][: self.RECENT_TITLES_MAX]
+        except Exception as exc:  # noqa: BLE001 - a hint only
+            self._log_error("recent_titles", exc)
+            titles = []
+        if len(self._titles_cache) > 32:
+            self._titles_cache.clear()
+        self._titles_cache[process] = (now, titles)
+        return titles
+
+    def _measure_opaque(self, hwnd: int, extraction: Extraction, result: CaptureResult) -> bool:
+        """Whether this read says the window is opaque (its content leaves cover under 5% of it), remembered.
+
+        Only a read that answered in time counts (a window that did not answer is busy, not opaque).
+        """
+        from yuki.memory.extract import OPAQUE_COVERAGE
+
+        coverage = extraction.stats.get("coverage")
+        result.coverage = coverage
+        truncated = bool(extraction.stats.get("truncated"))
+        opaque = extraction.profile != "error" and not truncated and coverage is not None and coverage < OPAQUE_COVERAGE
+        result.opaque = opaque
+        if opaque:
+            if len(self._opaque) > 256:
+                self._opaque.clear()
+            self._opaque[hwnd] = time.monotonic()
+        else:
+            self._opaque.pop(hwnd, None)
+        return opaque
+
+    def _follow_opaque(self, hwnd: int, facts: ProcessFacts, title: str, *, foreground: bool) -> None:
+        """For a window UI Automation cannot see into: the board gets its title and, when a reader for the app
+        exists (:data:`yuki.memory.now.APP_DATA_READERS`), what the app's own local data says about it."""
+        if self.now is None:
+            return
+        self.now.note_title(hwnd, title, time.time())
+        if self.now.entry(hwnd) is None:
+            self.now.put(hwnd, {"app": facts.app_name, "process": facts.process_name, "title": title, "kind": "",
+                                "text": "", "messages": [], "controls": [], "read_at": time.time(),
+                                "trigger": "opaque", "foreground": foreground, "opaque": True, "coverage": 0.0})
+        now = time.monotonic()
+        if now - self._app_data_at.get(hwnd, 0.0) < self.settings.app_data_every_s:
+            return
+        self._app_data_at[hwnd] = now
+        from yuki.memory.now import app_data_for
+
+        rect = _visibility.frame_bounds(hwnd) or _window_rect(hwnd)
+        try:
+            from yuki.perception.windows import list_monitors, monitor_at
+
+            center = ((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+            monitor = monitor_at(center[0], center[1], list_monitors())
+            scales = (1.0, monitor.dpi_scale) if monitor is not None and monitor.dpi_scale != 1.0 else (1.0,)
+        except Exception:
+            scales = (1.0,)
+        t0 = time.perf_counter()
+        data = app_data_for(facts.process_name, rect, title, privacy=self.privacy, scales=scales)
+        recent = self._recent_titles(facts.process_name)
+        if recent:
+            data = {**(data or {"source": "memory"}), "recent_titles": recent}
+        self.now.set_app_data(hwnd, data)
+        with self._bg_lock:
+            self._bg_stats["app_data_reads"] += 1
+        self._log("app_data", app=facts.app_name, found=data is not None,
+                  tabs=len(data.get("tabs") or []) if data else 0, ms=round((time.perf_counter() - t0) * 1000.0, 1))
 
     def _tell_screen(self, hwnd: int, facts: ProcessFacts, extraction: Extraction, rules: PrivacyRules) -> None:
         """Hand what the window offers (its control names) to ``on_screen``; never raises, never blocks."""
@@ -1590,6 +2384,7 @@ class Watcher:
         at: float | None = None,
         result: CaptureResult | None = None,
         acting: Any = None,
+        now_meta: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """Privacy-gate and store one extraction; returns ``(outcome, reason)``.
 
@@ -1598,6 +2393,8 @@ class Watcher:
         line delta of its main text.  The thread is ``(app, thread_scope)``.
         ``acting``: Yuki was acting for the user (:class:`yuki.memory.acting.Acting`):
         the capture is stored ``by_yuki`` with the request's text.
+        ``now_meta``: the window it came from (``hwnd``, ``foreground``, ``visible_share``, ``read_ms``,
+        ``opaque``, ``process``): the Now board (:mod:`yuki.memory.now`) gets the same gated, redacted text.
         """
         rules = self.privacy.rules()
         result = result if result is not None else CaptureResult(trigger=trigger)
@@ -1612,15 +2409,18 @@ class Watcher:
             return "failed", "extract_error"
         block = rules.check_url(extraction.url or "")
         if block:
+            self._now_block(now_meta, extraction, block, at)
             return "skipped", block
         if rules.skip_when_password_present and extraction.stats.get("password_fields"):
             # a password field on screen (UIA IsPassword): a sign-in page or credentials dialog, whatever its
             # address says - measured on the window itself instead of guessed from words in the URL path
+            self._now_block(now_meta, extraction, "password_field", at)
             return "skipped", "password_field"
         self._learn_names(store, extraction)
         # Secrets typed into chats, pages and documents become typed placeholders here,
         # before the delta, the store and every model call (docs/MEMORY.md, "Secret filter").
         extraction = _hide_secrets(extraction, result)
+        self._now_put(now_meta, extraction, rules, trigger, at, by_yuki=acting is not None)
 
         s0 = time.perf_counter()
         yuki = {"by_yuki": True, "yuki_request": getattr(acting, "request", "") or ""} if acting is not None else {}
@@ -1633,6 +2433,35 @@ class Watcher:
             return "failed", "store_error"
         finally:
             result.store_ms = (time.perf_counter() - s0) * 1000.0
+
+    def _now_block(self, meta: dict[str, Any] | None, extraction: Extraction, reason: str, at: float) -> None:
+        if self.now is None or not meta or not meta.get("hwnd"):
+            return
+        self.now.block(int(meta["hwnd"]), app=extraction.app, process=str(meta.get("process") or ""), reason=reason,
+                       at=at, foreground=bool(meta.get("foreground")))
+
+    def _now_put(self, meta: dict[str, Any] | None, extraction: Extraction, rules: PrivacyRules, trigger: str,
+                 at: float, *, by_yuki: bool) -> None:
+        """The board's copy of a read that passed every gate, secrets already hidden (never raises)."""
+        if self.now is None or not meta or not meta.get("hwnd"):
+            return
+        try:
+            from yuki.memory.now import gist_of
+
+            front = bool(meta.get("foreground"))
+            entry = gist_of(extraction, front=front, is_masked=rules.is_masked)
+            entry.update(app=extraction.app, process=str(meta.get("process") or ""), read_at=at,
+                         read_ms=round(float(meta.get("read_ms") or 0.0), 1), trigger=trigger, foreground=front,
+                         visible_share=meta.get("visible_share"), coverage=extraction.stats.get("coverage"),
+                         opaque=bool(meta.get("opaque")), by_yuki=by_yuki)
+            if meta.get("popup"):
+                entry["hwnd"] = int(meta["hwnd"])
+                entry["at"] = at
+                self.now.add_popup(entry)
+            else:
+                self.now.put(int(meta["hwnd"]), entry)
+        except Exception as exc:  # noqa: BLE001 - the board never breaks capture
+            self._log_error("now_board", exc)
 
     def _learn_names(self, store: CaptureStore, extraction: Extraction) -> None:
         known = {n.casefold() for n in self.user_names(store)}

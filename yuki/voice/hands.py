@@ -90,7 +90,7 @@ _DESK_FRESH_S = 1.5
 _DESK_AHEAD_EVERY_S = 0.5
 
 #: Hands that act at once, with no words before them.
-INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab")
+INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab", "click", "type")
 #: Hands that touch no window (sound only): they may act while the thinker works on the desktop.
 AUDIO_HANDS = ("media_key", "app_volume")
 #: How long a reopened tab may take to show its title (the browser restores it at once, the page after).
@@ -120,6 +120,13 @@ _PASSED_NOTE = (
     "the thinker is doing it now and its outcome comes back to you. Say nothing now: no retry, no other hand, no "
     "\"let me try another way\"."
 )
+#: The same, when nothing has been said for their words yet (v3.14: offline 29 Sept a click refused on Warp was passed on
+#: by code and they heard nothing for 12 s): two or three words now, so they know Yuki is on it.
+_PASSED_ACK_NOTE = (
+    "It did not take effect, so it was handed to the thinker with this report and the window already read; its outcome "
+    "comes back to you. They have heard nothing yet for their words: say two or three words that you are on it (\"On "
+    "it.\", \"One sec.\"), nothing about what did not work, never that it is done; no retry, no other hand."
+)
 #: What the talker reads when the same step was called again while it ran, or an opening it just did (v3.10:
 #: live 2026-09-28 09:07:13 two open_url calls for one "open YouTube" said "Opening YouTube. Opening YouTube now.
 #: YouTube's up. YouTube's up.").
@@ -129,6 +136,9 @@ _DUPLICATE_NOTE = (
 )
 #: A slow hand's opening (open_url, open_app) called again this soon after it was verified is the same request.
 _OPEN_REPEAT_S = 12.0
+#: A done line a hand already said this recently, word for word, is not said again (v3.14: live 27-29 Sept "Done." x5
+#: in 38 s): the effect was verified and they watch it happen; the words' identity, never their meaning.
+_REPEAT_LINE_S = 60.0
 _KEYS_NOTE = (
     "The keys went out; this is what the report saw. Say in a few words what it shows happened, never "
     "more than it shows. If it shows the keys did nothing they wanted, say so and hand it to the thinker "
@@ -282,7 +292,128 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "required": ["say_first", "name", "say_when_done"],
     },
 ]
+HAND_TOOLS += [
+    {
+        "name": "click",
+        "description": (
+            "Your hand for what they point at on the screen (v3.14): click one item of the items line of the desktop "
+            "block (the window in front's links, buttons and list rows, numbered, read while they talked), by its "
+            "number on that line: \"click the mix\", \"play the second one\", \"open that chat\". Only an item on "
+            "the items line: a name from the names line, a tab or a recent title is not an item (hand those over). "
+            "It is found again by its place "
+            "in that read and refused if the window changed since (then the thinker, which reads the window afresh, "
+            "gets it). Verified when something visibly changes after it (the page, the focus or the window)." + _NOW
+        ),
+        "properties": {
+            "window": _WINDOW,
+            "item": {"type": "integer", "description": "The item's number on the items line."},
+            "named": {"type": "string", "description": "The user's own words that name it."},
+            "say_when_done": _DONE_LINE,
+        },
+        "required": ["window", "item", "say_when_done"],
+    },
+    {
+        "name": "type",
+        "description": (
+            "Your hand for text (v3.14): type exactly the words they asked for into the text field the focus line of "
+            "the desktop block names (it has the keyboard now), nothing pressed after it: Enter, sending and every "
+            "shortcut are the thinker's. Verified by reading the field back." + _NOW
+        ),
+        "properties": {
+            "window": _WINDOW,
+            "text": {"type": "string", "description": "The text to type, as they said it."},
+            "say_when_done": _DONE_LINE,
+        },
+        "required": ["window", "text", "say_when_done"],
+    },
+]
 HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
+
+#: The items line (v3.14): at most this many items of the window in front, each name cut to this many characters.
+ITEMS_CAP = 20
+ITEM_NAME_CHARS = 60
+#: A click on an item of a read at most this old, with the window's title and the action log unchanged, goes by that
+#: read; an older one is found again in a fresh read by its role and name, or refused.
+ITEMS_FRESH_S = 4.0
+#: The user starting to talk reads the items again when the last read is older than this.
+ITEMS_AHEAD_S = 3.0
+
+
+@dataclass
+class ScreenItems:
+    """One read of the window in front's clickable items (content: RAM only).
+
+    ``read`` is the hands dispatcher's own read number for that tree (its element ids are only good for it);
+    ``items`` are ``{"id", "role", "name"}`` in the order shown (page content first, then the window's own).
+    """
+
+    hwnd: int
+    title: str
+    read: int
+    items: list[dict[str, Any]]
+    at: float
+    version: int
+
+
+def items_from_tree(tree: Any, cap: int = ITEMS_CAP) -> list[dict[str, Any]]:
+    """The named interactive items of a window tree, page content first, each (role, name) once.
+
+    By structure only (yuki.voice.screennames: UI Automation control types are the platform's fixed vocabulary, and
+    whether an element sits inside a page Document is where it is), never by what the names say.
+    """
+    from yuki.voice.screennames import ITEM_ROLES
+
+    elements = list((tree.get("elements") if isinstance(tree, dict) else getattr(tree, "elements", None)) or [])
+
+    def get(e: Any, key: str, default: Any = None) -> Any:
+        return e.get(key, default) if isinstance(e, dict) else getattr(e, key, default)
+
+    by_id = {get(e, "id"): e for e in elements}
+
+    def in_page(e: Any) -> bool:
+        hops = 0
+        parent = get(e, "parent", -1)
+        while parent not in (None, -1) and hops < 64:
+            up = by_id.get(parent)
+            if up is None:
+                return False
+            if str(get(up, "role", "")) == "Document":
+                return True
+            parent, hops = get(up, "parent", -1), hops + 1
+        return False
+
+    picked = [e for e in elements if get(e, "is_interactive", True) and str(get(e, "role", "")) in ITEM_ROLES
+              and " ".join(str(get(e, "name", "") or "").split()) and isinstance(get(e, "id"), int)]
+    ordered = [e for e in picked if in_page(e)] + [e for e in picked if not in_page(e)]
+    out: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for e in ordered:
+        name = " ".join(str(get(e, "name", "")).split())
+        key = (str(get(e, "role", "")), name.casefold())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append({"id": int(get(e, "id")), "role": key[0], "name": name})
+        if len(out) >= cap:
+            break
+    return out
+
+
+#: How the items line says a control type (the platform's fixed vocabulary, in words).
+_ROLE_WORDS = {"Hyperlink": "link", "Button": "button", "ListItem": "item", "DataItem": "row", "TreeItem": "item",
+               "TabItem": "tab", "MenuItem": "menu item"}
+
+
+def items_line(items: ScreenItems) -> str:
+    """The desktop block's items line (``""`` without items)."""
+    if not items.items:
+        return ""
+    parts = []
+    for n, item in enumerate(items.items, 1):
+        name = item["name"] if len(item["name"]) <= ITEM_NAME_CHARS else item["name"][:ITEM_NAME_CHARS - 1] + "…"
+        parts.append(f'{n} "{name}" {_ROLE_WORDS.get(item["role"], item["role"].casefold())}')
+    return (f"items on the screen in [{items.hwnd}], numbered for your click hand (page content first): "
+            + "; ".join(parts))
 
 
 @dataclass
@@ -383,7 +514,16 @@ class Hands:
         self.backend = backend
         self.log = log
         self.actions = actions if actions is not None else ActionLog()
-        self._dispatcher = Dispatcher(backend)
+        # One tree read of the window in front serves the names line and the items line (v3.14); its element ids
+        # are this dispatcher's own, so a click by item resolves against the very read the talker was shown.
+        self._dispatcher = Dispatcher(backend, max_tree_elements=300, tree_timeout_s=0.8)
+        from yuki.voice.workers import shared
+
+        #: Where the background reads run (yuki.voice.workers): started here, off every loop.
+        self._workers = shared()
+        #: The window in front's clickable items (``ScreenItems``, v3.14), read with the names; ``None`` before.
+        self.items: ScreenItems | None = None
+        self._items_lock = threading.Lock()
         self._lock = threading.Lock()
         self.last = Snapshot()
         #: Hands in flight (the narrator waits for them, like the mouth's other quick tools).
@@ -414,6 +554,8 @@ class Hands:
         #: Hands running now and the slow ones done lately, by what they act on (v3.10: one step runs once).
         self._inflight: dict[str, float] = {}
         self._opened: dict[str, tuple[float, str]] = {}
+        #: Done lines said lately, by their words (case and spacing aside): ``{words: said at}`` (v3.14).
+        self._lines_said: dict[str, float] = {}
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -454,6 +596,16 @@ class Hands:
                 from yuki.voice.screennames import screen_line
 
                 parts.append(screen_line(names_app, names))
+            with self._lock:
+                items = self.items
+            if (items is not None and items.hwnd == snap.foreground
+                    and items.title == titles.get(snap.foreground or 0, "")):
+                line = items_line(items)
+                if line:
+                    parts.append(line)
+            focus = self._focus_line(snap.foreground)
+            if focus:
+                parts.append(focus)
             done = self.actions.lines(_MOUTH_ACTION_LINES, 240)
             if done:
                 parts.append("done on the desktop in this conversation (newest last):\n" + "\n".join(done))
@@ -542,10 +694,13 @@ class Hands:
                     return
                 from yuki.voice.screennames import LIST_ROLES, names_from_tree
 
-                try:
-                    tree = read(front, max_elements=300, timeout_s=0.8)
-                except TypeError:  # a stand-in backend without the keyword arguments
-                    tree = read(front)
+                tree = self._read_items(front, str(win.get("title") or ""))
+                if tree is None:
+                    # a backend the dispatcher cannot read through (a minimal stand-in): the tree alone, for the names
+                    try:
+                        tree = read(front, max_elements=300, timeout_s=0.8)
+                    except TypeError:
+                        tree = read(front)
                 names = names_from_tree(tree)
                 image = str(win.get("process_name") or win.get("app") or "")
                 recent: list[str] = []
@@ -584,7 +739,7 @@ class Hands:
             finally:
                 self._names_busy = False
 
-        threading.Thread(target=run, name="yuki-voice-names", daemon=True).start()
+        self._workers.submit(run)   # a thread that already exists: never started from the loop (v3.14)
 
     def prefetch(self) -> None:
         """Read the foreground window's tabs ahead, off every thread that matters (the user started talking).
@@ -607,12 +762,17 @@ class Hands:
                 title = next((str(w.get("title") or "") for w in payload.get("windows") or []
                               if isinstance(w, dict) and w.get("hwnd") == front), "")
                 self._keep_tabs(front, title, read(front, budget_s=0.4))
+                with self._lock:
+                    items = self.items
+                if (items is None or items.hwnd != front or items.title != title or items.version != self.actions.version
+                        or time.monotonic() - items.at > ITEMS_AHEAD_S):
+                    self._read_items(front, title)   # the items line for the reply, read while they talk (v3.14)
             except Exception:  # noqa: BLE001 - only a head start
                 pass
             finally:
                 self._prefetching = False
 
-        threading.Thread(target=run, name="yuki-voice-tabs", daemon=True).start()
+        self._workers.submit(run)   # a thread that already exists: never started from the loop (v3.14)
 
     def prefetch_desk(self) -> None:
         """Read the whole summary ahead while the user talks (a thread; at most every ``_DESK_AHEAD_EVERY_S``).
@@ -632,7 +792,7 @@ class Hands:
             finally:
                 self._desk_ahead = False
 
-        threading.Thread(target=run, name="yuki-voice-desk", daemon=True).start()
+        self._workers.submit(run)   # a thread that already exists: never started from the loop (v3.14)
 
     async def for_call(self, wait_ms: float) -> tuple[Snapshot | None, str]:
         """A fresh summary for one mouth call, waiting at most ``wait_ms``; else the last one (``how``).
@@ -708,6 +868,16 @@ class Hands:
             self._opened = {k: v for k, v in self._opened.items() if started - v[0] < _OPEN_REPEAT_S}
             self._opened[key] = (time.monotonic(), report)
         speak = bool(line) and confirmed
+        if speak:
+            words = " ".join(line.casefold().split())
+            now = time.monotonic()
+            self._lines_said = {k: at for k, at in self._lines_said.items() if now - at < _REPEAT_LINE_S}
+            if words in self._lines_said:
+                speak, line = False, ""   # said a moment ago for the same kind of step: this time it is silent
+                if self.log is not None:
+                    self.log.event("hands", op=name, repeat_line_silent=True, call=params.tool_call_id)
+            else:
+                self._lines_said[words] = now
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified)
         if self.on_step is not None:
             try:
@@ -741,8 +911,16 @@ class Hands:
                 and self.bridge is not None and callable(getattr(self.bridge, "escalate", None))):
             # Tried and did not take effect (not refused, not "already so"): the thinker gets the same request
             # now, by code, with this report and the window read; no talker run narrates the failure (v3.9).
+            ack = False
             try:
-                passed = await self.bridge.escalate(params, name, args, report)
+                ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
+            except Exception:  # noqa: BLE001
+                ack = False
+            try:
+                try:
+                    passed = await self.bridge.escalate(params, name, args, report, acked=ack)
+                except TypeError:   # a stand-in bridge without the v3.14 argument
+                    passed = await self.bridge.escalate(params, name, args, report)
             except Exception as exc:  # noqa: BLE001 - then the talker handles the report as before
                 passed = False
                 if self.log is not None:
@@ -751,9 +929,12 @@ class Hands:
                 from pipecat.frames.frames import FunctionCallResultProperties
 
                 if self.log is not None:
-                    self.log.event("hands", op=name, escalated=True, call=params.tool_call_id)
-                await params.result_callback({key: report[:700], "passed_on": True, "how_to_handle_it": _PASSED_NOTE},
-                                             properties=FunctionCallResultProperties(run_llm=False))
+                    self.log.event("hands", op=name, escalated=True, acked=ack, call=params.tool_call_id)
+                if ack:
+                    self.bridge.acked()
+                await params.result_callback({key: report[:700], "passed_on": True,
+                                              "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=ack))
                 return
         await params.result_callback({key: report[:700], "how_to_say_it": note})
 
@@ -893,6 +1074,10 @@ class Hands:
             return ok, report, facts
         if name == "tab":
             return self._tab(args, facts)
+        if name == "click":
+            return self._click(args, facts)
+        if name == "type":
+            return self._type(args, facts)
         if name == "app_volume":
             return self._app_volume(args, facts)
         if name == "open_url":
@@ -907,6 +1092,125 @@ class Hands:
             facts["verified"] = ok
             return ok, report, facts
         raise _Refused(f"no hand called {name!r}")
+
+    def _read_items(self, hwnd: int, title: str) -> Any:
+        """One bounded tree read of ``hwnd`` through the hands' dispatcher: keeps its items, returns the tree (or None).
+
+        Blocking (a few hundred ms at most); call it off every loop. One read at a time.
+        """
+        with self._items_lock:
+            try:
+                outcome = self._dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
+            except Exception:  # noqa: BLE001 - the items are a hint
+                return None
+            if not outcome.ok or not isinstance(outcome.payload, dict):
+                return None
+            latest = getattr(self._dispatcher, "_latest_trees", {}).get(int(hwnd))
+            read = int(latest[0]) if latest else 0
+            items = ScreenItems(hwnd=int(hwnd), title=title, read=read, items=items_from_tree(outcome.payload),
+                                at=time.monotonic(), version=self.actions.version)
+            with self._lock:
+                self.items = items
+            if self.log is not None:
+                self.log.event("hands", op="items_read", hwnd=int(hwnd), items=len(items.items),
+                               ms=round(outcome.elapsed_ms))
+            return outcome.payload
+
+    def _focus(self, timeout_s: float = 0.25) -> Any:
+        """What has the keyboard (the backend's ``focus_snapshot``), or ``None`` when it cannot say."""
+        read = getattr(self.backend, "focus_snapshot", None)
+        if not callable(read):
+            return None
+        try:
+            snap = read(timeout_s=timeout_s)
+        except TypeError:
+            snap = read()
+        except Exception:  # noqa: BLE001
+            return None
+        return snap if getattr(snap, "ok", False) else None
+
+    def _focus_line(self, foreground: int | None) -> str:
+        """The desktop block's focus line, only when a text field of the window in front has the keyboard (v3.14)."""
+        snap = self._focus() if foreground else None
+        if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+            return ""
+        window = int(getattr(snap, "window", 0) or 0)
+        if window and window != foreground:
+            return ""
+        role = str(getattr(snap, "role", "") or "field")
+        name = str(getattr(snap, "name", "") or "")[:60]
+        what = f'{role} "{name}"' if name else role
+        return f"focus: the text field {what} in [{foreground}] has the keyboard (your type hand types there)"
+
+    def _click(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """Click an item of the items line, by the read it came from; found again, or refused, when that read is old."""
+        hwnd = self._window(args)
+        with self._lock:
+            items = self.items
+        try:
+            number = int(args.get("item"))
+        except (TypeError, ValueError):
+            raise _Refused("give the item's number from the items line") from None
+        if items is None or items.hwnd != hwnd or not 1 <= number <= len(items.items):
+            raise _Refused(f"item {number} of window {hwnd} is not on the items line you were shown; nothing was "
+                           f"clicked", stale=True)
+        item = items.items[number - 1]
+        title = self._title(hwnd)
+        if (title != items.title or items.version != self.actions.version
+                or time.monotonic() - items.at > ITEMS_FRESH_S):
+            # The read is old, or the window changed since: find the same item (its role and name) in a fresh read.
+            self._read_items(hwnd, title)
+            with self._lock:
+                fresh = self.items
+            same = [i for i in (fresh.items if fresh is not None and fresh.hwnd == hwnd else [])
+                    if i["role"] == item["role"] and i["name"] == item["name"]]
+            if len(same) != 1:
+                raise _Refused(f"the window changed since it was read and \"{item['name'][:60]}\" is not on it once "
+                               f"now; nothing was clicked", stale=True)
+            items, item = fresh, same[0]
+        lead = self._front(hwnd)
+        facts["sent_at"] = time.monotonic()
+        outcome = self._dispatcher.dispatch("click", {"element": item["id"], "read": items.read, "expect_hwnd": hwnd})
+        from yuki.agent.loop import action_verdict
+
+        verified, why = action_verdict("click", outcome)
+        facts["verified"] = verified if outcome.ok else False
+        facts["action_ms"] = round(outcome.elapsed_ms)
+        if not outcome.ok:
+            facts["stale"] = True   # nothing was clicked (a newer read came in between): the thinker reads afresh
+        return outcome.ok, f"{lead}clicked \"{item['name'][:80]}\" ({item['role']}): {outcome.summary} ({why})", facts
+
+    def _type(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """Type the words into the text field that has the keyboard in the window named; verified by reading it back."""
+        hwnd = self._window(args)
+        text = str(args.get("text") or "")
+        if not text.strip():
+            raise _Refused("no text to type")
+        snap = self._focus(timeout_s=0.4)
+        if snap is None:
+            raise _Refused("which field has the keyboard could not be read; nothing was typed", stale=True)
+        window = int(getattr(snap, "window", 0) or 0)
+        if window and window != hwnd:
+            raise _Refused(f"the keyboard is in another window, not [{hwnd}]; nothing was typed", stale=True)
+        if not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+            raise _Refused("what has the keyboard is not a text field you may type in; nothing was typed", stale=True)
+        facts["sent_at"] = time.monotonic()
+        outcome = self._dispatcher.dispatch("type_text", {"text": text, "expect_hwnd": hwnd})
+        from yuki.agent.loop import action_verdict
+
+        verified, why = action_verdict("type_text", outcome)
+        facts["verified"] = verified if outcome.ok else False
+        facts["action_ms"] = round(outcome.elapsed_ms)
+        return outcome.ok, f"typed into {getattr(snap, 'role', '') or 'the field'}: {outcome.summary} ({why})", facts
+
+    def _title(self, hwnd: int) -> str:
+        """The window's title now, from the window list (``""`` when it is not listed)."""
+        try:
+            _text, payload, _ms = self._dispatcher.overview_text()
+        except Exception:  # noqa: BLE001
+            return ""
+        return next((str(w.get("title") or "") for w in payload.get("windows") or []
+                     if isinstance(w, dict) and w.get("hwnd") == hwnd), "")
 
     def _app_volume(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         act = getattr(self.backend, "app_volume", None)

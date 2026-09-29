@@ -137,6 +137,13 @@ class EmbedServer:
         self._thread: threading.Thread | None = None
         self._listener: Any = None
         self.stats = {"connections": 0, "requests": 0, "texts": 0, "refused": 0, "errors": 0}
+        #: More ops served on the same pipe (``op -> fn(request) -> reply dict``, JSON only): the service's
+        #: screen recall (:mod:`yuki.memory.screenrecall`, op ``screen_related``). Plumbing; never raises out.
+        self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+
+    def register(self, op: str, fn: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+        """Serve ``op`` with ``fn(request) -> reply fields`` (a JSON-able dict)."""
+        self.handlers[str(op)] = fn
 
     def start(self) -> "EmbedServer":
         self._listener = _listener_class()(self.address)
@@ -239,6 +246,10 @@ class EmbedServer:
             return {"id": rid, "ok": True, "loaded": loaded}, b""
         if op == "stats":
             return {"id": rid, "ok": True, **embedder.stats()}, b""
+        handler = self.handlers.get(str(op))
+        if handler is not None:
+            self.stats["requests"] += 1
+            return {"id": rid, "ok": True, **(handler(request) or {})}, b""
         return {"id": rid, "ok": False, "error": "unknown op"}, b""
 
 
@@ -383,6 +394,18 @@ class EmbedClient:
             self._drop()
             return None
         return reply, body
+
+    def call(self, op: str, wait_s: float = 0.05, **fields: Any) -> dict[str, Any] | None:
+        """Another op the service serves on this pipe (:meth:`EmbedServer.register`): its reply fields, or
+        ``None`` when there is no service, it does not know the op, or no answer came within ``wait_s``."""
+        try:
+            answer = self._ask({"op": str(op), **fields}, max(0.01, float(wait_s)))
+        except Exception:  # noqa: BLE001 - optional plumbing: the caller goes on without it
+            return None
+        if not isinstance(answer, tuple) or answer[0] == "timeout":
+            return None
+        reply = answer[0]
+        return reply if isinstance(reply, dict) and reply.get("ok") else None
 
     def service_available(self) -> bool:
         """Whether the service's embedder answers on the pipe (connects if needed)."""

@@ -239,6 +239,35 @@ class BrowserDesk(StubDesktop):
                               kwargs={k: str(v)[:40] for k, v in kwargs.items()})
         return super()._act(name, summary, *args, **kwargs)
 
+    #: A text field that has the keyboard in the window in front (v3.14 type hand), ``None`` when none does:
+    #: ``{"window", "role", "name", "text"}``. Set by a test or a scenario.
+    focus_field: dict[str, Any] | None = None
+
+    def focus_snapshot(self, *, timeout_s: float = 0.6, ready_wait_s: float | None = None) -> Any:
+        """What has the keyboard, shaped like :class:`yuki.perception.tree.FocusSnapshot` (only what the hands read)."""
+        from types import SimpleNamespace
+
+        field = self.focus_field
+        if field is None or int(field.get("window", 0)) != self.front:
+            return SimpleNamespace(ok=True, role="", name="", window=self.front, accepts_text=False, is_password=False)
+        return SimpleNamespace(ok=True, role=field.get("role", "Edit"), name=field.get("name", ""),
+                               window=int(field["window"]), accepts_text=True, is_password=False)
+
+    def type_text(self, text: str, *, expect_hwnd: Any = None, **kwargs: Any) -> StubResult:
+        """Typing into the focused field, read back like the real input layer (``readback``)."""
+        refused = self._guard(expect_hwnd)
+        if refused:
+            return StubResult(ok=False, summary=refused)
+        result = self._act("type_text", f"typed {len(text)} chars", text, expect_hwnd=expect_hwnd, **kwargs)
+        field = self.focus_field
+        if field is not None and int(field.get("window", 0)) == self.front:
+            field["text"] = str(field.get("text", "")) + text
+            result.summary = f"typed {len(text)} chars; field now contains \"{field['text']}\""
+            result.details = {"readback": "arrived", "focus_changed": False}
+        else:
+            result.details = {"readback": "unreadable"}
+        return result
+
     def desk_state(self, t0: float) -> dict[str, Any]:
         """The pretend Chrome now (test reports): the tab showing, every tab's scroll, when titles came."""
         return {"selected": self.selected, "front": self.front,
@@ -423,22 +452,31 @@ class BrowserDesk(StubDesktop):
             self.volume += (2.0 if keys[0] == "volumeup" else -2.0) * times
         return note
 
+    def _watched(self, before: tuple[int, str], result: StubResult) -> StubResult:
+        """The input layer's own watch of a key's effect (yuki.actions.input: focus, window, title), stub-sized."""
+        front, title = before
+        result.details.update(foreground_changed=self.front != front, focus_changed=False,
+                              foreground_title_changed=self.front == front and self.title(self.front) != title)
+        return result
+
     def hotkey(self, *keys: str, expect_hwnd: Any = None, **_: Any) -> StubResult:
         refused = self._guard(expect_hwnd)
         if refused:
             return StubResult(ok=False, summary=refused)
+        before = (self.front, self.title(self.front))
         result = self._act("hotkey", f"pressed {'+'.join(keys)}", *keys, expect_hwnd=expect_hwnd)
         result.summary += self._keys(tuple(keys))
-        return result
+        return self._watched(before, result)
 
     def press(self, key: str, *, times: int = 1, expect_hwnd: Any = None, **_: Any) -> StubResult:
         refused = self._guard(expect_hwnd)
         if refused:
             return StubResult(ok=False, summary=refused)
+        before = (self.front, self.title(self.front))
         result = self._act("press", f"pressed {key}" + (f" x{times}" if times > 1 else ""), key, times=times,
                            expect_hwnd=expect_hwnd)
         result.summary += self._keys((key,), times)
-        return result
+        return self._watched(before, result)
 
 
 class TabsDesk(BrowserDesk):

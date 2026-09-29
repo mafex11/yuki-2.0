@@ -256,16 +256,22 @@ class NarratorGate:
         # result that follows within the settle replaces them (measured 2026-09-25: a
         # one-action result waited 4.5 s here, 1.5 s of it settle and cooldown).
         urgent = any(i.kind in URGENT for i in self.pending)
+        if urgent:
+            # v3.14: a ready result or question waits only while the user speaks or Yuki is mid-sentence (the gates
+            # above), never for a gap or a settle: its talker run and voice take ~2.5 s before a word is heard anyway.
+            # Measured on the live logs of 27-29 Sept: results waited p50 0.9 s, max 11.1 s, most of it on raw mic
+            # sound and Yuki's own speech, 2.2 s in all on the gap.
+            return None, None
         # Progress of a running task only after a real pause: Yuki has said nothing for
         # progress_pause_s (the acknowledgement counts), so a quick job is never narrated
         # step by step (measured 2026-09-25: "Opening the Chrome link now." right after
         # "Opening YouTube on Chrome"). A result that lands meanwhile replaces it.
         only_progress = all(i.kind in PROGRESS for i in self.pending)
-        cooldown = self.final_gap_s if urgent else (self.progress_pause_s if only_progress else self.cooldown_s)
+        cooldown = self.progress_pause_s if only_progress else self.cooldown_s
         last_stop = float(s.get("last_bot_stop") or 0.0)
         if last_stop and now - last_stop < cooldown:
             return "cooldown", last_stop + cooldown
-        if self._first_at is not None and not (urgent and not s.get("jobs_open")):
+        if self._first_at is not None:
             settle_until = min(self._last_at + self.settle_s, self._first_at + self.settle_max_s)
             if now < settle_until:
                 return "settle", settle_until

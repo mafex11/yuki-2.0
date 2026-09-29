@@ -71,6 +71,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.titles import TITLE_FIELD as _TITLE_FIELD, clean as _clean_label
 from yuki.memory.embed import Embedder, get_embedder
+from yuki.memory import workthreads as _work
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
 from yuki.memory.provenance import source_of
 from yuki.memory.questions import (
@@ -93,6 +94,7 @@ from yuki.memory.store import (
     Store,
     StoredMessage,
     ThreadInfo,
+    capture_attention,
 )
 
 HAIKU_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -164,6 +166,16 @@ latest MrBeast video', opened and played 'X' by MrBeast on YouTube." - never as 
 user browsed, watched, read, looked up or searched for, and never as a sign of the user's \
 interests or habits. What such a page or message says \
 is still what it says (who wrote what, when); only bringing it up was Yuki's doing.
+
+Sources marked NOT IN FRONT were read from a window that was on screen beside the one the user was \
+working in (another monitor, a side-by-side window, a chat open behind): the user may not have looked at \
+it. Record what it shows - who wrote what, when, what a page says - as what was on screen ("A Slack \
+message from Varun on screen at 14:02 said the deploy is fixed."), never that the user read, watched, did, \
+searched for or looked at anything, and never as a sign of their interests or habits on its own. Sources \
+marked POPUP appeared on screen by themselves - a notification toast, a dialog: record each as an event \
+that appeared ("A Gmail notification at 14:05 showed a new mail from Stripe about a failed payment."), \
+never as something the user did or saw. Either can still hold a fact worth keeping (a message someone \
+sent, a date, a result); only the user's attention to it is unknown.
 
 For WHAT THE USER SAID, record what the user said, decided, planned, promised or asked \
 for, and what it reveals about their work, people and plans - and about them as a person: how \
@@ -417,6 +429,8 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
             .replace("{other_ai}", "" if call_side else OTHER_AI_GUIDANCE)
             .replace("{nature}", NATURE_GUIDANCE)
             .replace("{questions}", guidance))
+    # the user's threads of work (migration 23): kept by this same call, no call of their own
+    text = f"{text}\n\n{_work.WORK_GUIDANCE}"
     if requests and not call_side:
         text = f"{text}\n\n{REQUEST_GUIDANCE}"
     return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}" if call_side else text
@@ -505,10 +519,11 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                 ),
                 "items": question_item_schema("source"),
             },
+            "work": _work.work_property(),
         },
     },
 }
-RECORD_FACTS_TOOL["input_schema"]["required"] = ["facts", "questions"]
+RECORD_FACTS_TOOL["input_schema"]["required"] = ["facts", "questions", "work"]
 
 #: The tool for a call's user side: journal facts plus the user's own commitments (to-dos).
 RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
@@ -583,10 +598,11 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "description": "Names the user said that memory cannot place (see ASK ABOUT NAMES); usually empty.",
                 "items": question_item_schema("source"),
             },
+            "work": _work.work_property(call_side=True),
         },
     },
 }
-RECORD_CALL_SIDE_TOOL["input_schema"]["required"] = ["facts", "commitments", "questions"]
+RECORD_CALL_SIDE_TOOL["input_schema"]["required"] = ["facts", "commitments", "questions", "work"]
 
 
 #: At most this many standing-request cards in 24 hours, whatever the model matches (plumbing).
@@ -795,11 +811,14 @@ def build_user_message(
     absent: set[int] | None = None,
     page_top: tuple[float, str] | None = None,
     user_day: str | None = None,
+    work: str = "",
 ) -> str:
     """The fenced user message for one batch (MaxMi's ``ExtractPrompt`` shape).
 
     ``user_day``: THE USER'S DAY line (:func:`user_day_line`), for relative dates said
-    after midnight before the user slept.
+    after midnight before the user slept. ``work``: the THREADS OF WORK block
+    (:func:`yuki.memory.workthreads.threads_block`, already scrubbed with this ``nonce``),
+    inside the fence before the sources.
 
     ``known``: the WHAT MEMORY ALREADY KNOWS block (:func:`yuki.memory.questions.known_text`,
     already scrubbed with this ``nonce``). ``absent``: ids of the captures taken while the
@@ -818,7 +837,15 @@ def build_user_message(
 
     def no_input(src: Source) -> str:
         return (" NO USER INPUT (nobody typed, clicked or scrolled for over a minute when this was on screen)"
-                if src.capture.id in absent else "")
+                if src.capture.id in absent else "") + glimpse(src)
+
+    def glimpse(src: Source) -> str:
+        attention = capture_attention(getattr(src.capture, "trigger", None))
+        if attention == "visible":
+            return " NOT IN FRONT (on screen beside the window the user was working in; they may not have looked at it)"
+        if attention == "popup":
+            return " POPUP (appeared on screen by itself: a notification, toast or dialog)"
+        return ""
 
     previous = "\n".join(f"- {_local(f.at)[:16]}: {f.fact}{nature_mark(getattr(f, 'nature', 'fact'))}"
                          for f in previous_facts)
@@ -840,8 +867,8 @@ def build_user_message(
     parts += [
         "FACTS ALREADY RECORDED for this thread (never extract from these):",
         safe(previous, PREVIOUS_FACTS_CHARS) or "(none)",
-        "SOURCES (the only fact source):",
     ]
+    parts.append("SOURCES (the only fact source):")
     def by_yuki(src: Source) -> str:
         cap = src.capture
         if not getattr(cap, "by_yuki", False):
@@ -891,6 +918,8 @@ def build_user_message(
             when = f"time not shown{shown}; on or after {when}"
         text = safe(m.text, max_capture_chars).replace("\n", "\n    ")
         parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}{no_input(src)}:\n    {text}")
+    if work:   # after the sources: next to FACTS ALREADY RECORDED its lines were taken for recorded facts (29 Sept A/B)
+        parts += ["", work]
     data = "\n".join(parts)
     day = f"{user_day}\n" if user_day else ""
     return (
@@ -1125,8 +1154,12 @@ class JournalWorker:
         known = "" if call_side else known_text(
             self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce, cap), about=about)
         absent = self.absent_captures(captures)
+        offered = self.offered_threads(thread, about)
+        work_text = _work.threads_block(offered, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()),
+                                                                                   nonce, cap))
         user = build_user_message(thread, sources, previous, nonce, max_capture_chars=self.batch_chars,
-                                  known=known, absent=absent, page_top=self.page_top(thread, captures))
+                                  known=known, absent=absent, page_top=self.page_top(thread, captures),
+                                  work=work_text)
         open_requests = [] if (call_side or supersedes) else self.open_requests()
         if open_requests:
             user += "\n\n" + requests_text(open_requests)
@@ -1160,27 +1193,21 @@ class JournalWorker:
                                      if call_side else ([], []))
             questions = ([] if call_side else
                          self._parse_questions(response, thread, sources, fact_sources, tool=tool["name"]))
-            vectors = None
-            embed_error = None
-            if facts:
-                try:
-                    vectors = self.embedder.embed([f.fact for f in facts])
-                except Exception as exc:  # facts are kept; backfill_vectors retries
-                    embed_error = f"{type(exc).__name__}: {exc}"
-            if vectors is not None:
-                for fact, vec in zip(facts, vectors):
-                    fact.vector = vec
-                    fact.embed_model = self.embedder.model_name
+            work_ops, work_rejected = self.parse_work(response, tool["name"], offered, thread, sources, fact_sources)
+            embed_error = self._embed_batch(facts, work_ops, offered)
+            work_notes = _work.dedupe_starts(work_ops, self.store)
+            work_ops = _work.live_ops(work_ops)
             if questions:
                 embed_error = embed_questions(questions, self.embedder) or embed_error
             question_outcomes: list[tuple[int | None, str]] = []
             if supersedes and not facts and self._guard_empty:
                 return self._empty_rejournal(thread_id, capture_ids, tokens, call)
             if call_side:
-                batch_id, commitment_ids = self.store.commit_call_batch(call, capture_ids, facts, commitments)
+                batch_id, commitment_ids = self.store.commit_call_batch(call, capture_ids, facts, commitments,
+                                                                        work=work_ops)
             else:
                 batch_id, commitment_ids = self.store.commit_batch(
-                    call, capture_ids, facts, questions, question_outcomes, supersedes=supersedes), []
+                    call, capture_ids, facts, questions, question_outcomes, supersedes=supersedes, work=work_ops), []
             fired = self._fire_requests(response, tool["name"], open_requests, sources, thread) if open_requests else []
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
@@ -1197,6 +1224,8 @@ class JournalWorker:
                 no_input_captures=len(absent), known_chars=len(known),
                 questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
                            for q, (qid, outcome) in zip(questions, question_outcomes)],
+                work_offered=[t.id for t in offered], work_chars=len(work_text), work=self._work_log(work_ops),
+                work_rejected=work_rejected or None, work_notes=work_notes or None,
                 request_ciphertext=self._seal(request),
                 response_ciphertext=self._seal(response.content),
             )
@@ -1271,8 +1300,13 @@ class JournalWorker:
         questions: list[NewQuestion] = []
         cost: float | None = 0.0
         nonce_known = str(uuid.uuid4()).upper()
-        known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap),
-                           about=" ".join(str((s.utterance or {}).get("text") or "") for s in sources))
+        said = " ".join(str((s.utterance or {}).get("text") or "") for s in sources)
+        known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap), about=said)
+        offered = self.offered_threads(thread, said)
+        work_text = _work.threads_block(offered, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()),
+                                                                                   nonce_known, cap))
+        work_ops: list[Any] = []
+        work_rejected: list[str] = []
         t0 = time.perf_counter()
         try:
             for part in parts:
@@ -1283,7 +1317,7 @@ class JournalWorker:
                             for c in commitments]
                 user = build_user_message(thread, part, earlier + previous, nonce_known,
                                           max_capture_chars=self.batch_chars, known=known,
-                                          user_day=user_day_line(self.store, [s.at for s in part]))
+                                          user_day=user_day_line(self.store, [s.at for s in part]), work=work_text)
                 request = {"model": self.model, "max_tokens": MAX_OUTPUT_TOKENS, "system": system, "tools": [tool],
                            "tool_choice": {"type": "tool", "name": tool["name"]},
                            "messages": [{"role": "user", "content": user}]}
@@ -1303,6 +1337,11 @@ class JournalWorker:
                 for q in self._parse_questions(response, thread, part, part_sources, tool=tool["name"]):
                     q.fact_indexes = [offset + i for i in q.fact_indexes]
                     questions.append(q)
+                ops, why = self.parse_work(response, tool["name"], offered, thread, part, part_sources)
+                for op in ops:
+                    op.fact_indexes = [offset + i for i in op.fact_indexes]
+                work_ops += ops
+                work_rejected += why
                 kept, why = self._parse_commitments(response, thread, part, tool["name"])
                 commitments += kept
                 rejected += why
@@ -1310,14 +1349,10 @@ class JournalWorker:
             call.input_tokens, call.output_tokens = totals["input_tokens"], totals["output_tokens"]
             call.cache_write_tokens, call.cache_read_tokens = totals["cache_write_tokens"], totals["cache_read_tokens"]
             call.cost_usd = cost
-            embed_error = None
-            if facts:
-                try:
-                    for fact, vec in zip(facts, self.embedder.embed([f.fact for f in facts])):
-                        fact.vector = vec
-                        fact.embed_model = self.embedder.model_name
-                except Exception as exc:  # facts are kept; backfill_vectors retries
-                    embed_error = f"{type(exc).__name__}: {exc}"
+            work_ops = self._join_parts(work_ops)
+            embed_error = self._embed_batch(facts, work_ops, offered)
+            work_notes = _work.dedupe_starts(work_ops, self.store)
+            work_ops = _work.live_ops(work_ops)
             if questions:
                 embed_error = embed_questions(questions, self.embedder) or embed_error
             if supersedes and not facts and self._guard_empty:
@@ -1327,7 +1362,7 @@ class JournalWorker:
             question_outcomes: list[tuple[int | None, str]] = []
             batch_id, commitment_ids = self.store.commit_call_batch(
                 call, capture_ids, facts, [] if supersedes else commitments, supersedes=supersedes,
-                questions=questions, question_outcomes=question_outcomes)
+                questions=questions, question_outcomes=question_outcomes, work=work_ops)
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
@@ -1339,6 +1374,8 @@ class JournalWorker:
                 commitments=len(commitment_ids), commitments_rejected=rejected, known_chars=len(known),
                 questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
                            for q, (qid, outcome) in zip(questions, question_outcomes)],
+                work_offered=[t.id for t in offered], work=self._work_log(work_ops),
+                work_rejected=work_rejected or None, work_notes=work_notes or None,
                 request_ciphertext=self._seal(requests), response_ciphertext=self._seal(responses),
             )
             return BatchResult(batch_id, thread_id, capture_ids, True, [f.fact for f in facts], totals,
@@ -1457,6 +1494,73 @@ class JournalWorker:
             if q is not None:
                 out.append(q)
         return out
+
+    # -- threads of work (migration 23, yuki.memory.workthreads) -------------------
+
+    def offered_threads(self, thread: ThreadInfo, text: str) -> list[Any]:
+        """The threads of work this batch is shown (its window's, the closest, the latest); never raises."""
+        try:
+            return _work.candidates(self.store, self.embedder.embed, [thread.id], text)
+        except Exception:
+            return []
+
+    def parse_work(self, response: Any, tool: str, offered: Sequence[Any], thread: ThreadInfo,
+                   sources: Sequence[Source], fact_sources: Sequence[int]) -> tuple[list[Any], list[str]]:
+        """``work`` of the answer, validated (:func:`yuki.memory.workthreads.parse_work`); never raises."""
+        try:
+            items = (self._tool_block(response, tool).input or {}).get("work")
+            return _work.parse_work(items, {t.id: t for t in offered}, sources, fact_sources, thread=thread)
+        except Exception as exc:
+            return [], [f"work unreadable: {type(exc).__name__}"]
+
+    @staticmethod
+    def _join_parts(ops: list[Any]) -> list[Any]:
+        """A long call's parts may each continue the same thread: one op per thread, the facts of all parts,
+        the latest part's state (starts are joined by :func:`yuki.memory.workthreads.dedupe_starts`)."""
+        out: list[Any] = []
+        by_thread: dict[int, Any] = {}
+        for op in ops:
+            if op.work_thread_id is None:
+                out.append(op)
+                continue
+            head = by_thread.get(op.work_thread_id)
+            if head is None:
+                by_thread[op.work_thread_id] = op
+                out.append(op)
+                continue
+            head.fact_indexes = sorted({*head.fact_indexes, *op.fact_indexes})
+            head.entities = list(dict.fromkeys([*head.entities, *op.entities]))[: _work.MAX_ENTITIES]
+            if op.at >= head.at:
+                head.state = op.state or head.state
+                head.open_items = op.open_items or head.open_items
+                head.action = op.action
+                head.at = op.at
+        return out
+
+    def _embed_batch(self, facts: list[NewFact], work_ops: list[Any], offered: Sequence[Any]) -> str | None:
+        """Embed the batch's facts and the threads its work ops write, in one call; the error text or None."""
+        work_texts = _work.texts_for(work_ops, {t.id: t for t in offered})
+        texts = [f.fact for f in facts] + work_texts
+        if not texts:
+            return None
+        try:
+            vectors = self.embedder.embed(texts)
+        except Exception as exc:  # facts are kept; backfill_vectors retries (a thread keeps its old vector)
+            return f"{type(exc).__name__}: {exc}"
+        model = self.embedder.model_name
+        for fact, vec in zip(facts, vectors[: len(facts)]):
+            fact.vector = vec
+            fact.embed_model = model
+        _work.attach_vectors(work_ops, vectors[len(facts):], model)
+        return None
+
+    @staticmethod
+    def _work_log(ops: Sequence[Any]) -> list[dict[str, Any]] | None:
+        """Content-free: what each work op did (the thread id, the action, the store's outcome, facts linked)."""
+        if not ops:
+            return None
+        return [{"thread": op.result_id, "action": op.action, "outcome": op.outcome, "facts": len(op.fact_indexes)}
+                for op in ops]
 
     # -- standing requests (migration 17) --------------------------------------
 
@@ -1620,6 +1724,7 @@ class JournalWorker:
                         thread_id=thread.id, app=thread.app, host=thread.host,
                         fact=text, importance=importance,
                         by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)), nature=nature,
+                        attention=capture_attention(getattr(sources[index].capture, "trigger", None)),
                         milestone=item.get("milestone") is True,
                         source=source_of(sources[index], thread, sources, index),
                         tainted=item.get("other_ai") is True)

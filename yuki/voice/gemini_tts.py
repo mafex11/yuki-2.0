@@ -167,6 +167,10 @@ class _Piece:
     #: The spoken-line check's verdict (yuki.voice.speechguard, v3.10), started with the piece; None: no check.
     verdict: Any = None
     created: float = field(default_factory=time.monotonic)
+    #: Its key in the voice cache (yuki.voice.ttscache, v3.14) when it is short enough to keep; ``""``: not cached.
+    cache_key: str = ""
+    #: It starts its reply (the spoken-line check's ``first``).
+    first: bool = False
 
 
 @dataclass
@@ -211,7 +215,7 @@ def service_class() -> type:
                      fallback_key: str | None = None, fallback_voice: str = "aura-2-thalia-en",
                      fallback_url: str = AURA_URL, log: Callable[..., None] | None = None,
                      ssl: Any = None, trim: bool = True, pause_frame_processing: bool = True,
-                     **kwargs: Any) -> None:
+                     cache: Any = None, **kwargs: Any) -> None:
             super().__init__(push_start_frame=True, push_stop_frames=True,
                              pause_frame_processing=pause_frame_processing,
                              sample_rate=SAMPLE_RATE, append_trailing_space=False,
@@ -236,6 +240,11 @@ def service_class() -> type:
             #: alongside the speech request, and a dropped piece is never played nor its words kept (v3.10).
             self._yuki_guard: Any = None
             self._yuki_audio_gate = True
+            #: ``() -> bool``: the reply about to be heard was asked for by a "still on it" line whose job has
+            #: finished since (``VoiceBridge.waiting_reply_stale``, v3.14); such a reply is dropped unheard.
+            self._yuki_stale: Any = None
+            #: Short lines she says often, replayed from disk (yuki.voice.ttscache, v3.14), or ``None``.
+            self._cache = cache
 
         def can_generate_metrics(self) -> bool:
             return True
@@ -331,11 +340,20 @@ def service_class() -> type:
             piece.pre, reply.pending_pre = reply.pending_pre, []
             if speakable(piece.text):
                 await self.start_tts_usage_metrics(strip_tags(piece.text))
+                piece.first = not any(speakable(p.text) for p in reply.pieces)
+                if self._cache is not None and self._cache.cacheable(piece.text):
+                    piece.cache_key = self._cache.key("gemini", str(self._settings.model), str(self._settings.voice),
+                                                      reply.style, piece.text)
                 if self._yuki_guard is not None:
-                    # The reply's first words are checked even when short: a fragment is (v3.13).
-                    first = not any(speakable(p.text) for p in reply.pieces)
+                    # The reply's first words are checked even when short: a fragment is (v3.13). A short line the
+                    # check already said SAY to as a first piece is known (v3.14, the voice cache).
+                    known = bool(piece.cache_key and piece.first and self._cache.approved(piece.cache_key))
                     try:
-                        piece.verdict = self._yuki_guard.start(strip_tags(piece.text), first=first)
+                        try:
+                            piece.verdict = self._yuki_guard.start(strip_tags(piece.text), first=piece.first,
+                                                                   known_ok=known)
+                        except TypeError:   # a stand-in check without the v3.14 argument
+                            piece.verdict = self._yuki_guard.start(strip_tags(piece.text), first=piece.first)
                     except Exception:  # noqa: BLE001 - the check fails open
                         piece.verdict = None
                 piece.task = self.create_task(self._fetch(reply, piece), name="gemini-piece")
@@ -399,6 +417,19 @@ def service_class() -> type:
                             continue
                         if chunk is None:
                             break
+                        if not reply.heard and not dropped and callable(self._yuki_stale):
+                            try:
+                                stale = bool(self._yuki_stale())
+                            except Exception:  # noqa: BLE001 - plumbing: never in the way of a line
+                                stale = False
+                            if stale:
+                                # Its outcome is known now: "still on it" would be stale, and the outcome follows.
+                                checked, dropped, reply.tainted = True, True, True
+                                self.stats["stale"] = self.stats.get("stale", 0) + 1
+                                self._log("tts_stale_dropped", chars=len(piece.text))
+                                if piece.task is not None and not piece.task.done():
+                                    piece.task.cancel()
+                                continue
                         if not checked:
                             # Its audio is ready: the line is heard only if the check keeps it (it ran alongside).
                             checked = True
@@ -409,6 +440,8 @@ def service_class() -> type:
                                 wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
                                 verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
                             self._refresh_audio_context(ctx)
+                            if verdict.ok and verdict.by == "model" and piece.first and piece.cache_key:
+                                self._cache.approve(piece.cache_key)   # its own SAY, remembered with its audio
                             if not verdict.ok:
                                 reply.tainted = reply.tainted or verdict.by != "repeat"
                                 dropped = True
@@ -447,7 +480,8 @@ def service_class() -> type:
             pieces = reply.pieces
             self._log("tts_reply", provider="gemini", pieces=len(pieces), style=bool(reply.style),
                       tags=reply.tags, dropped_tags=reply.dropped,
-                      fallback_pieces=sum(1 for p in pieces if p.via != "gemini"),
+                      fallback_pieces=sum(1 for p in pieces if p.via not in ("gemini", "cache")),
+                      cached_pieces=sum(1 for p in pieces if p.via == "cache"),
                       first_audio_ms=[p.first_audio_ms for p in pieces if p.first_audio_ms is not None],
                       trimmed_lead_ms=round(reply.lead_ms), trimmed_tail_ms=round(reply.tail_ms))
 
@@ -457,6 +491,18 @@ def service_class() -> type:
             got_audio = False
             piece.sent_at = time.monotonic()
             self.stats["pieces"] += 1
+            kept: list[bytes] | None = [] if piece.cache_key else None
+            if piece.cache_key:
+                cached = await asyncio.to_thread(self._cache.get, piece.cache_key)
+                if cached:
+                    # Her own voice for these exact words, made before (v3.14): no request, first audio at once.
+                    piece.via = "cache"
+                    piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
+                    self.stats["cached_pieces"] = self.stats.get("cached_pieces", 0) + 1
+                    for at in range(0, len(cached), 4800):
+                        piece.queue.put_nowait(cached[at:at + 4800])
+                    piece.queue.put_nowait(None)
+                    return
 
             def put(data: bytes) -> None:
                 nonlocal got_audio
@@ -467,7 +513,11 @@ def service_class() -> type:
                         got_audio = True
                         piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
                     piece.queue.put_nowait(data)
+                    if kept is not None:
+                        kept.append(data)
 
+            complete = False
+            errors_before = self.stats["errors"]
             try:
                 async with self._limit:
                     if not self._on_fallback and self._api_key:
@@ -495,6 +545,7 @@ def service_class() -> type:
                         if plain.strip():
                             async for chunk in self._aura(plain):
                                 put(chunk)
+                complete = got_audio and piece.via == "gemini" and self.stats["errors"] == errors_before
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - nothing more to try for this piece
@@ -504,9 +555,14 @@ def service_class() -> type:
                     tail = trimmer.finish()
                     if tail:
                         piece.queue.put_nowait(tail)
+                        if kept is not None:
+                            kept.append(tail)
                     reply.lead_ms += trimmer.trimmed_lead / SAMPLE_RATE * 1000
                     reply.tail_ms += trimmer.trimmed_tail / SAMPLE_RATE * 1000
                 piece.queue.put_nowait(None)
+            if complete and kept and piece.cache_key:
+                # Fetched whole, from the voice itself: kept for the next time these exact words are said.
+                await asyncio.to_thread(self._cache.put, piece.cache_key, b"".join(kept))
 
         async def _gemini(self, text: str, style: str | None) -> AsyncIterator[bytes]:
             """Stream one piece from Gemini: its PCM chunks, as they come."""

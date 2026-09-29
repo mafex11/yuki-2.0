@@ -1678,36 +1678,13 @@ def build_resume_message(
         parts.append("- (nothing settled yet)")
     parts.append("")
     if gap.last_present is not None:
+        from yuki.memory.before import stretch_lines   # the data assembly, shared with the agent's before tool
+
         until = gap.last_present
         since = until - config.resume_before_min * 60.0
-        rows = [r for r in store.timeline_between(since, until) if not r.by_yuki]
         parts.append(f"BEFORE THE GAP (their last {format_duration(config.resume_before_min * 60)} at the PC, "
                      f"{datetime.fromtimestamp(since):%a %H:%M}-{datetime.fromtimestamp(until):%a %H:%M}):")
-        agg = aggregate(rows, since, until, "site", limit=8)
-        lines = describe(agg, max_items=8)
-        parts.append("- totals: " + safe(lines[0], 400))
-        parts += [safe(x, 600) for x in lines[1:] if not x.startswith("power: ")]
-        parts.append("SESSIONS:")
-        parts += [f"- {session_line(x, safe, until + ONGOING_S + 1)}"
-                  for x in activity_sessions(rows, since, until, config)] or ["(none)"]
-        clips = _clip(rows, since, until)
-        last_runs = [run for run, _ in _runs(clips, "site") if run.present_s > 0]
-        if last_runs:
-            parts.append(f"LAST THING IN FRONT: {_run_line(last_runs[-1], safe)}")
-        parts.append("EPISODES:")
-        parts += [f"- {safe(e.text, 700)}" for e in store.episodes_between(since, until)[-3:]] or ["(none)"]
-        parts.append("JOURNAL (oldest first):")
-        journal = [j for j in store.journal_between(since, until + 60.0) if not j.by_yuki and usable(j)]
-        jl, used = [], 0
-        for j in reversed(journal):
-            line = _jline(j, safe)
-            if used + len(line) > JOURNAL_CHARS:
-                jl.insert(0, f"- ... {len(journal) - len(jl)} earlier facts not shown")
-                break
-            jl.insert(0, line)
-            used += len(line)
-            ids[f"J{j.id}"] = j.at
-        parts += jl or ["(none)"]
+        parts += stretch_lines(store, since, until, config, safe, ids)
     else:
         parts.append("BEFORE THE GAP: (nothing recorded in the day and a half before it)")
     parts.append("")

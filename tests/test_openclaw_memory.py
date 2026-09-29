@@ -186,7 +186,7 @@ def test_standing_request_fires_one_card_from_the_journals_own_call(store):
     assert len(cards) == 1 and cards[0].ref == f"request:{rid}" and "Varun replied" in cards[0].text
     assert store.standing_request(rid)["status"] == "fired"
     # no open request: the batch runs exactly as before (no block, no field)
-    assert record_facts_tool(False)["input_schema"]["required"] == ["facts", "questions"]
+    assert record_facts_tool(False)["input_schema"]["required"] == ["facts", "questions", "work"]   # threads of work (23)
 
 
 def test_standing_request_cooldown_budget_and_expiry_are_code(store):

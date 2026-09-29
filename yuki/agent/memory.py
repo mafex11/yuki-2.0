@@ -210,10 +210,27 @@ class MemoryContext:
     persona: str | None = None
     #: Wall time of the fast-memory lookup (embedding + ranking), ms.
     relevant_ms: float = 0.0
+    #: What the whole memory holds for this moment (``MemoryClient.related``: the user's words, their screen,
+    #: their threads of work; 2026-09-29), as returned, or ``None``. ``relevant`` then carries its items and
+    #: the block's text (:class:`RelatedItems`), so :func:`relevant_block_text` renders the whole block.
+    related: dict[str, Any] | None = None
     truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
+
+
+class RelatedItems(list):
+    """The related items of a request, carrying the block text they render as (``block``) and its timing.
+
+    A list, so everything that reads ``MemoryContext.relevant`` as the fast-memory items keeps working.
+    """
+
+    def __init__(self, items: list[dict[str, Any]], *, block: str | None = None,
+                 timing: dict[str, Any] | None = None) -> None:
+        super().__init__(items)
+        self.block = block
+        self.timing = dict(timing or {})
 
 
 def _open_real_client(path: Any = None) -> Any:
@@ -403,13 +420,19 @@ class MemoryAccess:
         return text, "memory"
 
     def warm(self, *, timeout_s: float = 30.0) -> MemoryContext:
-        """Open the client, fill the portrait cache and read the resume context, off the request path."""
+        """Open the client, fill the portrait cache and read the resume context, off the request path (and load
+        the whole-memory index, so the first request does not pay for it)."""
         started = time.perf_counter()
         try:
             text, source = self.portrait(timeout_s=timeout_s)
             result = MemoryContext(portrait=text, source=source)
         except MemoryUnavailable as exc:
             result = MemoryContext(error=str(exc))
+        if result.error is None and "warm_related" not in self._absent:
+            try:
+                self.call_method("warm_related", timeout_s=min(timeout_s, 20.0))
+            except MemoryUnavailable:
+                pass
         if result.error is None:
             try:
                 result.resume = self.resume(timeout_s=min(timeout_s, TRAY_TIMEOUT_S))
@@ -666,8 +689,25 @@ class MemoryAccess:
                     result.day = value.strip() if isinstance(value, str) and value.strip() else None
                 except MemoryUnavailable:
                     pass
-            if query and query.strip() and "relevant" not in self._absent:
-                # the message's vector was just made for the know-how lookup: this costs the ranking only
+            if query and query.strip() and "related" not in self._absent:
+                # the whole memory against the user's words, their screen and their thread of work (the message's
+                # vector was just made for the know-how lookup; the screen's comes ranked from the service). A
+                # request with no words (the voice mouth's own memory fetch) has its own call: related_brief.
+                t0 = time.perf_counter()
+                remaining = max(deadline - time.perf_counter(), 0.05)
+                try:
+                    found = self.call_method("related", query or "", previous=previous,
+                                             embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
+                    if isinstance(found, dict):
+                        result.related = found
+                        result.relevant = RelatedItems(
+                            [dict(r) for r in found.get("items") or [] if isinstance(r, dict)],
+                            block=related_block(found), timing=found.get("timing"))
+                except MemoryUnavailable:
+                    pass
+                result.relevant_ms = round((time.perf_counter() - t0) * 1000, 1)
+            if query and query.strip() and "relevant" not in self._absent and "related" in self._absent:
+                # an older memory without the whole-memory ranking: fast memory from the words alone
                 t0 = time.perf_counter()
                 remaining = max(deadline - time.perf_counter(), 0.05)
                 try:
@@ -703,6 +743,20 @@ class MemoryAccess:
             result.source = "empty"
         result.elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         return result
+
+    def related_brief(self, query: str = "", *, previous: str | None = None, screen: Any = None,
+                      timeout_s: float = 0.15, embed_wait_s: float = 0.08) -> str | None:
+        """The compact related block for the voice talker: its thread of work now, a few memories near the
+        user's words and their screen with where each came from, the freshest screens in a few lines. ``None``
+        when there is nothing, memory is slow (past ``timeout_s``) or absent. Never raises. Blocking (bounded):
+        call it off the voice loop.
+        """
+        try:
+            found = self.call_method("related", query or "", previous=previous, screen=screen, voice=True,
+                                     embed_wait_s=embed_wait_s, timeout_s=timeout_s)
+        except MemoryUnavailable:
+            return None
+        return related_block(found, voice=True) if isinstance(found, dict) else None
 
     # -- to-dos and nudges ------------------------------------------------------
 
@@ -849,6 +903,12 @@ class MemoryAccess:
                 outcome = self._answer_question(tool_input, request)
             elif name == "watch_for":
                 outcome = self._watch_for(tool_input, request)
+            elif name == "threads":
+                outcome = self._threads(tool_input)
+            elif name == "before":
+                outcome = self._before(tool_input)
+            elif name == "links":
+                outcome = self._links(tool_input)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -1196,6 +1256,81 @@ class MemoryAccess:
             name="answer_question", ok=True, summary=summary, content=[{"type": "text", "text": text}],
             payload={**result, "question": ref, "outcome": outcome, "answer": answer},
         )
+
+    def _threads(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """The user's threads of work: list the current ones, search them, or open one with what is linked to it."""
+        query = _opt_text(tool_input, "query")
+        ref = _opt_text(tool_input, "thread")
+        action = _opt_text(tool_input, "action") or ("open" if ref else "search" if query else "list")
+        if action not in ("list", "search", "open"):
+            raise _BadInput(f"'action' must be list, search or open, got {action!r}")
+        asked = {"action": action, "query": query, "thread": ref}
+        try:
+            if action == "open":
+                detail = self.call_method("thread", ref, timeout_s=TOOL_TIMEOUT_S) if ref else None
+                if detail is None and (query or ref):
+                    rows = self.call_method("threads", query=query or ref, limit=1, timeout_s=TOOL_TIMEOUT_S) or []
+                    detail = self.call_method("thread", rows[0]["ref"], timeout_s=TOOL_TIMEOUT_S) if rows else None
+                if not isinstance(detail, dict):
+                    return _fail("threads", f"No thread of work {ref or query!r} in memory: list or search first.",
+                                 {"asked": asked, "error": "no_such_thread"})
+                return ToolOutcome(name="threads", ok=True, summary=f"thread \"{detail.get('title')}\"",
+                                   content=[{"type": "text", "text": format_thread(detail)}],
+                                   payload={"asked": asked, "thread": detail})
+            if action == "search":
+                if not query:
+                    raise _BadInput("'query' is needed to search")
+                rows = self.call_method("threads", query=query, limit=8, timeout_s=TOOL_TIMEOUT_S)
+            else:
+                rows = self.call_method("threads", statuses=("active", "paused"), limit=15, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("threads", f"Threads of work could not be read: {exc}", {"asked": asked, "error": str(exc)})
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        return ToolOutcome(name="threads", ok=True, summary=f"{len(rows)} thread{'' if len(rows) == 1 else 's'} of work",
+                           content=[{"type": "text", "text": format_threads(rows, action=action, query=query)}],
+                           payload={"asked": asked, "threads": rows})
+
+    def _before(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """What the user was doing before a moment: the break nearest it (or the last one) and the stretch before."""
+        at = _parse_when(tool_input.get("at"), "at", end_of_day=False)
+        event = _opt_text(tool_input, "event") or "break"
+        if event not in ("break", "time"):
+            raise _BadInput(f"'event' must be break or time, got {event!r}")
+        minutes = tool_input.get("minutes")
+        minutes = float(minutes) if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and minutes > 0 \
+            else 90.0
+        asked = {"at": tool_input.get("at"), "event": event, "minutes": minutes}
+        try:
+            result = self.call_method("before", at, event=event, minutes=min(minutes, 360.0), timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("before", f"Memory could not be read: {exc}", {"asked": asked, "error": str(exc)})
+        if not isinstance(result, dict) or not result.get("ok"):
+            why = (result or {}).get("error") if isinstance(result, dict) else "no answer"
+            return _fail("before", f"Could not rebuild that stretch: {why}", {"asked": asked, "error": why})
+        return ToolOutcome(name="before", ok=True, summary="the stretch before " + (
+            "the break" if result.get("break") else "that time"),
+            content=[{"type": "text", "text": format_before(result)}], payload={"asked": asked, "before": result})
+
+    def _links(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """Pages the user had open and links shared with them, by meaning and time."""
+        query = _opt_text(tool_input, "query")
+        since = _parse_when(tool_input.get("since"), "since", end_of_day=False)
+        until = _parse_when(tool_input.get("until"), "until", end_of_day=True)
+        how = _opt_text(tool_input, "how")
+        if how not in (None, "viewed", "shared"):
+            raise _BadInput(f"'how' must be viewed or shared, got {how!r}")
+        limit = tool_input.get("limit")
+        limit = int(limit) if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit > 0 else 8
+        asked = {"query": query, "since": tool_input.get("since"), "until": tool_input.get("until"), "how": how}
+        try:
+            rows = self.call_method("links", query=query, since=since, until=until, how=how, limit=min(limit, 25),
+                                    timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("links", f"Links could not be read: {exc}", {"asked": asked, "error": str(exc)})
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        return ToolOutcome(name="links", ok=True, summary=f"{len(rows)} link{'' if len(rows) == 1 else 's'}",
+                           content=[{"type": "text", "text": format_links(rows, query=query)}],
+                           payload={"asked": asked, "links": rows})
 
     def _correct(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = _need_text(tool_input, "text")
@@ -1613,8 +1748,26 @@ def format_call_transcript(t: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def related_block(found: dict[str, Any] | None, *, voice: bool = False) -> str | None:
+    """The connected-memory block of :meth:`MemoryAccess.context` (``MemoryClient.related``'s result): the screen,
+    the threads of work, the freshest screens (fenced) and the related memories. ``None`` for none."""
+    if not found:
+        return None
+    try:
+        from yuki.memory.related import block_text
+    except Exception:  # an older memory package: the items alone, as fast memory
+        return relevant_block_text([dict(r) for r in found.get("items") or [] if isinstance(r, dict)])
+    return block_text(found, voice=voice)
+
+
 def relevant_block_text(items: list[dict[str, Any]]) -> str | None:
-    """The fast-memory block: one line per item with its date, then where it came from. ``None`` for none."""
+    """The fast-memory block: one line per item with its date, then where it came from. ``None`` for none.
+
+    Items that came from the whole-memory ranking (:class:`RelatedItems`) render as their connected-memory
+    block (screen, threads of work, freshest screens, related memories)."""
+    block = getattr(items, "block", False)
+    if block is not False:
+        return block or None
     lines = []
     for row in items or []:
         text = " ".join(str(row.get("text") or "").split())
@@ -1631,6 +1784,80 @@ def relevant_block_text(items: list[dict[str, Any]]) -> str | None:
     if not lines:
         return None
     return f"{RELEVANT_LABEL}\n" + "\n".join(lines) + f"\n{RELEVANT_END}"
+
+
+def format_threads(rows: list[dict[str, Any]], *, action: str = "list", query: str | None = None) -> str:
+    """The ``threads`` tool's list: one line per thread of work with its id, status, where it stands, what is open."""
+    if not rows:
+        return ("No thread of work matches that." if action == "search" else
+                "Memory holds no threads of work yet (they are kept from the journal as the user works).")
+    head = (f"Threads of work closest to \"{query}\":" if action == "search" else
+            f"The user's threads of work, most recently touched first ({len(rows)}):")
+    return "\n".join([head, *(f"- [{r.get('ref')}] {' '.join(str(r.get('line') or '').split())}" for r in rows),
+                      "Open one with threads action=open and its id for its timeline, facts, calls, chats and links."])
+
+
+def format_thread(d: dict[str, Any]) -> str:
+    """One thread of work with what memory links to it, as the ``threads`` tool's ``open`` text."""
+    out = [f"[{d.get('ref')}] \"{d.get('title')}\" - {d.get('status')}; first seen {_when(d.get('first_seen'))}, "
+           f"last touched {_when(d.get('last_seen'))}; touched {d.get('events')} times.",
+           f"Where it stands: {d.get('state') or '(not recorded)'}"]
+    if d.get("open"):
+        out.append("Open: " + "; ".join(str(x) for x in d["open"]))
+    if d.get("involves"):
+        out.append("Involves: " + ", ".join(str(x) for x in d["involves"]))
+    events = d.get("events") or []
+    if events:
+        out.append("Timeline (when and where it was touched, oldest first):")
+        for e in events[-20:]:
+            where = ", ".join(str(v) for v in (e.get("app"), e.get("host")) if v)
+            state = f": {' '.join(str(e.get('state')).split())[:240]}" if e.get("state") else ""
+            out.append(f"- {_when(e.get('at'))} {e.get('action')}{f' in {where}' if where else ''}{state}")
+    facts = d.get("facts") or []
+    if facts:
+        out.append("Its journal facts (newest last):")
+        for f in facts:
+            mark = _NATURE_MARKS.get(f.get("nature"), "")
+            source = " ".join(str(f.get("source") or "").split())
+            out.append(f"- {_when(f.get('at'))} [{f.get('app')}] {' '.join(str(f.get('fact')).split())}{mark}"
+                       + (f"\n    from: {source}" if source else ""))
+    for label, key, fmt in (
+        ("Calls around it (open with call_timeline)", "calls",
+         lambda c: f"- [{c.get('ref')}] {c.get('app')} {_when(c.get('start'))}"),
+        ("Episodes around it", "episodes", lambda e: f"- {' '.join(str(e.get('text')).split())[:500]}"),
+        ("Conversations with Yuki around it", "chats",
+         lambda s: f"- {_when(s.get('start'))}: {' '.join(str(s.get('text')).split())[:400]}"),
+        ("Its links", "links", lambda link: f"- {link.get('line')}"),
+    ):
+        rows = d.get(key) or []
+        if rows:
+            out.append(f"{label}:")
+            out += [fmt(r) for r in rows]
+    return "\n".join(out)
+
+
+def format_before(r: dict[str, Any]) -> str:
+    """The ``before`` tool's text: the stretch before the break (or the time), the threads of work in it, and the
+    other breaks near then (to pick another when the user meant a different one)."""
+    out = [str(r.get("text") or "")]
+    threads = r.get("threads") or []
+    if threads:
+        out.append("Threads of work touched then:")
+        out += [f"- [{t.get('ref')}] {' '.join(str(t.get('line') or '').split())}" for t in threads]
+    if r.get("event") != "time":
+        out.append("The user's breaks from the PC near then (another one may be the one they mean; ask before to "
+                   "look at it with at=its start):")
+        out.append(str(r.get("breaks_text") or "(none)"))
+    return "\n".join(out)
+
+
+def format_links(rows: list[dict[str, Any]], *, query: str | None = None) -> str:
+    """The ``links`` tool's text: one line per page viewed or link shared, with where, when and how long."""
+    if not rows:
+        return "No links in memory match that." if query else "No links seen in that time."
+    head = f"Links closest to \"{query}\", best first:" if query else "Links seen, most recent first:"
+    return "\n".join([head, *(f"- [{r.get('ref')}] {' '.join(str(r.get('line') or '').split())}" for r in rows),
+                      "(This lookup opened and sent nothing.)"])
 
 
 #: How a recalled journal item that is not a plain fact is marked (yuki.memory.personality).

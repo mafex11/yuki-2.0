@@ -406,6 +406,11 @@ def plan(which: str) -> list[dict]:
         for name, text in V35_CLIPS:
             items.append({"set": "v35", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": "yuki" in text.lower()})
+    if which in ("v314",):
+        provider, voice = V314_USER
+        for name, text in V314_CLIPS:
+            items.append({"set": "v314", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": False})
     if which in ("names",):
         for provider, voice in NAMES_VOICES:
             tag = voice.replace("aura-2-", "").replace("-en", "")[:6]
@@ -415,10 +420,27 @@ def plan(which: str) -> list[dict]:
     return items
 
 
+#: v3.14 replays (docs/VOICE.md v3.14): the user's side of the sessions of 28 Sept 09:06 ("zen928": "it felt like
+#: two people"), 27 Sept 14:16 ("screen927"), 29 Sept 01:25 ("warp929") and the talker's new hands ("hands314").
+V314_USER = ("deepgram", "aura-2-arcas-en")
+V314_CLIPS = [
+    ("z_chrome", "Open Chrome."), ("z_restore", "Restore it."), ("z_youtube", "Open YouTube."),
+    ("z_tab2", "Go to the second YouTube tab."), ("z_close2", "Close that one."), ("z_scroll", "Scroll down."),
+    ("z_again", "Again."), ("z_sonnet", "Play the Sonnet 5.5 video."), ("z_pause", "Pause it."),
+    ("z_whatsapp", "Open WhatsApp."), ("z_bro", "Open the Bro chat."), ("z_scrollup", "Scroll up."),
+    ("z_res", "Open the res chat."),
+    ("z_open", "Open YouTube."), ("y_play", "Play make up my mind."), ("z_joji", "Play the Joji one."),
+    ("z_glimpse", "Glimpse of us."), ("y_thanks", "Thanks."),
+    ("w_open", "Open w a r p."), ("w_yeah", "Yeah."), ("w_full", "Make Warp full screen."), ("w_nice", "Yeah. Nice."),
+    ("w_tab", "Switch to the LLM OS rigid hardness one."), ("w_bye", "Bye."),
+    ("h_mix", "Click the make up my mind mix."), ("h_second", "Play the second one."), ("h_type", "Type hi."),
+]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "all"))
+    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "v314", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

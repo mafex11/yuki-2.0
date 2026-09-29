@@ -65,7 +65,9 @@ loops), rebuilt nightly from the facts;
 microphone is ever recorded, never anyone else);
 - procedures that worked on this PC (know-how);
 - a weekly review of the user's last seven days (time use against the week before, focus, what got done \
-and what is open), written on Sunday evenings.
+and what is open), written on Sunday evenings;
+- the user's threads of work (projects, tasks and workflows over days, with where each stands) and the web \
+pages they had open and links shared with them.
 
 Not everything in memory is a fact: an item marked as a joke is the user's humour (a bit, a tease, a boast), \
 never something true about them, and an item marked uncertain may be misheard; treat neither as fact. \
@@ -504,6 +506,78 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
 
             return run("get_call_timeline", {"call": call, "since": since, "until": until,
                                              "words": words or None, "page": page if words else None}, body)
+
+    # -- threads of work, links seen, connected memory (2026-09-29, only when the memory API offers them) -
+
+    if callable(getattr(MemoryClient, "threads", None)):
+
+        @server.tool(title="Get threads of work", annotations=READ_ONLY, structured_output=False)
+        def get_threads(
+            query: Annotated[str | None, Field(description="What the thread is about, in plain words; omit to list "
+                                                           "the current ones.")] = None,
+            thread: Annotated[str | None, Field(description="Open one thread whole by its id, e.g. thread:12.")] = None,
+        ) -> str:
+            """The user's threads of work - the projects, tasks and workflows they pursue over days (building something, a review, an application, studying, helping someone) - each with where it stands, what is open, what it involves and when it was last touched. With thread (or a query that finds one), that thread whole: its timeline, facts, and the calls, chats, episodes and links around it."""
+
+            def body() -> tuple[str, Window | None]:
+                from yuki.agent.memory import format_thread, format_threads
+
+                client = memory.client()
+                now = local_now()
+                head = f"Covers: threads of work as of {fmt_at(now)} (local time, {utc_offset(now)})."
+                if thread:
+                    detail = client.thread(thread)
+                    if not detail:
+                        raise ToolError(f"No thread {thread} in memory: list them first.")
+                    return f"{head}\n{format_thread(detail)}", None
+                rows = client.threads(query=query or None, limit=12)
+                return f"{head}\n{format_threads(rows, action='search' if query else 'list', query=query)}", None
+
+            return run("get_threads", {"query": query, "thread": thread}, body)
+
+    if callable(getattr(MemoryClient, "links", None)):
+
+        @server.tool(title="Get links", annotations=READ_ONLY, structured_output=False)
+        def get_links(
+            query: Annotated[str | None, Field(description="What the page or link was about; omit for the most "
+                                                           "recent.")] = None,
+            since: Annotated[str | None, Field(description=SINCE_HELP)] = None,
+            until: Annotated[str | None, Field(description=UNTIL_HELP)] = None,
+            how: Annotated[Literal["viewed", "shared"] | None, Field(
+                description="viewed: pages the user had open; shared: links in their messages. Omit for both.")] = None,
+            limit: Annotated[int, Field(ge=1, le=25, description="Maximum results (1-25).")] = 10,
+        ) -> str:
+            """Web pages the user had open and links people shared with them in chats and email: address, title, site, when and how long, who shared it and where. Best match first with a query, else most recent first."""
+
+            def body() -> tuple[str, Window | None]:
+                from yuki.agent.memory import format_links
+
+                window = resolve_range(since, until, default_today=False)
+                client = memory.client()
+                rows = client.links(query=query or None, since=window.since_ts, until=window.until_ts, how=how,
+                                    limit=int(limit))
+                return f"{describe(window)}\n{format_links(rows, query=query)}", window
+
+            return run("get_links", {"query": query, "since": since, "until": until, "how": how}, body)
+
+    if callable(getattr(MemoryClient, "related", None)):
+
+        @server.tool(title="Get connected memory", annotations=READ_ONLY, structured_output=False)
+        def get_related(
+            query: Annotated[str | None, Field(description="The question or topic, in plain words; omit for what "
+                                                           "bears on the user's screen now.")] = None,
+        ) -> str:
+            """What the user's whole memory holds that bears on a question and on what is on their screen now: the screen, their current threads of work, their last minutes on screen, and related facts, calls, chats, episodes, links and know-how, each with where and when it came from."""
+
+            def body() -> tuple[str, Window | None]:
+                from yuki.memory.related import block_text
+
+                client = memory.client()
+                text = block_text(client.related(query or "")) or "Nothing in memory bears on that right now."
+                now = local_now()
+                return f"Covers: all of memory, as of {fmt_at(now)} (local time, {utc_offset(now)}).\n{text}", None
+
+            return run("get_related", {"query": query}, body)
 
     return server, memory
 

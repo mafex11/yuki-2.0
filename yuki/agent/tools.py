@@ -34,7 +34,8 @@ from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
     {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
-     "activity", "calls", "call_timeline", "read_file", "fetch_url"}
+     "activity", "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links",
+     "look_at_focus", "read_clipboard"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -45,7 +46,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
     {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
-     "answer_question", "watch_for", "calls", "call_timeline"}
+     "answer_question", "watch_for", "calls", "call_timeline", "threads", "before", "links"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -160,6 +161,57 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _obj(
             {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
             ["hwnd"],
+        ),
+    },
+    {
+        "name": "look_at_focus",
+        "label": "Looking at what you're on",
+        "description": (
+            "What the user is on right now, for \"this\", \"that\", \"here\", \"what I selected\": the element "
+            "with keyboard focus (its role, name and value, and the window it is in), the text they have "
+            "selected in it, and the text just before and after the caret. A password field is named, never "
+            "read. Says plainly when the focused app does not answer, which is not the same as nothing having "
+            "focus."
+        ),
+        "input_schema": _obj({}),
+    },
+    {
+        "name": "read_clipboard",
+        "label": "Checking what you copied",
+        "description": (
+            "What is on the clipboard: its text (long text is clipped and says so), which kinds of data it "
+            "holds (text, an image, files) and which app put it there. Something an app marked private (a "
+            "password manager does) is not read, and the result says so."
+        ),
+        "input_schema": _obj({}),
+    },
+    {
+        "name": "write_clipboard",
+        "label": "Copying that",
+        "description": (
+            "Put text on the clipboard so the user can paste it themselves (\"copy the link\", \"copy that "
+            "address\"). It replaces what was there and is read back to check it holds exactly this text."
+        ),
+        "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
+    },
+    {
+        "name": "window_action",
+        "label": "Arranging a window",
+        "description": (
+            "Minimize, maximize, full screen, restore, focus or close one whole window by its hwnd, and check "
+            "that it happened: the result is the state the window reached, read from Windows, never the "
+            "request. Maximized fills the monitor's work area with the title bar and taskbar still there; "
+            "fullscreen covers the whole monitor (the app's own full screen, F11). close is what the window's "
+            "X does (the app may ask to save; the result says when it is still open). A window is not a tab: "
+            "this never changes which tab shows."
+        ),
+        "input_schema": _obj(
+            {
+                "hwnd": {"type": "integer", "description": "Window handle from the window list."},
+                "action": {"type": "string",
+                           "enum": ["minimize", "maximize", "fullscreen", "restore", "focus", "close"]},
+            },
+            ["hwnd", "action"],
         ),
     },
     {
@@ -780,6 +832,73 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "threads",
+        "label": "Looking at your work",
+        "description": (
+            "The user's threads of work, from memory: the projects, tasks and workflows they pursue over days - "
+            "building something, a review, an application, studying, helping someone - each with where it "
+            "stands, what is still open, the apps, sites, repos and people it involves, and when it was last "
+            "touched. list gives the current ones; search finds one by what it is about (\"the voice work\", "
+            "\"the maths for Ravi\"); open gives one thread whole: its timeline (when and where it was worked "
+            "on), its journal facts, the calls, chats with you and episodes around it, and its links. For "
+            "\"continue where I left off\", \"what's the status of X\", \"where was I with X\"."
+        ),
+        "input_schema": _obj(
+            {
+                "action": {"type": "string", "enum": ["list", "search", "open"],
+                           "description": "list (default without query or thread), search, or open."},
+                "query": {"type": "string", "description": "search, open: what the thread is about, in plain words."},
+                "thread": {"type": "string", "description": "open: its id as listed or as memory shows it, e.g. thread:12."},
+            }
+        ),
+    },
+    {
+        "name": "before",
+        "label": "Looking back",
+        "description": (
+            "What the user was doing before a moment, rebuilt from memory the way Yuki's welcome back does: the "
+            "break from the PC nearest at (a meal, sleep, going out: measured from when they were away, the PC "
+            "off or asleep) and their last stretch at the PC before it - time per app and page with titles, the "
+            "sessions, the last thing in front, episodes and journal facts - with the threads of work touched "
+            "then and the other breaks near that time. Without at: the latest break before now (\"continue where "
+            "I left off\", \"what was I doing before I went out\"). event time: the stretch that ended at at, "
+            "whatever came after. \"Before lunch yesterday\": at = yesterday around their lunch, event break, "
+            "then check the breaks it lists."
+        ),
+        "input_schema": _obj(
+            {
+                "at": {"type": "string", "description": "Local date-time, ISO format, e.g. 2026-09-28T13:30. Omit for "
+                                                        "the latest break before now."},
+                "event": {"type": "string", "enum": ["break", "time"],
+                          "description": "break (default): the break nearest at and what came before it; time: the "
+                                         "stretch that ended at at."},
+                "minutes": {"type": "integer", "description": "How much of the stretch before it (default 90)."},
+            }
+        ),
+    },
+    {
+        "name": "links",
+        "label": "Finding that link",
+        "description": (
+            "Web pages the user had open and links people shared with them in chats and email, from memory: the "
+            "address, the page's title and site, when it was seen and for how long, who shared it and where, "
+            "and the thread of work it belongs to. Search by what it was about (\"the Stripe docs\", \"the PR "
+            "Varun sent\") and narrow with since/until; with no query the most recently seen come first (\"that "
+            "link I was looking at\"). It only finds links: it opens and sends nothing."
+        ),
+        "input_schema": _obj(
+            {
+                "query": {"type": "string", "description": "What the page or link was about, in plain words."},
+                "since": {"type": "string", "description": "Earliest local date or date-time, ISO format."},
+                "until": {"type": "string", "description": "Latest local date or date-time; a date alone includes that "
+                                                           "whole day."},
+                "how": {"type": "string", "enum": ["viewed", "shared"],
+                        "description": "viewed: pages they had open; shared: links in messages. Omit for both."},
+                "limit": {"type": "integer", "description": "How many (default 8)."},
+            }
+        ),
+    },
+    {
         "name": "todo",
         "label": "Keeping your to-do list",
         "description": (
@@ -879,9 +998,11 @@ FINISHES_SCHEMA: dict[str, Any] = {
     "description": (
         "Optional. Fill it only when this action by itself completes what the user asked and you "
         "would not need to read its result first: the reply you would give done, worded as the "
-        "outcome (\"Discord's minimized\"). The request then ends the moment this succeeds, with "
-        "no further call; if it fails, the message is discarded and you get the result. Leave it "
-        "out when more steps follow or when you need its output."
+        "outcome (\"Discord's minimized\"). The request then ends the moment this succeeds and its "
+        "own report verifies the effect, with no further call; if it fails, or its report cannot "
+        "show the effect (a shortcut, a shell command), the message is discarded and you get the "
+        "result and the window after it to check. Leave it out when more steps follow or when you "
+        "need its output."
     ),
 }
 
@@ -909,6 +1030,8 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "tab",
     "hover",
     "app_volume",
+    "window_action",
+    "write_clipboard",
 )
 
 #: The brain's own declaration of what an action risks (``risk``): whether it can be undone and
@@ -946,6 +1069,49 @@ for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional fields on each ac
     TOOLS_BY_NAME[_name]["input_schema"]["properties"][RISK_FIELD] = RISK_SCHEMA
 TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", RISK_FIELD]
 
+#: The optional first field of the thinker's actions and slower reads (docs/VOICE.md v3.14, "one voice narrates
+#: live steps"): the few words Yuki's voice says as this step starts. First in each schema, so it is written first
+#: and can be spoken while the rest of the call is still streaming (yuki.agent.stream_partial). The voice decides
+#: when it is worth saying (only into a noticeable silence, never over the user, never once the outcome is known);
+#: a typed request ignores it. The brain's words about the call, not what the call does: left out wherever calls
+#: are compared (yuki.agent.loop).
+STEP_FIELD = "say_now"
+STEP_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Voice requests only, optional, written first: the few words you say aloud as this step starts, first "
+        "person, present tense (\"Opening your Warp tabs.\"), when they would otherwise wait in silence for it. "
+        "Never an outcome, a guess or your reasoning, never words already said."
+    ),
+}
+#: The tools that carry it: every action, and the reads that can take a while.
+STEP_TOOLS: tuple[str, ...] = ACTION_TOOL_NAMES + (
+    "look_at_window", "read_page", "read_tabs", "recall", "activity", "calls", "call_timeline", "read_file",
+    "fetch_url", "spawn_helpers", "threads", "before", "links",
+)
+STEP_TOOLS = tuple(n for n in STEP_TOOLS if n in TOOLS_BY_NAME)   # (a build without one of them)
+for _name in STEP_TOOLS:  # plumbing: first in the schema, so it streams first
+    _schema = TOOLS_BY_NAME[_name]["input_schema"]
+    _schema["properties"] = {STEP_FIELD: STEP_SCHEMA, **_schema["properties"]}
+
+#: What a ``done`` message says about the PC as it is now (docs/VOICE.md v3.14, a state claim needs evidence): the
+#: brain names the windows whose present state its message asserts, and the loop checks, from this request's own
+#: calls and their verified reports, that it looked at each or acted on it with a verified result (never by
+#: reading the message). ``[]`` when the message says nothing about how something on the PC is now.
+ABOUT_FIELD = "about"
+ABOUT_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "description": (
+        "The hwnds of the windows whose present state your message tells them (open or closed, full screen, which "
+        "tab or page shows, what is playing, what it says), [] when it says nothing about how something on the PC "
+        "is now. A window named here must have been read in this request (look_at_window, read_tabs, read_page, "
+        "or the view attached after your actions) or acted on with a verified result; if not, look first."
+    ),
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][ABOUT_FIELD] = ABOUT_SCHEMA
+TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD]
+
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
 
@@ -954,7 +1120,7 @@ AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
 #: its backend exposes only the reading functions.
 HELPER_TOOLS: tuple[str, ...] = (
     "look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
-    "calls", "call_timeline", "read_file", "fetch_url",
+    "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links",
 )
 
 #: Actions after which the loop attaches a fresh read of the window acted on to
@@ -964,6 +1130,12 @@ HELPER_TOOLS: tuple[str, ...] = (
 #: of names for plumbing, not a rule about what the model should do.
 AUTO_VIEW_TOOLS: frozenset[str] = frozenset(
     {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab", "hover"}
+)
+
+#: Input actions after which the window they went to may look different from its latest read, so a click
+#: at raw x,y there is refused until it is read again (:meth:`Dispatcher._check_raw_point`). Plumbing.
+_MARKS_ACTED: frozenset[str] = frozenset(
+    {"type_text", "hotkey", "press", "scroll", "hover", "tab", "window_action"}
 )
 
 #: How long a window's element count and covered area must hold still before the
@@ -1262,6 +1434,13 @@ class Backend(Protocol):
     def app_volume(self, app: str, *, level: float | None = None, change: float | None = None,
                    mute: bool | None = None) -> Any: ...  # pragma: no cover - protocol only
     def warm_activity(self) -> None: ...  # pragma: no cover - protocol only
+    # Optional too (2026-09-29, Phase 2 "eyes"): what has keyboard focus with its selection and caret text
+    # (a yuki.perception.tree.FocusSnapshot), the clipboard read / written, and the top-level window at a point.
+    def focus_snapshot(self, *, timeout_s: float = 0.6,
+                       ready_wait_s: float | None = None) -> Any: ...  # pragma: no cover - protocol only
+    def read_clipboard(self) -> Any: ...  # pragma: no cover - protocol only
+    def write_clipboard(self, text: str) -> Any: ...  # pragma: no cover - protocol only
+    def window_at(self, x: int, y: int) -> int: ...  # pragma: no cover - protocol only
 
 
 class _LazyRealBackend:
@@ -1374,6 +1553,39 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.perception.audio").master_volume()
+
+    # Optional (2026-09-29): "this", the clipboard, and which window is at a point.
+    def focus_snapshot(self, *, timeout_s: float = 0.6, ready_wait_s: float | None = None) -> Any:
+        """:func:`yuki.perception.tree.focus_snapshot`: focus, selection and caret text, read-only."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.tree").focus_snapshot(timeout_s=timeout_s,
+                                                                               ready_wait_s=ready_wait_s)
+
+    def read_clipboard(self) -> Any:
+        """:func:`yuki.perception.clipboard.read_clipboard`: text and formats, private content never read."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.clipboard").read_clipboard()
+
+    def write_clipboard(self, text: str) -> Any:
+        """:func:`yuki.actions.clipboard.write_clipboard`: text put on the clipboard, read back."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.clipboard").write_clipboard(text)
+
+    def window_at(self, x: int, y: int) -> int:
+        """The top-level window at a screen point (``WindowFromPoint``, its root), 0 for none. Read-only."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")  # its own instance: the argtypes set here leak nowhere
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        return int(user32.GetAncestor(hwnd, 2) or hwnd or 0) if hwnd else 0  # GA_ROOT
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
         import importlib
@@ -1512,6 +1724,50 @@ class Dispatcher:
         self._latest_trees: dict[int, tuple[int, dict[int, dict[str, Any]]]] = {}
         #: The window of the most recent tree read, the default for an element id.
         self._latest_tree_hwnd: int | None = None
+        #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
+        #: whether Yuki has acted on it since): what a click at raw x,y is checked against.
+        self._read_facts: dict[int, dict[str, Any]] = {}
+        #: Refuse a click at raw x,y on a window that is opaque, was never read, or changed since its latest
+        #: read (the element click's staleness rule, for coordinates). On for every dispatcher.
+        self.guard_raw_clicks = True
+        #: Append the live picture of the screen (yuki.memory.now: what the windows on screen show, popups,
+        #: the focus line) to :meth:`overview_text`, i.e. the brain's per-turn situation block. Off unless the
+        #: owner of the dispatcher turns it on (the agent loop, from ``Settings.now_in_situation``).
+        self.include_now = False
+        #: Wait bounds (s) of that picture: the memory service's answer, and the focus read.
+        self.now_wait_s = 0.05
+        self.focus_wait_s = 0.05
+
+    def enable_now(self, settings: Any = None) -> bool:
+        """Turn the per-turn Now picture on from ``settings`` (``now_in_situation``, ``now_wait_ms``,
+        ``focus_wait_ms``; a default :class:`~yuki.config.Settings` when ``None``) and start the focus reader
+        in the background so the first turn already has a focus line. Returns whether it is on. The agent
+        loop calls this once for the brain's own dispatcher (the voice's hands and the helpers keep theirs off)."""
+        if settings is None:
+            from yuki.config import Settings
+
+            settings = Settings()
+        self.include_now = bool(getattr(settings, "now_in_situation", True))
+        self.now_wait_s = float(getattr(settings, "now_wait_ms", 50.0)) / 1000.0
+        self.focus_wait_s = float(getattr(settings, "focus_wait_ms", 50.0)) / 1000.0
+        if self.include_now and isinstance(self.backend, _LazyRealBackend):
+            import threading
+
+            def warm() -> None:
+                try:
+                    import importlib
+
+                    importlib.import_module("yuki.perception.tree").warm_focus_reader()
+                    from yuki.memory.now import shared_client
+
+                    client = shared_client()
+                    if client is not None:
+                        client.now(wait_s=0.5)  # connects the pipe ahead of the first turn
+                except Exception:  # noqa: BLE001 - the first turn just goes without
+                    pass
+
+            threading.Thread(target=warm, name="yuki-now-warm", daemon=True).start()
+        return self.include_now
 
     # -- warm-up -----------------------------------------------------------
 
@@ -1552,7 +1808,17 @@ class Dispatcher:
         return facts if isinstance(facts, dict) else {}
 
     def warm_activity(self) -> bool:
-        """Start the backend's activity-facts warm-up (WinRT import) if it has one."""
+        """Start the backend's activity-facts warm-up (WinRT import) if it has one.
+
+        Only the brain's own agents call this (their prewarm, :class:`yuki.agent.loop.Agent`), so it is also
+        where their dispatcher turns the per-turn Now picture on (:meth:`enable_now`, from the configured
+        ``Settings.now_in_situation``); the voice's hands and the read-only helpers never call it and keep it off.
+        """
+        if isinstance(self.backend, _LazyRealBackend) and not self.include_now:
+            try:
+                self.enable_now()
+            except Exception:  # noqa: BLE001 - the brain works without it, as before
+                pass
         warm = getattr(self.backend, "warm_activity", None)
         if not callable(warm):
             return False
@@ -1596,6 +1862,20 @@ class Dispatcher:
         outcome.name = name
         if not outcome.elapsed_ms:
             outcome.elapsed_ms = (time.perf_counter() - started) * 1000
+        if outcome.ok and name in _MARKS_ACTED and self._read_facts:
+            # the window it acted on may look different now: coordinates from its last read are stale
+            hwnd = tool_input.get("expect_hwnd") or tool_input.get("hwnd")
+            if hwnd is None and tool_input.get("x") is not None and tool_input.get("y") is not None:
+                try:
+                    hwnd = self._pointed_window(int(tool_input["x"]), int(tool_input["y"]))
+                except (TypeError, ValueError):
+                    hwnd = None
+            if hwnd is None and tool_input.get("element") is not None:
+                hwnd = self._latest_tree_hwnd
+            try:
+                self._mark_acted(int(hwnd) if hwnd is not None else None, name)
+            except (TypeError, ValueError):
+                pass
         return outcome
 
     # -- argument helpers --------------------------------------------------
@@ -1659,7 +1939,93 @@ class Dispatcher:
         started = time.perf_counter()
         overview = self.backend.get_desktop_overview()
         text = self.backend.format_overview(overview)
-        return text, _plain(overview), (time.perf_counter() - started) * 1000
+        payload = _plain(overview)
+        if self.include_now:
+            foreground = payload.get("foreground_hwnd") if isinstance(payload, dict) else None
+            now_text, now_facts = self.now_text(foreground)
+            if now_text:
+                text = f"{text}\n\n{now_text}"
+            if isinstance(payload, dict):
+                payload = {**payload, "now": now_facts}
+        return text, payload, (time.perf_counter() - started) * 1000
+
+    # -- the live picture of the screen (yuki.memory.now) -------------------
+
+    def _now_board(self, wait_s: float | None = None) -> dict[str, Any] | None:
+        """The memory service's picture of the screen, or ``None`` (no service, or no answer in time)."""
+        try:
+            from yuki.memory.now import shared_client
+
+            client = shared_client()
+            return client.now(wait_s=self.now_wait_s if wait_s is None else wait_s) if client is not None else None
+        except Exception:  # noqa: BLE001 - the brain goes on without it
+            return None
+
+    def now_text(self, foreground: Any = None) -> tuple[str, dict[str, Any]]:
+        """The Now block for the per-turn situation, and content-free facts about it for the log.
+
+        What the memory service read of every visible window (the one in front first), the popups that
+        appeared lately, and a live one-line focus read - each bounded by its own wait
+        (:attr:`now_wait_s`, :attr:`focus_wait_s`, ~50 ms each), left out when it does not answer in time.
+        A read of the window in front that is older than a change the service saw is said to be so, and the
+        service is asked to read it again (the next turn has it).
+        """
+        started = time.perf_counter()
+        facts: dict[str, Any] = {}
+        try:
+            fg = int(foreground) if foreground else None
+        except (TypeError, ValueError):
+            fg = None
+        # the focus read runs alongside the board's answer (each has its own bound)
+        focus_box: dict[str, Any] = {}
+        snapshot = getattr(self.backend, "focus_snapshot", None)
+        focus_thread = None
+        if callable(snapshot):
+            import threading
+
+            def read_focus() -> None:
+                f0 = time.perf_counter()
+                try:
+                    focus_box["focus"] = snapshot(timeout_s=self.focus_wait_s)
+                except Exception as exc:  # noqa: BLE001
+                    focus_box["error"] = type(exc).__name__
+                focus_box["ms"] = round((time.perf_counter() - f0) * 1000.0, 2)
+
+            focus_thread = threading.Thread(target=read_focus, name="yuki-now-focus", daemon=True)
+            focus_thread.start()
+        board = self._now_board()
+        facts["board_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+        facts["board"] = board is not None
+        focus_line = ""
+        if focus_thread is not None:
+            focus_thread.join(self.focus_wait_s + 0.02)
+            focus = focus_box.get("focus")
+            if getattr(focus, "ok", False) and not _is_own_window(getattr(focus, "window", 0)):
+                # (focus in Yuki's own ask bar or chat says nothing about "this")
+                focus_line = focus.line()
+            facts["focus_ok"] = bool(getattr(focus, "ok", False))
+            facts["focus_ms"] = focus_box.get("ms")
+            if focus_box.get("error"):
+                facts["focus_error"] = focus_box["error"]
+        if board is None:
+            facts["ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+            return (focus_line, facts)
+        from yuki.memory.now import format_now, shared_client
+
+        windows = board.get("windows") or []
+        front = next((w for w in windows if w.get("hwnd") == (fg or board.get("foreground"))), None)
+        if front is not None and (front.get("stale") or front.get("read_at") is None) and not front.get("blocked"):
+            try:
+                client = shared_client()
+                facts["refresh_asked"] = bool(client and client.refresh(fg, wait_s=self.now_wait_s))
+            except Exception:  # noqa: BLE001
+                facts["refresh_asked"] = False
+        text = format_now(board, foreground=fg, focus_line=focus_line)
+        facts.update(windows=len(windows), popups=len(board.get("popups") or []), chars=len(text),
+                     front_age_s=front.get("age_s") if front else None,
+                     front_stale=bool(front.get("stale")) if front else None,
+                     ms=round((time.perf_counter() - started) * 1000.0, 2))
+        return text, facts
 
     def _do_look_at_desktop(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text, payload, elapsed = self.overview_text()
@@ -1705,6 +2071,8 @@ class Dispatcher:
             },
         )
         self._latest_tree_hwnd = int(hwnd)
+        opaque = bool(payload.get("opaque")) if isinstance(payload, dict) else False
+        self._note_read(int(hwnd), payload if isinstance(payload, dict) else {}, opaque)
         header = (
             f"window {hwnd} \"{payload.get('title', '')}\" ({payload.get('process_name', '')}): "
             f"{len(elements)} elements{', truncated' if truncated else ''}, status {status}, "
@@ -1715,6 +2083,11 @@ class Dispatcher:
             summary += f", {status}"
         if note:
             summary += f": {note}"
+        if opaque:
+            known = self._opaque_window_facts(int(hwnd), payload if isinstance(payload, dict) else {})
+            if known:
+                text = f"{text}\n{known}"
+                payload = {**payload, "app_data": True} if isinstance(payload, dict) else payload
         return ToolOutcome(
             name="look_at_window",
             ok=True,
@@ -1723,6 +2096,46 @@ class Dispatcher:
             payload=payload,
             elapsed_ms=(time.perf_counter() - started) * 1000,
         )
+
+    def _note_read(self, hwnd: int, payload: dict[str, Any], opaque: bool) -> None:
+        """What a raw x,y click on ``hwnd`` is checked against: this read's number and the window as it was."""
+        rect = _window_rect_now(hwnd)
+        self._read_facts[int(hwnd)] = {
+            "read": self._reads, "at": time.time(), "title": str(payload.get("title") or ""),
+            "rect": list(rect) if rect else None, "opaque": opaque, "acted": None,
+        }
+        if len(self._read_facts) > 64:
+            oldest = sorted(self._read_facts, key=lambda h: self._read_facts[h]["at"])[:16]
+            for old in oldest:
+                self._read_facts.pop(old, None)
+
+    def _opaque_window_facts(self, hwnd: int, payload: dict[str, Any]) -> str:
+        """For a window UI Automation cannot see into: what the app's own data says about it (Warp's tabs,
+        from the memory service's picture, else read here read-only), as lines after its tree."""
+        from yuki.memory.now import _app_data_line, app_data_for
+
+        data = None
+        board = self._now_board()
+        if board is not None:
+            entry = next((w for w in board.get("windows") or [] if int(w.get("hwnd") or 0) == hwnd), None)
+            data = (entry or {}).get("app_data")
+        if data is None:
+            try:
+                from yuki.memory.privacy import PrivacyConfig
+                from yuki.perception.visibility import frame_bounds
+
+                rect = frame_bounds(hwnd)
+                if rect is not None:
+                    data = app_data_for(str(payload.get("process_name") or ""), rect, str(payload.get("title") or ""),
+                                        privacy=PrivacyConfig())
+            except Exception:  # noqa: BLE001 - the tree is still the answer
+                data = None
+        line = _app_data_line(data)
+        if not line:
+            return ""
+        return (f"What this window holds, {line}. To switch to one of these, use the app's own keyboard "
+                f"shortcuts (its tab-switching keys) and read the window title after each step until it names "
+                f"the one wanted; if two fit about equally, ask which, naming them.")
 
     def _do_read_page(self, tool_input: dict[str, Any]) -> ToolOutcome:
         """The whole text of the page a window shows, with its title and address.
@@ -2192,7 +2605,10 @@ class Dispatcher:
         if button not in {"left", "right", "middle"}:
             raise ToolError(f"button must be left, right or middle, got {button!r}")
         x, y, guard, label = self._point(tool_input)
-        return self._labelled(
+        target = None
+        if not label and self.guard_raw_clicks:
+            target = self._check_raw_point(x, y, tool_input)
+        outcome = self._labelled(
             self._from_action(
                 "click",
                 self.backend.click(
@@ -2205,6 +2621,90 @@ class Dispatcher:
             ),
             label,
         )
+        if outcome.ok:
+            self._mark_acted(guard or target or self._pointed_window(x, y), "click")
+        return outcome
+
+    def _pointed_window(self, x: int, y: int) -> int | None:
+        locate = getattr(self.backend, "window_at", None)
+        if not callable(locate):
+            return None
+        try:
+            return int(locate(x, y) or 0) or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _mark_acted(self, hwnd: int | None, name: str) -> None:
+        """Yuki acted on ``hwnd`` after its latest read: coordinates from that read may be stale now."""
+        if hwnd and int(hwnd) in self._read_facts:
+            self._read_facts[int(hwnd)]["acted"] = name
+
+    def _check_raw_point(self, x: int, y: int, tool_input: dict[str, Any]) -> int | None:
+        """The staleness rule of element clicks, for a click at raw x,y; returns the window at the point.
+
+        Refused (nothing is sent) when the point is in a window that is opaque to UI Automation (a point
+        there is a guess), in a user window never read in this conversation, or in one that changed since
+        its latest read: moved or resized, retitled, or acted on by Yuki since (the view after the turn's
+        actions is a new read).  ``read``, when given, must be that window's latest read.  A backend that
+        cannot say which window is at a point, and the shell's own surfaces (taskbar, desktop), are not
+        checked.  Facts about windows only, never about what the model meant.
+
+        Raises:
+            ToolError: the refusal, saying why and what to do instead.
+        """
+        target = self._pointed_window(x, y)
+        if not target:
+            return None
+        facts = self._read_facts.get(target)
+        title = _window_title_now(target)
+        name = f"window {target} \"{(title or '')[:60]}\""
+        try:
+            from yuki.perception.tree import measured_opaque
+
+            opaque_now = measured_opaque(target)
+        except Exception:  # noqa: BLE001
+            opaque_now = False
+        if opaque_now or (facts is not None and facts.get("opaque")):
+            raise ToolError(
+                f"not clicked: ({x},{y}) is in {name}, which draws its own interface - UI Automation shows "
+                f"nothing inside it, so any point there is a guess. Use the app's own keyboard shortcuts and "
+                f"read its title after each step (or the app's own data given with its read), or ask the user "
+                f"naming the options you know"
+            )
+        if facts is None:
+            try:
+                from yuki.perception.windows import is_user_window
+
+                user_window = is_user_window(target)
+            except Exception:  # noqa: BLE001
+                user_window = False
+            if not user_window:
+                return target
+            raise ToolError(
+                f"not clicked: ({x},{y}) is in {name}, which has not been read in this conversation, so the "
+                f"point is a guess. Read it with look_at_window and click an element id from that read"
+            )
+        if tool_input.get("read") is not None:
+            asked = self._need_int(tool_input, "read")
+            if asked != facts["read"]:
+                raise ToolError(
+                    f"not clicked: coordinates from read #{asked} are out of date - the latest read of {name} "
+                    f"is #{facts['read']}. Use a point or an element id from read #{facts['read']}"
+                )
+        changed = []
+        rect_now = _window_rect_now(target)
+        if facts.get("rect") and rect_now and list(rect_now) != list(facts["rect"]):
+            changed.append("it moved or was resized")
+        if title is not None and title != facts.get("title"):
+            changed.append("its title changed")
+        if facts.get("acted"):
+            changed.append(f"you acted on it since ({facts['acted']})")
+        if changed:
+            raise ToolError(
+                f"not clicked: {name} changed since read #{facts['read']} ({'; '.join(changed)}), so ({x},{y}) "
+                f"may point at something else now. Read it again, then click an element id from the new read"
+            )
+        return target
 
     def _do_type_text(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = tool_input.get("text")
@@ -2420,6 +2920,99 @@ class Dispatcher:
             outcome.content = [{"type": "text", "text": f"{outcome.summary}\n" + "\n".join(lines)}]
         return outcome
 
+    # -- "this", the clipboard, whole windows (2026-09-29) ---------------------
+
+    #: Budget of an explicit look at the focus (the per-turn line keeps :attr:`focus_wait_s`), and how long
+    #: it waits for the focus reader to start on its first use in this process.
+    FOCUS_LOOK_S = 0.6
+    FOCUS_READY_S = 3.0
+
+    def _do_look_at_focus(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """What has keyboard focus, its selection and the text around the caret. A look, never an action."""
+        read = getattr(self.backend, "focus_snapshot", None)
+        if not callable(read):
+            raise ToolError("this backend cannot read the focus")
+        started = time.perf_counter()
+        try:
+            focus = read(timeout_s=self.FOCUS_LOOK_S, ready_wait_s=self.FOCUS_READY_S)
+        except TypeError:  # a backend written before ready_wait_s
+            focus = read(timeout_s=self.FOCUS_LOOK_S)
+        ok = bool(getattr(focus, "ok", False))
+        lines = [focus.line(limit=600)] if hasattr(focus, "line") else [str(focus)]
+        if ok and getattr(focus, "role", "") and getattr(focus, "selection", ""):
+            # the line shows the selection; the text on each side of it says where it sits
+            if getattr(focus, "before", "") or getattr(focus, "after", ""):
+                lines.append(f'text before the selection: "{focus.before}"')
+                lines.append(f'text after the selection: "{focus.after}"')
+        payload = {k: v for k, v in _plain(focus).items() if k not in ("value", "selection", "before", "after")} \
+            if isinstance(_plain(focus), dict) else {}
+        payload.update(selection_chars=len(getattr(focus, "selection", "") or ""),
+                       value_chars=len(getattr(focus, "value", "") or ""))
+        return ToolOutcome(
+            name="look_at_focus",
+            ok=ok,
+            summary=lines[0] if ok else f"could not read the focus: {getattr(focus, 'error', '') or 'no answer'}",
+            content=[{"type": "text", "text": "\n".join(lines)}],
+            payload=payload,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _do_read_clipboard(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """The clipboard's text and formats (private content never read). A look; its text is not logged."""
+        read = getattr(self.backend, "read_clipboard", None)
+        if not callable(read):
+            raise ToolError("this backend cannot read the clipboard")
+        started = time.perf_counter()
+        clip = read()
+        formats = list(getattr(clip, "formats", []) or [])
+        owner = getattr(clip, "owner_process", "") or "an unknown app"
+        if not getattr(clip, "ok", False):
+            raise ToolError(f"could not read the clipboard: {getattr(clip, 'error', '') or 'no answer'}")
+        if getattr(clip, "private", False):
+            text = (f"The clipboard holds something {owner} marked private (a password manager does this), so "
+                    f"it was not read. Formats: {', '.join(formats[:8]) or 'none'}.")
+            summary = "private content, not read"
+        elif getattr(clip, "text", None) is None:
+            text = f"The clipboard holds no text (formats: {', '.join(formats[:8]) or 'nothing'}), put there by {owner}."
+            summary = "no text on the clipboard"
+        else:
+            clipped = " (clipped: the start only)" if getattr(clip, "truncated", False) else ""
+            text = (f"Clipboard text from {owner}, {getattr(clip, 'chars', 0)} characters{clipped}:\n"
+                    f"{clip.text}")
+            summary = f"{getattr(clip, 'chars', 0)} characters of text from {owner}"
+        return ToolOutcome(
+            name="read_clipboard",
+            ok=True,
+            summary=summary,
+            content=[{"type": "text", "text": text}],
+            # content-free: the text itself only goes to the model (whose request log filters secrets)
+            payload={"chars": getattr(clip, "chars", 0), "formats": formats[:12], "owner": owner,
+                     "private": bool(getattr(clip, "private", False)), "truncated": bool(getattr(clip, "truncated", False)),
+                     "sequence": getattr(clip, "sequence", 0)},
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _do_write_clipboard(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        text = tool_input.get("text")
+        if not isinstance(text, str):
+            raise ToolError(f"'text' must be a string, got {text!r}")
+        write = getattr(self.backend, "write_clipboard", None)
+        if not callable(write):
+            raise ToolError("this backend cannot write the clipboard")
+        outcome = self._from_action("write_clipboard", write(text))
+        return outcome
+
+    def _do_window_action(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """One whole window minimized / maximized / full screen / restored / focused / closed, verified."""
+        hwnd = self._need_int(tool_input, "hwnd")
+        action = self._need_str(tool_input, "action")
+        if action not in ("minimize", "maximize", "fullscreen", "restore", "focus", "close"):
+            raise ToolError(f"'action' must be minimize, maximize, fullscreen, restore, focus or close, got {action!r}")
+        act = getattr(self.backend, "window_action", None)
+        if not callable(act):
+            raise ToolError("this backend cannot act on whole windows")
+        return self._from_action("window_action", act(hwnd, action))
+
     # -- control tools -----------------------------------------------------
 
     def _do_ask_user(self, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -2578,6 +3171,51 @@ def _leaf_cells(elements: list[dict[str, Any]]) -> int:
         for row in range(r0, r1):
             grid[row * cols + c0 : row * cols + c1] = run
     return grid.count(1)
+
+
+def _window_rect_now(hwnd: int) -> list[int] | None:
+    """``GetWindowRect`` of a live window, ``None`` when it is not one (a test double's fake handle)."""
+    try:
+        import win32gui
+
+        if not win32gui.IsWindow(int(hwnd)):
+            return None
+        return list(win32gui.GetWindowRect(int(hwnd)))
+    except Exception:
+        return None
+
+
+def _is_own_window(hwnd: Any) -> bool:
+    """Whether a window belongs to Yuki itself (this process, or a program in Yuki's own folder)."""
+    try:
+        hwnd = int(hwnd or 0)
+        if not hwnd:
+            return False
+        import os
+        import sys
+        from pathlib import Path
+
+        import psutil
+        import win32process
+
+        pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+        if pid == os.getpid():
+            return True
+        from yuki.core.paths import app_dir
+
+        exe = Path(psutil.Process(pid).exe()).resolve()
+        return any(exe.is_relative_to(root) for root in (app_dir().resolve(), Path(sys.prefix).resolve()))
+    except Exception:
+        return False
+
+
+def _window_title_now(hwnd: int) -> str | None:
+    try:
+        import win32gui
+
+        return win32gui.GetWindowText(int(hwnd)) if win32gui.IsWindow(int(hwnd)) else None
+    except Exception:
+        return None
 
 
 def _png_size(png: bytes) -> tuple[int, int] | None:

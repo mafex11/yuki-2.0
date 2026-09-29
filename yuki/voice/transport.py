@@ -167,6 +167,7 @@ class SpeakerOutput(BaseOutputTransport):
     def set_speaker(self, speaker: Speaker) -> None:
         self._speaker = speaker
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-out")
+        self._executor.submit(lambda: None)   # its thread starts now, not on the loop's first write (v3.14)
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)

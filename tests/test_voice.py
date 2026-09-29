@@ -21,7 +21,7 @@ from yuki.config import Settings
 from yuki.log.events import Final, Say, SessionLogger
 from yuki.voice.bridge import VoiceBridge
 from yuki.voice.mouth import SPOKEN_NOTE
-from yuki.voice.offline import StubDesktop
+from yuki.voice.offline import StubDesktop, StubResult
 
 APP = QCoreApplication.instance() or QCoreApplication([])
 
@@ -370,7 +370,7 @@ def _gate(state: _State, **kw: Any) -> Any:
                         stale_turns=kw.get("stale", 2))
 
 
-def test_gate_merges_near_results_into_one_turn() -> None:
+def test_gate_says_each_ready_result_at_once() -> None:
     from yuki.voice.narrator import Item
 
     async def main() -> None:
@@ -383,14 +383,15 @@ def test_gate_merges_near_results_into_one_turn() -> None:
                 got.append((name, run_llm, stale))
             return d
 
-        state.s["jobs_open"] = 1  # job 2 still running: job 1's result settles for it
+        # v3.14: a ready result is said at once (no settle for another job's result), each its own turn.
+        state.s["jobs_open"] = 1
         gate.enqueue(Item(job=1, kind="final", deliver=deliver("a")))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
         state.s["jobs_open"] = 0
         gate.enqueue(Item(job=2, kind="final", deliver=deliver("b")))
         await asyncio.sleep(0.3)
-        assert got == [("a", False, False), ("b", True, False)]  # one mouth run for both
-        assert gate.stats["turns"] == 1 and gate.stats["merged"] == 1
+        assert got == [("a", True, False), ("b", True, False)]
+        assert gate.stats["turns"] == 2 and gate.stats["merged"] == 0
         await gate.stop()
 
     asyncio.run(main())
@@ -688,9 +689,27 @@ def test_action_marked_as_finishing_ends_the_request_in_one_call(tmp_path: Path)
     assert FINISHES_FIELD not in TOOLS_BY_NAME["look_at_desktop"]["input_schema"]["properties"]
     client = FakeClient([_response(_block("tool_use", id="t1", name="hotkey",
                                           input={"keys": ["win", "down"], FINISHES_FIELD: "Discord's minimized."}))])
-    events = list(_agent(client, tmp_path).run("minimize discord"))
+    agent = _agent(client, tmp_path)
+    # the input layer's own watch saw the effect (the window in front changed), as it does for a minimize (v3.14)
+    agent.dispatcher.backend.hotkey = lambda *keys, **kw: StubResult(
+        summary="pressed win+down; the foreground changed", details={"foreground_changed": True})
+    events = list(agent.run("minimize discord"))
     assert isinstance(events[-1], Final) and events[-1].text == "Discord's minimized."
     assert len(client.calls) == 1  # no second call only to say it worked
+
+
+def test_finishing_mark_needs_a_verified_report(tmp_path: Path) -> None:
+    """v3.14: a finishes_with on an action whose report cannot show the effect is not the outcome: one more call."""
+    from yuki.agent.tools import FINISHES_FIELD
+
+    client = FakeClient([
+        _response(_block("tool_use", id="t1", name="hotkey",
+                         input={"keys": ["f11"], FINISHES_FIELD: "It's full screen."})),
+        _response(_block("tool_use", id="t2", name="done", input={"message": "It's maximized, not full screen.",
+                                                                  "about": []})),
+    ])
+    events = list(_agent(client, tmp_path).run("make it full screen"))
+    assert events[-1].text == "It's maximized, not full screen." and len(client.calls) == 2
 
 
 def test_finishing_mark_is_dropped_when_the_action_fails(tmp_path: Path) -> None:

@@ -147,6 +147,73 @@ def _process_profile(profiles: ProfileSet, hwnd: int, tree: object | None) -> Pr
     return profiles.for_window(process=process, url=None)
 
 
+#: A window whose content leaves (its own root and window-sized containers left
+#: out) cover less than this share of it is opaque: the same measure and number
+#: as :data:`yuki.perception.tree.OPAQUE_COVERAGE`.
+OPAQUE_COVERAGE = 0.05
+_COVERAGE_CELL = 32
+_WINDOW_SIZED = 0.9
+
+
+def snapshot_coverage(snap: Snapshot) -> float | None:
+    """Share of the read's viewport covered by content leaves (0..1), ``None`` without a viewport.
+
+    Leaves are nodes with no children; the root and any node covering at least
+    90% of the viewport say nothing is drawn where they sit, so they do not count
+    (a GPU-drawn terminal reads as one root element: 0).  Rectangles only.
+    """
+    viewport = snap.viewport or (snap.root.bounds if snap.root is not None else None)
+    if snap.root is None or viewport is None:
+        return None
+    left, top, right, bottom = viewport
+    if right <= left or bottom <= top:
+        return None
+    cols = max((right - left + _COVERAGE_CELL - 1) // _COVERAGE_CELL, 1)
+    rows = max((bottom - top + _COVERAGE_CELL - 1) // _COVERAGE_CELL, 1)
+    grid = bytearray(cols * rows)
+    view_area = (right - left) * (bottom - top)
+    for node in snap.root.walk():
+        if node is snap.root or node.children or node.bounds is None or node.offscreen or node.sr_only:
+            continue
+        l, t, r, b = max(node.bounds[0], left), max(node.bounds[1], top), min(node.bounds[2], right), min(node.bounds[3], bottom)
+        if r <= l or b <= t or (r - l) * (b - t) >= _WINDOW_SIZED * view_area:
+            continue
+        c0, c1 = (l - left) // _COVERAGE_CELL, min((r - left - 1) // _COVERAGE_CELL + 1, cols)
+        r0, r1 = (t - top) // _COVERAGE_CELL, min((b - top - 1) // _COVERAGE_CELL + 1, rows)
+        for row in range(r0, r1):
+            grid[row * cols + c0: row * cols + c1] = b"\x01" * max(c1 - c0, 0)
+    return grid.count(1) / len(grid)
+
+
+def prune_snapshot(snap: Snapshot, hidden: object) -> int:
+    """Drop every node ``hidden(node.bounds)`` says cannot be seen (with its subtree); returns how many went.
+
+    For a window other windows partly cover: what lies wholly under them is not
+    on the screen, whatever UI Automation reports, so it is not read as if it were.
+    The root is kept.
+    """
+    if snap.root is None:
+        return 0
+    from yuki.memory.extract.model import number
+
+    removed = 0
+    stack = [snap.root]
+    while stack:
+        node = stack.pop()
+        kept = []
+        for child in node.children:
+            if child.bounds is not None and hidden(child.bounds):  # type: ignore[operator]
+                removed += sum(1 for _ in child.walk())
+                continue
+            kept.append(child)
+        node.children = kept
+        stack.extend(kept)
+    if removed:
+        snap.nodes = number(snap.root)
+        snap.notes.append(f"{removed} element(s) under other windows left out")
+    return removed
+
+
 def extract(
     hwnd: int,
     tree: object | None = None,
@@ -157,6 +224,7 @@ def extract(
     app: str | None = None,
     timeout_s: float = READ_TIMEOUT_S,
     snapshot: Snapshot | None = None,
+    hidden: object | None = None,
 ) -> Extraction:
     """What window ``hwnd`` shows, as messages or clean main text (never raises).
 
@@ -173,6 +241,9 @@ def extract(
         app: app display name; derived from the process when omitted.
         timeout_s: budget of the structured read.
         snapshot: a Snapshot already read (tests, or a caller that budgets reads itself).
+        hidden: ``(bounds) -> bool``: an element's rectangle lies wholly under other windows
+            (:meth:`yuki.perception.visibility.Layout.covered`); such elements are left out
+            (:func:`prune_snapshot`).  ``None``: the whole window counts as visible.
     """
     started = _time.perf_counter()
     profiles = _profiles.current()
@@ -190,6 +261,9 @@ def extract(
                 hidden_labels=bool(early and early.hidden_labels),
             )
         read_ms = snap.elapsed_ms
+        # measured on the whole read, before anything is left out: how much of the window UI Automation sees
+        coverage = snapshot_coverage(snap)
+        covered = prune_snapshot(snap, hidden) if hidden is not None else 0
         result = extract_snapshot(snap, profiles=profiles, now=now, user_names=user_names, app=app, page=page)
     except Exception as exc:  # noqa: BLE001 - extraction must never take the watcher down
         return Extraction(
@@ -203,6 +277,10 @@ def extract(
         # UIA IsPassword elements on screen: the window shows a password field (a sign-in page, a
         # credentials dialog), which the watcher's privacy gate skips (docs/MEMORY.md, "Privacy gates")
         password_fields=sum(1 for n in snap.root.walk() if n.is_password) if snap.root is not None else 0,
+        coverage=round(coverage, 3) if coverage is not None else None,
+        covered_nodes=covered,
+        # the read's own element (a popup's: ToolTip, Menu, Window...), a UIA control type
+        root_role=snap.root.role if snap.root is not None else "",
     )
     if profiles.problems:
         result.notes.extend(f"profiles: {p}" for p in profiles.problems)

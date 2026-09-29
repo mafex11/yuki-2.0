@@ -462,7 +462,8 @@ def _youtube_desk(timeline: Timeline) -> Any:
                 x, y = center
                 elements.append({"id": len(elements), "role": role, "name": name, "depth": 6,
                                  "bounds": (x - 150, y - 40, x + 150, y + 40), "center": center,
-                                 "is_interactive": True})
+                                 "is_interactive": True,   # inside the page, as a real tree says (v3.14 items line)
+                                 "parent": next((e["id"] for e in elements if e.get("role") == "Document"), -1)})
                 self._links.append((center, action, arg))
 
             if kind == "watch":
@@ -487,6 +488,8 @@ def _youtube_desk(timeline: Timeline) -> Any:
             if action == "toggle":
                 self.playing = not self.playing
                 result.summary = f"clicked Button at ({x},{y}); the player is now {'playing' if self.playing else 'paused'}"
+                # the input layer's own watch (v3.14): the click moved the keyboard focus onto the player's button
+                result.details = {"foreground_changed": False, "focus_changed": True, "page_changed": False}
                 return result
             before = tab["name"]
             tab.update(name=f"{name} - YouTube", url="https://www.youtube.com/watch?v=" + str(abs(hash(name)) % 10**6),
@@ -494,6 +497,8 @@ def _youtube_desk(timeline: Timeline) -> Any:
             self.playing = True
             result.summary = (f'clicked Hyperlink "{name}" at ({x},{y}); the page changed from "{before}" to '
                               f'"{tab["name"]}" (youtube.com/watch)')
+            result.details = {"foreground_changed": False, "focus_changed": False, "page_changed": True,
+                              "foreground_title_changed": True}   # as the input layer's page watch reports it
             return result
 
         def open_url(self, url: str, *, app: str | None = None, **kw: Any) -> StubResult:
@@ -674,6 +679,7 @@ def _zen_desk(timeline: Timeline) -> Any:
                 result.summary = f'clicked DataItem "{hit[2]}" at ({x},{y}); the chat with {hit[2]} is open'
                 return result
             if hit is not None and hit[1] == "restore" and self.front == self.CHROME:
+                title_before = self.title(self.CHROME)
                 result = self._act("click", "", x, y, **kwargs)
                 self.restored = True
                 self.tabs = [
@@ -688,6 +694,10 @@ def _zen_desk(timeline: Timeline) -> Any:
                 ]
                 self.selected = 2
                 result.summary = f"clicked Button \"Restore\" at ({x},{y}); the last session's 4 tabs came back"
+                changed = self.title(self.CHROME) != title_before
+                # What the input layer's watch reports for it: the window's title (the page showing) changed.
+                result.details = {"foreground_changed": False, "focus_changed": False, "page_changed": changed,
+                                  "foreground_title_changed": changed}
                 return result
             return super().click(x, y, **kwargs)
 
@@ -1121,6 +1131,9 @@ def _real_brain(settings: Settings, memory: Any, timeline: Timeline, desk: Any =
                                             detail=[x for x in a[2:] if not isinstance(x, bool)]))
     # When a lane picks a request up (within ms of the bridge's submit): end of speech -> job submitted.
     runtime.started.connect(lambda lane, job, _request: timeline.add("brain", event="submitted", job=job, lane=lane))
+    # v3.14: a step line streamed ahead of its call (yuki.agent.stream_partial), for the report
+    runtime.partial.connect(lambda lane, job, what, text: timeline.add("brain", event="step_line", job=job,
+                                                                       detail=[text]) if what == "step" else None)
     return runtime, desk
 
 
@@ -1181,6 +1194,10 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         over["voice_hold_max_s"] = 8.0
     if args.grounding is not None:
         over["voice_grounding"] = args.grounding == "on"
+    if getattr(args, "grounding_source", None):
+        over["voice_grounding_source"] = args.grounding_source
+    # v3.14: the voice cache of a replay is its own (never the user's voice folder); --tts-cache-dir shares one
+    over.setdefault("voice_tts_cache_dir", str(args.tts_cache_dir or (tmp / "tts-cache")))
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider=args.tts,
                         voice_tts_voice=args.voice or ("" if args.tts == "elevenlabs" else "aura-2-thalia-en"),
                         voice_idle_s=args.idle, **over)
@@ -1359,6 +1376,19 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("z_glimpse"), "z_glimpse", after_s=1.0, wait_for=settled()),
             ScriptLine(clip("y_thanks"), "z_thanks", after_s=1.0, wait_for=settled()),
         ]
+    elif scenario == "hands314":
+        # v3.14, the talker's own hands for the visible screen: "click the make up my mind mix" and "play the second
+        # one" from the items line (no thinker), then "type hi" into the search box that has the keyboard.
+        desk = _youtube_desk(timeline)
+        desk.focus_field = {"window": desk.CHROME, "role": "Edit", "name": "Search", "text": ""}
+        runtime, desk = _real_brain(settings, memory, timeline, desk=desk)
+        settled = lambda: _settled(box)  # noqa: E731
+        lines = [
+            ScriptLine(clip("h_mix"), "h_mix", after_s=1.0),
+            ScriptLine(clip("h_second"), "h_second", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("h_type"), "h_type", after_s=1.0, wait_for=settled()),
+            ScriptLine(clip("y_thanks"), "h_thanks", after_s=1.0, wait_for=settled()),
+        ]
     elif scenario == "zen928":
         # v3.10, the user's session of 2026-09-28 09:06-09:11 ("it felt like talking with 2 people at the same
         # time"): open Chrome, restore, YouTube, the second YouTube tab, close it, scroll x2, the Sonnet 5.5 video,
@@ -1517,7 +1547,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
 
     z928 = scenario in ("zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead", "cut_stop",
                         "warp929")
-    front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927") or z928
+    front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927", "hands314") or z928
              else (lambda: None))
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
                          **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
@@ -1677,7 +1707,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         report["quiet_asked"] = quiet_asked
         report["z928"] = z928_metrics(report, box)
     if scenario in ("latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927", "zen928", "call928",
-                    "stale928"):
+                    "stale928", "hands314", "warp929"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -1690,9 +1720,10 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                     and eos is not None and e["t"] >= eos and (not nxt or e["t"] < nxt[0])]
             row["submit_ms"] = round((subs[0] - eos) * 1000) if subs else None
         if "desk" in box:
-            report["closed_tabs"] = [t["name"] for t in box["desk"].closed]
-            report["tabs_left"] = [t["name"] for t in box["desk"].tabs]
-            report["app_volumes"] = dict(box["desk"].mixer.levels)
+            report["closed_tabs"] = [t["name"] for t in getattr(box["desk"], "closed", [])]
+            report["tabs_left"] = [t["name"] for t in getattr(box["desk"], "tabs", [])]
+            mixer = getattr(box["desk"], "mixer", None)
+            report["app_volumes"] = dict(mixer.levels) if mixer is not None else {}
     if scenario in ("hands", "hands3"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
@@ -1781,10 +1812,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
                                          "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927",
                                          "zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead",
-                                         "cut_stop", "warp929", "all"))
+                                         "cut_stop", "warp929", "hands314", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
+    ap.add_argument("--grounding-source", dest="grounding_source", choices=("relevant", "related"), default=None,
+                    help="v3.14: the talker's memory lookup (fast memory, or the whole-memory related block)")
     ap.add_argument("--serve-embedder", dest="serve_embedder", action="store_true",
                     help="serve the embedder from a stand-in memory service process on the DB copy")
     ap.add_argument("--add-rule", dest="add_rule", default="", help="a standing rule added to the temp DB copy")
@@ -1795,6 +1828,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db", type=Path, help="a COPY of memory.db (it is copied again into a temp folder)")
     ap.add_argument("--tts", default="deepgram", choices=("deepgram", "elevenlabs", "gemini"))
     ap.add_argument("--voice", default="")
+    ap.add_argument("--tts-cache-dir", dest="tts_cache_dir", type=Path, default=None,
+                    help="the voice cache folder for this run (default: a fresh one in the run's temp folder)")
     ap.add_argument("--idle", type=float, default=8.0)
     ap.add_argument("--max-s", dest="max_s", type=float, default=240.0)
     ap.add_argument("--eager", type=float, default=None)

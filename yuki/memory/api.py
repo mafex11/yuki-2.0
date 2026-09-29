@@ -270,6 +270,24 @@ class MemoryClient:
                 self._embedder = EmbedClient(self.store.cipher, self.store.path)
             return self._embedder
 
+    # -- Now: the memory service's live picture of the screen (yuki.memory.now, 2026-09-29) -------------
+
+    def now(self, wait_s: float = 0.05) -> dict[str, Any] | None:
+        """What the memory service last read of every visible window, popup and toast, in RAM
+        (:meth:`yuki.memory.now.NowBoard.snapshot`), or ``None`` when the service does not answer within
+        ``wait_s``.  No model call, no database read."""
+        from yuki.memory.now import shared_client
+
+        client = shared_client(self.store.path)
+        return client.now(wait_s=wait_s) if client is not None else None
+
+    def now_text(self, *, foreground: int | None = None, wait_s: float = 0.05, **caps: Any) -> str:
+        """:meth:`now` formatted by :func:`yuki.memory.now.format_now` (``caps``: its size limits); ``""``
+        without an answer."""
+        from yuki.memory.now import format_now
+
+        return format_now(self.now(wait_s), foreground=foreground, **caps)
+
     def _embed(self, text: str, wait_s: float | None = None) -> np.ndarray | None:
         """Embedding of ``text``, or ``None`` if none could be had within ``wait_s`` (default: a long bound).
 
@@ -2190,6 +2208,172 @@ class MemoryClient:
         return [{"ref": f"resource:{f.id}", "id": f.id, "what": f.subject, "value": f.value, "text": f.text,
                  "keyterms": list(f.keyterms), "confirmed": AS_HEARD_NOTE not in (f.text or ""),
                  "since": _iso(f.valid_from)} for f in rows]
+
+    # ======================================================================================================
+    # Connecting the dots (2026-09-29, migration 23; docs/MEMORY.md "Threads of work" and "Connecting the dots"):
+    # the whole-memory ranking from the user's words and their screen, the freshest screens, threads of work,
+    # what came before a moment, links seen. Nothing here calls a model.
+    # ======================================================================================================
+
+    def screen_related(self, wait_s: float = 0.03) -> dict | None:
+        """The memory service's screen-triggered recall (:mod:`yuki.memory.screenrecall`): the screen it last
+        ranked memory against, its thread of work and the best memories (ids and scores), over the embedder's
+        pipe; ``None`` when no service answers within ``wait_s``. Never raises."""
+        from yuki.memory.screenrecall import OP
+
+        try:
+            call = getattr(self.embedder, "call", None)
+            reply = call(OP, wait_s) if callable(call) else None
+        except Exception:
+            return None
+        cache = (reply or {}).get("cache")
+        return cache if isinstance(cache, dict) else None
+
+    def related(self, query: str = "", *, previous: str | None = None, screen: Any = None, limit: int | None = None,
+                voice: bool = False, embed_wait_s: float | None = None, now: float | None = None,
+                with_recent: bool = True) -> dict:
+        """What the whole memory holds that bears on this moment: ranked from the user's words (and the previous
+        message), what is on their screen now and their current thread of work, across every kind of memory
+        (:func:`yuki.memory.related.related`). ``screen``: a live picture from the caller (a dict with ``app``,
+        ``title``, ``host``, ``url``, ``text``; or text), else the service's screen recall, else the newest
+        capture. Returns ``{"items", "screen", "threads", "recent", "timing"}``. Never raises."""
+        from yuki.memory import related as rel
+
+        try:
+            service = None if screen is not None else self.screen_related()
+            return rel.related(self, query, previous=previous, screen=screen, limit=limit, voice=voice,
+                               embed_wait_s=embed_wait_s, now=now, service=service, with_recent=with_recent)
+        except Exception as exc:
+            return {"items": [], "screen": None, "threads": [], "recent": [], "timing": {"error": type(exc).__name__}}
+
+    def warm_related(self) -> dict:
+        """Load the whole-memory index now (the first :meth:`related` of a process otherwise builds it: ~1 s on
+        the real memory of 2026-09-29). Returns its rows per kind; never raises."""
+        try:
+            return self.relevant_index.refresh()
+        except Exception:
+            return {}
+
+    def related_text(self, query: str = "", *, voice: bool = False, **kwargs: Any) -> str | None:
+        """:meth:`related` as the block a request gets (``voice``: the talker's compact one), ``None`` for none."""
+        from yuki.memory import related as rel
+
+        return rel.block_text(self.related(query, voice=voice, **kwargs), voice=voice)
+
+    def recent(self, minutes: float = 45.0, chars: int = 1_800, now: float | None = None) -> list[dict]:
+        """The freshest layer: the last ``minutes`` of screens, condensed and capped (:func:`yuki.memory.related.recent`):
+        ``[{"start", "end", "app", "title", "host", "kind", "text", "thread_id", "by_yuki"}]``, oldest first."""
+        from yuki.memory import related as rel
+
+        return rel.recent(self.store, minutes=minutes, chars=chars, now=now)
+
+    @staticmethod
+    def _thread_dict(t: Any) -> dict:
+        from yuki.memory.workthreads import thread_line
+
+        return {"ref": f"thread:{t.id}", "id": t.id, "title": t.title, "status": t.status, "state": t.state,
+                "open": list(t.open_items), "involves": list(t.entities), "first_seen": _iso(t.first_seen),
+                "last_seen": _iso(t.last_seen), "events": t.events, "importance": t.importance,
+                "line": thread_line(t)}
+
+    @staticmethod
+    def thread_id_of(ref: Any) -> int | None:
+        """``thread:12`` / ``W12`` / ``12`` -> 12 (the id formats the lists show)."""
+        text = str(ref or "").strip().strip("[]")
+        text = text.split(":")[-1].lstrip("Ww")
+        return int(text) if text.isdigit() else None
+
+    def threads(self, statuses: Any = ("active", "paused"), query: str | None = None, limit: int = 12,
+                embed_wait_s: float | None = None) -> list[dict]:
+        """The user's threads of work, most recently touched first (``query``: closest in meaning first, any
+        status but merged). Each: ``{"ref": "thread:N", "id", "title", "status", "state", "open", "involves",
+        "first_seen", "last_seen", "events", "importance", "line"}``. Never raises."""
+        try:
+            if query and query.strip():
+                pool = self.store.work_threads(("active", "paused", "done"))
+                vec = self._embed(query.strip(), embed_wait_s)
+                if vec is not None and pool:
+                    vecs = self.store.work_thread_vectors([t.id for t in pool])
+                    q = np.asarray(vec, dtype=np.float32)
+                    q = q / (float(np.linalg.norm(q)) or 1.0)
+
+                    def score(t: Any) -> float:
+                        v = vecs.get(t.id)
+                        if v is None or v.shape != q.shape:
+                            return -1.0
+                        return float(v @ q / (float(np.linalg.norm(v)) or 1.0))
+
+                    pool.sort(key=lambda t: -score(t))
+                rows = pool[: max(0, int(limit))]
+            else:
+                rows = self.store.work_threads(tuple(statuses) if statuses else None, limit=max(0, int(limit)))
+            return [self._thread_dict(t) for t in rows]
+        except Exception:
+            return []
+
+    def thread(self, ref: Any) -> dict | None:
+        """One thread of work with what is linked to it: ``{**thread, "events": [...], "facts": [...], "episodes":
+        [...], "calls": [...], "chats": [...], "links": [...]}`` (merged threads followed). ``None`` if unknown."""
+        from yuki.memory import links as _links
+        from yuki.memory.workthreads import describe_thread
+
+        tid = self.thread_id_of(ref)
+        tid = self.store.resolve_work_thread(tid) if tid is not None else None
+        t = self.store.work_thread(tid) if tid is not None else None
+        if t is None:
+            return None
+        d = describe_thread(self.store, t)
+        secs = _links.seconds_of(self.store, d["links"])
+        return {
+            **self._thread_dict(t),
+            "events": [{"at": _iso(e["at"]), "action": e["action"], "app": e["app"], "host": e["host"],
+                        "state": e["state"]} for e in d["events"]],
+            "facts": [{"at": _iso(j.at), "app": j.app, "fact": j.fact, "nature": j.nature,
+                       "source": describe_source(j.source, app=j.app, at=j.at)} for j in d["facts"]],
+            "episodes": [{"start": _iso(e.started_at), "end": _iso(e.ended_at), "text": e.text} for e in d["episodes"]],
+            "calls": [{"ref": f"call:{c.id}", "app": c.app, "start": _iso(c.recording_started_at or c.detected_at),
+                       "end": _iso(c.ended_at)} for c in d["calls"]],
+            "chats": [{"start": _iso(s.started_at), "end": _iso(s.ended_at), "text": s.text} for s in d["chats"]],
+            "links": [{"url": link.url, "title": link.title, "line": _links.describe(link, secs.get(link.id))}
+                      for link in d["links"]],
+        }
+
+    def before(self, at: Any = None, event: str = "break", minutes: float = 90.0) -> dict:
+        """What the user was doing before a moment: the break nearest ``at`` (or, with no ``at``, the latest
+        break: "where I left off") and the stretch before it, as the coach's welcome back rebuilds it; or with
+        ``event="time"`` the stretch that ended at ``at`` (:func:`yuki.memory.before.before`). Returns ``{"event",
+        "break", "since", "until" (ISO), "text", "breaks": [...], "threads": [thread dicts], "ok"}``."""
+        from yuki.memory import before as _before
+
+        result = _before.before(self.store, _time_arg(at), event=event, minutes=float(minutes))
+        brk = result.get("break")
+        return {**result, "at": _iso(result.get("at")), "since": _iso(result.get("since")),
+                "until": _iso(result.get("until")),
+                "break": ({**brk, "start": _iso(brk["start"]), "end": _iso(brk.get("end"))} if brk else None),
+                "breaks_text": _before.breaks_text(result.get("breaks") or []),
+                "breaks": [{**b, "start": _iso(b["start"]), "end": _iso(b.get("end"))} for b in result.get("breaks") or []],
+                "threads": [self._thread_dict(t) for t in result.get("threads") or []]}
+
+    def links(self, query: str | None = None, since: Any = None, until: Any = None, how: str | None = None,
+              limit: int = 10, embed_wait_s: float | None = None) -> list[dict]:
+        """Links seen - pages the user had in front and links shared with them in conversations - best first
+        (by meaning with ``query``, else most recently seen). Each: ``{"ref": "link:N", "url", "title", "host",
+        "app", "how", "sender", "where", "first_seen", "last_seen", "seconds", "visits", "thread", "by_yuki",
+        "line"}``. Never raises."""
+        from yuki.memory import links as _links
+
+        try:
+            found = _links.search(self.store, (lambda texts: self.embedder.embed(texts, embed_wait_s)),
+                                  query, since=_time_arg(since), until=_time_arg(until), how=how, limit=limit)
+            secs = _links.seconds_of(self.store, found)
+        except Exception:
+            return []
+        return [{"ref": f"link:{link.id}", "url": link.url, "title": link.title, "host": link.host, "app": link.app,
+                 "how": link.how, "sender": link.sender, "where": link.where, "first_seen": _iso(link.first_seen),
+                 "last_seen": _iso(link.last_seen), "seconds": round(secs.get(link.id, 0.0), 1), "visits": link.visits,
+                 "thread": f"thread:{link.work_thread_id}" if link.work_thread_id else None, "by_yuki": link.by_yuki,
+                 "score": link.score, "line": _links.describe(link, secs.get(link.id))} for link in found]
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",

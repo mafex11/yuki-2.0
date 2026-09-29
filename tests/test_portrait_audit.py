@@ -164,7 +164,7 @@ def test_call_side_questions_are_stored_with_their_evidence(store):
     from yuki.memory.journal import system_text
 
     assert "ASK ABOUT NAMES" in system_text(client.requests[0]["system"])
-    assert RECORD_CALL_SIDE_TOOL["input_schema"]["required"] == ["facts", "commitments", "questions"]
+    assert RECORD_CALL_SIDE_TOOL["input_schema"]["required"] == ["facts", "commitments", "questions", "work"]
 
 
 # -- the audit ------------------------------------------------------------------------------------

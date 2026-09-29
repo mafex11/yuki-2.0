@@ -385,7 +385,7 @@ def test_one_still_on_it_line_only_into_silence() -> None:
         await _settle()
         job = rt.submitted[0][0]
         rt.started.emit("worker", job, "x")
-        rt.tool_called.emit("worker", job, "read_file", {"path": "x"})
+        rt.tool_called.emit("worker", job, "read_file", {"say_now": "Reading the invoices.", "path": "x"})
         await asyncio.sleep(0.2)
         await _settle()
         assert not [r for r, _ in params.results if "still_working_on" in r]  # someone is speaking: nothing
@@ -393,10 +393,12 @@ def test_one_still_on_it_line_only_into_silence() -> None:
         await asyncio.sleep(0.5)
         await _settle()
         lines = [r for r, _ in params.results if "still_working_on" in r]
-        assert len(lines) == 1 and lines[0]["now"] and lines[0]["for_seconds"] >= 0
+        # v3.14: it names the thinker's own words for the running step, never the tool's generic label
+        assert lines and lines[0]["now"] == "Reading the invoices." and lines[0]["for_seconds"] >= 0
         await asyncio.sleep(0.4)
         await _settle()
-        assert len([r for r, _ in params.results if "still_working_on" in r]) == 1  # one line, never a second
+        # at most voice_progress_lines (2) for a job nobody acknowledged (v3.14: the setting holds)
+        assert len([r for r, _ in params.results if "still_working_on" in r]) == 2
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -404,9 +406,9 @@ def test_one_still_on_it_line_only_into_silence() -> None:
     asyncio.run(main())
 
 
-def test_an_acknowledged_job_gets_no_waiting_line_until_its_outcome() -> None:
-    """v3.10: "acknowledge once, then stay quiet until the outcome" (live 09:08:11 "Still on it, switching tabs now."
-    after "On it." sounded like a second voice)."""
+def test_an_acknowledged_job_gets_one_waiting_line_after_real_silence() -> None:
+    """v3.14 (was v3.10's "no line at all"): after "On it." and real silence, one "still on it", never a second. The
+    09:08 "second voice" came from the tool's generic label; the line now names only the thinker's own words."""
     async def main() -> None:
         rt, bridge = _bridge(settings=Settings(voice_wait_line_s=0.05, voice_wait_again_s=0.1))
         bridge.quiet_for = lambda: 10.0
@@ -417,7 +419,8 @@ def test_an_acknowledged_job_gets_no_waiting_line_until_its_outcome() -> None:
         rt.started.emit("worker", job, "x")
         await asyncio.sleep(0.4)
         await _settle()
-        assert not [r for r, _ in params.results if "still_working_on" in r]
+        lines = [r for r, _ in params.results if "still_working_on" in r]
+        assert len(lines) == 1 and "now" not in lines[0]   # no step running: no step named
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -569,6 +572,8 @@ def test_a_hand_that_did_not_take_is_passed_to_the_thinker_without_a_talker_run(
         old = hands_module._WATCH_S
         hands_module._WATCH_S = 0.05
         try:
+            bridge.user_turns = lambda: 1
+            bridge.acked()   # their words were acknowledged already (v3.14: then no talker run at all, as in v3.9)
             params = _hand_params("media_key", {"key": "playpause", "want": "paused", "say_when_done": "Paused."})
             await hands.handle(params)
         finally:

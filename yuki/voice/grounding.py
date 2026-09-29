@@ -56,6 +56,8 @@ class Lookup:
     ms: float | None = None
     error: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
+    #: The whole-memory block itself when the lookup's source gives one (``related``, v3.14), else ``None``.
+    block: str | None = None
 
 
 #: Know-how lines shown with the lookup: how things were done right on this PC (v3.5).
@@ -81,6 +83,14 @@ def _lookup(client: Any, text: str, keep: int) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 - the facts are enough
         howto = []
     return facts + [{"kind": "know-how", "fact": line} for line in howto or []]
+
+
+def _related(client: Any, text: str, keep: int) -> tuple[str | None, list[dict[str, Any]]]:
+    """The whole-memory block for the talker (``MemoryClient.related_text(voice=True)``), else the v3.5 lookup."""
+    block = getattr(client, "related_text", None)
+    if not callable(block):
+        return None, _lookup(client, text, keep)
+    return block(text, voice=True, embed_wait_s=EMBED_WAIT_S), []
 
 
 def _when(iso: str | None, now: datetime) -> str:
@@ -123,11 +133,16 @@ class Grounder:
         log: Content-free voice log, or ``None``.
     """
 
-    def __init__(self, memory: Any, *, facts: int = 4, log: Any = None) -> None:
+    def __init__(self, memory: Any, *, facts: int = 4, log: Any = None, source: str = "relevant") -> None:
         self.memory = memory
         self.keep = facts
         self.log = log
+        #: Where a turn's memory comes from (v3.14, ``Settings.voice_grounding_source``): ``relevant`` (fast memory
+        #: and know-how by the user's words, as since v3.5) or ``related`` (the memory builder's whole-memory
+        #: ``MemoryClient.related_text(voice=True)``: words, screen and threads of work), one switch to swap them.
+        self.lookup_source = source
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-ground")
+        self._pool.submit(lambda: None)   # its thread starts now, not on the loop's first lookup (v3.14)
         self._lock = threading.Lock()
         self._turn = 0
         self._running: Lookup | None = None
@@ -163,11 +178,17 @@ class Grounder:
                 self.source = self.memory.call("voice_grounding_warm",
                                                lambda c: c.embedder.warm(allow_local=False), timeout_s=5.0)
                 if self.source != "remote" and not self.embedder_was_loaded:
-                    # No service embedder to ask: the lookup would load ~550 MB into the tray
+                    # No service embedder to ask: the lookup would load a second embedder into the tray
                     # for a hint. This conversation goes without it (memory questions go to the brain).
                     self.disabled = True
+                elif self.lookup_source == "related":
+                    # The whole-memory index, built now rather than inside the first turn's lookup (~1 s).
+                    self.memory.call("voice_related_warm",
+                                     lambda c: c.warm_related() if callable(getattr(c, "warm_related", None)) else {},
+                                     timeout_s=5.0)
                 self._log("grounding", op="warm", ms=round((time.perf_counter() - started) * 1000),
-                          source=self.source, was_loaded=self.embedder_was_loaded, disabled=self.disabled)
+                          source=self.source, lookup=self.lookup_source, was_loaded=self.embedder_was_loaded,
+                          disabled=self.disabled)
             except Exception as exc:  # noqa: BLE001 - voice works without it
                 self._log("grounding", op="warm", error=f"{type(exc).__name__}: {str(exc)[:160]}")
             finally:
@@ -238,8 +259,12 @@ class Grounder:
             lookup.done.set()
             return
         try:
-            lookup.facts = self.memory.call("voice_grounding", lambda c: _lookup(c, lookup.text, self.keep),
-                                            timeout_s=2.0)
+            if self.lookup_source == "related":
+                lookup.block, lookup.facts = self.memory.call(
+                    "voice_grounding", lambda c: _related(c, lookup.text, self.keep), timeout_s=2.0) or (None, [])
+            else:
+                lookup.facts = self.memory.call("voice_grounding", lambda c: _lookup(c, lookup.text, self.keep),
+                                                timeout_s=2.0)
         except Exception as exc:  # noqa: BLE001
             lookup.error = f"{type(exc).__name__}: {str(exc)[:120]}"
         lookup.ms = (time.perf_counter() - lookup.started) * 1000

@@ -28,6 +28,7 @@ spoken exchange to memory's turn log (encrypted), marked as voice:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import os
 import time
 from datetime import datetime
@@ -334,6 +335,7 @@ class LlmCall:
     grounded: float | None = None       # grounding wait over
     grounding: str = "off"              # final | partial | previous | none | off
     facts: int = 0
+    grounding_chars: int = 0            # the memory text attached (v3.14: the related block's size)
     sent: float | None = None           # the API request went out
     opened: float | None = None         # the stream was open (response headers)
     first_event: float | None = None    # message_start
@@ -1582,6 +1584,7 @@ class TurnObserver:
             "transcript_to_context_ms": ms(turn.transcript_at, turn.context_at),
             "llm_start_after_eos_ms": ms(turn.speech_end, c.entered) if c else None,
             "grounding": c.grounding if c else None, "grounding_facts": c.facts if c else None,
+            "grounding_chars": c.grounding_chars if c else None,
             "grounding_wait_ms": ms(c.entered, c.grounded) if c else None,
             "desk": c.desk if c else None, "desk_ms": c.desk_ms if c else None,
             "desk_chars": c.desk_chars if c else None,
@@ -1623,15 +1626,28 @@ class TurnObserver:
             # talk the mouth judged was for someone else (the people on a call, dictation to another app)
             # is stored as "others" and never extracted into memory; the thinker is never handed it either
             # (``quiet_answered``).
+            memory, log = self.memory, self.log
+            fields = dict(request_id=f"voice-{self.session}-{turn.n}", at=time.time(), user_text=turn.user_text,
+                          reply_text=reply, actions=[f"{name} (by voice)" for name in turn.tools], outcome="voice",
+                          addressed=addressed)
+
+            def write() -> None:
+                try:
+                    memory.log_turn(**fields)
+                except Exception as exc:  # noqa: BLE001 - memory never breaks voice
+                    if log is not None:
+                        log.event("memory_turn", error=f"{type(exc).__name__}: {exc}")
+
             try:
-                self.memory.log_turn(
-                    request_id=f"voice-{self.session}-{turn.n}", at=time.time(),
-                    user_text=turn.user_text, reply_text=reply,
-                    actions=[f"{name} (by voice)" for name in turn.tools], outcome="voice", addressed=addressed,
-                )
-            except Exception as exc:  # noqa: BLE001 - memory never breaks voice
-                if self.log is not None:
-                    self.log.event("memory_turn", error=f"{type(exc).__name__}: {exc}")
+                asyncio.get_running_loop()
+            except RuntimeError:
+                write()   # not on a loop (a test's observer, a closing conversation): as before
+            else:
+                # Off the voice loop, in order (v3.14): memory's first log_turn starts its writer thread, and a
+                # thread's start waits for the interpreter lock (0.5 s on the loop, offline 29 Sept).
+                from yuki.voice.workers import ordered
+
+                ordered().submit(write)
 
     # -- frames ------------------------------------------------------------------
 
@@ -1851,7 +1867,9 @@ class _Hooks:
         from yuki.voice.grounding import format_facts
 
         call.grounding, call.facts = how, len(lookup.facts)
-        return format_facts(lookup.facts)
+        text = lookup.block if lookup.block is not None else format_facts(lookup.facts)
+        call.grounding_chars = len(text or "")   # (lookup.block: the whole-memory block for the talker, v3.14)
+        return text
 
     def call_started(self, call: LlmCall) -> None:
         self.c.observer.call_started(call)
@@ -2073,6 +2091,8 @@ class Conversation:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.reason = "running"
         self.gate: Any = None
+        #: The thinker's step lines (yuki.voice.steplines, v3.14), made with the gate.
+        self.steps: Any = None
         self.grounder: Any = None
         self.observer = TurnObserver(
             settings=settings, log=log, memory=memory, session=session, speech_end=speech_end,
@@ -2204,6 +2224,9 @@ class Conversation:
         # Whether the mouth's reply now making a tool call said anything aloud (a stream fact).
         bridge.spoke_in_reply = lambda: bool(getattr(llm, "_yuki_call", None) is not None
                                              and llm._yuki_call.first_text is not None)
+        tts = getattr(self, "_tts", None)
+        if tts is not None and hasattr(tts, "_yuki_stale") and callable(getattr(bridge, "waiting_reply_stale", None)):
+            tts._yuki_stale = bridge.waiting_reply_stale   # a stale "still on it" reply is never heard (v3.14)
         # The say_first words spoken for a silent hand-over belong before its call, too.
         bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
         bridge.said_early = lambda call_id: str(call_id) in llm._yuki_early
@@ -2222,6 +2245,7 @@ class Conversation:
         bridge.on_jobs_changed = self._activity.set
         bridge.announce = self._announce
         bridge.gate = self.gate
+        bridge.steps = self.steps
         bridge.progress_answerer = self._progress_answer
         bridge.on_remembered = self._refresh_rules
         bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
@@ -2411,11 +2435,21 @@ class Conversation:
                     log.event(event, session=session, **facts)
 
             fallback_key = get_key(DEEPGRAM) if s.voice_tts_fallback == "deepgram" else None
+            cache = None
+            if getattr(s, "voice_tts_cache", True):
+                # v3.14: short lines she says often come back from disk at once (yuki.voice.ttscache)
+                from yuki.voice.ttscache import TTSCache
+
+                cache = TTSCache(Path(s.voice_tts_cache_dir) if getattr(s, "voice_tts_cache_dir", "") else None)
+                self._tts_cache = cache
+                from yuki.voice.workers import shared as _workers
+
+                _workers().submit(cache.preload)   # its index read off the loop, before the first reply
             tts = _clause_tts(service_class())(
                 api_key=get_key(GOOGLE) or "", model=s.voice_gemini_model, voice=s.voice_gemini_voice,
                 style=s.voice_gemini_style, first_audio_timeout_s=s.voice_gemini_first_audio_s,
                 fallback_key=fallback_key, fallback_voice=DEFAULT_VOICES["deepgram"], log=tts_log,
-                ssl=shared_ssl_context())
+                ssl=shared_ssl_context(), cache=cache)
         elif provider == "deepgram":
             from pipecat.services.deepgram.tts import DeepgramTTSService
 
@@ -2516,9 +2550,11 @@ class Conversation:
     # -- running -----------------------------------------------------------------
 
     #: Raw sound counts as the user talking only this soon after it (s), and not when a
-    #: stretch of it has gone on this long without speech recognition hearing a turn (noise).
+    #: stretch of it has gone on this long without speech recognition hearing a turn (noise). v3.14: 6 -> 2 s. Flux
+    #: reports a start of turn ~0.5-1 s into speech (docs/VOICE.md §6.4), so sound going on longer with no turn is a
+    #: video or the room; on the live logs of 27-29 Sept this held ready results 22.6 s in all (3-4 s each).
     SOUND_RECENT_S = 0.35
-    SOUND_MAX_STRETCH_S = 6.0
+    SOUND_MAX_STRETCH_S = 2.0
 
     def _gate_state(self) -> dict[str, Any]:
         state = self.observer.live_state()
@@ -2531,6 +2567,15 @@ class Conversation:
             state["user_sound"] = bool(last and now - last < self.SOUND_RECENT_S
                                        and (last - since) < self.SOUND_MAX_STRETCH_S)
         return state
+
+    def _step_state(self) -> dict[str, Any]:
+        """What the step-line voice needs to know now (v3.14): who is speaking, and how long nobody has."""
+        obs = self.observer
+        gate = self._gate_state()
+        return {"user_speaking": obs.user_speaking, "user_sound": bool(gate.get("user_sound")),
+                "bot_busy": bool(obs.bot_speaking or obs.generating or obs.speech_pending or obs.owes_reply
+                                 or self.bridge.busy_tools),
+                "call_mode": bool(self.call_app), "quiet_for": self._quiet_for()}
 
     async def _progress_answer(self, log_text: str, question: str) -> tuple[str | None, dict[str, Any]]:
         from yuki.voice.progress import answer_progress
@@ -2555,13 +2600,29 @@ class Conversation:
 
         s = self.settings
         self._loop = asyncio.get_running_loop()
+        # v3.14: every thread the loop's work runs on exists before anything is live (starting one from the loop
+        # stalled it 0.4-3.4 s under a busy interpreter lock; yuki.voice.workers).
+        from yuki.voice.workers import prestart_default_executor
+
+        executor_ms = await prestart_default_executor(self._loop)
+        self.log.event("session", state="executor", session=self.session, ms=round(executor_ms))
         self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
                                  cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log,
                                  final_gap_s=s.voice_final_gap_s, progress_pause_s=s.voice_progress_pause_s)
+        if getattr(s, "voice_step_lines", True):
+            # v3.14: the thinker's step and say lines, said by code in Yuki's one voice when a pause would be noticed.
+            from yuki.voice.steplines import StepLines
+
+            self.steps = StepLines(state=self._step_state, speak=self._speak,
+                                   on_said=getattr(self.bridge, "step_said", None), log=self.log,
+                                   silence_s=float(getattr(s, "voice_step_silence_s", 2.5)),
+                                   after_s=float(getattr(s, "voice_step_after_s", 0.8)),
+                                   long_silence_s=float(getattr(s, "voice_step_long_silence_s", 5.0)))
         if s.voice_grounding and self.memory is not None:
             from yuki.voice.grounding import Grounder
 
-            self.grounder = Grounder(self.memory, facts=s.voice_grounding_facts, log=self.log)
+            self.grounder = Grounder(self.memory, facts=s.voice_grounding_facts, log=self.log,
+                                     source=str(getattr(s, "voice_grounding_source", "relevant") or "relevant"))
             self.grounder.warm()
             self.observer.grounder = self.grounder
         self.observer.idle_state = lambda: "working" if self.bridge.open_voice_jobs() else "listening"
@@ -2600,6 +2661,8 @@ class Conversation:
                 self.log.event("speech_guard", op="summary", session=self.session, cost_usd=round(cost or 0.0, 6),
                                **summary)
             await self.gate.stop()
+            if self.steps is not None:
+                await self.steps.stop()
             self.observer.close()
             if self._bound:
                 self.bridge.closing = True
@@ -2612,6 +2675,12 @@ class Conversation:
                                p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
                                max_ms=round(timings[-1], 1) if timings else None)
             self.log.event("narrator", op="summary", **self.gate.stats)
+            cache = getattr(self, "_tts_cache", None)
+            if cache is not None:
+                self.log.event("tts_cache", op="summary", **cache.stats)   # counts only (v3.14)
+                from yuki.voice.workers import shared as _workers
+
+                _workers().submit(cache.flush)   # approvals not yet written with a put, off the loop
         if self.observer.fatal and self.reason == "running":
             self.reason = "error"
         return self.reason
@@ -2699,6 +2768,9 @@ class Conversation:
         watchdog = threading.Thread(target=self._stall_watch, args=(state, loop_thread), name="yuki-voice-watch",
                                     daemon=True)
         watchdog.start()
+        from yuki.voice import gcwatch
+
+        gcwatch.watch()   # long garbage collections are recorded from here on (v3.14)
         try:
             while True:
                 if self.dormant:   # nothing runs on the loop while dormant: look once a second, measure nothing
@@ -2712,7 +2784,12 @@ class Conversation:
                 lags.append(late)
                 if late >= report_ms:
                     stacks, state["stacks"] = state["stacks"], []
-                    self.log.event("loop_lag", ms=round(late), **({"where": stacks} if stacks else {}))
+                    from yuki.voice.gcwatch import pauses_between
+
+                    # v3.14: a garbage collection that overlapped the stall (it holds the interpreter lock)
+                    gcs = pauses_between(started, state["tick"])
+                    self.log.event("loop_lag", ms=round(late), **({"where": stacks} if stacks else {}),
+                                   **({"gc": gcs} if gcs else {}))
         except asyncio.CancelledError:
             state["stop"] = True
             if lags:
@@ -3100,6 +3177,15 @@ def _preimport() -> None:
         from anthropic.lib.bedrock._stream_decoder import get_response_stream_shape
 
         get_response_stream_shape()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # v3.14: Pipecat's sentence splitter loads NLTK and its punkt data the first time a reply is split, on the
+        # voice loop: measured 2026-09-29 in a fresh process 0.8 s to import and 1.2 s for the first sentence (disk
+        # and path checks), and live a 3.5 s loop stall inside nltk.pathsec. Loaded here once per process.
+        from pipecat.utils.string import match_endofsentence
+
+        match_endofsentence("Warm up. Then the rest")
     except Exception:  # noqa: BLE001
         pass
 

@@ -1524,6 +1524,18 @@ def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
             facts[f"{name}_ms"] = round((time.perf_counter() - t) * 1000)
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             facts[f"{name}_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    # v3.14: everything is imported now: one collection, then the heap so far is frozen, so the collector's later
+    # full passes (which hold the interpreter lock and so freeze the voice loop) walk only what came after
+    # (yuki.voice.gcwatch; measured there).
+    t = time.perf_counter()
+    try:
+        from yuki.voice import gcwatch
+
+        gcwatch.watch()
+        facts["gc"] = gcwatch.freeze_heap()
+        facts["gc_ms"] = round((time.perf_counter() - t) * 1000)
+    except Exception as exc:  # noqa: BLE001 - only an optimisation
+        facts["gc_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     facts["rss_after_mb"] = rss_mb()
     facts["ms"] = round((time.perf_counter() - started) * 1000)
     if log is not None:

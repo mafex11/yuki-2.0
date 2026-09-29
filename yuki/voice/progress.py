@@ -4,11 +4,8 @@
   runtime's signals: the request, each tool call (its label and a few
   harmless details of its input), each result's one-line summary, ``say``
   lines, questions, the outcome. Only real events go in; nothing is inferred.
-* :func:`step_of` turns a tool call into a progress step for the mouth, and
-  :class:`StepPacer` decides which steps are worth saying, by activity, never
-  by a clock: only a step of a kind not said before for that task (the same
-  tool again is the same step: gradient-bang's epoch), and at most
-  ``Settings.voice_progress_lines`` per task.
+* :func:`step_of` turns a tool call into a step (its label, for the job table and the log). Since v3.14 the
+  thinker's own step lines are said by :mod:`yuki.voice.steplines`, not paced here.
 * :func:`answer_progress` answers "how's it going?" with one isolated model
   call over that task's log alone (gradient-bang's ``query_task_progress`` with
   ``task_progress.md``): no conversation, no memory, nothing accumulated, and
@@ -77,34 +74,6 @@ def step_of(name: str, tool_input: dict[str, Any] | None) -> tuple[str, str] | N
         if isinstance(value, str) and value.strip() and len(value) <= 80:
             details.append(f"{key}: {value.strip()}")
     return label, "; ".join(details)
-
-
-class StepPacer:
-    """Which real steps become spoken progress: new kinds of step only, a few per task.
-
-    A step offered to the narrator counts against the cap until it is dropped
-    (superseded by a newer step or result, or gone stale), so a burst of calls
-    cannot queue more lines than the cap.
-    """
-
-    def __init__(self, max_lines: int = 2) -> None:
-        self.max_lines = max_lines
-        self.offered: list[str] = []
-        self.last_seen: str | None = None
-
-    def offer(self, label: str) -> bool:
-        """Whether a step with this label should be offered to the narrator now (and count it)."""
-        repeat = label == self.last_seen
-        self.last_seen = label
-        if repeat or label in self.offered or len(self.offered) >= self.max_lines:
-            return False
-        self.offered.append(label)
-        return True
-
-    def dropped(self, label: str) -> None:
-        """An offered step was never said: it no longer counts."""
-        if label in self.offered:
-            self.offered.remove(label)
 
 
 async def answer_progress(client: Any, model: str, log_text: str, question: str, *,

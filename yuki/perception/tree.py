@@ -130,6 +130,13 @@ _P_IS_PASSWORD = 30019
 _P_SELECTION_ITEM_IS_SELECTED = 30079
 _P_TOGGLE_STATE = 30086
 _P_EXPAND_COLLAPSE_STATE = 30070
+#: What an element says about itself besides its name (Chromium: the ``title``
+#: attribute / tooltip is HelpText, ``aria-description`` FullDescription), and
+#: its place in a set of like items (``aria-posinset`` / a list's own count).
+_P_HELP_TEXT = 30013
+_P_FULL_DESCRIPTION = 30159
+_P_POSITION_IN_SET = 30152
+_P_SIZE_OF_SET = 30153
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -162,6 +169,10 @@ _CACHED_PROPERTIES = (
     _P_TOGGLE_STATE,
     _P_EXPAND_COLLAPSE_STATE,
 )
+
+#: Cached too when the provider knows them (added one by one: an older UIA
+#: without one simply reads it as absent).
+_OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET)
 
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_CHILDREN = 2
@@ -409,6 +420,27 @@ _MIN_COVERAGE = 0.25
 #: 400 rectangles, fine enough that a sidebar is not mistaken for the page.
 _COVERAGE_CELL = 32
 
+#: Below this share of the visible window covered by *content* leaves (the
+#: window's own element and window-sized containers left out, see
+#: :func:`content_coverage`) a settled window is **opaque**: it draws its own
+#: interface and UI Automation can neither read nor aim inside it.  Measured
+#: 2026-09-29 on this desktop: four Warp windows 0% (one element each: the
+#: window itself, which the older leaf coverage counted as 100%), a Chrome page
+#: 60-95%, Task Manager's grid of unnamed panes above 20%.  A fact about
+#: rectangles, never about which program drew them.
+OPAQUE_COVERAGE = 0.05
+
+#: A container covering at least this share of the visible window says nothing
+#: about what is drawn inside it (a frame, a page wrapper, a GPU surface).
+_WINDOW_SIZED = 0.9
+
+#: How long a window measured opaque is read without the lazy-tree wake polling
+#: (it was already watched: a Warp read went 1.1 s -> ~0.1 s without it).  A
+#: freshly opened window (:func:`note_window_fresh`, a young process) still gets
+#: the patience.
+_OPAQUE_MEMO_S = 600.0
+_opaque_windows: dict[int, float] = {}
+
 #: Slack (px) when comparing an element's rectangle against the viewport or a
 #: window rectangle - providers round differently from ``GetWindowRect``.
 _EDGE_SLACK = 2
@@ -451,6 +483,14 @@ class UIElement:
     #: (or when not known).  Depth alone cannot say this: an ancestor that was
     #: not kept (layout padding) leaves two unrelated branches at the same depths.
     parent: int = -1
+    #: What the element says about itself besides its name: its UIA HelpText
+    #: (a web page's tooltip ``title``) or FullDescription (``aria-description``),
+    #: when it differs from the name; ``""`` otherwise.  An icon button with no
+    #: name often has one.
+    description: str = ""
+    #: ``(PositionInSet, SizeOfSet)`` when the provider reports them (a list's
+    #: own numbering, ``aria-posinset``), else ``None``.
+    position: tuple[int, int] | None = None
 
 
 #: The pattern flags :class:`UIElement` reports, in the order they are listed:
@@ -501,6 +541,13 @@ class WindowTree:
     #: page's window is on top of them: a browser's background tabs (see
     #: :meth:`_ViewportPass._background_page`).
     background_pages: int = 0
+    #: Share of the window's visible area covered by content leaves
+    #: (:func:`content_coverage`), ``None`` when not measured.
+    coverage: float | None = None
+    #: The window answered and settled, and its content leaves cover less than
+    #: :data:`OPAQUE_COVERAGE` of it: it draws its own interface, so nothing
+    #: inside it can be read or aimed at through UI Automation.
+    opaque: bool = False
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -528,6 +575,10 @@ class FocusInfo:
             field is empty and the caller should say "unknown" rather than "none".
         has_value: whether the element exposes a Value pattern at all, so that
             ``value is None`` can be read as "empty" rather than "not known".
+        error: why ``ok`` is False: ``"no answer within 0.6 s"`` (a timeout) or
+            the UIA error; ``""`` when UIA answered.  A timeout is never
+            reported as "nothing focused" (that is ``ok`` with no role).
+        elapsed_ms: how long the read took.
     """
 
     role: str = ""
@@ -538,11 +589,13 @@ class FocusInfo:
     shortcut: str | None = None
     ok: bool = False
     has_value: bool = False
+    error: str = ""
+    elapsed_ms: float = 0.0
 
     def describe(self) -> str:
         """One short phrase: ``Edit "What do you want to play?"``."""
         if not self.ok:
-            return "unknown"
+            return f"unknown ({self.error})" if self.error else "unknown"
         if not self.role and not self.name:
             return "nothing"
         parts = [self.role or "element"]
@@ -739,6 +792,37 @@ def _rect(value: object) -> tuple[int, int, int, int] | None:
     return (left, top, left + width, top + height)
 
 
+#: Longest description kept per element (a tooltip, an aria-description).
+_MAX_DESCRIPTION_CHARS = 120
+
+
+def _description(get: object, name: str) -> str:
+    """HelpText, else FullDescription, when it says something the name does not."""
+    for prop in (_P_HELP_TEXT, _P_FULL_DESCRIPTION):
+        try:
+            text = " ".join(_as_text(get(prop)).split())  # type: ignore[operator]
+        except Exception:
+            continue
+        if text and text != name:
+            return text[:_MAX_DESCRIPTION_CHARS]
+    return ""
+
+
+def _set_position(get: object) -> tuple[int, int] | None:
+    """``(PositionInSet, SizeOfSet)`` when the provider gives both as a sensible pair."""
+    try:
+        position = get(_P_POSITION_IN_SET)  # type: ignore[operator]
+        size = get(_P_SIZE_OF_SET)  # type: ignore[operator]
+    except Exception:
+        return None
+    if (
+        isinstance(position, int) and isinstance(size, int) and not isinstance(position, bool)
+        and 0 < position <= size
+    ):
+        return (position, size)
+    return None
+
+
 def _states(get: object) -> tuple[str, ...]:
     """Current state from the cached SelectionItem/Toggle/ExpandCollapse values.
 
@@ -926,6 +1010,8 @@ class _CachedWalker:
                 patterns=patterns if is_interactive else (),
                 states=states,
                 parent=next((entry[1] for entry in reversed(lineage[:-1]) if entry[1] >= 0), -1),
+                description=_description(get, name),
+                position=_set_position(get),
             )
         )
         lineage[-1][1] = len(self.elements) - 1
@@ -1025,6 +1111,11 @@ def _build_cache_request(
     request = automation.CreateCacheRequest()  # type: ignore[attr-defined]
     for prop in _CACHED_PROPERTIES:
         request.AddProperty(prop)
+    for prop in _OPTIONAL_PROPERTIES:
+        try:
+            request.AddProperty(prop)
+        except Exception:
+            pass  # an older UIA without it: reads as absent
     request.TreeScope = scope
     request.TreeFilter = (
         tree_filter
@@ -2365,6 +2456,54 @@ def _leaf_coverage(
     return grid.count(1) / len(grid)
 
 
+def content_coverage(
+    elements: list[UIElement], viewport: tuple[int, int, int, int] | None
+) -> float | None:
+    """Share of ``viewport`` covered by *content* leaves (0..1), ``None`` without a viewport.
+
+    :func:`_leaf_coverage` with two kinds of element left out, because neither
+    says anything is drawn where it sits: the window's own element (depth 0) and
+    any element covering at least :data:`_WINDOW_SIZED` of the viewport (a frame,
+    a page wrapper, a surface).  A window whose tree is only its own element
+    (a GPU-drawn terminal) comes out at 0 here, where the leaf coverage counted
+    that one element as covering everything.  Rectangles only.
+    """
+    if viewport is None:
+        return None
+    view_area = max(_area(viewport), 1)
+    kept: list[UIElement] = []
+    for element in elements:
+        if element.depth <= 0:
+            continue
+        visible = _overlap(element.bounds, viewport)
+        if visible is not None and _area(visible) >= _WINDOW_SIZED * view_area:
+            continue
+        kept.append(element)
+    if not kept:
+        return 0.0
+    # Depth order is kept, so "leaf" still means "nothing kept below it".
+    return _leaf_coverage(kept, viewport)
+
+
+def _note_opaque(hwnd: int, opaque: bool) -> None:
+    """Remember (or forget) that ``hwnd`` was measured opaque (see :data:`_OPAQUE_MEMO_S`)."""
+    now = time.monotonic()
+    with _fresh_lock:
+        for stale in [h for h, at in _opaque_windows.items() if now - at >= _OPAQUE_MEMO_S]:
+            del _opaque_windows[stale]
+        if opaque:
+            _opaque_windows[int(hwnd)] = now
+        else:
+            _opaque_windows.pop(int(hwnd), None)
+
+
+def measured_opaque(hwnd: int) -> bool:
+    """Whether a read of ``hwnd`` in the last :data:`_OPAQUE_MEMO_S` found it opaque."""
+    with _fresh_lock:
+        at = _opaque_windows.get(int(hwnd))
+    return at is not None and time.monotonic() - at < _OPAQUE_MEMO_S
+
+
 @dataclass
 class _Gaps:
     """What a pass left unexplained (see :func:`_surface_gaps`)."""
@@ -2498,6 +2637,10 @@ def _walk_window(
         or _surface_gaps(best).any
     )
     if not thin or len(best.elements) >= max_elements or time.monotonic() >= deadline:
+        return best
+    if not young and measured_opaque(hwnd):
+        # Measured opaque minutes ago and not just opened: it was already watched
+        # for a tree to wake, and polling it again only costs the reader time.
         return best
 
     poll_started = time.monotonic()
@@ -2757,8 +2900,22 @@ def get_window_tree(
             f"frame down to {where} - what comes after that in the tree was not read"
         )
     status = "ok" if elements else "empty"
+    coverage = content_coverage(elements, chosen.viewport) if elements else None
+    opaque = (
+        status == "ok" and not partial and not young
+        and coverage is not None and coverage < OPAQUE_COVERAGE
+    )
+    _note_opaque(hwnd, opaque)
     if status == "empty":
         note = "the window answered but exposes no elements with a size on screen"
+    elif opaque:
+        note = (
+            f"OPAQUE: this window draws its own interface - UI Automation exposes "
+            f"{len(elements)} element(s), covering {coverage:.0%} of it with content, so "
+            f"what it shows cannot be read or aimed at from here and any x,y inside it "
+            f"would be a guess; use the app's own keyboard shortcuts and check its title "
+            f"after each step, or the app's own data when it is given"
+        )
     elif not partial:
         gaps = _surface_gaps(chosen)
         if gaps.any:
@@ -2817,6 +2974,8 @@ def get_window_tree(
         offscreen_skipped=chosen.offscreen_skipped,
         fetches=chosen.fetches,
         background_pages=chosen.background_pages,
+        coverage=round(coverage, 3) if coverage is not None else None,
+        opaque=opaque,
     )
 
 
@@ -3783,11 +3942,15 @@ def focused_element(*, timeout_s: float = _FOCUS_TIMEOUT_S) -> FocusInfo:
     ``timeout_s`` and not the calling thread.
 
     Returns:
-        A :class:`FocusInfo`.  ``ok`` is False if UIA never answered; the function
-        does not raise, because it is called to *describe* an action's outcome and
-        must never be the reason that action reports failure.
+        A :class:`FocusInfo`.  ``ok`` is False if UIA never answered, and then
+        ``error`` says why: ``"no answer within 0.6 s"`` for a timeout, the
+        exception otherwise - never the same thing as "nothing has focus" (``ok``
+        with no role).  The function does not raise, because it is called to
+        *describe* an action's outcome and must never be the reason that action
+        reports failure.
     """
     result: dict[str, object] = {}
+    started = time.perf_counter()
 
     def _worker() -> None:
         try:
@@ -3800,8 +3963,8 @@ def focused_element(*, timeout_s: float = _FOCUS_TIMEOUT_S) -> FocusInfo:
                 _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
             )
             result["focus"] = _read_focus(automation)
-        except BaseException:  # noqa: BLE001 - reported as ok=False
-            pass
+        except BaseException as exc:  # noqa: BLE001 - reported as ok=False with its reason
+            result["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             try:
                 comtypes.CoUninitialize()
@@ -3811,8 +3974,13 @@ def focused_element(*, timeout_s: float = _FOCUS_TIMEOUT_S) -> FocusInfo:
     thread = threading.Thread(target=_worker, name="yuki-uia-focus", daemon=True)
     thread.start()
     thread.join(timeout_s)
+    elapsed = (time.perf_counter() - started) * 1000.0
     focus = result.get("focus")
-    return focus if isinstance(focus, FocusInfo) else FocusInfo()
+    if isinstance(focus, FocusInfo):
+        focus.elapsed_ms = elapsed
+        return focus
+    error = str(result.get("error") or f"no answer within {timeout_s:g} s")
+    return FocusInfo(error=error, elapsed_ms=elapsed)
 
 
 @dataclass
@@ -3957,6 +4125,294 @@ def focused_text(
     return FocusText(
         reason=str(result.get("error") or f"UIA did not answer within {timeout_s:g} s")
     )
+
+
+# ---------------------------------------------------------------------------
+# "This" and "that": what has focus, and what is selected or around the caret
+# ---------------------------------------------------------------------------
+
+#: Characters of text kept on each side of the caret / selection, and of a selection itself.
+FOCUS_CONTEXT_CHARS = 200
+FOCUS_SELECTION_CHARS = 2000
+#: UIA's own connection/transaction timeouts for the focus reader's client (ms):
+#: a provider that hangs frees the reader within about this long.
+_FOCUS_UIA_TIMEOUT_MS = 500
+_CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
+
+
+@dataclass
+class FocusSnapshot:
+    """What the user is pointing at with the keyboard: the focused element, and its text around the caret.
+
+    Attributes:
+        ok: UIA answered.  When False, ``error`` says why (a timeout, a stuck
+            provider, a UIA error) - never the same as "nothing has focus", which
+            is ``ok`` with an empty ``role``.
+        role, name: the focused element's control type and name.
+        value: its Value pattern's value, clipped (``None`` without one, and
+            always for a password field).
+        hwnd: the element's own native window (0 inside a Chromium page).
+        window, window_title: the top-level window it is in.
+        accepts_text: typing now would go into it.
+        is_password: UIA IsPassword; nothing of its text is ever read.
+        selection: the selected text (Text pattern), clipped; ``""`` for none.
+        before, after: up to :data:`FOCUS_CONTEXT_CHARS` characters on each side
+            of the caret or selection.
+        text_source: ``"text"`` (Text pattern), ``"value"`` (Value only) or ``""``.
+        elapsed_ms: how long the read took.
+    """
+
+    ok: bool = False
+    error: str = ""
+    role: str = ""
+    name: str = ""
+    value: str | None = None
+    hwnd: int = 0
+    window: int = 0
+    window_title: str = ""
+    accepts_text: bool = False
+    is_password: bool = False
+    selection: str = ""
+    before: str = ""
+    after: str = ""
+    text_source: str = ""
+    elapsed_ms: float = 0.0
+
+    def line(self, limit: int = 160) -> str:
+        """One line for a reader: ``focus: Edit "Search" (takes text) in [123] "Title"; selected: "..."``."""
+        if not self.ok:
+            return f"focus: unknown ({self.error or 'no answer'})"
+        if not self.role and not self.name:
+            return "focus: nothing has keyboard focus"
+        what = self.role or "element"
+        if self.name:
+            what += f' "{_one_line(self.name, 60)}"'
+        if self.is_password:
+            what += " (a password field)"
+        elif self.accepts_text:
+            what += " (takes text)"
+        where = f' in [{self.window}] "{_one_line(self.window_title, 60)}"' if self.window else ""
+        text = f"focus: {what}{where}"
+        if self.selection:
+            text += f'; selected: "{_one_line(self.selection, limit)}"'
+        elif self.before or self.after:
+            text += f'; at the caret: "{_one_line(self.before[-limit // 2:], limit // 2)}|{_one_line(self.after[: limit // 2], limit // 2)}"'
+        elif self.value:
+            text += f'; value: "{_one_line(self.value, limit)}"'
+        return text
+
+
+def _range_text(text_range: object, limit: int) -> str:
+    try:
+        return str(text_range.GetText(int(limit)) or "")  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+
+
+def _read_focus_snapshot(automation: object, context_chars: int) -> FocusSnapshot:
+    """The focused element and its text around the caret.  Runs on the reader thread."""
+    element = automation.GetFocusedElement()  # type: ignore[attr-defined]
+    if not element:
+        return FocusSnapshot(ok=True)
+    request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
+    request.AddProperty(_P_IS_TEXT_AVAILABLE)
+    request.AddProperty(_P_IS_PASSWORD)
+    cached = element.BuildUpdatedCache(request)
+    get = cached.GetCachedPropertyValue
+    role = _role_name(get(_P_CONTROL_TYPE))
+    password = _as_bool(get(_P_IS_PASSWORD))
+    has_value = _as_bool(get(_P_IS_VALUE_AVAILABLE))
+    editable = has_value and not _as_bool(get(_P_VALUE_IS_READONLY))
+    has_text = _as_bool(get(_P_IS_TEXT_AVAILABLE))
+    try:
+        hwnd = int(get(_P_NATIVE_WINDOW_HANDLE) or 0)
+    except Exception:
+        hwnd = 0
+    snap = FocusSnapshot(
+        ok=True, role=role, name=_as_text(get(_P_NAME)), hwnd=hwnd, is_password=password,
+        accepts_text=editable or has_text or role in _TEXT_INPUT_ROLES,
+    )
+    if password:
+        return snap  # never a character of it
+    if has_value:
+        raw = get(_P_VALUE_VALUE)
+        if isinstance(raw, str) and raw:
+            snap.value = raw[:_MAX_VALUE_CHARS] + "…" if len(raw) > _MAX_VALUE_CHARS else raw
+            snap.text_source = "value"
+    if not has_text:
+        return snap
+    module = _uia_core()
+    try:
+        pattern = element.GetCurrentPattern(_PATTERN_TEXT).QueryInterface(
+            module.IUIAutomationTextPattern  # type: ignore[attr-defined]
+        )
+        selection = pattern.GetSelection()
+        if selection is None or selection.Length <= 0:
+            return snap
+        current = selection.GetElement(0)
+    except Exception:
+        return snap
+    snap.text_source = "text"
+    snap.selection = _range_text(current, FOCUS_SELECTION_CHARS)
+    around = max(int(context_chars), 0)
+    if around:
+        try:
+            before = current.Clone()
+            before.MoveEndpointByRange(_TEXT_ENDPOINT_END, current, _TEXT_ENDPOINT_START)
+            before.MoveEndpointByUnit(_TEXT_ENDPOINT_START, _TEXT_UNIT_CHARACTER, -around)
+            snap.before = _range_text(before, around + 1)[-around:]
+        except Exception:
+            pass
+        try:
+            after = current.Clone()
+            after.MoveEndpointByRange(_TEXT_ENDPOINT_START, current, _TEXT_ENDPOINT_END)
+            after.MoveEndpointByUnit(_TEXT_ENDPOINT_END, _TEXT_UNIT_CHARACTER, around)
+            snap.after = _range_text(after, around + 1)[:around]
+        except Exception:
+            pass
+    return snap
+
+
+class _FocusReader:
+    """One daemon thread with its own UIA client that answers focus questions within a bound.
+
+    A fresh client and thread per question (what :func:`focused_element` does)
+    cost 5-40 ms before the question is even asked, and the first one on this
+    desktop 0.6-2 s; this reader pays that once.  One question at a time: while
+    one is stuck in an app that does not answer, the next caller is told so at
+    once instead of queueing behind it (the same shape as the watcher's password
+    probe).  Read-only UIA property and Text-pattern reads; nothing is sent.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._answered = threading.Condition(self._lock)
+        self._wake = threading.Event()
+        self._busy = False
+        self._generation = 0
+        self._context_chars = FOCUS_CONTEXT_CHARS
+        self._answer: tuple[int, FocusSnapshot | None] = (0, None)
+        self._ready = threading.Event()
+        self._error = ""
+        threading.Thread(target=self._main, name="yuki-uia-focus-reader", daemon=True).start()
+
+    def _main(self) -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            try:
+                automation = comtypes.client.CreateObject(
+                    _CUIAUTOMATION8_CLSID, interface=module.IUIAutomation2  # type: ignore[attr-defined]
+                )
+                automation.ConnectionTimeout = _FOCUS_UIA_TIMEOUT_MS
+                automation.TransactionTimeout = _FOCUS_UIA_TIMEOUT_MS
+            except Exception:
+                automation = comtypes.client.CreateObject(
+                    _CUIAUTOMATION_CLSID, interface=module.IUIAutomation  # type: ignore[attr-defined]
+                )
+        except Exception as exc:  # noqa: BLE001 - every read then reports it
+            self._error = f"{type(exc).__name__}: {exc}"
+            self._ready.set()
+            return
+        try:
+            # The client's first call sets up its connection (0.1-2 s measured on this desktop); pay it
+            # here, before the first question, not inside the first caller's budget.
+            automation.GetFocusedElement()
+        except Exception:
+            pass
+        self._ready.set()
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                generation, context = self._generation, self._context_chars
+            started = time.perf_counter()
+            try:
+                answer = _read_focus_snapshot(automation, context)
+            except Exception as exc:  # noqa: BLE001 - reported to the caller
+                answer = FocusSnapshot(error=f"{type(exc).__name__}: {exc}")
+            answer.elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if answer.ok and not answer.window:
+                answer.window, answer.window_title = _top_window_of(answer.hwnd)
+            with self._lock:
+                self._busy = False
+                self._answer = (generation, answer)
+                self._answered.notify_all()
+
+    def read(self, *, context_chars: int, timeout_s: float, ready_wait_s: float | None = None) -> FocusSnapshot:
+        started = time.perf_counter()
+        ready_wait = max(timeout_s if ready_wait_s is None else ready_wait_s, 0.0)
+        if not self._ready.wait(ready_wait):
+            return FocusSnapshot(error=f"the focus reader was still starting (first use, {ready_wait:g} s)",
+                                 elapsed_ms=(time.perf_counter() - started) * 1000.0)
+        if self._error:
+            return FocusSnapshot(error=self._error)
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        with self._lock:
+            if self._busy:
+                return FocusSnapshot(error="the last focus read is still waiting on an app that does not answer",
+                                     elapsed_ms=(time.perf_counter() - started) * 1000.0)
+            self._generation += 1
+            generation = self._generation
+            self._context_chars = context_chars
+            self._busy = True
+            self._wake.set()
+            while self._answer[0] != generation:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return FocusSnapshot(error=f"no answer within {timeout_s:g} s",
+                                         elapsed_ms=(time.perf_counter() - started) * 1000.0)
+                self._answered.wait(left)
+            answer = self._answer[1]
+        return answer if answer is not None else FocusSnapshot(error="no answer")
+
+
+def _top_window_of(hwnd: int) -> tuple[int, str]:
+    """``(top-level window, its title)`` holding an element: its own window's root, else the foreground."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        root = int(user32.GetAncestor(int(hwnd), 2) or 0) if hwnd else 0  # GA_ROOT
+        if not root:
+            root = int(user32.GetForegroundWindow() or 0)
+        return root, (win32gui.GetWindowText(root) if root else "")
+    except Exception:
+        return 0, ""
+
+
+_focus_reader: _FocusReader | None = None
+_focus_reader_lock = threading.Lock()
+
+
+def focus_snapshot(
+    *, context_chars: int = FOCUS_CONTEXT_CHARS, timeout_s: float = _FOCUS_TIMEOUT_S,
+    ready_wait_s: float | None = None,
+) -> FocusSnapshot:
+    """What has keyboard focus now, anywhere on the desktop, with its selection and the text around the caret.
+
+    Answered by one long-lived reader (:class:`_FocusReader`), waiting at most
+    ``timeout_s`` for the answer (and ``ready_wait_s``, default ``timeout_s``,
+    for the reader to start on first use); never raises.  A password field is
+    named, never read.
+    """
+    return _get_focus_reader().read(context_chars=context_chars, timeout_s=timeout_s, ready_wait_s=ready_wait_s)
+
+
+def _get_focus_reader() -> _FocusReader:
+    global _focus_reader
+    with _focus_reader_lock:
+        if _focus_reader is None:
+            _focus_reader = _FocusReader()
+        return _focus_reader
+
+
+def warm_focus_reader() -> None:
+    """Start the focus reader now (it sets itself up on its own thread); returns at once."""
+    _get_focus_reader()
 
 
 try:  # pay the one-off wrapper-generation cost on the importing thread
@@ -4155,6 +4611,173 @@ def _drop_redundant(
     return [elements[index] for index in kept_index]
 
 
+#: Names that read the same once clipped at :data:`_FORMAT_NAME_CHARS` are
+#: written out this far instead, so two near-identical items can be told apart.
+_FORMAT_LONG_NAME_CHARS = 240
+#: At most this many unnamed controls get a "next to" label per tree (the rest
+#: keep their role, position and patterns), so a grid of hundreds of unnamed
+#: cells cannot bloat the text.
+_UNNAMED_CONTEXT_MAX = 60
+#: A named element this close (px, centre to centre) can label an unnamed
+#: control that has no named sibling.
+_LABEL_REACH_PX = 240
+#: UIA control types that are items of a set (a list's rows, a tree's nodes, a
+#: tab strip's tabs, a menu's entries, a radio group's options): they get their
+#: place in it (``#k/n``).  A fixed machine vocabulary, not application names.
+_SET_ROLES = frozenset({"ListItem", "DataItem", "TreeItem", "TabItem", "MenuItem", "RadioButton"})
+#: Printed-alike names in more than this many elements are a control repeated
+#: on every row, not near-duplicates; and at most this many lines get a group.
+_COLLISION_GROUP_MAX = 6
+_COLLISION_CONTEXT_MAX = 40
+
+
+def _relation(element: UIElement, label: UIElement) -> str:
+    """Where ``element`` is relative to ``label``, from their centres: "right of", "below"..."""
+    dx = element.center[0] - label.center[0]
+    dy = element.center[1] - label.center[1]
+    if abs(dx) >= abs(dy):
+        return "right of" if dx > 0 else "left of"
+    return "below" if dy > 0 else "above"
+
+
+class _UnnamedContext:
+    """Labels for controls that have no name, from the tree's own structure and geometry.
+
+    An icon-only button is listed with what is known about it: its own
+    description (a tooltip, ``aria-description``), else where it sits next to
+    the nearest named element of the same group ("right of \"Title\""), else the
+    named group it is in, else the nearest named element within
+    :data:`_LABEL_REACH_PX`.  Rectangles and parent links only; never a guess
+    from its role or from words.
+    """
+
+    def __init__(self, listed: list[UIElement], parents: list[int], siblings: dict[int, list[int]]) -> None:
+        self.listed = listed
+        self.parents = parents
+        self.siblings = siblings
+        self.used = 0
+
+    def _nearest(self, index: int, candidates: list[int], reach: float | None = None) -> int | None:
+        element = self.listed[index]
+        best: int | None = None
+        best_d = 0.0
+        for other in candidates:
+            if other == index or not self.listed[other].name:
+                continue
+            ox, oy = self.listed[other].center
+            d = ((ox - element.center[0]) ** 2 + (oy - element.center[1]) ** 2) ** 0.5
+            if reach is not None and d > reach:
+                continue
+            if best is None or d < best_d:
+                best, best_d = other, d
+        return best
+
+    def for_element(self, index: int) -> str:
+        element = self.listed[index]
+        if element.description:
+            return f'described "{_one_line(element.description, 60)}"'
+        if self.used >= _UNNAMED_CONTEXT_MAX:
+            return ""
+        self.used += 1
+        label = self._nearest(index, self.siblings.get(self.parents[index], []))
+        if label is not None:
+            return f'{_relation(element, self.listed[label])} "{_one_line(self.listed[label].name, 50)}"'
+        parent = self.parents[index]
+        if parent >= 0 and self.listed[parent].name:
+            return f'in "{_one_line(self.listed[parent].name, 50)}"'
+        label = self._nearest(index, list(range(len(self.listed))), reach=_LABEL_REACH_PX)
+        if label is not None:
+            return f'{_relation(element, self.listed[label])} "{_one_line(self.listed[label].name, 50)}"'
+        return ""
+
+    def for_run(self, index: int) -> str:
+        """For a run of identical unnamed siblings starting at ``index``: the group, else the first one's label."""
+        parent = self.parents[index]
+        if parent >= 0 and self.listed[parent].name:
+            return f'in "{_one_line(self.listed[parent].name, 50)}"'
+        return self.for_element(index)
+
+
+def _set_positions(listed: list[UIElement], siblings: dict[int, list[int]]) -> dict[int, str]:
+    """``index -> "#k/n"`` for items of a set: the provider's own PositionInSet/SizeOfSet, else
+    the item's place among the listed siblings of its role (two or more of them)."""
+    out: dict[int, str] = {}
+    for members in siblings.values():
+        by_role: dict[str, list[int]] = {}
+        for index in members:
+            if listed[index].role in _SET_ROLES:
+                by_role.setdefault(listed[index].role, []).append(index)
+        for indexes in by_role.values():
+            for k, index in enumerate(indexes, 1):
+                position = listed[index].position
+                if position is not None and position[1] >= 2:
+                    out[index] = f"#{position[0]}/{position[1]}"
+                elif len(indexes) >= 2:
+                    out[index] = f"#{k}/{len(indexes)}"
+    return out
+
+
+def _named_ancestor(index: int, listed: list[UIElement], parents: list[int]) -> str:
+    parent = parents[index]
+    hops = 0
+    while parent >= 0 and hops <= _MAX_DEPTH:
+        if listed[parent].name:
+            return listed[parent].name
+        parent = parents[parent]
+        hops += 1
+    return ""
+
+
+def _ancestor_in(index: int, members: set[int], parents: list[int]) -> bool:
+    parent, hops = parents[index], 0
+    while parent >= 0 and hops <= _MAX_DEPTH:
+        if parent in members:
+            return True
+        parent, hops = parents[parent], hops + 1
+    return False
+
+
+def _name_collisions(
+    listed: list[UIElement], parents: list[int]
+) -> tuple[set[int], dict[int, str], set[int]]:
+    """Elements whose line would read like another's: ``(indexes to write in full, index -> group
+    name, every index whose printed name another element shares)``.
+
+    Two listed elements whose names are equal once clipped (compared as they
+    would be printed, case-folded) get their full names, and - when the named
+    groups they sit in differ - the group each is in, so a near-duplicate can be
+    told apart by what the tree itself says (its full name, its place, its
+    group) rather than by guessing.  Equality of printed text only.
+    """
+    printed: dict[str, list[int]] = {}
+    for index, element in enumerate(listed):
+        if element.name:
+            printed.setdefault(_one_line(element.name, _FORMAT_NAME_CHARS).casefold(), []).append(index)
+    long_names: set[int] = set()
+    groups: dict[int, str] = {}
+    collided: set[int] = set()
+    for indexes in printed.values():
+        if len(indexes) < 2:
+            continue
+        collided.update(indexes)
+        if len({listed[i].name for i in indexes}) > 1:
+            long_names.update(indexes)
+        if len(indexes) > _COLLISION_GROUP_MAX or len(groups) >= _COLLISION_CONTEXT_MAX:
+            continue  # a control repeated on every row ("Reply"), not two items to tell apart
+        # an element and its own container sharing a name (a menu bar and its one menu) are one thing
+        members = set(indexes)
+        if any(_ancestor_in(i, members, parents) for i in indexes):
+            continue
+        names = {i: _named_ancestor(i, listed, parents) for i in indexes}
+        if len(set(names.values())) > 1:
+            for i, name in names.items():
+                parent = parents[i]
+                # the listed parent is already shown by the indentation right above the line
+                if name and not (parent >= 0 and listed[parent].name == name):
+                    groups[i] = name
+    return long_names, groups, collided
+
+
 def _origin(address: str) -> str:
     """``scheme://host`` of an address, or ``""`` when it has no host."""
     from urllib.parse import urlsplit
@@ -4200,6 +4823,17 @@ def format_window_tree(tree: WindowTree) -> str:
     * consecutive unnamed siblings that are identical but for position are one
       line: ``Button ×3 {invoke}: [9]@(242,17) [10]@(892,17) [11]@(966,17)``;
     * ``Hyperlink`` is written ``Link``.
+
+    To tell things apart (2026-09-29):
+
+    * a control with no name says what is known about it, from structure and
+      geometry only: ``(described "Like")`` (its tooltip / description), else
+      ``(no name, right of "Title")`` (the nearest named element of its group),
+      else ``(no name, in "Toolbar")`` (see :class:`_UnnamedContext`);
+    * items of a set (list rows, tree nodes, tabs, menu entries, radio options)
+      carry their place, ``#3/12`` (the app's own numbering when it gives one);
+    * names that would print the same are written in full, with the named group
+      each sits in when those differ (see :func:`_name_collisions`).
     """
     status = getattr(tree, "status", "ok") or "ok"
     note = getattr(tree, "note", "") or ""
@@ -4319,9 +4953,21 @@ def format_window_tree(tree: WindowTree) -> str:
     def run_key(index: int) -> tuple | None:
         """What an unnamed leaf looks like apart from its id and position."""
         element = listed[index]
-        if element.name or element.value is not None or has_child[index]:
+        if element.name or element.value is not None or has_child[index] or element.description:
             return None
         return (parents[index], element.role, tuple(marks(element)), wants_point(index))
+
+    siblings: dict[int, list[int]] = {}
+    for position_index, parent in enumerate(parents):
+        siblings.setdefault(parent, []).append(position_index)
+    unnamed_context = _UnnamedContext(listed, parents, siblings)
+    set_positions = _set_positions(listed, siblings)
+    long_names, group_of, collided = _name_collisions(listed, parents)
+    if set_positions:
+        lines[0] += (
+            " | #k/n = k-th of the n like items in its list (the app's own numbering when it "
+            "gives one, else as listed here)"
+        )
 
     index = 0
     while index < len(listed):
@@ -4336,6 +4982,9 @@ def format_window_tree(tree: WindowTree) -> str:
         if end - index > 1:
             members = listed[index:end]
             parts = [f"{indent}{role} ×{len(members)}", *marks(element)]
+            context = unnamed_context.for_run(index) if element.is_interactive else ""
+            if context:
+                parts.append(f"(no name, {context})")
             where = " ".join(
                 f"[{member.id}]{point(member)}" if key[3] else f"[{member.id}]"
                 for member in members
@@ -4345,7 +4994,21 @@ def format_window_tree(tree: WindowTree) -> str:
             continue
         parts = [f"{indent}[{element.id}] {role}"]
         if element.name:
-            parts.append(f'"{_one_line(element.name, _FORMAT_NAME_CHARS)}"')
+            limit = _FORMAT_LONG_NAME_CHARS if index in long_names else _FORMAT_NAME_CHARS
+            parts.append(f'"{_one_line(element.name, limit)}"')
+            if element.description and index in collided:
+                # a name another element shares: what each says about itself can tell them apart
+                parts.append(f'(described "{_one_line(element.description, 60)}")')
+        elif element.is_interactive and element.value is None and not has_child[index]:
+            # a control with nothing listed inside it (an icon button): what is next to it names it; a
+            # container with listed children is described by them
+            context = unnamed_context.for_element(index)
+            if context:
+                parts.append(f"(no name, {context})")
+        if index in set_positions:
+            parts.append(set_positions[index])
+        if index in group_of:
+            parts.append(f'in "{_one_line(group_of[index], 50)}"')
         if element.value is not None and element.value != element.name:
             value = element.value
             origin = origins[parents[index]] if parents[index] >= 0 else ""

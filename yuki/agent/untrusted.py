@@ -22,7 +22,8 @@ import secrets
 #: names, not a rule about content.
 EXTERNAL_TEXT_TOOLS: frozenset[str] = frozenset({
     "look_at_window", "read_page", "read_tabs", "run_powershell", "recall", "activity",
-    "calls", "call_timeline", "read_file", "fetch_url", "spawn_helpers",
+    "calls", "call_timeline", "read_file", "fetch_url", "spawn_helpers", "threads", "before", "links",
+    "look_at_focus", "read_clipboard",
 })
 
 BEGIN = "BEGIN_UNTRUSTED_DATA"
@@ -82,4 +83,9 @@ def source_for(name: str, tool_input: dict) -> str:
         "read_file": f"the file {tool_input.get('path', '')}",
         "fetch_url": f"the web address {tool_input.get('url', '')}",
         "spawn_helpers": "your helpers' reports (drawn from memory, files, pages and windows)",
+        "threads": "memory (the user's threads of work, kept from their screen, calls and chats)",
+        "before": "memory (window titles, pages and facts from the user's screen before that moment)",
+        "links": "memory (pages the user had open and links shared in their chats)",
+        "look_at_focus": "the focused control (its text and what is selected in it)",
+        "read_clipboard": "the clipboard (text another app or the user copied)",
     }.get(name, f"the {name} tool")

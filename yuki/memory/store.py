@@ -249,6 +249,7 @@ Service coordination (flag files next to the database, the service's mutex)::
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -494,6 +495,10 @@ class JournalEntry:
     source: dict[str, Any] | None = None
     #: Text the user typed into, or read from, another AI tool: never evidence of who the user is.
     tainted: bool = False
+    #: The thread of work it belongs to (migration 23), or ``None``.
+    work_thread_id: int | None = None
+    #: ``front`` | ``visible`` | ``popup``: the attention its source had (migration 24; older rows read ``front``).
+    attention: str = "front"
 
 
 @dataclass
@@ -514,6 +519,117 @@ class NewFact:
     #: Provenance of the cited source (:func:`yuki.memory.provenance.source_of`), stored encrypted.
     source: dict[str, Any] | None = None
     tainted: bool = False
+    #: How much of the user's attention the cited source had (:func:`capture_attention`, migration 24):
+    #: ``front`` | ``visible`` | ``popup``.
+    attention: str = "front"
+
+
+#: Where a capture's window was when the watcher read it (migration 24; the watcher's own trigger format, a fixed
+#: machine format): ``front`` - the window in front, the one the user works in; ``visible`` - on screen beside it
+#: (trigger ``visible:<why>``), the user may not have looked at it; ``popup`` - something that appeared by itself
+#: (trigger ``popup``: a notification toast, a dialog). The two last are weaker evidence of the user's attention.
+ATTENTIONS: tuple[str, ...] = ("front", "visible", "popup")
+
+
+def capture_attention(trigger: str | None) -> str:
+    """``front`` | ``visible`` | ``popup`` for a capture's trigger (see :data:`ATTENTIONS`)."""
+    t = str(trigger or "")
+    if t == "popup":
+        return "popup"
+    if t.startswith("visible:"):
+        return "visible"
+    return "front"
+
+
+#: A work thread's status (migration 23): active (being worked on), paused (set aside, or quiet for days),
+#: done (finished), merged (tidied into another thread: ``merged_into``), dismissed (the nightly tidy judged it no
+#: piece of work: its facts no longer point to it).
+WORK_STATUSES: tuple[str, ...] = ("active", "paused", "done", "merged", "dismissed")
+#: What a journal batch (or the nightly pass) did to a thread; each is one ``work_thread_events`` row.
+#: ``seen``: the thread came up only in a window beside the one in front or a popup (migration 24): what it said
+#: may update where the thread stands, but the user's own last touch and its status stay as they were.
+WORK_ACTIONS: tuple[str, ...] = ("starts", "continues", "pauses", "ends", "reopens", "merged", "closed", "renamed",
+                                 "seen")
+
+
+@dataclass
+class WorkThread:
+    """One thread of work (decrypted), see :mod:`yuki.memory.workthreads`."""
+
+    id: int
+    title: str
+    kind: str | None
+    status: str
+    state: str
+    open_items: list[str]
+    entities: list[str]
+    first_seen: float
+    last_seen: float
+    importance: int | None
+    origin: str
+    merged_into: int | None
+    events: int
+    created_at: float
+    updated_at: float
+    score: float | None = None
+
+
+@dataclass
+class WorkOp:
+    """What one journal batch (or the backfill) does to one thread of work, validated by
+    :mod:`yuki.memory.workthreads`; applied by :meth:`Store.commit_batch` in the batch's transaction.
+
+    ``fact_indexes``: the batch's facts (their index in its fact list) that belong to the thread;
+    ``journal_ids``: the same, for facts already stored (the backfill).
+    """
+
+    action: str                          # starts | continues | pauses | ends
+    work_thread_id: int | None           # None: a new thread (starts)
+    title: str = ""
+    state: str = ""
+    open_items: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
+    kind: str | None = None
+    at: float = 0.0
+    fact_indexes: list[int] = field(default_factory=list)
+    journal_ids: list[int] = field(default_factory=list)
+    capture_thread_id: int | None = None
+    app: str | None = None
+    host: str | None = None
+    importance: int | None = None
+    origin: str = "journal"
+    vector: np.ndarray | None = None
+    embed_model: str | None = None
+    #: The attention its sources had (:func:`capture_attention`): ``front`` when any was in front.
+    attention: str = "front"
+    #: What the store made of it (set in the transaction): the thread id written, and ``started`` |
+    #: ``continued`` | ``paused`` | ``ended`` | ``reopened`` | ``rejected:<why>``.
+    result_id: int | None = None
+    outcome: str = ""
+
+
+@dataclass
+class LinkSeen:
+    """One page the user had in front, or a link shared in a conversation (decrypted), migration 23."""
+
+    id: int
+    url: str
+    title: str | None
+    host: str | None
+    app: str | None
+    how: str                             # viewed | shared
+    sender: str | None
+    where: str | None
+    page_key: str | None
+    capture_thread_id: int | None
+    work_thread_id: int | None
+    by_yuki: bool
+    first_seen: float
+    last_seen: float
+    visits: int
+    score: float | None = None
+    #: ``None``: the user had it in front; ``visible``: only ever on screen beside the window in front (migration 24).
+    attention: str | None = None
 
 
 @dataclass
@@ -2111,6 +2227,106 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE conversation_facts ADD COLUMN value_ciphertext TEXT;
     ALTER TABLE conversation_facts ADD COLUMN keyterms_ciphertext TEXT;
     """,
+    # 23 (2026-09-29, "connect the dots from the entire memory", docs/research/human-like-review.md §5 Phase 3):
+    # - work_threads: the user's threads of work (a project, task or workflow they pursue over days: "Yuki voice
+    #   pipeline", "OpenSchool maths for Ravi", a PR review), each with where it stands, what is open, the apps,
+    #   sites, repos and people involved, first and last seen and a status (active | paused | done | merged).
+    #   Kept by the journal's own per-batch call (yuki.memory.workthreads) and tidied nightly; bi-temporal in
+    #   spirit: nothing is deleted, a merged thread points at the one it went into, every change is an event.
+    # - work_thread_events: every time a batch continued, started, paused or ended a thread (and the nightly
+    #   merges and closes): when, from which window, page, conversation or call (capture thread), and where the
+    #   thread stood after it - the thread's own timeline.
+    # - journal.work_thread_id: the thread a journal fact belongs to.
+    # - links_seen: pages the user had in front (from the timeline and the capture threads) and links shared in
+    #   conversations (a URL in a message, with who sent it), queryable ("that link I was looking at").
+    # - work_thread_vec, link_vec, call_digest_vec: local embeddings for the whole-memory ranking.
+    # Additive only.
+    """
+    CREATE TABLE work_threads (
+        id                  INTEGER PRIMARY KEY,
+        title_ciphertext    TEXT NOT NULL,
+        kind                TEXT,                    -- the model's word for it: project | task | study | review | helping | errand | other
+        status              TEXT NOT NULL,           -- active | paused | done | merged
+        state_ciphertext    TEXT,                    -- where it stands now, one or two sentences
+        open_ciphertext     TEXT,                    -- JSON list: what is still to do or waited on
+        entities_ciphertext TEXT,                    -- JSON list: apps, sites, repos, files, people involved
+        first_seen          REAL NOT NULL,
+        last_seen           REAL NOT NULL,
+        importance          INTEGER,
+        origin              TEXT NOT NULL DEFAULT 'journal',   -- journal | backfill | consolidate
+        merged_into         INTEGER,
+        events              INTEGER NOT NULL DEFAULT 0,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL
+    );
+    CREATE INDEX work_threads_status ON work_threads(status, last_seen);
+    CREATE TABLE work_thread_events (
+        id               INTEGER PRIMARY KEY,
+        work_thread_id   INTEGER NOT NULL,
+        at               REAL NOT NULL,              -- the newest source it rests on
+        action           TEXT NOT NULL,              -- starts | continues | pauses | ends | reopens | merged | closed | renamed
+        batch_id         INTEGER,                    -- the journal batch (NULL for the nightly pass)
+        thread_id        INTEGER,                    -- the capture thread: window, page, conversation, terminal folder, call
+        app              TEXT,
+        host             TEXT,
+        state_ciphertext TEXT,                       -- where the thread stood after it
+        origin           TEXT NOT NULL DEFAULT 'journal',
+        created_at       REAL NOT NULL
+    );
+    CREATE INDEX work_thread_events_thread ON work_thread_events(work_thread_id, at);
+    CREATE INDEX work_thread_events_capture ON work_thread_events(thread_id, at);
+    CREATE INDEX work_thread_events_at ON work_thread_events(at);
+    CREATE TABLE work_thread_vec (
+        work_thread_id  INTEGER PRIMARY KEY REFERENCES work_threads(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    ALTER TABLE journal ADD COLUMN work_thread_id INTEGER;
+    CREATE INDEX journal_work_thread ON journal(work_thread_id, at);
+    CREATE TABLE links_seen (
+        id                INTEGER PRIMARY KEY,
+        url_key           TEXT NOT NULL UNIQUE,      -- HMAC(how, the URL)
+        url_ciphertext    TEXT NOT NULL,
+        title_ciphertext  TEXT,
+        host              TEXT,                      -- cleartext metadata, as in threads and the timeline
+        app               TEXT,
+        how               TEXT NOT NULL,             -- viewed (in front) | shared (in a message)
+        sender_ciphertext TEXT,                      -- shared: who sent it, as the app showed them
+        where_ciphertext  TEXT,                      -- shared: the conversation it was in
+        page_key          TEXT,                      -- viewed: the timeline's page identity (time in front)
+        capture_thread_id INTEGER,
+        work_thread_id    INTEGER,
+        by_yuki           INTEGER NOT NULL DEFAULT 0,
+        first_seen        REAL NOT NULL,
+        last_seen         REAL NOT NULL,
+        visits            INTEGER NOT NULL DEFAULT 0,
+        updated_at        REAL NOT NULL
+    );
+    CREATE INDEX links_seen_last ON links_seen(last_seen);
+    CREATE INDEX links_seen_host ON links_seen(host, last_seen);
+    CREATE TABLE link_vec (
+        link_id         INTEGER PRIMARY KEY REFERENCES links_seen(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    CREATE TABLE call_digest_vec (
+        call_id         INTEGER PRIMARY KEY REFERENCES calls(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    """,
+    # 24 (2026-09-29, the eyes read every visible window and popup, not only the one in front): how much of the
+    # user's attention a journal fact or a link rests on. NULL = the window was in front (the user worked in it);
+    # 'visible' = only on screen beside the window in front (trigger visible:<why>; they may not have looked);
+    # 'popup' = something that appeared by itself (a toast, a dialog). Weaker evidence of attention, weighed by
+    # the whole-memory ranking (yuki.memory.relevant.ATTENTION_DISCOUNT). Additive only.
+    """
+    ALTER TABLE journal ADD COLUMN attention TEXT;
+    ALTER TABLE links_seen ADD COLUMN attention TEXT;
+    """,
 )
 
 
@@ -2203,6 +2419,24 @@ class Store:
         #: Turns the background writer had to drop (content-free counters for diagnostics).
         self.turn_write_errors = 0
         self.last_turn_error: str | None = None
+        #: Called with the new capture ids after every capture write of this Store (the service's screen
+        #: recall, :mod:`yuki.memory.screenrecall`): must return at once and never raise into a write.
+        self._capture_listeners: list[Any] = []
+
+    def add_capture_listener(self, fn: Any) -> None:
+        """Call ``fn(capture_ids)`` after each capture this Store writes (plumbing; ``fn`` must not block)."""
+        self._capture_listeners.append(fn)
+
+    def _captured(self, ids: Sequence[int | None]) -> None:
+        """Wake the journal's wait and tell the capture listeners (never raises)."""
+        with self._cond:
+            self._cond.notify_all()
+        new = [int(i) for i in ids if i is not None]
+        for fn in list(self._capture_listeners):
+            try:
+                fn(new)
+            except Exception:
+                pass
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -2407,8 +2641,7 @@ class Store:
 
         capture_id = self._write(op)
         if capture_id is not None:
-            with self._cond:
-                self._cond.notify_all()
+            self._captured([capture_id])
         return capture_id
 
     def add_health(
@@ -2564,8 +2797,7 @@ class Store:
 
         result = self._write(op)
         if result.capture_id is not None:
-            with self._cond:
-                self._cond.notify_all()
+            self._captured([result.capture_id])
         return result
 
     def messages_for_captures(self, capture_ids: Iterable[int]) -> dict[int, list[StoredMessage]]:
@@ -2691,13 +2923,15 @@ class Store:
         nature = getattr(fact, "nature", None)
         cur = conn.execute(
             "INSERT INTO journal(at, thread_id, app, host, fact_ciphertext, importance, batch_id, created_at,"
-            " by_yuki, nature, milestone, source_ciphertext, tainted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " by_yuki, nature, milestone, source_ciphertext, tainted, attention) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 float(fact.at), fact.thread_id, fact.app or "", fact.host, self.cipher.encrypt(fact.fact),
                 int(fact.importance), batch_id, time.time(), int(bool(getattr(fact, "by_yuki", False))),
                 nature if nature in JOURNAL_NATURES else "fact", int(bool(getattr(fact, "milestone", False))),
                 self._enc(json.dumps(fact.source, ensure_ascii=False)) if getattr(fact, "source", None) else None,
                 int(bool(getattr(fact, "tainted", False))),
+                getattr(fact, "attention", "front") if getattr(fact, "attention", "front") in ("visible", "popup")
+                else None,
             ),
         )
         journal_id = int(cur.lastrowid)
@@ -2722,12 +2956,13 @@ class Store:
     def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
                      questions: Sequence[NewQuestion] = (),
                      question_outcomes: list[tuple[int | None, str]] | None = None,
-                     *, supersedes: Sequence[int] = ()) -> int:
+                     *, supersedes: Sequence[int] = (), work: Sequence[WorkOp] = ()) -> int:
         """Atomically record a batch, its facts (+vectors), its questions for the user (deduped,
         see :meth:`add_questions`; each gets the journal ids of the facts from its source) and
         mark its captures journaled. ``question_outcomes`` receives ``(id, outcome)`` per question.
         ``supersedes``: a re-journal's earlier batches of the same captures, whose facts it replaces
-        (:meth:`_supersede_batches`, same transaction)."""
+        (:meth:`_supersede_batches`, same transaction). ``work``: what the batch did to the user's threads
+        of work (:meth:`_apply_work`, same transaction; each op's ``result_id`` / ``outcome`` are set)."""
         ids = list(capture_ids)
         known = self.question_known_keys() if questions else set()
 
@@ -2735,6 +2970,8 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            if work:
+                self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
                 q.source_ids = sorted({*q.source_ids, *(journal_ids[i] for i in q.fact_indexes
                                                         if 0 <= i < len(journal_ids))})
@@ -2825,6 +3062,8 @@ class Store:
             milestone=bool(r["milestone"]) if "milestone" in keys else False,
             source=self._source(r["source_ciphertext"]) if "source_ciphertext" in keys else None,
             tainted=bool(r["tainted"]) if "tainted" in keys else False,
+            work_thread_id=r["work_thread_id"] if "work_thread_id" in keys else None,
+            attention=(r["attention"] or "front") if "attention" in keys else "front",
         )
 
     def _source(self, stored: str | None) -> dict[str, Any] | None:
@@ -3890,8 +4129,7 @@ class Store:
 
         ids = self._write(op)
         if ids:
-            with self._cond:
-                self._cond.notify_all()
+            self._captured(ids)
         return ids
 
     # -- episodes ------------------------------------------------------------
@@ -5120,9 +5358,11 @@ class Store:
         ))
 
     def captures_between(self, since: TimeArg, until: TimeArg = None, *, limit: int = 4) -> list[dict[str, Any]]:
-        """The newest ``limit`` captures in ``[since, until)`` that were the user's own screen (not ``by_yuki``),
-        oldest first: ``{"at", "app", "host", "kind", "text"}`` (text decrypted)."""
-        clauses, params = ["c.by_yuki = 0"], []
+        """The newest ``limit`` captures in ``[since, until)`` that were the user's own screen (not ``by_yuki``;
+        the window in front - not one beside it or a popup, migration 24's attention), oldest first: ``{"at",
+        "app", "host", "kind", "text"}`` (text decrypted)."""
+        clauses, params = ["c.by_yuki = 0", "coalesce(c.trigger, '') != 'popup'",
+                           "coalesce(c.trigger, '') NOT LIKE 'visible:%'"], []
         if (s := _ts(since)) is not None:
             clauses.append("c.at >= ?")
             params.append(s)
@@ -5657,8 +5897,7 @@ class Store:
             return None
         capture_id = self._write(lambda conn: self._add_call_side(conn, call_id, app, process, started_at, ended_at,
                                                                   items, final))
-        with self._cond:
-            self._cond.notify_all()
+        self._captured([capture_id])
         return capture_id
 
     def _add_call_side(self, conn: sqlite3.Connection, call_id: int, app: str, process: str | None,
@@ -5855,22 +6094,22 @@ class Store:
 
         capture_id = self._write(op)
         if capture_id is not None:
-            with self._cond:
-                self._cond.notify_all()
+            self._captured([capture_id])
         return capture_id
 
     def commit_call_batch(
         self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
         commitments: Sequence[ConversationChange] = (), *, supersedes: Sequence[int] = (),
         questions: Sequence[NewQuestion] = (), question_outcomes: list[tuple[int | None, str]] | None = None,
+        work: Sequence[WorkOp] = (),
     ) -> tuple[int, list[int]]:
         """:meth:`commit_batch` for a call's side, plus the user's commitments from it, in one transaction.
 
         Commitments are conversation facts of kind ``commitment``, origin
         ``call`` (so they reach the to-do list and reminders like any other),
         each already checked to quote the user's own words. Returns the batch
-        id and the new commitment ids. ``supersedes``, ``questions`` and
-        ``question_outcomes``: as for :meth:`commit_batch` (a call's questions are
+        id and the new commitment ids. ``supersedes``, ``questions``,
+        ``question_outcomes`` and ``work``: as for :meth:`commit_batch` (a call's questions are
         about names the user said).
         """
         ids = list(capture_ids)
@@ -5881,6 +6120,8 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            if work:
+                self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
                 q.source_ids = sorted({*q.source_ids, *(journal_ids[i] for i in q.fact_indexes
                                                         if 0 <= i < len(journal_ids))})
@@ -6002,6 +6243,10 @@ class Store:
                 " input_tokens=?, output_tokens=?, cache_write_tokens=?, cache_read_tokens=?,"
                 " cost_usd=cost_usd+?, latency_ms=?, error=NULL, claimed_by=NULL, claimed_at=NULL, updated_at=?"
                 " WHERE call_id=?", (*values, now, int(call_id)))
+            try:   # the digest's words changed: its vector (whole-memory ranking, migration 23) is made again
+                conn.execute("DELETE FROM call_digest_vec WHERE call_id=?", (int(call_id),))
+            except sqlite3.OperationalError:
+                pass
 
         self._write(op)
 
@@ -6065,7 +6310,7 @@ class Store:
 
     #: What :meth:`recall_vectors` reads per kind: the metadata columns and the join to the vectors.
     _RECALL_SQL = {
-        "journal": ("SELECT j.id, j.at, j.importance, j.nature, j.tainted, j.by_yuki, v.vec_ciphertext, v.dim"
+        "journal": ("SELECT j.id, j.at, j.importance, j.nature, j.tainted, j.by_yuki, j.attention, v.vec_ciphertext, v.dim"
                     " FROM journal j JOIN journal_vec v ON v.journal_id = j.id"
                     " WHERE j.superseded_at IS NULL AND j.id > ?"),
         "portrait": ("SELECT f.id, f.valid_from AS at, f.importance, f.kind, f.origin, f.confidence,"
@@ -6080,6 +6325,22 @@ class Store:
         "resource": ("SELECT c.id, c.valid_from AS at, c.status, c.kind, v.vec_ciphertext, v.dim"
                      " FROM conversation_facts c JOIN conversation_fact_vec v ON v.fact_id = c.id"
                      " WHERE c.kind = 'resource' AND c.status = 'active' AND c.id > ?"),
+        # whole-memory ranking (migration 23, yuki.memory.related): session summaries, exchanges said to Yuki,
+        # know-how, call digests, threads of work and links seen
+        "session": ("SELECT s.id, s.ended_at AS at, v.vec_ciphertext, v.dim FROM session_summaries s"
+                    " JOIN session_summary_vec v ON v.summary_id = s.id WHERE s.id > ?"),
+        "chat": ("SELECT t.id, t.at, t.addressed, v.vec_ciphertext, v.dim FROM conversation_turns t"
+                 " JOIN conversation_turn_vec v ON v.turn_id = t.id WHERE t.id > ?"),
+        "knowhow": ("SELECT k.id, k.valid_from AS at, v.vec_ciphertext, v.dim FROM knowhow k"
+                    " JOIN knowhow_vec v ON v.knowhow_id = k.id WHERE k.valid_to IS NULL AND k.id > ?"),
+        "call": ("SELECT c.id, coalesce(d.started_at, c.detected_at) AS at, v.vec_ciphertext, v.dim FROM calls c"
+                 " JOIN call_digest_vec v ON v.call_id = c.id JOIN call_digests d ON d.call_id = c.id"
+                 " WHERE c.id > ?"),
+        "thread": ("SELECT w.id, w.last_seen AS at, w.importance, w.status, v.vec_ciphertext, v.dim FROM work_threads w"
+                   " JOIN work_thread_vec v ON v.work_thread_id = w.id WHERE w.status NOT IN ('merged', 'dismissed')"
+                   " AND w.id > ?"),
+        "link": ("SELECT l.id, l.last_seen AS at, l.by_yuki, l.attention, v.vec_ciphertext, v.dim FROM links_seen l"
+                 " JOIN link_vec v ON v.link_id = l.id WHERE l.id > ?"),
     }
 
     def recall_vectors(self, kind: str, after_id: int = 0) -> list[tuple[sqlite3.Row, np.ndarray]]:
@@ -6089,7 +6350,10 @@ class Store:
         ``commitment`` (open or done). Nothing but the vectors is decrypted: the index
         (:mod:`yuki.memory.relevant`) decrypts the text of the few it picks.
         """
-        rows = self._query(self._RECALL_SQL[kind], (int(after_id),))
+        try:
+            rows = self._query(self._RECALL_SQL[kind], (int(after_id),))
+        except sqlite3.OperationalError:   # a table a newer kind needs is not there (a database not yet migrated)
+            return []
         out: list[tuple[sqlite3.Row, np.ndarray]] = []
         for r in rows:
             try:
@@ -6104,7 +6368,7 @@ class Store:
         A journal fact can be superseded by a re-journal, a portrait fact or an episode replaced,
         a commitment superseded or revoked after the index loaded it; the index drops those.
         """
-        return {
+        live = {
             "journal_dead": {r[0] for r in self._query("SELECT id FROM journal WHERE superseded_at IS NOT NULL")},
             "portrait": {r[0] for r in self._query("SELECT id FROM portrait_facts WHERE valid_to IS NULL")},
             "episode": {r[0] for r in self._query("SELECT id FROM episodes WHERE expired_at IS NULL")},
@@ -6113,6 +6377,15 @@ class Store:
             "resource": {r[0] for r in self._query(
                 "SELECT id FROM conversation_facts WHERE kind='resource' AND status='active'")},
         }
+        # the whole-memory kinds (migration 23): summaries, exchanges and links are never ended; know-how and
+        # threads are (a superseded entry, a merged thread)
+        for kind, sql in (("knowhow", "SELECT id FROM knowhow WHERE valid_to IS NULL"),
+                          ("thread", "SELECT id FROM work_threads WHERE status NOT IN ('merged', 'dismissed')")):
+            try:
+                live[kind] = {r[0] for r in self._query(sql)}
+            except sqlite3.OperationalError:
+                live[kind] = set()
+        return live
 
     def episode_importance(self, spans: Sequence[tuple[int, float, float]]) -> dict[int, int]:
         """The highest journal importance inside each episode's span (a measured signal the journal's model
@@ -6542,6 +6815,17 @@ class Store:
 
         return self._write(op)
 
+    def retire_episodes(self, pairs: Sequence[tuple[int, int]]) -> int:
+        """Expire episodes that retell a stretch another one tells (``(retold id, kept id)``): kept as history,
+        pointing at the one kept (:func:`yuki.memory.episodes.repair_overlaps`). Returns how many."""
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> int:
+            return sum(conn.execute("UPDATE episodes SET expired_at=?, superseded_by=? WHERE id=? AND expired_at IS NULL",
+                                    (now, int(kept), int(retold))).rowcount for retold, kept in pairs)
+
+        return self._write(op) if pairs else 0
+
     def supersede_question(self, question_id: int, subject: str, question: str, evidence: str | None, *,
                            vector: np.ndarray | None = None, embed_model: str | None = None) -> int | None:
         """A corrected version of an open or asked question (everything else kept: status, card, sources); the
@@ -6667,6 +6951,687 @@ class Store:
             if p.exists():
                 total += p.stat().st_size
         return total
+
+    # ==================================================================================================
+    # Threads of work, links seen, the freshest screens (migration 23; yuki.memory.workthreads, links,
+    # related, screenrecall). Plumbing only: what a thread is, and what a batch did to one, is the
+    # journal model's judgement; nothing here reads words.
+    # ==================================================================================================
+
+    #: Most entities a thread keeps (apps, sites, repos, files, people), newest first.
+    WORK_ENTITIES_MAX = 12
+    #: Most open items a thread keeps.
+    WORK_OPEN_MAX = 5
+
+    def _json_list(self, stored: str | None) -> list[str]:
+        if not stored:
+            return []
+        try:
+            value = json.loads(self.cipher.decrypt(stored))
+        except Exception:
+            return []
+        return [str(v) for v in value if str(v).strip()] if isinstance(value, list) else []
+
+    def _work_thread(self, r: sqlite3.Row, score: float | None = None) -> WorkThread:
+        return WorkThread(
+            id=int(r["id"]), title=self._dec(r["title_ciphertext"]) or "", kind=r["kind"], status=r["status"],
+            state=self._dec(r["state_ciphertext"]) or "", open_items=self._json_list(r["open_ciphertext"]),
+            entities=self._json_list(r["entities_ciphertext"]), first_seen=float(r["first_seen"]),
+            last_seen=float(r["last_seen"]), importance=r["importance"], origin=r["origin"],
+            merged_into=r["merged_into"], events=int(r["events"] or 0), created_at=float(r["created_at"]),
+            updated_at=float(r["updated_at"]), score=score)
+
+    def work_threads(self, statuses: Sequence[str] | None = ("active", "paused"), *, since: TimeArg = None,
+                     limit: int | None = None, ids: Iterable[int] | None = None) -> list[WorkThread]:
+        """Threads of work, most recently touched first. ``statuses`` None: every status (merged ones too)."""
+        clauses, params = [], []
+        if statuses is not None:
+            clauses.append("status IN (%s)" % ",".join("?" * len(statuses)))
+            params.extend(statuses)
+        if (s := _ts(since)) is not None:
+            clauses.append("last_seen >= ?")
+            params.append(s)
+        if ids is not None:
+            wanted = sorted({int(i) for i in ids})
+            if not wanted:
+                return []
+            clauses.append("id IN (%s)" % ",".join("?" * len(wanted)))
+            params.extend(wanted)
+        sql = "SELECT * FROM work_threads" + (" WHERE " + " AND ".join(clauses) if clauses else "")
+        sql += " ORDER BY last_seen DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        try:
+            return [self._work_thread(r) for r in self._query(sql, params)]
+        except sqlite3.OperationalError:   # an older schema: no threads
+            return []
+
+    def work_thread(self, thread_id: int) -> WorkThread | None:
+        rows = self.work_threads(None, ids=[int(thread_id)])
+        return rows[0] if rows else None
+
+    def resolve_work_thread(self, thread_id: int | None) -> int | None:
+        """The thread a (possibly merged) thread lives on in: follows ``merged_into`` (at most 16 hops)."""
+        if thread_id is None:
+            return None
+        current = int(thread_id)
+        for _ in range(16):
+            rows = self._query("SELECT id, merged_into FROM work_threads WHERE id=?", (current,))
+            if not rows:
+                return None
+            if rows[0]["merged_into"] is None:
+                return current
+            current = int(rows[0]["merged_into"])
+        return current
+
+    def work_thread_vectors(self, ids: Iterable[int] | None = None) -> dict[int, np.ndarray]:
+        """Stored (decrypted) vectors of threads (all non-merged ones when ``ids`` is None)."""
+        if ids is None:
+            sql, params = ("SELECT v.work_thread_id, v.vec_ciphertext FROM work_thread_vec v JOIN work_threads w"
+                           " ON w.id = v.work_thread_id WHERE w.status NOT IN ('merged', 'dismissed')"), []
+        else:
+            wanted = sorted({int(i) for i in ids})
+            if not wanted:
+                return {}
+            sql = "SELECT work_thread_id, vec_ciphertext FROM work_thread_vec WHERE work_thread_id IN (%s)" % (
+                ",".join("?" * len(wanted)))
+            params = wanted
+        try:
+            rows = self._query(sql, params)
+        except sqlite3.OperationalError:
+            return {}
+        out: dict[int, np.ndarray] = {}
+        for r in rows:
+            try:
+                out[int(r[0])] = np.frombuffer(self.cipher.decrypt_bytes(r[1]), dtype=np.float32)
+            except Exception:
+                continue
+        return out
+
+    def work_threads_of_capture_threads(self, capture_thread_ids: Iterable[int], *, limit: int = 3,
+                                        since: TimeArg = None) -> list[int]:
+        """The threads of work these windows, pages, conversations or calls were last part of, newest first
+        (merged ones resolved to the thread they went into)."""
+        wanted = sorted({int(i) for i in capture_thread_ids if i is not None})
+        if not wanted:
+            return []
+        params: list[Any] = list(wanted)
+        extra = ""
+        if (s := _ts(since)) is not None:
+            extra = " AND at >= ?"
+            params.append(s)
+        try:
+            rows = self._query("SELECT work_thread_id, max(at) a FROM work_thread_events WHERE thread_id IN (%s)%s"
+                               " GROUP BY work_thread_id ORDER BY a DESC LIMIT ?" % (",".join("?" * len(wanted)), extra),
+                               (*params, int(limit) * 3))
+        except sqlite3.OperationalError:
+            return []
+        out: list[int] = []
+        for r in rows:
+            tid = self.resolve_work_thread(int(r[0]))
+            if tid is not None and tid not in out:
+                out.append(tid)
+        return out[: int(limit)]
+
+    def work_thread_events(self, work_thread_id: int, *, limit: int = 200) -> list[dict[str, Any]]:
+        """A thread's events, oldest first: ``{"id", "at", "action", "batch_id", "thread_id", "app", "host",
+        "state", "origin"}`` (the events of threads merged into it were moved onto it at the merge)."""
+        try:
+            rows = self._query("SELECT * FROM work_thread_events WHERE work_thread_id=? ORDER BY at DESC, id DESC LIMIT ?",
+                               (int(work_thread_id), int(limit)))
+        except sqlite3.OperationalError:
+            return []
+        return [{"id": r["id"], "at": r["at"], "action": r["action"], "batch_id": r["batch_id"],
+                 "thread_id": r["thread_id"], "app": _shown(r["app"]) if r["app"] else r["app"], "host": r["host"],
+                 "state": self._dec(r["state_ciphertext"]), "origin": r["origin"]} for r in reversed(rows)]
+
+    def work_event_spans(self, work_thread_ids: Iterable[int]) -> dict[int, list[tuple[float, int | None]]]:
+        """``{thread: [(at, capture thread), ...]}`` oldest first, content-free (the thread-affinity plumbing)."""
+        wanted = sorted({int(i) for i in work_thread_ids if i is not None})
+        if not wanted:
+            return {}
+        try:
+            rows = self._query("SELECT work_thread_id, at, thread_id FROM work_thread_events WHERE work_thread_id IN (%s)"
+                               " ORDER BY at" % ",".join("?" * len(wanted)), wanted)
+        except sqlite3.OperationalError:
+            return {}
+        out: dict[int, list[tuple[float, int | None]]] = {}
+        for r in rows:
+            out.setdefault(int(r[0]), []).append((float(r[1]), r[2]))
+        return out
+
+    #: The events that are the user's own touch of a thread (not the nightly tidy's merges, closes and renames,
+    #: nor a thread only glimpsed beside the window in front or in a popup).
+    WORK_TOUCHES: tuple[str, ...] = ("starts", "continues", "pauses", "ends", "reopens")
+
+    def latest_work_events(self, *, since: TimeArg = None, until: TimeArg = None,
+                           limit: int = 20) -> list[dict[str, Any]]:
+        """The newest events in ``[since, until)`` where the user touched a thread (:data:`WORK_TOUCHES`),
+        newest first, content-free: ``{"work_thread_id", "at", "action", "thread_id", "app", "host"}``."""
+        clauses = ["action IN (%s)" % ",".join("?" * len(self.WORK_TOUCHES))]
+        params: list[Any] = list(self.WORK_TOUCHES)
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("at < ?")
+            params.append(u)
+        try:
+            rows = self._query("SELECT work_thread_id, at, action, thread_id, app, host FROM work_thread_events WHERE "
+                               + " AND ".join(clauses) + " ORDER BY at DESC, id DESC LIMIT ?", (*params, int(limit)))
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
+
+    def journal_for_work_thread(self, work_thread_id: int, *, limit: int = 40) -> list[JournalEntry]:
+        """The newest ``limit`` current journal facts of a thread, oldest first."""
+        try:
+            rows = self._query("SELECT j.* FROM journal j WHERE j.work_thread_id=? AND j.superseded_at IS NULL"
+                               " ORDER BY j.at DESC, j.id DESC LIMIT ?", (int(work_thread_id), int(limit)))
+        except sqlite3.OperationalError:
+            return []
+        return [self._entry(r) for r in reversed(rows)]
+
+    def journal_ids_of_work_threads(self, work_thread_ids: Iterable[int]) -> set[int]:
+        """Ids of the current journal facts of these threads (the related ranking's thread affinity)."""
+        wanted = sorted({int(i) for i in work_thread_ids if i is not None})
+        if not wanted:
+            return set()
+        try:
+            return {int(r[0]) for r in self._query(
+                "SELECT id FROM journal WHERE superseded_at IS NULL AND work_thread_id IN (%s)"
+                % ",".join("?" * len(wanted)), wanted)}
+        except sqlite3.OperationalError:
+            return set()
+
+    def work_affinity(self, work_thread_ids: Iterable[int], *, pad_s: float = 600.0,
+                      call_pad_s: float = 3600.0) -> dict[str, set[int]]:
+        """Ids of what is linked to these threads (the related ranking's thread affinity), id-only queries with
+        nothing decrypted: ``{"thread", "journal", "episode", "call", "link"}`` - their current facts and links,
+        the episodes within ``pad_s`` of one of their events, the calls whose capture thread one of their events
+        came from (within ``call_pad_s``)."""
+        wanted = sorted({int(i) for i in work_thread_ids if i is not None})
+        out: dict[str, set[int]] = {"thread": set(wanted)}
+        if not wanted:
+            return out
+        marks = ",".join("?" * len(wanted))
+        out["journal"] = self.journal_ids_of_work_threads(wanted)
+        try:
+            out["link"] = {int(r[0]) for r in self._query(
+                f"SELECT id FROM links_seen WHERE work_thread_id IN ({marks})", wanted)}
+        except sqlite3.OperationalError:
+            out["link"] = set()
+        spans = self.work_event_spans(wanted)
+        times = sorted(a for evs in spans.values() for a, _t in evs)
+        caps = {t for evs in spans.values() for _a, t in evs if t is not None}
+        out["episode"], out["call"] = set(), set()
+        if not times:
+            return out
+        rows = self._query("SELECT id, started_at, ended_at FROM episodes WHERE expired_at IS NULL AND ended_at >= ?"
+                           " AND started_at <= ?", (times[0] - pad_s, times[-1] + pad_s))
+        for r in rows:
+            start, end = float(r[1]) - pad_s, float(r[2]) + pad_s
+            i = bisect.bisect_left(times, start)
+            if i < len(times) and times[i] <= end:
+                out["episode"].add(int(r[0]))
+        if caps:
+            cmarks = ",".join("?" * len(caps))
+            out["call"] = {int(r[0]) for r in self._query(
+                f"SELECT id FROM calls WHERE thread_id IN ({cmarks}) AND detected_at < ?"
+                " AND (ended_at IS NULL OR ended_at > ?)", (*sorted(caps), times[-1] + call_pad_s,
+                                                           times[0] - call_pad_s))}
+        return out
+
+    def _put_work_vec(self, conn: sqlite3.Connection, thread_id: int, vec: np.ndarray | None, model: str | None) -> None:
+        if vec is None:
+            return
+        v = np.asarray(vec, dtype=np.float32).ravel()
+        conn.execute("INSERT OR REPLACE INTO work_thread_vec(work_thread_id, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
+                     (int(thread_id), model or "", int(v.shape[0]), self.cipher.encrypt_bytes(v.tobytes())))
+
+    def _merge_list(self, old: list[str], new: Sequence[str], cap: int) -> list[str]:
+        """``new`` first, then the ``old`` items not in it (case-insensitive identity: plumbing on strings)."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in [*new, *old]:
+            text = " ".join(str(item or "").split())
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                out.append(text)
+        return out[:cap]
+
+    def _apply_work(self, conn: sqlite3.Connection, ops: Sequence[WorkOp], *, batch_id: int | None,
+                    journal_ids: Sequence[int] = ()) -> None:
+        """Write what a batch did to threads of work, inside the caller's transaction; sets each op's
+        ``result_id`` and ``outcome``. A thread named that is gone (merged away) is followed to where it went."""
+        now = time.time()
+        for op in ops:
+            at = float(op.at or now)
+            state = " ".join((op.state or "").split())
+            if op.action == "starts":
+                cur = conn.execute(
+                    "INSERT INTO work_threads(title_ciphertext, kind, status, state_ciphertext, open_ciphertext,"
+                    " entities_ciphertext, first_seen, last_seen, importance, origin, merged_into, events, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,1,?,?)",
+                    (self.cipher.encrypt(" ".join(op.title.split())), op.kind, "active", self._enc(state or None),
+                     self.cipher.encrypt(json.dumps(self._merge_list([], op.open_items, self.WORK_OPEN_MAX))),
+                     self.cipher.encrypt(json.dumps(self._merge_list([], op.entities, self.WORK_ENTITIES_MAX))),
+                     at, at, op.importance, op.origin, now, now))
+                tid, event, op.outcome = int(cur.lastrowid), "starts", "started"
+            else:
+                tid = None
+                current = op.work_thread_id
+                for _ in range(16):   # a thread merged away since the batch was offered it: follow it
+                    row = conn.execute("SELECT * FROM work_threads WHERE id=?", (current,)).fetchone()
+                    if row is None:
+                        break
+                    if row["merged_into"] is None:
+                        tid = int(row["id"])
+                        break
+                    current = int(row["merged_into"])
+                if tid is None:
+                    op.outcome = "rejected:no such thread"
+                    continue
+                if row["status"] == "dismissed":   # the nightly tidy judged it no piece of work
+                    op.outcome = "rejected:dismissed thread"
+                    continue
+                status = {"continues": "active", "pauses": "paused", "ends": "done"}.get(op.action)
+                if status is None:
+                    op.outcome = f"rejected:unknown action {op.action}"
+                    continue
+                entities = self._merge_list(self._json_list(row["entities_ciphertext"]), op.entities,
+                                            self.WORK_ENTITIES_MAX)
+                open_items = (self._merge_list([], op.open_items, self.WORK_OPEN_MAX) if (op.open_items or state)
+                              else self._json_list(row["open_ciphertext"]))
+                rated = [x for x in (row["importance"], op.importance) if x is not None]
+                older = at < float(row["last_seen"]) - 60.0
+                if older:
+                    # an older source (a history message read now, an old page): the thread's newer state and
+                    # status stand; the event still records that the thread came up there
+                    state, open_items, status = "", self._json_list(row["open_ciphertext"]), row["status"]
+                glimpsed = op.attention in ("visible", "popup")
+                touched = at
+                event = op.action
+                if glimpsed:
+                    # only beside the window in front, or a popup (migration 24): what it said may move where the
+                    # thread stands, but it is no touch of the user's - status and last seen stay
+                    status, touched, event = row["status"], float(row["last_seen"]), "seen"
+                if op.action == "continues" and row["status"] in ("paused", "done") and not older and not glimpsed:
+                    event = "reopens"
+                conn.execute(
+                    "UPDATE work_threads SET status=?, state_ciphertext=coalesce(?, state_ciphertext), open_ciphertext=?,"
+                    " entities_ciphertext=?, first_seen=min(first_seen, ?), last_seen=max(last_seen, ?),"
+                    " importance=?, events=events+1, updated_at=? WHERE id=?",
+                    (status, self._enc(state or None), self.cipher.encrypt(json.dumps(open_items)),
+                     self.cipher.encrypt(json.dumps(entities)), min(at, touched), touched,
+                     max(rated) if rated else None, now, tid))
+                op.outcome = {"continues": "continued", "pauses": "paused", "ends": "ended"}[op.action]
+                if event == "reopens":
+                    op.outcome = "reopened"
+                elif glimpsed:
+                    op.outcome = "seen"
+            self._put_work_vec(conn, tid, op.vector, op.embed_model)
+            conn.execute(
+                "INSERT INTO work_thread_events(work_thread_id, at, action, batch_id, thread_id, app, host,"
+                " state_ciphertext, origin, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tid, at, event, batch_id, op.capture_thread_id, op.app, op.host, self._enc(state or None),
+                 op.origin, now))
+            linked = [journal_ids[i] for i in op.fact_indexes if 0 <= i < len(journal_ids)] + list(op.journal_ids)
+            if linked:
+                conn.executemany("UPDATE journal SET work_thread_id=? WHERE id=?", [(tid, int(j)) for j in linked])
+            op.result_id = tid
+
+    def apply_work(self, ops: Sequence[WorkOp], *, batch_id: int | None = None) -> list[WorkOp]:
+        """:meth:`_apply_work` in a transaction of its own (the backfill: facts already stored, ``journal_ids``)."""
+        if ops:
+            self._write(lambda conn: self._apply_work(conn, ops, batch_id=batch_id))
+        return list(ops)
+
+    def change_work_threads(self, changes: Sequence[dict[str, Any]], *, now: float | None = None,
+                            origin: str = "consolidate") -> list[dict[str, Any]]:
+        """The nightly pass's validated decisions, in one transaction; returns what happened to each.
+
+        Each change: ``{"action": "merge", "ids": [...], "keep": id, "title", "state", "open", "vector",
+        "embed_model"}`` (the others end ``merged`` into ``keep``; their facts, events and links move to it),
+        ``{"action": "close", "id", "status": "paused" | "done"}``, ``{"action": "rename", "id", "title",
+        "vector", "embed_model"}``, ``{"action": "update", "id", "state", "open", "vector", "embed_model"}``.
+        """
+        now = time.time() if now is None else float(now)
+        out: list[dict[str, Any]] = []
+
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            for ch in changes:
+                action = ch.get("action")
+                if action == "merge":
+                    keep = int(ch["keep"])
+                    others = [int(i) for i in ch["ids"] if int(i) != keep]
+                    rows = {int(r["id"]): r for r in conn.execute(
+                        "SELECT * FROM work_threads WHERE status NOT IN ('merged', 'dismissed') AND id IN (%s)"
+                        % ",".join("?" * (len(others) + 1)), (keep, *others)).fetchall()}
+                    if keep not in rows or not all(o in rows for o in others):
+                        out.append({**{k: v for k, v in ch.items() if k not in ("vector",)}, "ok": False,
+                                    "why": "not all current"})
+                        continue
+                    group = [rows[keep], *(rows[o] for o in others)]
+                    entities = self._json_list(rows[keep]["entities_ciphertext"])
+                    for r in group[1:]:
+                        entities = self._merge_list(entities, self._json_list(r["entities_ciphertext"]),
+                                                    self.WORK_ENTITIES_MAX)
+                    status = "active" if any(r["status"] == "active" for r in group) else rows[keep]["status"]
+                    marks = ",".join("?" * len(others))
+                    conn.execute(
+                        "UPDATE work_threads SET title_ciphertext=?, state_ciphertext=coalesce(?, state_ciphertext),"
+                        " open_ciphertext=coalesce(?, open_ciphertext), entities_ciphertext=?, status=?,"
+                        " first_seen=?, last_seen=?, events=?, importance=coalesce(?, importance), updated_at=?"
+                        " WHERE id=?",
+                        (self.cipher.encrypt(str(ch.get("title") or self._dec(rows[keep]["title_ciphertext"]) or "")),
+                         self._enc(ch.get("state") or None),
+                         self.cipher.encrypt(json.dumps(list(ch["open"])[: self.WORK_OPEN_MAX])) if ch.get("open")
+                         is not None else None,
+                         self.cipher.encrypt(json.dumps(entities)), status,
+                         min(r["first_seen"] for r in group), max(r["last_seen"] for r in group),
+                         sum(int(r["events"] or 0) for r in group), ch.get("importance"), now, keep))
+                    conn.execute(f"UPDATE work_threads SET status='merged', merged_into=?, updated_at=? WHERE id IN ({marks})",
+                                 (keep, now, *others))
+                    conn.execute(f"UPDATE journal SET work_thread_id=? WHERE work_thread_id IN ({marks})", (keep, *others))
+                    conn.execute(f"UPDATE work_thread_events SET work_thread_id=? WHERE work_thread_id IN ({marks})",
+                                 (keep, *others))
+                    conn.execute(f"UPDATE links_seen SET work_thread_id=? WHERE work_thread_id IN ({marks})", (keep, *others))
+                    conn.execute(f"DELETE FROM work_thread_vec WHERE work_thread_id IN ({marks})", others)
+                    self._put_work_vec(conn, keep, ch.get("vector"), ch.get("embed_model"))
+                    conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
+                                 " created_at) VALUES (?,?,?,?,?,?)", (keep, now, "merged", self._enc(ch.get("state") or None),
+                                                                       origin, now))
+                    out.append({"action": "merge", "keep": keep, "ids": [keep, *others], "ok": True})
+                elif action == "dismiss":
+                    tid = int(ch["id"])
+                    if conn.execute("UPDATE work_threads SET status='dismissed', updated_at=? WHERE id=?"
+                                    " AND status NOT IN ('merged', 'dismissed')", (now, tid)).rowcount != 1:
+                        out.append({"action": action, "id": tid, "ok": False, "why": "not current"})
+                        continue
+                    conn.execute("UPDATE journal SET work_thread_id=NULL WHERE work_thread_id=?", (tid,))
+                    conn.execute("UPDATE links_seen SET work_thread_id=NULL WHERE work_thread_id=?", (tid,))
+                    conn.execute("DELETE FROM work_thread_vec WHERE work_thread_id=?", (tid,))
+                    conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
+                                 " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "closed", self._enc(ch.get("reason") or None),
+                                                                       origin, now))
+                    out.append({"action": action, "id": tid, "ok": True})
+                elif action in ("close", "rename", "update"):
+                    tid = int(ch["id"])
+                    row = conn.execute("SELECT * FROM work_threads WHERE id=? AND status NOT IN ('merged', 'dismissed')", (tid,)).fetchone()
+                    if row is None:
+                        out.append({"action": action, "id": tid, "ok": False, "why": "not current"})
+                        continue
+                    if action == "close":
+                        status = ch.get("status") if ch.get("status") in ("paused", "done") else "paused"
+                        conn.execute("UPDATE work_threads SET status=?, updated_at=? WHERE id=?", (status, now, tid))
+                        event = "closed"
+                    elif action == "rename":
+                        conn.execute("UPDATE work_threads SET title_ciphertext=?, updated_at=? WHERE id=?",
+                                     (self.cipher.encrypt(str(ch["title"])), now, tid))
+                        event = "renamed"
+                    else:
+                        conn.execute(
+                            "UPDATE work_threads SET state_ciphertext=coalesce(?, state_ciphertext),"
+                            " open_ciphertext=coalesce(?, open_ciphertext), updated_at=? WHERE id=?",
+                            (self._enc(ch.get("state") or None),
+                             self.cipher.encrypt(json.dumps(list(ch["open"])[: self.WORK_OPEN_MAX]))
+                             if ch.get("open") is not None else None, now, tid))
+                        event = "renamed" if ch.get("title") else "continues"
+                    self._put_work_vec(conn, tid, ch.get("vector"), ch.get("embed_model"))
+                    conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
+                                 " created_at) VALUES (?,?,?,?,?,?)",
+                                 (tid, now, event, self._enc(ch.get("state") or ch.get("reason") or None), origin, now))
+                    out.append({"action": action, "id": tid, "ok": True})
+            return out
+
+        return self._write(op) if changes else []
+
+    # -- links seen (migration 23, yuki.memory.links) ------------------------------------
+
+    def _link(self, r: sqlite3.Row, score: float | None = None) -> LinkSeen:
+        return LinkSeen(
+            id=int(r["id"]), url=self._dec(r["url_ciphertext"]) or "", title=self._dec(r["title_ciphertext"]),
+            host=r["host"], app=_shown(r["app"]) if r["app"] else r["app"], how=r["how"],
+            sender=self._dec(r["sender_ciphertext"]), where=self._dec(r["where_ciphertext"]), page_key=r["page_key"],
+            capture_thread_id=r["capture_thread_id"], work_thread_id=r["work_thread_id"], by_yuki=bool(r["by_yuki"]),
+            first_seen=float(r["first_seen"]), last_seen=float(r["last_seen"]), visits=int(r["visits"] or 0),
+            score=score, attention=r["attention"] if "attention" in r.keys() else None)
+
+    def upsert_links(self, items: Sequence[dict[str, Any]]) -> list[int]:
+        """Record pages seen and links shared, one transaction; one row per (how, URL). Each item: ``url``,
+        ``how`` (viewed | shared), ``at`` (first seen this time), ``until`` (last seen), and optionally ``title``,
+        ``host``, ``app``, ``sender``, ``where``, ``page_key``, ``capture_thread_id``, ``work_thread_id``,
+        ``by_yuki``, ``visit`` (count one visit), ``attention`` (``None``: in front; ``visible``: only beside the
+        window in front - once seen in front, a link stays in front). Returns the row ids."""
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> list[int]:
+            ids: list[int] = []
+            for it in items:
+                url = str(it.get("url") or "").strip()
+                how = str(it.get("how") or "viewed")
+                if not url:
+                    continue
+                key = self.cipher.digest("link", how, url)
+                first = float(it.get("at") or now)
+                last = float(it.get("until") or first)
+                row = conn.execute("SELECT id FROM links_seen WHERE url_key=?", (key,)).fetchone()
+                if row is None:
+                    cur = conn.execute(
+                        "INSERT INTO links_seen(url_key, url_ciphertext, title_ciphertext, host, app, how, sender_ciphertext,"
+                        " where_ciphertext, page_key, capture_thread_id, work_thread_id, by_yuki, first_seen, last_seen,"
+                        " visits, updated_at, attention) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (key, self.cipher.encrypt(url), self._enc(it.get("title") or None), it.get("host"), it.get("app"),
+                         how, self._enc(it.get("sender") or None), self._enc(it.get("where") or None), it.get("page_key"),
+                         it.get("capture_thread_id"), it.get("work_thread_id"), int(bool(it.get("by_yuki"))), first, last,
+                         1 if it.get("visit", True) else 0, now, it.get("attention") or None))
+                    ids.append(int(cur.lastrowid))
+                    continue
+                conn.execute(
+                    "UPDATE links_seen SET title_ciphertext=coalesce(?, title_ciphertext), host=coalesce(?, host),"
+                    " app=coalesce(?, app), sender_ciphertext=coalesce(?, sender_ciphertext),"
+                    " where_ciphertext=coalesce(?, where_ciphertext), page_key=coalesce(?, page_key),"
+                    " capture_thread_id=coalesce(?, capture_thread_id), work_thread_id=coalesce(?, work_thread_id),"
+                    " by_yuki=min(by_yuki, ?), first_seen=min(first_seen, ?), last_seen=max(last_seen, ?),"
+                    " visits=visits+?, updated_at=?, attention=CASE WHEN ? IS NULL THEN NULL ELSE attention END"
+                    " WHERE id=?",
+                    (self._enc(it.get("title") or None), it.get("host"), it.get("app"), self._enc(it.get("sender") or None),
+                     self._enc(it.get("where") or None), it.get("page_key"), it.get("capture_thread_id"),
+                     it.get("work_thread_id"), int(bool(it.get("by_yuki"))), first, last,
+                     1 if it.get("visit", True) else 0, now, it.get("attention") or None, int(row["id"])))
+                ids.append(int(row["id"]))
+            return ids
+
+        return self._write(op) if items else []
+
+    def links(self, *, since: TimeArg = None, until: TimeArg = None, how: str | None = None, limit: int = 200,
+              ids: Iterable[int] | None = None) -> list[LinkSeen]:
+        """Links seen, most recently seen first (last seen in ``[since, until)``)."""
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("last_seen >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("first_seen < ?")
+            params.append(u)
+        if how:
+            clauses.append("how = ?")
+            params.append(how)
+        if ids is not None:
+            wanted = sorted({int(i) for i in ids})
+            if not wanted:
+                return []
+            clauses.append("id IN (%s)" % ",".join("?" * len(wanted)))
+            params.extend(wanted)
+        sql = "SELECT * FROM links_seen" + (" WHERE " + " AND ".join(clauses) if clauses else "")
+        try:
+            return [self._link(r) for r in self._query(sql + " ORDER BY last_seen DESC, id DESC LIMIT ?",
+                                                       (*params, int(limit)))]
+        except sqlite3.OperationalError:
+            return []
+
+    def links_without_vectors(self, limit: int = 128) -> list[LinkSeen]:
+        try:
+            return [self._link(r) for r in self._query(
+                "SELECT l.* FROM links_seen l LEFT JOIN link_vec v ON v.link_id = l.id WHERE v.link_id IS NULL"
+                " ORDER BY l.id LIMIT ?", (int(limit),))]
+        except sqlite3.OperationalError:
+            return []
+
+    def add_link_vectors(self, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        def op(conn: sqlite3.Connection) -> int:
+            for link_id, vec in items:
+                self._put_vec(conn, "link_vec", "link_id", int(link_id), vec, model)
+            return len(items)
+        return self._write(op) if items else 0
+
+    def link_vectors(self, ids: Iterable[int]) -> dict[int, np.ndarray]:
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return {}
+        rows = self._query("SELECT link_id, vec_ciphertext FROM link_vec WHERE link_id IN (%s)" % ",".join("?" * len(wanted)),
+                           wanted)
+        return {int(r[0]): np.frombuffer(self.cipher.decrypt_bytes(r[1]), dtype=np.float32) for r in rows}
+
+    def page_seconds(self, page_keys: Iterable[str]) -> dict[str, tuple[float, int]]:
+        """``{page_key: (seconds in front, stretches)}`` from the timeline (content-free)."""
+        wanted = sorted({str(k) for k in page_keys if k})
+        if not wanted:
+            return {}
+        rows = self._query("SELECT page_key, sum(coalesce(active_s,0)+coalesce(passive_s,0)), count(*) FROM timeline"
+                           " WHERE state='present' AND page_key IN (%s) GROUP BY page_key" % ",".join("?" * len(wanted)),
+                           wanted)
+        return {str(r[0]): (float(r[1] or 0.0), int(r[2] or 0)) for r in rows}
+
+    def timeline_pages_since(self, updated_after: float, *, limit: int = 2000) -> list[dict[str, Any]]:
+        """Timeline stretches of web pages written or changed after ``updated_after`` (the links sync), oldest
+        change first: ``{"id", "started_at", "ended_at", "state", "process", "app", "host", "path", "title",
+        "page_key", "by_yuki", "updated_at"}``; privacy-withheld and full-screen rows are left out."""
+        rows = self._query(
+            "SELECT id, started_at, ended_at, state, process, app, host, path_ciphertext, title_ciphertext, page_key,"
+            " by_yuki, updated_at FROM timeline WHERE updated_at > ? AND host IS NOT NULL AND withheld IS NULL"
+            " AND fullscreen = 0 AND meeting IS NULL AND state = 'present' ORDER BY updated_at, id LIMIT ?",
+            (float(updated_after), int(limit)))
+        return [{"id": r["id"], "started_at": r["started_at"], "ended_at": r["ended_at"], "state": r["state"],
+                 "process": r["process"], "app": _shown(r["app"], r["process"]), "host": r["host"],
+                 "path": self._dec(r["path_ciphertext"]), "title": self._dec(r["title_ciphertext"]),
+                 "page_key": r["page_key"], "by_yuki": bool(r["by_yuki"]), "updated_at": r["updated_at"]} for r in rows]
+
+    def url_threads_since(self, after: float, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Capture threads with a web address seen after ``after`` (the links sync): ``{"id", "app", "url",
+        "title", "host", "first_seen", "last_seen", "kind", "front"}``, oldest first. ``front``: some capture of
+        it was taken with the window in front (not only beside it, migration 24)."""
+        rows = self._query(
+            "SELECT t.*, EXISTS(SELECT 1 FROM captures c WHERE c.thread_id = t.id AND c.trigger != 'popup'"
+            " AND c.trigger NOT LIKE 'visible:%') AS front FROM threads t WHERE t.url_ciphertext IS NOT NULL"
+            " AND t.last_seen > ? ORDER BY t.last_seen LIMIT ?", (float(after), int(limit)))
+        return [{"id": r["id"], "app": _shown(r["app"], r["process"]), "url": self._dec(r["url_ciphertext"]),
+                 "title": self._dec(r["title_ciphertext"]), "host": r["host"], "first_seen": r["first_seen"],
+                 "last_seen": r["last_seen"], "kind": r["kind"], "front": bool(r["front"])} for r in rows]
+
+    def message_captures_after(self, after_id: int, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Conversation and mail captures with ``id > after_id`` (the links sync reads the links in them),
+        oldest first: ``{"id", "at", "thread_id", "app", "title", "scope", "text", "by_yuki"}``."""
+        rows = self._query(
+            "SELECT c.id, c.at, c.thread_id, c.delta_ciphertext, c.by_yuki, t.app, t.process, t.title_ciphertext,"
+            " t.scope_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id WHERE c.id > ?"
+            " AND c.kind IN ('conversation', 'email') ORDER BY c.id LIMIT ?", (int(after_id), int(limit)))
+        return [{"id": r["id"], "at": r["at"], "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]),
+                 "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
+                 "text": self.cipher.decrypt(r["delta_ciphertext"]), "by_yuki": bool(r["by_yuki"])} for r in rows]
+
+    def max_capture_id(self) -> int:
+        return int(self._query("SELECT coalesce(max(id), 0) FROM captures")[0][0])
+
+    # -- call digests as vectors (migration 23) -------------------------------------------
+
+    def call_digests_without_vectors(self, limit: int = 32) -> list[dict[str, Any]]:
+        """Written digests (status ok) that have no vector yet: ``{"call_id", "app", "started_at", "gist",
+        "blocks"}``."""
+        try:
+            rows = self._query("SELECT d.call_id FROM call_digests d LEFT JOIN call_digest_vec v ON v.call_id = d.call_id"
+                               " WHERE v.call_id IS NULL AND d.status = 'ok' AND d.blocks_ciphertext IS NOT NULL"
+                               " ORDER BY d.call_id LIMIT ?", (int(limit),))
+        except sqlite3.OperationalError:
+            return []
+        digests = self.call_digests([int(r[0]) for r in rows])
+        return [{"call_id": cid, **d} for cid, d in digests.items()]
+
+    def add_call_digest_vectors(self, items: Sequence[tuple[int, np.ndarray]], model: str) -> int:
+        def op(conn: sqlite3.Connection) -> int:
+            for call_id, vec in items:
+                self._put_vec(conn, "call_digest_vec", "call_id", int(call_id), vec, model)
+            return len(items)
+        return self._write(op) if items else 0
+
+    # -- the freshest layer: recent screens (yuki.memory.related.recent) ------------------
+
+    def recent_captures(self, since: TimeArg, until: TimeArg = None, *, limit: int = 40,
+                        kinds: Sequence[str] | None = None, skip_kinds: Sequence[str] = ("my_call_side",)
+                        ) -> list[dict[str, Any]]:
+        """The newest ``limit`` captures in ``[since, until)``, oldest first, with their window: ``{"id", "at",
+        "kind", "text", "thread_id", "app", "process", "title", "scope", "url", "host", "by_yuki", "trigger",
+        "attention"}`` (text decrypted; ``attention``: :func:`capture_attention`)."""
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("c.at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("c.at < ?")
+            params.append(u)
+        if kinds:
+            clauses.append("c.kind IN (%s)" % ",".join("?" * len(kinds)))
+            params.extend(kinds)
+        if skip_kinds:
+            clauses.append("coalesce(c.kind, '') NOT IN (%s)" % ",".join("?" * len(skip_kinds)))
+            params.extend(skip_kinds)
+        params.append(int(limit))
+        rows = self._query(
+            "SELECT c.id, c.at, c.kind, c.delta_ciphertext, c.thread_id, c.by_yuki, c.trigger, t.app, t.process, t.host,"
+            " t.title_ciphertext, t.scope_ciphertext, t.url_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
+            + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY c.at DESC, c.id DESC LIMIT ?", params)
+        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "text": self.cipher.decrypt(r["delta_ciphertext"]),
+                 "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]), "process": r["process"],
+                 "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
+                 "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
+                 "trigger": r["trigger"], "attention": capture_attention(r["trigger"])}
+                for r in reversed(rows)]
+
+    def batch_times(self, batch_ids: Iterable[int]) -> dict[int, float]:
+        """``{journal batch: when it was made}`` (the order the journal wrote its facts in)."""
+        wanted = sorted({int(i) for i in batch_ids})
+        out: dict[int, float] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            out.update({int(r[0]): float(r[1]) for r in self._query(
+                "SELECT id, at FROM journal_batches WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk)})
+        return out
+
+    def summaries_by_ids(self, ids: Iterable[int]) -> list[SessionSummary]:
+        """Session summaries by id (the whole-memory ranking's picks), oldest first."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return []
+        return [self._summary(r) for r in self._query(
+            "SELECT * FROM session_summaries WHERE id IN (%s) ORDER BY started_at" % ",".join("?" * len(wanted)), wanted)]
+
+    def captures_by_ids(self, ids: Iterable[int]) -> list[dict[str, Any]]:
+        """Captures by id with their window (as :meth:`recent_captures`), oldest first."""
+        wanted = sorted({int(i) for i in ids if i is not None})
+        if not wanted:
+            return []
+        rows = self._query(
+            "SELECT c.id, c.at, c.kind, c.delta_ciphertext, c.thread_id, c.by_yuki, c.trigger, t.app, t.process, t.host,"
+            " t.title_ciphertext, t.scope_ciphertext, t.url_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
+            " WHERE c.id IN (%s) ORDER BY c.at, c.id" % ",".join("?" * len(wanted)), wanted)
+        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "text": self.cipher.decrypt(r["delta_ciphertext"]),
+                 "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]), "process": r["process"],
+                 "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
+                 "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
+                 "trigger": r["trigger"], "attention": capture_attention(r["trigger"])} for r in rows]
 
 
 def _split_sql(script: str) -> list[str]:

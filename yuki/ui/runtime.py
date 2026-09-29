@@ -330,12 +330,17 @@ class Lane(QThread):
         settings = self.runtime.settings
         voice = job.source == "voice"
         effort = getattr(settings, "voice_brain_effort", None) if voice else None
+        # v3.14: a spoken request starts fast (low effort, thinking off) and the same request moves to the
+        # escalated profile for its next calls only on a measured signal (docs/VOICE.md v3.14, Agent.run).
+        escalate = ((getattr(settings, "voice_brain_escalate_effort", "") or None,
+                     getattr(settings, "voice_brain_escalate_thinking", None)) if voice else None)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
             model=(getattr(settings, "voice_brain_model", "") or None) if voice else None,
             thinking=None if not voice or getattr(settings, "voice_brain_thinking", True) else False,
             lean=voice and not getattr(settings, "voice_brain_portrait", True),
             **({"view_hwnd": job.view_hwnd} if job.view_hwnd else {}),
+            **({"escalate": escalate} if escalate and (escalate[0] or escalate[1] is not None) else {}),
         )
         while True:
             try:

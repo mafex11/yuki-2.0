@@ -248,6 +248,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-review", action="store_true", help="no weekly review (scheduled or requested)")
     parser.add_argument("--no-calls", action="store_true",
                         help="never detect calls, ask, or transcribe the user's side of one")
+    parser.add_argument("--no-visible", action="store_true",
+                        help="read only the window in front (no other visible windows, popups or toasts)")
+    parser.add_argument("--no-now", action="store_true",
+                        help="do not keep or serve the live picture of the screen (yuki.memory.now)")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -296,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
     calls_thread: threading.Thread | None = None
     transcriber = None
     transcriber_thread: threading.Thread | None = None
+    screen_recall = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -303,6 +308,7 @@ def run(args: argparse.Namespace) -> int:
     review_path = flag_path(db_path, REVIEW_FLAG)
     store = None
     embed_server = None
+    now_server = None
     code = 0
     try:
         store = Store.open(db_path)
@@ -322,6 +328,8 @@ def run(args: argparse.Namespace) -> int:
             nudges=not (args.no_journal or args.no_timeline or args.no_nudges),
             review=not (args.no_journal or args.no_review),
             calls=not args.no_calls,
+            visible=not args.no_visible,
+            now=not args.no_now,
             duration_s=args.duration,
         )
         try:
@@ -356,10 +364,28 @@ def run(args: argparse.Namespace) -> int:
         shared = store
         from yuki.config import Settings
 
+        # The live picture of the screen, in RAM, fed by every read of the watcher and served to Yuki's
+        # tray over a local pipe (yuki.memory.now); nothing of it is written anywhere.
+        now_board = None
+        if not args.no_now:
+            try:
+                from yuki.memory.now import NowBoard
+
+                now_board = NowBoard()
+            except Exception as exc:
+                log("error", where="now_board", error=f"{type(exc).__name__}: {exc}")
         watcher = Watcher(
-            lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(), on_close=stop.set,
-            user_names=Settings().user_names,
+            lambda: shared, privacy=privacy, log=log, settings=WatcherSettings(visible=not args.no_visible),
+            on_close=stop.set, user_names=Settings().user_names, now_board=now_board,
         )
+        if now_board is not None:
+            try:
+                from yuki.memory.now import NowServer
+
+                now_server = NowServer(now_board, store.cipher, db_path, on_refresh=watcher.request_refresh,
+                                       log=log).start()
+            except Exception as exc:   # Yuki then reads the screen itself, as before
+                log("error", where="now_ipc_start", error=f"{type(exc).__name__}: {exc}")
         paused = pause_path.exists()
         if paused:
             watcher.set_paused(True)  # before start: nothing is read, not even the first window
@@ -429,6 +455,25 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # the watcher runs on without it
                 log("error", where="journal_start", error=f"{type(exc).__name__}: {exc}")
                 journal = None
+
+        # Screen-triggered recall (yuki.memory.screenrecall): on each new capture, what the whole memory holds for
+        # the screen in front, ranked with the shared embedder (no model), kept in RAM and served to the tray on
+        # the embedder's pipe; the same thread keeps the links seen up to date (yuki.memory.links).
+        if not args.no_journal:
+            try:
+                from yuki.memory.embed import get_embedder as _shared_embedder
+                from yuki.memory.screenrecall import OP as _SCREEN_OP, ScreenRecall
+
+                screen_recall = ScreenRecall(store, embedder=_shared_embedder, log=log,
+                                             board=getattr(watcher, "now", None))
+                store.add_capture_listener(screen_recall.seen)
+                if embed_server is not None:
+                    embed_server.register(_SCREEN_OP, screen_recall.serve)
+                threading.Thread(target=_guarded(screen_recall.run, log, "screen_recall"), args=(stop, pause_path),
+                                 name="yuki-memory-screen", daemon=True).start()
+            except Exception as exc:   # everything else runs on without it
+                log("error", where="screen_recall_start", error=f"{type(exc).__name__}: {exc}")
+                screen_recall = None
 
         if not (args.no_journal or args.no_terminal):
             try:
@@ -654,7 +699,8 @@ def run(args: argparse.Namespace) -> int:
                 next_stats = now + args.stats_every
                 log("stats", **meter.reading(), watcher=watcher.stats(),
                     timeline=timeline.stats() if timeline is not None else None,
-                    warp=warp.stats() if warp is not None else None)
+                    warp=warp.stats() if warp is not None else None,
+                    screen_recall=screen_recall.stats() if screen_recall is not None else None)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
@@ -673,6 +719,11 @@ def run(args: argparse.Namespace) -> int:
         if embed_server is not None:
             try:
                 embed_server.stop()
+            except Exception:
+                pass
+        if now_server is not None:
+            try:
+                now_server.stop()
             except Exception:
                 pass
         if acting_event is not None:

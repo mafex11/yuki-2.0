@@ -37,11 +37,11 @@ from typing import Any, Awaitable, Callable
 from PySide6.QtCore import QObject, Signal
 
 from yuki.voice.mouth import (
-    CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE, brain_request, progress_payload,
-    result_payload, waiting_payload,
+    CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE, brain_request, result_payload,
+    waiting_payload,
 )
 from yuki.voice.narrator import RANKS, Item, condense
-from yuki.voice.progress import JobLog, StepPacer, step_of
+from yuki.voice.progress import JobLog, step_of
 
 #: Job states.
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
@@ -89,7 +89,14 @@ class Job:
     events: asyncio.Queue | None = None
     token: int = 0
     log: JobLog | None = None
-    pacer: StepPacer | None = None
+    #: The thinker's steps so far (tool calls that are steps): the number of the one running now, for its spoken
+    #: line (v3.14, :mod:`yuki.voice.steplines`).
+    step_seq: int = 0
+    #: The thinker's own words for its latest step (``say_now``), and whether that step is running now (v3.14): what
+    #: the talker's thinker line and a "still on it" line name, rather than the tool's generic label (live 09:08 on
+    #: 28 Sept "Still on it, switching tabs now." came from the tab tool's label while it was closing a tab).
+    step_line: str | None = None
+    step_running: bool = False
     #: Handed over with intent ``remember`` (a rule, correction or life fact to keep).
     remember: bool = False
     #: The desktop action it is running now, in a few words (for the shared action log).
@@ -217,6 +224,9 @@ class VoiceBridge(QObject):
         self.log = log
         self._foreground = foreground or _foreground_hwnd
         self._max_sentences = int(getattr(settings, "voice_result_sentences", 2))
+        #: The profile a spoken request's first model call runs at (v3.14): what the thinker's cache is warmed for.
+        self._voice_profile = (getattr(settings, "voice_brain_effort", None),
+                               getattr(settings, "voice_brain_thinking", None))
         self._max_chars = int(getattr(settings, "voice_result_chars", 280))
         self._progress_lines = int(getattr(settings, "voice_progress_lines", 2))
         #: Seconds of silence (nobody speaking) before a running task's one "still on it" line, and before a
@@ -243,6 +253,9 @@ class VoiceBridge(QObject):
         self.announce: Callable[[dict[str, Any]], Any] | None = None
         #: The conversation's narrator gate (``None``: deliver at once, as in tests).
         self.gate: Any = None
+        #: The conversation's step-line voice (:class:`yuki.voice.steplines.StepLines`, v3.14): the thinker's step
+        #: and say lines, said by code at the right moments; ``None`` without a conversation.
+        self.steps: Any = None
         #: ``async (log_text, question) -> (text | None, facts)``: the isolated progress call.
         self.progress_answerer: Callable[[str, str], Awaitable[tuple[str | None, dict]]] | None = None
         #: The mouth's own quick tools in flight (check_progress): the gate waits for them.
@@ -283,6 +296,8 @@ class VoiceBridge(QObject):
         #: When a result or a question was handed to the mouth to be said (monotonic): a stay_quiet in the
         #: run it started is refused once, because a result or a question is always said (v3.5).
         self.said_owed_at: float | None = None
+        #: The "still on it" line last handed to the talker, and when (``waiting_reply_stale``, v3.14).
+        self._waiting_run: tuple[Job, float] | None = None
         #: ``() -> int``: the conversation's user turns so far (set by the conversation; v3.9): binds each job to
         #: the request it answers, so a result arriving after the user said more is framed as the earlier one's.
         self.user_turns: Callable[[], int] | None = None
@@ -320,6 +335,7 @@ class VoiceBridge(QObject):
             ("said", self._on_said), ("asked", self._on_asked), ("finished", self._on_finished),
             ("failed", self._on_failed), ("withdrawn", self._on_withdrawn), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
+            ("partial", self._on_partial),
         ):
             signal = getattr(runtime, name, None)
             if signal is not None:
@@ -339,6 +355,7 @@ class VoiceBridge(QObject):
         self._named_refused = False
         if loop is None:
             self.gate = None
+            self.steps = None
             self.progress_answerer = None
             self.spoke_in_reply = None
             self.on_remembered = None
@@ -452,7 +469,8 @@ class VoiceBridge(QObject):
             elif j.state == WAITING:
                 parts.append(f'{name} "{j.brief()}" waiting for their answer to: {j.question or "its question"}')
             else:
-                step = f", now: {j.step.lower()}" if j.step else ", starting"
+                step = (f', now: "{j.step_line}"' if j.step_line and j.step_running else
+                        f", now: {j.step.lower()}" if j.step else ", starting")
                 parts.append(f'{name} "{j.brief()}" running for {ago} s{step}')
         if done:
             j = done[-1]
@@ -502,8 +520,7 @@ class VoiceBridge(QObject):
             except Exception:  # noqa: BLE001
                 turns = 0
         return Job(job_id=None, request=request, source=source, token=next(self._tokens),
-                   events=asyncio.Queue() if with_queue else None, log=JobLog(request=request),
-                   pacer=StepPacer(self._progress_lines), user_turn=turns)
+                   events=asyncio.Queue() if with_queue else None, log=JobLog(request=request), user_turn=turns)
 
     # -- the mouth's tools (voice thread) ---------------------------------------
 
@@ -541,6 +558,18 @@ class VoiceBridge(QObject):
             return
         if intent == "new_task" and not remember and not replaced:
             same = self._same_turn_job()
+            if same is not None and same.escalated:
+                # v3.14: the talker's hand did not take effect and code already gave the thinker these very words
+                # (``escalate``); the talker's own hand-off of them in the run that says "on it" adds nothing. Its
+                # words are said, the call settles, and the running job is not steered with a copy of its request
+                # (offline 29 Sept that copy held the job's done for one more round).
+                await self._ack_if_silent(params, args)
+                self._log("bridge", op="merged_escalated", job_id=same.job_id, call=params.tool_call_id)
+                from pipecat.frames.frames import FunctionCallResultProperties
+
+                await params.result_callback({"status": "already being done for these words"},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                return
             if same is not None:
                 # One job per request (v3.10): a second hand-off for the same user turn (the reply's own second call,
                 # or a re-run of the same words) is that request again, never a second job saying a second outcome.
@@ -578,9 +607,8 @@ class VoiceBridge(QObject):
         job = self._new_job(request)
         job.acked = self._acked(params, args)
         if remember:
-            # Saved quietly: no progress lines, and its outcome folded in unless it failed.
+            # Saved quietly: no step lines, and its outcome folded in unless it failed.
             job.remember = True
-            job.pacer = StepPacer(0)
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
@@ -588,6 +616,8 @@ class VoiceBridge(QObject):
         # being withdrawn: through the front desk it would only look, then be queued anyway a model call later.
         lane = "worker" if (replaced or acts) else None
         view = (origin or self._desk_foreground()) if (screen or (acts and self._just_used_desk())) else None
+        if lane == "worker" and not remember:
+            self._pass_over_questions(lane)   # a question they went past would hold this behind it for good
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
                   request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
@@ -666,15 +696,12 @@ class VoiceBridge(QObject):
         loop = asyncio.get_running_loop()
         while True:
             kind, payload = await job.events.get()
-            if kind == "moved":
-                # The job took its next step: a progress line still waiting is about a step it is past (v3.6:
-                # live 04:47:28 "Opening Bluetooth settings for you" was said after they had opened).
-                if self.gate is not None:
-                    for item in self.gate.take(job.token, kinds=("step", "queued")):
-                        if item.drop is not None:
-                            item.drop()
-                        self._log("narrator", op="dropped_passed", job=job.token, item=item.kind)
+            if self._step_item(job, kind, payload):
                 continue
+            if kind == "say_line":
+                kind, payload = "say", payload[1]   # no step-line voice (a test's stand-in): the talker says it
+            if kind in ("done", "failed", "withdrawn") and self.steps is not None:
+                self.steps.closed(job.token)
             self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
                       chars=len(str(payload)))
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
@@ -720,6 +747,7 @@ class VoiceBridge(QObject):
                         self.said_owed_at = time.monotonic()
                     if run_llm and not stale:
                         self._outcome_said(job)
+                    self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                                 request=job.request, late=late, verified=verified),
                                                  properties=FunctionCallResultProperties(run_llm=run_llm))
@@ -731,11 +759,8 @@ class VoiceBridge(QObject):
                 await self._offer(job, "final", final)
                 await delivered
                 return
-            if kind == "step":
-                label, detail = payload
-                body: dict[str, Any] = progress_payload(label, detail)
-            elif kind == "waiting":
-                body = waiting_payload(job.brief(200), *payload)
+            if kind == "waiting":
+                body: dict[str, Any] = waiting_payload(job.brief(200), *payload)
             elif kind == "say":
                 body = {"yuki_says": payload}
             elif kind == "ask":
@@ -747,13 +772,58 @@ class VoiceBridge(QObject):
                 del stale
                 if run_llm and kind == "ask":
                     self.said_owed_at = time.monotonic()
+                if run_llm:
+                    self._waiting_run = (job, time.monotonic()) if kind == "waiting" else None
                 await params.result_callback(body, properties=FunctionCallResultProperties(
                     is_final=False, run_llm=run_llm))
 
-            drop = None
-            if kind == "step" and job.pacer is not None:
-                drop = (lambda label=payload[0]: job.pacer.dropped(label))
-            await self._offer(job, kind, intermediate, drop)
+            await self._offer(job, kind, intermediate)
+
+    def _step_item(self, job: Job, kind: str, payload: Any) -> bool:
+        """The thinker's step lines, say lines and step boundaries (v3.14): to the step-line voice
+        (:mod:`yuki.voice.steplines`), said by code in Yuki's one voice, never through a talker run. ``True``: taken.
+
+        A job handed over to be kept (``remember``) says nothing of its steps. Without a step-line voice (a test's
+        stand-in conversation) the step items are dropped and a say line goes to the talker as before.
+        """
+        if kind == "moved":
+            # The job took its next step: a "still on it" line still waiting names a step it is past (v3.6: live
+            # 04:47:28 "Opening Bluetooth settings for you" was said after they had opened).
+            if self.gate is not None:
+                for item in self.gate.take(job.token, kinds=("waiting", "queued")):
+                    if item.drop is not None:
+                        item.drop()
+                    self._log("narrator", op="dropped_passed", job=job.token, item=item.kind)
+            return True
+        if kind not in ("step_line", "step_start", "step_end", "say_line", "step_hold", "closing"):
+            return False
+        steps = self.steps
+        if steps is None:
+            return kind != "say_line"
+        if job.remember and kind in ("step_line", "say_line"):
+            return True
+        if kind == "step_start":
+            steps.step_started(job.token, int(payload))
+        elif kind == "step_end":
+            seq, ok = payload if isinstance(payload, tuple) else (payload, True)
+            steps.step_ended(job.token, int(seq), ok=bool(ok))
+        elif kind in ("step_line", "say_line"):
+            seq, text = payload
+            steps.offer(job.token, str(text), kind="step" if kind == "step_line" else "say", seq=int(seq))
+        elif kind == "step_hold":
+            steps.hold(job.token)
+        else:
+            steps.closed(job.token)
+        return True
+
+    def step_said(self, token: int, kind: str, text: str) -> None:
+        """A step or say line of a job went to the voice: into its action log, for "how's it going?" (v3.14)."""
+        with self._lock:
+            job = next((j for j in list(self._jobs.values()) + list(self._unsubmitted.values()) if j.token == token),
+                       None)
+        if job is not None and job.log is not None:
+            job.log.add("said to the user", text)
+            job.last_say = text
 
     async def _offer(self, job: Job, kind: str, deliver: Callable[[bool, bool], Awaitable[None]],
                      drop: Callable[[], None] | None = None, *, self_spoken: bool = False) -> None:
@@ -825,7 +895,6 @@ class VoiceBridge(QObject):
         job.acked = job.acked or self._acked(params, args)
         if remember:
             job.remember = True
-            job.pacer = StepPacer(0)
         extra = []
         if context:
             extra.append(f"[References in that request, as the conversation had them: {context}]")
@@ -876,13 +945,19 @@ class VoiceBridge(QObject):
 
         def run() -> None:
             started = time.monotonic()
+            effort, thinking = self._voice_profile
             try:
+                # v3.14: the voice profile's own entry (on Sonnet 5 each effort is its own cached prefix, measured).
+                ok = warm(effort=effort, thinking=thinking) if (effort or thinking is not None) else warm()
+            except TypeError:  # a stand-in agent without the arguments
                 ok = warm()
             except Exception as exc:  # noqa: BLE001 - only an optimisation
                 ok = f"{type(exc).__name__}"
             self._log("brain_warm", ms=round((time.monotonic() - started) * 1000), ok=ok)
 
-        threading.Thread(target=run, name="yuki-voice-brain-warm", daemon=True).start()
+        from yuki.voice.workers import shared
+
+        shared().submit(run)   # an existing thread: this is called on the voice loop (v3.14)
         return True
 
     async def check_progress(self, params: Any) -> None:
@@ -969,9 +1044,12 @@ class VoiceBridge(QObject):
         by_user = self.user_turn() if self.user_turn is not None else None
         in_call = bool(self.call_mode()) if self.call_mode is not None else False
         owed, self.said_owed_at = self.said_owed_at, None
-        if not by_user and owed is not None and time.monotonic() - owed < 20.0:
+        spoke_now = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
+        if not by_user and not spoke_now and owed is not None and time.monotonic() - owed < 20.0:
             # This run was started by a result or a question to be said (live 2026-09-26: a result met
-            # with stay_quiet was never heard). Refused once; the mouth says it now.
+            # with stay_quiet was never heard). Refused once; the mouth says it now. Not when this very reply
+            # already said it aloud before the call (v3.14: offline 29 Sept the refusal made it say the same
+            # outcome twice, "Nothing's playing right now..." and again a second later).
             self._log("bridge", op="quiet", refused="result_owed")
             await params.result_callback({"not_quiet": "A result, a failure or a question is always said. Say what it "
                                           "says now, in a few words of your own."})
@@ -1182,7 +1260,7 @@ class VoiceBridge(QObject):
     def _typed(self, lane: str, job_id: int, request: str) -> Job:
         """A job the bridge did not submit (typed in the overlay): tracked for progress questions."""
         job = Job(job_id=job_id, request=request, source="text", lane=lane, state=RUNNING,
-                  log=JobLog(request=request), pacer=StepPacer(0))
+                  log=JobLog(request=request))
         with self._lock:
             self._jobs[job_id] = job
         return job
@@ -1199,8 +1277,18 @@ class VoiceBridge(QObject):
         self._changed()
         self._job_event(job, RUNNING, job.request)
 
+    def _on_partial(self, lane: str, job_id: int, what: str, text: str) -> None:
+        """A step line the thinker is writing, complete while the rest of its call still streams (v3.14)."""
+        if what != "step":
+            return
+        job = self._job(job_id)
+        if job is None or job.source != "voice" or job.remember:
+            return
+        job.step_line = text
+        self._post(job, "step_line", (job.step_seq + 1, text))
+
     def _on_tool_called(self, lane: str, job_id: int, name: str, tool_input: dict) -> None:
-        from yuki.agent.tools import ACTION_TOOL_NAMES, FINISHES_FIELD
+        from yuki.agent.tools import ACTION_TOOL_NAMES, FINISHES_FIELD, STEP_FIELD
 
         job = self._job(job_id)
         if job is None:
@@ -1214,17 +1302,25 @@ class VoiceBridge(QObject):
         job.finishing = finishing.strip() if isinstance(finishing, str) and finishing.strip() else None
         label, detail = step
         if job.source == "voice" and job.step is not None and label != job.step:
-            self._post(job, "moved", name)  # a progress line still waiting is about an earlier step now
+            self._post(job, "moved", name)  # a "still on it" line still waiting is about an earlier step now
+        job.step_seq += 1
+        job.step_running = True
+        line = (tool_input or {}).get(STEP_FIELD)
+        job.step_line = line.strip() if isinstance(line, str) and line.strip() else None
+        if job.source == "voice":
+            # v3.14: the step starts now; its line (streamed ahead, or with the finished call) may be said while it
+            # runs, when a pause would be noticeable (yuki.voice.steplines).
+            self._post(job, "step_start", job.step_seq)
+            if job.step_line:
+                self._post(job, "step_line", (job.step_seq, job.step_line))
         job.step = label
         self._job_event(job, "step", label + (f" ({detail})" if detail else ""))
         if job.log is not None:
             job.log.steps += 1
             job.log.add("step", label + (f" ({detail})" if detail else ""))
-        # An action takes effect the moment it runs, long before a progress line could be said (after a pause
-        # in Yuki's speech): "opening X" would come after X is open. Its outcome is what is said; progress
-        # lines are for the looking and reading that take a while (v3.6). Which tools act is plumbing.
-        # v3.9: no progress line per step any more; one "still on it" line, only after real silence, names the
-        # step it is on (_wait_check). The step stays in the job table for the talker's thinker line.
+        # v3.9 dropped the per-step progress line (a talker run after the step: stale). v3.14 says the thinker's own
+        # step line by code while the step runs (yuki.voice.steplines); the step stays in the job table for the
+        # talker's thinker line.
         del acts
 
     def _on_tool_finished(self, lane: str, job_id: int, name: str, ok: bool, summary: str) -> None:
@@ -1241,16 +1337,20 @@ class VoiceBridge(QObject):
                 job.finishing = None
         if job is None or job.log is None or step_of(name, None) is None:
             return
+        job.step_running = False
+        if job.source == "voice":
+            # v3.14: a line about this step not said yet is past if the step failed; after a step that worked it may
+            # still be said while the silence after it runs long (yuki.voice.steplines).
+            self._post(job, "step_end", (job.step_seq, bool(ok)))
         job.log.add("returned", f"{job.step or name}: {'ok' if ok else 'failed'}, {summary}")
 
     def _on_said(self, lane: str, job_id: int, text: str) -> None:
         job = self._job(job_id)
         if job is None:
             return
-        job.last_say = text
-        if job.log is not None:
-            job.log.add("said to the user", text)
-        self._post(job, "say", text)
+        # v3.14: the thinker's say line is said by code in Yuki's one voice when the user may be spoken to (never a
+        # talker run), and goes into its log once said (``step_said``).
+        self._post(job, "say_line", (job.step_seq, text))
 
     def _on_asked(self, lane: str, job_id: int, question: str) -> None:
         job = self._job(job_id)
@@ -1259,6 +1359,7 @@ class VoiceBridge(QObject):
         job.state, job.question, job.lane = WAITING, question, lane
         if job.log is not None:
             job.log.add("asked the user", question)
+        self._post(job, "step_hold", None)   # its question is what is said now, never a step line over it
         self._post(job, "ask", question)
         self._log("bridge", op="state", job_id=job_id, state=WAITING)
         self._changed()
@@ -1394,6 +1495,51 @@ class VoiceBridge(QObject):
         except Exception:  # noqa: BLE001
             return False
 
+    #: How long after a "still on it" line was handed to the talker its reply may still be on its way (s).
+    WAITING_RUN_S = 10.0
+
+    def waiting_reply_stale(self) -> bool:
+        """Whether the talker's reply about to be heard was asked for by a "still on it" line whose job has finished
+        since (v3.14). The line goes to the talker the moment the silence is long; its reply takes ~2 s to be heard,
+        and offline 29 Sept (warp929) the job's outcome landed in that gap: "Still looking for it." was said after the
+        tab had switched, then "There you go." Asked by the voice right before a reply's first audio would play (the
+        gate holds the outcome until then: words on their way count as Yuki speaking), once per line handed over;
+        never for a reply to the user's own words. Plumbing on job states and times only."""
+        run, self._waiting_run = self._waiting_run, None   # asked once: the first reply heard after it is that one
+        if run is None:
+            return False
+        job, at = run
+        if time.monotonic() - at > self.WAITING_RUN_S:
+            return False
+        try:
+            if self.user_turn is not None and self.user_turn():
+                return False   # the user spoke since: this reply answers them
+        except Exception:  # noqa: BLE001
+            return False
+        return job.closing is not None or job.state not in OPEN_STATES
+
+    def _pass_over_questions(self, lane: str) -> list[Job]:
+        """Release the voice jobs on ``lane`` that wait for an answer the user did not give (v3.14).
+
+        A job that asked the user holds its lane until they answer (the lane waits on the answer, with no end), so
+        work handed to that lane after it waited behind it for good: offline 29 Sept (zen928) an unanswered "which
+        video?" held "Pause it." and "Open WhatsApp." until the run timed out, the talker saying "it's queued after
+        the other thing". The talker already judged the new words a new request rather than the answer (it used a
+        hand, or tell_yuki new_task): the question is passed over, as a person who asked and heard something else
+        would, and its job is withdrawn, unsaid. Returns the jobs withdrawn.
+        """
+        with self._lock:
+            waiting = [j for j in self._jobs.values()
+                       if j.source == "voice" and j.state == WAITING and j.lane == lane and not j.superseded]
+        for old in waiting:
+            self._drop_items(old)
+            if self.steps is not None:
+                self.steps.closed(old.token, "passed_over")
+            self._gui(lambda old=old: self._withdraw(old))
+        if waiting:
+            self._log("bridge", op="question_passed_over", lane=lane, withdrawn=[j.job_id for j in waiting])
+        return waiting
+
     def _drop_items(self, job: Job) -> None:
         """Take a job's waiting items out of the narrator gate, unsaid (it was withdrawn or stopped)."""
         if self.gate is None:
@@ -1491,9 +1637,13 @@ class VoiceBridge(QObject):
         job.wait_handle = None
         if job.state not in (QUEUED, RUNNING) or job.events is None or self._loop is None or job.superseded:
             return
-        if job.acked or job.waits >= min(1, self._progress_lines):
-            # Acknowledged once already, or its one line said: quiet until the outcome (v3.10; live 2026-09-28
-            # 09:08:11 "Still on it, switching tabs now." then "Closed it." sounded like a second person).
+        if job.waits >= (1 if job.acked else self._progress_lines):
+            # Its lines said: quiet until the outcome. v3.14: an acknowledged job gets one, others up to
+            # ``voice_progress_lines``, each only after real silence (the complaint of 2026-09-29 was "On it" then
+            # 6-24 s of nothing); the thinker's own step lines speak first and reset the silence, so these come only
+            # in a long quiet (a thinking step, a slow page), and they name the thinker's own words for a running
+            # step, never a tool's generic label. Before (v3.10-v3.13) an acknowledged job got none and
+            # ``min(1, voice_progress_lines)`` ignored the setting.
             return
         due = self._wait_line_s if job.waits == 0 else self._wait_again_s
         quiet = self.quiet_for() if self.quiet_for is not None else due
@@ -1501,11 +1651,14 @@ class VoiceBridge(QObject):
             self._arm_wait(job, due - quiet)
             return
         job.waits += 1
-        job.acked = True
-        self._post(job, "waiting", (job.step, round(time.monotonic() - job.started_at), job.state == QUEUED))
+        self._post(job, "waiting", (job.step_line if job.step_running else None,
+                                    round(time.monotonic() - job.started_at), job.state == QUEUED))
         self._log("bridge", op="waiting_line", job_id=job.job_id, n=job.waits)
+        if job.waits < (1 if job.acked else self._progress_lines):
+            self._arm_wait(job, self._wait_again_s)   # the next one, after as much silence again
 
-    async def escalate(self, params: Any, name: str, args: dict[str, Any], report: str) -> bool:
+    async def escalate(self, params: Any, name: str, args: dict[str, Any], report: str,
+                       acked: bool = False) -> bool:
         """A hand of the talker's did not take effect: hand the same request to the thinker now, by code (v3.9).
 
         Live 2026-09-27 14:18 the talker narrated every failed try ("The stop key didn't take. Let me pause it
@@ -1524,9 +1677,11 @@ class VoiceBridge(QObject):
                              tabs=self.tabs_for_thinker())
         job = self._new_job(request)
         job.escalated = True
+        job.acked = acked   # the talker says a word for it now (v3.14), so no "still on it" before its outcome
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
+        self._pass_over_questions("worker")   # the talker acted on these words: not the answer to a question
         self._gui(lambda: self._submit(job, text, origin, lane="worker", view=origin or self._desk_foreground()))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent="escalated", hand=name,
                   request_chars=len(request), context_chars=len(context), origin_hwnd=origin, heard_turns=len(heard))
@@ -1567,8 +1722,12 @@ class VoiceBridge(QObject):
         """Items of a job no tell_yuki call carries (escalated, or a too-late addition): through ``announce``."""
         while True:
             kind, payload = await job.events.get()
-            if kind in ("step", "moved"):
+            if self._step_item(job, kind, payload):
                 continue
+            if kind == "say_line":
+                kind, payload = "say", payload[1]
+            if kind in ("done", "failed", "withdrawn") and self.steps is not None:
+                self.steps.closed(job.token)
             announce = self.announce
             if announce is None:
                 return
@@ -1593,6 +1752,7 @@ class VoiceBridge(QObject):
                         self.said_owed_at = time.monotonic()
                     if run_llm and not stale:
                         self._outcome_said(job)
+                    self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await announce(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                   request=job.request, late=late, verified=verified),
                                    run_llm and not stale)
@@ -1607,8 +1767,10 @@ class VoiceBridge(QObject):
                 else:
                     body = {"status": payload}
 
-                async def deliver(run_llm: bool, stale: bool, body=body) -> None:
+                async def deliver(run_llm: bool, stale: bool, body=body, kind=kind) -> None:
                     del stale
+                    if run_llm:
+                        self._waiting_run = (job, time.monotonic()) if kind == "waiting" else None
                     await announce(body, run_llm)
                 item_kind = kind if kind in RANKS else "say"
             gate = self.gate

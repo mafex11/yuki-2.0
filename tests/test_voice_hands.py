@@ -162,7 +162,8 @@ def test_scroll_again_is_the_same_hand_twice() -> None:
     hands = Hands(desk)
     first = _hand(hands, "scroll", window=desk.CHROME, direction="down", say_when_done="Done.")
     again = _hand(hands, "scroll", window=desk.CHROME, direction="down", say_when_done="Done.")
-    assert first.spoken == again.spoken == ["Done."] and desk.tabs[1]["scroll"] == 20.0
+    # v3.14: the same done line again within a minute is not said again (live "Done." x5 in 38 s); both scrolls ran
+    assert first.spoken == ["Done."] and again.spoken == [] and desk.tabs[1]["scroll"] == 20.0
 
 
 def test_instant_hands_are_called_without_words_and_the_slow_ones_with() -> None:

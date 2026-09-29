@@ -305,7 +305,13 @@ class Settings:
             result or a question is said (progress lines keep ``voice_cooldown_s``).
         voice_brain_thinking: Thinking for spoken requests (off: ``thinking`` is
             disabled for them; typed ones keep adaptive thinking). v3.13: on (adaptive) with
-            effort medium; measured in docs/VOICE.md (v3.13).
+            effort medium; v3.14: off with effort low for the fast first pass, and
+            the escalation below when a measured signal says it needs judgement.
+        voice_brain_escalate_effort / voice_brain_escalate_thinking: The profile a spoken
+            request moves to for its next model calls once an action fails or its report
+            does not verify its effect, the loop breaker trips, the user is asked, or a claim
+            has no evidence (``Agent.run(escalate=)``, docs/VOICE.md v3.14). Empty / ``None``:
+            no escalation.
         voice_brain_portrait: Attach the rest of the portrait and the resume to a
             spoken request's memory block (off: the profile and rules layers only,
             plus to-dos, know-how and commitments).
@@ -313,6 +319,11 @@ class Settings:
             empty: the brain's own ``model``). Measured in docs/VOICE.md §7.
         voice_progress_pause_s: A progress line of a running task is said only
             after Yuki has been quiet this long (a real pause), never after its result.
+        voice_step_lines / voice_step_silence_s / voice_step_after_s / voice_step_long_silence_s: The
+            thinker's own step lines (``say_now``) said by code (v3.14, :mod:`yuki.voice.steplines`): while the
+            step runs, after this much silence and this long into the step, or at its start once the silence is
+            already the long one; a quick step that worked, only if the silence after it reaches the long one
+            before the next step starts.
         voice_hands: Give the mouth its own single-step desktop tools (docs/VOICE.md §5.6).
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
         voice_keyterms_max: At most this many names and terms from memory are given to speech
@@ -400,6 +411,11 @@ class Settings:
     voice_grounding: bool = True    # on again 2026-09-25: the service's embedder over its pipe (tray ~210 MB in a conversation); off by itself when no service answers
     voice_grounding_wait_ms: float = 60.0
     voice_grounding_facts: int = 4
+    # v3.14: where each turn's memory for the talker comes from: "related" (the memory builder's whole-memory
+    # related_text(voice=True): words, screen, threads of work; measured +25 ms on the talker's first token and
+    # lookups p50 49 ms vs 80 ms, docs/VOICE.md v3.14) or "relevant" (fast memory + know-how by the words, v3.5-v3.13;
+    # also what "related" falls back to where memory has no related_text)
+    voice_grounding_source: str = "related"
     voice_settle_s: float = 1.5
     voice_settle_max_s: float = 6.0
     voice_cooldown_s: float = 1.5
@@ -409,13 +425,28 @@ class Settings:
     voice_wait_again_s: float = 15.0
     voice_result_sentences: int = 2
     voice_result_chars: int = 280
-    # v3.13 (the user's call, measured on the Warp stub: full screen 4/4 vs 1/4 at low with thinking off)
-    voice_brain_effort: str = "medium"
-    voice_brain_thinking: bool = True
+    # v3.13 (the user's call, measured on the Warp stub: full screen 4/4 vs 1/4 at low with thinking off); v3.14: a
+    # fast first pass (low, thinking off) that escalates the same request to medium + adaptive on a measured signal,
+    # with outcomes said only on a verified report (measured in docs/VOICE.md v3.14).
+    voice_brain_effort: str = "low"
+    voice_brain_thinking: bool = False
+    voice_brain_escalate_effort: str = "medium"
+    voice_brain_escalate_thinking: bool | None = True
     voice_brain_portrait: bool = False
     voice_brain_model: str = ""
     voice_final_gap_s: float = 0.3
     voice_progress_pause_s: float = 8.0
+    # v3.14 "one voice narrates live steps": the thinker's say_now line is said by code only into a noticeable
+    # silence (nobody spoke for voice_step_silence_s and its step has run voice_step_after_s, or the silence is
+    # already voice_step_long_silence_s, the only case for a quick step that already ended); docs/VOICE.md v3.14.
+    voice_step_lines: bool = True
+    voice_step_silence_s: float = 2.5
+    voice_step_after_s: float = 0.8
+    voice_step_long_silence_s: float = 5.0
+    # v3.14: her own voice for short lines she says often, kept on disk (yuki.voice.ttscache; "": the user's voice
+    # folder, LOCALAPPDATA/Yuki/voice/tts-cache).
+    voice_tts_cache: bool = True
+    voice_tts_cache_dir: str = ""
     voice_hands: bool = True
     voice_desk_wait_ms: float = 250.0
     voice_keyterms_max: int = 50
@@ -460,6 +491,15 @@ class Settings:
     helpers_timeout_s: float = 45.0
     helpers_max_input_tokens: int = 60000
     helpers_max: int = 4
+    # -- eyes (2026-09-29, Phase 2; docs/ARCHITECTURE.md "Perception: Now") --
+    #: Attach the live picture of the screen to the brain's per-turn situation: what the memory service read
+    #: of every visible window (the one in front first), popups and toasts seen lately, and a live focus line
+    #: (yuki.memory.now; ``Dispatcher.include_now``, set by the agent loop from this).
+    now_in_situation: bool = True
+    #: How long a turn waits for that picture from the memory service, and for the focus line (ms); each is
+    #: left out when it does not answer in time (measured 2026-09-29: pipe p50 1.4 ms, focus p50 ~10 ms).
+    now_wait_ms: float = 50.0
+    focus_wait_ms: float = 50.0
 
     def __post_init__(self) -> None:
         if self.model_backend not in ("bedrock", "anthropic"):
@@ -467,6 +507,8 @@ class Settings:
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)
         self.voice_brain_effort = resolve_effort(self.voice_brain_effort) if self.voice_brain_effort else ""
+        self.voice_brain_escalate_effort = (resolve_effort(self.voice_brain_escalate_effort)
+                                            if self.voice_brain_escalate_effort else "")
 
     @property
     def sessions_dir(self) -> Path:

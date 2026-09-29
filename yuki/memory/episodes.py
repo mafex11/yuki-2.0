@@ -160,8 +160,8 @@ an AI; at most, record that the screen contained it."""
 RECORD_EPISODES_TOOL: dict[str, Any] = {
     "name": "record_episodes",
     "description": (
-        "Record the episodes of this window, in time order. Call exactly once; pass an empty "
-        "list when nothing is worth an episode. At most 3."
+        "Record the episodes of this window, in time order, each stretch of time told once (episodes never "
+        "overlap). Call exactly once; pass an empty list when nothing is worth an episode. At most 3."
     ),
     "strict": True,
     "input_schema": {
@@ -192,6 +192,95 @@ RECORD_EPISODES_TOOL: dict[str, Any] = {
 
 def _local(at: float, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return datetime.fromtimestamp(at).strftime(fmt)
+
+
+#: Two episodes that share at least this much of the shorter one's span tell the same stretch twice.
+SAME_STRETCH_SHARE = 0.5
+#: What is left of a trimmed episode must be at least this long, else it is dropped.
+MIN_EPISODE_S = 60.0
+
+
+def _retells(e: Any, k: Any) -> bool:
+    """``e`` tells (mostly) the same stretch as ``k``: they share at least :data:`SAME_STRETCH_SHARE` of the
+    shorter one's span."""
+    overlap = min(e.ended_at, k.ended_at) - max(e.started_at, k.started_at)
+    shorter = min(max(e.ended_at - e.started_at, 1e-9), max(k.ended_at - k.started_at, 1e-9))
+    return overlap > 0 and overlap >= SAME_STRETCH_SHARE * shorter
+
+
+def _pick(episodes: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, Any]]]:
+    """The episodes to keep and ``(retelling, the kept one it retells)`` pairs: the finest first (shortest span,
+    then the earliest written), so a stretch told once whole and once in parts keeps its parts."""
+    kept: list[Any] = []
+    retold: list[tuple[Any, Any]] = []
+    for e in sorted(episodes, key=lambda e: (e.ended_at - e.started_at, getattr(e, "id", 0) or 0, e.started_at)):
+        twin = next((k for k in kept if _retells(e, k)), None)
+        if twin is not None:
+            retold.append((e, twin))
+        else:
+            kept.append(e)
+    return kept, retold
+
+
+def non_overlapping(episodes: Sequence[Any]) -> tuple[list[Any], int]:
+    """Episodes in time order that do not tell one stretch twice, and how many were dropped (plumbing on times).
+
+    The model sometimes returns the same stretch twice with two wordings (2026-09-29 run 149: two episodes
+    03:45-04:08 in one answer). One that shares at least :data:`SAME_STRETCH_SHARE` of the shorter span with
+    another is a retelling: the finer one is kept (:func:`_pick`). A smaller overlap is trimmed off the later
+    one's start (dropped when under :data:`MIN_EPISODE_S` remains).
+    """
+    kept, retold = _pick(episodes)
+    dropped = len(retold)
+    out: list[Any] = []
+    for e in sorted(kept, key=lambda e: (e.started_at, e.ended_at)):
+        last_end = max((k.ended_at for k in out), default=None)
+        if last_end is not None and last_end > e.started_at:
+            if e.ended_at - last_end < MIN_EPISODE_S:
+                dropped += 1
+                continue
+            e.started_at = last_end
+        out.append(e)
+    return out, dropped
+
+
+def retellings(episodes: Sequence[Any]) -> list[tuple[int, int]]:
+    """``(retold id, kept id)`` pairs among one run's stored episodes: the rule of :func:`non_overlapping`, for the
+    ones written before it (only whole retellings; a smaller overlap is left as it was stored)."""
+    _kept, retold = _pick(episodes)
+    return [(int(e.id), int(k.id)) for e, k in retold]
+
+
+def repair_overlaps(store: Store, *, dry_run: bool = False) -> dict[str, Any]:
+    """Retire stored episodes that retell a stretch another episode of the same window run already tells
+    (the 29 Sept duplicate, written before :func:`non_overlapping`): each is kept as history, expired and
+    pointing at the one kept (the store's supersede). Yuki's own rule applied to what it stored; content-free."""
+    current = store.episodes_between(None, None)
+    by_run: dict[Any, list[Any]] = {}
+    for e in current:
+        by_run.setdefault((e.window_start, e.run_id), []).append(e)
+    pairs = [p for group in by_run.values() if len(group) > 1 for p in retellings(group)]
+    if pairs and not dry_run:
+        store.retire_episodes(pairs)
+    return {"episodes": len(current), "retold": len(pairs), "pairs": pairs, "dry_run": dry_run}
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m yuki.memory.episodes", description="Episode maintenance.")
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--repair-overlaps", action="store_true",
+                        help="retire stored episodes that retell a stretch another episode of their run tells")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    store = Store.open(args.db)
+    try:
+        out = repair_overlaps(store, dry_run=args.dry_run) if args.repair_overlaps else {"nothing": "asked"}
+    finally:
+        store.close()
+    print(json.dumps(out, indent=1))
+    return 0
 
 
 def present_seconds(rows: Sequence[Any], since: float, until: float) -> float:
@@ -648,7 +737,11 @@ class EpisodeWorker:
                 started_at=start, ended_at=end, window_start=window.start, window_end=window.end,
                 final=window.final, text=text, aggregates=aggregates,
             ))
-        return out
+        kept, dropped = non_overlapping(out)
+        if dropped:
+            self._log("episode_overlap", window_start=window.start, window_end=window.end, dropped=dropped,
+                      kept=len(kept))
+        return kept
 
     # -- loop ------------------------------------------------------------------
 
@@ -700,3 +793,9 @@ __all__ = [
     "EpisodeWorker", "EpisodeResult", "Window", "SYSTEM_PROMPT", "RECORD_EPISODES_TOOL", "build_user_message",
     "window_facts", "compact_aggregates", "present_seconds",
 ]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
