@@ -149,6 +149,9 @@ def test_the_cut_line_is_in_the_talkers_volatile_block() -> None:
     text = volatile_block(cut={"heard": "Do you mean the list,", "unsaid": "or something else?"})["text"]
     assert "They heard: \"Do you mean the list,\"" in text and "Not said yet: \"or something else?\"" in text
     assert "# When they cut you off" in MOUTH_PROMPT
+    # v3.14b: how to answer travels with the Cut off line (only the turns it applies to carry it)
+    assert "Answer the way a person would who was interrupted" in text
+    assert "Answer the way a person would who was interrupted" not in MOUTH_PROMPT
 
 
 # -- 3. one acknowledgement, outcomes bound to the latest request ---------------------------------------------------

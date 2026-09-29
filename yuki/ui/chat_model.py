@@ -571,6 +571,23 @@ class ChatModel:
         item.meta = str(ev.get("meta") or "")
         self._changed(item)
 
+    def _on_resumed(self, ev: dict[str, Any], at: float) -> None:
+        """A request set aside on an unanswered question carries on after the answer (v3.14b): same bubble."""
+        src, dst = ev.get("from_job"), ev.get("to_job")
+        if not isinstance(src, int) or not isinstance(dst, int):
+            return
+        item_id = self._job_item.get(src)
+        if item_id is None:
+            return
+        self._job_item[dst] = item_id
+        if src in self._voice_job:
+            self._voice_job[dst] = self._voice_job[src]
+        item = self._by_id.get(item_id)
+        if item is not None:
+            item.jobs.append(dst)
+            item.status = "running"
+            self._changed(item)
+
     def _on_handed_off(self, ev: dict[str, Any], at: float) -> None:
         """A front-desk request needed hands: the worker's new id goes on in the same bubble."""
         src, dst = ev.get("from_job"), ev.get("to_job")

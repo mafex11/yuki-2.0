@@ -81,6 +81,7 @@ from yuki.perception.windows import (
     is_cloaked,
     virtual_screen_bounds,
     window_info,
+    window_state,
 )
 
 pyautogui.FAILSAFE = False  # a corner-of-screen cursor must not abort Yuki
@@ -1458,6 +1459,34 @@ def _describe_page_change(
     ), facts
 
 
+#: How a window is shown, in the words of a key's report.
+_STATE_WORDS = {"fullscreen": "full screen", "maximized": "maximized", "normal": "a normal window",
+                "minimized": "minimized"}
+
+
+def _window_state_before(expect_hwnd: int | None, before: dict) -> tuple[int, str | None]:
+    """The window a key goes to (``expect_hwnd``, else the one in front) and how it is shown now."""
+    hwnd = int(expect_hwnd or before.get("foreground_hwnd") or 0)
+    return hwnd, window_state(hwnd) if hwnd else None
+
+
+def _window_state_after(hwnd: int, state_before: str | None, details: dict) -> str:
+    """How that window is shown after the key, into ``details`` (voice v3.14b): ``window_state_before`` /
+    ``window_state_after`` / ``window_state_changed`` (normal | maximized | fullscreen | minimized, measured from the
+    window's rect against its monitor and its styles). Read after the focus and page watches, so a full-screen switch
+    (a few hundred ms of animation) has landed. Returns the phrase for the summary ("" when unchanged or unread)."""
+    if not hwnd or state_before is None:
+        return ""
+    after = window_state(hwnd)
+    details["window_state_hwnd"] = hwnd
+    details["window_state_before"] = state_before
+    details["window_state_after"] = after
+    details["window_state_changed"] = after is not None and after != state_before
+    if not details["window_state_changed"]:
+        return ""
+    return f"the window is now {_STATE_WORDS.get(after, after)} (was {_STATE_WORDS.get(state_before, state_before)})"
+
+
 def _report_effects(
     before: dict,
     page_hwnd: int,
@@ -2394,6 +2423,7 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     if refusal:
         return _result(False, refusal, details, started)
     before = _focus_state()
+    shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
     pyautogui.hotkey(*resolved)
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
@@ -2405,11 +2435,12 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
         focus_timeout_s=_KEY_FOCUS_WATCH_S,
         details=details,
     )
+    shown = _window_state_after(shown_hwnd, shown_before, details)
     details["new_windows"] = _windows_appeared(watched_pid, windows_before)
     popup = _describe_appeared(details["new_windows"])
     return _result(
         True,
-        f"pressed {'+'.join(resolved)}; {outcome}" + (f"; {popup}" if popup else ""),
+        f"pressed {'+'.join(resolved)}; {outcome}" + (f"; {shown}" if shown else "") + (f"; {popup}" if popup else ""),
         details,
         started,
     )
@@ -2446,6 +2477,7 @@ def press(
     if refusal:
         return _result(False, refusal, details, started)
     before = _focus_state()
+    shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
     pyautogui.press(normalized, presses=times, interval=0)
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
@@ -2457,12 +2489,13 @@ def press(
         focus_timeout_s=_KEY_FOCUS_WATCH_S,
         details=details,
     )
+    shown = _window_state_after(shown_hwnd, shown_before, details)
     details["new_windows"] = _windows_appeared(watched_pid, windows_before)
     popup = _describe_appeared(details["new_windows"])
     suffix = f" x{times}" if times > 1 else ""
     return _result(
         True,
-        f"pressed {normalized}{suffix}; {outcome}" + (f"; {popup}" if popup else ""),
+        f"pressed {normalized}{suffix}; {outcome}" + (f"; {shown}" if shown else "") + (f"; {popup}" if popup else ""),
         details,
         started,
     )

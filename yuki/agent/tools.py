@@ -356,8 +356,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Press a key combination, given as the keys held together, e.g. "
             "['ctrl','t'] or ['win','r'] or ['volumemute']. The result says where "
-            "keyboard focus is afterwards and whether it moved, and names any new "
-            "window the application showed."
+            "keyboard focus is afterwards and whether it moved, names any new "
+            "window the application showed, and says when the window's state changed "
+            "(normal, maximized, full screen, minimized: before -> after, read from Windows). "
+            "To change how a whole window is shown, window_action does it in one step and reads it back."
         ),
         "input_schema": _obj(
             {
@@ -373,7 +375,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Press a single key, optionally several times, e.g. 'enter', 'tab', "
             "'down'. The result says where keyboard focus is afterwards and whether "
-            "it moved, and names any new window the application showed. Media keys "
+            "it moved, names any new window the application showed, and says when the "
+            "window's state changed (normal, maximized, full screen, minimized). Media keys "
             "('playpause', 'nexttrack', 'prevtrack', 'stop', 'volumemute', "
             "'volumeup', 'volumedown') act system-wide on whatever is playing: no "
             "window needs focus, so leave expect_hwnd out and do not switch windows."
@@ -1093,6 +1096,36 @@ STEP_TOOLS = tuple(n for n in STEP_TOOLS if n in TOOLS_BY_NAME)   # (a build wit
 for _name in STEP_TOOLS:  # plumbing: first in the schema, so it streams first
     _schema = TOOLS_BY_NAME[_name]["input_schema"]
     _schema["properties"] = {STEP_FIELD: STEP_SCHEMA, **_schema["properties"]}
+
+#: The same field for a spoken request (v3.14b): required there. Offline 29 Sept the fast first pass wrote it on 1 of
+#: 13 steps of a long search and 1 of 3 in the Warp session, so the voice had nothing to say while the steps ran.
+STEP_SCHEMA_VOICE: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "The few words you say aloud as this step starts: what you are doing right now, first person, present "
+        "tense (\"Opening your Warp tabs.\", \"Searching for it now.\"), never an intention (\"Let me ...\": Yuki's "
+        "voice drops those as thinking aloud). Said only if they would otherwise wait in silence. Never an outcome, "
+        "a guess or your reasoning, never words already said."
+    ),
+}
+
+
+def with_step_lines(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The tool list for a spoken request: ``say_now`` required, last, on every step tool (a copy; plumbing)."""
+    out = []
+    for tool in tools:
+        if tool.get("name") in STEP_TOOLS:
+            schema = dict(tool["input_schema"])
+            # Last, not first (v3.14b): written first it primed the fast pass's choice of key (the Warp bench's tab
+            # task: 5 of 12 unverified first keys with it first, 2 of 6 with it last, 4 of 12 before, optional);
+            # the line is only said while its step runs, so streaming it ahead of the call bought nothing.
+            props = {**{k: v for k, v in schema.get("properties", {}).items() if k != STEP_FIELD},
+                     STEP_FIELD: STEP_SCHEMA_VOICE}
+            schema["properties"] = props
+            schema["required"] = [*[r for r in schema.get("required", []) if r != STEP_FIELD], STEP_FIELD]
+            tool = {**tool, "input_schema": schema}
+        out.append(tool)
+    return out
 
 #: What a ``done`` message says about the PC as it is now (docs/VOICE.md v3.14, a state claim needs evidence): the
 #: brain names the windows whose present state its message asserts, and the loop checks, from this request's own

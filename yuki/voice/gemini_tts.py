@@ -419,7 +419,10 @@ def service_class() -> type:
                             break
                         if not reply.heard and not dropped and callable(self._yuki_stale):
                             try:
-                                stale = bool(self._yuki_stale())
+                                try:
+                                    stale = bool(self._yuki_stale(strip_tags(piece.text)))
+                                except TypeError:   # a check that takes no words
+                                    stale = bool(self._yuki_stale())
                             except Exception:  # noqa: BLE001 - plumbing: never in the way of a line
                                 stale = False
                             if stale:

@@ -224,6 +224,9 @@ class YukiUi(QObject):
         if withdrawn is not None:
             withdrawn.connect(self._on_withdrawn)
         runtime_signals.queued.connect(self._on_queued)
+        resumed = getattr(runtime_signals, "resumed", None)
+        if resumed is not None:   # v3.14b: a parked question answered later: its card goes on with the new request
+            resumed.connect(lambda old, new: self.cards.__setitem__(new, self.cards[old]) if old in self.cards else None)
         runtime_signals.summarized.connect(self._on_summarized)
         # Moments the screen may have come free for a queued nudge.
         runtime_signals.lane_done.connect(self._on_lane_free)

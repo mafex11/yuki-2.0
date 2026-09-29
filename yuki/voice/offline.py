@@ -100,6 +100,27 @@ class StubResult:
     elapsed_ms: float = 0.0
 
 
+#: How long the thinker's real tool calls took on this PC (ms), from the live worker logs of 27-29 Sept 2026
+#: (``tool_result.elapsed_ms``, 80 calls; ``launch_app`` from the Warp and Chrome launches measured live, 6.3 s and 1.8 s).
+#: With :attr:`StubDesktop.measured_steps` a stub action or window read takes one of these, so the thinker's step lines
+#: meet the pauses a real step makes (v3.14b); otherwise every action takes ``action_delay_s``, as before.
+MEASURED_STEP_MS: dict[str, tuple[int, ...]] = {
+    "click": (0, 79, 131, 146, 164, 229, 229, 263, 287, 297, 311, 324, 384, 505, 517, 830, 844, 857, 883, 7162),
+    "look_at_window": (195, 501, 621, 1124),
+    "open_url": (2120, 2492, 4159),
+    "focus_window": (21, 21, 871),
+    "run_powershell": (1999, 4836, 6983),
+    "press": (832, 841),
+    "hotkey": (229, 825),
+    "tab": (546, 2124),
+    "type_text": (958, 1390),
+    "launch_app": (1800, 6300),
+}
+#: Stub calls measured under another tool's name (the same kind of work on the real machine).
+_MEASURED_AS = {"select_tab": "tab", "window_action": "focus_window", "scroll": "hotkey", "hover": "click",
+                "get_window_tree": "look_at_window", "read_page": "look_at_window"}
+
+
 class StubDesktop:
     """A backend for :class:`~yuki.agent.tools.Dispatcher` that never touches the real machine.
 
@@ -107,14 +128,32 @@ class StubDesktop:
         action_delay_s: How long each "action" takes (a real one takes a while).
     """
 
+    #: Actions and window reads take the durations measured on the real machine (:data:`MEASURED_STEP_MS`).
+    measured_steps: bool = False
+
     def __init__(self, action_delay_s: float = 0.4) -> None:
         self.delay = action_delay_s
         self.calls: list[tuple[str, tuple, dict]] = []
+        import random
+
+        self._rng = random.Random(929)   # the same draws every run: replays stay comparable
+
+    def _step_s(self, name: str) -> float:
+        if not self.measured_steps:
+            return self.delay
+        samples = MEASURED_STEP_MS.get(_MEASURED_AS.get(name, name))
+        return self._rng.choice(samples) / 1000.0 if samples else self.delay
+
+    def _perceive(self, name: str) -> None:
+        """A window read's own time, when steps are measured (a stub read is otherwise instant)."""
+        if self.measured_steps:
+            time.sleep(self._step_s(name))
 
     def _act(self, name: str, summary: str, *args: Any, **kwargs: Any) -> StubResult:
         self.calls.append((name, args, kwargs))
-        if self.delay:
-            time.sleep(self.delay)  # a stand-in for a real action's duration, not a settle wait
+        wait = self._step_s(name)
+        if wait:
+            time.sleep(wait)  # a stand-in for a real action's duration, not a settle wait
         return StubResult(summary=summary)
 
     # -- perception -----------------------------------------------------------
@@ -135,6 +174,7 @@ class StubDesktop:
         return "\n".join(lines)
 
     def get_window_tree(self, hwnd: int, **_: Any) -> dict[str, Any]:
+        self._perceive("get_window_tree")
         title = next((t for h, _p, t in WINDOWS if h == hwnd), "")
         return {"hwnd": hwnd, "title": title, "process_name": "", "elements": [], "truncated": False,
                 "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 5.0, "passes": 1,
@@ -328,6 +368,7 @@ class BrowserDesk(StubDesktop):
             nodes=40, ms=3.0)
 
     def get_window_tree(self, hwnd: int, **_: Any) -> dict[str, Any]:
+        self._perceive("get_window_tree")
         elements: list[dict[str, Any]] = [{"id": 0, "role": "Window", "name": self.title(hwnd), "depth": 0,
                                            "bounds": (0, 0, 1920, 1040), "center": (960, 520)}]
         if int(hwnd) == self.CHROME:
@@ -452,18 +493,30 @@ class BrowserDesk(StubDesktop):
             self.volume += (2.0 if keys[0] == "volumeup" else -2.0) * times
         return note
 
+    def window_mode(self, hwnd: int) -> str:
+        """How the window is shown (the input layer's ``window_state``): the stub's Chrome is maximized."""
+        return "maximized"
+
     def _watched(self, before: tuple[int, str], result: StubResult) -> StubResult:
-        """The input layer's own watch of a key's effect (yuki.actions.input: focus, window, title), stub-sized."""
-        front, title = before
-        result.details.update(foreground_changed=self.front != front, focus_changed=False,
-                              foreground_title_changed=self.front == front and self.title(self.front) != title)
+        """The input layer's own watch of a key's effect (yuki.actions.input: focus, window, title, and v3.14b the
+        window's state: normal / maximized / fullscreen), stub-sized."""
+        front, title, *rest = before
+        details = dict(foreground_changed=self.front != front, focus_changed=False,
+                       foreground_title_changed=self.front == front and self.title(self.front) != title)
+        if rest:
+            mode = self.window_mode(front)
+            details.update(window_state_hwnd=front, window_state_before=rest[0], window_state_after=mode,
+                           window_state_changed=mode != rest[0])
+            if mode != rest[0]:
+                result.summary += f"; the window is now {mode} (was {rest[0]})"
+        result.details.update(details)
         return result
 
     def hotkey(self, *keys: str, expect_hwnd: Any = None, **_: Any) -> StubResult:
         refused = self._guard(expect_hwnd)
         if refused:
             return StubResult(ok=False, summary=refused)
-        before = (self.front, self.title(self.front))
+        before = (self.front, self.title(self.front), self.window_mode(self.front))
         result = self._act("hotkey", f"pressed {'+'.join(keys)}", *keys, expect_hwnd=expect_hwnd)
         result.summary += self._keys(tuple(keys))
         return self._watched(before, result)
@@ -472,7 +525,7 @@ class BrowserDesk(StubDesktop):
         refused = self._guard(expect_hwnd)
         if refused:
             return StubResult(ok=False, summary=refused)
-        before = (self.front, self.title(self.front))
+        before = (self.front, self.title(self.front), self.window_mode(self.front))
         result = self._act("press", f"pressed {key}" + (f" x{times}" if times > 1 else ""), key, times=times,
                            expect_hwnd=expect_hwnd)
         result.summary += self._keys((key,), times)

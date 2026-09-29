@@ -63,7 +63,7 @@ def load(root: Path, name: str) -> tuple[Any, Any]:
     return mods[0], mods[1]
 
 
-def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str = "") -> dict[str, Any]:
+def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str = "", history: int = 1) -> dict[str, Any]:
     from yuki.voice.pipeline import async_tool_instructions
 
     system = mouth.mouth_system_blocks(memory, tail=[async_tool_instructions()])
@@ -79,7 +79,8 @@ def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str =
                                          for i, (n, kind) in enumerate(ITEMS)])
         desk += "\n" + hands.items_line(items)
         desk += f"\nfocus: the text field Edit \"Search\" in [{CHROME}] has the keyboard (your type hand types there)"
-    messages = [{"role": r, "content": [{"type": "text", "text": t}]} for r, t in TURNS]
+    # ``history``: the short conversation said that many times over (a conversation some turns in, v3.14b)
+    messages = [{"role": r, "content": [{"type": "text", "text": t}]} for _ in range(max(1, history)) for r, t in TURNS]
     # Pipecat's breakpoints on the last two user messages (the moving conversation cache)
     for m in [m for m in messages if m["role"] == "user"][-1:]:
         m["content"][-1]["cache_control"] = {"type": "ephemeral"}
@@ -110,6 +111,8 @@ async def main(argv: list[str]) -> int:
                     help="name=<repo root>[@<text file>]: the file is the turn's memory lookup block (v3.14)")
     ap.add_argument("--rounds", type=int, default=10)
     ap.add_argument("--desk", choices=("items", "plain"), default="items")
+    ap.add_argument("--dump", type=Path, default=None, help="every call as a JSON line (variant, ttft, tokens)")
+    ap.add_argument("--history", type=int, default=1, help="the six-message conversation repeated this many times")
     args = ap.parse_args(argv)
 
     from yuki.agent.memory import MemoryAccess
@@ -125,13 +128,17 @@ async def main(argv: list[str]) -> int:
         lookup = Path(lookup_file).read_text(encoding="utf-8") if lookup_file else ""
         mouth, hands = load(Path(root).resolve(), name)
         memory = mouth.fetch_memory(MemoryAccess(path=args.db))
-        variants.append((name, request(mouth, hands, memory, args.desk == "items", lookup)))
+        variants.append((name, request(mouth, hands, memory, args.desk == "items", lookup, args.history)))
     for name, req in variants:   # write each variant's cache first (a conversation's warm-up does the same)
         await one(client, s.voice_mouth_model, req)
     rows: dict[str, list[dict[str, Any]]] = {name: [] for name, _ in variants}
     for _ in range(args.rounds):
         for name, req in variants:
-            rows[name].append(await one(client, s.voice_mouth_model, req))
+            row = await one(client, s.voice_mouth_model, req)
+            rows[name].append(row)
+            if args.dump is not None:
+                with open(args.dump, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"variant": name, "at": time.time(), **row}) + "\n")
     for name, rs in rows.items():
         t = sorted(r["ttft_ms"] for r in rs)
         last = rs[-1]

@@ -117,6 +117,10 @@ class Job:
     #: Started by code, not by a tell_yuki call: a hand of the talker's did not take effect and the thinker was
     #: handed the same request (v3.9). Its items reach the mouth through ``announce``.
     escalated: bool = False
+    #: The talker judged it needs the PC's hands (tell_yuki ``acts``), or its own hand was tried first (v3.14b).
+    acts: bool = False
+    #: Desktop actions of the job that succeeded (``ACTION_TOOL_NAMES``), from the runtime's tool signals.
+    actions_ok: int = 0
     #: "Still on it" lines offered for it (v3.9: said only when the user has heard nothing for a while).
     waits: int = 0
     #: The user already heard an acknowledgement for it (its say_first, or words in the reply that handed it over):
@@ -329,13 +333,17 @@ class VoiceBridge(QObject):
         if self.hands is not None:
             self.hands.bridge = self
         self._gui_call.connect(self._run)
+        from yuki.voice.workers import gui_poster
+
+        self._poster = gui_poster()               # made here, on the GUI thread, never first on the loop
+        self._gui_ident = threading.get_ident()   # the bridge is made on the GUI thread
         for name, slot in (
             ("started", self._on_started), ("tool_called", self._on_tool_called),
             ("tool_finished", self._on_tool_finished),
             ("said", self._on_said), ("asked", self._on_asked), ("finished", self._on_finished),
             ("failed", self._on_failed), ("withdrawn", self._on_withdrawn), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
-            ("partial", self._on_partial),
+            ("partial", self._on_partial), ("resumed", self._on_resumed),
         ):
             signal = getattr(runtime, name, None)
             if signal is not None:
@@ -388,8 +396,17 @@ class VoiceBridge(QObject):
             self._log("bridge_error", error=f"{type(exc).__name__}: {exc}")
 
     def _gui(self, fn: Callable[[], None]) -> None:
-        """Run ``fn`` on the GUI thread (queued; returns at once)."""
-        self._gui_call.emit(fn)
+        """Run ``fn`` on the GUI thread (queued; returns at once, and never calls into Qt from the caller).
+
+        v3.14b: the voice loop only puts ``fn`` on a queue; one emitter thread (``workers.gui_poster``, made with the
+        bridge) hands it to Qt (a queued signal). Offline 29 Sept the loop stalled 1.6 s inside this emit (``begin_early``): an emit
+        releases and re-takes the interpreter lock and takes Qt's post-event lock, either of which another thread
+        can hold. The order of calls is kept (one queue, one thread).
+        """
+        if threading.get_ident() == self._gui_ident:
+            self._gui_call.emit(fn)   # already on the GUI thread: Qt runs it as before (queued to itself)
+            return
+        self._poster.post(lambda: self._gui_call.emit(fn))
 
     def _post(self, job: Job, kind: str, payload: Any) -> None:
         """Hand one item to the job's waiting ``tell_yuki`` handler (from the GUI thread)."""
@@ -467,7 +484,8 @@ class VoiceBridge(QObject):
             if j.state == QUEUED:
                 parts.append(f'{name} "{j.brief()}" queued, waiting for the one before it ({ago} s)')
             elif j.state == WAITING:
-                parts.append(f'{name} "{j.brief()}" waiting for their answer to: {j.question or "its question"}')
+                parts.append(f'{name} "{j.brief()}" waiting for their answer to: {j.question or "its question"} '
+                             f'(asked already, never again: words that are not its answer are a new request)')
             else:
                 step = (f', now: "{j.step_line}"' if j.step_line and j.step_running else
                         f", now: {j.step.lower()}" if j.step else ", starting")
@@ -606,6 +624,7 @@ class VoiceBridge(QObject):
                     if x), done_before=done_before, corrects=corrects, said=said, tabs=tabs)
         job = self._new_job(request)
         job.acked = self._acked(params, args)
+        job.acts = acts
         if remember:
             # Saved quietly: no step lines, and its outcome folded in unless it failed.
             job.remember = True
@@ -749,7 +768,8 @@ class VoiceBridge(QObject):
                         self._outcome_said(job)
                     self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
-                                                                request=job.request, late=late, verified=verified),
+                                                                request=job.request, late=late, verified=verified,
+                                                                nothing_done=self._nothing_done(job)),
                                                  properties=FunctionCallResultProperties(run_llm=run_llm))
                     if not delivered.done():
                         delivered.set_result(stale)
@@ -893,6 +913,7 @@ class VoiceBridge(QObject):
                      corrects: str | None, remember: bool) -> None:
         """The tell_yuki call a job was started early for is complete: it carries that job's outcome."""
         job.acked = job.acked or self._acked(params, args)
+        job.acts = job.acts or args.get("acts") is True
         if remember:
             job.remember = True
         extra = []
@@ -1335,6 +1356,7 @@ class VoiceBridge(QObject):
             if job is not None:
                 job.finished_by_action = job.finishing if ok else None
                 job.finishing = None
+                job.actions_ok += 1 if ok else 0
         if job is None or job.log is None or step_of(name, None) is None:
             return
         job.step_running = False
@@ -1418,6 +1440,17 @@ class VoiceBridge(QObject):
                    + (f" ({ahead} more ahead)" if ahead else "") + ".")
         self._log("bridge", op="handed_off", job_id=origin_id, new_id=new_id, waiting=waiting)
         self._changed()
+
+    def _on_resumed(self, origin_id: int, new_id: int) -> None:
+        """A question the lane set aside was answered: the job carries on under the new id (v3.14b, runtime)."""
+        with self._lock:
+            job = self._jobs.pop(origin_id, None)
+            if job is not None:
+                job.job_id, job.state, job.question, job.closing = new_id, QUEUED, None, None
+                self._jobs[new_id] = job
+        if job is not None:
+            self._log("bridge", op="resumed", job_id=origin_id, new_id=new_id)
+            self._changed()
 
     def _on_steer_unread(self, lane: str, job_id: int, texts: list) -> None:
         """Something the user added arrived after the job's last step: run it as its own request."""
@@ -1517,6 +1550,13 @@ class VoiceBridge(QObject):
         except Exception:  # noqa: BLE001
             return False
         return job.closing is not None or job.state not in OPEN_STATES
+
+    def _nothing_done(self, job: Job) -> bool:
+        """The request asked for something to be done and no action of its job succeeded (v3.14b; its record only)."""
+        nothing = bool(job.acts and not job.remember and job.actions_ok == 0)
+        if nothing:
+            self._log("bridge", op="nothing_done", job_id=job.job_id)
+        return nothing
 
     def _pass_over_questions(self, lane: str) -> list[Job]:
         """Release the voice jobs on ``lane`` that wait for an answer the user did not give (v3.14).
@@ -1677,6 +1717,7 @@ class VoiceBridge(QObject):
                              tabs=self.tabs_for_thinker())
         job = self._new_job(request)
         job.escalated = True
+        job.acts = True   # the talker's own hand was tried for these words: they asked for something to happen
         job.acked = acked   # the talker says a word for it now (v3.14), so no "still on it" before its outcome
         with self._lock:
             self._unsubmitted[job.token] = job
@@ -1754,7 +1795,8 @@ class VoiceBridge(QObject):
                         self._outcome_said(job)
                     self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await announce(result_payload(kind, head, more=bool(rest), held_back=stale,
-                                                  request=job.request, late=late, verified=verified),
+                                                  request=job.request, late=late, verified=verified,
+                                                  nothing_done=self._nothing_done(job)),
                                    run_llm and not stale)
                 item_kind = "final"
             else:

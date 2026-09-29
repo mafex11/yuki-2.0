@@ -295,6 +295,9 @@ class MemoryAccess:
         self._turn_lock = threading.Lock()
         self._turns_idle = threading.Condition(self._turn_lock)
         self._turns_pending = 0
+        # Started now, not on the first exchange (2026-09-29, voice v3.14b): a thread's start waits for the new
+        # thread to get the interpreter lock, and the first log_turn was often called from the voice loop.
+        self._start_turn_writer()
 
     # -- availability --------------------------------------------------------
 
@@ -524,12 +527,21 @@ class MemoryAccess:
         with self._turn_lock:
             self._turns_pending += 1
             if self._turn_writer is None or not self._turn_writer.is_alive():
-                self._turn_writer = threading.Thread(
-                    target=self._write_turns, name="yuki-memory-turns", daemon=True
-                )
-                self._turn_writer.start()
+                self._start_turn_writer(locked=True)   # (it died: never expected)
         self._turns.put((turn, on_done))
         return True
+
+    def _start_turn_writer(self, locked: bool = False) -> None:
+        def start() -> None:
+            self._turn_writer = threading.Thread(target=self._write_turns, name="yuki-memory-turns", daemon=True)
+            self._turn_writer.start()
+
+        if locked:
+            start()
+            return
+        with self._turn_lock:
+            if self._turn_writer is None or not self._turn_writer.is_alive():
+                start()
 
     def _write_turns(self) -> None:
         """The writer thread's loop (a daemon: it never holds the process open)."""

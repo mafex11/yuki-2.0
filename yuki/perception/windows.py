@@ -412,6 +412,27 @@ def _is_zoomed(hwnd: int) -> bool:
         return False
 
 
+#: The states :func:`window_state` reads (voice v3.14b).
+WINDOW_STATES = ("minimized", "fullscreen", "maximized", "normal")
+
+
+def window_state(hwnd: int) -> str | None:
+    """How a top-level window is shown, measured from Windows: ``minimized`` (iconic), ``fullscreen`` (it covers its
+    whole monitor, not only the work area, with no caption), ``maximized`` (zoomed), ``normal``; ``None`` when it
+    cannot be read (gone). Cheap (a few Win32 calls): read before and after a key, so an F11 is verified in code."""
+    try:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return None
+        if win32gui.IsIconic(hwnd):
+            return "minimized"
+        rect = win32gui.GetWindowRect(hwnd)
+        if _covers_monitor_without_caption(hwnd, rect):
+            return "fullscreen"
+        return "maximized" if _is_zoomed(hwnd) else "normal"
+    except Exception:
+        return None
+
+
 def _covers_monitor_without_caption(hwnd: int, rect: tuple[int, int, int, int]) -> bool:
     """Full screen, measured: the window covers its whole monitor (not only the work area) and has no caption."""
     try:

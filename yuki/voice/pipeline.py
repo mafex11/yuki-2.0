@@ -2194,6 +2194,7 @@ class Conversation:
         self.stt_ready_at = now
         self.observer.last_bot_stop = 0.0
         self._bind_bridge()
+        self._boost()
         stream = getattr(self.transport.input(), "go_live", None)
         facts: dict[str, Any] = {}
         if callable(stream):
@@ -2226,7 +2227,17 @@ class Conversation:
                                              and llm._yuki_call.first_text is not None)
         tts = getattr(self, "_tts", None)
         if tts is not None and hasattr(tts, "_yuki_stale") and callable(getattr(bridge, "waiting_reply_stale", None)):
-            tts._yuki_stale = bridge.waiting_reply_stale   # a stale "still on it" reply is never heard (v3.14)
+            steps = self.steps
+
+            def stale(text: str = "") -> bool:
+                # Both asked every time (each answers once per line it sent): a "still on it" reply whose job has
+                # finished, or a step line whose step has returned, is never heard (v3.14b). The step line is known
+                # by its own words, so no other reply is ever taken for it.
+                waiting = bool(bridge.waiting_reply_stale())
+                step = bool(steps.line_stale(text)) if steps is not None else False
+                return waiting or step
+
+            tts._yuki_stale = stale
         # The say_first words spoken for a silent hand-over belong before its call, too.
         bridge.mark_spoken = lambda call_id: llm._yuki_spoke.add(str(call_id))
         bridge.said_early = lambda call_id: str(call_id) in llm._yuki_early
@@ -2638,6 +2649,7 @@ class Conversation:
         if not self.dormant:
             self.observer.set_state("listening")
             self._awake()   # the thinker's cache, the first desktop block (v3.6, v3.7), in the background
+            self._boost()
         self.gate.start()
         warm = asyncio.create_task(self._warm())
         watch = asyncio.create_task(self._watch(runner))
@@ -2647,6 +2659,7 @@ class Conversation:
         try:
             await runner.run()
         finally:
+            self._unboost()
             watch.cancel()
             warm.cancel()
             lag.cancel()
@@ -2758,6 +2771,23 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - recognition works without them
             self.log.event("keyterms", op="screen", error=type(exc).__name__)
 
+    def _boost(self) -> None:
+        """While the conversation is live, the process runs above normal priority (v3.14b, yuki.voice.priority)."""
+        if getattr(self, "_boosted", False) or not getattr(self.settings, "voice_priority_boost", True):
+            return
+        from yuki.voice import priority
+
+        self._boosted = True
+        self.log.event("priority", **priority.boost())
+
+    def _unboost(self) -> None:
+        if not getattr(self, "_boosted", False):
+            return
+        from yuki.voice import priority
+
+        self._boosted = False
+        self.log.event("priority", **priority.restore())
+
     async def _lag_monitor(self, every_s: float = 0.05, report_ms: float = 100.0) -> None:
         """How late the voice loop wakes up (a blocked loop delays every stage). Logs stalls and a summary."""
         lags: list[float] = []
@@ -2771,12 +2801,23 @@ class Conversation:
         from yuki.voice import gcwatch
 
         gcwatch.watch()   # long garbage collections are recorded from here on (v3.14)
+        stall: Any = None
         try:
             while True:
                 if self.dormant:   # nothing runs on the loop while dormant: look once a second, measure nothing
                     await asyncio.sleep(1.0)
                     state["tick"] = time.monotonic() + 1.0
                     continue
+                if stall is None:
+                    # v3.14b: every thread's stack during a stall (a native dump) and the CPU each used over it
+                    from yuki.voice.stallwatch import StallWatch
+
+                    try:
+                        stall = StallWatch(folder=getattr(self.log, "log_dir", None))
+                    except Exception:  # noqa: BLE001 - diagnostics never break the voice
+                        stall = False
+                if stall:
+                    stall.tick()
                 started = time.monotonic()
                 await asyncio.sleep(every_s)
                 state["tick"] = time.monotonic()
@@ -2788,10 +2829,13 @@ class Conversation:
 
                     # v3.14: a garbage collection that overlapped the stall (it holds the interpreter lock)
                     gcs = pauses_between(started, state["tick"])
+                    during = stall.report(started, state["tick"]) if stall else {}
                     self.log.event("loop_lag", ms=round(late), **({"where": stacks} if stacks else {}),
-                                   **({"gc": gcs} if gcs else {}))
+                                   **({"gc": gcs} if gcs else {}), **during)
         except asyncio.CancelledError:
             state["stop"] = True
+            if stall:
+                stall.stop()
             if lags:
                 ordered = sorted(lags)
                 self.log.event("loop_lag", op="summary", n=len(ordered), p50_ms=round(ordered[len(ordered) // 2], 1),

@@ -49,6 +49,7 @@ from PySide6.QtCore import QObject, Signal
 
 from yuki.config import Settings
 from yuki.voice.log import VoiceLog
+from yuki.voice.workers import gui_poster, posted
 
 #: How long a wake heard while a conversation was closing may wait to start the next one (s).
 PENDING_WAKE_S = 8.0
@@ -1085,16 +1086,16 @@ class VoiceSession(QObject):
             def closing(why: str) -> None:
                 conv = box.get("conv")
                 if conv is not None and conv.woken_at is not None:
-                    self._closing.emit(why)   # only a woken one is the user's conversation
+                    gui_poster().post(lambda: self._closing.emit(why))   # only a woken one is the user's (v3.14b: off the loop)
 
             conversation = Conversation(
                 settings=settings, bridge=self.bridge, transport=PairTransport(mic_input, output), memory=self.memory,
                 mouth_memory=mouth_memory, log=self.log,
                 speech_end=lambda: mic.stats.last_voiced or None,
                 voice_activity=lambda: (mic.stats.voiced_since, mic.stats.last_voiced),
-                on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
+                on_state=posted(self._thread_state.emit), session=session,
                 tts_provider=facts.get("tts_provider"), call_app=self.call_app, on_closing=closing,
-                extra_observers=list(self.extra_observers), keyterms=keyterms, on_chat=self._chat,
+                extra_observers=list(self.extra_observers), keyterms=keyterms, on_chat=posted(self._chat),
                 call_evidence=self.call_evidence if self.call_app else None, on_quiet=self.go_quiet, dormant=True)
             box["conv"] = conversation
 
@@ -1349,10 +1350,10 @@ class VoiceSession(QObject):
                 mouth_memory=mouth_memory, log=self.log,
                 speech_end=lambda: mic.stats.last_voiced or None,
                 voice_activity=lambda: (mic.stats.voiced_since, mic.stats.last_voiced),
-                on_state=lambda st, d: self._thread_state.emit(st, d), session=session,
+                on_state=posted(self._thread_state.emit), session=session,
                 tts_provider=facts.get("tts_provider"), call_app=call_app,
-                on_closing=self._closing.emit, extra_observers=list(self.extra_observers), keyterms=keyterms,
-                on_chat=self._chat, call_evidence=self.call_evidence if call_app else None, on_quiet=self.go_quiet,
+                on_closing=posted(self._closing.emit), extra_observers=list(self.extra_observers), keyterms=keyterms,
+                on_chat=posted(self._chat), call_evidence=self.call_evidence if call_app else None, on_quiet=self.go_quiet,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
             # What recognition hears starts after the name: the mouth is told its first words were said to it

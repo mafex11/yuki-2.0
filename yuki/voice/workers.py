@@ -64,6 +64,51 @@ def ordered() -> Workers:
     return _ordered
 
 
+class GuiPoster:
+    """Qt signal emits for the voice thread, made on one thread of their own, in order (v3.14b).
+
+    A cross-thread emit is queued by Qt, but the emit itself releases and re-takes the interpreter lock and takes the
+    receiver's post-event lock: offline 29 Sept the voice loop stalled 1.6 s inside one (the bridge's hand-off to the
+    GUI thread). The loop only puts a callable on a queue here; this thread runs it (the emit).
+    """
+
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue[Callable[[], Any]] = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="yuki-voice-gui", daemon=True)
+        self._thread.start()
+
+    def post(self, fn: Callable[[], Any]) -> None:
+        self._queue.put(fn)
+
+    def _run(self) -> None:
+        while True:
+            fn = self._queue.get()
+            try:
+                fn()
+            except RuntimeError:   # a Qt object already deleted (app exit)
+                pass
+            except Exception:  # noqa: BLE001 - one failed emit never stops the rest
+                pass
+
+
+_poster: GuiPoster | None = None
+
+
+def gui_poster() -> GuiPoster:
+    """The one poster (made on first call: call it off the voice loop first, as the bridge does)."""
+    global _poster
+    with _lock:
+        if _poster is None:
+            _poster = GuiPoster()
+        return _poster
+
+
+def posted(fn: Callable[..., Any]) -> Callable[..., None]:
+    """``fn`` (a Qt signal's ``emit``, or a function that emits) made to run on the poster's thread."""
+    poster = gui_poster()
+    return lambda *args: poster.post(lambda: fn(*args))
+
+
 #: Threads of a conversation loop's default executor (``asyncio.to_thread``: the desktop summary, the hands, memory).
 DEFAULT_EXECUTOR_THREADS = 8
 
@@ -81,4 +126,4 @@ async def prestart_default_executor(loop: asyncio.AbstractEventLoop,
     return (time.perf_counter() - started) * 1000.0
 
 
-__all__ = ["Workers", "shared", "ordered", "prestart_default_executor"]
+__all__ = ["Workers", "shared", "ordered", "GuiPoster", "gui_poster", "posted", "prestart_default_executor"]

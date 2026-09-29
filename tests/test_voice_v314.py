@@ -158,32 +158,30 @@ def test_step_line_waits_for_silence_and_the_step_to_have_run() -> None:
     asyncio.run(main())
 
 
-def test_quick_step_line_only_in_a_long_silence_and_never_once_failed_superseded_or_closed() -> None:
+def test_a_step_line_is_never_said_once_its_step_returned_or_its_job_closed() -> None:
     async def main() -> None:
         state = {"quiet_for": 1.0}
         said: list[str] = []
         steps = _steps(state, said)
         steps.step_started(1, 1)
         steps.offer(1, "Switching tabs.", seq=1)
-        steps.step_ended(1, 1)                 # a quick step that worked: not in a short pause
-        await asyncio.sleep(0.25)
-        assert said == []
-        state["quiet_for"] = 6.0               # the thinker weighs its next step: the silence runs long
-        await asyncio.sleep(0.25)
-        assert said == ["Switching tabs."]
-        state["quiet_for"] = 6.0
+        steps.step_ended(1, 1)                 # a quick step that worked, over before a pause was noticed
+        state["quiet_for"] = 6.0               # a long silence after it: the line would be stale now (v3.14b)
         steps.step_started(2, 1)
         steps.offer(2, "Pressing F11.", seq=1)
         steps.step_ended(2, 1, ok=False)       # it failed: its line is past
         steps.step_started(3, 1)
         steps.offer(3, "Reading the page.", seq=1)
-        steps.step_ended(3, 1)
         steps.step_started(3, 2)               # the job moved on to its next step
         steps.step_started(4, 1)
         steps.offer(4, "Looking it up.", seq=1)
         steps.closed(4)                        # its outcome is known
+        await asyncio.sleep(0.3)
+        assert said == []
+        steps.step_started(5, 1)
+        steps.offer(5, "Opening Warp.", seq=1)  # a slow step still running in the long silence: said
         await asyncio.sleep(0.25)
-        assert said == ["Switching tabs."]
+        assert said == ["Opening Warp."]
         await steps.stop()
 
     asyncio.run(main())
@@ -344,6 +342,28 @@ def test_a_short_line_said_again_comes_from_the_cache_without_a_request(tmp_path
     asyncio.run(main())
 
 
+
+def test_the_voice_cache_never_makes_the_loop_wait_for_its_disk(tmp_path: Path) -> None:
+    """``approved`` / ``approve`` run on the voice loop: a ``put`` writing on a slow disk must not hold them."""
+    import threading
+    import time
+
+    from yuki.voice.ttscache import TTSCache
+
+    cache = TTSCache(tmp_path / "cache")
+    cache.preload()
+    key = cache.key("gemini", "m", "Leda", None, "On it.")
+    with cache._io:   # the disk busy (a put or flush in progress on its worker)
+        done = threading.Event()
+        threading.Thread(target=lambda: (cache.approve(key), cache.approved(key), done.set()), daemon=True).start()
+        t0 = time.monotonic()
+        assert done.wait(1.0) and time.monotonic() - t0 < 0.5
+    assert cache.approved(key)
+    cache.put(key, b"\x00\x01" * 100)   # written with its audio
+    again = TTSCache(tmp_path / "cache")
+    again.preload()
+    assert again.approved(key) and again.get(key) == b"\x00\x01" * 100
+
 def test_a_slow_read_is_left_when_the_user_says_more_and_their_words_go_in_at_once(tmp_path: Path) -> None:
     import threading
 
@@ -444,5 +464,147 @@ def test_a_still_on_it_reply_is_dropped_once_its_job_has_finished(tmp_path: Path
                 heard.append(bool(_levels(down)))
             assert heard == [True, False]           # said while it ran; dropped once its outcome was known
             assert bridge._waiting_run is None      # asked once per line handed over
+
+    asyncio.run(main())
+
+
+# -- v3.14b: text from outside never breaks the console log ------------------------------------------
+
+
+def test_the_log_prints_model_and_tool_text_with_brackets_literally(tmp_path: Path) -> None:
+    import io
+
+    from rich.console import Console
+
+    from yuki.ui.uilog import UiLog
+
+    out = io.StringIO()
+    logger = SessionLogger(tmp_path, console=Console(file=out, soft_wrap=True, width=200), session_id="t")
+    stray = "the [/cyan] tag and [bold]x[/] and a lone [ bracket"
+    logger.thinking(stray)          # raised rich's MarkupError out of the agent loop before (2026-09-29)
+    logger.tool_call("click", {"named": stray})
+    logger.tool_result("click", ok=True, summary=stray, result={}, elapsed_ms=1.0)
+    logger.ask_user(stray)
+    logger.final(stray)
+    logger.error(stray)
+    text = out.getvalue()
+    assert text.count("[/cyan]") >= 4 and "lone [ bracket" in text   # printed as the words they are
+    ui = UiLog(sessions_dir=tmp_path, session_id=None)
+    ui.logger.console = Console(file=io.StringIO(), soft_wrap=True)
+    ui.event("submit", request=stray)   # the tray's own log line, the user's words in it
+
+
+# -- v3.14b: an outcome with nothing done is never said as done ---------------------------------------
+
+
+def test_a_result_with_no_action_for_a_request_that_asked_for_one_says_nothing_was_done() -> None:
+    from test_voice_v39 import Params, _bridge, _settle
+
+    async def main() -> None:
+        for acted in (False, True):
+            rt, bridge = _bridge()
+            params = Params("Ok on WhatsApp", call_id=f"c{acted}", heard="ok on whatsapp", acts=True)
+            task = asyncio.create_task(bridge.tell_yuki(params))
+            await _settle()
+            job = rt.submitted[0][0]
+            rt.started.emit("worker", job, "x")
+            if acted:
+                rt.tool_called.emit("worker", job, "launch_app", {"query": "WhatsApp"})
+                rt.tool_finished.emit("worker", job, "launch_app", True, "launched WhatsApp")
+            rt.finished.emit("worker", job, "Got it.")
+            rt.lane_done.emit("worker", job, "x", False, [])
+            await _settle(20)
+            await asyncio.wait_for(task, 2)
+            result = params.results[-1][0]
+            assert result.get("result") == "Got it."
+            assert bool(result.get("nothing_done")) is (not acted)   # from the job's record, not the words
+
+    asyncio.run(main())
+
+
+# -- v3.14b: a question nobody answers never holds its lane --------------------------------------------
+
+
+def test_an_unanswered_question_is_set_aside_and_an_answer_later_carries_it_on(tmp_path: Path) -> None:
+    import test_voice_v39  # noqa: F401 - the Qt application
+
+    from yuki.log.events import AskUser, ErrorEvent, Final
+    from yuki.ui.runtime import AgentRuntime, Job
+    from yuki.ui.uilog import UiLog
+
+    class Asker:
+        tool_names = None
+        last_summary = None
+
+        def __init__(self) -> None:
+            self.cancelled, self.cancel_reason, self.awaiting_answer = False, "cancelled", False
+            self.runs: list[str] = []
+            self.answers: list[str] = []
+
+        def run(self, request: str, **_: Any) -> Any:
+            self.runs.append(request)
+            self.cancelled = False
+            if len(self.runs) == 1:
+                self.awaiting_answer = True
+                yield AskUser("Which video?")
+                self.awaiting_answer = False
+                if self.cancelled:
+                    yield ErrorEvent("Parked: the question stays open until the user answers it.")
+                    return
+            yield Final("Playing it.")
+
+        def answer(self, text: str) -> None:
+            self.answers.append(text)
+
+        def cancel(self, reason: str = "cancelled") -> None:
+            self.cancelled, self.cancel_reason = True, reason
+
+        def take_steers(self) -> list:
+            return []
+
+    agent = Asker()
+    rt = AgentRuntime(Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv", ask_park_s=0.3),
+                      UiLog(sessions_dir=tmp_path / "s", session_id=None), worker_agent=agent,
+                      front_desk_agent=Asker(), memory=SimpleNamespace(session_id="t"))
+    seen: list[tuple] = []
+    rt.parked.connect(lambda lane, job, text: seen.append(("parked", job)))
+    rt.failed.connect(lambda lane, job, text: seen.append(("failed", job)))
+    rt.finished.connect(lambda lane, job, text: seen.append(("finished", job)))
+    rt.resumed.connect(lambda old, new: seen.append(("resumed", old, new)))
+    rt.worker.enqueue(Job(1, "play the five point five video", None, "text"))
+    rt.worker._jobs.put(None)
+    started = time.monotonic()
+    rt.worker.run()                                   # asks; nobody answers; set aside, and the lane is free
+    assert seen == [("parked", 1)] and time.monotonic() - started < 3.0
+    assert agent.answers[0].startswith("(no answer yet")
+    rt.answer("worker", "the Sonnet one")             # answered later: it carries on as a new request
+    rt.worker._jobs.put(None)
+    rt.worker.run()
+    assert seen[1][0] == "resumed" and seen[1][1] == 1 and seen[-1] == ("finished", seen[1][2])
+    assert "the Sonnet one" in agent.runs[-1] and "Which video?" in agent.runs[-1]
+
+
+def test_a_step_line_whose_step_returned_before_its_audio_is_dropped_unheard() -> None:
+    async def main() -> None:
+        state = {"quiet_for": 6.0}
+        said: list[str] = []
+        steps = _steps(state, said)
+        steps.step_started(1, 1)
+        steps.offer(1, "Switching to that tab.", seq=1)
+        await asyncio.sleep(0.25)
+        assert said == ["Switching to that tab."]      # sent to the voice while the step ran
+        steps.step_ended(1, 1)                          # the step returned before the line's first audio
+        assert steps.line_stale("Switching to that tab.") is True   # the voice drops it unheard
+        assert steps.line_stale("Switching to that tab.") is False  # asked once per line
+        steps.step_started(3, 1)
+        steps.offer(3, "Reading the page.", seq=1)
+        await asyncio.sleep(0.25)
+        steps.step_ended(3, 1)
+        assert steps.line_stale("Sure, here's the answer.") is False  # another reply is never taken for the line
+        steps.step_started(2, 1)
+        steps.offer(2, "Opening Warp.", seq=1)
+        await asyncio.sleep(0.25)
+        assert steps.line_stale() is False              # still running when its audio starts: heard
+        await steps.stop()
 
     asyncio.run(main())

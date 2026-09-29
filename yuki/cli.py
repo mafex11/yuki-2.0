@@ -11,6 +11,7 @@ import sys
 from typing import Iterator, Sequence
 
 from rich.console import Console
+from rich.markup import escape
 
 from yuki.agent.loop import Agent
 from yuki.config import EFFORT_LEVELS, MODEL_ALIASES, Settings
@@ -68,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_request(agent, line, console)
     finally:
         logger.close()
-        console.print(f"[dim]log: {logger.path}[/dim]")
+        console.print(f"[dim]log: {escape(str(logger.path))}[/dim]")
     return 0
 
 
@@ -127,7 +128,7 @@ def _command(line: str, agent: Agent, console: Console) -> bool:
                 f"choices: {', '.join(sorted(MODEL_ALIASES))}[/dim]"
             )
             return True
-        console.print(f"[dim]model -> {agent.set_model(parts[1])}[/dim]")
+        console.print(f"[dim]model -> {escape(str(agent.set_model(parts[1])))}[/dim]")
         return True
     if name == "/effort":
         if len(parts) < 2:
@@ -137,11 +138,11 @@ def _command(line: str, agent: Agent, console: Console) -> bool:
             )
             return True
         try:
-            console.print(f"[dim]effort -> {agent.set_effort(parts[1])}[/dim]")
+            console.print(f"[dim]effort -> {escape(str(agent.set_effort(parts[1])))}[/dim]")
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{escape(str(exc))}[/red]")
         return True
-    console.print(f"[red]unknown command {name}[/red]")
+    console.print(f"[red]unknown command {escape(name)}[/red]")
     return True
 
 

@@ -96,10 +96,7 @@ AUDIO_HANDS = ("media_key", "app_volume")
 #: How long a reopened tab may take to show its title (the browser restores it at once, the page after).
 _REOPEN_WAIT_S = 3.0
 
-_WINDOW = {
-    "type": "integer",
-    "description": "The window's hwnd, the [number] on its line in the desktop block of the latest user message.",
-}
+_WINDOW = {"type": "integer", "description": "The window's [hwnd] from the desktop block."}
 _SAID_NOTE = "It worked, verified, and your done line was said. Do not say it again."
 #: A verified hand whose done line was left empty (v3.12: "on every scroll it says done, it's very repetitive").
 _SILENT_NOTE = "It worked, verified, and, as you chose, nothing was said: they can see it. Say nothing now."
@@ -144,24 +141,19 @@ _KEYS_NOTE = (
     "more than it shows. If it shows the keys did nothing they wanted, say so and hand it to the thinker "
     "with tell_yuki (their request, and this report as context)."
 )
-#: Every hand's done line: said the moment its report verifies the step, with no second model call.
+#: Every hand's done line: said the moment its report verifies the step, with no second model call. v3.14b: the
+#: schemas are the hands' contracts only; when to leave it empty and every worked example are in the prompt's "# Your
+#: hands" (the same words in nine schemas were ~1.3k tokens of the talker's prefix, measured +250-300 ms of first token
+#: once the whole prompt passed ~18k tokens).
 _DONE_LINE = {
     "type": "string",
-    "description": (
-        "The few words to say the moment the report verifies it worked, e.g. \"Done, it's minimized.\"; said only "
-        "then, by the hand (if it did not work you get the report instead). Or \"\" to say nothing when it worked: "
-        "when they can see the effect happen and there is nothing to add, above all a simple step again (\"scroll "
-        "down\", \"again\", the next tab): a person helping would just do it. It is never silent when it did not "
-        "work or reached the end: then you get the report and say so."
-    ),
+    "description": "Said once its report verifies it (\"Done, it's minimized.\"), or \"\" to say nothing.",
 }
-_NOW = (" Instant: call it with no words before it, the call alone; its done line is what the user hears, "
-        "once it is verified.")
+_NOW = " Instant: call it alone, no words before it."
 #: The spoken acknowledgement of a slow hand (open_url, open_app), said the moment it is written (v3.5).
 _SAY_FIRST = {
     "type": "string",
-    "description": ("Write this first: the few words said out loud as it starts (\"Opening it.\"), spoken the "
-                    "moment you write them. Call the hand alone, with no words before it."),
+    "description": "Written first: the few words said as it starts (\"Opening it.\"). Call it alone.",
 }
 
 #: The hands' schemas (Pipecat standard function schema fields).
@@ -169,19 +161,15 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "media_key",
         "description": (
-            "Your hand: a media key, or the SYSTEM volume. playpause, nexttrack, prevtrack and stop act on the "
-            "media session the desktop block marks as the one media keys act on. volumeup / volumedown / "
-            "volumemute change the system volume: the whole PC's output, every app at once, 2% per press. "
-            "For one app's own volume (only YouTube in Chrome, only Spotify) use app_volume instead. Verified "
-            "from the session's status or the system volume." + _NOW
+            "Your hand: a media key, or the SYSTEM volume (every app at once, 2% per press). playpause, nexttrack, "
+            "prevtrack and stop act on the media session the desktop block marks. One app's volume is app_volume. "
+            "Verified from the session's status or the volume." + _NOW
         ),
         "properties": {
             "key": {"type": "string", "enum": list(MEDIA_KEYS)},
             "want": {"type": "string", "enum": ["playing", "paused"],
-                     "description": ("For playpause: the state they want (pause -> paused, play or resume -> playing). "
-                                     "playpause toggles, so when the session is already that way nothing is pressed "
-                                     "and the report says so.")},
-            "times": {"type": "integer", "description": "Presses (default 1); e.g. 5 for 'a bit' of volume."},
+                     "description": "playpause: the state they want; already that way, nothing is pressed."},
+            "times": {"type": "integer", "description": "Presses (default 1)."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["key", "say_when_done"],
@@ -189,18 +177,14 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "app_volume",
         "description": (
-            "Your hand: ONE APP's own volume in the Windows volume mixer, e.g. only Chrome (so only the YouTube "
-            "video in it) or only Spotify; the system volume and every other app stay as they are. The app "
-            "volumes line of the desktop block lists the apps with sound and their levels: name the app as it "
-            "shows there. Nothing on the screen is touched (no window is focused or clicked), so a game in "
-            "front stays in front. Verified by reading the app's level back." + _NOW
+            "Your hand: ONE APP's own mixer volume (only Chrome, only Spotify), the app as the app volumes line "
+            "names it; nothing on the screen is touched. Verified by reading its level back." + _NOW
         ),
         "properties": {
-            "app": {"type": "string", "description": "The app as the app volumes line names it, e.g. chrome.exe."},
-            "change": {"type": "integer",
-                       "description": "Points to move it by: e.g. -20 for 'a bit quieter', 30 for 'much louder'."},
-            "level": {"type": "integer", "description": "Or the level to set, 0-100."},
-            "mute": {"type": "boolean", "description": "Optional: true mutes the app, false unmutes it."},
+            "app": {"type": "string", "description": "As the app volumes line names it, e.g. chrome.exe."},
+            "change": {"type": "integer", "description": "Points to move it by, e.g. -20."},
+            "level": {"type": "integer", "description": "Or the level, 0-100."},
+            "mute": {"type": "boolean", "description": "true mutes, false unmutes."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["app", "say_when_done"],
@@ -208,15 +192,13 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "scroll",
         "description": (
-            "Your hand: scroll one window's content up or down (brought to the front first if it is not). "
-            "It scrolls the window's scrollable page or list itself, wherever the mouse is, and reads the "
-            "scroll position back: verified only if the content really moved. The same for 'again' or "
-            "'more'." + _NOW
+            "Your hand: scroll one window's page or list up or down (brought to the front first), read back: "
+            "verified only if it moved." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
             "direction": {"type": "string", "enum": ["up", "down"]},
-            "amount": {"type": "integer", "description": "Wheel notches (default 5; about a screenful is 10)."},
+            "amount": {"type": "integer", "description": "Notches (default 5; a screenful is about 10)."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "direction", "say_when_done"],
@@ -224,18 +206,14 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "window",
         "description": (
-            "Your hand: focus (bring to the front), minimize, maximize, fullscreen, restore or close one whole "
-            "window. Maximized fills the screen but keeps its title bar and the taskbar; fullscreen (F11) covers the "
-            "whole monitor: when they say full screen, it is fullscreen, never maximize. "
-            "A window is not a tab: this never changes which tab a browser shows (that is the tab hand). The "
-            "report says whether the window really reached that state. close is what its X button does, and "
-            "only when the user asked to close that window (their words in named)." + _NOW
+            "Your hand: focus, minimize, maximize, fullscreen, restore or close one whole window, its state read back "
+            "from Windows. Maximized keeps the title bar and taskbar; full screen is fullscreen (F11), never "
+            "maximize. A window is not a tab. close only when they asked to close that window." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
             "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close"]},
-            "named": {"type": "string",
-                      "description": "close only: the user's own words asking to close this window."},
+            "named": {"type": "string", "description": "close: their own words asking to close it."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "action", "say_when_done"],
@@ -243,23 +221,17 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "tab",
         "description": (
-            "Your hand for a window's tab strip (a browser's tabs), from the tabs line of the desktop block. "
-            "show: make one tab the one showing. close: close exactly the tabs you name by their numbers on "
-            "that line; each is found by its identity (never whichever tab is active) and verified gone. "
-            "reopen: bring back the tab most recently closed, with the browser's own reopen; verified only "
-            "when the restored tab's title is the one in expect (the closed tab's title, from the done lines). "
-            "Only tabs on that line; which tab holds what inside its page is the thinker's." + _NOW
+            "Your hand for the tabs line. show: make one tab the one showing. close: exactly the tabs you name by "
+            "number, each found by its identity and verified gone. reopen: the tab most recently closed, verified "
+            "by expect. What a page holds is the thinker's." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
             "action": {"type": "string", "enum": ["show", "close", "reopen"], "description": "Default show."},
-            "tab": {"type": "integer",
-                    "description": "show / close: the tab's number on the tabs line (from 1, left to right)."},
-            "tabs": {"type": "array", "items": {"type": "integer"},
-                     "description": "close: several tabs' numbers at once, each one the user named."},
-            "named": {"type": "string",
-                      "description": "close: the user's own words that name each tab you close (\"the Claude tabs\")."},
-            "expect": {"type": "string", "description": "reopen: the title of the tab that was closed."},
+            "tab": {"type": "integer", "description": "Its number on the tabs line."},
+            "tabs": {"type": "array", "items": {"type": "integer"}, "description": "close: several at once."},
+            "named": {"type": "string", "description": "close: their own words naming each tab."},
+            "expect": {"type": "string", "description": "reopen: the closed tab's title."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "say_when_done"],
@@ -267,47 +239,37 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "open_url",
         "description": (
-            "Your hand: open a web address, in the app they named (e.g. 'Google Chrome') or else their "
-            "default browser, or an address Windows opens itself, like a Settings page (ms-settings:bluetooth, "
-            "ms-settings:display, ms-settings: for Settings' home). A browser that is open opens it in a new tab "
-            "of its own, so never press a new-tab key first. A web page is verified once it is at the address "
-            "and has its title, anything else once its window is in front (seconds), so say_first is heard while "
-            "it opens."
+            "Your hand: open an address in the app they named or their default browser (a new tab of its own: never "
+            "press a new-tab key first), or a Windows address (ms-settings:bluetooth). Verified once at the address "
+            "and titled, or its window in front (seconds)."
         ),
         "properties": {
             "say_first": _SAY_FIRST,
-            "url": {"type": "string", "description": "The full address, e.g. https://www.youtube.com"},
-            "app": {"type": "string", "description": "Optional: the app to open it in, as the Start menu names it."},
+            "url": {"type": "string", "description": "The full address."},
+            "app": {"type": "string", "description": "Optional: the app, as the Start menu names it."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["say_first", "url", "say_when_done"],
     },
     {
         "name": "open_app",
-        "description": ("Your hand: open (or bring up) an app by its Start menu name, e.g. 'Spotify'. Verified once "
-                        "its window is in front (a second or more), so say_first is heard while it opens."),
+        "description": "Your hand: open or bring up an app by its Start menu name. Verified once its window is in front.",
         "properties": {"say_first": _SAY_FIRST,
                        "name": {"type": "string", "description": "The app's name as they said it."},
                        "say_when_done": _DONE_LINE},
         "required": ["say_first", "name", "say_when_done"],
     },
-]
-HAND_TOOLS += [
     {
         "name": "click",
         "description": (
-            "Your hand for what they point at on the screen (v3.14): click one item of the items line of the desktop "
-            "block (the window in front's links, buttons and list rows, numbered, read while they talked), by its "
-            "number on that line: \"click the mix\", \"play the second one\", \"open that chat\". Only an item on "
-            "the items line: a name from the names line, a tab or a recent title is not an item (hand those over). "
-            "It is found again by its place "
-            "in that read and refused if the window changed since (then the thinker, which reads the window afresh, "
-            "gets it). Verified when something visibly changes after it (the page, the focus or the window)." + _NOW
+            "Your hand: click one item of the items line by its number there. Only an item on that line: a name, a "
+            "tab or a title is not one (hand those over). Refused if the window changed since. Verified when the "
+            "page, focus or window visibly changes." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
-            "item": {"type": "integer", "description": "The item's number on the items line."},
-            "named": {"type": "string", "description": "The user's own words that name it."},
+            "item": {"type": "integer", "description": "Its number on the items line."},
+            "named": {"type": "string", "description": "Their own words naming it."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "item", "say_when_done"],
@@ -315,13 +277,12 @@ HAND_TOOLS += [
     {
         "name": "type",
         "description": (
-            "Your hand for text (v3.14): type exactly the words they asked for into the text field the focus line of "
-            "the desktop block names (it has the keyboard now), nothing pressed after it: Enter, sending and every "
-            "shortcut are the thinker's. Verified by reading the field back." + _NOW
+            "Your hand: type exactly their words into the field the focus line names, nothing pressed after (Enter "
+            "and shortcuts are the thinker's). Verified by reading the field back." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
-            "text": {"type": "string", "description": "The text to type, as they said it."},
+            "text": {"type": "string", "description": "The text, as they said it."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "text", "say_when_done"],

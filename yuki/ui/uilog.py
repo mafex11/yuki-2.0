@@ -57,7 +57,10 @@ class UiLog:
         """
         self.logger.log("ui", event=name, **fields)
         detail = " ".join(f"{k}={_brief(v)}" for k, v in fields.items())
-        self.logger.console.print(f"[dim]ui {name}[/dim] [dim]{detail}[/dim]", highlight=False)
+        # The fields carry the user's and the model's text: literal, never rich markup (2026-09-29, a stray bracket).
+        from rich.markup import escape
+
+        self.logger.console.print(f"[dim]ui {escape(str(name))}[/dim] [dim]{escape(detail)}[/dim]", highlight=False)
 
     def close(self) -> None:
         """Close the underlying session file."""

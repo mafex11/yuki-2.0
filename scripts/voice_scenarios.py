@@ -617,6 +617,7 @@ def _zen_desk(timeline: Timeline) -> Any:
         # -- what is on the screen ---------------------------------------------------------------------
         def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
             if int(hwnd) == self.WHATSAPP:
+                self._perceive("get_window_tree")
                 elements: list[dict[str, Any]] = [{"id": 0, "role": "Window", "name": "WhatsApp", "depth": 0,
                                                    "bounds": (0, 0, 1920, 1040), "center": (960, 520)}]
                 self._links = []
@@ -837,6 +838,7 @@ def _warp_desk(timeline: Timeline, *, warp_open: bool = False, launch_s: float =
         def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
             if int(hwnd) != self.WARP:
                 return super().get_window_tree(hwnd, **kw)
+            self._perceive("get_window_tree")
             left, top, right, _bottom = self._bounds(hwnd)
             caption = "Restore" if self.mode == "maximized" else "Maximize"
             elements = [{"id": 0, "role": "Window", "name": self.title(hwnd), "depth": 0,
@@ -864,6 +866,9 @@ def _warp_desk(timeline: Timeline, *, warp_open: bool = False, launch_s: float =
         def _set_mode(self, mode: str) -> None:
             self.mode = mode
             self.modes.append(mode)
+
+        def window_mode(self, hwnd: int) -> str:
+            return self.mode if int(hwnd) == self.WARP else "maximized"
 
         def _set_tab(self, i: int) -> None:
             self.warp_tab = i % len(WARP_TITLES)
@@ -1816,6 +1821,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
+    ap.add_argument("--measured-steps", dest="measured_steps", action="store_true",
+                    help="v3.14b: stub actions and window reads take the durations measured on the real PC")
     ap.add_argument("--grounding-source", dest="grounding_source", choices=("relevant", "related"), default=None,
                     help="v3.14: the talker's memory lookup (fast memory, or the whole-memory related block)")
     ap.add_argument("--serve-embedder", dest="serve_embedder", action="store_true",
@@ -1840,6 +1847,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="put the tail of every mouth request on the timeline (the JSON report only)")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "measured_steps", False):
+        from yuki.voice.offline import StubDesktop
+
+        StubDesktop.measured_steps = True   # every stub desk of this run (v3.14b): the real PC's step durations
     app = QCoreApplication.instance() or QCoreApplication([])
     if args.scenario == "wake2":
         results = []

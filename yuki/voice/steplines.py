@@ -10,14 +10,14 @@ reads what they say:
   and nobody has spoken for :attr:`silence_s` (or the silence is already :attr:`long_silence_s`, then as the step
   starts). Thresholds from measured step durations (docs/VOICE.md v3.14: of 159 real thinker calls, a step still
   running at 1.0 s was still running 0.5 s later 77% of the time; most clicks and focus changes end in under 0.4 s).
-* A quick step that worked is not narrated in a short pause (its outcome usually follows within a model call), but
-  its line is still the latest thing true of the job until the next step starts: when the silence after it runs to
-  :attr:`long_silence_s` (the thinker weighing its next step, offline 29 Sept 4-7 s at a time), it is said then.
-  A line whose step failed, or whose job has moved to a newer step, is never said.
+* A line is never said once its step has returned (v3.14b): "Switching tabs." after the tab switched is a stale line,
+  which the user's decision of 29 Sept rules out. A quick step (most clicks and keys end in under 0.4 s, measured) is
+  therefore rarely narrated; the thinker's pauses between steps are covered by the one "still on it" line. (v3.14 said
+  the line of a quick step that worked in a long silence after it; with the stubs' steps now taking the durations
+  measured on the real PC, that is gone.)
 * Never over the user (their speech, or the microphone hearing them before recognition does), never while Yuki is
   mid-sentence, never once the job's outcome or a question of it is known, never the same line twice in a
-  conversation (the exact words, whitespace and case aside), never a line whose step failed or was followed by
-  another.
+  conversation (the exact words, whitespace and case aside), never a line whose step has returned.
 * A ``say`` line (the thinker's own choice to speak up: a finding, a delay) waits only for the user and for Yuki's
   own speech.
 
@@ -79,11 +79,14 @@ class StepLines:
         self._pending: list[_Line] = []
         #: The step each job is on now, and when it started: ``{job: (seq, started_at)}``; a finished step is removed.
         self._running: dict[int, tuple[int, float]] = {}
-        #: The step each job last finished with success, and when, until its next step starts: ``{job: (seq, at)}``.
-        self._ended: dict[int, tuple[int, float]] = {}
         self._closed: set[int] = set()
         self._said: deque[str] = deque(maxlen=40)
+        #: ``(job, seq, words)`` of every line sent: the same line offered again (the finished call after its streamed
+        #: words) is the same line, not a second offer.
+        self._sent_for: set[tuple[int, int, str]] = set()
         self._poke = asyncio.Event()
+        #: The step line sent to the voice and not heard yet, as ``(job, seq)`` (``line_stale``).
+        self._airing: tuple[int, int, str] | None = None
         self._task: asyncio.Task | None = None
         self.stats = {"offered": 0, "spoken": 0, "dropped": 0}
 
@@ -93,7 +96,6 @@ class StepLines:
         """The job's step ``seq`` began running now (its tool call started)."""
         if job in self._closed:
             return
-        self._ended.pop(job, None)
         # A line of an earlier step that was never said is past: the job is doing something else now.
         self._drop(lambda line: line.job == job and line.kind == "step" and line.seq < seq, "newer_step")
         self._running[job] = (seq, time.monotonic())
@@ -103,17 +105,12 @@ class StepLines:
         self.poke()
 
     def step_ended(self, job: int, seq: int, ok: bool = True) -> None:
-        """The job's step ``seq`` returned (``ok``: it worked). A line about a failed step is past; a line about one
-        that worked waits for a long silence or the next step (:meth:`due`)."""
+        """The job's step ``seq`` returned (worked or not): a line about it not said yet is past."""
         running = self._running.get(job)
         if running is not None and running[0] == seq:
             del self._running[job]
-        if ok:
-            self._ended[job] = (seq, time.monotonic())
-            self.poke()
-            return
-        self._ended.pop(job, None)
-        self._drop(lambda line: line.job == job and line.kind == "step" and line.seq <= seq, "step_failed")
+        self._drop(lambda line: line.job == job and line.kind == "step" and line.seq <= seq,
+                   "step_ended" if ok else "step_failed")
 
     def offer(self, job: int, text: str, *, kind: str = "step", seq: int = 0) -> None:
         """A line the thinker wrote for step ``seq`` of ``job`` (or a ``say`` line)."""
@@ -121,8 +118,8 @@ class StepLines:
         if not text or job in self._closed:
             return
         if any(line.job == job and line.kind == kind and line.seq == seq and _key(line.text) == _key(text)
-               for line in self._pending):
-            return   # the same line again (streamed first, then with the finished call)
+               for line in self._pending) or (job, seq, _key(text)) in self._sent_for:
+            return   # the same line again (streamed first, then with the finished call): one line, not two
         self.stats["offered"] += 1
         running = self._running.get(job)
         started = running[1] if running is not None and running[0] == seq else None
@@ -142,11 +139,29 @@ class StepLines:
         """The job's outcome (or a question of it) is known: nothing more of it is said as a step or say line."""
         self._closed.add(job)
         self._running.pop(job, None)
-        self._ended.pop(job, None)
         self._drop(lambda line: line.job == job, why)
 
     def poke(self) -> None:
         self._poke.set()
+
+    def line_stale(self, text: str | None = None) -> bool:
+        """Asked by the voice right before a reply's first audio (once per line sent): the step line on its way
+        belongs to a step that has returned, or to a job whose outcome is known, so it is dropped unheard (v3.14b).
+        ``text``: the words about to be heard; another reply (the line was cut, the talker spoke first) is never
+        taken for the line, whatever the step's state."""
+        airing, self._airing = self._airing, None
+        if airing is None:
+            return False
+        job, seq, words = airing
+        if text is not None and _key(text) != words:
+            return False
+        running = self._running.get(job)
+        stale = job in self._closed or running is None or running[0] != seq
+        if stale:
+            self.stats["dropped"] += 1
+            self.stats["spoken"] = max(0, self.stats["spoken"] - 1)
+            self._log("dropped", kind="step", why="step_ended_before_heard")
+        return stale
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -178,10 +193,6 @@ class StepLines:
         quiet = float(s.get("quiet_for") or 0.0)
         running = self._running.get(line.job)
         if running is None or running[0] != line.seq:
-            ended = self._ended.get(line.job)
-            if ended is not None and ended[0] == line.seq:
-                # Its quick step worked and nothing newer started: said only once the silence is long.
-                return (True, "") if quiet >= self.long_silence_s else (False, "step_ended_short_pause")
             return False, "step_not_running"
         if quiet >= self.long_silence_s:
             return True, ""
@@ -222,16 +233,21 @@ class StepLines:
                 self._log("dropped", kind=chosen.kind, why="said_before", chars=len(chosen.text))
                 continue
             self._said.append(key)
+            self._sent_for.add((chosen.job, chosen.seq, key))
             self.stats["spoken"] += 1
             running = self._running.get(chosen.job)
             self._log("spoken", kind=chosen.kind, chars=len(chosen.text),
                       waited_ms=round((now - chosen.offered_at) * 1000),
                       step_ms=round((now - running[1]) * 1000) if running else None,
-                      step_ended=running is None or running[0] != chosen.seq,
                       quiet_ms=round(float(s.get("quiet_for") or 0.0) * 1000))
+            # The voice asks, right before the line's first audio, whether its step still runs (``line_stale``): the
+            # first audio comes ~1 s after this (the voice's first byte), and offline 29 Sept with measured step
+            # durations a line sent 0.81 s into a 0.84 s step was heard at 1.85 s, after the step had ended.
+            self._airing = (chosen.job, chosen.seq, key) if chosen.kind == "step" else None
             try:
                 await self._speak(chosen.text)
             except Exception as exc:  # noqa: BLE001 - a line that could not be said is only a line
+                self._airing = None
                 self._log("error", error=type(exc).__name__)
                 continue
             if self._on_said is not None:

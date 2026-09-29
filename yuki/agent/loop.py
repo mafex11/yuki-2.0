@@ -126,6 +126,9 @@ STEER_LABEL = "[The user added while you were working]"
 #: the user's newer request replaced it (voice: "no, close the tab instead"). A withdrawn run ends
 #: quietly: its caller shows it as cancelled, never as an error, and nothing of it is spoken.
 CANCELLED, WITHDRAWN = "cancelled", "withdrawn"
+#: v3.14b: a request paused on a question nobody answered, set aside so its lane can go on (yuki.ui.runtime parks it,
+#: and a later answer carries it on as a new request).
+PARKED = "parked"
 
 
 def written_tool_call(text: str, tools: Iterable[str]) -> str | None:
@@ -162,7 +165,8 @@ def acting_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 
 #: Input-watch facts of a key or click report (yuki.actions.input): each says the input changed something the
 #: user can see. Plumbing: which fields of the action's own report are its measured effects.
-_EFFECT_FACTS = ("foreground_changed", "focus_changed", "foreground_title_changed", "page_changed")
+_EFFECT_FACTS = ("foreground_changed", "focus_changed", "foreground_title_changed", "page_changed",
+                 "window_state_changed")   # v3.14b: normal / maximized / full screen, before -> after
 
 
 def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
@@ -208,7 +212,7 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
         if any(f is True for f in facts) or details.get("new_windows"):
             return True, "something visibly changed after it"
         if facts and all(f is False for f in facts):
-            return False, "focus, window and page were watched and nothing changed"
+            return False, "focus, window, its state and page were watched and nothing changed"
         return None, "nothing its report watched could show the effect"
     return None, "its report cannot show the effect"
 
@@ -393,6 +397,7 @@ class Agent:
         self._request_model: str | None = None
         self._request_thinking: bool | None = None
         self._request_lean = False
+        self._request_voice = False
         self._request_omit_effort = False
         #: ``(effort, thinking)`` this request moves to for its next model calls once a measured signal says the
         #: fast first pass needs judgement (``run(escalate=...)``, a spoken request: docs/VOICE.md v3.14), and why it
@@ -744,7 +749,7 @@ class Agent:
         closed, nothing of it is kept), so a withdrawn run frees the lane within
         a moment instead of after the whole response.
         """
-        self.cancel_reason = WITHDRAWN if reason == WITHDRAWN else CANCELLED
+        self.cancel_reason = reason if reason in (WITHDRAWN, PARKED) else CANCELLED
         self._cancelled.set()
 
     @property
@@ -763,6 +768,7 @@ class Agent:
         self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None,
         model: str | None = None, thinking: bool | None = None, lean: bool = False,
         view_hwnd: int | None = None, escalate: tuple[str | None, bool | None] | None = None,
+        voice: bool = False,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -832,6 +838,8 @@ class Agent:
         self._request_model = resolve_model(model) if model else None
         self._request_thinking = thinking
         self._request_lean = bool(lean)
+        #: A spoken request: its step tools take a required say_now (v3.14b, ``tools.with_step_lines``).
+        self._request_voice = bool(voice)
         self._escalate_to = escalate if escalate and (escalate[0] or escalate[1] is not None) else None
         self._escalation = None
         self._evidence = {}
@@ -1507,6 +1515,12 @@ class Agent:
 
     def _cancel_event(self) -> ErrorEvent:
         """Record a cancellation (or a withdrawal) in the transcript and build the event for it."""
+        if self.cancel_reason == PARKED:
+            message = "Parked: the question stays open until the user answers it."
+            self.logger.log("parked", message=message)
+            self.context.add_note("That request is paused on your question to the user, who has not answered yet; "
+                                  "it goes on only when they answer. Do not bring it up otherwise.")
+            return ErrorEvent(message)
         if self.cancel_reason == WITHDRAWN:
             message = "Withdrawn: replaced by the user's newer request."
             self.logger.log("withdrawn", message=message)
@@ -2298,6 +2312,12 @@ class Agent:
             messages = self.context.request_messages(
                 max_breakpoints=MAX_CACHE_BREAKPOINTS - used
             )
+        # A spoken request's step tools require say_now (v3.14b). The warm-up with a profile is the voice profile's
+        # (warm_cache(effort=, thinking=) is only called for it), so it writes the same tools.
+        if (profile is not None) if warmup else getattr(self, "_request_voice", False):
+            from yuki.agent.tools import with_step_lines
+
+            tools = with_step_lines(tools)
         # Effort and thinking per step (v3.14): a spoken request's fast first pass until a measured signal escalates
         # it (``_escalate``). The warm-up writes the entry of the profile it is asked for (``warm_cache``): on
         # Sonnet 5 an effort change is a different cached prefix from the tools on (measured 2026-09-29).

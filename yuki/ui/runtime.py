@@ -34,13 +34,14 @@ from __future__ import annotations
 
 import itertools
 import queue
+import time
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from yuki.agent.loop import CANCELLED, WITHDRAWN, Agent
+from yuki.agent.loop import CANCELLED, PARKED, WITHDRAWN, Agent
 from yuki.agent.memory import MemoryAccess, default_memory
 from yuki.agent.subagents import HelperStep
 from yuki.agent.tools import (
@@ -67,6 +68,10 @@ from yuki.ui.uilog import UiLog
 #: The lane names. Every signal carries one, so the UI knows who is talking.
 WORKER = "worker"
 FRONT_DESK = "front_desk"
+#: A question nobody answers sets its request aside after this long (s), freeing the lane (v3.14b: the six answered
+#: questions in the live logs of 27-29 Sept took 3-43 s; the one never answered held the worker until the app quit).
+ASK_PARK_S = 120.0
+_PARK = object()
 
 #: The tools the front desk may use: everything that only looks.
 LOOK_ONLY_TOOLS: tuple[str, ...] = tuple(
@@ -191,6 +196,11 @@ class Lane(QThread):
         self._waiting: list[int] = []
         #: Queued ids cancelled (or withdrawn) before they started, with why: skipped when dequeued.
         self._skip: dict[int, str] = {}
+        #: v3.14b: the request this lane set aside while it waited for an answer that did not come, as
+        #: ``(job, question)``; a later answer carries it on as a new request (:meth:`AgentRuntime.answer`).
+        self._parked: tuple[Job, str] | None = None
+        #: How long a question may hold the lane before it is set aside (s; ``Settings.ask_park_s``).
+        self.park_after_s = float(getattr(getattr(runtime, "settings", None), "ask_park_s", ASK_PARK_S))
 
     @property
     def allowed_tools(self) -> tuple[str, ...] | None:
@@ -232,9 +242,14 @@ class Lane(QThread):
             queued = job_id in self._waiting and job_id not in self._skip
             if queued and not running:
                 self._skip[job_id] = reason
+            parked = self._parked is not None and self._parked[0].id == job_id
+            if parked:
+                self._parked = None   # set aside on its question, and now dropped: an answer later starts nothing
         if running:
             self.cancel(reason)
             return "running"
+        if parked:
+            return "parked"
         return "queued" if queued else "unknown"
 
     def steer_job(self, job_id: int, text: str) -> bool:
@@ -248,6 +263,31 @@ class Lane(QThread):
     def answer(self, text: str) -> None:
         """Hand the user's answer to a paused request."""
         self._answers.put(text)
+
+    def take_parked(self) -> tuple[Job, str] | None:
+        """The request set aside on an unanswered question, if any (it is then no longer parked)."""
+        with self._state:
+            parked, self._parked = self._parked, None
+        return parked
+
+    def _wait_answer(self, job: Job) -> Any:
+        """The user's answer to a question, ``None`` (cancelled), or :data:`_PARK`: set it aside (v3.14b).
+
+        Before, the lane waited for the answer with no end: live 2026-09-28 21:06 a question nobody answered held the
+        worker until the app quit, and every later request waited behind it. Now the question is set aside when a new
+        request is waiting on this lane, or when it has gone unanswered for :attr:`park_after_s` (measured: the six
+        answered questions in the live logs of 27-29 Sept took 3-43 s). Plumbing on the queue and the clock only.
+        """
+        asked_at = time.monotonic()
+        while True:
+            try:
+                return self._answers.get(timeout=0.25)
+            except queue.Empty:
+                pass
+            with self._state:
+                waiting = [i for i in self._waiting if i not in self._skip]
+            if waiting or time.monotonic() - asked_at >= self.park_after_s:
+                return _PARK
 
     def cancel(self, reason: str = CANCELLED) -> None:
         """Cancel the request currently running on this lane.
@@ -341,6 +381,7 @@ class Lane(QThread):
             lean=voice and not getattr(settings, "voice_brain_portrait", True),
             **({"view_hwnd": job.view_hwnd} if job.view_hwnd else {}),
             **({"escalate": escalate} if escalate and (escalate[0] or escalate[1] is not None) else {}),
+            **({"voice": True} if voice else {}),
         )
         while True:
             try:
@@ -373,8 +414,13 @@ class Lane(QThread):
             elif isinstance(event, AskUser):
                 self._drain_answers()
                 runtime.asked.emit(self.name, job.id, event.question)
-                answer = self._answers.get()
-                if answer is None:
+                answer = self._wait_answer(job)
+                if answer is _PARK:
+                    with self._state:
+                        self._parked = (job, event.question)
+                    self.agent.cancel(PARKED)
+                    self.agent.answer("(no answer yet: the question stays open until they answer it)")
+                elif answer is None:
                     self.agent.cancel()
                     self.agent.answer("(the user cancelled instead of answering)")
                 else:
@@ -394,7 +440,11 @@ class Lane(QThread):
             elif isinstance(event, Final):
                 runtime.finished.emit(self.name, job.id, event.text)
             elif isinstance(event, ErrorEvent):
-                if self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == WITHDRAWN:
+                if self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == PARKED:
+                    # Set aside on its unanswered question (v3.14b): neither failed nor done; an answer later
+                    # carries it on (AgentRuntime.answer).
+                    runtime.parked.emit(self.name, job.id, event.text)
+                elif self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == WITHDRAWN:
                     # Replaced by the user's newer request: a quiet end, never an error (the chat shows it
                     # cancelled; the voice says nothing of it).
                     runtime.withdrawn.emit(self.name, job.id, event.text)
@@ -481,6 +531,10 @@ class AgentRuntime(QObject):
     lane_done = Signal(str, int, str, bool, list)
     said = Signal(str, int, str)
     handed_off = Signal(int, int, int)
+    #: v3.14b: ``(lane, id, text)``: the request was set aside on a question nobody answered (the lane goes on).
+    parked = Signal(str, int, str)
+    #: v3.14b: ``(parked id, new id)``: an answer came for a parked request, which carries on as the new one.
+    resumed = Signal(int, int)
     steer_unread = Signal(str, int, list)
     helper_step = Signal(str, int, int, str, str, bool)
     #: ``(lane, job, what, text)``: the reply or the thinking written so far (``what``: reply | thinking), live
@@ -669,12 +723,28 @@ class AgentRuntime(QObject):
     def answer(self, lane_name: str, text: str) -> None:
         """Answer the question a lane is paused on.
 
+        v3.14b: when that question was set aside (nobody answered it in time, or a newer request came), the answer
+        carries its request on as a new request on the same lane, with the question and the answer (``resumed``: the
+        chat and the voice keep one card for it). The request's steps so far are in the agent's own context.
+
         Args:
             lane_name: :data:`WORKER` or :data:`FRONT_DESK`.
             text: The user's answer.
         """
-        self.lane(lane_name).answer(text)
-        self.ui_log.event("answer", lane=lane_name, text=text)
+        lane = self.lane(lane_name)
+        parked = None if lane.agent.awaiting_answer else lane.take_parked()
+        if parked is None:
+            lane.answer(text)
+            self.ui_log.event("answer", lane=lane_name, text=text)
+            return
+        job, question = parked
+        request = (f"{job.request}\n\n[This request was set aside on your question, which went unanswered for a "
+                   f"while: \"{question}\". The user has now answered: \"{text}\". Carry on with it from where you "
+                   f"stopped.]")
+        _lane, new_id = self.submit(request, origin_hwnd=job.origin_hwnd, source=job.source,
+                                    lane=WORKER if lane_name == WORKER else None)
+        self.ui_log.event("answer", lane=lane_name, text=text, resumed=job.id, new_id=new_id)
+        self.resumed.emit(job.id, new_id)
 
     def cancel_worker(self) -> None:
         """Cancel whatever the worker is doing."""

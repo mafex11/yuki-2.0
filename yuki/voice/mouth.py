@@ -397,30 +397,7 @@ intent="follow_up") alone, or nothing new to hand over: never a second task for 
 
 # When they cut you off
 
-They may speak while you are talking. Your voice stops at once and what you had not said yet is never played. \
-When the latest message has a Cut off line, it says what they heard of your last reply and what you had not \
-said yet. Answer the way a person would who was interrupted mid-sentence:
-- A side comment, agreement or reaction ("oh nice, I had that idea too"): react to it briefly in your own \
-words, then pick up where you were cut, from the part not said yet, rephrased naturally ("anyway, where was I, \
-..."), never repeating what they heard.
-- A correction or a new request ("no, I meant X", "open Y"): drop the rest and handle the new thing.
-- "stop", "okay okay", "got it", "enough": drop the rest; at most a word, or stay_quiet.
-- A question about the point: answer it, then go on with the rest or offer it.
-- An answer to a question you were asking (your question was cut and they said "yeah", "the first one"): they \
-answered it: act on the answer; never finish asking it.
-Never finish a cut sentence word for word, and never say the unsaid part as it was written. A question \
-of yours that was cut is either asked again whole, in new words, only if it still matters after what they said, \
-or dropped; never later, and never its tail on its own. Every reply starts as a whole sentence of its own: never \
-with "or ...", "and ..." carrying on a sentence you said before.
-Bad: your question "Is it a file, or a tab you had open in Warp before?" was cut, and a result comes -> "or a \
-tab you had open in Warp before?" (a fragment: it means nothing on its own)
-Good: you were explaining how the cache works, cut after "the first request writes it,", they say "oh nice, I \
-had that same idea" -> "Ha, great minds. So, after that, every request reads it instead, which is why it's fast."
-Bad: the same -> "the first request writes it, and after that every request reads it." (repeats what they heard)
-Good: you were asking "Do you mean the subscriptions list in the sidebar, or something else", cut after \
-"sidebar,", they say "Yeah." -> the answer goes to the running task (tell_yuki intent follow_up, request "Yes, \
-the subscriptions list in the sidebar") with say_first "Expanding it."
-Bad: the same -> "or something else on the Sidemen page?" (finishing the cut question)
+They may speak while you are talking. Your voice stops at once and what you had not said yet is never played. When the latest message has a Cut off line, it says what they heard, what was not said, and how to answer. A question of yours that was cut is asked again whole, in new words, only if it still matters, or dropped; never its tail on its own. Every reply starts as a whole sentence of its own: never with "or ...", "and ..." carrying on a sentence you said before.
 
 # While the thinker works
 
@@ -444,8 +421,9 @@ What you say next follows on from them like a person would ("There, it's full sc
 them, and never tells the step again.
 - yuki_says: something the thinker wants the user to hear, when your voice could not say it itself. Pass it \
 on in your own words.
-- yuki_asks: a question for the user. Ask it in your own words; their answer goes back as a \
-follow_up.
+- yuki_asks: a question for the user. Ask it once, in your own words; their answer goes back as a \
+follow_up. When what they say next is not its answer (a new request, something else), handle their new words: a \
+request is a new_task and the question is set aside. Never ask it again.
 - status: about the queue.
 - result: the outcome, already cut short for listening. Say it in one or two short spoken \
 sentences of your own, adding nothing it does not say. One marked verified is the action that did it, \
@@ -880,8 +858,18 @@ VERIFIED_NOTE = (
 )
 
 
+#: A result for a request that asked for something to be done, when no action ran in its job (v3.14b).
+NOTHING_DONE_NOTE = (
+    "Nothing was done on the PC for this request: no action ran, the thinker only looked or answered. If its words "
+    "say plainly what it found and why nothing needed doing, say that in a few words. Otherwise tell them honestly "
+    "that you did not do it, or ask in a few words what they meant. Say it once, now, and never again later: never "
+    "that it is done, sorted, on it or got it."
+)
+
+
 def result_payload(kind: str, text: str, *, more: bool = False, held_back: bool = False,
-                   request: str | None = None, late: bool = False, verified: bool = False) -> dict[str, Any]:
+                   request: str | None = None, late: bool = False, verified: bool = False,
+                   nothing_done: bool = False) -> dict[str, Any]:
     """What a ``tell_yuki`` final result says to the mouth (``kind`` is ``done`` or ``failed``).
 
     ``result``, not ``done``: the word must not tell the mouth it worked; the brain's own
@@ -893,7 +881,10 @@ def result_payload(kind: str, text: str, *, more: bool = False, held_back: bool 
     user has said more since it was handed over, so it is framed as the earlier request's outcome, said in
     one line only if it still matters (v3.9: live 14:19:29 "Playing the mix now" answered "close the tab").
     ``verified``: the thinker marked the action that did it as the finish and it succeeded: the talker says it at
-    once and briefly (v3.10: the thinker never speaks itself, only the talker does).
+    once and briefly (v3.10: the thinker never speaks itself, only the talker does). ``nothing_done`` (v3.14b): the
+    request asked for something to be done (the talker handed it over with ``acts``, or a hand of its own was tried)
+    and no action ran in its job: the talker says so or asks (offline 29 Sept a misheard "Ok on WhatsApp" was
+    answered "Got it." with nothing done). Decided from the job's own record, never from the words.
     """
     about = {"for_request": request if len(request) <= 200 else request[:199] + "…"} if request else {}
     if held_back:
@@ -901,6 +892,9 @@ def result_payload(kind: str, text: str, *, more: bool = False, held_back: bool 
     if late:
         return {"result" if kind == "done" else "failed": text, **about, "late": True, "more_available": more,
                 "how_to_say_it": LATE_NOTE + (MORE_NOTE if more else "")}
+    if nothing_done and kind == "done":
+        return {"result": text, **about, "nothing_done": True, "more_available": more,
+                "how_to_say_it": NOTHING_DONE_NOTE}
     if verified and kind == "done":
         return {"result": text, **about, "verified": True, "how_to_say_it": VERIFIED_NOTE}
     note = SPOKEN_NOTE + (MORE_NOTE if more else "")
@@ -1032,6 +1026,34 @@ def mouth_rules(standing: str | None) -> str:
 DESK_LABEL = "[Desktop now, for your hands (background, not news):"
 
 
+#: How to answer after being cut off (v3.12), carried by the Cut off line itself (v3.14b): only the turns it applies
+#: to pay for it; in the talker's cached prompt it was ~550 tokens of every request (the prompt's length past
+#: ~18k tokens costs +250-300 ms of first token, measured).
+CUT_OFF_GUIDE = """\nAnswer the way a person would who was interrupted mid-sentence:
+- A side comment, agreement or reaction ("oh nice, I had that idea too"): react to it briefly in your own \
+words, then pick up where you were cut, from the part not said yet, rephrased naturally ("anyway, where was I, \
+..."), never repeating what they heard.
+- A correction or a new request ("no, I meant X", "open Y"): drop the rest and handle the new thing.
+- "stop", "okay okay", "got it", "enough": drop the rest; at most a word, or stay_quiet.
+- A question about the point: answer it, then go on with the rest or offer it.
+- An answer to a question you were asking (your question was cut and they said "yeah", "the first one"): they \
+answered it: act on the answer; never finish asking it.
+Never finish a cut sentence word for word, and never say the unsaid part as it was written. A question \
+of yours that was cut is either asked again whole, in new words, only if it still matters after what they said, \
+or dropped; never later, and never its tail on its own. Every reply starts as a whole sentence of its own: never \
+with "or ...", "and ..." carrying on a sentence you said before.
+Bad: your question "Is it a file, or a tab you had open in Warp before?" was cut, and a result comes -> "or a \
+tab you had open in Warp before?" (a fragment: it means nothing on its own)
+Good: you were explaining how the cache works, cut after "the first request writes it,", they say "oh nice, I \
+had that same idea" -> "Ha, great minds. So, after that, every request reads it instead, which is why it's fast."
+Bad: the same -> "the first request writes it, and after that every request reads it." (repeats what they heard)
+Good: you were asking "Do you mean the subscriptions list in the sidebar, or something else", cut after \
+"sidebar,", they say "Yeah." -> the answer goes to the running task (tell_yuki intent follow_up, request "Yes, \
+the subscriptions list in the sidebar") with say_first "Expanding it."
+Bad: the same -> "or something else on the Sidemen page?" (finishing the cut question)
+"""
+
+
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    desk: str | None = None, call: str | None = None, heard: str | None = None,
                    named: bool = False, work: str | None = None,
@@ -1070,8 +1092,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  "no words.]")
     if cut:
         text += (f"\n[Cut off: they spoke while you were saying your last reply. They heard: \"{cut.get('heard') or ''}\". "
-                 f"Not said yet: \"{cut.get('unsaid') or ''}\". Answer as the section on being cut off says: never "
-                 f"say the unsaid part on its own; a cut question is asked again whole only if it still matters.]")
+                 f"Not said yet: \"{cut.get('unsaid') or ''}\". Never say the unsaid part on its own; a cut question "
+                 f"is asked again whole only if it still matters. How to answer:\n{CUT_OFF_GUIDE.strip()}]")
     if work:
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}.]")

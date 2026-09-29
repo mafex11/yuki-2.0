@@ -62,6 +62,10 @@ def profile(argv: list[str]) -> tuple[dict, str, int]:
     rounds = int(argv[1]) if len(argv) > 1 else 4
     kwargs = {"effort": s.voice_brain_effort or None,
               "thinking": None if s.voice_brain_thinking else False}
+    import inspect
+
+    if "voice" in inspect.signature(Agent.run).parameters:   # v3.14b: a spoken request (say_now required)
+        kwargs["voice"] = True
     if s.voice_brain_escalate_effort or s.voice_brain_escalate_thinking is not None:
         kwargs["escalate"] = (s.voice_brain_escalate_effort or None, s.voice_brain_escalate_thinking)
     label = (f"voice {s.voice_brain_effort}/{'adaptive' if s.voice_brain_thinking else 'off'}"

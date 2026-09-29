@@ -66,6 +66,8 @@ def feel(report: dict[str, Any], log_events: list[dict[str, Any]] | None = None)
         eos = ends.get(label, t0)
         mine = [(a, b) for a, b in utts if eos <= a < t1]
         actions = [e["t"] for e in ev if e["kind"] == "action" and eos <= e["t"] < t1]
+        # Lines sent by code (a step line may still be dropped before its audio, v3.14b: the voice log's step_line
+        # "dropped step_ended_before_heard" says which; ``step_line_ops`` below).
         said = [e["text"] for e in ev if e["kind"] in ("yuki", "yuki_code") and eos <= e["t"] < t1
                 and str(e.get("text") or "").strip()]
         spoken_all += said

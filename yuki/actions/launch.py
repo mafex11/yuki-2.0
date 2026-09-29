@@ -2388,6 +2388,14 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     started = time.perf_counter()
 
     def finish(ok: bool, summary: str, details: dict) -> ActionResult:
+        if "window_state_before" in details:
+            # v3.14b: how the window is shown now, measured (normal / maximized / fullscreen / minimized), next to
+            # how it was: the same fact a key's report carries, so every window change is read the same way.
+            from yuki.perception.windows import window_state
+
+            after = window_state(hwnd) if action != "close" else None
+            details["window_state_after"] = after
+            details["window_state_changed"] = after is not None and after != details["window_state_before"]
         return ActionResult(ok=ok, summary=summary, details=details,
                             elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
@@ -2403,6 +2411,9 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     name = f"{info.process_name} \"{info.title}\"" if info else f"hwnd {hwnd}"
     details.update(title=info.title if info else "", process_name=info.process_name if info else "",
                    was_minimized=bool(win32gui.IsIconic(hwnd)), was_maximized=bool(_is_zoomed(hwnd)))
+    from yuki.perception.windows import window_state
+
+    details["window_state_before"] = window_state(hwnd)
     if action == "fullscreen":
         return _fullscreen(hwnd, name, details, finish)
     if action == "close":

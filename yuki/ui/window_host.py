@@ -78,6 +78,9 @@ class WindowHost(QObject):
             withdrawn.connect(lambda lane, job, text: self.emit({"type": "withdrawn", "job": job, "text": text}))
         rt.summarized.connect(self._on_summarized)
         rt.handed_off.connect(lambda src, dst, _w: self.emit({"type": "handed_off", "from_job": src, "to_job": dst}))
+        resumed = getattr(rt, "resumed", None)
+        if resumed is not None:   # v3.14b: a parked question answered later carries on in the same bubble
+            resumed.connect(lambda src, dst: self.emit({"type": "resumed", "from_job": src, "to_job": dst}))
         voice = ui.voice
         chat_event = getattr(voice, "chat_event", None)
         if chat_event is not None:   # the voice side's live turns (docs/UI-window.md "Voice events")

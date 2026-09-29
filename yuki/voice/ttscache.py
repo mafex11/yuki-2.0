@@ -39,12 +39,15 @@ def default_dir() -> Path:
 class TTSCache:
     """The cache (thread-safe). ``get``, ``put``, ``preload`` and ``flush`` touch the disk and run off the voice loop;
     ``approved`` and ``approve`` only touch memory (offline 29 Sept the first ``approved`` read the index on the loop:
-    a 724 ms stall), so the index is loaded ahead (``preload``) and an approval is written with the next ``put``."""
+    a 724 ms stall), so the index is loaded ahead (``preload``) and an approval is written with the next ``put``.
+    Two locks: ``_io`` serialises the disk work, ``_lock`` guards the index in memory and is never held across a disk
+    call (offline 29 Sept ``approve`` on the loop waited 1.36 s behind a ``put`` writing on a busy disk)."""
 
     def __init__(self, root: Path | None = None, *, max_entries: int = MAX_ENTRIES) -> None:
         self.root = Path(root) if root is not None else default_dir()
         self.max_entries = max_entries
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()   # the index in memory (the loop takes only this one)
+        self._io = threading.Lock()     # the disk (off the loop only)
         self._index: dict[str, dict[str, Any]] | None = None
         self._dirty = False
         self.stats = {"hits": 0, "misses": 0, "stored": 0, "approved_hits": 0}
@@ -61,21 +64,27 @@ class TTSCache:
         words = (text or "").split()
         return 0 < len(words) <= MAX_WORDS and len(text) <= MAX_CHARS
 
-    # -- the index -------------------------------------------------------------------------------
+    # -- the index (callers hold ``_io``) ----------------------------------------------------------
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if self._index is None:
             try:
-                self._index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
+                index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                self._index = {}
+                index = {}
+            with self._lock:
+                if self._index is None:
+                    self._index = index
         return self._index
 
     def _save(self) -> None:
+        with self._lock:
+            text = json.dumps(self._index or {})
+            self._dirty = False
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self.root / "index.json.tmp"
-            tmp.write_text(json.dumps(self._index or {}), encoding="utf-8")
+            tmp.write_text(text, encoding="utf-8")
             os.replace(tmp, self.root / "index.json")
         except OSError:
             pass
@@ -83,24 +92,28 @@ class TTSCache:
     # -- use -------------------------------------------------------------------------------------
 
     def get(self, key: str) -> bytes | None:
-        with self._lock:
-            entry = self._load().get(key)
-            if entry is None:
-                self.stats["misses"] += 1
-                return None
+        with self._io:
+            index = self._load()
+            with self._lock:
+                entry = index.get(key)
+                if entry is None:
+                    self.stats["misses"] += 1
+                    return None
             try:
                 pcm = (self.root / f"{key}.pcm").read_bytes()
             except OSError:
-                self._load().pop(key, None)
-                self.stats["misses"] += 1
+                with self._lock:
+                    index.pop(key, None)
+                    self.stats["misses"] += 1
                 return None
-            entry["used"] = time.time()
-            self.stats["hits"] += 1
+            with self._lock:
+                entry["used"] = time.time()
+                self.stats["hits"] += 1
             return pcm
 
     def preload(self) -> None:
         """Read the index now (off the voice loop, when the conversation is built)."""
-        with self._lock:
+        with self._io:
             self._load()
 
     def approved(self, key: str) -> bool:
@@ -115,7 +128,7 @@ class TTSCache:
     def put(self, key: str, pcm: bytes) -> None:
         if not pcm:
             return
-        with self._lock:
+        with self._io:
             index = self._load()
             try:
                 self.root.mkdir(parents=True, exist_ok=True)
@@ -124,18 +137,21 @@ class TTSCache:
                 os.replace(tmp, self.root / f"{key}.pcm")
             except OSError:
                 return
-            entry = index.setdefault(key, {})
-            entry.update(bytes=len(pcm), used=time.time())
-            self.stats["stored"] += 1
-            self._dirty = False   # saved just below, approvals with it
-            if len(index) > self.max_entries:
-                for old in sorted(index, key=lambda k: index[k].get("used", 0))[:len(index) - self.max_entries]:
-                    index.pop(old, None)
-                    try:
-                        (self.root / f"{old}.pcm").unlink()
-                    except OSError:
-                        pass
-            self._save()
+            old: list[str] = []
+            with self._lock:
+                entry = index.setdefault(key, {})
+                entry.update(bytes=len(pcm), used=time.time())
+                self.stats["stored"] += 1
+                if len(index) > self.max_entries:
+                    old = sorted(index, key=lambda k: index[k].get("used", 0))[:len(index) - self.max_entries]
+                    for k in old:
+                        index.pop(k, None)
+            for k in old:
+                try:
+                    (self.root / f"{k}.pcm").unlink()
+                except OSError:
+                    pass
+            self._save()   # approvals with it
 
     def approve(self, key: str) -> None:
         """Remember the check's SAY (memory only; written with the next ``put`` or ``flush``)."""
@@ -148,10 +164,8 @@ class TTSCache:
                 self._dirty = True
 
     def flush(self) -> None:
-        with self._lock:
+        with self._io:
             if self._index is not None and self._dirty:
                 self._save()
-                self._dirty = False
-
 
 __all__ = ["TTSCache", "default_dir", "MAX_WORDS", "MAX_CHARS"]

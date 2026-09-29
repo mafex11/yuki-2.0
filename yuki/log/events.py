@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Literal, TextIO
 
 from rich.console import Console
+from rich.errors import MarkupError
+from rich.markup import escape
 
 from yuki.memory import secret_filter
 
@@ -391,7 +393,7 @@ class SessionLogger:
             messages=self._dereference_images(_as_plain(messages)),
             tools=_as_plain(tools),
         )
-        self._print(f"[dim]-> {model} ({_count_messages(messages)} messages)[/dim]")
+        self._print(f"[dim]-> {_x(model)} ({_count_messages(messages)} messages)[/dim]")
 
     def llm_response(
         self,
@@ -416,7 +418,7 @@ class SessionLogger:
         if not isinstance(plain, dict):
             plain = {}
         self._print(
-            f"[dim]<- {stop_reason} {latency_ms / 1000:.1f}s "
+            f"[dim]<- {_x(stop_reason)} {latency_ms / 1000:.1f}s "
             f"in={plain.get('input_tokens', 0)} "
             f"cached={plain.get('cache_read_input_tokens', 0)} "
             f"out={plain.get('output_tokens', 0)}[/dim]"
@@ -429,14 +431,14 @@ class SessionLogger:
         if len(shown) > 200:
             shown = shown[:200] + "..."
         if shown:
-            self._print(f"[cyan]. {shown}[/cyan]")
+            self._print(f"[cyan]. {_x(shown)}[/cyan]")
 
     def tool_call(
         self, name: str, tool_input: dict[str, Any], *, tool_use_id: str | None = None
     ) -> None:
         """Log a tool invocation."""
         self.log("tool_call", name=name, input=tool_input, tool_use_id=tool_use_id)
-        self._print(f"[yellow]-> {name}[/yellow] [dim]{_brief(tool_input)}[/dim]")
+        self._print(f"[yellow]-> {_x(name)}[/yellow] [dim]{_x(_brief(tool_input))}[/dim]")
 
     def tool_result(
         self,
@@ -460,7 +462,7 @@ class SessionLogger:
         )
         colour = "green" if ok else "red"
         mark = "ok" if ok else "!!"
-        self._print(f"[{colour}]{mark} {name}[/] {summary} [dim]{elapsed_ms:.0f}ms[/dim]")
+        self._print(f"[{colour}]{mark} {_x(name)}[/] {_x(summary)} [dim]{elapsed_ms:.0f}ms[/dim]")
 
     def perception(self, kind: str, *, size_chars: int, elapsed_ms: float, payload: Any) -> None:
         """Log a perception snapshot in full, plus its size on the console."""
@@ -471,12 +473,12 @@ class SessionLogger:
             elapsed_ms=round(elapsed_ms, 1),
             payload=self._dereference_images(_as_plain(payload)),
         )
-        self._print(f"[dim]   {kind}: {size_chars} chars, {elapsed_ms:.0f}ms[/dim]")
+        self._print(f"[dim]   {_x(kind)}: {size_chars} chars, {elapsed_ms:.0f}ms[/dim]")
 
     def ask_user(self, question: str) -> None:
         """Log a question put to the user."""
         self.log("ask_user", question=question)
-        self._print(f"[bold magenta]? {question}[/bold magenta]")
+        self._print(f"[bold magenta]? {_x(question)}[/bold magenta]")
 
     def user_answer(self, text: str) -> None:
         """Log the user's reply to a question."""
@@ -501,20 +503,20 @@ class SessionLogger:
             stub=stub,
         )
         self._print(
-            f"[dim]   context: stubbed {name} from turn {from_turn} "
+            f"[dim]   context: stubbed {_x(name)} from turn {from_turn} "
             f"({original_chars} chars)[/dim]"
         )
 
     def final(self, text: str) -> None:
         """Log and show the agent's closing message."""
         self.log("final", text=text)
-        self._print(f"[bold green]yuki[/bold green] [bold]{text}[/bold]")
+        self._print(f"[bold green]yuki[/bold green] [bold]{_x(text)}[/bold]")
 
     def error(self, text: str, *, exc: BaseException | None = None) -> None:
         """Log an error, with a traceback when an exception is supplied."""
         tb = "".join(traceback.format_exception(exc)) if exc is not None else None
         self.log("error", text=text, traceback=tb)
-        self._print(f"[bold red]error[/bold red] {text}")
+        self._print(f"[bold red]error[/bold red] {_x(text)}")
 
     def usage_total(self) -> UsageTotals:
         """Log and print the per-request totals; returns them."""
@@ -544,7 +546,7 @@ class SessionLogger:
         waited = float(summary.get("waiting_for_user_s") or 0.0)
         waiting = f" (waited {waited:.1f}s for user)" if waited >= 0.05 else ""
         self._print(
-            f"[dim]== {summary.get('outcome')} - {float(summary.get('wall_s') or 0):.1f}s{waiting} "
+            f"[dim]== {_x(summary.get('outcome'))} - {float(summary.get('wall_s') or 0):.1f}s{waiting} "
             f"- model {float(summary.get('model_s') or 0):.1f}s "
             f"- tools {float(summary.get('tool_s') or 0):.1f}s "
             f"- {summary.get('model_calls', 0)} call(s) - {cost_text}[/dim]"
@@ -554,8 +556,15 @@ class SessionLogger:
     # -- console -----------------------------------------------------------
 
     def _print(self, markup: str) -> None:
-        if not self.quiet:
+        """One console line. Every piece of text from outside (the model, tools, the user) is escaped where the line
+        is built (``_x``); a line that still does not parse is printed as plain text, never raised (2026-09-29: a
+        stray "[/cyan]" in the model's reasoning raised rich's MarkupError out of the agent loop)."""
+        if self.quiet:
+            return
+        try:
             self.console.print(markup, highlight=False)
+        except MarkupError:
+            self.console.print(markup, highlight=False, markup=False)
 
 
 def _count_messages(messages: Any) -> int:
@@ -564,6 +573,11 @@ def _count_messages(messages: Any) -> int:
         return len(messages)
     except TypeError:  # pragma: no cover - defensive
         return -1
+
+
+def _x(value: Any) -> str:
+    """Text from outside (model, tools, user, pages) made literal for rich's console markup."""
+    return escape(str(value))
 
 
 def _brief(value: Any, limit: int = 120) -> str:

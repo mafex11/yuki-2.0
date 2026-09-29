@@ -178,6 +178,9 @@ class Settings:
         keep_perception_turns: How many recent assistant turns keep their full
             perception payloads before older ones are stubbed out.
         tool_timeout_s: Ceiling handed to PowerShell and other slow actions.
+        ask_park_s: A question the user has not answered within this many seconds sets its request aside, so
+            the lane runs what comes next; a later answer carries it on (v3.14b; a newer request on the lane sets
+            it aside at once). The six answered questions in the live logs of 27-29 Sept took 3-43 s.
         effort: ``output_config.effort`` sent on every request, one of
             :data:`EFFORT_LEVELS`. Lower effort means less thinking and fewer,
             more-consolidated tool calls; it also means less of the
@@ -320,10 +323,9 @@ class Settings:
         voice_progress_pause_s: A progress line of a running task is said only
             after Yuki has been quiet this long (a real pause), never after its result.
         voice_step_lines / voice_step_silence_s / voice_step_after_s / voice_step_long_silence_s: The
-            thinker's own step lines (``say_now``) said by code (v3.14, :mod:`yuki.voice.steplines`): while the
-            step runs, after this much silence and this long into the step, or at its start once the silence is
-            already the long one; a quick step that worked, only if the silence after it reaches the long one
-            before the next step starts.
+            thinker's own step lines (``say_now``) said by code (v3.14, :mod:`yuki.voice.steplines`), only while
+            the step runs: after this much silence and this long into the step, or at its start once the silence
+            is already the long one; never once the step has returned (v3.14b).
         voice_hands: Give the mouth its own single-step desktop tools (docs/VOICE.md §5.6).
         voice_desk_wait_ms: How long a mouth call waits for the desktop summary.
         voice_keyterms_max: At most this many names and terms from memory are given to speech
@@ -358,6 +360,7 @@ class Settings:
     max_steps: int = 40
     keep_perception_turns: int = 2
     tool_timeout_s: float = 20.0
+    ask_park_s: float = 120.0
     effort: str = DEFAULT_EFFORT
     ui_hotkey: str = "alt+shift"
     ui_cancel_hotkey: str = "alt+shift+x"
@@ -437,14 +440,17 @@ class Settings:
     voice_final_gap_s: float = 0.3
     voice_progress_pause_s: float = 8.0
     # v3.14 "one voice narrates live steps": the thinker's say_now line is said by code only into a noticeable
-    # silence (nobody spoke for voice_step_silence_s and its step has run voice_step_after_s, or the silence is
-    # already voice_step_long_silence_s, the only case for a quick step that already ended); docs/VOICE.md v3.14.
+    # silence while its step runs (nobody spoke for voice_step_silence_s and the step has run voice_step_after_s, or
+    # the silence is already voice_step_long_silence_s); never after the step returned (v3.14b); docs/VOICE.md.
     voice_step_lines: bool = True
     voice_step_silence_s: float = 2.5
     voice_step_after_s: float = 0.8
     voice_step_long_silence_s: float = 5.0
     # v3.14: her own voice for short lines she says often, kept on disk (yuki.voice.ttscache; "": the user's voice
     # folder, LOCALAPPDATA/Yuki/voice/tts-cache).
+    # v3.14b: the process runs at above-normal priority while a conversation is live (yuki.voice.priority; measured on
+    # a fully loaded PC: loop wake-up p99 8-11 ms vs 67-87 ms at normal).
+    voice_priority_boost: bool = True
     voice_tts_cache: bool = True
     voice_tts_cache_dir: str = ""
     voice_hands: bool = True
