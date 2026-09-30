@@ -36,6 +36,7 @@ milliseconds; a ``summary`` at the end of the conversation.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -89,6 +90,23 @@ not your concern here. Drop only what is clearly one of the four; when unsure, S
 
 Answer with exactly one word, SAY, or DROP followed by a colon and one reason word: reasoning, about_user, \
 internals or fragment. Nothing else."""
+
+
+#: Short first lines the model said SAY to in this process (v3.15), by their words: said again, they need no model.
+#: The Gemini voice keeps the same knowledge with its cached audio (v3.14); the voices without an audio gate
+#: (Aura, ElevenLabs) check a line BEFORE sending it, so a model call there is the whole first-audio wait
+#: (~1 s on a ~0.2 s voice). Bounded, oldest first out.
+_APPROVED_FIRST: "OrderedDict[str, None]" = OrderedDict()
+APPROVED_FIRST_MAX = 512
+
+
+def approve_first(text: str) -> None:
+    norm = _norm(text)
+    if norm:
+        _APPROVED_FIRST[norm] = None
+        _APPROVED_FIRST.move_to_end(norm)
+        while len(_APPROVED_FIRST) > APPROVED_FIRST_MAX:
+            _APPROVED_FIRST.popitem(last=False)
 
 
 @dataclass
@@ -178,7 +196,7 @@ class SpeechGuard:
         said = self._recent(now)
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
-        if len(norm.split()) <= FREE_WORDS and (not first or known_ok):
+        if len(norm.split()) <= FREE_WORDS and (not first or known_ok or norm in _APPROVED_FIRST):
             self.stats["free"] += 1
             self.heard(text)   # short lines go straight out: remember them for the repeat check now
             fut.set_result(Verdict(True, by="free"))
@@ -212,6 +230,8 @@ class SpeechGuard:
             verdict = Verdict(self.short(text), "unchecked", by="error")
             self._log(op="error", error=type(exc).__name__)
         verdict.ms = round((time.monotonic() - started) * 1000)
+        if first and verdict.ok and verdict.by == "model" and len(_norm(text).split()) <= FREE_WORDS:
+            approve_first(text)
         self.stats["checked"] += 1
         self.stats["ms"].append(verdict.ms)
         if not fut.done():

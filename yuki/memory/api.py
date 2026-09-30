@@ -1706,10 +1706,25 @@ class MemoryClient:
                 # How sure the call is (yuki.memory.callevidence): "fresh" = the screen showed the joined call
                 # recently; "stale" = it did, but long ago (voice asks "was that for me?" on ambiguous words).
                 "evidence": "stale" if c.via == "screen_stale" else "fresh",
+                # Other people in the call as its screen shows (0: the user is alone in it; None: not shown). Voice
+                # treats a call with nobody else in it as no call (v3.15).
+                "others": self._call_others(c.id),
             }
             return {"call": call, "recording": c.status == "recording", "waiting": waiting}
         except Exception:
             return {"call": None, "recording": False, "waiting": None}
+
+    def _call_others(self, call_id: int) -> int | None:
+        try:
+            import json as _json
+
+            raw = self.store.nudge_state("call_others")
+            data = _json.loads(raw) if raw else None
+            if isinstance(data, dict) and data.get("call_id") == call_id and data.get("others") is not None:
+                return int(data["others"])
+        except Exception:
+            pass
+        return None
 
     def call_audio_waiting(self) -> dict | None:
         """The user's call audio waiting to be transcribed: ``{"calls", "chunks", "minutes", "mb",

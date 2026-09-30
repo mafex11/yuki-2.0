@@ -111,6 +111,8 @@ _NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self", "say"
 
 #: Longest one-line action summary kept for memory and the collapsed request.
 _ACTION_LINE_CHARS = 160
+#: A request with this many actions ends with a learned note in its done (v3.15, ``Agent._learn_due``).
+LEARN_AFTER_ACTIONS = 3
 
 #: How the loop breaker's rethink note reaches the model (:mod:`yuki.agent.loopguard`).
 BREAKER_LABEL = "[Yuki's loop breaker, not the user]"
@@ -181,6 +183,10 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
     if not outcome.ok:
         return False, "it failed"
     payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+    if name == "type_text" and isinstance(payload.get("type_text"), dict):
+        # An element-targeted type_text (clicked to focus it first) nests the typing's own report (v3.15: live
+        # 30 Sept its read-back "arrived" was missed here, read as "could not be read back" and escalated).
+        payload = payload["type_text"]
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
     own = details.get("verified")
     if isinstance(own, bool):
@@ -828,6 +834,9 @@ class Agent:
         self._request_text = request
         self._requests += 1
         self._actions = []
+        #: What this request's actions measured for its learned note (v3.15, :meth:`_learn_due`).
+        self._learning: dict[str, Any] = {"actions": 0, "trouble_at": None, "told": False, "asked": False,
+                                          "saved": False, "targets": Counter(), "note": None, "worked_at": None}
         self._reset_accounting()
         self.last_summary = None
         started_at = datetime.now()
@@ -914,6 +923,8 @@ class Agent:
             self._log_turn(
                 request, reply=reply, outcome=outcome, at=started_epoch
             )
+            if outcome == "final":
+                self._save_learned(request)
             self._previous_request = request
             self._end_request(request, reply=reply, outcome=outcome, at=started_at)
 
@@ -1119,6 +1130,67 @@ class Agent:
                 break
         self.logger.log("memory_acting", state="end", token=token, withdrawn=withdrawn,
                         **({} if withdrawn else {"leak": "memory drops it once it is stale"}))
+
+    def _learn_step(self, target: int | None, worked: bool) -> None:
+        """One action of this request, for its learned note: counted, and the first that did not work (failed or
+        not verified) marked (v3.15)."""
+        learning = getattr(self, "_learning", None)
+        if learning is None:
+            return
+        learning["actions"] += 1
+        if not worked and learning["trouble_at"] is None:
+            learning["trouble_at"] = learning["actions"]
+        if worked:
+            learning["worked_at"] = learning["actions"]
+        if target is not None:
+            learning["targets"][int(target)] += 1
+
+    def _learn_due(self) -> bool:
+        """Whether this request's done must carry ``learned`` (v3.15): a measured trigger, never the words. It took
+        :data:`LEARN_AFTER_ACTIONS` or more actions, or an action failed or was not verified and a later one worked;
+        something worked (a verified action: nothing is learned from a job where nothing did), and nothing was kept
+        with remember_how in it already."""
+        learning = getattr(self, "_learning", None)
+        if learning is None or learning["saved"] or learning.get("worked_at") is None:
+            return False
+        trouble = learning["trouble_at"]
+        return learning["actions"] >= LEARN_AFTER_ACTIONS or (trouble is not None and learning["worked_at"] > trouble)
+
+    def _save_learned(self, request: str) -> None:
+        """After the reply is out: the done's learned note, kept as know-how for the app it acted in, through
+        memory's remember_how (the same path as the tool), on a thread of its own. Only when it was due."""
+        learning = getattr(self, "_learning", None)
+        note = learning.get("note") if learning else None
+        if not note:
+            return
+        if not self._learn_due():
+            self.logger.log("learned_note", saved=False, why="not due", chars=len(note))
+            return
+        app = None
+        windows = {w.get("hwnd"): w for w in ((self._overview_payload or {}).get("windows") or [])
+                   if isinstance(w, dict)} if isinstance(self._overview_payload, dict) else {}
+        for hwnd, _n in learning["targets"].most_common():
+            name = str((windows.get(hwnd) or {}).get("process_name") or "").strip()
+            if name:
+                app = name
+                break
+        app = app or _foreground_app(self._overview_payload)
+        memory, logger = self.memory, self.logger
+        tool_input = {"text": note, **({"app": app} if app else {})}
+
+        def save() -> None:
+            try:
+                outcome = memory.run_tool("remember_how", tool_input, request=request)
+                logger.log("learned_note", saved=bool(outcome.ok), app=app, chars=len(note),
+                           actions=learning["actions"], trouble=learning["trouble_at"] is not None)
+            except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+                logger.log("learned_note", saved=False, app=app, error=f"{type(exc).__name__}: {exc}")
+
+        if not getattr(memory, "installed", False):
+            self.logger.log("learned_note", saved=False, why="no memory", chars=len(note))
+            return
+        self._learn_thread = threading.Thread(target=save, name="yuki-learned-note", daemon=True)
+        self._learn_thread.start()
 
     def _note_action(self, name: str, ok: bool, summary: str) -> None:
         """Add one line to this request's actions (not for looks, done or the note)."""
@@ -1613,6 +1685,25 @@ class Agent:
             turn.stop_after = True
             return
 
+        if name == "done" and not str(tool_input.get("learned") or "").strip() and self._learn_due():
+            learning = self._learning
+            if not learning["asked"]:
+                # A long or troubled job ends with what it learned (v3.15; live 30 Sept a Discord message took 8 steps,
+                # $0.54, and nothing was kept for next time). Asked once, from the job's own record; not an error, so
+                # nothing escalates for it.
+                learning["asked"] = True
+                text = (f"Not sent yet: this request took {learning['actions']} actions"
+                        + (", and one did not work or was not verified before it worked"
+                           if learning["trouble_at"] is not None else "")
+                        + ". Call done again with the same message and fill learned: the fastest way to do this in "
+                        "this app next time, from what you saw work, and what not to do again.")
+                self.logger.log("learned_asked", actions=learning["actions"],
+                                trouble=learning["trouble_at"] is not None)
+                self.logger.tool_result(name, ok=False, summary=text, result={"held": "learned"}, elapsed_ms=0.0,
+                                        tool_use_id=tool_id)
+                turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": text}]))
+                return
+
         self.logger.tool_call(name, tool_input, tool_use_id=tool_id)
         yield ToolCall(name, tool_input)
 
@@ -1754,6 +1845,11 @@ class Agent:
             turn.finished.append(outcome.control_input["message"])
             about = tool_input.get(ABOUT_FIELD)
             turn.done_about = [h for h in (_as_hwnd(v) for v in about) if h] if isinstance(about, list) else []
+            learned = " ".join(str(tool_input.get("learned") or "").split())
+            if learned and hasattr(self, "_learning"):
+                self._learning["note"] = learned
+        if name == "remember_how" and outcome.ok and hasattr(self, "_learning"):
+            self._learning["saved"] = True   # it already kept what it learned
 
         verdict: tuple[bool | None, str] | None = None
         if name in ACTION_TOOL_NAMES:
@@ -1773,6 +1869,7 @@ class Agent:
             elif name in ("run_powershell", "hotkey", "press"):
                 self._evidence.clear()   # aimed at no window it names: any window may have changed
             self.logger.log("action_verdict", tool=name, verified=verdict[0], why=verdict[1], target=target)
+            self._learn_step(target, bool(outcome.ok and verdict[0] is True))
         elif outcome.ok and name in ("look_at_window", "read_tabs", "read_page"):
             looked = _as_hwnd(tool_input.get("hwnd"))
             if looked is not None:
@@ -1829,6 +1926,13 @@ class Agent:
             content.append({"type": "text", "text": (
                 f"\n(Verified from its own report: {verdict[1]}.)" if verdict[0] is True else
                 f"\n(Not verified: {verdict[1]}. What happened is only what the window shows now.)")})
+        learning = getattr(self, "_learning", None)
+        if verdict is not None and learning is not None and not learning["told"] and self._learn_due():
+            learning["told"] = True   # once, so the closing done carries it in the same call
+            content.append({"type": "text", "text": (
+                f"\n(This request has taken {learning['actions']} actions"
+                + (", one of them did not work first" if learning["trouble_at"] is not None else "")
+                + ": finish with done, not finishes_with, and fill done's learned: the fastest way next time.)")})
         turn.record(tool_id, self._result_block(tool_id, content, is_error=not outcome.ok))
 
         if not outcome.ok or outcome.kind == "done":
@@ -2544,7 +2648,7 @@ class Agent:
 
     # -- the view after actions ----------------------------------------------
 
-    def _auto_view(self, turn: _Turn) -> tuple[int, str] | None:
+    def _auto_view(self, turn: _Turn) -> tuple[int, str] | tuple[int, str, bool] | None:
         """Read the window this turn's actions acted on, for the next turn.
 
         Attached only when at least one state-changing action succeeded and
@@ -2591,8 +2695,12 @@ class Agent:
             content_ready = name in ("launch_app", "open_url") and details.get("content_ready") is True
             try:
                 # the settle poll is a read: a cancel or the user's words stop the wait (v3.14)
+                # Only what changed since the window's last read, when it fits (v3.15): the whole tree stays
+                # one look_at_window away, and every id the model holds from that read still holds.
+                near = tool_input.get("element")
+                near = near if isinstance(near, int) and not isinstance(near, bool) else None
                 view, abandoned = self._race("auto_view", lambda: self.dispatcher.window_view(
-                    hwnd, settle=not content_ready))
+                    hwnd, settle=not content_ready, changes=True, near=near))
                 if abandoned is not None:
                     return None
             except Exception as exc:
@@ -2614,9 +2722,11 @@ class Agent:
             self._auto_view_s += time.perf_counter() - started
         elapsed_ms = (time.perf_counter() - started) * 1000
         reads = f"{view.reads} read{'' if view.reads == 1 else 's'}"
+        changes = bool(getattr(view, "changes", False))
         text = (
             f"Window after your actions: {source}, read automatically after {name} "
-            f"({reads} in {view.elapsed_ms:.0f} ms; {view.reason}).\n"
+            f"({reads} in {view.elapsed_ms:.0f} ms; {view.reason})"
+            + ("; what changed on it" if changes else "") + ".\n"
             + wrap(view.text, source=f"the window {hwnd} (its on-screen text)", nonce=self._nonce)
         )
         self.logger.perception(
@@ -2635,11 +2745,13 @@ class Agent:
                     "content_ready_reported": name in ("launch_app", "open_url")
                     and details.get("content_ready") is True,
                     "summary": view.summary,
+                    "changes_only": changes,
+                    "full_chars": getattr(view, "full_chars", 0),
                 },
             },
         )
         self._evidence[hwnd] = "looked"   # the next call sees it read after the actions (v3.14)
-        return hwnd, text
+        return (hwnd, text, True) if changes else (hwnd, text)
 
 
 def _split_personality(portrait: str | None) -> tuple[str, str | None]:

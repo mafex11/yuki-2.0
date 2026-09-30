@@ -541,7 +541,14 @@ def service_class() -> type:
                                 self._on_fallback = True  # the rest of this conversation: no more waiting on it
                             if got_audio:
                                 return  # part of it was said: never say it twice
-                    if not got_audio and (self._on_fallback or not self._api_key) and self._fallback_key:
+                        else:
+                            if not got_audio and self._fallback_key:
+                                # The stream ended without a sound in it (live 30 Sept 21:32:52: "completed with
+                                # no audio", the reply lost): this piece is said by Aura now, the next one tries
+                                # Gemini again (not a refusal).
+                                self._log("tts_fallback", provider="gemini", status=200, reason="silent",
+                                          had_audio=False)
+                    if not got_audio and self._fallback_key:
                         piece.via = "aura"
                         self.stats["fallback_pieces"] += 1
                         plain = strip_tags(piece.text)

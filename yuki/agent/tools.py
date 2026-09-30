@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 
+from yuki.ui.own_window import PAGE_WORDS, PAGES as YUKI_PAGES
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -215,6 +217,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "open_yuki",
+        "label": "Opening my window",
+        "description": (
+            "Open your own window (Yuki's app window: the user's dashboard) in front, on one of its pages: "
+            + PAGE_WORDS + ". It is not in the window list while closed; this opens or brings it forward."
+        ),
+        "input_schema": _obj(
+            {"page": {"type": "string", "enum": list(YUKI_PAGES), "description": "Which page (today when unsure)."}},
+            ["page"],
+        ),
+    },
+    {
         "name": "take_screenshot",
         "label": "Taking a look at the screen",
         "description": (
@@ -331,8 +345,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "not pressed. With clear, the field's existing contents are selected and "
             "deleted first, and the result says whether it read empty. The result "
             "also names any new window the application showed meanwhile, such as a "
-            "suggestion list or menu. With element, that element is clicked first "
-            "to focus it."
+            "suggestion list or menu, and says when typing opened a suggestion list in "
+            "the field (a mention or autocomplete list: its items and the selected one); "
+            "Enter is then not pressed, since it would pick the suggestion instead of "
+            "sending. A name written as a mention (\"@Hem...\") only becomes one (a tag "
+            "that notifies them) when picked from the app's own list, so to mention or tag "
+            "someone, or pick from an autocomplete, type just the start of the name "
+            "(\"@Hem\") with accept_suggestion: it goes in by keys (a paste opens no list) "
+            "and the selected suggestion is accepted by key; then type the rest in a second "
+            "call. Never click a suggestion to pick it: a list row near the field may be a "
+            "message, not the suggestion. With element, that element is clicked first to "
+            "focus it."
         ),
         "input_schema": _obj(
             {
@@ -344,6 +367,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Select all and delete in the focused field before "
                     "typing. Text may be empty to only clear.",
+                },
+                "accept_suggestion": {
+                    "type": "boolean",
+                    "description": "Type by keys and accept the suggestion list the typing "
+                    "opens (Enter on its selected item, checked by reading the field again).",
                 },
                 "expect_hwnd": _GUARD,
             },
@@ -555,7 +583,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "description": "What you would text back: usually one short "
                     "sentence, in the user's own register. No restating the request "
                     "or narrating your steps.",
-                }
+                },
+                "learned": {
+                    "type": "string",
+                    "description": "Required when this request took 3 or more actions, or an action "
+                    "failed or was not verified before it worked (you are told when): the fastest "
+                    "way to do this in this app next time, from what you saw work (the keys, the "
+                    "field, the order), and what not to do again. One or two sentences. Saved as "
+                    "know-how for the app; never said to the user.",
+                },
             },
             ["message"],
         ),
@@ -1432,6 +1468,7 @@ class Backend(Protocol):
         press_enter: bool = False,
         clear: bool = False,
         expect_hwnd: int | None = None,
+        accept_suggestion: bool = False,
     ) -> Any: ...
     def hotkey(self, *keys: str, expect_hwnd: int | None = None) -> Any: ...
     def press(
@@ -1684,6 +1721,94 @@ class ToolOutcome:
         return self.name in PERCEPTION_TOOLS
 
 
+#: The view after actions lists only what changed since the window's previous read (v3.15: live 30 Sept every
+#: step re-sent a ~21.8k-character Discord tree) when that list fits in this many characters ...
+CHANGES_VIEW_CHARS = 4000
+#: ... and at most this share of the window's elements is new or changed (more is a new view: read whole).
+CHANGES_VIEW_SHARE = 0.5
+#: Named elements that went away listed by name in a list of changes, at most.
+_CHANGES_GONE_NAMED = 6
+
+
+def _field(element: Any, key: str, default: Any = None) -> Any:
+    """A tree element's field, whether the element is a plain dict (a stub, a log) or a dataclass."""
+    if isinstance(element, dict):
+        return element.get(key, default)
+    return getattr(element, key, default)
+
+
+def _renumbered(element: Any, new_id: int, parent: int) -> Any:
+    if isinstance(element, dict):
+        return {**element, "id": new_id, "parent": parent}
+    return dataclasses.replace(element, id=new_id, parent=parent)
+
+
+def _tree_with(tree: Any, elements: list[Any]) -> Any:
+    """The same tree read with these elements (the read's own header facts unchanged)."""
+    if isinstance(tree, dict):
+        return {**tree, "elements": elements}
+    import copy
+
+    clone = copy.copy(tree)
+    clone.elements = elements
+    return clone
+
+
+def _shown_as(element: Any) -> tuple:
+    """What a tree line shows of an element, besides its id and position: a change here is a change to list."""
+    return (_field(element, "role"), _field(element, "name") or "", _field(element, "value"),
+            tuple(_field(element, "states") or ()), bool(_field(element, "is_focused")),
+            tuple(_field(element, "patterns") or ()), _field(element, "description") or "")
+
+
+def carry_ids(previous: dict[int, Any], elements: list[Any], ceiling: int) -> tuple[dict[int, int], int]:
+    """Ids for a new read of a window that keep the previous read's ids for the same elements (v3.15).
+
+    Matched by structure only: the same role and name under the same (already matched) parent, else a named
+    element whose role and name are unique among the unmatched; among unnamed look-alikes, the nearest by
+    position. Everything else gets an id above ``ceiling`` (never one used before in this window's reads), so an
+    id the model holds from an earlier read either still means the same element or is gone.
+
+    Returns ``(new read's id -> carried id, new ceiling)``.
+    """
+    by_place: dict[tuple, list[int]] = {}
+    by_name: dict[tuple, list[int]] = {}
+    for old_id in sorted(previous):
+        old = previous[old_id]
+        role, name = _field(old, "role"), _field(old, "name") or ""
+        by_place.setdefault((role, name, _field(old, "parent", -1)), []).append(old_id)
+        if name:
+            by_name.setdefault((role, name), []).append(old_id)
+    used: set[int] = set()
+    mapping: dict[int, int] = {}
+    top = ceiling
+    for element in elements:
+        own = _field(element, "id")
+        parent = _field(element, "parent", -1)
+        parent = mapping.get(parent, -1) if isinstance(parent, int) and parent >= 0 else -1
+        role, name = _field(element, "role"), _field(element, "name") or ""
+        free = [i for i in by_place.get((role, name, parent), ()) if i not in used]
+        if not free and name:
+            free = [i for i in by_name.get((role, name), ()) if i not in used]
+            free = free if len(free) == 1 else []
+        if len(free) > 1:
+            cx, cy = (tuple(_field(element, "center") or (0, 0)) + (0, 0))[:2]
+
+            def distance(i: int) -> float:
+                ox, oy = (tuple(_field(previous[i], "center") or (0, 0)) + (0, 0))[:2]
+                return abs(ox - cx) + abs(oy - cy)
+
+            free.sort(key=distance)
+        if free:
+            carried = free[0]
+        else:
+            top += 1
+            carried = top
+        used.add(carried)
+        mapping[own] = carried
+    return mapping, max(top, max(mapping.values(), default=ceiling))
+
+
 @dataclass
 class WindowView:
     """One settled read of a window, for the view attached after actions.
@@ -1707,6 +1832,10 @@ class WindowView:
     settled: bool
     reason: str
     elapsed_ms: float
+    #: ``text`` lists only what changed since the window's previous read (v3.15); ``full_chars`` is the whole
+    #: tree's length, for the log.
+    changes: bool = False
+    full_chars: int = 0
 
 
 class ToolError(Exception):
@@ -1755,6 +1884,10 @@ class Dispatcher:
         #: hwnd -> ``(read number, {element id: element})`` of the latest tree
         #: of that window the model was given, for element-id input targets.
         self._latest_trees: dict[int, tuple[int, dict[int, dict[str, Any]]]] = {}
+        #: hwnd -> the reads whose ids still hold in the latest read (ids carried over, v3.15), and the highest id
+        #: any of them used (a new element never reuses an id).
+        self._id_lineage: dict[int, set[int]] = {}
+        self._id_ceiling: dict[int, int] = {}
         #: The window of the most recent tree read, the default for an element id.
         self._latest_tree_hwnd: int | None = None
         #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
@@ -2080,7 +2213,7 @@ class Dispatcher:
         )
         return self._tree_outcome(hwnd, tree, started)
 
-    def _tree_outcome(self, hwnd: int, tree: Any, started: float) -> ToolOutcome:
+    def _tree_outcome(self, hwnd: int, tree: Any, started: float, *, carried: bool = False) -> ToolOutcome:
         """Format one tree read exactly as ``look_at_window`` returns it.
 
         The text is the backend's own :func:`format_window_tree` behind a
@@ -2104,6 +2237,14 @@ class Dispatcher:
             },
         )
         self._latest_tree_hwnd = int(hwnd)
+        ids = [int(element["id"]) for element in elements if isinstance(element, dict)
+               and isinstance(element.get("id"), int)]
+        if carried:
+            self._id_lineage[int(hwnd)] = self._id_lineage.get(int(hwnd), set()) | {self._reads}
+            self._id_ceiling[int(hwnd)] = max([self._id_ceiling.get(int(hwnd), -1), *ids])
+        else:
+            self._id_lineage[int(hwnd)] = {self._reads}
+            self._id_ceiling[int(hwnd)] = max(ids, default=-1)
         opaque = bool(payload.get("opaque")) if isinstance(payload, dict) else False
         self._note_read(int(hwnd), payload if isinstance(payload, dict) else {}, opaque)
         header = (
@@ -2228,6 +2369,8 @@ class Dispatcher:
         settle: bool = True,
         quiet_s: float = AUTO_VIEW_QUIET_S,
         cap_s: float = AUTO_VIEW_CAP_S,
+        changes: bool = False,
+        near: int | None = None,
     ) -> "WindowView":
         """Read a window the way ``look_at_window`` does, once it has settled.
 
@@ -2240,12 +2383,23 @@ class Dispatcher:
         for the whole view. A condition poll, never a fixed wait: a window that
         is already still returns after two equal reads ``quiet_s`` apart.
 
+        With ``changes`` (the view after actions, v3.15) and an earlier read of
+        the window given to the model, the new read keeps that read's ids for
+        the same elements (:func:`carry_ids`) and the text lists only what
+        changed (new, gone, or shown differently), with the elements they sit in
+        and ``near`` (the element acted on) and its parts, when that fits in
+        :data:`CHANGES_VIEW_CHARS` and at most :data:`CHANGES_VIEW_SHARE` of the
+        window changed; otherwise the whole tree, as before. The whole tree is
+        always there through ``look_at_window``.
+
         Args:
             hwnd: Window to read.
             settle: ``False`` takes one read and returns it -- for when the
                 action already reported the window's content ready.
             quiet_s: How long the signature must hold still.
             cap_s: Bound on the whole view.
+            changes: List only what changed since the previous read when it fits.
+            near: The id (in the previous read) of the element the action was aimed at.
 
         Returns:
             A :class:`WindowView` holding the newest good read.
@@ -2300,17 +2454,77 @@ class Dispatcher:
                     settled = True
                     reason = f"unchanged for {(now - changed_at) * 1000:.0f} ms"
                     break
-        outcome = self._tree_outcome(hwnd, tree, started)
+        previous = self._latest_trees.get(int(hwnd)) if changes else None
+        changes_text = None
+        if previous is not None and signature[0] == "ok":
+            elements = list(_field(tree, "elements") or [])
+            mapping, _top = carry_ids(previous[1], elements, self._id_ceiling.get(int(hwnd), max(previous[1], default=-1)))
+            renumbered = []
+            for element in elements:
+                parent = _field(element, "parent", -1)
+                renumbered.append(_renumbered(element, mapping[_field(element, "id")],
+                                              mapping.get(parent, -1) if isinstance(parent, int) and parent >= 0
+                                              else -1))
+            tree = _tree_with(tree, renumbered)
+            outcome = self._tree_outcome(hwnd, tree, started, carried=True)
+            try:
+                changes_text = self._changes_text(int(hwnd), previous, tree, renumbered, near)
+            except Exception:  # noqa: BLE001 - the whole tree then, as before
+                changes_text = None
+        else:
+            outcome = self._tree_outcome(hwnd, tree, started)
+        full = str(outcome.content[0]["text"]) if outcome.content else ""
         return WindowView(
             hwnd=hwnd,
-            text=str(outcome.content[0]["text"]) if outcome.content else "",
+            text=changes_text if changes_text is not None else full,
             summary=outcome.summary,
             payload=outcome.payload if isinstance(outcome.payload, dict) else {},
             reads=reads,
             settled=settled,
             reason=reason,
             elapsed_ms=(time.perf_counter() - started) * 1000,
+            changes=changes_text is not None,
+            full_chars=len(full),
         )
+
+    def _changes_text(self, hwnd: int, previous: tuple[int, dict[int, Any]], tree: Any, elements: list[Any],
+                      near: int | None) -> str | None:
+        """The list of what changed in ``tree`` (ids carried) since ``previous``, or None when the whole is due."""
+        before_read, before = previous
+        by_id = {_field(e, "id"): e for e in elements}
+        changed = [i for i, e in by_id.items() if i not in before or _shown_as(before[i]) != _shown_as(e)]
+        gone = [before[i] for i in before if i not in by_id]
+        if len(changed) > CHANGES_VIEW_SHARE * max(1, len(elements)):
+            return None
+        keep = set(changed)
+        keep |= {i for i, e in by_id.items() if _field(e, "is_focused")}
+        if near is not None and near in by_id:
+            keep.add(near)
+            keep |= {i for i, e in by_id.items() if _field(e, "parent", -1) == near}
+        for i in list(keep):
+            parent = _field(by_id[i], "parent", -1)
+            hops = 0
+            while isinstance(parent, int) and parent >= 0 and parent in by_id and hops < 64:
+                keep.add(parent)
+                parent = _field(by_id[parent], "parent", -1)
+                hops += 1
+        subset = [e for e in elements if _field(e, "id") in keep]
+        body = self.backend.format_window_tree(_tree_with(tree, subset)) if subset else ""
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+        read = self._latest_trees[hwnd][0]
+        named = [f'{_field(g, "role")} "{str(_field(g, "name"))[:40]}"' for g in gone if _field(g, "name")]
+        gone_text = (f", {len(gone)} gone" + (": " + ", ".join(named[:_CHANGES_GONE_NAMED]) if named else "")
+                     + (" ..." if len(named) > _CHANGES_GONE_NAMED else "")) if gone else ""
+        header = (
+            f"window {hwnd} \"{_field(tree, 'title', '')}\" ({_field(tree, 'process_name', '')}): "
+            f"{len(elements)} elements, read #{read}. Only what changed since read #{before_read} is listed "
+            f"({len(changed)} new or changed{gone_text}), with the elements they sit in"
+            + (" and the element acted on" if near is not None and near in by_id else "")
+            + f"; every other element is as it was and keeps its id from read #{before_read}. "
+            f"look_at_window gives the whole window."
+        )
+        text = header + ("\n" + body if body else "\n(nothing on it changed)")
+        return text if len(text) <= CHANGES_VIEW_CHARS else None
 
     def _do_take_screenshot(self, tool_input: dict[str, Any]) -> ToolOutcome:
         if self.screenshot_policy == "never":
@@ -2586,7 +2800,7 @@ class Dispatcher:
         read, elements = self._latest_trees[hwnd]
         if tool_input.get("read") is not None:
             asked = self._need_int(tool_input, "read")
-            if asked != read:
+            if asked != read and not (asked in self._id_lineage.get(hwnd, ()) and element_id in elements):
                 raise ToolError(
                     f"element ids from read #{asked} are out of date: the latest read of "
                     f"window {hwnd} is #{read}; nothing was sent. Use an id from read "
@@ -2752,6 +2966,8 @@ class Dispatcher:
             # Only when asked, so a backend written before the option existed
             # keeps working for plain typing.
             options["clear"] = True
+        if tool_input.get("accept_suggestion"):
+            options["accept_suggestion"] = True   # likewise (v3.15)
         if target is None:
             return self._from_action("type_text", self.backend.type_text(text, **options))
         # Focus the element first by clicking it, guarded to its window; type
@@ -3047,6 +3263,15 @@ class Dispatcher:
         return self._from_action("window_action", act(hwnd, action))
 
     # -- control tools -----------------------------------------------------
+
+    def _do_open_yuki(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """Yuki's own window on a page (v3.15), through the tray's opener (:mod:`yuki.ui.own_window`)."""
+        from yuki.ui.own_window import open_page
+
+        page = self._need_str(tool_input, "page")
+        ok, report = open_page(page)
+        return ToolOutcome(name="open_yuki", ok=ok, summary=report, content=[{"type": "text", "text": report}],
+                           payload={"page": page, "opened": ok})
 
     def _do_ask_user(self, tool_input: dict[str, Any]) -> ToolOutcome:
         question = self._need_str(tool_input, "question")

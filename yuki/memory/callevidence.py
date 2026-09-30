@@ -54,6 +54,9 @@ MAX_CONTROLS = 80
 #: A site with in-call evidence is judged again at most this often (s) while its screen keeps changing (a busy
 #: chat changes with every message); a site with none (joining), or known content, is answered at once.
 REJUDGE_S = 60.0
+#: A site whose last verdict said the user is alone in the call (nobody else joined yet) is judged again this soon
+#: on a change: someone joining is what the change most likely is, and voice waits on it (v3.15).
+ALONE_REJUDGE_S = 8.0
 
 JUDGE_TOOL: dict[str, Any] = {
     "name": "judge_screen",
@@ -73,8 +76,16 @@ JUDGE_TOOL: dict[str, Any] = {
                 "description": "When in_call: the product's common name (Google Meet, Discord, Zoom, Microsoft "
                                "Teams, WhatsApp, Slack). Otherwise empty.",
             },
+            "others": {
+                "type": "integer",
+                "description": "When in_call: how many OTHER people are in the call with the user right now, as "
+                               "the screen shows it (participant tiles, the names listed under the voice channel "
+                               "the user is connected to, a participant count). 0 when the user is alone in it "
+                               "(only their own name or tile, waiting for someone, still ringing, 'no one else "
+                               "is here'). -1 when the screen does not show who is in the call. Otherwise -1.",
+            },
         },
-        "required": ["in_call", "service"],
+        "required": ["in_call", "service", "others"],
     },
 }
 
@@ -109,7 +120,18 @@ in_call false (Teams pre-join)
 titles -> in_call false
 - title "WhatsApp", controls: "Chats", "Search", "Bro", "Res", "Elina", "Archived" -> in_call false (a chat \
 list)
-- title "Voice call", controls: "End call", "Mute", "Speaker", "Video" -> in_call true, WhatsApp
+- title "Voice call", controls: "End call", "Mute", "Speaker", "Video" -> in_call true, WhatsApp, others -1
+- title "#general | Friends - Discord", controls: "General", "sam", "Rohan", "Voice Connected", "General / \
+Friends", "Disconnect", "Mute", "Deafen" -> in_call true, Discord, others 1 (two names under the voice channel: \
+the user and Rohan)
+- title "@Priya - Discord", controls: "Priya, Ongoing Call", "Voice Connected", "Disconnect", "sam", \
+"Ringing", "Mute", "Deafen" -> in_call true, Discord, others 0 (only the user has joined; the other is still \
+being rung)
+- title "Meet - abc-defg-hij", controls: "Leave call", "Turn off microphone", "Share screen", "People 1", \
+"You", "No one else is here" -> in_call true, Google Meet, others 0
+- title "Zoom Meeting", controls: "Mute", "Stop Video", "Participants 4", "End" -> in_call true, Zoom, others 3
+
+The user's own name or tile never counts in others; a call whose screen does not show who is in it is -1.
 
 Answer with the judge_screen tool only."""
 
@@ -130,6 +152,8 @@ class Screen:
 class Verdict:
     in_call: bool
     service: str = ""
+    #: Other people in the call with the user, as the screen shows (0: alone in it), or None when it does not say.
+    others: int | None = None
 
 
 def _digest(title: str, host: str | None, controls: Iterable[str]) -> str:
@@ -164,8 +188,8 @@ class CallEvidence:
         self._pending: set[tuple[str, str | None]] = set()
         #: The verdict each (app key, host) was last given, with its digest.
         self._applied: dict[tuple[str, str | None], str] = {}
-        #: In-call evidence per (app key, host): ``(last seen at, service)``.
-        self._evidence: dict[tuple[str, str | None], tuple[float, str]] = {}
+        #: In-call evidence per (app key, host): ``(last seen at, service, others)`` (others: see :class:`Verdict`).
+        self._evidence: dict[tuple[str, str | None], tuple[float, str, int | None]] = {}
         #: The executable each app key was last seen running as (to match a microphone holder by path or package).
         self._exes: dict[str, str] = {}
         self._verdicts: OrderedDict[str, Verdict] = OrderedDict()
@@ -200,7 +224,7 @@ class CallEvidence:
             if self._applied.get(where) == shot.digest:
                 # The same screen again: its verdict stands, and in-call evidence is renewed.
                 if where in self._evidence:
-                    self._evidence[where] = (shot.at, self._evidence[where][1])
+                    self._evidence[where] = (shot.at, *self._evidence[where][1:])
                 return
             self._pending.add(where)
             if len(self._screens) > 512:   # bounded: forget the oldest screens
@@ -242,7 +266,10 @@ class CallEvidence:
                 cached = shot.digest in self._verdicts
                 # A site in a call judged moments ago keeps its evidence while its screen changes (a busy chat):
                 # the newest screen waits for the next pass. Joining is never delayed (no evidence yet).
-                recent = where in self._evidence and                     time.monotonic() - self._judged_at.get(where, -1e9) < self.rejudge_s
+                # Alone in the call at the last verdict: a change is judged again sooner (someone joined?).
+                wait_s = (ALONE_REJUDGE_S if where in self._evidence and self._evidence[where][2] == 0
+                          else self.rejudge_s)
+                recent = where in self._evidence and time.monotonic() - self._judged_at.get(where, -1e9) < wait_s
             if recent and not cached:
                 continue
             verdict = self._verdict(shot)
@@ -255,7 +282,7 @@ class CallEvidence:
                 self._pending.discard(where)
                 self._applied[where] = shot.digest
                 if verdict.in_call:
-                    self._evidence[where] = (shot.at, verdict.service or "")
+                    self._evidence[where] = (shot.at, verdict.service or "", verdict.others)
                 else:
                     self._evidence.pop(where, None)
             applied += 1
@@ -289,7 +316,7 @@ class CallEvidence:
             while len(self._verdicts) > VERDICT_CACHE:
                 self._verdicts.popitem(last=False)
         self._log("call_evidence_judged", app=shot.key, page=shot.host is not None, in_call=verdict.in_call,
-                  controls=len(shot.controls), ms=ms, cost_usd=round(cost, 6))
+                  others=verdict.others, controls=len(shot.controls), ms=ms, cost_usd=round(cost, 6))
         return verdict
 
     def _model_verdict(self, shot: Screen) -> tuple[Verdict, float]:
@@ -317,9 +344,14 @@ class CallEvidence:
             messages=[{"role": "user", "content": "\n".join(lines)}])
         block = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
         data = getattr(block, "input", None) or {}
-        verdict = Verdict(in_call=data.get("in_call") is True,
-                          service=" ".join(str(data.get("service") or "").split())[:40] if data.get("in_call") is True
-                          else "")
+        in_call = data.get("in_call") is True
+        try:
+            others = int(data.get("others")) if in_call and data.get("others") is not None else None
+        except (TypeError, ValueError):
+            others = None
+        verdict = Verdict(in_call=in_call,
+                          service=" ".join(str(data.get("service") or "").split())[:40] if in_call else "",
+                          others=others if others is not None and others >= 0 else None)
         try:
             cost = float(settings.estimate_cost(model, usage_tokens(response.usage)) or 0.0)
         except Exception:  # noqa: BLE001
@@ -339,7 +371,7 @@ class CallEvidence:
             return None, ""
         now = time.time() if now is None else float(now)
         with self._lock:
-            found = [(at, service) for (k, _h), (at, service) in self._evidence.items()
+            found = [(at, service) for (k, _h), (at, service, _o) in self._evidence.items()
                      if self._matches(holder, k) and at >= float(mic_since) - HOLD_TOLERANCE_S]
         if not found:
             return None, ""
@@ -351,8 +383,17 @@ class CallEvidence:
         if not holder:
             return None
         with self._lock:
-            found = [(at, h or "") for (k, h), (at, _s) in self._evidence.items() if self._matches(holder, k)]
+            found = [(at, h or "") for (k, h), (at, _s, _o) in self._evidence.items() if self._matches(holder, k)]
         return (max(found)[1] or None) if found else None
+
+    def others_of(self, holder: Any) -> int | None:
+        """How many other people the newest in-call screen of an app (key or ``Holder``) showed with the user
+        (0: alone in the call), or None when there is none or it did not say (v3.15)."""
+        if not holder:
+            return None
+        with self._lock:
+            found = [(at, others) for (k, _h), (at, _s, others) in self._evidence.items() if self._matches(holder, k)]
+        return max(found, key=lambda f: f[0])[1] if found else None
 
     def forget(self, key: str) -> None:
         """The app let go of the microphone: its in-call evidence is over (a new hold needs a new screen)."""

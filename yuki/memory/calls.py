@@ -55,6 +55,7 @@ speech seconds, bytes spooled, encode ms, VAD CPU), never words or audio.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import queue
 import threading
@@ -1317,6 +1318,8 @@ class _Active:
     session: RecordingSession | None = None
     status: str = "asking"
     headphones: bool | None = None
+    #: Other people in the call as its screen last showed (0: the user is alone in it), None: not shown (v3.15).
+    others: int | None = None
 
 
 class CallWorker:
@@ -1601,7 +1604,35 @@ class CallWorker:
             act = self._begin(cfg, key, via, service, name, now)
             self.active = act
         if act is not None:
+            self._note_people(act)
             self._drive(cfg, act, now)
+
+    #: The ``nudge_state`` row that carries who is in the open call (:meth:`MemoryAPI.call_status` reads it).
+    PEOPLE_STATE = "call_others"
+
+    def _note_people(self, act: _Active) -> None:
+        """How many others its screen shows in the call (0: alone), kept for ``call_status`` on a change (v3.15).
+
+        Live 2026-09-30 the user sat alone in a Discord voice channel waiting for a friend, and voice's call mode
+        treated 15 of his 41 turns as said to the people on the call. The count is the screen judge's (a model).
+        """
+        evidence = self.evidence
+        if evidence is None or not hasattr(evidence, "others_of"):
+            return
+        try:
+            others = evidence.others_of(act.key)
+        except Exception:
+            return
+        if others == act.others:
+            return
+        act.others = others
+        try:
+            self.store.set_nudge_state(self.PEOPLE_STATE, json.dumps({"call_id": act.call_id, "others": others}))
+        except Exception as exc:
+            self._log("error", where="calls.people", error=f"{type(exc).__name__}: {exc}")
+            return
+        self._log("call_people", call_id=act.call_id, app=act.app, others=others)
+        self._tell_ui()
 
     def _begin(self, cfg: CallConfig, key: str, via: str, service: str | None, name: str, now: float) -> _Active:
         # a site's call inside a browser has its own standing answer, never the browser's (see Store.answer_call)

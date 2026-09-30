@@ -1126,8 +1126,12 @@ class VoiceBridge(QObject):
         # In a call, staying quiet on the user's own turn is the mouth's judgement that the words
         # were for the people on the call (logged as such; content-free).
         with_words = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else None
-        self._log("bridge", op="quiet", asked_by_user=by_user, with_words=with_words,
-                  **({"call_mode": True, "addressed": "others" if by_user else None} if in_call else {}))
+        # Why (content-free, v3.15): in call mode the talker judged the words were for the people on the call
+        # (with the call's evidence); outside a call, its judgement that they were for someone or something else.
+        why = ("talker_judged_for_call" if in_call else "talker_judged_not_for_yuki") if by_user else "no_user_turn"
+        self._log("bridge", op="quiet", asked_by_user=by_user, with_words=with_words, why=why,
+                  **({"call_mode": True, "addressed": "others" if by_user else None, "evidence": evidence}
+                     if in_call else {}))
         await params.result_callback({"ok": True}, properties=FunctionCallResultProperties(run_llm=False))
 
     async def end_conversation(self, params: Any) -> None:

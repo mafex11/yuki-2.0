@@ -141,6 +141,8 @@ ATTACHED_END = "[End of attached context]"
 #: The marker for the moving conversation breakpoint.
 CACHE_MARKER: dict[str, str] = {"type": "ephemeral"}
 
+#: Supersession key of a window view that lists only what changed (v3.15).
+_CHANGES_KEY = "window_changes"
 #: Supersession key shared by the per-turn overview and explicit look_at_desktop.
 _DESKTOP_KEY: tuple[str, ...] = ("look_at_desktop",)
 
@@ -232,6 +234,10 @@ class _Slot:
     situation_pos: int | None = None
     view_pos: int | None = None
     view_hwnd: int | None = None
+    #: The view lists only what changed since the window's last read (v3.15): it never supersedes a whole look
+    #: of the window (the rest of the window is only there), only older change lists, and any newer look of the
+    #: window supersedes it.
+    view_changes: bool = False
     stubbed: set[str] = field(default_factory=set)
     request: int = 0
     collapsed: bool = False
@@ -500,7 +506,7 @@ class ContextManager:
         *,
         tool_names: dict[str, str] | None = None,
         self_facts: str | None = None,
-        window_view: tuple[int, str] | None = None,
+        window_view: tuple[int, str] | tuple[int, str, bool] | None = None,
     ) -> None:
         """Append one user message holding every tool result plus the situation.
 
@@ -513,7 +519,8 @@ class ContextManager:
                 the situation block next to the overview.
             window_view: ``(hwnd, text)`` of the window read after this turn's
                 actions, attached as its own block right after the situation
-                block and tracked as a look at ``hwnd`` for stubbing.
+                block and tracked as a look at ``hwnd`` for stubbing;
+                ``(hwnd, text, True)`` when it lists only what changed (v3.15).
         """
         content: list[Any] = list(results)
         content.append(
@@ -522,8 +529,10 @@ class ContextManager:
         situation_pos = len(content) - 1
         view_pos: int | None = None
         view_hwnd: int | None = None
+        view_changes = False
         if window_view is not None:
             view_hwnd, view_text = int(window_view[0]), window_view[1]
+            view_changes = len(window_view) > 2 and bool(window_view[2])  # type: ignore[misc]
             content.append({"type": "text", "text": attached_text(view_text)})
             view_pos = len(content) - 1
         self._append(
@@ -535,6 +544,7 @@ class ContextManager:
                 situation_pos=situation_pos,
                 view_pos=view_pos,
                 view_hwnd=view_hwnd,
+                view_changes=view_changes,
             )
         )
 
@@ -720,10 +730,16 @@ class ContextManager:
             if not look.failed:
                 newest[look.key] = look
         edits = 0
+        order = {id(look): index for index, look in enumerate(looks)}
         for look in looks:
             if look.stubbed or look.failed:
                 continue
             latest = newest.get(look.key)
+            if look.key[0] == _CHANGES_KEY:
+                # A list of changes is superseded by a newer one, or by any newer whole look of its window.
+                later = [other for other in (latest, newest.get(("look_at_window", look.key[1])))
+                         if other is not None and order[id(other)] > order[id(look)]]
+                latest = max(later, key=lambda other: order[id(other)]) if later else None
             if latest is None or latest is look:
                 continue
             self._stub(look, latest)
@@ -754,7 +770,7 @@ class ContextManager:
                 if position == slot.view_pos:
                     looks.append(
                         _Look(
-                            key=("look_at_window", str(slot.view_hwnd)),
+                            key=(_CHANGES_KEY if slot.view_changes else "look_at_window", str(slot.view_hwnd)),
                             slot_index=slot_index,
                             position=position,
                             tool_use_id="",

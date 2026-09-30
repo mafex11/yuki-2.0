@@ -128,6 +128,24 @@ def save_prefs(prefs: dict[str, Any], path: Path = PREFS_PATH) -> None:
         pass
 
 
+def call_facing(call: dict[str, Any] | None) -> tuple[str | None, str | None, bool]:
+    """``(app, evidence, alone)`` a conversation is given for memory's ``call_status()["call"]`` (v3.15).
+
+    ``app`` is the call's app for call mode (docs/VOICE.md §25), None when there is no call or when the user is
+    alone in it: its screen shows nobody else in the call (``others`` == 0, judged by memory's screen model;
+    live 2026-09-30 he sat alone in a Discord voice channel waiting for a friend and call mode took 15 of 41
+    turns for the people on the call). ``others`` unknown (None) keeps call mode, as before. ``evidence`` is
+    "fresh" or "stale" (v3.10; a call the user listed themselves has no screen evidence: as fresh).
+    """
+    if not isinstance(call, dict):
+        return None, None, False
+    others = call.get("others")
+    alone = others is not None and int(others) == 0
+    if alone:
+        return None, None, True
+    return (str(call.get("app") or "") or "a call app"), str(call.get("evidence") or "fresh"), False
+
+
 class VoiceSession(QObject):
     """Voice for one app run.
 
@@ -215,6 +233,8 @@ class VoiceSession(QObject):
                 save_prefs(prefs, prefs_path)
             self.quiet_until = 0.0
         self.call_active = False
+        #: In a call with nobody else in it (the screen judge's count, v3.15): conversations are not in call mode.
+        self.call_alone = False
         #: The app of the voice call going on (call mode), ``None`` when there is none.
         self.call_app: str | None = None
         #: How sure memory is of that call: "fresh" (seen on the screen during this hold) or "stale" (v3.10).
@@ -717,17 +737,18 @@ class VoiceSession(QObject):
         """
         call = status.get("call") if isinstance(status, dict) else None
         active = call is not None
-        app = (str(call.get("app") or "") or "a call app") if active else None
-        # Memory's call detector judges the screen (v3.10): "fresh" while the call was seen during this microphone
-        # hold, "stale" when only a while ago; a call the user listed themselves has no screen evidence: as fresh.
-        evidence = (str(call.get("evidence") or "fresh") if active else None)
-        if active != self.call_active or app != self.call_app or evidence != self.call_evidence:
-            changed = active != self.call_active
-            self.call_active, self.call_app, self.call_evidence = active, app, evidence
+        app, evidence, alone = call_facing(call)
+        if active != self.call_active or app != self.call_app or evidence != self.call_evidence \
+                or alone != self.call_alone:
+            changed = active != self.call_active or alone != self.call_alone
+            self.call_active, self.call_app, self.call_evidence, self.call_alone = active, app, evidence, alone
             if changed:
-                self.log.event("wake", state="call_on" if active else "call_off",
+                # Alone in the call (its screen shows nobody else in it, v3.15): the wake word listens as in a
+                # call, but conversations run in normal mode (every turn is for Yuki).
+                self.log.event("wake", state="call_alone" if alone else ("call_on" if active else "call_off"),
                                listening=bool(self.wake_enabled and self._wake_allowed()),
-                               **({"evidence": evidence} if active else {}))
+                               **({"evidence": str(call.get("evidence") or "fresh"),
+                                   "others": call.get("others")} if active else {}))
             for conversation in (self._conversation, self._standby_conv):
                 if conversation is not None:
                     conversation.set_call(app, evidence)

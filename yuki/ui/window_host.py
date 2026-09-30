@@ -52,6 +52,10 @@ class WindowHost(QObject):
         self.proc: subprocess.Popen | None = None
         self._key_addr: tuple[bytes, str] | None = None
         self._gui_call.connect(lambda fn: fn())
+        # Yuki's own window for the thinker's open_yuki tool and the talker's open_yuki hand (v3.15).
+        from yuki.ui import own_window
+
+        own_window.register(self.open_from_anywhere)
         self._started = False
         self._hands = 0
         rt = ui.runtime
@@ -365,15 +369,22 @@ class WindowHost(QObject):
 
     # -- the window's process ----------------------------------------------------------------------
 
-    def open_window(self, page: str | None = None) -> None:
-        """Start the window (its own process), or bring the running one forward (tray icon click)."""
+    def open_from_anywhere(self, page: str) -> bool:
+        """:func:`yuki.ui.own_window.open_page`'s opener, from any thread: :meth:`open_window` on the GUI thread
+        (bounded wait); whether the window was brought forward or started."""
+        return bool(self._on_gui(lambda: self.open_window(page)))
+
+    def open_window(self, page: str | None = None) -> bool:
+        """Start the window (its own process), or bring the running one forward (tray icon click).
+
+        Returns whether it was brought forward or started (``False``: the launch failed)."""
         self.start()
         if self.proc is not None and self.proc.poll() is None:
             _allow_foreground(self.proc.pid)
             if self.server is not None:
                 self.server.broadcast({"ev": "focus", **({"page": page} if page else {})})
-            self._log("window", state="focus", pid=self.proc.pid)
-            return
+            self._log("window", state="focus", pid=self.proc.pid, **({"page": page} if page else {}))
+            return True
         from yuki.core.paths import app_dir
         from yuki.core.procs import WINDOW, module_command
 
@@ -386,8 +397,10 @@ class WindowHost(QObject):
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
             self._log("window", state="launched", pid=self.proc.pid)
+            return True
         except OSError as exc:
             self._log("window", state="launch_failed", error=f"{type(exc).__name__}: {exc}")
+            return False
 
 
 def _allow_foreground(pid: int) -> None:

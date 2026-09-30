@@ -1145,6 +1145,12 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
             """The spoken-line check (yuki.voice.speechguard, v3.10): every line passes it before it is heard."""
             self._yuki_guard = guard
 
+        async def process_ttfa_metrics(self, frame: Any) -> None:
+            """Off (v3.15): Pipecat's time-to-first-audible metric re-scans the whole buffered reply with numpy on
+            the loop for every chunk until it finds speech (quadratic on a quiet start); live 2026-09-30 the loop
+            stalled 6.2 s inside it. Nothing here reads it: the turn rows time the first audio themselves."""
+            return None
+
         async def _push_tts_frames(self, src_frame: Any, *args: Any, **kwargs: Any) -> None:
             text = str(getattr(src_frame, "text", "") or "")
             if text.strip() and not drop_unfinished_marks(text).strip(" .,;:!?-"):
@@ -1198,7 +1204,9 @@ def quiet_pipecat_logging(log_dir: Any) -> None:
     try:
         path = Path(log_dir) / f"pipecat-{datetime.now():%Y%m%d}.log"
         path.parent.mkdir(parents=True, exist_ok=True)
-        logger.add(str(path), level="WARNING", enqueue=False, backtrace=False, diagnose=False)
+        # enqueue: the file is written by loguru's own thread, never on the voice loop (live 2026-09-30 a burst of
+        # 473 error lines stalled the loop 6.1 s inside the sink's write; v3.15).
+        logger.add(str(path), level="WARNING", enqueue=True, backtrace=False, diagnose=False)
     except OSError:
         pass
     _LOGGING_SET = True
@@ -1615,6 +1623,11 @@ class TurnObserver:
             if turn.trigger == "user":
                 row["addressed"] = ("yuki" if not others else
                                     "others" if "stay_quiet" in turn.tools else "unanswered")
+                # Why a turn was taken as not for Yuki (content-free, v3.15): the talker's stay_quiet in call mode,
+                # or their next words came before any reply.
+                if others:
+                    row["for_others_why"] = ("talker_stay_quiet" if "stay_quiet" in turn.tools
+                                             else "next_words_first")
         self.totals["turns"] += 1
         self.totals["for_others"] += int(others)
         self.totals["mouth_cost_usd"] += cost or 0.0

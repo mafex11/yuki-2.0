@@ -4128,6 +4128,165 @@ def focused_text(
 
 
 # ---------------------------------------------------------------------------
+# The focused field as it is now: its parts, and the suggestion list it controls (v3.15)
+# ---------------------------------------------------------------------------
+
+#: ``UIA_ControllerForPropertyId``: the elements a control controls (ARIA ``aria-controls``: an autocomplete's list).
+_P_CONTROLLER_FOR = 30104
+#: Descendants of the field read for its parts, and items of a suggestion list, at most.
+_FIELD_MAX_PARTS = 80
+_FIELD_MAX_ITEMS = 12
+#: UIA item control types a list offers to choose from (structure: ListItem, MenuItem, TreeItem, DataItem).
+_CHOICE_ROLES = frozenset({"ListItem", "MenuItem", "TreeItem", "DataItem"})
+
+
+@dataclass
+class FieldState:
+    """The control with keyboard focus as it is now, read for typing into it (v3.15).
+
+    A rich-text editor (a chat's message box) often exposes no Value, or a Value that does not follow what it
+    shows; what it holds is in its descendants (text runs, and a mention or tag as an element of its own). An
+    app's suggestion list (mentions, autocomplete) is the element the field *controls* (UIA ControllerFor, ARIA
+    ``aria-controls``) or shows as the field being expanded. Structure only: never which app it is.
+
+    Attributes:
+        ok: UIA answered.
+        role, name: the focused control.
+        value: its Value (``None`` without one; never for a password field).
+        parts_text: the names of its descendant elements, in order (its text as shown).
+        parts: how many descendant elements it has (a mention chip adds one).
+        popup: a suggestion list is open for it.
+        popup_how: ``"controls"`` (the list it controls has items) or ``"expanded"`` (its expanded state).
+        items: the list's choosable items, in order (capped); ``selected`` the index of the selected one or -1.
+    """
+
+    ok: bool = False
+    role: str = ""
+    name: str = ""
+    value: str | None = None
+    parts_text: str = ""
+    parts: int = 0
+    popup: bool = False
+    popup_how: str = ""
+    items: tuple[str, ...] = ()
+    selected: int = -1
+    error: str = ""
+    elapsed_ms: float = 0.0
+
+    def facts(self) -> dict[str, object]:
+        """The suggestion list as plain data, for an action's details."""
+        return {"open": self.popup, "how": self.popup_how, "items": list(self.items), "selected": self.selected}
+
+
+def _read_field_state(automation: object) -> FieldState:
+    """Read the focused field, its parts and the list it controls.  Runs on the worker thread."""
+    element = automation.GetFocusedElement()  # type: ignore[attr-defined]
+    if not element:
+        return FieldState(ok=True)
+    request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
+    request.AddProperty(_P_IS_PASSWORD)
+    cached = element.BuildUpdatedCache(request)
+    get = cached.GetCachedPropertyValue
+    state = FieldState(ok=True, role=_role_name(get(_P_CONTROL_TYPE)), name=_as_text(get(_P_NAME)))
+    if _as_bool(get(_P_IS_PASSWORD)):
+        return state
+    if _as_bool(get(_P_IS_VALUE_AVAILABLE)):
+        raw = get(_P_VALUE_VALUE)
+        state.value = raw if isinstance(raw, str) else ""
+    parts_request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
+    try:
+        found = element.FindAllBuildCache(  # type: ignore[attr-defined]
+            _TREE_SCOPE_DESCENDANTS, automation.ControlViewCondition, parts_request  # type: ignore[attr-defined]
+        )
+        count = int(found.Length) if found is not None else 0
+    except Exception:
+        found, count = None, 0
+    names: list[str] = []
+    for index in range(min(count, _FIELD_MAX_PARTS)):
+        name = _as_text(found.GetElement(index).GetCachedPropertyValue(_P_NAME))
+        if name and (not names or names[-1] != name):
+            names.append(name)
+    state.parts, state.parts_text = count, " ".join(names)[:2000]
+    # The list it controls (an autocomplete's listbox): open when it is on screen with items to choose.
+    try:
+        targets = element.GetCurrentPropertyValue(_P_CONTROLLER_FOR)  # type: ignore[attr-defined]
+        targets = targets if isinstance(targets, (list, tuple)) else (
+            [targets.GetElement(i) for i in range(int(targets.Length))] if targets is not None
+            and hasattr(targets, "Length") else [])
+    except Exception:
+        targets = []
+    if not targets:
+        try:
+            array = element.CurrentControllerFor  # type: ignore[attr-defined]
+            targets = [array.GetElement(i) for i in range(int(array.Length))] if array is not None else []
+        except Exception:
+            targets = []
+    items: list[str] = []
+    selected = -1
+    for target in list(targets)[:3]:
+        try:
+            target = target.QueryInterface(_uia_core().IUIAutomationElement)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            if _as_bool(target.GetCurrentPropertyValue(_P_IS_OFFSCREEN)):
+                continue
+            kids = target.FindAllBuildCache(  # type: ignore[attr-defined]
+                _TREE_SCOPE_DESCENDANTS, automation.ControlViewCondition, parts_request  # type: ignore[attr-defined]
+            )
+            n = int(kids.Length) if kids is not None else 0
+        except Exception:
+            continue
+        for index in range(min(n, _FIELD_MAX_PARTS)):
+            kid = kids.GetElement(index)
+            kget = kid.GetCachedPropertyValue
+            choosable = _as_bool(kget(_P_IS_SELECTION_ITEM_AVAILABLE)) or _role_name(
+                kget(_P_CONTROL_TYPE)) in _CHOICE_ROLES
+            if not choosable or len(items) >= _FIELD_MAX_ITEMS:
+                continue
+            if _as_bool(kget(_P_SELECTION_ITEM_IS_SELECTED)) and selected < 0:
+                selected = len(items)
+            items.append(_as_text(kget(_P_NAME))[:80])
+    if items:
+        state.popup, state.popup_how, state.items, state.selected = True, "controls", tuple(items), selected
+    elif _as_bool(get(_P_IS_EXPAND_COLLAPSE_AVAILABLE)) and get(_P_EXPAND_COLLAPSE_STATE) == 1:
+        state.popup, state.popup_how = True, "expanded"
+    return state
+
+
+def field_state(*, timeout_s: float = _FOCUS_TIMEOUT_S) -> FieldState:
+    """The focused field's text, parts and suggestion list (:class:`FieldState`); never raises."""
+    result: dict[str, object] = {}
+    started = time.perf_counter()
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(_CUIAUTOMATION_CLSID, interface=module.IUIAutomation)
+            result["state"] = _read_field_state(automation)
+        except BaseException as exc:  # noqa: BLE001 - reported as ok=False
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name="yuki-uia-field", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    state = result.get("state")
+    if not isinstance(state, FieldState):
+        state = FieldState(error=str(result.get("error") or f"no answer within {timeout_s:g} s"))
+    state.elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return state
+
+
+# ---------------------------------------------------------------------------
 # "This" and "that": what has focus, and what is selected or around the caret
 # ---------------------------------------------------------------------------
 

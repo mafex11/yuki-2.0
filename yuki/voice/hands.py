@@ -66,6 +66,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from yuki.ui.own_window import PAGES as YUKI_PAGES
+
 #: Media and volume keys (pyautogui names, as :func:`yuki.actions.input.normalize_key` takes them).
 MEDIA_KEYS = ("playpause", "nexttrack", "prevtrack", "stop", "volumeup", "volumedown", "volumemute")
 #: The media keys whose effect the media session shows (its status), watched after sending.
@@ -90,7 +92,7 @@ _DESK_FRESH_S = 1.5
 _DESK_AHEAD_EVERY_S = 0.5
 
 #: Hands that act at once, with no words before them.
-INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab", "click", "type")
+INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab", "click", "type", "open_yuki")
 #: Hands that touch no window (sound only): they may act while the thinker works on the desktop.
 AUDIO_HANDS = ("media_key", "app_volume")
 #: How long a reopened tab may take to show its title (the browser restores it at once, the page after).
@@ -287,6 +289,12 @@ HAND_TOOLS: list[dict[str, Any]] = [
         },
         "required": ["window", "text", "say_when_done"],
     },
+    {
+        "name": "open_yuki",
+        "description": "Your hand: open your own window (Yuki's) in front, on one page. Verified once it is open." + _NOW,
+        "properties": {"page": {"type": "string", "enum": list(YUKI_PAGES)}, "say_when_done": _DONE_LINE},
+        "required": ["page", "say_when_done"],
+    },
 ]
 HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
 
@@ -298,6 +306,10 @@ ITEM_NAME_CHARS = 60
 ITEMS_FRESH_S = 4.0
 #: The user starting to talk reads the items again when the last read is older than this.
 ITEMS_AHEAD_S = 3.0
+#: A window whose own tree read took at least this long is heavy (v3.15, measured): its names and items then come
+#: from memory's Now picture (the watcher already reads the window in front on every settle), not from a second
+#: read here. Live 2026-09-30 the talker read Discord 53 times in 15 minutes, ~730 ms each, one of them 6.4 s.
+HEAVY_READ_MS = 500.0
 
 
 @dataclass
@@ -372,7 +384,7 @@ def items_line(items: ScreenItems) -> str:
     parts = []
     for n, item in enumerate(items.items, 1):
         name = item["name"] if len(item["name"]) <= ITEM_NAME_CHARS else item["name"][:ITEM_NAME_CHARS - 1] + "…"
-        parts.append(f'{n} "{name}" {_ROLE_WORDS.get(item["role"], item["role"].casefold())}')
+        parts.append(f'{n} "{name}" {_ROLE_WORDS.get(item["role"], item["role"].casefold())}'.rstrip())
     return (f"items on the screen in [{items.hwnd}], numbered for your click hand (page content first): "
             + "; ".join(parts))
 
@@ -485,6 +497,8 @@ class Hands:
         #: The window in front's clickable items (``ScreenItems``, v3.14), read with the names; ``None`` before.
         self.items: ScreenItems | None = None
         self._items_lock = threading.Lock()
+        #: The time of each window's last own tree read here (ms), to tell a heavy window (v3.15).
+        self._read_ms: dict[int, float] = {}
         self._lock = threading.Lock()
         self.last = Snapshot()
         #: Hands in flight (the narrator waits for them, like the mouth's other quick tools).
@@ -1052,18 +1066,71 @@ class Hands:
             # launch_app's ok is its window found and in front, ready for input.
             facts["verified"] = ok
             return ok, report, facts
+        if name == "open_yuki":
+            # Yuki's own window (v3.15), through the tray's opener: the page is the model's choice from the enum.
+            from yuki.ui.own_window import open_page
+
+            facts["sent_at"] = time.monotonic()
+            ok, report = open_page(str(args.get("page") or ""))
+            facts["verified"] = ok   # brought forward or started, on that page
+            return ok, report, facts
         raise _Refused(f"no hand called {name!r}")
 
-    def _read_items(self, hwnd: int, title: str) -> Any:
+    def _now_items(self, hwnd: int, title: str) -> tuple[ScreenItems, dict[str, Any]] | None:
+        """The window's names from memory's Now picture, when its entry is fresh (read after its last change).
+
+        ``(items, tree)``: the items have no element ids (``read`` 0: a click finds its item in a read of its own),
+        the tree is the names as list items, for the screen names. None: no service, no answer in 50 ms, no entry
+        or a stale one (then the caller reads the window itself).
+        """
+        try:
+            from yuki.memory.now import shared_client
+
+            client = shared_client()
+            board = client.now(wait_s=0.05) if client is not None else None
+        except Exception:  # noqa: BLE001 - then the window is read here
+            return None
+        entry = next((w for w in (board or {}).get("windows") or []
+                      if isinstance(w, dict) and int(w.get("hwnd") or 0) == int(hwnd)), None)
+        if not entry or entry.get("stale") or entry.get("read_at") is None:
+            return None
+        names: list[str] = []
+        for name in [*(entry.get("controls") or []),
+                     *(str(m.get("sender") or "") for m in entry.get("messages") or [] if isinstance(m, dict))]:
+            name = " ".join(str(name or "").split())
+            if name and name != "the user" and name.casefold() not in {n.casefold() for n in names}:
+                names.append(name)
+        items = ScreenItems(hwnd=int(hwnd), title=title, read=0,
+                            items=[{"id": None, "role": "", "name": n} for n in names[:ITEMS_CAP]],
+                            at=time.monotonic(), version=self.actions.version)
+        tree = {"elements": [{"id": i, "role": "ListItem", "name": n, "depth": 1, "parent": -1,
+                              "is_interactive": True} for i, n in enumerate(names)]}
+        return items, tree
+
+    def _read_items(self, hwnd: int, title: str, *, own: bool = False) -> Any:
         """One bounded tree read of ``hwnd`` through the hands' dispatcher: keeps its items, returns the tree (or None).
 
-        Blocking (a few hundred ms at most); call it off every loop. One read at a time.
+        Blocking (a few hundred ms at most); call it off every loop. One read at a time. A window measured heavy
+        (:data:`HEAVY_READ_MS`) is taken from memory's Now picture instead, when that is fresh (v3.15); ``own``
+        reads it here regardless (a click finding its item).
         """
         with self._items_lock:
+            if not own and self._read_ms.get(int(hwnd), 0.0) >= HEAVY_READ_MS:
+                started = time.perf_counter()
+                got = self._now_items(hwnd, title)
+                if got is not None:
+                    items, tree = got
+                    with self._lock:
+                        self.items = items
+                    if self.log is not None:
+                        self.log.event("hands", op="items_read", hwnd=int(hwnd), items=len(items.items),
+                                       ms=round((time.perf_counter() - started) * 1000), source="now")
+                    return tree
             try:
                 outcome = self._dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
             except Exception:  # noqa: BLE001 - the items are a hint
                 return None
+            self._read_ms[int(hwnd)] = float(outcome.elapsed_ms or 0.0)
             if not outcome.ok or not isinstance(outcome.payload, dict):
                 return None
             latest = getattr(self._dispatcher, "_latest_trees", {}).get(int(hwnd))
@@ -1117,14 +1184,15 @@ class Hands:
                            f"clicked", stale=True)
         item = items.items[number - 1]
         title = self._title(hwnd)
-        if (title != items.title or items.version != self.actions.version
+        if (title != items.title or items.version != self.actions.version or not items.read
                 or time.monotonic() - items.at > ITEMS_FRESH_S):
-            # The read is old, or the window changed since: find the same item (its role and name) in a fresh read.
-            self._read_items(hwnd, title)
+            # The read is old, or the window changed since, or the items came from memory's Now picture (no element
+            # ids, v3.15): find the same item (its role and name; the name alone from Now) in a fresh read here.
+            self._read_items(hwnd, title, own=True)
             with self._lock:
                 fresh = self.items
             same = [i for i in (fresh.items if fresh is not None and fresh.hwnd == hwnd else [])
-                    if i["role"] == item["role"] and i["name"] == item["name"]]
+                    if (not item["role"] or i["role"] == item["role"]) and i["name"] == item["name"]]
             if len(same) != 1:
                 raise _Refused(f"the window changed since it was read and \"{item['name'][:60]}\" is not on it once "
                                f"now; nothing was clicked", stale=True)
@@ -1456,7 +1524,7 @@ def _what(name: str, args: dict[str, Any]) -> str:
     """One line naming a hand's action from its arguments (for the shared action log)."""
     parts = [name]
     for key in ("window", "tab", "action", "direction", "amount", "key", "keys", "times", "url", "app", "name",
-                "level", "change", "mute"):
+                "level", "change", "mute", "page"):
         if args.get(key) not in (None, "", []):
             parts.append(f"{key}={args[key]}")
     return " ".join(str(p) for p in parts)

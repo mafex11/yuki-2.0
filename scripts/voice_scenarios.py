@@ -999,6 +999,15 @@ def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
                   "controls": ["Guide", "YouTube Home", "Search", "Voice search", "Create", "Notifications", "Home",
                                "Shorts", "Subscriptions", "You", "History", sonnet_title(), "Claude Code in 12 minutes"],
                   "at": now - 120}
+    elif kind in ("alone", "friend"):
+        # v3.15: live 30 Sept the user sat alone in a Discord call waiting for a friend (a DM call still ringing).
+        who = ["mafex"] + (["Hemanth"] if kind == "friend" else [])
+        screen = {"host": None, "title": "@Hemanth - Discord",
+                  "controls": ["Direct Messages", "Hemanth , Ongoing Call", "Hemanth", *who,
+                               *([] if kind == "friend" else ["Ringing"]), "Voice Connected", "Disconnect",
+                               "Turn On Camera", "Share Your Screen", "Mute", "Deafen", "User Settings",
+                               "Message @Hemanth"],
+                  "at": now - 20}
     elif kind in ("discord", "stale"):
         screen = {"host": "discord.com", "title": "#valorant | Friends - Discord",
                   "controls": ["Friends", "#general", "#valorant", "Voice Connected", "Valorant squad / Friends",
@@ -1014,11 +1023,15 @@ def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
 
     call = MemoryClient(store).call_status().get("call")
     facts = {"kind": kind, "judged": evidence.stats() if hasattr(evidence, "stats") else None,
-             "call": {k: call.get(k) for k in ("app", "status", "evidence")} if call else None}
+             "call": {k: call.get(k) for k in ("app", "status", "evidence", "others")} if call else None}
     store.close()
     if not call:
         return None, None, facts
-    return str(call.get("app") or "a call app"), str(call.get("evidence") or "fresh"), facts
+    from yuki.voice.session import call_facing
+
+    app, how_sure, alone = call_facing(call)   # alone in the call: no call mode (v3.15), as the session does
+    facts["alone"] = alone
+    return app, how_sure, facts
 
 
 def sonnet_title() -> str:
@@ -1557,10 +1570,13 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
                          **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
     call_app = call_evidence = None
-    if z928:
+    if z928 or (scenario == "steer" and args.call):
         # What memory's call detector says (the real screen judge on stubbed device holders), unless the run forces
         # the live case of the old code (--call Zen: the browser holding the microphone was taken for a call).
-        if args.call:
+        # --call alone / friend (v3.15): the user in a Discord call alone, or with a friend, judged for real.
+        if args.call in ("alone", "friend"):
+            call_app, call_evidence, box["call_detector"] = _call_now(args.call)
+        elif args.call:
             call_app, call_evidence = (None, None) if args.call == "none" else (args.call, args.evidence or "fresh")
             box["call_detector"] = {"forced": args.call}
         elif scenario not in ("zen928", "call928", "stale928"):

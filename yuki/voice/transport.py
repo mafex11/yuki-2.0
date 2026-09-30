@@ -163,11 +163,22 @@ class SpeakerOutput(BaseOutputTransport):
         #: ``None`` until a dormant conversation is woken (v3.11: no output stream is held open while it waits, so
         #: the PC can sleep and no audio session shows); :meth:`set_speaker` gives it the one opened then.
         self._speaker = speaker
+        # The writer thread. v3.11-v3.14b made it only in set_speaker (the woken standby's path), so a conversation
+        # started with its speaker (no standby ready) failed every audio write: live 2026-09-30 three of seven
+        # conversations were mute ("'SpeakerOutput' object has no attribute '_executor'", 615 frames), and the
+        # user's "Oh, answer, what the fuck?" was said to a reply he never heard (v3.15).
+        self._executor: ThreadPoolExecutor | None = None
+        if speaker is not None:
+            self._start_writer()
+
+    def _start_writer(self) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-out")
+            self._executor.submit(lambda: None)   # its thread starts now, not on the loop's first write (v3.14)
 
     def set_speaker(self, speaker: Speaker) -> None:
         self._speaker = speaker
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-out")
-        self._executor.submit(lambda: None)   # its thread starts now, not on the loop's first write (v3.14)
+        self._start_writer()
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
@@ -177,6 +188,8 @@ class SpeakerOutput(BaseOutputTransport):
         speaker = self._speaker
         if speaker is None:
             return True   # dormant: nothing is ever said before the wake, but never fail the pipeline on it
+        if self._executor is None:
+            self._start_writer()
         await self.get_event_loop().run_in_executor(self._executor, speaker.write, frame.audio)
         return True
 
@@ -184,7 +197,8 @@ class SpeakerOutput(BaseOutputTransport):
         try:
             await super().cleanup()
         finally:
-            self._executor.shutdown(wait=False)
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
 
 
 class PairTransport(BaseTransport):

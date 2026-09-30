@@ -65,6 +65,7 @@ import ctypes
 import struct
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 
 import pyautogui
@@ -1569,7 +1570,7 @@ def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, 
     deadline = time.monotonic() + _CLEAR_VERIFY_S
     after = _read_focus()
     while (
-        after is None or not after.ok or (after.same_as(focus) and after.value)
+        after is None or not after.ok or (after.same_as(focus) and not _blank(after.value))
     ) and time.monotonic() < deadline:
         time.sleep(_FOCUS_POLL_S)
         after = _read_focus()
@@ -1580,7 +1581,7 @@ def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, 
     if not after.same_as(focus):
         details["cleared"] = False
         return f"focus moved to {after.describe()} during select-all + delete", ""
-    if after.value:
+    if not _blank(after.value):
         details["cleared"] = False
         return (
             f"select-all + delete did not empty {focus.describe()}: its value is "
@@ -1636,12 +1637,50 @@ def _read_text(caret_chars: int):  # -> yuki.perception.tree.FocusText | None
 
 
 def _squash(text: str) -> str:
-    """Text for "did it arrive" comparison: no whitespace, case-folded.
+    """Text for "did it arrive" comparison: no whitespace, no invisible format characters, case-folded.
 
     A single-line field turns a newline into nothing or a space and some fields
-    change case as they go; neither is a dropped character.
+    change case as they go; neither is a dropped character.  A rich-text editor
+    pads its text with zero-width format characters (Unicode category Cf, live
+    30 Sept: '﻿@name ﻿ text'); they are not characters anyone typed.
     """
-    return "".join(text.split()).casefold()
+    return "".join(ch for ch in "".join(text.split()) if unicodedata.category(ch) != "Cf").casefold()
+
+
+def _blank(text: str | None) -> bool:
+    """Whether a field's value shows nothing: only whitespace and zero-width format characters.
+
+    An empty rich-text editor reads '﻿
+' (live 30 Sept: "select-all + delete did not empty" it).
+    """
+    return not _squash(text or "")
+
+
+def _read_field():  # -> yuki.perception.tree.FieldState | None
+    """The focused field's parts and suggestion list (:func:`yuki.perception.tree.field_state`), or None."""
+    try:
+        from yuki.perception.tree import field_state
+    except Exception:
+        return None
+    try:
+        return field_state()
+    except Exception:
+        return None
+
+
+#: After keystrokes, how long a suggestion list is waited for when one is to be accepted, and how long its
+#: acceptance is watched (condition polls: each ends the moment the list shows / closes).
+_SUGGESTION_WAIT_S = 1.0
+_SUGGESTION_ACCEPT_S = 1.0
+_SUGGESTION_POLL_S = 0.05
+
+
+def _field_text(state: object) -> str:
+    """What a field holds as shown: its Value when that says something, else its parts' text."""
+    value = getattr(state, "value", None)
+    if value is not None and not _blank(value):
+        return str(value)
+    return str(getattr(state, "parts_text", "") or "")
 
 
 def _shown(text: str, limit: int = 80) -> str:
@@ -1675,6 +1714,12 @@ def _read_back(text: str, target: object) -> tuple[bool | None, str, dict]:
         waited_ms = round((now - started) * 1000.0, 1)
         if seen is None or not seen.ok or not seen.readable:
             reason = getattr(seen, "reason", "") or "UIA is unavailable"
+            parts = _parts_hold(want)
+            if parts is not None:
+                # A rich-text editor with neither pattern: its text is in its descendants (v3.15).
+                return True, f"the field's parts now read {_shown(parts)}", {
+                    "readback": "arrived", "readback_source": "parts", "readback_text": parts[:500],
+                    "readback_ms": waited_ms}
             return None, f"field contents not readable ({reason})", {
                 "readback": "unreadable",
                 "readback_reason": reason,
@@ -1707,12 +1752,34 @@ def _read_back(text: str, target: object) -> tuple[bool | None, str, dict]:
             if seen.source == "document" and not seen.complete:
                 facts["readback"] = "unreadable"
                 return None, "field contents too long to check", facts
-            facts["readback"] = "missing"
-            return False, _shown(seen.text, 120), facts
+            return _missing_unless_parts(want, seen, facts)
         if now >= deadline:
-            facts["readback"] = "missing"
-            return False, _shown(seen.text, 120), facts
+            return _missing_unless_parts(want, seen, facts)
         time.sleep(_READBACK_POLL_S)
+
+
+def _parts_hold(want: str) -> str | None:
+    """The focused field's parts' text when it holds ``want`` (squashed), else None."""
+    state = _read_field()
+    if state is None or not getattr(state, "ok", False):
+        return None
+    text = str(getattr(state, "parts_text", "") or "")
+    return text if want and want in _squash(text) else None
+
+
+def _missing_unless_parts(want: str, seen: object, facts: dict) -> tuple[bool | None, str, dict]:
+    """A read-back that did not find the text: re-read the field's parts before calling it missing (v3.15).
+
+    A rich-text editor's Value can lag behind what it shows (an empty one reads '﻿
+'); the text is in its
+    descendant elements.
+    """
+    parts = _parts_hold(want)
+    if parts is not None:
+        facts.update(readback="arrived", readback_source="parts", readback_text=parts[:500])
+        return True, f"the field's parts now read {_shown(parts)}", facts
+    facts["readback"] = "missing"
+    return False, _shown(getattr(seen, "text", ""), 120), facts
 
 
 def _refuse_unless_ready(
@@ -2125,6 +2192,7 @@ def type_text(
     press_enter: bool = False,
     clear: bool = False,
     expect_hwnd: int | None = None,
+    accept_suggestion: bool = False,
 ) -> ActionResult:
     """Type into whatever has keyboard focus.
 
@@ -2170,12 +2238,27 @@ def type_text(
     paste - is chosen by :func:`_choose_method` and reported in
     ``details["method"]``/``details["method_reason"]``.
 
+    Suggestion lists (v3.15): after keystrokes the focused field is read once
+    more (:func:`yuki.perception.tree.field_state`): the list it controls (UIA
+    ControllerFor, an app's mention or autocomplete list) or its expanded state
+    says a suggestion list is open, and the result names its items and the
+    selected one (``details["suggestions"]``).  Enter with a list open and an
+    item selected would pick that item rather than submit, so Enter is not
+    pressed then and the result says so.  With ``accept_suggestion`` the text
+    always goes in by keystrokes (a paste opens no list), the list is waited
+    for, and the selected item is accepted with Enter (Tab when none is
+    selected), never by clicking it; the field is read again to check it took
+    (its text or its parts changed: a mention becomes an element of its own).
+    Structure only: nothing here knows which app it is typing into.
+
     Args:
         text: what to type (may be empty with ``clear`` to only clear).
         press_enter: press Enter after the text.
         clear: select all and delete in the focused control first.
         expect_hwnd: only send if this window is still in the foreground *and*
             ready to receive input.
+        accept_suggestion: type by keystrokes and accept the suggestion list that
+            opens (a mention, a name, an autocompleted address).
 
     Returns:
         ActionResult.  ``details`` always carries where the text went or would have
@@ -2194,6 +2277,8 @@ def type_text(
         "clear": bool(clear),
         "expect_hwnd": expect_hwnd,
     }
+    if accept_suggestion:
+        details["accept_suggestion"] = True
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
@@ -2257,6 +2342,9 @@ def type_text(
     into, facts = _input_target(target_state)
     details.update(facts)
     needs_clipboard, method_reason = _choose_method(text, target, details.get("ready_ms"))
+    if accept_suggestion:
+        # A paste opens no suggestion list (live 30 Sept: a pasted "@name" stayed plain text): keys, always.
+        needs_clipboard, method_reason = False, "a suggestion is to be accepted, and only typing opens the list"
     details["method"] = "clipboard" if needs_clipboard else "keystrokes"
     details["method_reason"] = method_reason
 
@@ -2332,6 +2420,40 @@ def type_text(
             details,
             started,
         )
+    # A suggestion list the typing opened (read only after keystrokes: a paste opens none).
+    suggestion = ""
+    popup = None
+    if not needs_clipboard:
+        popup = _suggestions_after(details, wait_s=_SUGGESTION_WAIT_S if accept_suggestion else 0.0)
+    if accept_suggestion:
+        suggestion, popup = _accept_suggestion(popup, expect_hwnd, details)
+    elif popup is not None and getattr(popup, "popup", False):
+        items = list(getattr(popup, "items", ()) or ())
+        chosen = getattr(popup, "selected", -1)
+        suggestion = (
+            f"a suggestion list is open for this field ({len(items)} item(s)"
+            + (": " + ", ".join(_quoted(i, 40) for i in items[:5]) if items else "")
+            + (f"; {_quoted(items[chosen], 40)} selected" if 0 <= chosen < len(items) else "")
+            + "): Enter or Tab accepts it, Escape closes it"
+        )
+    if press_enter and popup is not None and getattr(popup, "popup", False) and getattr(popup, "selected", -1) >= 0:
+        # Enter now would pick the selected suggestion, not submit what was typed.
+        details["enter_withheld"] = "suggestion_selected"
+        details.update(_where_focus_is()[1])
+        shown = text if len(text) <= 60 else text[:60] + "…"
+        return _result(
+            True,
+            summary(
+                cleared,
+                f"typed {len(text)} chars via {details['method']} into {into}: {shown!r}",
+                contents,
+                suggestion,
+                "Enter was not pressed: it would accept the selected suggestion instead of sending; accept it "
+                "(Enter/Tab, or type_text with accept_suggestion) or press Escape, then press Enter",
+            ),
+            details,
+            started,
+        )
     if press_enter:
         # The read-back took time; check the guard again before submitting.
         refusal = _foreground_mismatch(expect_hwnd)
@@ -2352,12 +2474,69 @@ def type_text(
             cleared,
             f"typed {len(text)} chars via {details['method']} into {into}: {preview!r}",
             contents + (" (before Enter)" if press_enter and verdict else ""),
+            suggestion,
             "then pressed Enter" if press_enter else "",
             appeared(_POPUP_WATCH_S),
         ),
         details,
         started,
     )
+
+
+def _suggestions_after(details: dict, *, wait_s: float):  # -> FieldState | None
+    """The focused field after keystrokes: whether a suggestion list is open (``details["suggestions"]``).
+
+    One read, or with ``wait_s`` a condition poll that ends the moment a list shows (an app builds it a moment
+    after the keys).
+    """
+    deadline = time.monotonic() + max(0.0, wait_s)
+    state = _read_field()
+    while (state is None or not getattr(state, "popup", False)) and time.monotonic() < deadline:
+        time.sleep(_SUGGESTION_POLL_S)
+        state = _read_field()
+    if state is not None and getattr(state, "ok", False) and (state.popup or wait_s > 0):
+        details["suggestions"] = state.facts()
+    return state
+
+
+def _accept_suggestion(state: object, expect_hwnd: int | None, details: dict) -> tuple[str, object]:
+    """Accept the open suggestion list's selected item by key (never a click); ``(phrase, field state after)``.
+
+    Enter when an item is selected, else Tab. Checked by reading the field again: accepted when the list closed
+    and the field's text or its parts changed (a mention becomes an element of its own).
+    """
+    if state is None or not getattr(state, "popup", False):
+        details["suggestion_accepted"] = None
+        return "no suggestion list opened, so the text stays as typed", state
+    refusal = _foreground_mismatch(expect_hwnd)
+    if refusal:
+        details["suggestion_accepted"] = None
+        return f"a suggestion list opened, but {refusal}; nothing was accepted", state
+    items = list(getattr(state, "items", ()) or ())
+    chosen = getattr(state, "selected", -1)
+    key = "enter" if chosen >= 0 or not items else "tab"
+    before_text, before_parts = _field_text(state), getattr(state, "parts", 0)
+    pyautogui.press(key)
+    deadline = time.monotonic() + _SUGGESTION_ACCEPT_S
+    after = _read_field()
+    while (after is None or getattr(after, "popup", False)) and time.monotonic() < deadline:
+        time.sleep(_SUGGESTION_POLL_S)
+        after = _read_field()
+    name = items[chosen] if 0 <= chosen < len(items) else (items[0] if items else "")
+    ok_after = after is not None and getattr(after, "ok", False)
+    changed = ok_after and (_field_text(after) != before_text or getattr(after, "parts", 0) != before_parts)
+    closed = ok_after and not getattr(after, "popup", False)
+    details["suggestion_key"] = key
+    details["suggestion_accepted"] = name or True
+    details["suggestion_verified"] = bool(changed and closed)
+    if ok_after:
+        details["suggestions_after"] = after.facts()
+        details["field_after"] = _field_text(after)[:300]
+    phrase = (f"pressed {key.capitalize()} to accept the suggestion" + (f" {_quoted(name, 40)}" if name else "")
+              + (f"; the field now reads {_shown(_field_text(after))}" if changed and closed else
+                 "; the field did not visibly change, so it may not have taken" if closed else
+                 "; the list is still open"))
+    return phrase, after
 
 
 def _page_before_keys(details: dict) -> tuple[int, dict | None, bool]:
