@@ -233,9 +233,14 @@ def embed_links(store: Any, embedder: Any, limit: int = EMBED_BATCH, rounds: int
 
 
 def digest_text(d: dict[str, Any]) -> str:
-    """What a call digest is embedded as: its app, its gist and its blocks' topics."""
+    """What a call digest is embedded as: its app, where and with whom (as the screen around it showed), its gist
+    and its blocks' topics."""
     topics = [str(b.get("topic") or "") for b in d.get("blocks") or [] if b.get("topic")]
-    return " ".join(f"{d.get('app') or ''} call. {d.get('gist') or ''} Topics: {'; '.join(topics)}".split())[:2000]
+    ctx = d.get("context") or {}
+    people = [str(p.get("name") or "") for p in ctx.get("people") or [] if p.get("name")]
+    around = (f" {ctx['where']}." if ctx.get("where") else "") + (f" With {', '.join(people)}." if people else "")
+    return " ".join(f"{d.get('app') or ''} call.{around} {d.get('gist') or ''} Topics: {'; '.join(topics)}"
+                    .split())[:2000]
 
 
 def embed_call_digests(store: Any, embedder: Any, limit: int = 64) -> int:

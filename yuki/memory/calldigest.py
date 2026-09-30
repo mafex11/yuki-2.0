@@ -38,10 +38,21 @@ latency in the clear, request and response encrypted); the cost is kept on the
 digest row and counts toward ``memory_cost_today_usd``. Digests are encrypted and
 never pruned; the transcript they came from goes with the 30-day capture TTL.
 
+Since 2026-10-01 each call (each part of a long one) is read with the context pack around it
+(:mod:`yuki.memory.callcontext`: the call app's screens - voice panel, participants, the call's chat -
+the other windows, links and chats around it, the threads of work, name spellings; screen text only),
+and the answer also says who was on the call (each name checked against what the model read) and where;
+stored in ``call_digests.context_ciphertext`` (migration 25). ``context=False`` reads the words alone.
+
 Command (Yuki's own pipeline, allowed on the real database; back it up first)::
 
-    python -m yuki.memory.calldigest --backfill [--calls 16,17] [--force] [--dry-run] [--db PATH]
-    python -m yuki.memory.calldigest --show 20 [--db PATH]        # print one stored digest (read-only)
+    python -m yuki.memory.calldigest --backfill [--calls 16,17 | --last N] [--rejournal] [--force] [--dry-run]
+        [--no-context] [--portrait auto|now|flag|skip] [--db PATH]
+    python -m yuki.memory.calldigest --show 20 [--db PATH]          # print one stored digest (read-only)
+    python -m yuki.memory.calldigest --show-context 20 [--db PATH]  # print one call's context pack (no model)
+
+``--rejournal`` first journals the chosen calls' words again (:mod:`yuki.memory.rejournal` over their time
+range, ``my_call_side`` only), so their facts and to-dos read the context too.
 
 Public API::
 
@@ -73,6 +84,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import CALL_TRANSCRIPT_GUIDANCE, HAIKU_MODEL, cached_system, sanitize_untrusted, \
     unreachable, user_identity
+from yuki.memory.callcontext import MAX_CHARS as CONTEXT_MAX_CHARS
 from yuki.memory.personality import NATURES, normalize_nature
 from yuki.memory.store import CALL_OPEN_STATUSES, Store
 
@@ -106,6 +118,12 @@ WAKE_TAIL_S = 5.0
 #: and a stretch longer than STRETCH_MAX_S is cut at its longest pause.
 STRETCH_QUIET_S = 20 * 60.0
 STRETCH_MAX_S = 90 * 60.0
+#: How the digest knows someone was on the call (strongest first): listed on the call screen, wrote in the call's
+#: chat, or only pointed to by the chats around it (yuki.memory.callcontext). Screen evidence only: a "spoken to by
+#: name" kind was tried on the 1 Oct copy and gave Claude, a colleague read aloud from a page and friends talked
+#: about on 3 of 4 calls.
+PEOPLE_HOW: tuple[str, ...] = ("on_call_screen", "call_chat", "likely")
+MAX_PEOPLE = 12
 
 SYSTEM_PROMPT = """\
 You write the timeline of the user's calls for Yuki, a personal assistant on the user's Windows PC, \
@@ -154,10 +172,41 @@ mostly about from the user's side. When EARLIER GIST is given, write the gist of
 so far, not only this part.
 
 THE OTHER SIDE IS NOT IN THE TRANSCRIPT. Never invent what anyone else said, asked, felt or did, \
-who they are, or what the call was about beyond the user's words. You may note what the user was \
+who they are, or what the call was about beyond the user's words and what the CONTEXT (below) shows \
+on screen. You may note what the user was \
 evidently answering or reacting to only when their own words make it plain ("Answered a question \
 about his job: said he..."); a short answer on its own ("yeah, Friday") answers a question you \
 cannot hear, so leave it out or make it uncertain.
+
+CONTEXT AROUND THE CALL. A call may come with a CONTEXT block: text Yuki read on the user's screen \
+during and just around the call - never audio. It holds the call app's own windows (its voice \
+panel, participant list or tiles, the call's text chat, captions it showed), the other windows the \
+user had open, shared or looked at, links opened or shared, chats just before and after, the threads \
+of work the user touched then, and how memory spells names; every item has its local time, so line it \
+up with the utterances. Use it only to understand the user's words:
+- Resolve what the user refers to when the context makes it plain at that time: "him", "you", "that \
+link", "this", "the thing on screen", "yeah do it" -> who (a name on the call screen or in its chat) and \
+what (the page, PR, document, video or game in front then). Write the resolved line ("Told Mafex to \
+share the screen again", "Said the Relay PR open on screen was ready to merge"), never a guess: when the \
+context does not settle it, keep the user's words as said, or make the line uncertain.
+- Lines stay the user's side: each rests on an utterance of the user. Never add a line that only \
+describes the screen, and never write what anyone said aloud - that is never known. What someone \
+WROTE on screen (the call's chat, captions) may be quoted as theirs only when it is in the context, \
+marked as on-screen text, inside the user's line ("Agreed to push it (Rohan had written 'push it' in \
+the call chat, on screen)").
+- Spell names as the context and memory spell them (NAMES corrects what the recogniser mishears).
+- people, for each call: who was on the call with the user, only as the CONTEXT shows them, each with \
+how: on_call_screen (listed in the call's voice channel, participant list or tiles while the user was \
+in that call, sharing their screen or streaming in it), call_chat (wrote in the call's own chat \
+during it), likely (the call's direct-message thread or the chats just around it point to them, but \
+the call screen does not show them). A name the user only says is not enough - the transcript cannot \
+tell someone on the call from someone talked about - so it stays in the lines, not in people. Never \
+the user themselves (their names and handles are given above; their own tile or name in the call is \
+them), never a bot, an AI assistant or a program, never someone only listed as online elsewhere or \
+named in a server's name. Empty when nothing shows who.
+- where, for each call: the app and, when the call screen shows it, the server and voice channel or \
+the meeting's title ("Discord, voice channel Minecraft in the server Friends"); "" when not shown.
+- The gist may say who the call was with and what it was about when the context makes that plain.
 
 {guidance}
 (In that guidance, a "fact" means one of your lines, and there are no commitments to take here.)"""
@@ -203,10 +252,27 @@ WRITE_TIMELINE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["call", "gist"],
+                    "required": ["call", "gist", "people", "where"],
                     "properties": {
                         "call": {"type": "integer", "description": "The call's number from its header."},
                         "gist": {"type": "string", "description": "At most 25 words."},
+                        "people": {
+                            "type": "array",
+                            "description": "Who was on the call with the user (see CONTEXT AROUND THE CALL); "
+                                           "empty when nothing shows who.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["name", "how"],
+                                "properties": {
+                                    "name": {"type": "string", "description": "As the screen or memory spells it."},
+                                    "how": {"type": "string", "enum": list(PEOPLE_HOW)},
+                                },
+                            },
+                        },
+                        "where": {"type": "string", "description": "The app and the server/channel or meeting "
+                                                                   "title as the call screen shows it; empty if "
+                                                                   "not shown."},
                     },
                 },
             },
@@ -248,9 +314,12 @@ class Piece:
     part: int                 # 1-based
     parts: int
     utterances: list[Utterance]
+    #: What was around this part of the call on screen (yuki.memory.callcontext), plain text; "" when none.
+    context: str = ""
 
     @property
     def chars(self) -> int:
+        """The utterances' size in a request (what a part is cut and packed by; the context comes on top)."""
         return sum(min(len(u.text), UTTERANCE_MAX_CHARS) + LINE_OVERHEAD for u in self.utterances)
 
 
@@ -372,19 +441,23 @@ def split_parts(utts: Sequence[Utterance], max_chars: int = PART_CHARS) -> list[
     return parts
 
 
-def pack_requests(pieces: Sequence[Piece], max_chars: int = PART_CHARS) -> list[list[Piece]]:
-    """Consecutive pieces packed into requests of at most ``max_chars`` (small calls share one request; a
-    long call's parts, each near the limit, go alone). Order is kept, so a part always follows its earlier
-    part in an earlier request."""
+def pack_requests(pieces: Sequence[Piece], max_chars: int = PART_CHARS,
+                  max_context: int = 2 * CONTEXT_MAX_CHARS) -> list[list[Piece]]:
+    """Consecutive pieces packed into requests of at most ``max_chars`` of utterances (small calls share one
+    request; a long call's parts, each near the limit, go alone) and at most ``max_context`` characters of
+    context around the calls. Order is kept, so a part always follows its earlier part in an earlier request.
+    (Counting the context in ``max_chars`` packed a full part with another call's and its answer thinned out:
+    call 42's first 26 minutes got no lines on the 1 Oct copy.)"""
     out: list[list[Piece]] = []
     cur: list[Piece] = []
-    size = 0
+    size = context = 0
     for p in pieces:
-        if cur and size + p.chars > max_chars:
+        if cur and (size + p.chars > max_chars or context + len(p.context) > max_context):
             out.append(cur)
-            cur, size = [], 0
+            cur, size, context = [], 0, 0
         cur.append(p)
         size += p.chars
+        context += len(p.context)
     if cur:
         out.append(cur)
     return out
@@ -435,6 +508,11 @@ def render_request(pieces: Sequence[Piece], earlier: dict[int, str], nonce: str)
         out.append(head)
         if earlier.get(p.call_id):
             out.append(sanitize_untrusted(earlier[p.call_id], nonce, 4_000))
+        if p.context:
+            out.append(f"CONTEXT AROUND CALL {p.call_id} (text on the user's screen during and just around it, "
+                       "never audio; only to understand the user's words - see CONTEXT AROUND THE CALL):")
+            out.append(sanitize_untrusted(p.context, nonce, CONTEXT_MAX_CHARS))
+            out.append(f"THE USER'S UTTERANCES, CALL {p.call_id}:")
         prev_end: float | None = None
         day = _day(first.at)
         for u in p.utterances:
@@ -540,6 +618,65 @@ def parse_blocks(tool_input: Any, numbered: dict[int, tuple[int, Utterance]]
     return out, gists
 
 
+def parse_people(tool_input: Any, numbered: dict[int, tuple[int, Utterance]], contexts: dict[int, str],
+                 me: Sequence[str] = ()) -> dict[int, dict[str, Any]]:
+    """Who was on each call and where, from the model's ``calls`` items: ``{call_id: {"people": [{"name",
+    "how"}], "where"}}``. A name is kept only when it occurs in the context the model read for that call (the
+    same check as a commitment's quote being a span of its utterance): a name nothing on screen showed is
+    dropped. One entry per name (the strongest
+    ``how``), at most :data:`MAX_PEOPLE`; ``where`` must come with a context. One of the user's own names
+    (``me``: identity, compared whole) is never someone else on the call."""
+    from yuki.memory.callcontext import grounded
+
+    mine = {" ".join(str(n).split()).casefold() for n in me if str(n).strip()}
+    data = tool_input if isinstance(tool_input, dict) else {}
+    said: dict[int, list[str]] = {}
+    for cid, u in numbered.values():
+        said.setdefault(cid, []).append(u.text)
+    out: dict[int, dict[str, Any]] = {}
+    for g in data.get("calls") or []:
+        if not isinstance(g, dict):
+            continue
+        try:
+            cid = int(g.get("call"))
+        except (TypeError, ValueError):
+            continue
+        if cid not in said:
+            continue
+        context = contexts.get(cid) or ""
+        best: dict[str, dict[str, str]] = {}
+        for p in g.get("people") or []:
+            if not isinstance(p, dict):
+                continue
+            name = " ".join(str(p.get("name") or "").split())[:60]
+            how = str(p.get("how") or "")
+            if not name or how not in PEOPLE_HOW or name.casefold() in mine:
+                continue
+            if not grounded(name, context):
+                continue
+            key = name.casefold()
+            if key not in best or PEOPLE_HOW.index(how) < PEOPLE_HOW.index(best[key]["how"]):
+                best[key] = {"name": name, "how": how}
+        people = sorted(best.values(), key=lambda p: PEOPLE_HOW.index(p["how"]))[:MAX_PEOPLE]
+        where = " ".join(str(g.get("where") or "").split())[:160] if context else ""
+        out[cid] = {"people": people, "where": where}
+    return out
+
+
+def merge_people(*groups: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+    """People lists of a call's parts (or a session's rows) as one: each name once, with its strongest ``how``."""
+    best: dict[str, dict[str, str]] = {}
+    for group in groups:
+        for p in group or []:
+            name, how = str(p.get("name") or ""), str(p.get("how") or "")
+            if not name or how not in PEOPLE_HOW:
+                continue
+            key = name.casefold()
+            if key not in best or PEOPLE_HOW.index(how) < PEOPLE_HOW.index(best[key]["how"]):
+                best[key] = {"name": name, "how": how}
+    return sorted(best.values(), key=lambda p: PEOPLE_HOW.index(p["how"]))[:MAX_PEOPLE]
+
+
 def yuki_spans_for(store: Store, captures: Sequence[dict[str, Any]]) -> list[tuple[float, float, bool]]:
     """:func:`said_to_yuki_spans` for the time a call's captures cover (the voice turns around it)."""
     times = [float(u.get("at") or 0.0) for c in captures for u in ((c.get("data") or {}).get("utterances") or [])
@@ -611,6 +748,9 @@ class _CallRun:
     requests: int = 0
     latency_ms: float = 0.0
     failed: str | None = None
+    #: Who was on the call and where (the model's reading of the context around it; migration 25).
+    people: list[dict[str, str]] = field(default_factory=list)
+    where: str = ""
 
 
 class CallDigestWorker:
@@ -618,8 +758,11 @@ class CallDigestWorker:
 
     def __init__(self, store: Store, *, settings: Settings | None = None, client: Any = None,
                  log_dir: Path | None = None, model: str = HAIKU_MODEL, part_chars: int = PART_CHARS,
-                 live_fn: Callable[[], dict[str, Any]] | None = None, log: Callable[..., Any] | None = None) -> None:
+                 live_fn: Callable[[], dict[str, Any]] | None = None, log: Callable[..., Any] | None = None,
+                 context: bool = True) -> None:
         self.store = store
+        #: Read the user's words with what was around the call on screen (yuki.memory.callcontext).
+        self.context = bool(context)
         self.settings = settings or Settings()
         self._client = client
         self.log_dir = Path(log_dir) if log_dir else self.settings.project_root / "logs" / "memory"
@@ -694,8 +837,26 @@ class CallDigestWorker:
         kept = [u for u in utts if not u.repeat and u.to_yuki != "yes"]
         run = _CallRun(call_id=call_id, app=app, capture_ids=[c["id"] for c in captures], utterances=utts, kept=kept)
         parts = split_parts(kept, self.part_chars)
-        run.pieces = [Piece(call_id, app, i + 1, len(parts), p) for i, p in enumerate(parts)]
+        run.pieces = [Piece(call_id, app, i + 1, len(parts), p, self._context(call_id, p, i == 0, i == len(parts) - 1))
+                      for i, p in enumerate(parts)]
         return run
+
+    def _context(self, call_id: int, utts: Sequence[Utterance], first: bool, last: bool) -> str:
+        """The context pack for one part of a call: its own span; the joining screens and the chats before the
+        call only for the first part, the chats after it only for the last. Never raises."""
+        if not self.context or not utts:
+            return ""
+        from yuki.memory import callcontext
+
+        try:
+            rec = self.store.call_record(call_id)
+            start = utts[0].at if not first or rec is None else min(utts[0].at, rec.recording_started_at
+                                                                       or rec.detected_at)
+            end = utts[-1].end if not last or rec is None or not rec.ended_at else max(utts[-1].end, rec.ended_at)
+            return callcontext.for_call(self.store, call_id, start=start, end=end, before=first, after=last).text
+        except Exception as exc:  # the digest goes on without it
+            self._service("error", where="call_context", error=f"{type(exc).__name__}: {exc}")
+            return ""
 
     def digest(self, call_ids: Sequence[int] | None = None, *, force: bool = False, dry_run: bool = False,
                journaled_only: bool = True) -> dict[str, Any]:
@@ -730,6 +891,7 @@ class CallDigestWorker:
         pieces = [p for r in runs if r.kept for p in r.pieces]
         requests = pack_requests(pieces, self.part_chars)
         summary["planned_requests"] = len(requests)
+        summary["context_chars"] = sum(len(p.context) for p in pieces)
         for r in runs:
             summary["speech_s"] += speech_seconds(r.utterances)
             summary["utterances"] += len(r.utterances)
@@ -809,6 +971,10 @@ class CallDigestWorker:
         cost = self.settings.estimate_cost(self.model, tokens) or 0.0
         block = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
         blocks, gists = parse_blocks(getattr(block, "input", None), numbered)
+        contexts: dict[int, str] = {}
+        for p in pieces:
+            contexts[p.call_id] = (contexts.get(p.call_id, "") + "\n" + p.context).strip()
+        seen = parse_people(getattr(block, "input", None), numbered, contexts, self.user_names())
         share = 1.0 / len(call_ids)
         for cid in call_ids:
             run = runs[cid]
@@ -820,6 +986,9 @@ class CallDigestWorker:
             run.blocks += [b for b in blocks if b["call_id"] == cid]
             if cid in gists:
                 run.gist = gists[cid]
+            if cid in seen:
+                run.people = merge_people(run.people, seen[cid]["people"])
+                run.where = seen[cid]["where"] or run.where
         summary["requests"] += 1
         summary["input_tokens"] += int(tokens.get("input_tokens") or 0) + int(tokens.get("cache_read_tokens") or 0) \
             + int(tokens.get("cache_write_tokens") or 0)
@@ -845,7 +1014,9 @@ class CallDigestWorker:
                 run.call_id, app=run.app, capture_ids=run.capture_ids, status=status, gist=run.gist, blocks=blocks,
                 started_at=utts[0].at if utts else None, ended_at=max(u.end for u in utts) if utts else None,
                 speech_s=speech_seconds(utts), utterances=len(utts), kept=len(run.kept), model=self.model,
-                usage=run.usage, requests=run.requests, cost_usd=run.cost, latency_ms=run.latency_ms)
+                usage=run.usage, requests=run.requests, cost_usd=run.cost, latency_ms=run.latency_ms,
+                context={"people": run.people, "where": run.where,
+                         "context_chars": sum(len(p.context) for p in run.pieces)} if self.context else None)
         except Exception as exc:
             run.failed = f"{type(exc).__name__}: {exc}"
             return
@@ -898,6 +1069,11 @@ def _print_digest(store: Store, call_id: int) -> None:
           f"utterances {d['utterances']} (kept {d['kept']}) cost ${d['cost_usd']:.4f}")
     if d.get("gist"):
         print(f"gist: {d['gist']}")
+    ctx = d.get("context") or {}
+    if ctx.get("where"):
+        print(f"where: {ctx['where']}")
+    if ctx.get("people"):
+        print("with: " + ", ".join(f"{p['name']} ({p['how']})" for p in ctx["people"]))
     for b in d["blocks"]:
         print(f"{_hm(b['start'])}-{_hm(b['end'])} {b.get('topic') or ''}")
         for ln in b["lines"]:
@@ -912,7 +1088,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--calls", default=None, help="only these call ids (comma-separated)")
     parser.add_argument("--force", action="store_true", help="re-write digests that already exist")
     parser.add_argument("--dry-run", action="store_true", help="plan only: calls, requests, speech; no model calls")
+    parser.add_argument("--last", type=int, default=None,
+                        help="only the N most recent ended calls that still have their words")
+    parser.add_argument("--rejournal", action="store_true",
+                        help="first journal those calls' words again (yuki.memory.rejournal, my_call_side only), "
+                             "so their facts and to-dos also read the context around the call")
+    parser.add_argument("--portrait", choices=("auto", "now", "flag", "skip"), default="auto",
+                        help="after --rejournal: refresh the portrait (as yuki.memory.rejournal does)")
+    parser.add_argument("--no-context", action="store_true",
+                        help="digest without the context around the call (the pre-2026-10-01 digest)")
     parser.add_argument("--show", type=int, default=None, help="print the stored digest of one call (read-only)")
+    parser.add_argument("--show-context", type=int, default=None,
+                        help="print the context pack of one call (read-only, no model)")
     parser.add_argument("--db", default=None, help="the memory database (default: the real one)")
     parser.add_argument("--log-dir", default=None, help="where the model calls are logged (default logs/memory)")
     args = parser.parse_args(argv)
@@ -924,19 +1111,56 @@ def main(argv: list[str] | None = None) -> int:
         if args.show is not None:
             _print_digest(store, args.show)
             return 0
-        if not (args.backfill or args.calls):
-            parser.error("give --backfill or --calls (or --show)")
+        if args.show_context is not None:
+            from yuki.memory.callcontext import for_call
+
+            ctx = for_call(store, args.show_context)
+            print(f"call {args.show_context}: {ctx.chars} chars {ctx.counts}\n{ctx.text}")
+            return 0
+        if not (args.backfill or args.calls or args.last):
+            parser.error("give --backfill, --calls or --last (or --show / --show-context)")
         ids = [int(x) for x in args.calls.split(",") if x.strip()] if args.calls else None
-        worker = CallDigestWorker(store, log_dir=Path(args.log_dir) if args.log_dir else None)
+        if args.last:
+            ids = last_calls(store, args.last)
+            print(f"calls: {ids}")
+        log_dir = Path(args.log_dir) if args.log_dir else None
+        if args.rejournal and ids:
+            _rejournal_calls(store, ids, dry_run=args.dry_run, log_dir=log_dir, portrait=args.portrait)
+        worker = CallDigestWorker(store, log_dir=log_dir, context=not args.no_context)
         summary = worker.digest(ids, force=args.force, dry_run=args.dry_run, journaled_only=False)
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     return 1 if summary.get("failed") else 0
 
 
+def last_calls(store: Store, n: int) -> list[int]:
+    """The ``n`` most recent ended calls that still hold their words (``my_call_side`` captures), oldest first."""
+    ids = [c["call_id"] for c in store.call_digest_candidates(journaled_only=False, include_done=True,
+                                                              max_attempts=10**6)]
+    return ids[-max(0, int(n)):] if n else []
+
+
+def _rejournal_calls(store: Store, call_ids: Sequence[int], *, dry_run: bool, log_dir: Path | None,
+                     portrait: str = "auto") -> None:
+    """Journal these calls' own side again with the current prompts (the context around each call included):
+    :func:`yuki.memory.rejournal.run` over each call's own words only (``my_call_side`` captures at that call's
+    capture times, so a call between them is left alone), then one portrait refresh."""
+    from yuki.memory import rejournal
+
+    ran = False
+    for cid in call_ids:
+        times = [float(c["at"]) for c in store.call_side_captures(cid)]
+        if times:
+            rejournal.run(store, thread_kind="my_call_side", since=min(times), until=max(times) + 0.001,
+                          dry_run=dry_run, portrait="skip", log_dir=log_dir)
+            ran = True
+    if ran and not dry_run:
+        rejournal.refresh_portrait(store, mode=portrait, log_dir=log_dir)
+
+
 __all__ = ["CallDigestWorker", "Utterance", "Piece", "prepare", "speech_seconds", "split_parts", "pack_requests",
-           "render_request", "parse_blocks", "earlier_text", "session_previous", "system_prompt", "stretches",
-           "said_to_yuki_spans", "voice_session_start", "yuki_spans_for",
-           "WRITE_TIMELINE_TOOL", "PART_CHARS", "SILENCE_MARK_S"]
+           "render_request", "parse_blocks", "parse_people", "merge_people", "last_calls", "earlier_text",
+           "session_previous", "system_prompt", "stretches", "said_to_yuki_spans", "voice_session_start",
+           "yuki_spans_for", "WRITE_TIMELINE_TOOL", "PART_CHARS", "SILENCE_MARK_S", "PEOPLE_HOW"]
 
 if __name__ == "__main__":
     raise SystemExit(main())

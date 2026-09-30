@@ -108,6 +108,8 @@ MAX_BATCH_CHARS = 12_000
 PREVIOUS_FACTS_CHARS = 2_000
 #: How much of a page's first capture is shown as TOP OF THIS PAGE with its later deltas.
 PAGE_TOP_CHARS = 600
+#: The context pack around a call (yuki.memory.callcontext) in a call batch, at most.
+CONTEXT_CHARS = 7_000
 MAX_OUTPUT_TOKENS = 4_096
 
 SYSTEM_PROMPT = """\
@@ -332,6 +334,27 @@ in the transcript: never assume what they said or who they are beyond what the u
 make plain."""
 
 
+#: Appended for a call's own side after the transcript guidance: the context pack around the call
+#: (:mod:`yuki.memory.callcontext`, 2026-10-01 "use what's around the call").
+CALL_CONTEXT_GUIDANCE = """\
+CONTEXT AROUND THE CALL. After the sources may come a CONTEXT AROUND THE CALL block: text Yuki read on \
+the user's screen during and just around the call - never audio - with local times: the call app's own \
+windows (voice channel, participants or tiles, the call's chat, captions), the other windows the user \
+had open or shared, links, chats just before and after, the threads of work touched then, and how \
+memory spells names. It is NEVER a fact source (those screens are journaled from their own captures): \
+every fact must be carried by what the user said in the utterance it cites; never record what was on \
+screen as such - a page or product viewed, a notification or mail that arrived, a setting, a number an \
+app showed. Use the context only to understand what the user said. Where it makes plain who or what the user's \
+words refer to at that time, write the fact with it - "In a Discord call with Rohan, the user said they \
+would send him the relay PR that was open on screen" instead of "said they would send him that" - and \
+name the call's people and place (server, channel, meeting) as the screen shows them, spelled as \
+memory spells them. When it does not settle who or what, keep the user's words as said: never guess. \
+The user's words stay the user's; what anyone else said aloud is never known, and what someone wrote \
+on screen (the call's chat, captions) may appear only as on-screen text ("Rohan had written 'push it' \
+in the call chat"). A commitment's text may name the person or thing resolved this way; its quote \
+stays the user's exact words."""
+
+
 #: A call's own side asks only about names the user said (:data:`RECORD_CALL_SIDE_TOOL` ``questions``).
 CALL_QUESTION_GUIDANCE = """\
 ASK ABOUT NAMES, NEVER GUESS. Never state a relationship, a meaning or an owner the user's words \
@@ -433,7 +456,7 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
     text = f"{text}\n\n{_work.WORK_GUIDANCE}"
     if requests and not call_side:
         text = f"{text}\n\n{REQUEST_GUIDANCE}"
-    return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}" if call_side else text
+    return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}\n\n{CALL_CONTEXT_GUIDANCE}" if call_side else text
 
 
 RECORD_FACTS_TOOL: dict[str, Any] = {
@@ -812,6 +835,7 @@ def build_user_message(
     page_top: tuple[float, str] | None = None,
     user_day: str | None = None,
     work: str = "",
+    context: str = "",
 ) -> str:
     """The fenced user message for one batch (MaxMi's ``ExtractPrompt`` shape).
 
@@ -918,6 +942,10 @@ def build_user_message(
             when = f"time not shown{shown}; on or after {when}"
         text = safe(m.text, max_capture_chars).replace("\n", "\n    ")
         parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}{no_input(src)}:\n    {text}")
+    if context:   # a call's surroundings on screen (yuki.memory.callcontext): after the sources, never one of them
+        parts += ["", "CONTEXT AROUND THE CALL (text on the user's screen during and just around it, never audio; "
+                      "NEVER a fact source - write no fact the user's own words do not carry; only to understand "
+                      "who and what their words refer to):", safe(context, CONTEXT_CHARS)]
     if work:   # after the sources: next to FACTS ALREADY RECORDED its lines were taken for recorded facts (29 Sept A/B)
         parts += ["", work]
     data = "\n".join(parts)
@@ -1050,6 +1078,8 @@ class JournalWorker:
         self._log_lock = threading.Lock()
         #: While a re-journal runs: its replaced batches had facts, so an empty answer writes nothing.
         self._guard_empty = False
+        #: A call's own side is read with what was around the call on screen (yuki.memory.callcontext).
+        self.call_context = True
 
     # -- dependencies ------------------------------------------------------
 
@@ -1302,14 +1332,15 @@ class JournalWorker:
         nonce_known = str(uuid.uuid4()).upper()
         said = " ".join(str((s.utterance or {}).get("text") or "") for s in sources)
         known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap), about=said)
-        offered = self.offered_threads(thread, said)
+        contexts, seen_windows = self._call_contexts(captures, parts)
+        offered = self.offered_threads(thread, said, seen_windows)
         work_text = _work.threads_block(offered, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()),
                                                                                    nonce_known, cap))
         work_ops: list[Any] = []
         work_rejected: list[str] = []
         t0 = time.perf_counter()
         try:
-            for part in parts:
+            for index, part in enumerate(parts):
                 earlier = [JournalEntry(id=0, at=f.at, thread_id=thread_id, app=thread.app, host=None, fact=f.fact,
                                         importance=f.importance, batch_id=None) for f in facts]
                 earlier += [JournalEntry(id=0, at=c.at, thread_id=None, app="", host=None,
@@ -1317,7 +1348,8 @@ class JournalWorker:
                             for c in commitments]
                 user = build_user_message(thread, part, earlier + previous, nonce_known,
                                           max_capture_chars=self.batch_chars, known=known,
-                                          user_day=user_day_line(self.store, [s.at for s in part]), work=work_text)
+                                          user_day=user_day_line(self.store, [s.at for s in part]), work=work_text,
+                                          context=contexts[index] if index < len(contexts) else "")
                 request = {"model": self.model, "max_tokens": MAX_OUTPUT_TOKENS, "system": system, "tools": [tool],
                            "tool_choice": {"type": "tool", "name": tool["name"]},
                            "messages": [{"role": "user", "content": user}]}
@@ -1371,6 +1403,7 @@ class JournalWorker:
                 parts=len(parts), usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
                 stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,
                 utterances=len(sources), unclear=sum(1 for s in sources if (s.utterance or {}).get("unclear")),
+                context_chars=[len(c) for c in contexts] or None,
                 commitments=len(commitment_ids), commitments_rejected=rejected, known_chars=len(known),
                 questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
                            for q, (qid, outcome) in zip(questions, question_outcomes)],
@@ -1497,12 +1530,54 @@ class JournalWorker:
 
     # -- threads of work (migration 23, yuki.memory.workthreads) -------------------
 
-    def offered_threads(self, thread: ThreadInfo, text: str) -> list[Any]:
-        """The threads of work this batch is shown (its window's, the closest, the latest); never raises."""
+    def offered_threads(self, thread: ThreadInfo, text: str, windows: Sequence[int] = ()) -> list[Any]:
+        """The threads of work this batch is shown (its window's, the closest, the latest); never raises.
+        ``windows``: more capture threads whose threads of work count as the batch's own (a call's: the windows
+        the user had open during it, most seen first)."""
         try:
-            return _work.candidates(self.store, self.embedder.embed, [thread.id], text)
+            return _work.candidates(self.store, self.embedder.embed, [thread.id, *windows], text)
         except Exception:
             return []
+
+    def _call_contexts(self, captures: Sequence[PendingCapture], parts: Sequence[Sequence[Source]]
+                       ) -> tuple[list[str], list[int]]:
+        """The context pack around the call (:mod:`yuki.memory.callcontext`) for each part of a call batch -
+        the joining screens and chats before only for the first part, the chats after only for the last - and
+        the windows seen during the call (their threads of work are offered). Never raises."""
+        if not self.call_context or not parts:
+            return [], []
+        from yuki.memory import callcontext
+
+        call_id = None
+        for cap in captures:
+            try:
+                data = json.loads(cap.delta or "{}")
+            except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("call_id") is not None:
+                call_id = int(data["call_id"])
+                break
+        if call_id is None:
+            return [], []
+        texts: list[str] = []
+        windows: list[int] = []
+        try:
+            rec = self.store.call_record(call_id)
+            for i, part in enumerate(parts):
+                times = [float(s.at) for s in part]
+                ends = [float((s.utterance or {}).get("end") or s.at) for s in part]
+                first, last = i == 0, i == len(parts) - 1
+                start, end = min(times), max(ends)
+                if rec is not None and first:
+                    start = min(start, rec.recording_started_at or rec.detected_at)
+                if rec is not None and last and rec.ended_at:
+                    end = max(end, rec.ended_at)
+                ctx = callcontext.for_call(self.store, call_id, start=start, end=end, before=first, after=last)
+                texts.append(ctx.text)
+                windows += [w for w in ctx.capture_thread_ids if w not in windows]
+        except Exception:
+            return texts, windows
+        return texts, windows[:6]
 
     def parse_work(self, response: Any, tool: str, offered: Sequence[Any], thread: ThreadInfo,
                    sources: Sequence[Source], fact_sources: Sequence[int]) -> tuple[list[Any], list[str]]:

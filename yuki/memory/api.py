@@ -1836,12 +1836,18 @@ class MemoryClient:
                 state = "nothing said"
             parts.append({"call_id": cid, "start": _iso(r.detected_at), "end": _iso(r.ended_at), "state": state})
         recorded = any(rows.get(c) is not None and rows[c].recording_started_at is not None for c in ids)
+        from yuki.memory.calldigest import merge_people
+
+        # who was on it and where, as the screen around the call showed (the digest's reading; migration 25)
+        contexts = [(digests.get(c) or {}).get("context") or {} for c in ids]
+        people = merge_people(*(c.get("people") or [] for c in contexts))
+        where = list(dict.fromkeys(c["where"] for c in contexts if c.get("where")))
         return {
             "ref": f"call:{ids[0]}", "call_ids": ids, "app": span["app"], "service": span.get("service"),
             "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
             "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
             "recorded": recorded, "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
-            "gists": gists, "rows": parts,
+            "gists": gists, "rows": parts, "people": people, "where": where,
         }
 
     def calls_in(self, since=None, until=None, limit: int = 30) -> list[dict]:
@@ -1855,8 +1861,10 @@ class MemoryClient:
 
         plus meetings the timeline measured (an app in front holding the microphone or camera) that no call
         row covers: ``{"ref": None, "app", "service", "start", "end", "seconds", "speech_s": 0, "recorded":
-        False, "transcript": False, "rows": [], ...}`` - hours only, no transcript. Nothing about anyone else
-        is ever stored. Content-free except the gists.
+        False, "transcript": False, "rows": [], ...}`` - hours only, no transcript. Nobody else's words are ever
+        stored; ``people`` (``[{"name", "how"}]``) and ``where`` (``[str]``) are who was on the call and where, as
+        the screen around it showed (the digest's reading, yuki.memory.callcontext). Content-free except the
+        gists, people and where.
         """
         from collections import Counter
 

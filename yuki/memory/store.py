@@ -2331,6 +2331,12 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE journal ADD COLUMN attention TEXT;
     ALTER TABLE links_seen ADD COLUMN attention TEXT;
     """,
+    # 25 (2026-10-01, "use what's around the call": the user's own half of a call is thin context): what the
+    # digest read from the screen around the call (yuki.memory.callcontext) - who was on it, as the call screen
+    # showed them, and where (the app, server/channel or meeting title) - as encrypted JSON. Additive only.
+    """
+    ALTER TABLE call_digests ADD COLUMN context_ciphertext TEXT;
+    """,
 )
 
 
@@ -5450,6 +5456,29 @@ class Store:
         return [{"at": r["at"], "app": _shown(r["app"], r["process"]), "host": r["host"], "kind": r["kind"],
                  "text": self.cipher.decrypt(r["delta_ciphertext"])} for r in reversed(rows)]
 
+    def captures_around(self, since: TimeArg, until: TimeArg, *, limit: int = 800) -> list[dict[str, Any]]:
+        """Every screen capture in ``[since, until)`` (any attention, Yuki's own too; never a call's words),
+        oldest first, at most ``limit`` (the earliest): ``{"id", "at", "trigger", "kind", "by_yuki", "thread_id",
+        "app", "process", "host", "title", "text"}``, decrypted. For the context pack of a call
+        (:mod:`yuki.memory.callcontext`)."""
+        s, u = _ts(since), _ts(until)
+        rows = self._query(
+            "SELECT c.id, c.at, c.trigger, c.kind, c.by_yuki, c.thread_id, c.delta_ciphertext, t.app, t.process,"
+            " t.host, t.title_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
+            " WHERE c.at >= ? AND c.at < ? AND coalesce(c.kind, '') != ? ORDER BY c.at, c.id LIMIT ?",
+            (s if s is not None else 0.0, u if u is not None else time.time() + 1.0, CALL_SIDE_KIND, int(limit)))
+        out = []
+        for r in rows:
+            try:
+                text = self.cipher.decrypt(r["delta_ciphertext"])
+            except Exception:
+                continue
+            out.append({"id": int(r["id"]), "at": float(r["at"]), "trigger": r["trigger"] or "", "kind": r["kind"],
+                        "by_yuki": bool(r["by_yuki"]), "thread_id": int(r["thread_id"]),
+                        "app": _shown(r["app"], r["process"]), "process": r["process"], "host": r["host"],
+                        "title": self._dec(r["title_ciphertext"]) or "", "text": text or ""})
+        return out
+
     # -- questions for the user (yuki.memory.questions) ----------------------------
 
     def _question_row(self, r: sqlite3.Row) -> QuestionRecord:
@@ -6292,10 +6321,11 @@ class Store:
         self, call_id: int, *, app: str, capture_ids: Sequence[int], status: str, gist: str | None,
         blocks: Sequence[dict[str, Any]], started_at: float | None, ended_at: float | None, speech_s: float,
         utterances: int, kept: int, model: str | None, usage: dict[str, int] | None = None, requests: int = 0,
-        cost_usd: float | None = None, latency_ms: float = 0.0,
+        cost_usd: float | None = None, latency_ms: float = 0.0, context: dict[str, Any] | None = None,
     ) -> None:
         """Store a call's digest (``status`` ok, or empty when the call held nothing worth a line), encrypted;
-        the cost is added to what earlier attempts cost."""
+        the cost is added to what earlier attempts cost. ``context``: who was on the call and where, as the
+        screen around it showed (:mod:`yuki.memory.callcontext`; migration 25)."""
         usage = usage or {}
         now = time.time()
         ids = json.dumps(sorted(int(i) for i in capture_ids))
@@ -6303,7 +6333,8 @@ class Store:
                   self._enc(gist) if gist else None, self.cipher.encrypt(json.dumps(list(blocks), ensure_ascii=False)),
                   model, int(requests), int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
                   int(usage.get("cache_write_tokens") or 0), int(usage.get("cache_read_tokens") or 0),
-                  float(cost_usd or 0.0), float(latency_ms or 0.0))
+                  float(cost_usd or 0.0), float(latency_ms or 0.0),
+                  self.cipher.encrypt(json.dumps(context, ensure_ascii=False)) if context else None)
 
         def op(conn: sqlite3.Connection) -> None:
             if conn.execute("SELECT 1 FROM call_digests WHERE call_id=?", (int(call_id),)).fetchone() is None:
@@ -6313,8 +6344,8 @@ class Store:
                 "UPDATE call_digests SET app=?, started_at=?, ended_at=?, speech_s=?, utterances=?, kept=?,"
                 " capture_ids=?, status=?, gist_ciphertext=?, blocks_ciphertext=?, model=?, requests=?,"
                 " input_tokens=?, output_tokens=?, cache_write_tokens=?, cache_read_tokens=?,"
-                " cost_usd=cost_usd+?, latency_ms=?, error=NULL, claimed_by=NULL, claimed_at=NULL, updated_at=?"
-                " WHERE call_id=?", (*values, now, int(call_id)))
+                " cost_usd=cost_usd+?, latency_ms=?, context_ciphertext=?, error=NULL, claimed_by=NULL,"
+                " claimed_at=NULL, updated_at=? WHERE call_id=?", (*values, now, int(call_id)))
             try:   # the digest's words changed: its vector (whole-memory ranking, migration 23) is made again
                 conn.execute("DELETE FROM call_digest_vec WHERE call_id=?", (int(call_id),))
             except sqlite3.OperationalError:
@@ -6350,7 +6381,13 @@ class Store:
                 captures = json.loads(r["capture_ids"] or "[]")
             except (ValueError, TypeError):
                 captures = []
+            try:   # migration 25: who was on the call and where, as the screen around it showed
+                context = json.loads(self._dec(r["context_ciphertext"]) or "{}") \
+                    if "context_ciphertext" in r.keys() else {}
+            except (ValueError, TypeError):
+                context = {}
             out[int(r["call_id"])] = {
+                "context": context if isinstance(context, dict) else {},
                 "call_id": int(r["call_id"]), "app": _shown(r["app"]), "status": r["status"],
                 "gist": self._dec(r["gist_ciphertext"]),
                 "blocks": blocks if isinstance(blocks, list) else [], "started_at": r["started_at"],

@@ -1639,6 +1639,25 @@ def _row_states(c: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+#: How the digest knew someone was on a call, in words (yuki.memory.calldigest.PEOPLE_HOW).
+_PEOPLE_HOW_TEXT = {"on_call_screen": "on the call screen", "call_chat": "wrote in the call's chat",
+                    "likely": "likely: chats around the call"}
+
+
+def call_people_text(c: dict[str, Any]) -> str:
+    """``Where: Discord, voice channel ... | With (from the screen around the call): Rohan (on the call screen),
+    ...``, or "" when the digest found neither."""
+    parts = []
+    where = [w for w in c.get("where") or [] if w]
+    if where:
+        parts.append("Where: " + "; ".join(where))
+    people = [p for p in c.get("people") or [] if p.get("name")]
+    if people:
+        parts.append("With (read from the screen around the call, never from their audio): " + ", ".join(
+            f"{p['name']} ({_PEOPLE_HOW_TEXT.get(p.get('how'), p.get('how') or '')})" for p in people))
+    return " | ".join(parts)
+
+
 def format_calls(calls: list[dict[str, Any]], *, since: datetime | None = None, until: datetime | None = None) -> str:
     """The ``calls`` tool's text: one entry per call or meeting (a session's rows merged), with its gist."""
     scope = " ".join(p for p in (f"since {_when(since)}" if since else "", f"before {_when(until)}" if until else "")
@@ -1652,6 +1671,9 @@ def format_calls(calls: list[dict[str, Any]], *, since: datetime | None = None, 
         gists = [g.get("gist") for g in c.get("gists") or [] if g.get("gist")]
         if gists:
             lines.append("  gist: " + " | ".join(gists))
+        seen = call_people_text(c)
+        if seen:
+            lines.append(f"  {seen}")
         states = _row_states(c)
         if states:
             lines.append(f"  {states}")
@@ -1669,6 +1691,9 @@ def format_call_timeline(t: dict[str, Any]) -> str:
     gists = [g.get("gist") for g in t.get("gists") or [] if g.get("gist")]
     if gists:
         out.append("Gist: " + " | ".join(gists))
+    seen = call_people_text(t)
+    if seen:
+        out.append(seen)
     groups = t.get("stretches")
     blocks = t.get("blocks") or []
     if groups is None:   # a result without stretches: each block is its own

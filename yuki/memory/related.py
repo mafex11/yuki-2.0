@@ -518,6 +518,9 @@ def item_for(client: Any, hit: dict[str, Any], *, now: float | None = None) -> d
         start = d.get("started_at") or c.detected_at
         end = d.get("ended_at") or c.ended_at or start
         text = (d.get("gist") or "") + (f" Topics: {'; '.join(topics)}." if topics else "")
+        people = [p["name"] for p in (d.get("context") or {}).get("people") or [] if p.get("name")]
+        if people:   # as the screen around the call showed (yuki.memory.callcontext)
+            text += f" With {', '.join(people)}."
         return {**base, "kind": "call", "at": _iso(start), "until": _iso(end), "call": f"call:{item_id}",
                 "text": f"{text} (open call:{item_id} with call_timeline for what was said when)",
                 "source": f"{d.get('app') or c.app} call {_day(start)}-{datetime.fromtimestamp(end):%H:%M}, "
