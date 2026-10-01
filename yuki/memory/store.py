@@ -194,6 +194,8 @@ Questions for the user (yuki.memory.questions; migration 13)::
     store.answer_question(id, "answered" | "skipped" | "never", words) -> correction id | 0 | None
     store.record_checkin(checkin, nudge, question=(id, "asked" | "dropped"))
     store.reopen_unshown_questions() / expire_questions(before)
+    store.drop_question(id, fact_id=None) -> bool   # memory answers it already (the vetting, questions.revet)
+    store.questions_near(vectors, statuses=("open", "asked"), limit=12) -> [(QuestionRecord, cosine)]
 
 The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
 
@@ -5646,6 +5648,33 @@ class Store:
             " AND nudge_id IN (SELECT id FROM nudges WHERE shown_at IS NULL AND reaction='expired')",
             (time.time(),),
         ).rowcount)
+
+    def drop_question(self, question_id: int, fact_id: int | None = None) -> bool:
+        """An open or asked question memory turned out to answer already (:func:`yuki.memory.questions.revet`):
+        ``dropped``, with the portrait fact that answers it in ``answer_fact_id`` when it is one. Returns whether
+        it changed."""
+        return bool(self._write(lambda conn: conn.execute(
+            "UPDATE questions SET status='dropped', answer_fact_id=coalesce(?, answer_fact_id), updated_at=?"
+            " WHERE id=? AND status IN ('open', 'asked')",
+            (int(fact_id) if fact_id is not None else None, time.time(), int(question_id)),
+        ).rowcount))
+
+    def questions_near(self, vectors: Sequence[np.ndarray], statuses: Sequence[str] = ("open", "asked"), *,
+                       limit: int = 12) -> list[tuple[QuestionRecord, float]]:
+        """Questions in ``statuses`` best first by their "subject: question" vector's highest cosine to any of
+        ``vectors`` (measured; questions without a vector are left out)."""
+        if not vectors or not statuses:
+            return []
+        rows = self._query(
+            "SELECT q.*, v.dim, v.vec_ciphertext FROM questions q JOIN question_vec v ON v.question_id = q.id"
+            " WHERE q.status IN (%s)" % ",".join("?" * len(statuses)), list(statuses))
+        best: dict[int, tuple[sqlite3.Row, float]] = {}
+        for vec in vectors:
+            for row, score in self._rank(rows, vec, len(rows)):
+                if row["id"] not in best or score > best[row["id"]][1]:
+                    best[row["id"]] = (row, score)
+        ranked = sorted(best.values(), key=lambda x: -x[1])[: max(0, int(limit))]
+        return [(self._question_row(r), s) for r, s in ranked]
 
     def expire_questions(self, before: float) -> int:
         """Open questions whose evidence is older than ``before`` are not asked any more (``expired``)."""

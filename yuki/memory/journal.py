@@ -81,6 +81,7 @@ from yuki.memory.questions import (
     known_text,
     question_from_item,
     question_item_schema,
+    vet_new,
 )
 from yuki.memory.store import (
     ConversationChange,
@@ -1182,7 +1183,8 @@ class JournalWorker:
         nonce = str(uuid.uuid4()).upper()
         about = " ".join([thread.title or "", thread.scope or "", *(c.delta or "" for c in captures)])
         known = "" if call_side else known_text(
-            self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce, cap), about=about)
+            self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce, cap), about=about,
+            embedder=self.embedder, thread_id=thread_id)
         absent = self.absent_captures(captures)
         offered = self.offered_threads(thread, about)
         work_text = _work.threads_block(offered, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()),
@@ -1227,6 +1229,9 @@ class JournalWorker:
             embed_error = self._embed_batch(facts, work_ops, offered)
             work_notes = _work.dedupe_starts(work_ops, self.store)
             work_ops = _work.live_ops(work_ops)
+            if questions:   # run past what memory already holds before they are stored (questions.vet_new)
+                questions = vet_new(self.store, questions, client=self.client, settings=self.settings,
+                                    embedder=self.embedder, log=self._log, where="journal", names=self.user_names())
             if questions:
                 embed_error = embed_questions(questions, self.embedder) or embed_error
             question_outcomes: list[tuple[int | None, str]] = []
@@ -1331,7 +1336,8 @@ class JournalWorker:
         cost: float | None = 0.0
         nonce_known = str(uuid.uuid4()).upper()
         said = " ".join(str((s.utterance or {}).get("text") or "") for s in sources)
-        known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap), about=said)
+        known = known_text(self.store, lambda v, cap: sanitize_untrusted(str(v or ""), nonce_known, cap), about=said,
+                           embedder=self.embedder)
         contexts, seen_windows = self._call_contexts(captures, parts)
         offered = self.offered_threads(thread, said, seen_windows)
         work_text = _work.threads_block(offered, lambda v, cap: sanitize_untrusted(" ".join(str(v or "").split()),
@@ -1385,6 +1391,9 @@ class JournalWorker:
             embed_error = self._embed_batch(facts, work_ops, offered)
             work_notes = _work.dedupe_starts(work_ops, self.store)
             work_ops = _work.live_ops(work_ops)
+            if questions:   # run past what memory already holds before they are stored (questions.vet_new)
+                questions = vet_new(self.store, questions, client=self.client, settings=self.settings,
+                                    embedder=self.embedder, log=self._log, where="call", names=self.user_names())
             if questions:
                 embed_error = embed_questions(questions, self.embedder) or embed_error
             if supersedes and not facts and self._guard_empty:

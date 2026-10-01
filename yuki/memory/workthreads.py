@@ -784,7 +784,7 @@ class Consolidator:
         """Ambiguous merges become questions for the user (asked on a card like every other question)."""
         if not asks:
             return 0
-        from yuki.memory.questions import embed_questions, question_from_item
+        from yuki.memory.questions import embed_questions, question_from_item, vet_new
 
         qs = []
         for a in asks:
@@ -797,6 +797,12 @@ class Consolidator:
                                    source_ids=sorted(self.store.journal_ids_of_work_threads(a["ids"]))[-6:])
             if q is not None:
                 qs.append(q)
+        worker = self.worker   # run past what memory already holds before they are stored (questions.vet_new)
+        names = worker.vet_names() if hasattr(worker, "vet_names") else ()
+        qs = vet_new(self.store, qs, client=worker.client, settings=getattr(worker, "settings", None),
+                     embedder=self.embedder, log=getattr(worker, "_log", None), where="threads", names=names)
+        if not qs:
+            return 0
         if self.embedder is not None:
             embed_questions(qs, self.embedder)
         try:
@@ -966,7 +972,7 @@ class Backfiller:
         from yuki.memory.questions import known_text
 
         about = " ".join(j.fact for _k, _t, es in chunk for j in es)
-        known = known_text(self.store, safe, about=about)   # the user's answers and the people memory knows
+        known = known_text(self.store, safe, about=about, embedder=self.embedder)   # what memory knows, ranked
         lines = ([known, ""] if known else []) + [threads_block(offered, safe, now), "", "JOURNAL, oldest first:"]
         for n, (_key, thread, entries) in enumerate(chunk, start=1):
             where = "(unknown window)"

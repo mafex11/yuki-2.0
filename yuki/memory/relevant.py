@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -319,3 +320,17 @@ def backfill_portrait_vectors(store: Any, embedder: Any, *, limit: int = 256) ->
                                                getattr(embedder, "model_name", None) or "")
     except Exception:
         return 0
+
+
+_SHARED_LOCK = threading.Lock()
+_SHARED: "weakref.WeakKeyDictionary[Any, RelevantIndex]" = weakref.WeakKeyDictionary()
+
+
+def shared_index(store: Any) -> RelevantIndex:
+    """The one :class:`RelevantIndex` of ``store`` in this process (the memory service's screen recall and the
+    question finders share it: one copy of the vectors in RAM). Thread-safe."""
+    with _SHARED_LOCK:
+        index = _SHARED.get(store)
+        if index is None:
+            index = _SHARED[store] = RelevantIndex(store)
+        return index

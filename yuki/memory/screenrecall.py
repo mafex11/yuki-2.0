@@ -70,7 +70,7 @@ class ScreenRecall:
         self._last_links = 0.0
         self._signature: str | None = None
         self._cache: dict[str, Any] | None = None
-        self.index = _rel.RelevantIndex(store)
+        self.index = _rel.shared_index(store)   # shared with the question finders (yuki.memory.questions)
         self.counters = {"captures": 0, "rankings": 0, "unchanged": 0, "errors": 0, "served": 0, "cpu_ms": 0.0,
                          "ms": 0.0, "links_syncs": 0}
 

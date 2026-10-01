@@ -80,6 +80,7 @@ from yuki.memory.questions import (
     known_text,
     question_from_item,
     question_item_schema,
+    vet_new,
 )
 from yuki.memory.store import (
     STANDING_KINDS,
@@ -1050,7 +1051,8 @@ class ConversationWorker:
             return sanitize_untrusted(value or "", nonce, cap)
 
         about = " ".join(f"{t.user_text or ''} {t.reply_text or ''}" for t in [*context, *turns])
-        known = known_text(self.store, lambda v, cap: safe(str(v or ""), cap), with_ids=True, about=about)
+        known = known_text(self.store, lambda v, cap: safe(str(v or ""), cap), with_ids=True, about=about,
+                           embedder=self.embedder)
         parts = [known, ""] if known else []
         lines = []
         for f in current:
@@ -1461,6 +1463,10 @@ class ConversationWorker:
                                                        "cache_read_tokens")}
                 return ExtractResult(None, session_id, turn_ids, True, records, [f.fact for f in facts], usage,
                                      call.cost_usd, call.latency_ms)
+            if questions:   # run past what memory already holds before they are stored (questions.vet_new)
+                questions = vet_new(self.store, questions, client=self.client, settings=self.settings,
+                                    embedder=self.embedder, log=self._log, where="conversation",
+                                    names=self.user_names())
             question_error = embed_questions(questions, self.embedder) if questions else None
             # embeddings: new item versions, journal facts, the turns themselves
             embed_texts = ([fact_embed_text(c) for c in changes if c.op in ("ADD", "UPDATE")]

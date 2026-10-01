@@ -117,7 +117,7 @@ from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
 from yuki.memory.titles import SUMMARY_FIELD as TITLES_SUMMARY_FIELD, fact_label
 from yuki.memory.personality import ASPECT_TITLES, ASPECTS, PERSONALITY_HEADING, nature_mark
-from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema
+from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema, vet_new
 from yuki.memory.store import (
     AUDIT_FLAG,
     CORRECTION_KIND,
@@ -1054,6 +1054,14 @@ class PortraitWorker:
             self._client = make_client(self.settings, log=self._log)
         return self._client
 
+    def vet_names(self) -> list[str]:
+        """The user's names for the question vetting: the configured ones plus the ones learned on screen."""
+        try:
+            learned = self.store.me_names()
+        except Exception:
+            learned = []
+        return list(dict.fromkeys([*self.settings.user_names, *learned]))
+
     def _log(self, type: str, **fields: Any) -> None:
         record = {"ts": time.time(), "type": type, **{k: _as_plain(v) for k, v in fields.items()}}
         path = self.log_dir / f"portrait-{datetime.now():%Y%m%d}.jsonl"
@@ -1547,7 +1555,16 @@ class PortraitWorker:
         try:
             from yuki.memory.embed import get_embedder
 
-            embed_error = embed_questions(questions, get_embedder())
+            embedder = self.embedder if self.embedder is not None else get_embedder()
+            # run past what memory already holds before they are stored (questions.vet_new)
+            vetted = {id(q) for q in vet_new(self.store, questions, client=self.client, settings=self.settings,
+                                             embedder=embedder, log=self._log, where="portrait",
+                                             names=self.vet_names())}
+            indexes = [i for q, i in zip(questions, indexes) if id(q) in vetted]
+            questions = [q for q in questions if id(q) in vetted]
+            if not questions:
+                return []
+            embed_error = embed_questions(questions, embedder)
             outcomes = self.store.add_questions(questions)
         except Exception as exc:
             self._log("portrait_questions_error", run_id=run_id, error=f"{type(exc).__name__}: {exc}")
@@ -2791,6 +2808,8 @@ class PortraitScheduler:
         #: use; earliest next pass.
         self._titler: Any = None
         self._titles_at = 0.0
+        #: The waiting questions' re-check against memory (questions.revet): earliest next pass.
+        self._revet_at = 0.0
 
     def _log(self, type: str, **fields: Any) -> None:
         if self._log_fn is not None:
@@ -3041,7 +3060,29 @@ class PortraitScheduler:
         embed = getattr(self.worker, "embed_facts", None)
         if embed is not None:
             embed()
+        if result.ok:
+            self._revet()
         return kind
+
+    def _revet(self) -> None:
+        """The waiting questions run past memory again (:func:`yuki.memory.questions.revet`: one Haiku call per ten
+        questions), after a run - it may have taught memory what one asks - at most every
+        :data:`yuki.memory.questions.REVET_EVERY_S`. Logs and never raises."""
+        from yuki.memory.questions import REVET_EVERY_S, revet
+
+        now = self.clock()
+        if now < self._revet_at:
+            return
+        self._revet_at = now + REVET_EVERY_S
+        worker = self.worker
+        try:
+            if not self.store.questions(("open", "asked"), limit=1) or not hasattr(worker, "vet_names"):
+                return
+            revet(self.store, client=worker.client, settings=worker.settings, embedder=worker.embedder,
+                  log=self._log, names=worker.vet_names())
+        except Exception as exc:
+            self._log("error", where="portrait_revet", error=f"{type(exc).__name__}: {exc}",
+                      traceback=traceback.format_exc())
 
     def _night(self, kind: str) -> None:
         """After the nightly (or weekly/first) run and its audit: dreaming tidies the portrait, the routines pass

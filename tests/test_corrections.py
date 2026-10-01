@@ -168,7 +168,8 @@ def test_aliases_reach_what_memory_already_knows(store):
     store.add_alias("Barun", "Varun", why="speech recognition misheard it")
     text = known_text(store, lambda v, cap: str(v)[:cap], about="waiting on Barun's approval")
     assert '"Barun" is Varun' in text
-    assert known_text(store, lambda v, cap: str(v)[:cap], about="nothing about them") == ""
+    # corrected names are part of the core profile: given whatever the model reads, no word matching
+    assert '"Barun" is Varun' in known_text(store, lambda v, cap: str(v)[:cap], about="nothing about them")
     assert MemoryClient(store).speech_names()[:1] == ["Varun"]
 
 
