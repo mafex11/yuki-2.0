@@ -25,6 +25,7 @@ database (its scheduler runs it within a minute), else in this process.
 Usage::
 
     python -m yuki.memory.rejournal --thread-kind my_call_side --since 2026-09-24 [--until 2026-09-26]
+    python -m yuki.memory.rejournal --batch 1087,1955
         [--db PATH] [--log-dir DIR] [--dry-run] [--portrait auto|now|flag|skip]
 
 ``--dry-run`` lists what would be re-journaled (and the facts it would replace) and
@@ -40,7 +41,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from yuki.memory.store import REFRESH_FLAG, PendingCapture, Store, flag_path
 
@@ -56,11 +57,16 @@ def _line(at: float, text: str, nature: str) -> str:
     return f"  {datetime.fromtimestamp(at):%m-%d %H:%M} [{nature}] {text}"
 
 
-def plan(store: Store, *, thread_kind: str | None, since: float | None, until: float | None
-         ) -> tuple[dict[int, list[tuple[PendingCapture, int]]], list[str]]:
-    """``({thread id: [(capture, its batch)]}, notes)``: the captures to journal again, whole batches only."""
-    selected = store.journaled_captures(thread_kind=thread_kind, since=since, until=until)
-    batches = {b for _, b in selected}
+def plan(store: Store, *, thread_kind: str | None, since: float | None, until: float | None,
+         batches: Sequence[int] = ()) -> tuple[dict[int, list[tuple[PendingCapture, int]]], list[str]]:
+    """``({thread id: [(capture, its batch)]}, notes)``: the captures to journal again, whole batches only.
+
+    ``batches``: the journal batches to read again (``--batch``), instead of a kind or time window.
+    """
+    if batches:
+        batches = {int(b) for b in batches}
+    else:
+        batches = {b for _, b in store.journaled_captures(thread_kind=thread_kind, since=since, until=until)}
     # every capture of those batches (a batch is replaced whole), and only batches whose captures all survive
     whole = store.journaled_captures(batch_ids=batches)
     found: dict[int, int] = defaultdict(int)
@@ -85,12 +91,12 @@ def plan(store: Store, *, thread_kind: str | None, since: float | None, until: f
 
 
 def run(store: Store, *, thread_kind: str | None, since: float | None, until: float | None,
-        dry_run: bool = False, portrait: str = "auto", log_dir: Path | None = None,
+        batches: Sequence[int] = (), dry_run: bool = False, portrait: str = "auto", log_dir: Path | None = None,
         client: Any = None, portrait_client: Any = None, out=print) -> dict[str, Any]:
     """Re-journal and report (``out`` gets the human-readable lines). Returns a content-free summary."""
     from yuki.memory.journal import EMPTY_REJOURNAL, JournalWorker
 
-    groups, notes = plan(store, thread_kind=thread_kind, since=since, until=until)
+    groups, notes = plan(store, thread_kind=thread_kind, since=since, until=until, batches=batches)
     for n in notes:
         out(f"note: {n}")
     summary: dict[str, Any] = {"threads": len(groups), "captures": sum(len(v) for v in groups.values()),
@@ -177,20 +183,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--thread-kind", default=None, help="threads.kind to re-journal (e.g. my_call_side)")
     parser.add_argument("--since", default=None, help="captures at or after this local date/time (ISO)")
     parser.add_argument("--until", default=None, help="captures before this local date/time (ISO)")
+    parser.add_argument("--batch", default="", help="journal batch ids to read again, comma-separated (e.g. 1087,1955)")
     parser.add_argument("--db", default=None, help="the memory database (default: the real one)")
     parser.add_argument("--log-dir", default=None, help="where the model calls are logged (default logs/memory)")
     parser.add_argument("--dry-run", action="store_true", help="list what would change; no model calls")
     parser.add_argument("--portrait", choices=("auto", "now", "flag", "skip"), default="auto",
                         help="auto: the refresh flag if the memory service is running, else a run here")
     args = parser.parse_args(argv)
-    if not (args.thread_kind or args.since):
-        parser.error("give --thread-kind and/or --since (re-journaling everything is never the default)")
+    batches = [int(b) for b in args.batch.replace(" ", "").split(",") if b]
+    if not (args.thread_kind or args.since or batches):
+        parser.error("give --batch, --thread-kind and/or --since (re-journaling everything is never the default)")
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
     with Store.open(args.db) as store:
         summary = run(store, thread_kind=args.thread_kind, since=_when(args.since), until=_when(args.until),
+                      batches=batches,
                       dry_run=args.dry_run, portrait=args.portrait,
                       log_dir=Path(args.log_dir) if args.log_dir else None)
     print({k: v for k, v in summary.items() if k != "portrait"})

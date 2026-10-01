@@ -243,9 +243,9 @@ it states; trait and story - personality facts, and a taste or preference they s
 a joke, bit, tease or boast: evidence only for personality facts (a running joke, how they talk, \
 how they are with people), always written as humour, never for a fact about their work, money, \
 people, plans or anything else it jokes about; uncertain - possibly misheard or ambiguous: never \
-evidence for any fact (at most, ask the user about it). An entry marked "other AI tool text" is \
-what the user typed into, or read from, another AI assistant (a prompt, a test, a role-play, the \
-AI's answer): never evidence of who the user is, what they do or what is happening in their life. A current fact marked as resting on \
+evidence for any fact (at most, ask the user about it). An entry marked "other AI tool or sample text" \
+is what the user typed into, or read from, another AI assistant (a prompt, a test, a role-play, the \
+AI's answer) or what a sample, demo or test page says: never evidence of who the user is, what they do or what is happening in their life. A current fact marked as resting on \
 re-journaled entries was built from entries since read again: judge it against their corrected \
 versions in JOURNAL - UPDATE it to what they support, or INVALIDATE it when they now show a joke \
 or something uncertain.
@@ -933,9 +933,9 @@ class _OneRender:
 
 def _nature_label(j: Any) -> str:
     """What a journal entry is, as the portrait's models read it: its nature, and whether it is text
-    for or from another AI tool (``journal.tainted``, never evidence about the user)."""
+    for or from another AI tool, or sample or demo content (``journal.tainted``, never evidence about the user)."""
     nature = getattr(j, "nature", "fact") or "fact"
-    return f"{nature}, other AI tool text" if getattr(j, "tainted", False) else nature
+    return f"{nature}, other AI tool or sample text" if getattr(j, "tainted", False) else nature
 
 
 def _loop_text(text: str, loop: Any) -> tuple[str | None, str | None]:
@@ -1429,7 +1429,7 @@ class PortraitWorker:
                 natures = sorted({journal_nature[i] for i in cited_known})
                 unfit = ("rests only on uncertain journal entries (possibly misheard or ambiguous)"
                          if natures == ["uncertain"] else
-                         "rests only on text for or from another AI tool, never evidence about the user"
+                         "rests only on text for or from another AI tool or sample content, never evidence about the user"
                          if natures == ["other_ai"] else
                          f"rests only on {'/'.join(natures)} entries, which cannot support a {new_kind} fact")
             else:

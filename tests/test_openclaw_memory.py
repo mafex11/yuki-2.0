@@ -101,9 +101,9 @@ def slack_capture(store: Store, text: str = "Varun: approved, go ahead with the 
     return tid
 
 
-def fact(text, source=1, other_ai=False, importance=5):
+def fact(text, source=1, other_ai=False, importance=5, user_said="no"):
     return {"text": text, "nature": "fact", "importance": importance, "source": source, "content_date": "",
-            "milestone": False, "other_ai": other_ai}
+            "milestone": False, "other_ai": other_ai, "user_said": user_said}
 
 
 # -- (3) provenance and (5) taint at write time ------------------------------------------------
@@ -126,6 +126,64 @@ def test_journal_stores_provenance_and_the_ai_tool_taint(store):
     from yuki.memory.personality import usable
 
     assert usable(rows[0]) and not usable(rows[1])      # the coach, episodes and the review leave it out
+
+
+def test_the_users_words_need_a_source_the_user_wrote(store):
+    """A local test page's "You:" line is never the user's words (2026-10-01, J1589); every capture names its page."""
+    url = "file:///C:/Users/x/AppData/Local/Temp/yuki-tts/agent/index.html"
+    tid = store.upsert_thread("Google Chrome", "Yuki voice samples", url, kind="page")
+    text = "You: dude I just got the offer from Google!\nYuki (as written): Oh my god, no way!"
+    store.add_capture(tid, T0, "focus", text, text, kind="page")
+    answer = {"facts": [fact("The user told Yuki they had just received a job offer from Google.",
+                             user_said="to_person_or_yuki"),
+                        fact("The user had a local test page 'Yuki voice samples' open in Chrome."),
+                        fact("The user asked ChatGPT for a Spanish script.", user_said="to_ai_tool")], "questions": []}
+    client = ToolClient({"record_facts": [answer]})
+    worker = JournalWorker(store, client=client, embedder=StubEmbedder(), log_dir=Path(tempfile.mkdtemp()))
+    [result] = worker.run_once()
+    assert result.ok and result.facts == ["The user had a local test page 'Yuki voice samples' open in Chrome.",
+                                          "The user asked ChatGPT for a Spanish script."]   # an AI tool's prompt stays
+    sent = client.requests[0]["messages"][0]["content"]
+    assert 'CAPTURE' in sent and f'from page "Yuki voice samples" at {url} (a file on this PC, not a website)' in sent
+    assert "user_said" in record_facts_tool()["input_schema"]["properties"]["facts"]["items"]["required"]
+    # the same flag on the user's own message is kept: the source's author is the user
+    mine = SimpleNamespace(at=T0, utterance=None, command=None, item=None, capture=SimpleNamespace(by_yuki=False),
+                           message=SimpleNamespace(is_me=True, sender="Kian", text="I got the offer!",
+                                                   status="new"))
+    said = {"facts": [fact("The user told Varun they got the offer.", user_said="to_person_or_yuki")]}
+    reply = SimpleNamespace(stop_reason="tool_use",
+                            content=[SimpleNamespace(type="tool_use", name="record_facts", input=said)])
+    dropped: list[int] = []
+    kept = worker._parse_facts(reply, store.thread_info(tid), [mine], not_users_words=dropped)
+    assert [f.fact for f in kept] == ["The user told Varun they got the offer."] and dropped == []
+
+
+def test_a_question_whose_evidence_was_rejournaled_is_vetted_on_the_new_reading(store):
+    """Q28 (2026-10-01): its evidence, a misread iCloud Drive listing, was re-journaled; the vetter must see that."""
+    from yuki.memory import questions as Q
+    from yuki.memory.store import NewQuestion
+
+    tid = store.upsert_thread("Google Chrome", "iCloud Drive", "https://www.icloud.com/iclouddrive/", kind="page")
+    row = "Offer Letter - Kian PDF document 199 KB 30/09/2026, 19:00"
+    store.add_capture(tid, T0, "title", row, row, kind="page")
+    first = {"facts": [fact("The user received an offer letter from Corvana.", importance=9)], "questions": []}
+    JournalWorker(store, client=ToolClient({"record_facts": [first]}), embedder=StubEmbedder(),
+                  log_dir=Path(tempfile.mkdtemp())).run_once()
+    [old] = store.journal_between()
+    [(qid, _)] = store.add_questions([NewQuestion(
+        at=T0, kind="fact", subject="offer letter", question="Has the user accepted the offer letter?",
+        evidence="iCloud Drive", reason="", importance=8, origin="journal", source_ids=[old.id])])
+    safe = lambda v, cap: str(v)[:cap]   # noqa: E731
+    assert Q.reread_items(store, store.question(qid), safe) is None      # its evidence still stands
+    again = {"facts": [fact("iCloud Drive listed a PDF named 'Offer Letter - Kian'.", importance=4)],
+             "questions": []}
+    caps = [c for c, _ in store.journaled_captures(batch_ids={old.batch_id})]
+    JournalWorker(store, client=ToolClient({"record_facts": [again]}), embedder=StubEmbedder(),
+                  log_dir=Path(tempfile.mkdtemp())).rejournal(tid, caps, [old.batch_id])
+    replaced, of, items = Q.reread_items(store, store.question(qid), safe)
+    assert (replaced, of) == (1, 1) and "listed a PDF named 'Offer Letter - Kian'" in items[0].line
+    text, shown = Q.vet_message(store, [store.question(qid)], [None], "N")
+    assert "ITS EVIDENCE WAS READ AGAIN" in text and items[0].ref in shown
 
 
 def test_call_facts_carry_the_users_words_and_describe_says_so(store):

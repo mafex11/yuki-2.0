@@ -65,6 +65,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 from yuki.config import Settings
 from yuki.log.events import _as_plain
@@ -142,7 +143,10 @@ moment (a delta against what the window showed before). A capture is dated by wh
 screen, but what it shows can be much older: a video's upload date, a post's, comment's or \
 article's date, an email's date ("738 views 1 year ago", "Jun 12, 2025"). TOP OF THIS PAGE, when \
 given, is how the page began when it was first read - its title, author, account and date - as \
-context for dating and naming what the captures show; it is never a source itself.
+context for dating and naming what the captures show; it is never a source itself. Each capture \
+names the page it was read from - its title and its address - and an address starting file:// is a \
+file on this PC opened in the browser (a local HTML page, a report, a test page), not a website. Read \
+what the page is from its title, address and content before you read anything on it as an event.
 - LIST ITEMS: one row each of a list that was on screen - an inbox, a folder, a playlist, \
 search results - dated by the row's own date when it shows one (an email's date, a file's \
 modified time), else by when the list was seen. A list is what was VISIBLE, not what the user \
@@ -150,6 +154,16 @@ did: an email in an inbox was received on its own date, a file in a folder was s
 changed on its date. Never write that the user read, opened, watched, downloaded or chose an \
 item because it was listed - only what the row itself says. A fact from a row cites that row, \
 so it is stored with the row's date, never the day the list was looked at.
+  FILE LISTINGS - a folder, a cloud drive, a downloads list or recent files, as LIST ITEMS or as a \
+listing inside a page capture: each row is evidence that a file with that name, type, size and date \
+is stored there, nothing more. One row, one file: never merge two rows into one file or one event, \
+never carry one row's words into another (a file's name says nothing about the file next to it). The \
+listed date is the file's own date (added or modified), never the date something happened to the \
+user: a listing never shows that the user received, sent, signed, accepted, applied for or was offered \
+anything. Write it as the file: "iCloud Drive listed a PDF named 'Offer Letter - Kian', dated \
+2026-09-30 19:00." Keep a listing short: only the files that tell something about the user's work or \
+life, one fact per file or per group the rows themselves show (one folder, one day), importance 3-5 \
+whatever a file's name says (a name is not news).
 - COMMANDS the user ran in their terminal (Warp), one source per command in the order \
 they ran: the command line, the folder it ran in, the git branch, the exit code (0 = it \
 succeeded, anything else = it failed; "not recorded" = unknown) and when it started. A \
@@ -379,7 +393,31 @@ from the content: a prompt box and its reply, a conversation with an assistant, 
 composing for an AI. Record what the user did ("The user asked ChatGPT to draft a Spanish tutorial \
 script for a Gamma workspace video") as usual, with other_ai false; mark other_ai true on any fact \
 whose content comes from such a prompt or answer (what the prompt claims about a person, a plan, a \
-job, a place), so it is never taken as a fact about the user. Everything else is other_ai false."""
+job, a place), so it is never taken as a fact about the user. Everything else is other_ai false.
+
+SAMPLE, DEMO AND TEST CONTENT is the same: a page can be made-up content rather than the user's life - a \
+demo, a sample script or dialogue, a test transcript, example, mock or placeholder data, samples Yuki or a \
+coding agent generated to try something out. Judge it from the page's title, address and content. A page \
+about the user's own work - a design mockup, a plan, a report, a comparison - is their work: record what \
+it shows as usual; only the made-up lines inside it are not events. Nothing made up is an event in the \
+user's life: never record its lines as what the user or anyone did, said, received or felt. At most record ONE fact for the page, saying what it is - "The user had a local \
+test page 'Yuki voice samples' open in Chrome, showing scripted sample dialogue for Yuki's voice." \
+(other_ai false: that is what the user had open) - without retelling or quoting its lines, and mark \
+other_ai true on any other fact that reports what such content says.
+
+WHOSE WORDS. A fact that the user said, told, wrote to, replied to or asked a person or Yuki something \
+rests only on words the user authored: a THE USER SAID utterance, a MESSAGE from the user, a COMMAND \
+they ran, or the request of a BY YUKI source. Give such a fact user_said "to_person_or_yuki" and cite \
+that source. What the user says to Yuki never comes from a page (it reaches memory by another path): a \
+page showing a dialogue with Yuki is a script or a sample. Text on a page or in a list is what the page \
+shows, never the user's words, even when it is labelled "You", "Me" or with the user's name: a script, a \
+transcript, a chat log, a sample dialogue or a quote on a page is content on screen, written by whoever \
+made the page. Write it as what the page shows, never as "the user said" or "the user told Yuki": a fact \
+with user_said "to_person_or_yuki" that cites a page, a list or someone else's message is thrown away. \
+The one exception is the user's own prompt in another AI tool or coding agent (ChatGPT, T3 Code, Claude \
+Code), shown in that tool's chat as the user's turn: record what the user asked the tool for as usual \
+(see TEXT FOR OR FROM ANOTHER AI TOOL and WHO DID IT), with user_said "to_ai_tool". Everything else is \
+user_said "no"."""
 
 #: The journal's model also checks each batch against the user's open standing requests (migration 17).
 REQUEST_GUIDANCE = """\
@@ -460,6 +498,11 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
     return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}\n\n{CALL_CONTEXT_GUIDANCE}" if call_side else text
 
 
+#: ``record_facts`` ``user_said``: whose words a fact gives as the user's (WHOSE WORDS). Words to a person or
+#: Yuki need a source the user authored (``JournalWorker._parse_facts``); a prompt in another AI tool's own chat
+#: is the user's action with that tool, judged by the model as before (TEXT FOR OR FROM ANOTHER AI TOOL).
+USER_SAID = ("no", "to_person_or_yuki", "to_ai_tool")
+
 RECORD_FACTS_TOOL: dict[str, Any] = {
     "name": "record_facts",
     "description": (
@@ -478,7 +521,7 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["text", "nature", "importance", "source", "content_date", "milestone",
-                                 "other_ai"],
+                                 "other_ai", "user_said"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -528,8 +571,21 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                             "type": "boolean",
                             "description": (
                                 "True when the fact's content comes from text the user typed into, or read from, "
-                                "another AI tool (a prompt or the AI's answer), so it says nothing true about the "
-                                "user (see TEXT FOR OR FROM ANOTHER AI TOOL). What the user did with the tool is false."
+                                "another AI tool (a prompt or the AI's answer), or from sample, demo or test content, "
+                                "so it says nothing true about the user (see TEXT FOR OR FROM ANOTHER AI TOOL and "
+                                "SAMPLE, DEMO AND TEST CONTENT). What the user did with the tool or page is false."
+                            ),
+                        },
+                        "user_said": {
+                            "type": "string",
+                            "enum": list(USER_SAID),
+                            "description": (
+                                "Whose words the fact gives as the user's (see WHOSE WORDS): \"to_person_or_yuki\" - "
+                                "the user said, told, wrote to, replied to or asked a person or Yuki something, which "
+                                "only a THE USER SAID utterance, a MESSAGE from the user, a COMMAND they ran or a BY "
+                                "YUKI request carries (text on a page or in a list never does, even labelled \"You\"); "
+                                "\"to_ai_tool\" - a prompt the user typed into another AI tool or coding agent, shown "
+                                "in that tool's own chat; \"no\" - anything else."
                             ),
                         },
                     },
@@ -570,7 +626,8 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                     "required": ["text", "nature", "importance", "source"],
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
-                           ["properties"].items() if k not in ("content_date", "milestone", "other_ai")},
+                           ["properties"].items() if k not in ("content_date", "milestone", "other_ai",
+                                                               "user_said")},
                         # dated by themselves; the user's own voice is never another AI tool's text
                         "nature": {
                             "type": "string",
@@ -818,6 +875,21 @@ def build_sources(
     return out
 
 
+def page_label(thread: ThreadInfo, safe: Any) -> str:
+    """`` from page "<title>" at <address>`` for each CAPTURE line, so every page source carries what the
+    page is (2026-10-01: a local "Yuki voice samples" test page's "You:" lines were journaled as the
+    user's words). An address with the ``file`` scheme is marked as a file on this PC (URL scheme only)."""
+    title = " ".join(str(thread.title or "").split())
+    url = str(thread.url or "").strip()
+    if not (title or url):
+        return ""
+    if not url:
+        return f' from "{safe(title, 200)}"'
+    local = urlsplit(url).scheme.lower() == "file"
+    return ((f' from page "{safe(title, 200)}"' if title else " from a page") + f" at {safe(url, 300)}"
+            + (" (a file on this PC, not a website)" if local else ""))
+
+
 def _sender(m: StoredMessage) -> str:
     if m.is_me:
         return f"the user (shown as {m.sender})" if m.sender else "the user"
@@ -933,7 +1005,8 @@ def build_user_message(
         m = src.message
         if m is None:
             cap = src.capture
-            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}{by_yuki(src)}{no_input(src)}")
+            parts.append(f"[{number}] CAPTURE {_local(cap.at)} trigger={safe(cap.trigger, 40)}"
+                         f"{page_label(thread, safe)}{by_yuki(src)}{no_input(src)}")
             parts.append(safe(cap.delta, max_capture_chars))
             continue
         mark = "NEW" if m.status == "new" else "HISTORY"
@@ -1220,7 +1293,9 @@ class JournalWorker:
             call.cost_usd = self.settings.estimate_cost(self.model, tokens)
             call.stop_reason = response.stop_reason
             fact_sources: list[int] = []
-            facts = self._parse_facts(response, thread, sources, tool=tool["name"], indexes=fact_sources)
+            not_users_words: list[int] = []
+            facts = self._parse_facts(response, thread, sources, tool=tool["name"], indexes=fact_sources,
+                                      not_users_words=not_users_words)
             commitments, rejected = (self._parse_commitments(response, thread, sources, tool["name"])
                                      if call_side else ([], []))
             questions = ([] if call_side else
@@ -1235,7 +1310,9 @@ class JournalWorker:
             if questions:
                 embed_error = embed_questions(questions, self.embedder) or embed_error
             question_outcomes: list[tuple[int | None, str]] = []
-            if supersedes and not facts and self._guard_empty:
+            # an empty answer is kept from replacing earlier facts, unless facts were dropped for citing
+            # words the user never authored: that empty batch is a verdict, not a flaky reading
+            if supersedes and not facts and not not_users_words and self._guard_empty:
                 return self._empty_rejournal(thread_id, capture_ids, tokens, call)
             if call_side:
                 batch_id, commitment_ids = self.store.commit_call_batch(call, capture_ids, facts, commitments,
@@ -1247,7 +1324,8 @@ class JournalWorker:
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
-                tainted=sum(1 for f in facts if f.tainted), open_requests=len(open_requests), requests_fired=fired,
+                tainted=sum(1 for f in facts if f.tainted), not_users_words=not_users_words or None,
+                open_requests=len(open_requests), requests_fired=fired,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
                 sources=len(sources), commands=sum(1 for x in sources if x.command is not None),
                 messages_new=sum(1 for x in sources if x.message and x.message.status == "new"),
@@ -1772,7 +1850,8 @@ class JournalWorker:
         return out
 
     def _parse_facts(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
-                     tool: str = "record_facts", indexes: list[int] | None = None) -> list[NewFact]:
+                     tool: str = "record_facts", indexes: list[int] | None = None,
+                     not_users_words: list[int] | None = None) -> list[NewFact]:
         """Facts from the ``record_facts`` tool_use block (structured, schema-checked).
 
         Each fact is dated by the source it cites: a message's own time, a
@@ -1780,6 +1859,13 @@ class JournalWorker:
         Each carries the nature the model gave it (yuki.memory.personality): an
         item without one is a fact; an older ``uncertain: true`` flag (the call
         tool before natures) reads as nature ``uncertain``.
+
+        WHOSE WORDS (structural): a fact marked ``user_said`` (the user said, told, wrote or asked
+        something) is kept only when its cited source's author is the user by the source's own
+        metadata (:func:`yuki.memory.provenance.source_of`: a call utterance, a message marked the
+        user's, a command the user ran, or a BY YUKI capture, which carries the user's own request);
+        one citing a page, a list row or someone else's message is dropped, and its source number
+        goes to ``not_users_words``.
         """
         block = self._tool_block(response, tool)
         items = (block.input or {}).get("facts")
@@ -1803,6 +1889,12 @@ class JournalWorker:
                 index = len(sources) - 1
             if not 0 <= index < len(sources):
                 index = len(sources) - 1
+            source = source_of(sources[index], thread, sources, index)
+            to_people = item.get("user_said") in (True, USER_SAID[1])   # True: a boolean answer
+            if to_people and source.get("by") != "the user" and not source.get("by_yuki"):
+                if not_users_words is not None:
+                    not_users_words.append(index + 1)
+                continue
             facts.append(
                 NewFact(at=content_date(item.get("content_date"), sources[index].at) or sources[index].at,
                         thread_id=thread.id, app=thread.app, host=thread.host,
@@ -1810,7 +1902,7 @@ class JournalWorker:
                         by_yuki=bool(getattr(sources[index].capture, "by_yuki", False)), nature=nature,
                         attention=capture_attention(getattr(sources[index].capture, "trigger", None)),
                         milestone=item.get("milestone") is True,
-                        source=source_of(sources[index], thread, sources, index),
+                        source=source,
                         tainted=item.get("other_ai") is True)
             )
             if indexes is not None:
