@@ -1217,7 +1217,8 @@ class JournalWorker:
 
     # -- one batch ---------------------------------------------------------
 
-    def rejournal(self, thread_id: int, captures: list[PendingCapture], supersedes: Sequence[int]) -> BatchResult:
+    def rejournal(self, thread_id: int, captures: list[PendingCapture], supersedes: Sequence[int], *,
+                  accept_empty: bool = False) -> BatchResult:
         """Journal already-journaled captures again with the current prompts (:mod:`yuki.memory.rejournal`).
 
         The facts the batches in ``supersedes`` wrote from these captures are not shown to the
@@ -1226,9 +1227,11 @@ class JournalWorker:
         ones this run finds are not written again. A run that finds no facts at all where the
         replaced batches had some writes nothing (``ok`` False, error ``EMPTY_REJOURNAL``): the
         earlier facts stay until a run that reads the captures again finds something.
+        ``accept_empty``: an empty reading is the answer (the operator named these batches, e.g. a demo page whose
+        earlier facts were never the user's): it writes an empty batch that supersedes the earlier facts.
         """
         replaced = [int(b) for b in supersedes]
-        self._guard_empty = bool(replaced) and bool(self.store.journal_of_batches(replaced))
+        self._guard_empty = (not accept_empty) and bool(replaced) and bool(self.store.journal_of_batches(replaced))
         try:
             return self._journal_batch(thread_id, captures, supersedes=replaced)
         finally:

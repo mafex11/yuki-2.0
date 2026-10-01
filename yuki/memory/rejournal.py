@@ -92,7 +92,7 @@ def plan(store: Store, *, thread_kind: str | None, since: float | None, until: f
 
 def run(store: Store, *, thread_kind: str | None, since: float | None, until: float | None,
         batches: Sequence[int] = (), dry_run: bool = False, portrait: str = "auto", log_dir: Path | None = None,
-        client: Any = None, portrait_client: Any = None, out=print) -> dict[str, Any]:
+        client: Any = None, portrait_client: Any = None, out=print, accept_empty: bool = False) -> dict[str, Any]:
     """Re-journal and report (``out`` gets the human-readable lines). Returns a content-free summary."""
     from yuki.memory.journal import EMPTY_REJOURNAL, JournalWorker
 
@@ -124,7 +124,7 @@ def run(store: Store, *, thread_kind: str | None, since: float | None, until: fl
         batch_of = {c.id: b for c, b in items}
         out(" AFTER:")
         for _tid, caps in worker._batches(captures):
-            result = worker.rejournal(thread_id, caps, sorted({batch_of[c.id] for c in caps}))
+            result = worker.rejournal(thread_id, caps, sorted({batch_of[c.id] for c in caps}), accept_empty=accept_empty)
             summary["cost_usd"] += result.cost_usd or 0.0
             if result.error == EMPTY_REJOURNAL:   # one more reading before keeping the earlier facts
                 out("  (no facts on this reading; reading it once more)")
@@ -187,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", default=None, help="the memory database (default: the real one)")
     parser.add_argument("--log-dir", default=None, help="where the model calls are logged (default logs/memory)")
     parser.add_argument("--dry-run", action="store_true", help="list what would change; no model calls")
+    parser.add_argument("--accept-empty", action="store_true",
+                        help="with --batch: a reading that finds no facts replaces the earlier facts (a page that was never about the user)")
     parser.add_argument("--portrait", choices=("auto", "now", "flag", "skip"), default="auto",
                         help="auto: the refresh flag if the memory service is running, else a run here")
     args = parser.parse_args(argv)
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     with Store.open(args.db) as store:
         summary = run(store, thread_kind=args.thread_kind, since=_when(args.since), until=_when(args.until),
                       batches=batches,
-                      dry_run=args.dry_run, portrait=args.portrait,
+                      dry_run=args.dry_run, portrait=args.portrait, accept_empty=bool(args.accept_empty and batches),
                       log_dir=Path(args.log_dir) if args.log_dir else None)
     print({k: v for k, v in summary.items() if k != "portrait"})
     return 1 if summary["failed"] else 0
