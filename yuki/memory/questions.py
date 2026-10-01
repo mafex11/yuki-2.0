@@ -613,8 +613,9 @@ def build_ask_message(store: Store, q: Any, rules: str, now: float, nonce: str) 
 # Vetting: every question is run past what memory already holds before it is stored or asked
 # ---------------------------------------------------------------------------
 
-#: The model that vets (the journal's Haiku; one call per batch of questions, never one per question).
-VET_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+#: The model that vets: Sonnet 5, one call per batch of questions (Haiku flipped keep/drop on the same question
+#: between runs on the real DB, 1 Oct: Q28 dropped 3/3 on a copy, kept on the real run). A few calls a day.
+VET_MODEL = "global.anthropic.claude-sonnet-5"
 #: Questions per vetting call (ten in one call diluted the judgement: measured on the 1 Oct copy).
 VET_BATCH = 5
 #: Memory items shown with each question (the closest by meaning; beside the core profile), and their floor.
@@ -818,7 +819,8 @@ def vet(store: Store, items: Sequence[Any], *, client: Any, settings: Any = None
             user, shown = vet_message(store, chunk, vectors[start:start + VET_BATCH], nonce, now=now)
             t0 = time.perf_counter()
             response = client.messages.create(
-                model=model, max_tokens=VET_MAX_TOKENS, system=system, tools=[VET_TOOL],
+                model=model, max_tokens=VET_MAX_TOKENS, system=system,
+                tools=[{k: v for k, v in VET_TOOL.items() if k != "strict"}],   # Sonnet 5 on Bedrock refuses "strict"
                 tool_choice={"type": "tool", "name": VET_TOOL["name"]},
                 messages=[{"role": "user", "content": user}])
             meta["latency_ms"] += (time.perf_counter() - t0) * 1000
