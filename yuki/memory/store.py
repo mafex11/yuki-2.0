@@ -180,6 +180,7 @@ The coach (yuki.memory.nudges; yuki.memory.api.MemoryClient.todos / pending_nudg
     store.record_checkin(checkin: NudgeCheckin, nudge: NewNudge | None) -> (checkin_id, nudge_id | None)
     store.nudges(since=None, until=None, *, kinds=None, pending=False, limit=None) -> list[NudgeRecord]
     store.nudge(id);  store.react_to_nudge(id, reaction);  store.expire_nudges(before, kinds) -> int
+    store.set_nudge_outcome(id, outcome, only_if=None) -> bool    # what came of a typed offer (migration 26)
     store.reminded(ref, due_at) -> bool;  store.nudge_checkins(since=None, limit=None) -> list[dict]
     store.nudge_state(name) / set_nudge_state(name, value | None)
     store.captures_between(since, until=None, *, limit=4) -> [{"at", "app", "host", "kind", "text"}]   # not by_yuki
@@ -211,7 +212,8 @@ The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
 
 Calls, just the user's side (yuki.memory.calls; MemoryClient.call_status / answer_call / stop_call)::
 
-    store.start_call(app=, process=, via=, service=None, at=None, status="asking", consent=None, ...) -> int
+    store.start_call(app=, process=, via=, service=None, at=None, status="asking", consent=None, ...,
+                     hold_since=None) -> int;  store.call_max_seq(id) -> int
     store.update_call(id, **plumbing columns);  store.call_record(id);  store.calls(statuses=, since=, limit=)
     store.answer_call(id, "yes"|"no"|"always"|"never"|"none", by="card") -> bool   # always/never kept per app
     store.request_call_stop(id=None) -> int | None
@@ -1092,6 +1094,16 @@ class NudgeRecord:
     reacted_at: float | None
     #: What the user wrote back when they replied to the card (their words), if known.
     reply: str | None = None
+    #: What came of the card's typed offer after the click (migration 26, :data:`NUDGE_OUTCOMES`), and when.
+    outcome: str | None = None
+    outcome_at: float | None = None
+
+
+#: ``nudges.outcome``: what came of a card's typed offer (yuki.memory.offers) - ``done`` (it ran), ``undone`` (the
+#: user pressed Undo), ``prefilled`` (an ``ask`` suggestion went into the ask bar), ``stopped`` (the request sent
+#: from it was stopped within a minute), ``abandoned`` (the ask bar closed without sending it), ``expired`` (a click
+#: after the offer's time ran out: nothing ran).
+NUDGE_OUTCOMES: tuple[str, ...] = ("done", "undone", "prefilled", "stopped", "abandoned", "expired")
 
 
 @dataclass
@@ -1199,7 +1211,7 @@ _CALL_COLUMNS: frozenset[str] = frozenset({
     "status", "consent", "consent_by", "consent_at", "output_form_factor", "output_device", "headphones",
     "recording_started_at", "recording_stopped_at", "stop_requested", "stop_reason", "ended_at", "thread_id",
     "chunks", "chunks_silent", "speech_s", "audio_s", "utterances", "transcribe_ms", "stt_model", "stt_device",
-    "captures", "via",
+    "captures", "via", "hold_since", "last_alive_at",
 })
 
 
@@ -1236,6 +1248,11 @@ class CallRecord:
     stt_device: str | None
     captures: int
     updated_at: float
+    #: The start of the microphone hold the call is in (the ConsentStore record's ``since``; moved on a re-grab of
+    #: the same call), migration 26; None for older rows.
+    hold_since: float | None = None
+    #: The last moment the call worker saw the call alive (at most 15 s stale while it runs), migration 26.
+    last_alive_at: float | None = None
 
 
 #: ``questions.kind``: what memory does not know - who a person is to the user,
@@ -2338,6 +2355,19 @@ MIGRATIONS: tuple[str, ...] = (
     # showed them, and where (the app, server/channel or meeting title) - as encrypted JSON. Additive only.
     """
     ALTER TABLE call_digests ADD COLUMN context_ciphertext TEXT;
+    """,
+    # 26 (2026-10-03, one call = one session, docs/research/revamp-2026-10-02/05-call-pill-timer.md §7; typed
+    # offers, 06-proactive-do-it.md §4.5): the microphone hold a call row is in (calls.hold_since: the ConsentStore
+    # record's start, moved on a re-grab of the same call) and the last moment the call worker saw it alive
+    # (calls.last_alive_at, written at most every 15 s), so a restarted service adopts a call whose hold goes on and
+    # ends one that did not at its last alive moment, never at the restart; and what came of a card's typed offer
+    # (nudges.outcome: done | undone | prefilled | stopped | abandoned | expired, nudges.outcome_at), read by the
+    # per-(channel, offer) learning (yuki.memory.offers). Additive only.
+    """
+    ALTER TABLE calls ADD COLUMN hold_since REAL;
+    ALTER TABLE calls ADD COLUMN last_alive_at REAL;
+    ALTER TABLE nudges ADD COLUMN outcome TEXT;
+    ALTER TABLE nudges ADD COLUMN outcome_at REAL;
     """,
 )
 
@@ -5148,7 +5178,26 @@ class Store:
             ref=r["ref"], due_at=r["due_at"], checkin_id=r["checkin_id"], shown_at=r["shown_at"],
             reaction=r["reaction"], reacted_at=r["reacted_at"],
             reply=self._dec(r["reply_ciphertext"]) if "reply_ciphertext" in r.keys() else None,
+            outcome=r["outcome"] if "outcome" in r.keys() else None,
+            outcome_at=r["outcome_at"] if "outcome_at" in r.keys() else None,
         )
+
+    def set_nudge_outcome(self, nudge_id: int, outcome: str, *, at: float | None = None,
+                          only_if: Sequence[str | None] | None = None) -> bool:
+        """Record what came of a card's typed offer (:data:`NUDGE_OUTCOMES`); False when the card is unknown, or
+        its outcome is not one of ``only_if`` (``None`` in it: no outcome yet) - a second click changes nothing."""
+        if outcome not in NUDGE_OUTCOMES:
+            raise ValueError(f"outcome must be one of {NUDGE_OUTCOMES}, not {outcome!r}")
+        now = float(at) if at is not None else time.time()
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT outcome FROM nudges WHERE id=?", (int(nudge_id),)).fetchone()
+            if row is None or (only_if is not None and row["outcome"] not in tuple(only_if)):
+                return False
+            conn.execute("UPDATE nudges SET outcome=?, outcome_at=? WHERE id=?", (outcome, now, int(nudge_id)))
+            return True
+
+        return self._write(op)
 
     def record_checkin(self, checkin: NudgeCheckin, nudge: NewNudge | None = None, *,
                        question: tuple[int, str] | None = None) -> tuple[int, int | None]:
@@ -5853,23 +5902,35 @@ class Store:
             chunks=r["chunks"], chunks_silent=r["chunks_silent"], speech_s=r["speech_s"], audio_s=r["audio_s"],
             utterances=r["utterances"], transcribe_ms=r["transcribe_ms"], stt_model=r["stt_model"],
             stt_device=r["stt_device"], captures=r["captures"], updated_at=r["updated_at"],
+            hold_since=r["hold_since"] if "hold_since" in r.keys() else None,
+            last_alive_at=r["last_alive_at"] if "last_alive_at" in r.keys() else None,
         )
 
     def start_call(
         self, *, app: str, process: str | None, via: str, service: str | None = None, at: float | None = None,
         status: str = "asking", consent: str | None = None, consent_by: str | None = None,
         output_form_factor: str | None = None, output_device: str | None = None, headphones: bool | None = None,
+        hold_since: float | None = None,
     ) -> int:
-        """A call was detected: one content-free ``calls`` row; returns its id."""
+        """A call was detected: one content-free ``calls`` row; returns its id. ``hold_since``: the start of the
+        microphone hold it is in (the ConsentStore's record); the row is alive as of ``at``."""
         now = time.time()
         when = float(at) if at is not None else now
         return self._write(lambda conn: int(conn.execute(
             "INSERT INTO calls(app, process, service, via, detected_at, status, consent, consent_by, consent_at,"
-            " output_form_factor, output_device, headphones, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " output_form_factor, output_device, headphones, updated_at, hold_since, last_alive_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (app or "", app_key(process), service, via, when, status, consent, consent_by,
              when if consent else None, output_form_factor, output_device,
-             None if headphones is None else int(bool(headphones)), now),
+             None if headphones is None else int(bool(headphones)), now,
+             None if hold_since is None else float(hold_since), when),
         ).lastrowid))
+
+    def call_max_seq(self, call_id: int) -> int:
+        """The highest spool chunk number written for a call (0 when none): a call adopted after a restart goes on
+        numbering its chunks from here (:meth:`write_spool` names files by call and number)."""
+        rows = self._query("SELECT max(seq) FROM call_chunks WHERE call_id=?", (int(call_id),))
+        return int(rows[0][0] or 0) if rows else 0
 
     def update_call(self, call_id: int, **fields: Any) -> None:
         """Set columns of one call (only the plumbing columns in ``_CALL_COLUMNS``)."""

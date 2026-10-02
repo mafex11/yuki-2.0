@@ -276,6 +276,13 @@ class TranscribeScheduler:
 
     # -- gates -----------------------------------------------------------------
 
+    def _lingering(self) -> bool:
+        """A call row ended within :data:`yuki.memory.calls.LINGER_S` while its app still holds the microphone
+        (:func:`yuki.memory.calls.lingering_call`, the call worker's last reading of the holders)."""
+        from yuki.memory.calls import lingering_call
+
+        return lingering_call(self.store, time.time()) is not None
+
     def _waiting(self) -> dict[str, Any]:
         rows = self.store.call_chunks()
         ready = [r for r in rows if r.get("call_status") == "ended"]
@@ -298,6 +305,11 @@ class TranscribeScheduler:
             return "paused", ""
         if not cfg.during_calls and self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
             return "call_active", ""
+        # A call row that ended minutes ago while its app still holds the microphone may not be over (05 §7.5:
+        # on 30 Sept a batch started 35 s into such a gap and ran 12 min of a call that was still on): its chunks
+        # would go to the journal as a finished call. Never start then, whatever defer_during_calls says.
+        if self._lingering():
+            return "call_lingering", ""
         if bool((self.live_fn() or {}).get("fullscreen")) or self.busy_fn():
             return "fullscreen", ""
         window = cfg.gpu_quiet_min * 60.0
@@ -331,7 +343,7 @@ class TranscribeScheduler:
         now = time.monotonic() if now is None else float(now)
         if self.paused:
             return "paused"
-        if not cfg.during_calls and self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
+        if not cfg.during_calls and (self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1) or self._lingering()):
             return "call_started"
         if bool((self.live_fn() or {}).get("fullscreen")) or self.busy_fn():
             return "fullscreen"

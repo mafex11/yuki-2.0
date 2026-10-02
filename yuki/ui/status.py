@@ -1,16 +1,24 @@
-"""The status strip: what Yuki is doing, bottom-right, while it has the hands.
+"""The status strip: what Yuki is doing, bottom-right, from the moment a request starts.
 
-While a task runs the overlay gets out of the way and this strip takes over: the
-thinking line (Horizon's dotted grey wave, drifting while it works) and one line of text. The line is the tool's own one-line ``label`` from
-the registry (:func:`yuki.agent.tools.tool_label`) plus its most telling argument,
-so the phrase a user reads is written next to the tool it describes rather than
-re-derived here from its identifier. Every tool in the registry has a label
-(``tests/test_no_pattern.py``); a name the registry does not know reads "Working".
+Every agent run (typed, spoken, anything) shows here **from its first second**
+(2026-10-03, ``docs/research/revamp-2026-10-02/06-proactive-do-it.md`` §4.4: the one real
+"Do it" ran 9.6 s before anything appeared, and nothing on screen could stop it): the
+thinking line (Horizon's dotted grey wave, drifting while it works), the current step,
+the time it has taken and the step count, and a **Stop** pill that never takes focus and
+cancels that request. The first strip of a session also says the stop shortcut once.
+The step line is the tool's own one-line ``label`` from the registry
+(:func:`yuki.agent.tools.tool_label`) plus its most telling argument, so the phrase a user
+reads is written next to the tool it describes rather than re-derived here from its
+identifier. Every tool in the registry has a label (``tests/test_no_pattern.py``); a name
+the registry does not know reads "Working". When the run ends the strip says how: the
+answer (Done), Stopped, or the error.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+import time
 
 from PySide6.QtCore import (
     Property,
@@ -21,17 +29,20 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from yuki.agent.tools import tool_label
 from yuki.ui.surface import ACCENT, SurfaceWindow
 from yuki.ui.wave import Wave
 
-#: Size of the panel (excluding the shadow margin), in logical pixels.
+#: Size of the panel (excluding the shadow margin), in logical pixels. The corner cards share the width.
 STRIP_WIDTH = 360
 STRIP_HEIGHT = 48
+#: The strip's own width: the step line, the time and step count, and the Stop pill side by side.
+STRIP_RUN_WIDTH = 440
 
 #: Gap between the panel and the screen edges.
 STRIP_MARGIN = 24
@@ -192,6 +203,21 @@ def describe_summary(summary: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def elapsed_words(seconds: float) -> str:
+    """A run's time so far, short: ``8 s``, ``1:05``, ``1:02:05``."""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return f"{secs} s"
+    h, rem = divmod(secs, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def run_meta(seconds: float, steps: int) -> str:
+    """The live suffix of a run: ``12 s`` before its first step, then ``12 s · step 3``."""
+    return elapsed_words(seconds) + (f" · step {steps}" if steps > 0 else "")
+
+
 def _money(usd: float) -> str:
     """``$1.23`` from a dollar up, whole cents below, one decimal under a cent."""
     if usd >= 1.0:
@@ -296,16 +322,22 @@ class ElidedLabel(QLabel):
 
 
 class StatusStrip(SurfaceWindow):
-    """Bottom-right strip showing the current step, then the final word.
+    """Bottom-right strip showing a run from its start: the step, its time and count, and Stop; then the final word.
 
     It never takes focus: it appears while the user is doing something else, and
-    stealing the keyboard mid-game would be unforgivable.
+    stealing the keyboard mid-game would be unforgivable. Its Stop pill is clickable
+    without taking focus, like the cards' buttons.
+
+    Signals:
+        stop_clicked: ``(request id)`` -- Stop on the run the strip shows.
     """
+
+    stop_clicked = Signal(int)
 
     def __init__(self) -> None:
         super().__init__(activates=False)
         self.setObjectName("YukiStatusStrip")
-        self.setFixedSize(STRIP_WIDTH + 2 * self.SHADOW, STRIP_HEIGHT + 2 * self.SHADOW)
+        self.setFixedSize(STRIP_RUN_WIDTH + 2 * self.SHADOW, STRIP_HEIGHT + 2 * self.SHADOW)
 
         from yuki.ui.window.theme import variable_font
 
@@ -320,22 +352,41 @@ class StatusStrip(SurfaceWindow):
         self.label.setFont(variable_font(14, "Regular"))
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
 
-        #: Dim time/steps/cost suffix, shown only with a final message.
+        #: Dim suffix: while a run goes on its time and step count ("12 s · step 3"); with a final message the
+        #: request's time, steps and cost.
         self.meta = QLabel(self)
         self.meta.setFont(variable_font(12, "Regular"))
         self.meta.setTextFormat(Qt.TextFormat.PlainText)
         self.meta.setVisible(False)
         row.addWidget(self.meta, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        #: Stop: cancels the run the strip shows (never takes focus).
+        self.stop_button = QPushButton("Stop", self)
+        self.stop_button.setFont(variable_font(12.5, "Regular"))
+        self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.stop_button.setToolTip("Stop this request")
+        self.stop_button.setVisible(False)
+        self.stop_button.clicked.connect(self._on_stop)
+        row.addWidget(self.stop_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self._linger = QTimer(self)
         self._linger.setSingleShot(True)
         self._linger.timeout.connect(self.fade_out)
+        #: The run shown: its request id, when it started (monotonic), its steps so far; a 1 s clock while shown.
+        self.run_id: int | None = None
+        self._run_started = 0.0
+        self._run_steps = 0
+        self._clock = QTimer(self)
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._tick)
         self._tone = "final"
         self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
         self.label.setStyleSheet(f"color: {self.ink_css('danger' if self._tone == 'error' else 'text')};")
         self.meta.setStyleSheet(f"color: {self.ink_css('text_3')};")
+        self.stop_button.setStyleSheet(self.button_css("outline"))
         self.update()
 
     def anchor(self) -> QPoint:
@@ -348,14 +399,85 @@ class StatusStrip(SurfaceWindow):
 
     # -- states ------------------------------------------------------------
 
+    @property
+    def running(self) -> bool:
+        """True while the strip shows a run that has not ended."""
+        return self.run_id is not None
+
+    def start_run(self, request_id: int, *, started: float | None = None, steps: int = 0, line: str = "",
+                  hint: str = "") -> None:
+        """Show a run from its start: "Thinking…" (or its current line), its time, its step count and Stop.
+
+        Args:
+            request_id: The request (Stop cancels it).
+            started: When it started (``time.monotonic()``); now by default.
+            steps: Steps taken so far (a run shown again after another one, or after a question).
+            line: Its current line; "Thinking…" when empty.
+            hint: Said once, before the first step (the stop shortcut on a session's first strip).
+        """
+        self.run_id = int(request_id)
+        self._run_started = time.monotonic() if started is None else float(started)
+        self._run_steps = int(steps)
+        self._linger.stop()
+        self._tone = "final"
+        self.restyle()
+        text = line or "Thinking…"
+        self.label.setText(f"{text} ({hint})" if hint and not line else text)
+        self.spinner.start()
+        self.spinner.setVisible(True)
+        self.stop_button.setText("Stop")
+        self.stop_button.setEnabled(True)
+        self.stop_button.setVisible(True)
+        self.meta.setVisible(True)
+        self._tick()
+        self._clock.start()
+        self.fade_in(self.anchor())
+
+    def run_step(self, request_id: int, text: str, steps: int | None = None) -> None:
+        """A step of the run the strip shows: its line, and the count when given; shown again if it was hidden."""
+        if self.run_id != int(request_id):
+            return
+        if steps is not None:
+            self._run_steps = int(steps)
+        self._linger.stop()
+        self.label.setText(text)
+        self._tick()
+        if not self.isVisible() or self.closing:
+            self.fade_in(self.anchor())
+
+    def stopping(self) -> None:
+        """Stop was pressed: it says so until the run ends (a tool in flight finishes first)."""
+        self.stop_button.setText("Stopping…")
+        self.stop_button.setEnabled(False)
+
+    def end_run(self, request_id: int | None = None) -> bool:
+        """The run ended: its clock and Stop go (True when it was the one shown). The caller shows the final word
+        (:meth:`show_final`) or dismisses the strip."""
+        if self.run_id is None or (request_id is not None and self.run_id != int(request_id)):
+            return False
+        self.run_id = None
+        self._clock.stop()
+        self.stop_button.setVisible(False)
+        return True
+
+    def _tick(self) -> None:
+        if self.run_id is not None:
+            self.meta.setText(run_meta(time.monotonic() - self._run_started, self._run_steps))
+
+    def _on_stop(self) -> None:
+        if self.run_id is not None:
+            self.stopping()
+            self.stop_clicked.emit(self.run_id)
+
     def show_step(self, text: str) -> None:
-        """Show (or update) a line of progress with the spinner running.
+        """Show (or update) a line of progress with the spinner running (outside a run: a question asked by
+        voice; inside one, prefer :meth:`run_step`).
 
         Args:
             text: The line to display.
         """
         self._linger.stop()
-        self.meta.setVisible(False)
+        self.meta.setVisible(self.run_id is not None)
         self._tone = "final"
         self.restyle()
         self.label.setText(text)
@@ -370,6 +492,7 @@ class StatusStrip(SurfaceWindow):
             text: The message.
             tone: ``final`` or ``error``; an error is said in red.
         """
+        self.end_run()
         self.meta.setVisible(False)
         self.label.setText(text)
         self.spinner.stop()
@@ -390,7 +513,17 @@ class StatusStrip(SurfaceWindow):
         self.meta.setVisible(bool(text))
 
     def dismiss(self) -> None:
-        """Hide the strip now."""
+        """Hide the strip now (a run it shows keeps its clock: it comes back on the run's next step)."""
         self._linger.stop()
         self.spinner.stop()
         self.fade_out()
+
+    def hideEvent(self, event: object) -> None:  # noqa: D102 - no clock while nothing is on screen
+        self._clock.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event: object) -> None:  # noqa: D102
+        super().showEvent(event)
+        if self.run_id is not None:
+            self._tick()
+            self._clock.start()

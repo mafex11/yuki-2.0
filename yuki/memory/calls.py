@@ -18,10 +18,16 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
    "screen_stale" after it (probably still in the call, not certain). An app the user listed in
    ``[calls] apps`` holding the microphone is a call too (``via`` "mic"). Sound out, the camera and the
    timeline's meeting row are hints only. A full-screen game in front using its own voice chat is not a
-   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`). It ends once the evidence is gone (the
-   app let go of the microphone, or its screen shows no call any more) for ``end_grace_s``. A call on a site
-   inside a browser (an app the timeline saw showing ``browser_sites``+ sites) is that site's: its standing
-   answer is kept for the site's service, never for the whole browser.
+   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`). A call on a site inside a browser (an
+   app the timeline saw showing ``browser_sites``+ sites) is that site's: its standing answer is kept for
+   the site's service, never for the whole browser.
+   **Once started, the microphone hold is the session** (:class:`CallLife`, 2026-10-03): the screen decided
+   that the hold is a call; the call then lives while its app holds the microphone (a re-grab of the
+   microphone by the same app is the same call), for ``release_grace_s`` after it lets go, or while an
+   in-call screen shown after it let go is fresh (Meet's mute). The screen ends a held call only on a
+   persistent, reliable contradiction (``neg_frames`` healthy "not in a call" sights over ``neg_span_s``),
+   never on one frame. A restarted service adopts the open row of a hold that goes on (:meth:`CallWorker.recover`)
+   and ends any other at its ``last_alive_at``.
 2. **Ask, every call.** A ``calls`` row with status ``asking`` and the named
    event ``Local\\YukiCallReady`` for the UI, which shows a glass card
    (:mod:`yuki.ui.calls`): Yes / No / Always for <app> / Never for <app>. The
@@ -49,7 +55,11 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
 
 Logs are content-free: ``call_detected``, ``call_consent``,
 ``call_recording_start``/``call_recording_stop``, ``call_chunk`` (audio and
-speech seconds, bytes spooled, encode ms, VAD CPU), never words or audio.
+speech seconds, bytes spooled, encode ms, VAD CPU), ``call_regrab`` (a new
+microphone hold inside a call), ``call_alive_by`` (what keeps it alive changed),
+``call_resumed`` (adopted after a restart), ``call_ended`` (with the hold, the
+screen's last in-call frame, the negatives after it and their frame sizes, what
+was in front), never words or audio.
 """
 
 from __future__ import annotations
@@ -117,11 +127,28 @@ class CallConfig:
     apps: frozenset[str] = frozenset()
     #: The user's own display names (process or package family -> name); default: the app's own name.
     names: tuple[tuple[str, str], ...] = ()
-    #: How long an app must have held the microphone (with sound out or the camera) to be a call.
-    hold_s: float = 15.0
     #: An in-call screen stays fresh evidence this long after it was last seen (s); then the call is "stale"
     #: (probably still going, not certain: voice asks "was that for me?" on ambiguous words).
     evidence_fresh_s: float = 900.0
+    # -- one call = one session (CallLife; docs/research/revamp-2026-10-02/05-call-pill-timer.md §7.2) --
+    #: The call's app let go of the microphone less than this long ago: still the same call (a re-grab with a new
+    #: ConsentStore ``since`` inside it continues the call). Measured: in the mic-only era one drop in 33.8 call
+    #: hours (919 s, a real leave); Meet mute gaps 5-536 s are kept by the screen instead (``screen_alive_s``).
+    release_grace_s: float = 90.0
+    #: A call whose app still holds the microphone ends on the screen only after this many reliable "not in a
+    #: call" sights spanning at least ``neg_span_s`` with no in-call frame between (the longest transient measured
+    #: was 21 s of Discord in front mid alt-tab; 6 of 6 call-ending flips were within it).
+    neg_frames: int = 3
+    neg_span_s: float = 120.0
+    #: Without the microphone, an in-call frame shown after the app let go of it keeps the call alive this long
+    #: (Meet drops the microphone on mute; the screen still shows the meeting).
+    screen_alive_s: float = 900.0
+    #: The row's ``last_alive_at`` is written at most this often while the call lives (a restart ends a call it
+    #: cannot adopt at that moment, never at the restart).
+    alive_write_s: float = 15.0
+    #: A restarted service adopts the open row of a call whose app still holds the microphone with the same
+    #: ``since`` (within ``HOLD_MATCH_S``) when the row was alive at most this long ago.
+    adopt_within_s: float = 600.0
     #: An app seen showing at least this many different sites in the last ``sites_days`` is a browser: a call
     #: in it is its site's (the standing answer is kept for the site's service, not the browser).
     browser_sites: int = 2
@@ -225,8 +252,13 @@ class CallConfig:
                         if str(v).strip())
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
-            hold_s=max(0.0, num("hold_s", d.hold_s)),
             evidence_fresh_s=max(30.0, num("evidence_fresh_s", d.evidence_fresh_s)),
+            release_grace_s=min(600.0, max(30.0, num("release_grace_s", d.release_grace_s))),
+            neg_frames=max(2, int(num("neg_frames", d.neg_frames))),
+            neg_span_s=max(30.0, num("neg_span_s", d.neg_span_s)),
+            screen_alive_s=max(0.0, num("screen_alive_s", d.screen_alive_s)),
+            alive_write_s=max(5.0, num("alive_write_s", d.alive_write_s)),
+            adopt_within_s=max(0.0, num("adopt_within_s", d.adopt_within_s)),
             browser_sites=max(2, int(num("browser_sites", d.browser_sites))),
             sites_days=max(1.0, num("sites_days", d.sites_days)),
             poll_s=max(1.0, num("poll_s", d.poll_s)),
@@ -1067,7 +1099,8 @@ class RecordingSession:
     """
 
     def __init__(self, store: Store, *, call_id: int, app: str, process: str | None, cfg: CallConfig,
-                 source_factory: Callable[[], Any], log: Callable[..., Any]) -> None:
+                 source_factory: Callable[[], Any], log: Callable[..., Any], start_seq: int = 0,
+                 base: RecordingStats | None = None) -> None:
         self.store = store
         self.call_id = call_id
         self.app = app
@@ -1082,8 +1115,13 @@ class RecordingSession:
             except Exception as exc:   # the energy gate alone still keeps silence out
                 log("call_vad_unavailable", call_id=call_id, error=f"{type(exc).__name__}: {exc}")
         self.chunker = Chunker(cfg, vad)
-        self.stats = RecordingStats()
-        self._seq = 0
+        #: A call adopted after a restart goes on from its row: its counts (``base``) and its last spool chunk
+        #: number (``start_seq``), so the row's totals and the spool's file names carry on.
+        base = base or RecordingStats()
+        self.stats = RecordingStats(chunks=base.chunks, chunks_silent=base.chunks_silent, audio_s=base.audio_s,
+                                    speech_s=base.speech_s)
+        self._silent_base = base.chunks_silent
+        self._seq = int(start_seq)
         self._source: Any = None
         self._source_lock = threading.Lock()
         self._stop = threading.Event()
@@ -1163,7 +1201,7 @@ class RecordingSession:
                      traceback=traceback.format_exc())
         finally:
             self.stats.cpu_s = time.thread_time() - c0
-            self.stats.chunks_silent = self.chunker.silent_dropped
+            self.stats.chunks_silent = self._silent_base + self.chunker.silent_dropped
             self._update_row()
 
     def _spool(self, chunk: Chunk) -> None:
@@ -1184,7 +1222,7 @@ class RecordingSession:
         st.speech_s += chunk.speech_s
         st.bytes += len(payload)
         st.encode_ms.append(ms)
-        st.chunks_silent = self.chunker.silent_dropped
+        st.chunks_silent = self._silent_base + self.chunker.silent_dropped
         vad = self.chunker.vad
         self.log("call_chunk", call_id=self.call_id, audio_s=round(chunk.seconds, 2), speech_s=round(chunk.speech_s, 2),
                  bytes=len(payload), codec=codec, ms=round(ms, 1), silent_dropped=st.chunks_silent,
@@ -1306,6 +1344,130 @@ class _ConsentStoreWatch:
             pass
 
 
+# ---------------------------------------------------------------------------
+# One call = one session (docs/research/revamp-2026-10-02/05-call-pill-timer.md §7)
+# ---------------------------------------------------------------------------
+
+#: Two ConsentStore ``since`` values this close are the same microphone hold (the record's start, read by two
+#: processes, or before and after a restart; the capture clock and the ConsentStore clock differ by this much).
+HOLD_MATCH_S = 5.0
+#: The ``nudge_state`` row with the microphone holders the call worker read last (``{"keys": [...], "at": t}``):
+#: the transcriber's and the digest's gates read it (:func:`lingering_call`).
+HOLDERS_STATE = "call_mic_holders"
+#: A call row that ended this recently while its app still holds the microphone may not have ended at all (a
+#: persistent screen contradiction, a pause, a restart it could not adopt): heavy work waits (05 §7.5, §8.4).
+LINGER_S = 600.0
+
+
+@dataclass
+class LifeStep:
+    """What :meth:`CallLife.observe` decided for one poll (content-free)."""
+
+    #: The call goes on.
+    alive: bool
+    #: Why it ends now (``alive`` False): ``mic_released`` or ``screen_contradicts``.
+    end: str | None = None
+    #: A new microphone hold of the same app inside this call: ``{"gap_s", "old_since", "new_since"}``.
+    regrab: dict[str, float] | None = None
+    #: What keeps it alive: ``hold`` (the app holds the microphone), ``release_grace`` (it let go less than
+    #: ``release_grace_s`` ago), ``screen`` (an in-call frame shown since it let go), ``end_grace`` (dying).
+    by: str = "hold"
+
+
+class CallLife:
+    """One call's lifetime from measured signals only (pure: no clock, no I/O; the worker feeds it every poll).
+
+    The live problem (2 Oct 2026): one Discord frame read mid alt-tab and judged "not in a call" ended a call
+    whose microphone was held the whole time, and the pill came back at 00:00 32 minutes later. The rule now:
+
+    * **The microphone hold is the session.** While the call's app holds the microphone the call is alive. A
+      new hold of the same app (a new ConsentStore ``since``) while the call is alive is a **re-grab**: the
+      same call. The screen's "newer than the hold" test applies to starting a call only
+      (:meth:`yuki.memory.callevidence.CallEvidence.state`).
+    * **The screen ends a held call only on a persistent, reliable contradiction**: at least ``neg_frames``
+      reliable "not in a call" sights spanning at least ``neg_span_s``, with no in-call frame between (a
+      "You left the meeting" page while the browser keeps the microphone). One frame never ends a held call;
+      half-drawn frames never count (:meth:`yuki.memory.callevidence.CallEvidence.life`).
+    * **Without the microphone** the call lives on for ``release_grace_s`` unless the screen already says it
+      is over, or while an in-call frame shown *after* the app let go is at most ``screen_alive_s`` old (Meet
+      drops the microphone on mute, its page still shows the meeting). Not alive for ``end_grace_s``: it ends.
+
+    Args:
+        cfg: The ``[calls]`` numbers.
+        now: When the call was started (or adopted).
+        hold_since: The ConsentStore ``since`` of the hold it is in.
+        held: Whether the app holds the microphone now (False: adopted after a restart while it had let go).
+        last_held_at: When it was last known to hold it (default ``now`` when held).
+    """
+
+    def __init__(self, cfg: CallConfig, *, now: float, hold_since: float | None, held: bool = True,
+                 last_held_at: float | None = None) -> None:
+        self.cfg = cfg
+        self.hold_since = hold_since
+        self.last_held_at: float | None = last_held_at if last_held_at is not None else (now if held else None)
+        #: The last poll the call was alive by something other than the end grace.
+        self.alive_at = float(now)
+        self.regrabs = 0
+
+    def contradicted(self, negatives: Sequence[float]) -> bool:
+        """At least ``neg_frames`` reliable negative sights spanning ``neg_span_s`` (no positive between)."""
+        return (len(negatives) >= self.cfg.neg_frames
+                and float(negatives[-1]) - float(negatives[0]) >= self.cfg.neg_span_s)
+
+    def observe(self, now: float, *, held: bool, hold_since: float | None, positive_at: float | None,
+                negatives: Sequence[float] = ()) -> LifeStep:
+        """One poll: does the call go on? ``negatives``: capture times of the reliable not-in-call sights of the
+        call's site since its newest in-call frame ``positive_at``."""
+        cfg = self.cfg
+        negs = sorted(float(t) for t in negatives)
+        if held:
+            regrab = None
+            if hold_since is not None and self.hold_since is not None and abs(hold_since - self.hold_since) > HOLD_MATCH_S:
+                held_until = self.last_held_at if self.last_held_at is not None else hold_since
+                regrab = {"gap_s": round(max(0.0, float(hold_since) - held_until), 1),
+                          "old_since": float(self.hold_since), "new_since": float(hold_since)}
+                self.regrabs += 1
+            if hold_since is not None:
+                self.hold_since = float(hold_since)
+            self.last_held_at = now
+            if self.contradicted(negs):
+                return LifeStep(False, end="screen_contradicts", regrab=regrab)
+            self.alive_at = now
+            return LifeStep(True, regrab=regrab, by="hold")
+        let_go = self.last_held_at if self.last_held_at is not None else self.alive_at
+        by = None
+        if not negs and now - let_go < cfg.release_grace_s:
+            by = "release_grace"
+        elif (positive_at is not None and not negs and now - positive_at <= cfg.screen_alive_s
+              and positive_at > let_go):
+            # an in-call frame captured after the last poll that saw the microphone held (the same clock): the
+            # screen still showed the call once the app had let go (Meet's page while muted)
+            by = "screen"
+        if by is not None:
+            self.alive_at = now
+            return LifeStep(True, by=by)
+        if now - self.alive_at < cfg.end_grace_s:
+            return LifeStep(True, by="end_grace")
+        return LifeStep(False, end="screen_contradicts" if negs else "mic_released")
+
+
+def lingering_call(store: Store, now: float | None = None, *, within_s: float = LINGER_S) -> Any:
+    """A call row that ended at most ``within_s`` ago whose app still holds the microphone, per the call worker's
+    last reading (:data:`HOLDERS_STATE`), or None: the call may not be over, so heavy work (the transcriber,
+    the digest) does not start (05 §7.5). Content-free; never raises."""
+    now = time.time() if now is None else float(now)
+    try:
+        data = json.loads(store.nudge_state(HOLDERS_STATE) or "{}")
+        keys = {str(k) for k in (data.get("keys") or [])} if isinstance(data, dict) else set()
+        if not keys:
+            return None
+        rows = [c for c in store.calls_overlapping(now - within_s, now + 1.0)
+                if c.ended_at is not None and now - c.ended_at <= within_s and (c.process or "") in keys]
+        return max(rows, key=lambda c: c.ended_at) if rows else None
+    except Exception:
+        return None
+
+
 @dataclass
 class _Active:
     call_id: int
@@ -1320,6 +1482,17 @@ class _Active:
     headphones: bool | None = None
     #: Other people in the call as its screen last showed (0: the user is alone in it), None: not shown (v3.15).
     others: int | None = None
+    #: The call's microphone holder as last seen (an ``avsignals.Holder``; kept while it has let go).
+    holder: Any = None
+    #: Its lifetime rules (:class:`CallLife`), and whether the app holds the microphone this poll.
+    life: CallLife | None = None
+    held: bool = True
+    #: What kept it alive at the last poll (:attr:`LifeStep.by`) and when ``last_alive_at`` was last written.
+    alive_by: str = "hold"
+    alive_written: float = 0.0
+    #: An adopted call's stored chunks and counts: its new recording goes on from them.
+    seq_base: int = 0
+    base: RecordingStats | None = None
 
 
 class CallWorker:
@@ -1372,6 +1545,9 @@ class CallWorker:
         #: The wake-up on a ConsentStore change (the loop's wait), only with real signals.
         self._watch_registry = holders_fn is None and bool(getattr(signals, "_watch", False))
         self._held: set[str] = set()
+        #: The microphone holders of the last read, by app key; the keys last written to HOLDERS_STATE.
+        self._holders: dict[str, Holder] = {}
+        self._holders_written: list[str] | None = None
         self.headphones_fn = headphones_fn
         self.source_factory = source_factory or (lambda cfg, app: MicSource(capture_device_for(cfg, app)))
         self.active: _Active | None = None
@@ -1405,17 +1581,76 @@ class CallWorker:
 
     # -- lifecycle -----------------------------------------------------------
 
-    def recover(self) -> int:
-        """Calls left open by a previous run (crash, restart) are ended now."""
+    def recover(self, now: float | None = None) -> int:
+        """Calls left open by a previous run (crash, restart): adopt the one that is still going, end the rest.
+
+        The service restarting is not the call ending (05 §7.3: rows 39-45 were cut by restarts, and row 41 ran
+        "505 min" because it was ended at the restart after the PC had been off for 7.9 h). An open row is
+        **adopted** (the same row goes on; a new recording continues its chunks) when its app still holds the
+        microphone with the same ConsentStore ``since`` (within :data:`HOLD_MATCH_S`) and the row was alive at
+        most ``adopt_within_s`` ago - or, by the same rules as a live call, when it was alive less than
+        ``release_grace_s`` ago (a re-grab or a short release around the restart). A row from before migration
+        26 (no ``hold_since``) is adopted when the hold it would be in began before the row did. Every other
+        open row ends at its ``last_alive_at`` (an older row: now, as before). Returns how many were ended.
+        """
+        now = time.time() if now is None else float(now)
+        cfg = self.cfg
+        try:
+            holders = {h.key: h for h in self.signals.read().mic if h.key}
+        except Exception as exc:
+            holders = {}
+            self._log("error", where="calls.recover_holders", error=f"{type(exc).__name__}: {exc}")
         n = 0
-        for c in self.store.calls(statuses=CALL_OPEN_STATUSES):
-            self.store.update_call(c.id, status="ended", ended_at=time.time(), stop_reason="service_restart")
+        for c in self.store.calls(statuses=CALL_OPEN_STATUSES):   # newest first
+            h = holders.get(c.process or "")
+            if self.active is None and cfg.enabled and self._adoptable(cfg, c, h, now):
+                self._adopt(cfg, c, h, now)
+                continue
+            end_at = min(max(c.last_alive_at, c.detected_at), now) if c.last_alive_at is not None else now
+            self.store.update_call(c.id, status="ended", ended_at=end_at, stop_reason="service_restart")
+            self._log("call_ended", call_id=c.id, app=c.app, reason="service_restart",
+                      seconds=round(end_at - c.detected_at, 1), held=h is not None, hold_since=c.hold_since,
+                      down_s=round(now - c.last_alive_at, 1) if c.last_alive_at is not None else None)
             n += 1
         try:
             self.rekey_prefs()
         except Exception as exc:
             self._log("error", where="calls.rekey_prefs", error=f"{type(exc).__name__}: {exc}")
         return n
+
+    @staticmethod
+    def _adoptable(cfg: CallConfig, c: Any, h: Holder | None, now: float) -> bool:
+        """Whether a restarted service goes on with open row ``c`` (see :meth:`recover`)."""
+        if c.hold_since is None:   # a row written before migration 26: the hold must have begun before it
+            return h is not None and h.since <= c.detected_at + HOLD_MATCH_S
+        if c.last_alive_at is None:
+            return False
+        down = now - c.last_alive_at
+        if h is not None and abs(h.since - c.hold_since) <= HOLD_MATCH_S:
+            return down <= cfg.adopt_within_s
+        return down < cfg.release_grace_s   # let go or re-grabbed around the restart: the live rules decide
+
+    def _adopt(self, cfg: CallConfig, c: Any, h: Holder | None, now: float) -> _Active:
+        """Go on with open row ``c`` after a restart: the same row, its counts and chunk numbers continue."""
+        held = h is not None
+        hold_since = c.hold_since if c.hold_since is not None else (h.since if h is not None else None)
+        act = _Active(c.id, c.process or (h.key if h is not None else ""), c.app, c.via, c.service, c.detected_at,
+                      now, status=c.status, headphones=c.headphones, holder=h, held=held)
+        # The previous run's hold epoch: a new ``since`` now is a re-grab inside the call (logged on the next poll).
+        act.life = CallLife(cfg, now=now, hold_since=hold_since, held=held,
+                            last_held_at=None if held else (c.last_alive_at or now))
+        act.seq_base = self.store.call_max_seq(c.id)
+        act.base = RecordingStats(chunks=c.chunks, chunks_silent=c.chunks_silent, audio_s=c.audio_s,
+                                  speech_s=c.speech_s)
+        act.alive_written = now
+        self.store.update_call(c.id, last_alive_at=now)
+        self.active = act
+        self._log("call_resumed", call_id=c.id, app=c.app, process=act.key, status=c.status, held=held,
+                  hold_since=hold_since, now_since=h.since if h is not None else None,
+                  down_s=round(now - (c.last_alive_at if c.last_alive_at is not None else c.updated_at), 1),
+                  seq=act.seq_base, legacy=c.hold_since is None)
+        self._tell_ui()
+        return act
 
     def rekey_prefs(self) -> list[tuple[str, str]]:
         """Standing answers given on a site's call inside a browser move from the browser to that service.
@@ -1453,7 +1688,8 @@ class CallWorker:
         self._event = _NamedEvent(call_event_name(self.db_path))
         watch = _ConsentStoreWatch() if self._watch_registry else None
         recovered = self.recover()
-        self._log("calls_start", recovered=recovered, poll_s=self.cfg.poll_s, enabled=self.cfg.enabled)
+        self._log("calls_start", recovered=recovered, adopted=self.active.call_id if self.active else None,
+                  poll_s=self.cfg.poll_s, enabled=self.cfg.enabled)
         try:
             while not stop.is_set():
                 self.paused = bool(pause_path is not None and pause_path.exists())
@@ -1471,7 +1707,7 @@ class CallWorker:
                     self._event.wait(timeout)
         finally:
             if self.active is not None:
-                self._end(self.active, "service_stop")
+                self._end(self.active, "service_stop", time.time())
                 self.active = None
             if watch is not None:
                 watch.close()
@@ -1525,12 +1761,18 @@ class CallWorker:
         snap = self.signals.read()
         mic: tuple[Holder, ...] = snap.mic
         self._held = {h.key for h in mic if h.key}
+        self._holders = {h.key: h for h in mic if h.key}
         evidence = self.evidence
         if evidence is not None:
             evidence.fresh_s = cfg.evidence_fresh_s
-        if evidence is not None and self._held:
+        # the holders' screens, and the open call's even while its app has let go (a "you left" screen ends it)
+        judge_for: list[Any] = [h for h in mic if h.key]
+        act = self.active
+        if act is not None and act.key not in self._held:
+            judge_for.append(act.holder or act.key)
+        if evidence is not None and judge_for:
             try:
-                evidence.judge([h for h in mic if h.key])
+                evidence.judge(judge_for)
             except Exception as exc:
                 self._log("error", where="calls.evidence", error=f"{type(exc).__name__}: {exc}")
         out: list[tuple[str, str, str | None, str]] = []
@@ -1580,25 +1822,14 @@ class CallWorker:
         cfg = self.cfg
         if self.paused or not cfg.enabled:
             if self.active is not None:
-                self._end(self.active, "paused" if self.paused else "disabled")
+                self._end(self.active, "paused" if self.paused else "disabled", now)
                 self.active = None
             return
         cands = self._candidates(cfg, now)
+        self._note_holders(now)
         act = self.active
-        if act is not None:
-            # a call goes on while the screen evidence of it holds (fresh or stale) during its microphone hold
-            mine = next((c for c in cands if c[0] == act.key), None)
-            if mine is not None:
-                act.last_seen = now
-                if mine[1] != act.via:
-                    self._log("call_evidence", call_id=act.call_id, app=act.app, via=mine[1], was=act.via)
-                    act.via = mine[1]
-                    self.store.update_call(act.call_id, via=mine[1])
-                    self._tell_ui()
-            elif now - act.last_seen >= cfg.end_grace_s:
-                self._end(act, "call_ended")
-                self.active = None
-                act = None
+        if act is not None and not self._goes_on(cfg, act, now):
+            self.active = act = None
         if act is None and cands:
             key, via, service, name = cands[0]
             act = self._begin(cfg, key, via, service, name, now)
@@ -1606,6 +1837,86 @@ class CallWorker:
         if act is not None:
             self._note_people(act)
             self._drive(cfg, act, now)
+            self._heartbeat(cfg, act, now)
+
+    def _goes_on(self, cfg: CallConfig, act: _Active, now: float) -> bool:
+        """One poll of the open call's life (:class:`CallLife`); ends it (and returns False) when it is over."""
+        h = self._holders.get(act.key)
+        if h is not None:
+            act.holder = h
+        act.held = h is not None
+        life = self._life(act)
+        if act.life is None:   # a call begun before CallLife existed in this object (tests that build _Active)
+            act.life = CallLife(cfg, now=act.detected_at, hold_since=h.since if h is not None else None)
+        step = act.life.observe(now, held=act.held, hold_since=h.since if h is not None else None,
+                                positive_at=life.positive_at, negatives=life.negatives)
+        if step.regrab is not None:
+            self._log("call_regrab", call_id=act.call_id, app=act.app, regrabs=act.life.regrabs, **step.regrab)
+            try:
+                self.store.update_call(act.call_id, hold_since=step.regrab["new_since"])
+            except Exception as exc:
+                self._log("error", where="calls.regrab", error=f"{type(exc).__name__}: {exc}")
+        if not step.alive:
+            self._end(act, step.end or "call_ended", now, life=life)
+            return False
+        if step.by != act.alive_by:
+            self._log("call_alive_by", call_id=act.call_id, app=act.app, by=step.by, was=act.alive_by,
+                      held=act.held, positive_age_s=None if life.positive_at is None else round(now - life.positive_at, 1),
+                      neg_frames=len(life.negatives))
+            act.alive_by = step.by
+        act.last_seen = now
+        via = self._via(cfg, act, life, now)
+        if via != act.via:
+            self._log("call_evidence", call_id=act.call_id, app=act.app, via=via, was=act.via)
+            act.via = via
+            self.store.update_call(act.call_id, via=via)
+            self._tell_ui()
+        return True
+
+    def _life(self, act: _Active) -> Any:
+        """What the screen says about the open call (:meth:`CallEvidence.life`); empty without evidence."""
+        from yuki.memory.callevidence import Life
+
+        evidence = self.evidence
+        if evidence is None or not hasattr(evidence, "life"):
+            return Life()
+        try:
+            return evidence.life(act.holder or act.key)
+        except Exception:
+            return Life()
+
+    @staticmethod
+    def _via(cfg: CallConfig, act: _Active, life: Any, now: float) -> str:
+        """How sure the open call is: ``screen`` (an in-call frame within ``evidence_fresh_s``, not contradicted
+        since), ``mic`` (one of the user's own ``[calls] apps``), else ``screen_stale`` (going on by the
+        microphone hold; voice then asks "was that for me?" on ambiguous words)."""
+        if life.positive_at is not None and not life.negatives and now - life.positive_at <= cfg.evidence_fresh_s:
+            return "screen"
+        if act.key in cfg.apps and (life.positive_at is None or life.negatives):
+            return "mic"
+        return "screen_stale"
+
+    def _heartbeat(self, cfg: CallConfig, act: _Active, now: float) -> None:
+        """``last_alive_at`` at most every ``alive_write_s`` while the call lives (what a restart reads)."""
+        if act.life is None or act.alive_by == "end_grace" or now - act.alive_written < cfg.alive_write_s:
+            return
+        act.alive_written = now
+        try:
+            self.store.update_call(act.call_id, last_alive_at=act.life.alive_at)
+        except Exception as exc:
+            self._log("error", where="calls.heartbeat", error=f"{type(exc).__name__}: {exc}")
+
+    def _note_holders(self, now: float) -> None:
+        """Keep the microphone holders' app keys in :data:`HOLDERS_STATE` when they change (the transcriber's and
+        the digest's gates read it, :func:`lingering_call`)."""
+        keys = sorted(self._held)
+        if keys == self._holders_written:
+            return
+        try:
+            self.store.set_nudge_state(HOLDERS_STATE, json.dumps({"keys": keys, "at": round(now, 1)}))
+            self._holders_written = keys
+        except Exception as exc:
+            self._log("error", where="calls.holders_state", error=f"{type(exc).__name__}: {exc}")
 
     #: The ``nudge_state`` row that carries who is in the open call (:meth:`MemoryAPI.call_status` reads it).
     PEOPLE_STATE = "call_others"
@@ -1646,12 +1957,17 @@ class CallWorker:
             status, consent, by = "not_asked", None, "quiet"
         else:
             status, consent, by = "asking", None, None
+        holder = self._holders.get(key)
+        hold_since = holder.since if holder is not None else None
         call_id = self.store.start_call(app=name, process=key, via=via, service=service, at=now, status=status,
                                         consent=consent, consent_by=by, output_form_factor=facts.get("form_factor"),
-                                        output_device=facts.get("device"), headphones=ok)
-        act = _Active(call_id, key, name, via, service, now, now, status=status, headphones=ok)
+                                        output_device=facts.get("device"), headphones=ok, hold_since=hold_since)
+        act = _Active(call_id, key, name, via, service, now, now, status=status, headphones=ok, holder=holder,
+                      held=holder is not None, alive_written=now)
+        act.life = CallLife(cfg, now=now, hold_since=hold_since, held=holder is not None)
         self._log("call_detected", call_id=call_id, app=name, process=key, via=via, service=service,
-                  headphones=ok, form_factor=facts.get("form_factor"), asked=status == "asking" and consent is None)
+                  headphones=ok, form_factor=facts.get("form_factor"), asked=status == "asking" and consent is None,
+                  hold_since=hold_since, hold_age_s=None if hold_since is None else round(now - hold_since, 1))
         if consent is not None or by == "quiet":
             self._log("call_consent", call_id=call_id, app=name, answer=consent or "none", by=by)
         self._tell_ui()
@@ -1709,6 +2025,13 @@ class CallWorker:
                           form_factor=facts.get("form_factor"))
             self._set_status(act, "waiting_headphones")
             return
+        if not act.held:
+            # The call's app let go of the microphone (Meet's mute, a re-grab under way): nothing the user says
+            # reaches the call now, so nothing is recorded; the call itself (row, pill) goes on.
+            if act.session is not None and act.session.listening:
+                act.session.pause()
+                self._log("call_recording_paused", call_id=act.call_id, reason="mic_released")
+            return
         if act.session is None:
             self._start_recording(cfg, act)
         elif not act.session.listening:
@@ -1720,12 +2043,16 @@ class CallWorker:
         session = RecordingSession(
             self.store, call_id=act.call_id, app=act.app, process=act.key, cfg=cfg,
             source_factory=lambda: self.source_factory(cfg, act.key), log=self._log,
+            start_seq=act.seq_base, base=act.base,
         )
         session.start()
         act.session = session
-        self.store.update_call(act.call_id, recording_started_at=time.time())
+        row = self.store.call_record(act.call_id)
+        if row is None or row.recording_started_at is None:   # an adopted call keeps its first start
+            self.store.update_call(act.call_id, recording_started_at=time.time())
         self._log("call_recording_start", call_id=act.call_id, app=act.app, device=session.device,
-                  opened_as=session.opened_as, vad=session.chunker.vad is not None, spool="encrypted, deferred")
+                  opened_as=session.opened_as, vad=session.chunker.vad is not None, spool="encrypted, deferred",
+                  **({"continues_seq": act.seq_base} if act.seq_base else {}))
 
     def _stop_recording(self, act: _Active, reason: str) -> None:
         session, act.session = act.session, None
@@ -1740,22 +2067,53 @@ class CallWorker:
                   vad_windows=vad.windows if vad is not None else None,
                   vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None, **info)
 
-    def _end(self, act: _Active, reason: str) -> None:
+    def _end(self, act: _Active, reason: str, now: float | None = None, *, life: Any = None) -> None:
+        now = time.time() if now is None else float(now)
         if act.session is not None:
             self._stop_recording(act, reason)
         row = self.store.call_record(act.call_id)
         if row is not None and row.status == "asking" and row.consent is None:
             self.store.answer_call(act.call_id, "none", by="call_ended")
             self._log("call_consent", call_id=act.call_id, app=act.app, answer="none", by="call_ended")
-        self.store.update_call(act.call_id, status="ended", ended_at=time.time(),
+        self.store.update_call(act.call_id, status="ended", ended_at=now,
                                **({} if row is not None and row.stop_reason else {"stop_reason": reason}))
         self._log("call_ended", call_id=act.call_id, app=act.app, reason=reason,
-                  seconds=round(time.time() - act.detected_at, 1))
+                  seconds=round(now - act.detected_at, 1), **self._end_facts(act, now, life))
         self._tell_ui()
+
+    def _end_facts(self, act: _Active, now: float, life: Any = None) -> dict[str, Any]:
+        """What the call's signals were when it ended (content-free, 05 §7.5), so the next unexplained split can
+        be read from the log: the hold, how long since the app let go, the screen's newest in-call frame and the
+        negatives after it with the frame sizes, what was in front and whether it was full screen."""
+        try:
+            life = life if life is not None else self._life(act)
+            cl = act.life
+            held = act.key in self._held
+            front = None
+            try:
+                front = self.foreground_fn()
+            except Exception:
+                front = None
+            front_key = app_key(str(front.get("exe") or "")) if front else None
+            if not front_key and self.evidence is not None and hasattr(self.evidence, "front"):
+                front_key = self.evidence.front()[0]
+            return {
+                "held": held, "hold_since": cl.hold_since if cl is not None else None,
+                "hold_gap_s": 0.0 if held else (round(now - cl.last_held_at, 1)
+                                               if cl is not None and cl.last_held_at is not None else None),
+                "regrabs": cl.regrabs if cl is not None else 0,
+                "positive_age_s": None if life.positive_at is None else round(now - life.positive_at, 1),
+                "neg_frames": len(life.negatives), "last_controls": life.last_controls,
+                "median_controls": None if life.median_controls is None else round(life.median_controls, 1),
+                "front_app_key": front_key, "fullscreen": front is not None,
+            }
+        except Exception as exc:   # the log line itself must never stop a call from ending
+            return {"facts_error": f"{type(exc).__name__}: {exc}"}
 
 
 __all__ = [
-    "CallConfig", "CallWorker", "Chunker", "Chunk", "MicSource", "ArraySource", "RecordingSession",
+    "CallConfig", "CallWorker", "CallLife", "LifeStep", "lingering_call", "HOLDERS_STATE", "LINGER_S",
+    "Chunker", "Chunk", "MicSource", "ArraySource", "RecordingSession",
     "FasterWhisperBackend", "make_backend", "load_backend", "mic_holders", "headphones_now",
     "capture_device_for", "own_executables", "summarize", "Gpu", "RATE", "Segment", "screen_segments",
     "vocabulary_hint", "ChunkTimeout",

@@ -811,11 +811,18 @@ class CallDigestWorker:
     # -- gates ---------------------------------------------------------------
 
     def blocked(self, pause_path: Path | None = None) -> str | None:
-        """Why not now (``paused``, ``call``, ``fullscreen``), or None: nothing runs during a call or a game."""
+        """Why not now (``paused``, ``call``, ``fullscreen``), or None: nothing runs during a call or a game.
+
+        A call counts while a row is open, and while a row that ended minutes ago has an app that still holds the
+        microphone (:func:`yuki.memory.calls.lingering_call`, 05 §7.5): a digest then would cut the call in two."""
         if pause_path is not None and Path(pause_path).exists():
             return "paused"
         try:
             if self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1):
+                return "call"
+            from yuki.memory.calls import lingering_call
+
+            if lingering_call(self.store, time.time()) is not None:
                 return "call"
         except Exception:
             return "store"

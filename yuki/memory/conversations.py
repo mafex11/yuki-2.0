@@ -653,6 +653,19 @@ def quote_in(quote: str | None, text: str | None) -> bool:
     return bool(q) and q in " ".join((text or "").translate(_QUOTE_MAP).casefold().split())
 
 
+#: The opening of a request that carried Yuki's own words, not the user's (our own request formats, fixed
+#: strings): a card's "Do it" before 2026-10-03 (``[The user pressed "Do it" on your card ...]`` + the offer Yuki
+#: wrote), and since then a card's suggestion sent from the ask bar unchanged (``yuki.ui.nudges.SUGGESTION_MARK``).
+#: On 1 Oct the extractor stored a Do-it offer as "The user replied to this card: ..." (conversation fact 41).
+YUKI_WORDS_MARKS: tuple[str, ...] = ('[The user pressed "Do it"', "[Yuki's own suggestion")
+
+
+def yuki_words_request(text: str | None) -> bool:
+    """Whether a request's words are Yuki's own (a Do-it offer, or a card's suggestion sent unchanged): never
+    the user's words, never a reply to a card (plumbing on our fixed prefixes, :data:`YUKI_WORDS_MARKS`)."""
+    return (text or "").startswith(YUKI_WORDS_MARKS)
+
+
 def own_words(text: str | None) -> str:
     """The user's own words in an exchange, without the context Yuki's UI put around them in brackets.
 
@@ -661,9 +674,12 @@ def own_words(text: str | None) -> str:
     (``yuki.ui.nudges.nudge_reply_request``), and notes such as the coach note or
     the voice context follow the words after a blank line, in brackets. Quotes of
     rules, preferences, feedback, commitments and answers must come from these
-    words, never from the card or note Yuki itself attached.
+    words, never from the card or note Yuki itself attached. A request whose
+    words are Yuki's own (:func:`yuki_words_request`) has none.
     """
     t = text or ""
+    if yuki_words_request(t):
+        return ""
     if t.startswith("[") and "]\n" in t:
         t = t.split("]\n", 1)[1]
     cut = t.find("\n\n[")
@@ -673,9 +689,10 @@ def own_words(text: str | None) -> str:
 
 
 def has_card_context(text: str | None) -> bool:
-    """Whether the exchange came with a card in brackets before the user's words (our own format)."""
+    """Whether the exchange came with a card in brackets before the user's words (our own format). A request of
+    Yuki's own words (a Do-it offer, a suggestion sent unchanged) is no reply to a card."""
     t = text or ""
-    return t.startswith("[") and "]\n" in t
+    return t.startswith("[") and "]\n" in t and not yuki_words_request(t)
 
 
 #: A card shown this long before an exchange that came with card context may be what it answers
@@ -995,6 +1012,9 @@ class ConversationWorker:
     def _exchange_lines(t: ConversationTurn, safe: Callable[[str | None, int], str], head: str) -> list[str]:
         if getattr(t, "addressed", None) == OTHERS:
             head += " SAID TO SOMEONE ELSE (the voice judged it was not said to Yuki)"
+        if yuki_words_request(t.user_text):
+            head += (" YUKI'S OWN WORDS (the user pressed a button on Yuki's card, or sent its suggestion unchanged:"
+                     " never the user's words, never a reply or feedback to the card)")
         lines = [head, "    the user: " + safe(t.user_text, USER_CHARS).replace("\n", "\n      ")]
         lines.append("    Yuki: " + (safe(t.reply_text, REPLY_CHARS).replace("\n", "\n      ") if t.reply_text
                                      else "(no reply)"))
@@ -1957,7 +1977,8 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "EXTRACT_SYSTEM_PROMPT", "RECORD_CONVERSATION_TOOL", "SUMMARY_SYSTEM_PROMPT", "SAVE_SUMMARY_TOOL",
     "ConversationWorker", "ExtractResult", "SummaryResult", "PassResult", "OpRecord",
-    "normalize_quote", "quote_in", "parse_due", "own_words", "has_card_context", "card_label", "main",
+    "normalize_quote", "quote_in", "parse_due", "own_words", "has_card_context", "yuki_words_request",
+    "YUKI_WORDS_MARKS", "card_label", "main",
 ]
 
 

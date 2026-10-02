@@ -14,9 +14,11 @@ Discord call was going on (docs/research/coach-and-answers-review.md section 2).
 This module is plumbing on those numbers (nothing decrypted, no model):
 
 * :func:`call_spans` - the calls overlapping a window, merged: rows of one app
-  are one call when the earlier one ended by a service restart and the next
-  began within :data:`RESTART_GAP_S`, or when the next began within
-  :data:`JOIN_GAP_S` whatever ended the earlier one. Measured on the real
+  are one call when they are in the same microphone hold (the same
+  ``hold_since``, migration 26: one hold is one session whatever the gap, so a
+  row the call worker cut is joined again), when the earlier one ended by a
+  service restart and the next began within :data:`RESTART_GAP_S`, or when the
+  next began within :data:`JOIN_GAP_S` whatever ended the earlier one. Measured on the real
   calls of 2026-09-24/26: every restart-split pair touches (gap 0 s, 9 of 9:
   the new service picks the call up the same second it closes the old row);
   the Meet meeting of 25 Sept 09:00-10:00 was 9 rows with gaps of 5 s to 9 min
@@ -43,6 +45,9 @@ from yuki.memory.timeline import POWER_WORDS, _clip, format_duration
 
 #: A row ended by a service restart and the next row of the same app within this is one call (measured 0 s).
 RESTART_GAP_S = 600.0
+#: Two rows whose ``hold_since`` (the ConsentStore start of their microphone hold) differ by at most this are in
+#: the same hold: one call, whatever the gap between them (yuki.memory.calls.HOLD_MATCH_S).
+SAME_HOLD_S = 5.0
 #: Any two rows of the same app this close are one call (Meet mute splits 5 s-9 min; a Discord drop 15 min).
 JOIN_GAP_S = 1200.0
 #: How far around a window rows are read to follow a call that began or ended outside it.
@@ -79,17 +84,21 @@ def _merge(rows: list[CallRecord], now: float) -> list[dict[str, Any]]:
             if current is not None:
                 gap = r.detected_at - current["end"]
                 limit = RESTART_GAP_S if current["stop_reason"] == "service_restart" else JOIN_GAP_S
-                if gap <= limit:
+                hold = getattr(r, "hold_since", None)
+                same_hold = (hold is not None and current["hold_since"] is not None
+                             and abs(hold - current["hold_since"]) <= SAME_HOLD_S)
+                if gap <= limit or same_hold:
                     current["pieces"].append((r.detected_at, end))
                     current["end"] = max(current["end"], end)
                     current["ongoing"] = ongoing
                     current["stop_reason"] = r.stop_reason
                     current["call_ids"].append(r.id)
                     current["service"] = current["service"] or r.service
+                    current["hold_since"] = hold if hold is not None else current["hold_since"]
                     continue
             current = {"app": r.app or key, "process": key, "service": r.service, "start": r.detected_at,
                        "end": end, "ongoing": ongoing, "stop_reason": r.stop_reason, "pieces": [(r.detected_at, end)],
-                       "call_ids": [r.id]}
+                       "call_ids": [r.id], "hold_since": getattr(r, "hold_since", None)}
             spans.append(current)
     return sorted(spans, key=lambda s: s["start"])
 
@@ -160,6 +169,20 @@ def merged_calls(store: Store, since: float, until: float, *, now: float | None 
     return [dict(s) for s in _merge(rows, now) if s["start"] < until and s["end"] > since]
 
 
+def session_start(store: Store, call_id: int, *, now: float | None = None) -> float | None:
+    """When the call session that row ``call_id`` belongs to began (epoch s): its first row's start, merged as in
+    :func:`call_spans` (rows of the same microphone hold, across restarts and short drops); None when the row is
+    unknown. The call pill counts from here, so a rare real reconnect does not restart the timer (05 §7.4)."""
+    now = time.time() if now is None else float(now)
+    row = store.call_record(int(call_id))
+    if row is None:
+        return None
+    for s in _merge(store.calls_overlapping(row.detected_at - CONTEXT_S, now + 1.0), now):
+        if row.id in s["call_ids"]:
+            return float(s["start"])
+    return float(row.detected_at)
+
+
 def open_calls(store: Store, now: float | None = None) -> list[dict[str, Any]]:
     """The calls going on now, merged: ``{"app", "process", "service", "since", "seconds"}`` each (epoch)."""
     now = time.time() if now is None else float(now)
@@ -218,5 +241,5 @@ def coach_calls_text(store: Store, now: float) -> str | None:
     return "\n".join(lines) or None
 
 
-__all__ = ["RESTART_GAP_S", "JOIN_GAP_S", "call_spans", "merged_calls", "open_calls", "describe_call",
-           "coach_calls_text"]
+__all__ = ["RESTART_GAP_S", "JOIN_GAP_S", "SAME_HOLD_S", "call_spans", "merged_calls", "open_calls", "session_start",
+           "describe_call", "coach_calls_text"]

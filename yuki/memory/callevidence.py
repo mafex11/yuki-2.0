@@ -22,21 +22,37 @@ a video page)? A verdict is cached by the screen's content, so an unchanged wind
   then went full screen in a game for an hour): probably still in the call, not certain;
 * ``None``: no in-call screen during this hold (mic only, a lobby, a video page): not a call.
 
-A later screen of the same app and site judged not in a call clears that site's evidence (they left: the
-Discord panel is gone, the Meet page shows "You left the meeting"); a screen of another site in the same
-browser does not (a Meet call goes on while they look at YouTube in another tab).
+A later screen of the same app and site judged not in a call means that site's evidence can no longer
+*start* a call (they left: the Discord panel is gone, the Meet page shows "You left the meeting"); a screen of
+another site in the same browser does not (a Meet call goes on while they look at YouTube in another tab).
 
-Logs are content-free (``call_evidence_judged``: app, whether in a call, ms, cost): never a control name.
-Nothing here decides from words in code: the model judges the screen.
+**Starting is not continuing** (2026-10-03, ``docs/research/revamp-2026-10-02/05-call-pill-timer.md``): one
+Discord frame read in the 6-21 s of an alt-tab from a game and judged "not in a call" used to delete the
+evidence, and 30 s later the call row ended (six calls cut that way in 3.5 days, 32 minutes lost on 2 Oct).
+Those frames were half drawn: 0, 0, 18, 21, 21 and 22 controls against at least 68 in all 183 in-call reads. So:
+
+* the judge has a third answer, ``unclear`` (an alt-tab or half-drawn window, a worked example in its
+  prompt), which counts as neither a call nor no call;
+* a frame is only **healthy** when its control count is at least :data:`HEALTH_RATIO` times the median of the
+  site's own last :data:`HEALTH_WINDOW` in-call frames (a measured number, no words): an unhealthy frame
+  counts as neither, whatever the verdict;
+* a healthy "not in a call" is a **reliable negative**; every sight of it is counted (the watcher re-reads a
+  window that stays in front), and the call worker's :class:`yuki.memory.calls.CallLife` ends a call whose
+  microphone is still held only on a persistent run of them (:meth:`life`), never on one.
+
+Logs are content-free (``call_evidence_judged`` / ``call_evidence_applied`` for a cached verdict: app, the
+verdict, the frame's control count, whether it was healthy, the site's median, ms, cost): never a control
+name. Nothing here decides from words in code: the model judges the screen.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
@@ -51,12 +67,26 @@ HOLD_TOLERANCE_S = 5.0
 VERDICT_CACHE = 256
 #: Controls sent to the model at most (names; the extraction already caps them).
 MAX_CONTROLS = 80
-#: A site with in-call evidence is judged again at most this often (s) while its screen keeps changing (a busy
-#: chat changes with every message); a site with none (joining), or known content, is answered at once.
-REJUDGE_S = 60.0
+#: A site with live in-call evidence is judged again at most this often (s) while its screen keeps changing (a
+#: busy chat changes with every message): a cost guard only (a judgement costs ~$0.003; 195 in 3.5 days, measured
+#: 2 Oct), 60 s until 2026-10-03, when the wait itself let a re-opened microphone hold end a call (05 §4 M3). A
+#: site with none (joining), or known content, is answered at once.
+REJUDGE_S = 20.0
 #: A site whose last verdict said the user is alone in the call (nobody else joined yet) is judged again this soon
 #: on a change: someone joining is what the change most likely is, and voice waits on it (v3.15).
 ALONE_REJUDGE_S = 8.0
+#: A frame is healthy (its verdict counts) only with at least this share of the median control count of the
+#: site's own recent in-call frames. Measured 28 Sept-2 Oct on Discord: 183 in-call reads had 68-80 controls;
+#: the six "not in a call" reads that ended live calls had 0, 0, 18, 21, 21 and 22 (half-drawn, mid alt-tab);
+#: real "not in a call" screens (before joining) had 80.
+HEALTH_RATIO = 0.5
+#: ... over this many of the site's latest in-call frames.
+HEALTH_WINDOW = 20
+#: Reliable negative sights kept per site (the call worker needs a few, spanning minutes).
+MAX_NEGATIVES = 32
+
+#: The judge's three answers.
+IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
 
 JUDGE_TOOL: dict[str, Any] = {
     "name": "judge_screen",
@@ -64,12 +94,17 @@ JUDGE_TOOL: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "in_call": {
-                "type": "boolean",
-                "description": "true only when the window shows a call the user is in now (joined): call controls "
-                               "such as leave, hang up, end call or disconnect, a voice-connected panel, participant "
-                               "tiles. false for a pre-join lobby or waiting screen, a call that ended, a text "
-                               "chat, a video or any other page.",
+            "state": {
+                "type": "string",
+                "enum": [IN_CALL, NOT_IN_CALL, UNCLEAR],
+                "description": "in_call only when the window shows a call the user is in now (joined): call "
+                               "controls such as leave, hang up, end call or disconnect, a voice-connected panel, "
+                               "participant tiles. not_in_call for a fully drawn window that shows no joined call: "
+                               "a pre-join lobby or waiting screen, a call that ended, a text chat, a video or any "
+                               "other page. unclear when the window cannot tell either way because it is not drawn "
+                               "yet or only partly: only its frame buttons, almost no controls, or the app's outer "
+                               "navigation without its main content (a window caught mid alt-tab or while it "
+                               "repaints).",
             },
             "service": {
                 "type": "string",
@@ -85,7 +120,7 @@ JUDGE_TOOL: dict[str, Any] = {
                                "is here'). -1 when the screen does not show who is in the call. Otherwise -1.",
             },
         },
-        "required": ["in_call", "service", "others"],
+        "required": ["state", "service", "others"],
     },
 }
 
@@ -96,40 +131,51 @@ video call that the user has actually joined right now. The microphone being in 
 pre-join lobby, a browser tab that was once given the microphone, or a game also use it. Only the screen says \
 whether they are in the call.
 
-In a call: the controls of a live call (leave call, hang up, end call, disconnect, mute and camera toggles of \
-the call, share screen, participants or people in the call, meeting details), or a panel saying the voice is \
-connected. Not in a call: a lobby that asks them to join (join now, ask to join, ready to join?), a screen \
-saying the call ended or they left, a chat or channel with messages only, a video page, an editor, a list of \
-chats, settings.
+Three answers. in_call: the controls of a live call (leave call, hang up, end call, disconnect, mute and \
+camera toggles of the call, share screen, participants or people in the call, meeting details), or a panel \
+saying the voice is connected. not_in_call: a fully drawn window that shows no joined call - a lobby that asks \
+them to join (join now, ask to join, ready to join?), a screen saying the call ended or they left, a chat or \
+channel with messages only, a video page, an editor, a list of chats, settings. unclear: the window cannot say \
+either way because it is not drawn yet or only partly - the user is switching to it (alt-tab from a game) or it \
+is repainting, so you see only its frame buttons, no controls at all, or the app's outer navigation without its \
+main content. A window that is half drawn is unclear, never not_in_call: the missing part may be the call.
 
 Examples:
 - title "Meet - abc-defg-hij", host meet.google.com, controls: "Ready to join?", "Join now", "Other ways to \
-join", "Turn off microphone", "Turn off camera" -> in_call false (the pre-join lobby)
+join", "Turn off microphone", "Turn off camera" -> not_in_call (the pre-join lobby)
 - title "Meet - abc-defg-hij", host meet.google.com, controls: "Leave call", "Turn off microphone", "Turn off \
-camera", "Share screen", "Meeting details", "People", "Chat with everyone", "Rohan", "You" -> in_call true, \
+camera", "Share screen", "Meeting details", "People", "Chat with everyone", "Rohan", "You" -> in_call, \
 Google Meet
 - title "#general | Friends - Discord", host discord.com, controls: "Voice Connected", "General / Friends", \
-"Disconnect", "Noise Suppression", "Mute", "Deafen", "#general", "Message #general" -> in_call true, Discord
+"Disconnect", "Noise Suppression", "Mute", "Deafen", "#general", "Message #general" -> in_call, Discord
 - title "#memes | Friends - Discord", host discord.com, controls: "#general", "#memes", "Message #memes", \
-"Mute", "Deafen", "User Settings" -> in_call false (a text channel; no voice-connected panel)
-- title "Zoom Meeting", controls: "Mute", "Stop Video", "Participants", "Share Screen", "End" -> in_call \
-true, Zoom
+"Mute", "Deafen", "User Settings" -> not_in_call (a text channel; no voice-connected panel)
+- title "Discord", host discord.com, controls: "Minimize", "Maximize", "Close" -> unclear (only the window's \
+frame: it is still being drawn)
+- title "#general | Friends - Discord", host discord.com, controls: (none visible) -> unclear (nothing drawn yet)
+- title "Friends - Discord", host discord.com, controls: "Minimize", "Maximize", "Close", "Servers", "Direct \
+Messages", "Friends", "Add a Server" -> unclear (the server list is drawn but not the channels or the voice \
+panel: half a window, caught while switching to it)
+- title "Meet - abc-defg-hij", host meet.google.com, controls: "Meet", "Loading" -> unclear (the page is \
+still loading)
+- title "Zoom Meeting", controls: "Mute", "Stop Video", "Participants", "Share Screen", "End" -> in_call, Zoom
 - title "Microsoft Teams", controls: "Join now", "Choose your video and audio options", "Computer audio" -> \
-in_call false (Teams pre-join)
+not_in_call (Teams pre-join)
 - title "(1558) YouTube", host youtube.com, controls: "Search", "Home", "Shorts", "Subscriptions", video \
-titles -> in_call false
-- title "WhatsApp", controls: "Chats", "Search", "Bro", "Res", "Elina", "Archived" -> in_call false (a chat \
-list)
-- title "Voice call", controls: "End call", "Mute", "Speaker", "Video" -> in_call true, WhatsApp, others -1
+titles -> not_in_call
+- title "WhatsApp", controls: "Chats", "Search", "Bro", "Res", "Elina", "Archived" -> not_in_call (a chat list)
+- title "Meet", host meet.google.com, controls: "You left the meeting", "Rejoin", "Return to home screen" -> \
+not_in_call (the call ended for them)
+- title "Voice call", controls: "End call", "Mute", "Speaker", "Video" -> in_call, WhatsApp, others -1
 - title "#general | Friends - Discord", controls: "General", "sam", "Rohan", "Voice Connected", "General / \
-Friends", "Disconnect", "Mute", "Deafen" -> in_call true, Discord, others 1 (two names under the voice channel: \
+Friends", "Disconnect", "Mute", "Deafen" -> in_call, Discord, others 1 (two names under the voice channel: \
 the user and Rohan)
 - title "@Priya - Discord", controls: "Priya, Ongoing Call", "Voice Connected", "Disconnect", "sam", \
-"Ringing", "Mute", "Deafen" -> in_call true, Discord, others 0 (only the user has joined; the other is still \
+"Ringing", "Mute", "Deafen" -> in_call, Discord, others 0 (only the user has joined; the other is still \
 being rung)
 - title "Meet - abc-defg-hij", controls: "Leave call", "Turn off microphone", "Share screen", "People 1", \
-"You", "No one else is here" -> in_call true, Google Meet, others 0
-- title "Zoom Meeting", controls: "Mute", "Stop Video", "Participants 4", "End" -> in_call true, Zoom, others 3
+"You", "No one else is here" -> in_call, Google Meet, others 0
+- title "Zoom Meeting", controls: "Mute", "Stop Video", "Participants 4", "End" -> in_call, Zoom, others 3
 
 The user's own name or tile never counts in others; a call whose screen does not show who is in it is -1.
 
@@ -154,6 +200,28 @@ class Verdict:
     service: str = ""
     #: Other people in the call with the user, as the screen shows (0: alone in it), or None when it does not say.
     others: int | None = None
+    #: The window could not say (half drawn, caught mid alt-tab): neither a call nor no call.
+    unclear: bool = False
+
+    @property
+    def state(self) -> str:
+        return UNCLEAR if self.unclear else IN_CALL if self.in_call else NOT_IN_CALL
+
+
+@dataclass
+class Life:
+    """What the screen says about a call that is going on, for :class:`yuki.memory.calls.CallLife` (measured,
+    content-free): the newest in-call frame of the call's site and the reliable "not in a call" sights after it."""
+
+    #: Capture time of the site's newest in-call frame (renewed whenever the same screen is seen again); None:
+    #: no in-call frame of this app at all.
+    positive_at: float | None = None
+    #: Capture times of the reliable not-in-call sights of that site since it, oldest first.
+    negatives: tuple[float, ...] = ()
+    host: str | None = None
+    #: Control count of the site's latest frame, and the median of its recent in-call frames (for the log).
+    last_controls: int | None = None
+    median_controls: float | None = None
 
 
 def _digest(title: str, host: str | None, controls: Iterable[str]) -> str:
@@ -186,10 +254,18 @@ class CallEvidence:
         self._screens: dict[tuple[str, str | None], Screen] = {}
         #: Screens whose content has no verdict applied yet, per (app key, host).
         self._pending: set[tuple[str, str | None]] = set()
-        #: The verdict each (app key, host) was last given, with its digest.
+        #: The digest of the screen each (app key, host) last had a verdict applied to ...
         self._applied: dict[tuple[str, str | None], str] = {}
+        #: ... and what that verdict counted as: "pos" (in a call), "neg" (a reliable not-in-a-call) or "none"
+        #: (unclear, or an unhealthy frame: neither).
+        self._kind: dict[tuple[str, str | None], str] = {}
         #: In-call evidence per (app key, host): ``(last seen at, service, others)`` (others: see :class:`Verdict`).
+        #: Kept after a reliable negative (a call goes on through one); :attr:`_negs` says whether it is contradicted.
         self._evidence: dict[tuple[str, str | None], tuple[float, str, int | None]] = {}
+        #: Capture times of the reliable not-in-call sights of each site since its last in-call frame.
+        self._negs: dict[tuple[str, str | None], list[float]] = {}
+        #: Control counts of each site's latest in-call frames (the measured health line).
+        self._pos_counts: dict[tuple[str, str | None], deque[int]] = {}
         #: The executable each app key was last seen running as (to match a microphone holder by path or package).
         self._exes: dict[str, str] = {}
         self._verdicts: OrderedDict[str, Verdict] = OrderedDict()
@@ -222,15 +298,60 @@ class CallEvidence:
             if shot.exe:
                 self._exes[shot.key] = shot.exe
             if self._applied.get(where) == shot.digest:
-                # The same screen again: its verdict stands, and in-call evidence is renewed.
-                if where in self._evidence:
+                # The same screen again: its verdict stands; in-call evidence is renewed, and a reliable
+                # "not in a call" is counted once more (a "You left the meeting" page left in front).
+                kind = self._kind.get(where)
+                if kind == "pos" and where in self._evidence:
                     self._evidence[where] = (shot.at, *self._evidence[where][1:])
+                elif kind == "neg":
+                    self._add_negative(where, shot.at)
                 return
             self._pending.add(where)
             if len(self._screens) > 512:   # bounded: forget the oldest screens
                 for old in sorted(self._screens, key=lambda w: self._screens[w].at)[:256]:
                     self._screens.pop(old, None)
                     self._pending.discard(old)
+
+    def _add_negative(self, where: tuple[str, str | None], at: float) -> None:
+        """One more reliable not-in-call sight of a site (under the lock); only a newer one counts."""
+        negs = self._negs.setdefault(where, [])
+        if negs and at <= negs[-1]:
+            return
+        negs.append(at)
+        if len(negs) > MAX_NEGATIVES:
+            del negs[: len(negs) - MAX_NEGATIVES]
+
+    def _live(self, where: tuple[str, str | None]) -> bool:
+        """The site has in-call evidence that no reliable negative followed (under the lock)."""
+        return where in self._evidence and not self._negs.get(where)
+
+    def _median(self, where: tuple[str, str | None]) -> float | None:
+        counts = self._pos_counts.get(where)
+        return float(statistics.median(counts)) if counts else None
+
+    def _apply(self, where: tuple[str, str | None], shot: Screen, verdict: Verdict) -> tuple[str, bool, float | None]:
+        """Count a verdict for a site's screen (under the lock): ``(kind, healthy, median)``.
+
+        A frame with fewer controls than :data:`HEALTH_RATIO` of the site's recent in-call median is not
+        healthy (half drawn): like an ``unclear`` verdict it counts as neither a call nor no call. Before the
+        site's first in-call frame there is no median and every frame counts.
+        """
+        n = len(shot.controls)
+        median = self._median(where)
+        healthy = median is None or n >= HEALTH_RATIO * median
+        self._applied[where] = shot.digest
+        if verdict.unclear or not healthy:
+            kind = "none"
+        elif verdict.in_call:
+            kind = "pos"
+            self._evidence[where] = (shot.at, verdict.service or "", verdict.others)
+            self._negs.pop(where, None)
+            self._pos_counts.setdefault(where, deque(maxlen=HEALTH_WINDOW)).append(n)
+        else:
+            kind = "neg"
+            self._add_negative(where, shot.at)
+        self._kind[where] = kind
+        return kind, healthy, median
 
     # -- judging (the call worker's thread) ----------------------------------------------------
 
@@ -265,36 +386,45 @@ class CallEvidence:
             with self._lock:
                 cached = shot.digest in self._verdicts
                 # A site in a call judged moments ago keeps its evidence while its screen changes (a busy chat):
-                # the newest screen waits for the next pass. Joining is never delayed (no evidence yet).
-                # Alone in the call at the last verdict: a change is judged again sooner (someone joined?).
-                wait_s = (ALONE_REJUDGE_S if where in self._evidence and self._evidence[where][2] == 0
-                          else self.rejudge_s)
-                recent = where in self._evidence and time.monotonic() - self._judged_at.get(where, -1e9) < wait_s
+                # the newest screen waits for the next pass (a cost guard). Joining is never delayed (no live
+                # evidence yet). Alone in the call at the last verdict: a change is judged again sooner.
+                live = self._live(where)
+                wait_s = ALONE_REJUDGE_S if live and self._evidence[where][2] == 0 else self.rejudge_s
+                recent = live and time.monotonic() - self._judged_at.get(where, -1e9) < wait_s
             if recent and not cached:
                 continue
-            verdict = self._verdict(shot)
-            if verdict is None:
+            got = self._verdict(shot)
+            if got is None:
                 continue
+            verdict, was_cached, ms, cost = got
+            kind, healthy, median = "", True, None
             with self._lock:
                 latest = self._screens.get(where)
-                if latest is not None and latest.digest != shot.digest:
-                    continue   # a newer screen arrived meanwhile: it is judged next time
-                self._pending.discard(where)
-                self._applied[where] = shot.digest
-                if verdict.in_call:
-                    self._evidence[where] = (shot.at, verdict.service or "", verdict.others)
-                else:
-                    self._evidence.pop(where, None)
-            applied += 1
+                superseded = latest is not None and latest.digest != shot.digest
+                if not superseded:   # else a newer screen arrived meanwhile: it is judged next time
+                    self._pending.discard(where)
+                    kind, healthy, median = self._apply(where, shot, verdict)
+            fields = dict(app=shot.key, page=shot.host is not None, state=verdict.state, others=verdict.others,
+                          controls=len(shot.controls), healthy=healthy,
+                          median=None if median is None else round(median, 1), counted=kind or None)
+            if was_cached:
+                if not superseded:
+                    self._log("call_evidence_applied", cached=True, **fields)
+            else:
+                self._log("call_evidence_judged", applied=not superseded, ms=ms, cost_usd=round(cost, 6), **fields)
+            if not superseded:
+                applied += 1
         return applied
 
-    def _verdict(self, shot: Screen) -> Verdict | None:
+    def _verdict(self, shot: Screen) -> tuple[Verdict, bool, int, float] | None:
+        """``(verdict, from the cache, ms, cost)`` for a screen, or None when the model failed (judged again on
+        the next pass)."""
         with self._lock:
             known = self._verdicts.get(shot.digest)
             if known is not None:
                 self._verdicts.move_to_end(shot.digest)
                 self.counters["cached"] += 1
-                return known
+                return known, True, 0, 0.0
         started = time.perf_counter()
         cost = 0.0
         try:
@@ -315,9 +445,7 @@ class CallEvidence:
             self._verdicts[shot.digest] = verdict
             while len(self._verdicts) > VERDICT_CACHE:
                 self._verdicts.popitem(last=False)
-        self._log("call_evidence_judged", app=shot.key, page=shot.host is not None, in_call=verdict.in_call,
-                  others=verdict.others, controls=len(shot.controls), ms=ms, cost_usd=round(cost, 6))
-        return verdict
+        return verdict, False, ms, cost
 
     def _model_verdict(self, shot: Screen) -> tuple[Verdict, float]:
         from yuki.log.requests import usage_tokens
@@ -344,14 +472,18 @@ class CallEvidence:
             messages=[{"role": "user", "content": "\n".join(lines)}])
         block = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
         data = getattr(block, "input", None) or {}
-        in_call = data.get("in_call") is True
+        state = str(data.get("state") or "").strip()
+        if state not in (IN_CALL, NOT_IN_CALL, UNCLEAR):   # an answer in the old shape (a boolean) still reads
+            state = IN_CALL if data.get("in_call") is True else NOT_IN_CALL if data.get("in_call") is False else UNCLEAR
+        in_call = state == IN_CALL
         try:
             others = int(data.get("others")) if in_call and data.get("others") is not None else None
         except (TypeError, ValueError):
             others = None
         verdict = Verdict(in_call=in_call,
                           service=" ".join(str(data.get("service") or "").split())[:40] if in_call else "",
-                          others=others if others is not None and others >= 0 else None)
+                          others=others if others is not None and others >= 0 else None,
+                          unclear=state == UNCLEAR)
         try:
             cost = float(settings.estimate_cost(model, usage_tokens(response.usage)) or 0.0)
         except Exception:  # noqa: BLE001
@@ -362,48 +494,79 @@ class CallEvidence:
 
     def state(self, holder: Any, mic_since: float, now: float | None = None) -> tuple[str | None, str]:
         """``(evidence, service)`` for an app (its key, or its ``Holder``) and its microphone hold that began at
-        ``mic_since``.
+        ``mic_since``: may this hold **start** a call?
 
-        ``evidence`` is ``"fresh"``, ``"stale"`` or ``None`` (see the module docstring); ``service`` is the
-        call's product name from the verdict ("" when unknown).
+        ``evidence`` is ``"fresh"``, ``"stale"`` or ``None`` (see the module docstring): only a site whose
+        newest counted frame was in a call, captured during this hold, starts one. ``service`` is the call's
+        product name from the verdict ("" when unknown). A call already going on is kept by
+        :meth:`life` (no "newer than the hold" test: a re-grab of the microphone is the same call).
         """
         if not holder:
             return None, ""
         now = time.time() if now is None else float(now)
         with self._lock:
-            found = [(at, service) for (k, _h), (at, service, _o) in self._evidence.items()
-                     if self._matches(holder, k) and at >= float(mic_since) - HOLD_TOLERANCE_S]
+            found = [(at, service) for (k, h), (at, service, _o) in self._evidence.items()
+                     if self._matches(holder, k) and self._live((k, h)) and at >= float(mic_since) - HOLD_TOLERANCE_S]
         if not found:
             return None, ""
         at, service = max(found)
         return ("fresh" if now - at <= self.fresh_s else "stale"), service
 
+    def life(self, holder: Any) -> Life:
+        """What the screen says about an app's call that is going on (key or ``Holder``): the newest in-call
+        frame of its site and the reliable not-in-call sights since (:class:`Life`; empty without one)."""
+        if not holder:
+            return Life()
+        with self._lock:
+            sites = [(at, w) for w, (at, _s, _o) in self._evidence.items() if self._matches(holder, w[0])]
+            if not sites:
+                return Life()
+            at, where = max(sites, key=lambda s: s[0])
+            shot = self._screens.get(where)
+            return Life(positive_at=at, negatives=tuple(t for t in self._negs.get(where, ()) if t > at),
+                        host=where[1], last_controls=len(shot.controls) if shot is not None else None,
+                        median_controls=self._median(where))
+
+    def front(self) -> tuple[str | None, float | None]:
+        """``(app key, capture time)`` of the newest window the watcher handed over (the one in front, as last
+        read), or ``(None, None)``; content-free, for the call log."""
+        with self._lock:
+            if not self._screens:
+                return None, None
+            shot = max(self._screens.values(), key=lambda s: s.at)
+            return shot.key, shot.at
+
     def host_of(self, holder: Any) -> str | None:
-        """The site of the newest in-call evidence of an app (key or ``Holder``; None: an app window, or none)."""
+        """The site of the newest live in-call evidence of an app (key or ``Holder``; None: an app window, or
+        none)."""
         if not holder:
             return None
         with self._lock:
-            found = [(at, h or "") for (k, h), (at, _s, _o) in self._evidence.items() if self._matches(holder, k)]
+            found = [(at, h or "") for (k, h), (at, _s, _o) in self._evidence.items()
+                     if self._matches(holder, k) and self._live((k, h))]
         return (max(found)[1] or None) if found else None
 
     def others_of(self, holder: Any) -> int | None:
-        """How many other people the newest in-call screen of an app (key or ``Holder``) showed with the user
-        (0: alone in the call), or None when there is none or it did not say (v3.15)."""
+        """How many other people the newest live in-call screen of an app (key or ``Holder``) showed with the
+        user (0: alone in the call), or None when there is none or it did not say (v3.15)."""
         if not holder:
             return None
         with self._lock:
-            found = [(at, others) for (k, _h), (at, _s, others) in self._evidence.items() if self._matches(holder, k)]
+            found = [(at, others) for (k, h), (at, _s, others) in self._evidence.items()
+                     if self._matches(holder, k) and self._live((k, h))]
         return max(found, key=lambda f: f[0])[1] if found else None
 
     def forget(self, key: str) -> None:
-        """The app let go of the microphone: its in-call evidence is over (a new hold needs a new screen)."""
+        """Drop an app's in-call evidence (a new hold then needs a new screen to start a call)."""
         with self._lock:
             for where in [w for w in self._evidence if w[0] == key.casefold()]:
                 self._evidence.pop(where, None)
+                self._negs.pop(where, None)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {**self.counters, "screens": len(self._screens), "evidence": len(self._evidence),
+                    "contradicted": sum(1 for w in self._evidence if self._negs.get(w)),
                     "cost_usd": round(self.cost_usd, 5)}
 
     def _log(self, type: str, **fields: Any) -> None:
@@ -414,4 +577,5 @@ class CallEvidence:
                 pass
 
 
-__all__ = ["CallEvidence", "Screen", "Verdict", "JUDGE_PROMPT", "JUDGE_TOOL", "FRESH_S"]
+__all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "FRESH_S", "HEALTH_RATIO",
+           "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]

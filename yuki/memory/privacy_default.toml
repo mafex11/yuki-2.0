@@ -276,6 +276,12 @@ question_gap_min = 20
 questions_per_day = 6
 question_min_importance = 5
 question_max_age_days = 7
+# What a card may offer.  "yuki_only": now and then one small thing of Yuki's
+# own, run by code the moment you press its button, never by the agent - add it
+# to your list, show what Yuki has on it, open again a page you had, a draft
+# to copy, or a suggestion put unsent in the ask bar - never your own work.
+# "off": cards only tell you things; no button runs anything.
+offers = "yuki_only"
 
 [review]
 # The weekly review (yuki.memory.review): the last seven days in numbers and a
@@ -305,17 +311,28 @@ retry_min = 30
 # or "Never" for that app; no answer means nothing is recorded.
 enabled = true
 # What a call is, is measured, not listed: an app (any app, a browser too) that
-# has held the microphone for hold_s seconds while it also plays sound or
-# holds the camera - or a meeting row of the timeline ([meetings]).  The card
-# still asks every time; "Never for <app>" is remembered.
-hold_s = 15
+# holds the microphone while a screen of it, read during that hold, shows a
+# joined call (judged by a small model from the window's control names; a
+# lobby, a video page or a text chat is not a call).  The card still asks
+# every time; "Never for <app>" is remembered.
 # Your own additions (empty by default): apps that are a call whenever they
 # hold the microphone, sound or not.  Process names of desktop apps, or
 # package family names of Store apps.
 apps = []
+# Once a call has started, its microphone hold is the session: it goes on
+# while the app holds the microphone (a new hold by the same app inside the
+# call is the same call), for release_grace_s seconds after it lets go, or
+# while a screen of the call shown after it let go is at most screen_alive_s
+# old (Meet drops the microphone on mute).  The screen ends a call whose
+# microphone is still held only after neg_frames clear "not in a call"
+# screens over at least neg_span_s seconds; one screen never does.  A call
+# that is not alive for end_grace_s ends.
+release_grace_s = 90
+neg_frames = 3
+neg_span_s = 120
+screen_alive_s = 900
 # How often the call worker wakes (the microphone's users are read again only
-# when Windows changes them), and how long a call may go quiet (app off the
-# microphone, meeting not in front) before it counts as ended.
+# when Windows changes them).
 poll_s = 5
 end_grace_s = 30
 # The card goes away unanswered after this long (= no recording for this call).

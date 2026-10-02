@@ -86,7 +86,7 @@ def shows(worker: CallWorker, exe: str, at: float, controls=IN_CALL, host=None, 
 
 
 def _worker(store, stubs: Stubs, **cfg) -> CallWorker:
-    config = CallConfig(**{"hold_s": 15.0, "end_grace_s": 30.0, **cfg})
+    config = CallConfig(**{"end_grace_s": 30.0, **cfg})
     worker = CallWorker(store, signals=stubs.signals(frozenset({PYTHON.casefold()})), config=config,
                         headphones_fn=lambda c: (False, {"form_factor": "speakers", "device": "Speakers"}),
                         source_factory=lambda c, app: pytest.fail("the microphone must not be opened"),
@@ -197,11 +197,16 @@ def test_call_goes_on_through_silence_and_ends_after_the_mic_is_let_go(store):
     stubs.render.clear()                  # nobody talks: no output stream for a while
     w.step(now + 40)
     assert w.active is not None and w.active.call_id == call_id
-    stubs.mic.clear()                     # left the call: no hold, so no evidence for it
+    stubs.mic.clear()                     # left the call: the app let go of the microphone after now + 40
     w.step(now + 50)
-    assert w.active is not None           # within end_grace_s
-    w.step(now + 81)
+    assert w.active is not None           # within release_grace_s (a re-grab would be the same call)
+    w.step(now + 125)
+    assert w.active is not None           # still within release_grace_s (90 s from the last poll it was held)
+    w.step(now + 135)
+    assert w.active is not None           # not alive any more, within end_grace_s
+    w.step(now + 166)
     assert w.active is None and store.call_record(call_id).status == "ended"
+    assert store.call_record(call_id).stop_reason == "mic_released"
 
 
 def test_no_mic_holder_reads_no_sound(store):

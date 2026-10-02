@@ -1332,10 +1332,62 @@ class MemoryClient:
 
     @staticmethod
     def _nudge_dict(n: Any) -> dict:
-        inputs = n.inputs if isinstance(getattr(n, "inputs", None), dict) else {}
-        offer = " ".join(str(inputs.get("offer") or "").split()) or None
+        from yuki.memory.offers import card_offer_view
+
+        # a typed offer only (yuki.memory.offers): what the card shows and its button runs, by code; a free-text
+        # offer from before 2026-10-03 gets no button (a sentence is not something code can run)
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
-                "trigger": n.trigger, "offer": offer}
+                "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None)}
+
+    def _nudges_config(self) -> Any:
+        """The user's ``[nudges]`` table (read only; the service applies the same), defaults when unreadable."""
+        from yuki.memory.nudges import NudgeConfig
+
+        try:
+            from types import SimpleNamespace
+
+            from yuki.memory.privacy import user_config_path
+            from yuki.memory.timeline import PrivacySection
+
+            if self._nudge_section is None:
+                self._nudge_section = PrivacySection(SimpleNamespace(path=user_config_path()), "nudges",
+                                                     NudgeConfig.from_dict)
+            return self._nudge_section.get()
+        except Exception:
+            return NudgeConfig()
+
+    def offer_act(self, nudge_id: int) -> dict:
+        """The user pressed a card's offer button: check it again and run it, by code (:func:`yuki.memory.offers.act`):
+        ``{"ok": True, "do", "state", ...}`` (``todo_add``: added; ``show_memory``: ``items``; ``bring_back``: the
+        ``url`` and ``title`` for the UI to open; ``draft``: ``text``; ``ask``: ``text`` for the ask bar, unsent) or
+        ``{"ok": False, "why"}`` (``expired`` after 30 minutes, ``gone``, ``off``, ``already``, ``unknown``,
+        ``no_offer``). Never a model call, never an agent run; a second press changes nothing."""
+        from yuki.memory import offers
+
+        try:
+            return offers.act(self.store, int(nudge_id), enabled=self._nudges_config().offers != "off")
+        except Exception as exc:
+            return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def offer_undo(self, nudge_id: int) -> dict:
+        """Undo a card's offer that ran (``todo_add``: the to-do ends as a wrong capture; ``bring_back``: recorded,
+        the UI brings back what was in front): ``{"ok": True, "state": "undone"}`` or ``{"ok": False, "why"}``."""
+        from yuki.memory import offers
+
+        try:
+            return offers.undo(self.store, int(nudge_id))
+        except Exception as exc:
+            return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def offer_outcome(self, nudge_id: int, outcome: str) -> bool:
+        """What became of an ``ask`` suggestion put in the ask bar: ``done`` (the request ran), ``stopped`` (stopped
+        within a minute), ``abandoned`` (closed unsent). Read by the per-kind learning (yuki.memory.offers)."""
+        from yuki.memory import offers
+
+        try:
+            return offers.record_outcome(self.store, int(nudge_id), str(outcome))
+        except Exception:
+            return False
 
     # -- questions for the user (yuki.memory.questions) -----------------------------
 
@@ -1396,9 +1448,11 @@ class MemoryClient:
 
         Each: ``{"id": int, "at": ISO, "kind": "praise" | "nudge" | "reminder" |
         "review" | "resume" | "question" | "notice", "text": str, "reason": str | None, "ref", "trigger",
-        "offer": str | None}`` (``notice``: an observation card, yuki.memory.presence, ``trigger`` its channel;
-        ``offer``: the instruction its "Do it" button sends to the agent as the user's own words; ``resume``:
-        picking up after the PC was off or asleep; it expires like a praise). ``text`` is what to show
+        "offer": dict | None, "outcome": str | None}`` (``notice``: an observation card, yuki.memory.presence,
+        ``trigger`` its channel; ``offer``: its typed offer, :func:`yuki.memory.offers.card_offer_view` - ``do``,
+        ``label``, ``steps``, ``refs``, ``text``, ``due``, the fixed ``wont`` line, ``undo``, ``expires_at``, and
+        ``target`` / ``items`` - run by code through :meth:`offer_act`, never by the agent; ``outcome``: what came
+        of it; ``resume``: picking up after the PC was off or asleep; it expires like a praise). ``text`` is what to show
         the user (one or two short sentences, already in their register and
         following their rules); ``reason`` is the coach's one-line why, for a
         tooltip or the log, not for the user. A ``review`` is the teaser of a
@@ -1456,8 +1510,9 @@ class MemoryClient:
 
     def ack_nudge(self, nudge_id: int, reaction: str, reply: str | None = None) -> None:
         """Record what happened to a nudge: ``"shown"`` | ``"dismissed"`` | ``"replied"`` | ``"snoozed"`` |
-        ``"accepted"`` ("Do it" on the card's offer: it ran as the user's instruction) | ``"less"`` ("Less of
-        these": feedback on that kind of card, read by its budget and by COACH FEEDBACK; never a mute of others).
+        ``"accepted"`` (the card's offer button was pressed; what came of it is the card's ``outcome``,
+        :meth:`offer_act`) | ``"less"`` ("Less of these": feedback on that kind of card, read by its budget and by
+        COACH FEEDBACK; never a mute of others).
 
         ``shown`` when it appears on screen (it leaves :meth:`pending_nudges`);
         then, if the user acts on it, ``dismissed`` / ``replied`` / ``snoozed``
@@ -1669,7 +1724,10 @@ class MemoryClient:
         ``{"call": {...} | None, "recording": bool}``; the call is
         ``{"id", "app", "status", "asking", "consent", "headphones",
         "form_factor", "output_device", "detected_at", "recording_since",
-        "ask_timeout_s", "can_remember_choice"}``. ``asking`` is True while the
+        "session_started_at", "ask_timeout_s", "can_remember_choice"}``
+        (``session_started_at``: when the call session began - its first row of
+        the same microphone hold, else merged as the Today chart merges rows;
+        the pill's timer counts from it). ``asking`` is True while the
         card should be up (no answer yet); ``status`` is ``asking`` |
         ``recording`` | ``waiting_headphones`` (said yes, output is not
         headphones: the microphone stays closed) | ``declined`` |
@@ -1697,11 +1755,21 @@ class MemoryClient:
                                          CallConfig.from_dict).get().ask_timeout_s
             except Exception:
                 pass
+            session_start = None
+            try:   # the call session this row is in: its first row of the same hold (or merged), for the pill
+                from yuki.memory.callspans import session_start as _session_start
+
+                session_start = _session_start(self.store, c.id)
+            except Exception:
+                session_start = None
             call = {
                 "id": c.id, "app": c.app, "status": c.status, "consent": c.consent,
                 "asking": c.status == "asking" and c.consent is None,
                 "headphones": c.headphones, "form_factor": c.output_form_factor, "output_device": c.output_device,
                 "detected_at": _iso(c.detected_at), "recording_since": _iso(c.recording_started_at),
+                # When the call session began (05 §7.4): the first row of the same microphone hold, else the rows
+                # merged as the Today chart merges them. The pill counts from here, never from this row alone.
+                "session_started_at": _iso(session_start if session_start is not None else c.detected_at),
                 "ask_timeout_s": timeout, "can_remember_choice": bool(c.process),
                 # How sure the call is (yuki.memory.callevidence): "fresh" = the screen showed the joined call
                 # recently; "stale" = it did, but long ago (voice asks "was that for me?" on ambiguous words).

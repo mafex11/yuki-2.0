@@ -2,9 +2,12 @@
 
 :class:`YukiUi` is the only place that knows how a stream of agent events turns
 into a visible thing. It holds no opinion about what a request *means*: it shows a
-card per request, and when the worker starts using tools it steps aside for the
-status strip. Every decision it makes is about who is busy and what is on screen --
-including when memory's nudge cards (:mod:`yuki.ui.nudges`) may show.
+card per request, the status strip from the moment any request starts (its step, time,
+step count and a Stop pill; 2026-10-03), and when the worker starts using tools the
+overlay steps aside for the strip. Every decision it makes is about who is busy and
+what is on screen -- including when memory's nudge cards (:mod:`yuki.ui.nudges`) may
+show. A card's offer never reaches the agent: memory runs it by code; only an ``ask``
+suggestion lands in the ask bar, unsent, for the user to send themselves.
 """
 
 from __future__ import annotations
@@ -57,13 +60,12 @@ from yuki.ui.nudges import (
     OVERLAY_NUDGES,
     NoticeCard,
     NudgeController,
-    card_offer,
     nudge_answered,
     nudge_moment,
     nudge_reply_request,
     notification_state,
-    offer_request,
     overlay_label,
+    suggestion_request,
 )
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
@@ -76,6 +78,9 @@ from yuki.voice.session import VoiceSession
 #: The effort levels offered in the tray menu (all five stay reachable from the
 #: CLI's ``/effort``); a level outside these simply shows nothing ticked.
 TRAY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+#: When the strip's run ends while another one is still going, the final word shows this long before the other
+#: run takes the strip over.
+FINAL_SWITCH_MS = 2_500
 
 class _HealthBridge(QObject):
     """The health check's thread hands its result to the GUI thread through this."""
@@ -85,6 +90,16 @@ class _HealthBridge(QObject):
 
 #: Name of the mutex that keeps one Yuki UI per session.
 MUTEX_NAME = "Local\\YukiUiSingleInstance"
+
+#: A request sent from a card's ``ask`` suggestion and stopped within this long counts against that kind of offer
+#: (yuki.memory.offers.STOP_WITHIN_S).
+ASK_STOP_WITHIN_S = 60.0
+
+
+def hotkey_words(combo: str) -> str:
+    """``alt+shift+x`` -> ``Alt+Shift+X`` (a hotkey spec, for the strip's one-time stop hint)."""
+    return "+".join(part.strip().capitalize() for part in str(combo or "").split("+") if part.strip())
+
 
 #: Where a typed request was written, told to the agent as a bracketed note after the request
 #: (Yuki's own format, stripped for display by chat_model.clean_request).
@@ -182,8 +197,10 @@ class YukiUi(QObject):
         self.nudges.reply_requested.connect(self._on_nudge_reply)
         self.nudges.in_overlay.connect(self._on_nudge_in_overlay)
         self.nudges.recent_ready.connect(self._on_recent_nudges)
-        # Do it on a card's offer (the corner card, or a card in the chat thread): run it as the user's instruction
-        self.nudges.do_requested.connect(self._on_nudge_do)
+        # A card's offer runs by code in memory (never the agent); an ``ask`` suggestion lands in the ask bar unsent,
+        # and every offer's state reaches the chat thread's button (Running / Done / Undone / Expired ...).
+        self.nudges.ask_requested.connect(self._on_offer_ask)
+        self.nudges.offer_state.connect(self._on_offer_state)
         #: Calls, just the user's side: the consent card, the indicator and Stop.
         self.calls = CallController(
             self.runtime.memory, ui_log, covered=lambda: self.nudges.showing is not None,
@@ -207,8 +224,19 @@ class YukiUi(QObject):
         #: Where each request's closing message landed (a card, or ``None`` for
         #: the strip), until its time/steps/cost suffix arrives.
         self._settled: dict[int, ReplyCard | None] = {}
+        #: Every run going on, shown on the strip from its start: ``{id: {"lane", "started", "steps", "line"}}``.
+        self._runs: dict[int, dict] = {}
+        #: Requests the user stopped (the strip's Stop, or the cancel hotkey): they end as "Stopped", not an error.
+        self._stopped: set[int] = set()
+        #: The strip says the stop shortcut once per session.
+        self._stop_hint_shown = False
+        #: An ``ask`` suggestion put in the ask bar and not sent yet (``{"nudge", "text"}``), and the requests sent
+        #: from one (id -> (nudge, started)), for what became of it (the per-kind learning).
+        self._pending_ask: dict | None = None
+        self._ask_runs: dict[int, tuple[dict, float]] = {}
 
         self.overlay.submitted.connect(self._on_submitted)
+        self.strip.stop_clicked.connect(self._on_strip_stop)
         self.overlay.do_nudge.connect(lambda nudge: self.nudges.accept_offer(nudge, via="overlay")
                                       if isinstance(nudge, dict) else None)
         self.overlay.dismissed.connect(self._on_overlay_dismissed)
@@ -233,6 +261,9 @@ class YukiUi(QObject):
         resumed = getattr(runtime_signals, "resumed", None)
         if resumed is not None:   # v3.14b: a parked question answered later: its card goes on with the new request
             resumed.connect(lambda old, new: self.cards.__setitem__(new, self.cards[old]) if old in self.cards else None)
+        parked = getattr(runtime_signals, "parked", None)
+        if parked is not None:    # set aside on an unanswered question: the run is over for the strip
+            parked.connect(self._on_parked)
         runtime_signals.summarized.connect(self._on_summarized)
         # Moments the screen may have come free for a queued nudge.
         runtime_signals.lane_done.connect(self._on_lane_free)
@@ -253,6 +284,9 @@ class YukiUi(QObject):
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
         self.overlay.attach_thread(self.window_host.model)
+        thread = getattr(self.overlay, "thread", None)
+        if thread is not None and hasattr(thread, "undo_nudge"):   # Undo on a card in the overlay's chat thread
+            thread.undo_nudge.connect(lambda nudge: self.nudges.undo_offer(nudge) if isinstance(nudge, dict) else None)
         #: One-off notices from the runtime (the daily cost alert) as a card, when the screen is free.
         self.notice_card: NoticeCard | None = None
         self._notices: list[tuple[str, str]] = []
@@ -337,6 +371,11 @@ class YukiUi(QObject):
         """React to a global hotkey."""
         self.ui_log.event("hotkey", action=action)
         if action == "cancel":
+            running = self.runtime.running_ids().get(WORKER) if hasattr(self.runtime, "running_ids") else None
+            if running is not None:
+                self._stopped.add(int(running))
+                if self.strip.run_id == int(running):
+                    self.strip.stopping()
             self.runtime.cancel_worker()
             self.voice.interrupt()
             return
@@ -382,6 +421,21 @@ class YukiUi(QObject):
             card = self.overlay.add_card(text)
             self.cards[request_id] = card
             self.overlay.expand_input()
+            return
+        # A card's ``ask`` suggestion the user now sends: its own request (no card as context, no coach note);
+        # sent unchanged, its words are marked as Yuki's (memory never stores them as the user's own words).
+        asked, self._pending_ask = self._pending_ask, None
+        if asked is not None:
+            unchanged = " ".join(text.split()) == " ".join(str(asked.get("text") or "").split())
+            request = suggestion_request(asked["nudge"], text) if unchanged else text
+            request = f"{request}\n\n{WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])}"
+            lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
+            self._ask_runs[request_id] = (asked["nudge"], time.monotonic())
+            self.window_host.user_message(request_id, text)
+            self.cards[request_id] = self.overlay.add_card(text)
+            self.overlay.expand_input()
+            self.ui_log.event("submit", id=request_id, lane=lane_name, text=text,
+                              from_offer=asked["nudge"].get("id"), unchanged=unchanged)
             return
         # A nudge this answers (Reply pressed, or typed soon after the newest
         # one in the overlay) goes in front as the reply context; what the coach
@@ -456,10 +510,63 @@ class YukiUi(QObject):
         card = self.cards.get(request_id)
         if card is None:
             self.cards[request_id] = self.overlay.add_card(request)
+        # every run shows on the strip from its first second, with its time and Stop (06 §4.4: the one real "Do it"
+        # showed nothing for 9.6 s, and nothing on screen could stop it)
+        self._runs[request_id] = {"lane": lane_name, "started": time.monotonic(), "steps": 0, "line": ""}
+        self._strip_run(request_id)
+        self.ui_log.event("run_strip", id=request_id, lane=lane_name, state="started",
+                          shown=self.strip.run_id == request_id)
+
+    def _strip_run(self, request_id: int) -> None:
+        """Show run ``request_id`` on the strip, unless it shows the worker's run and this one is another lane's."""
+        run = self._runs.get(request_id)
+        if run is None:
+            return
+        shown = self.strip.run_id
+        if (shown is not None and shown != request_id and shown in self._runs
+                and self._runs[shown]["lane"] == WORKER and run["lane"] != WORKER):
+            return
+        hint = ""
+        if not self._stop_hint_shown:
+            key = hotkey_words(self.bindings.get("cancel") or "")
+            hint = f"{key} stops it" if key else ""
+            self._stop_hint_shown = True
+        self.nudges.make_way()
+        self.strip.start_run(request_id, started=run["started"], steps=run["steps"], line=run["line"], hint=hint)
+
+    def _end_run(self, request_id: int) -> bool:
+        """A run ended: forget it; True when the strip was showing it (its clock and Stop go). Another run still
+        going takes the strip over."""
+        self._runs.pop(request_id, None)
+        shown = self.strip.end_run(request_id)
+        if shown and self._runs:
+            later = max(self._runs, key=lambda rid: (self._runs[rid]["lane"] == WORKER, self._runs[rid]["started"]))
+            QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=later: self._strip_run(rid)
+                              if rid in self._runs and self.strip.run_id is None else None)
+        return shown
+
+    def _on_strip_stop(self, request_id: int) -> None:
+        """Stop on the strip: cancel that request (and its voice, if it is the voice's)."""
+        self._stopped.add(int(request_id))
+        how = self.runtime.cancel(int(request_id))
+        if self.voice.owns(request_id):
+            self.voice.interrupt()
+        self.ui_log.event("strip_stop", id=request_id, how=how)
+
+    def _on_parked(self, lane_name: str, request_id: int, text: str) -> None:
+        """Set aside on a question nobody answered: the run is over for now (an answer later starts a new one)."""
+        if self._end_run(request_id):
+            self.strip.dismiss()
 
     def _on_tool_called(self, lane_name: str, request_id: int, name: str, tool_input: dict) -> None:
         """Show the step. For the worker, the first one takes the screen over."""
         line = describe_tool(name, tool_input)
+        run = self._runs.get(request_id)
+        if run is not None:
+            run["steps"] += 1
+            run["line"] = line
+            if self.strip.run_id != request_id:
+                self._strip_run(request_id)   # the worker's run takes the strip over another lane's, never back
         if lane_name == WORKER:
             if request_id not in self._acting:
                 self._acting.add(request_id)
@@ -467,8 +574,13 @@ class YukiUi(QObject):
                     self.overlay.dismiss()
                 self.ui_log.event("task_mode", id=request_id, tool=name)
             self.nudges.make_way()
-            self.strip.show_step(line)
+            if run is not None and self.strip.run_id == request_id:
+                self.strip.run_step(request_id, line, run["steps"])
+            else:
+                self.strip.show_step(line)
             return
+        if run is not None and self.strip.run_id == request_id:
+            self.strip.run_step(request_id, line, run["steps"])
         card = self.cards.get(request_id)
         if card is not None:
             card.set_body(line)
@@ -492,7 +604,13 @@ class YukiUi(QObject):
         self.overlay.open()
 
     def _on_said(self, lane_name: str, request_id: int, text: str) -> None:
-        """A progress line from the brain's ``say``: the strip shows it while the worker has the screen."""
+        """A progress line from the brain's ``say``: the strip shows it (the run's line, not a step)."""
+        run = self._runs.get(request_id)
+        if run is not None:
+            run["line"] = text
+            if self.strip.run_id == request_id:
+                self.strip.run_step(request_id, text)
+                return
         if lane_name == WORKER and request_id in self._acting:
             self.strip.show_step(text)
 
@@ -510,6 +628,9 @@ class YukiUi(QObject):
 
     def _on_withdrawn(self, lane_name: str, request_id: int, text: str) -> None:
         """A request replaced by the user's newer one: it ends quietly (no error card, no error strip)."""
+        if self._end_run(request_id) and self.strip.run_id is None:
+            self.strip.dismiss()
+        self._ask_runs.pop(request_id, None)
         self._acting.discard(request_id)
         if self._question is not None and self._question[1] == request_id:
             self._question = None
@@ -519,10 +640,18 @@ class YukiUi(QObject):
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone="withdrawn", text=text)
 
     def _settle(self, lane_name: str, request_id: int, text: str, *, tone: str) -> None:
-        """Put a closing message where the user is actually looking."""
+        """Put a closing message where the user is actually looking, saying honestly how the run ended: its answer
+        (done), "Stopped." when the user stopped it (never shown as an error), or the error."""
         self._acting.discard(request_id)
         if self._question is not None and self._question[1] == request_id:
             self._question = None
+        run = self._runs.get(request_id)
+        stopped = request_id in self._stopped
+        self._stopped.discard(request_id)
+        if stopped and tone == "error":
+            text, tone = "Stopped.", "stopped"
+        self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
+        shown = self._end_run(request_id)
         card = self.cards.pop(request_id, None)
         if card is not None:
             card.set_body(text, tone="error" if tone == "error" else "reply")
@@ -531,12 +660,34 @@ class YukiUi(QObject):
                 card = self.overlay.add_card("", text, tone="error" if tone == "error" else "reply")
             self.overlay.expand_input()
             self._settled[request_id] = card
+            if shown and self.strip.run_id is None:
+                self.strip.dismiss()   # the answer is in the open overlay; the strip's run is over
         else:
+            # another run on the strip (the worker's, while a quick question was answered): the final word shows
+            # over it for a moment, then that run comes back
+            other = self.strip.run_id if self.strip.run_id not in (None, request_id) else None
             self.nudges.make_way()
-            self.strip.show_final(text, tone=tone)
+            self.strip.show_final(text, tone="error" if tone == "error" else "final")
             self._settled[request_id] = None
-        self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text)
+            if other is not None:
+                QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=other: self._strip_run(rid)
+                                  if rid in self._runs and self.strip.run_id is None else None)
+        self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text,
+                          steps=run["steps"] if run else None,
+                          wall_s=round(time.monotonic() - run["started"], 1) if run else None)
         self.nudges.try_show()
+
+    def _ask_outcome(self, request_id: int, *, stopped: bool, failed: bool) -> None:
+        """A request sent from a card's ``ask`` suggestion ended: ``done``, or ``stopped`` when the user stopped it
+        within :data:`ASK_STOP_WITHIN_S` (counted against that kind of offer). A failure says nothing about it."""
+        sent = self._ask_runs.pop(request_id, None)
+        if sent is None:
+            return
+        nudge, started = sent
+        if stopped and time.monotonic() - started <= ASK_STOP_WITHIN_S:
+            self.nudges.offer_outcome(nudge, "stopped")
+        elif not stopped and not failed:
+            self.nudges.offer_outcome(nudge, "done")
 
     def _on_summarized(self, lane_name: str, request_id: int, summary: dict) -> None:
         """Put the dim ``52 s · 10 steps · 8¢`` suffix under the closing message."""
@@ -673,8 +824,12 @@ class YukiUi(QObject):
         self.ui_log.event("overlay", state="shown", via="nudge_reply", nudge_id=nudge.get("id"))
 
     def _on_overlay_dismissed(self) -> None:
-        """The overlay closed; a corner-card reply that was never sent counts as dismissed."""
+        """The overlay closed; a corner-card reply that was never sent counts as dismissed, and a card's ``ask``
+        suggestion that was never sent as abandoned (it counts against that kind of offer)."""
         self.ui_log.event("overlay", state="hidden")
+        if self._pending_ask is not None:
+            asked, self._pending_ask = self._pending_ask, None
+            self.nudges.offer_outcome(asked["nudge"], "abandoned")
         if self._nudge_reply is not None:
             nudge, self._nudge_reply = self._nudge_reply, None
             card = self.overlay.nudge_card(nudge.get("id"))
@@ -683,27 +838,22 @@ class YukiUi(QObject):
             if self._nudge_reply_via == "card":
                 self.nudges.reply_abandoned(nudge)
 
-    def _on_nudge_do(self, nudge: dict) -> None:
-        """Do it on a card's offer: its instruction goes to the agent exactly as if the user had typed it
-        (:func:`yuki.ui.nudges.offer_request`: the card as context, then their instruction). Nothing ran before
-        this press; the agent's own rules - anything sent to another person included - apply as to any request."""
-        instruction = card_offer(nudge)
-        if not instruction:
+    def _on_offer_ask(self, nudge: dict, text: str) -> None:
+        """A card's ``ask`` offer: the suggestion goes into the ask bar, **unsent** and editable; nothing runs until
+        the user presses Enter (then it is their own request, with the strip and Stop like any other)."""
+        if not text.strip():
             return
-        request = offer_request(nudge)
-        lane_guess = FRONT_DESK if self.runtime.worker_busy else WORKER   # as runtime.submit picks
-        note, note_ids = self.nudges.coach_note_for(lane_guess, exclude=nudge.get("id"))
-        if note:
-            request = f"{request}\n\n{note}"
-        request = f"{request}\n\n{WHERE_TYPED['ask_bar']}"
-        lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
-        self.window_host.user_message(request_id, instruction)
-        self.cards[request_id] = self.overlay.add_card(instruction)
-        self.nudges.mark_attached(lane_name, [nudge.get("id"), *note_ids])
-        # the card's Do it in the chat thread (here and in the window) reads Done from now on
-        self.window_host.emit({"type": "nudge_state", "id": nudge.get("id"), "state": "accepted"})
-        self.ui_log.event("nudge_offer_run", id=nudge.get("id"), kind=nudge.get("kind"), request_id=request_id,
-                          lane=lane_name, text=instruction)
+        self.overlay.open()
+        self.overlay.input.setPlainText(text)
+        cursor = self.overlay.input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.overlay.input.setTextCursor(cursor)
+        self._pending_ask = {"nudge": nudge, "text": text}
+        self.ui_log.event("nudge_offer_prefilled", id=nudge.get("id"), chars=len(text))
+
+    def _on_offer_state(self, nudge: dict, state: str) -> None:
+        """A card's offer changed state: the chat thread's button (here and in the window) says so honestly."""
+        self.window_host.emit({"type": "nudge_state", "id": nudge.get("id"), "state": f"offer:{state}"})
 
     def snooze_nudges(self, minutes: int) -> None:
         """Quiet nudges for ``minutes`` (``0``: back on), then re-read the tray's status line."""

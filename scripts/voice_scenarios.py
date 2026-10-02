@@ -988,7 +988,7 @@ def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
                         render_fn=lambda: [{"pid": 4242, "state": "active"}] if mic else [],
                         identity_fn=lambda pid: (exe, ""), watch=False, backstop_s=0.0, render_max_age_s=0.0)
     evidence = CallEvidence()
-    worker = CallWorker(store, signals=signals, config=CallConfig(hold_s=15.0),
+    worker = CallWorker(store, signals=signals, config=CallConfig(),
                         headphones_fn=lambda c: (False, {"form_factor": "speakers", "device": "Speakers"}),
                         source_factory=lambda c, app: None, evidence=evidence)
     worker._tell_ui = lambda: None

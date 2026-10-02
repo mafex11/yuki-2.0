@@ -391,12 +391,25 @@ class _Steps(QWidget):
             r.tick(now, tail[0] if r.step.key == "tail" and tail is not None else times.get(r.step.key))
 
 
+#: What a card's offer button says once it was pressed (``nudge_state`` ``offer:<state>``, or the card's stored
+#: ``outcome``): honest states, never "Done" at the press (06 §4.4). Dismissed / "less" cards lose the button.
+OFFER_STATE_WORDS: dict[str, str] = {
+    "running": "Running…", "done": "Done", "undoing": "Undoing…", "undone": "Undone", "prefilled": "In the ask bar",
+    "stopped": "Stopped", "abandoned": "Not sent", "expired": "Expired", "gone": "No longer there",
+    "off": "Offers are off", "already": "Already done", "error": "Didn't work",
+}
+#: Offer states after which the card's offer button is gone altogether.
+OFFER_GONE_STATES: frozenset[str] = frozenset({"dismissed", "less"})
+
+
 class _ItemWidget(QWidget):
     """One row of the thread: a user bubble, a response (steps + text), a nudge or a notice."""
 
     reply_nudge = Signal(object)
-    #: ``(nudge)`` -- Do it on a card with an offer (yuki.ui.nudges.offer_request).
+    #: ``(nudge)`` -- the offer's button on a card with a typed offer (run by code in memory, never the agent).
     do_nudge = Signal(object)
+    #: ``(nudge)`` -- Undo after a card's offer ran (adding to the list, opening a page again).
+    undo_nudge = Signal(object)
     toggle = Signal(str)
 
     def __init__(self, t: Theme, item: Item, max_w: int, look: str = "window") -> None:
@@ -473,17 +486,31 @@ class _ItemWidget(QWidget):
                 if overlay:
                     self.text.setFont(variable_font(14, "Regular"))
                 self.bubble.body.addWidget(self.text)
-                if card_offer(nudge):   # what Do it will run, in its own words
-                    from yuki.ui.nudges import offer_line
+            self.do: _Tiny | None = None
+            self.undo: _Tiny | None = None
+            self.offer_info: QLabel | None = None
+            self.offer_result: QLabel | None = None
+            #: The offer's state as this thread last heard it (``nudge_state`` ``offer:<state>``), else its outcome.
+            self.offer_state: str | None = str(nudge.get("_offer_state") or nudge.get("outcome") or "") or None
+            offer = card_offer(nudge) if kind != "question" else None
+            if offer is not None:   # what the button will and won't do, in sight before the press
+                from yuki.ui.nudges import offer_label, offer_lines
 
-                    self.bubble.body.addWidget(_label(t, offer_line(nudge), "caption", t.text_3))
+                self.offer_info = _label(t, offer_lines(nudge), "caption", t.text_3)
+                self.bubble.body.addWidget(self.offer_info)
+                self.offer_result = _label(t, "", "caption", t.text)   # a draft, or what Yuki holds, once shown
+                self.offer_result.setVisible(False)
+                self.bubble.body.addWidget(self.offer_result)
             acts = QHBoxLayout()
             acts.setSpacing(12)
-            self.do: _Tiny | None = None
-            if card_offer(nudge) and kind != "question":   # the card's offer: run it as the user's instruction
-                self.do = _Tiny(t, "Do it")
+            if offer is not None:   # named for the action; runs by code in memory, never the agent
+                self.do = _Tiny(t, offer_label(nudge) or "Do it")
                 self.do.clicked.connect(lambda: self.do_nudge.emit(item.nudge))
                 acts.addWidget(self.do)
+                self.undo = _Tiny(t, "Undo")
+                self.undo.clicked.connect(lambda: self.undo_nudge.emit(item.nudge))
+                self.undo.setVisible(False)
+                acts.addWidget(self.undo)
             self.reply = _Tiny(t, "Reply")
             self.reply.clicked.connect(lambda: self.reply_nudge.emit(item.nudge))
             acts.addWidget(self.reply)
@@ -583,14 +610,14 @@ class _ItemWidget(QWidget):
                 how = ", said to others on the call"
             self.meta.setText(f"You, {_stamp(item.at)}{how}")
         elif item.kind == "nudge" and hasattr(self, "reply"):
-            state = item.reply_state
-            if (item.nudge or {}).get("reaction") == "accepted" and state == "open":
-                state = "accepted"
+            state = item.reply_state or "open"
+            if state.startswith("offer:"):   # the offer's own state; the Reply button stays as it was
+                self.offer_state = state.split(":", 1)[1] or None
+                state = "open"
             self.reply.setText({"open": "Reply", "replying": "Replying…", "replied": "Replied"}.get(state, "Reply"))
             self.reply.setEnabled(state == "open")
             if getattr(self, "do", None) is not None:
-                self.do.setText("Done" if state == "accepted" else "Do it")
-                self.do.setEnabled(state == "open")
+                self._refresh_offer(item, now)
         elif item.kind == "assistant" and self.text is not None and self.meta is not None:
             if self.steps is not None:
                 real = bool(item.real_steps())   # a plain reply (only the closing call) shows no fold
@@ -637,6 +664,36 @@ class _ItemWidget(QWidget):
             if self.copy is not None:
                 self.copy.setVisible(bool(text))
 
+    def _refresh_offer(self, item: Item, now: float) -> None:
+        """The offer's button says honestly where it stands: its label while it can run; Running / Done / Undone /
+        In the ask bar / Expired ... after; gone on a card that was dismissed or given "Less of these", or whose
+        offer expired unpressed (also in the history). A draft or what Yuki holds shows in the card once run."""
+        from yuki.ui.nudges import card_offer, offer_expired, offer_label
+
+        nudge = item.nudge or {}
+        offer = card_offer(nudge) or {}
+        state = self.offer_state
+        reaction = str(nudge.get("reaction") or "")
+        gone = (state in OFFER_GONE_STATES or (state is None and reaction in ("dismissed", "less", "snoozed"))
+                or (state is None and offer_expired(nudge, now)))
+        self.do.setVisible(not gone)
+        if self.offer_info is not None:
+            self.offer_info.setVisible(not gone and state is None)
+        if not gone:
+            self.do.setText(OFFER_STATE_WORDS.get(state, state) if state else (offer_label(nudge) or "Do it"))
+            self.do.setEnabled(state is None)
+        if self.undo is not None:
+            self.undo.setVisible(state == "done" and offer.get("do") in ("todo_add", "bring_back"))
+        if self.offer_result is not None:
+            shown = ""
+            if state == "done" and offer.get("do") == "draft":
+                shown = str(offer.get("text") or "")
+            elif state == "done" and offer.get("do") == "show_memory":
+                shown = "\n\n".join(f"{i.get('title')}: {i.get('text')}" for i in offer.get("items") or []
+                                     if isinstance(i, dict))
+            self.offer_result.setText(shown)
+            self.offer_result.setVisible(bool(shown))
+
     def tick(self, item: Item, now: float) -> None:
         if self.steps is not None and item.steps and self.steps.isVisible():
             self.steps.tick(item, now)
@@ -647,11 +704,13 @@ class ChatThreadView(QWidget):
 
     Signals:
         reply_nudge: ``(nudge)`` -- Reply on a nudge in the thread.
-        do_nudge: ``(nudge)`` -- Do it on a card with an offer.
+        do_nudge: ``(nudge)`` -- the offer's button on a card with a typed offer.
+        undo_nudge: ``(nudge)`` -- Undo after a card's offer ran.
     """
 
     reply_nudge = Signal(object)
     do_nudge = Signal(object)
+    undo_nudge = Signal(object)
     content_resized = Signal()
 
     def __init__(self, model: ChatModel, theme: Callable[[], Theme], *, max_bubble: int = 560,
@@ -776,6 +835,7 @@ class ChatThreadView(QWidget):
         w = _ItemWidget(self.theme(), item, self.max_bubble, self.look)
         w.reply_nudge.connect(self.reply_nudge.emit)
         w.do_nudge.connect(self.do_nudge.emit)
+        w.undo_nudge.connect(self.undo_nudge.emit)
         w.toggle.connect(self.model.toggle)
         self._widgets[item.id] = w
         from yuki.ui.window.widgets import attach_tips

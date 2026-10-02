@@ -18,13 +18,18 @@ faded after :func:`linger_for` its text, or it was delivered into the open
 overlay), ``dismissed``, ``replied`` or ``snoozed``. Memory decides what a
 nudge says and when; nothing here reads its text.
 
-A card that carries an offer (``offer``: the observation cards of
-``yuki.memory.presence`` and the welcome back may end with one) shows **Do it**,
-**Not now** and, on an observation card, **Less of these**. Do it acknowledges
-``accepted`` and hands the offer to the agent as the user's own instruction
-(:func:`offer_request`, ``do_requested``); nothing runs without that press. Not
-now is ``dismissed``; Less of these is ``less`` (feedback on that kind of card:
-memory gives that kind fewer cards, nothing else changes).
+A card that carries an offer (``offer``: a **typed** offer of
+``yuki.memory.offers`` on an observation card or the welcome back) shows what it
+will do (**Will:** its steps; **Won't:** a fixed line per kind), a button named
+for the action, **Not now** and **Less of these** (also on a welcome back). The
+button never starts the agent (2026-10-03; the user: "that is my work, I'll do
+it"): memory checks the offer again and runs it by code (``offer_act``: add to
+the list, show what Yuki holds, open again a page the user had, a draft to copy,
+or a suggestion put unsent in the ask bar, ``ask_requested``), and the card shows
+the result in place, with **Undo** where it applies. A second press, an expired
+offer (30 minutes) or a ref that no longer resolves runs nothing. Not now is
+``dismissed``; Less of these is ``less`` (feedback on that kind of card: fewer of
+them, and that kind of offer counts down).
 
 While the overlay is open, nudges go into its conversation instead of the
 corner (the ``in_overlay`` signal), and when it opens the recent ones
@@ -102,10 +107,28 @@ NOTICE_TITLES: dict[str, str] = {
     "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
     "recall": "From memory", "thread": "Your work",
 }
-#: A card with an offer: run it, not now, fewer of this kind (the last on observation cards only).
-OFFER_BUTTONS: tuple[str, str, str] = ("Do it", "Not now", "Less of these")
+#: A card with an offer: not now, fewer of this kind (observation cards and the welcome back). The action
+#: button is named for the action (the offer's own label), never "Do it".
+OFFER_BUTTONS: tuple[str, str] = ("Not now", "Less of these")
+#: Card kinds with "Less of these" (feedback on that kind; 06 §4.5 gave the welcome back one too).
+LESS_KINDS: frozenset[str] = frozenset({"notice", "resume"})
 #: A card with an offer stays up this much longer (there is something to decide).
 OFFER_LINGER_EXTRA_MS = 6_000
+#: After its offer ran, a card shows the result (and Undo) this long, then fades.
+RESULT_LINGER_MS = 8_000
+#: A card that expanded something to read (a draft, what Yuki holds) stays this long untouched.
+EXPANDED_LINGER_MS = 45_000
+#: What the card says when its offer could not run (memory's ``why``), plain words.
+OFFER_FAILED: dict[str, str] = {
+    "expired": "This offer expired. Nothing ran.",
+    "gone": "That's no longer there. Nothing ran.",
+    "off": "Offers are turned off. Nothing ran.",
+    "already": "Already done.",
+    "error": "That didn't work. Nothing ran.",
+}
+#: The opening of a request sent from a card's suggestion unchanged: the words are Yuki's, the user sent them
+#: (memory never stores them as the user's words: ``yuki.memory.conversations.YUKI_WORDS_MARKS``).
+SUGGESTION_MARK = "[Yuki's own suggestion"
 #: A question card's buttons: answer it (opens the overlay), not now, don't ask about this.
 QUESTION_BUTTONS: tuple[str, str, str] = ("Answer", "Skip", "Don't ask")
 
@@ -139,30 +162,64 @@ def card_title(nudge: dict[str, Any]) -> str:
     return kind_title(kind)
 
 
-def card_offer(nudge: dict[str, Any] | None) -> str:
-    """The instruction a card's Do it runs (memory wrote it with the card), or ``""``."""
-    return " ".join(str((nudge or {}).get("offer") or "").split())
+#: The offer kinds the UI knows how to run (memory's closed list, yuki.memory.offers.OFFER_DOS).
+OFFER_DOS: frozenset[str] = frozenset({"todo_add", "show_memory", "bring_back", "draft", "ask"})
 
 
-def offer_line(nudge: dict[str, Any] | None) -> str:
-    """The dim line under a card with an offer: exactly what its Do it runs (``"Do it: Draft a reply ..."``)."""
+def card_offer(nudge: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The card's typed offer (``pending_nudges()``'s ``offer``: ``do``, ``label``, ``steps``, ``wont``, ...), or
+    None: no offer, or a free-text one from before 2026-10-03 (no button: a sentence is not something to run)."""
+    offer = (nudge or {}).get("offer")
+    if not isinstance(offer, dict) or offer.get("do") not in OFFER_DOS:
+        return None
+    return offer
+
+
+def offer_label(nudge: dict[str, Any] | None) -> str:
+    """The action button's text: the offer's own label (named for the action), ``""`` without an offer."""
     offer = card_offer(nudge)
-    return f"{OFFER_BUTTONS[0]}: {offer}" if offer else ""
+    return " ".join(str((offer or {}).get("label") or "").split()) if offer else ""
 
 
-def offer_request(nudge: dict[str, Any]) -> str:
-    """The request Do it becomes: the card as context, then its offer as the user's own instruction.
+def offer_lines(nudge: dict[str, Any] | None) -> str:
+    """What the card says its button will and won't do: ``Will: ...`` (the offer's steps, as written) and
+    ``Won't: ...`` (memory's fixed line for the kind); ``""`` without an offer."""
+    offer = card_offer(nudge)
+    if offer is None:
+        return ""
+    steps = [" ".join(str(x).split()) for x in offer.get("steps") or [] if str(x).strip()]
+    lines = []
+    if steps:
+        lines.append("Will: " + "; ".join(steps))
+    if offer.get("wont"):
+        lines.append(f"Won't: {offer['wont']}")
+    return "\n".join(lines)
 
-    The instruction is what the user accepted by pressing the button, exactly as if they had typed
-    it; the line before it says so, so the agent's rules for plain instructions (and for anything
-    sent to other people) apply to it unchanged.
-    """
-    kind = str(nudge.get("kind") or "notice")
-    sent = when_label(nudge.get("at"))
-    text = " ".join(str(nudge.get("text") or "").split())
-    head = (f'[The user pressed "Do it" on your card (kind: {kind}){f", sent {sent}" if sent else ""}: "{text}". '
-            "The line below is their own instruction, as if they had typed it.]")
-    return f"{head}\n{card_offer(nudge)}"
+
+def offer_expired(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
+    """Whether a card's offer is past its time (``expires_at``): its button is gone, also in the history."""
+    offer = card_offer(nudge)
+    if offer is None:
+        return False
+    at = _epoch(offer.get("expires_at"))
+    return at is not None and (time.time() if now is None else now) > at
+
+
+def offer_open(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
+    """Whether a card's offer button may still be pressed: a typed offer, not expired, nothing done with it yet,
+    and the card was not dismissed or given "Less of these"."""
+    if card_offer(nudge) is None or offer_expired(nudge, now):
+        return False
+    n = nudge or {}
+    if n.get("_offer_state") or n.get("outcome"):
+        return False
+    return str(n.get("reaction") or "") not in ("dismissed", "less", "snoozed")
+
+
+def suggestion_request(nudge: dict[str, Any], text: str) -> str:
+    """The request a card's suggestion becomes when the user sends it from the ask bar unchanged: marked as
+    Yuki's words (the user read and sent them), so memory never stores them as the user's own."""
+    return f"{SUGGESTION_MARK} from its card N{nudge.get('id')}, sent unchanged by the user]\n{text}"
 
 
 def notification_state() -> tuple[int, str]:
@@ -290,6 +347,31 @@ def coach_note(nudges: list[dict[str, Any]]) -> str:
 
 def _nudge_id(nudge: dict[str, Any]) -> str:
     return str(nudge.get("id"))
+
+
+def _foreground_hwnd() -> int | None:
+    """The window in front now (what a ``bring_back`` Undo brings back); None when it cannot be read."""
+    try:
+        user32 = ctypes.WinDLL("user32")
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        return int(user32.GetForegroundWindow() or 0) or None
+    except Exception:
+        return None
+
+
+def _open_page(url: str) -> bool:
+    """Open a web page the user already had, with their default browser (http/https only; memory resolved it)."""
+    from urllib.parse import urlsplit
+
+    try:
+        if urlsplit(url).scheme not in ("http", "https"):
+            return False
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        return bool(QDesktopServices.openUrl(QUrl(url)))
+    except Exception:
+        return False
 
 
 class NudgeWatcher(QObject):
@@ -455,8 +537,10 @@ class NudgeCard(SurfaceWindow):
         dismissed: ``(nudge)`` -- the user pressed Dismiss.
         expired: ``(nudge)`` -- it faded on its own after :attr:`linger_ms`.
         never_ask: ``(nudge)`` -- "Don't ask" on a question card (its Dismiss reads "Skip").
-        accepted: ``(nudge)`` -- "Do it" on a card with an offer.
-        less: ``(nudge)`` -- "Less of these" on an observation card.
+        accepted: ``(nudge)`` -- the offer's button (named for the action) on a card with a typed offer; the card
+            stays up and shows the result (:meth:`show_result`).
+        less: ``(nudge)`` -- "Less of these" on an observation card or a welcome back.
+        undo: ``(nudge)`` -- Undo after the offer ran (adding to the list, opening a page again).
     """
 
     replied = Signal(object)
@@ -465,6 +549,7 @@ class NudgeCard(SurfaceWindow):
     never_ask = Signal(object)
     accepted = Signal(object)
     less = Signal(object)
+    undo = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
         super().__init__(activates=False)
@@ -509,6 +594,13 @@ class NudgeCard(SurfaceWindow):
         self.detail.setTextFormat(Qt.TextFormat.PlainText)
         self.detail.setVisible(False)
         column.addWidget(self.detail)
+        #: What the offer did, in place: "Added to your list.", the draft, what Yuki holds, or why nothing ran.
+        self.result = QLabel(self)
+        self.result.setFont(variable_font(13.5, "Regular"))
+        self.result.setWordWrap(True)
+        self.result.setTextFormat(Qt.TextFormat.PlainText)
+        self.result.setVisible(False)
+        column.addWidget(self.result)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
@@ -516,23 +608,33 @@ class NudgeCard(SurfaceWindow):
         buttons.addStretch(1)
         self.never_button = self._button(QUESTION_BUTTONS[2])
         self.never_button.setVisible(False)   # question cards only
-        self.less_button = self._button(OFFER_BUTTONS[2])
-        self.less_button.setVisible(False)    # observation cards only
+        self.less_button = self._button(OFFER_BUTTONS[1])
+        self.less_button.setVisible(False)    # observation cards and the welcome back
         self.dismiss_button = self._button("Dismiss")
         self.reply_button = self._button("Reply")
-        self.do_button = self._button(OFFER_BUTTONS[0])
-        self.do_button.setVisible(False)      # cards with an offer only
+        self.do_button = self._button("")
+        self.do_button.setVisible(False)      # cards with a typed offer only: its label names the action
+        self.undo_button = self._button("Undo")
+        self.copy_button = self._button("Copy")
+        self.close_button = self._button("Close")
+        for after in (self.undo_button, self.copy_button, self.close_button):
+            after.setVisible(False)           # after the offer ran
         self.never_button.clicked.connect(self._on_never)
         self.less_button.clicked.connect(self._on_less)
         self.dismiss_button.clicked.connect(self._on_dismiss)
         self.reply_button.clicked.connect(self._on_reply)
         self.do_button.clicked.connect(self._on_do)
-        buttons.addWidget(self.never_button)
-        buttons.addWidget(self.less_button)
-        buttons.addWidget(self.dismiss_button)
-        buttons.addWidget(self.reply_button)
-        buttons.addWidget(self.do_button)
+        self.undo_button.clicked.connect(self._on_undo)
+        self.copy_button.clicked.connect(self._on_copy)
+        self.close_button.clicked.connect(self._on_close)
+        for button in (self.never_button, self.less_button, self.dismiss_button, self.reply_button, self.do_button,
+                       self.undo_button, self.copy_button, self.close_button):
+            buttons.addWidget(button)
         column.addLayout(buttons)
+        #: The offer ran (or was refused) on this card: what it says now is the result.
+        self._acted = False
+        #: A draft the card shows (for Copy).
+        self._draft = ""
 
         self._linger = QTimer(self)
         self._linger.setSingleShot(True)
@@ -554,16 +656,17 @@ class NudgeCard(SurfaceWindow):
     def _style_buttons(self) -> None:
         self.reply_button.setStyleSheet(self.button_css("default"))
         self.do_button.setStyleSheet(self.button_css("default"))
+        self.copy_button.setStyleSheet(self.button_css("default"))
         quiet = self.button_css("ghost")
-        self.dismiss_button.setStyleSheet(quiet)
-        self.never_button.setStyleSheet(quiet)
-        self.less_button.setStyleSheet(quiet)
+        for button in (self.dismiss_button, self.never_button, self.less_button, self.undo_button, self.close_button):
+            button.setStyleSheet(quiet)
         self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
         self.body.setStyleSheet(f"color: {self.ink_css('text')};")
         self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
+        self.result.setStyleSheet(f"color: {self.ink_css('text')};")
         self._style_buttons()
 
     # -- content -----------------------------------------------------------
@@ -574,13 +677,21 @@ class NudgeCard(SurfaceWindow):
         kind = str(nudge.get("kind") or "nudge")
         self.title.setText("" if kind == "nudge" else card_title(nudge))   # a plain check-in: the wave says it
         question = str(nudge.get("kind") or "") == "question"
-        offer = bool(card_offer(nudge)) and not question
+        offer = offer_open(nudge) and not question
+        self._acted, self._draft = False, ""
         self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
         self.reply_button.setVisible(not offer)
+        self.do_button.setText(offer_label(nudge) if offer else "")
+        self.do_button.setEnabled(True)
         self.do_button.setVisible(offer)
-        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else OFFER_BUTTONS[1] if offer else "Dismiss")
+        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else OFFER_BUTTONS[0] if offer else "Dismiss")
+        self.dismiss_button.setVisible(True)
         self.never_button.setVisible(question)
-        self.less_button.setVisible(kind == "notice")
+        self.less_button.setVisible(kind in LESS_KINDS)
+        for after in (self.undo_button, self.copy_button, self.close_button):
+            after.setVisible(False)
+        self.result.setVisible(False)
+        self.result.setText("")
         self.when.setText(when_label(nudge.get("at")))
         text = _squash(nudge.get("text"))
         from yuki.ui.window.theme import variable_font
@@ -594,18 +705,86 @@ class NudgeCard(SurfaceWindow):
         else:
             self.body.setFont(variable_font(15, "Regular"))
             self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
-            # what Do it will run, in its own words, always in sight before the press
-            self.detail.setText(offer_line(nudge) if offer else "")
+            # what the button will and won't do, always in sight before the press
+            self.detail.setText(offer_lines(nudge) if offer else "")
             self.detail.setVisible(offer)
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
             linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0))
         self.restyle()
+        self._fit_height()
+
+    def _fit_height(self) -> None:
         width = CARD_WIDTH + 2 * self.SHADOW
+        self.layout().activate()
         wanted = self.layout().totalHeightForWidth(width) if self.layout().hasHeightForWidth() else (
             self.layout().sizeHint().height()
         )
-        self.setFixedHeight(max(CARD_MIN_HEIGHT + 2 * self.SHADOW, wanted))
+        height = max(CARD_MIN_HEIGHT + 2 * self.SHADOW, wanted)
+        if height != self.height():
+            bottom = self.geometry().bottom()
+            self.setFixedHeight(height)
+            if self.isVisible():   # grow upwards: the card stays on its corner
+                self.move(self.x(), bottom - height + 1)
         self.update()
+
+    # -- the offer's result, in place ---------------------------------------
+
+    def show_running(self) -> None:
+        """The offer's button was pressed: it says so until memory answers (typed offers answer at once)."""
+        self._acted = True
+        self._linger.stop()
+        self.do_button.setText("Running…")
+        self.do_button.setEnabled(False)
+        for button in (self.dismiss_button, self.less_button, self.reply_button, self.never_button):
+            button.setVisible(False)
+
+    def show_result(self, result: dict[str, Any]) -> None:
+        """What the offer did (``offer_act``'s answer): a line and Undo (added to the list, a page opened again),
+        the draft with Copy, what Yuki holds, or why nothing ran; then the card fades after a while."""
+        self._acted = True
+        self.do_button.setVisible(False)
+        for button in (self.dismiss_button, self.less_button, self.reply_button, self.never_button):
+            button.setVisible(False)
+        do = str(result.get("do") or (card_offer(self.nudge) or {}).get("do") or "")
+        linger = RESULT_LINGER_MS
+        if not result.get("ok"):
+            why = str(result.get("why") or "error")
+            text = OFFER_FAILED.get(why, OFFER_FAILED["error"])
+            if why == "already" and result.get("state") == "undone":
+                text = "Already undone."
+            self.result.setText(text)
+            self.close_button.setVisible(True)
+        elif do == "draft":
+            self._draft = str(result.get("text") or "")
+            self.result.setText(self._draft)
+            self.copy_button.setVisible(True)
+            self.close_button.setVisible(True)
+            linger = EXPANDED_LINGER_MS
+        elif do == "show_memory":
+            items = result.get("items") or []
+            self.result.setText("\n\n".join(f"{i.get('title')}: {i.get('text')}" for i in items if isinstance(i, dict)))
+            self.close_button.setVisible(True)
+            linger = EXPANDED_LINGER_MS
+        else:
+            self.result.setText(str(result.get("message") or "Done."))
+            self.undo_button.setVisible(bool(result.get("undo")))
+        self.result.setVisible(True)
+        self.detail.setVisible(False)
+        self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger
+        self._fit_height()
+        if self.underMouse():
+            self._paused = True    # being read: the clock starts when the pointer leaves
+        elif not self._paused:
+            self._linger.start(self.linger_ms)
+
+    def show_undone(self, result: dict[str, Any]) -> None:
+        """Undo's answer: "Undone." (or why not)."""
+        self.undo_button.setVisible(False)
+        self.result.setText("Undone." if result.get("ok") else "Couldn't undo that.")
+        self.close_button.setVisible(True)
+        self._fit_height()
+        if not self._paused:
+            self._linger.start(self._fixed_linger if self._fixed_linger is not None else RESULT_LINGER_MS)
 
     def anchor(self) -> QPoint:
         """Top-left to sit at: bottom-right of the primary screen's work area, like the strip."""
@@ -675,8 +854,9 @@ class NudgeCard(SurfaceWindow):
     # -- outcomes ----------------------------------------------------------
 
     def _on_expire(self) -> None:
+        acted = self._acted
         nudge = self.close_card()
-        if nudge is not None:
+        if nudge is not None and not acted:   # after its offer ran the card's outcome is recorded already
             self.expired.emit(nudge)
 
     def _on_dismiss(self) -> None:
@@ -695,9 +875,24 @@ class NudgeCard(SurfaceWindow):
             self.never_ask.emit(nudge)
 
     def _on_do(self) -> None:
-        nudge = self.close_card()
-        if nudge is not None:
-            self.accepted.emit(nudge)
+        nudge = self.nudge
+        if nudge is None or self._acted or not offer_open(nudge):
+            return
+        self.show_running()   # the card stays: the result shows here (typed offers answer at once)
+        self.accepted.emit(nudge)
+
+    def _on_undo(self) -> None:
+        if self.nudge is not None:
+            self.undo_button.setEnabled(False)
+            self.undo.emit(self.nudge)
+
+    def _on_copy(self) -> None:
+        QGuiApplication.clipboard().setText(self._draft)
+        self.copy_button.setText("Copied")
+        QTimer.singleShot(1500, lambda: self.copy_button.setText("Copy"))
+
+    def _on_close(self) -> None:
+        self.close_card()
 
     def _on_less(self) -> None:
         nudge = self.close_card()
@@ -719,6 +914,9 @@ class NoticeCard(NudgeCard):
         self.never_button.hide()
         self.do_button.hide()
         self.less_button.hide()
+        self.undo_button.hide()
+        self.copy_button.hide()
+        self.close_button.hide()
         self.dismiss_button.setText("OK")
         self._paused = False
         self.fade_in(self.anchor())
@@ -748,15 +946,22 @@ class NudgeController(QObject):
             (already acknowledged ``shown``); ``via`` is ``arrived`` or
             ``card_moved``.
         recent_ready: ``(rows)`` -- :meth:`fetch_recent`'s answer, oldest first.
+        offer_state: ``(nudge, state)`` -- a card's offer is ``running``, ``done``, ``undone``, ``prefilled``
+            (an ``ask`` suggestion went into the ask bar) or could not run (``expired``, ``gone``, ``off``,
+            ``already``, ``error``): the chat thread's button says so honestly.
+        ask_requested: ``(nudge, text)`` -- an ``ask`` offer: put ``text`` in the ask bar, unsent.
     """
 
     reply_requested = Signal(object)
     in_overlay = Signal(object, str)
     recent_ready = Signal(object)
-    #: ``(nudge)`` -- Do it on a card's offer: run it as the user's instruction (the app submits it).
-    do_requested = Signal(object)
+    offer_state = Signal(object, str)
+    ask_requested = Signal(object, str)
     #: ``(event name, fields)`` from worker threads, written on the GUI thread.
     _logged = Signal(str, object)
+    #: ``(nudge, result, via)`` / ``(nudge, result)``: memory's answer to a press / an Undo, back on the GUI thread.
+    _acted = Signal(object, object, str)
+    _undone = Signal(object, object)
 
     def __init__(
         self,
@@ -801,6 +1006,9 @@ class NudgeController(QObject):
         self.card.never_ask.connect(self._on_never_ask)
         self.card.accepted.connect(self.accept_offer)
         self.card.less.connect(self._on_less)
+        self.card.undo.connect(self.undo_offer)
+        self._acted.connect(self._on_acted)
+        self._undone.connect(self._on_undone)
         self.card.faded_out.connect(self.try_show)
         self._retry = QTimer(self)
         self._retry.setInterval(RETRY_MS)
@@ -1022,6 +1230,9 @@ class NudgeController(QObject):
         """The strip is about to take the corner: put a card that is up back at the head of the queue."""
         if not self.card.isVisible():
             return
+        if self.card._acted:   # its offer ran (the card shows the result): it is done, never queued again
+            self.card.close_card()
+            return
         nudge = self.card.withdraw()
         if nudge is None:
             return
@@ -1039,25 +1250,150 @@ class NudgeController(QObject):
     def _on_dismissed(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card")
         self.ack(nudge, "dismissed")
+        if card_offer(nudge) is not None:   # Not now on an offer: its button is gone in the chat thread too
+            self.offer_state.emit(nudge, "dismissed")
         if str(nudge.get("kind") or "") == "question":
             self.question_feedback(nudge, never=False)
 
-    def accept_offer(self, nudge: dict[str, Any], via: str = "card") -> None:
-        """Do it on a card's offer (the corner card, or a card in the chat thread): acknowledged ``accepted``,
-        then handed to the app to run as the user's instruction (``do_requested``). Once per card."""
-        if not card_offer(nudge):
-            return
+    def accept_offer(self, nudge: dict[str, Any], via: str = "card") -> threading.Thread | None:
+        """The offer's button on a card (the corner card, or a card in the chat thread): acknowledged ``accepted``,
+        then memory checks the offer again and runs it **by code** (``offer_act``; never the agent, never a model
+        call), off the GUI thread; the answer comes back to :meth:`_on_acted`. Once per card: a second press, an
+        expired offer or a card already answered runs nothing."""
+        offer = card_offer(nudge)
+        if offer is None:
+            return None
         stored = self.record_delivery(nudge, via)   # the one dict per card, shared by the corner card and the thread
-        if "accepted" in (str(stored.get("reaction") or ""), str(nudge.get("reaction") or "")):
-            return
+        if not offer_open(stored) or not offer_open(nudge):
+            self.ui_log.event("nudge_offer_refused", id=nudge.get("id"), via=via, state=stored.get("_offer_state"),
+                              outcome=stored.get("outcome"), expired=offer_expired(stored))
+            if stored.get("_offer_state") is None and offer_expired(stored):
+                self._show_result(stored, {"ok": False, "why": "expired", "do": offer.get("do")})
+            return None
+        stored["_offer_state"] = "running"
         self.ui_log.event("nudge_accepted", id=nudge.get("id"), kind=nudge.get("kind"), via=via,
-                          trigger=nudge.get("trigger"), offer=card_offer(nudge))
+                          trigger=nudge.get("trigger"), do=offer.get("do"), label=offer.get("label"))
         self.ack(stored, "accepted")
-        self.do_requested.emit(stored)
+        self.offer_state.emit(stored, "running")
+        nudge_id = stored.get("id")
+
+        def work() -> None:
+            t0 = time.perf_counter()
+            try:
+                result = self.memory.call_method("offer_act", nudge_id, timeout_s=TRAY_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                result = {"ok": False, "why": "error", "error": str(exc)}
+            except Exception as exc:  # never take the UI down
+                result = {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+            result = dict(result) if isinstance(result, dict) else {"ok": False, "why": "error"}
+            result["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+            self._acted.emit(stored, result, via)
+
+        thread = threading.Thread(target=work, name="yuki-ui-offer", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
+
+    def _on_acted(self, stored: dict[str, Any], result: dict[str, Any], via: str) -> None:
+        """Memory's answer to an offer press (GUI thread): open the page again (``bring_back``, remembering what
+        was in front for Undo), hand an ``ask`` suggestion to the ask bar, and show the result on the card."""
+        offer = card_offer(stored) or {}
+        do = str(result.get("do") or offer.get("do") or "")
+        ok = bool(result.get("ok"))
+        state = str(result.get("state") or "done") if ok else str(result.get("why") or "error")
+        if not ok and result.get("why") == "already" and result.get("state"):
+            state = str(result["state"])
+        stored["_offer_state"] = state
+        if ok:
+            stored["outcome"] = state
+            if do == "bring_back":
+                stored["_prev_hwnd"] = _foreground_hwnd()
+                opened = _open_page(str(result.get("url") or ""))
+                if not opened:
+                    result = {**result, "message": "Couldn't open that page.", "undo": False}
+        self.ui_log.event("nudge_offer_result", id=stored.get("id"), via=via, do=do, ok=ok, state=state,
+                          why=result.get("why"), ms=result.get("ms"), error=result.get("error"))
+        if ok and do == "ask":
+            self.ask_requested.emit(stored, str(result.get("text") or ""))
+            if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
+                self.card.close_card()   # the ask bar has it now
+        else:
+            self._show_result(stored, result)
+        self.offer_state.emit(stored, state)
+
+    def _show_result(self, stored: dict[str, Any], result: dict[str, Any]) -> None:
+        if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
+            self.card.show_result(result)
+
+    def undo_offer(self, nudge: dict[str, Any]) -> threading.Thread | None:
+        """Undo on a card whose offer ran: ``bring_back`` brings back the window that was in front; memory takes back
+        what it did (``offer_undo``: a to-do added ends as a wrong capture) and records it (the learning counts it)."""
+        stored = self.record_delivery(nudge, str(nudge.get("_via") or "card"))
+        offer = card_offer(stored) or {}
+        if stored.get("_offer_state") != "done" or offer.get("do") not in ("todo_add", "bring_back"):
+            return None
+        stored["_offer_state"] = "undoing"
+        prev = stored.get("_prev_hwnd") if offer.get("do") == "bring_back" else None
+        nudge_id = stored.get("id")
+
+        def work() -> None:
+            if prev:
+                try:
+                    from yuki.actions.launch import focus_window
+
+                    focus_window(int(prev))
+                except Exception:
+                    pass
+            try:
+                result = self.memory.call_method("offer_undo", nudge_id, timeout_s=TRAY_TIMEOUT_S)
+            except Exception as exc:  # never take the UI down
+                result = {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+            self._undone.emit(stored, result if isinstance(result, dict) else {"ok": False})
+
+        thread = threading.Thread(target=work, name="yuki-ui-offer-undo", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
+
+    def _on_undone(self, stored: dict[str, Any], result: dict[str, Any]) -> None:
+        state = "undone" if result.get("ok") else "done"
+        stored["_offer_state"] = state
+        if result.get("ok"):
+            stored["outcome"] = "undone"
+        self.ui_log.event("nudge_offer_undo", id=stored.get("id"), ok=bool(result.get("ok")), why=result.get("why"))
+        if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
+            self.card.show_undone(result)
+        self.offer_state.emit(stored, state)
+
+    def offer_outcome(self, nudge: dict[str, Any], outcome: str) -> threading.Thread:
+        """What became of an ``ask`` suggestion (``done`` / ``stopped`` / ``abandoned``), for the learning."""
+        nudge_id = nudge.get("id")
+        stored = self.delivered.get(_nudge_id(nudge))
+        if stored is not None:
+            stored["_offer_state"] = outcome
+            stored["outcome"] = outcome
+
+        def work() -> None:
+            fields: dict[str, Any] = {"id": nudge_id, "outcome": outcome}
+            try:
+                fields["ok"] = bool(self.memory.call_method("offer_outcome", nudge_id, outcome,
+                                                            timeout_s=TRAY_TIMEOUT_S))
+            except Exception as exc:  # never take the UI down
+                fields.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+            self._logged.emit("nudge_offer_outcome", fields)
+
+        thread = threading.Thread(target=work, name="yuki-ui-offer-outcome", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        if stored is not None:
+            self.offer_state.emit(stored, outcome)
+        return thread
 
     def _on_less(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_less", id=nudge.get("id"), kind=nudge.get("kind"), trigger=nudge.get("trigger"))
         self.ack(nudge, "less")
+        if card_offer(nudge) is not None:
+            self.offer_state.emit(nudge, "less")
 
     def _on_never_ask(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card_never")

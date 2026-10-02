@@ -273,7 +273,8 @@ class CallIndicator(SurfaceWindow):
     no timer, the words say it. Never takes focus.
 
     The timer ticks once a second and the wave moves only while the pill is shown (a full-screen game hides
-    it, and then nothing runs)."""
+    it, and then nothing runs). It counts from the call **session**'s start (``session_started_at``: the first
+    row of the same microphone hold), so a row the service had to cut and reopen keeps one running time."""
 
     def __init__(self) -> None:
         from yuki.ui.wave import Wave
@@ -337,7 +338,8 @@ class CallIndicator(SurfaceWindow):
         self.call = call
         self.label.setText(indicator_text(call))
         waiting = call.get("status") == "waiting_headphones"
-        start = local_moment(call.get("detected_at") or call.get("recording_since"))
+        # The session's start (05 §7.4): a call row the service had to cut and reopen keeps one running time.
+        start = local_moment(call.get("session_started_at") or call.get("detected_at") or call.get("recording_since"))
         self._since = start.timestamp() if start is not None else None
         self.dot.setVisible(not waiting)
         self.timer_label.setVisible(not waiting and self._since is not None)

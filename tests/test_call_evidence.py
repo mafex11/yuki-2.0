@@ -94,21 +94,36 @@ def test_evidence_goes_stale_and_is_renewed_by_seeing_the_call_again(store):
     assert w.active.via == "screen" and status(store)["evidence"] == "fresh"
 
 
-def test_same_site_not_in_call_clears_evidence_another_site_does_not(store):
+LEFT = ("You left the meeting", "Rejoin", "Return to home screen")
+
+
+def test_same_site_not_in_call_ends_a_held_call_only_when_it_persists_another_site_never(store):
+    """The 2026-10-03 contract (05 §7.1): one "not in a call" screen never ends a call whose microphone is held;
+    a persistent run of them on the call's own site does (a "You left the meeting" page while the browser keeps
+    the microphone). Another site of the same browser never counts. Either way the site can no longer start one."""
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", ZEN, now - 30)
     w = worker(store, stubs, browser=True, end_grace_s=30.0)
     see(w, ZEN, now, JOINED, host="meet.google.com")
     w.step(now + 1)
-    assert w.active is not None
+    call_id = w.active.call_id
     see(w, ZEN, now + 10, YOUTUBE, host="www.youtube.com")   # another tab: the meeting goes on
     w.step(now + 11)
     assert w.active is not None and w.active.via == "screen"
-    see(w, ZEN, now + 20, ("You left the meeting", "Rejoin", "Return to home screen"), host="meet.google.com")
+    see(w, ZEN, now + 20, LEFT, host="meet.google.com")
     w.step(now + 21)
-    w.step(now + 60)                        # the evidence went away more than end_grace_s ago
+    w.step(now + 60)                        # one reliable negative, the microphone still held: still the call
+    assert w.active is not None and w.active.call_id == call_id and w.active.via == "screen_stale"
+    assert w.evidence.state("zen", now - 30, now + 60) == (None, "")   # but this hold could no longer start one
+    see(w, ZEN, now + 90, LEFT, host="meet.google.com")      # the page left in front, read again
+    w.step(now + 91)
+    assert w.active is not None             # two sights over 70 s: not yet persistent
+    see(w, ZEN, now + 145, LEFT, host="meet.google.com")     # three sights over 125 s (>= neg_span_s)
+    w.step(now + 146)
     assert w.active is None
+    row = store.call_record(call_id)
+    assert row.status == "ended" and row.stop_reason == "screen_contradicts" and len(store.calls()) == 1
 
 
 def test_a_browser_holding_the_mic_while_showing_youtube_is_not_a_call(store):
