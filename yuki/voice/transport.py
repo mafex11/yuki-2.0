@@ -155,11 +155,27 @@ class MicInput(BaseInputTransport):
         await super().cleanup()
 
 
+#: Consecutive failed speaker writes before the speaker is reopened once (v3.16, 04 F7).
+WRITE_FAILURES_REOPEN = 3
+
+
 class SpeakerOutput(BaseOutputTransport):
-    """Output transport writing to a :class:`Speaker` (blocking writes on one worker thread)."""
+    """Output transport writing to a :class:`Speaker` (blocking writes on one worker thread).
+
+    v3.16 (04 F7): a write that fails is counted, not raised (Pipecat logged one error line per frame, 473 of them
+    in a burst on 30 Sept); at :data:`WRITE_FAILURES_REOPEN` in a row the speaker is reopened once
+    (``on_write_failing``, the session's; on the writer thread), and if that does not help the session ends the
+    conversation with the error tone.
+    """
 
     def __init__(self, speaker: Speaker | None, params: TransportParams) -> None:
         super().__init__(params)
+        #: ``(error) -> bool``: reopen the speaker (the session's); ``True`` when it opened again. ``None``: no reopen.
+        self.on_write_failing: Any = None
+        #: ``(error)``: the reopen did not help: the session ends the conversation with the error tone.
+        self.on_write_failed: Any = None
+        self._write_failures = 0
+        self._reopened = False
         #: ``None`` until a dormant conversation is woken (v3.11: no output stream is held open while it waits, so
         #: the PC can sleep and no audio session shows); :meth:`set_speaker` gives it the one opened then.
         self._speaker = speaker
@@ -178,6 +194,7 @@ class SpeakerOutput(BaseOutputTransport):
 
     def set_speaker(self, speaker: Speaker) -> None:
         self._speaker = speaker
+        self._write_failures, self._reopened = 0, False
         self._start_writer()
 
     async def start(self, frame: StartFrame) -> None:
@@ -190,7 +207,32 @@ class SpeakerOutput(BaseOutputTransport):
             return True   # dormant: nothing is ever said before the wake, but never fail the pipeline on it
         if self._executor is None:
             self._start_writer()
-        await self.get_event_loop().run_in_executor(self._executor, speaker.write, frame.audio)
+        return await self.get_event_loop().run_in_executor(self._executor, self._write, speaker, frame.audio)
+
+    def _write(self, speaker: Speaker, pcm: bytes) -> bool:
+        """One blocking write on the writer thread; failures counted, and the speaker reopened once at the third."""
+        try:
+            speaker.write(pcm)
+        except Exception as exc:  # noqa: BLE001 - counted; a dead stream is reopened, never a flood of errors
+            self._write_failures += 1
+            if self._write_failures == WRITE_FAILURES_REOPEN:
+                if not self._reopened and callable(self.on_write_failing):
+                    self._reopened = True
+                    try:
+                        ok = bool(self.on_write_failing(exc))
+                    except Exception:  # noqa: BLE001
+                        ok = False
+                    if ok:
+                        self._write_failures = 0
+                        return False
+                if callable(self.on_write_failed):
+                    try:
+                        self.on_write_failed(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return False
+        if self._write_failures:
+            self._write_failures = 0
         return True
 
     async def cleanup(self) -> None:

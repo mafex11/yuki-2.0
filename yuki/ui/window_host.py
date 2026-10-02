@@ -91,11 +91,13 @@ class WindowHost(QObject):
             chat_event.connect(self._on_voice_event)
         voice.state_changed.connect(lambda st, d: self.live({"voice_state": st, "voice_detail": d}))
         voice.conversation_changed.connect(self._on_conversation)
-        voice.wake_changed.connect(lambda on: self.live({"wake": bool(on and not getattr(voice, "quiet", False)),
-                                                         "wake_state": getattr(voice, "listening_state", "on")}))
+        # v3.16: "wake" is whether the name is listened for now (off for this call counts as off)
+        voice.wake_changed.connect(lambda on: self.live({"wake": bool(getattr(voice, "listening", on and not getattr(
+            voice, "quiet", False))), "wake_state": getattr(voice, "listening_state", "on")}))
         quiet = getattr(voice, "quiet_changed", None)
         if quiet is not None:
-            quiet.connect(lambda until: self.live({"wake": bool(voice.wake_enabled and not voice.quiet),
+            quiet.connect(lambda until: self.live({"wake": bool(getattr(voice, "listening",
+                                                                        voice.wake_enabled and not voice.quiet)),
                                                    "wake_state": voice.listening_state, "quiet_until": until}))
         voice.devices_changed.connect(lambda text: self.live({"devices": text}))
 
@@ -264,7 +266,7 @@ class WindowHost(QObject):
             "voice_state": getattr(voice, "state", "off"), "conversation": bool(voice.in_conversation),
             # v3.13: the window's listening key shows a timed quiet as not listening (clicking it listens again),
             # never as "Listening"; a click then turns listening on, it can never switch it off for good.
-            "wake": bool(voice.wake_enabled and not getattr(voice, "quiet", False)),
+            "wake": bool(getattr(voice, "listening", voice.wake_enabled and not getattr(voice, "quiet", False))),
             "wake_state": getattr(voice, "listening_state", "on"), "quiet_until": getattr(voice, "quiet_until", 0.0),
             "devices": voice.devices_text(),
             "mic": voice.device_choice("capture"), "speaker": voice.device_choice("render"),

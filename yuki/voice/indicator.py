@@ -8,7 +8,8 @@ tooltip says so instead): an always-visible pill would be noise all day.
 
 An error or a note widens the pill to fit its words (up to :data:`NOTE_MAX_WIDTH`) and stays for
 :data:`NOTE_MS` even if voice goes back to listening for the name meanwhile: a failure is never shown for a
-blink. The wave animates only while the pill is shown (:class:`yuki.ui.wave.Wave`: at most 30 frames a
+blink. ``ended`` (v3.16) is the line after a conversation ended by itself ("Say 'Yuki' to talk again"), for
+:data:`ENDED_MS`. The wave animates only while the pill is shown (:class:`yuki.ui.wave.Wave`: at most 30 frames a
 second, stopped when hidden, still with "Reduce motion"). Purely presentational; it decides nothing.
 """
 
@@ -25,8 +26,12 @@ PILL_HEIGHT = 40
 MARGIN = 24
 #: How long an error or a "voice off" note stays before the pill fades.
 NOTE_MS = 8000
+#: How long the "Say 'Yuki' to talk again" line stays after a conversation ended by itself (v3.16, 04 F2).
+ENDED_MS = 3000
 #: An error or a note may widen the pill up to this, so the reason can be read.
 NOTE_MAX_WIDTH = 520
+#: States that show words of their own (the detail) for a while, then fade: how long each stays.
+TIMED = {"error": NOTE_MS, "note": NOTE_MS, "ended": ENDED_MS}
 
 #: state -> (label, ink role, wave kind or ""). The state is in its words; an error is said in red.
 LOOK: dict[str, tuple[str, str, str]] = {
@@ -38,6 +43,7 @@ LOOK: dict[str, tuple[str, str, str]] = {
     "working": ("Working on it", "text_2", "think"),
     "error": ("Voice error", "danger", ""),
     "note": ("Voice", "text_2", ""),
+    "ended": ("Say ‘Yuki’ to talk again", "text_2", ""),
 }
 
 
@@ -101,7 +107,7 @@ class VoicePill(SurfaceWindow):
             return
         self._fade.stop()
         label, self._ink, wave = LOOK.get(state, (state.capitalize(), "text", "listen"))
-        if state in ("error", "starting", "note") and detail and detail not in ("tray", "hotkey", "wake"):
+        if state in ("error", "starting", "note", "ended") and detail and detail not in ("tray", "hotkey", "wake"):
             label = detail  # an error, or a note such as the voice or a device falling back
             self.setToolTip(detail + (f"\n{self._devices}" if self._devices else ""))
         elif self._devices:
@@ -110,7 +116,7 @@ class VoicePill(SurfaceWindow):
         if wave:
             self.wave.set_kind(wave)
         room = self.label.fontMetrics().horizontalAdvance(label) + 14 + 18 + (46 + 11 if wave else 0) + 2
-        width = max(PILL_WIDTH, room) if state not in ("error", "note") else min(NOTE_MAX_WIDTH, max(PILL_WIDTH, room))
+        width = max(PILL_WIDTH, room) if state not in TIMED else min(NOTE_MAX_WIDTH, max(PILL_WIDTH, room))
         self._set_width(width)
         inner = width - 14 - 18 - (46 + 11 if wave else 0)
         self.label.setText(self.label.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, inner))
@@ -120,5 +126,5 @@ class VoicePill(SurfaceWindow):
             self.fade_in(self.anchor())
         else:
             self.move(self.anchor())
-        if state in ("error", "note"):
-            self._fade.start(NOTE_MS)
+        if state in TIMED:
+            self._fade.start(TIMED[state])

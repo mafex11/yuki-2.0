@@ -41,8 +41,29 @@ from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.hands import HAND_TOOLS
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
-    mouth_system_blocks, volatile_block,
+    ReplyChannel, mouth_system_blocks, volatile_block, with_markers,
 )
+
+#: The speech channels (``Settings.voice_speech_channel``, v3.16).
+CHANNELS = ("guard", "marker")
+
+
+def speech_channel(settings: Any) -> str:
+    """The speech channel in force: ``"marker"`` or ``"guard"`` (anything else is the guard, as before v3.16)."""
+    value = str(getattr(settings, "voice_speech_channel", "guard") or "guard").strip().lower()
+    return value if value in CHANNELS else "guard"
+
+
+def _with_text(event: Any, text: str) -> Any:
+    """A text delta event of the talker's stream carrying ``text`` instead (the marker channel's speech, v3.16)."""
+    delta = getattr(event, "delta", None)
+    try:
+        return event.model_copy(update={"delta": delta.model_copy(update={"text": text})})
+    except Exception:  # noqa: BLE001 - a stand-in event (tests): the same shape, plain
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type=getattr(event, "type", "content_block_delta"), index=getattr(event, "index", 0),
+                               delta=SimpleNamespace(type="text_delta", text=text))
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
 DEFAULT_VOICES = {"elevenlabs": "cgSgspJ2msm6clMCkdW9", "deepgram": "aura-2-thalia-en"}
@@ -52,6 +73,12 @@ WAKE_NAME = "Yuki"
 
 #: The voice states the UI shows.
 STATES = ("starting", "listening", "hearing", "thinking", "speaking", "working", "error", "off")
+
+#: The pill's words when a reply had words to say and none of them could be played (v3.16: never the service's raw
+#: text, and never for a reply that had nothing to say, 04 §4.4).
+SILENT_REPLY_NOTE = "Couldn't say that one out loud"
+#: The pill's words while a fatal service error ends the conversation (the session's notice then says why).
+FATAL_NOTE = "Voice ran into a problem"
 
 
 class VoiceUnavailable(Exception):
@@ -872,12 +899,18 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             composed = self._settings.system_instruction or MOUTH_PROMPT
             tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
             call = hooks.call()
+            channel = hook("channel", default="guard")
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call,
-                                                   call_evidence=hook("call_evidence", default=None))
-            params["messages"] = with_volatile(params.get("messages"), volatile_block(
+                                                   call_evidence=hook("call_evidence", default=None),
+                                                   channel=channel)
+            messages = params.get("messages")
+            if channel == "marker":
+                messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
+            params["messages"] = with_volatile(messages, volatile_block(
                 lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
                 named=bool(hook("named", default=False)), work=hook("work", default=None),
-                cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False))))
+                cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
+                channel=channel, rerun=bool(hook("rerun", default=False))))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -974,51 +1007,68 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if call is None:
                 return response
             call.opened = time.monotonic()
+            # v3.16, the marker channel: only text after a say marker line reaches the voice (and so the context);
+            # the marker lines and any scratch are taken out of the stream here, before anything downstream sees
+            # them, so every stream fact (first text, words in the reply, an early say_first) is about speech only.
+            channel = ReplyChannel() if hook("channel", default="guard") == "marker" else None
 
             async def timed() -> Any:
                 tool_id, args, said = None, "", True
                 early_wait = False  # a tell_yuki whose early thinker start waits for its screen field (v3.9)
-                async for event in response:
-                    now = time.monotonic()
-                    if call.first_event is None:
-                        call.first_event = now
-                    kind = getattr(event, "type", "")
-                    if call.first_content is None and kind in ("content_block_start", "content_block_delta"):
-                        call.first_content = now
-                    if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
-                        call.first_text = now
-                        if call.user_turn:
-                            hook("acked")   # the reply's own words answer them: no second acknowledgement
-                    if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
-                        tool_id, args = str(event.content_block.id), ""
-                        name = getattr(event.content_block, "name", "")
-                        if call.first_text is not None and self._yuki_words is None:
-                            # The reply's words are complete (it goes on to a call): the voice says the
-                            # sentence waiting for its lookahead now, not when the call is written (v3.7).
-                            await self.push_frame(_words_done_frame())
-                        # On a doubtful turn nothing is said before the reply is judged (its words wait too).
-                        said = name not in SAY_FIRST_TOOLS or self._yuki_words is not None
-                        # The mouth has decided to hand over: the thinker starts on the user's own words while
-                        # the call is still being written (v3.6), as soon as its first field says whether the
-                        # window in front is to be read for it (v3.9, a few tokens in).
-                        early_wait = name == "tell_yuki" and call.user_turn
-                    elif (kind == "content_block_delta" and tool_id is not None
-                          and hasattr(event.delta, "partial_json")):
-                        args += event.delta.partial_json or ""
-                        if early_wait:
-                            flag = early_flag(args, "screen")
-                            if flag is not None or '"say_first"' in args or '"request"' in args:
-                                early_wait = False
-                                if self._speculation_gate.is_speculating:
-                                    self._yuki_early_pending = (tool_id, bool(flag))  # once the turn is confirmed
-                                else:
-                                    hook("handoff_began", tool_id, bool(flag))
-                        words = early_words(args) if not said else None
-                        if words is not None:
-                            said = True
-                            if call.first_text is None:  # a reply that already spoke keeps its own words
-                                await self._yuki_say_early(call, tool_id, words)
-                    yield event
+                try:
+                    async for event in response:
+                        now = time.monotonic()
+                        if call.first_event is None:
+                            call.first_event = now
+                        kind = getattr(event, "type", "")
+                        if call.first_content is None and kind in ("content_block_start", "content_block_delta"):
+                            call.first_content = now
+                        if channel is not None:
+                            if kind == "content_block_delta" and hasattr(getattr(event, "delta", None), "text"):
+                                speech = channel.feed(getattr(event.delta, "text", "") or "")
+                                if not speech:
+                                    continue   # a marker line or scratch: never spoken, never in the conversation
+                                event = _with_text(event, speech)
+                            elif kind in ("content_block_stop", "message_delta", "message_stop"):
+                                channel.finish()
+                        if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
+                            call.first_text = now
+                            if call.user_turn:
+                                hook("acked")   # the reply's own words answer them: no second acknowledgement
+                        if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
+                            tool_id, args = str(event.content_block.id), ""
+                            name = getattr(event.content_block, "name", "")
+                            if call.first_text is not None and self._yuki_words is None:
+                                # The reply's words are complete (it goes on to a call): the voice says the
+                                # sentence waiting for its lookahead now, not when the call is written (v3.7).
+                                await self.push_frame(_words_done_frame())
+                            # On a doubtful turn nothing is said before the reply is judged (its words wait too).
+                            said = name not in SAY_FIRST_TOOLS or self._yuki_words is not None
+                            # The mouth has decided to hand over: the thinker starts on the user's own words while
+                            # the call is still being written (v3.6), as soon as its first field says whether the
+                            # window in front is to be read for it (v3.9, a few tokens in).
+                            early_wait = name == "tell_yuki" and call.user_turn
+                        elif (kind == "content_block_delta" and tool_id is not None
+                              and hasattr(event.delta, "partial_json")):
+                            args += event.delta.partial_json or ""
+                            if early_wait:
+                                flag = early_flag(args, "screen")
+                                if flag is not None or '"say_first"' in args or '"request"' in args:
+                                    early_wait = False
+                                    if self._speculation_gate.is_speculating:
+                                        self._yuki_early_pending = (tool_id, bool(flag))  # once the turn is confirmed
+                                    else:
+                                        hook("handoff_began", tool_id, bool(flag))
+                            words = early_words(args) if not said else None
+                            if words is not None:
+                                said = True
+                                if call.first_text is None:  # a reply that already spoke keeps its own words
+                                    await self._yuki_say_early(call, tool_id, words)
+                        yield event
+                finally:
+                    if channel is not None:
+                        channel.finish()
+                        hook("marker_report", call, channel)
 
             return timed()
 
@@ -1140,10 +1190,27 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
             self._text_aggregator = aggregator_type(aggregation_type=self._text_aggregation_mode)
             if not hasattr(self, "_yuki_guard"):
                 self._yuki_guard = None
+            #: Lines said by code for an owed outcome (v3.16): the thinker's own words, never held by the check.
+            self._yuki_unguarded: set[str] = set()
 
         def set_guard(self, guard: Any) -> None:
             """The spoken-line check (yuki.voice.speechguard, v3.10): every line passes it before it is heard."""
             self._yuki_guard = guard
+
+        def unguard(self, text: str) -> None:
+            """These exact words (said by code for an owed outcome, v3.16) pass without the spoken-line check."""
+            key = " ".join(strip_tags(text or "").split())
+            if key:
+                self._yuki_unguarded.add(key)
+                if len(self._yuki_unguarded) > 16:
+                    self._yuki_unguarded.pop()
+
+        def _take_unguarded(self, text: str) -> bool:
+            key = " ".join(strip_tags(text or "").split())
+            if key and key in self._yuki_unguarded:
+                self._yuki_unguarded.discard(key)
+                return True
+            return False
 
         async def process_ttfa_metrics(self, frame: Any) -> None:
             """Off (v3.15): Pipecat's time-to-first-audible metric re-scans the whole buffered reply with numpy on
@@ -1157,9 +1224,10 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
                 return   # a lone "[" or a mark cut off at a stream boundary: never a sound (live 13:32:34 "[")
             guard = getattr(self, "_yuki_guard", None)
             if guard is not None and not getattr(self, "_yuki_audio_gate", False):
-                # A voice without an audio gate (Aura, ElevenLabs): the line is checked before it is sent.
+                # A voice without an audio gate (Aura, ElevenLabs): the line is checked before it is sent (in shadow
+                # mode only scored, never waited for; an owed outcome said by code is never checked, v3.16).
                 text = strip_tags(str(getattr(src_frame, "text", "") or ""))
-                if text.strip() and not await guard.allows(text):
+                if text.strip() and not self._take_unguarded(text) and not await guard.allows(text):
                     return
             await super()._push_tts_frames(src_frame, *args, **kwargs)
 
@@ -1256,6 +1324,24 @@ class _Turn:
     guarded: int = 0                     # lines the spoken-line check kept from being said (v3.10)
     audible: list[str] = field(default_factory=list)   # words as they left the output: really heard (v3.12)
     audible_at: float | None = None      # when the last of them left it
+    # v3.16: the marker channel, the rerun's outcome, and a voice that played nothing
+    marker: str | None = None            # the reply's first marker line (say / act / quiet), marker mode only
+    scratch: int = 0                     # characters of its text that were never spoken (no marker, act, quiet)
+    unmarked: bool = False               # text came with no marker line at all: nothing of it was spoken
+    responses_at_rerun: int = 0          # mouth runs finished when it was answered again
+    rerun_at: float | None = None        # when it was answered again (monotonic)
+    gave_up: bool = False                # the rerun was silent too: the error tone said so, the window was extended
+    tts_silent: int = 0                  # replies of this turn whose voice played nothing at all
+
+    @property
+    def heard(self) -> bool:
+        """Words of a reply to it left the speaker (not a breath of silence, not marks alone)."""
+        return bool(strip_tags("".join(self.audible)).strip())
+
+    @property
+    def quiet(self) -> bool:
+        """Yuki chose silence on it: the stay_quiet call, or a quiet marker (v3.16)."""
+        return "stay_quiet" in self.tools or self.marker == "quiet"
 
 
 class TurnObserver:
@@ -1345,6 +1431,15 @@ class TurnObserver:
         self.screen_terms: list[str] = []
         #: The last reply the user spoke over: what they heard and what was not said (v3.12), for the talker.
         self.last_cut: dict[str, Any] | None = None
+        #: ``(now, turn)``: words left the speaker (v3.16, the owed-output ledger listens here). Set by the conversation.
+        self.on_audible: Callable[[float, Any], None] | None = None
+        #: The user's turn being answered again (``Conversation._reply_watch``): the rerun's reply stays in it (v3.16).
+        self.rerun_turn: _Turn | None = None
+        #: Words were heard since Yuki last started speaking: a stretch with none (the voice's breath of silence for a
+        #: reply that had nothing audible) is no answer and no exchange (v3.16, 04 §4.1).
+        self._stretch_words = False
+        #: When words last left the speaker (monotonic, 0: never).
+        self.words_heard_at = 0.0
 
     def cut_for_now(self) -> dict[str, str] | None:
         """The last reply they spoke over, as they heard it (v3.12), for the first user turn after it; else ``None``."""
@@ -1418,8 +1513,11 @@ class TurnObserver:
         frame = data.frame
         if (isinstance(frame, TTSTextFrame) and self.turn is not None and self.output_processor is not None
                 and getattr(data, "source", None) is self.output_processor):
-            self.turn.audible.append(strip_tags(frame.text or "") + " ")
+            words = strip_tags(frame.text or "")
+            self.turn.audible.append(words + " ")
             self.turn.audible_at = time.monotonic()
+            if words.strip():
+                self._heard_words(self.turn.audible_at)
         if self.on_chat is None:
             return
         if isinstance(frame, TTSTextFrame) and self.output_processor is not None \
@@ -1438,6 +1536,38 @@ class TurnObserver:
                        "text": " ".join(w.strip() for w in self._said if w.strip()), "final": True,
                        "interrupted": isinstance(frame, InterruptionFrame)})
             self._said = []
+
+    def _heard_words(self, now: float) -> None:
+        """Words of Yuki's left the speaker (v3.16): only this answers the user and counts as an exchange.
+
+        Before, the start of any audio did (``BotStartedSpeakingFrame``), and the voice's 20 ms breath of silence
+        for a fully dropped reply counted as an answer: live 2 Oct 21:24:08 "Open Chrome." got that breath, the
+        unanswered-turn rerun never ran, and the call's idle clock restarted on it (04 §4.1).
+        """
+        self.words_heard_at = now
+        self._stretch_words = True
+        self.owes_reply_since = None
+        self._took_part(now)
+        if self.on_audible is not None:
+            try:
+                self.on_audible(now, self.turn)
+            except Exception:  # noqa: BLE001 - bookkeeping never breaks the voice
+                pass
+
+    def tts_silent(self, speakable: int) -> None:
+        """A reply's voice finished with nothing audible (v3.16; the voice's breath closed it, no ErrorFrame).
+
+        The pill says so only when the reply had words to say (``speakable`` pieces) and none of this turn's were
+        heard, in plain words; a reply of marks alone, or one whose words were dropped on purpose, shows nothing.
+        """
+        turn = self.turn
+        if turn is None:
+            return
+        turn.tts_silent += 1
+        if self.log is not None:
+            self.log.event("tts_silent", turn=turn.n, trigger=turn.trigger, speakable=int(speakable))
+        if speakable > 0 and not turn.heard:
+            self.set_state("error", SILENT_REPLY_NOTE)
 
     # -- live state (the narrator gate) -------------------------------------------
 
@@ -1614,19 +1744,25 @@ class TurnObserver:
         others = self.for_others(turn, reply)
         addressed = None
         if turn.trigger == "user":
-            addressed = ("others" if others or (not reply and "stay_quiet" in turn.tools and not turn.counted)
+            addressed = ("others" if others or (not reply and turn.quiet and not turn.counted)
                          else "yuki")
             self.chat({"type": "turn_closed", "turn_id": f"{self.session}-{turn.n}", "addressed": addressed,
                        "replied": bool(reply), "cut_by_user": turn.cut})
+        # v3.16: what was really heard, the marker channel, and an unheard turn answered again (content-free)
+        row["audible_chars"] = len(strip_tags("".join(turn.audible)).strip())
+        if turn.marker is not None or turn.unmarked or turn.scratch:
+            row.update(marker=turn.marker, unmarked=turn.unmarked, scratch_chars=turn.scratch)
+        if turn.rerun:
+            row.update(rerun=True, gave_up=turn.gave_up)
         if turn.call:
             row["call_mode"] = True
             if turn.trigger == "user":
                 row["addressed"] = ("yuki" if not others else
-                                    "others" if "stay_quiet" in turn.tools else "unanswered")
+                                    "others" if turn.quiet else "unanswered")
                 # Why a turn was taken as not for Yuki (content-free, v3.15): the talker's stay_quiet in call mode,
                 # or their next words came before any reply.
                 if others:
-                    row["for_others_why"] = ("talker_stay_quiet" if "stay_quiet" in turn.tools
+                    row["for_others_why"] = ("talker_stay_quiet" if turn.quiet
                                              else "next_words_first")
         self.totals["turns"] += 1
         self.totals["for_others"] += int(others)
@@ -1700,7 +1836,7 @@ class TurnObserver:
             self.heard, self.heard_plain = None, False  # a new turn: the last one's doubts are not about these
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
-            if (self.turn is not None and self.turn.trigger == "user" and self.turn.first_audio is None
+            if (self.turn is not None and self.turn.trigger == "user" and not self.turn.heard
                     and self.owes_reply):
                 # They went on talking before hearing a reply (a pause inside what they were saying): that
                 # reply is dropped and the next one answers everything (logged: silent turns, 26 Sept).
@@ -1750,7 +1886,10 @@ class TurnObserver:
                 self.turn.context_at = now
         elif isinstance(frame, LLMFullResponseStartFrame):
             self.generating = True
-            if self.turn is None or self.turn.first_audio is not None or self.turn.responses:
+            rerun, self.rerun_turn = self.rerun_turn, None
+            if rerun is not None and rerun is self.turn:
+                pass   # the user's turn answered again (v3.16): its new reply is still that turn's answer
+            elif self.turn is None or self.turn.first_audio is not None or self.turn.responses:
                 # A new mouth run after this turn already had one (a result, a progress line,
                 # a follow-up to a tool-only reply) is its own turn, with its own stages.
                 self._open("result")
@@ -1792,9 +1931,11 @@ class TurnObserver:
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.bot_speaking = True
             self.speech_pending_since = None
+            self._stretch_words = False
             if self.turn is not None and self.turn.first_audio is None:
                 self.turn.first_audio = now
-            self._took_part(now)
+            # v3.16: the exchange is counted by the first words heard (``_heard_words``), not by the start of any
+            # audio: a breath of silence closing a reply with nothing audible is not an answer.
             self.set_state("speaking")
             self._activity()
         elif isinstance(frame, BotStoppedSpeakingFrame):
@@ -1803,8 +1944,9 @@ class TurnObserver:
             self.bot_speaking = False
             self.speech_pending_since = None
             self.last_bot_stop = now
-            self.last_exchange = now
-            self.owes_reply_since = None
+            if self._stretch_words:
+                self.last_exchange = now
+                self.owes_reply_since = None
             self.set_state(self.idle_state())
             self._activity()
         elif isinstance(frame, InterruptionFrame):
@@ -1830,13 +1972,20 @@ class TurnObserver:
                     self.turn.tts_chars += int(item.value or 0)
         elif isinstance(frame, ErrorFrame):
             text = str(getattr(frame, "error", "") or "error")
+            fatal = bool(getattr(frame, "fatal", False))
             if self.turn is not None:
                 self.turn.error = text[:200]
             if self.log is not None:
-                self.log.event("error", fatal=bool(getattr(frame, "fatal", False)), error=text[:500])
-            if getattr(frame, "fatal", False):
+                self.log.event("error", fatal=fatal, error=text[:500])
+            if fatal:
                 self.fatal = text
-            self.set_state("error", text[:120])
+                self.set_state("error", FATAL_NOTE)   # the session's notice says why, in words the user can act on
+            elif self.turn is not None:
+                # v3.16: a non-fatal error (a TTS context with no audio, a hiccup) is never shown as the service's
+                # raw text; the pill says something only when the reply had words and none were heard.
+                speakable = bool(strip_tags("".join(self.turn.reply)).strip())
+                if speakable and not self.turn.heard and not self.bot_speaking:
+                    self.set_state("error", SILENT_REPLY_NOTE)
             self._activity()
 
 
@@ -1996,6 +2145,22 @@ class _Hooks:
         call = getattr(getattr(c, "_llm", None), "_yuki_call", None)
         return bool(c.woken_by_name and (call is None or call.user_turn) and c.observer.user_turns <= 1)
 
+    # -- v3.16: the speech channel and an unheard turn answered again --------------------------------------
+
+    def channel(self) -> str:
+        """``"marker"`` or ``"guard"`` (``Settings.voice_speech_channel``)."""
+        return self.c.channel
+
+    def rerun(self) -> bool:
+        """Whether this call answers the user's turn again because nothing of the last reply to it was heard."""
+        turn = self.c.observer.turn
+        call = getattr(getattr(self.c, "_llm", None), "_yuki_call", None)
+        return bool(turn is not None and turn.rerun and turn.trigger == "user" and (call is None or call.user_turn))
+
+    def marker_report(self, call: LlmCall, channel: Any) -> None:
+        """A reply's text was read by the marker channel: record it on its turn and log it (content-free)."""
+        self.c._marker_report(call, channel)
+
 
 def quiet_answered(messages: list[Any] | None) -> set[int]:
     """Ids of the user messages the mouth answered only with ``stay_quiet`` (in a call: talk to the others).
@@ -2128,6 +2293,22 @@ class Conversation:
         self.started_at = time.monotonic()
         self._extra_observers = list(extra_observers or [])
         self.progress_cost_usd = 0.0
+        # -- v3.16 -------------------------------------------------------------------------------------------
+        #: Which of the talker's words are spoken: ``"marker"`` or ``"guard"`` (``Settings.voice_speech_channel``).
+        self.channel = speech_channel(settings)
+        #: Every outcome handed to the talker until it is heard (:class:`yuki.voice.narrator.OwedLedger`), made in run.
+        self.ledger: Any = None
+        #: ``(kind)``: play an earcon (:func:`yuki.voice.echo.tone`) through this conversation's output; set by the
+        #: session (a test's stand-in records it). Non-speech only: Yuki never speaks first.
+        self.on_tone: Callable[[str], None] | None = None
+        #: Loop stalls seen while live, ``(start, end)`` monotonic (the lag monitor's and the watch's own): the idle
+        #: clock does not count them (04 F4).
+        self._stalls: list[tuple[float, float]] = []
+        #: One more idle window from here (the rerun of an unheard turn was silent too, 04 F1).
+        self._grace_since: float | None = None
+        #: Why and how the conversation ended (content-free, for the ``session stop`` event; 04 F3).
+        self.stop_facts: dict[str, Any] = {}
+        self.observer.on_audible = self._on_audible
 
     def _on_activity(self) -> None:
         self._activity.set()
@@ -2269,6 +2450,7 @@ class Conversation:
         bridge.on_jobs_changed = self._activity.set
         bridge.announce = self._announce
         bridge.gate = self.gate
+        bridge.ledger = self.ledger   # v3.16: every outcome handed to the talker stays owed until it is heard
         bridge.steps = self.steps
         bridge.progress_answerer = self._progress_answer
         bridge.on_remembered = self._refresh_rules
@@ -2300,10 +2482,10 @@ class Conversation:
         if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
         tts = getattr(self, "_tts", None)
-        warm = getattr(tts, "_maybe_warm", None)
+        warm = getattr(tts, "warm_now", None) or getattr(tts, "_maybe_warm", None)
         if callable(warm) and self.woken_at is not None:   # built awake, the voice warms itself as it starts
             try:
-                warm()   # the voice's connection, if it went idle while dormant
+                warm()   # v3.16: the voice's connections at every wake (live 2 Oct its first byte timed out 8 s in)
             except Exception:  # noqa: BLE001 - only a head start
                 pass
         if self.woken_at is not None and self._loop is not None:
@@ -2473,7 +2655,13 @@ class Conversation:
                 api_key=get_key(GOOGLE) or "", model=s.voice_gemini_model, voice=s.voice_gemini_voice,
                 style=s.voice_gemini_style, first_audio_timeout_s=s.voice_gemini_first_audio_s,
                 fallback_key=fallback_key, fallback_voice=DEFAULT_VOICES["deepgram"], log=tts_log,
-                ssl=shared_ssl_context(), cache=cache)
+                ssl=shared_ssl_context(), cache=cache,
+                # v3.16: hedge a slow first byte with Aura, a per-piece circuit breaker instead of a sticky switch
+                hedge_s=float(getattr(s, "voice_tts_hedge_s", 1.8) or 0.0),
+                breaker=(int(getattr(s, "voice_tts_breaker_failures", 2)),
+                         float(getattr(s, "voice_tts_breaker_window_s", 60.0)),
+                         float(getattr(s, "voice_tts_breaker_open_s", 60.0))))
+            tts._yuki_on_silent = self.observer.tts_silent   # a reply that played nothing: its breath, no error
         elif provider == "deepgram":
             from pipecat.services.deepgram.tts import DeepgramTTSService
 
@@ -2500,7 +2688,8 @@ class Conversation:
 
             guard = SpeechGuard(self._client, s.voice_mouth_model, log=self.log, session=self.session,
                                 timeout_s=float(getattr(s, "voice_speech_guard_timeout_s", 2.5)),
-                                context=lambda: {"user": self.observer.last_user_text})
+                                context=lambda: {"user": self.observer.last_user_text},
+                                shadow=self.channel == "marker")   # v3.16: with the marker channel it only measures
             guard.on_drop = self.observer.guarded
             self.guard = guard
             self.observer.guard = guard
@@ -2633,6 +2822,9 @@ class Conversation:
         self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
                                  cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log,
                                  final_gap_s=s.voice_final_gap_s, progress_pause_s=s.voice_progress_pause_s)
+        from yuki.voice.narrator import OwedLedger
+
+        self.ledger = OwedLedger(stale_turns=s.voice_stale_turns, log=self.log)
         if getattr(s, "voice_step_lines", True):
             # v3.14: the thinker's step and say lines, said by code in Yuki's one voice when a pause would be noticed.
             from yuki.voice.steplines import StepLines
@@ -2694,6 +2886,9 @@ class Conversation:
                 self.bridge.closing = True
                 self.bridge.attach(None)
                 self.bridge.announce = None
+                self.bridge.ledger = None
+            if self.ledger is not None and (self.ledger.items or self.ledger.stats["owed"]):
+                self.log.event("owed", op="summary", session=self.session, **self.ledger.summary())
             if self.grounder is not None:
                 unloaded = self.grounder.release(busy=self.bridge.brain_busy())
                 timings = sorted(self.grounder.timings)
@@ -2837,6 +3032,7 @@ class Conversation:
                 late = (state["tick"] - started - every_s) * 1000
                 lags.append(late)
                 if late >= report_ms:
+                    self._note_stall(started + every_s, state["tick"])   # the idle clock does not count it (F4)
                     stacks, state["stacks"] = state["stacks"], []
                     from yuki.voice.gcwatch import pauses_between
 
@@ -3044,37 +3240,53 @@ class Conversation:
     #: again once the user has been quiet this long after it (s), and at least this long after its words.
     REPLY_WATCH_QUIET_S = 0.9
     REPLY_WATCH_AFTER_S = 1.2
+    #: A rerun whose reply has not even started this long after it was asked for counts as silent (s, v3.16).
+    RERUN_WAIT_S = 8.0
 
     def _unanswered(self) -> Any:
-        """The latest turn when it is the user's, was said to Yuki and got nothing audible, else ``None``."""
+        """The latest turn when it is the user's, was said to Yuki and got nothing audible, else ``None``.
+
+        v3.16 (04 F1): "audible" is words that left the speaker (``turn.heard``), never the start of any audio: a
+        fully dropped or marks-only reply ends with a breath of silence, which is no answer. A turn Yuki acted on
+        (a hand, a hand-off), chose silence on (stay_quiet, a quiet marker), or gave up on after a silent rerun is
+        not unanswered.
+        """
         obs = self.observer
         turn = obs.turn
         if turn is None or turn.trigger != "user" or not (turn.user_text or "").strip():
             return None
-        if turn.first_audio is not None or turn.tools or getattr(turn, "rerun", False):
-            return None  # heard something, or acted, or handed over, or already answered again
+        if turn.heard or turn.tools or turn.quiet or turn.gave_up:
+            return None  # heard something, or acted, or handed over, or chose silence, or already given up on
         if not (turn.cut or turn.responses):
             return None  # its reply may still be on its way
         return turn
 
     async def _reply_watch(self, every_s: float = 0.2) -> None:
-        """Every utterance said to Yuki gets an audible answer (v3.9).
+        """Every utterance said to Yuki gets an audible answer (v3.9), and every outcome owed is heard (v3.16).
 
         Live 2026-09-27 14:17:01-14:17:10 "uke", "Yuki." and a third utterance each got a reply that was cut
         before a sound was heard (the next words, or a start of turn that brought no words) and nothing was
-        said for ten seconds: the user thought Yuki was dead. When the newest turn is the user's, got no audio,
-        no hand, no hand-off and no stay_quiet, and the user has since been quiet (no speech, no mic sound, no
-        reply being written or spoken), the mouth runs again on the same context, once per turn. A fact about
-        the stream, never about the words.
+        said for ten seconds: the user thought Yuki was dead. When the newest turn is the user's, got no words
+        heard, no hand, no hand-off and no stay_quiet, and the user has since been quiet (no speech, no mic sound,
+        no reply being written or spoken), the mouth runs again on the same context, once per turn. If that rerun
+        is silent too, the error tone says so (a non-speech notice) and the conversation stays open one more idle
+        window (v3.16, 04 F1). A fact about the stream, never about the words. Each tick also gives the owed-output
+        ledger its turn (:meth:`_owed_tick`).
         """
         from pipecat.frames.frames import LLMRunFrame
 
         try:
             while True:
                 await asyncio.sleep(every_s if not self.dormant else 1.0)
+                if self.dormant or self._stop.is_set():
+                    continue
+                try:
+                    await self._owed_tick()
+                except Exception as exc:  # noqa: BLE001 - the ledger never stops the watch
+                    self.log.event("owed", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
                 turn = self._unanswered()
                 obs = self.observer
-                if turn is None or self.worker is None or self._stop.is_set():
+                if turn is None or self.worker is None:
                     continue
                 if obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending:
                     continue
@@ -3083,12 +3295,126 @@ class Conversation:
                     continue
                 if self._quiet_for() < self.REPLY_WATCH_QUIET_S:
                     continue
+                if turn.rerun:
+                    started = turn.rerun_at or now
+                    if turn.responses <= turn.responses_at_rerun and now - started < self.RERUN_WAIT_S:
+                        continue   # the rerun's reply is still on its way
+                    self._give_up(turn)
+                    continue
                 turn.rerun = True
+                turn.responses_at_rerun = turn.responses
+                turn.rerun_at = now
+                obs.rerun_turn = turn
                 self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
-                               responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000))
+                               responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000),
+                               marker=turn.marker, unmarked=turn.unmarked, tts_silent=turn.tts_silent,
+                               guarded=turn.guarded)
                 await self.worker.queue_frame(LLMRunFrame())
         except asyncio.CancelledError:
             return
+
+    def _give_up(self, turn: Any) -> None:
+        """The rerun of an unheard turn was silent too: the error tone, and one more idle window (04 F1)."""
+        turn.gave_up = True
+        self._grace_since = time.monotonic()
+        self.log.event("reply_watch", op="gave_up", turn=turn.n, responses=turn.responses, marker=turn.marker,
+                       unmarked=turn.unmarked, tts_silent=turn.tts_silent, guarded=turn.guarded)
+        self._tone("error")
+        self._activity.set()
+
+    def _tone(self, kind: str) -> None:
+        """An earcon through this conversation's output (non-speech; the session plays it)."""
+        if self.on_tone is None:
+            return
+        try:
+            self.on_tone(kind)
+        except Exception:  # noqa: BLE001 - a notice never breaks the voice
+            pass
+
+    # -- the owed-output ledger (v3.16, 07 §6 A) -----------------------------------------------------------------
+
+    def _on_audible(self, now: float, turn: Any) -> None:
+        if self.ledger is not None:
+            self.ledger.heard(now, getattr(turn, "opened", None), getattr(turn, "trigger", None))
+
+    async def _owed_tick(self) -> None:
+        """Say by code (or show with a sound) an outcome whose talker run was not heard, at a quiet moment."""
+        ledger = self.ledger
+        if ledger is None or not ledger.pending:
+            return
+        obs = self.observer
+        ledger.expire(obs.user_turns)
+        now = time.monotonic()
+        busy = bool(obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending or obs.owes_reply
+                    or getattr(self.bridge, "busy_tools", 0))
+        item = ledger.due(now, last_response_end=obs.last_response_end, quiet_for=self._quiet_for(), busy=busy)
+        if item is None:
+            return
+        if ledger.attempt(item, now) == "code":
+            await self._speak_owed(item.text)
+            return
+        # Said twice by code and still not heard (the voice itself is failing): on the pill, with a sound.
+        obs.set_state("note", item.text)
+        self._tone("error" if item.kind == "failed" else "note")
+
+    async def _speak_owed(self, text: str) -> None:
+        """An owed outcome said by code in the one voice: the thinker's own words, never held by the line check."""
+        tts = getattr(self, "_tts", None)
+        unguard = getattr(tts, "unguard", None)
+        if callable(unguard):
+            unguard(text)
+        await self._speak(text)
+
+    def _owed_pending(self) -> int:
+        return len(self.ledger.pending) if self.ledger is not None else 0
+
+    def _held_pending(self, now: float) -> int:
+        """1 while a hand the talker held until the user answers waits for that answer (04 F1), else 0.
+
+        Held (doubtful words, ``_hold``) and the user has not spoken since: their next words are what it waits for.
+        """
+        bridge = self.bridge
+        if getattr(bridge, "held_call", None) is None:
+            return 0
+        at = getattr(bridge, "held_at", None)
+        if at is None or now - at > float(self.settings.voice_hold_max_s):
+            return 0
+        return 0 if (self.observer.last_user_at or 0.0) > at else 1
+
+    def _marker_report(self, call: Any, channel: Any) -> None:
+        """A reply's text read by the marker channel (v3.16): kept on its turn, logged content-free."""
+        facts = channel.facts()
+        turn = self.observer.turn
+        if turn is not None:
+            turn.marker = facts.get("marker") or turn.marker
+            turn.scratch += int(facts.get("scratch_chars") or 0)
+            turn.unmarked = bool(turn.unmarked or facts.get("unmarked"))
+        if facts.get("marker") is not None or facts.get("scratch_chars"):
+            self.log.event("marker", session=self.session, user_turn=bool(getattr(call, "user_turn", False)),
+                           turn=turn.n if turn is not None else None, **facts)
+
+    # -- loop stalls (04 F4) -------------------------------------------------------------------------------------
+
+    #: A wake-up later than asked by more than this, or a watch pass that took this long, was a loop stall (s).
+    STALL_MIN_S = 0.25
+
+    def _note_stall(self, start: float, end: float) -> None:
+        if end - start <= 0:
+            return
+        self._stalls.append((start, end))
+        if len(self._stalls) > 64:
+            del self._stalls[:-64]
+
+    def _stalled_since(self, since: float, now: float) -> float:
+        """Seconds of loop stalls between ``since`` and ``now`` (overlapping measurements counted once)."""
+        spans = sorted((max(a, since), min(b, now)) for a, b in self._stalls if b > since and a < now)
+        total, end = 0.0, since
+        for a, b in spans:
+            a = max(a, end)
+            if b > a:
+                total += b - a
+                end = b
+        return total
 
     async def _end_after_speech(self, max_s: float = 6.0) -> None:
         """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on)."""
@@ -3143,6 +3469,13 @@ class Conversation:
     #: the calls after the stream ends): the conversation does not end in between (measured: a
     #: call-mode run ended 0.4 s before the "turn it up" hand it had just decided on).
     CALL_TOOL_START_S = 1.0
+    #: In call mode the microphone's own voiced signal this recent (s) means they are still talking: the call idle
+    #: never ends the conversation then (v3.16, 04 F1: live 2 Oct 21:28:00 it closed on their "Hello?", which Flux had
+    #: not reported yet; its start of turn comes ~0.5-1 s into speech). A measured level, never words.
+    CALL_VOICED_HOLD_S = 0.6
+    #: A stop the watch decided is confirmed on a second look this long later, with the loop free in between, so a
+    #: frame that waited out a stall (a transcript, a reply) is handled before the end (v3.16, 04 F4).
+    STOP_CONFIRM_S = 0.15
 
     def idle_limit(self) -> float:
         """Quiet seconds that end a conversation: longer the more the user has been talking with Yuki."""
@@ -3150,35 +3483,63 @@ class Conversation:
         extra = s.voice_idle_per_exchange_s * max(0, self.observer.exchanges - 1)
         return max(s.voice_idle_s, min(s.voice_idle_max_s, s.voice_idle_s + extra))
 
+    def _user_voiced(self, now: float) -> bool:
+        """The microphone hears them talking right now (its voiced level), not a long stretch of noise."""
+        if self._voice_activity is None:
+            return False
+        try:
+            since, last = self._voice_activity()
+        except Exception:  # noqa: BLE001
+            return False
+        if not last or now - last >= self.CALL_VOICED_HOLD_S:
+            return False
+        return bool((last - since) < self.SOUND_MAX_STRETCH_S or self.observer.user_speaking)
+
     async def _watch(self, runner: Any) -> None:
         """End the conversation when it has been quiet long enough, or on stop / fatal error.
 
         Normal mode: after :meth:`idle_limit` of nobody speaking (longer while a task runs, up
         to ``voice_hold_max_s``). Call mode: ``voice_call_idle_s`` after the last exchange with
         Yuki, however much the user goes on talking to the people on the call.
+
+        v3.16 (04 F1, F3, F4): never while the user's newest turn has had no audible answer (it is answered again
+        first), while a held hand waits for their answer or an outcome is still owed (then the hold limit applies),
+        or, in a call, while the microphone hears them talking. The quiet time does not count loop stalls, and a stop
+        is confirmed on a second look a moment later. Why it ended is kept in :attr:`stop_facts`.
         """
         s = self.settings
         if self.dormant and not await self._dormant_upkeep():
             self._set_stop("standby_lost")
         last = time.monotonic()
+        confirming = False
+        held = unanswered = False
+        window = last
         while True:
             obs = self.observer
+            began = time.monotonic()
+            held = bool(self._held_pending(began))
+            owed = (self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
+                    + int(held) + self._owed_pending())
+            unanswered = self._unanswered() is not None
             now = time.monotonic()
-            owed = self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
+            if now - began > self.STALL_MIN_S:
+                self._note_stall(began, now)   # this pass itself was held up: a stall, not quiet
             if self.call_app:
-                busy = (obs.bot_speaking or obs.generating or obs.owes_reply
+                busy = (obs.bot_speaking or obs.generating or obs.owes_reply or unanswered or self._user_voiced(now)
                         or now - obs.last_response_end < self.CALL_TOOL_START_S)
-                since = max(x for x in (self.stt_ready_at, obs.last_exchange, self.started_at) if x is not None)
+                window = max(x for x in (self.stt_ready_at, obs.last_exchange, self.started_at, self._grace_since)
+                             if x is not None)
                 limit = s.voice_hold_max_s if owed else s.voice_call_idle_s
                 if obs.user_speaking and not owed:
                     limit += self.CALL_SPEECH_GRACE_S
-                remaining = limit - (now - since)
+                remaining = limit - ((now - window) - self._stalled_since(window, now))
                 wait = 1.0 if busy else max(0.05, remaining)  # owes_reply expires by time, not by an event
             else:
-                busy = obs.user_speaking or obs.bot_speaking or obs.generating
+                busy = obs.user_speaking or obs.bot_speaking or obs.generating or unanswered
+                window = max(last, self._grace_since or 0.0)
                 limit = s.voice_hold_max_s if owed else self.idle_limit()
-                remaining = limit - (now - last)
-                wait = None if busy else max(0.05, remaining)
+                remaining = limit - ((now - window) - self._stalled_since(window, now))
+                wait = (1.0 if unanswered else None) if busy else max(0.05, remaining)
             if not busy and not obs.owes_reply and obs.state in ("thinking", "working", "listening"):
                 # The pill says "Working on it" only while a job really runs (queued or running); a
                 # result folded in silently, a cancelled job or a stay_quiet leaves it "Listening".
@@ -3186,18 +3547,34 @@ class Conversation:
             if self._stop.is_set() or obs.fatal:
                 break
             if not busy and remaining <= 0:
+                if not confirming:
+                    # Look again in a moment with the loop free in between: frames that waited out a stall are
+                    # handled first (a transcript, a reply on its way), and a stall in between is measured.
+                    confirming = True
+                    before = time.monotonic()
+                    await asyncio.sleep(self.STOP_CONFIRM_S)
+                    after = time.monotonic()
+                    if after - before > self.STOP_CONFIRM_S + self.STALL_MIN_S:
+                        self._note_stall(before + self.STOP_CONFIRM_S, after)
+                    continue
                 self._set_stop("held_too_long" if owed else ("call_idle" if self.call_app else "idle"))
                 break
+            confirming = False
             self._activity.clear()
+            slept_from = time.monotonic()
             try:
                 await asyncio.wait_for(self._activity.wait(), timeout=wait)
             except asyncio.TimeoutError:
+                woke = time.monotonic()
+                if wait is not None and woke - slept_from > wait + self.STALL_MIN_S:
+                    self._note_stall(slept_from + wait, woke)   # it woke late: the loop was stalled
                 continue
             except asyncio.CancelledError:
                 return
             last = time.monotonic()
             if self._stop.is_set():
                 break
+        self._record_stop(window, held=held, unanswered=unanswered)
         if self._on_closing is not None:
             try:
                 self._on_closing(self.reason)
@@ -3206,6 +3583,22 @@ class Conversation:
         if self._bound:
             self.bridge.closing = True
         await runner.cancel()
+
+    def _record_stop(self, window: float, *, held: bool, unanswered: bool) -> None:
+        """What ended the conversation, content-free, for the session's ``session stop`` event (04 F3)."""
+        obs = self.observer
+        now = time.monotonic()
+        exchange = obs.last_exchange or self.stt_ready_at or self.started_at
+        self.stop_facts = {
+            "reason": self.reason,
+            "since_exchange_s": round(now - exchange, 1),
+            "exchanges": obs.exchanges,
+            "unanswered": bool(unanswered),
+            "held": bool(held),
+            "owed": self._owed_pending(),
+            "stall_ms_in_window": round(self._stalled_since(window, now) * 1000),
+            "call_mode": bool(self.call_app),
+        }
 
 
 def _preimport() -> None:

@@ -533,7 +533,8 @@ KIND_WORD = {"capture": "Microphone", "render": "Speaker"}
 def audio_devices() -> dict[str, Any]:
     """The active capture and render devices (Core Audio, read-only, ~15 ms) and the defaults.
 
-    ``{"capture": [names], "render": [names], "default_capture": name, "default_render": name}``;
+    ``{"capture": [names], "render": [names], "default_capture": name, "default_render": name,
+    "capture_ids": {name: endpoint id}, "render_ids": {name: endpoint id}}``;
     the capture default is Windows' communications input (what voice uses when nothing is
     chosen), the render default the console output (what PortAudio's default plays to).
     Never raises: on a failure the lists are empty and ``error`` says why.
@@ -545,25 +546,42 @@ def audio_devices() -> dict[str, Any]:
         caps = defaults.get("capture") or {}
         cap = caps.get("communications") or caps.get("console") or {}
         ren = (defaults.get("render") or {}).get("console") or {}
-        return {"capture": [str(d["name"]) for d in list_endpoints(E_CAPTURE) if d.get("name")],
-                "render": [str(d["name"]) for d in list_endpoints(E_RENDER) if d.get("name")],
+        capture = [d for d in list_endpoints(E_CAPTURE) if d.get("name")]
+        render = [d for d in list_endpoints(E_RENDER) if d.get("name")]
+        return {"capture": [str(d["name"]) for d in capture], "render": [str(d["name"]) for d in render],
+                "capture_ids": {str(d["name"]): str(d.get("id") or "") for d in capture},
+                "render_ids": {str(d["name"]): str(d.get("id") or "") for d in render},
                 "default_capture": cap.get("name"), "default_render": ren.get("name")}
     except Exception as exc:  # noqa: BLE001 - the menu then offers the default only
         return {"capture": [], "render": [], "default_capture": None, "default_render": None,
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-def resolve_device(kind: str, wanted: str | None, devices: dict[str, Any]) -> tuple[str | None, str]:
+def device_id(kind: str, name: str | None, devices: dict[str, Any]) -> str | None:
+    """The Core Audio endpoint id of the active device named ``name`` (``None`` when it is not listed)."""
+    if not name:
+        return None
+    return ((devices.get(f"{kind}_ids") or {}).get(name)) or None
+
+
+def resolve_device(kind: str, wanted: str | None, devices: dict[str, Any],
+                   wanted_id: str | None = None) -> tuple[str | None, str]:
     """The device to open for a choice: ``(name, "")``, or ``(None, note)`` when it is not connected.
 
     ``None`` means Windows' default. A chosen device that is not among the active ones
     (Bluetooth off, unplugged) falls back to the default, with a note for the pill.
-    Matching is on the exact name Core Audio lists (plumbing, not a guess).
+    Matching is on the endpoint id first (v3.16, 04 F7: Windows renames an endpoint, "Line 1/2 (4- M-Audio AIR 192 4)"
+    stopped matching on 2 Oct, while its id stays), giving the name Core Audio lists for it now; then on the exact
+    name Core Audio lists (plumbing, not a guess).
     """
-    if not wanted:
+    if not wanted and not wanted_id:
         return None, ""
-    if wanted in (devices.get(kind) or []) or devices.get("error"):
+    if wanted_id:
+        for name, endpoint in (devices.get(f"{kind}_ids") or {}).items():
+            if endpoint and endpoint == wanted_id:
+                return name, ""
+    if wanted and (wanted in (devices.get(kind) or []) or devices.get("error")):
         return wanted, ""
     default = devices.get(f"default_{kind}")
-    return None, (f"{KIND_WORD.get(kind, kind)} '{wanted}' isn't connected; using "
+    return None, (f"{KIND_WORD.get(kind, kind)} '{wanted or 'chosen'}' isn't connected; using "
                   f"{('the default, ' + default) if default else 'the default'}")

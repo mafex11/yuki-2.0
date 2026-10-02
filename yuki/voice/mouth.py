@@ -449,8 +449,7 @@ there are only things you found. A result may say something did not happen: say 
 user later asks about it, answer from it.
 - late: a result marked late came after they had said other things: it is the outcome of that \
 earlier request (for_request), never an answer to their latest words. Say it in one short line that \
-names what it was about ("oh, and the mix is on now") only if it still matters to them; if they have \
-moved on from it, call stay_quiet.
+names what it was about ("oh, and the mix is on now"): it is still theirs.
 - still_working_on: they have heard nothing for a while. One short line that you are still on it, \
 what it is doing now if given; nothing about results.
 - withdrawn: a task stopped because their newer request replaced it. Say nothing about it.
@@ -589,6 +588,171 @@ each rule and fix what breaks one. When they ask what their rules are, or whethe
 them, list every rule there, each briefly in your own words: not a selection, and nothing that \
 is not there."""
 
+# ---------------------------------------------------------------------------
+# The speech channel (v3.16, ``Settings.voice_speech_channel = "marker"``)
+# ---------------------------------------------------------------------------
+
+#: The closed set of marker lines a talker reply starts with: ``say`` (the lines after it are spoken, and nothing else
+#: is), ``act`` (a tool call; nothing written is spoken), ``quiet`` (nothing is said; stay_quiet). Parsed like JSON
+#: (:class:`ReplyChannel`): a fixed format of our own, never a reading of what the words mean.
+MARKERS: tuple[str, ...] = ("say", "act", "quiet")
+
+#: Appended to the core layer in marker mode (:func:`mouth_prompt`); the guard mode sends :data:`MOUTH_PROMPT` alone.
+SPEECH_CHANNEL_PROMPT = """\
+# Speech channel
+
+Every reply starts with a marker line: one word alone on the first line, saying what the reply is. The marker is \
+never spoken.
+- say: the lines after it are spoken to them, word for word, and nothing else you write is. Only what a person \
+helping them would say to them goes there (a style mark, if any, first after the say line).
+- act: this reply is a tool call (a hand, tell_yuki, check_progress, more_of_result, end_conversation, go_quiet). \
+Write nothing after it: the call's say_first or its done line is what they hear.
+- quiet: you say nothing to them this time; call stay_quiet after it.
+Text before the marker line, or after act or quiet, is never spoken, and a reply with no marker line is not heard \
+at all: they wait in silence. The examples in this prompt show what comes after the marker line; every real reply \
+starts with one. A result, a failure or a question the thinker sent is always said: say, never quiet.
+Good: "what time is it?" -> the line say, then "It's ten past four."
+Good: "pause the music" -> the line act, then media_key(key="playpause", say_when_done="Paused.")
+Good: "what have I done today?" -> the line act, then tell_yuki(screen=false, say_first="Let me go through your \
+day.", request="What have I done today?")
+Good: in a call, "bro did you see that clutch" -> the line quiet, then stay_quiet
+Good: a result says the pages were restored -> the line say, then "Done, your pages are back."
+Bad: "It's ten past four." with no marker line (nothing is heard)
+Bad: the line say, then "They asked for the time, so I'll read the Now line." (everything after say is spoken: only \
+words for them)"""
+
+
+def mouth_prompt(channel: str | None = None) -> str:
+    """The talker's core layer for a speech channel: :data:`MOUTH_PROMPT`, plus the marker section in marker mode."""
+    if (channel or "").strip().lower() == "marker":
+        return MOUTH_PROMPT + "\n\n" + SPEECH_CHANNEL_PROMPT
+    return MOUTH_PROMPT
+
+
+class ReplyChannel:
+    """One talker reply's text, read as speech and scratch by its marker lines (v3.16).
+
+    :meth:`feed` takes the reply's text as it streams and returns what is speech (the text after a ``say`` marker
+    line); everything else is scratch and never spoken: text before the first marker line, and text after ``act`` or
+    ``quiet``. A marker line is one of :data:`MARKERS` alone on a line (case, surrounding spaces and a trailing colon
+    aside), or the marker, a colon and a space with the words on the same line (``say: Sure.``). Once ``say`` is in
+    force, the rest of the reply is speech. Plumbing on our own fixed format.
+    """
+
+    def __init__(self) -> None:
+        self.first: str | None = None      # the first marker line seen
+        self.marker: str | None = None     # the marker in force now
+        self.spoken = 0                    # characters passed on as speech
+        self.scratch = 0                   # characters (stripped lines) not spoken
+        self.before = 0                    # of those, before the first marker line
+        self._line = ""
+        self._fresh = False                # speech has just begun: leading line breaks are dropped
+
+    @property
+    def unmarked(self) -> bool:
+        """Text came and no marker line at all: nothing of it was spoken."""
+        return self.first is None and self.scratch > 0
+
+    def feed(self, text: str) -> str:
+        out: list[str] = []
+        i, n = 0, len(text or "")
+        while i < n:
+            if self.marker == "say":
+                rest = text[i:]
+                if self._fresh:
+                    rest = rest.lstrip("\r\n")
+                    if rest:
+                        self._fresh = False
+                if rest:
+                    self.spoken += len(rest)
+                    out.append(rest)
+                break
+            ch = text[i]
+            i += 1
+            if ch == "\n":
+                self._end_line()
+                continue
+            self._line += ch
+            low = self._line.lstrip().lower()
+            for marker in MARKERS:
+                if low == marker + ": ":
+                    self._line = ""
+                    self._set(marker)
+                    break
+        return "".join(out)
+
+    def finish(self) -> None:
+        """The reply's text ended: a last line without a line break is judged too."""
+        if self._line:
+            self._end_line()
+
+    def _end_line(self) -> None:
+        line, self._line = self._line, ""
+        word = line.strip().lower()
+        if word.endswith(":"):
+            word = word[:-1].strip()
+        if word in MARKERS:
+            self._set(word)
+            return
+        kept = line.strip()
+        if kept:
+            self.scratch += len(kept)
+            if self.first is None:
+                self.before += len(kept)
+
+    def _set(self, marker: str) -> None:
+        if self.first is None:
+            self.first = marker
+        self.marker = marker
+        self._fresh = marker == "say"
+
+    def facts(self) -> dict[str, Any]:
+        """Content-free: which marker, how much was spoken and how much was scratch."""
+        return {"marker": self.first, "spoken_chars": self.spoken, "scratch_chars": self.scratch,
+                "before_marker_chars": self.before, "unmarked": self.unmarked}
+
+
+def with_markers(messages: Any) -> Any:
+    """The talker's earlier replies as the marker channel writes them, for the copy of the conversation it is sent.
+
+    The conversation keeps only what was heard (no marker lines), so in the request each earlier assistant message
+    gets its marker back: ``say`` before its words, ``act`` before a reply that only called tools (``quiet`` when
+    that call was stay_quiet alone). Its own history then shows the format it is asked to write. Deterministic per
+    message, so the cached prefix stays the same from call to call. Plumbing: only our own format is added.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out: list[Any] = []
+    for message in messages:
+        if not (isinstance(message, dict) and message.get("role") == "assistant"):
+            out.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            out.append({**message, "content": _say(content)} if content.strip() else message)
+            continue
+        blocks = list(content or [])
+        texts = [n for n, b in enumerate(blocks) if isinstance(b, dict) and b.get("type") == "text"
+                 and str(b.get("text") or "").strip()]
+        if texts:
+            n = texts[0]
+            blocks[n] = {**blocks[n], "text": _say(str(blocks[n].get("text") or ""))}
+            out.append({**message, "content": blocks})
+            continue
+        tools = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if tools:
+            quiet = all(b.get("name") == "stay_quiet" for b in tools)
+            blocks.insert(0, {"type": "text", "text": "quiet" if quiet else "act"})
+            out.append({**message, "content": blocks})
+            continue
+        out.append(message)
+    return out
+
+
+def _say(text: str) -> str:
+    head = text.lstrip().split("\n", 1)[0].strip().lower().rstrip(":")
+    return text if head in MARKERS else "say\n" + text.lstrip("\n")
+
 #: The call layers (docs/VOICE.md §25, v3.10): a system block present only while memory's call detector has
 #: screen evidence that the user is in a voice call (a joined meeting, a voice channel's connected panel). The
 #: mouth decides, by its own judgement, who each utterance was for, and stays silent on talk to the call.
@@ -609,6 +773,9 @@ When their words were for the call, your whole reply is the stay_quiet call: no 
 "okay", and never a word about the call or about whom the words were for. When you cannot tell, it was for the \
 call: if it was for you, they will say your name. When it was for you, answer as usual and as briefly as you \
 can; the people on the call do not hear you, only the user does, over their friends.
+In a call, when they tell you to stop listening ("stop listening", "don't listen to this call", "turn yourself \
+off"), they mean for the rest of this call: go_quiet with this_call true and a very short okay as its say_first. \
+You listen for your name again by yourself when the call ends.
 
 Good: "Yuki, pause the music" -> media_key(key="playpause", say_when_done="Paused.") alone
 Good: "bro did you see that clutch" -> stay_quiet
@@ -623,6 +790,7 @@ Good: you just said "Paused.", then "wait, put it back on" -> media_key(key="pla
 say_when_done="Back on.") alone (still with you)
 Good: you just opened YouTube for them, then "scroll down" -> scroll(...) alone (still with you)
 Good: "Yuki, what time is it?" -> "Twenty past nine."
+Good: "Yuki, stop listening" -> go_quiet(say_first="Sure, I'm off for this call.", minutes=60, this_call=true) alone
 [End of the call note]"""
 
 #: The call layer when the only evidence is old (v3.10): the call was seen on the screen a while ago and may be
@@ -797,7 +965,7 @@ END_CONVERSATION: dict[str, Any] = {
         "End this voice conversation now, because the user wants it to stop (\"you can turn off the voice\", "
         "\"stop listening\", \"that's all\", \"bye\"). Call it alone; say_first is your very short goodbye. "
         "They can call you by name again any time, and tasks already running go on. It is not a rule: nothing "
-        "is saved."
+        "is saved. In a voice call, \"stop listening\" means for the rest of the call: go_quiet with this_call true."
     ),
     "properties": {
         "say_first": {"type": "string", "description": "Write this first: a very short goodbye (\"Sure, later!\")."},
@@ -813,12 +981,16 @@ GO_QUIET: dict[str, Any] = {
         "\"go to sleep for an hour\", \"don't listen till I'm back\"): you stop listening for your name for that long, "
         "this conversation ends after say_first, and it holds across restarts; then you listen again by yourself. "
         "Call it alone. \"Stop listening\", \"that's all\" or \"bye\" with no while asked for only end this "
-        "conversation: use end_conversation for those, even when they say it twice."
+        "conversation: use end_conversation for those, even when they say it twice; but in a voice call "
+        "\"stop listening\" means for the rest of that call: this_call true."
     ),
     "properties": {
         "say_first": {"type": "string", "description": "Write this first: a very short okay (\"Sure, going quiet.\")."},
         "minutes": {"type": "integer", "description": "How long, in minutes (\"a couple of hours\" = 120). With no time "
                                                       "said, 60."},
+        "this_call": {"type": "boolean", "description": (
+            "true when they want you off for the rest of the voice call they are on: you listen for your name again "
+            "by yourself when the call ends, and minutes does not count. Only in a call.")},
     },
     "required": ["say_first", "minutes"],
 }
@@ -848,9 +1020,8 @@ HELD_BACK_NOTE = (
 )
 LATE_NOTE = (
     "They have said other things since they asked for this: it is the outcome of that earlier request "
-    "(for_request), never an answer to their latest words. If it still matters to them, say it in one short line "
-    "that names what it was about; if they have moved on from it (changed it, replaced it, or it no longer "
-    "matters), call stay_quiet."
+    "(for_request), never an answer to their latest words. Say it now in one short line that names what it was "
+    "about (\"oh, and the mix is on now\"): it is still owed to them, so never stay quiet on it."
 )
 WAITING_NOTE = (
     "The user has heard nothing for a while. One short line in your own words that you are still on it: what it "
@@ -1065,10 +1236,18 @@ Bad: the same -> "or something else on the Sidemen page?" (finishing the cut que
 """
 
 
+#: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
+MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
+#: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
+RERUN_NOTE = ("[Nothing of your last reply to these words reached them (it was not spoken, or not heard). Answer them "
+              "now, in a few words.]")
+
+
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    desk: str | None = None, call: str | None = None, heard: str | None = None,
                    named: bool = False, work: str | None = None,
-                   cut: dict[str, str] | None = None, after_goodbye: bool = False) -> dict[str, Any]:
+                   cut: dict[str, str] | None = None, after_goodbye: bool = False,
+                   channel: str | None = None, rerun: bool = False) -> dict[str, Any]:
     """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
     It goes at the end of the newest user message, after every cache breakpoint, so
@@ -1082,6 +1261,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     ``named``: these are the first words after the wake word heard the user say Yuki's name (the name
     itself is kept out of what speech recognition hears, v3.6), so they are said to Yuki.
     ``work`` is what the thinker is doing now (:meth:`yuki.voice.bridge.VoiceBridge.work_line`), ``None`` when idle.
+    ``channel`` ``"marker"``: the marker reminder ends the block (v3.16). ``rerun``: this call answers the user's turn
+    again because nothing of the last reply to it was heard (v3.16).
     """
     now = now or datetime.now()
     text = f"[Now: {now.strftime('%A %d %B %Y, %H:%M')} local time. For when they ask; the clock moving on is not news.]"
@@ -1108,16 +1289,20 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     if work:
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}.]")
+    if rerun:
+        text += "\n" + RERUN_NOTE
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
+    if (channel or "").strip().lower() == "marker":
+        text += "\n\n" + MARKER_REMINDER
     return {"type": "text", "text": text}
 
 
 def mouth_system_blocks(
     memory: MouthMemory, *, tail: list[str] | None = None, now: datetime | None = None, call: str | None = None,
-    call_evidence: str | None = None,
+    call_evidence: str | None = None, channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """The mouth's system prompt as layers, most stable first (docs/VOICE.md §5.1).
 
@@ -1139,9 +1324,11 @@ def mouth_system_blocks(
     activity tools. Cache breakpoints go on the profile and rules layers (two: Pipecat puts
     its own on the last two user messages, and the API allows four). Haiku 4.5 caches only
     prefixes of 4,096 tokens or more; the v3 prompt with a real profile is ~4.7k.
+
+    ``channel`` ``"marker"`` (v3.16): the core carries the speech-channel section (:func:`mouth_prompt`).
     """
     del now
-    core = "\n\n".join([MOUTH_PROMPT, *[t for t in (tail or []) if t and t.strip()]])
+    core = "\n\n".join([mouth_prompt(channel), *[t for t in (tail or []) if t and t.strip()]])
     blocks: list[dict[str, Any]] = [{"type": "text", "text": core}]
     if call:
         layer = CALL_LAYER_UNSURE if call_evidence == "stale" else CALL_LAYER

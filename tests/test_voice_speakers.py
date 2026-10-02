@@ -307,6 +307,13 @@ def test_call_talk_is_neither_answered_nor_kept_nor_counted() -> None:
     obs.on_frame(LLMFullResponseStartFrame())
     obs.on_frame(LLMTextFrame(text="Twenty past nine."))
     obs.on_frame(BotStartedSpeakingFrame())
+    # v3.16: an exchange is counted when words leave the speaker (a breath of silence also starts audio)
+    from pipecat.frames.frames import TTSTextFrame
+
+    output = object()
+    obs.output_processor = output
+    obs.on_played(types.SimpleNamespace(frame=TTSTextFrame("Twenty past nine.", aggregated_by="sentence"),
+                                        source=output))
     obs.on_frame(BotStoppedSpeakingFrame())
     obs.on_frame(LLMFullResponseEndFrame())
     obs.close()

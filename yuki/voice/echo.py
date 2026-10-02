@@ -352,21 +352,33 @@ class EchoGuard:
                                after_s=self.stats.converged_after_s)
 
 
+#: The earcons: notes ``(Hz, seconds)``, level (dBFS) and fade (seconds). Non-speech sounds only (Yuki never speaks
+#: first): ``listening`` a soft rising pair (the wake was heard), ``error`` a falling pair (something failed),
+#: ``ended`` a softer, slower falling pair (v3.16: a conversation ended by itself; say the name to talk again),
+#: ``note`` two short level pings (v3.16: something owed could not be said and is shown on the pill instead).
+TONES: dict[str, tuple[tuple[tuple[float, float], ...], float, float]] = {
+    "listening": (((660.0, 0.07), (990.0, 0.09)), -20.0, 0.012),
+    "error": (((620.0, 0.12), (410.0, 0.2)), -16.0, 0.012),
+    "ended": (((587.0, 0.11), (440.0, 0.22)), -26.0, 0.04),
+    "note": (((880.0, 0.06), (880.0, 0.06)), -24.0, 0.012),
+}
+
+
 def tone(kind: str, rate: int = 24_000) -> bytes:
-    """A short earcon as int16 mono PCM: ``listening`` (a soft rising pair) or ``error`` (a falling pair).
+    """A short earcon as int16 mono PCM (:data:`TONES`).
 
     Synthesised here (no file, no network): a wake is acknowledged the moment it is heard,
     and a failure is audible even when the speech services are what failed.
     """
-    notes = {"listening": ((660.0, 0.07), (990.0, 0.09)), "error": ((620.0, 0.12), (410.0, 0.2))}[kind]
-    level = 10 ** ((-20.0 if kind == "listening" else -16.0) / 20)
+    notes, level_db, fade = TONES[kind]
+    level = 10 ** (level_db / 20)
     parts = []
     for freq, dur in notes:
         t = np.arange(int(dur * rate)) / rate
-        env = np.minimum(1.0, np.minimum(t, dur - t) / 0.012)  # 12 ms fades: no clicks
+        env = np.minimum(1.0, np.minimum(t, dur - t) / fade)  # fades: no clicks (the end tone's are long and soft)
         parts.append(np.sin(2 * np.pi * freq * t) * env * level)
         parts.append(np.zeros(int(0.02 * rate)))
     return (np.concatenate(parts) * 32767).astype("<i2").tobytes()
 
 
-__all__ = ["EchoGuard", "PlaybackTimeline", "choose_mode", "load_apm", "tone", "MODES"]
+__all__ = ["EchoGuard", "PlaybackTimeline", "choose_mode", "load_apm", "tone", "MODES", "TONES"]

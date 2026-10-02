@@ -73,6 +73,10 @@ def waiting_text(waiting: Any) -> str:
     return f"{n} call{'' if n == 1 else 's'} waiting to be remembered"
 
 
+#: What the call pill adds while Yuki is not listening for its name (v3.16, 04 F6; the voice session's own words).
+NOT_LISTENING_TEXT = "Yuki isn't listening"
+
+
 def indicator_text(call: dict[str, Any]) -> str:
     app = str(call.get("app") or "")
     if call.get("status") == "waiting_headphones":
@@ -298,6 +302,8 @@ class CallIndicator(SurfaceWindow):
         row.addWidget(self.label, 1, Qt.AlignmentFlag.AlignVCenter)
         self.call: dict[str, Any] | None = None
         self._since: float | None = None
+        #: Whether Yuki listens for its name now (v3.16, 04 F6): when not, the pill says so after its own words.
+        self._listening = True
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._update_time)
@@ -332,11 +338,25 @@ class CallIndicator(SurfaceWindow):
         if width + 2 * self.SHADOW != self.width():
             self.setFixedSize(width + 2 * self.SHADOW, INDICATOR_HEIGHT + 2 * self.SHADOW)
 
+    def set_listening(self, listening: bool) -> None:
+        """Voice's listening state (v3.16): "Yuki isn't listening" after the pill's words while the name is not heard."""
+        if bool(listening) == self._listening:
+            return
+        self._listening = bool(listening)
+        if self.call is not None:
+            self.label.setText(self._text(self.call))
+            self._fit()
+            self.update()
+
+    def _text(self, call: dict[str, Any]) -> str:
+        text = indicator_text(call)
+        return text if self._listening else f"{text} · {NOT_LISTENING_TEXT}"
+
     def set_call(self, call: dict[str, Any]) -> None:
         from yuki.ui.memory import local_moment
 
         self.call = call
-        self.label.setText(indicator_text(call))
+        self.label.setText(self._text(call))
         waiting = call.get("status") == "waiting_headphones"
         # The session's start (05 §7.4): a call row the service had to cut and reopen keeps one running time.
         start = local_moment(call.get("session_started_at") or call.get("detected_at") or call.get("recording_since"))

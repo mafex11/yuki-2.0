@@ -19,6 +19,13 @@ Two pieces, both plain code with no opinion on what anything means:
   ``SubagentNarrator`` (research: docs/research/voice-parallel.md §1.4).
 
 The gate decides *when* and *whether*; the mouth still decides every word.
+
+* :class:`OwedLedger` (v3.16) makes an outcome owed and audible by construction: once a job's result, failure or
+  question is handed to the talker to be said, it stays owed until audible words of the run that says it leave the
+  speaker. A run that was silent (``stay_quiet``, a ``quiet`` or missing marker, a dropped line, a voice that
+  failed) leaves it owed, and at the next quiet moment it is said by code in the thinker's own words (the same
+  one voice), once more if that too was not heard, and then shown on the pill with a sound. Only the user moving
+  on (``voice_stale_turns`` user turns since) lets it go. No model decides to drop it.
 """
 
 from __future__ import annotations
@@ -390,3 +397,165 @@ class NarratorGate:
     def _log(self, event_type: str, **fields: Any) -> None:
         if self.log is not None:
             self.log.event(event_type, **fields)
+
+
+# ---------------------------------------------------------------------------
+# The owed-output ledger (v3.16)
+# ---------------------------------------------------------------------------
+
+#: What an owed item is: a job's result (``done``), its failure (``failed``) or its question (``ask``).
+OWED_KINDS = ("done", "failed", "ask")
+
+
+@dataclass
+class Owed:
+    """One outcome the user is owed (content: ``text`` is never logged)."""
+
+    token: int
+    kind: str
+    #: What is said by code if the talker's run is not heard: the thinker's own words, already condensed.
+    text: str
+    at: float = field(default_factory=time.monotonic)
+    #: The conversation's user turns when it became owed (the stale rule counts from here).
+    user_turns: int = 0
+    attempts: int = 0
+    next_at: float = 0.0
+    #: When it was last put into the voice by code (``None``: never).
+    spoken_at: float | None = None
+    #: The talker's run for it chose silence (``stay_quiet`` or a ``quiet`` marker): no need to wait for it.
+    quiet: bool = False
+    #: owed | heard | shown | moved_on | dropped
+    state: str = "owed"
+    #: How it was resolved: ``talker`` (its run was heard), ``code`` (said by code), ``pill`` (shown with a sound).
+    via: str = ""
+
+
+class OwedLedger:
+    """Every outcome handed to the talker, until it is heard (see the module docstring). One per conversation.
+
+    Plumbing on the conversation's states and times only: which run started after it, whether audible words left
+    the output after it, how many user turns came since. Never what any of the words say.
+
+    Args:
+        stale_turns: ``Settings.voice_stale_turns``: the user has moved on after this many turns.
+        log: Content-free event log or ``None``.
+    """
+
+    #: Times it is said by code before it is shown on the pill with a sound instead.
+    CODE_TRIES = 2
+    #: No talker run ended this long after it became owed: said by code anyway (s).
+    RUN_WAIT_S = 6.0
+    #: After it was said by code, how long before trying again (the voice's first audio takes ~1-2 s).
+    RETRY_GAP_S = 2.5
+    #: The user must have been quiet this long before it is said by code (s).
+    QUIET_S = 0.9
+
+    def __init__(self, *, stale_turns: int = 3, log: Any = None) -> None:
+        self.stale_turns = max(1, int(stale_turns))
+        self.log = log
+        self.items: list[Owed] = []
+        self.stats = {"owed": 0, "heard_talker": 0, "heard_code": 0, "shown": 0, "moved_on": 0, "dropped": 0}
+
+    @property
+    def pending(self) -> list[Owed]:
+        return [i for i in self.items if i.state == "owed"]
+
+    def owe(self, token: int, kind: str, text: str, user_turns: int, now: float | None = None) -> Owed | None:
+        """An outcome was handed to the talker to be said now. A newer one of the same job replaces an older one."""
+        text = " ".join(str(text or "").split())
+        if kind not in OWED_KINDS or not text:
+            return None
+        now = time.monotonic() if now is None else now
+        for old in self.pending:
+            if old.token == token:
+                old.state = "dropped"   # the job's newer outcome (its final after its question) is what is owed now
+        item = Owed(token=token, kind=kind, text=text, at=now, user_turns=int(user_turns), next_at=now)
+        self.items.append(item)
+        del self.items[:-24]
+        self.stats["owed"] += 1
+        self._log(op="owed", job=token, kind=kind, chars=len(text))
+        return item
+
+    def drop(self, token: int) -> None:
+        """The job was withdrawn or stopped: nothing of it is owed any more."""
+        for item in self.pending:
+            if item.token == token:
+                item.state = "dropped"
+                self.stats["dropped"] += 1
+
+    def quiet_run(self) -> bool:
+        """The talker's run for what is owed chose silence: it is said by code at the next quiet moment."""
+        marked = False
+        for item in self.pending:
+            if item.spoken_at is None:
+                item.quiet = True
+                marked = True
+        if marked:
+            self._log(op="talker_quiet", items=len(self.pending))
+        return marked
+
+    def heard(self, now: float, turn_opened: float | None, trigger: str | None) -> None:
+        """Audible words left the output (the turn they belong to opened at ``turn_opened``, by ``trigger``).
+
+        An owed item is heard when they come from a talker run that started after it became owed (not a reply to
+        the user's own newer words), or after it was said by code.
+        """
+        for item in self.pending:
+            by_code = item.spoken_at is not None and now >= item.spoken_at
+            by_talker = (turn_opened is not None and turn_opened > item.at and trigger != "user"
+                         and item.spoken_at is None)
+            if by_code or by_talker:
+                item.state, item.via = "heard", ("code" if by_code else "talker")
+                self.stats["heard_code" if by_code else "heard_talker"] += 1
+                self._log(op="heard", job=item.token, kind=item.kind, via=item.via, attempts=item.attempts,
+                          after_ms=round((now - item.at) * 1000))
+
+    def expire(self, user_turns: int) -> list[Owed]:
+        """Items the user has measurably moved on from (``stale_turns`` user turns since): let go, logged."""
+        gone = [i for i in self.pending if int(user_turns) - i.user_turns >= self.stale_turns]
+        for item in gone:
+            item.state = "moved_on"
+            self.stats["moved_on"] += 1
+            self._log(op="moved_on", job=item.token, kind=item.kind, attempts=item.attempts)
+        return gone
+
+    def due(self, now: float, *, last_response_end: float, quiet_for: float, busy: bool) -> Owed | None:
+        """The owed item to say by code (or show) now, else ``None``.
+
+        Only when nothing else is being said or written, the user has been quiet a moment, and the talker's run
+        for it has ended without being heard (or chose silence, or never came within :attr:`RUN_WAIT_S`).
+        """
+        if busy or quiet_for < self.QUIET_S:
+            return None
+        for item in self.pending:
+            if now < item.next_at:
+                continue
+            run_over = (item.spoken_at is not None or item.quiet or last_response_end > item.at
+                        or now - item.at >= self.RUN_WAIT_S)
+            if run_over:
+                return item
+        return None
+
+    def attempt(self, item: Owed, now: float) -> str:
+        """Record the next try for ``item``: ``"code"`` (say it by code now) or ``"pill"`` (show it with a sound)."""
+        if item.attempts < self.CODE_TRIES:
+            item.attempts += 1
+            item.spoken_at = now
+            item.next_at = now + self.RETRY_GAP_S
+            self._log(op="say_by_code", job=item.token, kind=item.kind, attempt=item.attempts,
+                      quiet=item.quiet, after_ms=round((now - item.at) * 1000))
+            return "code"
+        item.state, item.via = "shown", "pill"
+        self.stats["shown"] += 1
+        self._log(op="shown", job=item.token, kind=item.kind, attempts=item.attempts)
+        return "pill"
+
+    def summary(self) -> dict[str, Any]:
+        return dict(self.stats, unheard=len(self.pending))
+
+    def _log(self, **fields: Any) -> None:
+        if self.log is not None:
+            try:
+                self.log.event("owed", **fields)
+            except Exception:  # noqa: BLE001 - logging never breaks the voice
+                pass

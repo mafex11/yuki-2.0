@@ -70,6 +70,20 @@ VOICE_ID_ENV = "YUKI_VOICE_ID"
 
 #: ``voice.json`` keys of the tray's device choices, by kind (``Settings`` field on the right).
 DEVICE_PREFS = {"capture": ("mic_device", "voice_input_device"), "render": ("speaker_device", "voice_output_device")}
+#: ``voice.json`` keys of the chosen devices' Core Audio endpoint ids (v3.16, 04 F7): matched before the name.
+DEVICE_ID_PREFS = {"capture": "mic_device_id", "render": "speaker_device_id"}
+#: ``voice.json`` key of the days the "saved device isn't connected" note was last shown, by kind (once a day).
+DEVICE_NOTE_PREF = "device_note_days"
+#: ``voice.json`` key of the end tone switch (the tray's "End tone"; ``Settings.voice_end_tone`` otherwise).
+END_TONE_PREF = "end_tone"
+
+#: The pill's line when a conversation ended by itself (v3.16, 04 F2), and when it did with the name not listened for.
+ENDED_NOTE = "Say ‘Yuki’ to talk again"
+ENDED_NOT_LISTENING_NOTE = "Ended. Yuki isn't listening for its name"
+#: How Yuki says it is not listening (tray tooltip, call pill; v3.16, 04 F6).
+NOT_LISTENING = "Yuki isn't listening"
+#: Stops that end a conversation by themselves: only these get the end cue (never a stop the user caused).
+SELF_ENDED = ("call_idle", "idle")
 
 #: How often the chosen devices are looked for while the mic is open (a Bluetooth headset
 #: switched off must fall back to the default, not leave voice deaf). A status poll of Core
@@ -90,9 +104,12 @@ TTS_PREFS = {"tts_speed": "voice_tts_speed", "tts_stability": "voice_tts_stabili
 
 #: ``voice.json`` keys that choose the voice and the Gemini voice's settings (text values).
 VOICE_TEXT_PREFS = {"tts_provider": "voice_tts_provider", "gemini_voice": "voice_gemini_voice",
-                    "gemini_model": "voice_gemini_model", "gemini_style": "voice_gemini_style"}
+                    "gemini_model": "voice_gemini_model", "gemini_style": "voice_gemini_style",
+                    "speech_channel": "voice_speech_channel"}
 #: The voices ``tts_provider`` may name.
 PROVIDERS = ("gemini", "elevenlabs", "deepgram")
+#: The speech channels ``speech_channel`` may name (v3.16).
+SPEECH_CHANNELS = ("guard", "marker")
 
 
 def conversation_settings(settings: Settings, prefs: dict[str, Any]) -> Settings:
@@ -109,7 +126,12 @@ def conversation_settings(settings: Settings, prefs: dict[str, Any]) -> Settings
         if isinstance(value, str) and (value.strip() or name == "voice_gemini_style"):
             if name == "voice_tts_provider" and value.strip().lower() not in PROVIDERS:
                 continue
-            over[name] = value.strip().lower() if name == "voice_tts_provider" else value.strip()
+            if name == "voice_speech_channel" and value.strip().lower() not in SPEECH_CHANNELS:
+                continue
+            lower = name in ("voice_tts_provider", "voice_speech_channel")
+            over[name] = value.strip().lower() if lower else value.strip()
+    if isinstance(prefs.get(END_TONE_PREF), bool):
+        over["voice_end_tone"] = prefs[END_TONE_PREF]
     return replace(settings, **over)
 
 
@@ -169,7 +191,10 @@ class VoiceSession(QObject):
     wake_changed = Signal(bool)
     #: ``(until)``: the user asked Yuki to go quiet until this time (epoch seconds; 0.0 when awake again, v3.10).
     quiet_changed = Signal(float)
-    _quiet_asked = Signal(float)
+    #: ``(state)``: whether Yuki listens for the name now: ``on`` · ``off`` (the user's switch, stored) · ``quiet``
+    #: (a timed quiet) · ``call_off`` (off for this call only, never stored; v3.16, 04 F6). For the tray and the pills.
+    listening_changed = Signal(str)
+    _quiet_asked = Signal(float, bool)
     #: ``"Mic: … · Speaker: …"``: the devices voice is using (the pill's and tray's tooltip).
     devices_changed = Signal(str)
     #: The chat UI's events (v3.5, docs/VOICE.md §12), queued into the GUI thread. Words, for the screen only.
@@ -233,6 +258,15 @@ class VoiceSession(QObject):
                 save_prefs(prefs, prefs_path)
             self.quiet_until = 0.0
         self.call_active = False
+        #: Off for this call (v3.16, 04 F6): the wake word is off until the call ends; never written to voice.json.
+        self.call_off = False
+        #: How the last conversation ended, for its end cue: ``{"reason", "exchanges"}`` (v3.16, 04 F2).
+        self._last_end: dict[str, Any] = {}
+        #: Why the running conversation must end in an error the user should hear about (the speaker died, v3.16).
+        self._pending_error = ""
+        #: The days the "saved device isn't connected" note was shown, by kind (once a day; v3.16).
+        self._note_days: dict[str, str] = dict(prefs.get(DEVICE_NOTE_PREF) or {}) \
+            if isinstance(prefs.get(DEVICE_NOTE_PREF), dict) else {}
         #: In a call with nobody else in it (the screen judge's count, v3.15): conversations are not in call mode.
         self.call_alone = False
         #: The app of the voice call going on (call mode), ``None`` when there is none.
@@ -394,18 +428,62 @@ class VoiceSession(QObject):
         prefs = load_prefs(self._prefs_path)
         prefs["wake"] = self.wake_enabled
         save_prefs(prefs, self._prefs_path)
-        self.log.event("wake", state="enabled" if enabled else "disabled", by=by, quiet=self.quiet)
+        self.log.event("wake", state="enabled" if enabled else "disabled", by=by, quiet=self.quiet,
+                       call_off=self.call_off)
+        if enabled and self.call_off:
+            self.call_off = False   # turning listening on means now, in this call too
         if enabled and self.quiet:
             self._quiet_over(by=by)
         self._apply_wake()
         self.wake_changed.emit(self.wake_enabled)
+        self._emit_listening()
 
     @property
     def listening_state(self) -> str:
-        """``"on"`` (listening for the name), ``"quiet"`` (a timed quiet holds) or ``"off"`` (the user switched it off)."""
+        """``"on"`` (listening for the name), ``"quiet"`` (a timed quiet holds), ``"call_off"`` (off for this call
+        only, v3.16) or ``"off"`` (the user switched it off: stored)."""
         if not self.wake_enabled:
             return "off"
-        return "quiet" if self.quiet else "on"
+        if self.quiet:
+            return "quiet"
+        return "call_off" if self.call_off else "on"
+
+    @property
+    def listening(self) -> bool:
+        """Whether the name is listened for now (the switch on, no timed quiet, not off for this call)."""
+        return self.listening_state == "on"
+
+    def _emit_listening(self) -> None:
+        self.listening_changed.emit(self.listening_state)
+
+    def set_call_off(self, off: bool, *, by: str = "user") -> None:
+        """"Off for this call" (v3.16, 04 F6): the wake word stops until the call ends, then listens again by itself.
+
+        Never written to ``voice.json`` (the permanent off is :meth:`set_wake`). Outside a call it does nothing.
+        """
+        off = bool(off) and self.call_active
+        if off == self.call_off:
+            return
+        self.call_off = off
+        self.log.event("wake", state="call_off" if off else "call_on_again", by=by)
+        if off and by != "voice" and self.in_conversation and self.call_app:
+            self.stop_conversation("call_off")   # by voice, the talker's okay plays and the bridge ends it
+        self._apply_wake()
+        self.wake_changed.emit(self.wake_enabled)
+        self._emit_listening()
+
+    @property
+    def end_tone(self) -> bool:
+        """The end tone (v3.16, 04 F2): ``voice.json`` ``end_tone`` (the tray), else ``Settings.voice_end_tone``."""
+        value = load_prefs(self._prefs_path).get(END_TONE_PREF)
+        return value if isinstance(value, bool) else bool(getattr(self.settings, "voice_end_tone", True))
+
+    def set_end_tone(self, on: bool) -> None:
+        """The tray's "End tone" switch: remembered in ``voice.json``."""
+        prefs = load_prefs(self._prefs_path)
+        prefs[END_TONE_PREF] = bool(on)
+        save_prefs(prefs, self._prefs_path)
+        self.log.event("end_tone", on=bool(on))
 
     # -- quiet for a while (v3.10) ------------------------------------------------------
 
@@ -414,11 +492,17 @@ class VoiceSession(QObject):
         """Whether the user asked Yuki to stay quiet and that time has not run out."""
         return bool(self.quiet_until and time.time() < self.quiet_until)
 
-    def go_quiet(self, minutes: float) -> None:
-        """Stay quiet for ``minutes``: the wake word is off until then, remembered across restarts. Thread-safe."""
-        self._quiet_asked.emit(float(minutes))
+    def go_quiet(self, minutes: float, this_call: bool = False) -> None:
+        """Stay quiet for ``minutes``: the wake word is off until then, remembered across restarts. Thread-safe.
 
-    def _go_quiet(self, minutes: float) -> None:
+        ``this_call`` (v3.16, the talker's judgement of "stop listening" in a call): off for the rest of this call
+        instead, never stored (:meth:`set_call_off`)."""
+        self._quiet_asked.emit(float(minutes), bool(this_call))
+
+    def _go_quiet(self, minutes: float, this_call: bool = False) -> None:
+        if this_call and self.call_active:
+            self.set_call_off(True, by="voice")
+            return
         minutes = max(1.0, min(float(minutes), 24 * 60.0))
         self.quiet_until = time.time() + minutes * 60.0
         prefs = load_prefs(self._prefs_path)
@@ -428,6 +512,7 @@ class VoiceSession(QObject):
         self._arm_quiet_timer()
         self._apply_wake()
         self.quiet_changed.emit(self.quiet_until)
+        self._emit_listening()
 
     def wake_now(self) -> None:
         """The tray's "Wake Yuki now": listen for the name again before the quiet time is over."""
@@ -444,6 +529,7 @@ class VoiceSession(QObject):
             self.log.event("wake", state="awake", by=by)
         self._apply_wake()
         self.quiet_changed.emit(0.0)
+        self._emit_listening()
 
     def _arm_quiet_timer(self) -> None:
         left_ms = int(max(0.0, self.quiet_until - time.time()) * 1000)
@@ -466,8 +552,21 @@ class VoiceSession(QObject):
         prefs = load_prefs(self._prefs_path)
         if name:
             prefs[key] = name
+            # v3.16 (04 F7): the endpoint's id too, so a renamed endpoint ("4- " prefixes, profiles) stays chosen
+            endpoint = None
+            try:
+                from yuki.voice.audio import device_id
+
+                endpoint = device_id(kind, name, self._devices())
+            except Exception:  # noqa: BLE001 - the name alone, as before
+                endpoint = None
+            if endpoint:
+                prefs[DEVICE_ID_PREFS[kind]] = endpoint
+            else:
+                prefs.pop(DEVICE_ID_PREFS[kind], None)
         else:
             prefs.pop(key, None)
+            prefs.pop(DEVICE_ID_PREFS[kind], None)
         save_prefs(prefs, self._prefs_path)
         self.log.event("device", kind=kind, state="chosen" if name else "default")
         if kind == "capture":
@@ -561,34 +660,38 @@ class VoiceSession(QObject):
             return f"Couldn't open '{wanted}'; Yuki is speaking on {facts.get('device')}"
         return ""
 
-    def _switch_output(self) -> None:
-        """The tray's Speaker changed during a conversation: move the output, re-choose the echo mode."""
+    def _move_output(self, speaker: Any, target: str | None) -> dict[str, Any]:
+        """Move the conversation's speaker to ``target`` (``None``: the default), re-choosing the echo mode."""
         from yuki.voice.audio import headphones_check
         from yuki.voice.echo import choose_mode
 
+        facts = speaker.switch(target)
+        refreshed = False
+        if target and not facts.get("found", True):
+            box: list[bool] = []
+            facts = speaker.switch(target, between=lambda: box.append(self._refresh_audio_devices()))
+            refreshed = bool(box and box[0])
+        on_headphones, heard = headphones_check(self.settings.voice_headphone_devices, device=facts.get("device"))
+        mode, why = choose_mode(on_headphones, preference=self.settings.voice_echo)
+        mic = self._mic
+        guard = self._echo_guard(mode, facts.get("device"), speaker, mic)
+        if mic is not None:
+            mic.set_echo(guard)
+        self._guard = guard
+        self.speaker_used = facts.get("device")
+        self.log.event("device", kind="render", state="switched", wanted=target, opened=facts.get("device"),
+                       found=facts.get("found"), refreshed=refreshed, echo=mode, echo_why=why,
+                       headphones=heard.get("form_factor") if isinstance(heard, dict) else None)
+        return facts
+
+    def _switch_output(self) -> None:
+        """The tray's Speaker changed during a conversation: move the output, re-choose the echo mode."""
         speaker = self._speaker
         if speaker is None or not hasattr(speaker, "switch"):
             self.state_changed.emit("note", "The new speaker is used from the next conversation")
             return
         try:
-            target = self._output_target(self._resolve("render"))
-            facts = speaker.switch(target)
-            refreshed = False
-            if target and not facts.get("found", True):
-                box: list[bool] = []
-                facts = speaker.switch(target, between=lambda: box.append(self._refresh_audio_devices()))
-                refreshed = bool(box and box[0])
-            on_headphones, heard = headphones_check(self.settings.voice_headphone_devices, device=facts.get("device"))
-            mode, why = choose_mode(on_headphones, preference=self.settings.voice_echo)
-            mic = self._mic
-            guard = self._echo_guard(mode, facts.get("device"), speaker, mic)
-            if mic is not None:
-                mic.set_echo(guard)
-            self._guard = guard
-            self.speaker_used = facts.get("device")
-            self.log.event("device", kind="render", state="switched", wanted=target, opened=facts.get("device"),
-                           found=facts.get("found"), refreshed=refreshed, echo=mode, echo_why=why,
-                           headphones=heard.get("form_factor") if isinstance(heard, dict) else None)
+            facts = self._move_output(speaker, self._output_target(self._resolve("render")))
             mic_name = self.device_in_use("capture") or "the default"
             note = self._output_note(facts) or f"Speaker now {facts.get('device')}; mic: {mic_name}"
             self.state_changed.emit("note", note)
@@ -608,19 +711,50 @@ class VoiceSession(QObject):
     def _emit_devices(self) -> None:
         self.devices_changed.emit(self.devices_text())
 
+    #: ``() -> dict``: the active audio devices (Core Audio, read-only, :func:`yuki.voice.audio.audio_devices`);
+    #: a test replaces it.
+    devices_source: Any = None
+
+    def _devices(self) -> dict[str, Any]:
+        from yuki.voice.audio import audio_devices
+
+        return (self.devices_source or audio_devices)()
+
     def _resolve(self, kind: str, *, quiet: bool = False) -> str | None:
         """The chosen device if it is connected, else ``None`` (the default) with a note in the pill
-        (``quiet``: no note, for the device watch's retries)."""
-        from yuki.voice.audio import audio_devices, resolve_device
+        (``quiet``: no note, for the device watch's retries).
+
+        v3.16 (04 F7): matched by its endpoint id first; found under a new name, the new name is remembered. The
+        "isn't connected" note shows at most once a day per kind (live: an AirPods choice not connected put the
+        note on the pill at every wake)."""
+        from yuki.voice.audio import resolve_device
 
         wanted = self.device_choice(kind)
         if not wanted:
             return None
-        name, note = resolve_device(kind, wanted, audio_devices())
+        prefs = load_prefs(self._prefs_path)
+        wanted_id = prefs.get(DEVICE_ID_PREFS[kind]) if prefs.get(DEVICE_PREFS[kind][0]) == wanted else None
+        name, note = resolve_device(kind, wanted, self._devices(), wanted_id=wanted_id)
         if note and not quiet:
             self.log.event("device", kind=kind, state="missing_fallback")
-            self.state_changed.emit("note", note)
+            if self._note_due(kind):
+                self.state_changed.emit("note", note)
+        elif name and name != wanted and wanted_id:
+            self.log.event("device", kind=kind, state="renamed")
+            prefs[DEVICE_PREFS[kind][0]] = name
+            save_prefs(prefs, self._prefs_path)
         return name
+
+    def _note_due(self, kind: str) -> bool:
+        """Whether the "saved device isn't connected" note may show now: once a day per kind (remembered)."""
+        today = time.strftime("%Y-%m-%d")
+        if self._note_days.get(kind) == today:
+            return False
+        self._note_days[kind] = today
+        prefs = load_prefs(self._prefs_path)
+        prefs[DEVICE_NOTE_PREF] = dict(self._note_days)
+        save_prefs(prefs, self._prefs_path)
+        return True
 
     def _reopen_mic(self, *, retry: bool = False) -> None:
         """Open the microphone again on the device in force now (the subscribers stay).
@@ -697,17 +831,72 @@ class VoiceSession(QObject):
             return
         wanted = self.device_choice("capture")
         present = devices.get("capture") or []
-        gone = bool(wanted) and mic.device == wanted and wanted not in present
-        back = bool(wanted) and mic.device is None and wanted in present
+        # v3.16: the open mic is known by the name it was opened under (its endpoint's name then), the choice by its
+        # endpoint id as well as its name (04 F7)
+        gone = bool(wanted) and bool(mic.device) and mic.device not in present
+        back = bool(wanted) and mic.device is None and (wanted in present or self._id_present("capture", devices))
         if gone or back or info.get("stalled"):
             self.log.event("device", kind="capture", state="gone" if gone else "back" if back else "stalled")
             self._reopen_mic()
             self._emit_devices()
         speaker = self.speaker_used
-        if self.in_conversation and speaker and speaker not in (devices.get("render") or []):
+        if (self.in_conversation and speaker and speaker not in (devices.get("render") or [])
+                and not getattr(self, "_rerouting", False)):
             self.log.event("device", kind="render", state="gone")
-            self.state_changed.emit("note", f"Speaker '{speaker}' disconnected; ending this conversation")
+            # v3.16 (04 F7): the conversation goes on on Windows' default output (a Bluetooth profile switch or a
+            # renamed endpoint looks the same); it ends only when that cannot open.
+            self._rerouting = True
+            threading.Thread(target=self._reroute_speaker, args=(speaker,), name="yuki-voice-reroute",
+                             daemon=True).start()
+
+    def _id_present(self, kind: str, devices: dict[str, Any]) -> bool:
+        wanted_id = load_prefs(self._prefs_path).get(DEVICE_ID_PREFS[kind])
+        return bool(wanted_id) and wanted_id in ((devices.get(f"{kind}_ids") or {}).values())
+
+    def _reroute_speaker(self, old: str) -> None:
+        """The conversation's speaker is gone: reopen on the default output and go on, with a tone (04 F7)."""
+        try:
+            speaker = self._speaker
+            if speaker is None or not hasattr(speaker, "switch"):
+                raise RuntimeError("no speaker to move")
+            facts = self._move_output(speaker, self._output_target(None))
+            device = facts.get("device")
+            self.log.event("device", kind="render", state="rerouted", opened=device, found=facts.get("found"))
+            self.state_changed.emit("note", f"Speaker '{old}' disconnected; Yuki is on {device} now")
+            self._earcon("listening")
+        except Exception as exc:  # noqa: BLE001 - nothing to play on: the conversation ends, and says so
+            self.log.event("device", kind="render", state="reroute_failed", error=f"{type(exc).__name__}: {exc}")
+            self.state_changed.emit("note", f"Speaker '{old}' disconnected; ending this conversation")
             self.stop_conversation("speaker_gone")
+        finally:
+            self._rerouting = False
+            self.devices_changed.emit(self.devices_text())
+
+    def _reopen_speaker(self, error: BaseException) -> bool:
+        """Writes to the speaker kept failing (3 in a row): reopen it once, on the chosen output or the default.
+
+        On the conversation's writer thread (``SpeakerOutput.on_write_failing``). ``True`` when it opened again."""
+        speaker = self._speaker
+        if speaker is None or not hasattr(speaker, "switch"):
+            return False
+        try:
+            facts = self._move_output(speaker, self._output_target(self._resolve("render", quiet=True)))
+            self.log.event("device", kind="render", state="reopened_after_write_errors", opened=facts.get("device"),
+                           error=type(error).__name__)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log.event("device", kind="render", state="reopen_failed", error=f"{type(exc).__name__}: {exc}")
+            return False
+
+    def _take_pending_error(self) -> str:
+        error, self._pending_error = getattr(self, "_pending_error", ""), ""
+        return error
+
+    def _speaker_failed(self, conversation: Any, error: BaseException) -> None:
+        """The reopen did not help: the conversation ends, and the error tone and the pill say why (04 F7)."""
+        self.log.event("device", kind="render", state="write_failed", error=type(error).__name__)
+        self._pending_error = "Yuki's speaker stopped working, so voice stopped. Check the output in the tray."
+        conversation.request_stop("speaker_failed")
 
     @property
     def tts_voice(self) -> str:
@@ -752,7 +941,14 @@ class VoiceSession(QObject):
             for conversation in (self._conversation, self._standby_conv):
                 if conversation is not None:
                     conversation.set_call(app, evidence)
+            if not active and self.call_off:
+                # "Off for this call" ends with the call (v3.16, 04 F6): listening for the name again by itself.
+                self.call_off = False
+                self.log.event("wake", state="call_on_again", by="call_end")
+                self.wake_changed.emit(self.wake_enabled)
             self._apply_wake()
+            if changed:
+                self._emit_listening()
 
     def owns(self, job_id: int) -> bool:
         """Whether a request came from voice (its questions are spoken, not popped up)."""
@@ -827,16 +1023,52 @@ class VoiceSession(QObject):
         if not wanted:
             return None
         try:
-            from yuki.voice.audio import audio_devices, resolve_device
+            from yuki.voice.audio import resolve_device
 
-            return resolve_device("render", wanted, audio_devices())[0]
+            wanted_id = load_prefs(self._prefs_path).get(DEVICE_ID_PREFS["render"])
+            return resolve_device("render", wanted, self._devices(), wanted_id=wanted_id)[0]
         except Exception:  # noqa: BLE001
             return None
+
+    def _earcon(self, kind: str) -> None:
+        """A non-speech tone now (:func:`yuki.voice.echo.tone`): through the conversation's open speaker (the echo
+        guard knows it), else on its own short stream on the chosen output. Off the calling thread; never raises."""
+        try:
+            from yuki.voice.echo import tone
+
+            pcm = tone(kind)
+        except Exception:  # noqa: BLE001
+            return
+        speaker = self._speaker
+        if speaker is not None and self.play_tone is None:
+            threading.Thread(target=lambda: _quietly(speaker.write, pcm, gate=False), name="yuki-voice-earcon",
+                             daemon=True).start()
+            return
+        from yuki.voice.audio import play_pcm
+
+        play = self.play_tone or play_pcm
+        threading.Thread(target=lambda: _quietly(play, pcm, 24_000, self._chosen_output()), name="yuki-voice-earcon",
+                         daemon=True).start()
+
+    def _end_cue(self, reason: str) -> None:
+        """A conversation ended by itself after an exchange: the pill line, and the soft end tone (v3.16, 04 F2).
+
+        Only for ``call_idle`` / ``idle`` (never a stop the user caused); a non-speech sound, never words: Yuki never
+        speaks first. The tone is the user's choice (``end_tone``, the tray); the line is always shown."""
+        end = self._last_end or {}
+        if reason not in SELF_ENDED or int(end.get("exchanges") or 0) < 1:
+            return
+        listening = self._wake_allowed()
+        tone_on = self.end_tone
+        self.state_changed.emit("ended", ENDED_NOTE if listening else ENDED_NOT_LISTENING_NOTE)
+        self.log.event("session", state="end_cue", reason=reason, tone=tone_on, listening=listening)
+        if tone_on:
+            self._earcon("ended")
 
     # -- wake word ------------------------------------------------------------------
 
     def _wake_allowed(self) -> bool:
-        return (self.wake_enabled and not self.quiet
+        return (self.wake_enabled and not self.quiet and not self.call_off
                 and (self.settings.voice_wake_during_calls or not self.call_active))
 
     def _apply_wake(self) -> None:
@@ -855,8 +1087,8 @@ class VoiceSession(QObject):
             self._stop_listener()
             if not self.in_conversation:
                 self._close_mic()
-                self._set_state("off", "quiet" if self.quiet else (
-                    "call" if self.wake_enabled and self.call_active else ""))
+                self._set_state("off", "quiet" if self.quiet else ("call_off" if self.call_off else (
+                    "call" if self.wake_enabled and self.call_active else "")))
 
     def _ensure_mic(self) -> Any:
         from yuki.voice.audio import SharedMic
@@ -983,6 +1215,8 @@ class VoiceSession(QObject):
             self.notice(error)  # after the wake state, so the pill keeps the reason
         elif pending is not None and time.monotonic() - pending[1] < PENDING_WAKE_S and self._wake_allowed():
             self.start_conversation("wake", wake_at=pending[0], heard_at=pending[1], name_end=pending[2] or None)
+        else:
+            self._end_cue(reason)   # after the wake state too: "Say 'Yuki' to talk again" (v3.16)
 
     # -- standby: the conversation built ahead of the name (v3.11) --------------------------------------------------
 
@@ -1119,6 +1353,9 @@ class VoiceSession(QObject):
                 extra_observers=list(self.extra_observers), keyterms=keyterms, on_chat=posted(self._chat),
                 call_evidence=self.call_evidence if self.call_app else None, on_quiet=self.go_quiet, dormant=True)
             box["conv"] = conversation
+            conversation.on_tone = self._earcon   # v3.16: the conversation's earcons (error, note) via its speaker
+            output.on_write_failing = self._reopen_speaker
+            output.on_write_failed = lambda exc, c=conversation: self._speaker_failed(c, exc)
 
             def connected() -> None:
                 if box.get("ready"):
@@ -1240,12 +1477,14 @@ class VoiceSession(QObject):
             timings["kept_s"] = round(mic_input.kept_s, 2)
             timings["replayed_s"] = round(mic_input.replayed_s, 2)
             self.last_timings = timings
+        error = error or self._take_pending_error()
         self.log.event("session", state="stop", session=conversation.session, reason=reason, error=error or None,
                        seconds=round(time.monotonic() - started, 1), turns=obs.totals["turns"],
                        for_others=obs.totals.get("for_others", 0), mouth_cost_usd=round(obs.totals["mouth_cost_usd"], 5),
                        tts_chars=obs.totals["tts_chars"],
                        stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
-                       timings_ms=timings, standby=True)
+                       timings_ms=timings, standby=True, **_stop_facts(conversation))
+        self._last_end = {"reason": reason, "exchanges": int(getattr(obs, "exchanges", 0) or 0)}
         self._thread_done.emit(reason, error)
 
     def _echo_guard(self, mode: str, output: str | None, speaker: Any, mic: Any) -> Any:
@@ -1365,7 +1604,8 @@ class VoiceSession(QObject):
             params = TransportParams(audio_in_enabled=True, audio_in_sample_rate=16_000,
                                      audio_out_enabled=True, audio_out_sample_rate=24_000)
             mic_input = MicInput(mic, params, backlog_since=listen_from)
-            transport = PairTransport(mic_input, SpeakerOutput(speaker, params))
+            output = SpeakerOutput(speaker, params)
+            transport = PairTransport(mic_input, output)
             conversation = Conversation(
                 settings=settings, bridge=self.bridge, transport=transport, memory=self.memory,
                 mouth_memory=mouth_memory, log=self.log,
@@ -1377,6 +1617,9 @@ class VoiceSession(QObject):
                 on_chat=posted(self._chat), call_evidence=self.call_evidence if call_app else None, on_quiet=self.go_quiet,
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
+            conversation.on_tone = self._earcon   # v3.16: the conversation's earcons (error, note) via its speaker
+            output.on_write_failing = self._reopen_speaker
+            output.on_write_failed = lambda exc, c=conversation: self._speaker_failed(c, exc)
             # What recognition hears starts after the name: the mouth is told its first words were said to it
             # (not when the name was a sound-alike the second opinion heard as the name: then it judges).
             listener = self._listener
@@ -1427,6 +1670,7 @@ class VoiceSession(QObject):
             if self._mic is not None:
                 self.log.event("mic", state="levels", **self._mic.stats.levels())
             obs = getattr(self._conversation, "observer", None)
+            error = error or self._take_pending_error()
             self.log.event("session", state="stop", session=session, reason=reason, error=error or None,
                            seconds=round(time.monotonic() - started, 1),
                            turns=obs.totals["turns"] if obs else 0,
@@ -1434,7 +1678,8 @@ class VoiceSession(QObject):
                            mouth_cost_usd=round(obs.totals["mouth_cost_usd"], 5) if obs else 0,
                            tts_chars=obs.totals["tts_chars"] if obs else 0,
                            stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
-                           timings_ms=dict(timings))
+                           timings_ms=dict(timings), **_stop_facts(self._conversation))
+            self._last_end = {"reason": reason, "exchanges": int(getattr(obs, "exchanges", 0) or 0) if obs else 0}
             self._thread_done.emit(reason, error)
             if settings.voice_tts_provider == "elevenlabs":
                 # What this conversation spoke counts against the month: read the quota again for the next one.
@@ -1573,3 +1818,17 @@ def _plain_error(text: str) -> str:
     if "getaddrinfo" in low or "connect" in low or "timed out" in low or "network" in low:
         return "Voice can't reach the speech services right now (network?)."
     return f"Voice stopped: {text[:160]}"
+
+
+def _quietly(fn: Any, *args: Any, **kwargs: Any) -> None:
+    """Call ``fn``; a failure is swallowed (an earcon never breaks anything)."""
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stop_facts(conversation: Any) -> dict[str, Any]:
+    """Why and how a conversation ended (content-free; ``Conversation.stop_facts``, 04 F3), for ``session stop``."""
+    facts = getattr(conversation, "stop_facts", None) or {}
+    return {k: v for k, v in facts.items() if k != "reason"} if isinstance(facts, dict) else {}

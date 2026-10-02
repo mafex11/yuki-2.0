@@ -31,6 +31,12 @@ unsaid rest of a cut question, live 01:30) is a ``fragment``.
 
 Logs are content-free: ``speech_guard`` with ``op`` caught / timeout / error, the reason, the characters and the
 milliseconds; a ``summary`` at the end of the conversation.
+
+**Shadow mode (v3.16, ``Settings.voice_speech_channel = "marker"``).** With the marker channel the talker's reply
+says itself which of its text is speech (:data:`yuki.voice.mouth.MARKERS`), so this check stops being load-bearing:
+it still scores every spoken line with the same model and logs what it would have dropped (``op`` caught with
+``shadow`` true), but it never blocks, never holds a line's audio for its verdict and never drops the rest of a
+reply. A leak of reasoning into speech is then a measured number (its ``shadow_caught`` count), not a silence.
 """
 
 from __future__ import annotations
@@ -114,7 +120,7 @@ class Verdict:
     ok: bool
     why: str = ""
     ms: float = 0.0
-    by: str = "model"   # model | free | repeat | timeout | error | off
+    by: str = "model"   # model | free | repeat | timeout | error | off | shadow (would have dropped; said anyway)
 
 
 def _norm(text: str) -> str:
@@ -142,11 +148,13 @@ class SpeechGuard:
         context: ``() -> {"user": latest user words}`` for the check (``None``: none).
         timeout_s: How long a verdict is waited for once the audio is ready, at most, before the line goes out.
         judge: A stand-in for the model call in tests: ``async (text, said, user) -> answer``.
+        shadow: Score and log only, never block (v3.16, the marker channel; module docstring).
     """
 
     def __init__(self, client: Any, model: str, *, log: Any = None,
                  context: Callable[[], dict[str, Any]] | None = None, timeout_s: float = 2.5,
-                 judge: Callable[[str, list[str], str], Any] | None = None, session: str = "") -> None:
+                 judge: Callable[[str, list[str], str], Any] | None = None, session: str = "",
+                 shadow: bool = False) -> None:
         self.client = client
         self.model = model
         self.log = log
@@ -154,6 +162,7 @@ class SpeechGuard:
         self.timeout_s = float(timeout_s)
         self.judge = judge
         self.session = session
+        self.shadow = bool(shadow)
         #: ``()``: a line was dropped (the turn log keeps only what was heard); set by the conversation.
         self.on_drop: Callable[[], None] | None = None
         self._said: deque[tuple[float, str, str]] = deque(maxlen=12)   # (at, words, normalised) of lines let through
@@ -168,7 +177,7 @@ class SpeechGuard:
         self._written: deque[tuple[float, str]] = deque(maxlen=8)
         self._tasks: set[asyncio.Task] = set()
         self.stats: dict[str, Any] = {"checked": 0, "free": 0, "caught": 0, "repeats": 0, "timeouts": 0, "errors": 0,
-                                      "input_tokens": 0, "output_tokens": 0, "ms": []}
+                                      "shadow_caught": 0, "input_tokens": 0, "output_tokens": 0, "ms": []}
 
     # -- the check -------------------------------------------------------------------------------------
 
@@ -267,13 +276,23 @@ class SpeechGuard:
         except asyncio.TimeoutError:
             # Fails closed for anything but a short plain line (v3.13): an unchecked long line is never heard.
             self.stats["timeouts"] += 1
-            self._log(op="timeout", chars=len(text), waited_ms=round(wait * 1000), said=self.short(text))
-            verdict = Verdict(self.short(text), "unchecked", by="timeout")
+            self._log(op="timeout", chars=len(text), waited_ms=round(wait * 1000), said=self.short(text) or self.shadow,
+                      **({"shadow": True} if self.shadow else {}))
+            verdict = Verdict(self.short(text) or self.shadow, "unchecked", by="timeout")
         self._pending.discard(_norm(text))
         if verdict.ok:
             if verdict.by != "free":
                 self.heard(text)
             return verdict
+        if self.shadow:
+            # v3.16: the marker channel decides what is spoken; this verdict is only measured (a leak, if any, is
+            # logged with its reason) and the line is said. A check that failed has no verdict: not a catch.
+            self.heard(text)
+            if verdict.by in ("error", "timeout"):
+                return Verdict(True, verdict.why, verdict.ms, by=verdict.by)
+            self.stats["shadow_caught"] += 1
+            self._log(op="caught", why=verdict.why, by=verdict.by, chars=len(text), ms=verdict.ms, shadow=True)
+            return Verdict(True, verdict.why, verdict.ms, by="shadow")
         self.stats["caught"] += 1
         self._log(op="caught", why=verdict.why, by=verdict.by, chars=len(text), ms=verdict.ms)
         if self.on_drop is not None:
@@ -301,8 +320,23 @@ class SpeechGuard:
         return Verdict(False, "rest_of_reply", by="reply")
 
     async def allows(self, text: str) -> bool:
-        """Check ``text`` and wait for the verdict (the fallback voices, which check before sending)."""
-        return (await self.decide(self.start(text), text)).ok
+        """Check ``text`` and wait for the verdict (the fallback voices, which check before sending).
+
+        In shadow mode the line goes out at once and its verdict is only logged when it comes (no wait)."""
+        fut = self.start(text)
+        if self.shadow:
+            self.observe(fut, text)
+            return True
+        return (await self.decide(fut, text)).ok
+
+    def observe(self, fut: "asyncio.Future[Verdict]", text: str) -> None:
+        """Shadow mode: log this line's verdict when it arrives, in the background; the line is never held for it."""
+        try:
+            task = asyncio.get_running_loop().create_task(self.decide(fut, text))
+        except RuntimeError:
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def heard(self, text: str) -> None:
         """A line that is being said (for the repeat check)."""

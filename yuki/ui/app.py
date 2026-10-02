@@ -131,8 +131,11 @@ def single_instance_handle(name: str = MUTEX_NAME) -> int | None:
     return int(handle)
 
 
-def tray_icon() -> QIcon:
-    """A small snowflake glyph, drawn rather than shipped as a file."""
+def tray_icon(listening: bool = True) -> QIcon:
+    """A small snowflake glyph, drawn rather than shipped as a file.
+
+    ``listening`` False (v3.16, 04 F6): the glyph greyed with a slash through it, so "Yuki isn't listening" is
+    visible in the tray at a glance (it was only the menu item's text, and it stayed off for days unnoticed)."""
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -140,7 +143,7 @@ def tray_icon() -> QIcon:
     painter.setBrush(QColor(16, 17, 20, 235))
     painter.setPen(QPen(QColor(255, 255, 255, 40), 2.0))
     painter.drawRoundedRect(3, 3, 58, 58, 16, 16)
-    pen = QPen(ACCENT, 5.0)
+    pen = QPen(ACCENT if listening else QColor(150, 150, 150), 5.0)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     painter.setPen(pen)
     centre, arm = 32, 17
@@ -149,8 +152,19 @@ def tray_icon() -> QIcon:
         painter.drawLine(
             int(centre - dx * 0.87), int(centre - dy * 0.5), int(centre + dx * 0.87), int(centre + dy * 0.5)
         )
+    if not listening:
+        slash = QPen(QColor(235, 235, 235), 5.0)
+        slash.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(slash)
+        painter.drawLine(14, 50, 50, 14)
     painter.end()
     return QIcon(pixmap)
+
+
+#: The tray tooltip's line for each "not listening" state (v3.16, 04 F6); ``on`` has none.
+NOT_LISTENING_LINES = {"off": "Yuki isn't listening (switched off: Listen for ‘Yuki’ turns it on)",
+                       "quiet": "Yuki isn't listening (quiet for a while)",
+                       "call_off": "Yuki isn't listening (off for this call)"}
 
 
 class YukiUi(QObject):
@@ -1136,6 +1150,50 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     ui.voice.wake_changed.connect(show_wake)
     show_wake(ui.voice.wake_enabled)
     menu.addAction(wake_item)
+    # v3.16 (04 F6): off for this call only (never stored; listening comes back when the call ends), next to the
+    # permanent switch above. Shown only during a call.
+    call_off_item = QAction("Off for this call", menu, checkable=True)
+    call_off_item.triggered.connect(lambda checked: ui.voice.set_call_off(bool(checked)))
+    menu.addAction(call_off_item)
+    # v3.16 (04 F2): the soft tone when a conversation ends by itself (the pill line shows either way).
+    end_tone_item = QAction("End tone when a conversation ends", menu, checkable=True)
+    end_tone_item.triggered.connect(lambda checked: ui.voice.set_end_tone(bool(checked)))
+    menu.addAction(end_tone_item)
+    icons = {True: icon or tray_icon(True), False: tray_icon(False)}
+
+    def show_listening(state: str | None = None) -> None:
+        """Whether Yuki listens for the name, in the tray icon, its tooltip, the menu and the call pill (04 F6)."""
+        state = state or getattr(ui.voice, "listening_state", "on")
+        on = state == "on"
+        tray.setIcon(icons[on])
+        call_off_item.blockSignals(True)
+        call_off_item.setChecked(state == "call_off")
+        call_off_item.setVisible(bool(getattr(ui.voice, "call_active", False)) or state == "call_off")
+        call_off_item.setEnabled(state in ("on", "call_off"))
+        call_off_item.blockSignals(False)
+        tray.setToolTip(tray_tip())
+        indicator = getattr(getattr(ui, "calls", None), "indicator", None)
+        if indicator is not None and hasattr(indicator, "set_listening"):
+            indicator.set_listening(on)
+
+    def tray_tip() -> str:
+        state = getattr(ui.voice, "listening_state", "on")
+        line = NOT_LISTENING_LINES.get(state, "")
+        return (f"Yuki — {ui.settings.model} · effort {ui.settings.effort}\n{ui.voice.devices_text()}"
+                + (f"\n{line}" if line else ""))
+
+    listening_changed = getattr(ui.voice, "listening_changed", None)
+    if listening_changed is not None:
+        listening_changed.connect(show_listening)
+    ui.voice.wake_changed.connect(lambda _on: show_listening())
+
+    def show_end_tone() -> None:
+        end_tone_item.blockSignals(True)
+        end_tone_item.setChecked(bool(getattr(ui.voice, "end_tone", True)))
+        end_tone_item.blockSignals(False)
+
+    menu.aboutToShow.connect(show_end_tone)
+    menu.aboutToShow.connect(lambda: show_listening())
     # "Go quiet for a couple of hours" (v3.10): shown while it holds, with the time it ends; clicking wakes her now.
     quiet_item = QAction("", menu)
     quiet_item.triggered.connect(lambda _checked=False: ui.voice.wake_now())
@@ -1239,7 +1297,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
             for key, item in items.items():
                 item.setChecked(key == current)
             group.setExclusive(True)
-        tray.setToolTip(f"Yuki — {ui.settings.model} · effort {ui.settings.effort}\n{ui.voice.devices_text()}")
+        tray.setToolTip(tray_tip())
 
     def switch_model(alias: str) -> None:
         ui.set_model(alias)
@@ -1284,6 +1342,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
 
     tray.setContextMenu(menu)
     refresh_ticks()
+    show_listening()   # v3.16: a listener that is off shows in the icon from the start (04 F6)
     tray.activated.connect(   # a left click opens the Yuki window (its own process)
         lambda reason: ui.window_host.open_window()
         if reason == QSystemTrayIcon.ActivationReason.Trigger

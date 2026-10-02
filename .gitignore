@@ -23,3 +23,6 @@ docs/ui-mockups/mobbin/
 
 # 2026-10 revamp designs: real personal data + third-party research screenshots
 docs/ui-mockups/revamp-2026-10/
+
+# Claude Code agent worktrees
+.claude/worktrees/

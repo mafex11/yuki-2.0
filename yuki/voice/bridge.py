@@ -298,8 +298,12 @@ class VoiceBridge(QObject):
         #: ``()``: the user asked to end this voice conversation (``end_conversation``); set by the conversation.
         self.end_requested: Callable[[], Any] | None = None
         #: When a result or a question was handed to the mouth to be said (monotonic): a stay_quiet in the
-        #: run it started is refused once, because a result or a question is always said (v3.5).
+        #: run it started is refused once, because a result or a question is always said (v3.5). With a ledger
+        #: (v3.16) it is not refused: the ledger says the outcome itself.
         self.said_owed_at: float | None = None
+        #: The conversation's owed-output ledger (:class:`yuki.voice.narrator.OwedLedger`, v3.16), set while one is
+        #: live: every result, failure or question handed to the talker stays owed until it is heard.
+        self.ledger: Any = None
         #: The "still on it" line last handed to the talker, and when (``waiting_reply_stale``, v3.14).
         self._waiting_run: tuple[Job, float] | None = None
         #: ``() -> int``: the conversation's user turns so far (set by the conversation; v3.9): binds each job to
@@ -381,6 +385,8 @@ class VoiceBridge(QObject):
             self.speak = None
             self.in_exchange = None
             self.held_at = None
+            self.held_call = None
+            self.ledger = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -439,6 +445,27 @@ class VoiceBridge(QObject):
     def _job(self, job_id: int) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def _owe(self, job: Job, kind: str, text: str) -> None:
+        """v3.16: an outcome handed to the talker to be said now stays owed until it is heard (the ledger)."""
+        ledger = self.ledger
+        if ledger is None or job.remember:
+            return
+        try:
+            turns = int(self.user_turns()) if self.user_turns is not None else 0
+        except Exception:  # noqa: BLE001
+            turns = 0
+        try:
+            ledger.owe(job.token, kind, text, turns)
+        except Exception as exc:  # noqa: BLE001 - the ledger never breaks the bridge
+            self._log("bridge_error", error=f"owe: {type(exc).__name__}: {exc}")
+
+    def _unowe(self, job: Job) -> None:
+        if self.ledger is not None:
+            try:
+                self.ledger.drop(job.token)
+            except Exception:  # noqa: BLE001
+                pass
 
     def owns(self, job_id: int) -> bool:
         """Whether a job came from voice (the UI speaks its questions instead of popping the overlay)."""
@@ -656,6 +683,7 @@ class VoiceBridge(QObject):
                     for item in self.gate.take(job.token, kinds=tuple(RANKS)):
                         if item.drop is not None:
                             item.drop()
+                self._unowe(job)
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
 
@@ -727,6 +755,7 @@ class VoiceBridge(QObject):
                 # Replaced by the user's newer request: nothing of it is ever said. Its call settles quietly, so
                 # the talker knows it stopped, and its waiting lines go with it.
                 self._drop_items(job)
+                self._unowe(job)
                 await params.result_callback({"withdrawn": job.brief(), "how_to_handle_it": WITHDRAWN_NOTE},
                                              properties=FunctionCallResultProperties(run_llm=False))
                 self._log("bridge", op="withdrawn_settled", job_id=job.job_id, raced=kind != "withdrawn")
@@ -766,6 +795,10 @@ class VoiceBridge(QObject):
                         self.said_owed_at = time.monotonic()
                     if run_llm and not stale:
                         self._outcome_said(job)
+                    if not stale:
+                        # v3.16: owed until heard, late or not (only the stale rule lets it go): the ledger says it
+                        # by code if the run that should say it is silent.
+                        self._owe(job, kind, head)
                     self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                                 request=job.request, late=late, verified=verified,
@@ -788,10 +821,12 @@ class VoiceBridge(QObject):
             else:
                 body = {"status": payload}
 
-            async def intermediate(run_llm: bool, stale: bool, body=body, kind=kind) -> None:
+            async def intermediate(run_llm: bool, stale: bool, body=body, kind=kind, payload=payload) -> None:
                 del stale
                 if run_llm and kind == "ask":
                     self.said_owed_at = time.monotonic()
+                if kind == "ask":
+                    self._owe(job, "ask", str(payload))   # a question of the thinker's is owed too (v3.16)
                 if run_llm:
                     self._waiting_run = (job, time.monotonic()) if kind == "waiting" else None
                 await params.result_callback(body, properties=FunctionCallResultProperties(
@@ -900,6 +935,7 @@ class VoiceBridge(QObject):
                 for item in self.gate.take(job.token, kinds=tuple(RANKS)):
                     if item.drop is not None:
                         item.drop()
+            self._unowe(job)
             self._log("bridge", op="early_dropped", why="call_not_made", call=job.early_call)
 
     def settle_early(self, made: set[str]) -> None:
@@ -942,6 +978,7 @@ class VoiceBridge(QObject):
                     for item in self.gate.take(job.token, kinds=tuple(RANKS)):
                         if item.drop is not None:
                             item.drop()
+                self._unowe(job)
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
 
@@ -1066,6 +1103,17 @@ class VoiceBridge(QObject):
         in_call = bool(self.call_mode()) if self.call_mode is not None else False
         owed, self.said_owed_at = self.said_owed_at, None
         spoke_now = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
+        ledger = self.ledger
+        held_recently = self.held_at is not None and time.monotonic() - self.held_at < 20.0
+        if not by_user and not spoke_now and ledger is not None and ledger.pending and not held_recently:
+            # v3.16 (07 §6 A): staying quiet is not an option on a run that owes an outcome. Not refused (that cost a
+            # second talker run, and live 2 Oct "Pages restored." still ended in silence after it): the run settles,
+            # and the ledger says the outcome by code at once, in the thinker's own words.
+            ledger.quiet_run()
+            self._log("bridge", op="quiet", owed=True, said_by="ledger")
+            await params.result_callback({"ok": True, "note": "Its outcome is said for you now."},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         if not by_user and not spoke_now and owed is not None and time.monotonic() - owed < 20.0:
             # This run was started by a result or a question to be said (live 2026-09-26: a result met
             # with stay_quiet was never heard). Refused once; the mouth says it now. Not when this very reply
@@ -1166,14 +1214,23 @@ class VoiceBridge(QObject):
         except (TypeError, ValueError):
             minutes = 60.0
         minutes = max(1.0, min(minutes, 24 * 60.0))
+        # v3.16 (04 F6): in a call, "stop listening" is off for the rest of that call (the talker's judgement, its
+        # this_call field); the session restores listening when the call ends and never stores it.
+        in_call = bool(self.call_mode()) if self.call_mode is not None else False
+        this_call = bool(args.get("this_call") is True and in_call)
         await self._ack_if_silent(params, args)
-        self._log("bridge", op="go_quiet", minutes=round(minutes))
+        self._log("bridge", op="go_quiet", minutes=round(minutes), this_call=this_call)
         if self.quiet_requested is not None:
             try:
-                self.quiet_requested(minutes)
+                try:
+                    self.quiet_requested(minutes, this_call)
+                except TypeError:   # a stand-in that takes the minutes only
+                    self.quiet_requested(minutes)
             except Exception as exc:  # noqa: BLE001 - logged; the conversation still ends
                 self._log("bridge_error", error=f"go_quiet: {type(exc).__name__}: {exc}")
-        await params.result_callback({"ok": True, "note": f"Quiet for {round(minutes)} minutes after your okay."},
+        note = ("Not listening for the rest of this call, after your okay." if this_call
+                else f"Quiet for {round(minutes)} minutes after your okay.")
+        await params.result_callback({"ok": True, "note": note},
                                      properties=FunctionCallResultProperties(run_llm=False))
         if self.end_requested is not None:
             self.end_requested()
@@ -1586,6 +1643,7 @@ class VoiceBridge(QObject):
 
     def _drop_items(self, job: Job) -> None:
         """Take a job's waiting items out of the narrator gate, unsaid (it was withdrawn or stopped)."""
+        self._unowe(job)   # nothing of it is owed any more either (v3.16)
         if self.gate is None:
             return
         for item in self.gate.take(job.token, kinds=tuple(RANKS)):
@@ -1778,6 +1836,7 @@ class VoiceBridge(QObject):
                 return
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
                 self._drop_items(job)
+                self._unowe(job)
                 await announce({"withdrawn": job.brief(), "how_to_handle_it": WITHDRAWN_NOTE}, False)
                 return
             if kind in ("done", "failed"):
@@ -1797,6 +1856,8 @@ class VoiceBridge(QObject):
                         self.said_owed_at = time.monotonic()
                     if run_llm and not stale:
                         self._outcome_said(job)
+                    if not stale:
+                        self._owe(job, kind, head)   # v3.16: owed until heard
                     self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await announce(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                   request=job.request, late=late, verified=verified,
@@ -1813,10 +1874,12 @@ class VoiceBridge(QObject):
                 else:
                     body = {"status": payload}
 
-                async def deliver(run_llm: bool, stale: bool, body=body, kind=kind) -> None:
+                async def deliver(run_llm: bool, stale: bool, body=body, kind=kind, payload=payload) -> None:
                     del stale
                     if run_llm:
                         self._waiting_run = (job, time.monotonic()) if kind == "waiting" else None
+                    if kind == "ask":
+                        self._owe(job, "ask", str(payload))   # v3.16
                     await announce(body, run_llm)
                 item_kind = kind if kind in RANKS else "say"
             gate = self.gate

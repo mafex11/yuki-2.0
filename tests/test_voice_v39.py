@@ -732,7 +732,7 @@ def test_a_turn_that_was_heard_or_acted_on_is_left_alone(tmp_path: Path) -> None
     for turn in (Turn(n=1, trigger="user", opened=now - 2, user_text="pause it", cut=True, transcript_at=now - 1.5,
                       tools=["media_key"]),
                  Turn(n=2, trigger="user", opened=now - 2, user_text="hi", responses=1, transcript_at=now - 1.5,
-                      first_audio=now - 1.0),
+                      first_audio=now - 1.0, audible=["Hey! "]),   # v3.16: answered = words heard, not any audio
                  Turn(n=3, trigger="result", opened=now - 2, user_text="", responses=1)):
         conv.observer.turn = turn
         assert conv._unanswered() is None

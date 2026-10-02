@@ -264,8 +264,14 @@ class Settings:
             (``voice.json`` ``gemini_model`` / ``gemini_voice`` win).
         voice_gemini_style: A baseline delivery style sent with every reply the mouth gives no style
             of its own (``""``: none; ``voice.json`` ``gemini_style`` wins).
-        voice_gemini_first_audio_s: A Gemini request with no audio by then is said by the fallback
-            voice, and so is the rest of that conversation (measured first audio ~1.0-1.3 s).
+        voice_gemini_first_audio_s: A Gemini request with no audio by then has failed (it counts towards the
+            circuit breaker below); measured first audio ~1.0-1.3 s.
+        voice_tts_hedge_s: A Gemini piece with no first byte this long after its request also starts on the
+            fallback voice (Aura); whichever plays first wins and the other is cancelled (v3.16; ``0``: off).
+        voice_tts_breaker_failures / voice_tts_breaker_window_s / voice_tts_breaker_open_s: Gemini failures
+            (no audio in time, an error, a silent stream) this many within the window send the following pieces
+            straight to the fallback voice for the open time, then Gemini is tried again (v3.16: per piece, never
+            for the rest of a conversation; a quota or key refusal opens it for ``DOWN_FOR_S``).
         voice_tts_model / voice_tts_voice: The ElevenLabs (or Aura) model and voice id
             (empty: the provider's default in :mod:`yuki.voice.pipeline`).
         voice_tts_fallback: Provider used when the main one cannot speak (its
@@ -341,6 +347,14 @@ class Settings:
         voice_speech_guard: Check every line with the fast model before the voice says it: never its
             reasoning, talk about the user, its inner workings or a repeat (yuki.voice.speechguard, v3.10).
         voice_speech_guard_timeout_s: The check's verdict is waited for at most this long (fails open).
+        voice_speech_channel: What decides which of the talker's words are spoken (v3.16). ``"guard"``: the
+            spoken-line check above blocks lines (as since v3.10). ``"marker"``: every reply starts with a fixed
+            marker line (``say`` / ``act`` / ``quiet``, :data:`yuki.voice.mouth.MARKERS`) and only text after
+            ``say`` is spoken; unmarked text never is (the turn is answered again), and the check runs in shadow
+            mode: it scores and logs every spoken line but never blocks.
+        voice_end_tone: When a conversation ends by itself (quiet in a call, or quiet for its idle time) after
+            at least one exchange, a soft falling tone says so (v3.16, non-speech; the pill line "Say 'Yuki' to
+            talk again" is shown either way). ``voice.json`` ``end_tone`` (the tray) wins.
         voice_prewarm: With the wake word on, load the conversation's code (Pipecat, the services)
             and do the one-off checks in the background after start-up, so the first "Yuki" is
             heard at once (docs/VOICE.md §26, v3.5). Costs RAM while idle.
@@ -399,6 +413,10 @@ class Settings:
     voice_gemini_voice: str = "Leda"
     voice_gemini_style: str = ""
     voice_gemini_first_audio_s: float = 3.0
+    voice_tts_hedge_s: float = 1.8
+    voice_tts_breaker_failures: int = 2
+    voice_tts_breaker_window_s: float = 60.0
+    voice_tts_breaker_open_s: float = 60.0
     voice_tts_model: str = "eleven_flash_v2_5"
     voice_tts_voice: str = ""
     voice_tts_fallback: str = "deepgram"
@@ -462,6 +480,10 @@ class Settings:
     voice_cache_refresh_s: float = 3000.0
     voice_speech_guard: bool = True
     voice_speech_guard_timeout_s: float = 2.5
+    # v3.16: "marker" by the offline eval (docs/research/revamp-2026-10-02/21-build-A1-A2.md): 220 replies, 0 unmarked,
+    # 0 reasoning in speech; "guard" (voice.json speech_channel) brings back the blocking line check
+    voice_speech_channel: str = "marker"
+    voice_end_tone: bool = True
     voice_prewarm: bool = True
     voice_prewarm_delay_s: float = 20.0
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --

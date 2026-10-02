@@ -22,10 +22,22 @@ where a sound belongs (``<sigh>``); tags Gemini does not document are cut out, n
 words; :class:`~yuki.voice.expressive.EdgeTrimmer` keeps 30 ms and 150 ms, with 4 ms fades, so sentence
 gaps sound like a person's and the first word is heard sooner.
 
-**Fallback:** a piece whose request fails (an HTTP error, the quota, no audio within
-``first_audio_timeout_s``) is said by Deepgram Aura instead, with every mark stripped, and so is the rest
-of the conversation; a quota or key refusal also tells :func:`gemini_status` so the next conversations
-start on Aura (``pipeline.preflight``). Keys come from the environment only (``GOOGLE_API_KEY``).
+**Fallback, per piece (v3.16).** A piece whose Gemini request fails (an HTTP error, the quota, no audio within
+``first_audio_timeout_s``, a stream with no sound in it) is said by Deepgram Aura instead, with every mark
+stripped; the next piece tries Gemini again. A piece with no first byte from Gemini after ``hedge_s`` is also
+started on Aura: whichever plays first wins and the other is cancelled (live 2 Oct 21:24:30 a 3 s timeout made
+"open chrome" heard 6.1 s after the user stopped). A small circuit breaker keeps a failing Gemini out of the way:
+``breaker`` failures within its window send the pieces straight to Aura for its open time, then Gemini is tried
+again (before, one timeout switched the rest of the conversation to Aura: two voices, and no second chance). A
+quota or key refusal also tells :func:`gemini_status` so the next conversations start on Aura
+(``pipeline.preflight``). Aura gets one retry on a fresh connection when its pooled one was dropped before any
+byte came back (live 2 Oct 21:25:04 ``ServerDisconnectedError``, the reply lost), and its pool keeps idle
+connections only briefly. Keys come from the environment only (``GOOGLE_API_KEY``).
+
+**A reply that plays nothing** (every piece dropped, marks alone, or a voice that failed) ends with a breath of
+silence like any other, so Pipecat raises no "completed with no audio" error (and never marks the service
+unusable for it); the conversation is told how many of its pieces had words (``_yuki_on_silent``), so the pill
+says something only when words were lost (v3.16).
 """
 
 from __future__ import annotations
@@ -48,10 +60,14 @@ SAMPLE_RATE = 24_000
 DOWN_FOR_S = 600.0
 #: The connection is opened again before a reply when it has been unused this long (s).
 WARM_IDLE_S = 45.0
+#: At a wake the connections are opened unless they were used this recently (s, v3.16).
+WARM_RECENT_S = 5.0
 #: A player waits at most this long for the next piece of an unfinished reply before closing it (s).
 PIECE_WAIT_MAX_S = 30.0
 #: How many piece requests of one conversation run at once.
 PARALLEL = 4
+#: Aura's pooled connections are kept idle at most this long (s): below the server's own idle limit (v3.16).
+AURA_KEEPALIVE_S = 15.0
 
 #: Process-wide state of the Gemini voice: ``{"down_until": monotonic, "why": str, "check": (ok, why, at)}``.
 _STATE: dict[str, Any] = {}
@@ -171,6 +187,10 @@ class _Piece:
     cache_key: str = ""
     #: It starts its reply (the spoken-line check's ``first``).
     first: bool = False
+    #: Dropped on purpose (the line check, or a stale "still on it"): never counted as lost words (v3.16).
+    dropped: bool = False
+    #: Its audio came whole from Gemini with no error on the way (only then is it kept in the voice cache).
+    clean: bool = False
 
 
 @dataclass
@@ -207,6 +227,11 @@ def service_class() -> type:
     from pipecat.services.settings import TTSSettings
     from pipecat.services.tts_service import TTSService
 
+    #: A dropped pooled connection, before any byte came back: worth one retry on a fresh one (v3.16).
+    retry_errors = tuple(x for x in (getattr(aiohttp, "ServerDisconnectedError", None),
+                                     getattr(aiohttp, "ClientOSError", None),
+                                     getattr(aiohttp, "ClientConnectionResetError", None)) if x is not None)
+
     class GeminiTTSService(TTSService):
         """Gemini TTS over HTTP streaming, pieces fetched in parallel and played in order (module docstring)."""
 
@@ -215,7 +240,8 @@ def service_class() -> type:
                      fallback_key: str | None = None, fallback_voice: str = "aura-2-thalia-en",
                      fallback_url: str = AURA_URL, log: Callable[..., None] | None = None,
                      ssl: Any = None, trim: bool = True, pause_frame_processing: bool = True,
-                     cache: Any = None, **kwargs: Any) -> None:
+                     cache: Any = None, hedge_s: float = 0.0,
+                     breaker: tuple[int, float, float] = (2, 60.0, 60.0), **kwargs: Any) -> None:
             super().__init__(push_start_frame=True, push_stop_frames=True,
                              pause_frame_processing=pause_frame_processing,
                              sample_rate=SAMPLE_RATE, append_trailing_space=False,
@@ -231,18 +257,29 @@ def service_class() -> type:
             self._ssl = ssl
             self._trim = trim
             self._http: aiohttp.ClientSession | None = None
+            self._aura_http: aiohttp.ClientSession | None = None
             self._replies: dict[str, _Reply] = {}
-            self._on_fallback = False        # this conversation speaks with Aura from now on
+            #: v3.16: Aura starts on a piece whose Gemini first byte has not come this long after its request (0: off).
+            self._hedge_s = max(0.0, float(hedge_s or 0.0))
+            #: v3.16: the circuit breaker (failures, window s, open s): Gemini skipped until ``_skip_until``.
+            self._breaker_failures, self._breaker_window_s, self._breaker_open_s = (
+                max(1, int(breaker[0])), float(breaker[1]), float(breaker[2]))
+            self._failures: list[float] = []
+            self._skip_until = 0.0
             self._used_at = 0.0              # when a request last went out (monotonic)
             self._limit = asyncio.Semaphore(PARALLEL)
-            self.stats = {"pieces": 0, "fallback_pieces": 0, "errors": 0, "guarded": 0}
+            self.stats = {"pieces": 0, "fallback_pieces": 0, "errors": 0, "guarded": 0, "hedged": 0,
+                          "hedge_won_by_aura": 0, "aura_retries": 0, "breaker_opened": 0, "silent_replies": 0}
             #: The spoken-line check (yuki.voice.speechguard): a piece's audio is held until its verdict, which runs
-            #: alongside the speech request, and a dropped piece is never played nor its words kept (v3.10).
+            #: alongside the speech request, and a dropped piece is never played nor its words kept (v3.10). In
+            #: shadow mode (v3.16) the verdict is only logged: nothing waits for it, nothing is dropped.
             self._yuki_guard: Any = None
             self._yuki_audio_gate = True
             #: ``() -> bool``: the reply about to be heard was asked for by a "still on it" line whose job has
             #: finished since (``VoiceBridge.waiting_reply_stale``, v3.14); such a reply is dropped unheard.
             self._yuki_stale: Any = None
+            #: ``(speakable_pieces)``: a reply finished with nothing audible (v3.16; set by the conversation).
+            self._yuki_on_silent: Callable[[int], None] | None = None
             #: Short lines she says often, replayed from disk (yuki.voice.ttscache, v3.14), or ``None``.
             self._cache = cache
 
@@ -258,17 +295,50 @@ def service_class() -> type:
                 except Exception:  # noqa: BLE001 - logging never breaks the voice
                     pass
 
+        def _connector(self, *, keepalive_s: float, limit: int, fresh: bool = False) -> aiohttp.TCPConnector:
+            ssl = self._ssl if self._ssl is not None else True
+            if fresh:
+                return aiohttp.TCPConnector(limit=1, force_close=True, ssl=ssl)
+            return aiohttp.TCPConnector(limit=limit, keepalive_timeout=keepalive_s, ttl_dns_cache=600, ssl=ssl)
+
         def _session(self) -> aiohttp.ClientSession:
             if self._http is None or self._http.closed:
-                connector = aiohttp.TCPConnector(limit=PARALLEL + 1, keepalive_timeout=90, ttl_dns_cache=600,
-                                                 ssl=self._ssl if self._ssl is not None else True)
-                self._http = aiohttp.ClientSession(connector=connector,
+                self._http = aiohttp.ClientSession(connector=self._connector(keepalive_s=90, limit=PARALLEL + 1),
                                                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=10))
             return self._http
 
+        def _aura_session(self) -> aiohttp.ClientSession:
+            """Aura's own pool (v3.16): idle connections kept only briefly, never shared with Gemini's."""
+            if self._aura_http is None or self._aura_http.closed:
+                self._aura_http = aiohttp.ClientSession(
+                    connector=self._connector(keepalive_s=AURA_KEEPALIVE_S, limit=PARALLEL),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=10))
+            return self._aura_http
+
+        def _gemini_usable(self) -> bool:
+            """Whether the next piece goes to Gemini: a key, and the circuit breaker closed (or its time over)."""
+            return bool(self._api_key) and time.monotonic() >= self._skip_until
+
+        def _gemini_failed(self, why: str, *, hard: bool = False) -> None:
+            """A Gemini failure for one piece: the breaker opens on a refusal, or on enough failures in its window."""
+            now = time.monotonic()
+            if hard:
+                self._skip_until = now + DOWN_FOR_S
+                self._failures.clear()
+                self.stats["breaker_opened"] += 1
+                self._log("tts_breaker", state="open", hard=True, for_s=round(DOWN_FOR_S), why=str(why)[:60])
+                return
+            self._failures = [t for t in self._failures if now - t <= self._breaker_window_s] + [now]
+            if len(self._failures) >= self._breaker_failures:
+                self._skip_until = now + self._breaker_open_s
+                self.stats["breaker_opened"] += 1
+                self._log("tts_breaker", state="open", hard=False, for_s=round(self._breaker_open_s),
+                          failures=len(self._failures), why=str(why)[:60])
+                self._failures.clear()
+
         async def _warm(self, n: int = 2) -> None:
             """Open ``n`` connections before they are needed: one free GET of the model each."""
-            if not self._api_key or self._on_fallback:
+            if not self._gemini_usable():
                 return
             self._used_at = time.monotonic()
 
@@ -283,7 +353,13 @@ def service_class() -> type:
             await asyncio.gather(*(one() for _ in range(n)))
 
         def _maybe_warm(self) -> None:
-            if self._api_key and not self._on_fallback and time.monotonic() - self._used_at > WARM_IDLE_S:
+            if self._gemini_usable() and time.monotonic() - self._used_at > WARM_IDLE_S:
+                self._used_at = time.monotonic()
+                self.create_task(self._warm(), name="gemini-warm")
+
+        def warm_now(self) -> None:
+            """At a wake (v3.16): open the connections now, unless they were used a moment ago."""
+            if self._gemini_usable() and time.monotonic() - self._used_at > WARM_RECENT_S:
                 self._used_at = time.monotonic()
                 self.create_task(self._warm(), name="gemini-warm")
 
@@ -292,12 +368,14 @@ def service_class() -> type:
             self._maybe_warm()
 
         async def _close_http(self) -> None:
-            http, self._http = self._http, None
-            if http is not None and not http.closed:
-                try:
-                    await http.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            for name in ("_http", "_aura_http"):
+                http = getattr(self, name)
+                setattr(self, name, None)
+                if http is not None and not http.closed:
+                    try:
+                        await http.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         async def stop(self, frame: Any) -> None:
             for reply in self._replies.values():
@@ -344,7 +422,9 @@ def service_class() -> type:
                 if self._cache is not None and self._cache.cacheable(piece.text):
                     piece.cache_key = self._cache.key("gemini", str(self._settings.model), str(self._settings.voice),
                                                       reply.style, piece.text)
-                if self._yuki_guard is not None:
+                take = getattr(self, "_take_unguarded", None)
+                unguarded = bool(callable(take) and take(piece.text))   # an owed outcome said by code (v3.16)
+                if self._yuki_guard is not None and not unguarded:
                     # The reply's first words are checked even when short: a fragment is (v3.13). A short line the
                     # check already said SAY to as a first piece is known (v3.14, the voice cache).
                     known = bool(piece.cache_key and piece.first and self._cache.approved(piece.cache_key))
@@ -428,6 +508,7 @@ def service_class() -> type:
                             if stale:
                                 # Its outcome is known now: "still on it" would be stale, and the outcome follows.
                                 checked, dropped, reply.tainted = True, True, True
+                                piece.dropped = True
                                 self.stats["stale"] = self.stats.get("stale", 0) + 1
                                 self._log("tts_stale_dropped", chars=len(piece.text))
                                 if piece.task is not None and not piece.task.done():
@@ -437,21 +518,26 @@ def service_class() -> type:
                             # Its audio is ready: the line is heard only if the check keeps it (it ran alongside).
                             checked = True
                             guard = self._yuki_guard
-                            if reply.tainted and callable(getattr(guard, "drop_rest", None)):
-                                verdict = guard.drop_rest(strip_tags(piece.text))
+                            if getattr(guard, "shadow", False):
+                                # v3.16, the marker channel: the verdict is logged when it comes; nothing waits.
+                                guard.observe(piece.verdict, strip_tags(piece.text))
                             else:
-                                wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
-                                verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
-                            self._refresh_audio_context(ctx)
-                            if verdict.ok and verdict.by == "model" and piece.first and piece.cache_key:
-                                self._cache.approve(piece.cache_key)   # its own SAY, remembered with its audio
-                            if not verdict.ok:
-                                reply.tainted = reply.tainted or verdict.by != "repeat"
-                                dropped = True
-                                reply.guarded += 1
-                                self.stats["guarded"] += 1
-                                if piece.task is not None and not piece.task.done():
-                                    piece.task.cancel()
+                                if reply.tainted and callable(getattr(guard, "drop_rest", None)):
+                                    verdict = guard.drop_rest(strip_tags(piece.text))
+                                else:
+                                    wait = max(0.2, guard.timeout_s - (time.monotonic() - piece.created))
+                                    verdict = await guard.decide(piece.verdict, strip_tags(piece.text), wait_s=wait)
+                                self._refresh_audio_context(ctx)
+                                if verdict.ok and verdict.by == "model" and piece.first and piece.cache_key:
+                                    self._cache.approve(piece.cache_key)   # its own SAY, remembered with its audio
+                                if not verdict.ok:
+                                    reply.tainted = reply.tainted or verdict.by != "repeat"
+                                    dropped = True
+                                    piece.dropped = True
+                                    reply.guarded += 1
+                                    self.stats["guarded"] += 1
+                                    if piece.task is not None and not piece.task.done():
+                                        piece.task.cancel()
                         if not dropped:
                             reply.heard = True
                             await self._emit(ctx, TTSAudioRawFrame(chunk, SAMPLE_RATE, 1, context_id=ctx))
@@ -471,10 +557,15 @@ def service_class() -> type:
 
         async def _finish(self, reply: _Reply) -> None:
             ctx = reply.context_id
-            if reply.guarded and not reply.heard:
-                # Every piece was dropped by the spoken-line check: a breath of silence closes the reply, so it ends
-                # like any other (no "completed with no audio" error, no reply still owed).
+            lost = 0
+            if not reply.heard:
+                # Nothing of it played (every piece dropped, marks alone, or the voice failed): a breath of silence
+                # closes the reply like any other, so there is no "completed with no audio" error (v3.16; before, a
+                # marks-only reply raised it, and the pill showed Pipecat's text in red). The conversation is told
+                # how many pieces had words that were lost (not dropped on purpose).
                 await self._emit(ctx, TTSAudioRawFrame(bytes(SAMPLE_RATE // 50 * 2), SAMPLE_RATE, 1, context_id=ctx))
+                lost = sum(1 for p in reply.pieces if speakable(p.text) and not p.dropped)
+                self.stats["silent_replies"] += 1
             for frame in reply.pending_pre:
                 await self._emit(ctx, frame)
             await self._emit(ctx, TTSStoppedFrame(context_id=ctx))
@@ -486,12 +577,16 @@ def service_class() -> type:
                       fallback_pieces=sum(1 for p in pieces if p.via not in ("gemini", "cache")),
                       cached_pieces=sum(1 for p in pieces if p.via == "cache"),
                       first_audio_ms=[p.first_audio_ms for p in pieces if p.first_audio_ms is not None],
-                      trimmed_lead_ms=round(reply.lead_ms), trimmed_tail_ms=round(reply.tail_ms))
+                      trimmed_lead_ms=round(reply.lead_ms), trimmed_tail_ms=round(reply.tail_ms),
+                      heard=reply.heard, **({"lost_pieces": lost} if not reply.heard else {}))
+            if not reply.heard and callable(self._yuki_on_silent):
+                try:
+                    self._yuki_on_silent(lost)
+                except Exception:  # noqa: BLE001 - bookkeeping never breaks the voice
+                    pass
 
         async def _fetch(self, reply: _Reply, piece: _Piece) -> None:
-            """One piece's audio into its queue: Gemini, else Aura. Always ends the queue with ``None``."""
-            trimmer = EdgeTrimmer(SAMPLE_RATE) if self._trim else None
-            got_audio = False
+            """One piece's audio into its queue: Gemini, Aura, or both raced (v3.16). Always ends with ``None``."""
             piece.sent_at = time.monotonic()
             self.stats["pieces"] += 1
             kept: list[bytes] | None = [] if piece.cache_key else None
@@ -506,61 +601,147 @@ def service_class() -> type:
                         piece.queue.put_nowait(cached[at:at + 4800])
                     piece.queue.put_nowait(None)
                     return
-
-            def put(data: bytes) -> None:
-                nonlocal got_audio
-                if trimmer is not None:
-                    data = trimmer.feed(data)
-                if data:
-                    if not got_audio:
-                        got_audio = True
-                        piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
-                    piece.queue.put_nowait(data)
-                    if kept is not None:
-                        kept.append(data)
-
-            complete = False
-            errors_before = self.stats["errors"]
             try:
                 async with self._limit:
-                    if not self._on_fallback and self._api_key:
-                        try:
-                            async for chunk in self._gemini(piece.text, reply.style):
-                                put(chunk)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:  # noqa: BLE001 - said by the fallback instead
-                            self.stats["errors"] += 1
-                            why = exc.reason if isinstance(exc, GeminiError) else type(exc).__name__
-                            status = exc.status if isinstance(exc, GeminiError) else 0
-                            self._log("tts_fallback", provider="gemini", status=status, reason=str(why)[:80],
-                                      had_audio=got_audio)
-                            if status in (401, 403) or status == 429 or "RESOURCE_EXHAUSTED" in str(why):
-                                mark_down(f"Gemini refused ({status} {why})")
-                            if self._fallback_key:
-                                self._on_fallback = True  # the rest of this conversation: no more waiting on it
-                            if got_audio:
-                                return  # part of it was said: never say it twice
-                        else:
-                            if not got_audio and self._fallback_key:
-                                # The stream ended without a sound in it (live 30 Sept 21:32:52: "completed with
-                                # no audio", the reply lost): this piece is said by Aura now, the next one tries
-                                # Gemini again (not a refusal).
-                                self._log("tts_fallback", provider="gemini", status=200, reason="silent",
-                                          had_audio=False)
-                    if not got_audio and self._fallback_key:
-                        piece.via = "aura"
-                        self.stats["fallback_pieces"] += 1
-                        plain = strip_tags(piece.text)
-                        if plain.strip():
-                            async for chunk in self._aura(plain):
-                                put(chunk)
-                complete = got_audio and piece.via == "gemini" and self.stats["errors"] == errors_before
+                    await self._race(reply, piece, kept)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - nothing more to try for this piece
                 self._log("tts_error", provider=piece.via, error=type(exc).__name__)
             finally:
+                piece.queue.put_nowait(None)
+            if piece.clean and piece.via == "gemini" and kept and piece.cache_key:
+                # Fetched whole, from the voice itself: kept for the next time these exact words are said.
+                await asyncio.to_thread(self._cache.put, piece.cache_key, b"".join(kept))
+
+        async def _race(self, reply: _Reply, piece: _Piece, kept: list[bytes] | None) -> None:
+            """Fetch one piece from Gemini (hedged with Aura after ``hedge_s``) or Aura alone; play the first to sound.
+
+            Each source has its own edge trimmer; the first whose audio is audible after trimming wins, the other
+            is cancelled, and only the winner's audio reaches the piece. A source that ends with no sound, or fails
+            before any, lets the other say it (Aura is started then if it was not yet). A winner that breaks after
+            its first audio ends the piece: part of it was said, so it is never said twice.
+            """
+            plain = strip_tags(piece.text)
+            use_gemini = self._gemini_usable()
+            can_aura = bool(self._fallback_key) and bool(plain.strip())
+            if not use_gemini and not can_aura:
+                return
+            queue: asyncio.Queue = asyncio.Queue()
+            tasks: dict[str, asyncio.Task] = {}
+            trimmers = {"gemini": EdgeTrimmer(SAMPLE_RATE) if self._trim else None,
+                        "aura": EdgeTrimmer(SAMPLE_RATE) if self._trim else None}
+            done: set[str] = set()
+            winner: str | None = None
+            errors = 0
+
+            async def pump(name: str) -> None:
+                try:
+                    source = self._gemini(piece.text, reply.style) if name == "gemini" else self._aura(plain)
+                    async for chunk in source:
+                        queue.put_nowait((name, chunk))
+                    queue.put_nowait((name, None))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - handed to the race
+                    queue.put_nowait((name, exc))
+
+            def start(name: str) -> None:
+                if name not in tasks:
+                    tasks[name] = asyncio.ensure_future(pump(name))
+
+            def emit(name: str, data: bytes) -> None:
+                trimmer = trimmers[name]
+                if trimmer is not None:
+                    data = trimmer.feed(data)
+                if data:
+                    if piece.first_audio_ms is None:
+                        piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
+                    piece.queue.put_nowait(data)
+                    if kept is not None:
+                        kept.append(data)
+
+            start("gemini" if use_gemini else "aura")
+            hedge_at = piece.sent_at + self._hedge_s if (use_gemini and can_aura and self._hedge_s > 0) else None
+            try:
+                while True:
+                    timeout = None
+                    if winner is None and hedge_at is not None and "aura" not in tasks:
+                        timeout = max(0.0, hedge_at - time.monotonic())
+                    try:
+                        name, item = await asyncio.wait_for(queue.get(), timeout=timeout)
+                    except TimeoutError:
+                        # No first byte from Gemini in time: Aura starts on the same piece; first to sound wins.
+                        self.stats["hedged"] += 1
+                        self._log("tts_hedge", op="started", after_ms=round((time.monotonic() - piece.sent_at) * 1000))
+                        start("aura")
+                        continue
+                    if winner is not None and name != winner:
+                        continue   # the loser's leftovers
+                    if isinstance(item, BaseException) or item is None:
+                        done.add(name)
+                        if isinstance(item, BaseException):
+                            errors += 1
+                        if name == "gemini" and winner != "gemini":
+                            if isinstance(item, BaseException):
+                                self.stats["errors"] += 1
+                                why = item.reason if isinstance(item, GeminiError) else type(item).__name__
+                                status = item.status if isinstance(item, GeminiError) else 0
+                                self._log("tts_fallback", provider="gemini", status=status, reason=str(why)[:80],
+                                          had_audio=False)
+                                hard = status in (401, 403, 429) or "RESOURCE_EXHAUSTED" in str(why)
+                                if hard:
+                                    mark_down(f"Gemini refused ({status} {why})")
+                                self._gemini_failed(str(why), hard=hard)
+                            else:
+                                # The stream ended without a sound in it (live 30 Sept 21:32:52: "completed with no
+                                # audio", the reply lost): Aura says this piece; the next one tries Gemini again.
+                                self._log("tts_fallback", provider="gemini", status=200, reason="silent",
+                                          had_audio=False)
+                                self._gemini_failed("silent")
+                        elif name == "aura" and isinstance(item, BaseException):
+                            self._log("tts_error", provider="aura", error=type(item).__name__)
+                        if winner == name:
+                            piece.clean = item is None and errors == 0
+                            return   # the winner ended (or broke after its first audio: never said twice)
+                        if winner is None and can_aura and "aura" not in tasks:
+                            start("aura")   # nothing from Gemini: Aura says it now
+                            continue
+                        if all(n in done for n in tasks):
+                            return
+                        continue
+                    if winner is None:
+                        trimmer = trimmers[name]
+                        audible = trimmer.feed(item) if trimmer is not None else item
+                        if not audible:
+                            continue   # silence so far (Gemini's lead padding, or a silent stream)
+                        winner = name
+                        piece.via = name
+                        raced = len(tasks) > 1 and not (set(tasks) - {name}) <= done   # the other was still running
+                        for other, task in tasks.items():
+                            if other != name and not task.done():
+                                task.cancel()
+                        if raced:
+                            self._log("tts_hedge", op="winner", winner=name)
+                            if name == "aura":
+                                self.stats["hedge_won_by_aura"] += 1
+                                self._gemini_failed("slow")   # a Gemini slower than the hedge counts against it
+                        if name == "aura":
+                            self.stats["fallback_pieces"] += 1
+                        else:
+                            self._failures.clear()   # it answered in time
+                        if piece.first_audio_ms is None:
+                            piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
+                        piece.queue.put_nowait(audible)
+                        if kept is not None:
+                            kept.append(audible)
+                        continue
+                    emit(name, item)
+            finally:
+                for task in tasks.values():
+                    if not task.done():
+                        task.cancel()
+                trimmer = trimmers.get(winner or "")
                 if trimmer is not None:
                     tail = trimmer.finish()
                     if tail:
@@ -569,10 +750,6 @@ def service_class() -> type:
                             kept.append(tail)
                     reply.lead_ms += trimmer.trimmed_lead / SAMPLE_RATE * 1000
                     reply.tail_ms += trimmer.trimmed_tail / SAMPLE_RATE * 1000
-                piece.queue.put_nowait(None)
-            if complete and kept and piece.cache_key:
-                # Fetched whole, from the voice itself: kept for the next time these exact words are said.
-                await asyncio.to_thread(self._cache.put, piece.cache_key, b"".join(kept))
 
         async def _gemini(self, text: str, style: str | None) -> AsyncIterator[bytes]:
             """Stream one piece from Gemini: its PCM chunks, as they come."""
@@ -607,17 +784,43 @@ def service_class() -> type:
                         raise GeminiError(200, "no audio")
 
         async def _aura(self, text: str) -> AsyncIterator[bytes]:
-            """Stream one piece from Deepgram Aura (REST, the same 24 kHz PCM)."""
+            """Stream one piece from Deepgram Aura (REST, the same 24 kHz PCM).
+
+            v3.16: a pooled connection the server had already closed fails before any byte; that one try is
+            repeated once on a fresh connection (closed after it), so the piece is still said.
+            """
             params = {"model": self._fallback_voice, "encoding": "linear16", "sample_rate": str(SAMPLE_RATE),
                       "container": "none"}
-            async with asyncio.timeout(10.0) as deadline:
-                async with self._session().post(self._fallback_url, params=params, json={"text": text},
+            for attempt in (1, 2):
+                fresh = None
+                if attempt == 2:
+                    fresh = aiohttp.ClientSession(connector=self._connector(keepalive_s=0, limit=1, fresh=True),
+                                                  timeout=aiohttp.ClientTimeout(total=None, sock_connect=5,
+                                                                                sock_read=10))
+                session = fresh or self._aura_session()
+                yielded = False
+                try:
+                    async with asyncio.timeout(10.0) as deadline:
+                        async with session.post(self._fallback_url, params=params, json={"text": text},
                                                 headers={"Authorization": f"Token {self._fallback_key}"}) as resp:
-                    if resp.status != 200:
-                        raise GeminiError(resp.status, "aura")
-                    deadline.reschedule(None)
-                    async for chunk in resp.content.iter_chunked(4800):
-                        yield chunk
+                            if resp.status != 200:
+                                raise GeminiError(resp.status, "aura")
+                            deadline.reschedule(None)
+                            async for chunk in resp.content.iter_chunked(4800):
+                                yielded = True
+                                yield chunk
+                    return
+                except retry_errors as exc:
+                    if yielded or attempt == 2:
+                        raise
+                    self.stats["aura_retries"] += 1
+                    self._log("tts_retry", provider="aura", error=type(exc).__name__)
+                finally:
+                    if fresh is not None:
+                        try:
+                            await fresh.close()
+                        except Exception:  # noqa: BLE001
+                            pass
 
         # -- interruptions ----------------------------------------------------------------------------
 
