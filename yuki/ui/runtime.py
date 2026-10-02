@@ -157,6 +157,10 @@ class Job:
     #: A window to read and attach to the request as it starts (``Agent.run(view_hwnd=)``): the caller
     #: said the request is about something inside it (voice: the talker's ``screen`` mark).
     view_hwnd: int | None = None
+    #: The user's own words, what memory is searched with (``Agent.run(memory_query=)``; voice: the request and
+    #: the words heard, without the hand-off's notes), and the previous request's; ``None``: the agent's own.
+    memory_query: str | None = None
+    previous_query: str | None = None
 
 
 class Lane(QThread):
@@ -382,6 +386,8 @@ class Lane(QThread):
             **({"view_hwnd": job.view_hwnd} if job.view_hwnd else {}),
             **({"escalate": escalate} if escalate and (escalate[0] or escalate[1] is not None) else {}),
             **({"voice": True} if voice else {}),
+            **({"memory_query": job.memory_query} if job.memory_query else {}),
+            **({"previous_query": job.previous_query} if job.previous_query else {}),
         )
         while True:
             try:
@@ -559,6 +565,8 @@ class AgentRuntime(QObject):
         self._worker_outstanding: list[int] = []
         #: Where each front-desk request came from, for a hand-off to the worker.
         self._sources: dict[int, str] = {}
+        #: The memory query each front-desk request came with, kept across a hand-off to the worker.
+        self._memory_queries: dict[int, str] = {}
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -665,7 +673,7 @@ class AgentRuntime(QObject):
 
     def submit(
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
-        view_hwnd: int | None = None,
+        view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -683,6 +691,9 @@ class AgentRuntime(QObject):
                 look, then queue it anyway, a whole model call later). The caller's decision, never read
                 from the words.
             view_hwnd: A window to read and attach as the request starts (see :class:`Job`).
+            memory_query: The user's own words for the memory lookup (see :class:`Job`); ``None``: the agent
+                takes them from the request itself.
+            previous_query: The previous request's words, for a follow-up.
 
         Returns:
             ``(lane name, request id)``.
@@ -693,27 +704,32 @@ class AgentRuntime(QObject):
             self._worker_outstanding.append(request_id)
         else:
             self._sources[request_id] = source  # kept if the front desk hands it to the worker
-        waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd))
+            if memory_query:
+                self._memory_queries[request_id] = memory_query
+        waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
+                                   previous_query))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
         )
         return lane.name, request_id
 
-    def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text") -> int:
+    def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
+                         memory_query: str | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
             request: What the user asked for.
             origin_id: The front-desk request it came from, for the log.
             source: Where the request came from (``text`` or ``voice``), kept across the hand-off.
+            memory_query: The user's own words for the memory lookup, kept across the hand-off.
 
         Returns:
             The new request id.
         """
         request_id = next(self._ids)
         self._worker_outstanding.append(request_id)
-        waiting = self.worker.enqueue(Job(request_id, request, None, source))
+        waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
         )
@@ -844,7 +860,9 @@ class AgentRuntime(QObject):
         if needed_hands:
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
             new_id = self.queue_for_worker(request, origin_id=request_id,
-                                           source=self._sources.pop(request_id, "text"))
+                                           source=self._sources.pop(request_id, "text"),
+                                           memory_query=self._memory_queries.pop(request_id, None))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
         else:
             self._sources.pop(request_id, None)
+            self._memory_queries.pop(request_id, None)

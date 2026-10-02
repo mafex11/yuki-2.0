@@ -148,9 +148,9 @@ def _process_profile(profiles: ProfileSet, hwnd: int, tree: object | None) -> Pr
 
 
 #: A window whose content leaves (its own root and window-sized containers left
-#: out) cover less than this share of it is opaque: the same measure and number
-#: as :data:`yuki.perception.tree.OPAQUE_COVERAGE`.
-OPAQUE_COVERAGE = 0.05
+#: out) cover less than this share of it is opaque: the one threshold of
+#: :mod:`yuki.core.opacity` (re-exported here for the watcher).
+from yuki.core.opacity import OPAQUE_COVERAGE  # noqa: E402
 _COVERAGE_CELL = 32
 _WINDOW_SIZED = 0.9
 

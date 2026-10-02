@@ -956,8 +956,9 @@ class Watcher:
         self._appeared: dict[int, float] = {}
         #: Popups already read (hwnd -> title at the time), so one is read once while it stays up.
         self._popups_read: dict[int, str] = {}
-        #: Windows measured opaque (hwnd -> monotonic time), written by both workers.
+        #: Windows measured opaque (hwnd -> monotonic time), written by both workers, and the coverage measured.
         self._opaque: dict[int, float] = {}
+        self._opaque_coverage: dict[int, float] = {}
         self._app_data_at: dict[int, float] = {}
         self._titles_cache: dict[str, tuple[float, list[str]]] = {}
         self._store_ref: Any = None
@@ -2293,19 +2294,22 @@ class Watcher:
 
         Only a read that answered in time counts (a window that did not answer is busy, not opaque).
         """
-        from yuki.memory.extract import OPAQUE_COVERAGE
+        from yuki.core.opacity import is_opaque   # the one threshold (revamp A8)
 
         coverage = extraction.stats.get("coverage")
         result.coverage = coverage
         truncated = bool(extraction.stats.get("truncated"))
-        opaque = extraction.profile != "error" and not truncated and coverage is not None and coverage < OPAQUE_COVERAGE
+        opaque = extraction.profile != "error" and not truncated and is_opaque(coverage)
         result.opaque = opaque
         if opaque:
             if len(self._opaque) > 256:
                 self._opaque.clear()
+                self._opaque_coverage.clear()
             self._opaque[hwnd] = time.monotonic()
+            self._opaque_coverage[hwnd] = float(coverage)
         else:
             self._opaque.pop(hwnd, None)
+            self._opaque_coverage.pop(hwnd, None)
         return opaque
 
     def _follow_opaque(self, hwnd: int, facts: ProcessFacts, title: str, *, foreground: bool) -> None:
@@ -2317,7 +2321,8 @@ class Watcher:
         if self.now.entry(hwnd) is None:
             self.now.put(hwnd, {"app": facts.app_name, "process": facts.process_name, "title": title, "kind": "",
                                 "text": "", "messages": [], "controls": [], "read_at": time.time(),
-                                "trigger": "opaque", "foreground": foreground, "opaque": True, "coverage": 0.0})
+                                "trigger": "opaque", "foreground": foreground, "opaque": True,
+                                "coverage": self._opaque_coverage.get(hwnd)})
         now = time.monotonic()
         if now - self._app_data_at.get(hwnd, 0.0) < self.settings.app_data_every_s:
             return

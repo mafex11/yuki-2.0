@@ -139,6 +139,41 @@ COACH_QUIET_S = 3 * 3600.0
 COACH_QUIET_LOOKS = 4
 RESUME_CONTEXT_CHARS = 4_000
 RESUME_EXCHANGES = 6
+#: The parts of the standing context, in the order they are shown (:meth:`MemoryClient.standing_parts`).
+STANDING_GROUPS: tuple[str, ...] = ("rule", "preference", "coach", "resource", "commitment", "todo")
+#: Which of them are the user's own instructions for how Yuki talks or behaves: the agent's cached rules layer.
+STANDING_RULE_GROUPS: tuple[str, ...] = ("rule", "preference")
+#: The heading above each part (a fixed format of memory's own; ``yuki.agent.memory.split_standing`` reads it).
+STANDING_HEADINGS: dict[str, str] = {
+    "rule": "Rules the user set for Yuki:",
+    "preference": "The user's preferences about how Yuki talks or works:",
+    "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
+              "everything; forget_rule takes these ids too):"),
+    "resource": ("The user's own sites, accounts and links (use them directly when the "
+                 "user names one, e.g. \"open my portfolio\"):"),
+    "commitment": "Yuki's own commitments (what Yuki promised or was asked to do later):",
+    "todo": ("The user's own to-dos (their plans and work, not Yuki's: bring one up only when they ask about "
+             "their plans, never offer to do one):"),
+}
+#: Short texts whose vectors :meth:`MemoryClient.similarity` keeps (a to-do list is a few dozen lines).
+TEXT_VEC_CACHE = 256
+
+
+def render_standing(parts: dict[str, Any], groups: tuple[str, ...] = STANDING_GROUPS) -> str:
+    """The standing context text from :meth:`MemoryClient.standing_parts` (only ``groups``), with the coach's
+    state last; ``""`` when there is nothing."""
+    header = parts.get("header") or "[Standing rules and open commitments, from Yuki's conversations with the user]"
+    headings = parts.get("headings") or STANDING_HEADINGS
+    lines: list[str] = []
+    for g in groups:
+        rows = [str(item.get("line") or "") for item in (parts.get("groups") or {}).get(g) or [] if item.get("line")]
+        if rows:
+            lines += [headings.get(g, g), *rows]
+    text = "\n".join([header, *lines]) if lines else ""
+    coach = parts.get("coach_state")
+    if coach:   # its own budget: why the coach is quiet is not a rule and never pushes one out
+        text = (text or header) + "\n" + coach
+    return text
 #: Reciprocal-rank-fusion constant for merging vector and keyword hits.
 _RRF_K = 60.0
 _SYNCHRONIZE = 0x00100000
@@ -231,6 +266,8 @@ class MemoryClient:
         self._nudge_section: Any = None
         #: ``(query, vector)`` of the last message embedded: :meth:`knowhow` and :meth:`relevant` share it.
         self._query_vecs: dict[str, np.ndarray] = {}
+        #: Vectors of short texts measured against a request's words (:meth:`similarity`: the to-dos).
+        self._text_vecs: dict[str, np.ndarray] = {}
         self._relevant_index: Any = None
         self._relevant_lock = threading.Lock()
 
@@ -354,6 +391,14 @@ class MemoryClient:
         portrait = self.store.latest_portrait()
         return portrait.text if portrait else None
 
+    def portrait_sections(self) -> dict[str, str] | None:
+        """The latest portrait's sections as fields (``work``, ``interests``, ``routines``, ``behaviour``, ``people``,
+        ``preferences``, ``relationship``, ``personality``, ``open_loops``; migration 27), each written within its own
+        budget (``yuki.memory.portrait.PORTRAIT_FIELDS``), or ``None`` (no portrait, or one rendered before the fields).
+        For consumers that need one part, not the page."""
+        portrait = self.store.latest_portrait()
+        return dict(portrait.sections) if portrait and portrait.sections else None
+
     def correct_portrait(self, text: str) -> int:
         """Record a user-confirmed correction to the portrait; returns its fact id.
 
@@ -403,7 +448,8 @@ class MemoryClient:
         return f"[{app}] {text}" if app else text
 
     def knowhow(self, app: str | None = None, query: str | None = None, limit: int = 8,
-                embed_wait_s: float | None = None) -> list[str]:
+                embed_wait_s: float | None = None, *, min_cosine: float | None = None,
+                apps: Any = (), app_min_cosine: float | None = None) -> list[str]:
         """Current (valid) procedures that worked on this PC, as short strings.
 
         ``app`` is the foreground window's process name ("arc.exe",
@@ -416,10 +462,19 @@ class MemoryClient:
         ``[app]`` when it belongs to one: "[arc] pass the URL as a launch
         argument". At most ``limit`` entries. ``embed_wait_s`` bounds the wait for the query's
         embedding; past it the similar entries are left out (the app's own still come back).
+
+        ``min_cosine`` (2026-10-03, revamp 02 D3): a request's know-how by measured relevance, not by the window in
+        front: every entry must be at least this similar to ``query``; an entry of one of the apps in play
+        (``app`` and ``apps``: the apps a request names, from its caller) needs only ``app_min_cosine``. Without
+        the query's vector nothing comes back (no unranked filler). ``None``: the old order above.
         """
         limit = max(0, int(limit))
         if limit == 0:
             return []
+        if min_cosine is not None:
+            return self._knowhow_near(query, limit, embed_wait_s, min_cosine=float(min_cosine),
+                                      apps=[a for a in (app, *(apps or ())) if a],
+                                      app_min_cosine=float(min_cosine if app_min_cosine is None else app_min_cosine))
         picked: list[tuple[str | None, str]] = []
         seen: set[int] = set()
         if app:
@@ -443,6 +498,30 @@ class MemoryClient:
                     picked.append((k.app, k.text))
                     seen.add(k.id)
         return [self._format_knowhow(a, t) for a, t in picked[:limit]]
+
+    def _knowhow_near(self, query: str | None, limit: int, embed_wait_s: float | None, *, min_cosine: float,
+                      apps: list[str], app_min_cosine: float) -> list[str]:
+        """:meth:`knowhow` by measured relevance: entries whose cosine to ``query`` clears ``min_cosine`` (an entry
+        of an app in ``apps``: ``app_min_cosine``), best first."""
+        query = (query or "").strip()
+        keys = {k for k in (app_key(a) for a in apps) if k}
+        vec = self._embed(query, embed_wait_s) if query else None
+        if vec is None:
+            # relevance cannot be measured now (no words, or the embedder is not up): the apps in play are the only
+            # measured signal left - their own entries, newest first (a lesson just learned in the app in front
+            # still reaches the next request in it)
+            picked = [k for key in sorted(keys) for k in self.store.knowhow_current(key)]
+            picked.sort(key=lambda k: -float(k.valid_from or 0.0))
+            return [self._format_knowhow(k.app, k.text) for k in picked[:limit]]
+        hits = self.store.search_knowhow(vec, 64)
+        scored = []
+        for k in hits:
+            score = float(getattr(k, "score", 0.0) or 0.0)
+            floor = app_min_cosine if (k.app and k.app in keys) else min_cosine
+            if score >= floor:
+                scored.append((score, k))
+        scored.sort(key=lambda s: -s[0])
+        return [self._format_knowhow(k.app, k.text) for _s, k in scored[:limit]]
 
     def remember_how(self, app: str | None, text: str, source_request: str | None = None) -> int:
         """Store a procedure that worked (after a successful task); returns its id.
@@ -802,13 +881,23 @@ class MemoryClient:
 
     @classmethod
     def _chat_text(cls, t: ConversationTurn) -> str:
-        """One exchange as a recall line."""
-        out = f'The user said: "{cls._message(t.user_text, 600)}"'
+        """One exchange as a recall line: the user's own words (never Yuki's notes around them, migration 27), what
+        Yuki replied and what it did."""
+        from yuki.memory.conversations import has_card_context, own_words, yuki_words_request
+
+        parts: list[str] = []
+        if yuki_words_request(t.user_text):
+            parts.append(f'The user sent Yuki\'s own suggestion: "{cls._message(t.user_text, 400)}"')
+        else:
+            words = own_words(t.user_text) or (t.user_text or "").strip()
+            if words:
+                parts.append(f'The user said: "{cls._message(words, 600)}"'
+                             + (" (replying to Yuki's card)" if has_card_context(t.user_text) else ""))
         if t.reply_text:
-            out += f' Yuki replied: "{cls._message(t.reply_text, 600)}"'
+            parts.append(f'Yuki replied: "{cls._message(t.reply_text, 600)}"')
         if t.actions:
-            out += f" Yuki did: {cls._actions_line(t.actions, 300)}."
-        return out
+            parts.append(f"Yuki did: {cls._actions_line(t.actions, 300)}.")
+        return " ".join(parts) or "(an exchange with nothing said)"
 
     @staticmethod
     def _actions_line(actions: list[str], limit: int) -> str:
@@ -825,7 +914,7 @@ class MemoryClient:
 
     def log_turn(
         self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None,
-        actions: list[str], outcome: str, addressed: str | None = None,
+        actions: list[str], outcome: str, addressed: str | None = None, envelope: str | None = None,
     ) -> int:
         """Store one exchange between the user and Yuki; returns its turn id (0 if it could not be stored).
 
@@ -844,6 +933,8 @@ class MemoryClient:
         the database, else a background writer finishes it) and never raises.
         ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others");
         a turn said to others is kept for the record and never extracted (no rule, to-do or fact).
+        ``envelope``: the notes Yuki put after the user's words, when the caller has them apart; ``None``: read
+        off ``user_text`` (:func:`yuki.memory.store.split_envelope`). Stored apart from the words (migration 27).
         """
         try:
             # A key or password the user pastes is used by the agent in the moment (it has the words in its
@@ -851,8 +942,9 @@ class MemoryClient:
             user_text = secret_filter.redact_text(user_text or "")
             reply_text = secret_filter.redact_text(reply_text) if reply_text else reply_text
             actions = [secret_filter.redact_text(str(a)) for a in (actions or ())]
+            envelope = secret_filter.redact_text(envelope) if envelope else None
             turn_id = self.store.add_turn(session_id, request_id, at, user_text, reply_text, actions, outcome,
-                                          addressed=addressed)
+                                          addressed=addressed, envelope=envelope)
         except Exception as exc:
             self.last_turn_error = f"{type(exc).__name__}: {exc}"
             return 0
@@ -888,6 +980,74 @@ class MemoryClient:
         words = f' Their words: "{quote}"' if quote else ""
         return f"- [{ident}] {text}{words} ({_day(f.valid_from)})"
 
+    def standing_parts(self) -> dict[str, Any]:
+        """The standing context as its parts (2026-10-03, revamp 09 P0.1), each item whole, budgets applied.
+
+        Returns ``{"header": str, "headings": {group: heading}, "groups": {group: [{"ref", "line", "text"}]},
+        "coach_state": str | None}`` with the groups of :data:`STANDING_GROUPS`:
+
+        * ``rule`` / ``preference``: the user's own instructions for how Yuki talks or behaves (the agent's
+          cached rules layer holds these and nothing else);
+        * ``coach``: what the user said back to coach cards (feedback on that kind of card, not a rule);
+        * ``resource``: the user's own sites, accounts and links;
+        * ``commitment``: Yuki's own commitments (what Yuki promised or was asked to do later);
+        * ``todo``: the user's own to-dos (their plans and work, from a chat or a call: never Yuki's promise).
+
+        The parts used to reach the agent as one string parsed by its headings, and with no active rule the whole
+        string (to-dos included) became the cached rules layer: six stale to-dos sat in the block headed "every one
+        applies to every reply" (09 §3.4). Never raises (empty groups when memory cannot be read).
+        """
+        header = "[Standing rules and open commitments, from Yuki's conversations with the user]"
+        out: dict[str, Any] = {"header": header, "headings": dict(STANDING_HEADINGS),
+                               "groups": {g: [] for g in STANDING_GROUPS}, "coach_state": None}
+        try:
+            facts = self.store.conversation_facts(STANDING_KINDS)
+            cards = {f.id: self.store.fact_card(f) for f in facts if f.kind in ("preference", "feedback")}
+            items = [(f, line) for f in facts if (line := self._standing_line(f))]
+        except Exception:
+            return out
+
+        def group(f: ConversationFact) -> str:
+            if f.kind == "feedback" or (f.kind == "preference" and cards.get(f.id) is not None):
+                return "coach"
+            if f.kind == "commitment" and (f.origin == "call" or f.owner == "user"):
+                return "todo"   # the user's own to-do, from a call or a chat: never Yuki's promise
+            return f.kind
+
+        def size(chosen: list[tuple[ConversationFact, str]], part: tuple[str, ...]) -> int:
+            lines = [header]
+            for g in STANDING_GROUPS:
+                rows = [line for f, line in chosen if group(f) == g and g in part]
+                if rows:
+                    lines += [STANDING_HEADINGS[g], *rows]
+            return len("\n".join(lines))
+
+        # Two budgets: the user's standing instructions (rules, preferences, coach feedback) and the
+        # commitments, so neither can push the other out. Over a budget, what goes first is what
+        # matters least on every request: the user's own to-dos, then Yuki's commitments; within the
+        # instructions, coach feedback, then preferences, rules last. Oldest first within each. (Call
+        # commitments once pushed "call me captain" out of every request; rules once pushed out the
+        # preference the user then withdrew.)
+        drop_order = {"todo": 0, "commitment": 1, "coach": 2, "preference": 3, "rule": 4, "resource": 5}
+        instructions = ("rule", "preference", "coach")
+        kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
+        for part, cap in ((instructions, STANDING_RULES_CHARS), (("commitment", "todo"), STANDING_CONTEXT_CHARS),
+                          (("resource",), STANDING_RESOURCES_CHARS)):
+            while any(group(c[0]) in part for c in kept) and size(kept, part) > cap:
+                victim = min((c for c in kept if group(c[0]) in part),
+                             key=lambda item: (drop_order.get(group(item[0]), 0), item[0].valid_from, item[0].id))
+                kept.remove(victim)
+        for f, line in kept:
+            ref = (f"resource:{f.id}" if f.kind == "resource" else f"commit:{f.id}" if f.kind == "commitment"
+                   else f"feedback:{f.id}" if f.kind == "feedback" else f"rule:{f.id}")
+            out["groups"][group(f)].append({"ref": ref, "line": line, "text": " ".join((f.text or "").split()),
+                                            "due_at": f.due_at})
+        try:
+            out["coach_state"] = self.coach_context() or None
+        except Exception:
+            out["coach_state"] = None
+        return out
+
     def standing_context(self) -> str:
         """The user's active rules and preferences for Yuki, and Yuki's open commitments, as one block.
 
@@ -896,68 +1056,48 @@ class MemoryClient:
         what the user asked Yuki to do later or Yuki promised, with the due date
         when one was given and the date asked. Hard cap 1,200 characters (~300
         tokens): when it is over, items are dropped whole (never cut
-        mid-sentence), call commitments first, then commitments, then preferences, rules
+        mid-sentence), the user's own to-dos first, then commitments, then preferences, rules
         last, oldest first within each. ``""`` when there is nothing (or memory cannot be read).
         Meant to be attached to every request after the cached portrait.
+
+        The same text as ever, built from :meth:`standing_parts` (the voice talker reads it through
+        ``yuki.agent.memory.split_standing``, which keeps only the rule and preference sections as rules).
         """
-        try:
-            facts = self.store.conversation_facts(STANDING_KINDS)
-            cards = {f.id: self.store.fact_card(f) for f in facts if f.kind in ("preference", "feedback")}
-            items = [(f, line) for f in facts if (line := self._standing_line(f))]
-        except Exception:
-            return ""
-        headings = {
-            "rule": "Rules the user set for Yuki:",
-            "preference": "The user's preferences about how Yuki talks or works:",
-            "commitment": "Yuki's own commitments (what Yuki promised or was asked to do later):",
-            "call": ("The user's own to-dos (their plans and work, not Yuki's: bring one up only when they ask about "
-                     "their plans, never offer to do one):"),
-            "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
-                      "everything; forget_rule takes these ids too):"),
-            "resource": ("The user's own sites, accounts and links (use them directly when the "
-                         "user names one, e.g. \"open my portfolio\"):"),
-        }
+        return render_standing(self.standing_parts())
 
-        def group(f: ConversationFact) -> str:
-            if f.kind == "feedback" or (f.kind == "preference" and cards.get(f.id) is not None):
-                return "coach"
-            if f.kind == "commitment" and (f.origin == "call" or f.owner == "user"):
-                return "call"   # the user's own to-do, from a call or a chat: never Yuki's promise
-            return f.kind
-
-        def render(chosen: list[tuple[ConversationFact, str]]) -> str:
-            lines = ["[Standing rules and open commitments, from Yuki's conversations with the user]"]
-            for kind in ("rule", "preference", "coach", "resource", "commitment", "call"):
-                rows = [line for f, line in chosen if group(f) == kind]
-                if rows:
-                    lines += [headings[kind], *rows]
-            return "\n".join(lines)
-
-        # Two budgets: the user's standing instructions (rules, preferences, coach feedback) and the
-        # commitments, so neither can push the other out. Over a budget, what goes first is what
-        # matters least on every request: the user's own call commitments, then Yuki's; within the
-        # instructions, coach feedback, then preferences, rules last. Oldest first within each. (Call
-        # commitments once pushed "call me captain" out of every request; rules once pushed out the
-        # preference the user then withdrew.)
-        drop_order = {"call": 0, "commitment": 1, "coach": 2, "preference": 3, "rule": 4, "resource": 5}
-        instructions = ("rule", "preference", "coach")
-
-        def size(chosen: list[tuple[ConversationFact, str]], part: tuple[str, ...]) -> int:
-            return len(render([c for c in chosen if group(c[0]) in part]))
-
-        kept = sorted(items, key=lambda item: (item[0].valid_from, item[0].id))
-        for part, cap in ((instructions, STANDING_RULES_CHARS), (("commitment", "call"), STANDING_CONTEXT_CHARS),
-                          (("resource",), STANDING_RESOURCES_CHARS)):
-            while any(group(c[0]) in part for c in kept) and size(kept, part) > cap:
-                victim = min((c for c in kept if group(c[0]) in part),
-                             key=lambda item: (drop_order.get(group(item[0]), 0), item[0].valid_from, item[0].id))
-                kept.remove(victim)
-        text = render(kept) if kept else ""
-        coach = self.coach_context()
-        if coach:   # its own budget: why the coach is quiet is not a rule and never pushes one out
-            text = (text + "\n" if text else "[Standing rules and open commitments, from Yuki's conversations "
-                    "with the user]\n") + coach
-        return text
+    def similarity(self, query: str, texts: Any, embed_wait_s: float | None = None) -> list[float] | None:
+        """Cosine of each text to ``query`` on the shared embedder (measured relevance, no words matched), or
+        ``None`` when the query's vector cannot be had within ``embed_wait_s``. The texts' vectors are kept
+        (:data:`TEXT_VEC_CACHE` of them), so a to-do list attached to every request is embedded once."""
+        query = (query or "").strip()
+        texts = [" ".join(str(t or "").split()) for t in (texts or [])]
+        if not query:
+            return None
+        if not texts:
+            return []
+        q = self._embed(query, embed_wait_s)
+        if q is None:
+            return None
+        missing = [t for t in dict.fromkeys(texts) if t and t not in self._text_vecs]
+        if missing:
+            try:
+                vecs = self.embedder.embed(missing, embed_wait_s)
+            except Exception:
+                vecs = None
+            if vecs is not None and len(vecs) == len(missing):
+                for t, v in zip(missing, vecs):
+                    if len(self._text_vecs) >= TEXT_VEC_CACHE:
+                        self._text_vecs.pop(next(iter(self._text_vecs)))
+                    self._text_vecs[t] = np.asarray(v, dtype=np.float32)
+        qv = np.asarray(q, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(qv)) or 1.0
+        out: list[float] = []
+        for t in texts:
+            v = self._text_vecs.get(t)
+            if v is None or v.shape != qv.shape:
+                return None   # a text not embedded in time: relevance is unmeasured, the caller decides
+            out.append(round(float(v @ qv) / ((float(np.linalg.norm(v)) or 1.0) * qn), 4))
+        return out
 
     def resume_context(self, within_hours: float = 6.0) -> str | None:
         """Where the latest conversation left off, when it ended within ``within_hours``; else ``None``.
@@ -1073,7 +1213,7 @@ class MemoryClient:
         self.rerender_portrait()
         return fact_id
 
-    def revoke_rule(self, ref: str) -> int:
+    def revoke_rule(self, ref: str, *, note: str | None = None) -> int:
         """Mark one active rule (or preference) revoked by its id; returns the id, or 0.
 
         ``ref`` is the id :meth:`standing_context` shows (``"rule:12"``, also
@@ -1083,6 +1223,11 @@ class MemoryClient:
         when ``ref`` is not the id of an active rule or preference. A
         revocation asks the service for a portrait re-render
         (:meth:`rerender_portrait`).
+
+        ``note``: why it ended, stored as its end note. The default says the user withdrew it, which is true for
+        the callers that exist (the agent's forget_rule on the user's words, the Yuki window's forget button); code
+        that ends a rule for another reason (a rule moved into Yuki's defaults) must say so here - on 27 Sept five
+        rules revoked by a script read "the user withdrew it" (revamp 09 §3.1).
         """
         prefix, sep, number = str(ref or "").strip().strip("[]").strip().rpartition(":")
         if (sep and prefix.strip() not in ("rule", "preference", "feedback")) or not number.strip().isdigit():
@@ -1095,7 +1240,7 @@ class MemoryClient:
         target: ConversationFact | None = next((f for f in candidates if f.id == wanted), None)
         if target is None:
             return 0
-        ok = self.store.end_conversation_fact(target.id, "revoked", note="the user withdrew it")
+        ok = self.store.end_conversation_fact(target.id, "revoked", note=(note or "").strip() or "the user withdrew it")
         if ok:
             self.rerender_portrait()
         return target.id if ok else 0
@@ -2338,18 +2483,28 @@ class MemoryClient:
 
     def related(self, query: str = "", *, previous: str | None = None, screen: Any = None, limit: int | None = None,
                 voice: bool = False, embed_wait_s: float | None = None, now: float | None = None,
-                with_recent: bool = True) -> dict:
+                with_recent: bool = True, session_id: str | None = None, exclude_recent_s: float | None = None,
+                diet: bool = False) -> dict:
         """What the whole memory holds that bears on this moment: ranked from the user's words (and the previous
         message), what is on their screen now and their current thread of work, across every kind of memory
         (:func:`yuki.memory.related.related`). ``screen``: a live picture from the caller (a dict with ``app``,
         ``title``, ``host``, ``url``, ``text``; or text), else the service's screen recall, else the newest
-        capture. Returns ``{"items", "screen", "threads", "recent", "timing"}``. Never raises."""
+        capture. Returns ``{"items", "screen", "threads", "recent", "timing", "self_echo"}``. Never raises.
+
+        ``session_id``: the caller's conversation session; its own exchanges of the conversation going on, and
+        any exchange of the last ``exclude_recent_s`` seconds (default :data:`yuki.memory.related.SELF_ECHO_S`),
+        are the conversation itself, never memory (revamp 02 D2). ``diet``: the brain's relevance-gated block
+        (threads on screen or near the words, recent screens of the last minutes or near the words; the agent asks
+        for it, the voice talker and the MCP tools get the whole picture)."""
         from yuki.memory import related as rel
 
         try:
             service = None if screen is not None else self.screen_related()
             return rel.related(self, query, previous=previous, screen=screen, limit=limit, voice=voice,
-                               embed_wait_s=embed_wait_s, now=now, service=service, with_recent=with_recent)
+                               embed_wait_s=embed_wait_s, now=now, service=service, with_recent=with_recent,
+                               session_id=session_id,
+                               exclude_recent_s=rel.SELF_ECHO_S if exclude_recent_s is None else exclude_recent_s,
+                               diet=bool(diet) and bool((query or "").strip()) and not voice)
         except Exception as exc:
             return {"items": [], "screen": None, "threads": [], "recent": [], "timing": {"error": type(exc).__name__}}
 

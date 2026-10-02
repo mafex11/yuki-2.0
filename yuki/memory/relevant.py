@@ -226,12 +226,16 @@ class RelevantIndex:
                recency_weight: float = RECENCY_WEIGHT, half_life_days: float = HALF_LIFE_DAYS,
                same_as: float = SAME_AS, kinds: tuple[str, ...] = BASE_KINDS,
                boost: dict[str, set[int]] | None = None, boost_weight: float = 0.0,
-               per_kind: int | None = None) -> list[dict[str, Any]]:
+               per_kind: int | None = None, exclude: dict[str, set[int]] | None = None,
+               excluded: set[tuple[str, int]] | None = None) -> list[dict[str, Any]]:
         """The best items for ``query_vec``: ``[{kind, id, score, cosine, importance, at}]``, best first.
 
         ``boost``: per kind, ids that get ``boost_weight`` added to their score once they clear
         ``min_cosine`` (the whole-memory ranking's thread affinity; it never lets an item in by itself).
         ``per_kind``: at most this many of one kind (a diverse block over many kinds).
+        ``exclude``: per kind, ids that are never candidates (Yuki's own conversation going on: left out before the
+        near-duplicate check, so an older exchange like it still comes); those that cleared ``min_cosine`` are
+        added to ``excluded``.
         """
         now = time.time() if now is None else float(now)
         q = np.asarray(query_vec, dtype=np.float32).ravel()
@@ -248,6 +252,13 @@ class RelevantIndex:
                     continue
                 cos = k.matrix @ q
                 ok = (cos >= min_cosine) & k.arr["usable"]
+                drop = (exclude or {}).get(kind)
+                if drop and ok.any():
+                    gone = np.isin(k.arr["ids"], np.fromiter(drop, dtype=np.int64)) & ok
+                    if gone.any():
+                        if excluded is not None:
+                            excluded.update((kind, int(i)) for i in k.arr["ids"][gone])
+                        ok = ok & ~gone
                 if not ok.any():
                     continue
                 imp = (k.arr["importance"] - 5.0) / 5.0
@@ -281,6 +292,8 @@ class RelevantIndex:
         """The loaded (unit) vectors of these ids of one kind (the ranking's dedupe across queries)."""
         with self._lock:
             k = self._kinds.get(kind)
+            if k is not None and k.matrix is None and k.vecs:
+                k.build(k.vecs[0].shape[0])   # not searched yet this refresh: build it now
             if k is None or k.matrix is None:
                 return {}
             pos = {int(x): i for i, x in enumerate(k.arr.get("ids", []))}

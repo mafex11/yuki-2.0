@@ -231,7 +231,10 @@ def test_format_now_is_capped_and_says_opaque_blocked_and_age() -> None:
     }
     text = format_now(board, foreground=1, front_chars=1500)
     assert len(text) < 2600
-    assert "OPAQUE" in text and 'tab 1 "LLM OS agent harness revamp"' in text and "tab 2 (showing)" in text
+    # revamp A8: opaque is a measured fact (coverage, characters read), never "nothing can be read"
+    assert "opaque: its UI Automation elements cover" in text and "no text of it was read" in text
+    assert "nothing inside it can be read" not in text
+    assert 'tab 1 "LLM OS agent harness revamp"' in text and "tab 2 (showing)" in text
     assert "not read (the user's privacy rules)" in text
     assert "read 3 s ago" in text
 

@@ -1389,7 +1389,7 @@ def build_coach_message(
     parts.append("TO-DOS (open):")
     parts += _todo_lines(items, now, safe)
     parts.append("ABOUT THE USER (portrait facts):")
-    parts += _about_lines(store, ("work", "routine", "interest", "behaviour", "personality"), safe)
+    parts += _about_lines(store, COACH_ABOUT_KINDS, safe)
     parts.append("RECENT CARDS (last 24 h, oldest first, with what the user did):")
     recent = store.nudges(now - 86400.0, now + 1.0, limit=RECENT_NUDGES)
     for n in recent:
@@ -1430,27 +1430,51 @@ def build_coach_message(
     )
 
 
+#: ABOUT THE USER's budget per kind of portrait fact (characters), newest facts first within each (revamp 09 P0.3).
+#: One budget was shared by every kind, oldest first: 8 work facts of 24-25 Sept filled it and no routine, interest,
+#: behaviour, person or preference ever reached a card writer (run on the real memory, 2 Oct).
+ABOUT_KIND_CHARS: dict[str, int] = {"person": 700, "preference": 450, "routine": 400, "behaviour": 450,
+                                    "interest": 450, "work": 550, "personality": 1_000}
+#: The kinds each card writer reads: the coach (break nudges) and presence (observation cards).
+COACH_ABOUT_KINDS = ("person", "preference", "routine", "behaviour", "interest", "work", "personality")
+PRESENCE_ABOUT_KINDS = ("person", "preference", "routine", "interest", "work", "personality")
+
+
 def _about_lines(store: Store, kinds: Sequence[str], safe: Callable[[Any, int], str]) -> list[str]:
-    """ABOUT THE USER: the portrait's facts of these kinds, within :data:`PORTRAIT_CHARS`.
+    """ABOUT THE USER: the portrait's current facts of these kinds, each kind within its own budget
+    (:data:`ABOUT_KIND_CHARS`), newest first; a fact that was superseded or retired, or that rests only on journal
+    entries since withdrawn (re-journaled, or text for or from another AI tool or a sample page), is left out.
 
     Personality facts say which part they are, and a running joke says it is one,
     so a joke of theirs is never read as a fact about them.
     """
-    facts = store.portrait_facts(kinds)
+    from yuki.memory.portrait import withdrawn_facts
+
+    facts = store.portrait_facts(kinds, include_corrections=False)
+    try:
+        gone = withdrawn_facts(store, facts)
+    except Exception:
+        gone = set()
     lines: list[str] = []
-    used = 0
     for kind in kinds:
-        cap = PORTRAIT_CHARS + (PERSONALITY_CHARS if kind == "personality" else 0)
-        for f in [x for x in facts if x.kind == kind]:
+        cap = ABOUT_KIND_CHARS.get(kind, PORTRAIT_CHARS // max(1, len(kinds)))
+        used = 0
+        mine = [x for x in facts if x.kind == kind and x.superseded_by is None and x.expired_at is None]
+        mine.sort(key=lambda x: (-(x.valid_from or 0.0), -x.id))
+        for f in mine:
+            if f.id in gone:
+                continue
             label = kind
             if kind == "personality":
                 label = {"joke": "personality - a running joke of theirs (humour, not a fact)",
                          "talk": "personality - how they talk", "cares": "personality - what they care about",
                          "story": "personality - a story they tell", "people": "personality - with people",
                          }.get(f.aspect or "", "personality")
+            elif kind == "person" and f.subject:
+                label = f"person - {safe(f.subject, 60)}"
             line = f"- {label}: {safe(f.text, 300)}"
             if used + len(line) > cap:
-                break
+                continue   # a shorter, older one of the same kind may still fit
             lines.append(line)
             used += len(line)
     return lines or ["(none yet)"]

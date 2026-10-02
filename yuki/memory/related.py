@@ -98,6 +98,28 @@ VOICE_ITEM_CHARS = 200
 #: The current threads shown (brain, voice).
 THREADS = 3
 VOICE_THREADS = 1
+#: Yuki's own exchanges are the conversation, not memory (revamp 02 D2: 21 of 58 related items, 36%, were Yuki's own
+#: past exchanges; 4 of 8 requests got a cosine >= 0.99 echo of the turn before). An exchange or session summary of
+#: the last this-many seconds is left out, and so is every exchange of the caller's conversation going on (its own
+#: session, back to the last pause of :data:`CONVERSATION_IDLE_S`): the agent already holds that conversation.
+SELF_ECHO_S = 30 * 60.0
+#: A pause this long ends a conversation (the conversation worker's session_idle_s: its summaries are cut there).
+CONVERSATION_IDLE_S = 30 * 60.0
+#: The brain's relevance diet (revamp 02 P2: a ~9-10k-char block, mostly the same in every request). With the user's
+#: words in play, a current thread is shown when it is ON SCREEN or its own vector is at least this near the words;
+#: the freshest screens keep the last :data:`RECENT_TAIL_S` whole and, before that, only the window stretches whose
+#: text is at least :data:`RECENT_WORDS_MIN_COSINE` near the words. Measured on the logged requests replayed on a copy
+#: of the real memory (docs/research/revamp-2026-10-02/22-build-A6-A9.md).
+THREAD_WORDS_MIN_COSINE = 0.40
+RECENT_TAIL_S = 180.0
+RECENT_WORDS_MIN_COSINE = 0.45
+#: The journal writes a window's facts ~2.5 minutes after it was read (p50 156 s, revamp 02 §1): an older stretch is
+#: judged by the facts written up to this long after it.
+RECENT_FACT_LAG_S = 15 * 60.0
+#: With the diet, at most this many items in all, and at most :data:`DIET_CONTEXT_ITEMS` that only the screen or the
+#: thread found (none of the words): they are the context of the request, not its subject.
+DIET_LIMIT = 6
+DIET_CONTEXT_ITEMS = 3
 
 BLOCK_LABEL = (
     "[Connected from memory - what the user is doing now and what Yuki's whole memory holds that bears on it "
@@ -215,12 +237,14 @@ def current_threads(store: Any, screen: dict[str, Any] | None, *, now: float | N
 
 
 def recent(store: Any, *, minutes: float = RECENT_MINUTES, chars: int = RECENT_CHARS, now: float | None = None,
-           limit: int = RECENT_CAPTURES) -> list[dict[str, Any]]:
+           limit: int = RECENT_CAPTURES, select: Any = None) -> list[dict[str, Any]]:
     """The freshest layer: the last ``minutes`` of screens, one group per window stretch, newest kept within
     ``chars``: ``[{"start", "end", "app", "title", "host", "kind", "text", "thread_id", "by_yuki"}]`` oldest
     first. Condensed in code: consecutive captures of one window join, a chat keeps its newest lines, a page
     its first lines, a terminal its commands (never output). Each group's ``attention`` says whether its window
-    was in front, only beside it (``visible``) or a popup (migration 24). Never raises."""
+    was in front, only beside it (``visible``) or a popup (migration 24). ``select``: given every condensed group
+    (oldest first, each with its whole condensed ``text``), returns the ones to keep, before the budget (the brain's
+    diet: :func:`_diet_recent`). Never raises."""
     now = time.time() if now is None else float(now)
     try:
         caps = store.recent_captures(now - minutes * 60.0, now + 1.0, limit=limit)
@@ -240,18 +264,25 @@ def recent(store: Any, *, minutes: float = RECENT_MINUTES, chars: int = RECENT_C
         groups.append({"start": c["at"], "end": c["at"], "app": c["app"], "title": title, "host": c["host"],
                        "kind": c["kind"], "thread_id": c["thread_id"], "by_yuki": c["by_yuki"], "attention": attention,
                        "parts": [text]})
-    out: list[dict[str, Any]] = []
-    used = 0
-    for g in reversed(groups):   # newest first within the budget
+    for g in groups:
         parts = g.pop("parts")
         if g["kind"] in ("conversation", "email"):
             lines = [ln for p in parts for ln in p.splitlines() if ln.strip()][-6:]
-            body = "\n".join(_clip(ln, 220) for ln in lines)
+            g["text"] = "\n".join(_clip(ln, 220) for ln in lines)
         elif g["kind"] == "terminal":
             lines = [ln for p in parts for ln in p.splitlines() if ln.strip()][-6:]
-            body = "\n".join(_clip(ln, 200) for ln in lines)
+            g["text"] = "\n".join(_clip(ln, 200) for ln in lines)
         else:
-            body = _clip(" ".join(parts), 360)
+            g["text"] = _clip(" ".join(parts), 360)
+    if select is not None:
+        try:
+            groups = list(select(groups))
+        except Exception:
+            pass
+    out: list[dict[str, Any]] = []
+    used = 0
+    for g in reversed(groups):   # newest first within the budget
+        body = g["text"]
         room = chars - used
         if room < 80:
             break
@@ -280,11 +311,14 @@ def _affinity(store: Any, threads: Sequence[Any], now: float) -> dict[str, set[i
         return {"thread": set(ids)}
 
 
-def _search(index: Any, vec: Any, *, now: float, floor: float, affinity: dict[str, set[int]]) -> list[dict[str, Any]]:
+def _search(index: Any, vec: Any, *, now: float, floor: float, affinity: dict[str, set[int]],
+            exclude: dict[str, set[int]] | None = None, excluded: set[tuple[str, int]] | None = None
+            ) -> list[dict[str, Any]]:
     if vec is None:
         return []
+    extra: dict[str, Any] = {"exclude": exclude, "excluded": excluded} if exclude else {}
     hits = index.search(vec, now=now, limit=POOL, min_cosine=floor, kinds=rel.KINDS, boost=affinity,
-                        boost_weight=AFFINITY_WEIGHT, per_kind=POOL)
+                        boost_weight=AFFINITY_WEIGHT, per_kind=POOL, **extra)
     return [h for h in hits if h["cosine"] >= KIND_MIN_COSINE.get(h["kind"], 0.0)]
 
 
@@ -310,19 +344,145 @@ def _same_screen(store: Any, screen: dict[str, Any] | None, now: float) -> dict[
     return out
 
 
+def conversation_start(store: Any, session_id: str | None, now: float, idle_s: float = CONVERSATION_IDLE_S) -> float | None:
+    """When the conversation going on in ``session_id`` began: its exchanges walked back from ``now`` until a pause
+    of ``idle_s`` (a measure of time, as the conversation worker cuts its summaries). ``None``: no exchange yet."""
+    if not session_id:
+        return None
+    try:
+        rows = store._query("SELECT at FROM conversation_turns WHERE session_id = ? AND at <= ? ORDER BY at DESC"
+                            " LIMIT 500", (str(session_id), float(now) + 1.0))
+    except Exception:
+        return None
+    start = None
+    last = float(now)
+    for r in rows:
+        at = float(r[0])
+        if last - at > idle_s:
+            break
+        start = last = at
+    return start
+
+
+def self_echo_ids(store: Any, *, session_id: str | None, now: float, recent_s: float) -> dict[str, set[int]]:
+    """Yuki's own conversation, which is never memory (:data:`SELF_ECHO_S`): ``{"chat": turn ids, "session": summary
+    ids}`` of the last ``recent_s`` seconds, and of the caller's conversation going on (its session back to its last
+    pause). Left out before the ranking, so a near-identical older exchange (a real precedent) is not dropped as a
+    duplicate of the echo. Ids and times only (cleartext metadata); never raises."""
+    out: dict[str, set[int]] = {"chat": set(), "session": set()}
+    cut = float(now) - max(0.0, float(recent_s or 0.0))
+    begun = conversation_start(store, session_id, now)
+    try:
+        out["chat"] = {int(r[0]) for r in store._query(
+            "SELECT id FROM conversation_turns WHERE at >= ? AND at <= ?", (cut, float(now) + 60.0))}
+        out["session"] = {int(r[0]) for r in store._query(
+            "SELECT id FROM session_summaries WHERE ended_at >= ? AND started_at <= ?", (cut, float(now) + 60.0))}
+        if begun is not None:
+            out["chat"] |= {int(r[0]) for r in store._query(
+                "SELECT id FROM conversation_turns WHERE session_id = ? AND at >= ? AND at <= ?",
+                (str(session_id), begun - 1.0, float(now) + 60.0))}
+            out["session"] |= {int(r[0]) for r in store._query(
+                "SELECT id FROM session_summaries WHERE session_id = ? AND ended_at >= ?", (str(session_id), begun - 1.0))}
+    except Exception:
+        return out
+    return out
+
+
+def _unit(vec: Any) -> np.ndarray | None:
+    if vec is None:
+        return None
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    n = float(np.linalg.norm(v))
+    return v / n if n else None
+
+
+def _diet_threads(store: Any, threads: Sequence[Any], words_vec: Any, *, on_screen: int | None) -> list[Any]:
+    """The current threads that bear on the words: the one ON SCREEN, and any whose own vector is at least
+    :data:`THREAD_WORDS_MIN_COSINE` near them, nearest first after the screen's."""
+    q = _unit(words_vec)
+    if q is None or not threads:
+        return list(threads)
+    try:
+        vecs = store.work_thread_vectors([t.id for t in threads])
+    except Exception:
+        vecs = {}
+    kept: list[tuple[float, Any]] = []
+    for t in threads:
+        v = _unit(vecs.get(t.id))
+        cos = float(v @ q) if v is not None and v.shape == q.shape else -1.0
+        if t.id == on_screen:
+            kept.append((2.0, t))
+        elif cos >= THREAD_WORDS_MIN_COSINE:
+            kept.append((cos, t))
+    kept.sort(key=lambda c: -c[0])
+    return [t for _c, t in kept]
+
+
+def _diet_recent(client: Any, groups: list[dict[str, Any]], words_vec: Any, *, now: float,
+                 embed_wait_s: float | None) -> list[dict[str, Any]]:
+    """The freshest screens that bear on the words: every stretch of the last :data:`RECENT_TAIL_S`, and an older one
+    only when what the journal wrote from that window then (its facts written from :data:`RECENT_TAIL_S` before the
+    stretch to :data:`RECENT_FACT_LAG_S` after it) or a page it showed comes at least :data:`RECENT_WORDS_MIN_COSINE`
+    near the words. The vectors are the index's own (already loaded): no embedding on the request's path (embedding
+    the stretches' text took 0.7-1.8 s on this PC, measured on the replay)."""
+    del embed_wait_s
+    q = _unit(words_vec)
+    tail = [g for g in groups if float(g.get("end") or 0.0) >= now - RECENT_TAIL_S]
+    older = [g for g in groups if float(g.get("end") or 0.0) < now - RECENT_TAIL_S]
+    if q is None or not older:
+        return tail
+    keep_ids: set[int] = {id(g) for g in tail}
+    try:
+        index = client.relevant_index
+        store = client.store
+        tids = sorted({int(g["thread_id"]) for g in older if g.get("thread_id") is not None})
+        if not tids:
+            return tail
+        lo = min(float(g.get("start") or 0.0) for g in older) - RECENT_TAIL_S
+        hi = max(float(g.get("end") or 0.0) for g in older) + RECENT_FACT_LAG_S
+        marks = ",".join("?" * len(tids))
+        facts = store._query(f"SELECT id, thread_id, created_at FROM journal WHERE thread_id IN ({marks})"
+                             " AND created_at >= ? AND created_at <= ?", (*tids, lo, hi))
+        links = store._query(f"SELECT id, capture_thread_id FROM links_seen WHERE capture_thread_id IN ({marks})", tids)
+        fvecs = index.vectors_of("journal", {int(r[0]) for r in facts})
+        lvecs = index.vectors_of("link", {int(r[0]) for r in links})
+
+        def near(v: Any) -> bool:
+            return v is not None and v.shape == q.shape and float(v @ q) >= RECENT_WORDS_MIN_COSINE
+
+        for g in older:
+            tid = g.get("thread_id")
+            if tid is None:
+                continue
+            start, end = float(g.get("start") or 0.0), float(g.get("end") or 0.0)
+            if any(near(fvecs.get(int(r[0]))) for r in facts if int(r[1]) == int(tid)
+                   and start - RECENT_TAIL_S <= float(r[2]) <= end + RECENT_FACT_LAG_S) \
+                    or any(near(lvecs.get(int(r[0]))) for r in links if int(r[1]) == int(tid)):
+                keep_ids.add(id(g))
+    except Exception:
+        pass
+    return [g for g in groups if id(g) in keep_ids]
+
+
 def related(client: Any, query: str = "", *, previous: str | None = None, screen: Any = None,
             now: float | None = None, limit: int | None = None, voice: bool = False,
             recent_minutes: float | None = None, embed_wait_s: float | None = None,
-            service: dict[str, Any] | None = None, with_recent: bool = True) -> dict[str, Any]:
+            service: dict[str, Any] | None = None, with_recent: bool = True, session_id: str | None = None,
+            exclude_recent_s: float = SELF_ECHO_S, diet: bool | None = None) -> dict[str, Any]:
     """What the whole memory holds that bears on this moment (see the module docstring). Never raises.
 
     ``client``: the :class:`yuki.memory.api.MemoryClient` (its embedder over the pipe, its index, its item
     decryption). ``screen``: a live picture of the screen (a dict with ``app``, ``title``, ``host``, ``url``,
     ``text``, optionally ``thread_id``; or plain text), else the service's (``service``: what its screen recall
-    cached) or the newest capture. Returns ``{"items", "screen", "threads", "recent", "timing"}``: items as
-    :meth:`MemoryClient.relevant` gives them (``kind``, ``id``, ``at``, ``text``, ``source``, ``score``,
+    cached) or the newest capture. Returns ``{"items", "screen", "threads", "recent", "timing", "self_echo"}``:
+    items as :meth:`MemoryClient.relevant` gives them (``kind``, ``id``, ``at``, ``text``, ``source``, ``score``,
     ``cosine``, ``via``: which queries found it), ``screen`` as the line shown, ``threads`` the current
-    threads (store objects), ``recent`` the freshest layer.
+    threads (store objects), ``recent`` the freshest layer, ``self_echo`` how many of Yuki's own exchanges were
+    left out (:data:`SELF_ECHO_S`, ``session_id``).
+
+    ``diet`` (default: on when the brain gives words, off for the voice talker and screen-only lookups): the
+    threads and the freshest screens only as far as they bear on the words (:data:`THREAD_WORDS_MIN_COSINE`,
+    :data:`RECENT_TAIL_S`, :data:`RECENT_WORDS_MIN_COSINE`).
     """
     t0 = time.perf_counter()
     now = time.time() if now is None else float(now)
@@ -330,7 +490,9 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     timing: dict[str, float] = {}
     store = client.store
     out: dict[str, Any] = {"items": [], "screen": None, "threads": [], "screen_thread": None, "recent": [],
-                           "timing": timing}
+                           "timing": timing, "self_echo": 0}
+    if diet is None:
+        diet = bool((query or "").strip()) and not voice
     try:
         index = client.relevant_index
         client._embed_new_facts(embed_wait_s)
@@ -365,8 +527,10 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     t2 = time.perf_counter()
     queries: list[tuple[str, Any, float, float]] = []
     q = (query or "").strip()
+    words_vec = None
     if q:
-        queries.append(("words", client._embed(q, embed_wait_s), 0.0, WORDS_MIN_COSINE))
+        words_vec = client._embed(q, embed_wait_s)
+        queries.append(("words", words_vec, 0.0, WORDS_MIN_COSINE))
     prev = (previous or "").strip()
     if prev and prev != q:
         pv = client._query_vecs.get(prev)
@@ -401,19 +565,31 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
                 cur["via"] = sorted({via, *cur["via"]})
 
     own = {(kind, i) for kind in ("journal", "link") for i in affinity.get(kind, ())}
+    echo = self_echo_ids(store, session_id=session_id, now=now, recent_s=exclude_recent_s)
+    echoed: set[tuple[str, int]] = set()
     for name, vec, discount, floor in queries:
-        hits = _search(index, vec, now=now, floor=floor, affinity=affinity)
+        hits = _search(index, vec, now=now, floor=floor, affinity=affinity, exclude=echo, excluded=echoed)
         if name == "thread":   # the thread's own facts and links restate it (its line is shown): no dot it connects
             hits = [h for h in hits if (h["kind"], int(h["id"])) not in own]
         take(hits, discount, name)
     if cached_hits:
-        take([h for h in cached_hits if h["cosine"] >= KIND_MIN_COSINE.get(h["kind"], 0.0)], screen_discount, "screen")
+        for h in cached_hits:   # the service's screen recall ranked them without knowing this conversation
+            if int(h.get("id", -1)) in echo.get(str(h.get("kind")), ()):
+                echoed.add((str(h["kind"]), int(h["id"])))
+        take([h for h in cached_hits if h["cosine"] >= KIND_MIN_COSINE.get(h["kind"], 0.0)
+              and int(h.get("id", -1)) not in echo.get(str(h.get("kind")), ())], screen_discount, "screen")
     for h in best.values():   # found by two different queries: it connects them
         if len(h["via"]) >= 2 and not (set(h["via"]) <= {"words", "previous"}):
             h["score"] = round(h["base"] + CONSENSUS_BONUS, 4)
+    out["diet"] = bool(diet and words_vec is not None)
+    if out["diet"]:
+        threads = _diet_threads(store, threads, words_vec, on_screen=out.get("screen_thread"))
+        out["threads"] = threads
+        limit = min(limit, DIET_LIMIT)
     skip = {("thread", t.id) for t in threads}   # shown in their own section
     for kind, ids in _same_screen(store, screen if isinstance(screen, dict) else None, now).items():
         skip |= {(kind, i) for i in ids}
+    out["self_echo"] = len(echoed)   # Yuki's own exchanges that cleared a floor and were left out
     # a page merely viewed is a dot for the user's words ("that link"), not for the screen: another page of the
     # same site is not a connection to what is on screen (a link someone shared still is)
     context_links = [i for (k, i), h in best.items() if k == "link" and "words" not in h["via"] and "previous" not in h["via"]]
@@ -430,10 +606,14 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
         for i, v in index.vectors_of(kind, {i for k, i in best if k == kind}).items():
             vec_cache[(kind, i)] = v
     counts: dict[str, int] = {}
+    context_only = 0
     for h in ordered:
         if len(picked) >= limit:
             break
         if counts.get(h["kind"], 0) >= PER_KIND:
+            continue
+        by_words = bool({"words", "previous"} & set(h.get("via") or []))
+        if out["diet"] and not by_words and context_only >= DIET_CONTEXT_ITEMS:
             continue
         v = vec_cache.get((h["kind"], int(h["id"])))
         if v is not None and any(float(v @ vec_cache[(p["kind"], int(p["id"]))]) >= rel.SAME_AS
@@ -441,6 +621,7 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
             continue
         picked.append(h)
         counts[h["kind"]] = counts.get(h["kind"], 0) + 1
+        context_only += 0 if by_words else 1
     timing["rank_ms"] = round((time.perf_counter() - t3) * 1000, 1)
 
     t4 = time.perf_counter()
@@ -458,8 +639,13 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     timing["items_ms"] = round((time.perf_counter() - t4) * 1000, 1)
     if with_recent:
         t5 = time.perf_counter()
+        select = None
+        if diet and words_vec is not None:
+            def select(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return _diet_recent(client, groups, words_vec, now=now, embed_wait_s=embed_wait_s)
         out["recent"] = recent(store, minutes=recent_minutes or RECENT_MINUTES,
-                               chars=VOICE_RECENT_CHARS if voice else RECENT_CHARS, now=now)
+                               chars=VOICE_RECENT_CHARS if voice else RECENT_CHARS, now=now, select=select)
+        out["recent_diet"] = select is not None
         timing["recent_ms"] = round((time.perf_counter() - t5) * 1000, 1)
     timing["total_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     timing["queries"] = [name for name, vec, _d, _f in queries if vec is not None]   # type: ignore[assignment]
@@ -587,7 +773,8 @@ def block_text(result: dict[str, Any] | None, *, voice: bool = False, nonce: str
         on = result.get("screen_thread")
         head = ("Their thread of work now" if voice else
                 "Their threads of work now (the one marked ON SCREEN is what the window in front was last part of; "
-                "the others were touched most recently):")
+                + ("the others bear on their words):" if result.get("diet") else
+                   "the others were touched most recently):"))
         lines = [f"- [thread:{t.id}]{' ON SCREEN' if t.id == on else ''} {thread_line(t, cap=260 if voice else 420)}"
                  for t in threads]
         parts.append(head + "\n" + "\n".join(lines))
@@ -606,8 +793,11 @@ def block_text(result: dict[str, Any] | None, *, voice: bool = False, nonce: str
             lines.append(f"{span} {where}{mark}:\n    {text}" if text else f"{span} {where}{mark}")
         body = "\n".join(lines)
         minutes = RECENT_MINUTES
-        parts.append(f"Their last {minutes} minutes on screen, newest last (captured text, condensed):\n"
-                     + _fence(body, "the user's screen as memory captured it", nonce))
+        head = (f"On their screen lately, newest last (captured text, condensed: the last {int(RECENT_TAIL_S // 60)} "
+                f"minutes, and windows of the last {minutes} minutes that bear on their words):"
+                if result.get("recent_diet") else
+                f"Their last {minutes} minutes on screen, newest last (captured text, condensed):")
+        parts.append(head + "\n" + _fence(body, "the user's screen as memory captured it", nonce))
     items = result.get("items") or []
     if items:
         lines = []

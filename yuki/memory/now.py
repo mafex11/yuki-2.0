@@ -47,6 +47,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from yuki.core.opacity import AIMING_NOTE, opacity_fact, readable_chars
+
 #: Windows kept on the board (the oldest reads of windows no longer visible go first).
 MAX_WINDOWS = 24
 #: Popups kept, and how long one stays "recent".
@@ -374,10 +376,16 @@ def format_now(
             state.insert(0, str(w["kind"]))
         head += f" ({', '.join(state)})"
         if w.get("opaque"):
+            # a number and a fact (revamp A8): what its elements cover and what text was read, never "nothing can
+            # be read" beside text memory captured from the same window
             data = _app_data_line(w.get("app_data"))
-            lines.append(f"{head}: OPAQUE - it draws its own interface, nothing inside it can be read or aimed at "
-                         f"(clicks at x,y there are refused); use its keyboard shortcuts and check its title"
-                         + (f"; {data}" if data else ""))
+            body = _body(w, front_chars if front else other_chars) if w.get("read_at") else ""
+            fact = opacity_fact(w.get("coverage"), readable_chars(w) if body else 0)
+            line = f"{head}: {fact}; {AIMING_NOTE}" + (f"; {data}" if data else "")
+            if body:
+                indent = "\n  " if front else " "
+                line += f":{indent}" + (body.replace("\n", "\n  ") if front else _one(body, other_chars))
+            lines.append(line)
             continue
         if not w.get("read_at"):
             lines.append(head)

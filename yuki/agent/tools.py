@@ -23,7 +23,7 @@ import base64
 import dataclasses
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Literal, Protocol, Sequence, runtime_checkable
 
 from yuki.ui.own_window import PAGE_WORDS, PAGES as YUKI_PAGES
 
@@ -1513,6 +1513,65 @@ class Backend(Protocol):
     def window_at(self, x: int, y: int) -> int: ...  # pragma: no cover - protocol only
 
 
+#: The tool input fields that name a window (``look_at_window``'s ``hwnd``, an action's ``expect_hwnd`` guard).
+WINDOW_KEYS: tuple[str, ...] = ("hwnd", "expect_hwnd")
+#: The opacity threshold as a whole percent, for the words of a refused click (:mod:`yuki.core.opacity`).
+from yuki.core.opacity import OPAQUE_COVERAGE as _OPAQUE_COVERAGE  # noqa: E402
+
+OPAQUE_PERCENT = int(round(_OPAQUE_COVERAGE * 100))
+#: A window takes a vanished one's place when it is of the same process and scores at least this on
+#: ``SUCCESSOR_TITLE_WEIGHT * title likeness + (1 - weight) * overlap of the two windows' rectangles`` (both 0-1,
+#: measured), and the next best is at least :data:`SUCCESSOR_MARGIN` behind (else it is not clear which).
+SUCCESSOR_MIN_SCORE = 0.55
+SUCCESSOR_TITLE_WEIGHT = 0.6
+SUCCESSOR_MARGIN = 0.10
+
+
+def _rect_overlap(a: Any, b: Any) -> float:
+    """Intersection over union of two ``(left, top, right, bottom)`` rectangles (0 when either is unknown)."""
+    try:
+        al, at, ar, ab = (float(v) for v in a)
+        bl, bt, br, bb = (float(v) for v in b)
+    except (TypeError, ValueError):
+        return 0.0
+    iw, ih = max(0.0, min(ar, br) - max(al, bl)), max(0.0, min(ab, bb) - max(at, bt))
+    inter = iw * ih
+    union = max(0.0, ar - al) * max(0.0, ab - at) + max(0.0, br - bl) * max(0.0, bb - bt) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def find_successor(was: dict[str, Any], windows: Sequence[dict[str, Any]], *, gone: int) -> dict[str, Any] | None:
+    """The window that took a vanished one's place, or ``None``: of the same process (``was["process"]``, the
+    image name), the best by title likeness (``difflib``'s ratio over the two titles, a measured similarity of two
+    window titles) and overlap of their rectangles, scoring at least :data:`SUCCESSOR_MIN_SCORE` and clear of the
+    next by :data:`SUCCESSOR_MARGIN`. Returns the window with ``title_match``, ``overlap`` and ``score``."""
+    import difflib
+
+    process = str(was.get("process") or "").casefold()
+    if not process:
+        return None
+    title = str(was.get("title") or "").casefold()
+    scored: list[dict[str, Any]] = []
+    for w in windows:
+        try:
+            hwnd = int(w.get("hwnd"))
+        except (TypeError, ValueError):
+            continue
+        if hwnd == int(gone) or str(w.get("process_name") or "").casefold() != process:
+            continue
+        other = str(w.get("title") or "").casefold()
+        likeness = difflib.SequenceMatcher(None, title, other).ratio() if (title or other) else 0.0
+        overlap = _rect_overlap(was.get("rect"), w.get("bounds"))
+        score = SUCCESSOR_TITLE_WEIGHT * likeness + (1.0 - SUCCESSOR_TITLE_WEIGHT) * overlap
+        scored.append({**w, "title_match": round(likeness, 3), "overlap": round(overlap, 3), "score": round(score, 3)})
+    scored.sort(key=lambda s: -s["score"])
+    if not scored or scored[0]["score"] < SUCCESSOR_MIN_SCORE:
+        return None
+    if len(scored) > 1 and scored[0]["score"] - scored[1]["score"] < SUCCESSOR_MARGIN:
+        return None
+    return scored[0]
+
+
 class _LazyRealBackend:
     """Backend that resolves attributes from the real perception/action modules.
 
@@ -1545,6 +1604,12 @@ class _LazyRealBackend:
         "open_url",
         "window_action",
     }
+
+    def window_exists(self, hwnd: int) -> bool:
+        """Whether ``hwnd`` is still a window (``IsWindow``; microseconds, no UI Automation)."""
+        import ctypes
+
+        return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
 
     def prewarm_apps(self) -> int:
         """Read the Start menu list now (it is cached for the process): 1-3 s of PowerShell
@@ -1893,6 +1958,9 @@ class Dispatcher:
         #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
         #: whether Yuki has acted on it since): what a click at raw x,y is checked against.
         self._read_facts: dict[int, dict[str, Any]] = {}
+        #: What each window was (process, title, place) as the overviews showed it: a call on one that vanished goes
+        #: to the one that took its place (:meth:`_follow_vanished`).
+        self._windows_seen: dict[int, dict[str, Any]] = {}
         #: Refuse a click at raw x,y on a window that is opaque, was never read, or changed since its latest
         #: read (the element click's staleness rule, for coordinates). On for every dispatcher.
         self.guard_raw_clicks = True
@@ -1903,6 +1971,8 @@ class Dispatcher:
         #: Wait bounds (s) of that picture: the memory service's answer, and the focus read.
         self.now_wait_s = 0.05
         self.focus_wait_s = 0.05
+        #: The memory service's picture of the screen as the last situation block read it (``None``: none).
+        self.last_now_board: dict[str, Any] | None = None
 
     def enable_now(self, settings: Any = None) -> bool:
         """Turn the per-turn Now picture on from ``settings`` (``now_in_situation``, ``now_wait_ms``,
@@ -2006,6 +2076,13 @@ class Dispatcher:
             outcome = unavailable_tool(name, TOOLS_BY_NAME)
             outcome.elapsed_ms = (time.perf_counter() - started) * 1000
             return outcome
+        moved: dict[str, Any] | None = None
+        try:
+            tool_input, moved = self._follow_vanished(tool_input)
+        except ToolError as exc:
+            return ToolOutcome(name=name, ok=False, summary=str(exc), content=[{"type": "text", "text": str(exc)}],
+                               payload={"error": str(exc), "window_gone": True},
+                               elapsed_ms=(time.perf_counter() - started) * 1000)
         try:
             outcome = handler(tool_input)
         except ToolError as exc:
@@ -2026,6 +2103,12 @@ class Dispatcher:
                 payload={"error": message, "exception": type(exc).__name__},
             )
         outcome.name = name
+        if moved is not None:
+            note = moved["note"]
+            outcome.summary = f"{note} {outcome.summary}".strip()
+            outcome.content = [{"type": "text", "text": note}, *(outcome.content or [])]
+            if isinstance(outcome.payload, dict):
+                outcome.payload = {**outcome.payload, "successor": {k: v for k, v in moved.items() if k != "note"}}
         if not outcome.elapsed_ms:
             outcome.elapsed_ms = (time.perf_counter() - started) * 1000
         if outcome.ok and name in _MARKS_ACTED and self._read_facts:
@@ -2069,6 +2152,79 @@ class Dispatcher:
             raise ToolError(f"{key!r} must be an integer, got {value!r}")
         return int(value)
 
+    # -- windows that vanished (revamp A8, 01 §8.1 G) ------------------------
+
+    def _remember_windows(self, payload: Any) -> None:
+        """Keep what each window was (process, title, place) from an overview, so a call on one that vanished can
+        find the window that took its place."""
+        if not isinstance(payload, dict):
+            return
+        now = time.time()
+        for w in payload.get("windows") or []:
+            if not isinstance(w, dict) or w.get("hwnd") is None:
+                continue
+            try:
+                hwnd = int(w["hwnd"])
+            except (TypeError, ValueError):
+                continue
+            self._windows_seen[hwnd] = {"process": str(w.get("process_name") or ""), "title": str(w.get("title") or ""),
+                                        "rect": list(w.get("bounds") or []) or None, "at": now}
+        if len(self._windows_seen) > 256:
+            for old in sorted(self._windows_seen, key=lambda h: self._windows_seen[h]["at"])[:64]:
+                self._windows_seen.pop(old, None)
+
+    def _follow_vanished(self, tool_input: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """When the window a call names (``hwnd`` / ``expect_hwnd``) no longer exists - the app closed it or made it
+        again (a reload, a restart: T3 Code's 132798 became 1312414 on 1 Oct and the request died) - the call goes to
+        its successor: the window of the same process now most like it by title and place (:func:`find_successor`,
+        measured), said in the result. With none, a plain error saying so. Unchanged when the backend cannot tell
+        whether a window exists."""
+        keys = [k for k in WINDOW_KEYS if isinstance(tool_input.get(k), int) and not isinstance(tool_input.get(k), bool)]
+        if not keys:
+            return tool_input, None
+        try:   # a look-only wrapper (the helpers') refuses names it does not know: then there is no lookup
+            exists = getattr(self.backend, "window_exists", None)
+        except Exception:
+            return tool_input, None
+        if not callable(exists):
+            return tool_input, None
+        old = int(tool_input[keys[0]])
+        try:
+            if exists(old):
+                return tool_input, None
+        except Exception:
+            return tool_input, None
+        was = dict(self._windows_seen.get(old) or {})
+        facts = self._read_facts.get(old) or {}
+        was.setdefault("title", facts.get("title") or "")
+        was.setdefault("rect", facts.get("rect"))
+        if not was.get("process") and facts.get("process"):
+            was["process"] = facts["process"]
+        try:
+            overview = _plain(self.backend.get_desktop_overview())
+        except Exception:
+            overview = {}
+        self._remember_windows(overview)
+        windows = [w for w in (overview or {}).get("windows") or [] if isinstance(w, dict)]
+        found = find_successor(was, windows, gone=old)
+        name = f"{was.get('process') or 'its app'} \"{(was.get('title') or '')[:80]}\"" if was.get("title") else \
+            str(was.get("process") or "")
+        if found is None:
+            raise ToolError(
+                f"Window {old}{(' (' + name + ')') if name else ''} no longer exists: it closed, or its app made it again "
+                f"with a new id, and no window of {was.get('process') or 'that app'} took its place. look_at_desktop "
+                "shows the windows there are now.")
+        new = int(found["hwnd"])
+        changed = {k: (new if k in keys and int(tool_input[k]) == old else tool_input[k]) for k in tool_input}
+        if old in self._latest_trees:   # element ids read from the old window do not exist in the new one
+            self._latest_trees.pop(old, None)
+        note = (f"[Window {old} is gone (its app made it again); this ran on the window that took its place: "
+                f"[{new}] \"{str(found.get('title') or '')[:80]}\" - the same app ({found.get('process_name')}), "
+                f"title {found['title_match']:.0%} alike, {found['overlap']:.0%} the same place on screen. Element "
+                f"ids from the old window do not apply to it.]")
+        return changed, {"note": note, "from": old, "to": new, "title_match": found["title_match"],
+                         "overlap": found["overlap"], "score": found["score"]}
+
     def _opt_hwnd(self, tool_input: dict[str, Any]) -> int | None:
         """The optional ``expect_hwnd`` guard, or ``None`` when it was omitted."""
         if tool_input.get("expect_hwnd") is None:
@@ -2106,6 +2262,7 @@ class Dispatcher:
         overview = self.backend.get_desktop_overview()
         text = self.backend.format_overview(overview)
         payload = _plain(overview)
+        self._remember_windows(payload)
         if self.include_now:
             foreground = payload.get("foreground_hwnd") if isinstance(payload, dict) else None
             now_text, now_facts = self.now_text(foreground)
@@ -2160,6 +2317,8 @@ class Dispatcher:
             focus_thread = threading.Thread(target=read_focus, name="yuki-now-focus", daemon=True)
             focus_thread.start()
         board = self._now_board()
+        #: The last picture this turn had: the agent anchors its memory lookup on the window in front from it.
+        self.last_now_board = board
         facts["board_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
         facts["board"] = board is not None
         focus_line = ""
@@ -2277,6 +2436,7 @@ class Dispatcher:
         self._read_facts[int(hwnd)] = {
             "read": self._reads, "at": time.time(), "title": str(payload.get("title") or ""),
             "rect": list(rect) if rect else None, "opaque": opaque, "acted": None,
+            "process": str(payload.get("process_name") or ""),
         }
         if len(self._read_facts) > 64:
             oldest = sorted(self._read_facts, key=lambda h: self._read_facts[h]["at"])[:16]
@@ -2913,10 +3073,10 @@ class Dispatcher:
             opaque_now = False
         if opaque_now or (facts is not None and facts.get("opaque")):
             raise ToolError(
-                f"not clicked: ({x},{y}) is in {name}, which draws its own interface - UI Automation shows "
-                f"nothing inside it, so any point there is a guess. Use the app's own keyboard shortcuts and "
-                f"read its title after each step (or the app's own data given with its read), or ask the user "
-                f"naming the options you know"
+                f"not clicked: ({x},{y}) is in {name}, which draws its own interface - its UI Automation "
+                f"elements cover under {OPAQUE_PERCENT}% of it, so any point there is a guess (the text it exposes "
+                f"can still be read). Use the app's own keyboard shortcuts and read its title after each step "
+                f"(or the app's own data given with its read), or ask the user naming the options you know"
             )
         if facts is None:
             try:

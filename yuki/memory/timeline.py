@@ -1048,7 +1048,7 @@ class TimelineRecorder:
 
     def __init__(
         self, store: Store, *, privacy: Any = None, log: Callable[..., Any] | None = None,
-        on_page_change: Callable[[int], None] | None = None, signals: Any = None,
+        on_page_change: Callable[[int], None] | None = None, signals: Any = None, evidence: Any = None,
     ) -> None:
         from yuki.memory import watcher as _w
         from yuki.memory.privacy import PrivacyConfig
@@ -1098,6 +1098,12 @@ class TimelineRecorder:
         #: Who holds the microphone and camera (yuki.memory.avsignals.AvSignals; shared with the call
         #: worker in the service), read every MEDIA_EVERY_S - a cached read unless Windows changed them.
         self._signals = signals
+        #: The screen's call verdicts (yuki.memory.callevidence.CallEvidence, the call worker's own; None: not
+        #: running): a microphone hold is a meeting only when a screen of its app was judged in a call during it
+        #: (revamp A9: VALORANT's voice chat and FL Studio recording were 1 h 35 m of "meetings" on 2 Oct).
+        self._evidence = evidence
+        #: App keys whose hold was seen without call evidence (logged once per hold).
+        self._mic_only: dict[str, float] = {}
         self._av: Any = None                      # the last AvSnapshot
         self._mic_errors = 0
         #: Per app key with a measured meeting on: the site it is on ("" for an app without pages), and
@@ -1807,6 +1813,10 @@ class TimelineRecorder:
         if site is None:
             if now - h.since < rules.hold_s:
                 return None
+            if self._evidence is not None and st.seen_host is None and not self._call_seen(h, key, now):
+                # an app (not a site in a browser, whose meeting is the site that took the device) holds the
+                # microphone, and no screen of it was seen in a call: a game's voice chat, a recording - no meeting
+                return None
             site = ""
             if st.seen_host is not None:
                 site = self._site_at(key, h.since, st) or ""
@@ -1822,6 +1832,23 @@ class TimelineRecorder:
         if st.seen_host is not None:
             return None   # the meeting is an app without pages; this is one of its pages? not the meeting
         return rules.name_for(key, st.proc_app or key)
+
+    def _call_seen(self, holder: Any, key: str, now: float) -> bool:
+        """Whether the screen judge saw this app in a call during its microphone hold (the call worker's measured
+        verdicts, :meth:`yuki.memory.callevidence.CallEvidence.state`); a hold without it is logged once
+        (``timeline_mic_no_call``, content-free)."""
+        try:
+            state, _service = self._evidence.state(holder, holder.since, now)
+        except Exception:
+            return True   # the verdicts cannot be read: the measured hold decides, as before
+        if state is not None:
+            self._mic_only.pop(key, None)
+            return True
+        if self._mic_only.get(key) != holder.since:
+            self._mic_only[key] = holder.since
+            self.counters["mic_no_call"] += 1
+            self._log("timeline_mic_no_call", app=key, held_s=round(now - holder.since, 1))
+        return False
 
     def _gaming_voice(self, st: _Stretch, holder: Any, now: float) -> bool:
         """The microphone holder is this full-screen stretch's app drawing like a game (measured).

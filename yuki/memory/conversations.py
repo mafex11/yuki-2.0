@@ -641,10 +641,16 @@ def resource_seen(value: str, turns: Sequence[Any]) -> bool:
     if not want:
         return False
     for t in turns:
-        blob = " ".join([t.user_text or "", t.reply_text or "", *(t.actions or [])])
+        blob = " ".join([_request_text(t), t.reply_text or "", *(t.actions or [])])
         if want in "".join(ch for ch in blob.casefold() if ch.isalnum()):
             return True
     return False
+
+
+def _request_text(t: Any) -> str:
+    """A turn's request as Yuki sent it: the user's words and Yuki's notes after them (migration 27 stores them
+    apart; ``ConversationTurn.full_text``)."""
+    return getattr(t, "full_text", None) or getattr(t, "user_text", None) or ""
 
 
 def quote_in(quote: str | None, text: str | None) -> bool:
@@ -964,7 +970,7 @@ class ConversationWorker:
 
     @staticmethod
     def _turn_size(t: ConversationTurn) -> int:
-        return (min(len(t.user_text or ""), USER_CHARS) + min(len(t.reply_text or ""), REPLY_CHARS)
+        return (min(len(_request_text(t)), USER_CHARS) + min(len(t.reply_text or ""), REPLY_CHARS)
                 + min(sum(len(a) for a in t.actions), ACTIONS_CHARS) + 80)
 
     def batches(self, pending: Sequence[ConversationTurn]) -> list[tuple[str, list[ConversationTurn]]]:
@@ -1015,7 +1021,9 @@ class ConversationWorker:
         if yuki_words_request(t.user_text):
             head += (" YUKI'S OWN WORDS (the user pressed a button on Yuki's card, or sent its suggestion unchanged:"
                      " never the user's words, never a reply or feedback to the card)")
-        lines = [head, "    the user: " + safe(t.user_text, USER_CHARS).replace("\n", "\n      ")]
+        # the request as sent: the user's words and Yuki's own notes after them (the voice's heard words, what was
+        # done before), which the model reads to understand a spoken request; quotes are checked on own_words only
+        lines = [head, "    the user: " + safe(_request_text(t), USER_CHARS).replace("\n", "\n      ")]
         lines.append("    Yuki: " + (safe(t.reply_text, REPLY_CHARS).replace("\n", "\n      ") if t.reply_text
                                      else "(no reply)"))
         if t.actions:
@@ -1845,6 +1853,45 @@ class ConversationWorker:
                                                         self.embedder.model_name)
         return done
 
+    def check_commitments(self, now: float | None = None, *, dry_run: bool = False, force: bool = False) -> Any:
+        """Keep the to-do list true (:mod:`yuki.memory.commitments`): close the mirrors of done commitments, and at
+        most every 30 minutes, with newer evidence, check the open ones against it (one Haiku call). Never raises;
+        returns the :class:`~yuki.memory.commitments.CheckResult` (``None`` when it could not run)."""
+        try:
+            if getattr(self, "_commitments", None) is None:
+                from yuki.memory.commitments import CommitmentChecker
+
+                self._commitments = CommitmentChecker(self)
+            return self._commitments.check(now, dry_run=dry_run, force=force)
+        except Exception as exc:
+            self._log("conversation_error", purpose="commitments", error=f"{type(exc).__name__}: {exc}")
+            return None
+
+    def reembed_turns(self, *, dry_run: bool = False, batch: int = 32) -> dict[str, int]:
+        """Embed again the exchanges stored before migration 27 whose text carried Yuki's own notes (the voice
+        hand-off's ~1.5-2.8k characters): their vectors then rest on the user's words, Yuki's reply and actions
+        (``Store.turn_text``), as new exchanges' do. A turn whose words were stored apart already is left alone.
+        Re-running Yuki's own pipeline on stored data; nothing else changes. Returns counts."""
+        rows = self.store._query("SELECT id FROM conversation_turns WHERE envelope_ciphertext IS NULL ORDER BY id")
+        ids = [int(r[0]) for r in rows]
+        todo: list[ConversationTurn] = []
+        for start in range(0, len(ids), 200):
+            for t in self.store.turns_by_ids(ids[start:start + 200]):
+                if t.envelope:   # its stored text had Yuki's notes after the words
+                    todo.append(t)
+        done = 0
+        if not dry_run:
+            for start in range(0, len(todo), max(1, int(batch))):
+                chunk = todo[start:start + max(1, int(batch))]
+                vectors, error = self._embed([Store.turn_text(t)[:2000] for t in chunk])
+                if vectors is None:
+                    self._log("embed_error", what="reembed_turns", error=error)
+                    break
+                done += self.store.add_conversation_vectors("turn", [(t.id, v) for t, v in zip(chunk, vectors)],
+                                                            self.embedder.model_name)
+        self._log("reembed_turns", candidates=len(todo), embedded=done, dry_run=dry_run)
+        return {"old_turns": len(ids), "with_notes": len(todo), "embedded": done}
+
     # -- loop ----------------------------------------------------------------
 
     def run_once(self, now: float | None = None, *, force: bool = False) -> PassResult:
@@ -1861,6 +1908,7 @@ class ConversationWorker:
                 for sid, turns in self.ended_segments(now):
                     result.summaries.append(self.summarize(sid, turns, now))
                 self.sort_owners()
+                self.check_commitments(wall)
                 if any(not r.ok for r in [*result.extractions, *result.summaries]):
                     self._retry_at = wall + self.retry_after_s
             if result.extractions or result.summaries:
@@ -1926,7 +1974,9 @@ class ConversationWorker:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m yuki.memory.conversations reextract --turns ID[,ID...] [--db PATH] [--dry-run]``.
+    """``python -m yuki.memory.conversations reextract --turns ID[,ID...] [--db PATH] [--dry-run]``;
+    ``... reembed-turns [--db PATH] [--dry-run]`` (exchanges stored before migration 27 embedded again from the
+    user's words alone); ``... check-commitments [--db PATH] [--dry-run]`` (the to-do check, now).
 
     Runs the extraction again over exchanges already extracted once (the prompt or the
     code changed since), through :meth:`ConversationWorker.extract` with
@@ -1946,7 +1996,34 @@ def main(argv: list[str] | None = None) -> int:
     re_cmd.add_argument("--db", default=None, help="database path (default: the real memory)")
     re_cmd.add_argument("--dry-run", action="store_true", help="call the model and validate, write nothing")
     re_cmd.add_argument("--log-dir", default=None, help="where the model-call log goes (default: logs/memory)")
+    em_cmd = sub.add_parser("reembed-turns", help="embed again, from the user's words alone, the exchanges stored "
+                                                  "before migration 27 with Yuki's notes in their text")
+    em_cmd.add_argument("--db", default=None, help="database path (default: the real memory)")
+    em_cmd.add_argument("--dry-run", action="store_true", help="count them, write nothing")
+    em_cmd.add_argument("--log-dir", default=None, help="where the worker's log goes (default: logs/memory)")
+    cc_cmd = sub.add_parser("check-commitments", help="close the to-dos later evidence settles, and the mirrors of "
+                                                      "done ones, now (the service runs it every 30 min)")
+    cc_cmd.add_argument("--db", default=None, help="database path (default: the real memory)")
+    cc_cmd.add_argument("--dry-run", action="store_true", help="call the model and validate, write nothing")
+    cc_cmd.add_argument("--log-dir", default=None, help="where the worker's log goes (default: logs/memory)")
     args = parser.parse_args(argv)
+    if args.command == "check-commitments":
+        store = Store.open(args.db)
+        try:
+            worker = ConversationWorker(store, log_dir=Path(args.log_dir) if args.log_dir else None)
+            result = worker.check_commitments(dry_run=args.dry_run, force=True)
+            print(result)
+            return 0 if result is not None and result.error is None else 1
+        finally:
+            store.close()
+    if args.command == "reembed-turns":
+        store = Store.open(args.db)
+        try:
+            worker = ConversationWorker(store, log_dir=Path(args.log_dir) if args.log_dir else None)
+            print(worker.reembed_turns(dry_run=args.dry_run))
+            return 0
+        finally:
+            store.close()
     ids = [int(x) for x in str(args.turns).replace(" ", "").split(",") if x]
     store = Store.open(args.db)
     try:

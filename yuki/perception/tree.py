@@ -427,8 +427,9 @@ _COVERAGE_CELL = 32
 #: 2026-09-29 on this desktop: four Warp windows 0% (one element each: the
 #: window itself, which the older leaf coverage counted as 100%), a Chrome page
 #: 60-95%, Task Manager's grid of unnamed panes above 20%.  A fact about
-#: rectangles, never about which program drew them.
-OPAQUE_COVERAGE = 0.05
+#: rectangles, never about which program drew them. The one threshold, shared with memory's watcher and the Now
+#: board: :mod:`yuki.core.opacity` (revamp A8).
+from yuki.core.opacity import OPAQUE_COVERAGE, opacity_fact  # noqa: E402
 
 #: A container covering at least this share of the visible window says nothing
 #: about what is drawn inside it (a frame, a page wrapper, a GPU surface).
@@ -545,8 +546,9 @@ class WindowTree:
     #: (:func:`content_coverage`), ``None`` when not measured.
     coverage: float | None = None
     #: The window answered and settled, and its content leaves cover less than
-    #: :data:`OPAQUE_COVERAGE` of it: it draws its own interface, so nothing
-    #: inside it can be read or aimed at through UI Automation.
+    #: :data:`OPAQUE_COVERAGE` of it: it draws its own interface, so no point
+    #: inside it can be aimed at through UI Automation (what text it exposes is
+    #: still in its elements).
     opaque: bool = False
 
 
@@ -2909,12 +2911,11 @@ def get_window_tree(
     if status == "empty":
         note = "the window answered but exposes no elements with a size on screen"
     elif opaque:
+        readable = sum(len(getattr(e, "name", None) or "") + len(getattr(e, "value", None) or "") for e in elements)
         note = (
-            f"OPAQUE: this window draws its own interface - UI Automation exposes "
-            f"{len(elements)} element(s), covering {coverage:.0%} of it with content, so "
-            f"what it shows cannot be read or aimed at from here and any x,y inside it "
-            f"would be a guess; use the app's own keyboard shortcuts and check its title "
-            f"after each step, or the app's own data when it is given"
+            f"This window draws its own interface - {opacity_fact(coverage, readable, elements=len(elements))}. "
+            f"Any x,y inside it would be a guess: use the app's own keyboard shortcuts and check its title after "
+            f"each step, or the app's own data when it is given"
         )
     elif not partial:
         gaps = _surface_gaps(chosen)

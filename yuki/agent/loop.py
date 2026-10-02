@@ -48,8 +48,10 @@ from yuki.agent.memory import (
     default_memory,
     commitments_block_text,
     memory_block_text,
+    memory_query_of,
     relevant_block_text,
-    split_standing,
+    standing_commitments_text,
+    standing_rules_text,
 )
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
@@ -165,6 +167,15 @@ def acting_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in tool_input.items() if k != STEP_FIELD}
 
 
+#: The verdict reason of an action whose effect its report cannot show by the nature of its target, not because
+#: anything went wrong: a field that exposes no text to read back (Discord's message box, a canvas editor). An
+#: expected-unverifiable result (revamp A8, 01 S5): it never escalates the request's effort (on Sonnet 5 every switch
+#: rewrites the cached prompt: a 53k-token rewrite and a 13 s call on 30 Sept for exactly this), and a done is not
+#: held for it; a finish it marks is still held for a look. A field that does not hold the text, a failure and a
+#: loop-breaker trip still escalate.
+EXPECTED_UNVERIFIABLE = ("the field shows no text to read back (expected for this kind of field, not a failure; "
+                         "the keys were sent)")
+
 #: Input-watch facts of a key or click report (yuki.actions.input): each says the input changed something the
 #: user can see. Plumbing: which fields of the action's own report are its measured effects.
 _EFFECT_FACTS = ("foreground_changed", "focus_changed", "foreground_title_changed", "page_changed",
@@ -211,6 +222,8 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
         seen = details.get("readback")
         if seen == "arrived":
             return True, "the field reads back the text"
+        if seen == "unreadable":   # the field's own nature (no Value/Text pattern): expected, never a failure
+            return None, EXPECTED_UNVERIFIABLE
         return (False, "the field does not hold the text") if seen == "missing" else (
             None, "the field could not be read back")
     if name in ("click", "hotkey", "press"):
@@ -424,6 +437,10 @@ class Agent:
         self._requests = 0
         #: The previous request's words (fast memory also searches them: a follow-up names nothing itself).
         self._previous_request: str | None = None
+        #: The words memory was searched with for the previous request and the running one (the user's own words,
+        #: never Yuki's hand-off envelope: ``run(memory_query=)``, else ``memory_query_of``).
+        self._previous_query: str | None = None
+        self._this_query: str | None = None
         #: The profile and rules layers of the system prompt for the request being handled
         #: (``prompt.system_blocks``), set by ``_memory_context``; ``None`` when memory had
         #: nothing (then the layer is left out).
@@ -774,7 +791,8 @@ class Agent:
         self, request: str, *, origin_hwnd: int | None = None, effort: str | None = None,
         model: str | None = None, thinking: bool | None = None, lean: bool = False,
         view_hwnd: int | None = None, escalate: tuple[str | None, bool | None] | None = None,
-        voice: bool = False,
+        voice: bool = False, memory_query: str | None = None, previous_query: str | None = None,
+        memory_apps: Iterable[str] | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -811,6 +829,15 @@ class Agent:
                 written as text (docs/VOICE.md v3.14). It holds for the rest of the
                 request (every switch of effort rewrites the whole prompt cache on
                 Sonnet 5, measured). ``None``: fixed for the whole request.
+            memory_query: The user's own words, what memory is searched with (the
+                related memories and know-how). A spoken request's hand-off carries
+                ~1.8k characters of Yuki's own notes and the embedder reads ~128
+                tokens (revamp 02 D1). ``None``: the request's own words, Yuki's
+                bracketed notes left out (:func:`yuki.agent.memory.memory_query_of`).
+            previous_query: The previous request's words, for a follow-up; ``None``:
+                the memory query of this conversation's previous request.
+            memory_apps: Apps the caller says the request names (their know-how
+                is attached at a lower relevance floor, like the app in front's).
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -879,9 +906,13 @@ class Agent:
             as_call = view is not None and self._request_thinking is False
             if view is not None and not as_call:
                 overview = f"{overview}\n\n{view[0]}"
+            query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
             memory_text, commitments_text = self._memory_context(
-                request, first=self._requests == 1, lean=self._request_lean
+                request, first=self._requests == 1, lean=self._request_lean, query=query,
+                previous=" ".join(str(previous_query or "").split()) or self._previous_query,
+                apps=list(memory_apps or ()), origin_hwnd=origin_hwnd,
             )
+            self._this_query = query
             self.context.add_request(
                 request,
                 overview,
@@ -926,6 +957,8 @@ class Agent:
             if outcome == "final":
                 self._save_learned(request)
             self._previous_request = request
+            self._previous_query = self._this_query or memory_query_of(request) or None
+            self._this_query = None
             self._end_request(request, reply=reply, outcome=outcome, at=started_at)
 
     # -- per-request accounting --------------------------------------------
@@ -1310,7 +1343,9 @@ class Agent:
                     # extra round trip.
                     turn.finished.append(turn.finishing[-1][0])
                     self.logger.log("finished_by_action", message=turn.finishing[-1][0])
-                reason = self._step_signal(turn, breaker_blocks) or (held[0][1] if held else None)
+                reason = self._step_signal(turn, breaker_blocks)
+                if reason is None and held and not (turn.finishing and turn.finishing[-1][2] == EXPECTED_UNVERIFIABLE):
+                    reason = held[0][1]   # a finish held for an expected-unverifiable report is no trouble signal
                 if reason and self._escalate(reason) and not held and not breaker_blocks:
                     # The fast first pass did not show its effect: the next call thinks again from the screen, not
                     # from its own unchecked words before the call (v3.14; measured on the Warp stub: without this,
@@ -1438,7 +1473,7 @@ class Agent:
     def _claim_gaps(self, turn: _Turn) -> list[str]:
         """What this response's ``done`` asserts without evidence from this request's calls, in words for the brain."""
         gaps = [f"{tool}'s report does not show that it took effect ({why})"
-                for tool, verified, why in turn.verdicts if verified is not True]
+                for tool, verified, why in turn.verdicts if verified is not True and why != EXPECTED_UNVERIFIABLE]
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
                  f"verified result" for hwnd in (turn.done_about or []) if hwnd not in self._evidence]
         return gaps
@@ -1446,15 +1481,16 @@ class Agent:
     def _step_signal(self, turn: _Turn, breaker_blocks: list[dict[str, Any]]) -> str | None:
         """The measured reason this request's next model call needs judgement, or ``None`` (v3.14).
 
-        An action (or any real call) failed, an action's own report does not verify its effect, the loop breaker
-        tripped, or the user was just asked something. Signals only: which calls ran, their results and verdicts.
+        An action (or any real call) failed, an action's own report does not verify its effect (an
+        expected-unverifiable one, :data:`EXPECTED_UNVERIFIABLE`, is not that), the loop breaker tripped, or the user
+        was just asked something. Signals only: which calls ran, their results and verdicts.
         """
         for tool_id, block in turn.results.items():
             name = turn.names.get(tool_id, "")
             if block.get("is_error") and tool_id not in turn.gated and name not in LOOP_EXEMPT:
                 return f"{name} failed"
         for tool, verified, why in turn.verdicts:
-            if verified is not True:
+            if verified is not True and why != EXPECTED_UNVERIFIABLE:
                 return f"{tool} was not verified ({why})"
         if breaker_blocks:
             return "the loop breaker tripped"
@@ -2212,8 +2248,38 @@ class Agent:
 
     # -- memory ------------------------------------------------------------
 
+    def _live_screen(self, origin_hwnd: int | None = None) -> dict[str, Any] | None:
+        """The window the request came from as the Now board read it this turn (the dispatcher's last picture), as
+        the whole-memory ranking's screen anchor; ``None`` without one. The service's own last capture lags a fresh
+        window switch by its settle time (revamp 02 §3.3: "On their screen" named the wrong window twice)."""
+        board = getattr(self.dispatcher, "last_now_board", None)
+        if not isinstance(board, dict):
+            return None
+        payload = self._overview_payload if isinstance(self._overview_payload, dict) else {}
+        want = origin_hwnd or payload.get("foreground_hwnd") or board.get("foreground")
+        window = next((w for w in board.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") == want), None)
+        if window is None or window.get("blocked"):
+            return None
+        title = window.get("live_title") or window.get("title")
+        if not (title or window.get("text")):
+            return None
+        url = window.get("url") or None
+        host = None
+        if url:
+            try:
+                from urllib.parse import urlparse
+
+                host = urlparse(str(url)).hostname
+            except ValueError:
+                host = None
+        return {"app": window.get("app"), "process": window.get("process"), "title": title, "url": url,
+                "scope": window.get("scope"), "host": host, "kind": window.get("kind"),
+                "text": str(window.get("text") or ""), "at": window.get("read_at"), "by_yuki": bool(window.get("by_yuki")),
+                "source": "now"}
+
     def _memory_context(
-        self, request: str, *, first: bool = False, lean: bool = False
+        self, request: str, *, first: bool = False, lean: bool = False, query: str | None = None,
+        previous: str | None = None, apps: list[str] | None = None, origin_hwnd: int | None = None,
     ) -> tuple[str | None, str | None]:
         """Split what memory knows into the system layers and this request's message blocks.
 
@@ -2234,24 +2300,36 @@ class Agent:
         never raises.
 
         Args:
-            request: The request text (the know-how query).
+            request: The request text.
             first: This is the conversation's first request: attach the
                 resume context too.
             lean: Leave the rest of the portrait and the resume out of the block
                 (the profile and rules layers are unchanged).
+            query: The user's own words (what memory is searched with); ``None``:
+                :func:`yuki.agent.memory.memory_query_of` the request.
+            previous: The previous request's words.
+            apps: Apps the caller says the request names.
+            origin_hwnd: The window the request came from (the screen anchor).
+
+        The rules layer holds the user's rules and preferences only (or the "no rules" text); their
+        to-dos and Yuki's commitments go in the commitments block (revamp 09 P0.1). To-dos, know-how,
+        threads and recent screens come only as far as they bear on the words (revamp 02 P2).
         """
         started = time.perf_counter()
         app = _foreground_app(self._overview_payload)
+        query = query if query is not None else memory_query_of(request)
         self._profile_layer = profile_text(self.settings.user_names, None)
         self._rules_layer = None
         try:
-            fetched = self.memory.context(app=app, query=request, resume=first and not lean,
-                                          previous=self._previous_request)
+            screen = self._live_screen(origin_hwnd)
+            fetched = self.memory.context(app=app, query=query, resume=first and not lean, previous=previous,
+                                          apps=apps or (), screen=screen)
             rest, personality = _split_personality(fetched.portrait)
-            rules, commitments = split_standing(fetched.standing)
+            rules = standing_rules_text(fetched)
+            commitments = standing_commitments_text(fetched)
             self._profile_layer = profile_text(self.settings.user_names, personality, fetched.persona)
-            if fetched.source != "unavailable":
-                self._rules_layer = rules_text(rules or "")
+            if fetched.source != "unavailable" and rules is not None:
+                self._rules_layer = rules_text(rules)
             background = replace(fetched, portrait=None if lean else ((rest or "").strip() or None),
                                  resume=None if lean else fetched.resume)
             repeated = None
@@ -2293,6 +2371,12 @@ class Agent:
             "truncated": list(fetched.truncated),
             "knowhow_lines": len(fetched.knowhow) if text else 0,
             "todo_lines": len(fetched.todos) if text else 0,
+            "todos_held": fetched.todos_held,
+            "commitments_chars": len(commitments or ""),
+            "rules_layer_chars": len(self._rules_layer or ""),
+            "connected_chars": len(relevant or ""),
+            "self_echo": int((fetched.related or {}).get("self_echo") or 0),
+            "query_chars": len(query or ""),
             "relevant_items": len(fetched.relevant),
             "relevant_ms": fetched.relevant_ms,
             "persona_chars": len(fetched.persona or ""),
@@ -2316,6 +2400,11 @@ class Agent:
             truncated=list(fetched.truncated),
             knowhow_lines=len(fetched.knowhow),
             todo_lines=len(fetched.todos),
+            todos_held=fetched.todos_held,
+            connected_chars=len(relevant or ""),
+            self_echo=int((fetched.related or {}).get("self_echo") or 0),
+            query_chars=len(query or ""),
+            screen_source=("now" if screen else None),
             relevant=[{"kind": r.get("kind"), "id": r.get("id"), "cosine": r.get("cosine"), "score": r.get("score")}
                       for r in fetched.relevant],
             relevant_ms=fetched.relevant_ms,

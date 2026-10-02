@@ -423,6 +423,9 @@ def run(args: argparse.Namespace) -> int:
                     # a page that changed address without a title change (a reel, a feed): read it now
                     on_page_change=lambda hwnd: watcher.request_capture(hwnd, "page"),
                     signals=av_signals,
+                    # a microphone hold is a meeting only on a screen judged in a call (revamp A9): the same
+                    # verdicts the call worker starts calls on
+                    evidence=call_evidence,
                 )
                 timeline.set_paused(paused)  # before start: nothing is recorded, not even the first window
                 timeline.start()
