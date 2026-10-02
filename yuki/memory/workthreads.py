@@ -323,7 +323,12 @@ def parse_work(items: Any, offered: dict[int, WorkThread], sources: Sequence[Any
             rejected.append("what was only glimpsed starts no thread")
             continue
         times = [float(sources[i].at) for i in idx] or [float(s.at) for s in sources] or [time.time()]
+        # when memory saw them (the captures' own times): a thread is never dated after it was seen
+        captured = [float(getattr(getattr(s, "capture", None), "at", 0.0) or 0.0)
+                    for s in ([sources[i] for i in idx] or list(sources))]
+        captured = [t for t in captured if t > 0.0]
         ops.append(WorkOp(
+            seen_at=max(captured) if captured else None,
             action=action, work_thread_id=None if action == "starts" else n, title=title,
             state=_clean(item.get("state"), 400),
             open_items=[x for x in (_clean(v, 140) for v in list(item.get("open_items") or [])[:MAX_OPEN]) if x],
@@ -462,6 +467,11 @@ MAX_CHANGES = 10
 LOOKALIKE_COSINE = 0.62
 #: Threads finished or merged longer ago than this are not shown to the nightly pass.
 SHOW_DONE_DAYS = 14
+#: Inactivity, measured (days since a thread was last touched): from PAUSE_AFTER_DAYS the nightly pass is told a
+#: quiet thread is set aside unless something shows it still going (its judgement); one still active after
+#: AUTO_PAUSE_DAYS untouched is paused by code (revamp A9: all 12 threads stayed "active", one of them for weeks).
+PAUSE_AFTER_DAYS = 3.0
+AUTO_PAUSE_DAYS = 7.0
 CONSOLIDATE_MAX_TOKENS = 16_000
 
 CONSOLIDATE_SYSTEM_PROMPT = """\
@@ -482,8 +492,9 @@ application or person and purpose - under different names. keep_id is the one th
 give the merged title, state and open items. Never merge threads that only share an app, a repo \
 or a person: one repo can hold two projects, one friend can be in two threads.
 - close: finished (the latest states show it done, merged, sent, submitted) -> status done; set \
-aside (untouched for several days and nothing shows it still going) -> status paused. A thread \
-touched in the last two days stays as it is unless its state says it finished.
+aside -> status paused. Each thread shows how many days it has been idle (untouched): one idle {pause_days} \
+days or more is set aside unless its states show it still going or waiting on a near date - close it \
+as paused. A thread touched in the last two days stays as it is unless its state says it finished.
 - rename: a title that no longer says what the thread became.
 - update: rewrite the state and open items when the latest states contradict each other or pile up.
 - dismiss: a thread that is no piece of work at all - watching videos or streams, listening to music, scrolling or browsing for fun or for adult content, playing or watching games, chatting with friends, one look at a page, one meeting on its own - it stops being a thread (its facts stay in the journal).
@@ -601,8 +612,10 @@ class Consolidator:
         lines = []
         for t in threads:
             s = sig[t.id]
-            lines.append(f"{thread_line(t, now, safe=safe, cap=900)} [touched {s['events']} times on {s['days']} days, "
-                         f"{s['facts']} journal facts; apps: {safe(', '.join(s['apps']), 200) or '-'}]")
+            idle = max(0.0, (now - float(t.last_seen)) / 86400.0)
+            lines.append(f"{thread_line(t, now, safe=safe, cap=900)} [idle {idle:.1f} days; touched {s['events']} times "
+                         f"on {s['days']} days, {s['facts']} journal facts; apps: "
+                         f"{safe(', '.join(s['apps']), 200) or '-'}]")
             for e in s["states"]:
                 lines.append(f"    {datetime.fromtimestamp(e['at']):%a %d %b %H:%M} {e['action']}: {safe(e['state'], 300)}")
         pair_lines = [f"W{a} ~ W{b} ({c})" for a, b, c in pairs] or ["(none)"]
@@ -712,10 +725,17 @@ class Consolidator:
 
         now = time.time() if now is None else float(now)
         worker = self.worker
+        repaired = [] if dry_run else self.store.repair_work_thread_dates(now=now)
         threads = self.shown(now)
         stats = PortraitRunStats(kind="threads", model=worker.model, window_until=now)
         run_id = None if dry_run else self.store.start_portrait_run("threads", worker.model, at=now)
         result = ConsolidateResult(run_id)
+        if repaired and run_id is not None:
+            self.store.add_diary(run_id, [{"pass": "threads", "action": "update", "fact_ids": [c["id"] for c in repaired],
+                                           "text": f"Set {len(repaired)} thread date(s) back within what memory saw "
+                                                   f"(a first seen before memory began, or a last seen in the "
+                                                   f"future): W" + ", W".join(str(c["id"]) for c in repaired) + "."}],
+                                 now=now)
         if len(threads) < 2:
             if run_id is not None:
                 stats.outcome = "empty"
@@ -725,7 +745,8 @@ class Consolidator:
             sig, pairs = self.signals(threads)
             tool_input = worker._call(
                 purpose="threads", run_id=run_id,
-                system=CONSOLIDATE_SYSTEM_PROMPT.replace("{max_changes}", str(self.max_changes)),
+                system=CONSOLIDATE_SYSTEM_PROMPT.replace("{max_changes}", str(self.max_changes)).replace(
+                "{pause_days}", f"{PAUSE_AFTER_DAYS:g}"),
                 user=self.message(threads, sig, pairs, now), tool=CONSOLIDATE_TOOL, effort=self.effort or worker.effort,
                 max_tokens=CONSOLIDATE_MAX_TOKENS, stats=stats)
             items, qs = tool_input.get("decisions"), tool_input.get("questions")
@@ -762,6 +783,8 @@ class Consolidator:
                     diary.append({"pass": "threads", "action": ch["action"], "fact_ids": ch.get("ids") or [ch.get("id")],
                                   "text": text})
                     result.diary.append(text)
+                diary += self._auto_pause(threads, {i for ch in changes for i in (ch.get("ids") or [ch.get("id")])},
+                                          now, result)
                 if diary:
                     self.store.add_diary(run_id, diary, now=now)
                 result.asked = self._ask(asks, current, now)
@@ -779,6 +802,27 @@ class Consolidator:
                     cost_usd=round(result.cost_usd, 6), error=result.error,
                     diary_ciphertext=worker._seal(result.diary))
         return result
+
+    def _auto_pause(self, threads: Sequence[WorkThread], decided: set[Any], now: float,
+                    result: ConsolidateResult) -> list[dict[str, Any]]:
+        """The measured backstop of the nightly pass: an active thread untouched for :data:`AUTO_PAUSE_DAYS` that the
+        model left alone tonight is paused (it comes back to active the moment the user touches it again)."""
+        stale = [t for t in threads if t.status == "active" and t.id not in decided
+                 and now - float(t.last_seen) >= AUTO_PAUSE_DAYS * 86400.0]
+        if not stale:
+            return []
+        changes = [{"action": "close", "id": t.id, "status": "paused",
+                    "reason": f"untouched for {(now - float(t.last_seen)) / 86400.0:.0f} days (measured)"} for t in stale]
+        diary = []
+        for ch, oc, t in zip(changes, self.store.change_work_threads(changes, now=now), stale):
+            if not oc.get("ok"):
+                result.rejected.append(f"auto pause W{t.id}: {oc.get('why')}")
+                continue
+            result.applied += 1
+            text = f"Marked thread W{t.id} \"{t.title}\" paused - {ch['reason']}."
+            diary.append({"pass": "threads", "action": "close", "fact_ids": [t.id], "text": text})
+            result.diary.append(text)
+        return diary
 
     def _ask(self, asks: Sequence[dict[str, Any]], current: dict[int, WorkThread], now: float) -> int:
         """Ambiguous merges become questions for the user (asked on a card like every other question)."""

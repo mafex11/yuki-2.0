@@ -260,7 +260,7 @@ import os
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -606,6 +606,10 @@ class WorkOp:
     embed_model: str | None = None
     #: The attention its sources had (:func:`capture_attention`): ``front`` when any was in front.
     attention: str = "front"
+    #: When memory saw its sources (their newest capture time), ``None`` when not known (the backfill): a thread is
+    #: never dated after it was seen (a list row or calendar line printed "08 Nov" is a date inside the content,
+    #: not when the user worked on it; revamp A9).
+    seen_at: float | None = None
     #: What the store made of it (set in the transaction): the thread id written, and ``started`` |
     #: ``continued`` | ``paused`` | ``ended`` | ``reopened`` | ``rejected:<why>``.
     result_id: int | None = None
@@ -771,6 +775,9 @@ class Portrait:
     run_id: int | None
     model: str | None
     fact_count: int
+    #: The page's sections as fields (migration 27; ``yuki.memory.portrait.PORTRAIT_FIELDS``), ``None`` for a page
+    #: rendered before.
+    sections: dict[str, str] | None = None
 
 
 @dataclass
@@ -914,7 +921,12 @@ COMMITMENT_OWNERS: tuple[str, ...] = ("yuki", "user")
 
 @dataclass
 class ConversationTurn:
-    """One exchange between the user and Yuki (decrypted), see :meth:`Store.add_turn`."""
+    """One exchange between the user and Yuki (decrypted), see :meth:`Store.add_turn`.
+
+    ``user_text`` is the user's words (with a card in brackets before them when they replied to one); the notes Yuki
+    put after them are ``envelope`` (migration 27; read apart from older rows by :func:`split_envelope`), and
+    :attr:`full_text` is the request as it was sent.
+    """
 
     id: int
     session_id: str
@@ -932,6 +944,13 @@ class ConversationTurn:
     #: Who a voice turn was said to (migration 18): "yuki", "others" (the people on a call, dictation into
     #: another app), or None when not known (typed turns are to Yuki).
     addressed: str | None = None
+    #: Yuki's own notes after the user's words (migration 27), or ``None``.
+    envelope: str | None = None
+
+    @property
+    def full_text(self) -> str:
+        """The request as Yuki sent it: the user's words and Yuki's notes after them."""
+        return (self.user_text or "") + (self.envelope or "")
 
 
 @dataclass
@@ -2369,7 +2388,51 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE nudges ADD COLUMN outcome TEXT;
     ALTER TABLE nudges ADD COLUMN outcome_at REAL;
     """,
+    # 27 (2026-10-03, revamp A7/A9; docs/research/revamp-2026-10-02/22-build-A6-A9.md):
+    # - threads.ident_key: a capture thread's identity by the app's stable identity (its process image, app_key) and
+    #   its scope, URL or title - no longer by the app's display name. On 2 Oct the name Windows gave
+    #   whatsapp.root changed from "WhatsApp.Root" to "WhatsApp" and every WhatsApp chat (Hemanth, RES) split into
+    #   two threads. threads.merged_into: a thread that was one of such a split points at the one it went into
+    #   (its captures, facts, messages and links now on that one). The Python step after this SQL
+    #   (:meth:`Store._migrate_27`) fills ident_key and merges the splits; thread_key keeps its old value, so code
+    #   from before this migration still finds its rows.
+    # - conversation_turns.envelope_ciphertext: the notes Yuki itself put around the user's words in a request (the
+    #   voice hand-off's references, heard words, done-before log and guide; ~1.5-2.8k characters), kept apart from
+    #   the words, so recall lines, the resume and the turn's vector carry the user's words, not Yuki's boilerplate.
+    # - portraits.sections_ciphertext: the rendered page's sections as fields (work, interests, routines, behaviour,
+    #   people, preferences, relationship, personality, open loops; JSON), each written within its own stated budget
+    #   (revamp 09 P0.2: the page used to be cut blind, 30-70% of what the model wrote, every night). Consumers read
+    #   the fields; the page text keeps its old shape for the ones that read the page.
+    # Additive only.
+    """
+    ALTER TABLE threads ADD COLUMN ident_key TEXT;
+    ALTER TABLE threads ADD COLUMN merged_into INTEGER;
+    CREATE INDEX threads_ident ON threads(ident_key);
+    ALTER TABLE conversation_turns ADD COLUMN envelope_ciphertext TEXT;
+    ALTER TABLE portraits ADD COLUMN sections_ciphertext TEXT;
+    """,
 )
+
+#: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
+#: -> the :class:`Store` method's name): data moves that need the store's key (an HMAC identity, a decryption).
+PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27"}
+#: When the timeline began judging meetings by call evidence live (written by migration 27): meeting rows that ended
+#: before it are checked against the call rows when read (:meth:`Store._meetings_proven`).
+MEETING_GATE_CHECKPOINT = "meeting_evidence_since"
+
+
+def split_envelope(text: str | None) -> tuple[str, str | None]:
+    """``(words, envelope)`` of a request Yuki composed: the notes it put after the user's words (each in brackets
+    after a blank line: the voice hand-off's references, heard words, done-before log and guide, a coach note), or
+    ``None``. ``words + envelope`` is the text again. A card in brackets on its own line before the words stays with
+    the words (``yuki.memory.conversations.has_card_context`` reads it). Parsing Yuki's own request format, never
+    the user's words (the same cut :func:`yuki.memory.conversations.own_words` makes)."""
+    t = text or ""
+    start = t.index("]\n") + 2 if t.startswith("[") and "]\n" in t else 0
+    cut = t.find("\n\n[", start)
+    if cut < 0:
+        return t, None
+    return t[:cut], t[cut:]
 
 
 #: What carries a model-written short label (migration 21, :mod:`yuki.memory.titles`): surface ->
@@ -2531,6 +2594,8 @@ class Store:
                         continue
                     for statement in _split_sql(MIGRATIONS[index]):
                         self._conn.execute(statement)
+                    if index in PY_MIGRATIONS:
+                        getattr(self, PY_MIGRATIONS[index])(self._conn)
                     self._conn.execute(f"PRAGMA user_version={index + 1}")
                     self._conn.execute("COMMIT")
                 except BaseException:
@@ -2583,6 +2648,41 @@ class Store:
             lambda conn: self._upsert_thread(conn, app, title, url, process=process, scope=scope, kind=kind)
         )
 
+    def thread_identity(self, app: str | None, title: str | None, url: str | None, *, process: str | None = None,
+                        scope: str | None = None) -> tuple[str, str]:
+        """``(identity key, display-name key)`` of a capture thread (migration 27).
+
+        The identity is the app's stable identity - its process image (:func:`app_key`: "whatsapp.root"), the
+        app's display name only when the process is unknown - with the thread's scope (a chat, a channel, a mail
+        subject), else its URL, else its title. Keyed by the display name instead, the same chat became two threads
+        when Windows renamed the app ("WhatsApp.Root" -> "WhatsApp", 2 Oct). The second key is the old formula, by
+        the display name, which rows written before migration 27 are found by (``thread_key``).
+        """
+        app = app or ""
+        title = title or ""
+        url = url or None
+        scope = (scope or "").strip() or None
+        proc = app_key(process)
+        ident = f"proc:{proc}" if proc else app
+        if scope and scope != url:
+            return self.cipher.digest("scope", ident, scope), self.cipher.digest("scope", app, scope)
+        kind = "url" if url else "title"
+        return self.cipher.digest(kind, ident, url or title), self.cipher.digest(kind, app, url or title)
+
+    def find_thread(self, app: str | None, title: str | None, url: str | None, *, process: str | None = None,
+                    scope: str | None = None) -> int | None:
+        """The capture thread of this window or page, if memory has one (read only: nothing is created). The live
+        screen (the Now board's window in front) is anchored to its thread of work through it."""
+        ident, old = self.thread_identity(app, title, url, process=process, scope=scope)
+        try:
+            row = self._query("SELECT id FROM threads WHERE ident_key=? AND merged_into IS NULL ORDER BY id LIMIT 1",
+                              (ident,))
+            if not row:
+                row = self._query("SELECT coalesce(merged_into, id) FROM threads WHERE thread_key=?", (old,))
+        except sqlite3.OperationalError:   # a database before migration 27
+            row = self._query("SELECT id FROM threads WHERE thread_key=?", (old,))
+        return int(row[0][0]) if row else None
+
     def _upsert_thread(
         self, conn: sqlite3.Connection, app: str, title: str, url: str | None, *, process: str | None = None,
         scope: str | None = None, kind: str | None = None,
@@ -2593,14 +2693,22 @@ class Store:
         url = url or None
         scope = (scope or "").strip() or None
         proc = app_key(process)
-        if scope and scope != url:
-            key = self.cipher.digest("scope", app, scope)
-        else:
-            key = self.cipher.digest("url" if url else "title", app, url or title)
+        ident, old = self.thread_identity(app, title, url, process=process, scope=scope)
         now = time.time()
 
         def op(conn: sqlite3.Connection) -> int:
-            row = conn.execute("SELECT id FROM threads WHERE thread_key=?", (key,)).fetchone()
+            row = conn.execute("SELECT id FROM threads WHERE ident_key=? AND merged_into IS NULL ORDER BY id LIMIT 1",
+                               (ident,)).fetchone()
+            if row is None:
+                # a row written under the display-name key (before migration 27, or by an older build since): it is
+                # this thread; a split one that was merged points at the thread it went into
+                found = conn.execute("SELECT id, merged_into FROM threads WHERE thread_key IN (?, ?)"
+                                     " ORDER BY merged_into IS NOT NULL, id LIMIT 1", (old, ident)).fetchone()
+                if found is not None:
+                    target = int(found["merged_into"] or found["id"])
+                    conn.execute("UPDATE threads SET ident_key=coalesce(ident_key, ?) WHERE id=? AND merged_into IS NULL",
+                                 (ident, target))
+                    row = {"id": target}
             if row:
                 conn.execute(
                     "UPDATE threads SET title_ciphertext=?, url_ciphertext=?, last_seen=?,"
@@ -2611,12 +2719,75 @@ class Store:
                 return int(row["id"])
             cur = conn.execute(
                 "INSERT INTO threads(thread_key, app, host, title_ciphertext, url_ciphertext, first_seen, last_seen,"
-                " process, scope_ciphertext, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (key, app, url_host(url), self._enc(title), self._enc(url), now, now, proc, self._enc(scope), kind),
+                " process, scope_ciphertext, kind, ident_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (ident, app, url_host(url), self._enc(title), self._enc(url), now, now, proc, self._enc(scope), kind,
+                 ident),
             )
             return int(cur.lastrowid)
 
         return op(conn)
+
+    #: Every column that holds a capture thread's id (migration 27 moves a merged thread's references with it).
+    _THREAD_REFS: tuple[tuple[str, str], ...] = (
+        ("captures", "thread_id"), ("journal", "thread_id"), ("journal_batches", "thread_id"), ("calls", "thread_id"),
+        ("work_thread_events", "thread_id"), ("links_seen", "capture_thread_id"),
+    )
+
+    def _migrate_27(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """Migration 27's data step (inside its transaction): every capture thread gets its identity key
+        (:meth:`thread_identity`), and threads that are one window, page or chat of one app split by a change of
+        the app's display name are merged into the oldest: its captures, journal facts, messages, calls, thread
+        events and links move to it, the newest title and address stay, the others point at it
+        (``merged_into``). A message both had is kept once (the other copy marked a re-read, as the watcher marks
+        a message read again). Nothing is deleted. Returns counts."""
+        self._set_checkpoint(conn, MEETING_GATE_CHECKPOINT, f"{time.time():.3f}")   # the live meeting gate from now
+        rows = conn.execute("SELECT id, app, process, title_ciphertext, url_ciphertext, scope_ciphertext,"
+                            " first_seen, last_seen, messages_seen_at FROM threads ORDER BY first_seen, id").fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for r in rows:
+            try:
+                title, url, scope = (self._dec(r["title_ciphertext"]), self._dec(r["url_ciphertext"]),
+                                     self._dec(r["scope_ciphertext"]))
+            except Exception:   # a row that cannot be read keeps its own identity
+                groups.setdefault(f"row:{r['id']}", []).append(r)
+                continue
+            ident, _old = self.thread_identity(r["app"], title, url, process=r["process"], scope=scope)
+            groups.setdefault(ident, []).append(r)
+        merged = 0
+        for ident, members in groups.items():
+            keep = members[0]
+            if not ident.startswith("row:"):
+                conn.execute("UPDATE threads SET ident_key=? WHERE id=?", (ident, keep["id"]))
+            if len(members) < 2:
+                continue
+            newest = max(members, key=lambda m: (m["last_seen"], m["id"]))
+            for other in members[1:]:
+                self._merge_thread_rows(conn, int(keep["id"]), int(other["id"]))
+                merged += 1
+            conn.execute(
+                "UPDATE threads SET first_seen=?, last_seen=?, messages_seen_at=?, title_ciphertext=?,"
+                " url_ciphertext=?, scope_ciphertext=coalesce(?, scope_ciphertext) WHERE id=?",
+                (min(m["first_seen"] for m in members), max(m["last_seen"] for m in members),
+                 max((m["messages_seen_at"] for m in members if m["messages_seen_at"] is not None), default=None),
+                 newest["title_ciphertext"], newest["url_ciphertext"], newest["scope_ciphertext"], keep["id"]))
+        return {"threads": len(rows), "merged": merged}
+
+    def _merge_thread_rows(self, conn: sqlite3.Connection, keep: int, other: int) -> None:
+        """Move one capture thread's references onto another (migration 27's merge; see :meth:`_migrate_27`)."""
+        for table, column in self._THREAD_REFS:
+            try:
+                conn.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (keep, other))
+            except sqlite3.OperationalError:   # a table a test database does not have
+                continue
+        conn.execute("UPDATE OR IGNORE messages SET thread_id=? WHERE thread_id=?", (keep, other))
+        conn.execute("UPDATE messages SET status='reread' WHERE thread_id=?", (other,))
+        latest = conn.execute("SELECT thread_id, at FROM thread_latest WHERE thread_id IN (?, ?)", (keep, other)).fetchall()
+        mine = next((r["at"] for r in latest if r["thread_id"] == keep), None)
+        theirs = next((r["at"] for r in latest if r["thread_id"] == other), None)
+        if theirs is not None and (mine is None or theirs > mine):
+            conn.execute("INSERT OR REPLACE INTO thread_latest(thread_id, at, text_ciphertext, hash)"
+                         " SELECT ?, at, text_ciphertext, hash FROM thread_latest WHERE thread_id=?", (keep, other))
+        conn.execute("UPDATE threads SET merged_into=?, ident_key=NULL WHERE id=?", (keep, other))
 
     def thread_info(self, thread_id: int) -> ThreadInfo | None:
         """Decrypted thread metadata, or ``None``."""
@@ -3288,6 +3459,28 @@ class Store:
             "SELECT j.* FROM journal j WHERE j.batch_id IN (%s)%s ORDER BY j.at, j.id"
             % (",".join("?" * len(ids)), extra), ids)]
 
+    def withdrawn_journal(self, journal_ids: Iterable[int]) -> set[int]:
+        """Those of ``journal_ids`` that no longer stand as evidence: marked as text for or from another AI tool or a
+        sample page (``tainted``), or superseded by a re-journal that wrote nothing standing in their place (no
+        untainted entry of the same capture thread in the batch that replaced them: on 1 Oct the demo page's
+        "received a job offer from Google" was re-journaled into nothing). An entry re-journaled into corrected
+        entries is not withdrawn (the portrait's audit weighs those), and an id not in the journal is unknown, not
+        withdrawn. Ids and flags only (nothing decrypted)."""
+        ids = sorted({int(i) for i in journal_ids})
+        if not ids:
+            return set()
+        out: set[int] = set()
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self._query(
+                "SELECT j.id, coalesce(j.tainted, 0) AS tainted, j.superseded_at, EXISTS (SELECT 1 FROM journal n"
+                " WHERE n.batch_id = j.superseded_by AND n.thread_id IS j.thread_id AND n.superseded_at IS NULL"
+                " AND coalesce(n.tainted, 0) = 0) AS replaced FROM journal j WHERE j.id IN (%s)"
+                % ",".join("?" * len(chunk)), chunk)
+            out |= {int(r["id"]) for r in rows
+                    if r["tainted"] or (r["superseded_at"] is not None and not r["replaced"])}
+        return out
+
     def superseded_journal(self, journal_ids: Iterable[int]) -> dict[int, int]:
         """``{journal id: the batch that replaced it}`` for those of ``journal_ids`` a re-journal superseded."""
         ids = sorted({int(i) for i in journal_ids})
@@ -3667,13 +3860,16 @@ class Store:
 
     def save_portrait(
         self, text: str, *, run_id: int | None = None, model: str | None = None, fact_count: int = 0,
-        at: float | None = None,
+        at: float | None = None, sections: dict[str, str] | None = None,
     ) -> int:
-        """Store a rendered portrait (encrypted); the newest one is the current portrait."""
+        """Store a rendered portrait (encrypted); the newest one is the current portrait. ``sections``: the page's
+        fields (migration 27)."""
         when = float(at) if at is not None else time.time()
+        sealed = self.cipher.encrypt(json.dumps(sections, ensure_ascii=False)) if sections else None
         return self._write(lambda conn: int(conn.execute(
-            "INSERT INTO portraits(at, run_id, model, text_ciphertext, chars, fact_count) VALUES (?,?,?,?,?,?)",
-            (when, run_id, model, self.cipher.encrypt(text), len(text), int(fact_count)),
+            "INSERT INTO portraits(at, run_id, model, text_ciphertext, chars, fact_count, sections_ciphertext)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (when, run_id, model, self.cipher.encrypt(text), len(text), int(fact_count), sealed),
         ).lastrowid))
 
     def latest_portrait(self) -> Portrait | None:
@@ -3682,8 +3878,15 @@ class Store:
         if not rows:
             return None
         r = rows[0]
+        sections = None
+        if "sections_ciphertext" in r.keys() and r["sections_ciphertext"]:
+            try:
+                value = json.loads(self.cipher.decrypt(r["sections_ciphertext"]))
+                sections = {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else None
+            except Exception:
+                sections = None
         return Portrait(id=r["id"], at=r["at"], text=self.cipher.decrypt(r["text_ciphertext"]),
-                        run_id=r["run_id"], model=r["model"], fact_count=r["fact_count"])
+                        run_id=r["run_id"], model=r["model"], fact_count=r["fact_count"], sections=sections)
 
     def activity_slots(self, since: TimeArg, until: TimeArg, slot_s: float = 900.0) -> dict[str, Any]:
         """Foreground presence in fixed slots: which apps/sites the watcher read, when.
@@ -4023,9 +4226,71 @@ class Store:
             clauses.append("started_at < ?")
             params.append(u)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        return [self._timeline_row(r) for r in self._query(
-            "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
-        )]
+        raw = self._query("SELECT * FROM timeline" + where + " ORDER BY started_at, id", params)
+        return self._meetings_proven([self._timeline_row(r) for r in raw],
+                                     [float(r["updated_at"] or 0.0) for r in raw])
+
+    #: A meeting row needs a call of the same app around it, this close in time (seconds): the call worker sees a
+    #: call some seconds after the app takes the microphone and lets it linger ~2 minutes after it lets go.
+    MEETING_CALL_SLACK_S = 180.0
+
+    def _meetings_proven(self, rows: list[TimelineRow], written: Sequence[float] | None = None) -> list[TimelineRow]:
+        """Rows recorded before the timeline's live call-evidence gate (migration 27) that it marked a meeting only
+        because the app in front held the microphone, with no call of that app around them, read as that app's own
+        time (``meeting`` None): a game's voice chat (VALORANT) or a music app recording (FL Studio) is not a meeting
+        (revamp A9: 1 h 35 m of "meetings" on 2 Oct were those, and they held back the coach's cards). The evidence
+        is measured: the call worker writes a call row (a declined one too) for every hold on a screen judged in a
+        call, so a meeting with no call row of its app was never seen as one. Rows from before the first call row
+        ever written stay as they were (nothing to judge them by), and so do rows since the gate (it judged them
+        live; a meeting the user declined to record still has its call row). Read-time only: rows are untouched."""
+        meet = [r for r in rows if r.meeting and r.process and not r.host]   # an app's own meeting, not a site's
+        if not meet:
+            return rows
+        gate = getattr(self, "_meeting_gate_since", None)
+        if gate is None:
+            try:
+                value = self.source_checkpoint(MEETING_GATE_CHECKPOINT)
+                gate = float(value) if value else 0.0
+            except (sqlite3.OperationalError, ValueError):
+                gate = 0.0
+            self._meeting_gate_since = gate
+        written = list(written) if written is not None else [r.ended_at for r in rows]
+        before = {id(r) for r, w in zip(rows, written) if w < gate}   # last written before the live gate
+        meet = [r for r in meet if id(r) in before]   # rows written since were judged on a screen already
+        if not meet:
+            return rows
+        try:
+            first = self._query("SELECT min(detected_at) FROM calls")[0][0]
+            if first is None:
+                return rows
+            lo = min(r.started_at for r in meet) - self.MEETING_CALL_SLACK_S
+            hi = max(r.ended_at for r in meet) + self.MEETING_CALL_SLACK_S
+            now = time.time()
+            calls = self._query(
+                "SELECT process, detected_at, coalesce(ended_at, last_alive_at, ?), app FROM calls"
+                " WHERE detected_at < ? AND coalesce(ended_at, last_alive_at, ?) > ?", (now, hi, now, lo))
+        except sqlite3.OperationalError:   # a database before migration 26 (no last_alive_at)
+            try:
+                first = self._query("SELECT min(detected_at) FROM calls")[0][0]
+                now = time.time()
+                calls = self._query("SELECT process, detected_at, coalesce(ended_at, ?), app FROM calls", (now,))
+            except sqlite3.OperationalError:
+                return rows
+            if first is None:
+                return rows
+        slack = self.MEETING_CALL_SLACK_S
+        # the same app: its process key, or its name as Yuki resolves it (a packaged app's call row is keyed by its
+        # package, "com.tinyspeck.slackdesktop", where the timeline has the image, "slack")
+        spans = [(app_key(c[0]) or "", _shown(c[3], c[0]).casefold(), float(c[1]), float(c[2])) for c in calls]
+        out: list[TimelineRow] = []
+        for r in rows:
+            if r.meeting and r.process and not r.host and float(first) <= r.started_at and id(r) in before:
+                key, name = app_key(r.process) or "", (r.app or "").casefold()
+                if not any((p == key or (name and n == name)) and start < r.ended_at + slack and end > r.started_at - slack
+                           for p, n, start, end in spans):
+                    r = replace(r, meeting=None)
+            out.append(r)
+        return out
 
     def timeline_of(self, process: str, since: TimeArg = None) -> list[TimelineRow]:
         """One app's stretches (``process`` = its ``app_key``) ending after ``since``, oldest first (decrypted): only
@@ -4407,8 +4672,8 @@ class Store:
             try:
                 conn.execute(
                     "INSERT INTO conversation_turns(id, session_id, request_id, at, user_ciphertext,"
-                    " reply_ciphertext, actions_ciphertext, outcome, created_at, addressed)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    " reply_ciphertext, actions_ciphertext, outcome, created_at, addressed, envelope_ciphertext)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     row,
                 )
                 return True
@@ -4466,7 +4731,7 @@ class Store:
     def add_turn(
         self, session_id: str, request_id: int | str, at: float, user_text: str, reply_text: str | None = None,
         actions: Sequence[str] = (), outcome: str | None = None, *, busy_timeout_s: float = 0.008,
-        addressed: str | None = None,
+        addressed: str | None = None, envelope: str | None = None,
     ) -> int:
         """Store one exchange (encrypted) for the conversation worker; returns its id.
 
@@ -4479,14 +4744,19 @@ class Store:
         before the write lands). Raises only on encryption/argument errors.
         ``addressed``: who a voice turn was said to ("yuki" | "others", from voice's ``turn_closed``);
         a turn said to others is stored for the record but never extracted (migration 18).
+        ``envelope``: the notes Yuki put after the user's words; ``None``: read off ``user_text`` itself
+        (:func:`split_envelope`), so the words and the notes are always stored apart (migration 27).
         """
         now = time.time()
         acts = [" ".join(str(a).split()) for a in (actions or ()) if str(a).strip()]
+        if envelope is None:
+            user_text, envelope = split_envelope(user_text)
         row: list[Any] = [
             self._next_turn_id(), str(session_id or ""), _request_key(request_id), float(at),
             self.cipher.encrypt(user_text or ""), self._enc(reply_text),
             self.cipher.encrypt(json.dumps(acts, ensure_ascii=False)) if acts else None,
             outcome or None, now, addressed if addressed in ("yuki", "others") else None,
+            self._enc(envelope) if envelope else None,
         ]
         with self._deferred_lock:
             queued = bool(self._deferred_turns)
@@ -4508,13 +4778,18 @@ class Store:
             actions = json.loads(self._dec(r["actions_ciphertext"]) or "[]")
         except ValueError:
             actions = []
+        keys = r.keys()
+        words = self.cipher.decrypt(r["user_ciphertext"])
+        envelope = self._dec(r["envelope_ciphertext"]) if "envelope_ciphertext" in keys else None
+        if envelope is None:   # a turn stored before migration 27: its words and Yuki's notes are read apart here
+            words, envelope = split_envelope(words)
         return ConversationTurn(
             id=r["id"], session_id=r["session_id"], request_id=r["request_id"], at=r["at"],
-            user_text=self.cipher.decrypt(r["user_ciphertext"]), reply_text=self._dec(r["reply_ciphertext"]),
+            user_text=words, reply_text=self._dec(r["reply_ciphertext"]),
             actions=[str(a) for a in actions] if isinstance(actions, list) else [], outcome=r["outcome"],
             extracted=bool(r["extracted"]), attempts=r["extract_attempts"], summary_id=r["summary_id"],
             created_at=r["created_at"], score=score,
-            addressed=r["addressed"] if "addressed" in r.keys() else None,
+            addressed=r["addressed"] if "addressed" in keys else None, envelope=envelope,
         )
 
     def turns_pending(self, max_attempts: int = 3, limit: int | None = None) -> list[ConversationTurn]:
@@ -5751,6 +6026,39 @@ class Store:
             error=r["error"], cost_usd=r["cost_usd"], input_tokens=r["input_tokens"] or 0,
             output_tokens=r["output_tokens"] or 0, score=score,
         )
+
+    def revise_weekly_review(
+        self, review: WeeklyReview, *, text: str, sections: dict[str, Any], teaser: str | None, model: str | None,
+        stats: ReviewStats | None = None, vector: np.ndarray | None = None, embed_model: str | None = None,
+    ) -> int:
+        """Store a corrected version of a finished review (``python -m yuki.memory.recheck``): a new ``ok`` row for the
+        same week and period, dated like the original (so the review schedule and the teaser card see no new run:
+        its ``nudge_id`` is carried over), and the original marked ``superseded`` (kept as history, out of every
+        ``ok`` read: the latest review, recall, the window). Returns the new id."""
+        now = time.time()
+        stats = stats or ReviewStats()
+
+        def seal(value: Any) -> str | None:
+            return None if value is None else self.cipher.encrypt(json.dumps(value, ensure_ascii=False, default=str))
+
+        def op(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "INSERT INTO weekly_reviews(at, finished_at, week, period_start, period_end, trigger, model,"
+                " text_ciphertext, sections_ciphertext, teaser_ciphertext, numbers_ciphertext, candidates_ciphertext,"
+                " candidates_run_id, nudge_id, calls, input_tokens, output_tokens, cache_write_tokens,"
+                " cache_read_tokens, cost_usd, latency_ms, stop_reason, outcome)"
+                " VALUES (?,?,?,?,?,'recheck',?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,'ok')",
+                (float(review.at), now, review.week, float(review.period_start), float(review.period_end), model,
+                 self._enc(text), seal(sections), self._enc(teaser), seal(review.numbers), review.candidates_run_id,
+                 review.nudge_id, stats.calls, stats.input_tokens, stats.output_tokens, stats.cache_write_tokens,
+                 stats.cache_read_tokens, stats.cost_usd, stats.latency_ms, stats.stop_reason))
+            new_id = int(cur.lastrowid)
+            conn.execute("UPDATE weekly_reviews SET outcome='superseded' WHERE id=?", (int(review.id),))
+            if vector is not None:
+                self._put_vec(conn, "weekly_review_vec", "review_id", new_id, vector, embed_model)
+            return new_id
+
+        return self._write(op)
 
     def start_weekly_review(
         self, week: str, period_start: float, period_end: float, trigger: str, model: str | None,
@@ -7422,8 +7730,15 @@ class Store:
         """Write what a batch did to threads of work, inside the caller's transaction; sets each op's
         ``result_id`` and ``outcome``. A thread named that is gone (merged away) is followed to where it went."""
         now = time.time()
+        floor = self.memory_started_at()
         for op in ops:
-            at = float(op.at or now)
+            seen = float(op.seen_at) if op.seen_at else None
+            # never after it was seen, never in the future; a date before memory existed is the content's own (a
+            # file listed with its 2024 date), so the thread is dated when memory saw it (revamp A9)
+            at = min(float(op.at or now), (seen if seen is not None else now) + 60.0, now + 60.0)
+            first = at if floor is None or at >= floor - 86400.0 else (seen if seen is not None else now)
+            content_at = at   # the content's own date (an old one never moves where the thread stands)
+            at = max(at, first)   # its event and its touch are dated when memory saw it, never in 2024
             state = " ".join((op.state or "").split())
             if op.action == "starts":
                 cur = conn.execute(
@@ -7433,7 +7748,7 @@ class Store:
                     (self.cipher.encrypt(" ".join(op.title.split())), op.kind, "active", self._enc(state or None),
                      self.cipher.encrypt(json.dumps(self._merge_list([], op.open_items, self.WORK_OPEN_MAX))),
                      self.cipher.encrypt(json.dumps(self._merge_list([], op.entities, self.WORK_ENTITIES_MAX))),
-                     at, at, op.importance, op.origin, now, now))
+                     first, max(at, first), op.importance, op.origin, now, now))
                 tid, event, op.outcome = int(cur.lastrowid), "starts", "started"
             else:
                 tid = None
@@ -7461,7 +7776,7 @@ class Store:
                 open_items = (self._merge_list([], op.open_items, self.WORK_OPEN_MAX) if (op.open_items or state)
                               else self._json_list(row["open_ciphertext"]))
                 rated = [x for x in (row["importance"], op.importance) if x is not None]
-                older = at < float(row["last_seen"]) - 60.0
+                older = content_at < float(row["last_seen"]) - 60.0
                 if older:
                     # an older source (a history message read now, an old page): the thread's newer state and
                     # status stand; the event still records that the thread came up there
@@ -7480,7 +7795,7 @@ class Store:
                     " entities_ciphertext=?, first_seen=min(first_seen, ?), last_seen=max(last_seen, ?),"
                     " importance=?, events=events+1, updated_at=? WHERE id=?",
                     (status, self._enc(state or None), self.cipher.encrypt(json.dumps(open_items)),
-                     self.cipher.encrypt(json.dumps(entities)), min(at, touched), touched,
+                     self.cipher.encrypt(json.dumps(entities)), min(first, touched), touched,
                      max(rated) if rated else None, now, tid))
                 op.outcome = {"continues": "continued", "pauses": "paused", "ends": "ended"}[op.action]
                 if event == "reopens":
@@ -7497,6 +7812,56 @@ class Store:
             if linked:
                 conn.executemany("UPDATE journal SET work_thread_id=? WHERE id=?", [(tid, int(j)) for j in linked])
             op.result_id = tid
+
+    def memory_started_at(self) -> float | None:
+        """When memory began capturing (its first capture), or ``None`` before any: nothing it holds can have been seen
+        earlier. Cached once known."""
+        cached = getattr(self, "_memory_started", None)
+        if cached is not None:
+            return cached
+        try:
+            row = self._query("SELECT min(at) FROM captures")[0][0]
+        except sqlite3.OperationalError:
+            return None
+        if row is not None:
+            self._memory_started = float(row)
+        return float(row) if row is not None else None
+
+    def repair_work_thread_dates(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Threads of work dated outside what memory can have seen, set right from their own events (measured
+        bounds, revamp A9): a first seen before memory began (a thread "since Fri 2024-11-08", 11 months before
+        memory existed) becomes its first event dated after memory began; a last seen after now (a calendar line
+        "08 Nov" read as when it was touched) becomes its last event up to now. Returns what changed."""
+        now = time.time() if now is None else float(now)
+        floor = self.memory_started_at()
+        rows = self._query("SELECT id, first_seen, last_seen, created_at FROM work_threads WHERE status != 'merged'")
+        changed: list[dict[str, Any]] = []
+        for r in rows:
+            first, last = float(r["first_seen"]), float(r["last_seen"])
+            new_first, new_last = first, last
+            events = self._query("SELECT at, created_at FROM work_thread_events WHERE work_thread_id=?",
+                                 (int(r["id"]),))
+            ats = [float(e[0]) for e in events]
+            written = [min(float(e[1]), now) for e in events] or [min(float(r["created_at"]), now)]
+
+            def within(a: float) -> bool:
+                return a <= now + 60.0 and (floor is None or a >= floor - 86400.0)
+
+            if last > now + 60.0:
+                past = [a for a in ats if within(a)]
+                new_last = max(past) if past else max(written)   # else when memory wrote its events down
+            if floor is not None and first < floor - 86400.0:
+                good = [a for a in ats if within(a)]
+                new_first = min(good) if good else min(written)
+            if new_first > new_last:
+                new_first = new_last
+            if (new_first, new_last) != (first, last):
+                changed.append({"id": int(r["id"]), "first_seen": [first, new_first], "last_seen": [last, new_last]})
+        if changed:
+            self._write(lambda conn: conn.executemany(
+                "UPDATE work_threads SET first_seen=?, last_seen=?, updated_at=? WHERE id=?",
+                [(c["first_seen"][1], c["last_seen"][1], now, c["id"]) for c in changed]))
+        return changed
 
     def apply_work(self, ops: Sequence[WorkOp], *, batch_id: int | None = None) -> list[WorkOp]:
         """:meth:`_apply_work` in a transaction of its own (the backfill: facts already stored, ``journal_ids``)."""

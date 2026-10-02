@@ -76,6 +76,35 @@ RULE_HEADINGS = (
     "The user's preferences about how Yuki talks or works:",
 )
 
+#: Every heading memory's standing context uses (``yuki.memory.api.STANDING_HEADINGS``, a fixed format of memory's
+#: own), so :func:`split_standing` can tell "memory's format, no rule in it" from "a format it does not know".
+STANDING_SECTION_HEADINGS = RULE_HEADINGS + (
+    "What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
+    "everything; forget_rule takes these ids too):",
+    "The user's own sites, accounts and links (use them directly when the user names one, e.g. \"open my "
+    "portfolio\"):",
+    "Yuki's own commitments (what Yuki promised or was asked to do later):",
+    "The user's own to-dos (their plans and work, not Yuki's: bring one up only when they ask about their "
+    "plans, never offer to do one):",
+)
+
+#: The relevance floors of the request's memory (revamp 02 P2, 2026-10-03): the user's own to-dos and Yuki's know-how
+#: are attached only when their cosine to the user's words (the shared embedder's) clears these. A know-how entry of
+#: an app in play (the window in front, or an app the caller says the request names) needs less. Measured on the
+#: logged requests replayed on a copy of the real memory (docs/research/revamp-2026-10-02/22-build-A6-A9.md); before,
+#: the same 5 to-dos and 5 know-how lines (~2.5k chars) went with every request.
+TODO_MIN_COSINE = 0.40
+KNOWHOW_MIN_COSINE = 0.40
+KNOWHOW_APP_MIN_COSINE = 0.30
+
+#: Longest memory query (the embedder reads ~128 tokens, ~500 characters of English).
+MEMORY_QUERY_CHARS = 500
+
+#: Yuki's voice hand-off format (``yuki.voice.mouth.brain_request``, a fixed format Yuki writes itself): the
+#: request's own words come first, then bracketed notes after a blank line; the user's latest words as speech
+#: recognition heard them sit in the note that starts with this.
+VOICE_HEARD_MARK = "[Asked by voice. What the user said most recently"
+
 #: Heading of the resume context (first request of a conversation only).
 RESUME_LABEL = (
     "[Where we left off — earlier conversation, background only. An offer or question of "
@@ -214,6 +243,14 @@ class MemoryContext:
     #: their threads of work; 2026-09-29), as returned, or ``None``. ``relevant`` then carries its items and
     #: the block's text (:class:`RelatedItems`), so :func:`relevant_block_text` renders the whole block.
     related: dict[str, Any] | None = None
+    #: The standing context as parts (``MemoryClient.standing_parts``), ``None`` from an older memory: the rules
+    #: layer is built from its rule and preference groups only, the commitments block from the rest.
+    standing_parts: dict[str, Any] | None = None
+    #: The words memory was searched with (the user's own words, not Yuki's hand-off envelope).
+    query: str | None = None
+    #: Open to-dos on the user's list and in the standing context that were not attached (their cosine to the words
+    #: did not clear :data:`TODO_MIN_COSINE`, or it could not be measured in time): said as a count.
+    todos_held: int = 0
     truncated: list[str] = field(default_factory=list)
     source: str = "unavailable"
     error: str | None = None
@@ -642,6 +679,10 @@ class MemoryAccess:
         resume: bool = False,
         timeout_s: float = CONTEXT_TIMEOUT_S,
         previous: str | None = None,
+        apps: Any = (),
+        screen: Any = None,
+        gate: bool | None = None,
+        now: float | None = None,
     ) -> MemoryContext:
         """Portrait, know-how, standing context and (asked for) resume context. Never raises.
 
@@ -652,12 +693,26 @@ class MemoryAccess:
         :data:`RESUME_MAX_CHARS` (named in ``truncated``) if memory overshoots.
 
         Args:
+            query: The user's own words for this request (``Agent.run(memory_query=)``, else
+                :func:`memory_query_of` the request): what memory is searched with. ``""``: no words (the voice
+                mouth's once-per-conversation read), nothing is ranked or gated.
             resume: Also attach ``resume_context`` (a conversation's first
                 request); usually already read at warm-up.
+            previous: The previous request's words (a follow-up names nothing itself).
+            apps: Apps the caller says the request names (their know-how needs a lower floor, like the app in
+                front's).
+            screen: The live picture of the window in front (the Now board's), the anchor of the whole-memory
+                ranking; ``None``: memory's own last capture.
+            gate: Attach to-dos, know-how, threads and recent screens only as far as they bear on the words
+                (revamp 02 P2). Default: on whenever there are words.
+            now: The moment the whole-memory ranking is for (epoch seconds; replays and tests), ``None``: now.
         """
         started = time.perf_counter()
         deadline = started + timeout_s
         result = MemoryContext()
+        query = (query or "").strip()
+        result.query = query or None
+        gate = bool(query) if gate is None else (bool(gate) and bool(query))
         try:
             result.portrait, result.source = self.portrait(timeout_s=timeout_s)
         except MemoryUnavailable as exc:
@@ -668,18 +723,18 @@ class MemoryAccess:
         if result.source != "unavailable" or result.error is None:
             remaining = max(deadline - time.perf_counter(), 0.05)
             try:
-                lines = self.call(
-                    "knowhow",
-                    lambda c: c.knowhow(app=app, query=query, limit=KNOWHOW_LINES,
-                                        embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining)),
-                    timeout_s=remaining,
-                )
-                result.knowhow = [
-                    str(line).strip() for line in (lines or []) if str(line).strip()
-                ][:KNOWHOW_LINES]
+                result.knowhow = self._knowhow_lines(app, query, remaining, gate=gate, apps=apps)
             except MemoryUnavailable as exc:
                 result.error = result.error or str(exc)
-            if "standing_context" not in self._absent:
+            if "standing_parts" not in self._absent:
+                try:
+                    parts = self.call_method("standing_parts", timeout_s=max(deadline - time.perf_counter(), 0.05))
+                    if isinstance(parts, dict):
+                        result.standing_parts = parts
+                        result.standing = _render_parts(parts) or None
+                except MemoryUnavailable:
+                    pass
+            if result.standing_parts is None and "standing_context" not in self._absent:
                 try:
                     result.standing = self.standing(
                         timeout_s=max(deadline - time.perf_counter(), 0.05)
@@ -690,33 +745,33 @@ class MemoryAccess:
             if "todos" not in self._absent:
                 try:
                     result.todos = self.block_todos(
-                        result.standing, timeout_s=max(deadline - time.perf_counter(), 0.05)
+                        result.standing, timeout_s=max(deadline - time.perf_counter(), 0.05),
+                        limit=None if gate else TODO_LINES,
                     )
                 except MemoryUnavailable as exc:
                     if "todos" not in self._absent:
                         result.error = result.error or str(exc)
+            if gate:
+                self._gate_todos(result, query, deadline)
             if "day_context" not in self._absent:
                 try:
                     value = self.call_method("day_context", timeout_s=max(deadline - time.perf_counter(), 0.05))
                     result.day = value.strip() if isinstance(value, str) and value.strip() else None
                 except MemoryUnavailable:
                     pass
-            if query and query.strip() and "related" not in self._absent:
+            if query and "related" not in self._absent:
                 # the whole memory against the user's words, their screen and their thread of work (the message's
                 # vector was just made for the know-how lookup; the screen's comes ranked from the service). A
                 # request with no words (the voice mouth's own memory fetch) has its own call: related_brief.
                 t0 = time.perf_counter()
                 remaining = max(deadline - time.perf_counter(), 0.05)
-                try:
-                    found = self.call_method("related", query or "", previous=previous,
-                                             embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
-                    if isinstance(found, dict):
-                        result.related = found
-                        result.relevant = RelatedItems(
-                            [dict(r) for r in found.get("items") or [] if isinstance(r, dict)],
-                            block=related_block(found), timing=found.get("timing"))
-                except MemoryUnavailable:
-                    pass
+                found = self._related(query, previous=previous, screen=screen, gate=gate, now=now,
+                                      embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
+                if isinstance(found, dict):
+                    result.related = found
+                    result.relevant = RelatedItems(
+                        [dict(r) for r in found.get("items") or [] if isinstance(r, dict)],
+                        block=related_block(found), timing=found.get("timing"))
                 result.relevant_ms = round((time.perf_counter() - t0) * 1000, 1)
             if query and query.strip() and "relevant" not in self._absent and "related" in self._absent:
                 # an older memory without the whole-memory ranking: fast memory from the words alone
@@ -761,14 +816,88 @@ class MemoryAccess:
         """The compact related block for the voice talker: its thread of work now, a few memories near the
         user's words and their screen with where each came from, the freshest screens in a few lines. ``None``
         when there is nothing, memory is slow (past ``timeout_s``) or absent. Never raises. Blocking (bounded):
-        call it off the voice loop.
+        call it off the voice loop. This app run's own conversation is never returned as memory.
         """
-        try:
-            found = self.call_method("related", query or "", previous=previous, screen=screen, voice=True,
-                                     embed_wait_s=embed_wait_s, timeout_s=timeout_s)
-        except MemoryUnavailable:
-            return None
+        found = self._related(query or "", previous=previous, screen=screen, voice=True, gate=False,
+                              embed_wait_s=embed_wait_s, timeout_s=timeout_s)
         return related_block(found, voice=True) if isinstance(found, dict) else None
+
+    def _related(self, query: str, *, previous: str | None, screen: Any, gate: bool, embed_wait_s: float,
+                 timeout_s: float, voice: bool = False, now: float | None = None) -> dict[str, Any] | None:
+        """``MemoryClient.related`` with this app run's session left out of it (self-echo) and the brain's diet;
+        an older memory without those arguments is asked the old way. ``None`` when memory cannot answer."""
+        extra: dict[str, Any] = {"session_id": self.session_id, "diet": bool(gate)}
+        if screen is not None:
+            extra["screen"] = screen
+        if voice:
+            extra["voice"] = True
+        if now is not None:
+            extra["now"] = float(now)
+        try:
+            found = self.call_method("related", query, previous=previous, embed_wait_s=embed_wait_s,
+                                     timeout_s=timeout_s, **extra)
+        except MemoryUnavailable as exc:
+            if not isinstance(exc.__cause__, TypeError):
+                return None
+            extra.pop("session_id", None)
+            extra.pop("diet", None)
+            try:
+                found = self.call_method("related", query, previous=previous, embed_wait_s=embed_wait_s,
+                                         timeout_s=timeout_s, **extra)
+            except MemoryUnavailable:
+                return None
+        return found if isinstance(found, dict) else None
+
+    def _knowhow_lines(self, app: str | None, query: str, remaining: float, *, gate: bool, apps: Any) -> list[str]:
+        """Know-how for this request: by measured relevance to the words when gated (:data:`KNOWHOW_MIN_COSINE`, the
+        apps in play at :data:`KNOWHOW_APP_MIN_COSINE`), else the old order (the app in front's, then similar).
+        Raises :class:`MemoryUnavailable`."""
+        wait = min(KNOWHOW_EMBED_WAIT_S, remaining)
+        named = [str(a) for a in (apps or ()) if a]
+
+        def fetch(c: Any) -> Any:
+            if gate:
+                try:
+                    return c.knowhow(app=app, query=query, limit=KNOWHOW_LINES, embed_wait_s=wait,
+                                     min_cosine=KNOWHOW_MIN_COSINE, apps=named,
+                                     app_min_cosine=KNOWHOW_APP_MIN_COSINE)
+                except TypeError:   # an older memory: no floors
+                    pass
+            return c.knowhow(app=app, query=query, limit=KNOWHOW_LINES, embed_wait_s=wait)
+
+        lines = self.call("knowhow", fetch, timeout_s=remaining)
+        return [str(line).strip() for line in (lines or []) if str(line).strip()][:KNOWHOW_LINES]
+
+    def _gate_todos(self, result: MemoryContext, query: str, deadline: float) -> None:
+        """Keep only the to-dos whose cosine to the words clears :data:`TODO_MIN_COSINE` (the user's list and the
+        user's own to-dos in the standing context; Yuki's own commitments always stay), at most :data:`TODO_LINES`
+        from the list; the rest are counted in ``todos_held``. Unmeasured in time: none kept, all counted."""
+        own = list(((result.standing_parts or {}).get("groups") or {}).get("todo") or [])
+        rows = list(result.todos or [])
+        texts = [str(r.get("text") or "") for r in rows] + [str(i.get("text") or "") for i in own]
+        if not texts:
+            return
+        scores: list[float] | None = None
+        if "similarity" not in self._absent:
+            try:
+                remaining = max(deadline - time.perf_counter(), 0.05)
+                scores = self.call_method("similarity", query, texts, embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining),
+                                          timeout_s=remaining)
+            except MemoryUnavailable:
+                scores = None
+        if not isinstance(scores, list) or len(scores) != len(texts):
+            scores = [-1.0] * len(texts)
+        ranked = sorted(((s, r) for s, r in zip(scores[: len(rows)], rows) if s >= TODO_MIN_COSINE),
+                        key=lambda x: -x[0])
+        kept_rows = [r for _s, r in ranked][:TODO_LINES]
+        kept_own = [i for s, i in zip(scores[len(rows):], own) if s >= TODO_MIN_COSINE]
+        result.todos_held = (len(rows) - len(kept_rows)) + (len(own) - len(kept_own))
+        result.todos = kept_rows
+        if result.standing_parts is not None:
+            groups = dict(result.standing_parts.get("groups") or {})
+            groups["todo"] = kept_own
+            result.standing_parts = {**result.standing_parts, "groups": groups,
+                                     "todos_held": len(own) - len(kept_own)}
 
     # -- to-dos and nudges ------------------------------------------------------
 
@@ -780,9 +909,10 @@ class MemoryAccess:
         return [dict(row) for row in (rows or []) if isinstance(row, dict)]
 
     def block_todos(
-        self, standing: str | None, *, timeout_s: float = CONTEXT_TIMEOUT_S
+        self, standing: str | None, *, timeout_s: float = CONTEXT_TIMEOUT_S, limit: int | None = TODO_LINES,
     ) -> list[dict[str, Any]]:
-        """The open to-dos for the memory block: at most :data:`TODO_LINES`, in memory's order.
+        """The open to-dos for the memory block: at most ``limit`` (:data:`TODO_LINES`; ``None``: all), in memory's
+        order.
 
         An item the standing context already carries (memory lists Yuki's open
         commitments there, and may come to list to-dos too) is left out, so
@@ -802,7 +932,7 @@ class MemoryAccess:
             if not text or (said and text[:80] in said):
                 continue
             chosen.append(row)
-            if len(chosen) >= TODO_LINES:
+            if limit is not None and len(chosen) >= limit:
                 break
         return chosen
 
@@ -1399,7 +1529,7 @@ def memory_block_text(
     cached system layer and the commitments their own block (:func:`split_standing`).
     """
     if context.source == "unavailable" or not (
-        context.portrait or context.knowhow or context.resume or context.todos
+        context.portrait or context.knowhow or context.resume or context.todos or context.todos_held
     ):
         return None
     now = now or datetime.now()
@@ -1416,6 +1546,12 @@ def memory_block_text(
     if context.todos:
         lines = "\n".join(todo_line(row) for row in context.todos)   # with ids: todo done takes an id
         parts.append(f"{TODO_LABEL}\n{lines}")
+    if context.todos_held:
+        n = context.todos_held
+        one = n == 1
+        parts.append(f"{n} {'more ' if context.todos else ''}open to-do{'' if one else 's'} of the user's "
+                     f"{'does' if one else 'do'} not bear on these words and {'is' if one else 'are'} not shown here; "
+                     "the todo tool (action list) shows every one.")
     if context.knowhow:
         lines = "\n".join(f"- {' '.join(line.split())}" for line in context.knowhow)
         parts.append(f"Know-how saved on this PC that may apply:\n{lines}")
@@ -1429,9 +1565,12 @@ def split_standing(standing: str | None) -> tuple[str | None, str | None]:
 
     Parsing a structured API response (ARCHITECTURE.md rule 1 allows it): the context is a
     header line, then sections, each a heading line followed by ``- `` rows. Sections under
-    :data:`RULE_HEADINGS` are the rules layer; the rest are commitments. When no rule
-    heading is recognised at all (memory changed its format) everything is treated as
-    rules, so a rule can never silently drop out of the prompt.
+    :data:`RULE_HEADINGS` are the rules layer; the rest are commitments. A context in memory's own
+    format (any of :data:`STANDING_SECTION_HEADINGS`) with no rule section has no rules: its to-dos and
+    commitments are never rules (revamp 09 §3.4: with no active rule, the whole context, six stale to-dos
+    included, became the block "every one applies to every reply" for the agent and the voice talker). Only
+    when no heading at all is recognised (memory changed its format) is everything treated as rules, so a
+    rule can never silently drop out of the prompt.
     """
     text = (standing or "").strip()
     if not text:
@@ -1446,11 +1585,96 @@ def split_standing(standing: str | None) -> tuple[str | None, str | None]:
             sections[-1].append(line)
         else:
             sections.append([line])
+    known = any(s[0].strip() in STANDING_SECTION_HEADINGS for s in sections)
     rules = [s for s in sections if s[0].strip() in RULE_HEADINGS]
-    if not rules:
+    if not rules and not known:
         return text, None
     rest = [s for s in sections if s[0].strip() not in RULE_HEADINGS]
     return _sections(rules), _sections(rest)
+
+
+def memory_words(request: str | None, heard: Any = None, *, limit: int = MEMORY_QUERY_CHARS) -> str:
+    """What memory is searched with for one request: the request's own words, then the user's latest words as heard
+    when they add to them (``heard``: a string or the voice's list of turns, oldest first), capped at ``limit``.
+
+    The embedder reads ~128 tokens: the whole voice hand-off (~1.5-2.8k characters of Yuki's own notes) left ~18
+    characters of "Restore the pages." in it, and "What did I do today?" matched the stored turn of "Restore the pages."
+    at cosine 0.996 (revamp 02 D1). For the voice bridge to pass as ``memory_query`` (its ``request`` and ``heard``).
+    """
+    words = " ".join(str(request or "").split())
+    turns = [heard] if isinstance(heard, str) else list(heard or [])
+    turns = [" ".join(str(t).split()) for t in turns if t and str(t).strip()]
+    last = turns[-1] if turns else ""
+    if last and last.casefold() not in words.casefold():
+        words = f"{words} | {last}" if words else last
+    return words[:limit].strip()
+
+
+def memory_query_of(request: str | None) -> str:
+    """The user's words inside a request Yuki composed, for searching memory when the caller gave none.
+
+    Parsing Yuki's own request formats, never the user's words: a reply to a card starts with the card in brackets on
+    its own line (the user's words after it come first, the card's after them); notes Yuki adds (the voice hand-off's
+    references, heard words, done-before log and say_now guide; the coach note) follow the words after a blank line,
+    in brackets. The voice's heard words (:data:`VOICE_HEARD_MARK`) are kept: they are the user's own.
+    """
+    text = (request or "").strip()
+    if not text:
+        return ""
+    card = ""
+    if text.startswith("[") and "]\n" in text:
+        card, text = text[1:].split("]\n", 1)
+    cut = text.find("\n\n[")
+    head, notes = (text[:cut], text[cut:]) if cut >= 0 else (text, "")
+    heard: list[str] = []
+    at = notes.find(VOICE_HEARD_MARK)
+    if at >= 0:
+        block = notes[at:]
+        end = block.find("]\n")
+        block = block[: end if end >= 0 else len(block)]
+        colon = block.find("): ")
+        if colon >= 0:
+            quoted = block[colon + 3:].strip().rstrip("]").strip()
+            heard = [t.strip().strip('"') for t in quoted.split('" / "') if t.strip().strip('"')]
+    words = memory_words(head, heard)
+    if card and len(words) < MEMORY_QUERY_CHARS:
+        words = f"{words} | {' '.join(card.split())}" if words else " ".join(card.split())
+    return words[:MEMORY_QUERY_CHARS].strip()
+
+
+def _render_parts(parts: dict[str, Any], groups: tuple[str, ...] | None = None) -> str:
+    """Memory's standing parts as its standing-context text (``yuki.memory.api.render_standing``)."""
+    from yuki.memory.api import STANDING_GROUPS, render_standing
+
+    return render_standing(parts, groups if groups is not None else STANDING_GROUPS)
+
+
+def standing_rules_text(context: MemoryContext) -> str | None:
+    """The rules layer's body for a request: the user's rules and preferences only (``""`` when memory answered and
+    there are none: the layer says so; ``None`` when memory could not say)."""
+    if context.source == "unavailable" and not context.standing_parts and not context.standing:
+        return None
+    if context.standing_parts is not None:
+        from yuki.memory.api import STANDING_RULE_GROUPS
+
+        body = _render_parts({**context.standing_parts, "coach_state": None}, STANDING_RULE_GROUPS)
+        return "\n".join(body.splitlines()[1:]).strip() if body else ""
+    rules, _rest = split_standing(context.standing)
+    return rules or ""
+
+
+def standing_commitments_text(context: MemoryContext) -> str | None:
+    """The commitments block's body: coach feedback, the user's own resources, Yuki's own commitments, the user's
+    own to-dos (those the words bear on, labelled as their work), and the coach's state; ``None`` for none."""
+    if context.standing_parts is not None:
+        from yuki.memory.api import STANDING_GROUPS, STANDING_RULE_GROUPS
+
+        groups = tuple(g for g in STANDING_GROUPS if g not in STANDING_RULE_GROUPS)
+        body = _render_parts(context.standing_parts, groups)
+        body = "\n".join(body.splitlines()[1:]).strip() if body else ""   # without memory's own header line
+        return body or None
+    _rules, rest = split_standing(context.standing)
+    return rest
 
 
 def _sections(group: list[list[str]]) -> str | None:

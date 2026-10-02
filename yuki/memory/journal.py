@@ -646,13 +646,28 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "type": "array",
                 "description": (
                     "Things the user said THEY will do later (\"I'll send the deck tomorrow\", \"let me check "
-                    "and get back to you by Friday\"). Not what anyone else will do, not what was already done."
+                    "and get back to you by Friday\"), and plans they made with someone for a day or a date - a call, "
+                    "a meeting, a start - which they take part in (\"come on the call Sunday, we'll do the setup\" -> "
+                    "a setup call with that person on that Sunday; \"we start on the 12th\" -> starting it with them "
+                    "on the 12th): each with its due date resolved against the CALENDAR, the call's own dates. Not "
+                    "what anyone else will do alone, not what was already done, and never a joke, a tease, a boast or "
+                    "anything said in jest (its nature below)."
                 ),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "title", "quote", "due", "source", "subject"],
+                    "required": ["text", "title", "quote", "due", "source", "subject", "nature"],
                     "properties": {
+                        "nature": {
+                            "type": "string",
+                            "enum": list(NATURES),
+                            "description": (
+                                "What the words it rests on are, as you would label a fact from them: fact (meant "
+                                "seriously), humor (a joke, tease, boast or bit - \"send me an offer letter by "
+                                "11:55\" said as banter), uncertain (possibly misheard, or you cannot tell if it "
+                                "was meant), story or trait. Only a fact becomes a to-do."
+                            ),
+                        },
                         "text": {
                             "type": "string",
                             "description": (
@@ -1560,7 +1575,19 @@ class JournalWorker:
         """
         from yuki.memory.conversations import parse_due, quote_in
 
-        items = (self._tool_block(response, tool).input or {}).get("commitments") or []
+        tool_input = self._tool_block(response, tool).input or {}
+        items = tool_input.get("commitments") or []
+        # The nature the same call gave the facts it drew from each utterance: words it took as a joke, a bit or
+        # possibly misheard never become a to-do, whatever the commitment's own label says (the model's own
+        # labels, carried over; no words read). 1 Oct: "send Quasar40404 an offer letter by 23:55", a line the
+        # call's digest marks [joke], became a commitment.
+        unserious: set[int] = set()
+        for fact in tool_input.get("facts") or []:
+            if isinstance(fact, dict) and normalize_nature(fact.get("nature")) in ("humor", "uncertain"):
+                try:
+                    unserious.add(int(fact.get("source")) - 1)
+                except (TypeError, ValueError):
+                    pass
         out: list[ConversationChange] = []
         rejected: list[str] = []
         for item in items:
@@ -1577,6 +1604,10 @@ class JournalWorker:
                 continue
             if not 0 <= index < len(sources) or sources[index].utterance is None:
                 rejected.append("cites no utterance")
+                continue
+            nature = normalize_nature(item.get("nature") or "fact")
+            if nature != "fact" or index in unserious:
+                rejected.append(f"said as {nature if nature != 'fact' else 'a joke or possibly misheard'}: no to-do")
                 continue
             said = str(sources[index].utterance.get("text") or "")
             if not quote_in(quote, said):
