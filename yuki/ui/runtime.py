@@ -57,6 +57,7 @@ from yuki.log.events import (
     ErrorEvent,
     Final,
     Say,
+    SendPending,
     SessionLogger,
     Thinking,
     Partial,
@@ -64,6 +65,9 @@ from yuki.log.events import (
     ToolResult,
 )
 from yuki.ui.uilog import UiLog
+
+#: appPT: seconds a plain send waits on the send countdown before it goes (the user's 3 Oct "3 s to stop").
+SEND_COUNTDOWN_S = 3.0
 
 #: The lane names. Every signal carries one, so the UI knows who is talking.
 WORKER = "worker"
@@ -492,6 +496,13 @@ class Lane(QThread):
                     self.agent.answer(answer)
             elif isinstance(event, Say):
                 runtime.said.emit(self.name, job.id, event.text)
+            elif isinstance(event, SendPending):
+                # appPT: the send countdown (who / where / the text, seconds to stop or swap), for the island
+                runtime.send_pending.emit(self.name, job.id, {
+                    "state": event.state, "who": event.who, "where": event.where, "app": event.app,
+                    "text": event.text, "seconds": event.seconds, "who_alts": list(event.who_alts),
+                    "where_alts": list(event.where_alts), "typed": event.typed, "from_memory": event.from_memory,
+                    "window": event.window})
             elif isinstance(event, HelperStep):
                 # A read-only helper's step (yuki.agent.subagents): its own signal, and as a step of
                 # the request (tool name "helper") for a chat that lists tool calls. Emitted directly,
@@ -617,6 +628,9 @@ class AgentRuntime(QObject):
     #: ``(lane, id, frame)``: the request's task frame as plain data (:func:`frame_view`: who it may be about and
     #: their usual route, the playbooks shown), once, before its first step; the island's "from memory" chip.
     framed = Signal(str, int, dict)
+    #: appPT: ``(lane, id, send)``: the send countdown (``yuki.log.events.SendPending`` as a dict: ``state`` counting |
+    #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory, window).
+    send_pending = Signal(str, int, dict)
 
     def __init__(
         self,
@@ -652,6 +666,9 @@ class AgentRuntime(QObject):
                 lane=WORKER,
                 memory=self.memory,
             )
+            # appPT: a plain send waits this long on the island's send countdown (Stop, Esc, a chip swap); only the
+            # worker sends, and only the desktop's own agent gets it (a caller's agent keeps its own setting)
+            worker_agent.send_countdown_s = SEND_COUNTDOWN_S
         if front_desk_agent is None:
             front_desk_blocked = front_desk_blocked or HandsBlockedBackend()
             front_desk_agent = Agent(
@@ -924,6 +941,18 @@ class AgentRuntime(QObject):
         """
         ok = any(lane.steer_job(request_id, text) for lane in (self.worker, self.front_desk))
         self.ui_log.event("steer", id=request_id, delivered=ok, text=text)
+        return ok
+
+    def send_choice(self, request_id: int, kind: str, value: str) -> bool:
+        """appPT: a chip tapped on the send countdown of running request ``request_id`` (``kind`` ``who`` or
+        ``where``; :meth:`Agent.send_choice`). ``False`` when it is not running or no countdown is open."""
+        ok = False
+        for lane in (self.worker, self.front_desk):
+            if lane.current_id == int(request_id):
+                choose = getattr(lane.agent, "send_choice", None)
+                ok = bool(choose(kind, value)) if callable(choose) else False
+                break
+        self.ui_log.event("send_choice", id=request_id, kind=kind, delivered=ok)
         return ok
 
     def name_app(self, request_id: int, app: str | None) -> bool:

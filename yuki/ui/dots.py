@@ -8,7 +8,7 @@ the numbers are also in ``yuki/ui/web/tokens.json`` ``face`` / ``field``):
   frame), leaving a short phosphor trail. It blinks every 3.8-7 s (held 0.14 s), only while its eyes are open.
 * **The halo** (:class:`HaloModel`, :class:`HaloWidget`): a bounded 560 x 170 box of 10 px cells under the island;
   an ellipse whose dots shrink toward its edge, on a soft dark backing, holding one figure per live state (a ring,
-  a voice field, comets, five step segments, a sine ribbon, ripples, a dotted line, a stamped check). Cells ease
+  a voice field, comets, the steps so far as segments (no total), a sine ribbon, ripples, a dotted line, a stamped check). Cells ease
   toward their target (k 0.2 per frame) and the figure blends in and out (k 0.16), so states melt into each other.
 
 Both run on the one shared :class:`yuki.ui.lattice.Loop` (at most 30 frames a second) and only while something
@@ -54,7 +54,7 @@ class FaceModel:
         self.tn = [0] * n
         self.blink_at = -10.0
         self.t0 = 0.0
-        self.step_n, self.step_of = 2, 5
+        self.step_n, self.step_of = 1, 0   # the step it is on; no total (``step_of`` kept for callers, unused)
         self.dirty = True
 
     def set(self, state: str, t: float, step: tuple[int, int] | None = None) -> bool:
@@ -138,14 +138,18 @@ class FaceModel:
         elif s == "working":
             eyes([2, 3], 1.0)
             eyes([1], 0.25)
-            p = (self.step_n - 1 + 0.35 + 0.3 * pulse(1.2)) / self.step_of
-            head = 3 + _js_round(p * 10)
+            # no plan, so no total (appPT, the user: "it should do things on the go"): a light runs along the mouth on
+            # its own clock (busy, never a fraction done), and the dots under it are the steps so far with the newest
+            # one live, centred, the last five at most; nothing stands for steps to come
+            head = 3 + int(math.floor(t * 6.0)) % 11
             for c in range(3, 14):
-                L_(c, 5, 0.9 if c < head else 1.0 if c == head else 0.16, 1 if c == head else 0)
-            for n in range(self.step_of):
-                c = 4 + n * 2
-                cur = n == self.step_n - 1
-                L_(c, 6, 0.75 if n < self.step_n - 1 else (0.55 + 0.45 * pulse(6)) if cur else 0.12, 1 if cur else 0)
+                d = head - c
+                L_(c, 5, 1.0 if d == 0 else (0.75, 0.5, 0.3)[d - 1] if 1 <= d <= 3 else 0.16, 1 if d == 0 else 0)
+            shown = min(max(1, self.step_n), 5)
+            first = 8 - (shown - 1)
+            for n in range(shown):
+                cur = n == shown - 1
+                L_(first + n * 2, 6, (0.55 + 0.45 * pulse(6)) if cur else 0.75, 1 if cur else 0)
         elif s == "speaking":
             eyes([3] if blink else [2, 3], 1.0)
             for c in range(3, 14):
@@ -444,7 +448,7 @@ class HaloModel:
         self.last_live: str | None = None
         self.blend = 0.0
         self.state_t0 = 0.0
-        self.step_n, self.step_of = 2, 5
+        self.step_n, self.step_of = 1, 0   # the step it is on; no total (``step_of`` kept for callers, unused)
         self.lit: list[int] = []
         self.full = True
         C, R = self.cols, self.rows
@@ -514,19 +518,20 @@ class HaloModel:
                 val += 1.2 * math.exp(-((u - px) * (u - px) + (v - py) * (v - py)) / 1.3)
             return min(1.0, val), 0
         if s == "working":
-            if abs(v) > 2 or u < -17 or u > 17:
+            # the steps so far, the newest one filling, centred and growing from the middle (the last five at most);
+            # no segment stands for a step to come: there is no plan (appPT)
+            shown = min(max(1, self.step_n), 5)
+            x = u + (shown * 7) // 2
+            if abs(v) > 2 or x < 0 or x >= shown * 7:
                 return 0.0, 0
-            x = u + 17
             seg, in_seg = x // 7, x % 7
-            if in_seg == 6 or seg > 4:
+            if in_seg == 6:
                 return 0.0, 0
             if abs(v) == 2 and in_seg in (0, 5):
                 return 0.0, 0
-            n = self.step_n - 1
+            n = shown - 1
             if seg < n:
                 return 0.9, 0
-            if seg > n:
-                return 0.16, 0
             p = 0.35 + 0.3 * (0.5 + 0.5 * math.sin(t * 1.3))
             fill = int(math.floor(p * 6))
             if in_seg < fill:

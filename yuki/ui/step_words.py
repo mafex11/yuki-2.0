@@ -250,6 +250,22 @@ def _looks_like_code(text: str) -> bool:
     return False
 
 
+#: appPT (review F8): a run of this many digits is a number nobody says (a window handle, an id), not a time or count.
+ID_DIGITS = 5
+
+
+def _looks_like_id(text: str) -> bool:
+    """Character tests on fixed formats, never words: a run of :data:`ID_DIGITS` digits or more (``655432``), or a token
+    where a letter runs straight into a digit (``e12``, ``hwnd3``): window and element numbers. Times, counts and
+    "4pm" / "2nd" (a digit first) are fine."""
+    run = 0
+    for ch in text:
+        run = run + 1 if ch.isdigit() else 0
+        if run >= ID_DIGITS:
+            return True
+    return any(a.isalpha() and b.isdigit() for tok in text.split() for a, b in zip(tok, tok[1:]))
+
+
 def _cut(text: str, chars: int) -> str:
     return text if len(text) <= chars else text[: chars - 1].rstrip() + "…"
 
@@ -271,6 +287,22 @@ def plain_achieved(value: Any) -> str:
     if len(text.split()) < ACHIEVED_MIN_WORDS or _looks_like_code(text):
         return ""
     text = _cut(text, ACHIEVED_CHARS)
+    return text[:1].upper() + text[1:]
+
+
+#: appPT: the brain's live one-line note (its ``now``, or the situation check's plain line) is cut to this.
+THOUGHT_CHARS = 110
+
+
+def plain_thought(value: Any) -> str:
+    """The brain's live note of what it checks or does and why (appPT: the island's thinking and working line, the run
+    card's current step) when it is a plain line: one line, no address, path, switch or command name (character tests
+    on fixed formats, never words), first letter capital, no closing full stop; else ``""``. Times and counts a
+    person says ("6:08 PM", "3 messages") are fine; a window or element number is not (review F8)."""
+    text = _squash(value).strip(" .")
+    if not text or _looks_like_code(text) or _looks_like_id(text):
+        return ""
+    text = _cut(text, THOUGHT_CHARS)
     return text[:1].upper() + text[1:]
 
 
@@ -439,7 +471,11 @@ DONE_WORDS: dict[str, str] = {
     "watch_for": "Started keeping an eye out", "remember_how": "Kept how it’s done",
     "answer_question": "Kept your answer", "note_to_self": "Made a note", "memory": "Checked my memory",
     "about": "Checked who that is", "todo": "Changed your list", "say": "Told you", "ask_user": "Asked you",
+    "check_situation": "Checked first", "tasks": "Kept your list",
 }
+#: Running words for Yuki's own steps when the agent's registry is not loaded in this process (the HTML window's):
+#: the situation check before a step that lasts and the kept list (report 47 N0, N10; appPT).
+RUNNING_WORDS: dict[str, str] = {"check_situation": "Checking first", "tasks": "Keeping your list"}
 TODO_DONE: dict[str, str] = {"add": "Added to your list", "done": "Marked done on your list",
                              "not_needed": "Took off your list", "wrong": "Took off your list",
                              "list": "Checked your list"}
@@ -484,7 +520,7 @@ def describe_step(name: str, tool_input: dict[str, Any] | None = None, *, done: 
         line = TODO_DONE.get(str(args.get("action") or ""), "") if name == "todo" else ""
         line = line or DONE_WORDS.get(name, "") or "Did a step"
     else:
-        phrase = _registry_label(name, args) or "Working on it"
+        phrase = _registry_label(name, args) or RUNNING_WORDS.get(name) or "Working on it"
         when = _when_words([(k, d) for k, v in args.items() if (d := _iso(v)) is not None])
         line = f"{phrase} {when}" if when else phrase
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"

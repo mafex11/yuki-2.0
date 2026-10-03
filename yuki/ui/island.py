@@ -10,10 +10,14 @@ game-quiet          a real full screen on the monitor in use (an exclusive or bo
                     full-screen video, a presentation) or the session locked: hidden; the tray carries the
                     call timer (one clock, never reset). A borderless app that is only maximised is not one.
 needs-you           Yuki asked something and waits (auto-expands: the question and Answer / Stop)
+send-countdown      a plain send is about to go (auto-expands): who / where (swap chips), the exact text, "3 s to
+                    stop" and Stop / Esc; then the send goes on (appPT, the user's 3 Oct screenshot of the mock)
 voice-stopped       voice failed: the reason and the fix (Retry, Settings), on screen at least 8 s (auto-expands)
 speaking            Yuki talks: "Speaking"; on hover the words being said, "say stop to cut me off"
 hearing, listening  your turn: "Hearing you" / "Listening"; on hover a live caption, unsure words dimmed
-working, thinking   a request runs: "Working · 2/5"; on hover the step line, the time, Stop and the run card
+working, thinking   a request runs: "Working · step 2" (no plan, so never "of N": it acts on the go); on hover
+                    the brain's own live line of what it checks or does and why, the step, the time, Stop and the
+                    run card
 done-flash          the run ended: the result in a few words for 3 s, a stamped check
 call-notice         a call started recording: "Recording your mic · Discord" for 2.5 s, then nothing
 quiet-in-call       a call is recorded and nothing else goes on: hidden (the timer is in the tray's hover card)
@@ -57,6 +61,7 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect, QLineEdit, QSizePolicy, QW
 from yuki.ui import lattice as L
 from yuki.ui import tokens as T
 from yuki.ui.dots import FACE_W, HALO_GAP, HALO_H, HALO_W, FaceWidget, HaloWidget
+from yuki.ui.lattice_cards import SendCard
 
 # -- geometry and timing (tokens ``island`` / ``motion``; the design's CSS) ---------------------------------
 
@@ -109,12 +114,16 @@ BAR_SHIFT = 8
 #: The window: the widest island, so morphs paint inside it (the rest is transparent and lets clicks through).
 WIN_W = MAX_W
 
-STATES: tuple[str, ...] = ("game-quiet", "needs-you", "voice-stopped", "speaking", "hearing", "listening", "working",
-                           "thinking", "done-flash", "call-notice", "quiet-in-call", "not-listening", "hidden-armed")
+STATES: tuple[str, ...] = ("game-quiet", "needs-you", "send-countdown", "voice-stopped", "speaking", "hearing",
+                           "listening", "working", "thinking", "done-flash", "call-notice", "quiet-in-call",
+                           "not-listening", "hidden-armed")
 #: States with the halo figure of the same name: only while Yuki hears, thinks or works, or speaks (3 Oct, item 20).
 HALO_STATES = frozenset({"hearing", "thinking", "working", "speaking"})
-#: States that show the full bar without a hover: Yuki needs an answer, or voice broke.
-AUTO_EXPAND = frozenset({"needs-you", "voice-stopped"})
+#: States that show the full bar without a hover: Yuki needs an answer, a send is about to go (3 s to stop), or voice
+#: broke (the mock's Island spec: "On its own").
+AUTO_EXPAND = frozenset({"needs-you", "send-countdown", "voice-stopped"})
+#: The send countdown's open width (the mock's Island spec: "send countdown 620").
+SEND_W = 620
 #: The words the island and the tray use for "Yuki isn't listening" (v3.16, the voice session's states).
 NOT_LISTENING_WORDS = {"off": "Yuki isn't listening: switched off", "quiet": "Yuki isn't listening: quiet for a while",
                        "call_off": "Yuki isn't listening: off for this call"}
@@ -159,10 +168,36 @@ class RunInfo:
     hint: str = ""
     stopping: bool = False
     request: str = ""
-    of: int = 0                              # the plan's step count when one is known (0: not known)
+    # (no step total: Yuki acts on the go and plans nothing beforehand, so nothing on screen says "of N"; the user,
+    # 3 Oct: "planning beforehand is not the right choice")
     steers: list[Steer] = field(default_factory=list)
     chips: dict[int, list[tuple]] = field(default_factory=dict)   # step number -> [(icon, text[, playbook ref])]
     frame: dict[str, Any] | None = None
+    #: The brain's own live line of what it checks or does now and why (its ``now`` note, or the situation check's
+    #: plain line), for the current step; "" when the step came without one (its own words show instead).
+    thought: str = ""
+
+
+@dataclass
+class SendInfo:
+    """The send countdown the island shows (appPT; ``yuki.log.events.SendPending``): ``phase`` ``counting`` (seconds
+    to stop or swap) or ``switching`` (a chip was tapped; the countdown starts again when the send is ready)."""
+
+    request_id: int
+    phase: str = "counting"
+    who: str = ""
+    where: str = ""
+    app: str = ""
+    text: str = ""
+    seconds: float = 3.0
+    who_alts: tuple[str, ...] = ()
+    where_alts: tuple[str, ...] = ()
+    typed: bool = False
+    from_memory: bool = False
+    started: float = 0.0                     # time.monotonic() when this countdown began
+    #: The title of the window the text goes into, as the app writes it (the chat it shows): a wrong chat in front is
+    #: on the card whatever Yuki believes it is sending to (review F1). "" while switching.
+    window: str = ""
 
 
 @dataclass
@@ -187,6 +222,7 @@ class IslandInputs:
     question: str = ""
     question_id: int | None = None
     question_voice: bool = False
+    send: SendInfo | None = None             # the send countdown (appPT)
     call: dict | None = None
     fullscreen: bool = False
     fullscreen_title: str = ""
@@ -207,6 +243,8 @@ def resolve(i: IslandInputs) -> str:
         return "game-quiet"
     if i.question:
         return "needs-you"
+    if i.send is not None:
+        return "send-countdown"
     if i.voice_error:
         return "voice-stopped"
     if i.voice == "speaking":
@@ -262,12 +300,11 @@ def elapsed(seconds: float) -> str:
 
 
 def step_of(run: RunInfo | None) -> tuple[int, int]:
-    """The face's and the halo's step: ``(n, of)``; without a known plan, five segments and the current one filling."""
+    """The face's and the halo's step: ``(n, 0)``: the step it is on, and no total (there is no plan: the segments
+    show the steps done so far and the current one filling, never the ones to come; ``yuki.ui.dots``)."""
     if run is None:
-        return (2, 5)
-    of = run.of if run.of > 0 else 5
-    n = max(1, min(run.steps if run.steps > 0 else 1, of))
-    return (n, of)
+        return (1, 0)
+    return (max(1, run.steps), 0)
 
 
 @dataclass
@@ -283,7 +320,7 @@ class Spec:
     mini: bool = False
     hidden: bool = False
     halo: str | None = None
-    step: tuple[int, int] = (2, 5)
+    step: tuple[int, int] = (1, 0)
     rec: bool = False
     keys: tuple[str, ...] = ()  # right side, in order: stop, chev, retry, settings
     chip: str = ""              # a plain chip on the right: "done", "stopped", "failed", "handed"
@@ -297,7 +334,7 @@ class Spec:
 
 
 def compact_word(state: str, i: IslandInputs) -> str:
-    """The compact pill's one short word for ``state`` ("Listening", "Working · 2/5", the done result)."""
+    """The compact pill's one short word for ``state`` ("Listening", "Working · step 2", the done result)."""
     if state == "listening":
         return "Listening"
     if state == "hearing":
@@ -311,10 +348,10 @@ def compact_word(state: str, i: IslandInputs) -> str:
         if run is not None and run.stopping:
             return "Stopping…"
         n = run.steps if run is not None else 0
-        of = run.of if run is not None else 0
-        if n and of:
-            return f"Working · {min(n, of)}/{of}"
         return f"Working · step {n}" if n else "Working"
+    if state == "send-countdown":
+        s = i.send
+        return f"Sending to {s.who}" if s is not None and s.who else "Sending"
     if state == "done-flash":
         f = i.final
         return " ".join(str(f.text if f is not None else "Done.").split()) or "Done."
@@ -352,8 +389,8 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
             state, state)
         if state == "done-flash":
             face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
-        n, of = step_of(run)   # the halo belongs to the open island: the pill never carries it
-        return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=(n, of),
+        # the halo belongs to the open island: the pill never carries it
+        return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=step_of(run),
                     title=compact_word(state, i))
     if state == "call-notice":
         return Spec(state, face="quiet-in-call", compact=True, word=i.notice, rec=rec, title=i.notice)
@@ -373,26 +410,42 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         sub = "Say it, or press Answer to type it" if i.question_voice else "Answer in the ask bar"
         return Spec(state, face="needs-you", exp=True, width=600, line=i.question, sub=sub, rec=rec,
                     body="choices", title=i.question)
+    if state == "send-countdown" and i.send is not None:
+        s = i.send
+        target = f"{s.who} on {s.app}" if s.who and s.app else (s.who or s.app or "them")
+        if s.phase == "counting":
+            line = f"Sending to {target}…"
+            swaps = bool(s.who_alts or s.where_alts)
+            sub = ("resolved from memory" if s.from_memory else "from your words") + (
+                " · tap a chip to swap" if swaps else f" · {int(round(s.seconds))} s to stop")
+        else:
+            line = f"Switching to {target}…"
+            # review F3: text already typed stays in the first chat's box until it is cleared: said, never hidden
+            sub = ("the text typed in the first chat stays there, not sent, until it is cleared" if s.typed
+                   else "the countdown starts again once it's ready there")
+        return Spec(state, face="speaking", exp=True, width=SEND_W, line=line, sub=sub, rec=rec, body="send",
+                    title=line)
     if state == "voice-stopped":
         return Spec(state, face="voice-stopped", width=720, line="Voice stopped",
                     sub=i.voice_error, keys=("retry", "settings"), title=i.voice_error)
-    if state == "working" and expanded and run is not None:
-        n, of = step_of(run)
-        head = f"step {run.steps}" + (f" of {run.of}" if run.of else "")
-        return Spec("working", face="working", exp=True, width=RUN_W, line=run.line or "Working…",
-                    sub=f"{head} · {elapsed(now - run.started)}", rec=rec, step=(n, of), body="run", keys=("chev",))
     if state == "working" and run is not None:
-        n, of = step_of(run)
-        head = f"step {run.steps}" + (f" of {run.of}" if run.of else "")
-        return Spec(state, face="working", width=680, line=run.line or "Working…",
-                    sub=f"{head} · {elapsed(now - run.started)}", rec=rec, keys=("stop", "chev"), halo="working",
-                    step=(n, of))
+        # the brain's own line of what it checks or does now and why, when the step came with one; its step's own
+        # words then move to the sub line (appPT: real reasoning, not a canned status)
+        step = f"step {max(1, run.steps)}"
+        line = run.thought or run.line or "Working…"
+        mid = f" · {run.line}" if run.thought and run.line else ""
+        sub = f"{step}{mid} · {elapsed(now - run.started)}"
+        if expanded:
+            return Spec("working", face="working", exp=True, width=RUN_W, line=line, sub=sub, rec=rec,
+                        step=step_of(run), body="run", keys=("chev",))
+        return Spec(state, face="working", width=680, line=line, sub=sub, rec=rec, keys=("stop", "chev"),
+                    halo="working", step=step_of(run))
     if state == "thinking":
         if run is not None:
             sub = run.hint or (f"you said “{i.heard}”" if i.heard else "") or elapsed(now - run.started)
             if run.hint or i.heard:
                 sub = f"{elapsed(now - run.started)} · {sub}"
-            line = run.line or "Thinking…"
+            line = run.thought or run.line or "Thinking…"
             if expanded:
                 return Spec("thinking", face="thinking", exp=True, width=RUN_W, line=line, sub=sub, rec=rec,
                             body="run", keys=("chev",))
@@ -1027,9 +1080,10 @@ class RunCard(QWidget):
 
     def set_card(self, *, mode: str, title: str, touch: str, count: str, cost: str, asked: str,
                  steps: list[dict[str, Any]], steers: list[Steer], summary: tuple[str, str] | None = None,
-                 foot_note: str = "", stop_kbd: str = "Alt Shift X", lesson: bool = False) -> None:
+                 foot_note: str = "", stop_kbd: str = "Alt Shift X", lesson: bool = False, waiting: str = "") -> None:
         """``mode``: ``live`` | ``done`` | ``stopped`` | ``handed`` | ``failed``. ``steps``: ``{kind, verb, obj, ms,
-        note, chips}`` in order."""
+        note, chips}`` in order, the steps so far (never the ones to come). ``waiting``: the brain's own line before
+        its first step, in place of "Getting ready…"."""
         self.mode = mode
         live = mode == "live"
         self.tt.set_text(title)
@@ -1056,7 +1110,7 @@ class RunCard(QWidget):
                 s = steps[k]
                 row.set_step(s.get("kind", "done"), s.get("verb", ""), s.get("obj", ""), s.get("ms", ""),
                              s.get("note", ""), s.get("chips"), first=k == 0)
-        self.empty.set_text("" if steps else ("Getting ready…" if live else "No steps."))
+        self.empty.set_text("" if steps else ((waiting or "Getting ready…") if live else "No steps."))
         self.empty.setVisible(not steps)
         self.steerbox.setVisible(live)
         if live:
@@ -1304,6 +1358,8 @@ class IslandWindow(QWidget):
         self.k_answer = L.Key("Answer", variant="pri", size="sm", parent=P)
         self.k_qstop = L.Key("Stop", variant="ghost", size="sm", parent=P)
         self.run = RunCard(P)
+        self.send = SendCard(P)    # appPT: the send countdown, the island's open view while a send waits
+        self.send.hide()
         for w in (self.k_stop, self.k_chev, self.k_retry, self.k_settings, self.k_answer, self.k_qstop):
             w.hide()
         self.k_chev.setToolTip("Open the run card")
@@ -1379,6 +1435,8 @@ class IslandWindow(QWidget):
             return 26 + 16
         if spec.body == "run":
             return self.run.height_for(w - 2)
+        if spec.body == "send":
+            return self.send.height_for(w - 2)
         return 0
 
     def panel_height(self, spec: Spec, w: int) -> int:
@@ -1436,6 +1494,8 @@ class IslandWindow(QWidget):
             self.k_qstop.move(1 + CAPTION_INDENT + self.k_answer.width() + 8, y)
         elif spec.body == "run":
             self.run.setGeometry(1, y, w - 2, max(0, self.run.height_for(w - 2)))
+        elif spec.body == "send":
+            self.send.setGeometry(1, y, w - 2, max(0, self.send.height_for(w - 2)))
         del P
 
     # -- showing a spec --------------------------------------------------------------------------------------
@@ -1470,7 +1530,8 @@ class IslandWindow(QWidget):
         for w in (self.k_answer, self.k_qstop):
             w.setVisible(spec.body == "choices")
         self.run.setVisible(spec.body == "run")
-        pitch = 3 if spec.mini else COMPACT_PITCH if spec.compact else 8
+        self.send.setVisible(spec.body == "send")
+        pitch =3 if spec.mini else COMPACT_PITCH if spec.compact else 8
         small_was = (old.mini or old.compact) if old is not None and not old.hidden else None
         if self.face.pitch != pitch:   # the face scales between the pill (4 px cells) and the open island (8 px)
             self.face.set_pitch(pitch, grow=(small_was is True and pitch == 8 and not reduced))
@@ -1764,6 +1825,8 @@ class Island(QObject):
         ask_again(str): put a stopped request's words back in the ask bar, unsent.
         state_changed(str): the resolved state (the tray's icon follows it).
         save_lesson(): the run card's "Save the lesson".
+        send_stop(int): Stop (or Esc) on the send countdown of that request: nothing is sent.
+        send_swap(int, str, str): a chip tapped on the send countdown: ``(request, "who" | "where", the new value)``.
     """
 
     stop_clicked = Signal(int)
@@ -1775,6 +1838,8 @@ class Island(QObject):
     ask_again = Signal(str)
     state_changed = Signal(str)
     save_lesson = Signal()
+    send_stop = Signal(int)
+    send_swap = Signal(int, str, str)
 
     def __init__(self, *, bindings: dict[str, str] | None = None, model: Any = None) -> None:
         super().__init__()
@@ -1811,6 +1876,10 @@ class Island(QObject):
         rc.close.connect(self._close_card)
         rc.again.connect(self._on_again)
         rc.save_lesson.connect(self.save_lesson.emit)
+        self.window.send.stop.connect(self._on_send_stop)
+        self.window.send.swap.connect(self._on_send_swap)
+        #: A new send countdown is to start its drain at the next render (once per countdown, not per redraw).
+        self._send_restart = False
         self._clock = QTimer(self)
         self._clock.setInterval(1000)
         self._clock.timeout.connect(self._tick)
@@ -1915,6 +1984,8 @@ class Island(QObject):
             return "compact"
         if spec.body == "run":
             return "run card"
+        if spec.body == "send":
+            return "send countdown"
         return "full"
 
     def _entered(self) -> None:
@@ -2036,6 +2107,8 @@ class Island(QObject):
         if spec.body == "caption":
             text, spans = caption_spans(self.inputs.caption, unsure_threshold())
             self.window.caption.set_text(text, spans)
+        if spec.body == "send":
+            self._fill_send()
         if spec.body == "run":
             self._fill_card()
         self.window.show_spec(spec, animate=animate)
@@ -2048,7 +2121,8 @@ class Island(QObject):
     def _timers(self, spec: Spec) -> None:
         # one clock, only for the full bar's run time ("step 2 · 0:46"); the pill's words don't change by the second,
         # and the call's timer lives in the tray's hover card (its own clock, only while the card is open)
-        need = self.window.isVisible() and not spec.hidden and not spec.compact and self.inputs.run is not None
+        need = (self.window.isVisible() and not spec.hidden and not spec.compact and self.inputs.run is not None
+                and spec.state in ("working", "thinking"))
         if need and not self._clock.isActive():
             self._clock.start()
             self._tick()
@@ -2190,8 +2264,15 @@ class Island(QObject):
         mode = "live" if self.inputs.run is not None else (final.outcome if final else "done")
         steps = self._steps(run)
         done = sum(1 for s in steps if s["kind"] == "done")
-        count = f"{done}/{run.of}" if run.of else str(done if mode != "live" else max(done, run.steps))
-        cost = "so far" if mode == "live" else (f"{final.cost} total" if final and final.cost else "total")
+        # the steps done so far, never "of N" (there is no plan; the user, 3 Oct); nothing before the first is done
+        count = str(done) if done or mode != "live" else ""
+        cost = ("done so far" if count else "") if mode == "live" else \
+            (f"{final.cost} total" if final and final.cost else "total")
+        if mode == "live" and run.thought and steps:
+            # the brain's own line for what it checks or does now, under the current step (else the latest)
+            cur = next((s for s in reversed(steps) if s["kind"] == "running"), steps[-1])
+            if not cur.get("note"):
+                cur["note"] = run.thought
         asked = _clean(run.request)
         title = asked
         touch = _touching(run.frame)
@@ -2205,7 +2286,7 @@ class Island(QObject):
                                  asked=asked if self._needs_say(asked) else "", steps=steps, steers=run.steers,
                                  summary=summary, foot_note=note,
                                  stop_kbd=_words(self.bindings.get("cancel")).replace("+", " ") or "Alt Shift X",
-                                 lesson=self.lesson_available)
+                                 lesson=self.lesson_available, waiting=run.thought if mode == "live" else "")
 
     def _needs_say(self, asked: str) -> bool:
         """The request in full under the title only when the title had to cut it (no word said twice)."""
@@ -2264,6 +2345,81 @@ class Island(QObject):
         if run is not None:
             self.stop_clicked.emit(run.id)
         self.update(question="", question_id=None)
+
+    # -- the send countdown (appPT) ----------------------------------------------------------------------------
+
+    def show_send(self, request_id: int, send: dict[str, Any]) -> None:
+        """The runtime's ``send_pending`` for request ``request_id``: ``counting`` opens the send countdown on its own
+        (a new drain each time), ``swapped`` keeps it open as "Switching to …" until the send is ready again,
+        ``going`` and ``stopped`` close it."""
+        state = str(send.get("state") or "")
+        cur = self.inputs.send
+        rid = int(request_id)
+
+        def alts(key: str) -> tuple[str, ...]:
+            return tuple(str(x) for x in (send.get(key) or ()) if str(x).strip())[:2]
+
+        # the exact text: spaces tidied within each line, its line breaks kept (one may go out as Enter: review F9)
+        lines = [" ".join(part.split()) for part in str(send.get("text") or "").splitlines()]
+        fields = {"who": str(send.get("who") or ""), "where": str(send.get("where") or ""),
+                  "app": str(send.get("app") or ""), "text": "\n".join(lines).strip("\n"),
+                  "who_alts": alts("who_alts"), "where_alts": alts("where_alts"), "typed": bool(send.get("typed")),
+                  "from_memory": bool(send.get("from_memory")), "window": " ".join(str(send.get("window") or "").split())}
+        if state == "counting":
+            self._send_restart = True
+            self._log("send_countdown", state=state, swaps=len(fields["who_alts"]) + len(fields["where_alts"]))
+            self.update(send=SendInfo(rid, "counting", seconds=float(send.get("seconds") or 3.0),
+                                      started=time.monotonic(), **fields))
+        elif state == "swapped":
+            self._log("send_countdown", state=state)
+            self.update(send=SendInfo(rid, "switching", seconds=float(send.get("seconds") or 3.0),
+                                      started=time.monotonic(), **fields))
+        elif cur is not None and cur.request_id == rid:
+            self._log("send_countdown", state=state)
+            self.update(send=None)
+
+    def clear_send(self, request_id: int | None = None) -> None:
+        """The run ended (or asked something): no send countdown stays open for it."""
+        cur = self.inputs.send
+        if cur is not None and (request_id is None or cur.request_id == int(request_id)):
+            self.update(send=None)
+
+    def _fill_send(self) -> None:
+        s = self.inputs.send
+        if s is None:
+            return
+        run = self.inputs.run
+        said = _clean(run.request) if run is not None and run.id == s.request_id else ""
+        if len(said) > 70:
+            said = said[:69].rstrip() + "…"
+        restart, self._send_restart = self._send_restart, False
+        self.window.send.set_send(phase=s.phase, who=s.who, where=s.where, app=s.app, text=s.text, said=said,
+                                  seconds=s.seconds, who_swap=bool(s.who_alts), where_swap=bool(s.where_alts),
+                                  restart=restart and s.phase == "counting", window=s.window)
+
+    def _on_send_stop(self) -> None:
+        s = self.inputs.send
+        if s is not None:
+            self.send_stop.emit(s.request_id)
+
+    def _on_send_swap(self, kind: str) -> None:
+        s = self.inputs.send
+        if s is None or s.phase != "counting":
+            return
+        alts = s.who_alts if kind == "who" else s.where_alts
+        if alts:
+            self.send_swap.emit(s.request_id, kind, alts[0])
+
+    def set_thought(self, request_id: int, text: str) -> None:
+        """The brain's own live line for the current step (its ``now`` note, or the situation check's plain line): the
+        thinking / working line and the run card's current step show it until the next step (appPT)."""
+        from yuki.ui.step_words import plain_thought
+
+        run = self.inputs.run
+        line = plain_thought(text)
+        if run is None or run.id != int(request_id) or not line or line == run.thought:
+            return
+        self.update(run=replace(run, thought=line))
 
     def _on_handback(self) -> None:
         run = self.inputs.run
@@ -2341,6 +2497,11 @@ class Island(QObject):
         chip = _route_chip(frame)
         if chip:
             run.chips.setdefault(1, []).insert(0, ("memory", chip))
+        if chip and run.steps == 0 and not run.thought:
+            # review F4: before the first step the brain has written nothing yet; what Yuki already worked out (who,
+            # and their usual route, from memory) is the thinking line's real source until its own note arrives
+            self.update(run=replace(run, thought=chip[:1].upper() + chip[1:]))
+            return
         if self.expanded:
             self._render(animate=False)
 
@@ -2455,7 +2616,7 @@ class IslandStrip(QObject):
         run = RunInfo(int(request_id), time.monotonic() if started is None else float(started), int(steps), line,
                       hint=hint if not line else "", request=request or (keep.request if keep else ""))
         if keep is not None:
-            run.steers, run.chips, run.frame, run.of = keep.steers, keep.chips, keep.frame, keep.of
+            run.steers, run.chips, run.frame, run.thought = keep.steers, keep.chips, keep.frame, keep.thought
         isl._final_timer.stop()
         isl.update(run=run, final=None, transient="")
 
@@ -2468,7 +2629,9 @@ class IslandStrip(QObject):
             for s in run.steers:   # the model read it: this step came after it was added
                 if s.state.startswith("added"):
                     s.state = f"read at step {new_steps}"
-        self.island.update(run=replace(run, line=text, steps=new_steps, hint=""))
+        # a new step starts without the last one's thought (its own note, if any, comes right after it)
+        self.island.update(run=replace(run, line=text, steps=new_steps, hint="",
+                                       thought="" if new_steps > run.steps else run.thought))
 
     def stopping(self) -> None:
         run = self.island.inputs.run
@@ -2481,7 +2644,8 @@ class IslandStrip(QObject):
             return False
         was = self.isVisible()
         self._ended = run
-        self.island.update(run=None)
+        send = self.island.inputs.send
+        self.island.update(run=None, send=None if send is not None and send.request_id == run.id else send)
         self._changed(was)
         return True
 
@@ -2498,6 +2662,8 @@ class IslandStrip(QObject):
         if run is not None:
             self._ended = run
             self.island.inputs = replace(self.island.inputs, run=None)
+        if self.island.inputs.send is not None and (run is None or self.island.inputs.send.request_id == run.id):
+            self.island.inputs = replace(self.island.inputs, send=None)   # the run is over: no countdown stays
         ended = getattr(self, "_ended", None)
         kind = outcome or ("failed" if tone == "error" else "done")
         isl = self.island
@@ -2528,9 +2694,12 @@ class IslandStrip(QObject):
         self._changed(was)
 
     def ask(self, request_id: int, question: str, *, voice: bool) -> None:
-        """Yuki asked something and waits: needs-you (it auto-expands)."""
+        """Yuki asked something and waits: needs-you (it auto-expands). A send countdown left switching for this
+        request closes: the question decides what happens next."""
+        send = self.island.inputs.send
         self.island.update(question=" ".join(str(question or "").split()), question_id=int(request_id),
-                           question_voice=bool(voice))
+                           question_voice=bool(voice),
+                           send=None if send is not None and send.request_id == int(request_id) else send)
 
     def answered(self, request_id: int | None = None) -> None:
         i = self.island.inputs

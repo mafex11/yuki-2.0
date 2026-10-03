@@ -120,7 +120,33 @@ class Partial:
     kind: Literal["partial"] = "partial"
 
 
-AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent | Partial
+@dataclass(frozen=True)
+class SendPending:
+    """A message is about to go to a person: the send countdown (the user's 3 Oct "Sending to X ... 3 s to stop").
+
+    Yielded by the agent loop for a plain send that passed the situation check and the judge, only when its caller
+    opted in (``Agent.send_countdown_s``). ``state``: ``counting`` (the card opens, ``seconds`` to stop or swap),
+    ``going`` (the time ran out: the send runs now), ``stopped`` (cancelled in the window: nothing sent),
+    ``swapped`` (a chip was tapped: the call is not run; the countdown starts again when the send is ready for the new
+    person or place). ``typed``: the text is already in the box (a key or a click sends it), so a stop leaves it
+    there unsent. Never logged with its text."""
+
+    state: str
+    who: str = ""
+    where: str = ""
+    app: str = ""
+    text: str = ""
+    seconds: float = 0.0
+    who_alts: tuple[str, ...] = ()
+    where_alts: tuple[str, ...] = ()
+    typed: bool = False
+    from_memory: bool = False
+    #: The title of the window the text goes into (the chat it shows, as the app writes it; review F1); "" on a swap.
+    window: str = ""
+    kind: Literal["send_pending"] = "send_pending"
+
+
+AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent | Partial | SendPending
 
 #: Every event type name that may appear in a session JSONL file. Anything
 #: :meth:`SessionLogger.log` is called with should be in here, so a reader can

@@ -139,6 +139,12 @@
     if (sh.call && sh.call.recording) return 'quiet-in-call';
     return 'idle';
   }
+  /* the step the running request is on, for the face's and the field's working figures: no total (there is no plan,
+     appPT: "Working · step 2", never "of N"; review F5) */
+  function stepNow() {
+    const r = ((D.shell || {}).runs || [])[0];
+    return { n: Math.max(1, (r && +r.step) || 1), of: 0 };
+  }
   /* the field behind the page shows a live state only while something is live */
   function fieldState() {
     if (Q.get('state')) return Q.get('state');
@@ -219,7 +225,7 @@
       // loop (field.js Tick; 32-build-E11-E14.md §7); live faces blink through the loop they already run
       const f = new L.Face(cv, +cv.dataset.pitch || 4);
       if (Q.get('blink') === '0') f.idleBlink = false; else f.tickBlink();   // blink=0: the measurement baseline
-      f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
+      f.set(cv.dataset.core, stepNow()); cv.__face = f;
     });
   }
   function afterMain(main, nav) {
@@ -243,14 +249,15 @@
     mountFaces($app);
     afterMain(main, nav);
     renderDrawer();
-    field.setState(fieldState(), { step: { n: 2, of: 5 } });
+    field.setState(fieldState(), { step: stepNow() });
   }
   function renderRail() {
     const old = $app.querySelector('.rail'); if (!old) return;
     const el = rail();
     if (patchInto(old, el) !== old) old.replaceWith(el);   // the rail patched in place: its face keeps drawing
     mountFaces(old.isConnected ? old : el);
-    field.setState(fieldState(), { step: { n: 2, of: 5 } });
+    field.setState(fieldState(), { step: stepNow() });
+    $app.querySelectorAll('canvas[data-core]').forEach((cv) => { if (cv.__face) cv.__face.step = stepNow(); });
     tickSoon();
   }
 
@@ -338,7 +345,7 @@
     if (tickerOwned(old) && sameAttrs(old, neu)) return old;                   // the ticker's text is newer
     if (old.tagName === 'CANVAS') {   // a face: the one already drawing changes its expression, never a new one
       if (!old.__face) return neu;
-      if (old.dataset.core !== neu.dataset.core) { old.dataset.core = neu.dataset.core; old.__face.set(neu.dataset.core, { n: 2, of: 5 }); }
+      if (old.dataset.core !== neu.dataset.core) { old.dataset.core = neu.dataset.core; old.__face.set(neu.dataset.core, stepNow()); }
       return old;
     }
     if (old.tagName === 'DETAILS' && neu.tagName === 'DETAILS') neu.open = old.open;   // your fold stays as you left it

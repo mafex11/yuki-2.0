@@ -150,7 +150,7 @@
       this.fixedW = opts.w || 0; this.fixedH = opts.h || 0;
       this.sc = opts.scale || 1;                     // figure scale (halo figures are a little smaller)
       this.state = 'idle'; this.blend = 0; this.figs = []; this.hoverCol = -1; this.hoverTo = -1; this.solid = []; this.figT0 = 0; this.stateT0 = 0;
-      this.step = { n: 2, of: 5 }; this.maxDelay = 0; this.full = true;
+      this.step = { n: 1, of: 0 }; this.maxDelay = 0; this.full = true;   // the step it is on; no total (appPT)
       this.anchor = null; this.base = document.createElement('canvas');
       this.frame = this.frame.bind(this);
       this.resize();
@@ -394,14 +394,17 @@
           out.t = 0; return Math.min(1, val);
         }
         case 'working': {
-          if (Math.abs(v) > 2 || u < -17 || u > 17) return 0;
-          const x = u + 17, seg = Math.floor(x / 7), inSeg = x % 7;
-          if (inSeg === 6 || seg > 4) return 0;
+          // the steps so far, the newest one filling, centred and growing from the middle (the last five at most); no
+          // segment stands for a step to come: there is no plan (appPT; yuki/ui/dots.py's halo, review F5)
+          const shown = Math.min(Math.max(1, this.step.n || 1), 5);
+          const x = u + Math.floor(shown * 7 / 2);
+          if (Math.abs(v) > 2 || x < 0 || x >= shown * 7) return 0;
+          const seg = Math.floor(x / 7), inSeg = x % 7;
+          if (inSeg === 6) return 0;
           if (Math.abs(v) === 2 && (inSeg === 0 || inSeg === 5)) return 0;
-          const n = this.step.n - 1;
+          const n = shown - 1;
           out.t = 0;
           if (seg < n) return 0.9;
-          if (seg > n) return 0.16;
           const p = 0.35 + 0.3 * (0.5 + 0.5 * Math.sin(t * 1.3));
           const fill = Math.floor(p * 6);
           if (inSeg < fill) return 0.9;
@@ -545,7 +548,7 @@
       this.c = canvas; this.x = canvas.getContext('2d');
       this.state = 'idle'; this.cur = new Float32Array(FACE_W * FACE_H); this.tone = new Uint8Array(FACE_W * FACE_H);
       this.g = new Float32Array(FACE_W * FACE_H); this.tn = new Uint8Array(FACE_W * FACE_H);
-      this.blinkAt = -10; this.t0 = performance.now() / 1000; this.step = { n: 2, of: 5 };
+      this.blinkAt = -10; this.t0 = performance.now() / 1000; this.step = { n: 1, of: 0 };
       this.frame = this.frame.bind(this);
       this.setPitch(pitch || 4);
       SURFACES.add(this);
@@ -632,10 +635,13 @@
         }
         case 'working': {
           eyes([2, 3], 1); eyes([1], 0.25);
-          const p = (this.step.n - 1 + 0.35 + 0.3 * pulse(1.2)) / this.step.of;
-          const head = 3 + Math.round(p * 10);
-          for (let c = 3; c <= 13; c++) L(c, 5, c < head ? 0.9 : c === head ? 1 : 0.16, c === head ? 1 : 0);
-          for (let n = 0; n < this.step.of; n++) { const c = 4 + n * 2; L(c, 6, n < this.step.n - 1 ? 0.75 : n === this.step.n - 1 ? 0.55 + 0.45 * pulse(6) : 0.12, n === this.step.n - 1 ? 1 : 0); }
+          // no plan, so no total (appPT; yuki/ui/dots.py's face, review F5): a light runs along the mouth on its own
+          // clock (busy, never a fraction done); the dots under it are the steps so far, the newest one live, centred,
+          // the last five at most; nothing stands for steps to come
+          const head = 3 + Math.floor(t * 6) % 11;
+          for (let c = 3; c <= 13; c++) { const d = head - c; L(c, 5, d === 0 ? 1 : d >= 1 && d <= 3 ? [0.75, 0.5, 0.3][d - 1] : 0.16, d === 0 ? 1 : 0); }
+          const shown = Math.min(Math.max(1, this.step.n || 1), 5), first = 8 - (shown - 1);
+          for (let n = 0; n < shown; n++) { const cur = n === shown - 1; L(first + n * 2, 6, cur ? 0.55 + 0.45 * pulse(6) : 0.75, cur ? 1 : 0); }
           break;
         }
         case 'speaking': {

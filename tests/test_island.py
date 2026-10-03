@@ -83,7 +83,7 @@ def test_each_state_draws_the_designs_parts():
     run = RunInfo(5, time.monotonic() - 46, steps=2, line="Renaming the exports")
     w = spec_for("working", IslandInputs(run=run, call=call), now=time.monotonic())
     assert w.width == 680 and w.halo == "working" and w.keys == ("stop", "chev") and w.rec
-    assert w.sub.startswith("step 2 · 0:4") and w.step == (2, 5)   # no plan: "step n", five segments
+    assert w.sub.startswith("step 2 · 0:4") and w.step == (2, 0)   # no plan: "step n", no total (appPT)
     card = spec_for("working", IslandInputs(run=run, call=call), expanded=True)
     assert card.body == "run" and card.width == 600 and card.halo is None and card.exp
     done = spec_for("done-flash", IslandInputs(call=call, final=FinalInfo("Renamed 12 exports.")))
@@ -496,10 +496,11 @@ def test_the_face_and_halo_follow_the_designs_formulas():
     from yuki.ui.dots import FACE_H, FACE_W, FaceModel, HaloModel
 
     face = FaceModel()
-    face.set("working", 0.0, (2, 5))
+    face.set("working", 0.0, (2, 0))
     face.target(1.0)
     lit = {(n % FACE_W, n // FACE_W) for n, v in enumerate(face.g) if v > 0}
-    assert (4, 2) in lit and (11, 3) in lit and (6, 6) in lit     # half-lidded eyes, the step pips under the bar
+    assert (4, 2) in lit and (11, 3) in lit and (7, 6) in lit and (9, 6) in lit   # eyes, the two steps so far
+    assert not {(c, 6) for c in (3, 4, 5, 6, 8, 10, 11, 12, 13)} & lit   # no pip stands for a step to come (appPT)
     assert len(face.g) == FACE_W * FACE_H == 17 * 7
     halo = HaloModel()
     assert (halo.cols, halo.rows, halo.ai, halo.aj) == (56, 17, 28, 8)

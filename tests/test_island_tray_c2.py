@@ -63,7 +63,7 @@ def test_a_shown_island_ends_at_full_strength_after_any_sequence(qapp):
 
     rng = random.Random(20261003)
     isl = _island(qapp)
-    run = RunInfo(3, time.monotonic(), steps=2, of=5, line="Renaming the exports", request="rename the exports")
+    run = RunInfo(3, time.monotonic(), steps=2, line="Renaming the exports", request="rename the exports")
     moves = [
         lambda: isl.update(voice="listening"),
         lambda: isl.update(voice="hearing", caption=[("rename", 0.9), ("them", 0.3)]),
@@ -198,9 +198,9 @@ def test_every_state_is_a_compact_pill_until_the_pointer_rests_on_it(qapp):
 
     isl = _island(qapp)
     try:
-        isl.update(run=RunInfo(4, time.monotonic(), steps=2, of=5, line="Renaming the exports"))
+        isl.update(run=RunInfo(4, time.monotonic(), steps=2, line="Renaming the exports"))
         spec = isl.window.spec
-        assert spec.compact and spec.word == "Working · 2/5" and spec.halo is None
+        assert spec.compact and spec.word == "Working · step 2" and spec.halo is None
         assert isl.window.panel_height(spec, 300) == COMPACT_H + 2 and isl.window.face.pitch == 4
         isl.pointer(True)
         _pump(qapp, HOVER_IN_MS / 1000 * 0.4)
@@ -372,13 +372,13 @@ def test_the_hover_card_grows_on_windows_popup_and_folds_after_the_pointer(qapp)
     opened = []
     try:
         watch = TrayWatch(tray, isl, voice=voice, open_window=lambda: opened.append(True))
-        isl.update(run=RunInfo(4, time.monotonic(), steps=2, of=5, line="Renaming the exports",
+        isl.update(run=RunInfo(4, time.monotonic(), steps=2, line="Renaming the exports",
                                request="rename the exports"))
         assert tray.faces[-1][0] == "working" and watch._frames.isActive()    # 4 frames swap while working
         tray.popup_open.emit()
         card = watch.card
         assert card is not None and card.isVisible()
-        assert card.info.line == "Working on: rename the exports" and card.info.sub == "step 2 of 5"
+        assert card.info.line == "Working on: rename the exports" and card.info.sub == "step 2"
         assert card.k_stop.isVisibleTo(card.content) and card.info.task == "Renaming the exports"
         tray.popup_close.emit()
         _pump(qapp, 0.15)
