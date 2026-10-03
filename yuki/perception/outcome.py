@@ -326,7 +326,18 @@ def verdict(change: Change | None, *, opaque: bool = False, readable: bool = Tru
     if change is None or not readable:
         return None, "the window could not be read before and after"
     if change.any:
-        return True, "the window changed: " + describe(change)[0]
+        # the reason is kept in the run trace: the target's own change (a control the thinker acted on), else counts
+        # only, so nothing the window showed is copied into it
+        if change.target_changes:
+            return True, "the window changed: " + describe(change)[0]
+        parts = [f"{n} {what}" for n, what in ((sum(s for _e, s in change.appeared), "appeared"),
+                                               (sum(s for _e, s in change.gone), "went away"),
+                                               (len(change.changed), "changed")) if n]
+        if change.moved:
+            parts.insert(0, "its content moved")
+        if change.page or change.title:
+            parts.insert(0, "its page or title changed")
+        return True, "the window changed: " + ", ".join(parts)
     if opaque:
         return None, "the window draws its own interface, so a change inside it cannot be seen"
     return False, "nothing visible changed in the window"

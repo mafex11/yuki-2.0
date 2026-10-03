@@ -678,3 +678,33 @@ def test_an_after_read_cut_short_leaves_the_actions_own_verdict(monkeypatch: pyt
     assert "What changed" not in out.content[0]["text"]
     assert out.payload["details"].get("screen_change") is None or out.payload["details"]["screen_change"][
         "verified"] is None
+
+
+class _ChatDesk(_PlayerDesk):
+    """A Discord-like DM: Enter after typing sends the message, which shows at the bottom as the list scrolls."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.rids: dict = {}
+        self.count = 60
+        super().__init__(monkeypatch, window=chat_window(messages=60, visible_from=40, rids=self.rids))
+
+    def type_text(self, text: str, *, press_enter: bool = False, expect_hwnd: int | None = None, **kw: Any) -> Any:
+        if press_enter:
+            self.count += 1
+            self.window = chat_window(messages=self.count, visible_from=self.count - 20, rids=self.rids)
+        return ActionResult(ok=True, summary=f"typed {len(text)} chars", details={"readback": "unreadable"})
+
+
+def test_enter_after_typing_is_judged_by_the_chat_moving_to_show_the_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.agent.loop import action_verdict
+
+    desk = _ChatDesk(monkeypatch)
+    d = _dispatcher(desk)
+    d.dispatch("look_at_window", {"hwnd": 7001})
+    out = d.dispatch("type_text", {"text": "invented reply", "press_enter": True, "expect_hwnd": 7001})
+    assert 'the content of List "Messages in @Sam" moved up by about 40 px' in out.content[0]["text"]
+    assert action_verdict("type_text", out)[0] is True
+    # typing without Enter keeps the field's own read-back, no extra reads
+    reads = desk.reads
+    d.dispatch("type_text", {"text": "draft", "expect_hwnd": 7001})
+    assert desk.reads == reads

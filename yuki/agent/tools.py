@@ -2349,6 +2349,7 @@ class Dispatcher:
         """
         if not self.verify_outcomes or not hwnd:
             return act()
+        prepare_started = time.monotonic()
         try:
             hwnd = int(hwnd)
             model = self.window_model(hwnd)
@@ -2367,14 +2368,22 @@ class Dispatcher:
                 busy_rids = set(hub.busy_since(hwnd, started_at - OUTCOME_CAP_S))
         except Exception:  # noqa: BLE001 - the action runs either way
             return act()
+        prepared_ms = round((time.monotonic() - prepare_started) * 1000.0, 1)
         outcome = act()
         if before is None or (not outcome.ok and name != "scroll"):
             return outcome
         try:
+            waited = time.monotonic()
             self._settled_after(hwnd, generation)
+            settle_ms = round((time.monotonic() - waited) * 1000.0, 1)
+            read_started = time.monotonic()
             after = self._observe(hwnd)
+            # content-free facts for the log: what the bracket cost and whether events spared the read before
+            diag = {"before_read": "fresh" if fresh else "current by events", "events": generation is not None,
+                    "before_ms": prepared_ms, "settle_ms": settle_ms,
+                    "after_read_ms": round((time.monotonic() - read_started) * 1000.0, 1)}
             if after is None:
-                return self._with_change(outcome, None, [], None, "the window could not be read after it")
+                return self._with_change(outcome, None, [], None, "the window could not be read after it", diag)
             from yuki.perception.model import fact
             from yuki.perception.outcome import describe, diff, verdict
 
@@ -2383,27 +2392,34 @@ class Dispatcher:
             opaque = bool((self._observed.get(hwnd) or (None, 0.0, False))[2])
             verified, why = verdict(change, opaque=opaque)
             lines = describe(change, target_label=target_label)
-            return self._with_change(outcome, verified, lines, change, why)
+            return self._with_change(outcome, verified, lines, change, why, diag)
         except Exception as exc:  # noqa: BLE001 - the action's own report stands
             if isinstance(outcome.payload, dict):
                 outcome.payload = {**outcome.payload, "screen_change_error": f"{type(exc).__name__}: {exc}"}
             return outcome
 
     def _with_change(self, outcome: ToolOutcome, verified: bool | None, lines: list[str], change: Any,
-                     why: str) -> ToolOutcome:
+                     why: str, diag: dict[str, Any] | None = None) -> ToolOutcome:
         """The action's result with what changed on screen added (text, details, verdict)."""
-        payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+        outer = outcome.payload if isinstance(outcome.payload, dict) else {}
+        # an element-targeted type_text nests the typing's own report (action_verdict reads it there)
+        nested = outcome.name == "type_text" and isinstance(outer.get("type_text"), dict)
+        payload = outer["type_text"] if nested else outer
         details = dict(payload.get("details") or {}) if isinstance(payload.get("details"), dict) else {}
         effects = [details.get(k) for k in ("foreground_changed", "focus_changed", "foreground_title_changed",
                                             "page_changed", "window_state_changed")]
         own = details.get("verified")
-        if verified is True or own is True or any(e is True for e in effects) or details.get("new_windows"):
-            final: bool | None = True
+        if details.get("readback") == "missing" or details.get("enter_withheld"):
+            final: bool | None = own if isinstance(own, bool) else None   # the text did not arrive: no send to see
+            if details.get("readback") == "missing":
+                final = False
+        elif verified is True or own is True or any(e is True for e in effects) or details.get("new_windows"):
+            final = True
         elif verified is False:
             final = False
         else:
             final = own if isinstance(own, bool) else None
-        record = {"verified": verified, "why": why, "lines": lines[:8]}
+        record = {"verified": verified, "why": why, "lines": lines[:8], **(diag or {})}
         if change is not None:
             record["counts"] = dict(change.counts)
         details["screen_change"] = record
@@ -2417,12 +2433,18 @@ class Dispatcher:
             if not outcome.ok:
                 outcome.ok = True
                 outcome.summary = f"{outcome.summary}; but the window's content did move"
-        outcome.payload = {**payload, "details": details}
+        if nested:
+            outcome.payload = {**outer, "type_text": {**payload, "details": details}}
+        else:
+            outcome.payload = {**payload, "details": details}
         if lines:
+            # the account goes to the model with the result; the one-line summary (run trace, cards) stays as it was,
+            # so what was on screen is not copied into practice memory's traces
             said = "What changed: " + "; ".join(lines[:OUTCOME_LINES]) + "."
-            outcome.summary = f"{outcome.summary}. {said}"
             if outcome.content and outcome.content[0].get("type") == "text":
                 outcome.content[0]["text"] = f"{outcome.content[0]['text']}\n{said}"
+            else:
+                outcome.content = [{"type": "text", "text": said}, *(outcome.content or [])]
         return outcome
 
     def window_model(self, hwnd: int) -> Any:
@@ -3373,6 +3395,13 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             return None
         want = element.get("bounds") or (0, 0, 0, 0)
+        rid = element.get("runtime_id")
+        if rid:   # report 58: the very element, when the provider gives it an identity
+            exact = [e for e in (tree or {}).get("elements") or [] if isinstance(e, dict)
+                     and e.get("runtime_id") and list(e["runtime_id"]) == list(rid) and e.get("role") == element.get(
+                         "role")]
+            if exact:
+                return exact[0]
         same = [e for e in (tree or {}).get("elements") or [] if isinstance(e, dict)
                 and e.get("role") == element.get("role") and e.get("name") == element.get("name") and e.get("bounds")]
         if not same:
@@ -3526,18 +3555,25 @@ class Dispatcher:
             if via is not None:
                 return self._labelled(via, target[3])
         self._before_input("type_text")
-        if target is None:
-            return self._from_action("type_text", self.backend.type_text(text, **options))
-        # Focus the element first by clicking it, guarded to its window; type
-        # only if that click went through.
-        x, y, guard, label = target
-        focus = self._from_action("type_text", self.backend.click(x, y, expect_hwnd=guard))
-        if not focus.ok:
-            return self._labelled(focus, f"{label} (clicked to focus it; nothing typed)")
-        typed = self._from_action("type_text", self.backend.type_text(text, **options))
-        typed.payload = {"focus_click": focus.payload, "type_text": typed.payload}
-        typed.elapsed_ms += focus.elapsed_ms
-        return self._labelled(typed, f"{label} (clicked to focus it)")
+
+        def act() -> ToolOutcome:
+            if target is None:
+                return self._from_action("type_text", self.backend.type_text(text, **options))
+            # Focus the element first by clicking it, guarded to its window; type
+            # only if that click went through.
+            x, y, guard, label = target
+            focus = self._from_action("type_text", self.backend.click(x, y, expect_hwnd=guard))
+            if not focus.ok:
+                return self._labelled(focus, f"{label} (clicked to focus it; nothing typed)")
+            typed = self._from_action("type_text", self.backend.type_text(text, **options))
+            typed.payload = {"focus_click": focus.payload, "type_text": typed.payload}
+            typed.elapsed_ms += focus.elapsed_ms
+            return self._labelled(typed, f"{label} (clicked to focus it)")
+
+        if not options["press_enter"]:
+            return act()   # the field's own read-back says whether the text arrived
+        # report 58: Enter sends or submits; what that did shows in the window (the message in the chat, the box empty)
+        return self._bracketed("type_text", target[2] if target is not None else self._key_window(tool_input), act)
 
     def _do_hotkey(self, tool_input: dict[str, Any]) -> ToolOutcome:
         keys = tool_input.get("keys")
