@@ -425,7 +425,76 @@ def test_a_stale_index_still_finds_the_current_summary(store):
     assert card["summary"]["ref"] == f"fact:{new}"
 
 
-# -- live checks (opt-in) --------------------------------------------------------------------------------
+# -- review fixes (report 55, "Review fixes") ---------------------------------------------------------------
+
+
+def test_a_turned_down_rewrite_keeps_the_facts_merged_into_it(store):
+    """Review F1: a rewrite turned down (too long) is no rewrite, and the facts merged into it stay current (their
+    points were to go into it); a failing fact still fails."""
+    from yuki.memory.people_summary import SUMMARY_MAX_CHARS, PeoplePass
+
+    ids = people(store)
+    answers = answer(ids)
+    answers["write_people"][0]["people"][0]["text"] = RAVI_GOOD + " x" * SUMMARY_MAX_CHARS
+    worker, _client = worker_with(store, answers)
+    result = PeoplePass(worker).run(now=T0 + 3600)
+    assert result.ok, result.error
+    assert result.rewritten == 0 and result.retired_why == {"person_figures": 1}
+    assert store.portrait_fact(ids["ravi"]).valid_to is None
+    assert store.portrait_fact(ids["more"]).valid_to is None            # the chess point is still current
+    assert store.portrait_fact(ids["fees"]).valid_to is not None
+    assert any("turned down" in r for r in result.rejected)
+
+
+def test_a_failure_partway_leaves_what_was_written_logged_and_undoable(store, monkeypatch):
+    """Review F2: the second person's commit fails (the app holding the database); the first person's changes are
+    already in the diary, so the run can be taken back."""
+    import sqlite3
+
+    from yuki.memory.people_summary import PeoplePass
+
+    ids = people(store)
+    worker, _client = worker_with(store, answer(ids))
+    real = store.commit_portrait_changes
+    calls = []
+
+    def flaky(run_id, changes, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real(run_id, changes, **kw)
+
+    monkeypatch.setattr(store, "commit_portrait_changes", flaky)
+    result = PeoplePass(worker).run(now=T0 + 3600, include_pinned=True)   # Ravi, then Meera: two commits
+    monkeypatch.setattr(store, "commit_portrait_changes", real)
+    assert not result.ok and "locked" in result.error
+    assert (result.rewritten, result.retired) == (1, 2)                  # what was written, not what was decided
+    assert sorted(d["action"] for d in store.changelog(pass_="people")) == ["retire", "retire", "rewrite"]
+    assert next(f for f in store.portrait_facts(["person"]) if f.subject == "Ravi").text == RAVI_GOOD
+    undone = PeoplePass(worker).undo(result.run_id, now=T0 + 7200)
+    assert undone == {"reverted": 1, "restored": 2, "diverged": []}
+    assert sorted(f.text for f in store.portrait_facts(["person"])) == sorted(
+        [RAVI_BAD, RAVI_MORE, RAVI_FEES, KIRAN, MEERA_PINNED])
+
+
+def test_a_person_fact_added_since_the_link_run_joins_its_person(store):
+    """Review F3: a person fact the nightly run added after the last link run, under a contact's name, is one of that
+    contact's facts (after the cited ones), never a second person of the same name; the Me card shows it."""
+    from yuki.memory import contacts as C
+    from yuki.memory.people_summary import people_of
+
+    ids = people(store)
+    chess = add_fact(store, "Ravi", "Ravi is into chess.")
+    got = people_of(store, now=T0)
+    assert [(p.name, p.summary.id, [o.id for o in p.others]) for p in got] == [
+        ("Ravi", ids["ravi"], [ids["more"], ids["fees"], chess]), ("Kiran", ids["kiran"], []),
+        ("Meera", ids["meera"], [])]
+    card = C.card(store, next(p for p in C.people(store) if p.name == "Ravi"), with_samples=0)
+    assert card["summary"]["ref"] == f"fact:{ids['ravi']}"
+    assert f"fact:{chess}" in {f["ref"] for f in card["facts_shown"]}
+
+
+# -- live checks (opt-in)--------------------------------------------------------------------------------
 
 
 LIVE = pytest.mark.skipif(os.environ.get("YUKI_LIVE_PEOPLE") != "1", reason="live model check: set YUKI_LIVE_PEOPLE=1")

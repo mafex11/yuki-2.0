@@ -1541,17 +1541,20 @@ def person_facts_of(contact: Contact, current: dict[int, Any], store: Store | No
     """The current person facts about this contact: the ones the linking call cited (each followed to its current
     version when ``store`` is given: an UPDATE since the link run gave it a new id), else the person fact whose
     subject is their name or an alias (the join key a fact written after the last link run attaches by: report 38 §3,
-    a stale ``fact_ids``). Whole-name comparison of stored strings, as :func:`resolve` does."""
+    a stale ``fact_ids``). The cited facts come first (the first is the summary the Me page shows), then every other
+    person fact under their name: one the nightly run added since the last link run belongs to them too, never to a
+    second person of the same name (review F3 of report 55). Whole-name comparison of stored strings, as
+    :func:`resolve` does."""
     out: list[Any] = []
     for f in contact.fact_ids:
         fid = f if f in current else current_version(store, f)
         if fid in current and current[fid] not in out:
             out.append(current[fid])
-    if out:
-        return out
+    cited = {f.id for f in out}
     names = [tokens(n) for n in contact.names if tokens(n)]
-    return [f for f in current.values() if getattr(f, "kind", "person") == "person" and tokens(f.subject or "")
-            and tokens(f.subject) in names]
+    out += [f for f in current.values() if f.id not in cited and getattr(f, "kind", "person") == "person"
+            and tokens(f.subject or "") and tokens(f.subject) in names]
+    return out
 
 
 def usual_label(routes: Sequence[dict[str, Any]], tone: str | None = None) -> dict[str, Any] | None:
