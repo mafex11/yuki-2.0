@@ -49,12 +49,14 @@
   }
 
   /* ---------- the preview's stand-in host (invented data only) ---------- */
+  let fixtureDelta = 0;
   function fixture(msg) {
     const F = window.YUKI_FIXTURE;
     const later = (m, ms) => setTimeout(() => dispatch(m), ms || 0);
     if (msg.op === 'ready') {
       const q = new URLSearchParams(location.search);
       const delta = Date.now() / 1000 - (F.now || Date.now() / 1000);
+      fixtureDelta = delta;
       const pages = shiftTimes(F.pages, delta, '');
       const shell = shiftTimes(F.shell, delta, '');
       const chat = shiftTimes(F.chat, delta, '');
@@ -63,8 +65,9 @@
       return;
     }
     if (msg.op === 'act' && msg.id) {
-      const r = (F.replies || {})[msg.action] || { ok: true };
-      later(Object.assign({ kind: 'reply', id: msg.id }, JSON.parse(JSON.stringify(r))), 280);
+      let r = (F.replies || {})[msg.action] || { ok: true };
+      if (r.by_ref) r = r.by_ref[msg.ref] || Object.assign({}, r, { by_ref: undefined });   // a reply that depends on what was asked for
+      later(Object.assign({ kind: 'reply', id: msg.id }, shiftTimes(JSON.parse(JSON.stringify(r)), fixtureDelta, '')), 280);
     }
   }
 

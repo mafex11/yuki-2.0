@@ -36,13 +36,44 @@
             title: 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev')))), t.ref || t.title);
   }
 
+  /* the week bars (the 3 Oct item 16): a bar is your hours at the PC that day, its outlined top the part that was
+     full screen, today brightest and labelled; hovering or focusing a day shows its readout and brightens its
+     columns. The caption says what the figure is. */
+  const wkWords = (d) => `${d.dow}${d.today ? ' (today, so far)' : ''}: ${fmt.dur(d.pc || 0)} at the PC, ${fmt.dur(d.f || 0)} of it full screen`;
   function weekFig(w) {
     const days = (w && w.days) || [];
     const fig = h('div', { class: 'fig wide', data: { figure: 'week', anchor: '' } });
-    fig.__week = days.map((d) => ({ pc: d.pc || 0, a: d.a || 0, f: d.f || 0 }));
-    return [fig, h('div', { class: 'wk-lbl', data: { clear: '' } }, days.map((d) => h('span', { class: d.today ? 'today' : '', text: d.dow }))),
-      h('div', { class: 'fig-cap wk-cap', data: { clear: '' }, text: 'this week: at the PC, full screen dimmer' })];
+    fig.__week = days.map((d) => ({ pc: d.pc || 0, a: d.a || 0, f: d.f || 0, today: !!d.today }));
+    return [fig,
+      h('div', { class: 'wk-hit', attrs: { role: 'list', 'aria-label': 'Hours at the PC this week, by day' } },
+        days.map((d, n) => h('button', { data: { wk: n }, attrs: { type: 'button', role: 'listitem', 'aria-label': wkWords(d) } })),
+        h('div', { class: 'wk-tip', data: { keep: '' }, attrs: { id: 'wktip', 'aria-live': 'polite' } })),
+      h('div', { class: 'wk-lbl', data: { clear: '' } }, days.map((d) => h('span', { class: d.today ? 'today' : '', text: d.today ? `${d.dow} · today` : d.dow }))),
+      h('div', { class: 'fig-cap wk-cap2', data: { clear: '' } }, h('span', { text: 'Hours at the PC this week, by day' }),
+        h('span', { class: 'wk-key' }, h('i', { class: 'b' }), 'bar = hours at the PC', h('i', { class: 'o' }), 'outlined top = the full-screen part'))];
   }
+  function wkHover(n) {
+    const tip = document.getElementById('wktip'); if (!tip) return;
+    if (n == null) { tip.classList.remove('on'); Y.field.setHover(-1); return; }
+    const d = (((Y.D.pages.work || {}).week || {}).days || [])[n]; if (!d) return;
+    tip.replaceChildren(h('b', { text: `${d.dow}${d.today ? ' (today, so far)' : ''}:` }), ` ${fmt.dur(d.pc || 0)} at the PC, ${fmt.dur(d.f || 0)} of it full screen`);
+    // the readout starts at the hovered bar, never runs past the figure's right edge, and keeps clear of the toggle
+    const hb = tip.parentElement.getBoundingClientRect(), seg = document.querySelector('.ph .seg');
+    const minRel = seg ? Math.min(0, seg.getBoundingClientRect().right + 8 - hb.left) : 0;
+    tip.style.left = Math.round(Math.max(minRel, Math.min(n * 48, hb.width - tip.offsetWidth))) + 'px';
+    tip.classList.add('on');
+    const fig = document.querySelector('[data-figure="week"]');
+    if (fig) { const r = fig.getBoundingClientRect(); const f = Y.field.figureAt(r.left + n * 48 + 2, r.top + 4, 'week'); if (f) Y.field.setHover(f.col, f.col + 2); }
+  }
+  document.addEventListener('mouseover', (e) => {
+    const b = e.target.closest && e.target.closest('[data-wk]');
+    if (b) return wkHover(+b.dataset.wk);
+    if (e.target.closest && e.target.closest('.wk-hit')) return;
+    const tip = document.getElementById('wktip');
+    if (tip && tip.classList.contains('on')) wkHover(null);
+  });
+  document.addEventListener('focusin', (e) => { const b = e.target.closest && e.target.closest('[data-wk]'); if (b) wkHover(+b.dataset.wk); });
+  document.addEventListener('focusout', (e) => { if (e.target.closest && e.target.closest('[data-wk]')) wkHover(null); });
 
   function threads(d, S) {
     const T = d.threads || [];
@@ -52,7 +83,7 @@
       tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
     const body = T.length ? h('div', { class: 'grid3', data: { k: 'threads' } }, T.map(threadCard))
       : Y.k(Y.clearing('section', 'sec', Y.empty('Threads appear as Yuki follows your work across days: what it is, where it stands, what’s open.', 'No threads yet.')), 'none');
-    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub)), 'head'), body];
+    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'), body];
   }
 
   /* ---------- the day ---------- */
@@ -62,7 +93,7 @@
     const meta = [h('span', { text: d.date_label || '' }),
       d.first ? h('span', null, 'first ', h('b', { text: d.first }), d.last ? [', last ', h('b', { text: d.last })] : null) : h('span', { text: 'nothing recorded yet' }),
       offs ? h('span', null, 'PC off ', h('b', { text: offs })) : null];
-    const legend = Y.clearing('div', 'legend', LEGEND.map(([cls, n, t]) => h('span', null, h('i', { class: 'lg ' + cls }, Array.from({ length: n }, () => h('i'))), t)),
+    const legend = Y.clearing('div', 'legend', h('span', { class: 'label', text: 'Today, by what you did:' }), LEGEND.map(([cls, n, t]) => h('span', null, h('i', { class: 'lg ' + cls }, Array.from({ length: n }, () => h('i'))), t)),
       h('span', { class: 'hint', text: 'hover or use ← → to scrub' }));
     const sky = h('div', { class: 'sky', attrs: { id: 'sky', tabindex: 0, role: 'slider', 'aria-label': 'Scrub through the day', 'aria-valuemin': 0, 'aria-valuemax': 1439 }, data: { figure: 'skyline' } },
       // the now marker moves on the minute tick (data-nowmin); the cursor and readout are the scrub's own (data-keep)
@@ -78,25 +109,45 @@
     const calls = d.calls || [];
     return [Y.k(Y.head('Day', meta, null, tabs(S.sub)), 'head'), Y.k(legend, 'legend'), wrap, Y.k(totals, 'totals'), Y.k(weekHeat(d.week_hours || []), 'heat'),
       h('div', { class: 'grid2', data: { k: 'grid' }, css: { marginTop: '28px' } },
-        h('div', { class: 'col' }, Y.k(Y.sec('Sessions, latest first', sess.length, sess.length ? sess.map((s) => h('div', { class: 'sess', data: { k: `${s.start}:${s.app || ''}` } }, h('div', { class: 'tm', text: `${s.start}–${s.end}` }),
-          h('div', null, h('div', { class: 'tt' }, s.title || s.app, s.mode === 'full' ? h('span', { class: 'kind', text: 'full screen' }) : null),
-            h('div', { class: 'blk' }, (s.apps || []).slice(0, 4).map(([n, m]) => [h('span', { text: fmt.dur(m) }), h('span', { text: n })]))))) : Y.empty('No sessions yet today.')), 'sessions')),
-        h('div', { class: 'col' }, Y.k(Y.sec('Calls today', calls.length, calls.length ? calls.map((c) => h('div', { class: 'sess', data: { k: `call:${c.start}:${c.app || ''}` } }, h('div', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }),
-          h('div', null, h('div', { class: 'tt' }, c.app || 'Call', h('span', { class: 'kind', text: c.recorded ? 'your side kept' : 'not recorded' }), c.live && c.started_at ? Y.recChip(c.started_at) : null),
-            h('div', { class: 'blk one', text: c.gist || fmt.dur(c.min || 0) })))) : Y.empty('No calls today.')), 'calls')))];
+        h('div', { class: 'col' }, Y.k(Y.sec('Sessions, latest first', sess.length, sess.length ? sess.map(sessionRow) : Y.empty('No sessions yet today.'), Y.rightLabel('click one for its apps')), 'sessions')),
+        h('div', { class: 'col' }, Y.k(Y.sec('Calls today', calls.length, calls.length ? calls.map(callRow) : Y.empty('No calls today.')), 'calls')))];
   }
 
+  /* a session (the 3 Oct ask D): one row with its time and title; opened, the whole title and the time in every app */
+  function sessionRow(s) {
+    const apps = s.apps || [], max = Math.max(1, ...apps.map(([, m]) => m || 0));
+    const head = [h('span', { class: 'tm', text: `${s.start}–${s.end}` }), h('span', { class: 'tt' }, h('span', { class: 'tx', text: s.title || s.app }),
+      s.mode === 'full' ? h('span', { class: 'kind', text: 'full screen' }) : null)];
+    const meta = apps.length ? h('span', { class: 'mono', text: apps.slice(0, 2).map(([n]) => n).join(', ') + (apps.length > 2 ? ` +${apps.length - 2}` : '') }) : null;
+    const body = [s.full ? h('div', { class: 'd', text: s.full }) : null,
+      apps.length ? h('div', { class: 'perapp' }, apps.map(([n, m]) => h('div', { class: 'pa' }, h('span', { class: 'pa-n', text: n }), Y.bar(m, max, 20), h('span', { class: 'mono', text: fmt.dur(m) }))))
+        : h('div', { class: 't2', text: 'No app time measured in this stretch.' })];
+    return Y.fold(`s:${s.start}:${s.app || ''}`, head, meta, body, { cls: 'dayrow' });
+  }
+  /* a call today: when, where, who; opened, what was said (the gists, said to you) */
+  function callRow(c) {
+    const head = [h('span', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }), h('span', { class: 'tt' }, h('span', { class: 'tx', text: c.where || c.app || 'Call' }),
+      h('span', { class: 'kind', text: c.recorded ? 'your side kept' : 'not recorded' }), c.live && c.started_at ? Y.recChip(c.started_at) : null)];
+    const gists = c.gists || [];
+    const body = [(c.people || []).length ? h('div', { class: 'who', text: 'with ' + c.people.join(', ') }) : null,
+      gists.length ? h('ul', { class: 'gists' }, gists.map((g) => h('li', { text: g }))) : h('div', { class: 't2', text: c.recorded ? (c.live ? 'Live now. Turned into text when the PC is free.' : 'Waiting to be turned into text.') : `${fmt.dur(c.min || 0)}, not recorded.` })];
+    return Y.fold(`c:${c.start}:${c.app || ''}`, head, h('span', { class: 'mono', text: fmt.dur(c.min || 0) }), body, { cls: 'dayrow' });
+  }
+
+  /* the week by hour (the 3 Oct item 17): one grid template for the dot rows and the hour axis, so each label sits
+     exactly under its column (both centred in it) */
+  const HOUR_WORD = { a: 'at the PC', f: 'full screen', c: 'on a call', w: 'away', o: 'nothing' };
   function weekHeat(rows) {
     if (!rows.length) return null;
     const body = h('div', { class: 'heat' }, rows.map((d) => h('div', { class: 'hrow', title: d.title || '' },
       h('span', { class: 'hd', text: d.dow + (d.today ? ' · today' : '') }),
-      h('span', { class: 'hdots' }, (d.hours || []).map((x, i) => {
-        const i0 = h('i', { class: (x.k || 'o') + (x.fu ? ' fu' : ''), title: `${fmt.pad(i)}:00 · ${({ a: 'at the PC', f: 'full screen', c: 'on a call', w: 'away', o: 'nothing' })[x.k] || ''}` });
-        if (x.k && x.k !== 'o') { const px = (4 + 10 * Math.max(0, Math.min(1, x.v || 0))).toFixed(1) + 'px'; i0.style.width = px; i0.style.height = px; }
+      (d.hours || []).map((x, i) => {
+        const i0 = h('i', { class: 'hc ' + (x.k || 'o') + (x.fu ? ' fu' : ''), title: `${fmt.pad(i)}:00 · ${HOUR_WORD[x.k] || ''}` });
+        i0.style.setProperty('--v', Math.max(0, Math.min(1, x.v || 0)).toFixed(2));
         return i0;
-      })), h('span', { class: 'hm mono', text: fmt.dur(d.pc || 0) }))),
-    h('div', { class: 'hrow axis' }, h('span', { class: 'hd' }), h('span', { class: 'hdots' }, Array.from({ length: 24 }, (_, i) => h('b', { text: i % 3 === 0 ? fmt.pad(i) : '' }))), h('span')));
-    const leg = h('div', { class: 'hleg' }, [['a', 'at the PC'], ['f', 'full screen'], ['c', 'calls'], ['w', 'away']].map(([k, t]) => h('span', null, h('i', { class: k }), t)),
+      }), h('span', { class: 'hm mono', text: fmt.dur(d.pc || 0) }))),
+    h('div', { class: 'hrow axis' }, h('span', { class: 'hd' }), Array.from({ length: 24 }, (_, i) => h('b', { text: i % 3 === 0 ? fmt.pad(i) : '' })), h('span')));
+    const leg = h('div', { class: 'hleg' }, h('span', { class: 'label', text: 'Each dot is one hour:' }), [['a', 'at the PC'], ['f', 'full screen'], ['c', 'calls'], ['w', 'away']].map(([k, t]) => h('span', null, h('i', { class: k }), t)),
       h('span', { class: 't3', text: 'bigger dot = more of that hour' }));
     return Y.sec('This week, by hour', null, [body, leg], Y.rightLabel('7 days → today'), 'heatsec');
   }

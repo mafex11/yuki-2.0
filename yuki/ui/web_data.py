@@ -51,16 +51,18 @@ def hm(at: float | None) -> str:
 
 
 def day_words(at: float | None, today: date | None = None) -> str:
-    """``today 09:41`` / ``yesterday 23:40`` / ``2 Oct 12:19``."""
+    """``today, 9:41 AM`` / ``yesterday, 11:40 PM`` / ``2 Oct, 12:19 PM`` (12-hour, as people say it)."""
     if not at:
         return ""
+    from yuki.ui.window.data import nat_time
+
     d = datetime.fromtimestamp(at)
     t = today or date.today()
     if d.date() == t:
-        return f"today {d:%H:%M}"
+        return f"today, {nat_time(at)}"
     if d.date() == t - timedelta(days=1):
-        return f"yesterday {d:%H:%M}"
-    return f"{d.day} {d:%b} {d:%H:%M}"
+        return f"yesterday, {nat_time(at)}"
+    return f"{d.day} {d:%b}, {nat_time(at)}"
 
 
 def short_day(at: float | None) -> str:
@@ -621,13 +623,13 @@ def _call_id(ref: Any) -> int | None:
 
 
 def heard_line(app: str, call: dict[str, Any] | None, at: float | None, *, channel_known: bool = True,
-               label: str = "") -> str:
+               label: str = "", now: float | None = None) -> str:
     """Where something was said, in the one format every row uses (the 3 Oct feedback item 8): "Heard in Discord,
     #general voice (Friends), 1 October, 2:07 AM, with Riya and Dev"; a call whose channel the screen never showed
     "Heard on a Discord call, …"; said with no call, "You said it to me while WhatsApp was open, …"."""
     from yuki.ui.window.data import nat_when
 
-    when = nat_when(at)
+    when = nat_when(at, today=datetime.fromtimestamp(time.time() if now is None else now).date())
     if call is not None or label:
         place = (call or {}).get("label") or label
         app = (call or {}).get("app") or app
@@ -726,7 +728,8 @@ def review_view(q: dict[str, Any], facts_by_ref: dict[str, dict[str, Any]]) -> d
             "merged": int(merged.get("count") or 0)}
 
 
-def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[Any]) -> dict[str, Any]:
+def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[Any],
+                  now: float | None = None) -> dict[str, Any]:
     """"Maybe misheard" (memory's ``misheard()``: unanswered uncertain entries of the last week, newest first): the
     words as heard (the entry's own quote when memory kept it, else its text) and where they were heard, in the one
     format (:func:`heard_line`). An older memory: the Qt view's uncertain entries (``fallback``)."""
@@ -735,7 +738,7 @@ def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[
     fn = getattr(memory, "misheard", None)
     got = _safe(fn, None) if callable(fn) else None
     if not isinstance(got, dict):
-        items = [{"ref": i.ref, "text": i.text, "quote": "", "prov": heard_line(i.title, None, i.since)} for i in fallback]
+        items = [{"ref": i.ref, "text": i.text, "quote": "", "prov": heard_line(i.title, None, i.since, now=now)} for i in fallback]
         return {"items": items, "total": len(items), "direct": False}
     items = []
     for m in got.get("items") or []:
@@ -749,7 +752,7 @@ def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[
             call = {"label": m.get("heard_in") or "", "app": m.get("app") or "", "people": m.get("people") or []}
         items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))), "quote": quote,
                       "prov": heard_line(str(m.get("app") or ""), call, m.get("at"),
-                                         channel_known=bool(m.get("channel_known", True)))})
+                                         channel_known=bool(m.get("channel_known", True)), now=now)})
     return {"items": items, "total": int(got.get("total") or len(items)), "direct": callable(getattr(memory, "resolve_heard", None))}
 
 
@@ -819,7 +822,7 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
     total = sum(len(g["facts"]) for g in groups) + len(rules) + len(routines) + len(not_routines) + len(in_review)
     return {"source": source, "people": persons, "groups": groups, "rules": rules, "routines": routines,
             "not_routines": not_routines, "review": review, "total": total,
-            "misheard": misheard_view(memory, calls, fallback), "pending": pending or {},
+            "misheard": misheard_view(memory, calls, fallback, now), "pending": pending or {},
             "can": {"pin": callable(getattr(memory, "pin_fact", None)), "review": callable(rq),
                     "heard": callable(getattr(memory, "resolve_heard", None))}}
 

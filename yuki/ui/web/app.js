@@ -30,7 +30,7 @@
   Y.remeasure = () => field.remeasure();
   // the moment of your last action: a build that started before it is not drawn over what the action just showed
   // (actions that only read or open something leave the page's data alone)
-  const READS = new Set(['person', 'copy', 'askbar', 'continue']);
+  const READS = new Set(['person', 'copy', 'askbar', 'continue', 'thread_days', 'chat_day']);
   Y.act = (action, fields) => {
     if (!READS.has(action)) S.actedAt = Date.now();
     return B.request('act', Object.assign({ action: action }, fields || {}));
@@ -89,7 +89,7 @@
     if (v.conversation && v.state && v.state !== 'off') return [h('i', { class: 'recdot' }), { listening: 'listening', hearing: 'hearing you', thinking: 'thinking', speaking: 'speaking', working: 'working on it' }[v.state] || v.state];
     if (sh.call && sh.call.recording) return [h('i', { class: 'recdot' }), `quiet · ${sh.call.app || 'a'} call`];
     if ((sh.runs || []).length) return [h('i', { class: 'recdot' }), 'working on it'];
-    if (v.quiet_until && v.quiet_until * 1000 > Date.now()) return [h('i', { class: 'waitdot' }), `quiet until ${fmt.hm(v.quiet_until)}`];
+    if (v.quiet_until && v.quiet_until * 1000 > Date.now()) return [h('i', { class: 'waitdot' }), `quiet until ${fmt.natTime(v.quiet_until)}`];
     if (v.wake) return [h('i', { class: 'waitdot' }), 'waiting for “Yuki”'];
     return [h('i', { class: 'waitdot' }), 'voice off'];
   }
@@ -123,8 +123,8 @@
   }
 
   /* the page header: the big Doto title, a meta line, the figure the field draws in dots */
-  Y.head = function (title, meta, fig, tools) {
-    return h('header', { class: 'ph' },
+  Y.head = function (title, meta, fig, tools, cls) {
+    return h('header', { class: 'ph' + (cls ? ' ' + cls : '') },
       h('h1', { text: title, data: { clear: '', reveal: '' }, attrs: { elementtiming: 'page-title' } }),
       h('div', { class: 'meta', data: { clear: '' } }, meta, tools ? h('span', { class: 'tools' }, tools) : null),
       fig || null);
@@ -228,7 +228,8 @@
   function holdsHands(el, now, gone) {
     const a = document.activeElement;
     if (FIELDS.has(el.tagName)) return el === a || typedIn(el);
-    if (el.__forget || el.__leaving || el.classList.contains('editing')) return true;
+    // a Forget countdown, a row leaving, a row being edited, a resolved row in its 5 s Undo (Me's misheard / review)
+    if (el.__forget || el.__leaving || el.__res || el.classList.contains('editing')) return true;
     if (el === S.pressed && now - S.touched < PRESS_MS) { retireLater(PRESS_MS - (now - S.touched)); return true; }   // one patch when the hold ends
     if (Y.hasOrig(el)) {   // mid-morph: a confirmation, a draft, an edit box
       if (el.__fade || el.contains(a) || Array.from(el.querySelectorAll('input, textarea')).some(typedIn)) return true;
@@ -357,7 +358,7 @@
     let need = false;
     document.querySelectorAll('[data-from]').forEach((el) => { need = true; const v = fmt.clock(now - Number(el.dataset.from)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-since]').forEach((el) => { need = true; const v = fmt.secs(now - Number(el.dataset.since)); if (el.textContent !== v) el.textContent = v; });
-    document.querySelectorAll('[data-clock]').forEach((el) => { const v = fmt.nowClock(); if (el.textContent !== v) el.textContent = v; });
+    document.querySelectorAll('[data-clock]').forEach((el) => { const v = fmt.nowClock12(); if (el.textContent !== v) el.textContent = v; });
     // the minute's own changes, with no message from the host (42 §6.3): "x min ago", an Undo's minutes left, the
     // Day's now marker; an Undo whose window closed is patched away
     document.querySelectorAll('[data-rel]').forEach((el) => { const v = fmt.rel(Number(el.dataset.rel)); if (el.textContent !== v) el.textContent = v; });
@@ -594,6 +595,17 @@
   };
   Y.actions.undo = (t) => { let box = t.parentElement; while (box && !Y.hasOrig(box)) box = box.parentElement; if (box) Y.restore(box); };
   Y.actions['open-thread'] = () => go(S.page, S.sub, { chat: true });
+  /* a collapsible row (Yk.fold): open or close it in place, the design's 220 ms reveal; kept by key in S.open */
+  Y.actions.fold = (t) => {
+    const r = t.closest('[data-fold]'); if (!r) return;
+    const k = 'f:' + r.dataset.fold, open = !r.classList.contains('open');
+    if (open) S.open.add(k); else S.open.delete(k);
+    r.classList.toggle('open', open); t.setAttribute('aria-expanded', String(open));
+    const d = r.querySelector(':scope > .fx-d');
+    if (open && d && !L.Motion.reduced) d.animate([{ opacity: 0, transform: 'translateY(-4px)' }, { opacity: 1, transform: 'none' }], { duration: 220, easing: Y.EASE });
+    field.remeasure();
+    if (Y.onFold) Y.onFold(r, open);
+  };
 
   /* ================= first paint report (click-to-paint, the E2/E4 measurement) ================= */
   let reported = false;

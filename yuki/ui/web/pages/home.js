@@ -16,13 +16,13 @@
   function nowStrip(n) {
     if (!n) return null;
     const tiles = [];
-    if (n.front) tiles.push(Y.clearing('div', '', Y.label(`In front${n.front.since_at ? ' · since ' + fmt.hm(n.front.since_at) : ''}`, null, 'front'),
+    if (n.front) tiles.push(Y.clearing('div', '', Y.label(`In front${n.front.since_at ? ' · since ' + fmt.natTime(n.front.since_at) : ''}`, null, 'front'),
       h('div', { class: 'big' }, h('span', { text: n.front.app || 'An app' })), h('div', { class: 'sm', text: n.front.title || '' })));
     if (n.playing) tiles.push(Y.clearing('div', '', Y.label(`Playing · ${n.playing.status || ''}`, null, 'music'),
       h('div', { class: 'big' }, h('span', { text: n.playing.title || 'Something' })), h('div', { class: 'sm', text: [n.playing.artist, n.playing.app].filter(Boolean).join(' · ') })));
     if (n.call) {
       const c = n.call;
-      tiles.push(Y.clearing('div', '', Y.label(`Call · ${c.app || ''}${c.started_at ? ' since ' + fmt.hm(c.started_at) : ''}`, null, 'call'),
+      tiles.push(Y.clearing('div', '', Y.label(`Call · ${c.app || ''}${c.started_at ? ' since ' + fmt.natTime(c.started_at) : ''}`, null, 'call'),
         h('div', { class: 'big' }, c.started_at ? Y.timerEl(c.started_at) : null, h('span', { class: 'note', text: c.recording ? 'your side recording' : (c.status_words || 'not recording') })),
         h('div', { class: 'sm', text: c.note || '' })));
     }
@@ -99,9 +99,10 @@
 
   function awayRow(r) {
     return h('div', { class: 'item', data: { item: '', k: `away:${r.kind}:${r.at}` } },
-      h('div', { class: 'away-h' }, h('div', { class: 'tt', text: r.title }), h('span', { class: 'when', text: r.at ? fmt.hm(r.at) : '' })),
+      h('div', { class: 'away-h' }, h('div', { class: 'tt', text: r.title }), h('span', { class: 'when', text: r.at ? fmt.natTime(r.at) : '' })),
       (r.changed || []).map((c) => h('div', { class: 'chg' }, h('span', { class: 'chg-t' }, ic(c.state === 'failed' ? 'x' : 'check'), h('span', { text: c.text })),
-        c.undo && c.undo.until * 1000 > Date.now() ? key(c.undo.label || 'Undo', { cls: 'xs', data: { do: 'offer-undo', card: c.undo.card } }) : null)),
+        c.undo && c.undo.until * 1000 > Date.now() ? h('span', { class: 'chg-u' }, key(c.undo.label || 'Undo', { cls: 'xs', data: { do: 'offer-undo', card: c.undo.card } }),
+          h('span', { class: 'until', data: { until: c.undo.until }, text: `${Math.max(1, Math.round((c.undo.until * 1000 - Date.now()) / 60000))} min left` })) : null)),   // counted down by the ticker
       r.note ? h('div', { class: 'why', text: r.note }) : null, r.cost ? h('div', { class: 'cost', text: r.cost }) : null);
   }
 
@@ -110,7 +111,7 @@
     const needs = d.needs || [], offers = d.offers || [], away = d.away || [], running = d.running || [];
     const runningN = runs.length + running.length;
     const total = needs.length + offers.length + away.length + runningN;
-    const meta = [h('span', null, `${fmt.today()} · `, h('b', { data: { clock: '' }, text: fmt.nowClock() })),
+    const meta = [h('span', null, `${fmt.today()} · `, h('b', { data: { clock: '' }, text: fmt.nowClock12() })),
       h('span', null, h('b', { text: total }), ' things, ', h('b', { text: needs.length }), needs.length === 1 ? ' needs you' : ' need you'),
       h('span', { text: 'last 7 days' })];
     const head = Y.head('Home', meta, Y.numFig(needs.length, needs.length === 1 ? 'needs you' : 'need you'));
@@ -118,7 +119,7 @@
       : Y.empty('I’ll put questions and approvals here, never in your way.', 'Nothing needs you.');
     const offersB = offers.length ? offers.map(Y.offerItem) : Y.empty('No offers. I only offer when the thing is ready.');
     const runB = runningN ? [runs.map(runRow), running.map(runningRow)] : Y.empty('Nothing running.');
-    const awayB = away.length ? away.map(awayRow) : Y.empty(d.since ? `Caught up since ${fmt.hm(d.since)}.` : 'Caught up.');
+    const awayB = away.length ? away.map(awayRow) : Y.empty(d.since ? `Caught up since ${fmt.natTime(d.since)}.` : 'Caught up.');
     const people = (d.people || []).slice(0, 6);
     const latelyB = people.map((p) => h('a', { class: 'lately', data: { k: p.ref || p.name }, attrs: { href: '#me/' + encodeURIComponent(p.ref || p.name) } },
       h('span', { class: 'nm', text: p.name }), h('span', { class: 'rl', text: [p.route, p.last_at ? fmt.rel(p.last_at) : ''].filter(Boolean).join(' · ') }),

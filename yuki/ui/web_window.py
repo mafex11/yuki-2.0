@@ -1195,7 +1195,13 @@ class WebWindow:
             if handler is None:
                 reply = {"ok": False, "error": f"unknown action {action!r}"}
             elif self.fixture is not None:
-                reply = dict((self.fixture.get("replies") or {}).get(action) or {"ok": True})
+                from yuki.ui.web_data import shift_times
+
+                canned = dict((self.fixture.get("replies") or {}).get(action) or {"ok": True})
+                by_ref = canned.pop("by_ref", None)   # a reply that depends on what was asked for (a person's card)
+                if isinstance(by_ref, dict) and str(message.get("ref") or "") in by_ref:
+                    canned = dict(by_ref[str(message.get("ref"))])
+                reply = shift_times(canned, time.time() - float(self.fixture.get("now") or time.time()))
             else:
                 reply = getattr(self, handler)(message) or {}
                 reply.setdefault("ok", True)
@@ -1475,7 +1481,13 @@ class WebWindow:
         c = (conn() if callable(conn) else None) or None
         connector = None
         if isinstance(c, dict) and str(c.get("text") or "").strip():
-            connector = {"day": c.get("day"), "label": c.get("label") or "", "text": " ".join(str(c["text"]).split()),
+            from datetime import datetime
+
+            try:   # midday of that day (a time, so the page finds its day the way it finds every other)
+                day_at = datetime.fromisoformat(str(c.get("day"))).timestamp() + 12 * 3600
+            except (TypeError, ValueError):
+                day_at = None
+            connector = {"day": c.get("day"), "day_at": day_at, "label": c.get("label") or "", "text": " ".join(str(c["text"]).split()),
                          "open": [" ".join(str(o.get("text") or "").split()) for o in c.get("open") or []
                                   if isinstance(o, dict) and str(o.get("text") or "").strip()][:3]}
         days = []

@@ -55,6 +55,19 @@
     return clearing('section', 'sec ' + (cls || ''), h('div', { class: 'sec-h' }, label(title, n), right || null), body);
   }
   const rightLabel = (text) => h('span', { class: 'label', text });
+  /* one collapsible row (the 3 Oct ask D: long lists fold; the design's .fx row): a header button (what it is, a
+     meta line on the right, the chevron) and its detail, opened on a click. Open or closed is kept by key in S.open,
+     so a live patch, another page and back, or new data never folds what you opened. `k` must be stable for the
+     item (a ref, an id). */
+  function fold(k, head, meta, body, opts) {
+    const o = opts || {};
+    const open = !!(window.Yk.S && window.Yk.S.open.has('f:' + k));
+    const data = Object.assign({ k: 'f:' + k, fold: k }, o.data || {});
+    return h('div', { class: 'fx' + (o.cls ? ' ' + o.cls : '') + (open ? ' open' : ''), data, aria: o.aria },
+      h('button', { class: 'fx-h', data: { do: 'fold' }, attrs: { type: 'button', 'aria-expanded': String(open) }, title: o.title },
+        head, meta != null ? h('span', { class: 'fx-meta' }, meta) : null, ic('chev')),
+      h('div', { class: 'fx-d' }, body));
+  }
   const empty = (text, big) => big
     ? h('div', { class: 'empty-state' }, h('div', { class: 'doto', text: big, data: { reveal: '' } }), h('p', { text }))
     : h('div', { class: 'empty-state compact' }, h('p', { text }));
@@ -104,18 +117,33 @@
   const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const clock12 = (d) => { const hh = d.getHours() % 12 || 12, m = d.getMinutes(); return `${hh}${m ? ':' + pad(m) : ''} ${d.getHours() < 12 ? 'AM' : 'PM'}`; };
   const fmt = {
     pad,
     /* a running timer: 46:04, 1:02:03 */
     clock(secs) { const v = Math.max(0, Math.floor(secs)), hh = Math.floor(v / 3600), m = Math.floor((v % 3600) / 60); return hh ? `${hh}:${pad(m)}:${pad(v % 60)}` : `${m}:${pad(v % 60)}`; },
+    /* a time column (the ledger, sessions): 24-hour, aligned */
     hm(epoch) { const d = new Date(epoch * 1000); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; },
     nowClock() { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; },
+    /* everywhere else (headers, sentences, labels): 12-hour as people say it, 9:06 PM, 2 AM (the 3 Oct feedback) */
+    natTime(epoch) { return clock12(new Date(epoch * 1000)); },
+    nowClock12() { return clock12(new Date()); },
+    /* today / yesterday / 25 September (the year only when it isn't this year) */
+    natDay(epoch) {
+      const d = new Date(epoch * 1000), t = new Date(), y = new Date(t); y.setDate(t.getDate() - 1);
+      if (d.toDateString() === t.toDateString()) return 'today';
+      if (d.toDateString() === y.toDateString()) return 'yesterday';
+      return `${d.getDate()} ${MONTHS[d.getMonth()]}${d.getFullYear() !== t.getFullYear() ? ' ' + d.getFullYear() : ''}`;
+    },
+    /* yesterday, 2:29 AM · 25 September, 2 AM */
+    natWhen(epoch) { return epoch ? `${fmt.natDay(epoch)}, ${fmt.natTime(epoch)}` : ''; },
     today() { const d = new Date(); return `${DAYS[d.getDay()]} ${d.getDate()} ${MON[d.getMonth()]}`; },
     day(epoch) { const d = new Date(epoch * 1000); return `${d.getDate()} ${MON[d.getMonth()]}`; },
     dow(epoch) { return DOW[new Date(epoch * 1000).getDay()]; },
     /* 1h 36m, 18m */
     dur(min) { const m = Math.round(Math.max(0, min)), hh = Math.floor(m / 60); return hh ? `${hh}h ${pad(m % 60)}m` : `${m}m`; },
-    /* 5 min ago, 2 h ago, yesterday 23:40, 30 Sep */
+    /* 5 min ago, 2 h ago, yesterday, 11:40 PM, 30 Sep */
     rel(epoch) {
       if (!epoch) return '';
       const now = Date.now() / 1000, dt = now - epoch;
@@ -124,9 +152,11 @@
       const d = new Date(epoch * 1000), t = new Date();
       if (d.toDateString() === t.toDateString()) return `${Math.floor(dt / 3600)} h ago`;
       const y = new Date(t); y.setDate(t.getDate() - 1);
-      if (d.toDateString() === y.toDateString()) return `yesterday ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      if (d.toDateString() === y.toDateString()) return `yesterday, ${clock12(d)}`;
       return `${d.getDate()} ${MON[d.getMonth()]}`;
     },
+    /* how long something took, as people say it: 4 s, 1 min 9 s (a time shows only from a second up) */
+    took(secs) { if (secs == null || secs < 1) return ''; const s = Math.round(secs); if (s < 60) return `${s} s`; const m = Math.floor(s / 60); return m < 10 && s % 60 ? `${m} min ${s % 60} s` : `${m} min`; },
     /* "Today" / "Yesterday" / "Thu 1 Oct" for ledger day rules */
     dayRule(epoch) {
       const d = new Date(epoch * 1000), t = new Date(), y = new Date(t); y.setDate(t.getDate() - 1);
@@ -192,7 +222,7 @@
   function pop(el) { if (el && !reduced() && el.animate) el.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 240, easing: EASE }); return el; }
 
   window.Yk = Object.assign(window.Yk || {}, {
-    h, append, s, ic, key, clearing, label, sec, rightLabel, empty, rhythm, dotProgress, bar, meter, fmt,
+    h, append, s, ic, key, clearing, label, sec, rightLabel, empty, fold, rhythm, dotProgress, bar, meter, fmt,
     confirmRow, morph, restore, hasOrig, leave, toast, pop, EASE, pages: {}, actions: {},
     remeasure() { /* set by app.js */ }
   });
