@@ -39,9 +39,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
+from yuki.agent import consult as second_look
+from yuki.agent import finish as finish_gate
 from yuki.agent import frame as task_frame
 from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.failover import FailoverClient
+from yuki.agent.judge import Authorizer, call_text as judge_call_text
+from yuki.agent.lanes import READER_INSTRUCTIONS, READER_LANE_TOOLS, READER_TOOLS, is_reader
 from yuki.agent.loopguard import EXEMPT as LOOP_EXEMPT, LoopBreaker, signature as call_signature
 from yuki.agent.subagents import HelperTeam, report_text
 from yuki.agent.untrusted import EXTERNAL_TEXT_TOOLS, new_nonce, source_for, wrap, wrap_blocks
@@ -62,7 +66,9 @@ from yuki.agent.tools import (
     ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
     CONTROL_TOOLS,
+    FINISH_WORDS_FIELD,
     FINISHES_FIELD,
+    MEMORY_READ_KINDS,
     MEMORY_TOOLS,
     PLAYBOOK_FIELD,
     RISK_FIELD,
@@ -73,6 +79,7 @@ from yuki.agent.tools import (
     ToolOutcome,
     resolve_tool_names,
     tool_params,
+    tool_traits,
     unavailable_tool,
 )
 from yuki.config import Settings, resolve_effort, resolve_model
@@ -179,8 +186,13 @@ def acting_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 #: rewrites the cached prompt: a 53k-token rewrite and a 13 s call on 30 Sept for exactly this), and a done is not
 #: held for it; a finish it marks is still held for a look. A field that does not hold the text, a failure and a
 #: loop-breaker trip still escalate.
-EXPECTED_UNVERIFIABLE = ("the field shows no text to read back (expected for this kind of field, not a failure; "
-                         "the keys were sent)")
+EXPECTED_UNVERIFIABLE = finish_gate.EXPECTED_UNVERIFIABLE
+
+#: How the authorization judge's refusal reaches the model (revamp D, S1): framed as Yuki's own check, never the user.
+JUDGE_LABEL = "[Yuki's authorization check, not the user]"
+#: How a request stopped by too many denials ends (revamp D, S1: 3 in a row or 20 in all).
+DENIALS_MESSAGE = ("I stopped before doing something you hadn't asked for, a few times over. Tell me exactly what you "
+                   "want done and I'll do just that.")
 
 #: Input-watch facts of a key or click report (yuki.actions.input): each says the input changed something the
 #: user can see. Plumbing: which fields of the action's own report are its measured effects.
@@ -289,6 +301,9 @@ class _Turn:
     done_about: list[int] | None = None
     #: The user answered a question in this response (``ask_user`` or a risk confirmation).
     asked: bool = False
+    #: ``(tool, why)`` of actions this response ran whose own report shows the effect did not happen (revamp D, S2):
+    #: a measured signal for a second look.
+    contradicted: list[tuple[str, str]] = field(default_factory=list)
 
     def record(self, tool_use_id: str, block: dict[str, Any]) -> None:
         """Store one result block, noting whether it is an error."""
@@ -296,6 +311,37 @@ class _Turn:
         self.handled.add(tool_use_id)
         if block.get("is_error"):
             self.failed = True
+
+
+@dataclass
+class RequestPack:
+    """What a request needs before its first model call, built ahead (revamp D, S5; 07 §6 E2): the window list with
+    the Now picture, the request origin, the window the request is about, and memory's part (the screen anchor, the
+    task frame's inputs and memory's context). :meth:`Agent.build_pack` makes one (the voice can while the user is
+    still speaking); ``Agent.run(pack=...)`` uses it instead of building. Raw texts: they are fenced with the request's
+    own code when it runs.
+
+    Attributes:
+        built_at: ``time.monotonic()`` when it was made.
+        overview: ``(text, payload, elapsed_ms)`` from ``Dispatcher.overview_text``.
+        origin: The request-origin line.
+        view: The window view read for the request (a ``WindowView``), or ``None``.
+        memory: ``{"screen", "inputs": (facts, focus, clip), "fetched": MemoryContext}``, or ``None``.
+    """
+
+    built_at: float
+    origin_hwnd: int | None = None
+    view_hwnd: int | None = None
+    overview: tuple[str, Any, float] | None = None
+    origin: str | None = None
+    view: Any = None
+    memory: dict[str, Any] | None = None
+    build_ms: float = 0.0
+    parts_ms: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def age_s(self) -> float:
+        return time.monotonic() - self.built_at
 
 
 class Agent:
@@ -382,6 +428,7 @@ class Agent:
             screenshot_policy=self.settings.screenshot_policy,
             tool_timeout_s=self.settings.tool_timeout_s,
         )
+        self._setup_input_gate()
         self.context = ContextManager(self.logger, keep_turns=self.settings.keep_perception_turns)
         # Phase 2 (the eyes builder's relay, 2026-09-29): the per-turn Now picture follows this agent's own settings,
         # for the brain on the real desktop only; a stub desk (a test, an offline replay) never gets the live screen's
@@ -396,6 +443,19 @@ class Agent:
             pass
         self.tool_names = resolve_tool_names(tool_names)
         self.extra_instructions = (extra_instructions or "").strip() or None
+        #: The reader lane (revamp D: the front desk repurposed, yuki.agent.lanes): the read tools only (plus its
+        #: hand_over, kept out of its own subset so a call to it counts as needing hands) and the reader's framing.
+        self.reader = is_reader(lane)
+        if self.reader:
+            if self.tool_names is None or set(self.tool_names) - set(READER_TOOLS):
+                self.tool_names = resolve_tool_names(READER_TOOLS)
+            self.extra_instructions = READER_INSTRUCTIONS
+        #: The authorization judge (revamp D, S1, yuki.agent.judge): its per-request memo, grants and denial counts.
+        self.authorizer = Authorizer(lambda: self.client, self.settings, log=self.logger.log) \
+            if getattr(self.settings, "judge", True) else None
+        #: The user's own words in this conversation, oldest first (what the judge sees): request words, words added
+        #: mid-run, answers to questions. ``{"how": typed | voice | added | answer, "text", "question"?}``.
+        self._user_words: deque[dict[str, Any]] = deque(maxlen=24)
         self._client = client
         self._client_lock = threading.Lock()
         self._cancelled = threading.Event()
@@ -532,6 +592,8 @@ class Agent:
         def warm() -> None:
             self._warm_activity()
             warmed = self._warm_model()
+            if warmed and self.authorizer is not None and not self.reader:
+                self.authorizer.warm()   # revamp D: the judge's own cached prompt, before the first judged call
             self._warm_memory()
             self._warm_shell()
             self._warm_apps()
@@ -763,6 +825,8 @@ class Agent:
         self.logger.log("steer", texts=texts, count=len(texts))
         if isinstance(getattr(self, "_steer_texts", None), list):
             self._steer_texts.extend(texts)   # the user's own words mid-run: a post-mortem's evidence
+        for text in texts:
+            self._note_words(text, how="added")   # and the authorization judge's
         return [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
 
     def cancel(self, reason: str = CANCELLED) -> None:
@@ -806,7 +870,7 @@ class Agent:
         model: str | None = None, thinking: bool | None = None, lean: bool = False,
         view_hwnd: int | None = None, escalate: tuple[str | None, bool | None] | None = None,
         voice: bool = False, memory_query: str | None = None, previous_query: str | None = None,
-        memory_apps: Iterable[str] | None = None,
+        memory_apps: Iterable[str] | None = None, pack: "RequestPack | None" = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -852,6 +916,11 @@ class Agent:
                 the memory query of this conversation's previous request.
             memory_apps: Apps the caller says the request names (their know-how
                 is attached at a lower relevance floor, like the app in front's).
+            pack: A request pack built ahead (:meth:`build_pack`, e.g. while the
+                user was still speaking): its overview, origin, window view and
+                memory are used instead of being built now. A pack older than
+                ``Settings.pack_max_age_s`` has its screen half (overview, origin,
+                view) read again; its memory half is kept.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -888,6 +957,20 @@ class Agent:
         self._call_costs: dict[int, float] = {}
         self._steer_texts: list[str] = []
         self._practice_shown: list[int] = []
+        # Revamp D: the judge's per-request state, the consults taken, the sends and their confirmation, the text
+        # typed into each window (an Enter later sends it), the trace steps an independent confirmation may still back,
+        # the window view last attached (the consult's summary), and a stop for too many denials.
+        if self.authorizer is not None:
+            self.authorizer.begin_request()
+        self._consults: list[dict[str, Any]] = []
+        self._send_consulted = False
+        self._close_call_consulted = False
+        self._sends: list[dict[str, Any]] = []
+        self._typed: dict[int, str] = {}
+        self._unconfirmed: list[tuple[int, int | None]] = []
+        self._last_view_text: str | None = None
+        self._denial_stop: str | None = None
+        self._pending_notes: list[dict[str, Any]] = []
         self._reset_accounting()
         self.last_summary = None
         started_at = datetime.now()
@@ -918,23 +1001,34 @@ class Agent:
         reply = ""
         drive: Iterator[AgentEvent] | None = None
         try:
-            overview, _ = self._capture_overview()
-            origin = self._request_origin(origin_hwnd)
+            query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
+            self._note_words(query, how="voice" if self._request_voice else "typed")
+            fresh = pack is not None and pack.age_s <= float(getattr(self.settings, "pack_max_age_s", 20.0))
+            if pack is not None:
+                self.logger.log("request_pack", age_s=round(pack.age_s, 2), fresh=fresh, build_ms=pack.build_ms,
+                                has_view=pack.view is not None, has_memory=pack.memory is not None)
+            if origin_hwnd is None and pack is not None:
+                origin_hwnd = pack.origin_hwnd
+            if view_hwnd is None and pack is not None:
+                view_hwnd = pack.view_hwnd
+            overview, _ = self._capture_overview(prebuilt=pack.overview if fresh else None)
+            origin = pack.origin if fresh else self._request_origin(origin_hwnd)
             self._close_dangling_tools(overview)
             # The window the request is about, read now (v3.9). With thinking off (spoken requests) it goes in
             # as a look_at_window call already made and its result, the shape the model knows; pasted into the
             # request instead, Sonnet wrote its first tool call out as text in several offline replays.
-            view = self._request_view(int(view_hwnd)) if view_hwnd else None
+            view = self._request_view(int(view_hwnd), prebuilt=pack.view if fresh else None) if view_hwnd else None
             if view is not None:
                 self._evidence[int(view_hwnd)] = "looked"
+                self._last_view_text = view[1]
             as_call = view is not None and self._request_thinking is False
             if view is not None and not as_call:
                 overview = f"{overview}\n\n{view[0]}"
-            query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
             memory_text, commitments_text = self._memory_context(
                 request, first=self._requests == 1, lean=self._request_lean, query=query,
                 previous=" ".join(str(previous_query or "").split()) or self._previous_query,
                 apps=list(memory_apps or ()), origin_hwnd=origin_hwnd,
+                prefetched=pack.memory if pack is not None and pack.memory is not None else None,
             )
             self._this_query = query
             self.context.add_request(
@@ -1004,6 +1098,15 @@ class Agent:
         self._models_used: list[str] = []
         #: What the memory block of this request carried (``request_summary``).
         self._memory_info: dict[str, Any] = {}
+        #: Per model call: output, input and cache tokens, the tools it called, its first token (revamp D measures).
+        self._call_stats: list[dict[str, Any]] = []
+        self._first_token_ms: list[float | None] = []
+
+    def _judge_cost(self) -> float:
+        """What the authorization judge cost this request so far (revamp D; an early allow's cost lands a moment later,
+        from the judge's own thread)."""
+        authorizer = getattr(self, "authorizer", None)
+        return float(getattr(authorizer, "cost_usd", 0.0) or 0.0) if authorizer is not None else 0.0
 
     def _account_response(self, model: str, usage: Any) -> float | None:
         """Fold one real (non-warm-up) response into this request's totals; returns its cost (``None``: unpriced).
@@ -1041,7 +1144,7 @@ class Agent:
         try:
             wall_s = time.monotonic() - self._request_started
             models = self._models_used or [model]
-            cost = None if self._unpriced else round(self._cost_usd, 6)
+            cost = None if self._unpriced else round(self._cost_usd + self._judge_cost(), 6)
             summary: dict[str, Any] = {
                 "request": request,
                 "lane": self.lane,
@@ -1069,6 +1172,13 @@ class Agent:
                         for name in sorted(MEMORY_TOOLS)
                     },
                 },
+                # revamp D: per-call facts, the judge, the second looks and the sends of this request
+                "calls_detail": list(getattr(self, "_call_stats", [])),
+                "judge": ({"calls": self.authorizer.calls, "denials": self.authorizer.denials,
+                           "ms": list(self.authorizer.ms), "cost_usd": round(self.authorizer.cost_usd, 6)}
+                          if getattr(self, "authorizer", None) is not None else None),
+                "consults": list(getattr(self, "_consults", [])),
+                "sends": list(getattr(self, "_sends", [])),
             }
             self.last_summary = summary
             self.logger.request_summary(summary)
@@ -1225,9 +1335,42 @@ class Agent:
         return next((w for w in self._overview_payload.get("windows") or []
                      if isinstance(w, dict) and w.get("hwnd") == hwnd), None)
 
+    def _learned_control(self, name: str, target: dict[str, Any]) -> int:
+        """How many earlier unverifiable steps of this control were confirmed afterwards (practice memory's run traces),
+        when that makes it expected-unverifiable: at least ``LEARNED_MIN_CONFIRMED`` and none contradicted; else 0."""
+        fetch = getattr(self.memory, "call_method", None)
+        if not callable(fetch) or not getattr(self.memory, "installed", False):
+            return 0
+        try:
+            record = fetch("control_record", target.get("app"), name, target.get("control"), timeout_s=0.3) or {}
+        except Exception:  # noqa: BLE001 - memory missing: nothing learned
+            return 0
+        confirmed = int(record.get("unverifiable_confirmed") or 0)
+        if confirmed >= finish_gate.LEARNED_MIN_CONFIRMED and not int(record.get("contradicted") or 0):
+            return confirmed
+        return 0
+
+    def _mark_confirmations(self, hwnd: int | None, verdict: tuple[bool | None, str]) -> None:
+        """An unverifiable step stays open until something independent backs it in this request: a later verified step
+        in the same window (or a send seen in its chat) marks it confirmed in the run trace (practice memory then
+        learns the control as expected-unverifiable)."""
+        trace = getattr(self, "_trace", None)
+        if trace is None or not hwnd:
+            return
+        if verdict[0] is True:
+            keep = []
+            for index, window in self._unconfirmed:
+                if window == hwnd and index < len(trace):
+                    trace[index]["confirmed"] = True
+                else:
+                    keep.append((index, window))
+            self._unconfirmed = keep
+        elif verdict[0] is None and trace:
+            self._unconfirmed.append((len(trace) - 1, hwnd))
+
     def _trace_step(self, name: str, tool_input: dict[str, Any], *, ok: bool | None, verdict: bool | None = None,
                     why: str = "", result: str = "", ms: float = 0.0, outcome: ToolOutcome | None = None,
-                    kind: str | None = None) -> None:
+                    kind: str | None = None, control: str | None = None) -> None:
         """One step of this request's run trace (practice memory, Phase C): the tool, the app it acted in and the
         control's role and name and the window's title (never a window number as meaning: the ids and coordinates it
         touched go to the run's numbers), its input, the verdict and why, what it reported, how long it took and the
@@ -1265,13 +1408,16 @@ class Agent:
                     numbers.append(v)
             self._trace_numbers.update(n for n in numbers if n)
             acting = {k: v for k, v in acting_input(tool_input).items()
-                      if k not in (RISK_FIELD, FINISHES_FIELD, PLAYBOOK_FIELD)}
+                      if k not in (RISK_FIELD, FINISHES_FIELD, FINISH_WORDS_FIELD, PLAYBOOK_FIELD)}
             sig = hashlib.sha1(call_signature(acting).encode("utf-8", "replace")).hexdigest()[:12]
-            trace.append({"tool": name, "kind": kind, "app": app, "target": ", ".join(parts), "input": acting,
-                          "ok": ok, "verdict": verdict, "why": why, "expected": why == EXPECTED_UNVERIFIABLE,
-                          "result": " ".join(str(result or "").split())[:400], "ms": round(float(ms or 0.0), 1),
-                          "call": self._model_calls, "sig": sig, "playbook": tool_input.get(PLAYBOOK_FIELD),
-                          "at": time.time()})
+            step = {"tool": name, "kind": kind, "app": app, "target": ", ".join(parts), "input": acting,
+                    "ok": ok, "verdict": verdict, "why": why, "expected": finish_gate.is_expected(why),
+                    "result": " ".join(str(result or "").split())[:400], "ms": round(float(ms or 0.0), 1),
+                    "call": self._model_calls, "sig": sig, "playbook": tool_input.get(PLAYBOOK_FIELD),
+                    "at": time.time()}
+            if control:
+                step["control"] = control
+            trace.append(step)
         except Exception as exc:  # noqa: BLE001 - the trace never breaks a request
             self.logger.log("trace_step_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
 
@@ -1302,7 +1448,8 @@ class Agent:
                 "request_id": f"{self.lane}-{self._requests}", "lane": "voice" if self._request_voice else self.lane,
                 "at": at, "ended_at": time.time(), "words": self._this_query or memory_query_of(request),
                 "reply": reply, "outcome": outcome, "steps": steps,
-                "cost_usd": None if self._unpriced else round(self._cost_usd, 6), "model_calls": self._model_calls,
+                "cost_usd": None if self._unpriced else round(self._cost_usd + self._judge_cost(), 6),
+                "model_calls": self._model_calls,
                 "wall_s": round(time.monotonic() - self._request_started, 2), "note": learning.get("note"),
                 "steers": list(self._steer_texts), "breaker": len(self._breaker.trips),
                 "numbers": sorted(numbers), "injected": list(self._practice_shown),
@@ -1420,6 +1567,14 @@ class Agent:
                 if stop_reason == "max_tokens":
                     self._skip_truncated(response, turn)
                 blocks, names = yield from self._run_tools(tool_uses, turn)
+                if self._denial_stop:
+                    # Revamp D (S1): too many denials in a row or in all: the request stops, honestly.
+                    overview, facts = self._capture_overview()
+                    self.context.add_tool_results(blocks, overview, tool_names=names, self_facts=facts)
+                    self.logger.log("judge_stop", why=self._denial_stop)
+                    self.logger.error(DENIALS_MESSAGE)
+                    yield ErrorEvent(DENIALS_MESSAGE)
+                    return
                 breaker_blocks, stop_now = self._breaker_step(turn)
                 if stop_now:
                     # The hard stop was already given and the brain still reached for an action.
@@ -1439,9 +1594,19 @@ class Agent:
                     turn.finished.append(turn.finishing[-1][0])
                     self.logger.log("finished_by_action", message=turn.finishing[-1][0])
                 reason = self._step_signal(turn, breaker_blocks)
-                if reason is None and held and not (turn.finishing and turn.finishing[-1][2] == EXPECTED_UNVERIFIABLE):
+                if reason is None and held and not (turn.finishing and finish_gate.is_expected(turn.finishing[-1][2])):
                     reason = held[0][1]   # a finish held for an expected-unverifiable report is no trouble signal
-                if reason and self._escalate(reason) and not held and not breaker_blocks:
+                if getattr(self.settings, "consult", True):
+                    # Revamp D (S3): the actor's profile stays fixed for the whole request; a contradicted action or a
+                    # breaker trip gets one second look instead, its advice a labelled note in the next message.
+                    signal = (("contradicted", f"{turn.contradicted[0][0]}: {turn.contradicted[0][1]}")
+                              if turn.contradicted else ("breaker", "the loop breaker tripped") if breaker_blocks
+                              else None)
+                    if signal is not None and not turn.finished:
+                        advice = self._consult(*signal)
+                        if advice is not None and advice.advice and not advice.error:
+                            held = held + [({"type": "text", "text": advice.note()}, f"second look: {signal[0]}")]
+                elif reason and self._escalate(reason) and not held and not breaker_blocks:
                     # The fast first pass did not show its effect: the next call thinks again from the screen, not
                     # from its own unchecked words before the call (v3.14; measured on the Warp stub: without this,
                     # the escalated call repeated the first pass's "it has no full screen mode" 2 of 4 times).
@@ -1568,7 +1733,7 @@ class Agent:
     def _claim_gaps(self, turn: _Turn) -> list[str]:
         """What this response's ``done`` asserts without evidence from this request's calls, in words for the brain."""
         gaps = [f"{tool}'s report does not show that it took effect ({why})"
-                for tool, verified, why in turn.verdicts if verified is not True and why != EXPECTED_UNVERIFIABLE]
+                for tool, verified, why in turn.verdicts if verified is not True and not finish_gate.is_expected(why)]
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
                  f"verified result" for hwnd in (turn.done_about or []) if hwnd not in self._evidence]
         return gaps
@@ -1585,7 +1750,7 @@ class Agent:
             if block.get("is_error") and tool_id not in turn.gated and name not in LOOP_EXEMPT:
                 return f"{name} failed"
         for tool, verified, why in turn.verdicts:
-            if verified is not True and why != EXPECTED_UNVERIFIABLE:
+            if verified is not True and not finish_gate.is_expected(why):
                 return f"{tool} was not verified ({why})"
         if breaker_blocks:
             return "the loop breaker tripped"
@@ -1596,7 +1761,13 @@ class Agent:
     def _escalate(self, reason: str) -> bool:
         """Move this request's next model calls to its escalated effort and thinking (once; logged).
 
-        Returns whether it escalated now (``False``: nothing to escalate to, or already escalated)."""
+        Returns whether it escalated now (``False``: nothing to escalate to, or already escalated). Revamp D (S3): with
+        ``Settings.consult`` on (the default) the profile never switches (a switch rewrote the whole cached prompt);
+        the measured signals get a second look instead (:meth:`_consult`)."""
+        if getattr(self.settings, "consult", True):
+            if self._escalate_to is not None and self._escalation is None:
+                self.logger.log("effort_kept", reason=reason, after_calls=self._model_calls)
+            return False
         if self._escalate_to is None or self._escalation is not None:
             return False
         effort, thinking = self._escalate_to
@@ -1653,11 +1824,12 @@ class Agent:
         risk = tool_input.get(RISK_FIELD)
         if risk is None:
             if name == "run_powershell":
-                return "refuse", ("Not run: run_powershell needs its risk declared (reversible, user_asked, "
-                                  "effect). Call it again with that field.")
+                return "refuse", ("Not run: run_powershell needs its risk declared (reversible, user_asked; "
+                                  "effect when not reversible). Call it again with that field.")
             return "run", None
         if not isinstance(risk, dict) or not isinstance(risk.get("reversible"), bool):
-            return "refuse", "Not run: risk must be an object with reversible (true/false), user_asked and effect."
+            return "refuse", ("Not run: risk must be an object with reversible (true/false) and user_asked (effect "
+                              "only when not reversible).")
         if risk["reversible"] or risk.get("user_asked") is True:
             return "run", None
         if (name, call_signature(acting_input(tool_input))) in self._confirmed:
@@ -1818,8 +1990,17 @@ class Agent:
 
         # (v3.15 held a long job's done once to ask for a learned note: a whole extra model call per long job. Phase C
         # learns from the run trace instead - the distiller reads the steps themselves - so done goes out at once.)
-        self.logger.tool_call(name, tool_input, tool_use_id=tool_id)
-        yield ToolCall(name, tool_input)
+        acts = name in ACTION_TOOL_NAMES
+        target = self._call_target(name, tool_input) if acts else {}
+        # Revamp D (S4): finishes_with is a boolean; the line the request ends with is written by code from the call and
+        # its target (finish_words: the brain's own wording). It travels on the tool_call event in the finishes_with
+        # field as a string, the shape voice v3.17 reads to say a verified result by code.
+        finishes, own_words = finish_gate.finish_request(tool_input) if acts else (False, None)
+        finish_line = (own_words or finish_gate.finish_line(name, tool_input, process=target.get("app"),
+                                                             tab_name=target.get("tab_name"))) if finishes else None
+        event_input = tool_input if finish_line is None else {**tool_input, FINISHES_FIELD: finish_line}
+        self.logger.tool_call(name, event_input, tool_use_id=tool_id)
+        yield ToolCall(name, event_input)
 
         # The generator was suspended on that yield, which is exactly where a
         # cancel from the UI thread tends to land. The tool has not started,
@@ -1869,6 +2050,7 @@ class Agent:
                 text = "Not run: it can't be undone and the user did not answer whether to go ahead."
             else:
                 self.logger.user_answer(answer)
+                self._note_words(answer, how="answer", question=question)
                 self._confirmed.add((name, call_signature(acting)))
                 turn.asked = True
                 text = (f"Not run yet: you declared it irreversible and not asked for, so the user was asked "
@@ -1886,18 +2068,64 @@ class Agent:
             turn.stop_after = True
             return
 
-        if name in ACTION_TOOL_NAMES:
+        judged = None
+        if acts:
+            # Revamp D (S1): calls whose metadata can destroy or reach someone, and kinds the user's policy holds back,
+            # pass the authorization judge, which sees only the user's own words and this call.
+            judged = self._authorize(name, tool_input, target)
+            held_text = self._denial_text(judged) if judged is not None and not judged.allowed else None
+            if held_text is None:
+                # Revamp D (S3): a pending send to a person, or the request's first action on a close call, gets one
+                # second look before it runs; its verdict (the model's) can hold the call.
+                signal = None
+                if judged is not None and judged.sends:
+                    signal = ("send", "a message to a person is about to be sent")
+                elif self._learning.get("actions", 0) == 0 and _close_call(self._frame):
+                    signal = ("close_call", "the task frame calls two candidates a close call")
+                if signal is not None and self._consult_due(signal[0]):
+                    advice = self._consult(signal[0], signal[1],
+                                           pending=judge_call_text(name, tool_input, target=target))
+                    if (advice is not None and advice.blocking and advice.verdict in ("revise", "ask_user")
+                            and advice.advice):
+                        # held only on the second look's own mark that running it now would be a real mistake
+                        held_text = (advice.note() + " This step was not run. If it is right after all, make the "
+                                                     "same call again.")
+            if held_text is not None:
+                turn.gated.add(tool_id)
+                self.logger.tool_result(name, ok=False, summary=held_text,
+                                        result={"held": True, "judge": judged.facts() if judged else None},
+                                        elapsed_ms=judged.ms if judged else 0.0, tool_use_id=tool_id)
+                self._note_action(name, False, "not run: held by Yuki's check")
+                self._trace_step(name, tool_input, ok=False, kind="control", why="not run: held by Yuki's check",
+                                 result=held_text)
+                yield ToolResult(name, False, held_text)
+                turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": held_text}], is_error=True))
+                turn.stop_after = True
+                return
+
+        if acts:
             self._acting_start()
         dispatched = time.perf_counter()
+        dispatched_at = time.time()
         if early:
             turn.early += 1
             if turn.first_early_at is None:
                 turn.first_early_at = dispatched
-        if name == "spawn_helpers" and (self.tool_names is None or name in self.tool_names):
+        if name == "hand_over":
+            # The reader lane's hand-off (yuki.agent.lanes): not in its own subset, so the runtime counts the call as
+            # needing hands and queues the request for the worker when this one ends.
+            outcome = ToolOutcome(name=name, ok=True, summary="queued for the task lane", content=[{
+                "type": "text", "text": "Queued: the task lane takes it the moment you finish. Say in one line that it "
+                                        "comes right after what is running, then call done."}],
+                payload={"why": str(tool_input.get("why") or "")})
+        elif name == "spawn_helpers" and (self.tool_names is None or name in self.tool_names):
             outcome = yield from self._run_helpers(tool_input)
         elif name in PERCEPTION_TOOLS:
             # A read has no side effects: a cancel or the user's correction stops the wait for it (v3.14).
             outcome = self._abortable(name, lambda: self._dispatch(name, tool_input))
+        elif acts and tool_traits(name, tool_input).needs == "input":
+            # Global input may wait for the user to stop typing (S7): its one line is said as it waits.
+            outcome = yield from self._dispatch_watching(name, tool_input)
         else:
             outcome = self._dispatch(name, tool_input)
         self._tool_s += time.perf_counter() - dispatched
@@ -1948,6 +2176,7 @@ class Agent:
                 turn.stop_after = True
                 return
             self.logger.user_answer(answer)
+            self._note_words(answer, how="answer", question=question)
             turn.asked = True
             self._note_action("asked the user", True, f"{question} → {answer}")
             self.logger.tool_result(
@@ -1972,24 +2201,58 @@ class Agent:
             self._learning["saved"] = True   # it already kept what it learned
 
         verdict: tuple[bool | None, str] | None = None
+        send_note: str | None = None
         if name in ACTION_TOOL_NAMES:
-            # What the action's own report verifies (v3.14): an outcome is said only on a verified effect, and a
-            # fast first pass that cannot show its effect escalates the request's next call.
+            # What the action's own report verifies (v3.14): an outcome is said only on a verified effect.
             verdict = action_verdict(name, outcome)
-            turn.verdicts.append((name, verdict[0], verdict[1]))
-            if isinstance(outcome.payload, dict):
-                outcome.payload = {**outcome.payload, "verified": verdict[0]}
-            details = outcome.payload.get("details") if isinstance(outcome.payload, dict) else None
-            target = _view_target(name, tool_input, details if isinstance(details, dict) else {})[0]
-            if target is not None:
-                if verdict[0] is True:
-                    self._evidence[target] = "verified"
+            hwnd_acted = target.get("hwnd")
+            if (verdict[0] is None and outcome.ok and verdict[1] != EXPECTED_UNVERIFIABLE
+                    and target.get("control")):
+                # Revamp D (S2): a control practice memory learned never shows its effect is expected-unverifiable.
+                learned = self._learned_control(name, target)
+                if learned:
+                    verdict = (None, finish_gate.LEARNED_UNVERIFIABLE.format(n=learned))
+            if outcome.ok and judged is not None and judged.sends:
+                # Revamp D (S2): a send is confirmed from memory's own capture of the chat, independently of the
+                # action's report.
+                text = (str(tool_input.get("text") or "") if name == "type_text"
+                        else self._typed.get(int(hwnd_acted or 0), ""))
+                if text.strip():
+                    conf = self._confirm_send(target, text, dispatched_at)
+                    self._sends.append({"tool": name, "confirmed": conf["confirmed"], "waited_ms": conf["waited_ms"],
+                                        "similarity": conf["similarity"]})
+                    if conf["confirmed"]:
+                        verdict = (True, f"memory's capture of the chat shows the message arrived "
+                                         f"({conf['waited_ms']} ms after it was sent)")
+                        send_note = verdict[1]
+                    else:
+                        verdict = (None, f"the message did not show up in memory's capture of the chat within "
+                                         f"{float(getattr(self.settings, 'send_confirm_s', 4.0)):g} s: not confirmed")
+                        send_note = verdict[1]
                 else:
-                    self._evidence.pop(target, None)
+                    self._sends.append({"tool": name, "confirmed": None, "why": "no text known to look for"})
+                self._typed.pop(int(hwnd_acted or 0), None)
+            elif outcome.ok and name == "type_text" and hwnd_acted:
+                held = "" if tool_input.get("clear") else self._typed.get(int(hwnd_acted), "")
+                self._typed[int(hwnd_acted)] = (held + str(tool_input.get("text") or ""))[-2000:]
+            turn.verdicts.append((name, verdict[0], verdict[1]))
+            if outcome.ok and finish_gate.classify(True, verdict[0], verdict[1]) == finish_gate.CONTRADICTED:
+                turn.contradicted.append((name, verdict[1]))
+            if isinstance(outcome.payload, dict):
+                outcome.payload = {**outcome.payload, "verified": verdict[0],
+                                   "verdict_class": finish_gate.classify(outcome.ok, verdict[0], verdict[1])}
+            details = outcome.payload.get("details") if isinstance(outcome.payload, dict) else None
+            target_hwnd = _view_target(name, tool_input, details if isinstance(details, dict) else {})[0]
+            if target_hwnd is not None:
+                if verdict[0] is True:
+                    self._evidence[target_hwnd] = "verified"
+                else:
+                    self._evidence.pop(target_hwnd, None)
             elif name in ("run_powershell", "hotkey", "press"):
                 self._evidence.clear()   # aimed at no window it names: any window may have changed
-            self.logger.log("action_verdict", tool=name, verified=verdict[0], why=verdict[1], target=target)
-            self._learn_step(target, bool(outcome.ok and verdict[0] is True))
+            self.logger.log("action_verdict", tool=name, verified=verdict[0], why=verdict[1], target=target_hwnd,
+                            verdict_class=finish_gate.classify(outcome.ok, verdict[0], verdict[1]))
+            self._learn_step(target_hwnd, bool(outcome.ok and verdict[0] is True))
         elif outcome.ok and name in ("look_at_window", "read_tabs", "read_page"):
             looked = _as_hwnd(tool_input.get("hwnd"))
             if looked is not None:
@@ -2032,11 +2295,12 @@ class Agent:
         if name not in CONTROL_TOOLS:
             self._trace_step(name, tool_input, ok=outcome.ok, verdict=verdict[0] if verdict else None,
                              why=verdict[1] if verdict else "", result=outcome.summary, ms=outcome.elapsed_ms,
-                             outcome=outcome)
+                             outcome=outcome, control=target.get("control") if acts else None)
+            if acts and verdict is not None and outcome.ok:
+                self._mark_confirmations(target.get("hwnd"), verdict)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload)
-        finishing = tool_input.get(FINISHES_FIELD) if name in ACTION_TOOL_NAMES else None
-        if outcome.ok and isinstance(finishing, str) and finishing.strip():
-            turn.finishing.append((finishing.strip(), verdict[0] if verdict else None,
+        if outcome.ok and finish_line:
+            turn.finishing.append((finish_line, verdict[0] if verdict else None,
                                    verdict[1] if verdict else "", name))
 
         content = list(outcome.content) or [
@@ -2046,10 +2310,16 @@ class Agent:
             content.append({"type": "text", "text": repeat_note})
         if verdict is not None and outcome.ok:
             # The action's own verdict, as a fact next to its report (v3.14): whether what it measured shows the
-            # effect, so a claim about it rests on something checked.
-            content.append({"type": "text", "text": (
-                f"\n(Verified from its own report: {verdict[1]}.)" if verdict[0] is True else
-                f"\n(Not verified: {verdict[1]}. What happened is only what the window shows now.)")})
+            # effect, so a claim about it rests on something checked (revamp D: or memory's capture of a send).
+            if verdict[0] is True:
+                line = f"\n(Verified: {verdict[1]}.)" if send_note else f"\n(Verified from its own report: {verdict[1]}.)"
+            elif finish_gate.is_expected(verdict[1]):
+                line = f"\n(Expected: {verdict[1]}.)"
+            elif verdict[0] is False:
+                line = f"\n(Contradicted: {verdict[1]}. What happened is only what the window shows now.)"
+            else:
+                line = f"\n(Not verified: {verdict[1]}. What happened is only what the window shows now.)"
+            content.append({"type": "text", "text": line})
         turn.record(tool_id, self._result_block(tool_id, content, is_error=not outcome.ok))
 
         if not outcome.ok or outcome.kind == "done":
@@ -2182,6 +2452,9 @@ class Agent:
         belongs to the agent: two agents can share one dispatcher (and one
         PowerShell session) while showing the model different tools.
         """
+        if name in MEMORY_READ_KINDS and (self.tool_names is None or "memory" in self.tool_names):
+            # revamp D: the seven memory reads are one tool; a call by an old name runs as that kind
+            name, tool_input = "memory", {**tool_input, "kind": name}
         if self.tool_names is not None and name not in self.tool_names:
             return unavailable_tool(name, self.tool_names)
         if name in MEMORY_TOOLS:
@@ -2249,12 +2522,13 @@ class Agent:
 
     # -- perception --------------------------------------------------------
 
-    def _capture_overview(self) -> tuple[str, str | None]:
+    def _capture_overview(self, prebuilt: tuple[str, Any, float] | None = None) -> tuple[str, str | None]:
         """Grab the desktop overview handed to the model at the start of each turn.
 
         A failure here is reported to the model as text rather than raised: not
         being able to see the desktop is something Yuki should know about and work
-        around, not a crash.
+        around, not a crash. ``prebuilt``: ``(text, payload, elapsed_ms)`` read ahead
+        for a request pack (:meth:`build_pack`), fenced here with this request's code.
 
         Returns:
             ``(overview_text, self_facts_text)``. The second is the one-line
@@ -2266,7 +2540,7 @@ class Agent:
         facts_text = _turn_facts_text(facts)
         looked = time.perf_counter()
         try:
-            text, payload, elapsed = self.dispatcher.overview_text()
+            text, payload, elapsed = prebuilt if prebuilt is not None else self.dispatcher.overview_text()
         except Exception as exc:
             self._overview_s += time.perf_counter() - looked
             message = f"(could not read the desktop: {type(exc).__name__}: {exc})"
@@ -2329,14 +2603,17 @@ class Agent:
 
     # -- memory ------------------------------------------------------------
 
-    def _live_screen(self, origin_hwnd: int | None = None) -> dict[str, Any] | None:
+    def _live_screen(self, origin_hwnd: int | None = None, *, board: Any = None,
+                     payload: Any = None) -> dict[str, Any] | None:
         """The window the request came from as the Now board read it this turn (the dispatcher's last picture), as
         the whole-memory ranking's screen anchor; ``None`` without one. The service's own last capture lags a fresh
-        window switch by its settle time (revamp 02 §3.3: "On their screen" named the wrong window twice)."""
-        board = getattr(self.dispatcher, "last_now_board", None)
+        window switch by its settle time (revamp 02 §3.3: "On their screen" named the wrong window twice).
+        ``board`` / ``payload``: a request pack's own picture and window list (:meth:`build_pack`)."""
+        board = board if board is not None else getattr(self.dispatcher, "last_now_board", None)
         if not isinstance(board, dict):
             return None
-        payload = self._overview_payload if isinstance(self._overview_payload, dict) else {}
+        payload = payload if isinstance(payload, dict) else (
+            self._overview_payload if isinstance(self._overview_payload, dict) else {})
         want = origin_hwnd or payload.get("foreground_hwnd") or board.get("foreground")
         window = next((w for w in board.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") == want), None)
         if window is None or window.get("blocked"):
@@ -2384,8 +2661,12 @@ class Agent:
     def _memory_context(
         self, request: str, *, first: bool = False, lean: bool = False, query: str | None = None,
         previous: str | None = None, apps: list[str] | None = None, origin_hwnd: int | None = None,
+        prefetched: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None]:
         """Split what memory knows into the system layers and this request's message blocks.
+
+        ``prefetched``: what a request pack fetched ahead (:meth:`build_pack`: the screen anchor, the frame's
+        inputs and memory's context), used instead of fetching now.
 
         System layers (``prompt.system_blocks``, cached, stored on the agent for
         ``_request_params``): the **profile** (the user's names from settings and the
@@ -2426,21 +2707,24 @@ class Agent:
         self._rules_layer = None
         self._frame = None
         try:
-            screen = self._live_screen(origin_hwnd)
-            # the task frame (revamp Phase B): who and what the request may refer to, built in code from the Now
-            # board, this conversation, the focus, the clipboard and memory's people index; a request whose frame has
-            # a person, a route or a referent in play (or a spoken hand-off) is an action request, for which Yuki's
-            # own past exchanges from other days weigh less in the whole-memory ranking (follow-up 4)
-            facts, focus, clip = self._frame_inputs(query, screen, list(apps or ()))
+            if prefetched is not None:
+                screen = prefetched.get("screen")
+                facts, focus, clip = prefetched.get("inputs") or (None, None, None)
+            else:
+                screen = self._live_screen(origin_hwnd)
+                # the task frame (revamp Phase B): who and what the request may refer to, built in code from the Now
+                # board, this conversation, the focus, the clipboard and memory's people index; a request whose
+                # frame has a person, a route or a referent in play (or a spoken hand-off) is an action request, for
+                # which Yuki's own past exchanges from other days weigh less in the whole-memory ranking
+                facts, focus, clip = self._frame_inputs(query, screen, list(apps or ()))
             frame = task_frame.build(facts, focus=focus, clip=clip, overview=self._overview_payload)
             action = bool(self._request_voice or frame.action)
-            # the apps in play for practice memory: the open windows (with the apps the words name, found by memory,
-            # and the caller's), not only the window in front
-            open_apps = sorted({str(w.get("process_name")) for w in (self._overview_payload or {}).get("windows") or []
-                                if isinstance(w, dict) and w.get("process_name")}) if isinstance(
-                self._overview_payload, dict) else []
-            fetched = self.memory.context(app=app, query=query, resume=first and not lean, previous=previous,
-                                          apps=apps or (), screen=screen, action=action, open_apps=open_apps)
+            if prefetched is not None and prefetched.get("fetched") is not None:
+                fetched = prefetched["fetched"]
+            else:
+                fetched = self._fetch_memory(app=app, query=query, first=first, lean=lean, previous=previous,
+                                             apps=apps or (), screen=screen, action=action,
+                                             payload=self._overview_payload)
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
                                      overview=self._overview_payload, practice=getattr(fetched, "practice", None))
             self._frame = frame
@@ -2552,6 +2836,275 @@ class Agent:
         )
         return text, standing
 
+    def _fetch_memory(self, *, app: str | None, query: str, first: bool, lean: bool, previous: str | None,
+                      apps: Any, screen: Any, action: bool, payload: Any) -> Any:
+        """Memory's context for one request (the open windows' processes are the apps in play for practice memory)."""
+        open_apps = sorted({str(w.get("process_name")) for w in (payload or {}).get("windows") or []
+                            if isinstance(w, dict) and w.get("process_name")}) if isinstance(payload, dict) else []
+        return self.memory.context(app=app, query=query, resume=first and not lean, previous=previous,
+                                   apps=apps or (), screen=screen, action=action, open_apps=open_apps)
+
+    # -- the request pack (revamp D, S5) ---------------------------------------
+
+    def build_pack(self, request: str = "", *, origin_hwnd: int | None = None, view_hwnd: int | None = None,
+                   memory_query: str | None = None, previous_query: str | None = None,
+                   memory_apps: Iterable[str] | None = None, lean: bool = False, voice: bool = False,
+                   with_memory: bool = True) -> RequestPack:
+        """Build what ``run`` needs before its first model call, now, so the request does not wait for it.
+
+        For a caller that knows a request is coming (the voice, while the user is still speaking: 07 §6 E2): the
+        window list with the Now picture, the request origin, the window the request is about (``view_hwnd``) and
+        memory's part. Touches nothing of a running request (call it while this agent is idle, or from the thread
+        that will run it). Never raises: a part that fails is left out and ``run`` builds it then. Logged as
+        ``request_pack_built``."""
+        started = time.perf_counter()
+        pack = RequestPack(built_at=time.monotonic(), origin_hwnd=origin_hwnd, view_hwnd=view_hwnd)
+        try:
+            t0 = time.perf_counter()
+            pack.overview = self.dispatcher.overview_text()
+            pack.parts_ms["overview"] = round((time.perf_counter() - t0) * 1000, 1)
+        except Exception as exc:  # noqa: BLE001 - run reads it then
+            self.logger.log("request_pack_part", part="overview", error=f"{type(exc).__name__}: {exc}")
+        payload = pack.overview[1] if pack.overview else None
+        try:
+            t0 = time.perf_counter()
+            facts = self.dispatcher.activity_facts()
+            calls: list[dict[str, Any]] = []
+            if facts.get("microphone"):
+                fetch = getattr(self.memory, "call_method", None)
+                found = fetch("current_calls", timeout_s=1.0) if callable(fetch) else None
+                calls = [c for c in (found or []) if isinstance(c, dict)]
+            pack.origin = _origin_text(payload, facts, origin_hwnd=origin_hwnd, calls=calls)
+            pack.parts_ms["origin"] = round((time.perf_counter() - t0) * 1000, 1)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("request_pack_part", part="origin", error=f"{type(exc).__name__}: {exc}")
+        if view_hwnd:
+            try:
+                t0 = time.perf_counter()
+                pack.view = self.dispatcher.window_view(int(view_hwnd), settle=False)
+                pack.parts_ms["view"] = round((time.perf_counter() - t0) * 1000, 1)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("request_pack_part", part="view", error=f"{type(exc).__name__}: {exc}")
+        if with_memory and getattr(self.memory, "installed", False):
+            try:
+                t0 = time.perf_counter()
+                query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
+                board = getattr(self.dispatcher, "last_now_board", None)
+                screen = self._live_screen(origin_hwnd, board=board, payload=payload)
+                inputs = self._frame_inputs(query, screen, list(memory_apps or ()))
+                frame = task_frame.build(inputs[0], focus=inputs[1], clip=inputs[2], overview=payload)
+                fetched = self._fetch_memory(
+                    app=_foreground_app(payload), query=query, first=self._requests == 0, lean=lean,
+                    previous=" ".join(str(previous_query or "").split()) or self._previous_query,
+                    apps=list(memory_apps or ()), screen=screen, action=bool(voice or frame.action), payload=payload)
+                pack.memory = {"screen": screen, "inputs": inputs, "fetched": fetched, "query": query}
+                pack.parts_ms["memory"] = round((time.perf_counter() - t0) * 1000, 1)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("request_pack_part", part="memory", error=f"{type(exc).__name__}: {exc}")
+        pack.build_ms = round((time.perf_counter() - started) * 1000, 1)
+        self.logger.log("request_pack_built", build_ms=pack.build_ms, parts_ms=dict(pack.parts_ms),
+                        view=pack.view is not None, memory=pack.memory is not None)
+        return pack
+
+    # -- revamp D: the user's words, authorization, the second look, send confirmation -----------------------
+
+    def _setup_input_gate(self) -> None:
+        """Quieter hands (S7): on the real desktop, the dispatcher waits for the user to stop typing or using the mouse
+        before global input; its notices become this request's ``Say`` events. Stub desks get none."""
+        dispatcher = self.dispatcher
+        if getattr(dispatcher, "notices", None) is None:
+            try:
+                dispatcher.notices = queue.SimpleQueue()
+            except Exception:  # noqa: BLE001 - a dispatcher double without the attribute
+                return
+        dispatcher.cancel_check = lambda: self._cancelled.is_set()
+        try:
+            from yuki.agent.tools import _LazyRealBackend
+
+            if (getattr(self.settings, "input_yield", True) and getattr(dispatcher, "input_gate", None) is None
+                    and isinstance(getattr(dispatcher, "backend", None), _LazyRealBackend)):
+                from yuki.actions.leases import InputGate
+
+                dispatcher.input_gate = InputGate(
+                    recent_s=float(getattr(self.settings, "input_yield_recent_s", 1.0)),
+                    quiet_s=float(getattr(self.settings, "input_yield_quiet_s", 0.8)),
+                    max_s=float(getattr(self.settings, "input_yield_max_s", 12.0)))
+        except Exception:  # noqa: BLE001 - the hands work without it
+            pass
+
+    def _note_words(self, text: str | None, *, how: str, question: str | None = None) -> None:
+        """One piece of the user's own words for the judge (request words, words added mid-run, an answer)."""
+        text = " ".join(str(text or "").split())
+        if text:
+            entry: dict[str, Any] = {"how": how, "text": text, "at": time.time()}
+            if question:
+                entry["question"] = question
+            self._user_words.append(entry)
+
+    def _call_target(self, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        """The window a call acts on (from its own arguments, the element's window, else the window in front) and the
+        element's role and name, as the judge and the trace name them."""
+        hwnd = _as_hwnd(tool_input.get("expect_hwnd")) or (
+            _as_hwnd(tool_input.get("hwnd")) if name in ("window_action", "tab", "focus_window") else None)
+        if hwnd is None and tool_input.get("element") is not None:
+            hwnd = _as_hwnd(getattr(self.dispatcher, "_latest_tree_hwnd", None))
+        if hwnd is None and isinstance(self._overview_payload, dict) and name in (
+                "type_text", "hotkey", "press", "click", "scroll", "hover"):
+            hwnd = _as_hwnd(self._overview_payload.get("foreground_hwnd"))
+        window = self._window_of(hwnd) or {}
+        target: dict[str, Any] = {"hwnd": hwnd, "app": window.get("process_name"), "title": window.get("title")}
+        describe = getattr(self.dispatcher, "element_info", None)
+        element = describe(tool_input) if callable(describe) else None
+        if element:
+            target["element"] = f"{element.get('role') or 'element'} \"{element.get('name') or ''}\""
+            target["control"] = f"{element.get('role') or ''}|{element.get('name') or ''}"
+        if name == "tab":
+            names = (getattr(self.dispatcher, "tab_names", {}) or {}).get(hwnd or 0) or {}
+            tab = names.get(str(tool_input.get("tab") or "").strip().strip("[]"))
+            if tab:
+                target["element"] = f"tab \"{tab}\""
+                target["tab_name"] = tab
+        return target
+
+    def _authorize(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> Any:
+        """The judge's verdict for one action, or ``None`` when its metadata and the policy do not send it there."""
+        if self.authorizer is None or name not in ACTION_TOOL_NAMES:
+            return None
+        # Yuki's own earlier calls of this request (the calls, never what came back: auto mode's classifier sees the
+        # agent's tool calls too), so a message is judged whole (a mention typed by the call before is part of it).
+        earlier = [f"{s.get('tool')} {json.dumps(s.get('input') or {}, ensure_ascii=False, default=str)}"
+                   for s in getattr(self, "_trace", []) if s.get("kind") == "action" and s.get("ok")]
+        verdict = self.authorizer.check(name, tool_input, words=list(self._user_words), target=target,
+                                        signature=call_signature(acting_input(tool_input)), earlier=earlier)
+        if self.authorizer.stopped and verdict is not None and not verdict.allowed:
+            self._denial_stop = self.authorizer.stopped
+        return verdict
+
+    def _denial_text(self, verdict: Any) -> str:
+        """What the brain is told when a call is not run (framed as Yuki's own check, never the user)."""
+        if verdict.source == "policy":
+            return (f"{JUDGE_LABEL}: not run: {verdict.why}. Tell them what you would do and let them say go, or do "
+                    f"it themselves.")
+        if verdict.source == "error":
+            return (f"{JUDGE_LABEL}: not run: {verdict.why} ({verdict.error}). Ask the user one plain question before "
+                    f"this step.")
+        ask = f' (for example: "{verdict.question}")' if verdict.question else ""
+        return (f"{JUDGE_LABEL}: not run: the user did not ask for this ({verdict.why}). Do what they asked another "
+                f"way, or ask them one plain question with ask_user{ask}. Do not make this call again unless they "
+                f"say yes.")
+
+    def _consult_due(self, signal: str) -> bool:
+        if not getattr(self.settings, "consult", True):
+            return False
+        if len(self._consults) >= int(getattr(self.settings, "consult_max", 2)):
+            return False
+        if signal == "send" and (self._send_consulted or not getattr(self.settings, "consult_before_send", True)):
+            return False
+        if signal == "close_call" and self._close_call_consulted:
+            return False
+        return True
+
+    def _consult(self, signal: str, detail: str, *, pending: str | None = None) -> Any:
+        """One side call (revamp D, S3) over a summary written by code; the actor's own profile is untouched.
+        Returns the :class:`yuki.agent.consult.Advice` (``None`` when not due). Its cost joins this request's."""
+        if not self._consult_due(signal):
+            return None
+        if signal == "send":
+            self._send_consulted = True
+        if signal == "close_call":
+            self._close_call_consulted = True
+        windows = [w for w in (self._overview_payload or {}).get("windows") or []
+                   if isinstance(w, dict)] if isinstance(self._overview_payload, dict) else []
+        summary = second_look.summary_text(
+            words=self._this_query or memory_query_of(self._request_text or ""), signal=signal, detail=detail,
+            frame=self._frame.text if self._frame is not None else None, steps=self._trace, windows=windows,
+            view=self._last_view_text, pending=pending)
+        model = str(getattr(self.settings, "consult_model", "") or self.settings.model)
+        params = second_look.consult_request(summary, model=model,
+                                             effort=str(getattr(self.settings, "consult_effort", "medium") or ""))
+        try:
+            client = self.client
+        except Exception as exc:  # noqa: BLE001
+            advice = second_look.Advice(signal=signal, error=f"{type(exc).__name__}: {exc}")
+        else:
+            advice = second_look.run_consult(client, params, signal=signal,
+                                             timeout_s=float(getattr(self.settings, "consult_timeout_s", 30.0)))
+        if advice.usage:
+            cost = self.settings.estimate_cost(model, advice.usage)
+            if cost is not None:
+                advice.cost_usd = round(float(cost), 6)
+                self._cost_usd += float(cost)
+            for key in TOKEN_KEYS:
+                self._tokens[key] += int(advice.usage.get(key) or 0)
+        info = {**advice.facts(), "detail": detail[:200], "at_call": self._model_calls}
+        self._consults.append(info)
+        self.logger.log("consult", **info, advice=advice.advice)
+        return advice
+
+    def _confirm_send(self, target: dict[str, Any], text: str, since: float) -> dict[str, Any]:
+        """Wait (about ``Settings.send_confirm_s``) for memory's capture of the chat to show the message just sent
+        (revamp D, S2). Without memory the send is "not confirmed" (said plainly), never assumed."""
+        app = target.get("app")
+        hwnd = target.get("hwnd")
+
+        def lookup(t0: float) -> list[dict[str, Any]]:
+            fetch = getattr(self.memory, "call_method", None)
+            if not callable(fetch) or not getattr(self.memory, "installed", False):
+                return []
+            return fetch("sent_messages", app, t0 - 1.0, timeout_s=0.5) or []
+
+        def refresh() -> None:
+            try:
+                from yuki.memory.now import shared_client
+
+                if isinstance(getattr(self.dispatcher, "backend", None), _real_backend_type()):
+                    client = shared_client()
+                    if client is not None:
+                        client.refresh(hwnd, wait_s=0.05)
+            except Exception:  # noqa: BLE001
+                pass
+
+        result = finish_gate.confirm_send(lookup, text, since=since,
+                                          within_s=float(getattr(self.settings, "send_confirm_s", 4.0)),
+                                          refresh=refresh, cancelled=self._cancelled.is_set)
+        self.logger.log("send_confirmation", app=app, hwnd=hwnd, chars=len(text or ""), **result)
+        return result
+
+    def _dispatch_watching(self, name: str, tool_input: dict[str, Any]) -> Iterator[AgentEvent]:
+        """Run an action whose hands may wait for the user (S7) on its own thread, saying the gate's line as a ``Say``
+        the moment it waits. The action always finishes (never abandoned). Returns (``yield from``) its outcome."""
+        notices = getattr(self.dispatcher, "notices", None)
+        if notices is None or getattr(self.dispatcher, "input_gate", None) is None:
+            return self._dispatch(name, tool_input)
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                box["out"] = self._dispatch(name, tool_input)
+            except BaseException as exc:  # noqa: BLE001 - handed back below
+                box["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name=f"yuki-act-{name}", daemon=True).start()
+        while not done.wait(self.ABORT_POLL_S):
+            yield from self._drain_notices()
+        yield from self._drain_notices()
+        if "exc" in box:
+            raise box["exc"]
+        return box["out"]
+
+    def _drain_notices(self) -> Iterator[AgentEvent]:
+        notices = getattr(self.dispatcher, "notices", None)
+        while notices is not None:
+            try:
+                text = notices.get_nowait()
+            except queue.Empty:
+                return
+            self.logger.log("input_yield", text=text)
+            yield Say(text)
+
     # -- self-awareness facts ----------------------------------------------
 
     def _turn_facts(self) -> dict[str, Any]:
@@ -2613,10 +3166,13 @@ class Agent:
         # The prompt in layers, most stable first (prompt.system_blocks): core (+ this lane's
         # framing), profile, rules. The warm-up sends the core alone: its breakpoint sits at
         # the same position, so the entry it writes is the one real requests read.
+        # A spoken request (or the warm-up of the voice profile) carries the voice layer after the core (revamp D, S6).
+        voice = (profile is not None) if warmup else bool(getattr(self, "_request_voice", False))
         system = system_blocks(
             extra=self.extra_instructions,
             profile=None if warmup else self._profile_layer,
             rules=None if warmup else self._rules_layer,
+            voice=voice,
         )
         tools = tool_params(
             # No breakpoint of its own: tools come first in the cached prefix, so the core
@@ -2630,6 +3186,7 @@ class Agent:
                 self.dispatcher, "screenshot_policy", self.settings.screenshot_policy
             ),
             memory=self.memory.installed,
+            lane_tools=READER_LANE_TOOLS if getattr(self, "reader", False) else (),
         )
         if warmup:
             # No conversation breakpoint: the placeholder must never be cached.
@@ -2641,9 +3198,9 @@ class Agent:
             messages = self.context.request_messages(
                 max_breakpoints=MAX_CACHE_BREAKPOINTS - used
             )
-        # A spoken request's step tools require say_now (v3.14b). The warm-up with a profile is the voice profile's
-        # (warm_cache(effort=, thinking=) is only called for it), so it writes the same tools.
-        if (profile is not None) if warmup else getattr(self, "_request_voice", False):
+        # A spoken request's step tools carry say_now (v3.14b; optional since revamp D). The warm-up with a profile is
+        # the voice profile's (warm_cache(effort=, thinking=) is only called for it), so it writes the same tools.
+        if voice:
             from yuki.agent.tools import with_step_lines
 
             tools = with_step_lines(tools)
@@ -2714,6 +3271,7 @@ class Agent:
         )
         started = time.perf_counter()
         in_stream_s = 0.0
+        first_token_at: float | None = None
         try:
             if self.settings.stream:
                 with self.client.messages.stream(**params) as stream:
@@ -2724,6 +3282,8 @@ class Agent:
                         if self._cancelled.is_set() and not turn.handled and pending is None:
                             raise _StreamCancelled()
                         kind = getattr(event, "type", None)
+                        if first_token_at is None and kind in ("content_block_start", "content_block_delta"):
+                            first_token_at = time.perf_counter()   # revamp D: the first token, measured
                         part = stream_partial(event, live)
                         if part is not None:
                             yield part
@@ -2773,6 +3333,17 @@ class Agent:
         cost = self._account_response(used_model, getattr(response, "usage", None))
         if cost is not None and isinstance(getattr(self, "_call_costs", None), dict):
             self._call_costs[self._model_calls] = cost   # shared out over this call's steps in the run trace
+        try:   # revamp D: per-call facts for the request summary (output tokens per action call, the prefix, TTFT)
+            used = usage_tokens(getattr(response, "usage", None))
+            self._call_stats.append({
+                "out": used["output_tokens"], "in": used["input_tokens"], "cache_read": used["cache_read_tokens"],
+                "cache_write": used["cache_write_tokens"],
+                "tools": [str(getattr(b, "name", "")) for b in getattr(response, "content", []) or []
+                          if getattr(b, "type", None) == "tool_use"],
+                "first_token_ms": None if first_token_at is None else round((first_token_at - started) * 1000, 1),
+                "ms": round(latency_ms, 1)})
+        except Exception:  # noqa: BLE001 - accounting never breaks a request
+            pass
         # The request went through, so its cache entry exists: the next prune
         # measures "before the breakpoint" against this one.
         self.context.commit_breakpoint()
@@ -2786,7 +3357,9 @@ class Agent:
             ),
             tools_in_stream=turn.early,
             in_stream_tool_ms=round(in_stream_s * 1000, 1),
+            first_token_ms=None if first_token_at is None else round((first_token_at - started) * 1000, 1),
         )
+        self._first_token_ms.append(None if first_token_at is None else round((first_token_at - started) * 1000, 1))
         return response
 
     def _emit_thinking(self, block: Any) -> Iterator[AgentEvent]:
@@ -2834,16 +3407,17 @@ class Agent:
                 + "[/dim]"
             )
 
-    def _request_view(self, hwnd: int) -> tuple[str, str] | None:
+    def _request_view(self, hwnd: int, prebuilt: Any = None) -> tuple[str, str] | None:
         """The window ``hwnd`` read as the request comes in (one read, element ids usable), or ``None``.
 
         ``(framed text for the request, the fenced tree alone)``: the first is placed with the request, the
         second is a ``look_at_window`` result (:meth:`_add_view_call`). Logged as a ``perception`` record of
-        kind ``request_view``; its time counts as ``auto_view_s``. Never raises.
+        kind ``request_view``; its time counts as ``auto_view_s``. ``prebuilt``: the read a request pack made
+        ahead (the dispatcher already holds its element ids). Never raises.
         """
         started = time.perf_counter()
         try:
-            view = self.dispatcher.window_view(hwnd, settle=False)
+            view = prebuilt if prebuilt is not None else self.dispatcher.window_view(hwnd, settle=False)
         except Exception as exc:  # the window may have gone: the request goes on without it
             self.logger.log("request_view_skipped", hwnd=hwnd, error=f"{type(exc).__name__}: {exc}")
             return None
@@ -2978,7 +3552,24 @@ class Agent:
             },
         )
         self._evidence[hwnd] = "looked"   # the next call sees it read after the actions (v3.14)
+        self._last_view_text = view.text   # revamp D: the window acted on, for a second look's summary
         return (hwnd, text, True) if changes else (hwnd, text)
+
+
+def _close_call(frame: Any) -> bool:
+    """Whether the task frame measured a close call (two people, two things or two routes within their margin)."""
+    if frame is None:
+        return False
+    if getattr(frame, "close_people", False) or getattr(frame, "close_things", False):
+        return True
+    return any(bool(p.get("close")) and len(p.get("routes") or []) > 1
+               for p in getattr(frame, "persons", None) or [] if isinstance(p, dict))
+
+
+def _real_backend_type() -> type:
+    from yuki.agent.tools import _LazyRealBackend
+
+    return _LazyRealBackend
 
 
 def _practice_info(practice: Any) -> dict[str, Any] | None:

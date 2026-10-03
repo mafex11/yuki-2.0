@@ -11,10 +11,18 @@ They have no backend function: the dispatcher validates them and hands them back
 to :class:`yuki.agent.loop.Agent`, which owns pausing, finishing and the running
 summary.
 
-The seven *memory* tools (``recall``, ``remember_how``, ``correct_memory``,
-``remember_rule``, ``forget_rule``, ``activity``, ``todo``) have no backend function
-either: the agent runs them against Yuki's memory through
-:mod:`yuki.agent.memory`, and they are only listed when memory is installed.
+The *memory* tools have no backend function either: the agent runs them against
+Yuki's memory through :mod:`yuki.agent.memory`, and they are only listed when
+memory is installed. Since revamp D the seven reads (recall, activity, calls,
+call_timeline, threads, before, links) are one tool, ``memory(kind, ...)``; the
+writes keep their own names.
+
+Every action has fixed metadata (:class:`Traits`, :func:`tool_traits`): the
+autonomy-policy kinds it falls under, what it needs (the global input, focus, one
+window), whether it can destroy something or reach someone. The authorization
+judge (:mod:`yuki.agent.judge`), the ``risk`` field and the input leases
+(:mod:`yuki.actions.leases`) read it: a property of the tool and its operation,
+never of the words.
 """
 
 from __future__ import annotations
@@ -35,20 +43,26 @@ from yuki.ui.own_window import PAGE_WORDS, PAGES as YUKI_PAGES
 #: hygiene (:mod:`yuki.agent.context`) to decide what may be stubbed once stale.
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
-    {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
-     "activity", "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links",
-     "look_at_focus", "read_clipboard", "about"}
+    {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "memory",
+     "read_file", "fetch_url", "look_at_focus", "read_clipboard", "about"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
 CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "say"})
 
+#: Tools only one lane is shown (the reader lane's hand-off, :mod:`yuki.agent.lanes`): never in the worker's block.
+LANE_ONLY_TOOLS: frozenset[str] = frozenset({"hand_over"})
+
+#: The seven memory reads, one tool since revamp D (``memory(kind, ...)``): the old names, kept so a direct
+#: ``MemoryAccess.run_tool`` with one of them still runs.
+MEMORY_READ_KINDS: tuple[str, ...] = ("recall", "activity", "calls", "call_timeline", "threads", "before", "links")
+
 #: Tools backed by Yuki's memory (:mod:`yuki.agent.memory`) rather than the
 #: desktop backend. Left out of the tool block entirely when the memory API is
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
-    {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
-     "answer_question", "watch_for", "calls", "call_timeline", "threads", "before", "links", "about"}
+    {"memory", "remember_how", "correct_memory", "remember_rule", "forget_rule", "todo", "answer_question",
+     "watch_for", "about"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -78,25 +92,21 @@ def _obj(
 #: between tools would be both misleading and dead weight.
 _GUARD: dict[str, Any] = {
     "type": "integer",
-    "description": "Send only while this window is still in front. If focus has "
-    "moved, nothing is sent and you are told what has it instead.",
+    "description": "Send only while this window is in front (else nothing is sent).",
 }
 
 #: An element of the latest tree read of a window, as an input target. Shared by
 #: click, type_text and scroll for the same reason as :data:`_GUARD`.
 _ELEMENT: dict[str, Any] = {
     "type": "integer",
-    "description": "Id of an element in the latest read of the window (the [id] in "
-    "its tree, from look_at_window or the view attached after your actions). It is "
-    "resolved to that element's centre and input is guarded to that window: "
-    "expect_hwnd names the window, or else the window read most recently is used.",
+    "description": "An element id ([id]) from the latest read of its window (expect_hwnd, else the window read "
+    "last); input is guarded to that window.",
 }
 
 #: The read an element id comes from.
 _READ: dict[str, Any] = {
     "type": "integer",
-    "description": "The read number of the tree the element id comes from (read #N "
-    "in its header). If that window has been read again since, nothing is sent.",
+    "description": "The read number (read #N) the element id comes from.",
 }
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -104,13 +114,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "look_at_desktop",
         "label": "Looking at the desktop",
         "description": (
-            "List every visible top-level window with its hwnd, title, process, "
-            "bounds and which one is in the foreground, plus the cursor, the size of "
-            "the whole desktop and, when there is more than one display, each "
-            "monitor's index and rectangle. All coordinates are in one space "
-            "spanning every monitor, which is the same space click, scroll and "
-            "element centres use. Cheap and fast. You already receive this at the "
-            "start of every turn, already fresh, so you rarely need to call it."
+            "The window list again (hwnd, title, process, bounds, which is in front, the cursor, the monitors). "
+            "Every turn already starts with it, so you rarely need this."
         ),
         "input_schema": _obj({}),
     },
@@ -118,98 +123,58 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "look_at_window",
         "label": "Reading a window",
         "description": (
-            "Read the UI Automation element tree of one window: roles, names, text "
-            "field values, click points, keyboard shortcuts and whether each element "
-            "is interactive. This is how you find things to click or type into. The "
-            "result reports how many elements it found, whether it was truncated, and "
-            "whether the window was still building its tree while it was read, in "
-            "which case reading it again can show more. Its status is ok when the "
-            "window answered (however small the tree), busy when the window is on "
-            "screen but did not answer in time, which usually means it is loading or "
-            "rendering and can be read again shortly, and empty when it answered "
-            "with nothing usable. After a turn whose actions all succeeded, the window "
-            "you acted on is read for you and attached to your next turn as 'Window "
-            "after your actions', so there is no need to call this just to see what "
-            "an action did; call it for other windows, or when that attached view is "
-            "not enough."
+            "Read one window's UI Automation tree: roles, names, values, click points, shortcuts, which elements act "
+            "and which patterns they support. Status ok (it answered), busy (still loading: read again shortly) or "
+            "empty. After a turn whose actions all worked, the window acted on is read for you and attached as "
+            "'Window after your actions'."
         ),
-        "input_schema": _obj(
-            {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
-            ["hwnd"],
-        ),
+        "input_schema": _obj({"hwnd": {"type": "integer"}}, ["hwnd"]),
     },
     {
         "name": "read_page",
         "label": "Reading a page",
-        "description": (
-            "Read the full text of the page currently showing in a browser or "
-            "web-based app window, including parts scrolled out of view, with its "
-            "title and address. Use it to read, summarise or find information on a "
-            "page; use look_at_window when you need elements to click or type into."
-        ),
-        "input_schema": _obj(
-            {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
-            ["hwnd"],
-        ),
+        "description": "The full text of the page a browser or web app window shows, scrolled-out parts included, "
+                       "with its title and address. For reading; look_at_window gives elements to act on.",
+        "input_schema": _obj({"hwnd": {"type": "integer"}}, ["hwnd"]),
     },
     {
         "name": "read_tabs",
         "label": "Reading the tabs",
-        "description": (
-            "List a window's own tabs (a browser's tab strip), left to right: each tab's id, "
-            "its full name and which one is showing. Tabs are identified by that id, not by "
-            "their title: the tab tool takes it."
-        ),
-        "input_schema": _obj(
-            {"hwnd": {"type": "integer", "description": "Window handle from look_at_desktop."}},
-            ["hwnd"],
-        ),
+        "description": "A window's own tab strip, left to right: each tab's id (what the tab tool takes), full name and "
+                       "which one shows.",
+        "input_schema": _obj({"hwnd": {"type": "integer"}}, ["hwnd"]),
     },
     {
         "name": "look_at_focus",
         "label": "Looking at what you're on",
-        "description": (
-            "What the user is on right now, for \"this\", \"that\", \"here\", \"what I selected\": the element "
-            "with keyboard focus (its role, name and value, and the window it is in), the text they have "
-            "selected in it, and the text just before and after the caret. A password field is named, never "
-            "read. Says plainly when the focused app does not answer, which is not the same as nothing having "
-            "focus."
-        ),
+        "description": "What has keyboard focus now (role, name, value, window), the selected text and the text around "
+                       "the caret: \"this\", \"what I selected\". Password fields are named, never read.",
         "input_schema": _obj({}),
     },
     {
         "name": "read_clipboard",
         "label": "Checking what you copied",
-        "description": (
-            "What is on the clipboard: its text (long text is clipped and says so), which kinds of data it "
-            "holds (text, an image, files) and which app put it there. Something an app marked private (a "
-            "password manager does) is not read, and the result says so."
-        ),
+        "description": "The clipboard's text (clipped when long), which kinds of data it holds and which app put it "
+                       "there. Content an app marked private is not read.",
         "input_schema": _obj({}),
     },
     {
         "name": "write_clipboard",
         "label": "Copying that",
-        "description": (
-            "Put text on the clipboard so the user can paste it themselves (\"copy the link\", \"copy that "
-            "address\"). It replaces what was there and is read back to check it holds exactly this text."
-        ),
+        "description": "Put text on the clipboard for the user to paste (\"copy the link\"); read back to check.",
         "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
         "name": "window_action",
         "label": "Arranging a window",
         "description": (
-            "Minimize, maximize, full screen, restore, focus or close one whole window by its hwnd, and check "
-            "that it happened: the result is the state the window reached, read from Windows, never the "
-            "request. Maximized fills the monitor's work area with the title bar and taskbar still there; "
-            "fullscreen covers the whole monitor (the app's own full screen, F11). close is what the window's "
-            "X does (the app may ask to save; the result says when it is still open). A window is not a tab: "
-            "this never changes which tab shows."
+            "Minimize, maximize, full screen, restore, focus or close one whole window; the result is the state "
+            "read back from Windows. Maximized keeps the title bar and taskbar; fullscreen covers the monitor (F11). "
+            "close is the window's X (the app may ask to save). A window is not a tab."
         ),
         "input_schema": _obj(
             {
-                "hwnd": {"type": "integer", "description": "Window handle from the window list."},
+                "hwnd": {"type": "integer"},
                 "action": {"type": "string",
                            "enum": ["minimize", "maximize", "fullscreen", "restore", "focus", "close"]},
             },
@@ -219,87 +184,45 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "open_yuki",
         "label": "Opening my window",
-        "description": (
-            "Open your own window (Yuki's app window: the user's dashboard) in front, on one of its pages: "
-            + PAGE_WORDS + ". It is not in the window list while closed; this opens or brings it forward."
-        ),
-        "input_schema": _obj(
-            {"page": {"type": "string", "enum": list(YUKI_PAGES), "description": "Which page (today when unsure)."}},
-            ["page"],
-        ),
+        "description": "Open your own window (Yuki's app, the user's dashboard) on a page: " + PAGE_WORDS
+                       + ". It is not in the window list while closed.",
+        "input_schema": _obj({"page": {"type": "string", "enum": list(YUKI_PAGES)}}, ["page"]),
     },
     {
         "name": "take_screenshot",
         "label": "Taking a look at the screen",
         "description": (
-            "Capture pixels. Name at most one target: a window (hwnd), a screen "
-            "rectangle (region), or one display (monitor). With none you get the "
-            "whole desktop across all monitors, which is the only shot that is "
-            "scaled down. Use it when the element tree is empty, truncated or does "
-            "not explain what you are looking at, or when you need to read something "
-            "only rendering shows. Every shot tells you where its top-left corner is "
-            "on screen and whether it is 1:1; prefer a window, a monitor or a region "
-            "so that it is, and zoom in on a small region when you need to read or "
-            "aim at something precisely."
+            "Capture pixels of a window (hwnd), a screen rectangle (region) or one display (monitor), at most one; "
+            "none gives the whole desktop scaled down. For when the element tree does not explain what is shown. "
+            "Each shot says where its top-left is on screen and whether it is 1:1."
         ),
         "input_schema": _obj(
             {
-                "hwnd": {
-                    "type": "integer",
-                    "description": "Window to capture.",
-                },
-                "region": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 4,
-                    "maxItems": 4,
-                    "description": "Screen rectangle [left, top, right, bottom] in the "
-                    "same coordinates as window bounds and element centres.",
-                },
-                "monitor": {
-                    "type": "integer",
-                    "description": "Index of one display, as listed by look_at_desktop.",
-                },
+                "hwnd": {"type": "integer"},
+                "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4,
+                           "description": "[left, top, right, bottom] in screen coordinates."},
+                "monitor": {"type": "integer"},
             }
         ),
     },
     {
         "name": "system_facts",
         "label": "Reading system facts",
-        "description": (
-            "Current local date and time, uptime, CPU load, memory totals and the "
-            "processes using the most memory."
-        ),
+        "description": "Local date and time, uptime, CPU load, memory totals and the processes using the most memory.",
         "input_schema": _obj({}),
     },
     {
         "name": "launch_app",
         "label": "Opening an app",
         "description": (
-            "Start an installed application by name and wait for its window. If the "
-            "name matches several apps it returns the candidates instead of guessing, "
-            "so you can pick one or ask the user. The window that appeared or changed "
-            "is brought to the front and waited on until it accepts input, so there "
-            "is no need to focus it afterwards; the result says whether that worked. "
-            "With args the application is started with those command-line arguments, "
-            "such as a URL, a file or a folder for it to open; passing a URL as an "
-            "argument to a browser opens it there without using the address bar. "
-            "With args it also returns only once the content is ready - the result "
-            "says 'content ready' with the page or document now shown, or 'content "
-            "still not ready' after a few seconds' wait. An application that is "
-            "already running usually opens the arguments in the window it has, and "
-            "the result names the window that appeared or changed. If the application "
-            "cannot be given arguments, nothing is started and the result says why."
+            "Start an installed app by name and bring its window to the front, waited on until it takes input. Several "
+            "matches: the candidates come back instead. args are command-line arguments (a URL, file or folder); "
+            "with args it returns once the content is ready ('content ready' or 'content still not ready')."
         ),
         "input_schema": _obj(
             {
-                "query": {"type": "string", "description": "Application name, e.g. 'spotify'."},
-                "args": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Command-line arguments, one item per argument, "
-                    "e.g. a URL or a file path. Omit to start the application plainly.",
-                },
+                "query": {"type": "string", "description": "App name, e.g. 'spotify'."},
+                "args": {"type": "array", "items": {"type": "string"}},
             },
             ["query"],
         ),
@@ -307,19 +230,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "focus_window",
         "label": "Switching window",
-        "description": (
-            "Bring a window to the foreground, restoring it first if minimised. Do "
-            "this before typing or using keyboard shortcuts aimed at that window."
-        ),
+        "description": "Bring a window to the front (restored if minimised) before keys meant for it.",
         "input_schema": _obj({"hwnd": {"type": "integer"}}, ["hwnd"]),
     },
     {
         "name": "click",
         "label": "Clicking",
         "description": (
-            "Click an element or a screen coordinate. Prefer an element id from the "
-            "latest tree read of the window; give x and y only when no element "
-            "describes the target."
+            "Click an element (an id from the latest read of its window) or, when no element describes the target, "
+            "x and y. A left single click on an element that supports a UI Automation pattern (invoke, toggle, "
+            "select) goes through that pattern, without the mouse or taking focus; the result says which way."
         ),
         "input_schema": _obj(
             {
@@ -337,25 +257,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "type_text",
         "label": "Typing",
         "description": (
-            "Type text into whatever currently has keyboard focus, optionally pressing "
-            "Enter afterwards. Make sure the right field is focused first. The result "
-            "says which control had keyboard focus when typing began. When the "
-            "control's contents can be read, the result says what it holds after "
-            "typing; if the typed text is not in it, the action fails and Enter is "
-            "not pressed. With clear, the field's existing contents are selected and "
-            "deleted first, and the result says whether it read empty. The result "
-            "also names any new window the application showed meanwhile, such as a "
-            "suggestion list or menu, and says when typing opened a suggestion list in "
-            "the field (a mention or autocomplete list: its items and the selected one); "
-            "Enter is then not pressed, since it would pick the suggestion instead of "
-            "sending. A name written as a mention (\"@Hem...\") only becomes one (a tag "
-            "that notifies them) when picked from the app's own list, so to mention or tag "
-            "someone, or pick from an autocomplete, type just the start of the name "
-            "(\"@Hem\") with accept_suggestion: it goes in by keys (a paste opens no list) "
-            "and the selected suggestion is accepted by key; then type the rest in a second "
-            "call. Never click a suggestion to pick it: a list row near the field may be a "
-            "message, not the suggestion. With element, that element is clicked first to "
-            "focus it."
+            "Type into whatever has keyboard focus (with element: that element, focused first), optionally pressing "
+            "Enter. The result names the control that had focus and, when it can be read, what it holds after: text "
+            "missing means failed and Enter is not pressed. clear replaces the field's contents (through the field's "
+            "own value when it has a writable one). When typing opens a suggestion list (a mention, an "
+            "autocomplete) the result lists it and Enter is not pressed. A mention only becomes one when picked from "
+            "the app's list: type its start with accept_suggestion, then the rest in a second call."
         ),
         "input_schema": _obj(
             {
@@ -363,16 +270,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "element": _ELEMENT,
                 "read": _READ,
                 "press_enter": {"type": "boolean"},
-                "clear": {
-                    "type": "boolean",
-                    "description": "Select all and delete in the focused field before "
-                    "typing. Text may be empty to only clear.",
-                },
-                "accept_suggestion": {
-                    "type": "boolean",
-                    "description": "Type by keys and accept the suggestion list the typing "
-                    "opens (Enter on its selected item, checked by reading the field again).",
-                },
+                "clear": {"type": "boolean", "description": "Empty the field first (text may be empty to only clear)."},
+                "accept_suggestion": {"type": "boolean",
+                                      "description": "Type by keys and accept the suggestion list the typing opens."},
                 "expect_hwnd": _GUARD,
             },
             ["text"],
@@ -382,18 +282,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "hotkey",
         "label": "Pressing a shortcut",
         "description": (
-            "Press a key combination, given as the keys held together, e.g. "
-            "['ctrl','t'] or ['win','r'] or ['volumemute']. The result says where "
-            "keyboard focus is afterwards and whether it moved, names any new "
-            "window the application showed, and says when the window's state changed "
-            "(normal, maximized, full screen, minimized: before -> after, read from Windows). "
-            "To change how a whole window is shown, window_action does it in one step and reads it back."
+            "Press keys held together, e.g. ['ctrl','t']. The result says where focus is after, any new window, and "
+            "the window's state before -> after."
         ),
         "input_schema": _obj(
-            {
-                "keys": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                "expect_hwnd": _GUARD,
-            },
+            {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "expect_hwnd": _GUARD},
             ["keys"],
         ),
     },
@@ -401,30 +294,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "press",
         "label": "Pressing a key",
         "description": (
-            "Press a single key, optionally several times, e.g. 'enter', 'tab', "
-            "'down'. The result says where keyboard focus is afterwards and whether "
-            "it moved, names any new window the application showed, and says when the "
-            "window's state changed (normal, maximized, full screen, minimized). Media keys "
-            "('playpause', 'nexttrack', 'prevtrack', 'stop', 'volumemute', "
-            "'volumeup', 'volumedown') act system-wide on whatever is playing: no "
-            "window needs focus, so leave expect_hwnd out and do not switch windows."
+            "Press one key, optionally several times ('enter', 'tab', 'down'). Media keys ('playpause', "
+            "'nexttrack', 'volumeup', 'volumemute' ...) act system-wide: no window, no expect_hwnd."
         ),
         "input_schema": _obj(
-            {
-                "key": {"type": "string"},
-                "times": {"type": "integer", "minimum": 1},
-                "expect_hwnd": _GUARD,
-            },
+            {"key": {"type": "string"}, "times": {"type": "integer", "minimum": 1}, "expect_hwnd": _GUARD},
             ["key"],
         ),
     },
     {
         "name": "scroll",
         "label": "Scrolling",
-        "description": (
-            "Scroll by wheel notches over an element (preferred) or a point; "
-            "positive dy scrolls up."
-        ),
+        "description": "Scroll by wheel notches (positive dy is up) over an element (preferred: through its scroll "
+                       "pattern when it has one, no mouse) or a point.",
         "input_schema": _obj(
             {
                 "element": _ELEMENT,
@@ -440,36 +322,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "run_powershell",
         "label": "Running a command",
-        "description": (
-            "Run a PowerShell command on this PC and get stdout, stderr and the exit "
-            "code back. Often the fastest and most reliable way to inspect or change "
-            "the system, far better than clicking through a UI."
-        ),
+        "description": "Run a PowerShell command on this PC; stdout, stderr and the exit code come back.",
         "input_schema": _obj({"command": {"type": "string"}}, ["command"]),
     },
     {
         "name": "open_url",
         "label": "Opening a link",
         "description": (
-            "Open a URL, file or folder. Without app it opens with the default "
-            "handler for that kind of target. With app it is handed to that installed "
-            "application as an argument instead, the same as launch_app with args; "
-            "for a browser that loads the page there directly, without using the "
-            "address bar. Either way the window showing it is brought to the front "
-            "and, when it shows a page or document, the call returns once that "
-            "content is ready: the result says "
-            "'content ready' with the page or document now shown, or 'content still "
-            "not ready' after a few seconds' wait."
+            "Open a URL, file or folder with its default handler, or with app (an installed app, as launch_app takes "
+            "it). Returns once the page is ready ('content ready' or 'content still not ready')."
         ),
         "input_schema": _obj(
-            {
-                "url": {"type": "string", "description": "URL, file path or folder path."},
-                "app": {
-                    "type": "string",
-                    "description": "Installed application name, as launch_app takes "
-                    "it, to open the target with.",
-                },
-            },
+            {"url": {"type": "string"}, "app": {"type": "string"}},
             ["url"],
         ),
     },
@@ -477,23 +341,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "tab",
         "label": "Switching tab",
         "description": (
-            "Show or close one tab of a window's tab strip, by the tab's id from "
-            "read_tabs (never by its title: a tab that is no longer there is reported, "
-            "not swapped for another). The result says whether the effect was seen and "
-            "lists the tabs the strip has after it, read again. A tab that was closed comes "
-            "back with the browser's own reopen (hotkey ctrl+shift+t in that window), then "
-            "read_tabs to check by its title that it is the one wanted; never rebuild a closed "
-            "tab's address from memory or search for it again."
+            "Show or close one tab by its id from read_tabs (never by title); the strip is read again after it. A "
+            "closed tab comes back with the app's own reopen, checked by its title with read_tabs."
         ),
         "input_schema": _obj(
             {
-                "hwnd": {"type": "integer", "description": "The window whose tab it is."},
-                "tab": {"type": "string", "description": "The tab's id, as read_tabs lists it in brackets."},
-                "action": {
-                    "type": "string",
-                    "enum": ["select", "close"],
-                    "description": "select: make it the tab showing. close: close it.",
-                },
+                "hwnd": {"type": "integer"},
+                "tab": {"type": "string", "description": "The tab's id, as read_tabs lists it."},
+                "action": {"type": "string", "enum": ["select", "close"]},
             },
             ["hwnd", "tab", "action"],
         ),
@@ -501,93 +356,54 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "hover",
         "label": "Pointing at something",
-        "description": (
-            "Put the mouse pointer on an element (or x and y) without clicking, for controls "
-            "that only appear while the pointer is over something: YouTube's volume slider "
-            "shows on hover over the volume button, where a click would mute. The result "
-            "says what appeared near the pointer; the window is read again after it, so the "
-            "new control has an element id to act on. The pointer stays there."
-        ),
+        "description": "Put the pointer on an element (or x, y) without clicking, for controls that only appear "
+                       "under the pointer; the window is read again after, so what appeared has an id.",
         "input_schema": _obj(
-            {
-                "element": _ELEMENT,
-                "read": _READ,
-                "x": {"type": "integer"},
-                "y": {"type": "integer"},
-                "expect_hwnd": _GUARD,
-            },
+            {"element": _ELEMENT, "read": _READ, "x": {"type": "integer"}, "y": {"type": "integer"},
+             "expect_hwnd": _GUARD},
         ),
     },
     {
         "name": "app_volume",
         "label": "Changing an app's volume",
         "description": (
-            "One app's own volume in the Windows volume mixer (what the Volume Mixer's slider "
-            "for that app sets), e.g. only Chrome, so only the YouTube video playing in it, "
-            "or only Spotify; the system volume and every other app stay as they are. It works "
-            "through Windows' audio sessions: no window is focused, clicked or switched and no "
-            "script runs, so a game in front stays in front. When the user means one app's "
-            "sound, this is the way, rather than the volume keys (the whole PC) or a player's "
-            "own control. Without level, change or mute it lists the apps with sound and their "
-            "levels. The result is read back: the level before and after, and the system "
-            "volume untouched."
+            "One app's own volume in the Windows mixer (only Chrome, only Spotify): nothing focused or clicked, the "
+            "system volume untouched. Without level, change or mute it lists the apps with sound. Read back."
         ),
         "input_schema": _obj(
             {
-                "app": {"type": "string",
-                        "description": "The app's process name as the mixer lists it (chrome.exe), or its name."},
+                "app": {"type": "string", "description": "Process name as the mixer lists it, or the app's name."},
                 "change": {"type": "number", "description": "Points to move it by, e.g. -20."},
                 "level": {"type": "number", "description": "Or the level to set, 0-100."},
-                "mute": {"type": "boolean", "description": "Mute (true) or unmute (false) the app."},
+                "mute": {"type": "boolean"},
             },
         ),
     },
     {
         "name": "note_to_self",
         "label": "Making a note",
-        "description": (
-            "Replace your short working note for this conversation. You get it back at "
-            "the start of every turn. Use it to carry forward what you learned and what "
-            "is left to do, so you stay oriented after older observations have aged out "
-            "of view. Keep it a few lines at most."
-        ),
+        "description": "Replace your short working note (you get it back every turn): what you learned, what is left.",
         "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
         "name": "ask_user",
         "label": "Asking you something",
-        "description": (
-            "Put one question to the user and wait for their answer. Their reply comes "
-            "back as this tool's result."
-        ),
+        "description": "Ask the user one question and wait; their reply is the result.",
         "input_schema": _obj({"question": {"type": "string"}}, ["question"]),
     },
     {
         "name": "done",
         "label": "Wrapping up",
         "description": (
-            "What to tell the user once this turn's work has succeeded. Call it "
-            "exactly once. It is evaluated last, after every other tool in the turn, "
-            "and only if all of them succeeded -- so calling it alongside the actions "
-            "that finish the job is the normal thing to do, not a gamble: if one of "
-            "them fails your message is discarded and you get the results back to "
-            "react to instead. You can never end up having claimed something that "
-            "did not happen."
+            "Your reply once this turn's work has succeeded, exactly once. It runs last and only if every other call "
+            "in the turn succeeded, so send it alongside the actions that finish the job."
         ),
         "input_schema": _obj(
             {
-                "message": {
-                    "type": "string",
-                    "description": "What you would text back: usually one short "
-                    "sentence, in the user's own register. No restating the request "
-                    "or narrating your steps.",
-                },
-                "learned": {
-                    "type": "string",
-                    "description": "Optional, never said to the user: when the way to do this was not "
-                    "obvious, one sentence on what worked and what did not. A hint for Yuki's learner, "
-                    "which reads the job's own steps.",
-                },
+                "message": {"type": "string", "description": "What you would text back, in their register."},
+                "learned": {"type": "string",
+                            "description": "Optional, never said: when the way was not obvious, one sentence on what "
+                                           "worked (a hint for Yuki's learner)."},
             },
             ["message"],
         ),
@@ -595,118 +411,89 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "say",
         "label": "Telling you",
-        "description": (
-            "Tell the user something worth hearing while you keep working: a milestone, a "
-            "finding, or why this is taking a while. They may be listening rather than "
-            "watching (a request that came by voice is spoken back to them), so a line "
-            "here keeps them in the loop without stopping the work. It returns at once. "
-            "Not every step, never a guess about an outcome you have not seen, and never "
-            "the final answer, which goes in done. Their standing rules apply to it."
-        ),
-        "input_schema": _obj(
-            {"text": {"type": "string", "description": "One short sentence, the way you would say it."}},
-            ["text"],
-        ),
+        "description": "Tell the user something while you keep working (a finding, why it is taking a while); returns "
+                       "at once. Never the final answer.",
+        "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
-        "name": "recall",
-        "label": "Remembering",
+        "name": "memory",
+        "label": "Checking memory",
         "description": (
-            "Search the user's memory journal — dated facts about what they did, "
-            "watched, read, and who said what to them — and your past conversations "
-            "with them, for anything you need to know about their past activity, "
-            "people, plans or what the two of you discussed. Returns the matching "
-            "facts and exchanges as dated lines, each with where it came from (the app, "
-            "call or chat, when, and the words said when there are some). For a question "
-            "about when, how long, a day or a stretch of time ('last Friday afternoon', "
-            "'last week', 'how long was I on the call'), give since and until for that "
-            "window and with_time_use: the measured time use of the same window (apps, "
-            "calls with their real start and end, episodes) comes back with the facts, to "
-            "reconcile into one answer."
+            "Read memory of the user: text captured from their screen, chats and calls, their timeline, and your "
+            "past exchanges with them. Results are dated, each with where it came from. One tool, by kind:\n"
+            "- recall: facts and exchanges matching query. For when, how long or a stretch of time give since and "
+            "until and with_time_use: the measured time use of that window comes back with the facts.\n"
+            "- activity: time per site, app or page (group_by), longest stretches, away time and episodes in "
+            "since..until (default today). An app's window in front, its calls and its background use come apart.\n"
+            "- calls: the calls and meetings in since..until (default 7 days): app, start, end, how long they spoke, "
+            "a gist. For what happened on one, open it with call_timeline.\n"
+            "- call_timeline: one call (call, e.g. call:16), the whole session, in stretches with times; words true "
+            "gives their exact words a page at a time. Only the user's own microphone is recorded: it is their "
+            "side alone. Written, keep the shape it comes in: each stretch's time range as its own line, then one "
+            "short line per moment starting with its time, the quiet hours in a few words, for example\n"
+            "**13:24-13:51** Claude work, MCP deadline\n- 13:28 said five Claude sessions were running at once\n"
+            "(quiet 15:46-18:32)\nSpoken: the two or three moments that matter, with their times.\n"
+            "- threads: their threads of work over days. action list (current), search (query), open (thread or "
+            "query): where it stands, what is open, when and where it was worked on.\n"
+            "- before: what they were doing before a moment or a break (at; event break or time; minutes); without "
+            "at, before the latest break.\n"
+            "- links: pages they had open and links shared with them (query, since, until, how, limit). Finds only."
         ),
         "input_schema": _obj(
             {
-                "query": {"type": "string", "description": "What to look for, in plain words."},
-                "since": {
-                    "type": "string",
-                    "description": "Earliest local date or date-time to include, ISO "
-                    "format, e.g. 2026-09-20 or 2026-09-20T18:00.",
-                },
-                "until": {
-                    "type": "string",
-                    "description": "Latest local date or date-time to include, same "
-                    "format; a date alone includes that whole day.",
-                },
-                "app": {
-                    "type": "string",
-                    "description": "Only facts from this application, as recall results "
-                    "name it.",
-                },
-                "with_time_use": {
-                    "type": "boolean",
-                    "description": "Also return the measured time use of since-until "
-                    "(needs since): for when, how long and what-did-I-do-then questions.",
-                },
+                "kind": {"type": "string",
+                         "enum": ["recall", "activity", "calls", "call_timeline", "threads", "before", "links"]},
+                "query": {"type": "string", "description": "recall, threads, links: what to look for, in plain words."},
+                "since": {"type": "string",
+                          "description": "Earliest local date or date-time, ISO (2026-09-20, 2026-09-20T18:00). "
+                                         "A session going past midnight began the day before; 'today' begins when "
+                                         "their day at the PC began (the memory block says)."},
+                "until": {"type": "string", "description": "Latest local date or date-time; a date alone covers the day."},
+                "app": {"type": "string", "description": "recall: only facts from this app."},
+                "with_time_use": {"type": "boolean", "description": "recall: also the measured time use (needs since)."},
+                "group_by": {"type": "string", "enum": ["site", "app", "page"]},
+                "call": {"type": "string", "description": "call_timeline: the call's id, e.g. call:16."},
+                "words": {"type": "boolean", "description": "call_timeline: their exact words instead."},
+                "page": {"type": "integer"},
+                "action": {"type": "string", "enum": ["list", "search", "open"]},
+                "thread": {"type": "string", "description": "threads: an id, e.g. thread:12."},
+                "at": {"type": "string", "description": "before: local date-time, ISO."},
+                "event": {"type": "string", "enum": ["break", "time"]},
+                "minutes": {"type": "integer"},
+                "how": {"type": "string", "enum": ["viewed", "shared"]},
+                "limit": {"type": "integer"},
             },
-            ["query"],
+            ["kind"],
         ),
     },
     {
         "name": "remember_how",
         "label": "Saving how it's done",
-        "description": (
-            "Save a way of doing something on this PC that the user tells you or asks you "
-            "to remember (how an app accepts a URL, where something lives, the steps they "
-            "take), in their words. Your own jobs teach Yuki by themselves; this is for what "
-            "the user teaches. Only record what they said or you confirmed."
-        ),
+        "description": "Keep a way of doing something on this PC that the user tells you, in their words (your own "
+                       "jobs teach Yuki by themselves).",
         "input_schema": _obj(
-            {
-                "app": {
-                    "type": "string",
-                    "description": "The program it applies to, by its process name as "
-                    "the window list shows it. Omit when it is not about one program.",
-                },
-                "text": {"type": "string", "description": "The procedure, in a sentence or two."},
-            },
+            {"app": {"type": "string", "description": "The process name it applies to, if one."},
+             "text": {"type": "string"}},
             ["text"],
         ),
     },
     {
         "name": "correct_memory",
         "label": "Noting that",
-        "description": (
-            "Record a correction the user gave you about a fact of their life, "
-            "work or people. How they want you to talk or behave is a rule: "
-            "use remember_rule for that instead."
-        ),
-        "input_schema": _obj(
-            {"text": {"type": "string", "description": "The correction, as the user meant it."}},
-            ["text"],
-        ),
+        "description": "Record the user's correction of a fact about their life, work or people, or where something "
+                       "of theirs stands. How they want you to behave is a rule (remember_rule).",
+        "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
         "name": "answer_question",
         "label": "Noting your answer",
-        "description": (
-            "Save the user's reply to one of your getting-to-know-you questions (a nudge of kind question, "
-            "id question:<n>): their answer in their own words, or that they skipped it or do not want to "
-            "be asked about it. Call it in the turn their reply arrives, alongside done. The answer becomes "
-            "what memory knows, over anything it had inferred."
-        ),
+        "description": "Save the user's reply to one of your own getting-to-know-you questions (question:<n>): their "
+                       "exact words, or that they skipped it or never want it asked.",
         "input_schema": _obj(
             {
-                "question": {"type": "string", "description": "The question's id, e.g. question:12."},
-                "outcome": {
-                    "type": "string",
-                    "enum": ["answered", "skipped", "never"],
-                    "description": "answered; skipped (not now); never (don't ask about this).",
-                },
-                "answer": {
-                    "type": "string",
-                    "description": "answered: the user's own words that answer it, copied exactly from their "
-                    "message. Otherwise empty.",
-                },
+                "question": {"type": "string", "description": "e.g. question:12"},
+                "outcome": {"type": "string", "enum": ["answered", "skipped", "never"]},
+                "answer": {"type": "string", "description": "answered: their own words, copied exactly."},
             },
             ["question", "outcome"],
         ),
@@ -714,26 +501,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "watch_for",
         "label": "Keeping an eye out",
-        "description": (
-            "A standing request: the user asks you to tell them when something happens "
-            "(\"tell me when Varun replies\", \"let me know when the build email comes\"). "
-            "Save it with add in that same turn: memory checks everything new that comes in "
-            "against it and puts one card on screen when it happens. list shows the open ones; "
-            "cancel ends one the user no longer wants."
-        ),
+        "description": "A standing request (\"tell me when Varun replies\"): add it in that turn; memory checks what "
+                       "comes in and shows one card when it happens. list, or cancel one.",
         "input_schema": _obj(
             {
-                "action": {"type": "string", "enum": ["add", "list", "cancel"],
-                           "description": "add (default), list, or cancel."},
-                "condition": {"type": "string",
-                              "description": "add: what to watch for, in plain words that name who and what "
-                              "(\"Varun replies to the user, on Slack or anywhere\")."},
-                "quote": {"type": "string",
-                          "description": "add: the user's own words asking for it, copied exactly from their message."},
-                "repeat": {"type": "boolean",
-                           "description": "add: true only when they want it every time, not just the next time."},
-                "days": {"type": "number", "description": "add: how many days to keep watching, when they said."},
-                "request": {"type": "string", "description": "cancel: its id as list shows it, e.g. request:3."},
+                "action": {"type": "string", "enum": ["add", "list", "cancel"]},
+                "condition": {"type": "string", "description": "add: who and what, in plain words."},
+                "quote": {"type": "string", "description": "add: the user's own words asking for it, exactly."},
+                "repeat": {"type": "boolean", "description": "add: every time, not only the next."},
+                "days": {"type": "number"},
+                "request": {"type": "string", "description": "cancel: its id, e.g. request:3."},
             },
             ["action"],
         ),
@@ -741,218 +518,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "remember_rule",
         "label": "Noting that for good",
-        "description": (
-            "Save a standing instruction the user just gave you about how to talk to "
-            "them or behave from now on (in their words), so it holds in every future "
-            "conversation. Whenever a message sets such a rule, call this in that same "
-            "turn, alongside done -- a rule only acknowledged is forgotten. It applies at "
-            "once, starting with the reply you send in that done."
-        ),
-        "input_schema": _obj(
-            {
-                "text": {
-                    "type": "string",
-                    "description": "The instruction, in the user's own words.",
-                }
-            },
-            ["text"],
-        ),
+        "description": "Save a standing instruction about how to talk to them or behave from now on, in their words; "
+                       "it applies at once, starting with this reply.",
+        "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
         "name": "forget_rule",
         "label": "Dropping that rule",
-        "description": "Drop a standing instruction, preference or piece of coach feedback the user has withdrawn.",
-        "input_schema": _obj(
-            {
-                "text": {
-                    "type": "string",
-                    "description": "The id of the rule, preference or coach feedback they withdrew, "
-                    "exactly as the standing block shows it in brackets, e.g. rule:12 or feedback:7.",
-                }
-            },
-            ["text"],
-        ),
-    },
-    {
-        "name": "activity",
-        "label": "Looking at how your time went",
-        "description": (
-            "How the user spent their time: time per app, site or page, visits, "
-            "longest stretches, away time, and episode summaries of what they were "
-            "doing. Use it whenever they ask what they did or how long: the window "
-            "in front says nothing about whether they were actually at the PC. Time in "
-            "an app is reported three ways, apart: its window in front, calls in it "
-            "(an app using the microphone, in front or not, with the call's real start "
-            "and end), and background use."
-        ),
-        "input_schema": _obj(
-            {
-                "since": {
-                    "type": "string",
-                    "description": "Earliest local date or date-time, ISO format, e.g. "
-                    "2026-09-20 or 2026-09-20T18:00. Default: the start of today. Set it "
-                    "to cover what they mean: a session still going at 00:30 began "
-                    "yesterday, so a question about it needs a since before midnight; "
-                    "\"this morning\" or \"today\" starts when their day at the PC began, "
-                    "as the memory block says.",
-                },
-                "until": {
-                    "type": "string",
-                    "description": "Latest local date or date-time, same format; a date "
-                    "alone includes that whole day. Default: now.",
-                },
-                "group_by": {
-                    "type": "string",
-                    "enum": ["site", "app", "page"],
-                    "description": "Count time per site (a window without a web page "
-                    "counts as its app), per app, or per page. Default: site.",
-                },
-            }
-        ),
-    },
-    {
-        "name": "calls",
-        "label": "Checking your calls",
-        "description": (
-            "List the user's calls and meetings in a time range - Discord, Google Meet, Zoom, Teams, "
-            "WhatsApp or any app that used the microphone for a call: the app, start and end, how long "
-            "the user spoke, whether their side was recorded, and a one-line gist when there is one. "
-            "Rows of one continuous session are merged into one entry. Use it for any question about "
-            "a call or meeting (what happened, what they said, when), then open the one they mean "
-            "with call_timeline."
-        ),
-        "input_schema": _obj(
-            {
-                "since": {
-                    "type": "string",
-                    "description": "Earliest local date or date-time, ISO format, e.g. 2026-09-25 or "
-                    "2026-09-25T18:00. Default: 7 days ago. A call still going after midnight began "
-                    "the day before.",
-                },
-                "until": {
-                    "type": "string",
-                    "description": "Latest local date or date-time, same format; a date alone includes "
-                    "that whole day. Default: now.",
-                },
-            }
-        ),
-    },
-    {
-        "name": "call_timeline",
-        "label": "Going through the call",
-        "description": (
-            "What happened on one call or meeting, timeline-wise, from the user's side (only their own "
-            "microphone is ever recorded, never anyone else): the call in stretches, each a heading line "
-            "with its time range and topics, then one short line per moment starting with its time - "
-            "what the user said, asked, decided, planned and joked about. A written answer keeps exactly "
-            "that shape (heading line per stretch, then its moments with their times, picking the ones "
-            "that matter), never a paragraph per stretch; a spoken one gives the few moments that "
-            "matter. The whole session is "
-            "returned, a session split into several rows included; since and until narrow it to part "
-            "of the call. With words true it returns the user's exact words instead, as the speech "
-            "recogniser heard them (times, unclear lines and repeated recogniser loops marked), a page "
-            "at a time: for when they want exactly what they said. Exact words are kept 30 days, the "
-            "timeline longer."
-        ),
-        "input_schema": _obj(
-            {
-                "call": {"type": "string", "description": "The call's id as calls or recall shows it, e.g. call:16."},
-                "since": {"type": "string", "description": "Only from this local date-time, ISO format."},
-                "until": {"type": "string", "description": "Only before this local date-time, ISO format."},
-                "words": {"type": "boolean", "description": "true: the exact transcript lines instead of the timeline."},
-                "page": {"type": "integer", "description": "words only: which page of lines (default 1)."},
-            },
-            ["call"],
-        ),
-    },
-    {
-        "name": "threads",
-        "label": "Looking at your work",
-        "description": (
-            "The user's threads of work, from memory: the projects, tasks and workflows they pursue over days - "
-            "building something, a review, an application, studying, helping someone - each with where it "
-            "stands, what is still open, the apps, sites, repos and people it involves, and when it was last "
-            "touched. list gives the current ones; search finds one by what it is about (\"the voice work\", "
-            "\"the maths for Ravi\"); open gives one thread whole: its timeline (when and where it was worked "
-            "on), its journal facts, the calls, chats with you and episodes around it, and its links. For "
-            "\"continue where I left off\", \"what's the status of X\", \"where was I with X\"."
-        ),
-        "input_schema": _obj(
-            {
-                "action": {"type": "string", "enum": ["list", "search", "open"],
-                           "description": "list (default without query or thread), search, or open."},
-                "query": {"type": "string", "description": "search, open: what the thread is about, in plain words."},
-                "thread": {"type": "string", "description": "open: its id as listed or as memory shows it, e.g. thread:12."},
-            }
-        ),
-    },
-    {
-        "name": "before",
-        "label": "Looking back",
-        "description": (
-            "What the user was doing before a moment, rebuilt from memory the way Yuki's welcome back does: the "
-            "break from the PC nearest at (a meal, sleep, going out: measured from when they were away, the PC "
-            "off or asleep) and their last stretch at the PC before it - time per app and page with titles, the "
-            "sessions, the last thing in front, episodes and journal facts - with the threads of work touched "
-            "then and the other breaks near that time. Without at: the latest break before now (\"continue where "
-            "I left off\", \"what was I doing before I went out\"). event time: the stretch that ended at at, "
-            "whatever came after. \"Before lunch yesterday\": at = yesterday around their lunch, event break, "
-            "then check the breaks it lists."
-        ),
-        "input_schema": _obj(
-            {
-                "at": {"type": "string", "description": "Local date-time, ISO format, e.g. 2026-09-28T13:30. Omit for "
-                                                        "the latest break before now."},
-                "event": {"type": "string", "enum": ["break", "time"],
-                          "description": "break (default): the break nearest at and what came before it; time: the "
-                                         "stretch that ended at at."},
-                "minutes": {"type": "integer", "description": "How much of the stretch before it (default 90)."},
-            }
-        ),
-    },
-    {
-        "name": "links",
-        "label": "Finding that link",
-        "description": (
-            "Web pages the user had open and links people shared with them in chats and email, from memory: the "
-            "address, the page's title and site, when it was seen and for how long, who shared it and where, "
-            "and the thread of work it belongs to. Search by what it was about (\"the Stripe docs\", \"the PR "
-            "Varun sent\") and narrow with since/until; with no query the most recently seen come first (\"that "
-            "link I was looking at\"). It only finds links: it opens and sends nothing."
-        ),
-        "input_schema": _obj(
-            {
-                "query": {"type": "string", "description": "What the page or link was about, in plain words."},
-                "since": {"type": "string", "description": "Earliest local date or date-time, ISO format."},
-                "until": {"type": "string", "description": "Latest local date or date-time; a date alone includes that "
-                                                           "whole day."},
-                "how": {"type": "string", "enum": ["viewed", "shared"],
-                        "description": "viewed: pages they had open; shared: links in messages. Omit for both."},
-                "limit": {"type": "integer", "description": "How many (default 8)."},
-            }
-        ),
+        "description": "Drop a rule, preference or feedback item they withdrew, by its id in brackets (rule:12, "
+                       "feedback:7).",
+        "input_schema": _obj({"text": {"type": "string"}}, ["text"]),
     },
     {
         "name": "about",
         "label": "Checking who that is",
         "description": (
-            "A person the user talks to, from memory's people index (instant, no model): who they are to the user, "
-            "the names and misheard forms they go by, every place the user talks with them (app, DM, group or "
-            "channel) most used lately first with message counts both ways and when each was last used, which "
-            "one is usual and how clearly, and the user's own last messages to them on each, to write the way the "
-            "user writes to them. Use it before messaging someone when the task frame or the people list does not "
-            "already settle where, and to look up a name you do not recognise. When the user corrects which place "
-            "to use for someone (\"no, the other one\", \"use WhatsApp for him\"), pass prefer_route with that "
-            "route's id and their words: it is kept as their lasting choice for that person."
+            "A person the user talks to, from memory's people index: who they are to the user, the names they go by, "
+            "each place they talk (app, DM, group, channel) with counts and when last used, which is usual and how "
+            "clearly, and the user's last messages to them. When the user picks a place for someone, pass "
+            "prefer_route with that route's id and their words."
         ),
         "input_schema": _obj(
             {
-                "name": {"type": "string", "description": "Their name, handle or the name as heard."},
-                "prefer_route": {"type": "string",
-                                 "description": "Only when the user chose a place for them: the route id as about "
-                                                "lists it, e.g. route:12."},
-                "words": {"type": "string",
-                          "description": "With prefer_route: the user's own words that chose it, exactly."},
+                "name": {"type": "string"},
+                "prefer_route": {"type": "string", "description": "e.g. route:12"},
+                "words": {"type": "string", "description": "With prefer_route: their words that chose it, exactly."},
             },
             ["name"],
         ),
@@ -960,31 +550,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "todo",
         "label": "Keeping your to-do list",
-        "description": (
-            "Add to, complete or list the user's to-do list (open loops from memory, "
-            "Yuki's promises, the user's own to-dos and things the user added). When the user says one "
-            "is not needed any more, end it as not_needed; when they say it was never a to-do (captured "
-            "by mistake), as wrong."
-        ),
+        "description": "Add to, complete or list the user's to-dos. not_needed: no longer needed; wrong: never was one.",
         "input_schema": _obj(
             {
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "done", "not_needed", "wrong", "list"],
-                    "description": "add a to-do, mark one done, not needed or wrong (captured by mistake), "
-                    "or list the open ones.",
-                },
-                "text": {
-                    "type": "string",
-                    "description": "add: the to-do, in one short line. done, not_needed, wrong: the "
-                    "item's id exactly as shown in brackets (e.g. todo:3, commit:5, loop:12); list "
-                    "first when you do not have it.",
-                },
-                "due": {
-                    "type": "string",
-                    "description": "add only, when it has a deadline: local ISO date or "
-                    "date-time, e.g. 2026-09-25 or 2026-09-25T17:00.",
-                },
+                "action": {"type": "string", "enum": ["add", "done", "not_needed", "wrong", "list"]},
+                "text": {"type": "string", "description": "add: the to-do; otherwise its id in brackets (todo:3)."},
+                "due": {"type": "string", "description": "add: local ISO date or date-time."},
             },
             ["action"],
         ),
@@ -992,77 +563,55 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "read_file",
         "label": "Reading a file",
-        "description": (
-            "Read a text file on this PC (a document, notes, code, a log, a transcript): its text, "
-            "or the part from start_line on. Only reads; nothing is opened on screen. Binary files "
-            "are refused; very long files are clipped and the result says where to continue."
-        ),
-        "input_schema": _obj(
-            {
-                "path": {"type": "string", "description": "Full path of the file."},
-                "start_line": {"type": "integer", "description": "First line to return (1 = the start)."},
-            },
-            ["path"],
-        ),
+        "description": "Read a text file on this PC (from start_line on); nothing opens on screen. Long files are "
+                       "clipped and say where to continue.",
+        "input_schema": _obj({"path": {"type": "string"}, "start_line": {"type": "integer"}}, ["path"]),
     },
     {
         "name": "fetch_url",
         "label": "Reading a web page",
-        "description": (
-            "Download a web address in the background and return the page's text (title and "
-            "readable text, no scripts), without opening a browser or touching the screen. For "
-            "reading or checking something online; open_url is for showing it to the user."
-        ),
-        "input_schema": _obj(
-            {"url": {"type": "string", "description": "An http or https address."}},
-            ["url"],
-        ),
+        "description": "Download an http(s) page in the background and return its title and readable text, without "
+                       "a browser. open_url is for showing it to the user.",
+        "input_schema": _obj({"url": {"type": "string"}}, ["url"]),
     },
     {
         "name": "spawn_helpers",
         "label": "Asking helpers",
         "description": (
-            "Run 1-4 helpers at the same time, each on its own task with a fresh context, and get "
-            "their short reports back. Helpers can only look and read - memory (recall, activity), "
-            "files, web addresses, windows and tabs - never click, type, switch or run anything, so "
-            "they cannot disturb the desktop. Use them to gather several things at once: context "
-            "from memory for a complex question, reading several files or pages, summarising a long "
-            "transcript, checking a few things in parallel. Each task must stand alone (a helper "
-            "sees nothing of this conversation): say exactly what to find and what to report."
+            "Run 1-4 read-only helpers at once, each on its own self-contained task (they see nothing of this "
+            "conversation): memory, files, web pages, windows and tabs. Their short reports come back."
         ),
         "input_schema": _obj(
-            {
-                "tasks": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 4,
-                    "items": {"type": "string"},
-                    "description": "One self-contained instruction per helper.",
-                },
-            },
+            {"tasks": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "string"}}},
             ["tasks"],
         ),
     },
+    {
+        "name": "hand_over",
+        "label": "Handing it to the task lane",
+        "description": "Reader lane only: this request needs hands on the desktop. It is queued for the task lane "
+                       "the moment you finish; then say in one line that it comes right after.",
+        "input_schema": _obj({"why": {"type": "string"}}),
+    },
 ]
 
-#: The optional field every action tool takes: the brain's own mark that this call finishes
-#: the request, with what to tell the user. It is ``done`` riding on the action itself, the
-#: shape Sonnet actually fills (measured 2026-09-25: in 159 real requests it never sent
-#: ``done`` alongside an action, so every one-action task cost a whole extra model call,
-#: ~2.5 s, only to say it worked). The loop ends the request with it once every call of the
-#: response has succeeded (``Agent._run_tools``); a failure discards it.
+#: The brain's mark that an action completes the request (v3.14, revamp D: a boolean). With ``true`` the request ends
+#: the moment the call succeeds and its own report verifies the effect, with a line written by code from that call and
+#: its report (:mod:`yuki.agent.finish`), not by the model: about 40 output tokens less per finishing call. The line
+#: travels to the voice in this same field of the ``tool_call`` event (a string there, so voice v3.17's
+#: verified-result path reads it unchanged). A string sent here by an older habit counts as ``finish_words``.
 FINISHES_FIELD = "finishes_with"
 FINISHES_SCHEMA: dict[str, Any] = {
+    "type": "boolean",
+    "description": "true when this call alone completes what they asked: it ends the request with a line made from "
+                   "its verified report (no done).",
+}
+#: The text field kept beside it: the outcome in the brain's own words, only when the report cannot name it the way the
+#: user asked (a key, a click).
+FINISH_WORDS_FIELD = "finish_words"
+FINISH_WORDS_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "description": (
-        "Optional. Fill it only when this action by itself completes what the user asked and you "
-        "would not need to read its result first: the reply you would give done, worded as the "
-        "outcome (\"Discord's minimized\"). The request then ends the moment this succeeds and its "
-        "own report verifies the effect, with no further call; if it fails, or its report cannot "
-        "show the effect (a shortcut, a shell command), the message is discarded and you get the "
-        "result and the window after it to check. Leave it out when more steps follow or when you "
-        "need its output."
-    ),
+    "description": "With finishes_with: the outcome in your words, only when its report cannot name it as they asked.",
 }
 
 #: Name -> schema, for validation and lookups.
@@ -1073,9 +622,7 @@ TOOLS_BY_NAME: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOL_SCHEMAS}
 ALL_TOOL_NAMES: tuple[str, ...] = tuple(TOOLS_BY_NAME)
 
 #: The tools that reach out and change something on the machine, as opposed to the
-#: ones that only look. Handy as a ready-made argument for a look-but-do-not-touch
-#: Yuki (``tool_names=[n for n in ALL_TOOL_NAMES if n not in ACTION_TOOL_NAMES]``).
-#: It is a list of names, not a rule: nothing here decides what the model does.
+#: ones that only look. A list of names, not a rule: nothing here decides what the model does.
 ACTION_TOOL_NAMES: tuple[str, ...] = (
     "launch_app",
     "focus_window",
@@ -1093,120 +640,158 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "write_clipboard",
 )
 
-#: The brain's own declaration of what an action risks (``risk``): whether it can be undone and
-#: whether the user asked for exactly this. The code enforces one thing on it, never its own
-#: reading of the command: an action declared irreversible that the user did not ask for is not
-#: run until the user confirms (``Agent._risk_gate``, the ask_user card). Required on
-#: run_powershell (commands can change anything), optional on the other actions.
+
+# ---------------------------------------------------------------------------
+# Tool metadata: what a call can do, a fixed property of the tool and its operation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Traits:
+    """What one tool call can do, fixed per tool and operation (revamp D: the authorization judge, the risk field,
+    the input leases). Never read from words: the operation is a fixed argument of the tool (``window_action``'s and
+    ``tab``'s ``action`` enum, ``type_text``'s ``press_enter`` boolean).
+
+    Attributes:
+        kinds: The autonomy-policy kinds it falls under (``yuki.ui.policy`` KINDS: read_screen, open_apps,
+            click_type, send_messages, files, money); empty for reads and Yuki's own notes.
+        needs: ``input`` (the global mouse and keyboard), ``focus`` (brings a window forward), ``window`` (acts on one
+            window through UI Automation, nothing global), ``none``.
+        destroys: It can close, end, delete or overwrite something (a window, an app, a tab, files).
+        reaches: It can send, post or submit something to another person, or reach anything at all (a shell).
+    """
+
+    kinds: tuple[str, ...] = ()
+    needs: str = "none"
+    destroys: bool = False
+    reaches: bool = False
+
+
+#: Per tool. Keys and hotkeys can close or send anything (Ctrl+W closed the user's tabs; Enter sends), so they destroy
+#: and reach whatever the window; a shell can do anything.
+TOOL_TRAITS: dict[str, Traits] = {
+    "launch_app": Traits(("open_apps",), "focus"),
+    "focus_window": Traits(("open_apps",), "focus"),
+    "open_url": Traits(("open_apps",), "focus"),
+    "open_yuki": Traits((), "focus"),
+    "click": Traits(("click_type",), "input"),
+    "type_text": Traits(("click_type",), "input"),
+    "hotkey": Traits(("click_type", "send_messages"), "input", destroys=True, reaches=True),
+    "press": Traits(("click_type", "send_messages"), "input", destroys=True, reaches=True),
+    "scroll": Traits(("read_screen",), "input"),
+    "hover": Traits(("read_screen",), "input"),
+    "run_powershell": Traits(("files",), "none", destroys=True, reaches=True),
+    "tab": Traits(("open_apps",), "window"),
+    "app_volume": Traits(("open_apps",), "none"),
+    "window_action": Traits(("open_apps",), "window"),
+    "write_clipboard": Traits(("click_type",), "none"),
+}
+#: Per operation, where one tool's operations differ (the fixed enum or boolean argument that names it).
+OP_TRAITS: dict[tuple[str, str], Traits] = {
+    ("window_action", "close"): Traits(("open_apps",), "window", destroys=True),
+    ("window_action", "focus"): Traits(("open_apps",), "focus"),
+    ("tab", "close"): Traits(("open_apps",), "window", destroys=True),
+    ("type_text", "submit"): Traits(("click_type", "send_messages"), "input", reaches=True),
+}
+
+
+def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
+    """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool)."""
+    tool_input = tool_input or {}
+    op = None
+    if name in ("window_action", "tab"):
+        op = str(tool_input.get("action") or "")
+    elif name == "type_text" and tool_input.get("press_enter") is True:
+        op = "submit"
+    if op is not None and (name, op) in OP_TRAITS:
+        return OP_TRAITS[(name, op)]
+    return TOOL_TRAITS.get(name, Traits())
+
+
+#: Tools some operation of which can destroy or reach someone: they carry the ``risk`` field (revamp D, 07 E1: the
+#: rest no longer spend output tokens on it).
+RISK_TOOLS: tuple[str, ...] = tuple(
+    n for n in ACTION_TOOL_NAMES
+    if TOOL_TRAITS.get(n, Traits()).destroys or TOOL_TRAITS.get(n, Traits()).reaches
+    or any(t.destroys or t.reaches for (tool, _op), t in OP_TRAITS.items() if tool == n)
+)
+
+#: The brain's own declaration of what an action risks (``risk``): whether it can be undone and whether the user asked
+#: for exactly this. Enforced in code on one point only: declared irreversible and not asked for -> the user confirms
+#: first. Required on run_powershell; only on :data:`RISK_TOOLS`; ``effect`` only when irreversible.
 RISK_FIELD = "risk"
 RISK_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "description": (
-        "Your judgement of this action, before it runs. reversible is false when its effect cannot "
-        "be undone from here: files deleted outright (not to the Recycle Bin), a closed window or "
-        "killed program losing unsaved work, a message, email or post sent, a purchase or payment, "
-        "settings or data overwritten with no copy. Reading, listing, opening, focusing, switching, "
-        "scrolling and typing into a field without sending are reversible."
-    ),
+    "description": "Before it runs: reversible false when its effect cannot be undone from here (sent, deleted "
+                   "outright, unsaved work lost, data overwritten).",
     "properties": {
         "reversible": {"type": "boolean"},
-        "user_asked": {
-            "type": "boolean",
-            "description": "true only when the user explicitly asked for this very effect in this request.",
-        },
-        "effect": {
-            "type": "string",
-            "description": "In a few plain words for the user: what it changes and what would be lost.",
-        },
+        "user_asked": {"type": "boolean", "description": "They asked for this very effect in this request."},
+        "effect": {"type": "string", "description": "Only when not reversible: what it changes, in a few words."},
     },
-    "required": ["reversible", "user_asked", "effect"],
+    "required": ["reversible", "user_asked"],
     "additionalProperties": False,
 }
 
-#: The brain's own declaration that an action follows a playbook the task frame showed (``playbook``: its id, "pb:12"),
-#: like ``risk``: model judgement, never text matching. The loop records it in the run trace and memory's ledger logs it
-#: as ``cited``, so whether a playbook was ever used - and how that went - is measured (revamp Phase C, 03 §7.4).
+#: The brain's own declaration that an action follows a playbook the task frame showed (``playbook``: "pb:12"), so its
+#: use is measured (revamp Phase C, 03 §7.4).
 PLAYBOOK_FIELD = "playbook"
-PLAYBOOK_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "description": "Optional: the id (pb:N) of the task frame's playbook this action follows; leave it out otherwise.",
-}
+PLAYBOOK_SCHEMA: dict[str, Any] = {"type": "string", "description": "The frame playbook (pb:N) this follows, if one."}
 
 for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional fields on each action's schema
-    TOOLS_BY_NAME[_name]["input_schema"]["properties"][FINISHES_FIELD] = FINISHES_SCHEMA
-    TOOLS_BY_NAME[_name]["input_schema"]["properties"][RISK_FIELD] = RISK_SCHEMA
-    TOOLS_BY_NAME[_name]["input_schema"]["properties"][PLAYBOOK_FIELD] = PLAYBOOK_SCHEMA
+    _props = TOOLS_BY_NAME[_name]["input_schema"]["properties"]
+    _props[FINISHES_FIELD] = FINISHES_SCHEMA
+    _props[FINISH_WORDS_FIELD] = FINISH_WORDS_SCHEMA
+    if _name in RISK_TOOLS:
+        _props[RISK_FIELD] = RISK_SCHEMA
+    _props[PLAYBOOK_FIELD] = PLAYBOOK_SCHEMA
 TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", RISK_FIELD]
 
-#: The optional first field of the thinker's actions and slower reads (docs/VOICE.md v3.14, "one voice narrates
-#: live steps"): the few words Yuki's voice says as this step starts. First in each schema, so it is written first
-#: and can be spoken while the rest of the call is still streaming (yuki.agent.stream_partial). The voice decides
-#: when it is worth saying (only into a noticeable silence, never over the user, never once the outcome is known);
-#: a typed request ignores it. The brain's words about the call, not what the call does: left out wherever calls
-#: are compared (yuki.agent.loop).
+#: The voice's step line (docs/VOICE.md v3.14): the few words Yuki's voice says as a step starts. Only on a spoken
+#: request's tools (:func:`with_step_lines`), optional there since revamp D (07 E1: heard 0 of 9 times when required;
+#: a typed request never carried it usefully). The brain's words about the call, not what it does: left out wherever
+#: calls are compared (yuki.agent.loop).
 STEP_FIELD = "say_now"
-STEP_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "description": (
-        "Voice requests only, optional, written first: the few words you say aloud as this step starts, first "
-        "person, present tense (\"Opening your Warp tabs.\"), when they would otherwise wait in silence for it. "
-        "Never an outcome, a guess or your reasoning, never words already said."
-    ),
-}
-#: The tools that carry it: every action, and the reads that can take a while.
+#: The tools that may carry it: every action, and the reads that can take a while.
 STEP_TOOLS: tuple[str, ...] = ACTION_TOOL_NAMES + (
-    "look_at_window", "read_page", "read_tabs", "recall", "activity", "calls", "call_timeline", "read_file",
-    "fetch_url", "spawn_helpers", "threads", "before", "links",
+    "look_at_window", "read_page", "read_tabs", "memory", "read_file", "fetch_url", "spawn_helpers",
 )
 STEP_TOOLS = tuple(n for n in STEP_TOOLS if n in TOOLS_BY_NAME)   # (a build without one of them)
-for _name in STEP_TOOLS:  # plumbing: first in the schema, so it streams first
-    _schema = TOOLS_BY_NAME[_name]["input_schema"]
-    _schema["properties"] = {STEP_FIELD: STEP_SCHEMA, **_schema["properties"]}
-
-#: The same field for a spoken request (v3.14b): required there. Offline 29 Sept the fast first pass wrote it on 1 of
-#: 13 steps of a long search and 1 of 3 in the Warp session, so the voice had nothing to say while the steps ran.
 STEP_SCHEMA_VOICE: dict[str, Any] = {
     "type": "string",
-    "description": (
-        "The few words you say aloud as this step starts: what you are doing right now, first person, present "
-        "tense (\"Opening your Warp tabs.\", \"Searching for it now.\"), never an intention (\"Let me ...\": Yuki's "
-        "voice drops those as thinking aloud). Said only if they would otherwise wait in silence. Never an outcome, "
-        "a guess or your reasoning, never words already said."
-    ),
+    "description": "Optional, for a step they would wait on in silence: the few words you say as it starts, first "
+                   "person, present tense (\"Opening your Warp tabs.\"), never an outcome or a guess.",
 }
+#: Kept for callers that import it (the typed schema no longer carries the field).
+STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 
 
 def with_step_lines(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The tool list for a spoken request: ``say_now`` required, last, on every step tool (a copy; plumbing)."""
+    """The tool list for a spoken request: the optional ``say_now`` last on every step tool (a copy; plumbing).
+
+    Last, not first (v3.14b): written first it primed the fast pass's choice of key (the Warp bench); the line is only
+    said while its step runs. Optional since revamp D (07 E1)."""
     out = []
     for tool in tools:
         if tool.get("name") in STEP_TOOLS:
             schema = dict(tool["input_schema"])
-            # Last, not first (v3.14b): written first it primed the fast pass's choice of key (the Warp bench's tab
-            # task: 5 of 12 unverified first keys with it first, 2 of 6 with it last, 4 of 12 before, optional);
-            # the line is only said while its step runs, so streaming it ahead of the call bought nothing.
             props = {**{k: v for k, v in schema.get("properties", {}).items() if k != STEP_FIELD},
                      STEP_FIELD: STEP_SCHEMA_VOICE}
             schema["properties"] = props
-            schema["required"] = [*[r for r in schema.get("required", []) if r != STEP_FIELD], STEP_FIELD]
+            schema["required"] = [r for r in schema.get("required", []) if r != STEP_FIELD]
             tool = {**tool, "input_schema": schema}
         out.append(tool)
     return out
 
-#: What a ``done`` message says about the PC as it is now (docs/VOICE.md v3.14, a state claim needs evidence): the
-#: brain names the windows whose present state its message asserts, and the loop checks, from this request's own
-#: calls and their verified reports, that it looked at each or acted on it with a verified result (never by
-#: reading the message). ``[]`` when the message says nothing about how something on the PC is now.
+#: What a ``done`` message says about the PC as it is now (docs/VOICE.md v3.14): the windows whose present state it
+#: asserts; the loop checks, from this request's own calls and their verified reports, that each was looked at or
+#: acted on with a verified result (never by reading the message).
 ABOUT_FIELD = "about"
 ABOUT_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "integer"},
-    "description": (
-        "The hwnds of the windows whose present state your message tells them (open or closed, full screen, which "
-        "tab or page shows, what is playing, what it says), [] when it says nothing about how something on the PC "
-        "is now. A window named here must have been read in this request (look_at_window, read_tabs, read_page, "
-        "or the view attached after your actions) or acted on with a verified result; if not, look first."
-    ),
+    "description": "hwnds whose present state your message tells (open, full screen, which tab shows, what plays); "
+                   "each read or acted on with a verified result in this request. [] for none.",
 }
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][ABOUT_FIELD] = ABOUT_SCHEMA
 TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD]
@@ -1218,8 +803,7 @@ AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
 #: twice: the helper is only shown these, a call to anything else is refused without running, and
 #: its backend exposes only the reading functions.
 HELPER_TOOLS: tuple[str, ...] = (
-    "look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
-    "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links",
+    "look_at_desktop", "look_at_window", "read_page", "read_tabs", "memory", "read_file", "fetch_url",
 )
 
 #: Actions after which the loop attaches a fresh read of the window acted on to
@@ -1289,6 +873,7 @@ def available_tool_names(
     *,
     screenshot_policy: str | None = None,
     memory: bool = True,
+    lane_tools: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Every tool the model may be shown, in registry order.
 
@@ -1298,12 +883,17 @@ def available_tool_names(
             default.
         memory: whether Yuki's memory is installed; without it the
             :data:`MEMORY_TOOLS` are left out.
+        lane_tools: the :data:`LANE_ONLY_TOOLS` this lane is shown (the reader's
+            ``hand_over``); every other lane-only tool is left out.
 
     Returns:
         The names, minus any whose policy switches them off entirely.
     """
     allowed = resolve_tool_names(names)
-    dropped: set[str] = set()
+    extra = set(lane_tools or ())
+    if allowed is not None and extra:
+        allowed = tuple(n for n in ALL_TOOL_NAMES if n in set(allowed) | extra)
+    dropped: set[str] = set(LANE_ONLY_TOOLS) - extra
     if effective_screenshot_policy(screenshot_policy) == "never":
         dropped |= set(POLICY_GATED_TOOLS)
     if not memory:
@@ -1353,6 +943,7 @@ def tool_params(
     names: Iterable[str] | None = None,
     screenshot_policy: str | None = None,
     memory: bool = True,
+    lane_tools: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Return the tool definitions for a request.
 
@@ -1376,7 +967,7 @@ def tool_params(
         module copy.
     """
     allowed = set(
-        available_tool_names(names, screenshot_policy=screenshot_policy, memory=memory)
+        available_tool_names(names, screenshot_policy=screenshot_policy, memory=memory, lane_tools=lane_tools)
     )
     tools = [
         {k: v for k, v in t.items() if k != "label"}
@@ -1390,18 +981,32 @@ def tool_params(
     return tools
 
 
-def tool_label(name: str) -> str:
+#: The phrase for each kind of the one memory tool (and for its old tool names, which the voice and the UI may still
+#: be handed): what the step is doing, in plain words.
+MEMORY_KIND_LABELS: dict[str, str] = {
+    "recall": "Remembering", "activity": "Looking at how your time went", "calls": "Checking your calls",
+    "call_timeline": "Going through the call", "threads": "Looking at your work", "before": "Looking back",
+    "links": "Finding that link",
+}
+
+
+def tool_label(name: str, tool_input: dict[str, Any] | None = None) -> str:
     """The one-line human phrase for a tool, for the UI to show while it runs.
 
     Args:
         name: Tool name as the model called it.
+        tool_input: Its arguments, when the caller has them (the memory tool's phrase follows its kind).
 
     Returns:
         The tool's ``label``, or an empty string for a name that is not a tool --
         the UI is not the place to raise over an unknown tool.
     """
+    if name == "memory" and isinstance(tool_input, dict) and tool_input.get("kind") in MEMORY_KIND_LABELS:
+        return MEMORY_KIND_LABELS[str(tool_input["kind"])]
     schema = TOOLS_BY_NAME.get(name)
-    return str(schema.get("label") or "") if schema else ""
+    if schema:
+        return str(schema.get("label") or "")
+    return MEMORY_KIND_LABELS.get(name, "")
 
 
 def unavailable_tool(name: str, available: Iterable[str]) -> "ToolOutcome":
@@ -1679,6 +1284,13 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.perception.tabs").read_tabs(hwnd, budget_s=budget_s)
+
+    def element_action(self, hwnd: int, element: dict[str, Any], verb: str, **kwargs: Any) -> Any:
+        """:func:`yuki.actions.patterns.element_action`: a read element acted on through its UI Automation pattern
+        (revamp D, S7), or ``None`` when it cannot be (the dispatcher then uses the mouse or keys)."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.patterns").element_action(hwnd, element, verb, **kwargs)
 
     def select_tab(self, hwnd: int, index: int, *, expect_name: str | None = None) -> Any:
         """:func:`yuki.actions.tabs.select_tab`: one tab of a window made the one showing, verified."""
@@ -2006,6 +1618,15 @@ class Dispatcher:
         #: The focus read of the last situation block (a ``FocusSnapshot``; ``None``: none, or focus in Yuki's own
         #: window): the task frame's "this" (``yuki.agent.frame``) reuses it instead of reading again.
         self.last_focus: Any = None
+        #: Quieter hands (revamp D, S7): the gate that waits for the user to stop typing or moving the mouse before
+        #: global input (``yuki.actions.leases.InputGate``; ``None``: no waiting, the default for stub desks and the
+        #: voice's hands), the lines it wants said (the agent loop drains them into ``Say`` events), and the cancel
+        #: check it polls while it waits.
+        self.input_gate: Any = None
+        self.notices: Any = None
+        self.cancel_check: Callable[[], bool] | None = None
+        #: Tab names by window and id, from the latest read of each strip (the finish line names the tab).
+        self.tab_names: dict[int, dict[str, str]] = {}
 
     def enable_now(self, settings: Any = None) -> bool:
         """Turn the per-turn Now picture on from ``settings`` (``now_in_situation``, ``now_wait_ms``,
@@ -3062,6 +2683,61 @@ class Dispatcher:
                 outcome.payload = {**outcome.payload, "element_target": label}
         return outcome
 
+    # -- quieter hands (revamp D, S7) ----------------------------------------
+
+    def _read_element(self, tool_input: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+        """``(hwnd, element)`` of the read element an input names (after :meth:`_element_target` validated it)."""
+        try:
+            element_id = tool_input.get("element")
+            if element_id is None or isinstance(element_id, bool):
+                return None
+            hwnd = self._opt_hwnd(tool_input)
+            hwnd = self._latest_tree_hwnd if hwnd is None else hwnd
+            if hwnd is None or hwnd not in self._latest_trees:
+                return None
+            element = self._latest_trees[hwnd][1].get(int(element_id))
+            return (int(hwnd), element) if isinstance(element, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _pattern_first(self, name: str, tool_input: dict[str, Any], verb: str, **kwargs: Any) -> ToolOutcome | None:
+        """The action through the element's UI Automation pattern (no mouse, no keys, no focus taken), or ``None`` when
+        the backend has no such hand, the element offers no pattern for it or it could not be found again."""
+        act = getattr(self.backend, "element_action", None)
+        found = self._read_element(tool_input)
+        if not callable(act) or found is None:
+            return None
+        hwnd, element = found
+        try:
+            result = act(hwnd, element, verb, **kwargs)
+        except Exception:  # noqa: BLE001 - the mouse or keys then
+            return None
+        if result is None:
+            return None
+        outcome = self._from_action(name, result)
+        if isinstance(outcome.payload, dict):
+            outcome.payload = {**outcome.payload, "via": "uia_pattern"}
+        if outcome.ok:
+            self._mark_acted(hwnd, name)
+        return outcome
+
+    #: Keys that act system-wide and type nothing (the press tool's media keys, a fixed key vocabulary): they need no
+    #: wait for the user to stop typing.
+    SYSTEM_KEYS: frozenset[str] = frozenset({"playpause", "nexttrack", "prevtrack", "stop", "volumeup", "volumedown",
+                                             "volumemute"})
+
+    def _before_input(self, name: str) -> None:
+        """Wait while the user is typing or using the mouse before global input (:attr:`input_gate`); one line goes
+        to :attr:`notices`. Raises :class:`ToolError` (nothing sent) when they keep going past the gate's limit."""
+        gate = self.input_gate
+        if gate is None:
+            return
+        notices = self.notices
+        result = gate.wait(notify=(notices.put if notices is not None else None), cancelled=self.cancel_check)
+        if not result.get("ok", True):
+            raise ToolError(f"Not sent: {result.get('why') or 'the user was using the keyboard or mouse'}; nothing "
+                            f"was typed or clicked. Try again in a moment, or tell them you are waiting.")
+
     def _do_click(self, tool_input: dict[str, Any]) -> ToolOutcome:
         button = tool_input.get("button") or "left"
         if button not in {"left", "right", "middle"}:
@@ -3070,6 +2746,11 @@ class Dispatcher:
         target = None
         if not label and self.guard_raw_clicks:
             target = self._check_raw_point(x, y, tool_input)
+        if label and button == "left" and self._opt_int(tool_input, "clicks", 1) == 1:
+            via = self._pattern_first("click", tool_input, "click")
+            if via is not None:
+                return self._labelled(via, label)
+        self._before_input("click")
         outcome = self._labelled(
             self._from_action(
                 "click",
@@ -3183,6 +2864,13 @@ class Dispatcher:
             options["clear"] = True
         if tool_input.get("accept_suggestion"):
             options["accept_suggestion"] = True   # likewise (v3.15)
+        if target is not None and options.get("clear") and not options["press_enter"] and not options.get(
+                "accept_suggestion"):
+            # Replacing a field's contents is what its writable Value does: no click, no keys, no clipboard.
+            via = self._pattern_first("type_text", tool_input, "set_value", value=text)
+            if via is not None:
+                return self._labelled(via, target[3])
+        self._before_input("type_text")
         if target is None:
             return self._from_action("type_text", self.backend.type_text(text, **options))
         # Focus the element first by clicking it, guarded to its window; type
@@ -3200,15 +2888,20 @@ class Dispatcher:
         keys = tool_input.get("keys")
         if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
             raise ToolError(f"'keys' must be a non-empty list of strings, got {keys!r}")
+        if not (len(keys) == 1 and keys[0].strip().casefold() in self.SYSTEM_KEYS):
+            self._before_input("hotkey")
         return self._from_action(
             "hotkey", self.backend.hotkey(*keys, expect_hwnd=self._opt_hwnd(tool_input))
         )
 
     def _do_press(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        key = self._need_str(tool_input, "key")
+        if key.strip().casefold() not in self.SYSTEM_KEYS:
+            self._before_input("press")
         return self._from_action(
             "press",
             self.backend.press(
-                self._need_str(tool_input, "key"),
+                key,
                 times=self._opt_int(tool_input, "times", 1),
                 expect_hwnd=self._opt_hwnd(tool_input),
             ),
@@ -3216,6 +2909,12 @@ class Dispatcher:
 
     def _do_scroll(self, tool_input: dict[str, Any]) -> ToolOutcome:
         x, y, guard, label = self._point(tool_input)
+        if label:
+            via = self._pattern_first("scroll", tool_input, "scroll", dy=self._opt_int(tool_input, "dy", 0),
+                                      dx=self._opt_int(tool_input, "dx", 0))
+            if via is not None:
+                return self._labelled(via, label)
+        self._before_input("scroll")
         return self._labelled(
             self._from_action(
                 "scroll",
@@ -3240,6 +2939,7 @@ class Dispatcher:
 
     def _do_hover(self, tool_input: dict[str, Any]) -> ToolOutcome:
         x, y, guard, label = self._point(tool_input)
+        self._before_input("hover")
         return self._labelled(self._from_action("hover", self.backend.hover(x, y, expect_hwnd=guard, label=label)),
                               label)
 
@@ -3346,6 +3046,9 @@ class Dispatcher:
         strip = read(hwnd, budget_s=self.TABS_READ_S)
         payload = _plain(strip)
         tabs = list(getattr(strip, "tabs", None) or [])
+        if tabs:
+            self.tab_names[int(hwnd)] = {str(getattr(t, "tab_id", "") or ""): str(getattr(t, "name", "") or "")
+                                         for t in tabs if getattr(t, "tab_id", None)}
         error = getattr(strip, "error", None)
         ok = bool(tabs) or not error
         summary = (f"{len(tabs)} tab{'' if len(tabs) == 1 else 's'}" if tabs

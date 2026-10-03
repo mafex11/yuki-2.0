@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from yuki.agent.tools import HELPER_TOOLS, MEMORY_TOOLS, TOOLS_BY_NAME, Dispatcher, ToolOutcome
+from yuki.agent.tools import HELPER_TOOLS, MEMORY_READ_KINDS, MEMORY_TOOLS, TOOLS_BY_NAME, Dispatcher, ToolOutcome
 from yuki.agent.untrusted import EXTERNAL_TEXT_TOOLS, source_for, wrap_blocks
 
 #: Longest report a helper hands back (characters).
@@ -49,8 +49,9 @@ READ_ONLY_BACKEND: frozenset[str] = frozenset({
 
 HELPER_SYSTEM = (
     "You are a helper for Yuki, a personal assistant on the user's Windows PC. Yuki gives you one task. "
-    "You can only look and read: the memory of the user's past activity, chats and calls (recall, activity, "
-    "calls, call_timeline: for what happened on a call, list it with calls and read its timeline), "
+    "You can only look and read: the memory of the user's past activity, chats and calls (the memory tool, by "
+    "kind: recall, activity, calls, call_timeline - for what happened on a call, list it with calls and read its "
+    "timeline - threads, before, links), "
     "files, web addresses, and the windows and tabs on screen. You cannot click, type, open, close or change "
     "anything, and you cannot ask the user. Gather what the task needs with as few calls as you can (several "
     "calls in one turn save time), then reply with a short plain report of what you found: the facts with "
@@ -154,6 +155,9 @@ class Helper:
     # -- tools -----------------------------------------------------------------------------
 
     def _run_tool(self, name: str, tool_input: dict[str, Any]) -> ToolOutcome:
+        if name in MEMORY_READ_KINDS and "memory" in self.allowed:
+            # revamp D: the seven memory reads are one tool; a call by an old name runs as that kind
+            name, tool_input = "memory", {**tool_input, "kind": name}
         if name not in self.allowed:
             return ToolOutcome(name=name, ok=False, summary=f"{name} is not available to helpers",
                                content=[{"type": "text", "text": f"{name} is not available: helpers only look "

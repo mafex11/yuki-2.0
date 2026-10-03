@@ -138,7 +138,7 @@ def test_standing_context_shows_coach_feedback_with_ids_forget_rule_takes(store)
                                      origin="model", at=at("15:37"))
     client = MemoryClient(store)
     text = client.standing_context()
-    coach = text.split("What the user said back to Yuki's coach cards")[1]
+    coach = text.split("What the user said back to your own cards")[1]   # one Yuki (revamp D): no separate coach
     assert f"[rule:{pref}]" in coach and f"[feedback:{fb}]" in coach
     assert client.revoke_rule(f"feedback:{fb}") == fb and client.revoke_rule(f"rule:{pref}") == pref
 

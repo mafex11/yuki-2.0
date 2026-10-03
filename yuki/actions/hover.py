@@ -117,3 +117,9 @@ def hover(x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") ->
 
 
 __all__ = ["hover"]
+
+
+# Revamp D (S7): the pointer move holds the input lease like every global-input action (yuki.actions.leases).
+from yuki.actions.leases import leased as _leased  # noqa: E402
+
+hover = _leased(hover)

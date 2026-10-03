@@ -79,7 +79,7 @@ RULE_HEADINGS = (
 #: Every heading memory's standing context uses (``yuki.memory.api.STANDING_HEADINGS``, a fixed format of memory's
 #: own), so :func:`split_standing` can tell "memory's format, no rule in it" from "a format it does not know".
 STANDING_SECTION_HEADINGS = RULE_HEADINGS + (
-    "What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
+    "What the user said back to your own cards (feedback on that kind of card, not a rule for "
     "everything; forget_rule takes these ids too):",
     "The user's own sites, accounts and links (use them directly when the user names one, e.g. \"open my "
     "portfolio\"):",
@@ -1160,6 +1160,19 @@ class MemoryAccess:
         The text says plainly that nothing was saved.
         """
         started = time.perf_counter()
+        merged = name == "memory"
+        if merged:
+            # Revamp D: the seven memory reads are one tool, memory(kind, ...); each kind runs its old handler on the
+            # same arguments, and the outcome keeps the tool's name (the chat and the voice pair calls by name).
+            from yuki.agent.tools import MEMORY_READ_KINDS
+
+            kind = str(tool_input.get("kind") or "").strip()
+            if kind not in MEMORY_READ_KINDS:
+                outcome = _fail("memory", f"kind must be one of {', '.join(MEMORY_READ_KINDS)}, got {kind!r}",
+                                {"error": "bad kind", "kind": kind})
+                outcome.elapsed_ms = (time.perf_counter() - started) * 1000
+                return outcome
+            name, tool_input = kind, {k: v for k, v in tool_input.items() if k != "kind"}
         try:
             if name == "recall":
                 outcome = self._recall(tool_input)
@@ -1195,6 +1208,10 @@ class MemoryAccess:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
             outcome = _fail(name, str(exc), {"error": str(exc)})
+        if merged:
+            outcome.name = "memory"
+            if isinstance(outcome.payload, dict):
+                outcome.payload = {**outcome.payload, "kind": name}
         outcome.elapsed_ms = (time.perf_counter() - started) * 1000
         return outcome
 

@@ -175,7 +175,8 @@ STANDING_RULE_GROUPS: tuple[str, ...] = ("rule", "preference")
 STANDING_HEADINGS: dict[str, str] = {
     "rule": "Rules the user set for Yuki:",
     "preference": "The user's preferences about how Yuki talks or works:",
-    "coach": ("What the user said back to Yuki's coach cards (feedback on that kind of card, not a rule for "
+    # One Yuki (the user's requirement, 3 Oct 2026): the cards are Yuki's own, never a separate "coach".
+    "coach": ("What the user said back to your own cards (feedback on that kind of card, not a rule for "
               "everything; forget_rule takes these ids too):"),
     "resource": ("The user's own sites, accounts and links (use them directly when the "
                  "user names one, e.g. \"open my portfolio\"):"),
@@ -1823,13 +1824,13 @@ class MemoryClient:
             when = (f"the last card was {last[-1].kind} at {datetime.fromtimestamp(last[-1].at):%a %H:%M}" if last
                     else "no card yet")
             said = [c for c in silent if c["reason"]][-3:]
-            lines.append(f"- You looked {len(silent)} times in the last {COACH_QUIET_S / 3600:.0f} h and showed "
-                         f"nothing ({when})" + (". Your latest reasons:" if said else "."))
+            lines.append(f"- You looked {len(silent)} times in the last {COACH_QUIET_S / 3600:.0f} h and put up no "
+                         f"card ({when})" + (". Your latest reasons:" if said else "."))
             for c in said:
                 lines.append(f"  - {datetime.fromtimestamp(c['at']):%H:%M} {_clip_sentences(c['reason'], 220) or ''}")
         if not lines:
             return ""
-        head = "Your own cards (what you put on screen by yourself) right now:"
+        head = "Your own cards (the ones you put on their screen by yourself) right now:"
         text = "\n".join([head, *lines])
         while len(text) > COACH_CONTEXT_CHARS and len(lines) > 1:
             lines.pop()
@@ -2972,6 +2973,39 @@ class MemoryClient:
         from yuki.memory import practice as _p
 
         return _p.record_run(self.store, run)
+
+    def control_record(self, app: str | None, tool: str, control: str) -> dict:
+        """How a control's earlier steps went in the run traces (revamp D, S2; ``yuki.memory.practice.control_record``):
+        the brain's finish gate learns from it which controls are expected-unverifiable. No model; a few ms."""
+        from yuki.memory import practice as _p
+
+        return _p.control_record(self.store, app=app, tool=tool, control=control)
+
+    def sent_messages(self, app: str | None, since: float, *, limit: int = 12) -> list[dict]:
+        """The user's own messages memory's watcher captured since ``since`` (epoch s) in ``app``'s chats, newest
+        first: ``{"text", "at", "first_seen", "thread", "status"}`` (revamp D, S2: the independent confirmation of a
+        send, from ``messages.is_me``). Text is decrypted here, in-process, for the caller's similarity check only.
+        Never raises (``[]``)."""
+        from yuki.memory.store import app_key as _key
+
+        proc = _key(app) if app else None
+        try:
+            rows = self.store._query(
+                "SELECT m.thread_id, m.first_seen, m.at, m.status, m.text_ciphertext FROM messages m JOIN threads t"
+                " ON t.id = m.thread_id WHERE m.is_me = 1 AND m.first_seen >= ? AND m.text_ciphertext IS NOT NULL"
+                " AND (? IS NULL OR t.process = ? OR lower(t.app) = ?) ORDER BY m.first_seen DESC LIMIT ?",
+                (float(since), proc, proc, proc, int(limit)))
+        except Exception:  # noqa: BLE001 - an older database, or none
+            return []
+        out = []
+        for r in rows:
+            try:
+                text = self.store._dec(r["text_ciphertext"]) or ""
+            except Exception:  # noqa: BLE001
+                continue
+            out.append({"text": text, "at": r["at"], "first_seen": r["first_seen"], "thread": r["thread_id"],
+                        "status": r["status"]})
+        return out
 
     def record_hand_trace(self, session_id: str | None, name: str, args: dict | None, ok: bool, verified: bool | None,
                           report: str, ms: float, *, at: float | None = None, app: str | None = None,

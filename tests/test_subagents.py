@@ -149,8 +149,9 @@ def test_helper_tool_set_is_read_only():
     from yuki.agent.tools import ACTION_TOOL_NAMES
 
     names = {t["name"] for t in helper_tools(True)}
-    assert names == {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "recall", "activity",
-                     "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links"}
+    # revamp D: the seven memory reads are one tool, memory(kind, ...)
+    assert names == {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "memory", "read_file",
+                     "fetch_url"}
     assert not names & set(ACTION_TOOL_NAMES)
     assert not names & {"remember_how", "correct_memory", "remember_rule", "forget_rule", "todo", "watch_for",
                         "spawn_helpers", "ask_user", "say"}
