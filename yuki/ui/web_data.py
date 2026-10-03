@@ -877,20 +877,6 @@ def build_playbook(memory: Any) -> dict[str, Any]:
 # -- Activity ------------------------------------------------------------------------------------------------------
 
 
-#: What an acting step did, by its tool (the agent's closed set of tool names), in the past tense.
-TOOL_DONE = {"click": "Clicked", "type_text": "Typed", "launch_app": "Opened", "open_url": "Opened",
-             "focus_window": "Brought a window forward", "window_action": "Arranged a window", "hotkey": "Pressed",
-             "press": "Pressed", "scroll": "Scrolled", "hover": "Pointed at", "tab": "Switched tabs",
-             "app_volume": "Changed an app’s volume", "run_powershell": "Ran a command",
-             "write_clipboard": "Put text on the clipboard", "todo": "Changed your list", "remember_rule": "Kept a rule",
-             "forget_rule": "Dropped a rule", "correct_memory": "Corrected what I know",
-             "watch_for": "Started keeping an eye out", "remember_how": "Kept how it’s done",
-             "answer_question": "Kept your answer"}
-#: The argument that names what the tool acted on (the agent's own argument names); the rest show their target.
-TOOL_DETAIL = {"type_text": "text", "launch_app": "query", "open_url": "url", "hotkey": "keys", "press": "key",
-               "app_volume": "app", "window_action": "action", "tab": "tab", "run_powershell": "command",
-               "write_clipboard": "text", "todo": "text", "remember_rule": "text", "forget_rule": "text",
-               "correct_memory": "text", "watch_for": "condition", "remember_how": "text", "answer_question": "answer"}
 #: Practice memory's kinds: ways of doing (shown as "using …") and lessons (shown as "lesson …").
 WAY_KINDS = ("procedure", "habit")
 #: Memory's Undo window for something Yuki added (offers: yuki.memory.offers.UNDO_WITHIN_S; to-dos alike).
@@ -904,30 +890,19 @@ def _clip(text: Any, n: int) -> str:
     return t if len(t) <= n else t[: n - 1].rstrip() + "…"
 
 
-#: The to-do tool's own ``action`` values, in the past tense.
-TODO_DONE = {"add": "Added to your list", "done": "Marked done on your list", "not_needed": "Took off your list",
-             "wrong": "Took off your list"}
-
-
 def step_what(step: dict[str, Any]) -> str:
-    """One acting step in plain past-tense words: the tool's verb and what it acted on (its own argument when the tool
-    has one that says so, else the control and window the trace recorded)."""
-    verb = TOOL_DONE.get(str(step.get("tool") or ""), "Did a step")
-    detail = ""
-    key = TOOL_DETAIL.get(str(step.get("tool") or ""))
-    if key:
-        try:
-            args = json.loads(step.get("input") or "{}")
-        except (TypeError, ValueError):
-            args = {}
-        if step.get("tool") == "todo" and isinstance(args, dict):
-            verb = TODO_DONE.get(str(args.get("action") or ""), verb)
-        value = args.get(key) if isinstance(args, dict) else None
-        if isinstance(value, str) and value.strip():
-            detail = f"“{_clip(value, 70)}”" if key in ("text", "condition", "answer", "command") else _clip(value, 70)
-    if not detail and step.get("target"):
-        detail = _clip(step["target"], 80)
-    return f"{verb} {detail}".strip()
+    """One acting step in plain past-tense words, from the one label function of every run surface
+    (:func:`yuki.ui.step_words.describe_step`): the brain's own words for the step when it gave them, else the
+    control's name and the app the trace kept; never the command, typed text, address or keys (revamp 38 §8c)."""
+    from yuki.ui.step_words import ABOUT, describe_step, label_input
+
+    try:
+        args = json.loads(step.get("input") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    args = args if isinstance(args, dict) else {}
+    about = {"element": args.get("name"), "role": args.get("role"), "app": step.get("app_name") or step.get("app")}
+    return describe_step(str(step.get("tool") or ""), {**label_input(args), ABOUT: about}, done=True, limit=90)
 
 
 def step_result(step: dict[str, Any]) -> tuple[str, str]:

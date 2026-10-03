@@ -900,13 +900,10 @@ def _ts(value: Any) -> float:
 
 
 def _label(name: str, tool_input: Any) -> str:
-    """The step's line; the tool registry's own label when it can be had cheaply (yuki-ui has it loaded)."""
-    try:
-        from yuki.ui.status import describe_tool
+    """The step's line, from the one label function of every run surface (plain words, no Qt or agent import)."""
+    from yuki.ui.step_words import describe_step
 
-        return describe_tool(name, tool_input if isinstance(tool_input, dict) else {})
-    except Exception:   # the window process does not load the agent's tool registry
-        return name.replace("_", " ")
+    return describe_step(name, tool_input if isinstance(tool_input, dict) else {})
 
 
 def _summary_line(summary: dict[str, Any]) -> str:

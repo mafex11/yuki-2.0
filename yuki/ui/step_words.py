@@ -35,6 +35,15 @@ NAME_CHARS = 32
 NAME_WORDS = 5
 #: The model's ``what`` is cut to this many characters.
 WHAT_CHARS = 60
+#: The input fields the words are built from (a run surface keeps only these of a call: never the command, typed text
+#: or address).
+LABEL_KEYS = frozenset({WHAT, ABOUT, "query", "app", "action", "press_enter", "mute", "change", "level", "dy", "dx",
+                        "button", "clicks", "kind", "since", "until", "before", "after", "day", "start", "end"})
+
+
+def label_input(tool_input: Any) -> dict[str, Any]:
+    """The part of a call's input the words are built from (:data:`LABEL_KEYS`), for a surface that keeps steps."""
+    return {k: v for k, v in tool_input.items() if k in LABEL_KEYS} if isinstance(tool_input, dict) else {}
 
 # -- names ------------------------------------------------------------------------------------------------------------
 
@@ -446,12 +455,14 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
             finished)}``.
 
     Returns:
-        ``{"icon", "head", "title", "rows" (at most :data:`RETURN_ROWS`), "more" (how many rows did not fit)}``;
-        ``rows`` empty and ``worth`` False when there is nothing to tell beyond the strip's final word.
+        ``{"icon", "head", "title", "rows": [{"text", "icon"}] (at most :data:`RETURN_ROWS`; ``check`` for what
+        happened, ``dash`` for an effect that did not), "more" (how many rows did not fit), "worth"}``: ``worth`` is
+        False when there is nothing to tell beyond the strip's final word. No row carries an undo of any kind (the
+        user, 3 Oct 19:10: "dont show the undo options in this card").
     """
     icon, head = OUTCOME_HEADS.get(outcome, OUTCOME_HEADS["done"])
     opened: list[str] = []
-    rows: list[str] = []
+    rows: list[dict[str, str]] = []
     sent_ok = sent_missed = False
     for st in steps:
         name, args, ok = str(st.get("name") or ""), st.get("input") or {}, st.get("ok")
@@ -465,17 +476,18 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
                 opened.append(thing)
         elif is_effect(name, args):
             if ok is True:
-                line = describe_step(name, args, done=True)
+                row = {"text": describe_step(name, args, done=True), "icon": "check"}
             elif about.get("sends"):
                 continue   # said once, in the title ("Nothing was sent.")
             else:
                 what = plain_what(args.get(WHAT))
                 running = describe_step(name, args)
-                line = f"Didn’t {what}" if what else f"Didn’t finish {running[:1].lower() + running[1:]}"
-            if line not in rows:
-                rows.append(line)
+                row = {"text": f"Didn’t {what}" if what else f"Didn’t finish {running[:1].lower() + running[1:]}",
+                       "icon": "dash"}
+            if row not in rows:
+                rows.append(row)
     if opened:
-        rows.insert(0, "Opened " + _joined(opened))
+        rows.insert(0, {"text": "Opened " + _joined(opened), "icon": "check"})
     nothing_sent = sent_missed and not sent_ok
     title = " ".join(str(text or "").split())
     if outcome == "stopped":
@@ -486,3 +498,13 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
         title = title or "Handed back. You have the controls."
     return {"icon": icon, "head": head, "title": title, "rows": rows[:RETURN_ROWS],
             "more": max(0, len(rows) - RETURN_ROWS), "worth": bool(rows) or nothing_sent}
+
+
+def took_words(seconds: float) -> str:
+    """How long a run took, for the card's footer: ``41 s``, ``1 min 9 s``, ``1 h 2 min``."""
+    secs = max(1, int(round(seconds)))
+    if secs < 60:
+        return f"{secs} s"
+    if secs < 3600:
+        return f"{secs // 60} min {secs % 60} s" if secs % 60 else f"{secs // 60} min"
+    return f"{secs // 3600} h {secs % 3600 // 60} min"

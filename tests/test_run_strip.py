@@ -129,7 +129,7 @@ def bare_ui(qapp):
     ui.bindings = {"cancel": "alt+shift+x"}
     ui.cards, ui._settled, ui._acting = {}, {}, set()
     ui._question = None
-    ui._runs, ui._stopped, ui._stop_hint_shown = {}, set(), False
+    ui._runs, ui._stopped, ui._stop_hint_shown = {}, {}, False
     ui._pending_ask, ui._ask_runs = None, {}
     ui._origin_hwnd = None
     ui._nudge_reply = None
