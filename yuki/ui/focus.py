@@ -233,6 +233,52 @@ def set_no_activate(hwnd: int, enabled: bool) -> bool:
     return True
 
 
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_LAYERED = 0x00080000
+HWND_TOPMOST = -1
+
+
+def is_topmost(hwnd: int) -> bool:
+    """Whether ``hwnd`` is in the topmost band (``WS_EX_TOPMOST``)."""
+    if not hwnd:
+        return False
+    return bool(int(_get_window_long(hwnd, GWL_EXSTYLE)) & WS_EX_TOPMOST)
+
+
+def assert_topmost(hwnd: int) -> tuple[bool, bool]:
+    """Put ``hwnd`` back on top of the topmost band without moving, sizing or activating it.
+
+    A window made topmost once (Qt's ``WindowStaysOnTopHint``) stays in the band, but any other topmost window that
+    comes forward later sits above it. Called on every foreground change (an event, never a poll).
+
+    Returns:
+        ``(was_topmost, ok)``: whether the style already said topmost, and whether ``SetWindowPos`` succeeded.
+    """
+    if not hwnd:
+        return False, False
+    was = is_topmost(hwnd)
+    ok = bool(_user32.SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE))
+    return was, ok
+
+
+def set_click_through(hwnd: int, enabled: bool) -> bool:
+    """Make a layered window let every click and hover through (``WS_EX_TRANSPARENT``) or take them again.
+
+    Returns:
+        True if the style had to be changed.
+    """
+    if not hwnd:
+        return False
+    style = int(_get_window_long(hwnd, GWL_EXSTYLE))
+    wanted = (style | WS_EX_TRANSPARENT | WS_EX_LAYERED) if enabled else (style & ~WS_EX_TRANSPARENT)
+    if wanted == style:
+        return False
+    _set_window_long(hwnd, GWL_EXSTYLE, wanted)
+    return True
+
+
 # -- foreground -------------------------------------------------------------
 
 

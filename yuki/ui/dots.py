@@ -192,10 +192,12 @@ class FaceModel:
             L_(5, 3, 0.5, 0)
             L_(11, 3, 0.5, 0)
         elif s == "not-listening":
-            # Yuki isn't listening (v3.16): the eyes closed to a line, dim (not in the design: the mini island's own
-            # way to say it at a glance; the design has no such state)
+            # Yuki isn't listening (v3.16): the eyes closed to a line, dim, and the design's faint mouth (the mock's
+            # not-listening face, the tray's "off" card: columns 7-9, row 5, level 0.2)
             for c in (4, 5, 11, 12):
                 L_(c, 3, 0.4, 0)
+            for c in (7, 8, 9):
+                L_(c, 5, 0.2, 0)
         else:   # idle
             eyes([3] if blink else [2, 3], 1.0)
             for c in (7, 8, 9):
@@ -662,6 +664,8 @@ class HaloWidget(QWidget):
         self._base: QPixmap | None = None
         self._sheet: QPixmap | None = None
         self._frame_fn = self.frame
+        #: The painted strength (the halo window's fade in; its own window opacity stays 1).
+        self.alpha = 1.0
 
     def _ensure(self) -> None:
         d = L.dpr_of(self)
@@ -754,6 +758,8 @@ class HaloWidget(QWidget):
         self._ensure()
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        if self.alpha < 1.0:
+            p.setOpacity(max(0.0, self.alpha))
         dpr = self._dpr
         rect = e.rect() if hasattr(e, "rect") else self.rect()
         p.setClipRect(rect)

@@ -6,41 +6,52 @@ halo under it (:class:`yuki.ui.dots.HaloWidget`, in its own click-through window
 several apply (:func:`resolve`):
 
 ==================  ====================================================================================
-game-quiet          a full-screen app (a game, a video, a presentation) or the session locked: hidden; the
-                    tray carries the call timer (one clock, never reset)
+game-quiet          a real full screen on the monitor in use (an exclusive or borderless full-screen game, a
+                    full-screen video, a presentation) or the session locked: hidden; the tray carries the
+                    call timer (one clock, never reset). A borderless app that is only maximised is not one.
 needs-you           Yuki asked something and waits (auto-expands: the question and Answer / Stop)
-voice-stopped       voice failed: the reason and the fix (Retry, Settings), on screen at least 8 s
-speaking            Yuki talks: the words being said, "say stop to cut me off"
-hearing, listening  your turn: a live caption where unsure words are dimmed (auto-expands)
-working, thinking   a request runs: the step line, "step n", the time, Stop and the run card's chevron
-done-flash          the run ended: the answer (or Stopped / the error) for 4 s, a stamped check
-quiet-in-call       a call is recorded: "Quiet. You're on Discord." with the rec chip and the session's timer
-not-listening       Yuki isn't listening (switched off, quiet, off for this call): the mini island, eyes shut
-hidden-armed        listening for its name only: the mini island, two resting dots
+voice-stopped       voice failed: the reason and the fix (Retry, Settings), on screen at least 8 s (auto-expands)
+speaking            Yuki talks: "Speaking"; on hover the words being said, "say stop to cut me off"
+hearing, listening  your turn: "Hearing you" / "Listening"; on hover a live caption, unsure words dimmed
+working, thinking   a request runs: "Working · 2/5"; on hover the step line, the time, Stop and the run card
+done-flash          the run ended: the result in a few words for 3 s, a stamped check
+call-notice         a call started recording: "Recording your mic · Discord" for 2.5 s, then nothing
+quiet-in-call       a call is recorded and nothing else goes on: hidden (the timer is in the tray's hover card)
+not-listening       Yuki isn't listening (switched off, quiet, off for this call): hidden (the tray says it)
+hidden-armed        listening for its name only: the tiny resting pill (click-through), or nothing (a setting)
 ==================  ====================================================================================
 
-**The run card** (E7) expands from the island (the chevron, or a click on it while a run goes): the live steps from
+**Compact by default.** Every state but needs-you and voice-stopped shows a compact pill (the face and one short
+word); resting the pointer on it expands it to the full bar with the 300 ms morph, and it folds back 300 ms after
+the pointer leaves. The halo hangs under it only while Yuki hears, thinks or works, or speaks.
+
+**The run card** (E7) expands from the expanded island (the chevron, or a click on it while a run goes): the live steps from
 the chat thread (:class:`yuki.ui.chat_model.ChatModel`), "from memory" and "using your lesson" chips where the agent's
 task frame and its ``playbook`` field say so, the steer box ("added, not yet read" -> "read at step n", measured: the
 next step taken after it was added), Stop, and "I'll take it from here".
 
 Rules it keeps: never takes focus (``WS_EX_NOACTIVATE``; only a click into the steer box lets it take the keyboard,
-and Enter gives it back), sits over full-screen-free desktops on the monitor in use (the foreground window's), hides
-in games, paints from the shared tokens, at most 30 frames a second on the one shared loop, no timer while hidden,
-nothing repaints when idle, and "reduce motion" draws still frames. The controller (:class:`Island`) decides only what
-is on screen; every action goes out as a signal for :mod:`yuki.ui.app` to carry out.
+and Enter gives it back), sits over full-screen-free desktops on the monitor in use (the foreground window's), stays
+above other always-on-top windows (``HWND_TOPMOST`` re-asserted on every foreground change, an event), hides in real
+full screens, paints from the shared tokens, at most 30 frames a second on the one shared loop, no timer while hidden,
+nothing repaints when idle, and "reduce motion" draws still frames. Its fades are painted (an opacity effect on the
+panel, an alpha on the halo), never the window's own opacity, so a shown island is always drawn at full strength (3
+Oct: a bar left at window opacity 0 was invisible while its halo showed). What it does is logged without content
+(:meth:`Island.log`). The controller (:class:`Island`) decides only what is on screen; every action goes out as a
+signal for :mod:`yuki.ui.app` to carry out.
 """
 
 from __future__ import annotations
 
 import ctypes
+import math
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
+from PySide6.QtGui import QColor, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QLineEdit, QSizePolicy, QWidget
 
 from yuki.ui import lattice as L
 from yuki.ui import tokens as T
@@ -62,8 +73,26 @@ MORPH_MS = int(L.DUR["islandMorph"])       # 300
 ENTER_MS = 300
 LEAVE_MS = 260
 HALO_IN_MS = 360
-#: How long the run's end word stays (the strip's linger; the face's smile and the halo's check settle in 1.2 s).
-DONE_MS = 4000
+#: How long the run's end word stays (the face's smile settles in 1.2 s).
+DONE_MS = 3000
+#: The pointer rests this long on the compact pill before it expands (a pass across the top of the screen doesn't).
+HOVER_IN_MS = 150
+#: The expanded island folds back to the pill this long after the pointer leaves.
+HOVER_OUT_MS = 300
+#: The compact pill: the face at pitch 3 and one short word (the mini island's height).
+COMPACT_PAD = 10
+COMPACT_GAP = 8
+COMPACT_MAX_W = 360
+#: The resting pill (Settings: the tiny pill when idle): the design's ``.island.mini.resting``.
+RESTING_H = 26
+RESTING_PAD = 9
+#: Opacity of the mini and resting pills (the design's ``.island.mini`` .92 and ``.mini.resting`` .78).
+MINI_OPACITY = 0.92
+RESTING_OPACITY = 0.78
+#: A call that starts recording says so this long, then nothing stays on screen (3 Oct, item 20).
+CALL_NOTICE_MS = 2500
+#: After an animated enter, the island is checked once this long later: anything not at full strength is settled.
+SETTLE_CHECK_MS = ENTER_MS + 250
 #: A voice failure stays at least this long, even when voice has already gone back to waiting for its name.
 VOICE_ERROR_MS = 8000
 #: After the run ended, an open run card stays this long (untouched) before it folds back.
@@ -75,15 +104,20 @@ BAR_SHIFT = 8
 WIN_W = MAX_W
 
 STATES: tuple[str, ...] = ("game-quiet", "needs-you", "voice-stopped", "speaking", "hearing", "listening", "working",
-                           "thinking", "done-flash", "quiet-in-call", "not-listening", "hidden-armed")
-#: States with the halo figure of the same name (the run card has none).
-HALO_STATES = frozenset({"listening", "hearing", "thinking", "working", "speaking", "needs-you", "quiet-in-call",
-                         "voice-stopped", "done-flash"})
+                           "thinking", "done-flash", "call-notice", "quiet-in-call", "not-listening", "hidden-armed")
+#: States with the halo figure of the same name: only while Yuki hears, thinks or works, or speaks (3 Oct, item 20).
+HALO_STATES = frozenset({"hearing", "thinking", "working", "speaking"})
+#: States that show the full bar without a hover: Yuki needs an answer, or voice broke.
+AUTO_EXPAND = frozenset({"needs-you", "voice-stopped"})
 #: The words the island and the tray use for "Yuki isn't listening" (v3.16, the voice session's states).
 NOT_LISTENING_WORDS = {"off": "Yuki isn't listening: switched off", "quiet": "Yuki isn't listening: quiet for a while",
                        "call_off": "Yuki isn't listening: off for this call"}
-#: Windows' notification states that mean a full screen (a game, a video, a presentation) or nobody there.
-FULLSCREEN_STATES = frozenset({1, 2, 3, 4})
+#: Windows' notification states (``SHQueryUserNotificationState``) that alone mean a real full screen or nobody there:
+#: QUNS_NOT_PRESENT (locked, screen saver), QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE. QUNS_BUSY (2) also
+#: fires for a borderless window that only fills the monitor, so it counts only when the window in front measures as
+#: full screen (:func:`fullscreen_kind`).
+FULLSCREEN_STATES = frozenset({1, 3, 4})
+QUNS_BUSY = 2
 
 
 # -- what the island knows ---------------------------------------------------------------------------------
@@ -140,6 +174,9 @@ class IslandInputs:
     call: dict | None = None
     fullscreen: bool = False
     fullscreen_title: str = ""
+    fullscreen_kind: str = ""                # "locked" | "d3d" | "presentation" | "window" (why it hides; logged)
+    notice: str = ""                         # the call's start notice ("Recording your mic · Discord"), 2.5 s
+    call_asking: str = ""                    # the app of a call whose consent card waits ("" when none)
     final: FinalInfo | None = None
     transient: str = ""
     spoken: str = ""
@@ -169,7 +206,7 @@ def resolve(i: IslandInputs) -> str:
     if i.voice in ("thinking", "working") or i.transient:
         return "thinking"
     if call_on(i.call):
-        return "quiet-in-call"
+        return "call-notice" if i.notice else "quiet-in-call"
     if i.listening != "on":
         return "not-listening"
     return "hidden-armed"
@@ -237,27 +274,80 @@ class Spec:
     body: str = ""              # caption | choices | run
     title: str = ""             # the tooltip
     line_left: bool = False     # elide the line from the left (speaking: the newest words stay)
+    compact: bool = False       # the compact pill: the face and one short word (``word``)
+    word: str = ""
+    resting: bool = False       # the tiny resting pill (click-through, dimmer)
+    why_hidden: str = ""        # hidden: why (logged; never shown)
+
+
+def compact_word(state: str, i: IslandInputs) -> str:
+    """The compact pill's one short word for ``state`` ("Listening", "Working · 2/5", the done result)."""
+    if state == "listening":
+        return "Listening"
+    if state == "hearing":
+        return "Hearing you"
+    if state == "speaking":
+        return "Speaking"
+    if state == "thinking":
+        return "Stopping…" if i.run is not None and i.run.stopping else "Thinking"
+    if state == "working":
+        run = i.run
+        if run is not None and run.stopping:
+            return "Stopping…"
+        n = run.steps if run is not None else 0
+        of = run.of if run is not None else 0
+        if n and of:
+            return f"Working · {min(n, of)}/{of}"
+        return f"Working · step {n}" if n else "Working"
+    if state == "done-flash":
+        f = i.final
+        return " ".join(str(f.text if f is not None else "Done.").split()) or "Done."
+    if state == "call-notice":
+        return i.notice
+    return ""
 
 
 def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str = "", expanded: bool = False,
-             now: float | None = None) -> Spec:
-    """The island's look for ``state`` from what it knows (pure: the tests read it)."""
+             now: float | None = None, compact: bool = False, resting: bool = True) -> Spec:
+    """The island's look for ``state`` from what it knows (pure: the tests read it).
+
+    ``compact``: the pointer isn't on the island (and no run card is open), so a state that has a compact pill shows
+    it; needs-you and voice-stopped always show the full bar. ``resting``: the setting for idle (the tiny pill, or
+    nothing)."""
     now = time.monotonic() if now is None else now
     rec = bool(i.call) and (i.call or {}).get("status") == "recording"
     run = i.run
     app = str((i.call or {}).get("app") or "the call")
     if state == "game-quiet":
-        return Spec(state, face="game-quiet", hidden=True)
+        return Spec(state, face="game-quiet", hidden=True, why_hidden=f"full screen: {i.fullscreen_kind or 'yes'}")
     if state == "hidden-armed":
-        return Spec(state, face="hidden-armed", mini=True, title="Yuki is listening for its name")
+        if not resting:
+            return Spec(state, face="idle", hidden=True, why_hidden="idle, resting pill off")
+        return Spec(state, face="idle", mini=True, resting=True, title="Yuki is listening for its name")
     if state == "not-listening":
-        return Spec(state, face="not-listening", mini=True, title=NOT_LISTENING_WORDS.get(i.listening, "Yuki isn't listening"))
+        return Spec(state, face="not-listening", hidden=True, why_hidden="not listening",
+                    title=NOT_LISTENING_WORDS.get(i.listening, "Yuki isn't listening"))
+    if state == "quiet-in-call":
+        return Spec(state, face="quiet-in-call", hidden=True, why_hidden="in a call", rec=rec)
+    if compact and state not in AUTO_EXPAND and not expanded and state in ("listening", "hearing", "speaking",
+                                                                          "thinking", "working", "done-flash",
+                                                                          "call-notice"):
+        face = {"listening": "woke" if i.voice == "starting" else "listening", "call-notice": "quiet-in-call"}.get(
+            state, state)
+        if state == "done-flash":
+            face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
+        n, of = step_of(run)
+        return Spec(state, face=face, compact=True, word=compact_word(state, i),
+                    rec=rec, halo=state if state in HALO_STATES else None, step=(n, of),
+                    title=compact_word(state, i))
+    if state == "call-notice":
+        return Spec(state, face="quiet-in-call", compact=True, word=i.notice, rec=rec, title=i.notice)
     if state == "listening":
         starting = i.voice == "starting"
         sub = (f"{voice_key} to stop · dim words are unsure" if voice_key else "dim words are unsure")
         return Spec(state, face="woke" if starting else "listening", exp=True, width=600,
                     line="Yes?" if starting else "Listening", sub="starting voice…" if starting else sub, rec=rec,
-                    body="caption", halo="listening")
+                    body="caption")
     if state == "hearing":
         return Spec(state, face="hearing", exp=True, width=660, line="Hearing you", sub="Low-confidence words are dimmed",
                     rec=rec, body="caption", halo="hearing")
@@ -266,11 +356,11 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
                     sub="Speaking · say “stop” to cut me off", rec=rec, halo="speaking", line_left=bool(i.spoken))
     if state == "needs-you":
         sub = "Say it, or press Answer to type it" if i.question_voice else "Answer in the ask bar"
-        return Spec(state, face="needs-you", exp=True, width=600, line=i.question, sub=sub, rec=rec, halo="needs-you",
+        return Spec(state, face="needs-you", exp=True, width=600, line=i.question, sub=sub, rec=rec,
                     body="choices", title=i.question)
     if state == "voice-stopped":
         return Spec(state, face="voice-stopped", width=700, line="Voice stopped",
-                    sub=i.voice_error, keys=("retry", "settings"), halo="voice-stopped", title=i.voice_error)
+                    sub=i.voice_error, keys=("retry", "settings"), title=i.voice_error)
     if state == "working" and expanded and run is not None:
         n, of = step_of(run)
         head = f"step {run.steps}" + (f" of {run.of}" if run.of else "")
@@ -299,19 +389,12 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         if expanded and f.run is not None:
             return Spec(state, face="done-flash" if f.outcome == "done" else "handed", exp=True, width=RUN_W,
                         line=f.text, sub=f.meta or _final_sub(f), rec=rec, body="run", keys=("chev",))
+        keys = ("chev",) if f.run is not None else ()   # the finished run's card opens from here
         if f.outcome == "done":   # the design's done flash carries its chip only (no rec chip)
-            return Spec(state, face="done-flash", line=f.text, sub=f.meta or _final_sub(f), chip="done",
-                        halo="done-flash")
-        return Spec(state, face="handed", line=f.text, sub=f.meta or _final_sub(f), chip=f.outcome)
-    if state == "quiet-in-call":
-        waiting = (i.call or {}).get("status") == "waiting_headphones"
-        line = f"Waiting for headphones, {app}" if waiting else f"Quiet. You’re on {app}."
-        if i.listening != "on":
-            sub = NOT_LISTENING_WORDS.get(i.listening, "Yuki isn't listening")
-        else:
-            sub = "Say “Yuki” when it’s for me"
-        return Spec(state, face="quiet-in-call", line=line, sub=sub, rec=rec, halo="quiet-in-call")
-    return Spec("hidden-armed", face="hidden-armed", mini=True)
+            return Spec(state, face="done-flash", line=f.text, sub=f.meta or _final_sub(f), chip="done", keys=keys)
+        return Spec(state, face="handed", line=f.text, sub=f.meta or _final_sub(f), chip=f.outcome, keys=keys)
+    del app
+    return Spec("hidden-armed", face="idle", hidden=True, why_hidden="unknown state")
 
 
 def _final_sub(f: FinalInfo) -> str:
@@ -403,6 +486,75 @@ def window_title(hwnd: int) -> str:
         return buf.value
     except Exception:
         return ""
+
+
+@dataclass(frozen=True)
+class WindowFacts:
+    """What the window in front measures as (no title, no content): whether it covers its whole monitor, whether it
+    is maximised (``IsZoomed``), whether it has a title bar (``WS_CAPTION``), and its monitor's device name."""
+
+    covers: bool = False
+    zoomed: bool = False
+    caption: bool = False
+    device: str = ""
+
+
+def window_facts(hwnd: int) -> WindowFacts:
+    """Measure ``hwnd`` against its monitor (``GetWindowRect`` vs ``rcMonitor``); empty facts when unknown."""
+    if not hwnd or not _is_windows():
+        return WindowFacts()
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+
+        class MONITORINFOEXW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD), ("szDevice", wintypes.WCHAR * 32)]
+
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFOEXW)]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.IsZoomed.argtypes = [wintypes.HWND]
+        get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_long.restype = ctypes.c_ssize_t
+        h = ctypes.c_void_p(hwnd)
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if not user32.GetMonitorInfoW(user32.MonitorFromWindow(h, 2), ctypes.byref(info)):
+            return WindowFacts()
+        r = wintypes.RECT()
+        if not user32.GetWindowRect(h, ctypes.byref(r)):
+            return WindowFacts(device=str(info.szDevice))
+        m = info.rcMonitor
+        covers = r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom
+        style = int(get_long(h, -16))                       # GWL_STYLE
+        caption = (style & 0x00C00000) == 0x00C00000          # WS_CAPTION
+        return WindowFacts(covers=bool(covers), zoomed=bool(user32.IsZoomed(h)), caption=caption,
+                           device=str(info.szDevice))
+    except Exception:
+        return WindowFacts()
+
+
+def fullscreen_kind(quns: int, facts: WindowFacts) -> str:
+    """Whether a real full screen covers the monitor in use, and which: ``"locked"`` (the session is locked or a
+    screen saver runs), ``"d3d"`` (an exclusive full-screen game), ``"presentation"``, ``"window"`` (a borderless
+    full-screen game, a full-screen video or browser: Windows says busy AND the window in front covers its whole
+    monitor without a title bar and is not merely maximised), or ``""``.
+
+    Measured, not guessed: Windows' QUNS_BUSY alone also fires for a borderless app maximised on its monitor (Arc),
+    which is not a full screen (3 Oct: the island vanished over a maximised Arc)."""
+    if quns == 1:
+        return "locked"
+    if quns == 3:
+        return "d3d"
+    if quns == 4:
+        return "presentation"
+    if quns == QUNS_BUSY and facts.covers and not facts.zoomed and not facts.caption:
+        return "window"
+    return ""
 
 
 def pick_screen(device: str, screens: list[Any], primary: Any = None) -> Any:
@@ -931,12 +1083,13 @@ class RunCard(QWidget):
 
 
 class Panel(QWidget):
-    """The island's body: the field colour, a 1 px ``#2A2D31`` border, 22 px corners (20 expanded, 13 mini)."""
+    """The island's body: the field colour, a 1 px ``#2A2D31`` border, 22 px corners (20 expanded, 13 mini). The
+    resting pill is the design's ``.island.mini.resting``: ``rgba(11,11,12,.86)`` with a ``#222428`` border."""
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.radius = float(RADIUS)
-        self.opacity = 1.0
+        self.resting = False
 
     def paintEvent(self, _e: Any) -> None:  # noqa: D102
         p = QPainter(self)
@@ -945,15 +1098,38 @@ class Panel(QWidget):
         path = QPainterPath()
         rad = min(self.radius, r.height() / 2, r.width() / 2)
         path.addRoundedRect(r, rad - 0.5, rad - 0.5)
-        p.fillPath(path, L.BG)
-        p.setPen(QPen(L.BORDER, 1.0))
+        p.fillPath(path, QColor(11, 11, 12, 219) if self.resting else L.BG)
+        p.setPen(QPen(QColor("#222428") if self.resting else L.BORDER, 1.0))
         p.drawPath(path)
+        p.end()
+
+
+class RecDot(QWidget):
+    """The island's still mint rec dot (the design's ``.recmark .recdot.still``, 7 px): the call is recorded. The
+    call's timer lives only in the tray's hover card (3 Oct, item 20)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(7, 7)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip("Recording your mic")
+
+    def set_time(self, _text: str) -> None:   # the old rec chip's interface: no timer on the island any more
+        return
+
+    def paintEvent(self, _e: Any) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(L.live())
+        p.drawEllipse(QRectF(0, 0, 7, 7))
         p.end()
 
 
 class HaloWindow(QWidget):
     """The halo's own window: 560 x 170, under the island, transparent to the mouse (clicks reach the app beneath),
-    never focused. Fades in over 360 ms the first time a state brings it; leaves at once when one has none."""
+    never focused. Fades in over 360 ms the first time a state brings it (a painted alpha: the window's own opacity
+    stays 1); leaves at once when one has none."""
 
     def __init__(self) -> None:
         flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
@@ -969,7 +1145,30 @@ class HaloWindow(QWidget):
         self._fade = QVariantAnimation(self)
         self._fade.setDuration(HALO_IN_MS)
         self._fade.setEasingCurve(L.ease_curve())
-        self._fade.valueChanged.connect(lambda v: self.setWindowOpacity(float(v)))
+        self._fade.valueChanged.connect(self._on_fade)
+        self._fade.finished.connect(lambda: self._on_fade(1.0))
+
+    def _on_fade(self, v: Any) -> None:
+        self.halo.alpha = max(0.0, min(1.0, float(v)))
+        self.halo.update()
+
+    def fade_in(self, animate: bool) -> None:
+        """Show at full strength at once (``animate`` False) or fade in over 360 ms."""
+        self._fade.stop()
+        self.setWindowOpacity(1.0)
+        if animate:
+            self._on_fade(0.0)
+            self.show()
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
+        else:
+            self._on_fade(1.0)
+            self.show()
+
+    def strength(self) -> float:
+        """How strongly the halo is drawn now (window opacity times the painted alpha)."""
+        return float(self.windowOpacity()) * float(getattr(self.halo, "alpha", 1.0))
 
 
 class IslandWindow(QWidget):
@@ -991,7 +1190,9 @@ class IslandWindow(QWidget):
         self.face = FaceWidget(8, P)
         self.ln1 = L.Para("", font=L.ui_font(15, 500), line_height=1.25, parent=P, max_lines=1)
         self.ln2 = L.Para("", font=L.mono_font(11, 500), color=L.TEXT3, line_height=1.3, parent=P, max_lines=1)
-        self.rec = L.RecChip(P)
+        #: The compact pill's one word (12.5 px, 500).
+        self.word = L.Para("", font=L.ui_font(12.5, 500), line_height=1.25, parent=P, max_lines=1)
+        self.rec = RecDot(P)
         self.chip = L.Chip("done", icon="check", parent=P)
         self.k_stop = L.Key("Stop", variant="stop", size="sm", icon="stop", parent=P)
         self.k_chev = L.Key("", variant="ghost", size="sm", icon="chev", parent=P)
@@ -1023,7 +1224,13 @@ class IslandWindow(QWidget):
         self._move.finished.connect(self._move_done)
         self._leaving = False
         self._origin = QPoint(0, 0)    # where the window sits when settled
-        self._opacity = 1.0
+        #: The enter / leave fade, 0..1, painted through an opacity effect on the panel (never the window's opacity).
+        self._fade = 1.0
+        self._move_kind = ""
+        self._click_through = False
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.timeout.connect(self._settle_check)
 
     # -- geometry ------------------------------------------------------------------------------------------
 
@@ -1043,8 +1250,16 @@ class IslandWindow(QWidget):
         return out
 
     def natural_width(self, spec: Spec) -> int:
+        if spec.resting:
+            return 1 + RESTING_PAD + FACE_W * 3 + RESTING_PAD + 1
         if spec.mini:
             return 1 + BAR_SHIFT + 12 + FACE_W * 3 + 12 + 1
+        if spec.compact:
+            fm = QFontMetricsF(self.word.font())
+            text = int(math.ceil(fm.horizontalAdvance(spec.word))) + 2
+            w = 1 + COMPACT_PAD + FACE_W * 3 + COMPACT_GAP + text + (COMPACT_GAP + 7 if spec.rec else 0) \
+                + COMPACT_PAD + 2 + 1
+            return max(1 + COMPACT_PAD + FACE_W * 3 + COMPACT_PAD + 1, min(COMPACT_MAX_W, w))
         if spec.width:
             return spec.width
         face_w = FACE_W * 8
@@ -1064,16 +1279,31 @@ class IslandWindow(QWidget):
         return 0
 
     def panel_height(self, spec: Spec, w: int) -> int:
-        if spec.mini:
+        if spec.resting:
+            return RESTING_H + 2
+        if spec.mini or spec.compact:
             return MINI_H + 2
         return BAR_H + 2 + self.body_height(spec, w)
 
     def layout_parts(self, spec: Spec, w: int, h: int) -> None:
         """Place the parts inside a panel of ``w`` x ``h`` (called every morph frame: the bar reflows, as CSS)."""
         P = self.panel
+        if spec.resting:
+            self.face.move((w - self.face.width()) // 2, (h - self.face.height()) // 2)
+            return
         if spec.mini:
             inner = w - 2 - BAR_SHIFT
             self.face.move(1 + BAR_SHIFT + (inner - self.face.width()) // 2, (h - self.face.height()) // 2)
+            return
+        if spec.compact:
+            self.face.move(1 + COMPACT_PAD, (h - self.face.height()) // 2)
+            x = 1 + COMPACT_PAD + self.face.width() + COMPACT_GAP
+            right = w - 1 - COMPACT_PAD
+            if spec.rec:
+                self.rec.move(right - self.rec.width(), (h - self.rec.height()) // 2)
+                right -= self.rec.width() + COMPACT_GAP
+            lh = int(round(12.5 * 1.25))
+            self.word.setGeometry(x, (h - lh) // 2, max(10, right - x), lh)
             return
         fy = 1 + (BAR_H - self.face.height()) // 2
         self.face.move(1 + BAR_SHIFT + 12, fy)
@@ -1116,10 +1346,13 @@ class IslandWindow(QWidget):
         self.ln1._elide_left = spec.line_left
         self.ln1.set_text(spec.line)
         self.ln2.set_text(spec.sub)
+        self.word.set_text(spec.word)
         self.setToolTip(spec.title)
+        bar = not (spec.mini or spec.compact)
         for w in (self.ln1, self.ln2):
-            w.setVisible(not spec.mini)
-        items = self._right_items(spec)
+            w.setVisible(bar)
+        self.word.setVisible(spec.compact)
+        items = self._right_items(spec) if bar else ([self.rec] if spec.compact and spec.rec else [])
         for w in (self.rec, self.chip, self.k_stop, self.k_chev, self.k_retry, self.k_settings):
             w.setVisible(w in items)
         if spec.chip:
@@ -1132,13 +1365,16 @@ class IslandWindow(QWidget):
         for w in (self.k_answer, self.k_qstop):
             w.setVisible(spec.body == "choices")
         self.run.setVisible(spec.body == "run")
-        mini_was = old.mini if old is not None else None
-        if mini_was is None or mini_was != spec.mini:
-            self.face.set_pitch(3 if spec.mini else 8, grow=(mini_was is True and not spec.mini and not reduced))
+        small = spec.mini or spec.compact
+        small_was = (old.mini or old.compact) if old is not None and not old.hidden else None
+        if small_was is None or small_was != small or self.face.pitch != (3 if small else 8):
+            self.face.set_pitch(3 if small else 8, grow=(small_was is True and not small and not reduced))
         self.face.set_state(spec.face, spec.step)
-        self.panel.radius = float(RADIUS_MINI if spec.mini else RADIUS_EXP if spec.exp else RADIUS)
+        self.panel.radius = float(RADIUS_MINI if small else RADIUS_EXP if spec.exp else RADIUS)
+        self.panel.resting = spec.resting
+        self._set_click_through(spec.resting)
         if self._move.state() != QVariantAnimation.State.Running:
-            self.setWindowOpacity(self._opacity * (0.92 if spec.mini else 1.0))
+            self._apply_opacity()
         w = self.natural_width(spec)
         h = self.panel_height(spec, w)
         target = QRect((WIN_W - w) // 2, 0, w, h)
@@ -1171,7 +1407,7 @@ class IslandWindow(QWidget):
         a, b = self._from, self._to
         w = int(round(a.width() + (b.width() - a.width()) * k))
         h = int(round(a.height() + (b.height() - a.height()) * k))
-        if self.spec is not None and not self.spec.mini:
+        if self.spec is not None and not (self.spec.mini or self.spec.compact):
             w = max(MIN_W, w)    # the design's island keeps its min-width while it morphs (from the mini: 360 at once)
         self._set_rect(QRect((WIN_W - w) // 2, 0, w, h))
 
@@ -1184,21 +1420,12 @@ class IslandWindow(QWidget):
     def _place_halo(self, spec: Spec, reduced: bool) -> None:
         hw = self.halo_win
         if spec.halo and not spec.mini:
-            first = not self._halo_on
+            first = not self._halo_on or not hw.isVisible()
             self._halo_on = True
             hw.halo.set_state(spec.halo, spec.step)
             self._move_halo()
             if first:
-                if reduced:
-                    hw.setWindowOpacity(1.0)
-                    hw.show()
-                else:
-                    hw.setWindowOpacity(0.0)
-                    hw.show()
-                    hw._fade.stop()
-                    hw._fade.setStartValue(0.0)
-                    hw._fade.setEndValue(1.0)
-                    hw._fade.start()
+                hw.fade_in(animate=not reduced)
         else:
             if self._halo_on:
                 hw.halo.model.set_state("idle", L.now())   # blends away the next time it is shown, as the design
@@ -1215,36 +1442,87 @@ class IslandWindow(QWidget):
 
     # -- enter / leave ---------------------------------------------------------------------------------------
 
-    def enter(self, *, animate: bool) -> None:
-        self._leaving = False
-        self._origin = self.anchor()
+    # The fades are painted: an opacity effect on the panel while one runs (and on the mini and resting pills, which
+    # the design draws at .92 / .78), removed when the panel is at full strength. The window's own opacity is never
+    # anything but 1: on 3 Oct a bar was painted (PrintWindow showed it) yet invisible while its halo showed, which is
+    # what a layered window left at window opacity 0 looks like. Painting the fade keeps what is drawn and what is
+    # shown one and the same, and an enter is checked once after it should have ended (:meth:`_settle_check`).
+
+    def design_opacity(self, spec: Spec | None = None) -> float:
+        """The opacity the design gives a settled panel: .78 resting, .92 mini, else 1."""
+        spec = spec if spec is not None else self.spec
+        if spec is None:
+            return 1.0
+        return RESTING_OPACITY if spec.resting else MINI_OPACITY if spec.mini else 1.0
+
+    def panel_opacity(self) -> float:
+        """The panel's opacity now (1 when no effect is set)."""
+        eff = self.panel.graphicsEffect()
+        return float(eff.opacity()) if isinstance(eff, QGraphicsOpacityEffect) else 1.0
+
+    def _apply_opacity(self) -> None:
+        v = max(0.0, min(1.0, self._fade)) * self.design_opacity()
+        eff = self.panel.graphicsEffect()
+        if v >= 0.999:
+            if eff is not None:
+                self.panel.setGraphicsEffect(None)
+        else:
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(self.panel)
+                self.panel.setGraphicsEffect(eff)
+            if abs(eff.opacity() - v) > 0.001:
+                eff.setOpacity(v)
+        if self.windowOpacity() != 1.0:
+            self.setWindowOpacity(1.0)
+
+    def _set_click_through(self, on: bool) -> None:
+        """The resting pill lets every click and hover through to the app beneath (the design's resting island)."""
+        if on == self._click_through:
+            return
+        self._click_through = on
+        if _is_windows():
+            try:
+                from yuki.ui.focus import set_click_through
+
+                set_click_through(int(self.winId()), on)
+            except Exception:
+                pass
+
+    def _pin_native(self) -> None:
         if not getattr(self, "_native_pinned", False) and _is_windows():
             from yuki.ui.focus import set_no_activate
 
             set_no_activate(int(self.winId()), True)   # never activated, not even by a click
             set_no_activate(int(self.halo_win.winId()), True)
             self._native_pinned = True
-        mini = bool(self.spec and self.spec.mini)
+
+    def enter(self, *, animate: bool) -> None:
+        self._leaving = False
+        self._origin = self.anchor()
+        self._pin_native()
+        self._move.stop()
+        self._settle.stop()
         if not animate:
-            self._move.stop()
             self.move(self._origin)
-            self._opacity = 1.0
-            self.setWindowOpacity(0.92 if mini else 1.0)
+            self._fade = 1.0
+            self._apply_opacity()
             self.show()
+            self.island._entered()
             return
-        self._opacity = 0.0
-        self.setWindowOpacity(0.0)
+        self._fade = 0.0
+        self._apply_opacity()
         self.move(self._origin + QPoint(0, -10))
         self.show()
-        self._move.stop()
         self._move.setDuration(ENTER_MS)
         self._move.setEasingCurve(L.ease_curve())
         self._move.setStartValue(0.0)
         self._move.setEndValue(1.0)
         self._move_kind = "enter"
         self._move.start()
+        self._settle.start(SETTLE_CHECK_MS)
 
     def leave(self, *, animate: bool) -> None:
+        self._settle.stop()
         if not self.isVisible() or self._leaving:
             self.halo_win.hide()
             self._halo_on = False
@@ -1254,7 +1532,9 @@ class IslandWindow(QWidget):
             self.halo_win.halo.model.set_state("idle", L.now())
         self._halo_on = False
         if not animate:
+            self._move.stop()
             self.hide()
+            self.island._left()
             return
         self._leaving = True
         self._origin = self.pos()
@@ -1268,27 +1548,49 @@ class IslandWindow(QWidget):
 
     def _on_move(self, v: Any) -> None:
         k = float(v)
-        mini = 0.92 if (self.spec and self.spec.mini) else 1.0
-        if getattr(self, "_move_kind", "") == "enter":
-            self._opacity = k
-            self.setWindowOpacity(k * mini)
+        if self._move_kind == "enter":
+            self._fade = k
             self.move(self._origin + QPoint(0, int(round(-10 * (1 - k)))))
         else:
-            self._opacity = 1 - k
-            self.setWindowOpacity((1 - k) * mini)
+            self._fade = 1 - k
             self.move(self._origin + QPoint(0, int(round(-14 * k))))
+        self._apply_opacity()
         if self._halo_on:
             self._move_halo()
 
     def _move_done(self) -> None:
-        if getattr(self, "_move_kind", "") == "leave":
+        if self._move_kind == "leave":
             self._leaving = False
             self.hide()
             self.move(self._origin)
+            self._fade = 1.0          # the next enter starts its own fade; nothing waits at 0
+            self._apply_opacity()
+            self.island._left()
         else:
+            self._settle.stop()
             self.move(self._origin)
-            self._opacity = 1.0
-            self.setWindowOpacity(0.92 if (self.spec and self.spec.mini) else 1.0)
+            self._fade = 1.0
+            self._apply_opacity()
+            self.island._entered()
+
+    def _settle_check(self) -> None:
+        """Once, after an animated enter should have ended: a shown island not at full strength is settled now."""
+        if not self.isVisible() or self._leaving:
+            return
+        running = self._move.state() == QVariantAnimation.State.Running
+        if self._fade >= 0.999 and not running and self.windowOpacity() == 1.0:
+            return
+        before = (round(self._fade, 3), running, round(float(self.windowOpacity()), 3))
+        self._move.stop()
+        self.move(self._origin)
+        self._fade = 1.0
+        self._apply_opacity()
+        self.island._log("island_settled", fade_was=before[0], anim_running=before[1], window_opacity_was=before[2])
+        self.island._entered()
+
+    def shown_strength(self) -> float:
+        """How strongly the island is drawn now: the window's opacity times the fade (1 when settled and shown)."""
+        return float(self.windowOpacity()) * max(0.0, min(1.0, self._fade))
 
     def reposition(self) -> None:
         """The monitor in use changed: move there (no animation)."""
@@ -1310,9 +1612,20 @@ class IslandWindow(QWidget):
         super().showEvent(e)
         self.island._visibility_changed(True)
 
-    def mousePressEvent(self, e: Any) -> None:  # noqa: D102 - a click on a running island opens its run card
-        if self.spec is not None and self.spec.state in ("working", "thinking") and self.spec.body != "run" \
-                and self._rect.contains(e.position().toPoint()):
+    def enterEvent(self, e: Any) -> None:  # noqa: D102 - the pointer rests on the island: it expands
+        super().enterEvent(e)
+        self.island.pointer(True)
+
+    def leaveEvent(self, e: Any) -> None:  # noqa: D102 - it folds back 300 ms after the pointer leaves
+        super().leaveEvent(e)
+        self.island.pointer(False)
+
+    def mousePressEvent(self, e: Any) -> None:  # noqa: D102 - a click expands the pill, or opens the run card
+        inside = self._rect.contains(e.position().toPoint())
+        if self.spec is not None and inside and self.spec.compact:
+            self.island.pointer(True, now=True)
+        elif self.spec is not None and self.spec.state in ("working", "thinking") and self.spec.body != "run" \
+                and inside:
             self.island.toggle_card()
         super().mousePressEvent(e)
 
@@ -1354,6 +1667,18 @@ class Island(QObject):
         self.state = ""
         self.expanded = False
         self.lesson_available = False
+        #: The pointer rests on the island (it shows the full bar instead of the compact pill).
+        self.hovered = False
+        #: Settings → Island: the tiny resting pill when idle (True, the default) or nothing.
+        self.resting = True
+        #: Content-free logging: ``log(event, **fields)`` (the UI log's ``event``; set by the app).
+        self.log: Callable[..., None] | None = None
+        #: The last run that finished: ``(text, outcome, epoch seconds)`` (the tray's hover card says it).
+        self.last_final: tuple[str, str, float] | None = None
+        self._noticed_call: Any = None
+        self._shown = ""
+        self._fg_facts = WindowFacts()
+        self._quns = 0
         self.window = IslandWindow(self)
         self.window.k_stop.clicked.connect(self._on_stop)
         self.window.k_chev.clicked.connect(self.toggle_card)
@@ -1381,6 +1706,15 @@ class Island(QObject):
         self._card_timer = QTimer(self)
         self._card_timer.setSingleShot(True)
         self._card_timer.timeout.connect(self._close_card)
+        self._hover_in = QTimer(self)
+        self._hover_in.setSingleShot(True)
+        self._hover_in.timeout.connect(lambda: self._set_hovered(True))
+        self._hover_out = QTimer(self)
+        self._hover_out.setSingleShot(True)
+        self._hover_out.timeout.connect(lambda: self._set_hovered(False))
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(lambda: self.update(notice=""))
         self.watch = ForegroundWatch()
         self.watch.changed.connect(self.on_foreground)
         self.strip = IslandStrip(self)
@@ -1403,10 +1737,105 @@ class Island(QObject):
     def stop(self) -> None:
         self.enabled = False
         self.watch.stop()
-        for t in (self._clock, self._final_timer, self._voice_error_timer, self._card_timer):
+        for t in (self._clock, self._final_timer, self._voice_error_timer, self._card_timer, self._hover_in,
+                  self._hover_out, self._notice_timer, self.window._settle):
             t.stop()
         self.window.halo_win.hide()
         self.window.hide()
+
+    def set_resting(self, on: bool) -> None:
+        """Settings → Island: the tiny resting pill when idle, or nothing on screen (only the tray icon)."""
+        if bool(on) != self.resting:
+            self.resting = bool(on)
+            self._log("island_setting", resting=self.resting)
+            self.refresh()
+
+    # -- logging (content-free: states, numbers, flags; never a line of text) -----------------------------------
+
+    def _log(self, event: str, **fields: Any) -> None:
+        if self.log is None:
+            return
+        try:
+            self.log(event, **fields)
+        except Exception:
+            pass
+
+    def snapshot(self) -> dict[str, Any]:
+        """What the island is doing now, without content: the state, how it shows, whether it is visible and at what
+        strength, where, on which monitor, the full-screen verdict, topmost, and why it is hidden."""
+        w = self.window
+        spec = w.spec
+        g = w.geometry()
+        hwnd = int(w.winId()) if _is_windows() and w.testAttribute(Qt.WidgetAttribute.WA_WState_Created) else 0
+        topmost: bool | None = None
+        if hwnd:
+            try:
+                from yuki.ui.focus import is_topmost
+
+                topmost = is_topmost(hwnd)
+            except Exception:
+                topmost = None
+        return {
+            "state": self.state, "shown": self._shown_kind(spec), "visible": bool(w.isVisible()),
+            "leaving": bool(w._leaving), "strength": round(w.shown_strength(), 3),
+            "window_opacity": round(float(w.windowOpacity()), 3), "panel_opacity": round(w.panel_opacity(), 3),
+            "rect": [g.x(), g.y(), w._rect.width(), w._rect.height()], "monitor": _ACTIVE_DEVICE[0],
+            "fullscreen": self.inputs.fullscreen_kind or "", "quns": self._quns, "topmost": topmost,
+            "halo": bool(w.halo_win.isVisible()), "hovered": self.hovered, "run_card": self.expanded,
+            "why_hidden": spec.why_hidden if spec is not None and spec.hidden else "",
+        }
+
+    @staticmethod
+    def _shown_kind(spec: Spec | None) -> str:
+        if spec is None or spec.hidden:
+            return "hidden"
+        if spec.resting:
+            return "resting"
+        if spec.compact:
+            return "compact"
+        if spec.body == "run":
+            return "run card"
+        return "full"
+
+    def _entered(self) -> None:
+        """The island finished coming on screen: log it, with what covers its middle if anything does."""
+        snap = self.snapshot()
+        snap["covered_by"] = self._covered_by()
+        self._log("island_shown", **snap)
+
+    def _left(self) -> None:
+        self._log("island_hidden", **self.snapshot())
+
+    def _covered_by(self) -> str:
+        """The window class at the middle of the island's panel when another window sits over it (``""`` when the
+        island itself is on top there, or unknown). A class name is not content (``Chrome_WidgetWin_1``)."""
+        if not _is_windows() or not self.window.isVisible():
+            return ""
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32")
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = ctypes.c_void_p
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            hwnd = int(self.window.winId())
+            r = wintypes.RECT()
+            if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+                return ""
+            dpr = float(self.window.devicePixelRatioF() or 1.0)
+            c = self.window._rect.center()
+            pt = wintypes.POINT(int(r.left + c.x() * dpr), int(r.top + c.y() * dpr))
+            hit = user32.WindowFromPoint(pt)
+            root = int(user32.GetAncestor(hit, 2) or 0) if hit else 0     # GA_ROOT
+            if not root or root == hwnd:
+                return ""
+            buf = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(ctypes.c_void_p(root), buf, 128)
+            return buf.value or "unknown"
+        except Exception:
+            return ""
 
     def attach_model(self, model: Any) -> None:
         """The chat thread (the run card reads the run's steps from it)."""
@@ -1426,8 +1855,29 @@ class Island(QObject):
     # -- inputs ----------------------------------------------------------------------------------------------
 
     def update(self, **changes: Any) -> None:
+        before = self.inputs.call
         self.inputs = replace(self.inputs, **changes)
+        if "call" in changes:
+            self._call_changed(before, self.inputs.call)
         self.refresh()
+
+    def _call_changed(self, before: dict | None, now: dict | None) -> None:
+        """A call that starts recording says so for 2.5 s ("Recording your mic · Discord"), once per call session;
+        after that nothing about the call stays on screen (the tray's icon and hover card carry it)."""
+        recording = bool(now) and (now or {}).get("status") == "recording"
+        if not recording:
+            if self.inputs.notice:
+                self._notice_timer.stop()
+                self.inputs = replace(self.inputs, notice="")
+            return
+        key = (now or {}).get("session_started_at") or (now or {}).get("id") or (now or {}).get("detected_at")
+        if key == self._noticed_call:
+            return
+        self._noticed_call = key
+        app = str((now or {}).get("app") or "").strip()
+        self.inputs = replace(self.inputs, notice=f"Recording your mic · {app}" if app else "Recording your mic")
+        self._notice_timer.start(CALL_NOTICE_MS)
+        del before
 
     def refresh(self, *, animate: bool = True) -> None:
         if not self.enabled:
@@ -1445,7 +1895,8 @@ class Island(QObject):
 
     def current_spec(self) -> Spec:
         return spec_for(self.state or resolve(self.inputs), self.inputs, voice_key=_words(self.bindings.get("voice")),
-                        stop_key=_words(self.bindings.get("cancel")), expanded=self.expanded)
+                        stop_key=_words(self.bindings.get("cancel")), expanded=self.expanded,
+                        compact=not self.hovered, resting=self.resting)
 
     def _render(self, *, animate: bool = True) -> None:
         spec = self.current_spec()
@@ -1456,17 +1907,20 @@ class Island(QObject):
             self._fill_card()
         self.window.show_spec(spec, animate=animate)
         self._timers(spec)
+        shown = f"{spec.state}/{self._shown_kind(spec)}"
+        if shown != self._shown:
+            self._shown = shown
+            self._log("island", **self.snapshot())
 
     def _timers(self, spec: Spec) -> None:
-        need = self.window.isVisible() and not spec.hidden and (
-            spec.rec or self.inputs.run is not None or spec.state == "quiet-in-call")
+        # one clock, only for the full bar's run time ("step 2 · 0:46"); the pill's words don't change by the second,
+        # and the call's timer lives in the tray's hover card (its own clock, only while the card is open)
+        need = self.window.isVisible() and not spec.hidden and not spec.compact and self.inputs.run is not None
         if need and not self._clock.isActive():
             self._clock.start()
             self._tick()
         elif not need:
             self._clock.stop()
-        if spec.rec:
-            self.window.rec.set_time(clock(self._call_seconds()))
 
     def _call_seconds(self) -> float | None:
         since = call_since(self.inputs.call)
@@ -1477,9 +1931,7 @@ class Island(QObject):
         if spec is None or not self.window.isVisible():
             self._clock.stop()
             return
-        if spec.rec:
-            self.window.rec.set_time(clock(self._call_seconds()))
-        if self.inputs.run is not None and spec.state in ("working", "thinking"):
+        if self.inputs.run is not None and spec.state in ("working", "thinking") and not spec.compact:
             fresh = self.current_spec()
             if fresh.sub != self.window.ln2.text():
                 self.window.ln2.set_text(fresh.sub)
@@ -1487,6 +1939,10 @@ class Island(QObject):
     def _visibility_changed(self, visible: bool) -> None:
         if not visible:
             self._clock.stop()
+            self._hover_in.stop()
+            self._hover_out.stop()
+            if self.hovered and not self.window._leaving:
+                self.hovered = False
         elif self.window.spec is not None:
             self._timers(self.window.spec)
 
@@ -1494,21 +1950,70 @@ class Island(QObject):
         """The call's running time now (the tray's hover card and tooltip show the same clock)."""
         return clock(self._call_seconds())
 
-    # the monitor in use, a full screen
+    # -- hover: the compact pill expands while the pointer rests on it -------------------------------------------
+
+    def pointer(self, inside: bool, *, now: bool = False) -> None:
+        """The pointer came onto the island (``inside``) or left it. Resting on it 150 ms expands the pill to the full
+        bar; leaving folds it back 300 ms later. ``now``: a click expands at once."""
+        if inside:
+            self._hover_out.stop()
+            if now:
+                self._hover_in.stop()
+                self._set_hovered(True)
+            elif not self.hovered and not self._hover_in.isActive():
+                self._hover_in.start(HOVER_IN_MS)
+        else:
+            self._hover_in.stop()
+            if self.hovered and not self._hover_out.isActive():
+                self._hover_out.start(HOVER_OUT_MS)
+
+    def _set_hovered(self, on: bool) -> None:
+        if on == self.hovered:
+            return
+        spec = self.window.spec
+        if on and (spec is None or spec.hidden or spec.resting):
+            return
+        self.hovered = on
+        self._render(animate=True)
+
+    # the monitor in use, a full screen, always on top
     def on_foreground(self, hwnd: int) -> None:
-        device = monitor_device(hwnd)
+        facts = window_facts(hwnd)
+        device = facts.device or monitor_device(hwnd)
         if device:
             _ACTIVE_DEVICE[0] = device
         try:
             value, _name = self.screen_state()
         except Exception:
             value = 0
-        full = value in FULLSCREEN_STATES
+        self._quns, self._fg_facts = int(value or 0), facts
+        kind = fullscreen_kind(int(value or 0), facts)
+        full = bool(kind)
         title = window_title(hwnd) if full else ""
-        if full != self.inputs.fullscreen or title != self.inputs.fullscreen_title:
-            self.update(fullscreen=full, fullscreen_title=title)
+        if full != self.inputs.fullscreen or kind != self.inputs.fullscreen_kind:
+            self._log("island_fullscreen", kind=kind, quns=int(value or 0), covers=facts.covers, zoomed=facts.zoomed,
+                      caption=facts.caption, monitor=device)
+        if full != self.inputs.fullscreen or title != self.inputs.fullscreen_title or kind != self.inputs.fullscreen_kind:
+            self.update(fullscreen=full, fullscreen_title=title, fullscreen_kind=kind)
         else:
             self.window.reposition()
+        self.reassert_topmost()
+
+    def reassert_topmost(self) -> None:
+        """Put the island and its halo back on top of every other always-on-top window (``HWND_TOPMOST``, no move, no
+        size, no activation). Called on every foreground change: an event, never a poll. A loss is logged."""
+        if not _is_windows():
+            return
+        try:
+            from yuki.ui.focus import assert_topmost
+        except Exception:
+            return
+        for name, win in (("halo", self.window.halo_win), ("island", self.window)):
+            if not win.isVisible():
+                continue
+            was, ok = assert_topmost(int(win.winId()))
+            if not was or not ok:
+                self._log("island_topmost", window=name, was_topmost=was, ok=ok)
 
     # -- the run card ----------------------------------------------------------------------------------------
 
@@ -1696,6 +2201,9 @@ class Island(QObject):
         if self.expanded and self.inputs.final is not None and self.inputs.final.run is not None:
             self._card_timer.start(RUN_CARD_LINGER_MS)   # an open card stays to be read; Close folds it
             return
+        if self.hovered:                                  # being read: it stays until the pointer has left
+            self._final_timer.start(HOVER_OUT_MS + 700)
+            return
         self.update(final=None)
 
     def _voice_error_over(self) -> None:
@@ -1844,6 +2352,7 @@ class IslandStrip(QObject):
         ended = getattr(self, "_ended", None)
         kind = outcome or ("failed" if tone == "error" else "done")
         isl = self.island
+        isl.last_final = (" ".join(str(text or "").split()), kind, time.time())
         isl.update(final=FinalInfo(text, kind, "", ended, ended=time.monotonic()), transient="")
         isl._final_timer.start(DONE_MS)
         self._ended = None
@@ -1993,9 +2502,11 @@ class IslandCallIndicator(QObject):
 def on_call_status(island: Island, status: Any) -> None:
     """``CallController.changed``: the call being recorded (or waiting for headphones) goes on the island."""
     call = (status or {}).get("call") if isinstance(status, dict) else None
-    island.update(call=call if call_on(call) else None)
+    asking = str(call.get("app") or "a call") if isinstance(call, dict) and call.get("asking") else ""
+    island.update(call=call if call_on(call) else None, call_asking=asking)
 
 
 __all__ = ["BAR_H", "FinalInfo", "ForegroundWatch", "Island", "IslandCallIndicator", "IslandInputs", "IslandStrip",
            "IslandVoice", "IslandWindow", "RunInfo", "STATES", "Spec", "Steer", "active_screen", "call_since",
-           "caption_spans", "clock", "elapsed", "on_call_status", "pick_screen", "resolve", "spec_for"]
+           "caption_spans", "clock", "compact_word", "elapsed", "fullscreen_kind", "on_call_status", "pick_screen",
+           "resolve", "spec_for", "WindowFacts", "window_facts"]
