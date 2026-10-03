@@ -3031,6 +3031,9 @@ class PortraitScheduler:
         self.render_path = flag_path(db_path, RENDER_FLAG)
         self.pause_path = flag_path(db_path, PAUSE_FLAG)
         self.audit_path = flag_path(db_path, AUDIT_FLAG)
+        from yuki.memory.daydigest import DAYDIGEST_FLAG
+
+        self.daydigest_path = flag_path(db_path, DAYDIGEST_FLAG)
         self.render_debounce_s = float(render_debounce_s)
         self.loop_check_every_s = float(loop_check_every_s)
         #: Earliest next loop check (the first one comes soon after start).
@@ -3202,9 +3205,37 @@ class PortraitScheduler:
             return self._run(kind, reason)
         if now >= self._loop_check_at and self.worker.loop_check_pending():
             return self._check_loops(now)
+        if self._daydigest_wanted():
+            return self._daydigest("connector asked")
         if now >= self._titles_at:
             return self._titles("idle")
         return None
+
+    def _daydigest_wanted(self) -> bool:
+        """The window asked for yesterday's connector line and there was none (the ``day_digest`` flag, written by
+        :meth:`yuki.memory.api.MemoryClient.day_connector`): taken (deleted) here, built once in the background."""
+        try:
+            self.daydigest_path.unlink()
+            return True
+        except OSError:
+            return False
+
+    def _daydigest(self, kind: str) -> str | None:
+        """The day digests of the last completed days that have none (:class:`yuki.memory.daydigest.DayDigester`, one
+        Haiku call a day). Logs and never raises."""
+        from yuki.memory.daydigest import DayDigester
+
+        if not hasattr(self.worker, "_call"):
+            return None
+        try:
+            result = DayDigester(self.worker).run(reason=f"after the {kind} run" if kind in JOURNAL_RUN_KINDS else kind)
+        except Exception as exc:
+            self._log("error", where="portrait_daydigest", error=f"{type(exc).__name__}: {exc}",
+                      traceback=traceback.format_exc())
+            return None
+        self._log("portrait_run", kind="daydigest", ok=result.ok, run_id=result.run_id, days=len(result.days),
+                  calls=result.calls, cost_usd=round(result.cost_usd, 6), error=result.error)
+        return "daydigest" if result.calls else None
 
     def _titles(self, reason: str, *, gated: bool = True) -> str | None:
         """The batched labels pass (:class:`yuki.memory.titles.Titler`) for items without their short label.
@@ -3341,10 +3372,12 @@ class PortraitScheduler:
         """After the nightly (or weekly/first) run and its audit: dreaming tidies the portrait, the routines pass
         keeps the Routines true to the measured timeline, the threads of work are tidied (merged, closed,
         renamed, asked about), the people index is refreshed from what changed (yuki.memory.contacts: no call when
-        nothing did), then the persona pass writes how Yuki talks. Each logs and never raises (a failure waits for
-        the next night)."""
+        nothing did), the day digests of the last completed days are written (yuki.memory.daydigest: the line that
+        connects one day's chat to the next), then the persona pass writes how Yuki talks. Each logs and never
+        raises (a failure waits for the next night)."""
         for name, fn in (("dream", self._dream), ("routines", self._routines), ("threads", self._threads),
-                         ("contacts", self._contacts), ("persona", self._persona), ("personal", self._personal)):
+                         ("contacts", self._contacts), ("daydigest", self._daydigest), ("persona", self._persona),
+                         ("personal", self._personal)):
             try:
                 fn(kind)
             except Exception as exc:

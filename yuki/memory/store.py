@@ -6011,6 +6011,21 @@ class Store:
 
         return bool(self._write(op))
 
+    def cancel_correction(self, correction_id: int) -> bool:
+        """Take back a correction whose pass has not started (the user's Undo): its pass is skipped and the correction
+        ends (kept as history). False when the pass already started or finished."""
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> bool:
+            if conn.execute("UPDATE correction_passes SET status='skipped', updated_at=? WHERE correction_id=? AND"
+                            " status='queued'", (now, int(correction_id))).rowcount != 1:
+                return False
+            conn.execute("UPDATE portrait_facts SET valid_to=?, expired_at=? WHERE id=? AND kind=? AND valid_to IS NULL",
+                         (now, now, int(correction_id), CORRECTION_KIND))
+            return True
+
+        return bool(self._write(op))
+
     def review_counts(self, since: float) -> int:
         """How many portrait facts (any version) the user reviewed since ``since`` (the queue's daily cap)."""
         return int(self._query("SELECT count(*) FROM portrait_facts WHERE reviewed_at >= ?", (float(since),))[0][0])
@@ -6059,7 +6074,8 @@ class Store:
             self._insert_diary(conn, None, now, {"pass": "heard", "action": verdict, "fact_ids": [int(journal_id)],
                                                  "text": f"The user {line} for J{int(journal_id)}."})
             nature = "fact" if verdict == "right" else ("uncertain" if verdict == "undo" else row["nature"])
-            return {"id": int(journal_id), "verdict": verdict, "nature": nature, "text": text}
+            return {"id": int(journal_id), "verdict": verdict, "nature": nature, "text": text,
+                    "app": _shown(row["app"]) if row["app"] else ""}
 
         out = self._write(op)
         self._forget_withdrawn()
@@ -6076,6 +6092,18 @@ class Store:
             sql += " LIMIT ?"
             params.append(int(limit))
         return [self._entry(r) for r in self._query(sql, params)], total
+
+    def work_events_between(self, since: float, until: float, *, limit: int = 200) -> list[dict[str, Any]]:
+        """What happened to the threads of work in ``[since, until)``, oldest first: ``{"thread_id", "title", "status",
+        "at", "action", "state"}`` (decrypted; merged and dismissed threads left out)."""
+        rows = self._query(
+            "SELECT e.work_thread_id, e.at, e.action, e.state_ciphertext, t.title_ciphertext, t.status FROM"
+            " work_thread_events e JOIN work_threads t ON t.id = e.work_thread_id WHERE e.at >= ? AND e.at < ? AND"
+            " t.status NOT IN ('merged', 'dismissed') ORDER BY e.at, e.id LIMIT ?",
+            (float(since), float(until), int(limit)))
+        return [{"thread_id": int(r["work_thread_id"]), "title": self._dec(r["title_ciphertext"]) or "",
+                 "status": r["status"], "at": float(r["at"]), "action": r["action"],
+                 "state": self._dec(r["state_ciphertext"])} for r in rows]
 
     # -- day digests (migration 33, yuki.memory.daydigest) ----------------------------------------------------
 
