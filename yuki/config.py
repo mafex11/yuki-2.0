@@ -553,6 +553,36 @@ class Settings:
     #: left out when it does not answer in time (measured 2026-09-29: pipe p50 1.4 ms, focus p50 ~10 ms).
     now_wait_ms: float = 50.0
     focus_wait_ms: float = 50.0
+    # -- revamp D, part 1: the brain's safety and speed (docs/research/revamp-2026-10-02/30b-build-D-brain.md) --
+    #: The authorization judge (yuki.agent.judge): a separate Haiku call that sees only the user's words and the
+    #: proposed call, for calls whose tool metadata can destroy or reach someone and kinds the autonomy policy holds
+    #: below "do it and tell me". Its model, and how long a verdict may take before the call is held (fail closed).
+    #: (``YUKI_JUDGE=0`` / ``YUKI_CONSULT=0`` turn the defaults off: the test suite does, so a scripted fake model
+    #: client is never asked an extra question; the judge's and the consult's own tests turn them on.)
+    judge: bool = field(default_factory=lambda: os.environ.get("YUKI_JUDGE", "1") != "0")
+    judge_model: str = DEFAULT_VOICE_MOUTH_MODEL
+    judge_timeout_s: float = 8.0
+    #: Consult instead of escalating (yuki.agent.consult): the actor's cached profile stays fixed for the whole
+    #: request; on a measured signal one side call (this model, effort, thinking on) over a short summary returns
+    #: at most ~120 words of advice. Most consults per request; a pending send to a person is a signal too.
+    consult: bool = field(default_factory=lambda: os.environ.get("YUKI_CONSULT", "1") != "0")
+    consult_model: str = DEFAULT_MODEL
+    consult_effort: str = "medium"
+    consult_max: int = 2
+    consult_before_send: bool = True
+    consult_timeout_s: float = 30.0
+    #: A send is confirmed from memory's capture of the chat: a new message of the user's in that app since the
+    #: Enter, similar to the text, within this many seconds (yuki.agent.finish).
+    send_confirm_s: float = 4.0
+    #: Quieter hands (yuki.actions.leases): before global mouse or keys, wait while the user typed or moved the mouse
+    #: within ``recent`` seconds, until ``quiet`` seconds pass with no input, at most ``max`` seconds (then nothing is
+    #: sent and the brain is told).
+    input_yield: bool = True
+    input_yield_recent_s: float = 1.0
+    input_yield_quiet_s: float = 0.8
+    input_yield_max_s: float = 12.0
+    #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
+    pack_max_age_s: float = 20.0
 
     def __post_init__(self) -> None:
         if self.model_backend not in ("bedrock", "anthropic"):

@@ -22,6 +22,23 @@ import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _no_side_calls():
+    """Revamp D: the authorization judge and the second look are extra model calls; a test's scripted fake client
+    never answers them, so they are off unless a test turns them on (``Settings(judge=True, consult=True)``)."""
+    old = {k: os.environ.get(k) for k in ("YUKI_JUDGE", "YUKI_CONSULT")}
+    os.environ["YUKI_JUDGE"] = "0"
+    os.environ["YUKI_CONSULT"] = "0"
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
     """Point memory's default folder at a temp dir for the whole run (restored after)."""
     folder = tmp_path_factory.mktemp("yuki-memory")

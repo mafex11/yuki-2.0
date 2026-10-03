@@ -2727,3 +2727,16 @@ def scroll(
     moved = [a["moved"] for a in axes]
     details["verified"] = True if all(m is True for m in moved) else (False if any(m is False for m in moved) else None)
     return _result(all(oks), "; ".join(parts), details, started)
+
+
+# Revamp D (S7, quieter hands): every global-input action holds the input lease (and its expect_hwnd window's lease)
+# while it runs, so the brain and the voice's hands never interleave keystrokes, and its span is recorded as Yuki's
+# own input (yuki.actions.leases: the yield-to-the-user check leaves it out). Re-entrant: an action that clicks to
+# focus a field and then types holds it throughout.
+from yuki.actions.leases import leased as _leased  # noqa: E402
+
+click = _leased(click)
+type_text = _leased(type_text)
+hotkey = _leased(hotkey)
+press = _leased(press)
+scroll = _leased(scroll)

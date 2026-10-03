@@ -387,8 +387,14 @@ def test_helpers_and_fences_cover_the_call_tools():
     from yuki.agent.untrusted import EXTERNAL_TEXT_TOOLS
 
     names = {t["name"] for t in helper_tools(True)}
+    # revamp D: the call tools are kinds of the one memory tool, which helpers, fences and stubbing all cover
+    from yuki.agent.tools import TOOLS_BY_NAME
+
+    assert "memory" in names and "memory" in MEMORY_TOOLS and "memory" in EXTERNAL_TEXT_TOOLS
+    assert "memory" in PERCEPTION_TOOLS
+    kinds = TOOLS_BY_NAME["memory"]["input_schema"]["properties"]["kind"]["enum"]
     for tool in ("calls", "call_timeline"):
-        assert tool in names and tool in MEMORY_TOOLS and tool in EXTERNAL_TEXT_TOOLS and tool in PERCEPTION_TOOLS
+        assert tool in kinds and tool in EXTERNAL_TEXT_TOOLS
 
 
 def test_prompt_and_mouth_route_call_questions_to_the_timeline():

@@ -123,7 +123,8 @@ MAX_STEPS = 60
 #: Input fields that are the brain's notes about a call (spoken lines, its risk and finish marks, the playbook it
 #: follows), not what the call does; and fields that are window ids, element ids or coordinates (meaningless next
 #: time: kept apart as the run's numbers, so no lesson can carry them).
-NOTE_KEYS: frozenset[str] = frozenset({"say_now", "risk", "finishes_with", "playbook", "say_first", "say_when_done",
+NOTE_KEYS: frozenset[str] = frozenset({"say_now", "risk", "finishes_with", "finish_words", "playbook", "say_first",
+                                       "say_when_done",
                                        "about", "learned"})
 NUMBER_KEYS: frozenset[str] = frozenset({"hwnd", "expect_hwnd", "element", "read", "x", "y", "window", "tab_id",
                                          "dx", "dy"})
@@ -282,7 +283,51 @@ def _step_row(key: str, run: dict[str, Any], i: int, s: dict[str, Any], at: floa
             None if s.get("verdict") is None else int(bool(s.get("verdict"))),
             _clip(s.get("why"), 160) or None, _clip(_redact(s.get("result")), RESULT_CHARS) or None,
             float(s.get("ms") or 0.0), s.get("cost_usd"),
-            json.dumps({"cited": _ids([s.get("playbook")]), "sig": s.get("sig"), "expected": bool(s.get("expected"))}))
+            json.dumps({"cited": _ids([s.get("playbook")]), "sig": s.get("sig"), "expected": bool(s.get("expected")),
+                        **({"control": s["control_key"]} if s.get("control_key") else {}),
+                        **({"confirmed": True} if s.get("confirmed") else {})}))
+
+
+def control_key(store: Store, app: Any, tool: Any, control: Any) -> str | None:
+    """A control's identity in the run traces (revamp D, S2): the app, the tool and the control's role and name, as one
+    keyed digest (no text in clear). ``None`` without a control."""
+    text = " ".join(str(control or "").split()).casefold()
+    if not text or not tool:
+        return None
+    return store.cipher.digest("control", app_key(app) if app else "", str(tool), text)
+
+
+def control_record(store: Store, *, app: Any, tool: str, control: Any, limit: int = 400) -> dict[str, int]:
+    """How a control's earlier steps went, from the run traces (revamp D, S2: expected-unverifiable is learned per
+    control, never asked of a model): ``{"steps", "verified", "unverifiable_confirmed", "unverifiable", "contradicted"}``.
+    An unverifiable step counts as confirmed when something independent backed it afterwards in its run (a later
+    verified step in the same window, or the chat's capture of a sent message). Never raises."""
+    out = {"steps": 0, "verified": 0, "unverifiable_confirmed": 0, "unverifiable": 0, "contradicted": 0}
+    key = control_key(store, app, tool, control)
+    if key is None:
+        return out
+    try:
+        rows = store._query("SELECT ok, verdict, playbooks FROM runs WHERE step>0 AND tool=? AND app IS ? AND kind="
+                            "'action' ORDER BY id DESC LIMIT ?", (str(tool), app_key(app) if app else None, int(limit)))
+    except Exception:  # noqa: BLE001 - a database before migration 29
+        return out
+    for r in rows:
+        try:
+            meta = json.loads(r["playbooks"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if meta.get("control") != key:
+            continue
+        out["steps"] += 1
+        if r["verdict"] == 1:
+            out["verified"] += 1
+        elif r["verdict"] == 0:
+            out["contradicted"] += 1
+        elif r["ok"] == 1:
+            out["unverifiable"] += 1
+            if meta.get("confirmed"):
+                out["unverifiable_confirmed"] += 1
+    return out
 
 
 def record_run(store: Store, run: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
@@ -300,6 +345,8 @@ def record_run(store: Store, run: dict[str, Any], *, now: float | None = None) -
         at = float(run.get("at") or now)
         ended = float(run.get("ended_at") or now)
         steps = [s for s in (run.get("steps") or []) if isinstance(s, dict)][:MAX_STEPS]
+        steps = [{**s, "control_key": control_key(store, s.get("app"), s.get("tool"), s.get("control"))}
+                 if s.get("control") else s for s in steps]
         outcome = str(run.get("outcome") or "final")
         steers = [_clip(_redact(t), NOTE_CHARS) for t in (run.get("steers") or []) if str(t or "").strip()]
         signals = run_signals(steps, outcome=outcome, steers=len(steers), breaker=int(run.get("breaker") or 0))
@@ -1160,5 +1207,5 @@ __all__ = [
     "KINDS", "WEIGHTS", "HALF_LIFE_DAYS", "Playbook", "RunHeader", "RunStep", "run_key", "input_summary",
     "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
     "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
-    "relevant", "workflows", "workflow_edit", "pending_edits",
+    "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record",
 ]

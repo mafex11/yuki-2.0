@@ -533,7 +533,8 @@ def test_the_prompt_asks_for_know_how_provenance_deep_recall_and_standing_reques
 
     for name in ("remember_how", "watch_for", "with_time_use", "where and when it came from"):
         assert name in SYSTEM_PROMPT
-    assert "watch_for" in MEMORY_TOOLS and "with_time_use" in TOOLS_BY_NAME["recall"]["input_schema"]["properties"]
+    # revamp D: recall is a kind of the one memory tool
+    assert "watch_for" in MEMORY_TOOLS and "with_time_use" in TOOLS_BY_NAME["memory"]["input_schema"]["properties"]
 
 
 # -- cost gates (the owner's ~$1/day target) ----------------------------------------------------------

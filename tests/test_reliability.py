@@ -447,12 +447,22 @@ def test_a_command_without_a_risk_declaration_is_refused(tmp_path):
     assert "needs its risk declared" in _texts(client.calls[1]["messages"][-1]["content"])
 
 
-def test_risk_schema_is_on_every_action_and_required_on_the_shell():
-    from yuki.agent.tools import ACTION_TOOL_NAMES, TOOLS_BY_NAME
+def test_risk_schema_is_on_every_action_that_can_destroy_or_reach_and_required_on_the_shell():
+    """Revamp D (07 E1): risk is conditional on tool metadata - only actions some operation of which can destroy
+    something or reach someone carry it (and effect only when irreversible); the shell must declare it."""
+    from yuki.agent.tools import ACTION_TOOL_NAMES, OP_TRAITS, TOOL_TRAITS, TOOLS_BY_NAME
 
     for name in ACTION_TOOL_NAMES:
-        assert "risk" in TOOLS_BY_NAME[name]["input_schema"]["properties"]
+        can = TOOL_TRAITS[name].destroys or TOOL_TRAITS[name].reaches or any(
+            t.destroys or t.reaches for (tool, _op), t in OP_TRAITS.items() if tool == name)
+        assert ("risk" in TOOLS_BY_NAME[name]["input_schema"]["properties"]) == can, name
     assert "risk" in TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"]
+    risk = TOOLS_BY_NAME["run_powershell"]["input_schema"]["properties"]["risk"]
+    assert risk["required"] == ["reversible", "user_asked"]   # effect only when irreversible
+    for name in ("window_action", "tab", "hotkey", "press", "type_text"):
+        assert "risk" in TOOLS_BY_NAME[name]["input_schema"]["properties"]
+    for name in ("click", "scroll", "focus_window", "launch_app", "open_url"):
+        assert "risk" not in TOOLS_BY_NAME[name]["input_schema"]["properties"]
 
 
 # ---------------------------------------------------------------------------

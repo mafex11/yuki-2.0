@@ -21,7 +21,7 @@ import secrets
 #: captured memory, helpers' reports built from those). Their text is fenced; a list of tool
 #: names, not a rule about content.
 EXTERNAL_TEXT_TOOLS: frozenset[str] = frozenset({
-    "look_at_window", "read_page", "read_tabs", "run_powershell", "recall", "activity",
+    "look_at_window", "read_page", "read_tabs", "run_powershell", "memory", "recall", "activity",
     "calls", "call_timeline", "read_file", "fetch_url", "spawn_helpers", "threads", "before", "links",
     "look_at_focus", "read_clipboard",
 })
@@ -70,6 +70,8 @@ def wrap_blocks(content: list[dict], *, source: str, nonce: str) -> list[dict]:
 
 def source_for(name: str, tool_input: dict) -> str:
     """Where a tool's text came from, in plain words, for the fence's notice."""
+    if name == "memory":   # revamp D: the merged memory reads say where by their kind
+        name = str(tool_input.get("kind") or "recall")
     hwnd = tool_input.get("hwnd")
     return {
         "look_at_window": f"the window {hwnd} (its on-screen text)",
