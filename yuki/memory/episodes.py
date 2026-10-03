@@ -87,6 +87,41 @@ POWER_BEFORE_S = 1800.0
 
 MAX_OUTPUT_TOKENS = 2_048
 MAX_EPISODES = 3
+
+#: A work session's two lines in the app (migration 35; the user's feedback round 3, W2): a short distinct title and a
+#: concise summary said to the user. Shared with the sessions backfill (:mod:`yuki.memory.sessions`).
+SESSION_TITLE_FIELD = ("What the stretch was, 2 to 5 words, as a person would name it (\"Yuki voice fixes\", \"Valorant "
+                       "with friends\"); distinct from the other episodes' titles; a name, never a sentence or the "
+                       "summary cut short; English.")
+SESSION_SUMMARY_FIELD = ("The gist said to the user in one or two short sentences (about 30 words at most): what they did "
+                         "and how it went; second person, English, plain words; no clock times, minutes, per-app times "
+                         "or stretch-by-stretch account.")
+#: Kept when within these bounds (plumbing: words by whitespace, characters; nothing matched or cut).
+SESSION_TITLE_WORDS = (2, 6)
+SESSION_SUMMARY_MAX_CHARS = 260
+
+
+def session_title(text: Any) -> str | None:
+    """A model's session title kept as written (tidied, wrapping quotes and a closing full stop off), or None when it is
+    empty, cut off or outside :data:`SESSION_TITLE_WORDS`."""
+    t = " ".join(str(text or "").split())
+    while len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    if t.endswith(".") and not t.endswith(".."):
+        t = t[:-1].rstrip()
+    if not t or t.endswith("…") or t.endswith(".."):
+        return None
+    lo, hi = SESSION_TITLE_WORDS
+    return t if lo <= len(t.split()) <= hi else None
+
+
+def session_summary(text: Any) -> str | None:
+    """A model's session summary kept as written, or None when it is empty, cut off or over
+    :data:`SESSION_SUMMARY_MAX_CHARS`."""
+    from yuki.memory.titles import clean_shown
+
+    t = clean_shown(text)
+    return t if t is not None and len(t) <= SESSION_SUMMARY_MAX_CHARS else None
 #: Journal characters given with one window.
 JOURNAL_CHARS = 8_000
 SEQUENCE_LINES = 80
@@ -136,6 +171,17 @@ Claude desktop (25 min, longest stretch 9 min); 36 switches between the two." Us
 when the window has one thread of activity; split only where the activity clearly changed or \
 at an away break.
 
+Each episode also gets the two lines the user's app shows for it (the app shows the start, the end \
+and the time in every app beside them, so these never repeat them):
+- title: what the stretch was, in 2 to 5 words, as a person would name it ("Yuki voice fixes", \
+"Valorant with friends", "Maths prep for Kiran"), different from the other episodes' titles and \
+from every title in TITLES ALREADY USED TODAY (a long day of one piece of work: name what this \
+stretch did that the earlier ones did not); a name, never a sentence and never the summary cut short.
+- summary: the gist, said to the user, in one or two short sentences (about 30 words at most): what \
+they did and how it went - second person ("you"), in English whatever language the journal quotes, \
+plain words, no clock times, no minutes or per-app times, no stretch-by-stretch account. Example: \
+"You fixed the wake word's timing with Claude Code and reran the voice tests; two still failed."
+
 Rules:
 - Only what the data supports. Name apps, sites, pages, videos, channels and projects as the \
 data shows them, and use the JOURNAL to say what the activity was about. Do not guess \
@@ -174,7 +220,7 @@ RECORD_EPISODES_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["start", "end", "text"],
+                    "required": ["start", "end", "text", "title", "summary"],
                     "properties": {
                         "start": {"type": "string", "description": "Local start, YYYY-MM-DD HH:MM, inside the window."},
                         "end": {"type": "string", "description": "Local end, YYYY-MM-DD HH:MM, inside the window."},
@@ -182,6 +228,8 @@ RECORD_EPISODES_TOOL: dict[str, Any] = {
                             "type": "string",
                             "description": "One to four sentences, starting with the time span, with the real numbers.",
                         },
+                        "title": {"type": "string", "description": SESSION_TITLE_FIELD},
+                        "summary": {"type": "string", "description": SESSION_SUMMARY_FIELD},
                     },
                 },
             }
@@ -414,9 +462,11 @@ def _sequence_lines(seq: Sequence[dict[str, Any]], safe) -> list[str]:
 
 
 def build_user_message(
-    window: Window, facts: dict[str, Any], journal: Sequence[JournalEntry], nonce: str | None = None
+    window: Window, facts: dict[str, Any], journal: Sequence[JournalEntry], nonce: str | None = None,
+    used_titles: Sequence[str] = (),
 ) -> str:
-    """The fenced user message for one window."""
+    """The fenced user message for one window. ``used_titles``: the titles of the day's earlier sessions (W2: a
+    long day of one piece of work is cut into windows, and each window's titles must differ from them)."""
     nonce = nonce or str(uuid.uuid4()).upper()
     begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
     end = f"===END_UNTRUSTED_DATA_{nonce}==="
@@ -464,6 +514,9 @@ def build_user_message(
         journal_lines.append(line)
         used += len(line)
     parts += journal_lines or ["(none)"]
+    parts.append("TITLES ALREADY USED TODAY (earlier sessions; give each episode here a different title, naming "
+                 "what is new in it - \"Yuki voice fixes\" before becomes \"Yuki wake word tests\"):")
+    parts += [f"- {safe(t, 80)}" for t in used_titles] or ["(none)"]
     data = "\n".join(parts)
     state = (
         "finished (ended by a break or the window cap)" if window.final
@@ -622,6 +675,16 @@ class EpisodeWorker:
 
     # -- one window ------------------------------------------------------------
 
+    def _used_titles(self, window: Window) -> list[str]:
+        """The titles of the day's sessions before this window (its local calendar day, as the sessions backfill
+        groups them), oldest first, each once. Never raises."""
+        day = datetime.fromtimestamp(window.start).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        try:
+            eps = self.store.episodes_between(day, window.start)
+        except Exception:
+            return []
+        return list(dict.fromkeys(e.title for e in eps if getattr(e, "title", None) and e.started_at < window.start))
+
     def run_window(self, window: Window, now: float | None = None) -> EpisodeResult:
         """Write the episodes of one window (or record it empty / given up)."""
         now = time.time() if now is None else float(now)
@@ -643,7 +706,7 @@ class EpisodeWorker:
             else:
                 # an item that may be misheard or ambiguous is never evidence (yuki.memory.personality)
                 journal = [j for j in self.store.journal_between(window.start, window.end) if usable(j)]
-                user = build_user_message(window, facts, journal)
+                user = build_user_message(window, facts, journal, used_titles=self._used_titles(window))
                 request = {
                     "model": self.model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
@@ -736,6 +799,7 @@ class EpisodeWorker:
             out.append(NewEpisode(
                 started_at=start, ended_at=end, window_start=window.start, window_end=window.end,
                 final=window.final, text=text, aggregates=aggregates,
+                title=session_title(item.get("title")), summary=session_summary(item.get("summary")),
             ))
         kept, dropped = non_overlapping(out)
         if dropped:

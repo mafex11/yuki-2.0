@@ -162,7 +162,7 @@ user without their name, starting with the verb ("Asked whether...", "Said the b
 so busy for now"); where a line has to name the user again, write "the user", as the rest of memory \
 does - never he, she, him, her, his or hers for the user (other people keep their own pronouns). \
 Translate Hindi, Hinglish, Devanagari and any other \
-language into plain English; quote a few words only when the exact words matter. Several \
+language into plain English; quote a few words, translated into English, only when the exact words matter. Several \
 utterances on one point make one line; aim for about one line for each minute or two of real \
 talk, more when a lot happens, none for filler. Keep names, numbers, times and places exactly as \
 said. Banter and swearing among friends: say what it was (trash-talked a friend, teased someone \

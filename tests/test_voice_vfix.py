@@ -478,7 +478,8 @@ def test_a_marker_line_inside_the_speech_is_never_spoken() -> None:
 def test_v10_v12_v6_the_talker_writes_roman_script_short_and_only_what_was_reported() -> None:
     from yuki.voice.mouth import MOUTH_PROMPT, WORK_GUIDE
 
-    assert "always in Roman letters" in MOUTH_PROMPT and "Never Devanagari" in MOUTH_PROMPT
+    # the feedback round 3 (W5): English only, whatever language the user's words came in (was Roman-script Hinglish)
+    assert "Speak English only" in MOUTH_PROMPT and "Never Hindi, Hinglish or Devanagari" in MOUTH_PROMPT
     assert "with Hindi words in Devanagari" not in MOUTH_PROMPT
     assert "no praise of it, no question tacked on" in MOUTH_PROMPT and "unless asked" in MOUTH_PROMPT
     assert "never tell them it is doing a step it has not reported" in MOUTH_PROMPT
