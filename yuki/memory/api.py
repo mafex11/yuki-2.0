@@ -2906,17 +2906,28 @@ class MemoryClient:
                 card["rhythm"] = _c.rhythm(self.store, [found[0]]).get(found[0].id)
             except Exception:
                 card["rhythm"] = None
-            return {"found": True, **card, "text": _c.card_text(card), "others": [p.name for p in found[1:4]]}
+            text = _c.card_text(card)   # the agent's card: every fact, in memory's form
+            # the window's dossier shows one summary per person (``summary``) and only the other facts, said to the
+            # user (report 38 §3: the same person fact was shown twice, once "you", once "the user")
+            card["facts"] = list(card.pop("facts_shown", None) or [])
+            return {"found": True, **card, "text": text, "others": [p.name for p in found[1:4]]}
         except Exception:
             return None
 
     def people_list(self, *, limit: int = 40) -> list[dict]:
         """The people the user talks to, as structured rows for the Yuki window's Me page (no message text is
-        decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "app", "kind",
-        "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...], "usual", "margin", "close",
-        "last_contact", "rhythm"}]``, most recently in touch first; ``rhythm`` is their messages a day both ways over 14
-        days (``yuki.memory.contacts.rhythm``: ``days``, ``total``, ``known_days``, ``peak``...). ``[]`` when memory has
-        no people index yet. Never raises."""
+        decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "human", "use",
+        "app", "kind", "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...],
+        "usual", "usual_ref", "summary", "margin", "close", "last_contact", "rhythm"}]``, most recently in touch first;
+        ``rhythm`` is their messages a day both ways over 14 days (``yuki.memory.contacts.rhythm``: ``days``, ``total``,
+        ``known_days``, ``peak``...). ``[]`` when memory has no people index yet. Never raises.
+
+        Since migration 33 (the 3 Oct feedback): ``usual`` is a label object, never a ``route:N``
+        (:func:`yuki.memory.contacts.usual_label`: ``{"ref", "label": "Discord DM", "sub", "use", "mine", "theirs",
+        "last_at", "tone", "preferred"}`` or None; ``usual_ref`` is the bare ref); ``relation`` is the person fact's
+        short label written to the user ("Your father") when there is one; ``summary`` is the one summary per person
+        (``{"ref": "fact:N", "headline", "text" (shown form, may be None), "pinned"}`` or None); a route's ``use`` is
+        one sentence of what the user uses that chat for with them (None until the contacts rebuild writes it)."""
         from yuki.memory import contacts as _c
 
         try:
@@ -2935,12 +2946,14 @@ class MemoryClient:
                 facts = None
             for person in persons:
                 c = _c.card(self.store, person, with_samples=0, calls_seen=seen, person_facts=facts)
-                routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "chat", "handle", "mine", "theirs",
-                                                 "last_mine", "last_theirs", "share", "preferred")} for r in c["routes"]]
+                routes = [{k: r.get(k) for k in ("ref", "label", "human", "use", "app", "kind", "chat", "handle",
+                                                 "mine", "theirs", "last_mine", "last_theirs", "share", "preferred")}
+                          for r in c["routes"]]
                 last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),
                            default=None)
                 rows.append({"ref": c["ref"], "name": c["name"], "relation": c["relation"], "aliases": c["aliases"],
-                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "margin": c["margin"],
+                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "usual_ref": c["usual_ref"],
+                             "summary": c["summary"], "margin": c["margin"],
                              "close": c["close"], "last_contact": last, "rhythm": rhythms.get(person.id)})
             rows.sort(key=lambda r: r["last_contact"] or 0, reverse=True)
             return rows[:limit]
