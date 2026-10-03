@@ -59,7 +59,7 @@
       if (gone) return;
       gone = true;
       timers.forEach(clearTimeout); timers.clear();
-      document.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('keydown', onKey, true);
       if (ps) ps.destroy();
       el.remove();
       S.splash = why;
@@ -83,9 +83,10 @@
       } });
       S.splash = still ? 'still' : 'playing';
     }
-    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); remove('skipped'); } }
+    // Esc skips it and only that (first of all key handlers: the window's, in its capture phase)
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); remove('skipped'); } }
     el.addEventListener('pointerdown', (e) => { e.preventDefault(); remove('skipped'); });
-    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('keydown', onKey, true);
     S.splash = 'waiting';
     if (B.native) later(() => remove('no answer'), WAIT_GO_MS);   // the host answers ready at once
     else play();                                                   // the file:// preview: no host to ask
