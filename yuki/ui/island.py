@@ -23,7 +23,8 @@ hidden-armed        listening for its name only: the tiny resting pill (click-th
 
 **Compact by default.** Every state but needs-you and voice-stopped shows a compact pill (the face and one short
 word); resting the pointer on it expands it to the full bar with the 300 ms morph, and it folds back 300 ms after
-the pointer leaves. The halo hangs under it only while Yuki hears, thinks or works, or speaks.
+the pointer leaves (sizes and timings: the mock's Island spec, 3 Oct polish round). The halo hangs only under the open
+island, and only while Yuki hears, thinks or works, or speaks.
 
 **The run card** (E7) expands from the expanded island (the chevron, or a click on it while a run goes): the live steps from
 the chat thread (:class:`yuki.ui.chat_model.ChatModel`), "from memory" and "using your lesson" chips where the agent's
@@ -79,10 +80,15 @@ DONE_MS = 3000
 HOVER_IN_MS = 150
 #: The expanded island folds back to the pill this long after the pointer leaves.
 HOVER_OUT_MS = 300
-#: The compact pill: the face at pitch 3 and one short word (the mini island's height).
+#: The compact pill (the mock's Island spec): 40 px tall plus its border, up to 360 px wide, radius 20, padding
+#: 0 16 0 10, a 10 px gap, the face at 4 px cells (68 x 28) and one word in 13.5 px / 500.
+COMPACT_H = 40
 COMPACT_PAD = 10
-COMPACT_GAP = 8
+COMPACT_PAD_R = 16
+COMPACT_GAP = 10
 COMPACT_MAX_W = 360
+COMPACT_PITCH = 4
+RADIUS_PILL = 20
 #: The resting pill (Settings: the tiny pill when idle): the design's ``.island.mini.resting``.
 RESTING_H = 26
 RESTING_PAD = 9
@@ -336,9 +342,8 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
             state, state)
         if state == "done-flash":
             face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
-        n, of = step_of(run)
-        return Spec(state, face=face, compact=True, word=compact_word(state, i),
-                    rec=rec, halo=state if state in HALO_STATES else None, step=(n, of),
+        n, of = step_of(run)   # the halo belongs to the open island: the pill never carries it
+        return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=(n, of),
                     title=compact_word(state, i))
     if state == "call-notice":
         return Spec(state, face="quiet-in-call", compact=True, word=i.notice, rec=rec, title=i.notice)
@@ -359,7 +364,7 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         return Spec(state, face="needs-you", exp=True, width=600, line=i.question, sub=sub, rec=rec,
                     body="choices", title=i.question)
     if state == "voice-stopped":
-        return Spec(state, face="voice-stopped", width=700, line="Voice stopped",
+        return Spec(state, face="voice-stopped", width=720, line="Voice stopped",
                     sub=i.voice_error, keys=("retry", "settings"), title=i.voice_error)
     if state == "working" and expanded and run is not None:
         n, of = step_of(run)
@@ -1190,8 +1195,8 @@ class IslandWindow(QWidget):
         self.face = FaceWidget(8, P)
         self.ln1 = L.Para("", font=L.ui_font(15, 500), line_height=1.25, parent=P, max_lines=1)
         self.ln2 = L.Para("", font=L.mono_font(11, 500), color=L.TEXT3, line_height=1.3, parent=P, max_lines=1)
-        #: The compact pill's one word (12.5 px, 500).
-        self.word = L.Para("", font=L.ui_font(12.5, 500), line_height=1.25, parent=P, max_lines=1)
+        #: The compact pill's one word (13.5 px, 500).
+        self.word = L.Para("", font=L.ui_font(13.5, 500), line_height=1.25, parent=P, max_lines=1)
         self.rec = RecDot(P)
         self.chip = L.Chip("done", icon="check", parent=P)
         self.k_stop = L.Key("Stop", variant="stop", size="sm", icon="stop", parent=P)
@@ -1255,11 +1260,12 @@ class IslandWindow(QWidget):
         if spec.mini:
             return 1 + BAR_SHIFT + 12 + FACE_W * 3 + 12 + 1
         if spec.compact:
-            fm = QFontMetricsF(self.word.font())
-            text = int(math.ceil(fm.horizontalAdvance(spec.word))) + 2
-            w = 1 + COMPACT_PAD + FACE_W * 3 + COMPACT_GAP + text + (COMPACT_GAP + 7 if spec.rec else 0) \
-                + COMPACT_PAD + 2 + 1
-            return max(1 + COMPACT_PAD + FACE_W * 3 + COMPACT_PAD + 1, min(COMPACT_MAX_W, w))
+            if self.word.text() != spec.word:
+                self.word.set_text(spec.word)
+            text = int(math.ceil(self.word.natural_width())) + 4
+            w = 1 + COMPACT_PAD + FACE_W * COMPACT_PITCH + COMPACT_GAP + text + (COMPACT_GAP + 7 if spec.rec else 0) \
+                + COMPACT_PAD_R + 1
+            return max(1 + COMPACT_PAD + FACE_W * COMPACT_PITCH + COMPACT_PAD_R + 1, min(COMPACT_MAX_W, w))
         if spec.width:
             return spec.width
         face_w = FACE_W * 8
@@ -1281,7 +1287,9 @@ class IslandWindow(QWidget):
     def panel_height(self, spec: Spec, w: int) -> int:
         if spec.resting:
             return RESTING_H + 2
-        if spec.mini or spec.compact:
+        if spec.compact:
+            return COMPACT_H + 2
+        if spec.mini:
             return MINI_H + 2
         return BAR_H + 2 + self.body_height(spec, w)
 
@@ -1298,11 +1306,11 @@ class IslandWindow(QWidget):
         if spec.compact:
             self.face.move(1 + COMPACT_PAD, (h - self.face.height()) // 2)
             x = 1 + COMPACT_PAD + self.face.width() + COMPACT_GAP
-            right = w - 1 - COMPACT_PAD
+            right = w - 1 - COMPACT_PAD_R
             if spec.rec:
                 self.rec.move(right - self.rec.width(), (h - self.rec.height()) // 2)
                 right -= self.rec.width() + COMPACT_GAP
-            lh = int(round(12.5 * 1.25))
+            lh = int(round(13.5 * 1.25))
             self.word.setGeometry(x, (h - lh) // 2, max(10, right - x), lh)
             return
         fy = 1 + (BAR_H - self.face.height()) // 2
@@ -1365,12 +1373,13 @@ class IslandWindow(QWidget):
         for w in (self.k_answer, self.k_qstop):
             w.setVisible(spec.body == "choices")
         self.run.setVisible(spec.body == "run")
-        small = spec.mini or spec.compact
+        pitch = 3 if spec.mini else COMPACT_PITCH if spec.compact else 8
         small_was = (old.mini or old.compact) if old is not None and not old.hidden else None
-        if small_was is None or small_was != small or self.face.pitch != (3 if small else 8):
-            self.face.set_pitch(3 if small else 8, grow=(small_was is True and not small and not reduced))
+        if self.face.pitch != pitch:   # the face scales between the pill (4 px cells) and the open island (8 px)
+            self.face.set_pitch(pitch, grow=(small_was is True and pitch == 8 and not reduced))
         self.face.set_state(spec.face, spec.step)
-        self.panel.radius = float(RADIUS_MINI if small else RADIUS_EXP if spec.exp else RADIUS)
+        self.panel.radius = float(RADIUS_MINI if spec.mini else RADIUS_PILL if spec.compact
+                                  else RADIUS_EXP if spec.exp else RADIUS)
         self.panel.resting = spec.resting
         self._set_click_through(spec.resting)
         if self._move.state() != QVariantAnimation.State.Running:

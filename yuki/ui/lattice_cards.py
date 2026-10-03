@@ -1091,7 +1091,7 @@ def QGuiApplication_platform() -> str:  # noqa: N802 - a tiny helper
 #: 32 px rows with 8 px corners, hover ``raise-2``, the right-hand state in mono.
 TRAY_MENU_CSS = (
     "QMenu {{ background: {bg}; border: 1px solid #34373C; border-radius: 12px; padding: 5px; color: {text};"
-    " font-family: 'Segoe UI Variable Text', 'Segoe UI'; font-size: 13px; }}"
+    " }}"
     "QMenu::item {{ height: 32px; padding: 0 12px 0 8px; border-radius: 8px; background: transparent; }}"
     "QMenu::item:selected {{ background: {raise2}; }}"
     "QMenu::item:disabled {{ color: {text3}; }}"
@@ -1112,6 +1112,7 @@ class TrayMenu(QMenu):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
         self.setMinimumWidth(252)
+        self.setFont(L.ui_font(13))
         self.setStyleSheet(TRAY_MENU_CSS.format(bg=L.css(L.BG), text=L.css(L.TEXT), text3=L.css(L.TEXT3),
                                                 raise2=L.css(L.RAISE2), hair=L.css(L.HAIR)))
         self._words: dict[int, str] = {}
