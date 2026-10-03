@@ -208,9 +208,15 @@ async function main() {
       location.hash = '#settings';
       await T.sleep(250);
       const box = document.querySelector('#main .about-splash');
+      const r0 = box && box.getBoundingClientRect();
+      const below = !!r0 && r0.top >= window.innerHeight;
+      T.check('About is the last block, below the fold here', below && document.querySelector('#main [data-k="right"]').lastElementChild.dataset.k === 'about', r0 && r0.top);
+      T.check('nothing runs before it is in view', below && !box.__splash && !box.querySelector('canvas'));
+      box.scrollIntoView({ block: 'center' });
+      await T.sleep(250);
       const cv = box && box.querySelector('canvas');
       T.check('About has the splash', !!cv);
-      T.check('it plays when Settings opens', !!(box && box.__splash) && T.lit(cv) > 50, T.lit(cv));
+      T.check('it plays when it comes into view', !!(box && box.__splash) && T.lit(cv) > 50, T.lit(cv));
       const aboutText = document.querySelector('#main [data-k="about"]').textContent;
       T.check('About shows the version', aboutText.includes('Version') && aboutText.includes('9.8.7'), aboutText);
       await T.sleep(1500);
@@ -229,7 +235,10 @@ async function main() {
       await T.sleep(150);
       location.hash = '#settings';
       await T.sleep(150);
-      T.check('opening Settings again plays a new one', document.querySelector('#main .about-splash canvas') !== cv);
+      document.querySelector('#main .about-splash').scrollIntoView({ block: 'center' });
+      await T.sleep(250);
+      const cv2 = document.querySelector('#main .about-splash canvas');
+      T.check('opening Settings again plays a new one', !!cv2 && cv2 !== cv && T.lit(cv2) > 50, cv2 && T.lit(cv2));
     });
 
     if (shots) {   // pictures for the report: the splash mid-play over the page, and Settings -> About

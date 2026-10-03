@@ -85,14 +85,14 @@
       h('div', { class: 'set-grid', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
-          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps'),
-          Y.k(Y.sec('About', null, about), 'about')),
+          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps')),
         h('div', { class: 'col', data: { k: 'right' } },
           Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for my next start')), 'voice'),
           Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
           Y.k(Y.sec('Privacy and pause', null, privacy), 'privacy'),
           Y.k(Y.sec('Calls', null, calls), 'calls'),
-          Y.k(Y.sec('Accent and motion', null, look), 'look')))];
+          Y.k(Y.sec('Accent and motion', null, look), 'look'),
+          Y.k(Y.sec('About', null, about), 'about')))];
   }
 
   /* ---------- actions ---------- */
@@ -139,16 +139,28 @@
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
   });
 
-  /* About's splash: plays once when Settings opens (a still frame with reduced motion or under a full-screen app);
-     a live patch keeps the one already there; a press (or Enter) plays it again */
+  /* About's splash: plays once per opening of Settings, when it first comes into view (it is the page's last block,
+     so it never plays unseen below the fold; nothing runs until then). A still frame with reduced motion or under a
+     full-screen app; a live patch keeps the one already there; a press (or Enter) plays it again. */
+  function start(el) {
+    if (el.__splash || !el.isConnected) return;
+    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: window.Lattice.Motion.reduced });
+  }
   function mount(main) {
     const el = main.querySelector('.about-splash');
-    if (!el || el.__splash || !window.PlanetSplash) return;
-    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: window.Lattice.Motion.reduced });
+    if (!el || el.__splash || el.__seen || !window.PlanetSplash) return;
+    if (window.Lattice.Motion.reduced || !window.IntersectionObserver) { start(el); return; }
+    el.__seen = new IntersectionObserver((es) => {
+      if (!es.some((e) => e.isIntersecting)) return;
+      el.__seen.disconnect();
+      start(el);
+    }, { threshold: 0.35 });
+    el.__seen.observe(el);
   }
   A['about-replay'] = (t) => {
     const el = t.closest('.about-splash');
-    if (!el || !el.__splash) return;
+    if (!el || !window.PlanetSplash) return;
+    if (!el.__splash) { if (el.__seen) el.__seen.disconnect(); start(el); return; }
     if (window.Lattice.Motion.reduced) el.__splash.still(); else el.__splash.replay();
   };
 

@@ -59,11 +59,12 @@ APP_ICON = ROOT / "yuki" / "ui" / "yuki.ico"
 WEB_DIR = ROOT / "yuki" / "ui" / "web"
 INSTALLER_DIR = PKG / "installer"
 #: The wizard images Inno Setup chooses from by the size of its image area (it keeps 164:314 and a square; the
-#: sizes are its 100 %, 125 % and 150 % areas, before 6.6 and since): ``win`` is how many of the splash's 520 x 300
+#: sizes are its image areas at 100 %, 125 % and 150 %: 164x314, 202x386, 240x459 in the layout before 6.6,
+#: 202x386, 269x515, 336x643 since; Inno Setup picks the best match per DPI): ``win`` is how many of the splash's 520 x 300
 #: layout px span the width, ``cx``/``cy`` the layout point at the centre. The large image shows the planet over the
 #: name; the small one (58 to 124 px square) only the planet, zoomed so its dots are a whole number of pixels apart
 #: (size -> px between dots: crisp, no moire).
-WIZARD = ((164, 314), (202, 386), (240, 459), (336, 643))
+WIZARD = ((164, 314), (202, 386), (240, 459), (269, 515), (336, 643))
 WIZARD_SMALL = {58: 2, 77: 3, 97: 3, 124: 4}
 WIZARD_WIN = 214.0
 SPLASH_PITCH = 5.2               # planet-splash.js P: the field's dot pitch in layout px

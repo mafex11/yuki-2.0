@@ -303,6 +303,7 @@ class WebWindow:
                  policy_path: Path | None = None, shot_delay: float = 0.0, splash: bool = False) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.splash = splash                   # the startup splash was asked for (the tray's first window of a run)
+        self.splash_answered = False           # the page's first ready got its answer (play or not): only once
         self.page, self.thread_open = page, thread
         self.open_page = page                  # the page open now ("day" for Work's Day tab), from the page's want
         self.fixture = fixture
@@ -391,9 +392,12 @@ class WebWindow:
         if op == "ready":
             self.marks["page_ready"] = time.time()
             if self.splash and self.host is not None:   # the page holds its splash until this answer (UI thread)
-                covered = self.cover_now()
-                self.host.post({"kind": "splash", "on": not covered})
-                self.log("web_splash", on=not covered, **({"reason": "covered"} if covered else {}))
+                # once per window: a page loaded again (a renderer restart) gets "off" at once, never a second play
+                covered = self.cover_now() if not self.splash_answered else False
+                on = not covered and not self.splash_answered
+                self.splash_answered = True
+                self.host.post({"kind": "splash", "on": on})
+                self.log("web_splash", on=on, **({} if on else {"reason": "covered" if covered else "again"}))
             self.ready.set()
             threading.Thread(target=self._boot_when_ready, name="yuki-web-boot", daemon=True).start()
         elif op == "painted":

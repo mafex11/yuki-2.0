@@ -96,6 +96,8 @@ def test_ready_answers_whether_the_splash_may_play(tmp_path, monkeypatch):
     win.on_message({"op": "ready"})
     assert host.kinds("splash") == [{"kind": "splash", "on": True}]
     assert host.posted[0]["kind"] == "splash"                            # before anything else: the page waits on it
+    win.on_message({"op": "ready"})                                      # the page loaded again (a renderer restart)
+    assert host.kinds("splash")[-1] == {"kind": "splash", "on": False}   # once per window, never a second play
 
     win2, host2 = _window(tmp_path, monkeypatch, splash=True)
     monkeypatch.setattr(win2, "cover_now", lambda: True)                 # a full-screen game in front

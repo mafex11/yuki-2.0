@@ -182,6 +182,7 @@ def test_bitmap_frames_keep_soft_alpha_exactly(tmp_path):
 
 
 @pytest.mark.skipif(not GALLERY.exists(), reason="the logo gallery (gitignored) is not on this PC")
+@pytest.mark.skipif(not (GALLERY / "yuki-icon-16.png").exists(), reason="the logo gallery (gitignored) is not on this PC")
 def test_the_frames_are_the_gallerys_pngs_byte_for_byte():
     for s in M.SIZES:
         assert (FRAMES / f"{s}.png").read_bytes() == (GALLERY / f"yuki-icon-{s}.png").read_bytes(), s

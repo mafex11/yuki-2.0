@@ -40,8 +40,9 @@ Write-Host "Yuki $Version  (python: $Python)"
 & $Python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller is not installed for $Python (uv pip install --python $Python pyinstaller)" }
 
-# the app icon: the logo picked in packaging/icon/icon.json ("mark"), drawn from its committed SVGs at every size;
-# no pick yet keeps the current yuki.ico (make_icon.py)
+# the app icon: the logo picked in packaging/icon/icon.json ("mark"; the badge since 3 Oct 2026), packed from its
+# committed frames at every size into yuki.ico and copied to yuki\ui\yuki.ico for the window (make_icon.py; no
+# browser or Node needed). The installer's wizard images are committed too (make_icon.py --installer-images).
 & $Python (Join-Path $Pkg "make_icon.py")
 if ($LASTEXITCODE -ne 0) { throw "make_icon.py failed ($LASTEXITCODE)" }
 if ($Clean) { Remove-Item -Recurse -Force $Dist, $Work -ErrorAction SilentlyContinue }
