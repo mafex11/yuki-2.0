@@ -750,6 +750,64 @@ def test_shift_times_moves_only_times():
                  "since": 5, "label": "x"}
 
 
+# -- live refresh: the open page follows memory (42-window-live-refresh.md) ----------------------------------------
+
+
+class _Server:
+    """WindowServer's broadcast surface, recording what every window would get."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    def broadcast(self, event: dict) -> int:
+        self.sent.append(json.loads(json.dumps(event)))
+        return 1
+
+    def send_to(self, peer, event) -> bool:
+        self.sent.append(json.loads(json.dumps(event)))
+        return True
+
+
+def test_the_tray_forwards_nudge_and_call_events_once_per_change(tmp_path):
+    host, _nudges = _tray_host(tmp_path)
+    host.server = _Server()
+    recording = {"call": {"id": 7, "app": "Signal", "status": "recording", "session_started_at": "2026-10-03T10:00:00"},
+                 "recording": True, "waiting": {"calls": 0, "minutes": 0}}
+    for _ in range(4):                                     # the watcher's polls bring the same status every 10-20 s
+        host.call_status(recording)
+    host.call_status({**recording, "call": {**recording["call"], "others": 2}})   # nothing the window shows moved
+    host.call_status({"call": None, "recording": False, "waiting": {"calls": 1, "minutes": 12.0}})
+    calls = [e for e in host.server.sent if e["ev"] == "call"]
+    assert [c["status"]["recording"] for c in calls] == [True, False]
+    rows = [{"id": 51, "kind": "question", "text": "Invented question?"}]
+    for _ in range(3):                                     # NudgeWatcher.arrived on every 60 s poll
+        host.cards_arrived(rows, "poll")
+    host.cards_arrived([], "poll")
+    host.cards_arrived(rows + [{"id": 52, "kind": "notice"}], "event")
+    host.card_written("nudge_ack")
+    host.card_written("nudge_received")                    # not a write memory made: no refresh
+    topics = [(e["topic"], e.get("why")) for e in host.server.sent if e["ev"] == "memory"]
+    assert topics == [("cards", "arrived"), ("cards", "arrived"), ("cards", "nudge_ack")]
+
+
+def test_tray_focus_refreshes_the_open_page_not_home(tmp_path, monkeypatch):
+    win, host = _window(tmp_path, monkeypatch)
+    win.memory, win.booted = object(), True
+    asked: list[tuple] = []
+    monkeypatch.setattr(win, "refresh", lambda name, stale_s=None, **kw: asked.append((name, stale_s)))
+    win.on_message({"op": "want", "page": "playbook"})
+    assert win.open_page == "playbook" and asked[-1] == ("playbook", web_window.STALE_S)
+    asked.clear()
+    win._on_tray_event({"ev": "focus"})
+    assert asked == [("playbook", 10.0)] and host.kinds("focus")[-1] == {"kind": "focus"}
+    asked.clear()
+    win.come_forward()                                     # a second start: the same
+    assert asked == [("playbook", 10.0)]
+    asked.clear()
+    win.on_message({"op": "want", "page": "playbook", "again": True})   # the same tab clicked again
+    assert asked == [("playbook", web_window.AGAIN_S)]
+
+
 # -- a real window (opt-in) ------------------------------------------------------------------------------------------
 
 

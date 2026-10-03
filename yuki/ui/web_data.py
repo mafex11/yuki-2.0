@@ -140,7 +140,12 @@ def build_shell(memory: Any) -> dict[str, Any]:
 
 def call_now(memory: Any) -> dict[str, Any] | None:
     """The call going on now, for the rail's rec chip and Home's Now strip; ``None`` when there is none."""
-    cs = _safe(memory.call_status, {}) or {}
+    return call_view(_safe(memory.call_status, {}) or {})
+
+
+def call_view(cs: dict[str, Any]) -> dict[str, Any] | None:
+    """:func:`call_now` from a ``call_status()`` already read (the tray forwards each change: no memory read)."""
+    cs = cs if isinstance(cs, dict) else {}
     call = cs.get("call")
     if not call:
         return None
@@ -264,14 +269,16 @@ def request_row_words(r: dict[str, Any]) -> tuple[str, str]:
 
 
 def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
-               now: float | None = None, people: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+               now: float | None = None, people: list[dict[str, Any]] | None = None,
+               call_status: dict[str, Any] | None = None) -> dict[str, Any]:
     """Home: the Now strip, Needs you (questions), Running (the call, transcripts waiting; live runs come from the
-    tray), Offers, Since you were away (requests that finished, offers that ran) and the people lately."""
+    tray), Offers, Since you were away (requests that finished, offers that ran) and the people lately.
+    ``call_status``: the tray's forwarded ``call_status()`` (then the call and the transcripts waiting are not read)."""
     from yuki.ui.ledger import read_request_log
 
     now = time.time() if now is None else now
     since = since if since is not None else now - AWAY_HOURS * 3600
-    call = call_now(memory)
+    call = call_view(call_status) if call_status is not None else call_now(memory)
     now_strip = {"front": front_now(memory, now), "playing": None, "call": None}
     if call and (call.get("recording") or call.get("status") in ("asking", "waiting_headphones")):
         note = "Only your mic. Turned into text when the PC is free. Cards are held." if call.get("recording") else ""
@@ -282,7 +289,7 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
         running.append({"kind": "call", "live": True, "recording": True, "started_at": call.get("started_at"),
                         "title": f"Remembering your side of the {call.get('app') or ''} call".replace("  ", " "),
                         "detail": "Only your mic. Turned into text later, when the PC is free."})
-    waiting = _safe(memory.call_audio_waiting, {}) or {}
+    waiting = (call_status.get("waiting") if call_status is not None else _safe(memory.call_audio_waiting, {})) or {}
     if int(waiting.get("calls") or 0):
         n = int(waiting["calls"])
         running.append({"kind": "waiting", "live": False, "title": f"{n} call{'s' if n != 1 else ''} waiting to be turned into text",

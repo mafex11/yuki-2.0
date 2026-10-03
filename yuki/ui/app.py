@@ -279,7 +279,14 @@ class YukiUi(QObject):
         runtime_signals.said.connect(self._on_said)
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
-        self.overlay.attach_thread(self.window_host.model)
+        # the overlay's card inserts go through emit, so the window's replica of the thread gets them too
+        self.overlay.attach_thread(self.window_host.model, emit=self.window_host.emit)
+        # memory's named events reach the open window (42-window-live-refresh.md §6.2), each once per change:
+        # the call status, new cards, and each card write once memory has it (the controller's log signal fires
+        # after the write, so a rebuilt Home never races the "shown" ack)
+        self.calls.changed.connect(self.window_host.call_status)
+        self.nudges.watcher.arrived.connect(self.window_host.cards_arrived)
+        self.nudges._logged.connect(self.window_host.card_written)
         self.island.attach_model(self.window_host.model)
         # the island's own keys
         self.island.handback_clicked.connect(self._on_handback)

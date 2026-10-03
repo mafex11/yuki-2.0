@@ -76,6 +76,9 @@ class WindowHost(QObject):
         own_window.register(self.open_from_anywhere)
         self._started = False
         self._hands = 0
+        self._call_sig = call_signature({})
+        self._call_status: dict[str, Any] = {}
+        self._cards_sig = ""
         rt = ui.runtime
         rt.started.connect(self._on_started)
         rt.tool_called.connect(self._on_tool_called)
@@ -142,6 +145,47 @@ class WindowHost(QObject):
 
     def nudge(self, nudge: dict[str, Any], at: float | None = None) -> None:
         self.emit({"type": "nudge", "nudge": nudge, **({"at": at} if at else {})})
+
+    # -- memory's named events, forwarded (42-window-live-refresh.md §6.2) --------------------------------
+    # Memory's ``Local\YukiNudgeReady`` / ``Local\YukiCallReady`` are auto-reset with one waiter (the tray), so the
+    # window never opens them: the tray tells it over the pipe, once per real change (the watchers also fire on
+    # every fallback poll, so each forward is de-duplicated by a small signature of machine fields).
+
+    def call_status(self, status: object) -> None:
+        """``CallController.changed`` (after every fetch, polls included): the status to every open window, only
+        when its signature moved. The window patches its rail and pages from it without reading memory."""
+        status = status if isinstance(status, dict) else {}
+        sig = call_signature(status)
+        if sig == self._call_sig:
+            return
+        self._call_sig = sig
+        self._call_status = status
+        if self.server is not None:
+            self.server.broadcast({"ev": "call", "status": status})
+
+    def cards_arrived(self, rows: object, why: str = "") -> None:
+        """``NudgeWatcher.arrived`` (every event and every 60 s poll): ``cards`` once per new set of card ids."""
+        ids = sorted(str(r.get("id")) for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict))
+        sig = ",".join(ids)
+        if sig == self._cards_sig:
+            return
+        self._cards_sig = sig
+        if ids:
+            self.memory_topic("cards", why="arrived")
+
+    #: ``NudgeController`` log lines written once memory has the card's reaction, answer or outcome (its worker's
+    #: ``_logged``, on the GUI thread after the write): the moment a rebuilt Home can read it (42 verification,
+    #: missing 1: never at the insert, which races the "shown" ack).
+    CARD_WRITES = frozenset({"nudge_ack", "question_answer", "question_skip", "nudge_offer_outcome", "snooze"})
+
+    def card_written(self, name: str, _fields: object = None) -> None:
+        if name in self.CARD_WRITES:
+            self.memory_topic("cards", why=name)
+
+    def memory_topic(self, topic: str, why: str = "") -> None:
+        """Something in memory changed that open pages show (a closed topic name, no content)."""
+        if self.server is not None:
+            self.server.broadcast({"ev": "memory", "topic": topic, **({"why": why} if why else {})})
 
     def _is_voice(self, job: int) -> bool:
         try:
@@ -308,6 +352,8 @@ class WindowHost(QObject):
                 self.server.send_to(peer, {"ev": "snapshot", "snapshot": self.model.snapshot(last=SNAPSHOT_ITEMS),
                                            "state": self.state(),
                                            "session": getattr(ui.ui_log.logger, "session_id", None)})
+                if self._call_status:   # the last call status forwarded: a new window starts from it
+                    self.server.send_to(peer, {"ev": "call", "status": self._call_status})
             self._on_gui(send_snapshot)
             from yuki.ui.window_ipc import OPS, VERSION
 
@@ -842,6 +888,16 @@ class WindowHost(QObject):
             if not WindowHost._web_ok:
                 self._log("window", state="web_unavailable", fallback="qt")
         return "web" if WindowHost._web_ok else "qt"
+
+
+def call_signature(status: dict[str, Any]) -> str:
+    """What of a ``call_status()`` the window shows (machine fields only): the call, its status, recording, the
+    app, when its session began, and the transcripts waiting. Equal signatures need no forward."""
+    call = status.get("call") if isinstance(status.get("call"), dict) else {}
+    waiting = status.get("waiting") if isinstance(status.get("waiting"), dict) else {}
+    return repr((call.get("id"), call.get("status"), bool(call.get("asking")), bool(status.get("recording")),
+                 call.get("app"), call.get("session_started_at"), call.get("recording_since"),
+                 waiting.get("calls"), waiting.get("minutes")))
 
 
 def web_runtime_available() -> bool:

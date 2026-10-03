@@ -20,7 +20,8 @@
   const field = new L.Field(document.getElementById('field'), { kind: 'window', pitch: 12 });
   const Q = new URLSearchParams(location.search);     // preview knobs only (screenshots of the file:// bundle)
   const PAGES = ['home', 'work', 'me', 'playbook', 'activity', 'settings'];
-  const S = { page: 'home', sub: '', person: null, filter: 'all', chat: false, open: new Set(), touched: 0, booted: false,
+  // touched: the last press in the page; -Infinity at start, so the first fresh data draws at once (42 R4)
+  const S = { page: 'home', sub: '', person: null, filter: 'all', chat: false, open: new Set(), touched: -Infinity, booted: false,
     navs: 0, scrub: Q.has('scrub') ? Number(Q.get('scrub')) : null };
   const D = { shell: { connected: false }, pages: {}, source: {}, chat: { items: [], connected: false }, detail: {}, stamp: {} };
   const marks = { ready: 0, boot: 0, element: 0, frame: 0 };
@@ -48,11 +49,14 @@
     const hsh = hashFor(page, sub == null ? '' : sub, chat);
     if (hsh !== location.hash) location.hash = hsh; else route();
   }
+  /* the data key of the open page (Work's Day tab has its own) */
+  const openKey = () => (S.page === 'work' && S.sub === 'day' ? 'day' : S.page);
+  Y.openKey = openKey;
   function route() {
     const was = S.page + '/' + S.sub, chatWas = S.chat;
     parse();
     const now = S.page + '/' + S.sub;
-    if (now !== was || !S.booted) { S.navs++; render(true); B.send('want', { page: S.page === 'work' && S.sub === 'day' ? 'day' : S.page }); }
+    if (now !== was || !S.booted) { S.navs++; render(true); B.send('want', { page: openKey(), sub: S.sub }); }
     else if (chatWas !== S.chat) renderDrawer();
   }
   window.addEventListener('hashchange', route);
@@ -179,7 +183,12 @@
   function renderMain() {
     const old = document.getElementById('main'); if (!old) return render(false);
     const a = document.activeElement;
-    const busy = (a && old.contains(a) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) || performance.now() - S.touched < 6000 || old.querySelector('.forgetbar, .confirm');
+    // held only while your hands are on it: a focused field in the page, a press in the last 6 s, or a Forget
+    // countdown running (a redraw would drop its Undo while the interval still sends: 42 verification, wrong 7).
+    // A confirmation row left by an action no longer holds the page (42 R3).
+    const typing = a && old.contains(a) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName);
+    const counting = Array.from(old.querySelectorAll('.forgetbar')).some((b) => { const r = b.closest('[data-fact]'); return !!(r && r.__forget); });
+    const busy = typing || performance.now() - S.touched < 6000 || counting;
     if (busy) { clearTimeout(S.deferT); S.deferT = setTimeout(renderMain, 3000); return; }
     const top = old.scrollTop;
     const main = mainView();
@@ -213,7 +222,12 @@
     tickT = setTimeout(tick, need ? 1000 - (Date.now() % 1000) + 5 : 60000 - (Date.now() % 60000) + 50);
   }
   function tickSoon() { clearTimeout(tickT); tickT = setTimeout(tick, 0); }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tickSoon(); else { clearTimeout(tickT); tickT = 0; } });
+  // shown again (restored from the taskbar): the clock, and one want for the open page (42 R5)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(tickT); tickT = 0; return; }
+    tickSoon();
+    if (S.booted) B.send('want', { page: openKey(), sub: S.sub, shown: true });
+  });
 
   /* ================= appearance ================= */
   function applyAppearance(a) {
@@ -307,8 +321,7 @@
     if (!m.page) return;
     D.pages[m.page] = m.data; D.source[m.page] = m.source || 'memory'; D.stamp[m.page] = Date.now();
     if (m.page === 'home') renderRail();
-    const cur = S.page === 'work' && S.sub === 'day' ? 'day' : S.page;
-    if (m.page === cur) renderMain();
+    if (m.page === openKey()) renderMain();
   });
   B.on('memory_error', (m) => { D.memory_error = m.text; if (!D.pages[S.page]) render(false); Y.toast(m.text, true); });
   B.on('live', (m) => {
@@ -354,7 +367,11 @@
     if (ds.sub != null && t.closest('.seg')) { e.preventDefault(); return go(S.page, ds.sub); }
     if (ds.filter) { e.preventDefault(); return go('activity', ds.filter === 'all' ? '' : ds.filter); }
     if (ds.person) { e.preventDefault(); return go('me', ds.person); }
-    if (t.tagName === 'A' && t.getAttribute('href') && t.getAttribute('href').startsWith('#')) S.touched = 0;
+    if (t.tagName === 'A' && t.getAttribute('href') && t.getAttribute('href').startsWith('#')) {
+      S.touched = -Infinity;   // a navigation is not a press that holds the next redraw (42 verification, missing 12)
+      // the tab you are on, clicked again: no hash change, so ask for its data again (42 R5)
+      if (t.getAttribute('href') === location.hash && t.closest('.rail')) B.send('want', { page: openKey(), sub: S.sub, again: true });
+    }
   });
   document.addEventListener('keydown', (e) => {
     const a = document.activeElement;

@@ -74,6 +74,8 @@ PAGE_ALIASES = {"today": "home", "status": "activity", "yuki": "playbook", "chat
 #: Home is read again this often while the window is open (the rest when shown, if older than STALE_S).
 HOME_REFRESH_S = 60.0
 STALE_S = 45.0
+#: A want for the open page again (the same tab clicked, the window shown again): rebuilt if older than this.
+AGAIN_S = 5.0
 #: While yuki-ui is not answering, look for it again this often.
 RECONNECT_S = 10.0
 #: While a correction waits to be applied by memory, look this often (a read, no model).
@@ -178,6 +180,7 @@ class WebWindow:
                  policy_path: Path | None = None, shot_delay: float = 0.0) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.page, self.thread_open = page, thread
+        self.open_page = page                  # the page open now ("day" for Work's Day tab), from the page's want
         self.fixture = fixture
         self.want_connect = connect and fixture is None
         self.ui_path = ui_path
@@ -202,6 +205,7 @@ class WebWindow:
         self._closing = threading.Event()
         self._runs_sig = ""
         self._live_t: threading.Timer | None = None
+        self.call_status: dict[str, Any] | None = None   # the tray's last forwarded call_status()
         self.pending: dict[str, dict[str, Any]] = {}
         self.metrics: dict[str, Any] = {"t0": t0, "pid": os.getpid(), "frozen": bool(getattr(sys, "frozen", False)),
                                         "python": sys.version.split()[0], "fixture": fixture is not None}
@@ -231,7 +235,9 @@ class WebWindow:
         elif op == "want":
             page = str(message.get("page") or "")
             if page in PAGES or page == "day":
-                self.refresh(page, stale_s=STALE_S)
+                self.open_page = page   # the host knows which page is open only from here (42 verification, missing 6)
+                again = bool(message.get("again") or message.get("shown"))
+                self.refresh(page, stale_s=AGAIN_S if again else STALE_S)
         elif op == "act":
             threading.Thread(target=self._act, args=(message,), name="yuki-web-act", daemon=True).start()
         elif op == "caption" and self.host is not None:   # where the page drew its title bar (Windows' hit test)
@@ -572,12 +578,38 @@ class WebWindow:
             self.post_live()
         elif kind == "focus":
             page, thread = page_name(msg.get("page")) if msg.get("page") else (None, False)
-            if self.host is not None:
-                self.host.invoke(self.host.bring_forward)
-            self.post({"kind": "focus", **({"page": page} if page else {}), **({"thread": True} if thread else {})})
-            self.refresh("home", stale_s=10.0)
+            self.come_forward(page, thread)
         elif kind == "permissions":
             self.post({"kind": "permissions", "permissions": msg.get("permissions")})
+        elif kind == "call":   # the tray's call status, forwarded once per change: no memory read for the rail
+            self.on_call_status(msg.get("status") if isinstance(msg.get("status"), dict) else {})
+        elif kind == "memory":   # memory's named events, forwarded by the tray (a closed topic name)
+            self.on_memory_topic(str(msg.get("topic") or ""))
+
+    def come_forward(self, page: str | None = None, thread: bool = False) -> None:
+        """A tray click, the agent's open_yuki or a second start: the window comes forward and the page that will
+        be open is refreshed (not Home whatever is open: 42 R5)."""
+        if self.host is not None:
+            self.host.invoke(self.host.bring_forward)
+        self.post({"kind": "focus", **({"page": page} if page else {}), **({"thread": True} if thread else {})})
+        if page and page != self.open_page:
+            return   # the page goes there and asks for it (want)
+        self.refresh(self.open_page, stale_s=10.0)
+
+    def on_call_status(self, status: dict[str, Any]) -> None:
+        from yuki.ui.web_data import call_view
+
+        self.call_status = status
+        self.shell["call"] = call_view(status)
+        self.post_live()
+        if self.open_page in ("home", "day", "activity"):
+            self.refresh(self.open_page)
+
+    def on_memory_topic(self, topic: str) -> None:
+        if topic == "cards":
+            self.refresh("home")
+            if self.open_page == "activity":
+                self.refresh("activity")
 
     def _voice_from_state(self) -> None:
         from yuki.ui.web_data import hotkey_words
@@ -1332,7 +1364,7 @@ def main(argv: list[str] | None = None) -> int:
     host = WebView2Host(options)
     win.host = host
     if not args.offscreen:
-        watch_focus(lambda: (host.invoke(host.bring_forward), win.post({"kind": "focus"})))
+        watch_focus(win.come_forward)
     placement: list[Any] = []
 
     def remember_place() -> None:
