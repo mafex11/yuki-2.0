@@ -208,7 +208,8 @@ def current_thread(memory: Any, now: float, front: dict[str, Any] | None = None)
     if not events or float(events[0].get("at") or 0) < now - CURRENT_THREAD_S:
         return None
     tid = events[0].get("work_thread_id")
-    rows = _safe(lambda: memory.threads(statuses=("active", "blocked"), limit=40), []) or []
+    # the thread just touched is among the most recently touched open ones (a short read: Home builds often)
+    rows = _safe(lambda: memory.threads(statuses=("active", "blocked"), limit=8), []) or []
     t = next((r for r in rows if r.get("id") == tid), None)
     if t is None:
         return None

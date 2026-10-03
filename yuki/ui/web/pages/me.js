@@ -79,7 +79,7 @@
         h('div', { class: 'meta2' }, r.flag ? h('span', { class: 'flag' + (r.flag === 'new' ? ' new' : ''), text: r.flag }) : null, r.prov ? h('span', { text: r.prov }) : null, pendingMeta(p)),
         h('div', { class: 'acts inline' }, key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' } }),
           key('Wrong', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' } }), key('Not mine', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'notmine' } }),
-          canFix && !p ? Y.correctKey() : null));
+          canFix && !Y.fixing(p) ? Y.correctKey() : null));
     });
     const done = R.left <= 0 && !list.length ? 'All reviewed for today. The next few come tomorrow.'
       : 'Nothing to review right now. I’ll put new or unsure facts here, at most 5 a day.';
@@ -169,7 +169,7 @@
   const guessWords = (m) => (m.guess_is_name ? m.guess : `“${m.guess}”`);
   function misheardRow(m, M, d) {
     const p = (d.pending || {})[m.ref], guessed = !!(m.heard && m.guess);
-    const acts = p ? null : guessed && M.direct
+    const acts = Y.fixing(p) || (p && p.kind === 'forget') ? null : guessed && M.direct
       ? [key('Yes', { cls: 'xs', data: { do: 'resolve', verdict: 'guess_right' }, title: `Yes, it was ${m.guess}` }),
         key('No', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' }, title: 'No, drop it' })]
       : M.direct ? [key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' }, title: 'It was right as I heard it' }),

@@ -241,6 +241,8 @@
     return h('span', { class: 'fixline ' + st }, ic(st === 'failed' ? 'x' : st === 'fixed' ? 'check' : 'edit'), h('span', { text: FIX_WORDS[st](p.words || '') }),
       st === 'fixing' && p.cid != null ? key('Undo', { cls: 'xs ghost', data: { do: 'fix-undo', cid: p.cid }, title: 'Take it back before I start on it' }) : null);
   }
+  /* a correction you sent is still waiting for its pass (its row shows "Got it, fixing it" in place of Correct) */
+  const fixing = (p) => !!p && (!p.kind || p.kind === 'correct') && (p.state || 'fixing') === 'fixing';
   const correctKey = (label, title) => key(label || 'Correct', { cls: 'xs', data: { do: 'correct' }, title: title || 'Tell me what’s wrong in a few words' });
   const fixRow = (t) => t.closest('[data-cref]');
   const fixPage = (row) => row.dataset.cpage || (window.Yk.openKey ? window.Yk.openKey() : '');
@@ -298,7 +300,7 @@
 
   window.Yk = Object.assign(window.Yk || {}, {
     h, append, s, ic, key, clearing, label, sec, rightLabel, empty, fold, rhythm, dotProgress, bar, meter, fmt,
-    confirmRow, morph, restore, hasOrig, leave, toast, pop, fixLine, correctKey, EASE, pages: {}, actions,
+    confirmRow, morph, restore, hasOrig, leave, toast, pop, fixLine, fixing, correctKey, EASE, pages: {}, actions,
     remeasure() { /* set by app.js */ }
   });
 })();

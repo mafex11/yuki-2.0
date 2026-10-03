@@ -41,7 +41,7 @@
         h('button', { class: 'key sm' + (contOpen ? ' pressed' : ''), data: { do: 'continue', ref: t.ref }, attrs: { type: 'button', 'aria-expanded': String(contOpen) },
           title: can.cont ? 'The next step, and the windows and pages to bring back' : 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev'))),
       can.close || can.correct ? h('div', { class: 'tacts' },
-        can.correct && !p ? Y.correctKey() : null,
+        can.correct && !Y.fixing(p) ? Y.correctKey() : null,
         can.close ? key('Done', { cls: 'xs ghost', data: { do: 'thread-close', how: 'done' }, title: 'It’s finished: it leaves your threads' }) : null,
         can.close ? key('Not a thread', { cls: 'xs ghost', data: { do: 'thread-close', how: 'dismiss' }, title: 'It isn’t a piece of work: I stop treating it as one' }) : null) : null);
     Object.assign(el.dataset, { cref: t.ref || '', cpage: 'work', kind: 'thread', title: t.title || '', text: t.state || '' });
@@ -169,7 +169,7 @@
       apps.length ? h('div', { class: 'perapp' }, apps.map(([n, m]) => h('div', { class: 'pa' }, h('span', { class: 'pa-n', text: n }), Y.bar(m, max, 20), h('span', { class: 'mono', text: fmt.dur(m) }))))
         : h('div', { class: 't2', text: 'No app time measured in this stretch.' }),
       p ? h('div', { class: 'meta2' }, Y.fixLine(p)) : null,
-      canFix && !p ? h('div', { class: 'acts inline' }, Y.correctKey()) : null];
+      canFix && !Y.fixing(p) ? h('div', { class: 'acts inline' }, Y.correctKey()) : null];
     return Y.fold(`s:${s.start}:${s.app || ''}`, head, meta, body, { cls: 'dayrow',
       data: s.ref ? { cref: s.ref, cpage: 'day', kind: 'episode', title: s.title || '', text: words || '' } : null });
   }

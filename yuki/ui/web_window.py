@@ -1422,7 +1422,7 @@ class WebWindow:
         """Continue's Open on one page it brings back: memory's own URL for that place (read again here by its place
         in the list; http and https only), opened in the default browser. Types, clicks and sends nothing."""
         cont = self._continue_context(str(m.get("ref") or ""))
-        places = (cont or {}).get("places") or []
+        places = [p for p in (cont or {}).get("places") or [] if isinstance(p, dict)]   # as a_thread_continue listed them
         i = m.get("place")
         url = _web_url(places[i].get("url")) if isinstance(i, int) and 0 <= i < len(places) else None
         if not url:
