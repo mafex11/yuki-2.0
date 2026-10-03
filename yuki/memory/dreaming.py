@@ -511,8 +511,8 @@ class BarResult:
     lasting: int = 0
     #: ``{category: count}`` of the facts the pass retires (or would, on a dry run).
     categories: dict[str, int] = field(default_factory=dict)
-    #: Pinned facts that fail the bar (``{"id", "kind", "category", "included"}``): kept and reported, or, with
-    #: ``include_pinned``, decided like the others (``included`` True).
+    #: Pinned facts that fail the bar (``{"id", "kind", "category"}``): kept and reported, or, with
+    #: ``include_pinned``, also decided like the others (their decisions carry ``"pinned": True``).
     pinned: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
@@ -640,8 +640,7 @@ class BarPass:
             if f is None:
                 continue
             if f.pinned:
-                result.pinned.append({"id": f.id, "kind": f.kind, "category": v.category,
-                                      "included": self.include_pinned})
+                result.pinned.append({"id": f.id, "kind": f.kind, "category": v.category})
                 if not self.include_pinned:
                     continue
             if len(changes) >= cap:
