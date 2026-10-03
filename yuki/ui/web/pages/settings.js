@@ -53,21 +53,32 @@
       srow('Speaker', pick(withCur(devOpts('render'), v.speaker), v.speaker || '', { change: 'voice-speaker' }, 'Speaker'), 'Falls back to the default if it drops'),
       srow('Voice', pick((v.providers || []).map((p) => [p.key, p.label]), v.provider || '', { change: 'voice-provider' }, 'Voice'), (v.providers || []).find((p) => p.key === v.provider) ? (v.providers.find((p) => p.key === v.provider).note || null) : null),
       srow('End tone', tog(v.end_tone, { do: 'voice-tone' }, 'End tone'), 'A soft tone when a conversation ends on its own'),
-      srow('In a call', 'quiet until you say “Yuki”', 'Only your microphone is ever kept')];
+      srow('In a call', 'quiet until you say “Yuki”', 'What a recorded call keeps: see Calls')];
     const offers = [
       srow('Offers on cards', tog((d.offers || {}).enabled, { do: 'offers' }, 'Offers on cards'), 'A named button that does one small thing, with Undo where it can. Off: cards only talk.'),
       srow('Check-ins', tog(co.enabled, { do: 'coach' }, 'Check-ins')),
       srow('Questions', tog(co.questions, { do: 'questions' }, 'Questions'), 'When I’m not sure I heard or read something right'),
       srow('Quiet hours', co.quiet_start && co.quiet_start !== co.quiet_end ? `${co.quiet_start}–${co.quiet_end}` : 'none')];
     const privacy = [
-      h('div', { class: 'srow', data: { pause: '' } }, h('span', null, pr.paused ? 'Memory is paused' : 'Remember what I do', h('small', { class: 'pause-say', text: pr.paused ? 'I’m not looking at anything. Calls you said yes to still record your side.' : 'I see the window in front, never private windows or blocked apps' })),
+      h('div', { class: 'srow', data: { pause: '' } }, h('span', null, pr.paused ? 'Memory is paused' : 'Remember what I do', h('small', { class: 'pause-say', text: pr.paused ? 'I’m not looking at anything, and calls aren’t recorded.' : 'I see the window in front, never private windows or blocked apps' })),
         h('span', { class: 'ctl' }, pr.paused ? key('Resume', { cls: 'xs pri', data: { do: 'pause', on: '0' } }) : key('Pause', { cls: 'xs', data: { do: 'pause', on: '1' } }))),
       srow('Private browser windows', 'never looked at'),
       pr.blocked_sites != null ? srow('Blocked sites', fmt.plural(pr.blocked_sites, 'site')) : null,
       pr.seen_min != null ? srow('Seen today', `${Math.round(pr.seen_min)} min across ${fmt.plural(pr.seen_apps || 0, 'app')}`, 'Counts only, see Activity → Saw') : null];
+    /* what a recorded call keeps, said from the privacy file's [calls] knobs (read only here: record_others,
+       game_voice); then the per-app answers, then when it becomes text */
+    const kn = d.call_knobs || { record_others: true, game_voice: true };
+    const what = [
+      srow(kn.record_others ? 'Both sides' : 'Your side', '',
+        kn.record_others ? 'Your mic, only with headphones on, and the call app’s own sound either way. A browser call takes the browser’s sound.'
+          : 'Your mic, only with headphones on. The call’s own sound is off in the privacy file.'),
+      srow('Game voice chat', '',
+        kn.game_voice ? 'Your mic and the game’s voice chat, kept apart from your calls. I ask once you’re out of the game.'
+          : 'Games’ voice chat is off in the privacy file.')];
     const calls = (d.calls || []).length ? (d.calls || []).map((c) => srow(c.app, Y.seg([['always', 'Always'], ['ask', 'Ask'], ['never', 'Never']], 'callpref', c.decision || 'ask'), null))
-      : [srow('Record my side', 'asks each call')];
+      : [srow('Every app', 'asks each call')];
     calls.forEach((r) => { const s = r.querySelector('.seg'); if (s) s.dataset.app = (r.querySelector('span') || {}).textContent; });
+    calls.unshift(...what);
     calls.push(srow('Turn into text', 'when the PC is free', 'Never during a game'));
     const look = [
       h('div', { class: 'srow' }, h('span', null, 'Live colour', h('small', { text: 'Only for listening, working, recording and needs you' })),

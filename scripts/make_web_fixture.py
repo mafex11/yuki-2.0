@@ -289,8 +289,25 @@ def day_name(days_ago: int) -> str:
     return f"{datetime.fromtimestamp(NOW).date() - timedelta(days=days_ago):%Y-%m-%d}"
 
 
+def call_status(call_start: float) -> dict:
+    """An invented ``call_status()`` (memory's shape since report 60): a Signal call recorded on both sides, the
+    mic and Signal's own sound. The window's call words are built from it by the real builders."""
+    row = {"id": 12, "app": "Signal", "kind": "call", "status": "recording", "asking": False, "consent": "always",
+           "headphones": True, "session_started_at": call_start, "detected_at": call_start,
+           "recording_since": call_start}
+    return {"call": row, "recording": True, "waiting": {"calls": 2, "minutes": 94.0},
+            "sessions": [{"id": 12, "app": "Signal", "kind": "call", "status": "recording", "asking": False,
+                          "ended": False}],
+            "mic": {"state": "recording", "call_id": 12, "reason": None, "speech_s": 1080.0},
+            "tracks": [{"call_id": 12, "app": "Signal", "process": "signal.exe", "track_kind": "call",
+                        "state": "recording", "reason": None, "speech_s": 940.0}],
+            "pending_card": None}
+
+
 def build() -> dict:
     call_start = ago(46 * M + 4)
+    shell_call = W.call_view(call_status(call_start))
+    now_call, call_running = W.home_call(shell_call, None)
     rh = {"Riya": rhythm(8, 13, 17, 6, 20, 15, 11, 23, 9), "Dev": rhythm(3, 0, 1, 4, 0, 2, 5, 3, 2),
           "Mira": rhythm(1, 3, 0, 4, 2, 5, 0, 2, 1), "Noor": rhythm(0, 2, 5, 1, 0, 2, 3, 1, 4),
           "Theo": rhythm(0, 1, 0, 0, 2, 0, 1, 3, 0), "Ines": rhythm(0, 0, 0, 2, 0, 1, 0, 0, 0)}
@@ -299,7 +316,7 @@ def build() -> dict:
     shell = {
         "user": {"name": "Sam", "initial": "S"}, "memory_line": "memory on", "connected": True,
         "voice": {"state": "off", "wake": True, "conversation": False, "quiet_until": 0},
-        "call": {"app": "Signal", "started_at": call_start, "recording": True},
+        "call": shell_call,
         "runs": [{"item": "a41", "jobs": [31], "title": "“Rename the March invoices by client”",
                   "line": "Step 3 · Renaming an invoice", "started_at": run_start}],
         "hotkey_words": "Alt Shift", "needs": 2,
@@ -308,8 +325,7 @@ def build() -> dict:
         "now": {
             "front": {"app": "VS Code", "title": "garden-planner · beds.ts, the watering schedule", "since_at": ago(12 * M)},
             "playing": {"status": "paused", "title": "Rain Study No. 4", "artist": "The Lo-Fi Trio", "app": "Music"},
-            "call": {"app": "Signal", "started_at": call_start, "recording": True,
-                     "note": "Only your mic. Turned into text when the PC is free. Cards are held."},
+            "call": now_call,
             "goals": [{"ref": "G7", "text": "finish the watering schedule screen", "status": "open", "done": False, "thread": "W12"},
                       {"ref": "G8", "text": "reply on the seed-swap thread", "status": "unknown", "done": False, "thread": "W15"},
                       {"ref": "G6", "text": "order the seed trays", "status": "done", "done": True, "thread": None}],
@@ -321,8 +337,7 @@ def build() -> dict:
              "why": "It was saved twice with the same name. It may be a scratch copy."},
         ],
         "running": [
-            {"kind": "call", "live": True, "recording": True, "title": "Remembering your side of the Signal call",
-             "detail": "Only your mic. Turned into text later, when the PC is free.", "started_at": call_start},
+            *call_running,
             {"kind": "waiting", "live": False, "title": "2 calls waiting to be turned into text",
              "detail": "1h 34m in all. A full-screen game had the GPU, so they wait.", "meta": "waiting for the GPU"},
         ],
@@ -498,7 +513,7 @@ def build() -> dict:
             "done", "done", cost="5 s, 3¢"),
         row("c39", "card", "did", ago(52 * M), "Added “Order more seed trays” to your list", "Card · Your work",
             "you pressed Add to list on the card", "done", "done", card="39"),
-        row("call:1", "call", "calls", call_start, "Recording your side of a Signal call", "Signal", "rule: Signal calls, your mic only",
+        row("call:1", "call", "calls", call_start, "Recording a Signal call", "Signal", "rule: always for Signal calls",
             "live", "live"),
         row("run:d:1", "action", "did", ago(1 * H + 2 * M), "Opened Calc", "Calc", "you typed “open my budget”", "done, checked on screen",
             "verified", cost="3 s, 3¢"),
@@ -508,7 +523,7 @@ def build() -> dict:
             "done, checked on screen", "verified", chips=[{"kind": "lesson", "text": "Pause the music"}]),
         row("run:e:4", "action", "did", ago(2 * H + 10 * M - 2), "Pressed Pause", "Music", "you said “pause it”, keeping a lesson in mind",
             "done, checked on screen", "verified", chips=[{"kind": "lesson", "text": "Pause the music"}]),
-        row("call:2", "call", "calls", ago(26 * H + 52 * M), "Recorded a 1h 10m Mumble call", "Mumble", "rule: Mumble calls, your mic only",
+        row("call:2", "call", "calls", ago(26 * H + 52 * M), "Recorded a 1h 10m Mumble call", "Mumble", "rule: always for Mumble calls",
             "turned into text", "verified"),
         row("c35", "card", "did", ago(3 * H), "Asked if the Friday call moved", "Card · Question", "your calendar and a message disagreed",
             "you said skip", "done", card="35"),
@@ -532,7 +547,7 @@ def build() -> dict:
                   ("Notes", 21, 9), ("Music", 14, 6), ("Files", 11, 8), ("Thunderbird", 9, 5), ("Audacity", 6, 1)]],
         "calls": [
             {"start_at": call_start, "end_at": None, "live": True, "min": 46, "spoke_min": 18, "app": "Signal", "where": "Signal", "people": ["Riya"],
-             "gists": [], "recorded": True, "status": "Live now. Your side is kept; it’s turned into text when the PC is free."},
+             "gists": [], "recorded": True, "status": "Live now. Being recorded; it’s turned into text when the PC is free."},
             {"start_at": ago(26 * H + 52 * M), "end_at": ago(25 * H + 42 * M), "live": False, "min": 70, "spoke_min": 31, "app": "Mumble",
              "where": ROOM, "people": ["Noor", "maybe Dev"],
              "gists": ["You and Noor planned the meetup: she asks the community hall about tables and chairs.",
@@ -556,6 +571,7 @@ def build() -> dict:
         "offers": {"enabled": True}, "coach": {"enabled": True, "questions": True, "quiet_start": "00:30", "quiet_end": "08:00"},
         "privacy": {"paused": False, "seen_min": 642, "seen_apps": 14, "blocked_sites": 3},
         "calls": [{"app": "Signal", "decision": "always"}, {"app": "Telegram", "decision": "ask"}, {"app": "Meet", "decision": "never"}],
+        "call_knobs": W.call_knobs({}),
         "appearance": {"accent": "green", "reduce_motion": False, "accents": [{"key": "green", "label": "Mint"}, {"key": "orange", "label": "Orange"}]},
         "usage": {"mb": 312, "cpu": 0.4},
     }

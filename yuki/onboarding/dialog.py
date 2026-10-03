@@ -870,10 +870,11 @@ class OnboardingDialog(QDialog):
         col.addWidget(card)
 
         card, box = _card()
-        box.addWidget(_label("Remember what I say on calls", "section"))
+        box.addWidget(_label("Remember my calls", "section"))
         box.addWidget(_para(
-            "Only your own microphone, never the other people, and Yuki asks on each call first. Your voice is "
-            "kept encrypted on this PC until it's turned into text there later, then deleted. The AI you "
+            "Both sides of a call: your microphone (only with headphones on) and the call app's own sound. A "
+            "game's voice chat is kept as its own track. Yuki asks first: nothing is kept until you say yes. The "
+            "audio stays encrypted on this PC until it's turned into text there later, then deleted. The AI you "
             "picked writes the notes."))
         self.calls_choice = OnOff()
         box.addWidget(self.calls_choice)

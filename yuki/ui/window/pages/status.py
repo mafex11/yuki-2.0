@@ -212,7 +212,7 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
         w = v.calls_waiting
         rcol.addWidget(_row(t, "mic", f"{waiting_calls} call{'s' if waiting_calls != 1 else ''} waiting to "
                                                "be remembered",
-                            f"{dur(w['minutes'] * 60)} of your voice, kept on this PC until the GPU is free",
+                            f"{dur(w['minutes'] * 60)} of call audio, kept on this PC until the GPU is free",
                             [_confirm_pill(t, "Erase", "Sure? Tap again", act.erase_calls, glyph="delete",
                                            style="destructive")]))
     else:
@@ -220,10 +220,19 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
                             "A recorded call waits here, on this PC, until the GPU is free", []))
     named["calls"] = rcol.itemAt(rcol.count() - 1).widget()
     if v.call_now:
-        recording = v.call_now.get("status") == "recording"
-        rcol.addWidget(_row(t, "phone", f"On a {v.call_now['app']} call",
-                            "Only your side is remembered" if recording else "This call isn't remembered",
-                            [_pill(t, "Stop", act.stop_call, glyph="close")] if recording else [], live=recording))
+        from yuki.ui.call_words import RECORDING_STATUSES, call_line, call_rec, is_game
+
+        c = v.call_now
+        # Stop whenever anything is kept (the mic, the call's own sound or a game's voice chat: call_status()'s
+        # top-level recording, carried by the live view) or the row waits for headphones
+        recording = call_rec(c)
+        on = recording or c.get("status") in RECORDING_STATUSES
+        app = c.get("app") or ""
+        title = (f"In {app} voice chat" if app else "In a game's voice chat") if is_game(c) else (
+            f"On a {app} call" if app else "On a call")
+        rcol.addWidget(_row(t, "phone", title,
+                            (call_line(c) or "Being recorded") if on else "This call isn't remembered",
+                            [_pill(t, "Stop", act.stop_call, glyph="close")] if on else [], live=recording))
     if v.questions_waiting:
         named["questions"] = None
         q = v.questions_waiting[0]

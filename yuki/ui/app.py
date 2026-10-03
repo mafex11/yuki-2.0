@@ -192,7 +192,8 @@ class YukiUi(QObject):
         # and every offer's state reaches the chat thread's button (Running / Done / Undone / Expired ...).
         self.nudges.ask_requested.connect(self._on_offer_ask)
         self.nudges.offer_state.connect(self._on_offer_state)
-        #: Calls, just the user's side: the consent card, the indicator and Stop.
+        #: Calls, both sides (the mic and the call app's own sound; a game's voice chat as its own track): the
+        #: consent card, the indicator (on the island) and Stop.
         self.calls = CallController(
             self.runtime.memory, ui_log, covered=lambda: self.nudges.showing is not None,
             strip_up=lambda: False, indicator=self.island.call_indicator,
@@ -1377,7 +1378,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     nudges_on = QAction("Nudges on", menu)
     nudges_on.triggered.connect(lambda _checked=False: ui.snooze_nudges(0))
     menu.addAction(nudges_on)
-    # Calls: only while memory is remembering the user's side of one (or waiting for headphones).
+    # Calls: only while memory keeps anything of one (the mic, the call's own sound, a game's voice chat) or a
+    # row waits for headphones (CallController.recording, the status's top-level recording).
     stop_call = QAction("Stop remembering this call", menu)
     stop_call.triggered.connect(lambda _checked=False: ui.calls.stop_call())
     stop_call.setVisible(False)
