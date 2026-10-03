@@ -23,12 +23,13 @@
   // touched: the last press in the page; -Infinity at start, so the first fresh data draws at once (42 R4)
   const S = { page: 'home', sub: '', person: null, filter: 'all', chat: false, open: new Set(), touched: -Infinity, booted: false,
     navs: 0, scrub: Q.has('scrub') ? Number(Q.get('scrub')) : null };
-  const D = { shell: { connected: false }, pages: {}, source: {}, chat: { items: [], connected: false }, detail: {}, stamp: {} };
+  const D = { shell: { connected: false }, pages: {}, raw: {}, source: {}, chat: { items: [], connected: false }, detail: {}, stamp: {} };
   const marks = { ready: 0, boot: 0, element: 0, frame: 0 };
   const epoch = () => performance.timeOrigin + performance.now();
   Object.assign(Y, { S, D, field, B });
   Y.remeasure = () => field.remeasure();
-  Y.act = (action, fields) => B.request('act', Object.assign({ action: action }, fields || {}));
+  // the moment of your last action: a build that started before it is not drawn over what the action just showed
+  Y.act = (action, fields) => { S.actedAt = Date.now(); return B.request('act', Object.assign({ action: action }, fields || {})); };
   Y.go = go;
 
   /* ================= routing ================= */
@@ -93,7 +94,7 @@
 
   function rail() {
     const home = D.pages.home, sh = D.shell;
-    const needs = home ? (home.needs || []).length : (sh.needs || 0);
+    const needs = sh.needs != null ? sh.needs : (home ? (home.needs || []).length : 0);   // the host keeps it in the shell
     const items = [['home', 'Home', needs], ['work', 'Work'], ['me', 'Me'], ['playbook', 'Playbook'], ['activity', 'Activity']];
     const face = h('canvas', { data: { core: faceState(), pitch: 5 } });
     const user = sh.user || {};
@@ -158,12 +159,16 @@
     mountFaces(main);
     main.addEventListener('scroll', () => field.remeasure(), { passive: true });
     field.observe(main);
-    const pg = Y.pages[S.page];
-    if (pg && pg.mount) { try { pg.mount(main, S, D); } catch (e) { console.error(e); } }
+    mountPage(main);
     if (nav) main.querySelectorAll('[data-reveal]').forEach((el, i) => setTimeout(() => L.reveal(el), i * 60));
     if (nav && Q.get('scroll')) setTimeout(() => { main.scrollTop = Number(Q.get('scroll')); field.remeasure(); }, 50);   // preview knob
     setTimeout(() => field.measure(), 0);
+    armClock();
     tickSoon();
+  }
+  function mountPage(main) {
+    const pg = Y.pages[S.page];
+    if (pg && pg.mount) { try { pg.mount(main, S, D); } catch (e) { console.error(e); } }
   }
   function render(nav) {
     const main = mainView();
@@ -175,33 +180,140 @@
   }
   function renderRail() {
     const old = $app.querySelector('.rail'); if (!old) return;
-    const el = rail(); old.replaceWith(el); mountFaces(el);
+    const el = rail();
+    if (patchInto(old, el) !== old) old.replaceWith(el);   // the rail patched in place: its face keeps drawing
+    mountFaces(old.isConnected ? old : el);
     field.setState(fieldState(), { step: { n: 2, of: 5 } });
     tickSoon();
   }
-  /* a page's data changed: draw it again in place (scroll kept); never under the user's hands */
+
+  /* ================= patching the open page (42-window-live-refresh.md §6.3) =================
+     New data never rebuilds #main: the page is built off-DOM and walked against what is on screen by key
+     (data-k on the blocks, data-card / -run / -row / -ref / -person on the items, else tag, class and place).
+     A node equal to its new self stays; a node under your hands stays (a focused or typed-in field, a box mid-morph
+     or showing its confirmation, a Forget countdown, a row being edited, the item you just pressed); everything
+     else is patched in place or swapped. Scroll, focus, typed text, open folds and the field's figures (when their
+     data did not change) all survive. */
+  const FIELDS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+  const TICKER = ['from', 'since', 'clock', 'rel', 'until', 'nowmin'];   // text the ticker owns (tick below)
+  const FIG_PROPS = ['__week', '__sky'];                                  // figure data the field reads (field.js)
+  const RETIRE_MS = 4000;    // a confirmation row an action left stays this long, then new data may replace it
+  const PRESS_MS = 6000;     // the item you pressed is held this long (its reply may still morph it)
+  const morph0 = Y.morph;
+  Y.morph = function (box, node, opts) { if (box) box.__morphAt = performance.now(); return morph0(box, node, opts); };
+  Y.k = (el, k) => { if (el && el.dataset) el.dataset.k = k; return el; };   // a page's block key (pages/*.js)
+  let retireT = 0;
+  const stats = { patches: 0, changes: 0, swapped: 0, kept: 0, held: 0 };
+  Y.patchStats = stats;
+
+  function keyOf(el) {
+    if (el.nodeType !== 1) return '#' + el.nodeType;
+    const d = el.dataset;
+    const k = d.k || d.card || d.run || d.row || d.ref || d.person || el.id || (el.tagName === 'DETAILS' ? d.item : '');
+    return el.tagName + (k ? ':' + k : '.' + el.className);
+  }
+  const typedIn = (el) => (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.value !== el.defaultValue;
+  function holdsHands(el, now) {
+    const a = document.activeElement;
+    if (FIELDS.has(el.tagName)) return el === a || typedIn(el);
+    if (el.__forget || el.__leaving || el.classList.contains('editing')) return true;
+    if (el === S.pressed && now - S.touched < PRESS_MS) return true;
+    if (Y.hasOrig(el)) {   // mid-morph: a confirmation, a draft, an edit box
+      if (el.__fade || el.contains(a) || Array.from(el.querySelectorAll('input, textarea')).some(typedIn)) return true;
+      if (now - (el.__morphAt || 0) < RETIRE_MS) { retireLater(RETIRE_MS - (now - (el.__morphAt || 0))); return true; }
+      return false;
+    }
+    const bar = el.querySelector(':scope > .forgetbar');   // the Forget bar after its countdown: retires like a confirmation
+    if (bar) { if (!el.__barAt) el.__barAt = now; if (now - el.__barAt < RETIRE_MS) { retireLater(RETIRE_MS - (now - el.__barAt)); return true; } }
+    return false;
+  }
+  function retireLater(ms) { if (!retireT) retireT = setTimeout(() => { retireT = 0; renderMain(); }, ms + 60); }
+  const tickerOwned = (el) => el.nodeType === 1 && TICKER.some((k) => k in el.dataset);
+  function sameAttrs(a, b) {
+    if (a.attributes.length !== b.attributes.length) return false;
+    for (const at of b.attributes) if (a.getAttribute(at.name) !== at.value) return false;
+    return true;
+  }
+  function figSig(el) { return L.figSig ? L.figSig(el) : ''; }
+  function figsOf(el) { return el.nodeType === 1 ? (el.dataset.figure != null ? [el] : Array.from(el.querySelectorAll('[data-figure]'))) : []; }
+  function sameFigures(a, b) {
+    const fa = figsOf(a), fb = figsOf(b);
+    if (fa.length !== fb.length) return false;
+    return fa.every((f, i) => figSig(f) === figSig(fb[i]));
+  }
+  /* the node to put where `old` is: old itself (patched in place, or held) or `neu` */
+  function patchInto(old, neu) {
+    const now = performance.now();
+    if (old.nodeType !== neu.nodeType || old.nodeName !== neu.nodeName) { stats.swapped++; return neu; }
+    if (old.nodeType === 3) { if (old.data !== neu.data) { old.data = neu.data; stats.changes++; } return old; }
+    if (old.nodeType !== 1) return neu;
+    if ('keep' in old.dataset) return old;                                     // owned by the page's own code
+    if (holdsHands(old, now)) { stats.held++; return old; }
+    if (Y.hasOrig(old)) { stats.swapped++; return neu; }                      // a retired confirmation: the data's own row
+    if (tickerOwned(old) && sameAttrs(old, neu)) return old;                   // the ticker's text is newer
+    if (old.tagName === 'CANVAS') return old.__face && old.dataset.core === neu.dataset.core ? old : neu;
+    if (old.tagName === 'DETAILS' && neu.tagName === 'DETAILS') neu.open = old.open;   // your fold stays as you left it
+    if (old.isEqualNode(neu) && sameFigures(old, neu)) { stats.kept++; return old; }
+    if (FIELDS.has(old.tagName)) { stats.swapped++; return neu; }
+    for (const at of Array.from(old.attributes)) if (!neu.hasAttribute(at.name)) { old.removeAttribute(at.name); stats.changes++; }
+    for (const at of neu.attributes) if (old.getAttribute(at.name) !== at.value) { old.setAttribute(at.name, at.value); stats.changes++; }
+    for (const p of FIG_PROPS) if (p in neu) old[p] = neu[p];
+    if (old.dataset.figure != null) delete old.__figsig;                      // its data may have moved
+    patchChildren(old, neu);
+    return old;
+  }
+  function patchChildren(old, neu) {
+    const now = performance.now();
+    const pool = new Map();
+    for (const c of Array.from(old.childNodes)) { const k = keyOf(c); if (!pool.has(k)) pool.set(k, []); pool.get(k).push(c); }
+    const out = [];
+    for (const n of Array.from(neu.childNodes)) {
+      const list = pool.get(keyOf(n));
+      const o = list && list.length ? list.shift() : null;
+      out.push(o ? patchInto(o, n) : n);
+    }
+    // what is no longer in the data: gone, unless it is under your hands (then it stays where it was)
+    const placed = new Set(out);
+    let i = 0;
+    for (const c of Array.from(old.childNodes)) {
+      if (placed.has(c)) { i = out.indexOf(c) + 1; continue; }
+      if (c.nodeType === 1 && ('keep' in c.dataset || holdsHands(c, now))) { out.splice(i, 0, c); placed.add(c); i++; }
+      else if (c.nodeType === 1 && Y.hasOrig(c) && !c.__leaving) { c.__leaving = true; out.splice(i, 0, c); placed.add(c); i++; Y.leave(c); }
+    }
+    for (let j = 0; j < out.length; j++) if (old.childNodes[j] !== out[j]) { old.insertBefore(out[j], old.childNodes[j] || null); stats.changes++; }
+    while (old.childNodes.length > out.length) { old.removeChild(old.lastChild); stats.changes++; }
+  }
+  Y.patchInto = patchInto;
+
+  /* a page's data changed: patch it in place; returns what changed */
   function renderMain() {
     const old = document.getElementById('main'); if (!old) return render(false);
-    const a = document.activeElement;
-    // held only while your hands are on it: a focused field in the page, a press in the last 6 s, or a Forget
-    // countdown running (a redraw would drop its Undo while the interval still sends: 42 verification, wrong 7).
-    // A confirmation row left by an action no longer holds the page (42 R3).
-    const typing = a && old.contains(a) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName);
-    const counting = Array.from(old.querySelectorAll('.forgetbar')).some((b) => { const r = b.closest('[data-fact]'); return !!(r && r.__forget); });
-    const busy = typing || performance.now() - S.touched < 6000 || counting;
-    if (busy) { clearTimeout(S.deferT); S.deferT = setTimeout(renderMain, 3000); return; }
-    const top = old.scrollTop;
-    const main = mainView();
-    old.replaceWith(main);
-    main.scrollTop = top;
-    afterMain(main, false);
+    clearTimeout(retireT); retireT = 0;
+    const t0 = performance.now();
+    const figsBefore = figsOf(old).map(figSig).join('|');
+    const neu = mainView();
+    const before = stats.changes;
+    if (patchInto(old, neu) !== old) { old.replaceWith(neu); afterMain(neu, false); return; }
+    stats.patches++;
+    mountFaces(old);
+    mountPage(old);
+    const figsChanged = figsOf(old).map(figSig).join('|') !== figsBefore;
+    // the clearings move only if something did; figures re-raster only if theirs changed (field.js rasterFigures)
+    if (figsChanged || stats.changes !== before) field.remeasure();
+    armClock();
+    tickSoon();
+    S.lastPatch = { ms: Math.round((performance.now() - t0) * 10) / 10, figs: figsChanged, changes: stats.changes - before };
   }
   function renderDrawer() {
     const old = $app.querySelector('.drawer');
     if (!S.chat) { if (old) old.remove(); return; }
+    const oldBody = old && old.querySelector('.body');
+    const stick = !oldBody || oldBody.scrollHeight - oldBody.scrollTop - oldBody.clientHeight < 40;
     const el = Y.drawer(D, S, old);
-    if (old) old.replaceWith(el); else $app.append(el);
-    mountFaces(el);
+    if (!old) $app.append(el);
+    else if (patchInto(old, el) !== old) old.replaceWith(el);                // only the changed turns are touched
+    else if (stick && oldBody) oldBody.scrollTop = oldBody.scrollHeight;
+    mountFaces(old && old.isConnected ? old : el);
     tickSoon();
   }
   Y.renderMain = renderMain; Y.renderRail = renderRail; Y.renderDrawer = renderDrawer; Y.render = render;
@@ -218,14 +330,52 @@
     document.querySelectorAll('[data-from]').forEach((el) => { need = true; const v = fmt.clock(now - Number(el.dataset.from)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-since]').forEach((el) => { need = true; const v = fmt.secs(now - Number(el.dataset.since)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-clock]').forEach((el) => { const v = fmt.nowClock(); if (el.textContent !== v) el.textContent = v; });
+    // the minute's own changes, with no message from the host (42 §6.3): "x min ago", an Undo's minutes left, the
+    // Day's now marker; an Undo whose window closed is patched away
+    document.querySelectorAll('[data-rel]').forEach((el) => { const v = fmt.rel(Number(el.dataset.rel)); if (el.textContent !== v) el.textContent = v; });
+    let closed = false;
+    document.querySelectorAll('#main [data-until]').forEach((el) => {
+      const left = Number(el.dataset.until) - now;
+      if (left <= 0) { closed = true; return; }
+      const v = `${Math.max(1, Math.round(left / 60))} min left`; if (el.textContent !== v) el.textContent = v;
+    });
+    document.querySelectorAll('[data-nowmin]').forEach((el) => {
+      const d = new Date(), min = d.getHours() * 60 + d.getMinutes(), left = (min / 1440 * 100) + '%';
+      if (el.style.left !== left) el.style.left = left;
+      const label = el.firstElementChild, v = 'now ' + fmt.nowClock();
+      if (label && label.textContent !== v) label.textContent = v;
+    });
+    if (closed) setTimeout(renderMain, 0);
     if (document.hidden) return;
     tickT = setTimeout(tick, need ? 1000 - (Date.now() % 1000) + 5 : 60000 - (Date.now() % 60000) + 50);
   }
   function tickSoon() { clearTimeout(tickT); tickT = setTimeout(tick, 0); }
+
+  /* the next moment the open page changes with the clock alone (an Undo window closing, an offer running out, the
+     away window moving, midnight): one timer, a patch then (42 verification, missing 4); none while hidden */
+  let clockT = 0;
+  const CLOCK_KEYS = new Set(['until', 'undo_until', 'expires_at', 'next_at']);
+  function nextBoundary(v, now, best) {
+    if (Array.isArray(v)) { for (const x of v) best = nextBoundary(x, now, best); return best; }
+    if (v && typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) best = CLOCK_KEYS.has(k) && typeof x === 'number' ? (x > now ? Math.min(best, x) : best) : nextBoundary(x, now, best);
+    }
+    return best;
+  }
+  function armClock() {
+    clearTimeout(clockT); clockT = 0;
+    if (document.hidden || !S.booted) return;
+    const now = Date.now() / 1000, mid = new Date();
+    mid.setHours(24, 0, 1, 0);
+    const at = Math.min(nextBoundary(D.pages[openKey()], now, Infinity), mid.getTime() / 1000);
+    clockT = setTimeout(() => { clockT = 0; renderMain(); }, Math.min(2147483000, Math.max(1000, (at - now) * 1000 + 500)));
+  }
+  Y.nextBoundary = nextBoundary;
   // shown again (restored from the taskbar): the clock, and one want for the open page (42 R5)
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { clearTimeout(tickT); tickT = 0; return; }
+    if (document.hidden) { clearTimeout(tickT); tickT = 0; clearTimeout(clockT); clockT = 0; return; }
     tickSoon();
+    armClock();
     if (S.booted) B.send('want', { page: openKey(), sub: S.sub, shown: true });
   });
 
@@ -307,7 +457,8 @@
     knobs(m);
     applyAppearance(m.appearance);
     Object.assign(D.shell, m.shell || {});
-    for (const [k, v] of Object.entries(m.pages || {})) { D.pages[k] = v; D.source[k] = m.source || 'snapshot'; D.stamp[k] = Date.now(); }
+    for (const [k, v] of Object.entries(m.pages || {})) { D.pages[k] = v; D.raw[k] = JSON.stringify(v); D.source[k] = m.source || 'snapshot'; D.stamp[k] = Date.now(); }
+    if (D.pages.home && D.shell.needs == null) D.shell.needs = (D.pages.home.needs || []).length;
     if (m.chat) setChat(m.chat);
     if (m.page && !location.hash) { location.hash = hashFor(m.page, '', false); }
     S.booted = true;
@@ -319,9 +470,17 @@
   });
   B.on('data', (m) => {
     if (!m.page) return;
-    D.pages[m.page] = m.data; D.source[m.page] = m.source || 'memory'; D.stamp[m.page] = Date.now();
-    if (m.page === 'home') renderRail();
-    if (m.page === openKey()) renderMain();
+    const raw = JSON.stringify(m.data);
+    const same = raw === D.raw[m.page];
+    D.source[m.page] = m.source || 'memory'; D.stamp[m.page] = Date.now();
+    if (same) return;                                   // the same data again: nothing to draw (42 §6.3)
+    D.pages[m.page] = m.data; D.raw[m.page] = raw;
+    if (m.page === 'home') { D.shell.needs = (m.data.needs || []).length; renderRail(); }
+    if (m.page !== openKey()) return;
+    clearTimeout(S.staleT);
+    // built before your last action (42 §9): the build after it is on its way; drawn later only if none comes
+    if (m.built_at && m.built_at * 1000 < (S.actedAt || 0)) { S.staleT = setTimeout(renderMain, 1500); return; }
+    renderMain();
   });
   B.on('memory_error', (m) => { D.memory_error = m.text; if (!D.pages[S.page]) render(false); Y.toast(m.text, true); });
   B.on('live', (m) => {
@@ -344,7 +503,7 @@
       if (m.what === 'removed') { if (i >= 0) items.splice(i, 1); }
       else if (i >= 0) items[i] = m.item; else items.push(m.item);
     }
-    if (S.chat && !chatT) chatT = setTimeout(() => { chatT = 0; renderDrawer(); }, 60);
+    if (S.chat && !chatT) chatT = setTimeout(() => { chatT = 0; renderDrawer(); }, 100);   // a streamed reply: ~10 patches a second
   });
   B.on('focus', (m) => { if (m.page && PAGES.includes(m.page)) go(m.page, m.sub || ''); if (m.thread) go(S.page, S.sub, { chat: true }); });
   B.on('appearance', (m) => { applyAppearance(m.appearance); render(false); });
@@ -353,7 +512,12 @@
   B.on('permissions', (m) => { if (D.pages.settings) { D.pages.settings.autonomy = m.permissions; if (S.page === 'settings') renderMain(); } });
 
   /* ================= clicks and keys ================= */
-  document.addEventListener('pointerdown', (e) => { if (e.target.closest && e.target.closest('#main')) S.touched = performance.now(); }, true);
+  // a press in the page holds the item pressed (its reply may still morph it), not the whole page
+  document.addEventListener('pointerdown', (e) => {
+    if (!e.target.closest || !e.target.closest('#main')) return;
+    S.touched = performance.now();
+    S.pressed = e.target.closest('[data-item], [data-fact], [data-learned], [data-card], [data-row], .lrow, .srow, .approw, .dial-r') || null;
+  }, true);
   document.addEventListener('click', (e) => {
     const t = e.target.closest('button, a, [data-do]');
     if (!t) return;

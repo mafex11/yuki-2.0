@@ -121,15 +121,16 @@
       x.rhythm ? Y.rhythm(x.rhythm) : null)) : Y.empty('Nobody yet. People show up here as Yuki sees who you talk to.'));
     const right = cur ? dossier(cur, d, D) : Y.clearing('div', 'dossier', Y.empty('When Yuki knows someone, how you reach them shows here.', 'No one yet.'));
     const routines = d.routines || [], rules = d.rules || [], facts = d.facts || [], mis = d.misheard || [];
-    return [Y.head('Me', meta, Y.numFig(P.length, P.length === 1 ? 'person' : 'people')),
-      h('div', { class: 'me-grid' }, list, right),
-      h('div', { class: 'me-lower' },
-        h('div', { class: 'col' },
-          Y.sec('Routines', routines.length, routines.length ? routines.map((f) => factRow(f, pending)) : Y.empty('No routines yet. They come from what you do most days.')),
-          Y.sec('Portrait facts', facts.length, facts.length ? facts.map((f) => factRow(f, pending)) : Y.empty('Nothing yet. Your portrait is rebuilt each night from what Yuki saw.'))),
-        h('div', { class: 'col' },
-          Y.sec('Preferences and rules', rules.length, rules.length ? rules.map((r) => ruleRow(r, pending)) : Y.empty('No rules yet. Tell Yuki “always…” or “never…” and it lands here.')),
-          mis.length ? Y.sec('Maybe misheard', mis.length, mis.map((m) => misheardRow(m, pending))) : null))];
+    // data-k: the blocks' keys for the live patch (app.js patchInto)
+    return [Y.k(Y.head('Me', meta, Y.numFig(P.length, P.length === 1 ? 'person' : 'people')), 'head'),
+      h('div', { class: 'me-grid', data: { k: 'people' } }, Y.k(list, 'list'), Y.k(right, 'dossier:' + (cur ? cur.ref || cur.name : ''))),
+      h('div', { class: 'me-lower', data: { k: 'lower' } },
+        h('div', { class: 'col', data: { k: 'left' } },
+          Y.k(Y.sec('Routines', routines.length, routines.length ? routines.map((f) => factRow(f, pending)) : Y.empty('No routines yet. They come from what you do most days.')), 'routines'),
+          Y.k(Y.sec('Portrait facts', facts.length, facts.length ? facts.map((f) => factRow(f, pending)) : Y.empty('Nothing yet. Your portrait is rebuilt each night from what Yuki saw.')), 'facts')),
+        h('div', { class: 'col', data: { k: 'right' } },
+          Y.k(Y.sec('Preferences and rules', rules.length, rules.length ? rules.map((r) => ruleRow(r, pending)) : Y.empty('No rules yet. Tell Yuki “always…” or “never…” and it lands here.')), 'rules'),
+          mis.length ? Y.k(Y.sec('Maybe misheard', mis.length, mis.map((m) => misheardRow(m, pending))), 'misheard') : null))];
   }
 
   /* ---------- actions: Correct / Forget / Not mine / Pin ---------- */

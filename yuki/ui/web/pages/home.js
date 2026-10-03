@@ -27,12 +27,12 @@
         h('div', { class: 'sm', text: c.note || '' })));
     }
     if (!tiles.length) return null;
-    return h('div', { class: 'now' + (tiles.length === 2 ? ' two' : tiles.length === 1 ? ' one' : '') }, tiles);
+    return h('div', { class: 'now' + (tiles.length === 2 ? ' two' : tiles.length === 1 ? ' one' : ''), data: { k: 'now' } }, tiles);
   }
   /* today's goals (check-ins' goals, in your words): a quiet line under the Now strip, open ones first */
   function goalsLine(goals) {
     if (!(goals || []).length) return null;
-    return h('div', { class: 'now-goals', data: { clear: '' } }, Y.label('Today you’re after', null, 'lesson'),
+    return h('div', { class: 'now-goals', data: { clear: '', k: 'goals' } }, Y.label('Today you’re after', null, 'lesson'),
       goals.map((g) => h('span', { class: 'g' + (g.done ? ' done' : ''), title: g.done ? 'Done' : '' }, g.done ? ic('check') : null, h('span', { text: g.text }))));
   }
 
@@ -86,7 +86,7 @@
       r.started_at ? Y.timerEl(r.started_at) : h('span', { class: 'when', text: '' }));
   }
   function runningRow(r) {
-    return h('div', { class: 'run-i' }, h('i', { class: r.live ? 'recdot' : 'waitdot' }),
+    return h('div', { class: 'run-i', data: { k: 'running:' + r.kind } }, h('i', { class: r.live ? 'recdot' : 'waitdot' }),
       h('div', null, h('div', { class: 'tt', text: r.title }), r.detail ? h('div', { class: 'why', text: r.detail }) : null,
         r.kind === 'call' && r.recording ? h('div', { class: 'acts' }, key('Stop remembering', { cls: 'xs ghost', data: { do: 'stop-call' } })) : null),
       r.started_at ? Y.timerEl(r.started_at) : h('span', { class: 'when', text: r.meta || '' }));
@@ -98,7 +98,7 @@
   });
 
   function awayRow(r) {
-    return h('div', { class: 'item', data: { item: '' } },
+    return h('div', { class: 'item', data: { item: '', k: `away:${r.kind}:${r.at}` } },
       h('div', { class: 'away-h' }, h('div', { class: 'tt', text: r.title }), h('span', { class: 'when', text: r.at ? fmt.hm(r.at) : '' })),
       (r.changed || []).map((c) => h('div', { class: 'chg' }, h('span', { class: 'chg-t' }, ic(c.state === 'failed' ? 'x' : 'check'), h('span', { text: c.text })),
         c.undo && c.undo.until * 1000 > Date.now() ? key(c.undo.label || 'Undo', { cls: 'xs', data: { do: 'offer-undo', card: c.undo.card } }) : null)),
@@ -120,21 +120,22 @@
     const runB = runningN ? [runs.map(runRow), running.map(runningRow)] : Y.empty('Nothing running.');
     const awayB = away.length ? away.map(awayRow) : Y.empty(d.since ? `Caught up since ${fmt.hm(d.since)}.` : 'Caught up.');
     const people = (d.people || []).slice(0, 6);
-    const latelyB = people.map((p) => h('a', { class: 'lately', attrs: { href: '#me/' + encodeURIComponent(p.ref || p.name) } },
+    const latelyB = people.map((p) => h('a', { class: 'lately', data: { k: p.ref || p.name }, attrs: { href: '#me/' + encodeURIComponent(p.ref || p.name) } },
       h('span', { class: 'nm', text: p.name }), h('span', { class: 'rl', text: [p.route, p.last_at ? fmt.rel(p.last_at) : ''].filter(Boolean).join(' · ') }),
       p.rhythm ? Y.rhythm(p.rhythm) : h('span', { class: 'rl', text: p.count != null ? fmt.plural(p.count, 'message') : '' })));
     const anyRhythm = people.some((p) => p.rhythm);
     if (anyRhythm) latelyB.push(h('div', { class: 'lately-note', text: 'Only chats Yuki saw on this PC.' }));
-    return [head, nowStrip(d.now), goalsLine((d.now || {}).goals),
-      h('div', { class: 'grid2' },
-        h('div', { class: 'col' },
-          Y.sec('Needs you', needs.length, needsB),
-          Y.sec('Offers', offers.length, offersB, Y.rightLabel('cards only · never a run'))),
-        h('div', { class: 'col' },
-          Y.sec('Running', runningN, runB),
-          Y.sec('Since you were away', away.length, awayB),
-          people.length ? Y.sec('Your people lately', null, latelyB, Y.rightLabel(anyRhythm ? 'messages a day · 14 days' : 'last in touch')) : null,
-          total ? h('div', { class: 'label tail', text: `That’s all of it. ${total} things from the last 7 days.` }) : null))];
+    // data-k: the blocks' keys for the live patch (app.js patchInto)
+    return [Y.k(head, 'head'), nowStrip(d.now), goalsLine((d.now || {}).goals),
+      h('div', { class: 'grid2', data: { k: 'grid' } },
+        h('div', { class: 'col', data: { k: 'left' } },
+          Y.k(Y.sec('Needs you', needs.length, needsB), 'needs'),
+          Y.k(Y.sec('Offers', offers.length, offersB, Y.rightLabel('cards only · never a run')), 'offers')),
+        h('div', { class: 'col', data: { k: 'right' } },
+          Y.k(Y.sec('Running', runningN, runB), 'running'),
+          Y.k(Y.sec('Since you were away', away.length, awayB), 'away'),
+          people.length ? Y.k(Y.sec('Your people lately', null, latelyB, Y.rightLabel(anyRhythm ? 'messages a day · 14 days' : 'last in touch')), 'people') : null,
+          total ? h('div', { class: 'label tail', data: { k: 'tail' }, text: `That’s all of it. ${total} things from the last 7 days.` }) : null))];
   }
 
   /* ---------- actions ---------- */
