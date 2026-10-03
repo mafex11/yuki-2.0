@@ -32,6 +32,11 @@ content-free (:meth:`WebWindow.log`).
 Nothing here reads what a message says to decide anything; every button is a closed action name with machine fields
 (ids, kinds), turned into a memory call, a settings write or a pipe op.
 
+**The startup splash** (the 06a planet, ``web/planet-splash.js``): the tray passes ``--splash`` on the first window of
+each Yuki run only; the page gets ``splash=play`` (``still`` with reduced motion) in its address, holds a plain
+background until the host answers its ready with ``{kind: "splash", on}`` (off when a full-screen app is in front,
+:meth:`WebWindow.cover_now`), plays about 1.45 s over the first page's load and fades into it. A click or Esc skips it.
+
 Falls back to the Qt window (``yuki.ui.window``) by itself when the WebView2 runtime is missing or fails to start.
 One window at a time, whichever engine: the same single-instance mutex and focus event as the Qt window.
 
@@ -69,6 +74,8 @@ def _ui_dir() -> Path:
 UI_DIR = _ui_dir()
 WEB_DIR = UI_DIR / "web"
 FONTS_DIR = UI_DIR / "fonts"
+#: The app icon (the badge, every size; packaging/make_icon.py keeps it equal to packaging/yuki.ico).
+APP_ICON = UI_DIR / "yuki.ico"
 FIXTURE = WEB_DIR / "fixtures" / "window.js"
 FIXTURE_PREFIX = "window.YUKI_FIXTURE = "
 START_URL = f"https://{APP_HOST}/index.html"
@@ -168,6 +175,36 @@ def appearance() -> dict[str, Any]:
         return {"accent": s.accent, "reduce_motion": bool(s.reduce_motion)}
     except Exception:  # noqa: BLE001 - a broken settings file reads as defaults
         return {"accent": "green", "reduce_motion": False}
+
+
+def app_version(ui_dir: Path | None = None) -> str:
+    """Yuki's version, for Settings -> About.
+
+    An installed build carries ``build_version.txt`` (written by packaging/yuki.spec from build.ps1 -Version), so About
+    says what the installer and the exe's properties say; from source it is ``yuki.__version__``.
+    """
+    try:
+        built = ((ui_dir or UI_DIR) / "build_version.txt").read_text(encoding="utf-8").strip()
+        if built:
+            return built
+    except OSError:
+        pass
+    try:
+        from yuki import __version__
+
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def splash_query(asked: bool, appear: dict[str, Any] | None = None) -> str:
+    """The page's startup-splash knob: ``splash=play`` on the first window of a Yuki run (the tray passes
+    ``--splash``), ``splash=still`` when you chose reduced motion, ``""`` otherwise. The page still waits for the
+    host's word on ready (:meth:`WebWindow.cover_now`) before it plays."""
+    if not asked:
+        return ""
+    appear = appearance() if appear is None else appear
+    return "splash=still" if appear.get("reduce_motion") else "splash=play"
 
 
 def page_name(page: str | None) -> tuple[str, bool]:
@@ -273,8 +310,10 @@ class WebWindow:
                  fixture: dict[str, Any] | None = None, connect: bool = True, ui_path: Path | None = None,
                  t0: float | None = None, metrics_path: Path | None = None, shot: Path | None = None,
                  exit_after: float | None = None, memory_low_after: float | None = None,
-                 policy_path: Path | None = None, shot_delay: float = 0.0) -> None:
+                 policy_path: Path | None = None, shot_delay: float = 0.0, splash: bool = False) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
+        self.splash = splash                   # the startup splash was asked for (the tray's first window of a run)
+        self.splash_answered = False           # the page's first ready got its answer (play or not): only once
         self.page, self.thread_open = page, thread
         self.open_page = page                  # the page open now ("day" for Work's Day tab), from the page's want
         self.fixture = fixture
@@ -362,6 +401,13 @@ class WebWindow:
         op = message.get("op")
         if op == "ready":
             self.marks["page_ready"] = time.time()
+            if self.splash and self.host is not None:   # the page holds its splash until this answer (UI thread)
+                # once per window: a page loaded again (a renderer restart) gets "off" at once, never a second play
+                covered = self.cover_now() if not self.splash_answered else False
+                on = not covered and not self.splash_answered
+                self.splash_answered = True
+                self.host.post({"kind": "splash", "on": on})
+                self.log("web_splash", on=on, **({} if on else {"reason": "covered" if covered else "again"}))
             self.ready.set()
             threading.Thread(target=self._boot_when_ready, name="yuki-web-boot", daemon=True).start()
         elif op == "painted":
@@ -392,7 +438,7 @@ class WebWindow:
             self.booted = True
             self.post({"kind": "boot", "source": "fixture", "shell": shift_times(f["shell"], delta),
                        "pages": shift_times(f["pages"], delta), "chat": shift_times(f.get("chat") or {}, delta),
-                       "appearance": appearance(), "page": self.page})
+                       "appearance": appearance(), "page": self.page, "version": app_version()})
             return
         self._snapshot_done.wait(1.5)   # read in parallel with the browser's start; ~0.1 s
         with self._lock:
@@ -403,7 +449,7 @@ class WebWindow:
                 self.posted_full.setdefault(k, page_hash("", v))
         chat = self.chat_payload() if self.model is not None else None
         self.post({"kind": "boot", "source": "snapshot", "shell": self.shell, "pages": pages, "chat": chat,
-                   "appearance": appearance(), "page": self.page})
+                   "appearance": appearance(), "page": self.page, "version": app_version()})
         if self.thread_open:
             self.post({"kind": "focus", "page": self.page, "thread": True})
         self.marks["boot_sent"] = time.time()
@@ -892,17 +938,23 @@ class WebWindow:
         the window can't be seen: the page draws one still frame (``quiet``), and nothing is built or posted until
         that ends (:meth:`may_refresh`; then :meth:`catch_up`). Minimised or hidden, WebView2 marks the page hidden
         and its loop stops by itself. Windows' own answer, checked every 2 s."""
-        shell32, user32 = ctypes.windll.shell32, ctypes.windll.user32
         while not self._closing.wait(2.0):
             host = self.host
             if host is None or not host.hwnd or not self.booted:
                 continue
-            state = ctypes.c_int(0)
-            try:
-                busy = shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in (2, 3, 4)
-            except Exception:  # noqa: BLE001
-                busy = False
-            self.set_covered(busy and int(user32.GetForegroundWindow() or 0) != host.hwnd)
+            self.set_covered(self.cover_now())
+
+    def cover_now(self) -> bool:
+        """Whether a full-screen app (a game, a presentation, a full-screen video) is in front and this window is
+        not: Windows' own answer (``SHQueryUserNotificationState``), read once. ``False`` when Windows cannot say."""
+        host = self.host
+        hwnd = int(getattr(host, "hwnd", 0) or 0) if host is not None else 0
+        state = ctypes.c_int(0)
+        try:
+            busy = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in (2, 3, 4)
+            return busy and int(ctypes.windll.user32.GetForegroundWindow() or 0) != hwnd
+        except Exception:  # noqa: BLE001
+            return False
 
     def set_covered(self, covered: bool) -> None:
         if covered == self.covered:
@@ -1933,6 +1985,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dev-tools", action="store_true")
     ap.add_argument("--no-fallback", action="store_true", help="never open the Qt window instead")
     ap.add_argument("--probe-frame", action="store_true", help="measure the frameless frame (off-screen)")
+    ap.add_argument("--splash", action="store_true",
+                    help="play the startup splash (the tray asks on the first window of each Yuki run)")
     args = ap.parse_args(argv)
     page, thread = page_name(args.page)
     handle = None if args.offscreen else single_instance()
@@ -1961,12 +2015,13 @@ def main(argv: list[str] | None = None) -> int:
                     fixture=load_fixture(Path(args.fixture)) if args.fixture else None,
                     connect=not args.no_connect, t0=args.t0, metrics_path=args.metrics, shot=args.shot,
                     exit_after=args.exit_after, memory_low_after=args.memory_low_after,
-                    shot_delay=args.shot_delay)
+                    shot_delay=args.shot_delay, splash=bool(args.splash))
     win.probe_frame = bool(args.probe_frame and args.offscreen)
     win.start()
-    url = START_URL + (("?" + args.query) if args.query else "")
+    query = "&".join(q for q in (args.query, splash_query(bool(args.splash))) if q)
+    url = START_URL + (("?" + query) if query else "")
     options = HostOptions(
-        folders={APP_HOST: WEB_DIR, FONT_HOST: FONTS_DIR}, start_url=url,
+        folders={APP_HOST: WEB_DIR, FONT_HOST: FONTS_DIR}, start_url=url, icon=APP_ICON,
         user_data_dir=args.profile or default_profile(), placement="offscreen" if args.offscreen else "normal",
         browser_args=args.browser_args, dev_tools=args.dev_tools, on_message=win.on_message,
         on_event=win.on_host_event, on_shown=win.on_shown, marks={"main": t_main},

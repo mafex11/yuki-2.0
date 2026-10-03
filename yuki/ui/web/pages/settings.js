@@ -75,6 +75,11 @@
       h('div', { class: 'srow' }, h('span', null, 'Motion', h('small', { text: 'The field runs at 30 fps, the live figure at 15, and both sleep when nothing changes' })),
         h('span', { class: 'seg' }, h('button', { data: { do: 'motion', on: '0' }, attrs: { type: 'button', 'aria-pressed': String(!ap.reduce_motion) }, text: 'Full' }),
           h('button', { data: { do: 'motion', on: '1' }, attrs: { type: 'button', 'aria-pressed': String(!!ap.reduce_motion) }, text: 'Reduced' })))];
+    // About: the startup splash (mounted by mount() below; data-keep: a live patch never replaces it mid-play)
+    const about = [
+      h('div', { class: 'about-splash', data: { keep: '', do: 'about-replay', enter: 'about-replay' },
+        attrs: { role: 'button', tabindex: '0', title: 'Play again', 'aria-label': 'Yuki. Press to play the animation again' } }),
+      D.version ? srow('Version', D.version) : null];
     // data-k: the blocks' keys for the live patch (app.js patchInto)
     return [Y.k(Y.head('Settings', meta), 'head'),
       h('div', { class: 'set-grid', data: { k: 'grid' } },
@@ -86,7 +91,8 @@
           Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
           Y.k(Y.sec('Privacy and pause', null, privacy), 'privacy'),
           Y.k(Y.sec('Calls', null, calls), 'calls'),
-          Y.k(Y.sec('Accent and motion', null, look), 'look')))];
+          Y.k(Y.sec('Accent and motion', null, look), 'look'),
+          Y.k(Y.sec('About', null, about), 'about')))];
   }
 
   /* ---------- actions ---------- */
@@ -133,5 +139,30 @@
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
   });
 
-  Y.pages.settings = { build };
+  /* About's splash: plays once per opening of Settings, when it first comes into view (it is the page's last block,
+     so it never plays unseen below the fold; nothing runs until then). A still frame with reduced motion or under a
+     full-screen app; a live patch keeps the one already there; a press (or Enter) plays it again. */
+  function start(el) {
+    if (el.__splash || !el.isConnected) return;
+    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: () => window.Lattice.Motion.reduced });
+  }
+  function mount(main) {
+    const el = main.querySelector('.about-splash');
+    if (!el || el.__splash || el.__seen || !window.PlanetSplash) return;
+    if (window.Lattice.Motion.reduced || !window.IntersectionObserver) { start(el); return; }
+    el.__seen = new IntersectionObserver((es) => {
+      if (!es.some((e) => e.isIntersecting)) return;
+      el.__seen.disconnect();
+      start(el);
+    }, { threshold: 0.35 });
+    el.__seen.observe(el);
+  }
+  A['about-replay'] = (t) => {
+    const el = t.closest('.about-splash');
+    if (!el || !window.PlanetSplash) return;
+    if (!el.__splash) { if (el.__seen) el.__seen.disconnect(); start(el); return; }
+    if (window.Lattice.Motion.reduced) el.__splash.still(); else el.__splash.replay();
+  };
+
+  Y.pages.settings = { build, mount };
 })();

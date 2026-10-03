@@ -712,6 +712,15 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .swatches button[aria-pressed="true"] { border-color: var(--lit); }
 .sw-green { background: #6FEBC4; } .sw-orange { background: #FFA46B; }
 .pause-say { display: block; font-size: 12px; color: var(--text-3); margin-top: 2px; }
+/* About: the splash (planet-splash.js) plays when Settings opens; a press plays it again */
+.about-splash { width: 100%; max-width: 520px; aspect-ratio: 520 / 300; margin: 4px 0 10px; border-radius: var(--r-3); border: 1px solid var(--hair); background: var(--bg); overflow: hidden; cursor: pointer; }
+
+/* ---------- the startup splash (app.js): the first window of a Yuki run, over the window's own background ----------
+   Above the pages and the thread drawer, under the caption buttons (later in the page at the same level); one fade
+   out, no endless animation. */
+.startup-splash { position: fixed; inset: 0; z-index: 8; background: var(--bg); display: grid; place-items: center; }
+.startup-splash > .box { width: min(76vw, 760px); }
+.startup-splash.out { opacity: 0; pointer-events: none; transition: opacity 280ms var(--ease); }
 
 /* ---------- confirmations, toasts, folds ---------- */
 .confirm { display: flex; align-items: center; gap: 10px; min-height: 30px; padding: 4px 0; font-size: 13.5px; color: var(--text); }

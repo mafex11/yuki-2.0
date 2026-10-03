@@ -62,7 +62,8 @@ async function main() {
     let port = null;
     for (let i = 0; i < 100 && !port; i++) {
       const f = path.join(profile, 'DevToolsActivePort');
-      if (fs.existsSync(f)) port = fs.readFileSync(f, 'utf8').split('\n')[0].trim();
+      // Chrome may still hold the file (EBUSY) or be mid-write: retry until it is readable and has its second line
+      try { const t = fs.readFileSync(f, 'utf8'); if (t.includes('\n')) port = t.split('\n')[0].trim(); } catch (e) { /* not there or busy yet */ }
       if (!port) await sleep(100);
     }
     if (!port) throw new Error('the headless shell did not open its DevTools port: ' + stderr.slice(-500));

@@ -878,7 +878,9 @@ class WindowHost(QObject):
 
         engine = self.window_engine()
         module = WEB_WINDOW if engine == "web" else WINDOW
-        cmd = module_command(module, *(["--page", page] if page else []))   # Yuki.exe -m ... when installed
+        # the startup splash: the first window of this Yuki run only (an object that can't say: none)
+        splash = engine == "web" and not getattr(self, "_splash_shown", True)
+        cmd = module_command(module, *(["--page", page] if page else []), *(["--splash"] if splash else []))
         root = app_dir()
         flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         try:
@@ -886,11 +888,15 @@ class WindowHost(QObject):
             self.proc = subprocess.Popen(cmd, cwd=str(root), creationflags=flags, close_fds=True,
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
-            self._log("window", state="launched", pid=self.proc.pid, engine=engine)
+            self._splash_shown = True
+            self._log("window", state="launched", pid=self.proc.pid, engine=engine, **({"splash": True} if splash else {}))
             return True
         except OSError as exc:
             self._log("window", state="launch_failed", engine=engine, error=f"{type(exc).__name__}: {exc}")
             return False
+
+    #: Whether this tray run has opened a window yet: the first one plays the startup splash (``--splash``).
+    _splash_shown = False
 
     #: Whether the WebView2 runtime can host the HTML window (checked once per tray run; ``None``: not yet).
     _web_ok: bool | None = None

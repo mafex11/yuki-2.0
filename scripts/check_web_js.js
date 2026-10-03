@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const root = path.join(__dirname, '..', 'yuki', 'ui', 'web');
-const files = ['lattice/field.js', 'bridge.js', 'ui.js', 'app.js', 'fixtures/window.js']
+const files = ['lattice/field.js', 'dots.js', 'planet-splash.js', 'bridge.js', 'ui.js', 'app.js', 'fixtures/window.js']
   .concat(fs.readdirSync(path.join(root, 'pages')).filter((f) => f.endsWith('.js')).map((f) => 'pages/' + f));
 let bad = 0;
 for (const f of files) {

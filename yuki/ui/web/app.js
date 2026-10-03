@@ -38,6 +38,67 @@
   };
   Y.go = go;
 
+  /* ================= the startup splash (06a planet, planet-splash.js) =================
+     The first window of a Yuki run only: the host puts splash=play (or still, with reduced motion) in the address
+     when the tray asks, never again until Yuki starts again. Over the window's own background, it holds still until
+     the host answers ready (off behind a full-screen app), plays about 1.45 s while the first page loads, then fades
+     into the page. A click or Esc skips it at once; reduced motion shows the still frame for 0.6 s; a full-screen app
+     coming in front (quiet) ends it. Nothing of it is left afterwards: no timer, no observer, no element. */
+  const splash = (function () {
+    const mode = Q.get('splash');
+    if ((mode !== 'play' && mode !== 'still') || !window.PlanetSplash) return null;
+    const STILL_MS = 600, FADE_MS = 280, WAIT_GO_MS = 1500, WAIT_PAGE_MS = 2500;
+    const box = h('div', { class: 'box' });   // keeps the splash's 520:300 shape, centred
+    const el = h('div', { class: 'startup-splash', attrs: { 'aria-hidden': 'true' } }, box);
+    document.body.append(el);              // before the title bar (appended below): the caption buttons stay on top
+    let ps = null, gone = false, played = false, ended = false, paged = false, fading = false;
+    const timers = new Set();
+    const later = (fn, ms) => { const id = setTimeout(() => { timers.delete(id); fn(); }, ms); timers.add(id); };
+    const reduced = () => mode === 'still' || L.Motion.reduced || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    function remove(why) {
+      if (gone) return;
+      gone = true;
+      timers.forEach(clearTimeout); timers.clear();
+      window.removeEventListener('keydown', onKey, true);
+      if (ps) ps.destroy();
+      el.remove();
+      S.splash = why;
+    }
+    // it fades once it has played and the first page is drawn (or has waited long enough for the page)
+    function settle() {
+      if (gone || fading || !ended || !paged) return;
+      fading = true;
+      el.classList.add('out');
+      later(() => remove('done'), FADE_MS + 40);
+    }
+    function play() {
+      if (gone || played) return;
+      played = true;
+      timers.forEach(clearTimeout); timers.clear();
+      const still = reduced();
+      ps = window.PlanetSplash.mount(box, { colorSet: 'mint', background: null, reduced: still, onDone() {
+        if (gone) return;
+        later(() => { ended = true; settle(); }, still ? STILL_MS : 0);
+        later(() => { paged = true; settle(); }, WAIT_PAGE_MS);
+      } });
+      S.splash = still ? 'still' : 'playing';
+    }
+    // Esc skips it and only that (first of all key handlers: the window's, in its capture phase)
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); remove('skipped'); } }
+    el.addEventListener('pointerdown', (e) => { e.preventDefault(); remove('skipped'); });
+    window.addEventListener('keydown', onKey, true);
+    S.splash = 'waiting';
+    if (B.native) later(() => remove('no answer'), WAIT_GO_MS);   // the host answers ready at once
+    else play();                                                   // the file:// preview: no host to ask
+    return {
+      go(on) { if (on) play(); else remove('covered'); },
+      paged() { paged = true; settle(); },
+      quiet(on) { if (on) remove('covered'); },
+      active: () => !gone
+    };
+  })();
+  Y.splash = splash;
+
   /* ================= routing ================= */
   function parse() {
     const raw = decodeURIComponent(location.hash.slice(1) || 'home');
@@ -494,7 +555,9 @@
     if (m.chat) setChat(m.chat);
     if (m.page && !location.hash) { location.hash = hashFor(m.page, '', false); }
     S.booted = true;
+    if (m.version) D.version = m.version;
     render(true);
+    if (splash) splash.paged();
     reportPaint();
     reportCaption();
     // preview knob (transition captures): switch tab after N ms, e.g. goto=work&gotoAt=1500
@@ -544,7 +607,8 @@
   B.on('focus', (m) => { if (m.page && PAGES.includes(m.page)) go(m.page, m.sub || ''); if (m.thread) go(S.page, S.sub, { chat: true }); });
   B.on('appearance', (m) => { applyAppearance(m.appearance); render(false); });
   B.on('toast', (m) => Y.toast(m.text, !!m.warn));
-  B.on('quiet', (m) => L.Motion.setQuiet(!!m.on));   // a full-screen app covers the window: one still frame
+  B.on('quiet', (m) => { L.Motion.setQuiet(!!m.on); if (splash) splash.quiet(!!m.on); });   // a full-screen app covers the window: one still frame
+  B.on('splash', (m) => { if (splash) splash.go(!!m.on); });   // the host's answer to ready: play, or not behind a full-screen app
   B.on('permissions', (m) => { if (D.pages.settings) { D.pages.settings.autonomy = m.permissions; if (S.page === 'settings') renderMain(); } });
 
   /* ================= clicks and keys ================= */
