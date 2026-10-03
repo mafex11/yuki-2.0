@@ -188,6 +188,51 @@ def test_the_ledger_groups_actions_by_request_and_has_no_undo():
     assert W.took_words(69) == "1 min 9 s" and W.took_words(0.3) == "1 s" and W.took_words(None) == ""
 
 
+def test_a_parked_request_waits_on_you_and_an_unknown_outcome_is_never_done():
+    # review F2: a request paused on a question you never answered is not "Done"
+    runs = [{"key": "p1", "lane": "worker", "words": "book the hall", "outcome": "parked", "at": NOW - H},
+            {"key": "u1", "lane": "worker", "words": "tidy the notes", "outcome": "melted", "at": NOW - 2 * H},
+            {"key": "n1", "lane": "worker", "words": "water reminder", "at": NOW - 3 * H}]
+    rows = [{"id": "run:p1:1", "kind": "action", "at": NOW - H + 1, "what": "Opened Notes", "status": "done", "result": "done"},
+            {"id": "run:u1:1", "kind": "action", "at": NOW - 2 * H + 1, "what": "Opened Notes", "status": "done", "result": "done"},
+            {"id": "run:n1", "kind": "request", "at": NOW - 3 * H, "what": "Answered", "status": "done", "result": "answered"}]
+    _, groups = W.ledger_groups(rows, runs, NOW)
+    parked, unknown, none = groups
+    assert (parked["outcome"], parked["status"], parked["f"]) == ("Waiting on your answer", "waiting", "waiting")
+    assert unknown["outcome"] == "Ended" and unknown["status"] == "" and unknown["f"] == "did"
+    assert none["outcome"] == "Done"                                   # practice memory stores "final" when none given
+    answered = W.run_rows({"key": "p2", "words": "book the hall", "outcome": "parked", "at": NOW, "steps": []}, [], NOW)[0]
+    assert answered["result"] == "waiting on your answer" and answered["status"] == "waiting" and answered["f"] == "waiting"
+
+
+def test_a_request_log_group_keeps_its_key_and_its_words_quoted_once(tmp_path):
+    import csv
+    import io
+
+    def log(lines):
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        w.writerow(["timestamp", "session", "lane", "request", "wall_s", "tool_calls", "cost_usd", "outcome"])
+        for at, words in lines:
+            w.writerow([datetime.fromtimestamp(at).isoformat(), "s", "worker", words, 2, "open_app=1", 0.01, "final"])
+        p = tmp_path / "requests.csv"
+        p.write_text(buf.getvalue(), encoding="utf-8")
+        return p
+
+    class _Empty:
+        pass
+
+    t = time.time()
+    first = W.build_activity(_Empty(), requests_csv=log([(t - 900, "open my budget")]), now=t)
+    g = first["groups"][0]
+    # review F4: the draft quotes your words once
+    assert g["title"] == "“open my budget”" and g["wrong_text"] == "That wasn’t right: “open my budget”. "
+    # review F3: a newer request does not move the key of the one you opened
+    later = W.build_activity(_Empty(), requests_csv=log([(t - 900, "open my budget"), (t - 60, "pause it")]), now=t)
+    ids = {x["title"]: x["id"] for x in later["groups"]}
+    assert ids["“open my budget”"] == g["id"] and ids["“pause it”"] != g["id"]
+
+
 # -- Work: the Day's sessions and calls ----------------------------------------------------------------------------------
 
 

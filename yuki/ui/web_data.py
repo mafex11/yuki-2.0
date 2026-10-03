@@ -1338,11 +1338,10 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float,
     wrong = f"That wasn’t right: “{words}”. " if words else ""
     steps = run.get("steps") or []
     if not steps:
-        result = {"final": "answered", "error": "failed", "cancelled": "stopped", "withdrawn": "replaced by a newer request",
-                  "abandoned": "abandoned"}.get(str(run.get("outcome") or ""), str(run.get("outcome") or "answered"))
-        status = "failed" if run.get("outcome") == "error" else "stopped" if run.get("outcome") in (
-            "cancelled", "withdrawn", "abandoned") else "done"
-        return [{"id": f"run:{run.get('key')}", "kind": "request", "f": "failed" if status == "failed" else "did",
+        word, status = run_outcome(run.get("outcome"))
+        result = "answered" if status == "done" else word[:1].lower() + word[1:]
+        return [{"id": f"run:{run.get('key')}", "kind": "request",
+                 "f": "failed" if status == "failed" else "waiting" if status == "waiting" else "did",
                  "at": float(run.get("at") or now), "what": f"Answered “{words}”" if words else "Answered you",
                  "where": "Yuki", "cost": cost, "because": "because", "why": why, "chips": [], "result": result,
                  "status": status, "wrong_text": wrong}]
@@ -1398,6 +1397,7 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
     back (a to-do it added; an offer that ran); requests the traces don't have, from the request log; the cards Yuki
     showed (why: the card's reason, or the user's standing request); the calls it kept (why: the user's call rule).
     Filters by ``f``: did / failed / calls. Plus what it saw today (time by app, counts only) and the week's calls."""
+    from yuki.ui.chat_model import clean_request
     from yuki.ui.ledger import read_request_log
 
     now = time.time() if now is None else now
@@ -1413,13 +1413,18 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
         rows.extend(run_rows(run, todos, now, rules))
     run_starts = sorted(float(r.get("at") or 0) for r in runs)
     lanes = {"worker": "Typed request", "front_desk": "Quick answer", "voice": "Voice"}
-    for i, r in enumerate(read_request_log(requests_csv, since, limit=120) if requests_csv else []):
+    for r in read_request_log(requests_csv, since, limit=120) if requests_csv else []:
         if any(abs(r["at"] - a) <= SAME_REQUEST_S for a in run_starts):
             continue   # the run trace above has this request, step by step
         words, cost = request_row_words(r)
         status = {"done": "done", "failed": "failed", "stopped": "stopped"}.get(r["state"], "done")
         voice = r.get("where") == "voice"
-        rows.append({"id": f"r{i}", "kind": "request", "f": "failed" if status == "failed" else "did", "at": r["at"],
+        said = _clip(" ".join(clean_request(r.get("what") or "").split()), 120)
+        # the id is the request's own time (and session), never its place in the log: it is the fold's key, and a
+        # newer request must not move an opened group onto another one (review F3)
+        rows.append({"id": f"req:{r.get('session') or ''}:{float(r['at']):.3f}", "kind": "request",
+                     "f": "failed" if status == "failed" else "did", "at": r["at"],
+                     "wrong_text": f"That wasn’t right: “{said}”. " if said else "",
                      "what": request_title(r.get("what") or ""),
                      "where": lanes.get(r.get("where") or "", (r.get("where") or "").replace("_", " ").capitalize()),
                      "cost": cost, "because": "because", "why": "you asked by voice" if voice else "you asked",
@@ -1482,7 +1487,19 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
 
 #: A request's outcome (practice memory's run ``outcome``) in the words the Activity group's header shows.
 RUN_OUTCOME = {"final": "Done", "error": "Couldn’t finish", "cancelled": "Stopped",
-               "withdrawn": "Replaced by a newer request", "abandoned": "Left unfinished"}
+               "withdrawn": "Replaced by a newer request", "abandoned": "Left unfinished",
+               "parked": "Waiting on your answer"}
+#: Each run outcome's status (the glyph and the filter): a parked request is still waiting on you, never "done".
+RUN_STATUS = {"final": "done", "error": "failed", "cancelled": "stopped", "withdrawn": "stopped",
+              "abandoned": "stopped", "parked": "waiting"}
+
+
+def run_outcome(outcome: Any) -> tuple[str, str]:
+    """(the outcome in plain words, its status) for a run's stored outcome (the agent's ``final``/``error``/
+    ``cancelled``/``withdrawn``/``abandoned``/``parked``; none stored is ``final``, practice memory's own default).
+    An outcome this window doesn't know reads "Ended" with no status: never "Done" (review F2)."""
+    key = str(outcome or "final")
+    return RUN_OUTCOME.get(key, "Ended"), RUN_STATUS.get(key, "")
 
 
 def took_words(seconds: float | None) -> str:
@@ -1517,14 +1534,12 @@ def ledger_groups(rows: list[dict[str, Any]], runs: list[dict[str, Any]],
             if run is not None:
                 voice = run.get("lane") == "voice" or run.get("source") == "hand"
                 words = _clip(run.get("words"), 160)
-                outcome = RUN_OUTCOME.get(str(run.get("outcome") or ""), "Done")
+                outcome, status = run_outcome(run.get("outcome"))
                 g = {"id": gid, "kind": "request", "at": float(run.get("at") or row["at"]),
                      "title": request_title(words) if words else ("Something you asked by voice" if voice else "Something you asked"),
                      "said": "you said" if voice else "you typed", "outcome": outcome,
                      "took": took_words((run.get("ms") or 0) / 1000), "cost": money(run.get("cost_usd")) if run.get("cost_usd") else "",
-                     "status": "failed" if run.get("outcome") == "error" else "stopped" if run.get("outcome") in (
-                         "cancelled", "withdrawn", "abandoned") else "done",
-                     "steps": 0, "failed": 0, "wrong_text": row.get("wrong_text") or ""}
+                     "status": status, "steps": 0, "failed": 0, "wrong_text": row.get("wrong_text") or ""}
             else:
                 g = {"id": gid, "kind": row.get("kind") or "request", "at": row["at"], "title": row.get("what") or "",
                      "said": "", "outcome": (row.get("result") or "")[:1].upper() + (row.get("result") or "")[1:],
@@ -1540,7 +1555,7 @@ def ledger_groups(rows: list[dict[str, Any]], runs: list[dict[str, Any]],
         if g["kind"] == "request" and g["steps"] and g["failed"] and g["outcome"] == "Done":
             g["outcome"] = f"Done, but {'one step' if g['failed'] == 1 else str(g['failed']) + ' steps'} didn’t work"
         g["f"] = "calls" if g["kind"] == "call" else "failed" if g["status"] == "failed" or (
-            g["failed"] and g["failed"] == g["steps"]) else "did"
+            g["failed"] and g["failed"] == g["steps"]) else "waiting" if g["status"] == "waiting" else "did"
     return out_rows, sorted(groups.values(), key=lambda g: -(g["at"] or 0))
 
 

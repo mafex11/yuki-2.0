@@ -93,7 +93,7 @@
       });
       return;
     }
-    Y.S.draft = g.wrong_text || `That wasn’t right: “${g.title}”. `;
+    Y.S.draft = g.wrong_text || `That wasn’t right: ${g.title}. `;   /* the title is quoted already (review F4) */
     Y.go(Y.S.page, Y.S.sub, { chat: true });
     setTimeout(() => { const i = document.querySelector('.drawer-in'); if (i) { i.value = Y.S.draft; i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 80);
   };
