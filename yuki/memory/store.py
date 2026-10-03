@@ -232,6 +232,12 @@ Call timeline digests (migration 19, yuki.memory.calldigest)::
     store.save_call_digest(call_id, app=, capture_ids=, status=, gist=, blocks=, ...) / fail_call_digest(...)
     store.call_digests(ids) -> {id: {...}};  store.call_digest(id);  store.digested_call_threads() -> {thread_id: call_id}
 
+People and routes (migration 28, yuki.memory.contacts reads and writes them through the store's own helpers)::
+
+    contacts / contact_routes / contact_prefs tables: who the user talks to, where (service, chat, kind, threads),
+    and the user's lasting route choice; derived (rebuilt by ``python -m yuki.memory.contacts --rebuild``), no counts
+    stored (computed from ``messages`` when read)
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
@@ -2410,6 +2416,63 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX threads_ident ON threads(ident_key);
     ALTER TABLE conversation_turns ADD COLUMN envelope_ciphertext TEXT;
     ALTER TABLE portraits ADD COLUMN sections_ciphertext TEXT;
+    """,
+    # 28 (2026-10-03, revamp Phase B1 "people and routes", docs/research/revamp-2026-10-02/24-build-B.md;
+    # yuki.memory.contacts): who the user talks to and where, derived from rows memory already holds (capture threads,
+    # their messages, person facts, name aliases, call digests) by one model pass that links people across apps, its
+    # output checked against the stored strings. Rebuilt by Yuki's own pipeline (python -m yuki.memory.contacts
+    # --rebuild), refreshed after the nightly audit; no counts are stored (code computes them from messages when read).
+    # - contacts: one person (canonical name, relation in a person fact's own words, aliases incl. names speech
+    #   recognition misheard, how the user writes to them, the person facts it rests on); name_key = HMAC of the
+    #   casefolded name, so a route preference survives a rebuild. ended_at: retired (rebuilt, merged, unevidenced).
+    # - contact_routes: one place the user talks with a person (contact_id) - or, with contact_id NULL, a group chat or
+    #   channel the user takes part in ("my usual channel") - by service (the URL host or the app's key, cleartext),
+    #   chat name and kind (dm | group | channel), with every capture thread it spans (display-name variants) and the
+    #   journal entries that put a person in a group they never wrote in. route_key = HMAC(service, casefolded chat).
+    # - contact_prefs: the user's lasting choice of route for a person ("no, the other one"), in their own words,
+    #   written only through MemoryClient.prefer_route (the agent's about tool), never by hand.
+    # Additive only.
+    """
+    CREATE TABLE contacts (
+        id                  INTEGER PRIMARY KEY,
+        name_key            TEXT NOT NULL,
+        name_ciphertext     TEXT NOT NULL,
+        relation_ciphertext TEXT,
+        aliases_ciphertext  TEXT,
+        tone_ciphertext     TEXT,
+        fact_ids            TEXT,
+        run_id              INTEGER,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL,
+        ended_at            REAL
+    );
+    CREATE INDEX contacts_live ON contacts(ended_at, name_key);
+    CREATE TABLE contact_routes (
+        id                  INTEGER PRIMARY KEY,
+        contact_id          INTEGER REFERENCES contacts(id),
+        route_key           TEXT NOT NULL,
+        service             TEXT NOT NULL,
+        kind                TEXT NOT NULL,
+        chat_ciphertext     TEXT NOT NULL,
+        handle_ciphertext   TEXT,
+        thread_ids          TEXT NOT NULL,
+        evidence            TEXT,
+        run_id              INTEGER,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL,
+        ended_at            REAL
+    );
+    CREATE INDEX contact_routes_contact ON contact_routes(ended_at, contact_id);
+    CREATE TABLE contact_prefs (
+        id                  INTEGER PRIMARY KEY,
+        name_key            TEXT NOT NULL,
+        route_key           TEXT NOT NULL,
+        quote_ciphertext    TEXT NOT NULL,
+        source              TEXT NOT NULL,
+        created_at          REAL NOT NULL,
+        ended_at            REAL
+    );
+    CREATE INDEX contact_prefs_name ON contact_prefs(name_key, ended_at);
     """,
 )
 

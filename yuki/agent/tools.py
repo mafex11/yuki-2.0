@@ -37,7 +37,7 @@ from yuki.ui.own_window import PAGE_WORDS, PAGES as YUKI_PAGES
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
     {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "recall",
      "activity", "calls", "call_timeline", "read_file", "fetch_url", "threads", "before", "links",
-     "look_at_focus", "read_clipboard"}
+     "look_at_focus", "read_clipboard", "about"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
@@ -48,7 +48,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "
 #: not installed (see :func:`tool_params`), like a policy-gated tool.
 MEMORY_TOOLS: frozenset[str] = frozenset(
     {"recall", "remember_how", "correct_memory", "remember_rule", "forget_rule", "activity", "todo",
-     "answer_question", "watch_for", "calls", "call_timeline", "threads", "before", "links"}
+     "answer_question", "watch_for", "calls", "call_timeline", "threads", "before", "links", "about"}
 )
 
 #: The tool the screenshot policy governs. When the policy is ``never`` this name
@@ -935,6 +935,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "viewed: pages they had open; shared: links in messages. Omit for both."},
                 "limit": {"type": "integer", "description": "How many (default 8)."},
             }
+        ),
+    },
+    {
+        "name": "about",
+        "label": "Checking who that is",
+        "description": (
+            "A person the user talks to, from memory's people index (instant, no model): who they are to the user, "
+            "the names and misheard forms they go by, every place the user talks with them (app, DM, group or "
+            "channel) most used lately first with message counts both ways and when each was last used, which "
+            "one is usual and how clearly, and the user's own last messages to them on each, to write the way the "
+            "user writes to them. Use it before messaging someone when the task frame or the people list does not "
+            "already settle where, and to look up a name you do not recognise. When the user corrects which place "
+            "to use for someone (\"no, the other one\", \"use WhatsApp for him\"), pass prefer_route with that "
+            "route's id and their words: it is kept as their lasting choice for that person."
+        ),
+        "input_schema": _obj(
+            {
+                "name": {"type": "string", "description": "Their name, handle or the name as heard."},
+                "prefer_route": {"type": "string",
+                                 "description": "Only when the user chose a place for them: the route id as about "
+                                                "lists it, e.g. route:12."},
+                "words": {"type": "string",
+                          "description": "With prefer_route: the user's own words that chose it, exactly."},
+            },
+            ["name"],
         ),
     },
     {
@@ -1973,6 +1998,9 @@ class Dispatcher:
         self.focus_wait_s = 0.05
         #: The memory service's picture of the screen as the last situation block read it (``None``: none).
         self.last_now_board: dict[str, Any] | None = None
+        #: The focus read of the last situation block (a ``FocusSnapshot``; ``None``: none, or focus in Yuki's own
+        #: window): the task frame's "this" (``yuki.agent.frame``) reuses it instead of reading again.
+        self.last_focus: Any = None
 
     def enable_now(self, settings: Any = None) -> bool:
         """Turn the per-turn Now picture on from ``settings`` (``now_in_situation``, ``now_wait_ms``,
@@ -2322,12 +2350,14 @@ class Dispatcher:
         facts["board_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
         facts["board"] = board is not None
         focus_line = ""
+        self.last_focus = None
         if focus_thread is not None:
             focus_thread.join(self.focus_wait_s + 0.02)
             focus = focus_box.get("focus")
             if getattr(focus, "ok", False) and not _is_own_window(getattr(focus, "window", 0)):
                 # (focus in Yuki's own ask bar or chat says nothing about "this")
                 focus_line = focus.line()
+                self.last_focus = focus
             facts["focus_ok"] = bool(getattr(focus, "ok", False))
             facts["focus_ms"] = focus_box.get("ms")
             if focus_box.get("error"):

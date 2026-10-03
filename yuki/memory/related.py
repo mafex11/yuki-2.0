@@ -120,6 +120,17 @@ RECENT_FACT_LAG_S = 15 * 60.0
 #: thread found (none of the words): they are the context of the request, not its subject.
 DIET_LIMIT = 6
 DIET_CONTEXT_ITEMS = 3
+#: Yuki's own past exchanges and conversation summaries from another day weigh less for an action request (revamp
+#: follow-up 4, docs/research/revamp-2026-10-02/23 L3: on the first live request after Phase A, 3 of the 6 related items
+#: were Yuki's own chats from other days at cosine 0.60-0.69 - not echoes, but low value next to the request's facts,
+#: episodes and threads). Their score drops by this much (a weight, on the same scale as the cosine) and at most
+#: :data:`ACTION_OWN_PER_KIND` of each such kind is kept. What happened earlier the same day keeps its weight (it is the
+#: day's context). The caller says what an action request is (the agent: a spoken hand-off, or a request whose task
+#: frame resolved a person, a route or a referent in play - measured, never from the words). Measured on the logged
+#: requests replayed on a copy of the real memory (docs/research/revamp-2026-10-02/24-build-B.md).
+ACTION_OWN_DISCOUNT = 0.10
+ACTION_OWN_PER_KIND = 1
+OWN_EXCHANGE_KINDS = ("chat", "session")
 
 BLOCK_LABEL = (
     "[Connected from memory - what the user is doing now and what Yuki's whole memory holds that bears on it "
@@ -388,6 +399,25 @@ def self_echo_ids(store: Any, *, session_id: str | None, now: float, recent_s: f
     return out
 
 
+def _discount_own(best: dict[tuple[str, int], dict[str, Any]], now: float) -> int:
+    """Lower Yuki's own exchanges and summaries from another local day than ``now`` by :data:`ACTION_OWN_DISCOUNT`
+    (an action request: see the constant). An item whose time is unknown keeps its score. Returns how many."""
+    today = datetime.fromtimestamp(float(now)).date()
+    lowered = 0
+    for (kind, _i), h in best.items():
+        at = h.get("at")
+        if kind not in OWN_EXCHANGE_KINDS or not at:
+            continue
+        try:
+            other_day = datetime.fromtimestamp(float(at)).date() != today
+        except (OverflowError, OSError, ValueError):
+            continue
+        if other_day:
+            h["score"] = round(float(h["score"]) - ACTION_OWN_DISCOUNT, 4)
+            lowered += 1
+    return lowered
+
+
 def _unit(vec: Any) -> np.ndarray | None:
     if vec is None:
         return None
@@ -468,7 +498,7 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
             now: float | None = None, limit: int | None = None, voice: bool = False,
             recent_minutes: float | None = None, embed_wait_s: float | None = None,
             service: dict[str, Any] | None = None, with_recent: bool = True, session_id: str | None = None,
-            exclude_recent_s: float = SELF_ECHO_S, diet: bool | None = None) -> dict[str, Any]:
+            exclude_recent_s: float = SELF_ECHO_S, diet: bool | None = None, action: bool = False) -> dict[str, Any]:
     """What the whole memory holds that bears on this moment (see the module docstring). Never raises.
 
     ``client``: the :class:`yuki.memory.api.MemoryClient` (its embedder over the pipe, its index, its item
@@ -483,6 +513,10 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     ``diet`` (default: on when the brain gives words, off for the voice talker and screen-only lookups): the
     threads and the freshest screens only as far as they bear on the words (:data:`THREAD_WORDS_MIN_COSINE`,
     :data:`RECENT_TAIL_S`, :data:`RECENT_WORDS_MIN_COSINE`).
+
+    ``action``: the request asks Yuki to act (the caller's measure): Yuki's own exchanges and summaries from another
+    day weigh :data:`ACTION_OWN_DISCOUNT` less and at most :data:`ACTION_OWN_PER_KIND` of each come
+    (``out["own_discounted"]`` counts the items it lowered).
     """
     t0 = time.perf_counter()
     now = time.time() if now is None else float(now)
@@ -581,6 +615,8 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     for h in best.values():   # found by two different queries: it connects them
         if len(h["via"]) >= 2 and not (set(h["via"]) <= {"words", "previous"}):
             h["score"] = round(h["base"] + CONSENSUS_BONUS, 4)
+    out["action"] = bool(action)
+    out["own_discounted"] = _discount_own(best, now) if action else 0
     out["diet"] = bool(diet and words_vec is not None)
     if out["diet"]:
         threads = _diet_threads(store, threads, words_vec, on_screen=out.get("screen_thread"))
@@ -610,7 +646,8 @@ def related(client: Any, query: str = "", *, previous: str | None = None, screen
     for h in ordered:
         if len(picked) >= limit:
             break
-        if counts.get(h["kind"], 0) >= PER_KIND:
+        cap = ACTION_OWN_PER_KIND if action and h["kind"] in OWN_EXCHANGE_KINDS else PER_KIND
+        if counts.get(h["kind"], 0) >= cap:
             continue
         by_words = bool({"words", "previous"} & set(h.get("via") or []))
         if out["diet"] and not by_words and context_only >= DIET_CONTEXT_ITEMS:

@@ -256,6 +256,41 @@ def _review(store: Store) -> Any:
     return store.weekly_review(rid)
 
 
+class _WordsEmbedder:
+    """A stand-in for the shared embedder: a hashed bag of a text's words (minus a few function words), so texts
+    sharing words sit near each other. Deterministic, no model."""
+
+    model_name = "stub-words"
+    _SKIP = {"the", "a", "an", "and", "of", "to", "for", "on", "in", "that", "they", "had", "just", "from", "per"}
+
+    def embed(self, texts: list[str]) -> Any:
+        import numpy as np
+
+        out = np.zeros((len(texts), 512), dtype=np.float32)
+        for i, text in enumerate(texts):
+            word = ""
+            for ch in (text or "").casefold() + " ":
+                if ch.isalnum():
+                    word += ch
+                    continue
+                if word and word not in self._SKIP:
+                    out[i, sum(map(ord, word)) * 31 % 512] += 1.0
+                word = ""
+        return out
+
+
+def _stub_review_client(edits: list[dict[str, Any]], seen: list[dict[str, Any]] | None = None) -> Any:
+    def create(**request: Any) -> Any:
+        if seen is not None:
+            seen.append(request)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", name="correct_review", input={"edits": edits})],
+            stop_reason="tool_use", usage=SimpleNamespace(input_tokens=10, output_tokens=5,
+                                                          cache_creation_input_tokens=0, cache_read_input_tokens=0))
+
+    return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+
 def test_the_recheck_corrects_whole_sentences_and_stores_a_new_version(store):
     from yuki.memory.recheck import Rechecker, whole_sentence
 
@@ -264,22 +299,20 @@ def test_the_recheck_corrects_whole_sentences_and_stores_a_new_version(store):
     demo = store.add_journal(T0 - 86400, tid, "Chrome", "The user told Yuki they got a job offer from Google.", 7)
     store._write(lambda conn: conn.execute("UPDATE journal SET superseded_at=?, superseded_by=12345 WHERE id=?",
                                            (T0 + 86400 + 3600, demo)))   # re-journaled after the review
+    offer = {"words": "a Google job offer that landed Sunday evening", "journal_ids": [demo], "still_supported_by": []}
     fragment = {"section": "about", "sentence": "a Google job offer that landed Sunday evening", "replacement": "",
-                "journal_ids": [demo], "why": "demo text"}
+                "removed": [offer], "why": "demo text"}
     whole = {"section": "about",
              "sentence": "The week ran on Corvana and VALORANT, and a Google job offer that landed Sunday evening.",
-             "replacement": "The week ran on Corvana and VALORANT.", "journal_ids": [demo], "why": "demo text"}
+             "replacement": "The week ran on Corvana and VALORANT.", "removed": [offer], "why": "demo text"}
     teaser = {"section": "teaser", "sentence": "A Google offer and 31h of work.", "replacement": "31h of work.",
-              "journal_ids": [demo], "why": "demo text"}
-    uncited = {"section": "about", "sentence": "He also sorted music.", "replacement": "", "journal_ids": [],
+              "removed": [{"words": "A Google offer and", "journal_ids": [demo], "still_supported_by": []}],
+              "why": "demo text"}
+    uncited = {"section": "about", "sentence": "He also sorted music.", "replacement": "",
+               "removed": [{"words": "He also sorted music.", "journal_ids": [], "still_supported_by": []}],
                "why": "x"}
-    client = SimpleNamespace(messages=SimpleNamespace(create=lambda **r: SimpleNamespace(
-        content=[SimpleNamespace(type="tool_use", name="correct_review",
-                                 input={"edits": [fragment, whole, teaser, uncited]})],
-        stop_reason="tool_use", usage=SimpleNamespace(input_tokens=10, output_tokens=5,
-                                                      cache_creation_input_tokens=0, cache_read_input_tokens=0))))
-    checker = Rechecker(store, client=client, log_dir=Path(tempfile.mkdtemp()), embedder=SimpleNamespace(
-        embed=lambda texts: None, model_name="stub"))
+    client = _stub_review_client([fragment, whole, teaser, uncited])
+    checker = Rechecker(store, client=client, log_dir=Path(tempfile.mkdtemp()), embedder=_WordsEmbedder())
     result = checker.run(render="skip", out=lambda *a: None)
     [found] = result.reviews
     assert [e["section"] for e in found["edits"]] == ["about", "teaser"] and len(found["rejected"]) == 2
@@ -291,3 +324,91 @@ def test_the_recheck_corrects_whole_sentences_and_stores_a_new_version(store):
     assert not whole_sentence("a b. c d e.", "c d") and whole_sentence("a b. c d e.", "c d e.")
     # nothing withdrawn since the new version was written: nothing to do the next time
     assert checker.recheck_review(latest) is None
+
+
+def test_the_recheck_keeps_an_open_todo_that_a_withdrawn_entry_only_touches(store):
+    """Regression (live dry run, real memory, 3 Oct 2026, docs/research/revamp-2026-10-02/23 L7): besides the invented
+    Google offer, the recheck also dropped "laminating the certificate documents for Bro" from the review's open items,
+    citing a withdrawn "entrance exam score card" search - while the to-do was still open and sourced ("per Bro's request").
+    The model now sees what is still true, names each claim it takes out, and code corrects a sentence only when
+    every claim removed rests solely on withdrawn entries. Synthetic data, the real model's edits replayed."""
+    from yuki.memory.recheck import Rechecker
+
+    rid = store.start_weekly_review("2026-W39", T0 - 7 * 86400, T0 + 86400, "scheduled", "m", at=T0 + 86400)
+    about = ("The week ran on the agent harness revamp and VALORANT sessions, and a Google job offer that landed "
+             "Sunday evening.")
+    still_open = ("Nothing is overdue. Two loops remain open: laminating the certificate documents for Bro, and "
+                  "building the MCP server.")
+    done = "28 of 31 to-dos closed, including Hemanth's Discord ping."
+    sections = {"about": about, "time": "31h at the PC.", "focus": "", "done": done, "still_open": still_open,
+                "suggestions": []}
+    from yuki.memory.review import compose_text
+    from yuki.memory.store import ReviewStats
+
+    store.finish_weekly_review(rid, outcome="ok", stats=ReviewStats(), text=compose_text(sections), sections=sections,
+                               teaser="31h on the clock.", numbers={"x": 1})
+    store._write(lambda conn: conn.execute("UPDATE weekly_reviews SET finished_at=? WHERE id=?", (T0 + 86400, rid)))
+    review = store.weekly_review(rid)
+    tid = store.upsert_thread("Google Chrome", "Google", "https://www.google.com/", process="chrome.exe")
+    offer = store.add_journal(T0 - 3600, tid, "Google Chrome",
+                              "The user told Yuki they had just received a job offer from Google.", 7)
+    search = store.add_journal(T0 - 3500, tid, "Google Chrome", "The user searched for '2022 entrance exam score card' on Google.", 4)
+    for jid in (offer, search):   # both re-journaled after the review was written
+        store._write(lambda conn, j=jid: conn.execute("UPDATE journal SET superseded_at=?, superseded_by=4242 WHERE id=?",
+                                                      (T0 + 86400 + 3600, j)))
+    store.add_open_loop("Bro", "The user needs to laminate the certificate documents sent to Bro, per Bro's request.",
+                        opened_at=T0 - 9 * 86400)
+    # what the model returned on the real memory (its "why" even said the certificate was not from a withdrawn entry)
+    google = {"section": "about", "sentence": about,
+              "replacement": "The week ran on the agent harness revamp and VALORANT sessions.",
+              "removed": [{"words": "a Google job offer that landed Sunday evening", "journal_ids": [offer],
+                           "still_supported_by": []}], "why": "Job offer entry was withdrawn"}
+    bro = {"section": "still_open", "sentence": "Two loops remain open: laminating the certificate documents for Bro, "
+                                                "and building the MCP server.",
+           "replacement": "One loop remains open: building the MCP server.",
+           "removed": [{"words": "laminating the certificate documents for Bro", "journal_ids": [search],
+                        "still_supported_by": []}],
+           "why": "Certificate task was about searching for own entrance exam score card"}
+    noop = {"section": "done", "sentence": done, "replacement": done,
+            "removed": [{"words": "Hemanth's Discord ping", "journal_ids": [offer], "still_supported_by": []}],
+            "why": "no change needed"}
+    seen: list[dict[str, Any]] = []
+    checker = Rechecker(store, client=_stub_review_client([google, bro, noop], seen),
+                        log_dir=Path(tempfile.mkdtemp()), embedder=_WordsEmbedder())
+    found = checker.recheck_review(review, dry_run=True)
+    # the model was shown the open to-do as current evidence
+    prompt = seen[0]["messages"][0]["content"]
+    assert "STILL TRUE NOW" in prompt and "laminate the certificate documents sent to Bro" in prompt
+    assert [e["section"] for e in found["edits"]] == ["about"]
+    assert found["edits"][0]["removed"] == ["a Google job offer that landed Sunday evening"]
+    assert any(r.startswith("still_open:") and "does not rest on the withdrawn entries" in r for r in found["rejected"])
+    assert any(r.startswith("done:") and "changes nothing" in r for r in found["rejected"])
+
+    # the same edit with the model's own word that a current item supports it, and with a real citation: still kept
+    bro_cited = dict(bro, removed=[{"words": "laminating the certificate documents for Bro",
+                                    "journal_ids": [search, offer], "still_supported_by": [1]}])
+    checker._client = _stub_review_client([bro_cited])
+    assert "still supported by current memory (T1)" in checker.recheck_review(review, dry_run=True)["rejected"][0]
+    # measured even when the model says nothing: a claim close to an open loop stays
+    bro_quiet = dict(bro, removed=[{"words": "laminating the certificate documents for Bro",
+                                    "journal_ids": [search], "still_supported_by": []}])
+    _applied, rejected, _s, _t = checker.apply_edits(
+        review, [bro_quiet], {search}, withdrawn={search: "The user laminated the certificate documents for Bro."},
+        current=[{"id": "loop:1", "text": "The user needs to laminate the certificate documents sent to Bro, per "
+                                          "Bro's request.", "evidence": ""}])
+    assert rejected and "still supported by current memory (T1" in rejected[0]
+    # a correction that takes out more than the claims it names is refused
+    greedy = dict(google, replacement="The week ran on VALORANT.")
+    _a, rejected, _s, _t = checker.apply_edits(review, [greedy], {offer}, withdrawn={offer: "The user told Yuki they "
+                                               "had just received a job offer from Google."}, current=[])
+    assert rejected and "more than the claims it names" in rejected[0]
+    # without the embedder's vectors nothing is corrected
+    checker._embedder = SimpleNamespace(embed=lambda texts: None, model_name="none")
+    _a, rejected, _s, _t = checker.apply_edits(review, [google], {offer}, withdrawn={offer: "x"}, current=[])
+    assert rejected and "could not be measured" in rejected[0]
+    # applied for real, the review keeps Bro's to-do and loses the Google offer
+    checker._embedder = _WordsEmbedder()
+    checker._client = _stub_review_client([google, bro, noop])
+    stored = checker.recheck_review(review)
+    latest = store.weekly_review(stored["new_id"])
+    assert "Google" not in latest.text and "laminating the certificate documents for Bro" in latest.text

@@ -3271,10 +3271,11 @@ class PortraitScheduler:
     def _night(self, kind: str) -> None:
         """After the nightly (or weekly/first) run and its audit: dreaming tidies the portrait, the routines pass
         keeps the Routines true to the measured timeline, the threads of work are tidied (merged, closed,
-        renamed, asked about), then the persona pass writes how Yuki talks. Each logs and never raises (a failure
-        waits for the next night)."""
+        renamed, asked about), the people index is refreshed from what changed (yuki.memory.contacts: no call when
+        nothing did), then the persona pass writes how Yuki talks. Each logs and never raises (a failure waits for
+        the next night)."""
         for name, fn in (("dream", self._dream), ("routines", self._routines), ("threads", self._threads),
-                         ("persona", self._persona)):
+                         ("contacts", self._contacts), ("persona", self._persona)):
             try:
                 fn(kind)
             except Exception as exc:
@@ -3304,6 +3305,18 @@ class PortraitScheduler:
         self._log("portrait_run", kind="threads", ok=result.ok, run_id=result.run_id, changes=result.applied,
                   asked=result.asked, rejected=len(result.rejected), cost_usd=round(result.cost_usd, 6),
                   error=result.error)
+
+    def _contacts(self, kind: str) -> None:
+        from yuki.memory.contacts import Linker
+
+        with self.worker._run_lock:
+            result = Linker(self.worker).run(kind="refresh", reason=f"after the {kind} run")
+        if result.skipped:
+            self._log("portrait_run", kind="contacts", ok=True, skipped=result.skipped)
+            return
+        self._log("portrait_run", kind="contacts", ok=result.ok, run_id=result.run_id, counts=result.counts,
+                  people=len(result.people), rejected=len(result.rejected), asked=result.asked,
+                  cost_usd=round(result.cost_usd, 6), error=result.error)
 
     def _persona(self, kind: str) -> None:
         from yuki.memory.persona import PersonaWriter
