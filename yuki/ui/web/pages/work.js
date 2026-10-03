@@ -22,8 +22,8 @@
     }
     const people = (t.people || []).slice(0, 3);
     const apps = (t.apps || (t.people ? [] : t.involves) || []).slice(0, 4);
-    return Y.clearing('article', 'thread',
-      h('div', { class: 'top' }, h('span', { class: 'st-tag ' + (t.status || '') }, h('i'), t.status || ''), h('span', { class: 'when', text: fmt.rel(t.last_at) })),
+    return Y.k(Y.clearing('article', 'thread',
+      h('div', { class: 'top' }, h('span', { class: 'st-tag ' + (t.status || '') }, h('i'), t.status || ''), h('span', { class: 'when', data: { rel: t.last_at }, text: fmt.rel(t.last_at) })),
       h('h3', { text: t.title }),
       h('div', { class: 'stands' + (t.state ? '' : ' none'), text: t.state || 'Where it stands isn’t written yet.' }),
       prog,
@@ -33,7 +33,7 @@
           apps.length ? h('div', { class: 'apps', css: { marginTop: people.length ? '8px' : '0' }, text: apps.join(' · ') }) : null),
         t.status === 'done' ? h('span', { class: 'cost', text: 'done' })
           : h('button', { class: 'key sm', data: { do: 'continue', ref: t.ref }, attrs: { type: 'button' },
-            title: 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev'))));
+            title: 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev')))), t.ref || t.title);
   }
 
   function weekFig(w) {
@@ -50,9 +50,9 @@
     const w = d.week || {}, tot = w.totals || {};
     const meta = [h('span', null, h('b', { text: active }), ' active, ', h('b', { text: T.length }), T.length === 1 ? ' thread' : ' threads'),
       tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
-    const body = T.length ? h('div', { class: 'grid3' }, T.map(threadCard))
-      : Y.clearing('section', 'sec', Y.empty('Threads appear as Yuki follows your work across days: what it is, where it stands, what’s open.', 'No threads yet.'));
-    return [Y.head('Work', meta, weekFig(w), tabs(S.sub)), body];
+    const body = T.length ? h('div', { class: 'grid3', data: { k: 'threads' } }, T.map(threadCard))
+      : Y.k(Y.clearing('section', 'sec', Y.empty('Threads appear as Yuki follows your work across days: what it is, where it stands, what’s open.', 'No threads yet.')), 'none');
+    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub)), 'head'), body];
   }
 
   /* ---------- the day ---------- */
@@ -65,8 +65,9 @@
     const legend = Y.clearing('div', 'legend', LEGEND.map(([cls, n, t]) => h('span', null, h('i', { class: 'lg ' + cls }, Array.from({ length: n }, () => h('i'))), t)),
       h('span', { class: 'hint', text: 'hover or use ← → to scrub' }));
     const sky = h('div', { class: 'sky', attrs: { id: 'sky', tabindex: 0, role: 'slider', 'aria-label': 'Scrub through the day', 'aria-valuemin': 0, 'aria-valuemax': 1439 }, data: { figure: 'skyline' } },
-      d.today && d.now_min != null ? h('div', { class: 'sky-now', css: { left: (d.now_min / 1440 * 100) + '%' } }, h('span', { text: 'now ' + fmt.nowClock() })) : null,
-      h('div', { class: 'sky-cur', attrs: { id: 'skycur' } }), h('div', { class: 'sky-tip', attrs: { id: 'skytip', 'aria-live': 'polite' } }));
+      // the now marker moves on the minute tick (data-nowmin); the cursor and readout are the scrub's own (data-keep)
+      d.today && d.now_min != null ? h('div', { class: 'sky-now', data: { nowmin: '' }, css: { left: (d.now_min / 1440 * 100) + '%' } }, h('span', { text: 'now ' + fmt.nowClock() })) : null,
+      h('div', { class: 'sky-cur', data: { keep: '' }, attrs: { id: 'skycur' } }), h('div', { class: 'sky-tip', data: { keep: '' }, attrs: { id: 'skytip', 'aria-live': 'polite' } }));
     sky.__sky = { buckets: d.buckets || [] };
     const wrap = h('div', { class: 'day-wrap', attrs: { id: 'daywrap' } },
       h('div', { class: 'sky-lanes' }, h('div', { data: { clear: '' }, text: 'calls' }), h('div', { class: 'you', data: { clear: '' }, text: 'you' })),
@@ -75,14 +76,14 @@
     const totals = h('div', { class: 'totals' }, (d.totals || []).map(([a, b, c]) => Y.clearing('div', '', Y.label(a), h('span', { class: 'doto', text: b }), h('div', { class: 'sub', text: c || '' }))));
     const sess = (d.sessions || []).slice().reverse();
     const calls = d.calls || [];
-    return [Y.head('Day', meta, null, tabs(S.sub)), legend, wrap, totals, weekHeat(d.week_hours || []),
-      h('div', { class: 'grid2', css: { marginTop: '28px' } },
-        h('div', { class: 'col' }, Y.sec('Sessions, latest first', sess.length, sess.length ? sess.map((s) => h('div', { class: 'sess' }, h('div', { class: 'tm', text: `${s.start}–${s.end}` }),
+    return [Y.k(Y.head('Day', meta, null, tabs(S.sub)), 'head'), Y.k(legend, 'legend'), wrap, Y.k(totals, 'totals'), Y.k(weekHeat(d.week_hours || []), 'heat'),
+      h('div', { class: 'grid2', data: { k: 'grid' }, css: { marginTop: '28px' } },
+        h('div', { class: 'col' }, Y.k(Y.sec('Sessions, latest first', sess.length, sess.length ? sess.map((s) => h('div', { class: 'sess', data: { k: `${s.start}:${s.app || ''}` } }, h('div', { class: 'tm', text: `${s.start}–${s.end}` }),
           h('div', null, h('div', { class: 'tt' }, s.title || s.app, s.mode === 'full' ? h('span', { class: 'kind', text: 'full screen' }) : null),
-            h('div', { class: 'blk' }, (s.apps || []).slice(0, 4).map(([n, m]) => [h('span', { text: fmt.dur(m) }), h('span', { text: n })]))))) : Y.empty('No sessions yet today.'))),
-        h('div', { class: 'col' }, Y.sec('Calls today', calls.length, calls.length ? calls.map((c) => h('div', { class: 'sess' }, h('div', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }),
+            h('div', { class: 'blk' }, (s.apps || []).slice(0, 4).map(([n, m]) => [h('span', { text: fmt.dur(m) }), h('span', { text: n })]))))) : Y.empty('No sessions yet today.')), 'sessions')),
+        h('div', { class: 'col' }, Y.k(Y.sec('Calls today', calls.length, calls.length ? calls.map((c) => h('div', { class: 'sess', data: { k: `call:${c.start}:${c.app || ''}` } }, h('div', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }),
           h('div', null, h('div', { class: 'tt' }, c.app || 'Call', h('span', { class: 'kind', text: c.recorded ? 'your side kept' : 'not recorded' }), c.live && c.started_at ? Y.recChip(c.started_at) : null),
-            h('div', { class: 'blk one', text: c.gist || fmt.dur(c.min || 0) })))) : Y.empty('No calls today.'))))];
+            h('div', { class: 'blk one', text: c.gist || fmt.dur(c.min || 0) })))) : Y.empty('No calls today.')), 'calls')))];
   }
 
   function weekHeat(rows) {

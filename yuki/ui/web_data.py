@@ -127,7 +127,9 @@ def hotkey_words(combo: str) -> str:
     return " ".join(p[:1].upper() + p[1:] for p in parts)
 
 
-def build_shell(memory: Any) -> dict[str, Any]:
+def build_shell(memory: Any, call_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The rail: who, the memory line, the call (from the tray's forwarded status when there is one) and how many
+    questions wait (Home's badge, kept fresh while another page is open)."""
     st = _safe(memory.status, {}) or {}
     if st.get("paused"):
         line = "memory paused"
@@ -135,12 +137,19 @@ def build_shell(memory: Any) -> dict[str, Any]:
         line = "memory is off"
     else:
         line = "memory on"
-    return {"user": user_name(), "memory_line": line, "call": call_now(memory)}
+    needs = len(_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])
+    call = call_view(call_status) if call_status is not None else call_now(memory)
+    return {"user": user_name(), "memory_line": line, "call": call, "needs": needs}
 
 
 def call_now(memory: Any) -> dict[str, Any] | None:
     """The call going on now, for the rail's rec chip and Home's Now strip; ``None`` when there is none."""
-    cs = _safe(memory.call_status, {}) or {}
+    return call_view(_safe(memory.call_status, {}) or {})
+
+
+def call_view(cs: dict[str, Any]) -> dict[str, Any] | None:
+    """:func:`call_now` from a ``call_status()`` already read (the tray forwards each change: no memory read)."""
+    cs = cs if isinstance(cs, dict) else {}
     call = cs.get("call")
     if not call:
         return None
@@ -263,31 +272,42 @@ def request_row_words(r: dict[str, Any]) -> tuple[str, str]:
     return words, ", ".join(bits)
 
 
-def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
-               now: float | None = None, people: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Home: the Now strip, Needs you (questions), Running (the call, transcripts waiting; live runs come from the
-    tray), Offers, Since you were away (requests that finished, offers that ran) and the people lately."""
-    from yuki.ui.ledger import read_request_log
-
-    now = time.time() if now is None else now
-    since = since if since is not None else now - AWAY_HOURS * 3600
-    call = call_now(memory)
-    now_strip = {"front": front_now(memory, now), "playing": None, "call": None}
+def home_call(call: dict[str, Any] | None, waiting: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Home's call tile and its Running rows (the call being remembered, the transcripts waiting) from
+    :func:`call_view` and the waiting audio; also how the window patches Home from the tray's forwarded status."""
+    now_call = None
     if call and (call.get("recording") or call.get("status") in ("asking", "waiting_headphones")):
         note = "Only your mic. Turned into text when the PC is free. Cards are held." if call.get("recording") else ""
-        now_strip["call"] = {**call, "note": note}
-    needs = [question_item(q) for q in (_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])]
+        now_call = {**call, "note": note}
     running: list[dict[str, Any]] = []
     if call and call.get("recording"):
         running.append({"kind": "call", "live": True, "recording": True, "started_at": call.get("started_at"),
                         "title": f"Remembering your side of the {call.get('app') or ''} call".replace("  ", " "),
                         "detail": "Only your mic. Turned into text later, when the PC is free."})
-    waiting = _safe(memory.call_audio_waiting, {}) or {}
+    waiting = waiting or {}
     if int(waiting.get("calls") or 0):
         n = int(waiting["calls"])
         running.append({"kind": "waiting", "live": False, "title": f"{n} call{'s' if n != 1 else ''} waiting to be turned into text",
                         "detail": f"{dur_words(float(waiting.get('minutes') or 0) * 60)} in all. Done when the PC is free.",
                         "meta": "waiting"})
+    return now_call, running
+
+
+def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
+               now: float | None = None, people: list[dict[str, Any]] | None = None,
+               call_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Home: the Now strip, Needs you (questions), Running (the call, transcripts waiting; live runs come from the
+    tray), Offers, Since you were away (requests that finished, offers that ran) and the people lately.
+    ``call_status``: the tray's forwarded ``call_status()`` (then the call and the transcripts waiting are not read)."""
+    from yuki.ui.ledger import read_request_log
+
+    now = time.time() if now is None else now
+    since = since if since is not None else now - AWAY_HOURS * 3600
+    call = call_view(call_status) if call_status is not None else call_now(memory)
+    waiting = (call_status.get("waiting") if call_status is not None else _safe(memory.call_audio_waiting, {})) or {}
+    now_call, running = home_call(call, waiting)
+    now_strip = {"front": front_now(memory, now), "playing": None, "call": now_call}
+    needs = [question_item(q) for q in (_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])]
     cards = _safe(lambda: memory.recent_nudges(hours=24 * INBOX_DAYS), []) or []
     cards = sorted(cards, key=lambda n: epoch_of(n.get("shown_at")) or epoch_of(n.get("at")) or 0, reverse=True)
     offers = [offer_card(n, now) for n in cards if card_offer(n) is not None and offer_open(n, now)][:INBOX_MAX]
@@ -308,8 +328,13 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
                      "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}], "cost": cost})
     away.sort(key=lambda x: x.get("at") or 0, reverse=True)
     now_strip["goals"] = goals_today(memory)
+    # when Home next changes with the clock alone: an open offer running out, the oldest "since you were away" row
+    # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
+    moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
+    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away[:INBOX_MAX] if a.get("at")]
+    next_at = min((m for m in moments if m and m > now), default=None)
     return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away[:INBOX_MAX],
-            "people": (people or [])[:6], "since": since}
+            "people": (people or [])[:6], "since": since, "next_at": next_at}
 
 
 #: Goals the Now strip shows at most (today's, open first).
@@ -1247,7 +1272,47 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
     return out
 
 
-__all__ = ["SCHEMA", "build_shell", "build_home", "build_me", "build_work", "build_day", "build_playbook",
+# -- change stamps (the window's live refresh: 42-window-live-refresh.md §6.2) -------------------------------------
+
+#: Each page's memory tables (the ones its builder reads). Work's week figure and Activity's "Seen today, by app"
+#: read the timeline, so it is in their stamps (review F3): a revisit after STALE_S, or the open page's slow fallback,
+#: rebuilds them while you are at the PC; the hash still skips a build that shows nothing new.
+PAGE_TABLES: dict[str, tuple[str, ...]] = {
+    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls"),
+    "work": ("work_threads", "goals", "timeline"),
+    "day": ("timeline", "calls"),
+    "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
+    "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
+    "activity": ("runs", "nudges", "todos", "calls", "timeline"),
+    "shell": ("questions",),
+}
+
+
+def page_stamps(memory: Any, page: str, *, requests_csv: Path | None = None) -> Any:
+    """A page's change stamps: memory's per-table stamps (:func:`yuki.memory.api.change_stamps`) and, for Home and
+    Activity, the request log's size and time. Equal stamps: nothing the page shows from memory moved, so it is not
+    built. ``None`` (build it) for a page without stamps (Settings: files and the tray's state) or an older memory."""
+    tables = PAGE_TABLES.get(page)
+    if not tables:
+        return None
+    try:
+        from yuki.memory.api import change_stamps
+    except ImportError:
+        return None
+    stamps = change_stamps(memory, tables)
+    if not stamps or any(v is None for v in stamps.values()):
+        return None
+    out: list[Any] = [[t, stamps.get(t)] for t in tables]
+    if page in ("home", "activity") and requests_csv is not None:
+        try:
+            st = Path(requests_csv).stat()
+            out.append(["requests", st.st_size, st.st_mtime_ns])
+        except OSError:
+            out.append(["requests", None])
+    return json.dumps(out, default=str)
+
+
+__all__ = ["SCHEMA", "build_shell", "page_stamps", "build_home", "build_me", "build_work", "build_day", "build_playbook",
            "build_activity", "build_settings", "people_now", "person_from_index", "contact_card", "chat_item",
            "rhythm_view", "goals_today", "thread_goals", "run_rows", "call_rows", "step_what", "step_result",
            "runs_of", "offer_card", "shift_times", "media_now", "read_pending", "week_days", "week_figure"]

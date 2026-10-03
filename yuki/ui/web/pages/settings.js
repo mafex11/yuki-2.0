@@ -40,7 +40,7 @@
       d.usage ? h('span', null, 'Yuki right now: ', h('b', { text: `${Math.round(d.usage.mb)} MB` }), d.usage.cpu != null ? [', ', h('b', { text: `${d.usage.cpu.toFixed(1)}%` }), ' CPU'] : null) : null];
     const apps = d.apps || [];
     const appsB = apps.length ? [h('div', { class: 'approw hd' }, h('span', { text: 'App' }), h('span', { class: 'c', title: 'Yuki may look at it' }, ic('eye')), h('span', { class: 'c', title: 'Yuki may click and type in it' }, ic('hand'))),
-      apps.map((a) => h('div', { class: 'approw' }, h('span', null, a.app, a.note ? h('small', { text: a.note }) : null),
+      apps.map((a) => h('div', { class: 'approw', data: { k: a.app } }, h('span', null, a.app, a.note ? h('small', { text: a.note }) : null),
         h('span', { class: 'c' }, tog(a.look, { do: 'app-look', app: a.app }, `Look at ${a.app}`)),
         h('span', { class: 'c' }, tog(a.act, { do: 'app-act', app: a.app }, `Act in ${a.app}`, !a.look))))]
       : Y.empty('Apps show here once Yuki has seen you use them.');
@@ -75,17 +75,18 @@
       h('div', { class: 'srow' }, h('span', null, 'Motion', h('small', { text: 'The field runs at 30 fps, the live figure at 15, and both sleep when nothing changes' })),
         h('span', { class: 'seg' }, h('button', { data: { do: 'motion', on: '0' }, attrs: { type: 'button', 'aria-pressed': String(!ap.reduce_motion) }, text: 'Full' }),
           h('button', { data: { do: 'motion', on: '1' }, attrs: { type: 'button', 'aria-pressed': String(!!ap.reduce_motion) }, text: 'Reduced' })))];
-    return [Y.head('Settings', meta),
-      h('div', { class: 'set-grid' },
-        h('div', { class: 'col' },
-          Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')),
-          Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act'))),
-        h('div', { class: 'col' },
-          Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for Yuki’s next start')),
-          Y.sec('Offers and check-ins', null, offers),
-          Y.sec('Privacy and pause', null, privacy),
-          Y.sec('Calls', null, calls),
-          Y.sec('Accent and motion', null, look)))];
+    // data-k: the blocks' keys for the live patch (app.js patchInto)
+    return [Y.k(Y.head('Settings', meta), 'head'),
+      h('div', { class: 'set-grid', data: { k: 'grid' } },
+        h('div', { class: 'col', data: { k: 'left' } },
+          Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
+          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps')),
+        h('div', { class: 'col', data: { k: 'right' } },
+          Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for Yuki’s next start')), 'voice'),
+          Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
+          Y.k(Y.sec('Privacy and pause', null, privacy), 'privacy'),
+          Y.k(Y.sec('Calls', null, calls), 'calls'),
+          Y.k(Y.sec('Accent and motion', null, look), 'look')))];
   }
 
   /* ---------- actions ---------- */

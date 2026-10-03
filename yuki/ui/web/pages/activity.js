@@ -13,7 +13,7 @@
     if (r.undo && r.undo.until * 1000 > Date.now()) {
       const left = Math.max(1, Math.round((r.undo.until * 1000 - Date.now()) / 60000));
       const data = r.undo.todo ? { do: 'todo-undo', todo: r.undo.todo } : { do: 'offer-undo', card: r.undo.card };
-      return [key(r.undo.label || 'Undo', { cls: 'xs', data }), ' ', h('span', { text: `${left} min left` })];
+      return [key(r.undo.label || 'Undo', { cls: 'xs', data }), ' ', h('span', { data: { until: r.undo.until }, text: `${left} min left` })];   // counted down by the ticker
     }
     return r.cant_undo ? 'can’t undo' : '';
   }
@@ -43,14 +43,14 @@
   function seen(d) {
     const apps = d.seen || [];
     const max = Math.max(1, ...apps.map((a) => a.min));
-    return Y.sec('Seen today, by app', apps.length, apps.length ? [apps.map((a) => h('div', { class: 'aprow' }, h('span', { text: a.app }),
+    return Y.sec('Seen today, by app', apps.length, apps.length ? [apps.map((a) => h('div', { class: 'aprow', data: { k: a.app } }, h('span', { text: a.app }),
       h('span', { class: 'dbar' }, Array.from({ length: Math.max(1, Math.round((a.min / max) * 60)) }, () => h('i'))),
       h('span', { class: 'mono', text: `${Math.round(a.min)} min` }), h('span', { class: 'mono', text: fmt.plural(a.visits || 0, 'visit') }))),
     h('div', { class: 'label', css: { marginTop: '14px' }, text: 'Counts only. This view keeps no screen content.' })] : Y.empty('Nothing seen yet today.'), null, 'apps-seen');
   }
   function calls(d) {
     const C = d.calls || [];
-    return Y.sec('Calls', C.length, C.length ? C.map((c) => h('div', { class: 'callrow' },
+    return Y.sec('Calls', C.length, C.length ? C.map((c) => h('div', { class: 'callrow', data: { k: `${c.start_at}:${c.app || ''}` } },
       h('div', { class: 'tm' }, h('b', { text: `${fmt.dayRule(c.start_at)} ${fmt.hm(c.start_at)}` }), `${c.live ? 'live' : c.end_at ? 'to ' + fmt.hm(c.end_at) : ''} · ${fmt.dur(c.min || 0)}`,
         h('br'), c.spoke_min != null ? `you spoke ${Math.round(c.spoke_min)}m` : ''),
       h('div', null, h('div', { class: 'wh' }, c.app || 'Call', c.live && c.start_at ? Y.recChip(c.start_at) : null),
@@ -67,7 +67,7 @@
     if (f === 'saw') body = seen(d);
     else if (f === 'calls') body = calls(d);
     else body = ledger(rows.filter((r) => f === 'all' || (r.f || (r.status === 'failed' ? 'failed' : 'did')) === f), f);
-    return [Y.head('Activity', meta, Y.numFig(did, 'actions today'), Y.seg(FILTERS, 'filter', f)), body];
+    return [Y.k(Y.head('Activity', meta, Y.numFig(did, 'actions today'), Y.seg(FILTERS, 'filter', f)), 'head'), Y.k(body, 'body:' + f)];
   }
 
   /* Wrong: a card gets "less like this"; a request or a step opens the thread with your words to finish (nothing is

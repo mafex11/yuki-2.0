@@ -750,6 +750,602 @@ def test_shift_times_moves_only_times():
                  "since": 5, "label": "x"}
 
 
+# -- live refresh: the open page follows memory (42-window-live-refresh.md) ----------------------------------------
+
+
+class _Server:
+    """WindowServer's broadcast surface, recording what every window would get."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    def broadcast(self, event: dict) -> int:
+        self.sent.append(json.loads(json.dumps(event)))
+        return 1
+
+    def send_to(self, peer, event) -> bool:
+        self.sent.append(json.loads(json.dumps(event)))
+        return True
+
+
+def test_the_tray_forwards_nudge_and_call_events_once_per_change(tmp_path):
+    host, _nudges = _tray_host(tmp_path)
+    host.server = _Server()
+    recording = {"call": {"id": 7, "app": "Signal", "status": "recording", "session_started_at": "2026-10-03T10:00:00"},
+                 "recording": True, "waiting": {"calls": 0, "minutes": 0}}
+    for _ in range(4):                                     # the watcher's polls bring the same status every 10-20 s
+        host.call_status(recording)
+    host.call_status({**recording, "call": {**recording["call"], "others": 2}})   # nothing the window shows moved
+    host.call_status({"call": None, "recording": False, "waiting": {"calls": 1, "minutes": 12.0}})
+    calls = [e for e in host.server.sent if e["ev"] == "call"]
+    assert [c["status"]["recording"] for c in calls] == [True, False]
+    rows = [{"id": 51, "kind": "question", "text": "Invented question?"}]
+    for _ in range(3):                                     # NudgeWatcher.arrived on every 60 s poll
+        host.cards_arrived(rows, "poll")
+    host.cards_arrived([], "poll")
+    host.cards_arrived(rows + [{"id": 52, "kind": "notice"}], "event")
+    host.card_written("nudge_ack")
+    host.card_written("nudge_received")                    # not a write memory made: no refresh
+    topics = [(e["topic"], e.get("why")) for e in host.server.sent if e["ev"] == "memory"]
+    assert topics == [("cards", "arrived"), ("cards", "arrived"), ("cards", "nudge_ack")]
+
+
+class _Live:
+    """A window with its real worker and refresh clock, over stand-ins: ``build`` counts and returns invented data,
+    ``_stamps`` reads ``self.stamps``; ``shown`` plays Windows' "can it be seen" answer."""
+
+    def __init__(self, tmp_path, monkeypatch, *, memory=None, real_build=False, open_page="home") -> None:
+        monkeypatch.setattr(web_window, "DEBOUNCE_S", 0.05)
+        monkeypatch.setattr(web_window, "MAX_WAIT_S", 0.3)
+        monkeypatch.setattr(web_window, "MIN_GAP_S", {})
+        monkeypatch.setattr(web_window, "DEFAULT_GAP_S", 0.0)
+        self.win, self.host = _window(tmp_path, monkeypatch)
+        win = self.win
+        win.memory = memory if memory is not None else SimpleNamespace(close=lambda: None)
+        win.open_page = open_page
+        self.built: list[str] = []
+        self.stamp_reads: list[str] = []
+        self.stamps: dict[str, str] = {}
+        self.version: dict[str, int] = {}
+        self.shown = True
+        monkeypatch.setattr(win, "window_shown", lambda: self.shown)
+        if not real_build:
+            def build(name):
+                self.built.append(name)
+                if name == "shell":
+                    return {"memory_line": "memory on", "needs": 0}
+                return {"page": name, "v": self.version.get(name, 0)}
+            monkeypatch.setattr(win, "build", build)
+        else:
+            real = win.build
+            monkeypatch.setattr(win, "build", lambda name: (self.built.append(name), real(name))[1])
+        monkeypatch.setattr(win, "_stamps", lambda name: (self.stamp_reads.append(name), self.stamps.get(name))[1])
+        monkeypatch.setattr(win, "_media", lambda: None)
+        win.booted = True
+        win.ready.set()
+        threading.Thread(target=win._worker, daemon=True).start()
+        threading.Thread(target=win._scheduler, daemon=True).start()
+
+    def settle(self, s: float = 0.4) -> None:
+        time.sleep(s)
+
+    def data(self, page: str | None = None) -> list[dict]:
+        return [m for m in self.host.kinds("data") if page is None or m["page"] == page]
+
+    def close(self) -> None:
+        self.win.close()
+
+
+def test_unchanged_page_data_is_not_posted_again(tmp_path, monkeypatch):
+    win, host = _window(tmp_path, monkeypatch)
+    win.booted = True
+    home = {"needs": [], "offers": [], "away": [], "since": 1000.0}
+    assert win.send_page("home", home) is True
+    assert win.send_page("home", dict(home)) is False                     # the same again: not sent
+    assert win.send_page("home", {**home, "since": 1060.0}) is False      # only the moving "since": not sent
+    assert win.send_page("home", {**home, "needs": [{"ref": "q:1"}]}) is True
+    assert win.send_page("day", {"buckets": [1], "now_min": 600}) is True
+    assert win.send_page("day", {"buckets": [1], "now_min": 601}) is False   # the now marker is the page's tick
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 80}}) is True
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 81}}) is False
+    assert [m["page"] for m in host.kinds("data")] == ["home", "home", "day", "settings"]
+    # what the snapshot painted counts as sent: fresh data equal to it is not posted at all
+    win2, host2 = _window(tmp_path / "b", monkeypatch)
+    win2.pages = {"work": {"threads": [{"ref": "thread:1"}]}}
+    win2._snapshot_done.set()
+    win2._boot_when_ready()
+    assert win2.send_page("work", {"threads": [{"ref": "thread:1"}]}) is False and not host2.kinds("data")
+
+
+def test_nothing_is_built_or_posted_while_minimised_and_the_open_page_catches_up_once_on_restore(tmp_path, monkeypatch):
+    from yuki.ui.chat_model import ChatModel
+
+    live = _Live(tmp_path, monkeypatch)
+    win, host = live.win, live.host
+    try:
+        win.model = ChatModel()
+        win.model.subscribe(win._on_chat_change)
+        live.shown = False                                                   # minimised
+        for i in range(5):
+            win.topic("cards")
+            win._on_tray_event({"ev": "chat", "event": {"type": "user", "job": 40 + i, "text": "Invented", "at": 1000.0 + i}})
+            win._on_tray_event({"ev": "state", "voice_state": "listening"})
+        win.send_page("work", {"threads": []})                               # a build finished while hidden
+        live.settle()
+        assert live.built == [] and not host.kinds("data") and not host.kinds("chat") and not host.kinds("live")
+        assert "home" in win.dirty and "shell" in win.dirty
+        live.shown = True                                                    # restored: the host's hook
+        win.on_shown("restore")
+        live.settle()
+        assert sorted(live.built) == ["home", "shell"]                       # the open page (and the rail), once
+        chat = host.kinds("chat")
+        assert len(chat) == 1 and chat[0]["reset"] and len(chat[0]["items"]) == len(win.model.items) > 5
+        assert len(host.kinds("live")) >= 1 and [m["page"] for m in live.data()].count("work") == 1
+        assert [m["page"] for m in live.data()].count("home") == 1
+    finally:
+        live.close()
+
+
+def test_nothing_is_built_while_a_full_screen_app_covers_the_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_window, "FALLBACK_S", {"home": 0.15})
+    live = _Live(tmp_path, monkeypatch)
+    win, host = live.win, live.host
+    try:
+        win._arm_fallback()
+        win.set_covered(True)
+        assert host.kinds("quiet")[-1] == {"kind": "quiet", "on": True}     # the page stills its field
+        win.topic("cards")
+        win.on_call_status({"call": {"id": 3, "status": "recording", "app": "Invented"}, "recording": True})
+        live.settle(0.6)                                                     # past the fallback too
+        assert live.built == [] and live.stamp_reads == [] and not live.data()
+        assert not host.kinds("live")                                        # even the rail's chip waits
+        win.set_covered(False)
+        live.settle()
+        assert host.kinds("quiet")[-1]["on"] is False and "home" in live.built and host.kinds("live")
+    finally:
+        live.close()
+
+
+def test_a_burst_of_card_events_builds_the_open_page_once(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch)
+    win = live.win
+    monkeypatch.setattr(web_window, "DEBOUNCE_S", 0.3)
+    monkeypatch.setattr(web_window, "MAX_WAIT_S", 2.0)
+    try:
+        for _ in range(20):                                                  # 20 events in about a second
+            win._on_tray_event({"ev": "memory", "topic": "cards"})
+            time.sleep(0.04)
+        live.settle(0.8)
+        assert live.built.count("home") == 1 and live.built.count("shell") == 1 and "activity" not in live.built
+    finally:
+        live.close()
+
+
+def test_a_forwarded_call_status_patches_rail_and_home_without_reading_memory(tmp_path, monkeypatch):
+    class _NoCallRead(_Memory):
+        reads = 0
+
+        def call_status(self):
+            _NoCallRead.reads += 1
+            return super().call_status()
+
+        def call_audio_waiting(self):
+            _NoCallRead.reads += 1
+            return super().call_audio_waiting()
+
+        def close(self):
+            pass
+
+    live = _Live(tmp_path, monkeypatch, memory=_NoCallRead(), real_build=True)
+    win, host = live.win, live.host
+    try:
+        win.mark("home", "want", urgent=True)                                # Home on screen (read from memory once)
+        live.settle(0.6)
+        assert live.built == ["home"]
+        _NoCallRead.reads = 0
+        status = {"call": {"id": 9, "app": "Signal", "status": "recording", "session_started_at": "2026-10-03T10:00:00"},
+                  "recording": True, "waiting": {"calls": 1, "minutes": 30.0}}
+        win._on_tray_event({"ev": "call", "status": status})
+        assert host.kinds("live")[-1]["shell"]["call"]["recording"] is True   # the rail's chip, at once
+        live.settle(0.3)
+        home = live.data("home")[-1]["data"]
+        assert home["now"]["call"]["app"] == "Signal" and [r["kind"] for r in home["running"]] == ["call", "waiting"]
+        assert _NoCallRead.reads == 0 and live.built == ["home"]              # patched from the status: no build, no read
+        assert {"day", "activity"} <= set(win.dirty)                          # pages with call rows: built when opened
+        n, m = len(host.kinds("live")), len(live.data("home"))
+        win._on_tray_event({"ev": "call", "status": status})                  # the same status: nothing new to draw
+        live.settle()
+        assert len(host.kinds("live")) == n and len(live.data("home")) == m
+        # a build later uses the forwarded status too (no call read)
+        win.mark("home", "action", urgent=True)
+        live.settle(0.6)
+        assert live.built == ["home", "home"] and _NoCallRead.reads == 0
+    finally:
+        live.close()
+
+
+def test_a_new_card_marks_home_and_activity_dirty_and_builds_only_the_open_page(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch)
+    win = live.win
+    try:
+        win.fresh.update({"home", "activity"})
+        win.stamps.update(home=time.time(), activity=time.time())
+        win._on_tray_event({"ev": "memory", "topic": "cards", "why": "nudge_ack"})
+        live.settle()
+        assert "home" in live.built and "activity" not in live.built and "activity" in win.dirty
+        win.on_message({"op": "want", "page": "activity"})                   # opened: built because it is dirty
+        live.settle()
+        assert live.built.count("activity") == 1 and "activity" not in win.dirty
+    finally:
+        live.close()
+
+
+def test_a_finished_request_refreshes_the_open_activity_page_and_marks_home_stale(tmp_path, monkeypatch):
+    from yuki.ui.chat_model import ChatModel
+
+    live = _Live(tmp_path, monkeypatch, open_page="activity")
+    win = live.win
+    try:
+        win.model = ChatModel()
+        for ev in ({"type": "user", "job": 5, "text": "Invented request", "at": 1000.0},
+                   {"type": "started", "job": 5, "lane": "worker", "at": 1000.1},
+                   {"type": "finished", "job": 5, "text": "Done.", "at": 1002.0}):
+            win._on_tray_event({"ev": "chat", "event": ev})
+        live.settle()
+        assert live.built == ["activity"] and "home" in win.dirty
+        assert {"work", "playbook"} <= set(win.maybe)                         # a run may have moved these: stamps later
+        win._on_tray_event({"ev": "chat", "event": {"type": "tool_finished", "job": 5, "name": "remember_rule", "ok": True}})
+        assert {"me", "playbook"} <= set(win.dirty)
+    finally:
+        live.close()
+
+
+def test_every_memory_tool_the_agent_has_is_in_the_topic_table():
+    from yuki.agent.tools import MEMORY_TOOLS
+
+    assert set(web_window.TOOL_TOPICS) == set(MEMORY_TOOLS) - {"memory"}     # a renamed tool fails here
+    for topic in web_window.TOOL_TOPICS.values():
+        assert topic in web_window.TOPIC_PAGES or topic in web_window.CHECK_TOPICS
+
+
+def test_want_rebuilds_a_dirty_page_inside_the_45s_window(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch, open_page="home")
+    win = live.win
+    try:
+        win.fresh.add("me")
+        win.stamps["me"] = time.time()                                       # built 0 s ago
+        win.on_message({"op": "want", "page": "me"})
+        live.settle()
+        assert "me" not in live.built and live.stamp_reads == []             # fresh and clean: nothing
+        win.open_page = "home"
+        win.topic("rules")                                                   # a rule changed while Home was open
+        win.on_message({"op": "want", "page": "me"})
+        live.settle()
+        assert live.built.count("me") == 1
+    finally:
+        live.close()
+
+
+def test_the_fallback_reads_only_stamps_and_builds_only_when_a_stamp_moved(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_window, "FALLBACK_S", {"day": 0.2})
+    live = _Live(tmp_path, monkeypatch, open_page="day")
+    win = live.win
+    try:
+        live.stamps["day"] = "s1"
+        win.fresh.add("day")
+        win.seen_stamps["day"] = "s1"
+        win._arm_fallback()
+        live.settle(0.7)
+        assert live.stamp_reads.count("day") >= 2 and live.built == []       # stamps read, nothing moved: no build
+        live.stamps["day"] = "s2"                                            # the timeline moved
+        live.settle(0.5)
+        assert live.built == ["day"]
+        win.client, win.call_status = object(), {"recording": True}          # a call records: no fallback reads
+        reads = len(live.stamp_reads)
+        win._arm_fallback()
+        live.settle(0.6)
+        assert len(live.stamp_reads) == reads
+    finally:
+        win.client = None
+        live.close()
+
+
+def test_a_restore_with_the_tray_down_makes_one_connection_not_three(tmp_path, monkeypatch):
+    """Review F1: on_shown, the page's shown want and the woken scheduler each used to connect."""
+    live = _Live(tmp_path, monkeypatch, open_page="home")
+    win = live.win
+    attempts: list[str] = []
+
+    def connect_once():
+        attempts.append(threading.current_thread().name)
+        time.sleep(0.05)
+        win.client = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(win, "_connect_once", connect_once)
+    try:
+        win._scheduler_on = True
+        live.shown = False                                                   # minimised while the tray restarted
+        win.cipher, win.want_connect = object(), True
+        live.settle(0.2)
+        assert attempts == []                                                # nothing while hidden
+        live.shown = True
+        win.on_shown("restore")
+        win.on_message({"op": "want", "page": "home", "shown": True})
+        live.settle(0.4)
+        assert len(attempts) == 1, attempts
+        # an older connection's goodbye arriving late leaves the current one alone
+        current = win.client
+        win._on_tray_closed(SimpleNamespace())
+        assert win.client is current
+    finally:
+        win.client = None
+        live.close()
+
+
+def test_the_tray_going_away_mid_call_clears_the_chip_and_rereads_from_memory(tmp_path, monkeypatch):
+    """Review F2: a stale 'recording' chip stayed for good and switched the fallback off."""
+    live = _Live(tmp_path, monkeypatch, open_page="home")
+    win = live.win
+    try:
+        tray = SimpleNamespace(close=lambda: None)
+        win.client = tray
+        win.on_call_status({"call": {"id": 4, "status": "recording", "app": "Invented"}, "recording": True})
+        assert win.shell["call"]["recording"] is True and win._recording() is True
+        live.settle()
+        live.built.clear()
+        win._on_tray_closed(tray)
+        assert win.shell["call"] is None and win.client is None and win._recording() is False
+        assert live.host.kinds("live")[-1]["shell"]["call"] is None             # the chip goes at once
+        live.settle(0.5)
+        assert "shell" in live.built and "home" in live.built                   # read from memory again
+    finally:
+        live.close()
+
+
+def test_a_failed_build_of_the_open_page_keeps_its_fallback(tmp_path, monkeypatch):
+    """Review F7: one exception used to switch the open page's fallback off until you navigated away."""
+    monkeypatch.setattr(web_window, "FALLBACK_S", {"day": 0.2})
+    live = _Live(tmp_path, monkeypatch, open_page="day")
+    win = live.win
+    tries: list[str] = []
+
+    def build(name):
+        tries.append(name)
+        raise RuntimeError("memory busy (invented)")
+    monkeypatch.setattr(win, "build", build)
+    try:
+        win._arm_fallback()
+        live.settle(0.9)
+        assert tries.count("day") >= 2, tries                                 # tried again on the next fallback
+    finally:
+        live.close()
+
+
+def test_a_build_you_asked_for_sends_the_volatile_fields_events_do_not(tmp_path, monkeypatch):
+    """Settings' 'Yuki right now' and Home's 'since' stay out of the hash for events and the fallback, but a revisit
+    (or your own action) shows them current."""
+    win, host = _window(tmp_path, monkeypatch)
+    win.booted = True
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 80}}) is True
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 81}}) is False             # an event: not sent
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 82}}, asked=True) is True  # you opened it
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 82}}, asked=True) is False # exactly the same
+    assert win.send_page("home", {"needs": [], "since": 1.0}) is True
+    assert win.send_page("home", {"needs": [], "since": 2.0}, asked=True) is True
+    assert [m["data"].get("usage", {}).get("mb") for m in host.kinds("data") if m["page"] == "settings"] == [80, 82]
+
+
+def test_tray_focus_refreshes_the_open_page_not_home(tmp_path, monkeypatch):
+    win, host = _window(tmp_path, monkeypatch)
+    win.memory, win.booted = object(), True
+    marked: list[tuple] = []
+    monkeypatch.setattr(win, "mark", lambda name, reason, **kw: marked.append((name, reason, kw.get("check", False))))
+    win.on_message({"op": "want", "page": "playbook"})
+    assert win.open_page == "playbook" and marked[-1] == ("playbook", "want", False)   # never built yet
+    win.fresh.add("playbook")
+    win.stamps["playbook"] = time.time() - 30
+    marked.clear()
+    win._on_tray_event({"ev": "focus"})
+    assert marked == [("playbook", "action", False)]                       # not Home
+    assert host.kinds("focus")[-1] == {"kind": "focus"}
+    marked.clear()
+    win.come_forward()                                                       # a second start: the same
+    assert [m[0] for m in marked] == ["playbook"]
+    marked.clear()
+    win.on_message({"op": "want", "page": "playbook", "again": True})        # the same tab clicked again: a check
+    assert marked == [("playbook", "want", True)]
+    marked.clear()
+    win._on_tray_event({"ev": "focus", "page": "me"})                        # another page: it asks itself (want)
+    assert marked == [] and host.kinds("focus")[-1]["page"] == "me"
+
+
+def test_settings_follows_its_own_controls_and_the_trays_voice_state(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch, open_page="settings")
+    win, host = live.win, live.host
+    try:
+        r = _act(win, host, "motion", reduce=True)                           # writes the test's own ui.json
+        assert r["ok"]
+        live.settle()
+        assert live.built.count("settings") == 1
+        win._on_tray_event({"ev": "state", "voice_state": "listening"})      # not shown on Settings: nothing
+        win._on_tray_event({"ev": "state", "voice_state": "thinking"})
+        live.settle()
+        assert live.built.count("settings") == 1
+        win._on_tray_event({"ev": "state", "mic": "Invented USB mic"})        # shown there: rebuilt once
+        live.settle()
+        assert live.built.count("settings") == 2
+    finally:
+        live.close()
+
+
+def test_pages_that_change_with_the_clock_are_rebuilt_at_the_next_boundary(tmp_path, monkeypatch):
+    now = time.time()
+    data = {"rows": [{"undo": {"until": now + 120}}, {"undo": {"until": now - 5}}], "offers": [{"undo_until": now + 60}]}
+    assert abs(web_window.next_boundary(data, now) - (now + 60)) < 1e-6
+    from datetime import datetime, timedelta
+
+    midnight = (datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp()
+    assert abs(web_window.next_boundary({"rows": []}, now) - (midnight + 1)) < 1e-6
+    live = _Live(tmp_path, monkeypatch, open_page="activity")
+    win = live.win
+    try:
+        live.version["activity"] = 1
+        win.mark("activity", "want", urgent=True)
+        live.settle(0.2)
+        assert live.built == ["activity"]
+        win._clock_at["activity"] = time.time() + 0.3                         # an Undo window closes then
+        with win._cv:
+            win._cv.notify()
+        live.settle(0.7)
+        assert live.built == ["activity", "activity"]
+        assert any(e.get("reason") == "clock" for e in win.events if e["kind"] == "web_page")
+    finally:
+        live.close()
+
+
+def test_a_build_carries_when_it_started_and_media_never_lands_on_an_older_home(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch)
+    win = live.win
+    try:
+        live.version["home"] = 7
+        win.mark("home", "want", urgent=True)
+        live.settle(0.3)
+        first = live.data("home")[-1]
+        assert first["built_at"] <= time.time() and first["data"]["v"] == 7
+        win._jobs.put(("media", "home", {"status": "playing", "title": "Invented song"}, ()))
+        live.settle(0.2)
+        last = live.data("home")[-1]["data"]
+        assert last["v"] == 7 and last["now"]["playing"]["title"] == "Invented song" and win.playing["title"] == "Invented song"
+    finally:
+        live.close()
+
+
+def test_page_refreshes_are_logged_content_free(tmp_path, monkeypatch):
+    live = _Live(tmp_path, monkeypatch)
+    win = live.win
+    try:
+        live.version["home"] = 3
+        win.topic("cards")
+        live.settle()
+        live.shown = False
+        win.send_page("home", {"page": "home", "v": 99, "secret": "Invented private words"})
+        live.shown = True
+        win.catch_up("restore")
+        live.settle(0.2)
+    finally:
+        live.close()
+    lines = [json.loads(x) for x in (tmp_path / "window-refresh.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["type"] == "session_start" and all(x["type"] == "ui" for x in lines[1:])   # UiLog's writer and shape
+    pages = [x for x in lines if x.get("event") == "web_page"]
+    assert pages and {"page", "reason", "topic", "ms", "result"} <= set(pages[0]) and pages[0]["topic"] == "cards"
+    assert {x.get("event") for x in lines} >= {"web_page", "web_hold", "web_restore"}
+    text = json.dumps(lines)
+    assert "Invented private words" not in text and '"v"' not in text
+
+
+def test_page_stamps_move_on_each_write_and_stay_cheap(tmp_path):
+    from yuki.memory.api import MemoryClient, _STAMP_SQL, change_stamps
+
+    m = MemoryClient.open(tmp_path / "memory.db")
+    try:
+        conn = m.store._conn
+
+        def insert(table: str) -> None:
+            cols = [c for c in m.store._query(f"PRAGMA table_info({table})") if c[3] and c[4] is None and not c[5]]
+            values = [1.0 if str(c[2]).upper() in ("REAL", "INTEGER") else "x" for c in cols]
+            m.store._write(lambda c: c.execute(f"INSERT INTO {table} ({', '.join(x[1] for x in cols)}) VALUES "
+                                               f"({', '.join('?' for _ in cols)})", values))
+
+        before = change_stamps(m, list(_STAMP_SQL))
+        assert all(v is not None for v in before.values()), before
+        for table in _STAMP_SQL:
+            prev = change_stamps(m, [table])[table]
+            insert(table)
+            assert change_stamps(m, [table])[table] != prev, table
+            cols = {c[1] for c in m.store._query(f"PRAGMA table_info({table})")}
+            if "updated_at" in cols:                                         # an edit, no new row, moves it too
+                prev = change_stamps(m, [table])[table]
+                m.store._write(lambda c: c.execute(f"UPDATE {table} SET updated_at = updated_at + 5"))
+                assert change_stamps(m, [table])[table] != prev, table
+        for page, tables in web_data.PAGE_TABLES.items():
+            assert set(tables) <= set(_STAMP_SQL), page
+            t = time.perf_counter()
+            for _ in range(20):
+                assert web_data.page_stamps(m, page) is not None
+            assert (time.perf_counter() - t) / 20 < 0.005, page               # under 5 ms a check
+        assert web_data.page_stamps(m, "settings") is None                    # no stamps: built (and hash-skipped)
+        # review F3: Work's week figure and Activity's "Seen today" read the timeline, so it moves their stamps
+        work0, act0 = web_data.page_stamps(m, "work"), web_data.page_stamps(m, "activity")
+        insert("timeline")
+        assert web_data.page_stamps(m, "work") != work0 and web_data.page_stamps(m, "activity") != act0
+        del conn
+    finally:
+        m.close()
+
+
+def test_the_host_says_when_the_window_is_shown_again_once_per_restore(monkeypatch):
+    calls: list[str] = []
+    opts = webview2.HostOptions(folders={}, start_url=f"https://{webview2.APP_HOST}/index.html", user_data_dir=Path("."),
+                                on_shown=calls.append)
+    host = webview2.WebView2Host(opts)
+
+    class _Ctl:
+        def __bool__(self):
+            return True
+
+        def put_bool(self, *a):
+            pass
+
+        def call(self, *a):
+            pass
+    host._controller = _Ctl()
+    monkeypatch.setattr(host, "set_memory_low", lambda low: True)
+    host._fit()                                                              # a resize: nothing
+    host._fit(minimized=True)
+    host._fit()                                                              # restored: once
+    host._fit()
+    assert calls == ["restore"]
+    host._proc(0, webview2.WM_ACTIVATE, 1, 0)                                # brought to the front
+    host._proc(0, webview2.WM_ACTIVATE, 0, 0)                                # deactivated: nothing
+    host._proc(0, webview2.WM_ACTIVATE, 1 | (1 << 16), 0)                    # activated while minimised: nothing
+    assert calls == ["restore", "activate"]
+
+
+def test_overlay_card_inserts_reach_the_window_thread():
+    """The overlay in thread mode adds a card through WindowHost.emit (applied and sent to the open window), not
+    straight into the model (42 R2). The overlay's method over a stand-in self: no widget, no QApplication."""
+    from yuki.ui.chat_model import ChatModel
+    from yuki.ui.overlay import Overlay
+
+    model, sent = ChatModel(), []
+
+    def emit(ev):                                                            # WindowHost.emit: apply, then broadcast
+        model.apply(ev)
+        sent.append(ev["type"])
+    me = SimpleNamespace(thread=object(), nudge_card=lambda _id: None, scroll_to_latest=lambda: None, _thread_emit=emit,
+                         _proxy=lambda tone, nudge=None, at=None: ("proxy", tone))
+    out = Overlay.add_nudge_card(me, {"id": 61, "kind": "notice", "text": "Invented card."}, "Card", at=time.time())
+    assert out == ("proxy", "nudge") and sent == ["nudge"] and any(i.kind == "nudge" for i in model.items)
+    # the wiring: the tray passes WindowHost.emit to the overlay
+    app = (ROOT / "yuki" / "ui" / "app.py").read_text(encoding="utf-8")
+    assert "self.overlay.attach_thread(self.window_host.model, emit=self.window_host.emit)" in app
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_live_patch_keeps_scroll_focus_and_figures_in_headless_chrome():
+    """scripts/check_live_patch.js: the real index.html in Playwright's headless shell (never a visible window, a
+    throwaway profile), the invented fixture; new data pushed into each open page."""
+    try:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import web_shots
+
+        exe = web_shots.headless_shell()
+    except (SystemExit, ImportError):
+        pytest.skip("chrome-headless-shell is not installed")
+    r = subprocess.run(["node", str(ROOT / "scripts" / "check_live_patch.js"), "--chrome", str(exe)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
+
+
 # -- a real window (opt-in) ------------------------------------------------------------------------------------------
 
 

@@ -581,6 +581,7 @@ class Overlay(SurfaceWindow):
         #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
         self.thread: Any = None
         self._thread_model: Any = None
+        self._thread_emit: Any = lambda ev: None
         self._proxies: list[ThreadCard] = []
         #: The call's ``(timer, app)`` for the foot, or None (the tray gives it: the island's clock).
         self.call_line: Any = lambda: None
@@ -816,13 +817,16 @@ class Overlay(SurfaceWindow):
 
     # -- thread mode (the live chat thread) ------------------------------------
 
-    def attach_thread(self, model: Any) -> None:
-        """Show the live chat thread instead of the card stack (see the module docstring)."""
+    def attach_thread(self, model: Any, emit: Any = None) -> None:
+        """Show the live chat thread instead of the card stack (see the module docstring). ``emit``: how this
+        overlay adds its own events to the thread (``WindowHost.emit``: applied here and sent to the open Yuki
+        window, so its replica keeps the cards too; 42-window-live-refresh.md R2); ``model.apply`` by default."""
         if self.thread is not None:
             return
         from yuki.ui.chatview import ChatThreadView
 
         self._thread_model = model
+        self._thread_emit = emit if callable(emit) else model.apply
         self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 92,
                                      margins=(0, 0, 2, 0), look="lattice", parent=self.thread_box)
         self.thread.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -845,7 +849,7 @@ class Overlay(SurfaceWindow):
 
         def reply_state(state: str) -> None:
             if nudge is not None and model is not None:
-                model.apply({"type": "nudge_state", "id": nudge.get("id"), "state": state})
+                self._thread_emit({"type": "nudge_state", "id": nudge.get("id"), "state": state})
 
         card = ThreadCard(tone, at=at, nudge=nudge, on_reply_state=reply_state)
         self._proxies.append(card)
@@ -1031,7 +1035,7 @@ class Overlay(SurfaceWindow):
         if existing is not None:
             return existing
         if self.thread is not None:
-            self._thread_model.apply({"type": "nudge", "nudge": nudge, "at": at})
+            self._thread_emit({"type": "nudge", "nudge": nudge, "at": at})
             self.scroll_to_latest()
             return self._proxy("nudge", nudge=nudge, at=at)  # type: ignore[return-value]
         cards = self.cards()

@@ -262,30 +262,35 @@ def test_m11_route_measures_and_the_watch_start_are_cached_until_a_message_arriv
 def test_m11_the_home_refresh_waits_while_the_window_is_minimised(tmp_path: Path, monkeypatch) -> None:
     from yuki.ui import web_window
 
+    # since the live refresh (42-window-live-refresh.md) there is no 60 s Home timer: Home is built on events, and
+    # while the window can't be seen nothing is built; it catches up once when shown again
+    import threading
+    import time
+
     win = web_window.WebWindow(db_path=tmp_path / "mem" / "memory.db", ui_path=tmp_path / "ui.json", connect=False,
                                policy_path=tmp_path / "autonomy.json")
     assert win.window_shown()                                          # no window yet: never skipped by mistake
-    monkeypatch.setattr(web_window, "HOME_REFRESH_S", 0.0)
+    monkeypatch.setattr(web_window, "DEBOUNCE_S", 0.02)
+    monkeypatch.setattr(web_window, "MIN_GAP_S", {})
     refreshed: list[str] = []
-    monkeypatch.setattr(win, "refresh", lambda name: refreshed.append(name))
-
-    class Ticks:
-        def __init__(self, n: int) -> None:
-            self.n = n
-
-        def wait(self, _s: float) -> bool:
-            self.n -= 1
-            return self.n < 0
-
+    monkeypatch.setattr(win, "_enqueue", lambda name, *a, **k: refreshed.append(name))
     shown = {"now": False}
     monkeypatch.setattr(win, "window_shown", lambda: shown["now"])
-    win._closing = Ticks(3)
-    win._timers()
-    assert refreshed == []                                             # minimised: three ticks, no refresh
-    shown["now"] = True
-    win._closing = Ticks(1)
-    win._timers()
-    assert refreshed == ["home"]                                       # shown again: refreshed on the next tick
+    win.memory, win.booted, win.open_page = object(), True, "home"
+    threading.Thread(target=win._scheduler, daemon=True).start()
+    try:
+        for _ in range(3):
+            win.topic("cards")
+        time.sleep(0.3)
+        assert refreshed == []                                         # minimised: no refresh
+        shown["now"] = True
+        win.catch_up("restore")
+        time.sleep(0.3)
+        assert sorted(refreshed) == ["home", "shell"]                  # shown again: refreshed once
+    finally:
+        win._closing.set()
+        with win._cv:
+            win._cv.notify_all()
 
 
 # ---------------------------------------------------------------------------

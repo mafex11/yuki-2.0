@@ -41,10 +41,21 @@
 
   /* ---------------- perf counters (read by the ?perf=1 HUD) ---------------- */
   const Perf = {
-    draws: 0, ticks: 0, ms: 0, maxMs: 0,           // cumulative since load
+    draws: 0, ticks: 0, ms: 0, maxMs: 0, rasters: 0,   // cumulative since load
     drew() { this.draws++; },
-    snap() { return { draws: this.draws, ticks: this.ticks, ms: this.ms, maxMs: this.maxMs, at: performance.now() }; }
+    snap() { return { draws: this.draws, ticks: this.ticks, ms: this.ms, maxMs: this.maxMs, rasters: this.rasters, at: performance.now() }; }
   };
+
+  /* a figure's signature: its kind and the data it is drawn from (data-value, the page's __week / __sky), kept on the
+     element; two equal signatures draw the same dots (app.js patches compare them too: isEqualNode can't see them) */
+  function figSig(el) {
+    if (el.__figsig != null) return el.__figsig;
+    const d = el.dataset || {};
+    let data = '';
+    try { data = JSON.stringify(el.__week || (el.__sky && el.__sky.buckets) || d.days || null); } catch (e) { data = ''; }
+    el.__figsig = [d.figure, d.value, d.scale, data].join('|');
+    return el.__figsig;
+  }
 
   /* ---------------- one loop for everything ---------------- */
   const Loop = {
@@ -158,7 +169,7 @@
       this.cur = new Float32Array(n); this.fig = new Float32Array(n); this.figTone = new Uint8Array(n);
       this.delay = new Float32Array(n); this.mask = new Float32Array(n).fill(1); this.tone = new Uint8Array(n);
       this.stamp = new Uint32Array(n); this.gen = 1;
-      this.figIdx = new Int32Array(0); this.lit = [];
+      this.figIdx = new Int32Array(0); this.lit = []; this.rasterOK = false;   // the arrays are new: raster again
       const size = Math.ceil(this.pitch * DPR);
       this.sp = makeSprites(size, this.pitch * 0.3 * DPR, 1.3 * DPR, false);
       this.full = true;
@@ -219,21 +230,39 @@
       this.full = true;
       Loop.add(this.frame);
     }
+    /* The figures are rasterised again only when one changed: its kind, place, size or data (figSig). A figure
+       already on screen (the same element, patched in place) in the same kind and size keeps no sweep: its cells ease to their new values (a changed
+       skyline column grows, a moved figure follows) through the cur easing; only a new figure sweeps in
+       (42-window-live-refresh.md R6: a redraw no longer replays the sweep). */
     rasterFigures(o) {
       const P = this.pitch, C = this.cols, R = this.rows;
+      const found = [];
+      document.querySelectorAll('[data-figure]').forEach((el) => {
+        const r = el.getBoundingClientRect();
+        if (!r.width) return;
+        found.push({ el, kind: el.dataset.figure, sig: figSig(el), i0: Math.round((r.left - o.left) / P), j0: Math.round((r.top - o.top) / P), ci: Math.floor(r.width / P), cj: Math.floor(r.height / P) });
+      });
+      const prev = this.figs || [];
+      const same = (a, b) => a.el === b.el && a.kind === b.kind && a.sig === b.sig && a.i0 === b.i0 && a.j0 === b.j0 && a.ci === b.ci && a.cj === b.cj;
+      if (this.rasterOK && found.length === prev.length && found.every((f, n) => same(f, prev[n]))) {
+        return;   // nothing to raster: figT0, delays and the drawn cells stay as they are
+      }
       const fig = this.fig, tone = this.figTone, delay = this.delay;
       fig.fill(0); tone.fill(0); delay.fill(0);
       this.figs = []; this.maxDelay = 0;
       const idx = [];
-      document.querySelectorAll('[data-figure]').forEach((el) => {
-        const r = el.getBoundingClientRect();
-        if (!r.width) return;
-        const f = { el, kind: el.dataset.figure, i0: Math.round((r.left - o.left) / P), j0: Math.round((r.top - o.top) / P), ci: Math.floor(r.width / P), cj: Math.floor(r.height / P) };
+      let fresh = false;
+      found.forEach((f) => {
+        const el = f.el;
+        // the same element (a patch keeps it; a navigation builds new ones, so a new page's figure always sweeps in)
+        const kept = prev.some((q) => q.el === el && q.kind === f.kind && q.ci === f.ci && q.cj === f.cj);
+        if (!kept) fresh = true;
         this.figs.push(f);
         const put = (i, j, v, t, d) => {
           if (i < 0 || j < 0 || i >= C || j >= R) return;
           const k = j * C + i;
           if (fig[k] === 0) idx.push(k);
+          if (kept) d = -1;   // already on screen: no sweep
           if (v > fig[k]) { fig[k] = v; tone[k] = t || 0; delay[k] = d || 0; if (d > this.maxDelay) this.maxDelay = d; }
         };
         if (f.kind === 'num') {
@@ -272,7 +301,9 @@
         }
       });
       this.figIdx = Int32Array.from(idx);
-      this.figT0 = performance.now() / 1000;
+      if (fresh || !this.figT0) this.figT0 = performance.now() / 1000;
+      this.rasterOK = true;
+      Perf.rasters++;
     }
     /* Yuki: the day from the page's data (el.__sky.buckets: equal slices, each {p: share of it at the PC, m: active |
        full | away | off | gap | future, c: 0 | 1 call | 2 live call}); the design's drawing and sweep delays. Height is
@@ -736,5 +767,5 @@
     readLive();
     SURFACES.forEach((s) => { if (!s.c.isConnected) { SURFACES.delete(s); return; } if (s instanceof Face) s.setPitch(s.p); else s.recolor(); });
   }
-  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, Tick, icon, reveal, refreshColors, DPR, FACE_W, FACE_H };
+  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, Tick, icon, reveal, refreshColors, figSig, DPR, FACE_W, FACE_H };
 })();

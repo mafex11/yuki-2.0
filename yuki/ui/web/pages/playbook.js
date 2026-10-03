@@ -22,7 +22,7 @@
     return el;
   }
   function procedure(p) {
-    return h('div', { class: 'proc' + (p.disabled ? ' off' : '') },
+    return h('div', { class: 'proc' + (p.disabled ? ' off' : ''), data: { k: p.ref || p.title } },
       h('div', null, h('h4', { text: p.title }), p.when ? h('div', { class: 'when', text: p.when }) : null,
         (p.steps || []).length ? h('ol', null, p.steps.map((s) => h('li', { text: s }))) : null),
       h('div', { class: 'side' }, p.app ? h('b', { text: p.app }) : null, p.app ? h('br') : null,
@@ -35,7 +35,7 @@
       h('div', { class: 'side' }, k.app ? h('b', { text: k.app }) : null, k.app ? h('br') : null, k.since ? 'learned ' + k.since : 'learned from a run that worked'));
   }
   function lesson(l) {
-    return h('div', { class: 'lesson' + (l.disabled ? ' off' : '') }, h('span', { class: 'd', text: l.dont }), l.because ? [' ', h('span', { class: 'b', text: l.because })] : null,
+    return h('div', { class: 'lesson' + (l.disabled ? ' off' : ''), data: { k: l.ref || l.dont } }, h('span', { class: 'd', text: l.dont }), l.because ? [' ', h('span', { class: 'b', text: l.because })] : null,
       l.do ? h('div', { class: 'z', text: l.do }) : null,
       h('div', { class: 'm', text: [l.tentative ? 'tentative, seen once' : '', `used ${fmt.plural(l.used || 0, 'time')}`,
         l.from ? l.from.charAt(0).toLowerCase() + l.from.slice(1) : ''].filter(Boolean).join(' · ') }));
@@ -59,13 +59,14 @@
         : Y.empty('Nothing yet. When something works on this PC, how it was done lands here, with how often I used it.'))
       : Y.sec('What I learned to do', know.length, know.length ? know.map(howto)
         : Y.empty('Nothing yet. When something works on this PC, how it was done lands here.'));
-    return [Y.head('Playbook', meta, Y.numFig(nProc, practice ? (nProc === 1 ? 'procedure' : 'procedures') : 'learned')),
+    // data-k: the blocks' keys for the live patch (app.js patchInto)
+    return [Y.k(Y.head('Playbook', meta, Y.numFig(nProc, practice ? (nProc === 1 ? 'procedure' : 'procedures') : 'learned')), 'head'),
       props.map(proposal),
-      h('div', { class: 'grid2' },
-        h('div', { class: 'col' }, left),
-        h('div', { class: 'col' },
-          Y.sec('Lessons', les.length, les.length ? les.map(lesson) : Y.empty('No lessons yet. When I get something wrong and you correct me, the fix lands here, and I show it when I use it.')),
-          Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow) : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.'))))];
+      h('div', { class: 'grid2', data: { k: 'grid' } },
+        h('div', { class: 'col', data: { k: 'left' } }, Y.k(left, 'how')),
+        h('div', { class: 'col', data: { k: 'right' } },
+          Y.k(Y.sec('Lessons', les.length, les.length ? les.map(lesson) : Y.empty('No lessons yet. When I get something wrong and you correct me, the fix lands here, and I show it when I use it.')), 'lessons'),
+          Y.k(Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow) : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.')), 'rules')))];
   }
 
   /* Forget a rule / stop a standing request: 10 s to undo (Me's Forget), then memory's own op */

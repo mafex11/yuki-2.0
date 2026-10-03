@@ -70,6 +70,7 @@ WS_EX_NOACTIVATE = 0x08000000
 SW_SHOWNORMAL, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SW_RESTORE = 1, 3, 4, 9
 WM_DESTROY, WM_MOVE, WM_SIZE, WM_CLOSE = 0x0002, 0x0003, 0x0005, 0x0010
 WM_MOUSEACTIVATE, WM_DPICHANGED, WM_APP = 0x0021, 0x02E0, 0x8000
+WM_ACTIVATE, WA_INACTIVE = 0x0006, 0
 MA_NOACTIVATE = 3
 SIZE_MINIMIZED = 1
 CS_HREDRAW, CS_VREDRAW = 0x2, 0x1
@@ -458,6 +459,10 @@ class HostOptions:
     on_message: Callable[[Any], None] | None = None   # each JSON message the page posts (parsed)
     on_ready: Callable[["WebView2Host"], None] | None = None   # navigation to the start page began
     on_event: Callable[..., None] | None = None        # ``on_event(kind, **fields)``: content-free log lines
+    #: ``on_shown(reason)`` on the UI thread when the window can be seen again: ``restore`` (from minimised; once per
+    #: edge, ``WM_SIZE`` also fires on every resize) or ``activate`` (brought to the front from behind other windows:
+    #: WebView2 changes nothing there, so the page hears no ``visibilitychange``; 42 verification, missing 5).
+    on_shown: Callable[[str], None] | None = None
     marks: dict[str, float] = field(default_factory=dict)   # epoch times of each stage (filled by the host)
 
 
@@ -485,6 +490,7 @@ class WebView2Host:
         self.exit_code = 0
         self._closing = False
         self._low = False   # the memory target is Low (set while minimised)
+        self._minimized = False   # for on_shown's edge
         #: Called on the UI thread when the window starts to close, before it is destroyed (read its placement).
         self.on_closing: Callable[[], Any] | None = None
         # the frameless frame: where the page drew its title bar (until it says: the design's height, no buttons)
@@ -821,6 +827,8 @@ class WebView2Host:
                     self._maximized_changed()
             elif msg == WM_MOVE and self._controller:
                 self._controller.call(CTL_NOTIFY_MOVED)
+            elif msg == WM_ACTIVATE and (wparam & 0xFFFF) != WA_INACTIVE and not (wparam >> 16) & 0xFFFF:
+                self._shown("activate")   # activated and not minimised (the high word)
             elif msg == WM_MOUSEACTIVATE and self.o.placement == "offscreen":
                 return MA_NOACTIVATE
             elif msg == WM_DPICHANGED:
@@ -842,7 +850,9 @@ class WebView2Host:
             # 2026-10-03: resident memory 384 MB -> 52 MB within 30 s, docs/research/revamp-2026-10-02/25-...)
             self._controller.put_bool(CTL_PUT_IS_VISIBLE, False)
             self._low = self.set_memory_low(True)
+            self._minimized = True
             return
+        was_minimized, self._minimized = self._minimized, False
         rect = wintypes.RECT()
         ctypes.windll.user32.GetClientRect(wintypes.HWND(self.hwnd), byref(rect))
         self._controller.call(CTL_PUT_BOUNDS, (wintypes.RECT,), rect)
@@ -850,6 +860,15 @@ class WebView2Host:
         if self._low:
             self.set_memory_low(False)
             self._low = False
+        if was_minimized:
+            self._shown("restore")
+
+    def _shown(self, reason: str) -> None:
+        if self.o.on_shown is not None:
+            try:
+                self.o.on_shown(reason)
+            except Exception as exc:  # noqa: BLE001
+                self._handler_error("on_shown", exc)
 
     def _begin_close(self) -> None:
         if self._closing:

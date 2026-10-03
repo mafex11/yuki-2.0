@@ -26,18 +26,20 @@
       h('summary', null, ic('chev'), [it.work_line, it.meta].filter(Boolean).join(' · ')), h('div', { class: 'fold-in' }, steps.map(stepRow))) : null;
     const text = it.text || '';
     const liveLine = it.running && !text ? h('div', { class: 'live-line' }, h('i', { class: 'recdot' }), it.question ? 'Waiting for your answer' : (it.thinking || 'Thinking…')) : null;
-    return h('div', { class: 'y' }, h('span', { class: 'who', text: 'yuki' }),
+    return h('div', { class: 'y', data: { k: it.id } }, h('span', { class: 'who', text: 'yuki' }),
       text ? h('span', { class: 'tx' + (it.status === 'failed' ? ' failed' : it.status === 'interrupted' ? ' dim' : ''), text }) : h('span', { class: 'tx dim', text: it.question || '' }),
       liveLine, fold, !steps.length && it.meta && !it.running ? h('div', { class: 'meta', text: it.meta }) : null,
       it.status === 'interrupted' ? h('div', { class: 'meta', text: 'interrupted' }) : null);
   }
+  /* each turn and each message is keyed by its item's id, so a redraw while a reply streams patches only the turn
+     that changed (app.js patchInto; 42-window-live-refresh.md §6.3) */
   function turns(items, S) {
     const out = []; let cur = null;
     items.forEach((it) => {
-      if (it.kind === 'notice') { out.push(h('div', { class: 'turn' }, h('div', { class: 'label', text: it.text }))); cur = null; return; }
-      if (it.kind === 'user' || !cur) { cur = h('div', { class: 'turn' }); out.push(cur); }
-      if (it.kind === 'user') cur.append(h('div', { class: 'u' }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx', text: it.text || '' })));
-      else if (it.kind === 'nudge') cur.append(h('div', { class: 'n' }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx dim', text: it.text || '' })));
+      if (it.kind === 'notice') { out.push(h('div', { class: 'turn', data: { k: it.id } }, h('div', { class: 'label', text: it.text }))); cur = null; return; }
+      if (it.kind === 'user' || !cur) { cur = h('div', { class: 'turn', data: { k: it.id } }); out.push(cur); }
+      if (it.kind === 'user') cur.append(h('div', { class: 'u', data: { k: it.id } }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx', text: it.text || '' })));
+      else if (it.kind === 'nudge') cur.append(h('div', { class: 'n', data: { k: it.id } }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx dim', text: it.text || '' })));
       else cur.append(assistant(it, S));
     });
     return out;

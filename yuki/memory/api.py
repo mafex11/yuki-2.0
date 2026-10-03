@@ -3373,3 +3373,44 @@ __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
     "STANDING_CONTEXT_CHARS", "RESUME_CONTEXT_CHARS", "RESUME_EXCHANGES",
 ]
+
+
+# -- change stamps for the Yuki window's live refresh (yuki.ui.web_data.page_stamps; 42-window-live-refresh.md) ------
+
+#: One read-only query per table: the newest id and the latest change time it keeps (the newest row only, for the big
+#: timeline). A closed table of machine columns; never content.
+_STAMP_SQL: dict[str, str] = {
+    "questions": "SELECT max(id), max(updated_at) FROM questions",
+    "nudges": "SELECT max(id), max(shown_at), max(reacted_at), max(outcome_at) FROM nudges",
+    "timeline": "SELECT id, updated_at FROM timeline ORDER BY id DESC LIMIT 1",
+    "goals": "SELECT max(id), max(updated_at) FROM goals",
+    "todos": "SELECT max(id), max(updated_at) FROM todos",
+    "contacts": "SELECT max(id), max(updated_at) FROM contacts",
+    "calls": "SELECT max(id), max(updated_at) FROM calls",
+    "work_threads": "SELECT max(id), max(updated_at) FROM work_threads",
+    "portraits": "SELECT max(id) FROM portraits",
+    "portrait_facts": "SELECT max(id), max(valid_to), max(expired_at) FROM portrait_facts",
+    "conversation_facts": "SELECT max(id), max(valid_to), max(expired_at) FROM conversation_facts",
+    "playbooks": "SELECT max(id), max(updated_at) FROM playbooks",
+    "standing_requests": "SELECT max(id), max(updated_at) FROM standing_requests",
+    "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",
+    "runs": "SELECT max(id) FROM runs",
+    "journal": "SELECT max(id) FROM journal",
+}
+
+
+def change_stamps(client: MemoryClient, tables: tuple[str, ...] | list[str]) -> dict[str, list | None]:
+    """``{table: [newest id, latest change, ...]}`` for each known table (``None`` when it can't be read): equal
+    stamps mean nothing a page shows from that table changed. Reads only; each query is the table's max over the
+    primary key or a short scan of a small table (under a few ms together)."""
+    out: dict[str, list | None] = {}
+    for table in tables:
+        sql = _STAMP_SQL.get(table)
+        if sql is None:
+            continue
+        try:
+            rows = client.store._query(sql)
+            out[table] = list(rows[0]) if rows else []
+        except Exception:
+            out[table] = None
+    return out
