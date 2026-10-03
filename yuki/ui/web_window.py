@@ -767,21 +767,21 @@ class WebWindow:
             if data is not None:
                 self.post({"kind": "data", "page": name, "data": data, "source": "memory"})
         now = time.time()
+        scheduled: list[str] = []
         with self._cv:
-            for name in (self.open_page, "shell"):
-                if name in self.dirty or name in self.maybe:
-                    self._schedule(name, now, True)
-            if self._fallback_at <= now:
-                self.maybe.setdefault(self.open_page, set()).add("fallback")
-                self._schedule(self.open_page, now, True)
             if self._clock_at.get(self.open_page, float("inf")) <= now:   # a time boundary passed while hidden
                 self._clock_at[self.open_page] = float("inf")
                 self.dirty.setdefault(self.open_page, set()).add("clock")
-                self._schedule(self.open_page, now, True)
+            for name in (self.open_page, "shell"):
+                if name in self.dirty or name in self.maybe:
+                    self._schedule(name, now, True)
+                    scheduled.append(name)
             self._cv.notify()
         if self.want_connect and self.client is None and self.cipher is not None:
             threading.Thread(target=self._connect, name="yuki-web-connect", daemon=True).start()
-        self.log("web_restore", page=self.open_page, reason=reason, held=sorted(held), pages=sorted(pages))
+        if held or pages or scheduled:   # an alt-tab with nothing waiting is not worth a line
+            self.log("web_restore", page=self.open_page, reason=reason, held=sorted(held), pages=sorted(pages),
+                     scheduled=scheduled)
 
     def _arm_fallback(self) -> None:
         every = FALLBACK_S.get(self.open_page)
@@ -821,8 +821,10 @@ class WebWindow:
                         self.dirty.setdefault(self.open_page, set()).add("clock")
                         self._schedule(self.open_page, now, True)   # picked up on the next turn, at once
                     if self._fallback_at <= now:
-                        self._fallback_at = float("inf")   # re-armed by the check (or by catch_up after a call)
-                        if not self._recording():
+                        if self._recording():   # during a call: no reads, look again later
+                            self._fallback_at = now + FALLBACK_S.get(self.open_page, 300.0)
+                        else:
+                            self._fallback_at = float("inf")   # re-armed when the check or build is done
                             run.append((self.open_page, "fallback", ("fallback",), self.open_page not in self.dirty))
                 else:
                     # held: marks stay, catch_up schedules them on show; the fallback waits for it too
