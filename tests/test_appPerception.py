@@ -724,3 +724,20 @@ def test_left_out_notes_follow_the_carried_ids(monkeypatch: pytest.MonkeyPatch) 
     lines = second.splitlines()
     at = next(i for i, ln in enumerate(lines) if '"Messages in @Sam"' in ln)
     assert "off screen: 40 above" in lines[at + 1]
+
+
+class _DialogDesk(_PlayerDesk):
+    def click(self, x: int, y: int, *, button: str = "left", clicks: int = 1, expect_hwnd: int | None = None) -> Any:
+        return ActionResult(ok=True, summary="clicked; a new window of the same process appeared",
+                            details={"new_windows": [{"hwnd": 99, "title": "Invented dialog"}], "focus_changed": False})
+
+
+def test_an_effect_outside_the_window_is_never_called_nothing_changed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.agent.loop import action_verdict
+
+    desk = _DialogDesk(monkeypatch)
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    out = d.dispatch("click", {"element": _ids(text, "Home"), "expect_hwnd": 7001})
+    assert "nothing changed inside this window itself" in out.content[0]["text"]
+    assert action_verdict("click", out)[0] is True

@@ -2320,7 +2320,8 @@ class Dispatcher:
                 # the same read again, its ids carried (an identity carry: the model already holds it)
                 elements = list(_field(last, "elements") or [])
                 if elements:
-                    return self.window_model(int(hwnd)).carry(elements, self._reads), False
+                    return self.window_model(int(hwnd)).carry(elements, self._reads,
+                                                              partial=bool(_field(last, "truncated"))), False
         # Without events a fresh read is the only way to know the window as it is now, and comparing it with the
         # thinker's read is what shows the elements that change on their own (a clock, a progress bar).
         return self._observe(hwnd), True
@@ -2419,6 +2420,11 @@ class Dispatcher:
             final = False
         else:
             final = own if isinstance(own, bool) else None
+        if verified is False and final is True:
+            # the effect is outside the window read (a new window, another window in front, the focus): say so,
+            # never "nothing changed"
+            lines = ["nothing changed inside this window itself; what changed is in the facts above (the window in "
+                     "front, the focus, a new window)"]
         record = {"verified": verified, "why": why, "lines": lines[:8], **(diag or {})}
         if change is not None:
             record["counts"] = dict(change.counts)
