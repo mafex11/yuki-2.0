@@ -84,7 +84,7 @@ ADVICE = "The coding agent advised the user to run fewer parallel chats until 23
 MIX = "From 2026-08-08 to 2026-08-14 the user's tokens were 81% one model and 19% another, 12.4B in total."
 SISTER = "Mira, the user's sister, talks with them on WhatsApp most evenings about her exams."
 WORK = "The user builds Pinecone, a desktop assistant, by directing coding agents and reviewing their work."
-HABIT = "On 4 of the last 5 weekday evenings the user played Valorant from about 22:00 to midnight."
+HABIT = "On 4 of the last 5 weekday evenings the user practised the cello from about 19:30 to 20:30."
 LASTING = "The user runs several Claude accounts for coding across their Mac and PC."
 
 
@@ -203,7 +203,7 @@ def _facts(store):
         FactChange("ADD", None, "work", "token mix", MIX, 0.6, [j[2]], T0),
         FactChange("ADD", None, "person", "Mira", SISTER, 0.9, [j[3]], T0),
         FactChange("ADD", None, "work", "Pinecone", WORK, 0.9, [j[3]], T0),
-        FactChange("ADD", None, "behaviour", "Valorant", HABIT, 0.6, [j[3]], T0),
+        FactChange("ADD", None, "behaviour", "cello", HABIT, 0.6, [j[3]], T0),
         FactChange("ADD", None, "work", "advice", ADVICE, 0.5, [j[1]], T0),
         FactChange("ADD", None, "open_loop", "Mira", "The user owes Mira the notes.", 0.8, [j[3]], T0),
     ])

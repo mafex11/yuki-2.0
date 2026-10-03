@@ -248,12 +248,12 @@ several Claude accounts for coding across their Mac and PC."
 limits." - an AI tool's advice for one evening.
 - FAILS: "From 2026-08-08 to 2026-08-14 the user's tokens were 81% one model, 12% another, 7% a third, \
 17.6B in total." - a model mix and token counts.
-- FAILS: "The user's C: drive had 41 GB free on 2026-08-20 after a cleanup." - one day's machine state.
+- FAILS: "The user's backup NAS was 93% full on the morning of 2026-08-20." - one day's machine state.
 - PASSES: "The user built Meterly, a menu-bar app that shows their AI coding spend." - their own work, \
 lasting; its readings ("Meterly showed $312 this week") would fail.
 - PASSES: "The user builds Pinecone, a desktop assistant, by directing coding agents and reviewing \
 their work." - their work and how they work.
-- PASSES: "On 4 of the last 5 weekday evenings the user played Valorant from about 22:00 to midnight." - \
+- PASSES: "On 4 of the last 5 weekday evenings the user practised the cello from about 19:30 to 20:30." - \
 a habit of theirs across days; its numbers describe them.
 - PASSES: "Asha, the user's sister, talks with them on WhatsApp most evenings about her exams." - a \
 person in their life."""
