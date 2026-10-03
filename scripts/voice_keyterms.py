@@ -27,9 +27,9 @@ from yuki.config import Settings  # noqa: E402
 from yuki.voice.keys import DEEPGRAM, get_key  # noqa: E402
 
 #: The names each clip says (test data: what the clip's text was written with).
-TARGETS = {"m_hemanth": ["Hemanth"], "m_varun": ["Varun"], "m_cli": ["CLI"], "m_komal": ["Komal"],
+TARGETS = {"m_tarnesh": ["Tarnesh"], "m_rohit": ["Rohit"], "m_cli": ["CLI"], "m_kavya": ["Kavya"],
            "m_bhaskar": ["Bhaskar", "Malini"], "m_corvana": ["Corvana"], "m_claude": ["Claude"],
-           "m_jatin": ["Jatin"], "m_hemanth2": ["Hemanth"], "m_ezra": ["Ezra"]}
+           "m_jatin": ["Jatin"], "m_tarnesh2": ["Tarnesh"], "m_ezra": ["Ezra"]}
 
 
 def _pcm(path: Path) -> bytes:

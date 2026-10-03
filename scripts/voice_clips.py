@@ -192,7 +192,7 @@ V35_USER = ("deepgram", "aura-2-arcas-en")
 V35_CLIPS = [
     ("n_hello", "Hello."),
     ("n_working", "Nothing much. I'm just working right now."),
-    ("n_hemanth", "Tell Hemanth on WhatsApp, ask him when he will join Discord."),
+    ("n_tarnesh", "Tell Tarnesh on WhatsApp, ask him when he will join Discord."),
     ("n_chrome", "Switch back to the Chrome browser."),
     ("n_cli", "What's the CLI setup?"),
     ("n_thanks", "Nothing much as of now. Thank you."),
@@ -208,20 +208,20 @@ V35_CLIPS = [
     # v3.5 clarify: what recognition gets wrong, as it came out live (said as heard), and the answers
     ("g_cloud", "Close the cloud tabs on Chrome."),
     ("g_yes", "Yeah, the Claude ones."),
-    ("g_niche", "Tell hey meant on WhatsApp to call me."),
-    ("g_yes2", "Yes, Hemanth."),
+    ("g_niche", "Tell tar niche on WhatsApp to call me."),
+    ("g_yes2", "Yes, Tarnesh."),
 ]
 NAMES_VOICES = [("deepgram", "aura-2-arcas-en"), ("deepgram", "aura-2-orion-en"), ("elevenlabs", "TX3LPaxmHKxFdv7VOQHJ")]
 NAMES_CLIPS = [
-    ("m_hemanth", "Send Hemanth a message on WhatsApp."),
-    ("m_varun", "I'm waiting for Varun's document approval."),
+    ("m_tarnesh", "Send Tarnesh a message on WhatsApp."),
+    ("m_rohit", "I'm waiting for Rohit's document approval."),
     ("m_cli", "What's the CLI setup?"),
-    ("m_komal", "Did Komal reply on Slack?"),
+    ("m_kavya", "Did Kavya reply on Slack?"),
     ("m_bhaskar", "Tell Bhaskar and Malini I'm running late."),
     ("m_corvana", "Open the Corvana dashboard."),
     ("m_claude", "Close the Claude tabs."),
     ("m_jatin", "Ask Jatin to review the pull request."),
-    ("m_hemanth2", "Is Hemanth on Discord right now?"),
+    ("m_tarnesh2", "Is Tarnesh on Discord right now?"),
     ("m_ezra", "Check what Ezra said in the DM."),
 ]
 
@@ -451,6 +451,7 @@ V318_CLIPS = [
     ("p_correction", "No. No. No. Not my system's audio. I want you to turn your volume down."),
     ("p_restore", "Restore the pages."), ("p_youtube", "Open YouTube."),
     ("p_chrome_restore", "Open Chrome and restore the pages."), ("p_thanks", "Thanks."),
+    ("p_open_chrome", "Open Chrome."),
 ]
 
 

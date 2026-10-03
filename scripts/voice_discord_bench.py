@@ -56,9 +56,9 @@ CHANNELS = {
                          "slime-videos", "bot", "memes", "spam", "private-stuff", "neko", "no-mic",
                          "art-corner", "asmr", "food-corner", "cool-places"],
 }
-MEMBERS = ["Hemanth", "Harry Tran", "Mafex", "Riya", "Kabir", "Zed", "Ananya", "Vik", "Yash", "Ishaan", "Meera",
+MEMBERS = ["Tarnesh", "Harry Tran", "Mafex", "Riya", "Kabir", "Zed", "Ananya", "Vik", "Yash", "Ishaan", "Meera",
            "Dev", "Sana", "Arjun", "Noor", "Kavya"]
-USERNAMES = {"Hemanth": "hemanth_q", "Harry Tran": "harryt", "Mafex": "mafex11", "Riya": "riya.k", "Kabir": "kabz",
+USERNAMES = {"Tarnesh": "tarnesh_q", "Harry Tran": "harryt", "Mafex": "mafex11", "Riya": "riya.k", "Kabir": "kabz",
              "Zed": "zedd", "Ananya": "ann", "Vik": "vikram", "Yash": "yash_b", "Ishaan": "ish", "Meera": "meera.s",
              "Dev": "devv", "Sana": "sana_x", "Arjun": "arjunr", "Noor": "noor", "Kavya": "kavya7"}
 
@@ -447,13 +447,13 @@ class DiscordDesk(StubDesktop):
 TASKS = {
     # tonight's third job: already in the channel
     "in_channel": dict(start=("Mafex's Hangout", "after-hours"),
-                       request="Tag Hemanth in a message and ask when he will join the Discord VC",
-                       heard=["Tag Hemanth in a message and ask when he'll join the VC."], said=["On it."]),
+                       request="Tag Tarnesh in a message and ask when he will join the Discord VC",
+                       heard=["Tag Tarnesh in a message and ask when he'll join the VC."], said=["On it."]),
     # the whole intent in one hand-off (v3.15, item 3c)
     "full": dict(start=("Study Hall", "general"),
-                 request="Message Hemanth in the after-hours channel on the Mafex's Hangout server asking "
+                 request="Message Tarnesh in the after-hours channel on the Mafex's Hangout server asking "
                          "when he'll join the VC",
-                 heard=["Message Hemanth in after-hours on the Mafex server asking when he'll join."],
+                 heard=["Message Tarnesh in after-hours on the Mafex server asking when he'll join."],
                  said=["On it."]),
 }
 
@@ -500,7 +500,7 @@ def one(task: str, spec: dict, kwargs: dict) -> dict:
     summary = agent.last_summary or {}
     state = desk.desk_state()
     sent = [m for m in state["sent"] if m["server"] == "Mafex's Hangout" and m["channel"] == "after-hours"]
-    tagged = any(("mention", "Hemanth") in m["parts"] for m in sent)
+    tagged = any(("mention", "Tarnesh") in m["parts"] for m in sent)
     steps = _steps(tmp / "sessions")
     calls = [s for s in steps if "first_tool_ms" in s]
     views = [s["chars"] for s in steps if "view" in s]

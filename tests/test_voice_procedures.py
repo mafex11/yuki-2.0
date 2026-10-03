@@ -505,6 +505,35 @@ def test_keys_type_and_keys_with_an_expectation_switch_the_channel_and_send_noth
     assert [c[0] for c in desk.calls] == ["hotkey", "type_text", "hotkey"]
 
 
+def test_an_expectation_settles_what_a_report_could_not_tell_and_never_overrules_a_measured_verdict() -> None:
+    """Replay 3 Oct: the talker's expect for the Restore click was its own paraphrase ("the last session's tabs come
+    back"), no text on the screen, while the click had verifiably restored them: no deviation for that."""
+    from practice_eval import RESTORED, WARP
+
+    desk = _desk("restore_pages", front=WARP)
+    bridge = EscalateBridge()
+    hands = _hands(desk, words=["Restore the pages."], offered={"pb:9": RESTORE}, bridge=bridge)
+    steps = [RESTORE_STEPS[0], dict(RESTORE_STEPS[1], expect="the last session's tabs come back")]
+    p = _run(hands, "run_skill", {"say_first": "", "skill": "pb:9", "steps": steps, "sends": False,
+                                  "say_when_done": "Your pages are back."})
+    assert p.spoken == ["Your pages are back."] and bridge.escalated == []
+    assert [t["name"] for t in desk.chrome_tabs] == [n for n, _u in RESTORED]
+    # a scroll's report cannot tell; its expected words on the screen settle it
+    from practice_eval import DISCORD
+
+    desk2 = _desk("discord_tag", front=DISCORD)
+    hands2 = _hands(desk2, words=["scroll down"], offered={"pb:10": CHANNEL}, bridge=EscalateBridge())
+    p2 = _run(hands2, "run_skill", {"say_first": "", "skill": "pb:10", "steps": [
+        {"do": "scroll", "direction": "down", "expect": "general"}], "sends": False, "say_when_done": "Done."})
+    assert p2.spoken == ["Done."]
+    # not seen either: it ran, the effect is unknown, and the thinker is asked to look (not told it failed)
+    hands3 = _hands(_desk("discord_tag", front=DISCORD), words=["scroll down"], offered={"pb:10": CHANNEL},
+                    bridge=EscalateBridge())
+    p3 = _run(hands3, "run_skill", {"say_first": "", "skill": "pb:10", "steps": [
+        {"do": "scroll", "direction": "down", "expect": "nowhere to be seen"}], "sends": False, "say_when_done": ""})
+    assert p3.spoken == [] and "could not show its effect" in hands3.bridge.escalated[0]["context"]
+
+
 def test_a_key_never_follows_a_step_whose_effect_could_not_be_seen() -> None:
     from practice_eval import DISCORD
 
@@ -552,12 +581,12 @@ def test_a_way_that_was_not_offered_or_cannot_run_as_written_does_nothing_and_go
 def test_never_a_send_unless_their_words_plainly_said_what_goes_to_whom() -> None:
     from yuki.voice.skills import check_sends, check_texts, parse_steps
 
-    said = ["tell Hemanth I'm on in ten"]
+    said = ["tell Tarnesh I'm on in ten"]
     assert check_sends({"sends": False}, said) is None
-    assert check_sends({"sends": True, "to": "Hemanth", "what": "I'm on in ten"}, said) is None
-    assert "do not plainly say" in check_sends({"sends": True, "to": "Hemanth", "what": ""}, ["message Hemanth"])
-    assert "not what they said" in check_sends({"sends": True, "to": "Hemanth", "what": "see you soon"}, said)
-    assert "not what they said" in check_sends({"sends": True, "to": "Elina", "what": "I'm on in ten"}, said)
+    assert check_sends({"sends": True, "to": "Tarnesh", "what": "I'm on in ten"}, said) is None
+    assert "do not plainly say" in check_sends({"sends": True, "to": "Tarnesh", "what": ""}, ["message Tarnesh"])
+    assert "not what they said" in check_sends({"sends": True, "to": "Tarnesh", "what": "see you soon"}, said)
+    assert "not what they said" in check_sends({"sends": True, "to": "Meher", "what": "I'm on in ten"}, said)
     steps = parse_steps([{"do": "type", "text": "I'm on in ten"}, {"do": "keys", "keys": ["enter"]}])
     assert check_texts(steps, said, "") is None
     assert check_texts(parse_steps([{"do": "type", "text": "I'm on in five"}]), said, "") is not None
@@ -777,19 +806,21 @@ def test_closing_tabs_is_checked_with_the_tab_names_and_a_new_user_turn_is_a_new
     assert judge.requests == 2
 
 
-def test_a_learned_ways_keys_are_checked_and_a_held_step_stops_it_and_asks_the_user() -> None:
+def test_a_learned_ways_keys_are_checked_and_a_held_step_stops_it_and_asks_the_user(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     from practice_eval import DISCORD
 
     desk = _desk("discord_tag", front=DISCORD)
     bridge = EscalateBridge()
     hands = _hands(desk, words=["go to the general channel"], offered={"pb:10": CHANNEL}, bridge=bridge)
-    judge = FakeJudge(allow=True)
-    hands._authorizer = judge
+    forced = _forced(monkeypatch, hands, allow=True)
+    judge = hands._authorizer
     steps = [{"do": "keys", "keys": ["ctrl", "k"]}, {"do": "type", "text": "general"},
              {"do": "keys", "keys": ["enter"], "expect": "general"}]
     p = _run(hands, "run_skill", {"say_first": "", "skill": "pb:10", "steps": steps, "sends": False,
                                   "say_when_done": "There."})
-    assert p.spoken == ["There."] and [c[0] for c in judge.calls] == ["hotkey", "hotkey"]   # typing is not judged
+    assert p.spoken == ["There."] and [c[0] for c in judge.calls] == ["hotkey", "hotkey"]   # keys: the gate's own
+    assert [j[0] for j in forced.judged] == ["type_text"]                                  # typing: always judged
     assert judge.calls[1][4] == ['hotkey {"do": "keys", "keys": ["ctrl", "k"]}',
                                  'type_text {"do": "type", "text": "general"}']   # the run's earlier calls
     # held at its first key: nothing is pressed, the user is asked, the thinker is not handed it
@@ -825,3 +856,165 @@ def test_the_hand_off_note_follows_the_thinkers_finish_contract(monkeypatch: pyt
     assert "worded as the outcome" in old and "Give each action or slower read its say_now" in old
     monkeypatch.setattr(mouth, "_FINISH_CONTRACT", None)
     assert mouth.finish_contract() in ("boolean", "string")   # probed from the agent's own schema
+
+
+# -- 7. the 34-review fixes (H1, H4, H5, M7) ---------------------------------------------------------------------
+
+class ForcedJudge:
+    """``yuki.agent.judge``'s public request and decision, for calls its gate lets through (a click on a button,
+    typing): records what was judged and answers allow or hold."""
+
+    def __init__(self, allow: bool = True) -> None:
+        self.allow = allow
+        self.judged: list[tuple[str, dict, list, dict]] = []
+
+    def judge_request(self, words: list, name: str, tool_input: dict, *, target: Any = None, levels: Any = None,
+                      traits: Any = None, model: str = "", cache: bool = True, review: bool = False,
+                      earlier: Any = ()) -> dict:
+        if not review:
+            self.judged.append((name, dict(tool_input), [w["text"] for w in words], dict(target or {})))
+        return {"name": name, "review": review}
+
+    def decide(self, client: Any, params: dict, *, timeout_s: float = 4.0, need: Any = (), on_rest: Any = None) -> Any:
+        return SimpleNamespace(allowed=self.allow, decision="allow" if self.allow else "ask_user", error=None,
+                               question="" if self.allow else "Send it to Sam?", why="their words did not say it",
+                               source="judge", ms=900.0, scope="call", usage={})
+
+
+def _forced(monkeypatch: pytest.MonkeyPatch, hands: Any, *, allow: bool = True) -> ForcedJudge:
+    import types
+
+    import yuki.agent.tools as agent_tools
+
+    import yuki.agent
+
+    fake = ForcedJudge(allow)
+    module = types.ModuleType("yuki.agent.judge")
+    module.judge_request, module.decide = fake.judge_request, fake.decide
+    monkeypatch.setitem(sys.modules, "yuki.agent.judge", module)
+    monkeypatch.setattr(yuki.agent, "judge", module, raising=False)   # a brain that has the judge imported it already
+    monkeypatch.setattr(agent_tools, "tool_traits", lambda name, tool_input=None: SimpleNamespace(), raising=False)
+    gate = FakeJudge(allow=True)   # its own gate: closes and keys only (clicks and typing pass at the default)
+    gate.settings = SimpleNamespace(judge_model="haiku", judge_timeout_s=8.0)
+    gate.policy = SimpleNamespace(levels=lambda: {})
+    hands._authorizer = gate
+    hands._judge_client = lambda: object()
+    return fake
+
+
+def test_a_click_on_a_button_and_any_typing_are_judged_with_the_heard_words_even_at_the_default_policy(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """34-review H1/H2: the click hand could press any item (a Send or Delete button) and the type hand type
+    model-written words; the judge's gate lets both through at "Click and type: do it and tell me". A click on a button,
+    menu item or link and every typing now go to the check, with what speech recognition heard (never the talker's
+    words); a held one is not done and the talker asks the check's question."""
+    from practice_eval import CHROME, DISCORD
+
+    desk = _desk("restore_pages", open=[CHROME], front=CHROME)
+    hands = _hands(desk, words=["restore the pages"], bridge=EscalateBridge())
+    fake = _forced(monkeypatch, hands, allow=True)
+    hands.snapshot()
+    hands._read_items(CHROME, desk.title(CHROME), own=True)
+    hands.snapshot()
+    items = hands.items.items
+    tab = next(i for i, it in enumerate(items, 1) if it["role"] == "TabItem")
+    _run(hands, "click", {"window": CHROME, "item": tab, "say_when_done": ""})
+    assert fake.judged == []                        # a tab is selected, nothing sent: as the policy says (not judged)
+    hands.snapshot()
+    hands._read_items(CHROME, desk.title(CHROME), own=True)
+    hands.snapshot()
+    restore = next(i for i, it in enumerate(hands.items.items, 1) if it["name"] == "Restore")
+    _run(hands, "click", {"window": CHROME, "item": restore, "say_when_done": ""})
+    name, tool_input, words, target = fake.judged[0]
+    assert name == "click" and tool_input["element"] == 'Button "Restore"' and words == ["restore the pages"]
+    assert target["app"] == "chrome.exe" and not desk.bubble           # allowed: clicked
+    # typing, held: nothing typed, the talker asks the check's question, nothing goes to the thinker
+    desk2 = _desk("discord_tag", front=DISCORD)
+    desk2.discord_view = "general"
+    hands2 = _hands(desk2, words=["message the general channel"], bridge=EscalateBridge())
+    fake2 = _forced(monkeypatch, hands2, allow=False)
+    p = _run(hands2, "type", {"window": DISCORD, "text": "see you all at nine", "say_when_done": ""})
+    assert fake2.judged[0][0] == "type_text" and fake2.judged[0][1]["text"] == "see you all at nine"
+    assert "type_text" not in [c[0] for c in desk2.calls] and desk2.draft == ""
+    assert "Send it to Sam?" in p.results[0]["how_to_handle_it"] and hands2.bridge.escalated == []
+
+
+def test_the_act_switch_off_for_an_app_stops_clicks_typing_and_keys_there(tmp_path: Path) -> None:
+    """34-review H5: Settings can switch "Act" off per app ("Yuki won't click or type in Discord"); the talker's click,
+    type and key hands, and a learned way's steps, refuse to act there and say so (nothing goes to the thinker)."""
+    import json
+
+    from practice_eval import DISCORD
+
+    policy = tmp_path / "autonomy.json"
+    policy.write_text(json.dumps({"apps": {"discord": {"name": "Discord", "act": False}}}), encoding="utf-8")
+    desk = _desk("discord_tag", front=DISCORD)
+    bridge = EscalateBridge()
+    hands = _hands(desk, words=["open the general channel"], offered={"pb:10": CHANNEL}, bridge=bridge)
+    hands.policy_path = policy
+    assert hands.act_off("Discord.exe") == "Discord" and hands.act_off("chrome.exe") is None
+    hands.snapshot()
+    hands._read_items(DISCORD, desk.title(DISCORD), own=True)
+    hands.snapshot()
+    item = next(i for i, it in enumerate(hands.items.items, 1) if it["name"].startswith("general"))
+    p = _run(hands, "click", {"window": DISCORD, "item": item, "say_when_done": ""})
+    assert desk.calls == [] and "Act is switched off for Discord" in p.results[0]["how_to_handle_it"]
+    p = _run(hands, "run_skill", {"say_first": "", "skill": "pb:10", "sends": False, "say_when_done": "",
+                                  "steps": [{"do": "keys", "keys": ["ctrl", "k"]}]})
+    assert desk.calls == [] and "Act is switched off" in p.results[0]["how_to_handle_it"] and bridge.escalated == []
+    # a stand-in desk never reads the user's real settings unless told where they are
+    hands.policy_path = None
+    assert hands.act_off("Discord.exe") is None
+
+
+class WordsRuntime(FakeRuntime):
+    def submit(self, text: str, *, origin_hwnd: Any = None, source: str = "text", lane: Any = None,
+               view_hwnd: Any = None, memory_query: Any = None, user_words: Any = None) -> tuple[str, int]:
+        return super().submit(text, origin_hwnd=origin_hwnd, source=source, lane=lane, view_hwnd=view_hwnd,
+                              memory_query=memory_query, user_words=user_words)
+
+
+def test_a_hand_off_passes_what_speech_recognition_heard_apart_as_the_users_words() -> None:
+    """34-review H4: the talker's request is its reading of the words and may carry content it made up ("message
+    Sam" -> "Message Sam asking when he joins tonight"); the heard turns go apart, labelled as the user's own words, for
+    the judge (only when the runtime names ``user_words``)."""
+    from test_voice_v39 import Params as TellParams
+
+    async def main(rt: Any) -> list:
+        _rt, bridge = _bridge(rt)
+        task = asyncio.create_task(bridge.tell_yuki(TellParams("Message Sam asking when he joins tonight",
+                                                               heard="message sam")))
+        await _settle()
+        task.cancel()
+        return rt.submitted
+
+    got = asyncio.run(main(WordsRuntime()))
+    assert got[-1][2]["user_words"] == [{"how": "voice", "text": "message sam"}]
+    assert "user_words" not in asyncio.run(main(FakeRuntime()))[-1][2]
+
+
+def test_a_lost_speaker_in_a_call_is_never_moved_to_speakers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """34-review M7: in a call (or with voice_require_headphones) the default output takes over only when it is
+    headphones; otherwise the conversation ends with speaker_gone, so Yuki never plays into the call's microphone."""
+    from test_voice_v316 import _Speaker, _session, _wait_for
+
+    for headphones in (False, True):
+        monkeypatch.setattr("yuki.voice.audio.headphones_check",
+                            lambda *a, h=headphones, **k: (h, {"form_factor": "headphones" if h else "speakers"}))
+        session, _played = _session(tmp_path, voice_echo="full")
+        speaker = _Speaker()
+        session._speaker, session.speaker_used = speaker, "Headphones (WH-XB900N)"
+        session._thread = SimpleNamespace(is_alive=lambda: True)
+        session._mic = SimpleNamespace(is_open=True, device=None, stats=SimpleNamespace(blocks=1),
+                                       set_echo=lambda g: None, device_used="Mic")
+        session.call_app = "Discord"
+        stops: list[str] = []
+        session.stop_conversation = lambda reason="user", wait_s=0.0: stops.append(reason)
+        session._output_target = lambda chosen: chosen
+        session._on_devices_seen({"devices": {"capture": [], "render": ["Speakers (Realtek)"]}, "stalled": False})
+        assert _wait_for(lambda: not session._rerouting and (bool(stops) or bool(speaker.switched)))
+        if headphones:
+            assert stops == [] and speaker.switched == [None]
+        else:
+            assert stops == ["speaker_gone"] and speaker.switched == []
+        session._thread = None

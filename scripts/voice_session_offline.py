@@ -66,7 +66,26 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     timeline = Timeline()
     desk = _hands_desk(timeline)
     runtime = TimedBrain([[(3.0, "done", "Done.")]] * 10, timeline)
-    session = VoiceSession(settings, runtime, None, prefs_path=tmp / "voice.json")
+    memory = service = None
+    if getattr(args, "db", None):
+        # v3.18: memory on a COPY (practice memory's lines for the talker, the hands' run traces, the grounding
+        # lookup), its embedder served from a stand-in service process over its pipe as live; never the real memory
+        import os
+        import shutil
+
+        from voice_scenarios import _serve_embedder
+
+        from yuki.agent.memory import MemoryAccess
+
+        mem_dir = tmp / "memory"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("memory.db", "memory.key", "privacy.toml"):
+            if (args.db / name).exists():
+                shutil.copy2(args.db / name, mem_dir / name)
+        os.environ["YUKI_MEMORY_DIR"] = str(mem_dir)
+        service = _serve_embedder(mem_dir / "memory.db")
+        memory = MemoryAccess(path=mem_dir / "memory.db")
+    session = VoiceSession(settings, runtime, memory, prefs_path=tmp / "voice.json")
     session.bridge = VoiceBridge(runtime, session.log, settings=settings, hands_backend=desk, foreground=lambda: None)
     session.play_tone = lambda *a: timeline.add("notice_tone")
     session.extra_observers = (timeline.observer(),)
@@ -219,6 +238,8 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         app.processEvents()
         time.sleep(0.05)
     session.shutdown()
+    if service is not None:
+        service.kill()
     t0 = timeline.t0
     mic = mics[0] if mics else None
     line_starts = [ln["started_at"] - t0 for ln in (mic.lines if mic else [])]
@@ -360,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-standby", dest="no_standby", action="store_true", help="v3.11: build on the wake (before)")
     ap.add_argument("--audit-io", dest="audit_io", action="store_true",
                     help="v3.17: count every disk access on the voice loop's thread (where in the code, which file)")
+    ap.add_argument("--db", type=Path, default=None,
+                    help="v3.18: a folder with a COPY of memory (memory.db, memory.key): practice lines, hand traces")
     ap.add_argument("--one-breath", dest="one_breath", action="store_true",
                     help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
     args = ap.parse_args(argv)

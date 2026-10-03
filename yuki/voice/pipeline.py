@@ -472,7 +472,7 @@ def one_stop_per_turn(base: type) -> type:
 
 
 #: A word recognized with less confidence than this is named to the mouth (measured 2026-09-27 on 44 clips:
-#: misheard names 0.40-0.74, e.g. "harsh" 0.40, "Hemish" 0.48, "Varez" 0.49; words of clear commands mostly
+#: misheard contacts' names 0.40-0.74 (the cases are in docs/, not in code); words of clear commands mostly
 #: >= 0.9, a few 0.64-0.86).
 LOW_WORD_CONFIDENCE = 0.7
 #: ... but only for words of at least this many letters; a shorter word only below :data:`VERY_LOW_CONFIDENCE`.
@@ -480,13 +480,13 @@ LOW_WORD_CONFIDENCE = 0.7
 #: 12 of 100 turns were flagged, mostly on short words said right ("can", "the", "pass", "What", "made"), and
 #: each flag cost the reply ~2 s (its words held, a second mouth run). With the length rule 7 of 100, and 6 of
 #: those 7 were real mistranscriptions ("You can me OTP" for "you key in the OTP", "Soaki", "picoris"); the
-#: misheard names of v3.5 are all 5+ letters ("harsh" 0.40, "Hemish", "Varez", "savvy", "letter path").
+#: misheard names of v3.5 are all 5+ letters.
 LOW_WORD_MIN_LETTERS = 5
 VERY_LOW_CONFIDENCE = 0.4
 #: A heard word (or two adjacent ones) this similar to a keyterm, without being it, is named as sounding close
-#: (measured: "Hemish" / "harsh" / "Hemant" 0.83-0.92 and "hey meant" 0.67 against Hemanth, "Komala" 0.83
-#: against Komal, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every name). A
-#: similarity measure, no word list.
+#: (measured: three mishearings of one contact's name 0.83-0.92 and the same name heard as two English words 0.67
+#: against it, another contact's 0.83, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every
+#: name). A similarity measure, no word list.
 NEAR_TERM_RATIO = 0.65
 
 
@@ -546,8 +546,8 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     exact = {i for i, w in enumerate(spoken) if key(w) in terms}
     exact |= {j for i in range(len(spoken) - 1) if key(spoken[i] + spoken[i + 1]) in terms for j in (i, i + 1)}
     def closest(k: str) -> str | None:
-        # The same first sound and most of the letters: misheard names keep their start ("Hemish", "hey
-        # meant" for Hemanth, "cloud" for Claude); a word that merely contains a name's letters does not
+        # The same first sound and most of the letters: misheard names keep their start ("tar niche" for
+        # Tarnesh, "cloud" for Claude); a word that merely contains a name's letters does not
         # ("after" in "Father"). Measures of the two strings, no word list.
         best = max((t for t in terms if t[:1] == k[:1] and k not in t and t not in k),
                    key=lambda t: difflib.SequenceMatcher(None, k, t).ratio(), default=None)
@@ -1630,8 +1630,6 @@ class TurnObserver:
         self._eager_at = time.monotonic()
         if self.grounder is not None:
             self.grounder.interim(transcript)
-        if self.practice is not None:
-            self.practice.interim(transcript)
 
     def on_update(self, transcript: str) -> None:
         words = " ".join((transcript or "").split())
@@ -1640,8 +1638,9 @@ class TurnObserver:
             self._words_at = time.monotonic()  # when speech recognition last heard a new word
         if self.grounder is not None:
             self.grounder.interim(transcript)
-        if self.practice is not None:
-            self.practice.interim(transcript)   # lessons and learned ways for the words, while they talk (v3.18)
+        # v3.18: practice memory is looked up on the final words only (their lookup, ~10-35 ms measured, fits inside the
+        # grounding wait the talker's call has anyway); a lookup per interim transcript was CPU spent on every word of
+        # every utterance, a call's talk to the others included (lightweight rule)
         if self.hands is not None and hasattr(self.hands, "prefetch_desk"):
             self.hands.prefetch_desk()  # the reply's desktop block, read while they talk (v3.7)
 
@@ -2066,6 +2065,12 @@ class _Hooks:
         desk_task = (asyncio.ensure_future(hands.for_call(self.c.settings.voice_desk_wait_ms))
                      if hands is not None else None)
         practice = getattr(self.c, "practice", None)
+        if practice is not None and user_turn:
+            # the final words' lookup starts here, with the call (the observer sees the transcript a moment later:
+            # Pipecat calls observers from a queue of its own); a lookup of the same words already running is reused
+            words = _last_user_text(context)
+            if words.strip():
+                practice.final(words)
         practice_task = (asyncio.ensure_future(self._practice_for(practice, user_turn))
                          if practice is not None else None)
         lookup_text = await self._lookup(call, user_turn)
@@ -2312,6 +2317,26 @@ def _last_role(context: Any) -> str | None:
         if isinstance(message, dict) and message.get("role") in ("user", "assistant", "developer", "tool"):
             return str(message.get("role"))
     return None
+
+
+def _last_user_text(context: Any) -> str:
+    """The newest user message's words in the talker's context (``""`` when the newest message is not the user's)."""
+    try:
+        messages = context.get_messages()
+    except Exception:  # noqa: BLE001
+        return ""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "developer", "tool"):
+            continue
+        if message.get("role") != "user":
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        return ""
+    return ""
 
 
 class Conversation:

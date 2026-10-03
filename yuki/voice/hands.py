@@ -104,6 +104,12 @@ _JUDGE_HELD_NOTE = (
     "Not done: Yuki's own check held it back, because their words did not plainly ask for this. Nothing was done. Ask "
     "them in a few words, the question alone with no call: {question} If they say yes, call it again."
 )
+#: What the talker reads when the app's "Act" switch is off in Settings (v3.18, 34-review H5).
+_ACT_OFF_NOTE = (
+    "Not done: in Yuki's settings Act is switched off for {app}, so Yuki does not click, type or press keys there; "
+    "nothing was done and the thinker will not do it either. Say so in a few words (they can switch it on in "
+    "Settings); no other hand, no hand-off."
+)
 
 _WINDOW = {"type": "integer", "description": "The window's [hwnd] from the desktop block."}
 _SAID_NOTE = "It worked, verified, and your done line was said. Do not say it again."
@@ -312,6 +318,9 @@ HAND_TOOLS.append(RUN_SKILL_TOOL)
 HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
 #: The hand that runs a learned way (it may take seconds: a say_first, like the openings).
 SKILL_HAND = "run_skill"
+#: UI Automation control types (the platform's fixed vocabulary) whose click can send, delete, buy or sign out: such a
+#: click always passes Yuki's own authorization check (34-review H1/H2: a machine fact, never the control's words).
+RISKY_CLICK_ROLES = frozenset({"Button", "SplitButton", "MenuItem", "Hyperlink"})
 
 #: The items line (v3.14): at most this many items of the window in front, each name cut to this many characters.
 ITEMS_CAP = 20
@@ -666,10 +675,16 @@ class Hands:
         #: use from the thinker's agent (its client, settings and policy), ``False`` when there is none (no judge in
         #: this build, no agent, or the judge turned off); a user turn is one request for it.
         self._authorizer: Any = None
+        #: The judge's model client (the agent's), its verdicts on calls judged although their gate let them through
+        #: (per user turn), and the stored policy's per-app switches as last read (34-review H1, H5).
+        self._judge_client: Any = None
+        self._forced_memo: dict[str, Any] = {}
+        self._acts_cache: tuple[Any, dict[str, bool]] | None = None
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
         self.halted = None
+        self._forced_memo = {}
         judge = self._authorizer
         if judge:
             try:
@@ -702,16 +717,21 @@ class Hands:
             try:
                 self._authorizer = Authorizer(lambda: agent.client, agent.settings, log=judge_log,
                                               policy=getattr(agent.authorizer, "policy", None))
+                self._judge_client = lambda: agent.client
             except Exception:  # noqa: BLE001
                 self._authorizer = False
         return self._authorizer or None
 
     def authorize(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None = None,
-                  earlier: list[str] | None = None) -> Any:
+                  earlier: list[str] | None = None, *, force: bool = False) -> Any:
         """The check's verdict for one call as the thinker's tool it is (``None``: not judged - its metadata and the
-        user's policy do not send it there, or there is no judge). It reads only the user's words in this
-        conversation and the proposed call (the target window's app and title, the element). Blocking (~1 s when it
-        asks the model); off every loop. A check that raises holds the call (fails closed)."""
+        user's policy do not send it there, or there is no judge). It reads only the user's own heard words in this
+        conversation (speech recognition's final transcripts, never the talker's wording) and the proposed call (the
+        target window's app and title, the element). ``force``: judged even when the metadata and the policy would
+        not send it there (34-review H1/H2: a click on a button, menu item or link can send, delete or buy; typing puts
+        words in a field) - by the judge's own request and two-stage decision, memoized per user turn by call and
+        window, never with a window grant. Blocking (~1 s when it asks the model); off every loop. A check that
+        raises or cannot run holds the call (fails closed)."""
         judge = self._judge()
         if judge is None:
             return None
@@ -720,16 +740,145 @@ class Hands:
 
         signature = json.dumps(tool_input, sort_keys=True, default=str)
         try:
-            return judge.check(tool, tool_input, words=words, target=target, signature=signature,
-                               earlier=list(earlier or []))
+            verdict = judge.check(tool, tool_input, words=words, target=target, signature=signature,
+                                  earlier=list(earlier or []))
+            if verdict is None and force:
+                verdict = self._force_judge(judge, tool, tool_input, target or {}, words, list(earlier or []),
+                                            signature)
+            return verdict
         except Exception as exc:  # noqa: BLE001 - fail closed
             return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error",
                                    why=f"the check could not run ({type(exc).__name__})")
+
+    def _force_judge(self, judge: Any, tool: str, tool_input: dict[str, Any], target: dict[str, Any],
+                     words: list[dict[str, Any]], earlier: list[str], signature: str) -> Any:
+        """The judge's verdict for a call its gate lets through at this policy (``yuki.agent.judge``'s public request
+        and decision: the quick verdict, and the careful review when it holds; fail closed on an error)."""
+        from yuki.agent import judge as J
+        from yuki.agent.tools import tool_traits
+
+        key = f"{tool}:{target.get('hwnd')}:{signature}"
+        memo = self._forced_memo.get(key)
+        if memo is not None:
+            return memo
+        settings = getattr(judge, "settings", None)
+        model = str(getattr(settings, "judge_model", "") or "")
+        timeout = float(getattr(settings, "judge_timeout_s", 8.0) or 8.0)
+        levels = judge.policy.levels() if getattr(judge, "policy", None) is not None else {}
+        traits = tool_traits(tool, tool_input)
+        client = self._judge_client() if self._judge_client is not None else None
+        if client is None:
+            return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error",
+                                   why="the authorization check could not run")
+        verdict = J.decide(client, J.judge_request(words, tool, tool_input, target=target, levels=levels,
+                                                   traits=traits, model=model, earlier=earlier),
+                           timeout_s=timeout, need=())
+        if verdict.error is None and not verdict.allowed:
+            first = verdict
+            again = J.decide(client, J.judge_request(words, tool, tool_input, target=target, levels=levels,
+                                                     traits=traits, model=model, review=True, earlier=earlier),
+                             timeout_s=timeout + 2.0, need=())
+            if again.error is None:
+                again.question = again.question or first.question
+                again.why = again.why or first.why
+                again.source = "review"
+                again.ms = round(first.ms + again.ms, 1)
+                verdict = again
+        if verdict.error is not None:
+            verdict.decision, verdict.source = "ask_user", "error"
+            verdict.why = "the authorization check could not run"
+        else:
+            self._forced_memo[key] = verdict
+        if self.log is not None:
+            self.log.event("judge", who="voice_hand", forced=True, tool=tool, decision=verdict.decision,
+                           source=verdict.source, ms=verdict.ms, error=verdict.error)
+        return verdict
+
+    # -- 34-review H5: the per-app "Act" switch in Settings ----------------------------------------------------
+
+    #: Where the stored autonomy policy lives (``None``: ``%LOCALAPPDATA%\\Yuki\\autonomy.json``, as the judge reads it).
+    policy_path: Any = None
+
+    def act_off(self, app: str | None) -> str | None:
+        """The name Settings switched "Act" off for, when ``app`` (a window's process, or a popup's app name) is that
+        app: Yuki may not click, type or press keys there. Read like the judge's policy reader (the ``apps`` of the
+        stored policy file, re-read when it changes), by names only: the process, its stem and its display name are
+        compared with the switched-off names, case aside. ``None``: allowed (or nothing switched off)."""
+        if not app:
+            return None
+        acts = self._app_acts()
+        if not acts or all(acts.values()):
+            return None
+        names = {str(app), str(app).removesuffix(".exe"), str(app).rsplit(".", 1)[0]}
+        try:
+            from yuki.core import appnames
+
+            names.add(str(appnames.name_for_key(str(app)) or ""))
+        except Exception:  # noqa: BLE001 - the process names are enough
+            pass
+        for name in names:
+            if name and acts.get(name.casefold()) is False:
+                return name
+        return None
+
+    def _app_acts(self) -> dict[str, bool]:
+        """``{app name casefolded: allowed}`` from the stored policy (the judge's reader when it has ``apps``)."""
+        if self.policy_path is None and not _is_real_backend(self.backend):
+            return {}   # a stand-in desk never reads the user's real settings (tests set policy_path)
+        judge = self._judge() if self.policy_path is None else None
+        reader = getattr(getattr(judge, "policy", None), "apps", None) if judge else None
+        if callable(reader):
+            try:
+                got = reader()
+                if isinstance(got, dict):
+                    return {str(k).casefold(): bool(v) for k, v in got.items()}
+            except Exception:  # noqa: BLE001 - then the file is read here
+                pass
+        path = self.policy_path
+        if path is None:
+            try:
+                from yuki.agent.judge import policy_path
+
+                path = policy_path()
+            except Exception:  # noqa: BLE001 - an older brain: the same file, by its documented place
+                import os
+                from pathlib import Path
+
+                path = Path(os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")) / "Yuki" / \
+                    "autonomy.json"
+        from pathlib import Path
+
+        try:
+            st = Path(path).stat()
+            stamp = (str(path), st.st_mtime, st.st_size)
+        except OSError:
+            return {}
+        if self._acts_cache is not None and self._acts_cache[0] == stamp:
+            return self._acts_cache[1]
+        import json
+
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        apps = raw.get("apps") if isinstance(raw, dict) else None
+        acts = {str(k).casefold(): bool(v.get("act", True)) for k, v in (apps or {}).items()
+                if isinstance(v, dict) and str(k).strip()} if isinstance(apps, dict) else {}
+        self._acts_cache = (stamp, acts)
+        return acts
+
+    def _refuse_if_act_off(self, app: str | None) -> None:
+        off = self.act_off(app)
+        if off:
+            raise _Refused(f"Act is switched off for {off} in Yuki's settings, so Yuki does not click, type or press "
+                           f"keys there; nothing was done", act_off=off)
 
     def _check_hand(self, name: str, args: dict[str, Any]) -> None:
         """Hold a hand the check holds (raises :class:`_Refused` with ``held``): a window close, a tab close, or a kind
         the user's autonomy policy holds back (the hand's fixed name and operation map to the thinker's tool, whose
         metadata decides; the media keys are a fixed set of sound keys that can close or send nothing)."""
+        if name in ("click", "type"):
+            return   # judged inside, once the control they act on is known (its role decides for a click)
         hwnd = args.get("window")
         names: list[str] = []
         if name == "tab":
@@ -1084,7 +1233,7 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
-        if not confirmed and not facts.get("settled") and not facts.get("held"):
+        if not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off"):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
         if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
             self.closed_at = time.monotonic()
@@ -1137,6 +1286,11 @@ class Hands:
             question = str(facts.get("question") or "").strip() or "Ask whether they want exactly this."
             await params.result_callback({"held": report[:700],
                                           "how_to_handle_it": _JUDGE_HELD_NOTE.format(question=question)})
+            return
+        if facts.get("act_off"):
+            # v3.18 (34-review H5): Act is off for that app in Settings: nothing is done there, by anyone
+            await params.result_callback({"refused": report[:700], "how_to_handle_it": _ACT_OFF_NOTE.format(
+                app=facts["act_off"])})
             return
         if name == "press_keys" and ok:
             note, key = _KEYS_NOTE, "report"
@@ -1227,7 +1381,10 @@ class Hands:
 
         def write() -> None:
             try:
-                if shown and callable(getattr(memory, "record_run", None)):
+                if shown and _takes_kw(getattr(memory, "record_hand_trace", None), "injected"):
+                    memory.record_hand_trace(**payload, injected=shown)
+                elif shown and callable(getattr(memory, "record_run", None)):
+                    # the same one-step run record_hand_trace keeps, with the playbooks shown (it has no such field)
                     memory.record_run(hand_run(payload, session_id=getattr(memory, "session_id", None),
                                                injected=shown))
                 else:
@@ -1266,6 +1423,7 @@ class Hands:
         steps = trace_steps(results, pid)
         started = min((float(s.get("at") or time.time()) for s in steps), default=time.time())
         outcome = ("final" if ok and facts.get("verified") is True else "held" if facts.get("held") else
+                   "refused" if facts.get("act_off") else
                    "handed_over" if facts.get("deviated_at") is not None else "unverified")
         run = {"source": "hand", "session_id": getattr(memory, "session_id", None), "request_id": request_id,
                "lane": "voice", "at": started, "ended_at": started + float(ms or 0) / 1000.0,
@@ -1377,6 +1535,8 @@ class Hands:
             if exc.held is not None:
                 facts["held"] = True   # ... or asks the check's question (v3.18)
                 facts["question"] = exc.held
+            if exc.act_off is not None:
+                facts["act_off"] = exc.act_off   # ... or says Act is off for that app in Settings (v3.18)
             if exc.stale:
                 # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
                 # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
@@ -1737,10 +1897,19 @@ class Hands:
                 raise _Refused(f"the window changed since it was read and \"{item['name'][:60]}\" is not on it once "
                                f"now; nothing was clicked", stale=True)
             items, item = found
-        lead = self._front(hwnd)
-        facts["target"] = (f'{item.get("role") or "control"} "{str(item.get("name") or "")[:80]}"'
-                           + (f' in "{title[:60]}"' if title else ""))
+        role_name = f'{item.get("role") or "control"} "{str(item.get("name") or "")[:80]}"'
+        facts["target"] = role_name + (f' in "{title[:60]}"' if title else "")
         facts["app"] = facts.get("app") or self._app_at(hwnd)
+        self._refuse_if_act_off(facts["app"])          # 34-review H5
+        # 34-review H1/H2: a click on a button, a menu item or a link can send, delete or buy: Yuki's own check reads
+        # the user's heard words and this call; other clicks only as the user's policy says
+        verdict = self.authorize("click", {"hwnd": hwnd, "element": role_name},
+                                 {"hwnd": hwnd, "app": facts["app"], "title": title, "element": role_name},
+                                 force=str(item.get("role") or "") in RISKY_CLICK_ROLES)
+        if verdict is not None and not getattr(verdict, "allowed", False):
+            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
+                           held=str(getattr(verdict, "question", "") or ""))
+        lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("click", {"element": item["id"], "read": items.read, "expect_hwnd": hwnd})
         from yuki.agent.loop import action_verdict
@@ -1803,6 +1972,14 @@ class Hands:
         if not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
             raise _Refused("what has the keyboard is not a text field you may type in; nothing was typed", stale=True)
         facts["target"] = f'{getattr(snap, "role", "") or "field"} "{str(getattr(snap, "name", "") or "")[:60]}"'
+        self._refuse_if_act_off(facts.get("app"))      # 34-review H5
+        # 34-review H1: typed words land in their work or a message box: always Yuki's own check, with their words
+        verdict = self.authorize("type_text", {"hwnd": hwnd, "text": text},
+                                 {"hwnd": hwnd, "app": facts.get("app"), "title": self._title_shown(hwnd),
+                                  "element": facts["target"]}, force=True)
+        if verdict is not None and not getattr(verdict, "allowed", False):
+            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
+                           held=str(getattr(verdict, "question", "") or ""))
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("type_text", {"text": text, "expect_hwnd": hwnd})
         from yuki.agent.loop import action_verdict
@@ -2113,6 +2290,18 @@ def _what(name: str, args: dict[str, Any]) -> str:
     return " ".join(str(p) for p in parts)
 
 
+def _takes_kw(fn: Any, name: str) -> bool:
+    """Whether ``fn`` names a keyword parameter ``name`` (probed, never assumed)."""
+    if not callable(fn):
+        return False
+    try:
+        import inspect
+
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def judged_call(name: str, args: dict[str, Any], *, tab_names: list[str] | None = None
                 ) -> tuple[str, dict[str, Any]] | None:
     """A talker hand as the thinker's tool for the authorization check (revamp D S1): ``(tool, input)``, whose fixed
@@ -2171,11 +2360,14 @@ class _Refused(Exception):
     said): the thinker gets the request by code instead of a talker run narrating the refusal.
     """
 
-    def __init__(self, message: str, *, stale: bool = False, held: str | None = None) -> None:
+    def __init__(self, message: str, *, stale: bool = False, held: str | None = None,
+                 act_off: str | None = None) -> None:
         super().__init__(message)
         self.stale = stale
         #: Held by the authorization check (v3.18): its question for the user (``""`` without one); ``None``: not held.
         self.held = held
+        #: The app whose "Act" switch is off in Settings (v3.18, 34-review H5), or ``None``.
+        self.act_off = act_off
 
 
 def _step_key(name: str, args: dict[str, Any]) -> str:

@@ -1,7 +1,8 @@
 """Names and terms speech recognition should expect, from memory (docs/VOICE.md §9, v3.5).
 
-Live 2026-09-26 Deepgram heard "Hemanth" as "hey meant" and "Hemish", "Varun" as "Barun",
-and the thinker then messaged the wrong name and memory kept "Barun" as a person. Deepgram
+Live 2026-09-26 Deepgram heard two of the user's contacts' names as other words (one as two
+English words), the thinker then messaged the wrong name and memory kept the misheard one as a
+person (the real cases are in docs/, not in code). Deepgram
 Flux takes keyterms (prompting: the words are boosted in recognition). They come from what
 memory already holds as structured facts, never from a list in code: the portrait's people
 (each person fact's subject is the name), the short names of their work and interests, the
@@ -38,7 +39,7 @@ def terms_from_facts(facts: list[Any], loops: list[Any] = (), limit: int = 50) -
     """Keyterms from portrait facts (``kind``, ``subject``), people first.
 
     Open loops are not used (``loops`` is ignored): their subjects are extracted per loop, and live one
-    was "Barun", the misheard Varun, which as a keyterm would teach recognition the mistake."""
+    was a misheard contact's name, which as a keyterm would teach recognition the mistake."""
     order = {kind: i for i, kind in enumerate(NAME_KINDS)}
     ranked = sorted((f for f in facts if getattr(f, "kind", None) in order),
                     key=lambda f: order[f.kind])
@@ -73,8 +74,8 @@ def memory_keyterms(memory: Any, *, limit: int = 50, timeout_s: float = 1.5) -> 
         return [], {"terms": 0, "error": "no memory"}
 
     def read(client: Any) -> list[str]:
-        # MemoryClient.speech_names (v3.5): the right names of the user's corrections first (a misheard form
-        # such as "Barun" is never included), then the portrait's people and names. Older clients: the facts.
+        # MemoryClient.speech_names (v3.5): the right names of the user's corrections first (a misheard form is
+        # never included), then the portrait's people and names. Older clients: the facts.
         names = getattr(client, "speech_names", None)
         if callable(names):
             return list(names(limit))

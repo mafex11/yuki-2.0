@@ -538,13 +538,13 @@ def _youtube_desk(timeline: Timeline) -> Any:
 def _zen_desk(timeline: Timeline, *, popup: bool = False) -> Any:
     """The live session of 2026-09-28 09:06-09:11 (v3.10), test code only: Chrome closed at first, with a "Restore"
     button once opened (the last session's tabs come back when it is clicked); YouTube's home page with the Sonnet 5.5
-    video among others; WhatsApp in the background with its chat list (Bro, Res, Mother, Elina...). A chat row
+    video among others; WhatsApp in the background with its chat list (Bro, Res, Mother, Meher...). A chat row
     clicked opens that chat; its message list scrolls. What happened is recorded for the report (``opened_chats``).
     """
     base = type(_youtube_desk(timeline))
     sonnet = "Sonnet 5.5 Next Week, GPT-7?, Qwen 4 Spotted and DeepSeek V5 Beats Astra"
     chats = [("Bro", "Yesterday", "on my way"), ("Res", "09:02", "ok see you tomorrow"),
-             ("Mother", "08:40", "reached home?"), ("Elina", "Friday", "sent the pdf"),
+             ("Mother", "08:40", "reached home?"), ("Meher", "Friday", "sent the pdf"),
              ("rohan BAC", "06:07", "Was this you?")]
 
     class ZenDesk(base):  # type: ignore[misc, valid-type]
@@ -1052,12 +1052,12 @@ def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
                   "at": now - 120}
     elif kind in ("alone", "friend"):
         # v3.15: live 30 Sept the user sat alone in a Discord call waiting for a friend (a DM call still ringing).
-        who = ["mafex"] + (["Hemanth"] if kind == "friend" else [])
-        screen = {"host": None, "title": "@Hemanth - Discord",
-                  "controls": ["Direct Messages", "Hemanth , Ongoing Call", "Hemanth", *who,
+        who = ["mafex"] + (["Tarnesh"] if kind == "friend" else [])
+        screen = {"host": None, "title": "@Tarnesh - Discord",
+                  "controls": ["Direct Messages", "Tarnesh , Ongoing Call", "Tarnesh", *who,
                                *([] if kind == "friend" else ["Ringing"]), "Voice Connected", "Disconnect",
                                "Turn On Camera", "Share Your Screen", "Mute", "Deafen", "User Settings",
-                               "Message @Hemanth"],
+                               "Message @Tarnesh"],
                   "at": now - 20}
     elif kind in ("discord", "stale"):
         screen = {"host": "discord.com", "title": "#valorant | Friends - Discord",
@@ -1414,7 +1414,7 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         settled = lambda: _settled(box)  # noqa: E731
         lines = [ScriptLine(clip("n_hello"), "n_hello", after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())
-            for n in ("n_working", "n_hemanth", "n_chrome", "n_cli", "n_thanks", "n_sysvol")]
+            for n in ("n_working", "n_tarnesh", "n_chrome", "n_cli", "n_thanks", "n_sysvol")]
     elif scenario == "tabs926":
         # The live session of 2026-09-26 21:22-21:31 on a stub Chrome with the same tabs: dictation to
         # another app, "close the Claude tabs and the ElevenLabs one", the YouTube volume, "you closed my
@@ -1460,9 +1460,9 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
 
         desk = TabsDesk(timeline=timeline)
         box["desk"] = desk
-        box["keyterms"] = ["Hemanth", "Varun", "Komal", "Jatin", "Claude", "ElevenLabs", "Corvana"]
+        box["keyterms"] = ["Tarnesh", "Rohit", "Kavya", "Jatin", "Claude", "ElevenLabs", "Corvana"]
         runtime = TimedBrain([[(1.5, "tool", ("launch_app", {"query": "WhatsApp"})),
-                               (3.0, "done", "Sent Hemanth: call me.")]] * 3, timeline)
+                               (3.0, "done", "Sent Tarnesh: call me.")]] * 3, timeline)
         settled = lambda: _settled(box)  # noqa: E731
         lines = [ScriptLine(clip("g_cloud"), "g_cloud", after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled())

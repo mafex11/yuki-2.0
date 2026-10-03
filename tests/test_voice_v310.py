@@ -312,7 +312,7 @@ def test_the_speech_line_names_screen_names_and_a_name_run_into_the_next_word() 
 
     words = [{"word": "Open", "confidence": 0.99}, {"word": "the", "confidence": 0.99},
              {"word": "brochure.", "confidence": 0.55}]
-    note, _low, near = heard_note(words, ["Bro", "Elina"], screen=["Bro", "Res"])
+    note, _low, near = heard_note(words, ["Bro", "Meher"], screen=["Bro", "Res"])
     assert "'brochure' may be Bro said together with the next word" in note and near >= 1
     clear = [{"word": "Scroll", "confidence": 0.99}, {"word": "down.", "confidence": 0.99}]
     assert heard_note(clear, ["Bro"], screen=["Bro", "Res", "Search", "Settings"])[0] is None

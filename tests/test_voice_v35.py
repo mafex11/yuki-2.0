@@ -319,14 +319,14 @@ def test_keyterms_are_people_first_short_subjects_only() -> None:
     from yuki.voice.pipeline import keyterm_list
 
     facts = [SimpleNamespace(kind="work", subject="Corvana infrastructure (Vercel/Supabase/GitHub)"),
-             SimpleNamespace(kind="work", subject="Claude"), SimpleNamespace(kind="person", subject="Hemanth"),
-             SimpleNamespace(kind="person", subject="Varun"), SimpleNamespace(kind="behaviour", subject="Late night"),
+             SimpleNamespace(kind="work", subject="Claude"), SimpleNamespace(kind="person", subject="Tarnesh"),
+             SimpleNamespace(kind="person", subject="Rohit"), SimpleNamespace(kind="behaviour", subject="Late night"),
              SimpleNamespace(kind="interest", subject="Driftwood Music / music production")]
     facts.append(SimpleNamespace(kind="work", subject="Speech transcription setup"))
-    loops = [SimpleNamespace(person="Barun")]  # the misheard Varun, as an open loop kept it live
+    loops = [SimpleNamespace(person="Robit")]  # the misheard Rohit, as an open loop kept it live
     terms = terms_from_facts(facts, loops)
-    assert terms == ["Hemanth", "Varun", "Claude"]
-    assert keyterm_list(["Yuki", "Kian"], terms + ["yuki"], 4) == ["Yuki", "Kian", "Hemanth", "Varun"]
+    assert terms == ["Tarnesh", "Rohit", "Claude"]
+    assert keyterm_list(["Yuki", "Kian"], terms + ["yuki"], 4) == ["Yuki", "Kian", "Tarnesh", "Rohit"]
 
 
 # -- the voiced level on a noisy interface input ----------------------------------------------------
@@ -478,15 +478,15 @@ def test_heard_note_names_doubtful_words_and_near_names_only() -> None:
     from yuki.voice.mouth import volatile_block
     from yuki.voice.pipeline import heard_note
 
-    names = ["Hemanth", "Claude", "ElevenLabs", "Father", "Komal"]
+    names = ["Tarnesh", "Claude", "ElevenLabs", "Father", "Kavya"]
 
     def words(text: str, low: dict[str, float] | None = None) -> list[dict]:
         return [{"word": w, "confidence": (low or {}).get(w, 0.99)} for w in text.split()]
 
-    note, low, near = heard_note(words("Tell hey meant on WhatsApp to call me."), names)
-    assert near == 1 and "'hey meant' sounds close to Hemanth" in note
-    note, low, near = heard_note(words("Send harsh message on WhatsApp.", {"harsh": 0.40}), names)
-    assert low == 1 and "'harsh' (0.40)" in note and "Hemanth" in note
+    note, low, near = heard_note(words("Tell tar niche on WhatsApp to call me."), names)
+    assert near == 1 and "'tar niche' sounds close to Tarnesh" in note
+    note, low, near = heard_note(words("Send trash message on WhatsApp.", {"trash": 0.40}), names)
+    assert low == 1 and "'trash' (0.40)" in note and "Tarnesh" in note
     for clear in ("Close the Claude tabs and the eleven labs tab as well.", "Increase the system volume a bit.",
                   "So after the compaction this will stay in your memory."):
         assert heard_note(words(clear), names)[0] is None, clear  # a clear command gets no note

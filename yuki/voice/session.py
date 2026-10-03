@@ -854,12 +854,29 @@ class VoiceSession(QObject):
         return bool(wanted_id) and wanted_id in ((devices.get(f"{kind}_ids") or {}).values())
 
     def _reroute_speaker(self, old: str) -> None:
-        """The conversation's speaker is gone: reopen on the default output and go on, with a tone (04 F7)."""
+        """The conversation's speaker is gone: reopen on the default output and go on, with a tone (04 F7).
+
+        v3.18 (34-review M7): in a call, or with ``voice_require_headphones``, only onto headphones: when the default
+        output is not (``headphones_check``), the conversation ends with ``speaker_gone`` instead, so Yuki never plays
+        through the laptop's speakers into the call's microphone."""
         try:
             speaker = self._speaker
             if speaker is None or not hasattr(speaker, "switch"):
                 raise RuntimeError("no speaker to move")
-            facts = self._move_output(speaker, self._output_target(None))
+            target = self._output_target(None)
+            in_call = bool(getattr(self, "call_app", None))
+            if in_call or getattr(self.settings, "voice_require_headphones", False):
+                from yuki.voice.audio import headphones_check
+
+                ok, heard = headphones_check(self.settings.voice_headphone_devices, device=target)
+                if not ok:
+                    self.log.event("device", kind="render", state="reroute_refused", in_call=in_call,
+                                   form_factor=(heard or {}).get("form_factor"))
+                    self.state_changed.emit("note", f"Speaker '{old}' disconnected; ending this conversation"
+                                            + (" so Yuki doesn't play into the call" if in_call else ""))
+                    self.stop_conversation("speaker_gone")
+                    return
+            facts = self._move_output(speaker, target)
             device = facts.get("device")
             self.log.event("device", kind="render", state="rerouted", opened=device, found=facts.get("found"))
             self.state_changed.emit("note", f"Speaker '{old}' disconnected; Yuki is on {device} now")
@@ -1743,6 +1760,9 @@ def _import_pipeline() -> None:
     import yuki.voice.stallwatch  # noqa: F401
     import yuki.voice.steplines  # noqa: F401
     import yuki.voice.ttscache  # noqa: F401
+    # v3.18: practice memory's lookups and the learned-way runner (the audit found the lookup imported in run)
+    import yuki.voice.practice  # noqa: F401
+    import yuki.voice.skills  # noqa: F401
     from yuki.voice.gemini_tts import service_class
 
     service_class()
