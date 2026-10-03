@@ -61,8 +61,10 @@ front and for how long, and episode narratives of what the user was doing;
 - the user's conversations with Yuki: exchanges, session summaries, and the standing rules the user set;
 - a one-page portrait of the user (work, interests, people, routines, preferences, personality, open \
 loops), rebuilt nightly from the facts;
-- the user's calls and meetings: when, and a timeline of what the user said on each (only the user's own \
-microphone is ever recorded, never anyone else);
+- the user's calls and meetings, and games' voice chats: when, and a timeline of what was said on each, every \
+line marked with who spoke - the user (their microphone) or the others in that app's own sound (maybe several \
+people; on a game, teammates and the game's own voice lines); calls before 3 Oct 2026 kept only the user's \
+microphone;
 - procedures that worked on this PC (know-how);
 - a weekly review of the user's last seven days (time use against the week before, focus, what got done \
 and what is open), written on Sunday evenings;
@@ -71,7 +73,8 @@ pages they had open and links shared with them.
 
 Not everything in memory is a fact: an item marked as a joke is the user's humour (a bit, a tease, a boast), \
 never something true about them, and an item marked uncertain may be misheard; treat neither as fact. \
-Dates matter. Each fact is dated by when it happened or was said, not when it was captured; older facts may \
+A call line marked as someone else's is theirs, never the user's word, plan or promise. Dates matter. Each \
+fact is dated by when it happened or was said, not when it was captured; older facts may \
 be out of date and a later one can supersede an earlier one. Read the dates in each result and narrow \
 searches with since/until. Times are the PC's local time. Every result starts with the time range it covers. \
 Memory is partial: it sees only the window in front, skips blocked apps and sites, and lags by minutes \
@@ -459,7 +462,7 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
             since: Annotated[str | None, Field(description=f"{SINCE_HELP} Default: the last 7 days.")] = None,
             until: Annotated[str | None, Field(description=f"{UNTIL_HELP} Default: now.")] = None,
         ) -> str:
-            """The user's calls and meetings (Discord, Google Meet, Zoom, Teams, WhatsApp, any app using the microphone for a call): app, start and end, how long the user spoke, whether their side was recorded, and a one-line gist. Rows of one continuous session are merged. Only the user's own microphone is ever recorded. Open one with get_call_timeline."""
+            """The user's calls and meetings (Discord, Google Meet, Zoom, Teams, WhatsApp, any app using the microphone for a call) and games' own voice chats: app, start and end, how long the user and the others spoke, which sides were kept (the user's microphone; the call app's or game's own sound, i.e. the other people), and a one-line gist. Rows of one continuous session are merged. Open one with get_call_timeline."""
 
             def body() -> tuple[str, Window | None]:
                 from datetime import timedelta
@@ -482,10 +485,11 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
             call: Annotated[str, Field(description="The call's id as get_calls or search_memory shows it, e.g. call:16.")],
             since: Annotated[str | None, Field(description=f"Only the part of the call from here. {_FORMS}")] = None,
             until: Annotated[str | None, Field(description=f"Only the part of the call before this. {_FORMS}")] = None,
-            words: Annotated[bool, Field(description="true: the user's exact words (noisy speech recognition) instead of the timeline.")] = False,
+            words: Annotated[bool, Field(description="true: the exact words of every side (noisy speech recognition), each line marked with who spoke, instead of the timeline.")] = False,
             page: Annotated[int, Field(ge=1, description="words only: which page of lines.")] = 1,
+            who: Annotated[Literal["all", "user", "others"], Field(description="words only: every line (all), only the user's own (user) or only the other people's (others).")] = "all",
         ) -> str:
-            """What happened on one call or meeting, timeline-wise, from the user's side only: stretches of the call with their time ranges and topics, then one dated line per moment (what the user said, asked, decided, planned, joked about). With words=true, a page of the user's exact words (kept 30 days; loops, unclear lines and speech said to Yuki are marked)."""
+            """What happened on one call, meeting or game voice chat, timeline-wise: stretches with their time ranges and topics, then one dated line per moment - what the user said, asked, decided, planned or joked about, and, marked [others on <app>] or [game on <app>], what the others said (an app's own sound: maybe several people; on a game, teammates and the game's own voice lines). Calls before 3 Oct 2026 kept only the user's side. With words=true, a page of the exact words, every line marked [user] (with the apps their microphone was open to, when known) or with who else spoke (kept 30 days; loops, unclear lines and speech said to Yuki are marked)."""
 
             def body() -> tuple[str, Window | None]:
                 from yuki.agent.memory import format_call_timeline, format_call_transcript
@@ -493,8 +497,9 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                 window = resolve_range(since, until, default_today=False)
                 client = memory.client()
                 if words:
+                    extra = {"who": who} if who != "all" else {}
                     result = client.call_transcript(call, since=window.since_ts, until=window.until_ts,
-                                                    page=int(page), per_page=60)
+                                                    page=int(page), per_page=60, **extra)
                 else:
                     result = client.call_timeline(call, since=window.since_ts, until=window.until_ts)
                 if not result:
@@ -505,7 +510,8 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
                 return f"{describe(span)}\n{text}", span
 
             return run("get_call_timeline", {"call": call, "since": since, "until": until,
-                                             "words": words or None, "page": page if words else None}, body)
+                                             "words": words or None, "page": page if words else None,
+                                             "who": who if words and who != "all" else None}, body)
 
     # -- threads of work, links seen, connected memory (2026-09-29, only when the memory API offers them) -
 
