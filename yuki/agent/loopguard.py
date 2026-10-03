@@ -30,9 +30,10 @@ EXEMPT: frozenset[str] = frozenset({"ask_user", "done", "say", "note_to_self"})
 #: Input fields that are the brain's notes about a call, not what the call does.
 #: (``say_now``: the few words Yuki's voice says as the step starts, v3.14; the same call with new words is the same
 #: call. ``playbook``: the practice object the call follows, Phase C. ``what``: the step in the brain's plain words for
-#: the user, revamp 38 §8c. ``_about``: what the loop adds to the ``tool_call`` event for the UI.)
+#: the user, revamp 38 §8c. ``_about``: what the loop adds to the ``tool_call`` event for the UI. ``now``: the brain's
+#: one-line note of what it checks or does next and why, for the island and the run card, appPT.)
 NOTE_FIELDS: frozenset[str] = frozenset({"finishes_with", "finish_words", "risk", "say_now", "playbook", "what",
-                                         "_about"})
+                                         "_about", "now"})
 
 
 def signature(tool_input: dict[str, Any]) -> str:

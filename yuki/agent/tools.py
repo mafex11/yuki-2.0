@@ -909,6 +909,25 @@ STEP_SCHEMA_VOICE: dict[str, Any] = {
 #: Kept for callers that import it (the typed schema no longer carries the field).
 STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 
+#: appPT (the user, 3 Oct: "will it show the real thinking? it would be nice if it shows the real thinking"): the
+#: brain's own one-line note of what it is checking or doing next and why, shown live in the island's thinking and
+#: working lines and on the run card's current step, in place of a canned "Thinking…". Chosen over streaming the
+#: model's summarised thinking: a spoken request runs with thinking off (nothing would show), a summary is paragraphs
+#: about "the user" that would need another model call to become one line, and this note costs a few output tokens
+#: only on the calls that carry it. Optional, on the step tools and the situation check; a note, never run or compared
+#: (``yuki.agent.loopguard.NOTE_FIELDS``, so the judge never reads it either).
+NOW_FIELD = "now"
+NOW_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": "Optional, shown on their screen while this runs: what you are checking or doing and why, one "
+                   "short line in plain words, to them, at most 12 words (\"Checking the chat first so it isn't sent "
+                   "twice\", \"Sam's DM is the one you use most\"). Never a tool name, command, id or number.",
+}
+NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(STEP_TOOLS + ("check_situation",)))
+for _name in NOW_TOOLS:
+    if _name in TOOLS_BY_NAME:
+        TOOLS_BY_NAME[_name]["input_schema"]["properties"][NOW_FIELD] = NOW_SCHEMA
+
 
 def with_step_lines(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The tool list for a spoken request: the optional ``say_now`` last on every step tool (a copy; plumbing).

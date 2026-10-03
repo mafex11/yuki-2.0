@@ -242,6 +242,23 @@ def when(at: Any, now: float | None = None) -> str:
     return f"{day}, {clock}, {ago}"
 
 
+def said_when(at: Any, now: float | None = None) -> str:
+    """A time as a sentence says it to the user (appPT): "at 6:08 PM" today, "yesterday at 9:15 PM", "on 25 September
+    at 2 AM" further back; "" for an unknown time. Deterministic formatting."""
+    try:
+        dt = datetime.fromtimestamp(float(at))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    today = datetime.fromtimestamp(time.time() if now is None else float(now)).date()
+    clock = dt.strftime("%I:%M %p").lstrip("0").replace(":00 ", " ")
+    days = (today - dt.date()).days
+    if days == 0:
+        return f"at {clock}"
+    if days == 1:
+        return f"yesterday at {clock}"
+    return f"on {dt.day} {dt.strftime('%B')} at {clock}"
+
+
 @dataclass
 class Situation:
     """What one check gathered (each part may be empty: missing memory or an unreadable window is said, never
@@ -360,6 +377,35 @@ class Situation:
             bits.append("related facts")
         return "Checked first: " + ("; ".join(bits) if bits else "nothing could be read")
 
+    def shown(self, app: str = "") -> str:
+        """appPT: one line for the user's screen (the island's thinking line, the run card), second person, plain words:
+        what was looked at and the one measured fact worth knowing, never the content. A message of theirs in that
+        chat at least :data:`SIMILAR_MARK` similar to this one, with its time ("Checked Discord first: you sent
+        something close to this at 6:08 PM"), else their last message to the person ("... your last message to Sam
+        was yesterday at 9:15 PM"), else just what was read. Deterministic formatting of the gathered facts; what they
+        mean is still the model's call (its next step, or its question)."""
+        where = app or ("the window" if self.hwnd is not None else "memory")
+        head = f"Checked {where} first"
+        close = [m for m in self.own if self.chat_of(m)[0] is not False
+                 and float(m.get("similarity") or 0.0) >= SIMILAR_MARK and m.get("at")]
+        if close:
+            best = max(close, key=lambda m: float(m.get("similarity") or 0.0))
+            at = said_when(best.get("at"), self.now)
+            if at:
+                return f"{head}: you sent something close to this {at}"
+        person = self.person or {}
+        if person.get("found") and person.get("name"):
+            mine = []
+            for r in (person.get("routes") or [])[:3]:
+                try:
+                    mine.append(float(r.get("last_mine") or 0.0) if isinstance(r, dict) else 0.0)
+                except (TypeError, ValueError):
+                    continue
+            at = said_when(max(mine, default=0.0), self.now) if max(mine, default=0.0) else ""
+            if at:
+                return f"{head}: your last message to {person.get('name')} was {at}"
+        return head
+
     def facts_dict(self) -> dict[str, Any]:
         """Content-free facts for the log."""
         person = self.person or {}
@@ -477,4 +523,4 @@ def gather(tool_input: dict[str, Any], *, read_tree: Callable[[int], Any] | None
 
 
 __all__ = ["CHECK_LABEL", "CheckRecord", "QUESTION", "REFUSAL", "REFUSAL_OTHER", "SITUATION_TOOL", "Situation",
-           "TOOL_NAME", "consequence", "covered", "gather", "latest_lines", "when"]
+           "TOOL_NAME", "consequence", "covered", "gather", "latest_lines", "said_when", "when"]
