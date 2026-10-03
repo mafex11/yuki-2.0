@@ -738,7 +738,7 @@ class WindowApp(Actions):
         if getattr(self, "_pending_busy", False):
             return
         self._pending_busy = True
-        from yuki.ui.window.data import second_person
+        from yuki.ui.window.data import natural
 
         pending = dict(self.pending)
 
@@ -748,7 +748,7 @@ class WindowApp(Actions):
             for ref, p in pending.items():
                 if status is not None and p.get("fid") is not None:
                     states[ref] = str((status(p["fid"]) or {}).get("state") or "none")
-            texts = {f["ref"]: second_person(f["text"]) for f in self.memory.portrait_facts_with_evidence(0)}
+            texts = {f["ref"]: natural(f["text"]) for f in self.memory.portrait_facts_with_evidence(0)}
             return texts, states
 
         def then(got: tuple[dict[str, str], dict[str, str]]) -> None:

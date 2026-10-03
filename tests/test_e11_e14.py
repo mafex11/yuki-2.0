@@ -420,12 +420,17 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     assert launch["result"] == "done, checked on screen" and "cant_undo" not in launch
     assert click["f"] == "failed" and click["status"] == "failed" and click["result"] == "didn’t work"
     assert click["chips"] == [{"kind": "lesson", "text": "Pause the music"}] and "keeping a lesson in mind" in click["why"]
-    # the to-do's own words, from memory's record of it (appC1 review F9), never from the step's input
-    assert todo["what"] == "Added to your list “Water the basil”" and todo["undo"]["todo"] == "todo:7"
-    assert todo["undo"]["until"] == pytest.approx(run_at + 6 + W.LEDGER_UNDO_S)
+    # the to-do's own words, from memory's record of it (appC1 review F9), never from the step's input; no Undo on
+    # the Activity tab (the 3 Oct ask A)
+    assert todo["what"] == "Added to your list “Water the basil”" and "undo" not in todo
+    # the steps are grouped under the request they belonged to (3 Oct ask C)
+    g = next(x for x in d["groups"] if x["id"] == "run:agent:s:worker-3")
+    assert g["title"] == "“pause it and remind me to water the basil”" and g["steps"] == 3 and g["said"] == "you said"
+    assert g["outcome"] == "Done, but one step didn’t work" and g["took"] == "9 s" and g["f"] == "did"
+    assert {launch["group"], click["group"], todo["group"]} == {"run:agent:s:worker-3"}
     answered = rows["run:agent:s:worker-4"]
     assert answered["what"] == "Answered “what's on today”" and answered["why"] == "you typed “what's on today”"
-    reqs = [r for r in d["rows"] if r["kind"] == "request" and r["id"][1:].isdigit()]   # request log rows
+    reqs = [r for r in d["rows"] if r["kind"] == "request" and r["id"].startswith("req:")]   # request log rows
     assert [r["what"] for r in reqs] == ["“open my budget”"]          # the traced request is not listed twice
     assert rows["c41"]["why"] == "rule: “Tell me when the forum thread gets a reply.”"
     assert rows["c42"]["why"] == "you stopped mid-way"
@@ -433,26 +438,6 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     assert call["why"] == "rule: Signal calls, your mic only" and call["f"] == "calls" and call["result"] == "turned into text"
     assert len([r for r in d["rows"] if r["kind"] == "call"]) == 1   # an unrecorded meeting is nothing Yuki did
     assert d["counts"]["did_today"] >= 4 and d["counts"]["no_reason"] == 0
-
-
-def test_undo_of_a_todo_only_inside_its_window_and_only_one_the_ledger_offered(tmp_path):
-    from yuki.ui import web_window
-
-    ended = []
-
-    class Mem:
-        def end_todo(self, ref, how="done"):
-            ended.append((ref, how))
-            return ref
-
-    win = web_window.WebWindow(db_path=tmp_path / "x.db", connect=False)
-    win.memory = Mem()
-    win.pages["activity"] = {"rows": [{"id": "a", "undo": {"todo": "todo:7", "until": time.time() + 60}},
-                                      {"id": "b", "undo": {"todo": "todo:8", "until": time.time() - 1}}]}
-    assert win.a_todo_undo({"todo": "todo:7"})["ok"] and ended == [("todo:7", "not_needed")]
-    assert not win.a_todo_undo({"todo": "todo:8"})["ok"]            # its 10 minutes are over
-    assert not win.a_todo_undo({"todo": "todo:9"})["ok"]            # never offered
-    assert ended == [("todo:7", "not_needed")]
 
 
 # -- the frameless window --------------------------------------------------------------------------------------------

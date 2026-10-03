@@ -23,7 +23,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import ASPECT_TITLES, Todo, YukiView, day_label, epoch, hm, plain, second_person
+from yuki.ui.window.data import ASPECT_TITLES, Todo, YukiView, day_label, epoch, hm, plain, natural
 from yuki.ui.window.pages.fold import fold_panel, lines_body, one_line, todo_row, todos_section
 from yuki.ui.window.theme import PAGE_PAD, SPACE, Theme
 from yuki.ui.window.widgets import (
@@ -134,7 +134,7 @@ def _question_body(t: Theme, q: dict, act: Actions, row_ref: list) -> QWidget:
     col.setContentsMargins(0, 0, 0, 0)
     col.setSpacing(8)
     if q.get("evidence"):
-        col.addWidget(text_label(t, f"Why it asks: {plain(second_person(q['evidence']))}", "micro", "text_3",
+        col.addWidget(text_label(t, f"Why it asks: {plain(natural(q['evidence']))}", "micro", "text_3",
                                  wrap=True, parent=box))
     answer_box = _composer(t, "Your answer, in your words", "Tell Yuki",
                            lambda words, ref=q["id"]: act.answer_question(ref, words), parent=box)
@@ -164,7 +164,7 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
     rows: list[QWidget] = []
     for i, q in enumerate(view.waiting):
         ref: list = [None]
-        words = plain(second_person(q["question"]))
+        words = plain(natural(q["question"]))
         row = FoldRow(t, words, "", "waiting", led="on", full=words,
                       body=lambda q=q, ref=ref: _question_body(t, q, act, ref), expanded=i == 0)
         ref[0] = row
@@ -173,7 +173,7 @@ def _questions(t: Theme, view: YukiView, act: Actions) -> Panel:
     for q in view.asked[:6]:
         status = f"{word.get(q['status'], q['status'])} {day_label(epoch(q['answered_at'] or q['at']) or 0)}"
         answer = q.get("answer")
-        words = plain(second_person(q["question"]))
+        words = plain(natural(q["question"]))
         rows.append(FoldRow(t, words, f"You: “{one_line(answer, 90)}”" if answer else "", status.strip(),
                             body=lines_body(t, [(f"You: “{answer}”", "")]) if answer and len(answer) > 90
                             else None, full=words + (f"\n\nYou: “{answer}”" if answer and len(answer) <= 90 else "")))

@@ -137,6 +137,29 @@ async function inPage(F) {
     return { count: () => recs.length, what, stop: () => mo.disconnect() };
   }
   async function push(page, data) { window.__push({ kind: 'data', page, data, source: 'memory' }); await sleep(40); await frames(); }
+  // the stand-in host answers each action from REPLY (an action's reply may be a function of the message)
+  const REPLY = {};
+  const answered = new Set();
+  setInterval(() => {
+    for (const m of window.__sent) {
+      if (m.op !== 'act' || m.id == null || answered.has(m.id)) continue;
+      answered.add(m.id);
+      const r = REPLY[m.action];
+      const reply = typeof r === 'function' ? r(m) : (r || { ok: true });
+      setTimeout(() => window.__push(Object.assign({ kind: 'reply', id: m.id }, reply)), 30);
+    }
+  }, 20);
+  const acts = (action) => window.__sent.filter((m) => m.op === 'act' && m.action === action);
+  // the drawer's days (read once when it first opens): yesterday's connector line and an earlier day
+  REPLY.thread_days = { ok: true, connector: { day: '2026-10-02', day_at: Date.now() / 1000 - 86400, label: 'Yesterday',
+    text: 'Yesterday you finished the invented screen.', open: ['Write the invented timer'] },
+  days: [{ day: '2026-09-30', count: 2, first_at: Date.now() / 1000 - 3 * 86400, last_at: Date.now() / 1000 - 3 * 86400 + 600 },
+    { day: '2026-10-01', count: 5, first_at: Date.now() / 1000 - 2 * 86400, last_at: Date.now() / 1000 - 2 * 86400 + 3600 }] };
+  const twoDaysAgo = Date.now() / 1000 - 2 * 86400;
+  REPLY.chat_day = (m) => (m.day === '2026-10-01'
+    ? { ok: true, turns: [{ id: 't49', at: twoDaysAgo + 60, user: 'an earlier invented question', reply: 'An earlier invented answer.' },
+      { id: 't50', at: twoDaysAgo + 3000, user: 'the live invented question', reply: 'The live invented answer.' }] }
+    : { ok: true, turns: [{ id: 't1', at: Date.now() / 1000 - 3 * 86400, user: 'an invented question', reply: 'An invented answer.' }] });
 
   // ---- boot, then the first fresh data (17: drawn at once, not 6-9 s later) ----
   // nothing live (no run, no call): the idle page, so a no-op can be told from the live figure's own frames
@@ -223,7 +246,7 @@ async function inPage(F) {
     ['day', '#work/day', 'day', (d) => { d.totals[0][1] = '9h 99m'; return '9h 99m'; }],
     ['me', '#me', 'me', (d) => { d.rules[0].text = 'Invented rule, said again.'; return 'Invented rule, said again.'; }],
     ['playbook', '#playbook', 'playbook', (d) => { d.lessons[0].dont = 'Invented lesson, updated'; return 'Invented lesson, updated'; }],
-    ['activity', '#activity', 'activity', (d) => { d.rows[0].result = 'invented result'; return 'invented result'; }],
+    ['activity', '#activity', 'activity', (d) => { d.groups[0].outcome = 'Invented outcome'; return 'Invented outcome'; }],
     ['settings', '#settings', 'settings', (d) => { d.voice.end_tone = !d.voice.end_tone; return null; }],
   ];
   for (const [name, hash, key, change] of pages) {
@@ -234,7 +257,7 @@ async function inPage(F) {
     const top = m.scrollTop;
     await sleep(150);   // the scroll's own re-measure (a moved figure follows, no sweep)
     const field = m.querySelector('input, select, textarea, [tabindex]');
-    if (field) field.focus();
+    if (field) field.focus({ preventScroll: true });   // focus is what's checked; the scroll is set above
     const focused = document.activeElement;
     const d = clone(F.pages[key]);
     const text = change(d);
@@ -279,18 +302,18 @@ async function inPage(F) {
   const left0 = marker ? marker.style.left : null;
   window.Date = Shifted; Y.tickSoon(); await sleep(50); window.Date = RealDate;
   check('20 the Day\'s now marker moves on the tick', marker && marker.style.left !== left0, `${left0} -> ${marker && marker.style.left}`);
-  await go('#activity');
+  await go('#home');   // the Activity tab has no Undo any more (the 3 Oct ask A): Home's "Since you were away" keeps one
   await sleep(300);
   const until = main().querySelector('[data-until]');
   const t1 = until ? until.textContent : null;
   window.Date = Shifted; Y.tickSoon(); await sleep(50); window.Date = RealDate;
-  check('20 Activity\'s Undo minutes count down on the tick', until && until.textContent !== t1, `${t1} -> ${until && until.textContent}`);
+  check('20 an Undo\'s minutes (Home) count down on the tick', until && until.textContent !== t1, `${t1} -> ${until && until.textContent}`);
   Y.tickSoon(); await sleep(20);
 
   // ---- a Forget countdown survives a patch (Me) ----
   await go('#me');
   await sleep(500);
-  const factRow = main().querySelector('[data-k="facts"] [data-fact]');
+  const factRow = main().querySelector('[data-k="facts"] .fgroup [data-fact]');
   factRow.querySelector('[data-do="forget"]').click();
   await sleep(50);
   const me = clone(F.pages.me);
@@ -312,7 +335,7 @@ async function inPage(F) {
   }
 
   // ---- review F5: an Undo window closing on the row you just pressed patches once, not in a loop ----
-  await go('#activity'); await sleep(600);
+  await go('#home'); await sleep(600);
   const uspan = main().querySelector('[data-until]');
   const urow = uspan && uspan.closest('[data-row], .lrow, .srow, [data-item]');
   if (urow) {
@@ -322,7 +345,7 @@ async function inPage(F) {
     Y.tickSoon();
     await sleep(1000);
     check('F5 a closed Undo on a held row patches at most twice in a second', Y.patchStats.patches - p0 <= 2, `${Y.patchStats.patches - p0} patches`);
-  } else check('F5 an Activity row with an Undo is in the fixture', false, 'no [data-until] row');
+  } else check('F5 a row with an Undo is in the fixture (Home)', false, 'no [data-until] row');
   await sleep(5200);   // the press hold ends: one patch then
 
   // ---- review F6: a content morph (a draft with Copy) outlives the 4 s retire; a confirmation row does not ----
@@ -367,6 +390,120 @@ async function inPage(F) {
   check('21 the streamed text shows', drawer.textContent.includes('word 99'));
   check('21 the drawer input keeps focus and its text', document.activeElement === steer && steer.value === 'a half-written message');
   check('21 a fold you closed stays closed', !fold || (fold.isConnected && !fold.open));
+
+  // ---- the 3 Oct design (report 45): the drawer's days ----
+  await go('#home');
+  await go('#home?thread=1');
+  await sleep(400);
+  const dr = document.querySelector('.drawer');
+  check('15 the thread has a Today separator', !!dr && Array.from(dr.querySelectorAll('.dsep span')).some((s) => s.textContent === 'Today'));
+  const rem = dr && dr.querySelector('.remember');
+  check('15 the connector line about your last day shows, with its buttons', !!rem && rem.textContent.includes('invented screen') && !!rem.querySelector('[data-do="day-answer"]'));
+  if (rem) {
+    rem.querySelector('[data-do="day-answer"][data-verdict="done"]').click();
+    await sleep(350);
+    check('15 Done confirms in place with Undo (no error)', rem.textContent.includes('Marked done') && !!rem.querySelector('[data-do="day-undo"]'));
+    rem.querySelector('[data-do="day-undo"]').click();
+    await sleep(350);
+    check('15 Undo brings the buttons back and sends nothing', !!rem.querySelector('[data-do="day-answer"]') && acts('day_answer').length === 0);
+  }
+  const folds = dr ? dr.querySelectorAll('details.dayfold') : [];
+  const older = Array.from(folds).find((f) => f.dataset.mem === '2026-09-30');
+  check('15 an earlier day is folded to one line', !!older && !older.open);
+  if (older) {
+    older.open = true; older.dispatchEvent(new Event('toggle'));
+    await sleep(400);
+    const fresh = document.querySelector('details.dayfold[data-mem="2026-09-30"]');
+    check('15 opening an earlier day reads it from memory and shows it', acts('chat_day').some((m) => m.day === '2026-09-30') && !!fresh && fresh.textContent.includes('An invented answer.'));
+  }
+  // review F6: a day the window holds only the last turn of (the newest session started then) folds to memory's
+  // count, and opening it reads memory's day and merges it with the live turn (by turn id, shown once)
+  Y.D.chat.items = [{ id: 'm:50:u', kind: 'user', at: twoDaysAgo + 3000, text: 'the live invented question', source: 'history' },
+    { id: 'm:50:a', kind: 'assistant', at: twoDaysAgo + 3000, text: 'The live invented answer.', source: 'history', status: 'done', steps: [] },
+    ...(Y.D.chat.items || [])];
+  Y.renderDrawer(); await sleep(150);
+  const part = document.querySelector('details.dayfold[data-mem="2026-10-01"]');
+  check('15 a day partly in the window folds to memory’s count', !!part && part.querySelector('summary em').textContent.includes('5 chats'), part && part.querySelector('summary em').textContent);
+  if (part) {
+    part.open = true; part.dispatchEvent(new Event('toggle'));
+    await sleep(400);
+    const merged = document.querySelector('details.dayfold[data-mem="2026-10-01"]');
+    const txt = merged ? merged.textContent : '';
+    check('15 opening it reads memory’s day and shows each turn once', acts('chat_day').some((m) => m.day === '2026-10-01')
+      && txt.includes('An earlier invented answer.') && txt.split('The live invented answer.').length === 2, txt.slice(0, 200));
+    merged.open = false; merged.dispatchEvent(new Event('toggle'));
+  }
+  Y.D.chat.items = Y.D.chat.items.filter((i) => !String(i.id).startsWith('m:50:')); Y.renderDrawer();
+  const ms = dr ? Array.from(dr.querySelectorAll('.fold .ms')).map((e) => e.textContent).filter(Boolean) : [];
+  check('14 no step shows milliseconds or a sub-second time', ms.every((t) => !/ms|\d\.\d/.test(t)), ms.join(' | '));
+  await go('#home');
+  check('no 24-hour clock in the page headers', !/\b\d{2}:\d{2}\b/.test(main().querySelector('.ph .meta').textContent), main().querySelector('.ph .meta').textContent);
+
+  // ---- Me: pin <-> unpin, Right resolves at once with a 5 s Undo, an Undo too late keeps it removed ----
+  await go('#me'); await sleep(500);
+  const groupBtn = main().querySelector('.fgroup[data-group="work"] > .fg-h');
+  groupBtn.click(); await sleep(60);
+  const fx = main().querySelector('.fgroup[data-group="work"] .fx[data-fact]');
+  fx.querySelector('.fx-h').click(); await sleep(60);
+  check('10 a fact opens to its detail and actions on click', fx.classList.contains('open') && !!fx.querySelector('.fx-d [data-do="pin"]'));
+  const pin = fx.querySelector('[data-do="pin"]'), was = pin.getAttribute('aria-pressed') === 'true';
+  REPLY.pin = (m) => ({ ok: true, pinned: !!m.on });
+  pin.click(); await sleep(150);
+  check('3 Pin toggles to its other state at once', pin.getAttribute('aria-pressed') === String(!was) && pin.textContent.includes(was ? 'Pin' : 'Unpin'));
+  pin.click(); await sleep(150);
+  const sentPins = acts('pin').slice(-2).map((m) => m.on);
+  check('3 Unpin works too (two pin acts, opposite flags)', sentPins.length === 2 && sentPins[0] === !was && sentPins[1] === was, JSON.stringify(sentPins));
+  const me2 = clone(F.pages.me);
+  await push('me', me2);
+  check('10 an open fact stays open through a patch', main().querySelector('.fgroup[data-group="work"] .fx[data-fact]').classList.contains('open'));
+  const mh = main().querySelector('.mhsec [data-resolve]');
+  const mhRef = mh && mh.dataset.ref;
+  const countBefore = +main().querySelector('.mhsec .sec-h .doto').textContent;
+  REPLY.resolve_heard = (m) => (m.verdict === 'undo' ? { ok: false, too_late: true, error: 'Too late to undo: I’m already updating my memory from your answer.' } : { ok: true, correction_id: 7 });
+  mh.querySelector('[data-do="resolve"][data-verdict="right"]').click();
+  await sleep(80);
+  check('7 Right resolves at once: "Got it" with Undo, no "updating"', mh.textContent.includes('Got it') && !!mh.querySelector('[data-do="res-undo"]') && !/updating/i.test(mh.textContent));
+  check('7 the count drops at once', +main().querySelector('.mhsec .sec-h .doto').textContent === countBefore - 1);
+  await push('me', clone(F.pages.me));   // memory hasn't caught up yet: the row must not come back
+  check('7 a patch with the old data keeps it resolved', mh.isConnected && mh.textContent.includes('Got it'));
+  mh.querySelector('[data-do="res-undo"]').click();
+  await sleep(700);
+  check('7 an Undo that is too late keeps it removed', !document.querySelector(`.mhsec [data-ref="${mhRef}"]`) || document.querySelector(`.mhsec [data-ref="${mhRef}"]`).__leaving);
+  await sleep(500);
+  await push('me', clone(F.pages.me));
+  check('7 it stays gone after a redraw', !main().querySelector(`.mhsec [data-ref="${mhRef}"]`));
+  const dossierRel = main().querySelector('.dossier .rel');
+  check('4 one summary per person, no relation line repeating it', !dossierRel && !!main().querySelector('.dossier .note'));
+
+  // ---- Work: week bars readout, the hour axis under its columns, a session opens to its apps ----
+  await go('#work'); await sleep(700);
+  const wk = main().querySelector('[data-wk="3"]');
+  wk.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); await sleep(200);
+  const tip = document.getElementById('wktip');
+  check('16 hovering a day shows its readout', tip.classList.contains('on') && /at the PC, .* full screen/.test(tip.textContent), tip.textContent);
+  check('16 today is labelled', Array.from(main().querySelectorAll('.wk-lbl span.today')).some((s) => s.textContent.includes('today')));
+  await go('#work/day'); await sleep(700);
+  const rows = main().querySelectorAll('.heat .hrow');
+  const dots = rows[0].querySelectorAll('i.hc'), labels = main().querySelectorAll('.heat .hrow.axis b');
+  const cx = (el) => { const r = el.getBoundingClientRect(); return r.left + r.width / 2; };
+  const off = [0, 3, 6, 9, 12, 15, 18, 21].map((i) => Math.abs(cx(dots[i]) - cx(labels[i])));
+  check('17 each hour label sits under its dot column (within 1 px)', off.every((d) => d <= 1), off.map((d) => d.toFixed(1)).join(','));
+  const sess = main().querySelector('[data-k="sessions"] .fx');
+  sess.querySelector('.fx-h').click(); await sleep(80);
+  check('D a session opens to the time in each app', sess.classList.contains('open') && sess.querySelectorAll('.perapp .pa').length >= 1);
+  const day2 = clone(F.pages.day); day2.totals[0][1] = '9h 98m';
+  await push('day', day2);
+  check('D an open session stays open through a patch', main().querySelector('[data-k="sessions"] .fx').classList.contains('open'));
+
+  // ---- Activity: grouped by request, no Undo anywhere, a group opens to its steps ----
+  await go('#activity'); await sleep(500);
+  check('A the Activity tab has no Undo', !/\bUndo\b/.test(main().textContent) && !main().querySelector('[data-until], [data-do="todo-undo"], [data-do="offer-undo"]'));
+  const g = Array.from(main().querySelectorAll('.lgroup')).find((x) => x.querySelectorAll('.lstep').length >= 2);
+  check('C actions are grouped under the request they belonged to', !!g);
+  if (g) {
+    g.querySelector('.fx-h').click(); await sleep(80);
+    check('C a group opens to its steps in plain words', g.classList.contains('open') && g.querySelector('.lstep .w1').textContent.length > 0);
+  }
   return results;
 }
 

@@ -102,8 +102,13 @@
   function makeSprites(size, maxR, minR, crisp) {
     const LV = 16, s = size;
     const cv = document.createElement('canvas');
-    cv.width = s * LV; cv.height = s * 3;
+    cv.width = s * LV; cv.height = s * 4;
     const x = cv.getContext('2d');
+    for (let l = 0; l < LV; l++) {        // row 3: an outline dot (the same lit colour, hollow): the week bars' full-screen top
+      const v = (l + 1) / LV, r = minR + (maxR - minR) * Math.pow(v, 0.8);
+      x.strokeStyle = `rgba(${COL.lit[0]},${COL.lit[1]},${COL.lit[2]},${0.25 + 0.75 * v})`; x.lineWidth = Math.max(1, 1.15 * DPR);
+      x.beginPath(); x.arc(l * s + s / 2, 3 * s + s / 2, Math.max(1, r - 0.6 * DPR), 0, 6.2832); x.stroke();
+    }
     [COL.lit, COL.live, COL.mid].forEach((c, row) => {
       for (let l = 0; l < LV; l++) {
         const v = (l + 1) / LV;
@@ -144,7 +149,7 @@
       this.pitch = opts.pitch || 12;
       this.fixedW = opts.w || 0; this.fixedH = opts.h || 0;
       this.sc = opts.scale || 1;                     // figure scale (halo figures are a little smaller)
-      this.state = 'idle'; this.blend = 0; this.figs = []; this.hoverCol = -1; this.figT0 = 0; this.stateT0 = 0;
+      this.state = 'idle'; this.blend = 0; this.figs = []; this.hoverCol = -1; this.hoverTo = -1; this.solid = []; this.figT0 = 0; this.stateT0 = 0;
       this.step = { n: 2, of: 5 }; this.maxDelay = 0; this.full = true;
       this.anchor = null; this.base = document.createElement('canvas');
       this.frame = this.frame.bind(this);
@@ -226,6 +231,8 @@
         }
       }
       this.rasterFigures(o);
+      // the week bars' own cells ignore nearby clearings (the day labels sit right under them), so no row reads dimmer
+      for (const k of this.solid) mask[k] = 1;
       this.drawBase();
       this.full = true;
       Loop.add(this.frame);
@@ -249,7 +256,7 @@
       }
       const fig = this.fig, tone = this.figTone, delay = this.delay;
       fig.fill(0); tone.fill(0); delay.fill(0);
-      this.figs = []; this.maxDelay = 0;
+      this.figs = []; this.maxDelay = 0; this.solid = [];
       const idx = [];
       let fresh = false;
       found.forEach((f) => {
@@ -283,17 +290,22 @@
             ox += (q.w + 1) * sc;
           });
         } else if (f.kind === 'week') {
-          // Yuki: the page's week (el.__week: minutes at the PC, of which active a / full screen f), the design's scale
-          const days = (el.__week || JSON.parse(el.dataset.days || '[]')).map((d) => ({ pc: d.pc || 0, work: d.work != null ? d.work : d.a || 0, game: d.game != null ? d.game : d.f || 0 }));
+          // Yuki: the page's week (el.__week: minutes at the PC, of which full screen f; today), the 3 Oct design: a
+          // bar is the hours at the PC, its outlined top the full-screen part, today drawn brightest
+          const days = (el.__week || JSON.parse(el.dataset.days || '[]')).map((d) => ({ pc: d.pc || 0, full: d.full != null ? d.full : d.f || 0, today: !!d.today }));
           const max = 660, H = f.cj;
           days.forEach((d, n) => {
             const x0 = f.i0 + n * 4;
             const total = Math.max(1, Math.round((d.pc / max) * H));
-            const work = Math.round((d.work / max) * H), game = Math.round((d.game / max) * H);
+            const full = Math.min(total, Math.round((d.full / max) * H)), at = total - full;
             for (let y = 0; y < total; y++) {
-              const t = y < work ? 0 : y < work + game ? 2 : 3;
-              const v = t === 0 ? 1 : t === 2 ? 0.85 : 0.32;
-              for (let a = 0; a < 3; a++) put(x0 + a, f.j0 + H - 1 - y, v, t === 3 ? 2 : t, n * 0.06 + y * 0.012);
+              const ring = y >= at;
+              const v = d.today ? 1 : ring ? 0.8 : 0.78;
+              for (let a = 0; a < 3; a++) {
+                const ii = x0 + a, jj = f.j0 + H - 1 - y;
+                put(ii, jj, v, ring ? 3 : 0, n * 0.06 + y * 0.012);
+                if (ii >= 0 && jj >= 0 && ii < C && jj < R) this.solid.push(jj * C + ii);
+              }
             }
           });
         } else if (f.kind === 'skyline') {
@@ -458,7 +470,7 @@
         let tg = 0, tn = 0;
         const fv = fig[n];
         if (fv > 0 && (reduced || ft > this.delay[n])) { tg = fv * figK; tn = this.figTone[n]; }
-        if (hc >= 0 && fv > 0 && i === hc) tg = Math.min(1, tg + 0.35);
+        if (hc >= 0 && fv > 0 && i >= hc && i <= this.hoverTo) tg = Math.min(1, tg + 0.35);
         if (this.blend > 0 && Math.abs(i - ai) <= RX && Math.abs(j - aj) <= RY) {
           out.t = 0;
           const sv = this.stateVal(s === 'idle' || s === 'hidden-armed' ? this.lastLive || 'idle' : s, i - ai, j - aj, tt, out) * this.blend;
@@ -501,7 +513,7 @@
           if (cx + s2 < px0 || cx - s2 > px1 || cy + s2 < py0 || cy - s2 > py1) continue;
           const v = cur[n] * mask[n];
           const l = Math.min(sp.LV - 1, Math.floor(v * sp.LV));
-          const row = tone[n] === 1 ? 1 : tone[n] === 2 ? 2 : 0;
+          const row = tone[n] === 1 ? 1 : tone[n] === 2 ? 2 : tone[n] === 3 ? 3 : 0;
           x.drawImage(sp.cv, l * s2, row * s2, s2, s2, Math.round(cx - s2 / 2), Math.round(cy - s2 / 2), s2, s2);
         }
         x.restore();
@@ -511,7 +523,8 @@
       const settled = maxD < 0.003 && this.blend === target && (reduced || ft > this.maxDelay + 0.05);
       return (dyn && live) || !settled;
     }
-    setHover(col) { if (col !== this.hoverCol) { this.hoverCol = col; Loop.add(this.frame); } }
+    /* brighten one column, or columns col..to (a week bar is three wide) */
+    setHover(col, to) { const t2 = to == null ? col : to; if (col !== this.hoverCol || t2 !== this.hoverTo) { this.hoverCol = col; this.hoverTo = t2; Loop.add(this.frame); } }
     figureAt(clientX, clientY, kind) {
       const f = this.figs.find((q) => q.kind === kind); if (!f) return null;
       const o = this.c.getBoundingClientRect();

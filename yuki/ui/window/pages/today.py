@@ -366,7 +366,7 @@ class _Click(QObject):
 def _details(t: Theme, m: Moment, day: DayView) -> Card:
     """What the panel above leaves out (it already says what you were doing, in full): everything Yuki noticed
     in the stretch, with its time, in full."""
-    from yuki.ui.window.data import hm, plain, second_person
+    from yuki.ui.window.data import hm, plain, natural
 
     card = Card(t, level="muted", padding=0)
     card.body.setContentsMargins(18, 14, 18, 14)
@@ -377,7 +377,7 @@ def _details(t: Theme, m: Moment, day: DayView) -> Card:
         noticed = [f for f in sess.facts if f.get("importance", 0) >= 3 and not f.get("by_yuki")]
         noticed.sort(key=lambda f: f.get("at", 0))
         rows = [(hm(f["at"]), ("Said as a joke: " if f.get("nature") == "humor" else "") +
-                 plain(second_person(f["text"]))) for f in noticed[:12]]
+                 plain(natural(f["text"]))) for f in noticed[:12]]
     if not rows:
         rows = [("", "Yuki noticed nothing more in this stretch.")]
     for when, words in rows:

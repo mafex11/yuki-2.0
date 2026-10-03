@@ -39,11 +39,11 @@
     const meta = [h('span', { text: 'What I may do, see and say' }),
       d.usage ? h('span', null, 'Yuki right now: ', h('b', { text: `${Math.round(d.usage.mb)} MB` }), d.usage.cpu != null ? [', ', h('b', { text: `${d.usage.cpu.toFixed(1)}%` }), ' CPU'] : null) : null];
     const apps = d.apps || [];
-    const appsB = apps.length ? [h('div', { class: 'approw hd' }, h('span', { text: 'App' }), h('span', { class: 'c', title: 'Yuki may look at it' }, ic('eye')), h('span', { class: 'c', title: 'Yuki may click and type in it' }, ic('hand'))),
+    const appsB = apps.length ? [h('div', { class: 'approw hd' }, h('span', { text: 'App' }), h('span', { class: 'c', title: 'I may look at it' }, ic('eye')), h('span', { class: 'c', title: 'I may click and type in it' }, ic('hand'))),
       apps.map((a) => h('div', { class: 'approw', data: { k: a.app } }, h('span', null, a.app, a.note ? h('small', { text: a.note }) : null),
         h('span', { class: 'c' }, tog(a.look, { do: 'app-look', app: a.app }, `Look at ${a.app}`)),
         h('span', { class: 'c' }, tog(a.act, { do: 'app-act', app: a.app }, `Act in ${a.app}`, !a.look))))]
-      : Y.empty('Apps show here once Yuki has seen you use them.');
+      : Y.empty('Apps show here once I’ve seen you use them.');
     const devs = v.devices || {};
     const devOpts = (kind) => [['', 'System default' + (devs['default_' + kind] ? ` (${devs['default_' + kind]})` : '')]].concat((devs[kind] || []).map((n) => [n, n]));
     const withCur = (opts, cur) => (cur && !opts.some(([k]) => k === cur) ? opts.concat([[cur, cur + ' (not connected)']]) : opts);
@@ -57,7 +57,7 @@
     const offers = [
       srow('Offers on cards', tog((d.offers || {}).enabled, { do: 'offers' }, 'Offers on cards'), 'A named button that does one small thing, with Undo where it can. Off: cards only talk.'),
       srow('Check-ins', tog(co.enabled, { do: 'coach' }, 'Check-ins')),
-      srow('Questions', tog(co.questions, { do: 'questions' }, 'Questions'), 'When Yuki isn’t sure it heard or read something right'),
+      srow('Questions', tog(co.questions, { do: 'questions' }, 'Questions'), 'When I’m not sure I heard or read something right'),
       srow('Quiet hours', co.quiet_start && co.quiet_start !== co.quiet_end ? `${co.quiet_start}–${co.quiet_end}` : 'none')];
     const privacy = [
       h('div', { class: 'srow', data: { pause: '' } }, h('span', null, pr.paused ? 'Memory is paused' : 'Remember what I do', h('small', { class: 'pause-say', text: pr.paused ? 'I’m not looking at anything. Calls you said yes to still record your side.' : 'I see the window in front, never private windows or blocked apps' })),
@@ -82,7 +82,7 @@
           Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
           Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps')),
         h('div', { class: 'col', data: { k: 'right' } },
-          Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for Yuki’s next start')), 'voice'),
+          Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for my next start')), 'voice'),
           Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
           Y.k(Y.sec('Privacy and pause', null, privacy), 'privacy'),
           Y.k(Y.sec('Calls', null, calls), 'calls'),
@@ -109,8 +109,8 @@
     const say = document.getElementById('dialsay'); if (say) { say.replaceWith(dialSentence(d.autonomy)); }
     save(t, 'permissions_set', { kind, level }, null, () => { k.level = prev; Y.renderMain(); }).then((r) => { if (r.ok && r.permissions) d.autonomy = r.permissions; });
   };
-  A['app-look'] = (t) => { const on = flip(t); save(t, 'app_look', { app: t.dataset.app, look: on }, on ? `Yuki may look at ${t.dataset.app} again.` : `Yuki won’t look at ${t.dataset.app}.`, () => flip(t)); };
-  A['app-act'] = (t) => { const on = flip(t); save(t, 'app_act', { app: t.dataset.app, act: on }, on ? `Yuki may click and type in ${t.dataset.app}.` : `Yuki won’t click or type in ${t.dataset.app}.`, () => flip(t)); };
+  A['app-look'] = (t) => { const on = flip(t); save(t, 'app_look', { app: t.dataset.app, look: on }, on ? `I may look at ${t.dataset.app} again.` : `I won’t look at ${t.dataset.app}.`, () => flip(t)); };
+  A['app-act'] = (t) => { const on = flip(t); save(t, 'app_act', { app: t.dataset.app, act: on }, on ? `I may click and type in ${t.dataset.app}.` : `I won’t click or type in ${t.dataset.app}.`, () => flip(t)); };
   A['voice-wake'] = (t) => { const on = flip(t); save(t, 'voice', { wake: on }, (r) => (on ? 'Listening for “Yuki”.' : 'Stopped listening for “Yuki”.') + (r.offline ? ' (used when Yuki next starts)' : ''), () => flip(t)); };
   A['voice-tone'] = (t) => { const on = flip(t); save(t, 'voice', { end_tone: on }, on ? 'End tone on.' : 'End tone off.', () => flip(t)); };
   A.offers = (t) => { const on = flip(t); save(t, 'offers', { enabled: on }, on ? 'Offers on. Cards can carry one named button.' : 'Offers off. Cards only talk now.', () => flip(t)); };

@@ -16,7 +16,7 @@ from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
-from yuki.ui.window.data import StatusView, day_label, dur, first_sentence, hm, plain, second_person
+from yuki.ui.window.data import StatusView, day_label, dur, first_sentence, hm, plain, natural
 from yuki.ui.window.paint import paint_led, paint_surface
 from yuki.ui.window.theme import ICON, PAGE_PAD, Theme, font
 from yuki.ui.window.widgets import Button, Card, DotDisplay, Led, Masonry, page_header, text_label
@@ -229,7 +229,7 @@ def build(t: Theme, v: StatusView, *, act: Actions = NOOP) -> QWidget:
         q = v.questions_waiting[0]
         n = len(v.questions_waiting)
         rcol.addWidget(_row(t, "question", "A question for you" if n == 1 else f"{n} questions for you",
-                            first_sentence(plain(second_person(q["question"])), 90),
+                            first_sentence(plain(natural(q["question"])), 90),
                             [_pill(t, "Answer", lambda: act.navigate("yuki"), glyph="edit", style="default")]))
     if v.quiet_until:
         rcol.addWidget(_row(t, "moon", f"Coach is quiet until {hm(v.quiet_until)}", "Reminders wait, none are lost",

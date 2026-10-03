@@ -109,7 +109,9 @@ def test_a_moment_belongs_to_its_session_else_its_hour():
     day = _day()
     m = moment_at(day, day.since + 20.25 * 3600)
     assert m.kind == "session" and m.title == "Coding the skyline" and m.lead == "Warp"
-    assert m.noticed == ["Fixed the call band."]           # second person, as the window speaks
+    # memory's own words (report 45: the word pass that turned "the user" into "you" is gone; a journal entry has no
+    # shown form yet, so only its date and time formats would change)
+    assert m.noticed == ["The user fixed the call band."]
     assert apps_line(m) == "Warp 1h 00m, Chrome 30m, Discord call ongoing, from 20:00 to 21:30"
     hour = moment_at(day, day.since + 21.75 * 3600)       # after the session: its hour
     assert hour.kind == "hour" and (hour.start, hour.end) == (day.since + 21 * 3600, day.since + 22 * 3600)
@@ -572,7 +574,9 @@ def test_rows_prefer_memorys_model_written_title_and_summary():
     assert item.title == "Komal" and item.summary == "Corvana colleague, reviews your dashboards"
     assert item.short == item.summary and "Slack" in item.text          # the full text stays behind the fold
     no_summary = D.portrait_item({**fact, "summary": None})
-    assert no_summary.summary == "" and no_summary.short.startswith("Your colleague Komal")
+    assert no_summary.summary == "" and no_summary.short.startswith("The user's colleague Komal")   # no word rewritten
+    shown = D.portrait_item({**fact, "shown": "Your colleague Komal reviews your dashboards."})
+    assert shown.text == "Your colleague Komal reviews your dashboards."                # memory's shown form, as written
 
     class _Mem:
         def todos(self, include_done=False):
@@ -580,7 +584,7 @@ def test_rows_prefer_memorys_model_written_title_and_summary():
                      "the pitch.", "title": "Test the MCP server", "source": "call", "owner": "user"}]
 
     todos, _p = D.read_todos(_Mem())
-    assert todos[0].title == "Test the MCP server" and todos[0].text.startswith("Must build")
+    assert todos[0].title == "Test the MCP server" and todos[0].text.startswith("The user must build")   # as memory wrote it
 
 
 def test_the_hovered_moment_says_everything_wrapped_and_only_the_panel_scrolls(qapp):

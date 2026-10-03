@@ -51,16 +51,18 @@ def hm(at: float | None) -> str:
 
 
 def day_words(at: float | None, today: date | None = None) -> str:
-    """``today 09:41`` / ``yesterday 23:40`` / ``2 Oct 12:19``."""
+    """``today, 9:41 AM`` / ``yesterday, 11:40 PM`` / ``2 Oct, 12:19 PM`` (12-hour, as people say it)."""
     if not at:
         return ""
+    from yuki.ui.window.data import nat_time
+
     d = datetime.fromtimestamp(at)
     t = today or date.today()
     if d.date() == t:
-        return f"today {d:%H:%M}"
+        return f"today, {nat_time(at)}"
     if d.date() == t - timedelta(days=1):
-        return f"yesterday {d:%H:%M}"
-    return f"{d.day} {d:%b} {d:%H:%M}"
+        return f"yesterday, {nat_time(at)}"
+    return f"{d.day} {d:%b}, {nat_time(at)}"
 
 
 def short_day(at: float | None) -> str:
@@ -323,18 +325,71 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
         away.append({"kind": "card", "title": {"done": "Done from a card", "undone": "Undone"}[n["outcome"]],
                      "at": epoch_of(n.get("outcome_at")) or at, "state": n["outcome"], "changed": [change]})
     for r in (read_request_log(requests_csv, since, limit=INBOX_MAX) if requests_csv else []):
-        words, cost = request_row_words(r)
+        words, _cost = request_row_words(r)
+        took = took_words(r.get("wall_s"))
+        # how long it took, as a person says it; never the raw "7.0 s, 3 steps, 8¢" line (the 3 Oct feedback)
         away.append({"kind": "request", "title": request_title(r.get("what") or ""), "at": r["at"], "state": r["state"],
-                     "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}], "cost": cost})
+                     "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}],
+                     "cost": f"took {took}" if took else ""})
     away.sort(key=lambda x: x.get("at") or 0, reverse=True)
+    away = away[:INBOX_MAX]
+    cost_row = ai_cost_row(Path(requests_csv).parent if requests_csv else None, now)
+    if cost_row is not None:
+        away.append(cost_row)
     now_strip["goals"] = goals_today(memory)
     # when Home next changes with the clock alone: an open offer running out, the oldest "since you were away" row
     # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
     moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
-    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away[:INBOX_MAX] if a.get("at")]
+    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away if a.get("at")]
     next_at = min((m for m in moments if m and m > now), default=None)
-    return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away[:INBOX_MAX],
+    return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away,
             "people": (people or [])[:6], "since": since, "next_at": next_at}
+
+
+#: Where the day's AI spend went, in plain words (``yuki.core.cost``'s parts: memory's worker log names, the agent,
+#: the voice). A part not listed is "other memory work". Display names only: nothing is decided from them.
+COST_PARTS = {"journal": "daily notes", "portrait": "your profile", "nudges": "cards and check-ins",
+              "calldigest": "call summaries", "transcribe": "turning calls into text",
+              "conversations": "remembering our chats", "episodes": "the story of your day",
+              "recheck": "double-checking notes", "titles": "short titles", "daydigest": "day summaries",
+              "agent": "your requests", "voice": "talking with you"}
+#: The cost ledger is incremental (each log read from where it stopped); one per logs folder, kept for the process.
+_cost_ledgers: dict[str, Any] = {}
+
+
+def ai_cost_row(logs: Path | None, now: float | None = None) -> dict[str, Any] | None:
+    """Home's AI cost card (the 3 Oct feedback: plain words): "My AI use today: about $1.84" and where it went,
+    "Daily notes $0.92, your profile $0.51, …", read from the logs Yuki already writes (``yuki.core.cost``'s ledger,
+    incremental: only new lines are read). A "notice" row of Since you were away, keyed by the day (its total
+    changes; its row stays). None with no logs or under a cent."""
+    if logs is None:
+        return None
+    from yuki.core.cost import CostLedger
+
+    try:
+        ledger = _cost_ledgers.get(str(logs))
+        if ledger is None:
+            ledger = _cost_ledgers[str(logs)] = CostLedger(Path(logs))
+        spend = ledger.refresh()
+    except Exception:  # noqa: BLE001 - a cost line must never break Home
+        return None
+    parts: dict[str, float] = {}
+    for kind, usd in (spend.memory or {}).items():
+        name = COST_PARTS.get(kind, "other memory work")
+        parts[name] = parts.get(name, 0.0) + float(usd or 0)
+    parts[COST_PARTS["agent"]] = parts.get(COST_PARTS["agent"], 0.0) + spend.agent + spend.agent_startup
+    parts[COST_PARTS["voice"]] = parts.get(COST_PARTS["voice"], 0.0) + spend.voice_mouth
+    total = spend.model_total
+    if total < 0.01:
+        return None
+    shown = [(n, v) for n, v in sorted(parts.items(), key=lambda kv: -kv[1]) if v >= 0.01]
+    note = ", ".join(f"{n} ${v:.2f}" for n, v in shown[:4])
+    note = note[:1].upper() + note[1:]
+    rest = sum(v for _n, v in shown[4:])
+    if rest >= 0.01:
+        note += f", the rest ${rest:.2f}"
+    return {"kind": "notice", "key": f"cost:{spend.day}", "title": f"My AI use today: about ${total:.2f}", "at": None,
+            "when": "today", "state": "done", "changed": [], "note": note + "." if note else ""}
 
 
 #: Goals the Now strip shows at most (today's, open first).
@@ -389,7 +444,7 @@ def _route(r: dict[str, Any]) -> dict[str, Any]:
     if chat or handle:
         place = "DM" if kind == "dm" else chat or handle
         sub = (("@" + (handle or chat).lstrip("@")) if kind == "dm" else
-               (handle if handle and handle != chat else {"group": "group", "channel": "channel"}.get(kind, "")))
+               (handle if handle and handle != place else {"group": "group", "channel": "channel"}.get(kind, "")))
     else:   # an older index without the chat's own fields: the route's label as it was
         place, sub = r.get("label") or "", ""
     return {"label": place, "sub": sub, "app": r.get("app") or "", "kind": kind,
@@ -426,9 +481,46 @@ def rhythm_view(r: Any) -> tuple[list[Any] | None, dict[str, Any] | None]:
     return days, info
 
 
+def _usual_line(value: Any) -> str:
+    """Memory's ``usual`` as the dossier's "Usually" line: one plain sentence (memory writes it, migration 33). An
+    older memory's route ref (``route:24``, the 3 Oct feedback item 1) is never shown."""
+    text = " ".join(str(value or "").split()) if isinstance(value, str) else ""
+    return "" if text.startswith("route:") else text
+
+
+def _summary_view(s: Any) -> dict[str, Any] | None:
+    """A person's one summary (memory's ``summary``: the person fact's headline and its shown form, said to the
+    user) as the dossier shows it, with its pin; ``None`` when memory has none."""
+    if not isinstance(s, dict) or not s.get("ref"):
+        return None
+    from yuki.ui.window.data import natural, plain
+
+    text = " ".join(str(s.get("text") or "").split())
+    return {"ref": str(s["ref"]), "headline": natural(" ".join(str(s.get("headline") or "").split())),
+            "text": plain(text) if text else "", "pinned": bool(s.get("pinned"))}
+
+
+def person_ids(p: dict[str, Any]) -> list[str]:
+    """Who a person is, by every name the people index knows them by (their name, aliases, the handles and chat
+    names of their direct routes), folded for an exact lookup: a call's people list names one friend once
+    (the 3 Oct feedback item 18: two handles of one person). Identity from memory's own index, no guessing."""
+    ids = [p.get("name"), *(p.get("aliases") or [])]
+    for r in p.get("routes") or []:
+        if isinstance(r, dict) and r.get("kind") == "dm":
+            ids += [r.get("handle"), r.get("chat")]
+    out: list[str] = []
+    for i in ids:
+        key = " ".join(str(i or "").split()).lstrip("@").casefold()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
 def person_from_index(p: dict[str, Any]) -> dict[str, Any]:
     """One row of memory's people index (``people_list()``) as Me's list and dossier show it. Message counts and the
-    last contact come from the index; the contact rhythm (messages a day both ways, 14 days) from its ``rhythm``."""
+    last contact come from the index; the contact rhythm (messages a day both ways, 14 days) from its ``rhythm``;
+    the one summary (``summary``), the "Usually" line (``usual``, a plain sentence) and the relation the people
+    list shows (the person fact's short label, said to the user) from memory (migration 33)."""
     routes = [_route(r) for r in p.get("routes") or [] if isinstance(r, dict)]
     count = sum(int(r["mine"] or 0) + int(r["theirs"] or 0) for r in routes if isinstance(r.get("mine"), int))
     preferred = next((r for r in routes if r["preferred"]), routes[0] if routes else None)
@@ -437,9 +529,13 @@ def person_from_index(p: dict[str, Any]) -> dict[str, Any]:
         if r["app"] and r["app"] not in apps:
             apps.append(r["app"])
     out = {"ref": str(p.get("ref") or p.get("name") or ""), "name": p.get("name") or "", "relation": p.get("relation") or "",
-           "aliases": [str(a) for a in p.get("aliases") or [] if str(a).strip()][:4], "usual": p.get("usual") or "",
+           "aliases": [str(a) for a in p.get("aliases") or [] if str(a).strip()][:4], "usual": _usual_line(p.get("usual")),
            "last_at": epoch_of(p.get("last_contact")), "count": count if routes else None, "routes": routes,
-           "route": preferred["app"] if preferred else "", "prov": ("Seen in " + " and ".join(apps[:2])) if apps else ""}
+           "route": preferred["app"] if preferred else "", "prov": ("Seen in " + " and ".join(apps[:2])) if apps else "",
+           "ids": person_ids(p)}
+    summary = _summary_view(p.get("summary"))
+    if summary is not None:
+        out["summary"] = summary
     days, info = rhythm_view(p.get("rhythm"))
     if days is not None:
         out["rhythm"] = days
@@ -450,15 +546,22 @@ def person_from_index(p: dict[str, Any]) -> dict[str, Any]:
 
 def contact_card(card: dict[str, Any]) -> dict[str, Any]:
     """``contact(ref)``'s full card trimmed for the dossier: routes with counts (never the message samples: the
-    window does not need the user's own messages), the facts as lines, usual, aliases, relation."""
+    window does not need the user's own messages), the person's other facts as key facts (``{ref, h, d}``: memory's
+    headline and its shown form; the summary is not repeated here), usual, aliases, relation."""
+    from yuki.ui.window.data import natural, plain
+
     facts = []
     for f in card.get("facts") or []:
-        text = f.get("text") if isinstance(f, dict) else f
-        if text and str(text).strip():
-            facts.append(" ".join(str(text).split()))
+        if isinstance(f, dict):
+            text = plain(" ".join(str(f.get("text") or "").split()))
+            head = natural(" ".join(str(f.get("headline") or "").split()))
+            if text or head:
+                facts.append({"ref": str(f.get("ref") or ""), "h": head or text, "d": text if head else ""})
+        elif str(f or "").strip():
+            facts.append({"ref": "", "h": plain(natural(" ".join(str(f).split()))), "d": ""})
     out = {"found": bool(card.get("found", True)), "relation": card.get("relation") or "",
-           "aliases": [str(a) for a in card.get("aliases") or []][:4], "usual": card.get("usual") or "",
-           "routes": [_route(r) for r in card.get("routes") or [] if isinstance(r, dict)], "facts": facts[:4]}
+           "aliases": [str(a) for a in card.get("aliases") or []][:4], "usual": _usual_line(card.get("usual")),
+           "routes": [_route(r) for r in card.get("routes") or [] if isinstance(r, dict)], "facts": facts[:12]}
     days, info = rhythm_view(card.get("rhythm"))
     if days is not None:
         out["rhythm"] = days
@@ -489,8 +592,9 @@ def people_now(memory: Any, limit: int = 40, *, use_index: bool = True) -> tuple
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append({"ref": it.ref, "name": f.get("subject") or it.title, "relation": it.summary or it.short,
-                    "note": it.text, "prov": it.source, "routes": [], "last_at": max([e.at for e in it.evidence] or [it.since]),
+        out.append({"ref": it.ref, "name": f.get("subject") or it.title, "relation": it.summary or "",
+                    "prov": it.source, "routes": [], "last_at": max([e.at for e in it.evidence] or [it.since]),
+                    "summary": {"ref": it.ref, "headline": it.summary, "text": it.text, "pinned": bool(f.get("pinned"))},
                     "fact": {"ref": it.ref, "title": it.title, "text": it.text}})
     out.sort(key=lambda p: -(p.get("last_at") or 0))
     return "portrait", out
@@ -499,10 +603,276 @@ def people_now(memory: Any, limit: int = 40, *, use_index: bool = True) -> tuple
 # -- Me ------------------------------------------------------------------------------------------------------------
 
 
-def fact_json(it: Any, kind: str = "fact") -> dict[str, Any]:
-    """A portrait item (:class:`yuki.ui.window.data.Item`) as Me shows it, with where it came from."""
-    return {"ref": it.ref, "title": it.title, "text": it.text, "prov": it.source, "tags": list(it.tags or []),
-            "conf_word": "" if it.origin == "user" else conf_word(it.confidence), "kind": kind}
+#: Me's portrait, by topic (the 3 Oct design, item 10): each group's memory kinds. A fact is shown once: a person's
+#: fact is a link row to their page here, routines live in Routines, a fact waiting in To review only there.
+FACT_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("work", "Work", ("work", "open_loop")), ("people", "People", ("person",)),
+    ("interests", "Interests", ("interest",)), ("prefs", "Preferences and rules", ("preference",)),
+    ("about", "About you", ("personality",)))
+#: Below this (the model's own confidence) a fact Yuki wrote says "not sure" (the Qt window's UNSURE_BELOW).
+UNSURE_BELOW = 0.4
+#: The review queue's flags in the words the page shows.
+REVIEW_FLAG = {"unsure": "not sure", "new": "new"}
+#: How far back the window looks for the call an entry was said on (its place and who was on it).
+CALLS_DAYS = 21
+
+
+def name_lookup(people: list[dict[str, Any]] | None) -> dict[str, str]:
+    """Every name the people index knows someone by (:func:`person_ids`) -> the name the page shows them by."""
+    out: dict[str, str] = {}
+    for p in people or []:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        for key in p.get("ids") or person_ids(p):
+            out.setdefault(key, str(p["name"]))
+    return out
+
+
+def call_people(people: list[Any], lookup: dict[str, str]) -> list[str]:
+    """A call's people (the digest's ``[{name, how}]``) as the page names them: each person once, by their index
+    name when a handle is theirs (two handles of one friend are one friend), those the digest only thought likely
+    as "maybe <name>"."""
+    best: dict[str, tuple[int, str]] = {}
+    order: list[str] = []
+    for p in people or []:
+        raw = p.get("name") if isinstance(p, dict) else p
+        how = str(p.get("how") or "on_call_screen") if isinstance(p, dict) else "on_call_screen"
+        raw = " ".join(str(raw or "").split())
+        if not raw:
+            continue
+        name = lookup.get(raw.lstrip("@").casefold(), raw)
+        key = name.casefold()
+        rank = 1 if how == "likely" else 0
+        if key not in best:
+            order.append(key)
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, name)
+    return [best[k][1] if best[k][0] == 0 else f"maybe {best[k][1]}" for k in order]
+
+
+#: Calls read for provenance are kept this long (a call's place and people don't change; ``calls_in`` over days
+#: costs about half a second on a real memory, and Me is rebuilt as the journal grows).
+CALLS_CACHE_S = 600.0
+_calls_cache: dict[tuple[int, int, int], tuple[float, list[Any]]] = {}
+
+
+def call_places(memory: Any, lookup: dict[str, str] | None = None, now: float | None = None,
+                days: float = CALLS_DAYS, since: float | None = None) -> dict[int, dict[str, Any]]:
+    """call id -> ``{"label", "app", "people"}`` for the calls since ``since`` (default: the last ``days``): the
+    place in one format ("Discord, #general voice (Friends)", memory's place label; an older digest's own words;
+    "" when the screen never showed it), the app, and who was on it (:func:`call_people`). One ``calls_in`` read,
+    kept :data:`CALLS_CACHE_S`; ``{}`` without calls."""
+    now = time.time() if now is None else now
+    since = max(now - days * 86400, since if since is not None else now - days * 86400)
+    key = (id(memory), int(since // 3600), int(now // CALLS_CACHE_S))
+    hit = _calls_cache.get(key)
+    if hit is None:
+        rows = _safe(lambda: memory.calls_in(since=since, until=now, limit=400), []) or []
+        _calls_cache.clear()
+        _calls_cache[key] = hit = (now, rows)
+    out: dict[int, dict[str, Any]] = {}
+    for c in hit[1]:
+        if not isinstance(c, dict):
+            continue
+        view = {"label": call_where(c, default=""), "app": str(c.get("app") or ""),
+                "people": call_people(c.get("people") or [], lookup or {})}
+        for cid in c.get("call_ids") or []:
+            if isinstance(cid, int):
+                out[cid] = view
+    return out
+
+
+def _call_id(ref: Any) -> int | None:
+    t = str(ref or "")
+    return int(t[5:]) if t.startswith("call:") and t[5:].isdigit() else None
+
+
+def heard_line(app: str, call: dict[str, Any] | None, at: float | None, *, channel_known: bool = True,
+               label: str = "", now: float | None = None, kind: str = "", where: str = "") -> str:
+    """Where something was said or seen, in the one format every row uses (the 3 Oct feedback item 8): "Heard in
+    Discord, #general voice (Friends), 1 October, 2:07 AM, with Riya and Dev"; a call whose channel the screen never
+    showed "Heard on a Discord call, …". With no call it follows the entry's source ``kind`` (memory's provenance):
+    ``chat`` (said to me) "You said it to me, …"; read off the screen (``page``, ``message``, ``list``, ``command``)
+    "Seen in #general in Slack, …" (``where``, else the app; a command names only the app); no source at all
+    "Noted while Chrome was open, …". Never claims you said what was only seen (review F1)."""
+    from yuki.ui.window.data import nat_when
+
+    when = nat_when(at, today=datetime.fromtimestamp(time.time() if now is None else now).date())
+    if call is not None or label:
+        place = (call or {}).get("label") or label
+        app = (call or {}).get("app") or app
+        head = f"Heard in {place}" if place and channel_known else f"Heard on a {app or 'voice'} call"
+        people = (call or {}).get("people") or []
+        tail = f", with {_and(people)}" if people else ""
+        return f"{head}{', ' + when if when else ''}{tail}"
+    tail = f", {when}" if when else ""
+    if kind == "call":
+        return f"Heard on a {app or 'voice'} call{tail}"
+    if kind == "chat":
+        return f"You said it to me{tail}"
+    if kind in ("page", "message", "list", "command"):
+        place = app if kind == "command" else (where or app)
+        return f"Seen in {place}{tail}" if place else f"Seen on your screen{tail}"
+    return f"Noted while {app} was open{tail}" if app else f"Noted{tail}"
+
+
+def _and(names: list[str]) -> str:
+    names = [n for n in names if n]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1] if names else ""
+
+
+def fact_prov(f: dict[str, Any], calls: dict[int, dict[str, Any]]) -> str:
+    """Where a fact came from, in plain words: "You told me, 25 Sep", "Heard in Discord, #general voice (Friends),
+    30 Sep, with Riya", "Seen in Slack, 1 Oct", or "From my reading of your week, 1 Oct"."""
+    from yuki.ui.window.data import epoch
+
+    ev = [e for e in f.get("evidence") or [] if isinstance(e, dict)]
+    last = max([epoch(e.get("at")) or 0.0 for e in ev] + [epoch(f.get("since")) or 0.0]) or None
+    day = short_day(last)
+    if f.get("origin") == "user":
+        return f"You told me{', ' + day if day else ''}"
+    for e in ev:
+        cid = _call_id(e.get("call"))
+        if cid is not None and cid in calls:
+            c = calls[cid]
+            head = f"Heard in {c['label']}" if c["label"] else f"Heard on a {c['app'] or 'voice'} call"
+            return f"{head}, {short_day(epoch(e.get('at')))}" + (f", with {_and(c['people'])}" if c["people"] else "")
+    apps: dict[str, int] = {}
+    for e in ev:
+        app = str(e.get("app") or "")
+        if app and not app.startswith("call"):
+            apps[app] = apps.get(app, 0) + 1
+    if apps:
+        return f"Seen in {max(apps, key=lambda a: apps[a])}{', ' + day if day else ''}"
+    if any(str(e.get("app") or "").startswith("call") for e in ev):
+        return f"Heard on a call{', ' + day if day else ''}"
+    return f"From my reading of your week{', ' + day if day else ''}"
+
+
+def week_seen(f: dict[str, Any], now: float | None = None) -> list[bool]:
+    """The last 7 days (today last): on which of them the evidence a fact rests on was seen (the routine's week
+    dots: "days seen in the last 7", measured from its cited entries)."""
+    now = time.time() if now is None else now
+    today = datetime.fromtimestamp(now).date()
+    days = evidence_days(f)
+    return [today - timedelta(days=6 - i) in days for i in range(7)]
+
+
+def fact_view(f: dict[str, Any], calls: dict[int, dict[str, Any]], now: float | None = None) -> dict[str, Any]:
+    """One portrait fact as Me shows it: a one-line headline (memory's short ``summary``), the detail (its
+    ``shown`` form: second person, natural dates; until memory writes it, the fact's text with its dates in natural
+    form), where it came from, its own pin, and the flags (a joke, not sure, you told me)."""
+    from yuki.ui.window.data import epoch, first_sentence, natural, plain
+
+    shown = " ".join(str(f.get("shown") or "").split())
+    detail = plain(shown) if shown else plain(natural(str(f.get("text") or "")))
+    head = natural(" ".join(str(f.get("summary") or "").split())) or first_sentence(detail, 90)
+    conf = f.get("confidence")
+    out = {"ref": f.get("ref"), "kind": f.get("kind") or "", "h": head, "d": detail if detail != head else "",
+           "prov": fact_prov(f, calls), "pinned": bool(f.get("pinned")), "you": f.get("origin") == "user",
+           "joke": f.get("aspect") == "joke", "subject": f.get("subject") or "",
+           "unsure": f.get("origin") != "user" and conf is not None and conf < UNSURE_BELOW,
+           "importance": f.get("importance") or 3, "at": epoch(f.get("created_at")) or epoch(f.get("since")) or 0}
+    if f.get("kind") == "routine":
+        out["week"] = week_seen(f, now)
+        out["conf_word"] = conf_word(conf) or ("you told me" if f.get("origin") == "user" else "")
+        out["when"] = routine_when(f)
+    if f.get("kind") == "behaviour":
+        out["days_seen"] = len(evidence_days(f))
+    return out
+
+
+def evidence_days(f: dict[str, Any]) -> set[Any]:
+    """The days the evidence a fact rests on was seen (its cited entries' times)."""
+    from yuki.ui.window.data import epoch
+
+    return {datetime.fromtimestamp(t).date() for e in f.get("evidence") or [] if isinstance(e, dict)
+            and (t := epoch(e.get("at"))) is not None}
+
+
+#: A routine's "when" is said only from this many cited times, and a time of day only when they sit this close.
+WHEN_MIN_TIMES, WHEN_SPAN_H = 3, 3.0
+
+
+def routine_when(f: dict[str, Any]) -> str:
+    """When a routine happens, measured from the times of the entries it rests on (memory keeps no "when" field):
+    "weekdays, around 9 PM", "around 7 AM", "weekends", or "" when the times don't agree. Arithmetic on its own
+    evidence: the hours' circular spread (a routine across midnight stays one), the weekdays of distinct days."""
+    import math
+
+    from yuki.ui.window.data import epoch
+
+    times = sorted(t for e in f.get("evidence") or [] if isinstance(e, dict) and (t := epoch(e.get("at"))) is not None)
+    if len(times) < WHEN_MIN_TIMES:
+        return ""
+    stamps = [datetime.fromtimestamp(t) for t in times]
+    hours = [s.hour + s.minute / 60 for s in stamps]
+    ang = [h / 24 * 2 * math.pi for h in hours]
+    mean = (math.degrees(math.atan2(sum(map(math.sin, ang)), sum(map(math.cos, ang)))) / 15) % 24
+    spread = max(min(abs(h - mean), 24 - abs(h - mean)) for h in hours) * 2
+    bits = []
+    days = {s.date() for s in stamps}
+    if len(days) >= WHEN_MIN_TIMES:
+        if all(d.weekday() < 5 for d in days):
+            bits.append("weekdays")
+        elif all(d.weekday() >= 5 for d in days):
+            bits.append("weekends")
+    if spread <= WHEN_SPAN_H:
+        half = int(round(mean * 2)) % 48          # to the nearest half hour
+        hour, mins = divmod(half * 30, 60)
+        bits.append(f"around {hour % 12 or 12}{':30' if mins else ''} {'AM' if hour < 12 else 'PM'}")
+    return ", ".join(bits)
+
+
+def review_view(q: dict[str, Any], facts_by_ref: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Memory's "To review" queue (``review_queue()``, at most 5 a day) as the page shows it: each fact's headline,
+    its detail, its flag ("new" / "not sure") and where it came from; the day's cap, what's left, the merges."""
+    from yuki.ui.window.data import natural, plain
+
+    items = []
+    for it in q.get("items") or []:
+        if not isinstance(it, dict) or not it.get("ref"):
+            continue
+        known = facts_by_ref.get(str(it["ref"])) or {}
+        text = plain(" ".join(str(it.get("text") or "").split())) or known.get("d") or ""
+        head = natural(" ".join(str(it.get("headline") or "").split())) or known.get("h") or text
+        items.append({"ref": str(it["ref"]), "h": head, "d": text if text != head else "",
+                      "flag": REVIEW_FLAG.get(str(it.get("flag") or ""), str(it.get("flag") or "")),
+                      "prov": known.get("prov") or ""})
+    merged = q.get("merged") if isinstance(q.get("merged"), dict) else {}
+    return {"items": items, "cap": int(q.get("cap") or 5), "left": int(q.get("left_today") or 0),
+            "done": int(q.get("reviewed_today") or 0), "waiting": int(q.get("waiting") or 0),
+            "merged": int(merged.get("count") or 0)}
+
+
+def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[Any],
+                  now: float | None = None, lookup: dict[str, str] | None = None) -> dict[str, Any]:
+    """"Maybe misheard" (memory's ``misheard()``: unanswered uncertain entries of the last week, newest first): the
+    words as heard (the entry's own quote when memory kept it, else its text) and where they were heard, in the one
+    format (:func:`heard_line`). An older memory: the Qt view's uncertain entries (``fallback``)."""
+    from yuki.ui.window.data import natural, plain
+
+    fn = getattr(memory, "misheard", None)
+    got = _safe(fn, None) if callable(fn) else None
+    if not isinstance(got, dict):
+        items = [{"ref": i.ref, "text": i.text, "quote": "", "prov": heard_line(i.title, None, i.since, now=now)} for i in fallback]
+        return {"items": items, "total": len(items), "direct": False}
+    items = []
+    for m in got.get("items") or []:
+        if not isinstance(m, dict) or not m.get("ref"):
+            continue
+        src = m.get("source") if isinstance(m.get("source"), dict) else {}
+        quote = " ".join(str(src.get("quote") or "").split())
+        cid = _call_id(m.get("call"))
+        call = calls.get(cid) if cid is not None else None
+        if cid is not None and call is None:   # memory's own label for it (its digest's place) and who was on it
+            call = {"label": m.get("heard_in") or "", "app": m.get("app") or "",
+                    "people": call_people(m.get("people") or [], lookup or {})}
+        items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))), "quote": quote,
+                      "prov": heard_line(str(m.get("app") or ""), call, m.get("at"),
+                                         channel_known=bool(m.get("channel_known", True)), now=now,
+                                         kind=str(src.get("kind") or ""), where=str(src.get("where") or ""))})
+    return {"items": items, "total": int(got.get("total") or len(items)), "direct": callable(getattr(memory, "resolve_heard", None))}
 
 
 def read_pending(path: Path, db: str) -> dict[str, dict[str, Any]]:
@@ -525,32 +895,57 @@ def rule_json(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
-             people: tuple[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
-    from yuki.ui.window.data import build_me as qt_build_me
-
+             people: tuple[str, list[dict[str, Any]]] | None = None, now: float | None = None) -> dict[str, Any]:
+    """Me (the 3 Oct design): the people and their dossiers (one summary each, the "Usually" line, key facts on
+    open); your portrait as a "To review" queue (at most 5 a day) and topic groups of one-line headlines (each fact
+    once; a person's fact links to their page); Routines (title, week dots, how sure; detail on click) with the
+    day-specific observations under "Not routines"; Maybe misheard with where it was heard. Every fact carries its own
+    pin. Built from memory's shown forms (second person, natural dates); nothing here rewrites a word."""
+    now = time.time() if now is None else now
     source, persons = people if people is not None else people_now(memory)
-    view = _safe(lambda: qt_build_me(memory), None)
-    facts: list[dict[str, Any]] = []
-    routines: list[dict[str, Any]] = []
-    misheard: list[dict[str, Any]] = []
-    if view is not None:
-        routines = [fact_json(i, "behaviour") for i in view.routines]
-        for group, kind in ((view.work, "work"), (view.interests, "interest"), (view.preferences, "preference"),
-                            (view.on_your_plate, "open_loop")):
-            facts += [fact_json(i, kind) for i in group]
-        for items in view.personality.values():
-            facts += [fact_json(i, "personality") for i in items]
-        misheard = [{"ref": i.ref, "title": i.title, "text": i.text, "prov": i.source} for i in view.unsure]
-        if source == "index":   # the portrait fact behind a person, for the dossier's Correct / Forget / Pin
-            by_name = {str(i.title).casefold(): i for i in view.people}
-            for p in persons:
-                it = by_name.get(str(p.get("name") or "").casefold())
-                if it is not None:
-                    p["fact"] = {"ref": it.ref, "title": it.title, "text": it.text}
-                    p.setdefault("note", it.text)
+    lookup = name_lookup(persons)
+    raw = [f for f in (_safe(memory.portrait_facts_with_evidence, []) or []) if isinstance(f, dict) and f.get("ref")]
+    # the calls a fact was heard on (their place and people): read only for the span those entries cover
+    heard = [t for f in raw for e in f.get("evidence") or [] if isinstance(e, dict) and _call_id(e.get("call")) is not None
+             and (t := epoch_of(e.get("at"))) is not None]
+    misheard_fn = getattr(memory, "misheard", None)
+    calls = call_places(memory, lookup, now, since=min(heard) - 6 * 3600) if heard else {}
+    views = [fact_view(f, calls, now) for f in raw]
+    by_ref = {str(v["ref"]): v for v in views}
+    rq = getattr(memory, "review_queue", None)
+    review = review_view(_safe(rq, {}) or {}, by_ref) if callable(rq) else None
+    in_review = {it["ref"] for it in (review or {}).get("items") or []}
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for v in views:
+        by_kind.setdefault(v["kind"], []).append(v)
+    for items in by_kind.values():
+        items.sort(key=lambda v: -(v["at"] or 0))
+    # a person's fact is their dossier's summary: here it is a link row to their page, never the detail again
+    person_ref = {str(p.get("name") or "").casefold(): p.get("ref") for p in persons}
+    groups = []
+    for key, name, kinds in FACT_GROUPS:
+        facts = [v for k in kinds for v in by_kind.get(k, []) if v["ref"] not in in_review]
+        if key == "people":
+            facts = [{"ref": v["ref"], "kind": "person", "h": v["h"], "person": person_ref.get(v["subject"].casefold()) or v["subject"],
+                      "pinned": v["pinned"], "at": v["at"], "importance": v["importance"]} for v in facts]
+        facts.sort(key=lambda v: -(v["at"] or 0))
+        groups.append({"key": key, "name": name, "facts": facts})
     rules = [rule_json(r) for r in (_safe(memory.rules, []) or [])]
-    return {"source": source, "people": persons, "routines": routines, "rules": rules, "facts": facts,
-            "misheard": misheard, "pending": pending or {}}
+    routines = [v for v in by_kind.get("routine", []) if v["ref"] not in in_review]
+    # the day-specific observations memory keeps as "behaviour" facts: not routines, said apart (report 38 §12.5)
+    not_routines = [v for v in by_kind.get("behaviour", []) if v["ref"] not in in_review]
+    fallback: list[Any] = []
+    if not callable(misheard_fn):
+        from yuki.ui.window.data import build_me as qt_build_me
+
+        view = _safe(lambda: qt_build_me(memory), None)
+        fallback = list(view.unsure) if view is not None else []
+    total = sum(len(g["facts"]) for g in groups) + len(rules) + len(routines) + len(not_routines) + len(in_review)
+    return {"source": source, "people": persons, "groups": groups, "rules": rules, "routines": routines,
+            "not_routines": not_routines, "review": review, "total": total,
+            "misheard": misheard_view(memory, calls, fallback, now, lookup), "pending": pending or {},
+            "can": {"pin": callable(getattr(memory, "pin_fact", None)), "review": callable(rq),
+                    "heard": callable(getattr(memory, "resolve_heard", None))}}
 
 
 # -- Work and the Day ----------------------------------------------------------------------------------------------
@@ -589,6 +984,8 @@ def thread_involves(t: dict[str, Any]) -> tuple[list[str], list[str]]:
 def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, Any]:
     """Threads of work (memory's ``threads``), most recently touched first, with their checklists, the people and
     the apps they involve, their open goal; and the week figure."""
+    from yuki.ui.window.data import natural
+
     rows = _safe(lambda: memory.threads(statuses=("active", "paused", "done"), limit=24), []) or []
     goals = thread_goals(memory)
     threads = []
@@ -596,7 +993,10 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, 
         people, things = thread_involves(t)
         goal = goals.get(f"W{t.get('id')}") if t.get("id") is not None else None
         threads.append({"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
-                        "state": " ".join(str(t.get("state") or "").split()), "open": [str(x) for x in t.get("open") or []],
+                        # where it stands, said to you (memory's shown form, migration 33); until it is written, the
+                        # state with only its date and time formats changed
+                        "state": " ".join(str(t.get("shown") or "").split()) or natural(" ".join(str(t.get("state") or "").split())),
+                        "open": [str(x) for x in t.get("open") or []],
                         "involves": [str(x) for x in t.get("involves") or []], "people": people, "apps": things,
                         "last_at": epoch_of(t.get("last_seen")), "checks": thread_checks(t),
                         "goal": goal["text"] if goal else None})
@@ -667,9 +1067,34 @@ def week_days(memory: Any, now: float | None = None) -> list[dict[str, Any]]:
     return out
 
 
+def call_gists(c: dict[str, Any]) -> list[str]:
+    """A call's gists said to the user (memory's ``shown`` form, migration 33: "your friends chose …, which shocked
+    you"), the stored gist with its dates in natural form until that is written."""
+    from yuki.ui.window.data import natural
+
+    out = []
+    for g in c.get("gists") or []:
+        if isinstance(g, dict):
+            text = " ".join(str(g.get("shown") or "").split()) or natural(" ".join(str(g.get("gist") or "").split()))
+            if text:
+                out.append(text)
+    return out
+
+
+def call_where(c: dict[str, Any], default: str | None = None) -> str:
+    """Where a call was, in the one format every row uses: "Discord, #general voice (Friends)" (memory's place
+    label); a digest written before the structured place, its own words as they are; else the app."""
+    for key in ("places", "where"):
+        for p in c.get(key) or []:
+            if str(p).strip():
+                return " ".join(str(p).split())
+    return str(c.get("app") or "") if default is None else default
+
+
 def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
-              week: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """The Day tab: the day in slices (the skyline), today's totals, sessions, calls, and the week by hour."""
+              week: list[dict[str, Any]] | None = None, people: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The Day tab: the day in slices (the skyline), today's totals, sessions (each opens to its whole title and the
+    time in every app), calls (where, who, the gists said to you), and the week by hour."""
     from yuki.ui.window.data import build_day as qt_build_day
 
     now = time.time() if now is None else now
@@ -720,26 +1145,33 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
             if call.start < b0 + slice_s and call.end > b0:
                 c = 2 if call.ongoing else max(c, 1)
         buckets.append({"p": round(p, 2), "m": mode, "c": c})
+    from yuki.ui.window.data import nat_time, natural
+
     lanes = {ln.key: ln.label for ln in v.lanes}
     sessions = []
     for s in v.sessions:
         fs = sum(seg.present_s for seg in v.segments if seg.fullscreen and seg.state == "present"
                  and seg.start < s.end and seg.end > s.start)
+        full = natural(getattr(s, "title_full", "") or s.title)
+        # the row shows the title and its first apps; opening it shows the whole title and the time in every app
+        # (the 3 Oct ask D: "clicking on each session should show the time spent per app and the entire session title")
         sessions.append({"a": int((s.start - since) // 60), "b": int((s.end - since) // 60), "start": hm(s.start),
-                         "end": hm(s.end), "title": s.title, "app": lanes.get(s.lane, s.lane),
+                         "end": hm(s.end), "title": natural(s.title), "app": lanes.get(s.lane, s.lane),
                          "mode": "full" if fs > s.present_s / 2 else "active",
-                         "apps": [[name, round(secs / 60)] for name, secs in s.apps[:4]]})
+                         "apps": [[name, round(secs / 60)] for name, secs in s.apps if secs >= 30],
+                         **({"full": full} if full != natural(s.title) else {})})
     calls_rows = _safe(lambda: memory.calls_in(since=since, until=since + 86400, limit=30), []) or []
+    lookup = name_lookup(people)
     calls = []
     for c in calls_rows:
         cs, ce = epoch_of(c.get("start")), epoch_of(c.get("end")) or now
         if cs is None:
             continue
-        gists = [g.get("gist") for g in c.get("gists") or [] if isinstance(g, dict) and g.get("gist")]
         calls.append({"a": int((max(cs, since) - since) // 60), "b": int((min(ce, since + 86400) - since) // 60),
                       "start": hm(cs), "end": hm(ce), "app": c.get("app") or "", "live": bool(c.get("ongoing")),
                       "recorded": bool(c.get("recorded")), "min": round(float(c.get("seconds") or 0) / 60),
-                      "gist": gists[0] if gists else "", "started_at": cs})
+                      "gists": call_gists(c), "where": call_where(c),
+                      "people": call_people(c.get("people") or [], lookup), "started_at": cs})
     t = v.totals
     longest, top_full = longest_focus(v), _top_full(v)
     lane_top = max(v.lanes, key=lambda ln: ln.present_s - ln.fullscreen_s, default=None)
@@ -749,16 +1181,16 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
                f"{lane_top.label} {dur_words(lane_top.present_s)}" if lane_top else ""],
               ["Full screen", dur_words(t.get("fullscreen_s", 0)), top_full],
               ["Calls", dur_words(t.get("call_s", 0)), f"{n_calls} call{'s' if n_calls != 1 else ''}" if n_calls else "none"],
-              ["Longest focus", dur_words(longest[0]), f"{longest[1]}, {hm(longest[2])}" if longest[1] else ""]]
+              ["Longest focus", dur_words(longest[0]), f"{longest[1]}, {nat_time(longest[2])}" if longest[1] else ""]]
     offs = []
     for s, e in sorted(off):
         if offs and s - offs[-1][1] < 300:
             offs[-1] = (offs[-1][0], max(offs[-1][1], e))
         else:
             offs.append((s, e))
-    return {"date_label": f"{day:%A} {day.day} {day:%b}", "today": is_today, "first": hm(v.first_at), "last": hm(v.last_at),
+    return {"date_label": f"{day:%A} {day.day} {day:%b}", "today": is_today, "first": nat_time(v.first_at), "last": nat_time(v.last_at),
             "now_min": int((now - since) // 60) if is_today else None,
-            "off": [{"from": hm(s), "to": hm(e)} for s, e in offs if e - s >= 600],
+            "off": [{"from": nat_time(s), "to": nat_time(e)} for s, e in offs if e - s >= 600],
             "buckets": buckets, "sessions": sessions, "calls": calls, "totals": totals,
             "week_hours": week if week is not None else week_days(memory, now)}
 
@@ -1001,11 +1433,10 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float,
     wrong = f"That wasn’t right: “{words}”. " if words else ""
     steps = run.get("steps") or []
     if not steps:
-        result = {"final": "answered", "error": "failed", "cancelled": "stopped", "withdrawn": "replaced by a newer request",
-                  "abandoned": "abandoned"}.get(str(run.get("outcome") or ""), str(run.get("outcome") or "answered"))
-        status = "failed" if run.get("outcome") == "error" else "stopped" if run.get("outcome") in (
-            "cancelled", "withdrawn", "abandoned") else "done"
-        return [{"id": f"run:{run.get('key')}", "kind": "request", "f": "failed" if status == "failed" else "did",
+        word, status = run_outcome(run.get("outcome"))
+        result = "answered" if status == "done" else word[:1].lower() + word[1:]
+        return [{"id": f"run:{run.get('key')}", "kind": "request",
+                 "f": "failed" if status == "failed" else "waiting" if status == "waiting" else "did",
                  "at": float(run.get("at") or now), "what": f"Answered “{words}”" if words else "Answered you",
                  "where": "Yuki", "cost": cost, "because": "because", "why": why, "chips": [], "result": result,
                  "status": status, "wrong_text": wrong}]
@@ -1049,18 +1480,19 @@ def call_rows(calls: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
                   c.get("status") or "waiting to be turned into text")
         out.append({"id": f"call:{c.get('start_at')}", "kind": "call", "f": "calls", "at": c.get("start_at") or now,
                     "what": f"Recording your side of a {app} call" if live else
-                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": app, "cost": "", "because": "because",
+                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": c.get("where") or app, "cost": "", "because": "because",
                     "why": why, "chips": [], "result": result, "status": "live" if live else "verified"})
     return out
 
 
 def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float | None = None,
-                   days: int = 7) -> dict[str, Any]:
+                   days: int = 7, people: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The ledger (E14), newest first: every acting step of Yuki's requests from the run traces (practice memory) with
     why - the user's words, a procedure or lesson it used - its result and an Undo window where memory can take it
     back (a to-do it added; an offer that ran); requests the traces don't have, from the request log; the cards Yuki
     showed (why: the card's reason, or the user's standing request); the calls it kept (why: the user's call rule).
     Filters by ``f``: did / failed / calls. Plus what it saw today (time by app, counts only) and the week's calls."""
+    from yuki.ui.chat_model import clean_request
     from yuki.ui.ledger import read_request_log
 
     now = time.time() if now is None else now
@@ -1076,13 +1508,18 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
         rows.extend(run_rows(run, todos, now, rules))
     run_starts = sorted(float(r.get("at") or 0) for r in runs)
     lanes = {"worker": "Typed request", "front_desk": "Quick answer", "voice": "Voice"}
-    for i, r in enumerate(read_request_log(requests_csv, since, limit=120) if requests_csv else []):
+    for r in read_request_log(requests_csv, since, limit=120) if requests_csv else []:
         if any(abs(r["at"] - a) <= SAME_REQUEST_S for a in run_starts):
             continue   # the run trace above has this request, step by step
         words, cost = request_row_words(r)
         status = {"done": "done", "failed": "failed", "stopped": "stopped"}.get(r["state"], "done")
         voice = r.get("where") == "voice"
-        rows.append({"id": f"r{i}", "kind": "request", "f": "failed" if status == "failed" else "did", "at": r["at"],
+        said = _clip(" ".join(clean_request(r.get("what") or "").split()), 120)
+        # the id is the request's own time (and session), never its place in the log: it is the fold's key, and a
+        # newer request must not move an opened group onto another one (review F3)
+        rows.append({"id": f"req:{r.get('session') or ''}:{float(r['at']):.3f}", "kind": "request",
+                     "f": "failed" if status == "failed" else "did", "at": r["at"],
+                     "wrong_text": f"That wasn’t right: “{said}”. " if said else "",
                      "what": request_title(r.get("what") or ""),
                      "where": lanes.get(r.get("where") or "", (r.get("where") or "").replace("_", " ").capitalize()),
                      "cost": cost, "because": "because", "why": "you asked by voice" if voice else "you asked",
@@ -1119,26 +1556,102 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
     seen = [{"app": it.get("label") or it.get("app") or "", "min": round(float(it.get("present_s") or 0) / 60, 1),
              "visits": int(it.get("visits") or 0)} for it in act.get("items") or [] if float(it.get("present_s") or 0) >= 30]
     calls = []
+    lookup = name_lookup(people)
     for c in reversed(_safe(lambda: memory.calls_in(since=since, until=now, limit=30), []) or []):
         cs = epoch_of(c.get("start"))
         if cs is None:
             continue
-        gists = [g.get("gist") for g in c.get("gists") or [] if isinstance(g, dict) and g.get("gist")]
-        people = [p.get("name") for p in c.get("people") or [] if isinstance(p, dict) and p.get("name")]
+        gists = call_gists(c)
         status = "" if gists else ("Live now. Your side is kept; it’s turned into text when the PC is free."
                                    if c.get("ongoing") and c.get("recorded") else
                                    "Waiting to be turned into text." if c.get("recorded") else "Not recorded.")
         calls.append({"start_at": cs, "end_at": None if c.get("ongoing") else epoch_of(c.get("end")),
                       "live": bool(c.get("ongoing")), "min": round(float(c.get("seconds") or 0) / 60),
                       "spoke_min": round(float(c.get("speech_s") or 0) / 60) if c.get("recorded") else None,
-                      "app": c.get("app") or "", "people": people, "gists": gists[:4], "recorded": bool(c.get("recorded")),
-                      "status": status, "consent": c.get("consent")})
+                      "app": c.get("app") or "", "where": call_where(c),
+                      "people": call_people(c.get("people") or [], lookup), "gists": gists[:6],
+                      "recorded": bool(c.get("recorded")), "status": status, "consent": c.get("consent")})
     rows.extend(call_rows(calls, now))
     rows.sort(key=lambda r: r["at"], reverse=True)
     did_today = sum(1 for r in rows if r["at"] >= midnight and r["kind"] in ("action", "request"))
     no_reason = sum(1 for r in rows if r["at"] >= midnight and not r.get("why"))
-    return {"rows": rows[:150], "counts": {"did_today": did_today, "no_reason": no_reason}, "seen": seen,
+    rows, groups = ledger_groups(rows[:150], runs, now)
+    return {"rows": rows, "groups": groups, "counts": {"did_today": did_today, "no_reason": no_reason}, "seen": seen,
             "calls": calls}
+
+
+#: A request's outcome (practice memory's run ``outcome``) in the words the Activity group's header shows.
+RUN_OUTCOME = {"final": "Done", "error": "Couldn’t finish", "cancelled": "Stopped",
+               "withdrawn": "Replaced by a newer request", "abandoned": "Left unfinished",
+               "parked": "Waiting on your answer"}
+#: Each run outcome's status (the glyph and the filter): a parked request is still waiting on you, never "done".
+RUN_STATUS = {"final": "done", "error": "failed", "cancelled": "stopped", "withdrawn": "stopped",
+              "abandoned": "stopped", "parked": "waiting"}
+
+
+def run_outcome(outcome: Any) -> tuple[str, str]:
+    """(the outcome in plain words, its status) for a run's stored outcome (the agent's ``final``/``error``/
+    ``cancelled``/``withdrawn``/``abandoned``/``parked``; none stored is ``final``, practice memory's own default).
+    An outcome this window doesn't know reads "Ended" with no status: never "Done" (review F2)."""
+    key = str(outcome or "final")
+    return RUN_OUTCOME.get(key, "Ended"), RUN_STATUS.get(key, "")
+
+
+def took_words(seconds: float | None) -> str:
+    """``4 s`` / ``1 min 9 s`` / ``12 min``: how long something took, as a person says it."""
+    if seconds is None or seconds <= 0:
+        return ""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{max(1, s)} s"
+    m, s = divmod(s, 60)
+    return f"{m} min {s} s" if m < 10 and s else f"{m} min"
+
+
+def ledger_groups(rows: list[dict[str, Any]], runs: list[dict[str, Any]],
+                  now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The ledger grouped by the request each action belonged to (the 3 Oct ask C): one group per request (the run's
+    key, which every step of it already carries), card and call; the group says what you asked in your words, how it
+    went, when and how long; its rows are the steps, opened on a click. No Undo on any row (the 3 Oct ask A: the
+    Activity tab has no Undo section). Returns (rows, each with its ``group``, and the groups, newest first)."""
+    by_run = {f"run:{r.get('key')}": r for r in runs}
+    groups: dict[str, dict[str, Any]] = {}
+    out_rows = []
+    for row in rows:
+        row = {k: v for k, v in row.items() if k not in ("undo", "cant_undo")}
+        rid = str(row.get("id") or "")
+        gid = next((g for g in (rid, rid.rsplit(":", 1)[0]) if g in by_run), rid) if rid.startswith("run:") else rid
+        row["group"] = gid
+        out_rows.append(row)
+        g = groups.get(gid)
+        if g is None:
+            run = by_run.get(gid)
+            if run is not None:
+                voice = run.get("lane") == "voice" or run.get("source") == "hand"
+                words = _clip(run.get("words"), 160)
+                outcome, status = run_outcome(run.get("outcome"))
+                g = {"id": gid, "kind": "request", "at": float(run.get("at") or row["at"]),
+                     "title": request_title(words) if words else ("Something you asked by voice" if voice else "Something you asked"),
+                     "said": "you said" if voice else "you typed", "outcome": outcome,
+                     "took": took_words((run.get("ms") or 0) / 1000), "cost": money(run.get("cost_usd")) if run.get("cost_usd") else "",
+                     "status": status, "steps": 0, "failed": 0, "wrong_text": row.get("wrong_text") or ""}
+            else:
+                g = {"id": gid, "kind": row.get("kind") or "request", "at": row["at"], "title": row.get("what") or "",
+                     "said": "", "outcome": (row.get("result") or "")[:1].upper() + (row.get("result") or "")[1:],
+                     "took": "", "cost": row.get("cost") or "", "status": row.get("status") or "", "steps": 0, "failed": 0,
+                     "where": row.get("where") or "", "why": row.get("why") or "", "card": row.get("card"),
+                     "wrong_text": row.get("wrong_text") or ""}
+            groups[gid] = g
+        if row.get("kind") == "action":
+            g["steps"] += 1
+            g["failed"] += row.get("status") == "failed"
+            g["at"] = min(g["at"], row["at"])
+    for g in groups.values():
+        if g["kind"] == "request" and g["steps"] and g["failed"] and g["outcome"] == "Done":
+            g["outcome"] = f"Done, but {'one step' if g['failed'] == 1 else str(g['failed']) + ' steps'} didn’t work"
+        g["f"] = "calls" if g["kind"] == "call" else "failed" if g["status"] == "failed" or (
+            g["failed"] and g["failed"] == g["steps"]) else "waiting" if g["status"] == "waiting" else "did"
+    return out_rows, sorted(groups.values(), key=lambda g: -(g["at"] or 0))
 
 
 # -- Settings ------------------------------------------------------------------------------------------------------

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from yuki.ui import policy  # noqa: E402
+from yuki.ui import web_data as W  # noqa: E402
 
 OUT = ROOT / "yuki" / "ui" / "web" / "fixtures" / "window.js"
 #: The fixture's own "now": Saturday 3 Oct 2026, 21:52 local (any fixed epoch works; the times are shifted).
@@ -113,6 +114,181 @@ def rhythm(*counts: int | None) -> tuple[list, dict]:
     return days, info
 
 
+#: The invented voice room the fixture's calls were in (never a real server).
+ROOM = "Mumble, #seed-swap voice (Allotment Club)"
+
+
+def _ev(at: float, app: str, call: int | None = None) -> dict:
+    return {"at": at, "app": app, "text": "", "nature": "fact", "call": f"call:{call}" if call else None}
+
+
+def _fact(fid: int, kind: str, subject: str, summary: str, shown: str, *, ago_s: float, ev: list[dict],
+          origin: str = "model", confidence: float = 0.7, aspect: str | None = None, pinned: bool = False,
+          importance: int = 4) -> dict:
+    return {"id": fid, "ref": f"fact:{fid}", "kind": kind, "subject": subject, "text": shown, "summary": summary,
+            "shown": shown, "aspect": aspect, "origin": origin, "confidence": confidence, "since": ago(ago_s),
+            "created_at": ago(ago_s), "pinned": pinned or origin == "user", "reviewed_at": None,
+            "importance": importance, "evidence": ev}
+
+
+class InventedMemory:
+    """A stand-in memory with invented facts, people and calls (Sam in Pune, the garden planner, friends Riya, Dev,
+    Mira, Noor, Theo and Ines): the methods web_data.build_me reads, in memory's own shapes (yuki.memory.api)."""
+
+    def people_list(self, limit: int = 40) -> list[dict]:
+        def route(app, kind, chat, handle, mine, theirs, last, preferred=False):
+            return {"app": app, "kind": kind, "chat": chat, "handle": handle, "mine": mine, "theirs": theirs,
+                    "last_mine": last, "last_theirs": last, "preferred": preferred}
+
+        def summary(fid, headline, text, pinned=False):
+            return {"ref": f"fact:{fid}", "headline": headline, "text": text, "pinned": pinned}
+
+        return [
+            {"ref": "person:2", "name": "Riya", "relation": "Close friend, from the climbing gym", "aliases": ["riyaclimbs"],
+             "usual": "Signal chat. A call on Signal when it’s long.", "last_contact": ago(52 * M),
+             "routes": [route("Signal", "dm", "Riya", "riyaclimbs", 78, 47, ago(52 * M), True),
+                        route("Telegram", "group", "Climbing crew", "", 12, 31, ago(1 * D + 1 * H)),
+                        route("Thunderbird", "email", "", "riya@…", 2, 1, ago(9 * D))],
+             "summary": summary(21, "Riya tests the garden planner", "You talk most evenings. She’s testing the garden planner on her balcony beds and sends you photos of what grew.")},
+            {"ref": "person:5", "name": "Dev", "relation": "Your brother", "aliases": [], "usual": "Email, short and plain.",
+             "last_contact": ago(2 * H), "routes": [route("Thunderbird", "email", "", "dev@…", 18, 13, ago(2 * H), True)],
+             "summary": summary(22, "Dev has your old laptop", "You gave him your old laptop on Thursday, wiped and set up. He answers in one line.", pinned=True)},
+            {"ref": "person:3", "name": "Mira", "relation": "Your sister", "aliases": ["mimi"], "usual": "Telegram, mornings.",
+             "last_contact": ago(1 * D + 3 * H), "routes": [route("Telegram", "dm", "Mira", "mimi", 22, 26, ago(1 * D + 3 * H), True)],
+             "summary": summary(23, "Mira’s birthday is on 14 October", "Her birthday is on 14 October. You looked at two book shops and a candle place, nothing ordered yet.")},
+            {"ref": "person:8", "name": "Noor", "relation": "Bandmate, runs the seed swap", "aliases": ["noor.plays"],
+             "usual": "Signal for quick things; a voice call to plan the swap.", "last_contact": ago(1 * D + 6 * H),
+             "routes": [route("Signal", "dm", "Noor", "noor", 9, 10, ago(1 * D + 6 * H), True)],
+             "summary": summary(24, "Noor runs the seed swap", "She runs the seed swap on the 18th, and you play in her band on Wednesdays.")},
+            {"ref": "person:4", "name": "Theo", "relation": "Your landlord", "aliases": [], "usual": "Email only.",
+             "last_contact": ago(2 * D), "routes": [route("Thunderbird", "email", "", "theo@…", 5, 7, ago(2 * D), True)],
+             "summary": summary(25, "Theo owes you the new rent figure", "You’re waiting on his new figure for the lease before you compare it with two listings you saved.")},
+            {"ref": "person:9", "name": "Ines", "relation": "Study group", "aliases": [], "usual": None,
+             "last_contact": ago(4 * D), "routes": [],
+             "summary": summary(26, "Ines is in your Rust study group", "You meet her online for the Rust study group, every other Sunday.")},
+        ][:limit]
+
+    def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
+        today = [_ev(ago(h * H), "VS Code") for h in (1, 3)]
+
+        def week(app: str, days: tuple[int, ...], at: tuple[int, int] | None = None) -> list[dict]:
+            """Evidence on those days ago: 2 h before NOW's time of day, or at ``at`` (hour, minute) of each day."""
+            if at is None:
+                return [_ev(ago(d * D + 2 * H), app) for d in days]
+            from datetime import datetime, timedelta
+
+            midnight = datetime.fromtimestamp(NOW).replace(hour=0, minute=0, second=0, microsecond=0)
+            return [_ev(round((midnight - timedelta(days=d)).timestamp() + at[0] * H + at[1] * M, 1), app) for d in days]
+
+        call = [_ev(ago(1 * D + 5 * H), "call:mumble", 7)]
+        return [
+            _fact(12, "work", "Garden planner", "Garden planner app, in TypeScript",
+                  "You’re building a garden planner app in your spare time, in TypeScript. On 2 October you finished the bed sizes screen.",
+                  ago_s=2 * H, ev=today, importance=7, pinned=True),
+            _fact(13, "open_loop", "Seed swap", "You’ll confirm who brings the tables",
+                  "On 1 October, on a call with Noor in #seed-swap voice, you said you’d confirm who brings the tables for the swap on the 18th.",
+                  ago_s=1 * D + 5 * H, ev=call, importance=6),
+            _fact(15, "work", "Watering timer", "The watering timer isn’t started",
+                  "The schedule screen is half built; the timer logic isn’t started yet.", ago_s=3 * H, ev=today),
+            _fact(18, "work", "Budget", "October budget: rent and groceries in",
+                  "Your budget sheet has September closed. October has rent and groceries in; the train tickets aren’t.",
+                  ago_s=6 * H, ev=[_ev(ago(6 * H), "Calc")]),
+            _fact(19, "work", "Photo backup", "Phone photos backed up to August",
+                  "The phone photos up to August are on the external drive. September is still only on the phone.",
+                  ago_s=1 * D + 2 * H, ev=[_ev(ago(1 * D + 2 * H), "Files")]),
+            _fact(20, "work", "Chart library", "You’re choosing a chart library",
+                  "For the planner’s watering chart you compared two chart libraries on 2 October and haven’t picked one.",
+                  ago_s=1 * D + 1 * H, ev=[_ev(ago(1 * D + 1 * H), "Firefox")]),
+            _fact(27, "work", "Old laptop", "Test the planner on the old laptop",
+                  "You want to try the planner on a slow laptop before you share it.", ago_s=2 * D, ev=week("Notes", (2,))),
+            _fact(28, "open_loop", "Lease", "Compare the lease with two listings",
+                  "Once Theo sends the new figure, you’ll compare it with the two listings you saved.", ago_s=2 * D + 3 * H,
+                  ev=week("Thunderbird", (2,))),
+            _fact(21, "person", "Riya", "Riya tests the garden planner", "You talk most evenings.", ago_s=3 * D,
+                  ev=week("Signal", (0, 1, 2))),
+            _fact(22, "person", "Dev", "Dev has your old laptop", "He answers in one line.", ago_s=4 * D,
+                  ev=week("Thunderbird", (2,)), origin="user"),
+            _fact(14, "interest", "Climbing", "You climb twice a week",
+                  "You climb twice a week at the gym near the station, usually with Riya.", ago_s=6 * D,
+                  ev=[_ev(ago(6 * D), "Yuki")], origin="user", confidence=0.95),
+            _fact(17, "interest", "Rust", "Learning Rust, a chapter a week",
+                  "You’re learning Rust from the book, one chapter a week; on 3 October you were on chapter 12.", ago_s=5 * H,
+                  ev=[_ev(ago(5 * H), "Firefox")]),
+            _fact(29, "interest", "Music", "Lo-fi playlists while you code",
+                  "You put on lo-fi playlists in Music while you code, most afternoons.", ago_s=2 * D, ev=week("Music", (0, 1, 2))),
+            _fact(30, "preference", "Replies", "Plain replies, no greeting",
+                  "You like replies short and plain, with no greeting.", ago_s=5 * D, ev=[_ev(ago(5 * D), "Yuki")], origin="user"),
+            _fact(16, "personality", "Basil", "Your basil “has a personality”",
+                  "A joke you keep making about the basil on the balcony. A joke, never a fact.", ago_s=2 * D,
+                  ev=[_ev(ago(2 * D), "Signal")], aspect="joke"),
+            _fact(35, "personality", "Learning", "You learn by building",
+                  "You’d rather build a small thing than read a chapter first.", ago_s=4 * D, ev=week("VS Code", (4,)), aspect="cares"),
+            _fact(36, "personality", "Writing", "Lowercase, short messages to friends",
+                  "You write to friends in lowercase, short lines.", ago_s=3 * D, ev=week("Signal", (3,)), aspect="talk"),
+            _fact(31, "routine", "Evenings", "Evenings at the desk from 8:30 PM",
+                  "Most evenings you sit down at the PC from about 8:30 PM and often stay past midnight.", ago_s=5 * D,
+                  ev=week("VS Code", (0, 1, 2, 4, 5, 6), at=(20, 40)), confidence=0.86),
+            _fact(32, "routine", "Games", "A game most weekday evenings",
+                  "On most weekday evenings you play a game full screen, roughly 7 PM to 8:30 PM.", ago_s=6 * D,
+                  ev=week("Hollow Knight", (2, 3, 4, 5), at=(19, 5)), confidence=0.72),
+            _fact(33, "routine", "Mornings", "Late starts at weekends",
+                  "At weekends you’re first at the PC after 9:30 AM.", ago_s=6 * D, ev=week("Firefox", (0, 6)), confidence=0.58),
+            _fact(34, "behaviour", "Seed packets", "Sorted seed packets on 1 October",
+                  "On 1 October you spent about an hour sorting the seed packets for the swap.", ago_s=2 * D,
+                  ev=[_ev(ago(2 * D), "Notes")], confidence=0.6),
+            _fact(40, "work", "Moving", "You might move flats in spring",
+                  "On 2 October you looked at two flat listings and said you might move in spring.", ago_s=20 * H,
+                  ev=[_ev(ago(20 * H), "Firefox")], confidence=0.62),
+            _fact(41, "person", "Noor", "Noor plays bass in your band",
+                  "On 1 October, on a call in #seed-swap voice with Noor and maybe Dev, you said Noor plays bass in your band.",
+                  ago_s=1 * D + 5 * H, ev=call, confidence=0.35),
+        ]
+
+    def review_queue(self, now: float | None = None) -> dict:
+        return {"items": [{"ref": "fact:40", "headline": "You might move flats in spring", "flag": "new",
+                           "text": "On 2 October you looked at two flat listings and said you might move in spring."},
+                          {"ref": "fact:41", "headline": "Noor plays bass in your band", "flag": "unsure",
+                           "text": "On 1 October, on a call in #seed-swap voice with Noor and maybe Dev, you said Noor plays bass in your band."}],
+                "cap": 5, "reviewed_today": 1, "left_today": 4, "waiting": 9, "merged": {"count": 3, "since": ago(7 * D)}}
+
+    def misheard(self, days: float = 7, limit: int = 8, now: float | None = None) -> dict:
+        return {"items": [
+            {"id": 812, "ref": "journal:812", "at": ago(1 * D + 5 * H), "app": "Mumble", "nature": "uncertain",
+             "text": "Said “the hair loom swap”, maybe “the heirloom swap”.", "call": "call:7",
+             "source": {"quote": "the hair loom swap", "call": "call:7"}, "heard_in": ROOM, "channel_known": True,
+             "people": ["Noor"]},
+            {"id": 815, "ref": "journal:815", "at": ago(5 * H), "app": "Firefox", "nature": "uncertain",
+             "text": "Said “seed swop” while the forum was open.", "call": None, "source": {"quote": "seed swop"},
+             "heard_in": "Firefox", "channel_known": False, "people": []}], "total": 2}
+
+    def resolve_heard(self, ref, verdict, *, correction_id=None) -> dict:
+        return {"ok": True}
+
+    def pin_fact(self, ref, on=True) -> dict:
+        return {"ok": True, "pinned": on}
+
+    def rules(self) -> list[dict]:
+        def rule(rid: int, text: str, days: int, kind: str) -> dict:
+            return {"ref": f"rule:{rid}", "text": text, "at": ago(days * D), "origin": "user", "kind": kind}
+
+        return [rule(4, "Don’t call me “buddy”.", 8, "preference"),
+                rule(6, "Keep replies short unless I ask for detail.", 7, "preference"),
+                rule(9, "Never cost me frames in a game or interrupt a call.", 6, "rule"),
+                rule(11, "My to-dos are mine: bring one up only if I ask.", 3, "rule")]
+
+    def calls_in(self, since=None, until=None, limit=30) -> list[dict]:
+        return [{"ref": "call:7", "call_ids": [7], "app": "Mumble", "places": [ROOM], "start": ago(1 * D + 6 * H),
+                 "end": ago(1 * D + 5 * H), "people": [{"name": "Noor", "how": "on_call_screen"},
+                                                       {"name": "noor.plays", "how": "call_chat"},
+                                                       {"name": "Dev", "how": "likely"}], "gists": []}]
+
+def day_name(days_ago: int) -> str:
+    """Memory's name for a user day (``YYYY-MM-DD``) some days before the fixture's now."""
+    from datetime import datetime, timedelta
+
+    return f"{datetime.fromtimestamp(NOW).date() - timedelta(days=days_ago):%Y-%m-%d}"
+
+
 def build() -> dict:
     call_start = ago(46 * M + 4)
     rh = {"Riya": rhythm(8, 13, 17, 6, 20, 15, 11, 23, 9), "Dev": rhythm(3, 0, 1, 4, 0, 2, 5, 3, 2),
@@ -125,7 +301,7 @@ def build() -> dict:
         "voice": {"state": "off", "wake": True, "conversation": False, "quiet_until": 0},
         "call": {"app": "Signal", "started_at": call_start, "recording": True},
         "runs": [{"item": "a41", "jobs": [31], "title": "“Rename the March invoices by client”",
-                  "line": "Step 3 · Renaming a file, invoice-0312.pdf", "started_at": run_start}],
+                  "line": "Step 3 · Renaming an invoice", "started_at": run_start}],
         "hotkey_words": "Alt Shift", "needs": 2,
     }
     home = {
@@ -139,9 +315,9 @@ def build() -> dict:
                       {"ref": "G6", "text": "order the seed trays", "status": "done", "done": True, "thread": None}],
         },
         "needs": [
-            {"kind": "question", "ref": "q:7", "at_label": "2 Oct 12:19", "title": "Is the Friday planning call still at 10?",
+            {"kind": "question", "ref": "q:7", "at_label": "2 Oct, 12:19 PM", "title": "Is the Friday planning call still at 10?",
              "why": "You moved it once last week. The weekly review should have the right time."},
-            {"kind": "question", "ref": "q:9", "at_label": "today 09:41", "title": "The “beds v2” sketch from Thursday: keep it, or was it a test?",
+            {"kind": "question", "ref": "q:9", "at_label": "today, 9:41 AM", "title": "The “beds v2” sketch from Thursday: keep it, or was it a test?",
              "why": "It was saved twice with the same name. It may be a scratch copy."},
         ],
         "running": [
@@ -166,14 +342,15 @@ def build() -> dict:
         ],
         "away": [
             {"kind": "request", "title": "Pages restored", "at": ago(28 * M), "state": "done",
-             "changed": [{"text": "Firefox: 6 tabs back from before the restart", "state": "done"}], "cost": "4 s, 1 step, 4¢"},
+             "changed": [{"text": "Firefox: 6 tabs back from before the restart", "state": "done"}], "cost": "took 4 s"},
             {"kind": "card", "title": "Added to your list", "at": ago(52 * M), "state": "done",
              "changed": [{"text": "“Order more seed trays”, due Tuesday", "state": "done",
                           "undo": {"card": "39", "until": ago(-4 * M), "label": "Undo"}}]},
             {"kind": "request", "title": "Told you what you did today", "at": ago(27 * M), "state": "done", "changed": [],
-             "note": "The text showed but the voice came back empty. I’ll retry speech next time instead of going quiet.", "cost": "7 s"},
-            {"kind": "notice", "title": "Models cost $1.84 today", "at": ago(3 * H + 34 * M), "state": "done", "changed": [],
-             "note": "Journal $0.92, portrait $0.51, cards $0.24, call text $0.17."},
+             "note": "The text showed but the voice came back empty. I’ll retry speech next time instead of going quiet.", "cost": "took 7 s"},
+            {"kind": "notice", "key": "cost:today", "title": "My AI use today: about $1.84", "at": None, "when": "today",
+             "state": "done", "changed": [],
+             "note": "Daily notes $0.92, your profile $0.51, cards and check-ins $0.24, turning calls into text $0.17."},
         ],
         "people": [
             {"ref": "person:2", "name": "Riya", "route": "Signal", "last_at": ago(52 * M), "count": 125, "rhythm": rh["Riya"][0]},
@@ -225,81 +402,38 @@ def build() -> dict:
             "totals": {"pc": 3252, "a": 2050, "f": 474}},
     }
     day = {
-        "date_label": "Saturday 3 Oct", "today": True, "first": "00:00", "last": "21:49", "now_min": 21 * 60 + 52,
-        "off": [{"from": "01:31", "to": "09:40"}],
+        "date_label": "Saturday 3 Oct", "today": True, "first": "12 AM", "last": "9:49 PM", "now_min": 21 * 60 + 52,
+        "off": [{"from": "1:31 AM", "to": "9:40 AM"}],
         "buckets": buckets(),
         "sessions": [
             {"a": 0, "b": 90, "start": "00:00", "end": "01:30", "title": "Reading the seed-swap forum", "app": "Firefox", "mode": "active",
              "apps": [["Firefox", 61], ["Signal", 14]]},
             {"a": 580, "b": 750, "start": "09:40", "end": "12:30", "title": "Garden planner: bed sizes", "app": "VS Code", "mode": "active",
-             "apps": [["VS Code", 104], ["Firefox", 31], ["Notes", 9]]},
+             "apps": [["VS Code", 104], ["Firefox", 31], ["Notes", 9], ["Signal", 4]],
+             "full": "Garden planner: you finished the bed sizes screen and checked it against the balcony beds Riya measured."},
             {"a": 800, "b": 1030, "start": "13:20", "end": "17:10", "title": "Budget sheet, then the Rust exercise", "app": "Calc", "mode": "active",
-             "apps": [["Calc", 66], ["VS Code", 72], ["Firefox", 40]]},
+             "apps": [["VS Code", 72], ["Calc", 66], ["Firefox", 40], ["Music", 12]],
+             "full": "Budget sheet, then the Rust exercise: October\u2019s rent and groceries went in, then chapter 12\u2019s case-insensitive search."},
             {"a": 1120, "b": 1230, "start": "18:40", "end": "20:30", "title": "Hollow Knight", "app": "Hollow Knight", "mode": "full",
              "apps": [["Hollow Knight", 104]]},
             {"a": 1230, "b": 1312, "start": "20:30", "end": "21:52", "title": "Garden planner: watering schedule", "app": "VS Code", "mode": "active",
              "apps": [["VS Code", 44], ["Signal", 12], ["Music", 6]]},
         ],
         "calls": [
-            {"a": 1140, "b": 1210, "start": "19:00", "end": "20:10", "app": "Signal", "live": False, "recorded": True, "min": 70,
-             "gist": "Planning the meetup with Noor: who brings tables, the seed list."},
-            {"a": 1266, "b": 1312, "start": "21:06", "end": "now", "app": "Signal", "live": True, "recorded": True, "min": 46, "started_at": call_start},
+            {"a": 1140, "b": 1210, "start": "19:00", "end": "20:10", "app": "Mumble", "live": False, "recorded": True, "min": 70,
+             "where": "Mumble, #seed-swap voice (Allotment Club)", "people": ["Noor", "maybe Dev"],
+             "gists": ["You and Noor planned the meetup: she asks the community hall about tables.",
+                       "You bring tomato and basil seeds, 20 packets each."]},
+            {"a": 1266, "b": 1312, "start": "21:06", "end": "now", "app": "Signal", "live": True, "recorded": True, "min": 46,
+             "where": "Signal", "people": ["Riya"], "gists": [], "started_at": call_start},
         ],
         "totals": [["At the PC", "7h 32m", "214 app switches"], ["Active", "5h 06m", "VS Code 3h 40m"], ["Full screen", "1h 44m", "Hollow Knight"],
-                   ["Calls", "1h 56m", "2 on Signal, 1 live"], ["Longest focus", "52m", "VS Code, 10:12"]],
+                   ["Calls", "1h 56m", "1 on Mumble, 1 live"], ["Longest focus", "52m", "VS Code, 10:12 AM"]],
         "week_hours": week_hours(),
     }
-    me = {
-        "source": "index",
-        "people": [
-            {"ref": "person:2", "name": "Riya", "relation": "Close friend, from the climbing gym", "aliases": ["riyaclimbs"],
-             "note": "Talks most evenings. She’s helping test the garden planner on her balcony beds.", "last_at": ago(52 * M), "count": 125,
-             "prov": "Seen in Signal, most days", "usual": "Signal chat. Calls on Signal when it’s long.",
-             "routes": [{"label": "DM", "sub": "@riyaclimbs", "app": "Signal", "kind": "dm", "mine": 78, "theirs": 47, "last_at": ago(52 * M), "preferred": True},
-                        {"label": "Climbing crew", "sub": "group", "app": "Telegram", "kind": "group", "mine": 12, "theirs": 31, "last_at": ago(1 * D + 1 * H), "preferred": False},
-                        {"label": "riya@…", "sub": "", "app": "Thunderbird", "kind": "email", "mine": 2, "theirs": 1, "last_at": ago(9 * D), "preferred": False}],
-             "fact": {"ref": "fact:21", "title": "Riya", "text": "Riya is a close friend from the climbing gym who is testing the garden planner."}},
-            {"ref": "person:5", "name": "Dev", "relation": "Brother", "aliases": [], "note": "Got your old laptop on Thursday.", "last_at": ago(2 * H), "count": 31,
-             "prov": "You told Yuki, 28 Sep", "usual": "Email, short.",
-             "routes": [{"label": "dev@…", "app": "Thunderbird", "kind": "email", "mine": 18, "theirs": 13, "last_at": ago(2 * H), "preferred": True}],
-             "fact": {"ref": "fact:22", "title": "Dev", "text": "Dev is the user's brother."}},
-            {"ref": "person:3", "name": "Mira", "relation": "Sister", "aliases": ["mimi"], "note": "Birthday on the 14th.", "last_at": ago(1 * D + 3 * H), "count": 48,
-             "prov": "Seen in Telegram", "usual": "Telegram, mornings.",
-             "routes": [{"label": "DM", "sub": "@mimi", "app": "Telegram", "kind": "dm", "mine": 22, "theirs": 26, "last_at": ago(1 * D + 3 * H), "preferred": True}]},
-            {"ref": "person:8", "name": "Noor", "relation": "Bandmate, runs the seed swap", "aliases": [], "note": "", "last_at": ago(1 * D + 6 * H), "count": 19,
-             "prov": "Seen in Signal and on calls", "usual": "Signal; calls to plan.",
-             "routes": [{"label": "DM", "sub": "@noor", "app": "Signal", "kind": "dm", "mine": 9, "theirs": 10, "last_at": ago(1 * D + 6 * H), "preferred": True}]},
-            {"ref": "person:4", "name": "Theo", "relation": "Landlord", "aliases": [], "note": "", "last_at": ago(2 * D), "count": 12,
-             "prov": "Seen in Thunderbird", "usual": "Email only.",
-             "routes": [{"label": "theo@…", "app": "Thunderbird", "kind": "email", "mine": 5, "theirs": 7, "last_at": ago(2 * D), "preferred": True}]},
-            {"ref": "person:9", "name": "Ines", "relation": "Study group", "aliases": [], "note": "", "last_at": ago(4 * D), "count": 6,
-             "prov": "Seen in Telegram", "usual": "", "routes": []},
-        ],
-        "routines": [
-            {"ref": "fact:31", "title": "Evenings", "text": "At the desk most evenings from about 20:30, often past midnight.", "prov": "Seen 6 of 7 days", "conf_word": "sure",
-             "week": [True, True, True, False, True, True, True], "kind": "behaviour"},
-            {"ref": "fact:32", "title": "Games", "text": "A game most weekday evenings, roughly 19:00 to 20:30, full screen.", "prov": "Seen 4 of 7 days", "conf_word": "fairly sure",
-             "week": [False, True, False, True, False, True, True], "kind": "behaviour"},
-            {"ref": "fact:33", "title": "Mornings", "text": "First at the PC after 09:30 at weekends.", "prov": "Seen in your activity", "conf_word": "still learning",
-             "week": [True, False, False, False, False, False, True], "kind": "behaviour"},
-        ],
-        "rules": [
-            {"ref": "rule:4", "text": "Don’t call me “buddy”.", "prov": "You told me, 25 Sep", "kind": "preference"},
-            {"ref": "rule:6", "text": "Keep replies short unless I ask for detail.", "prov": "You told me, 26 Sep", "kind": "preference"},
-            {"ref": "rule:9", "text": "Never cost me frames in a game or interrupt a call.", "prov": "You told me, 27 Sep", "kind": "rule"},
-            {"ref": "rule:11", "text": "My to-dos are mine: bring one up only if I ask.", "prov": "You told me, 30 Sep", "kind": "rule"},
-        ],
-        "facts": [
-            {"ref": "fact:12", "title": "Garden planner", "text": "Building a garden planner app in your spare time, in TypeScript.", "prov": "Seen in VS Code, today", "conf_word": "sure", "kind": "work"},
-            {"ref": "fact:14", "title": "Climbing", "text": "Climbs twice a week at the gym near the station.", "prov": "You told Yuki, 27 Sep", "tags": ["you"], "kind": "interest"},
-            {"ref": "fact:16", "title": "Plants", "text": "Says the basil “has a personality”.", "prov": "Seen in Signal, 1 Oct", "tags": ["joke"], "kind": "personality"},
-            {"ref": "fact:17", "title": "Rust", "text": "Learning Rust from the book, one chapter a week.", "prov": "Seen in Firefox, 2 Oct", "conf_word": "fairly sure", "kind": "interest"},
-        ],
-        "misheard": [
-            {"ref": "journal:812", "title": "a call", "text": "“the heirloom swap” heard as “the hair loom swap”", "prov": "Heard in a call, today"},
-        ],
-        "pending": {},
-    }
+    # Me is built by the real builder (web_data.build_me) over an invented memory, so the preview has exactly the
+    # page's shapes: one summary per person, the review queue, topic groups, routines, misheard with its place
+    me = W.build_me(InventedMemory(), now=NOW)
     for p in me["people"]:
         p["rhythm"], p["rhythm_info"] = rh[p["name"]]
     playbook = {
@@ -345,18 +479,25 @@ def build() -> dict:
         return {"id": id_, "kind": kind, "f": f, "at": at, "what": what, "where": where, "cost": kw.pop("cost", ""),
                 "because": "because", "why": why, "chips": kw.pop("chips", []), "result": result, "status": status, **kw}
 
+    # what I did, in plain words only (the 3 Oct asks A-C: no Undo, no command or typed text), grouped by what you
+    # asked through the real grouping (web_data.ledger_groups), from invented runs
+    runs = [{"key": "a", "lane": "voice", "words": "What did I do today?", "outcome": "final", "ms": 7000, "cost_usd": 0.08, "at": ago(27 * M)},
+            {"key": "b", "lane": "voice", "words": "bring my tabs back", "outcome": "final", "ms": 4000, "cost_usd": 0.04, "at": ago(28 * M + 5)},
+            {"key": "c", "lane": "voice", "words": "remind me to water the basil sunday", "outcome": "final", "ms": 5000, "cost_usd": 0.03, "at": ago(41 * M + 3)},
+            {"key": "d", "lane": "worker", "words": "open my budget", "outcome": "final", "ms": 3000, "cost_usd": 0.03, "at": ago(1 * H + 2 * M + 2)},
+            {"key": "e", "lane": "voice", "words": "pause it", "outcome": "final", "ms": 12000, "cost_usd": 0.06, "at": ago(2 * H + 11 * M + 4)}]
     rows = [
-        row("run:a:0", "request", "did", ago(27 * M), "Answered “What did I do today?”", "Yuki", "you asked by voice",
-            "shown; the voice came back empty", "unverified", cost="7 s, 8¢"),
-        row("run:b:2", "action", "did", ago(28 * M), "Clicked Restore in “Restore pages?”", "Firefox",
+        row("run:a", "request", "did", ago(27 * M), "Answered “What did I do today?”", "Yuki", "you said “What did I do today?”",
+            "answered", "done", cost="7 s, 8¢"),
+        row("run:b:2", "action", "did", ago(28 * M), "Clicked Restore", "Firefox",
             "you said “bring my tabs back”, using how you do it", "done, checked on screen", "verified", cost="4 s, 4¢",
             chips=[{"kind": "memory", "text": "Restore Firefox after a restart"}]),
         row("run:b:1", "action", "did", ago(28 * M + 3), "Opened Firefox", "Firefox", "you said “bring my tabs back”, using how you do it",
             "done, checked on screen", "verified", chips=[{"kind": "memory", "text": "Restore Firefox after a restart"}]),
         row("run:c:1", "action", "did", ago(41 * M), "Added to your list “Water the basil on Sunday”", "Yuki", "you said “remind me to water the basil sunday”",
-            "done", "done", cost="5 s, 3¢", undo={"todo": "todo:12", "until": ago(-4 * M), "label": "Undo"}),
+            "done", "done", cost="5 s, 3¢"),
         row("c39", "card", "did", ago(52 * M), "Added “Order more seed trays” to your list", "Card · Your work",
-            "you pressed Add to list on the card", "done", "done", card="39", undo={"card": "39", "until": ago(-4 * M), "label": "Undo"}),
+            "you pressed Add to list on the card", "done", "done", card="39"),
         row("call:1", "call", "calls", call_start, "Recording your side of a Signal call", "Signal", "rule: Signal calls, your mic only",
             "live", "live"),
         row("run:d:1", "action", "did", ago(1 * H + 2 * M), "Opened Calc", "Calc", "you typed “open my budget”", "done, checked on screen",
@@ -365,7 +506,9 @@ def build() -> dict:
             "didn’t work", "failed", cost="12 s, 6¢"),
         row("run:e:3", "action", "did", ago(2 * H + 10 * M), "Switched to Music", "Music", "you said “pause it”, keeping a lesson in mind",
             "done, checked on screen", "verified", chips=[{"kind": "lesson", "text": "Pause the music"}]),
-        row("call:2", "call", "calls", ago(2 * H + 52 * M), "Recorded a 1h 10m Signal call", "Signal", "rule: Signal calls, your mic only",
+        row("run:e:4", "action", "did", ago(2 * H + 10 * M - 2), "Pressed Pause", "Music", "you said “pause it”, keeping a lesson in mind",
+            "done, checked on screen", "verified", chips=[{"kind": "lesson", "text": "Pause the music"}]),
+        row("call:2", "call", "calls", ago(26 * H + 52 * M), "Recorded a 1h 10m Mumble call", "Mumble", "rule: Mumble calls, your mic only",
             "turned into text", "verified"),
         row("c35", "card", "did", ago(3 * H), "Asked if the Friday call moved", "Card · Question", "your calendar and a message disagreed",
             "you said skip", "done", card="35"),
@@ -376,21 +519,27 @@ def build() -> dict:
         row("r6", "request", "did", ago(1 * D + 3 * H), "“rename the photos by date”", "Typed request", "you asked",
             "stopped", "stopped", cost="9 s, 2 steps, 5¢"),
     ]
+    for r in rows:
+        if r["id"].startswith("run:"):
+            r["wrong_text"] = "That wasn’t right: “" + next(x["words"] for x in runs if r["id"].split(":")[1] == x["key"]) + "”. "
     rows.sort(key=lambda r: -r["at"])
+    rows, groups = W.ledger_groups(rows, runs, NOW)
     activity = {
-        "rows": rows, "counts": {"did_today": sum(1 for r in rows if r["kind"] in ("action", "request") and r["at"] > NOW - 21 * H),
-                                 "no_reason": 0},
+        "rows": rows, "groups": groups,
+        "counts": {"did_today": sum(1 for r in rows if r["kind"] in ("action", "request") and r["at"] > NOW - 21 * H), "no_reason": 0},
         "seen": [{"app": a, "min": m, "visits": v} for a, m, v in
                  [("VS Code", 220, 41), ("Firefox", 131, 64), ("Hollow Knight", 104, 2), ("Calc", 66, 12), ("Signal", 38, 29),
                   ("Notes", 21, 9), ("Music", 14, 6), ("Files", 11, 8), ("Thunderbird", 9, 5), ("Audacity", 6, 1)]],
         "calls": [
-            {"start_at": call_start, "end_at": None, "live": True, "min": 46, "spoke_min": 18, "app": "Signal", "people": ["Riya"], "gists": [], "recorded": True,
-             "status": "Live now. Your side is being kept; it’s turned into text when the PC is free."},
-            {"start_at": ago(2 * H + 52 * M), "end_at": ago(1 * H + 42 * M), "live": False, "min": 70, "spoke_min": 31, "app": "Signal", "people": ["Noor"],
-             "gists": ["Tables and chairs: Noor asks the community hall.", "You bring tomato and basil seeds, 20 packets each.",
-                       "Next check-in Wednesday."], "recorded": True},
-            {"start_at": ago(1 * D + 2 * H), "end_at": ago(1 * D + 1 * H + 20 * M), "live": False, "min": 40, "spoke_min": 0, "app": "Telegram", "people": [],
-             "gists": [], "recorded": False, "status": "Not recorded: you said no for this call."},
+            {"start_at": call_start, "end_at": None, "live": True, "min": 46, "spoke_min": 18, "app": "Signal", "where": "Signal", "people": ["Riya"],
+             "gists": [], "recorded": True, "status": "Live now. Your side is kept; it’s turned into text when the PC is free."},
+            {"start_at": ago(26 * H + 52 * M), "end_at": ago(25 * H + 42 * M), "live": False, "min": 70, "spoke_min": 31, "app": "Mumble",
+             "where": ROOM, "people": ["Noor", "maybe Dev"],
+             "gists": ["You and Noor planned the meetup: she asks the community hall about tables and chairs.",
+                       "You bring tomato and basil seeds, 20 packets each.",
+                       "Then a long game where your friends picked the hardest route on purpose, which annoyed you."], "recorded": True},
+            {"start_at": ago(1 * D + 2 * H), "end_at": ago(1 * D + 1 * H + 20 * M), "live": False, "min": 40, "spoke_min": None, "app": "Telegram",
+             "where": "Telegram", "people": [], "gists": [], "recorded": False, "status": "Not recorded: you said no for this call."},
         ],
     }
     settings = {
@@ -411,6 +560,9 @@ def build() -> dict:
         "usage": {"mb": 312, "cpu": 0.4},
     }
     chat_items = [
+        {"id": "u0", "kind": "user", "at": ago(1 * D + 2 * H), "text": "how far is the community hall from the station?", "source": "text"},
+        {"id": "a0", "kind": "assistant", "at": ago(1 * D + 2 * H), "text": "About a 12-minute walk, along the canal path.", "source": "text",
+         "status": "done", "meta": "2¢", "steps": []},
         {"id": "u1", "kind": "user", "at": ago(5 * H), "text": "Open the seed-swap forum.", "source": "voice"},
         {"id": "a1", "kind": "assistant", "at": ago(5 * H), "text": "The forum’s up, on your question thread.", "source": "voice", "status": "done",
          "work_line": "worked for 6 s, 2 steps", "meta": "3¢", "steps": [
@@ -426,9 +578,9 @@ def build() -> dict:
         {"id": "u3", "kind": "user", "at": ago(45), "text": "Rename the March invoices by client", "source": "text"},
         {"id": "a41", "kind": "assistant", "at": ago(41), "text": "", "source": "text", "status": "running", "running": True, "jobs": [31],
          "work_line": "working 41 s, 3 steps", "thinking": "Reading the client names from each PDF", "steps": [
-             {"key": "s6", "label": "Listing files, Documents › Invoices › March", "ok": True, "seconds": 2.1},
-             {"key": "s7", "label": "Reading a file, invoice-0311.pdf", "ok": True, "seconds": 4.8},
-             {"key": "s8", "label": "Renaming a file, invoice-0312.pdf", "ok": None, "running": True, "started": ago(6)}]},
+             {"key": "s6", "label": "Listing the March invoices", "ok": True, "seconds": 2.1},
+             {"key": "s7", "label": "Reading an invoice", "ok": True, "seconds": 4.8},
+             {"key": "s8", "label": "Renaming an invoice", "ok": None, "running": True, "started": ago(6)}]},
     ]
     replies = {
         "offer": {"ok": True, "result": {"ok": True, "do": "todo_add", "state": "done", "message": "Added to your list.", "undo": True}},
@@ -436,12 +588,35 @@ def build() -> dict:
         "card_feedback": {"ok": True}, "answer": {"ok": True, "saved": True}, "skip_question": {"ok": True},
         "continue": {"ok": True}, "askbar": {"ok": True}, "stop": {"ok": True}, "steer": {"ok": True, "delivered": True},
         "submit": {"ok": True}, "copy": {"ok": True}, "correct": {"ok": True}, "forget": {"ok": True}, "rule_edit": {"ok": True},
-        "workflow_edit": {"ok": True, "state": "active"}, "todo_undo": {"ok": True},
+        "workflow_edit": {"ok": True, "state": "active"},
         "person": {"ok": True, "person": {"found": True, "facts": []}},
         "permissions_set": {"ok": True}, "app_look": {"ok": True}, "app_act": {"ok": True}, "voice": {"ok": True}, "offers": {"ok": True},
         "coach": {"ok": True}, "questions": {"ok": True}, "pause": {"ok": True}, "accent": {"ok": True}, "motion": {"ok": True},
         "call_pref": {"ok": True}, "stop_call": {"ok": True},
+        "pin": {"ok": True, "pinned": True}, "resolve_heard": {"ok": True, "correction_id": None},
+        "review_mark": {"ok": True, "correction_id": None}, "day_answer": {"ok": True, "sent": True},
+        "thread_days": {"ok": True, "connector": {
+            "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
+            "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",
+            "open": ["Write the watering timer"]},
+            "days": [{"day": day_name(1), "count": 1, "first_at": ago(1 * D + 2 * H), "last_at": ago(1 * D + 2 * H)},
+                     {"day": day_name(3), "count": 2, "first_at": ago(3 * D + 3 * H), "last_at": ago(3 * D + 2 * H)}]},
+        "chat_day": {"ok": True, "turns": [
+            {"id": "t91", "at": ago(3 * D + 3 * H), "user": "what time does the climbing gym close on Sundays?",
+             "reply": "8 PM on Sundays, an hour earlier than weekdays.", "outcome": "final"},
+            {"id": "t92", "at": ago(3 * D + 2 * H), "user": "add chalk to my list", "reply": "Added “chalk” to your list.",
+             "outcome": "final"}]},
     }
+    # each person's key facts on their page (the person reply, by the person asked for)
+    replies["person"] = {"ok": True, "person": {"found": True, "facts": []}, "by_ref": {
+        "person:2": {"ok": True, "person": {"found": True, "facts": [
+            {"ref": "fact:51", "h": "Riya climbs with you on Tuesdays", "d": ""},
+            {"ref": "fact:52", "h": "She grows chillies and tomatoes on her balcony", "d": ""},
+            {"ref": "fact:53", "h": "She asked for a dark mode in the planner", "d": ""},
+            {"ref": "fact:54", "h": "You owe her the climbing photos from 27 September", "d": ""}]}},
+        "person:8": {"ok": True, "person": {"found": True, "facts": [
+            {"ref": "fact:41", "h": "Noor plays bass in your band", "d": ""},
+            {"ref": "fact:55", "h": "Band practice is on Wednesdays at 7 PM", "d": ""}]}}}}
     return {"schema": "yuki-window/1",
             "note": "Invented data for the Lattice window's preview and tests. No real person, message or app use: nothing here comes from memory.",
             "now": NOW, "shell": shell,
