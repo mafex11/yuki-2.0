@@ -246,10 +246,10 @@ def overlay_label(nudge: dict[str, Any]) -> str:
 
 
 def coach_note(nudges: list[dict[str, Any]]) -> str:
-    """The attached-context note telling an agent what its coach said, one line per nudge.
+    """The attached-context note telling the agent what it said on its own cards, one line per nudge.
 
-    ``[Yuki's coach said at 14:32 (nudge): "..." -- why: ...]``. The words are
-    the nudge's own; this only frames them as something Yuki already said.
+    ``[You said on a card at 14:32 (nudge): "..." -- why: ...]``. The words are
+    the nudge's own; this only frames them as something Yuki (one entity) already said.
     """
     lines = []
     for nudge in nudges:
@@ -257,7 +257,7 @@ def coach_note(nudges: list[dict[str, Any]]) -> str:
         if not text:
             continue
         sent = when_label(nudge.get("at"))
-        head = f"[Yuki's coach said{f' at {sent}' if sent else ''} ({nudge.get('kind') or 'nudge'}): \"{text}\""
+        head = f"[You said on a card{f' at {sent}' if sent else ''} ({nudge.get('kind') or 'nudge'}): \"{text}\""
         reason = _clip(_squash(nudge.get("reason")), COACH_NOTE_REASON_CHARS)
         if reason:
             head += f" -- why: {reason}"

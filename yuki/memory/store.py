@@ -247,6 +247,18 @@ store's own helpers)::
     injected, cited, ...); written only by the practice pipeline (MemoryClient.record_run / record_hand_trace /
     workflow_edit and the service's practice worker), never by hand
 
+The user's goals and Yuki's check-ins (migration 30, yuki.memory.checkins)::
+
+    store.goals(statuses=("open", "unknown"), *, scope=None, day=None, work_thread_id=None, ids=None) -> [Goal]
+    store.goal(id);  store.goal_events(id) -> [dict]
+    store.add_goal(scope, text, *, source, ...) -> int;  store.update_goal(id, *, type, ...) -> bool
+        # written only by the check-in pipeline (a check-in that rests on a goal memory shows, the fold-in of the
+        # user's answer), never by hand
+    store.record_checkin_question(checkin, nudge, question, *, moment, goal) -> (checkin, nudge, question, goal)
+        # one transaction: the check-in question (origin "checkin", status asked), its goal, the card
+    store.checkin_answers_pending() -> [QuestionRecord];  store.mark_checkin_folded(id, tone, at=None)
+    store.expire_checkins(before) -> int      # unanswered check-ins expire (and an unshown one is never reopened)
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
@@ -1357,10 +1369,55 @@ class QuestionRecord:
     answer: str | None
     answer_fact_id: int | None
     updated_at: float
+    #: A check-in (origin "checkin", migration 30): its moment (yuki.memory.checkins.MOMENTS), the goal it is about,
+    #: when its answer was folded into the goals, and how the user took being asked (welcome | neutral | unwelcome |
+    #: skipped | never), judged by the fold-in's model or read from their Skip / "Don't ask".
+    moment: str | None = None
+    goal_id: int | None = None
+    folded_at: float | None = None
+    reply_tone: str | None = None
 
     @property
     def ref(self) -> str:
         return f"question:{self.id}"
+
+
+#: ``goals.scope``: a goal for one day (``day`` says which: "today's goals" on that day), a thread of work's goal
+#: (``work_thread_id``), or a longer goal of the user's with no thread (a project, a plan).
+GOAL_SCOPES: tuple[str, ...] = ("day", "thread", "project")
+#: ``goals.status``: open (they are on it), done, dropped, unknown (memory inferred it from a thread, a plan or a
+#: commitment and the user has not said yet).
+GOAL_STATUSES: tuple[str, ...] = ("open", "done", "dropped", "unknown")
+#: ``goals.source``: where the goal came from - the user's answer to a check-in, a stated plan in a call digest, a
+#: commitment (a to-do of theirs), or a thread of work's open item.
+GOAL_SOURCES: tuple[str, ...] = ("answer", "call", "commitment", "thread")
+
+
+@dataclass
+class Goal:
+    """One of the user's goals (decrypted), see :mod:`yuki.memory.checkins`."""
+
+    id: int
+    scope: str                        # GOAL_SCOPES
+    day: str | None                   # "YYYY-MM-DD" for a day goal
+    work_thread_id: int | None
+    text: str                         # the goal, in the user's words when they stated it
+    words: str | None                 # the user's own words it rests on (a quote of their answer), if any
+    source: str                       # GOAL_SOURCES
+    source_ref: str | None            # question:12 | commit:5 | D50.3 | W12
+    status: str                       # GOAL_STATUSES
+    evidence: list[str]               # ids it rests on (machine formats)
+    due_at: float | None
+    next_checkin_at: float | None
+    last_checkin_at: float | None
+    checkins: int
+    created_at: float
+    updated_at: float
+    ended_at: float | None = None
+
+    @property
+    def ref(self) -> str:
+        return f"G{self.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -2584,6 +2641,60 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX playbook_events_pb ON playbook_events(playbook_id, at);
     CREATE INDEX playbook_events_run ON playbook_events(run_key);
+    """,
+    # 30 (2026-10-03, proactive check-ins, docs/research/revamp-2026-10-02/33-build-checkins.md; yuki.memory.checkins):
+    # the user: "it should connect this on-screen context with more data on what I am trying to achieve ... and then
+    # ask me 'did you achieve what you were trying to do'".
+    # - goals: what the user is going for - a day's goal ("today's goals", ``day``), a thread of work's goal, or a
+    #   longer one - in their own words when they said it (text and the quote it rests on, encrypted), where it came
+    #   from (source: answer | call | commitment | thread, with the id), its status (open | done | dropped | unknown:
+    #   inferred, not confirmed), the evidence ids, and when Yuki may check in on it next. Written only by the
+    #   check-in pipeline: a check-in that rests on a goal memory shows creates it (unknown), the fold-in of the
+    #   user's answer (a model pass over their words, checked in code) adds and updates them. Never by hand.
+    # - goal_events: every change to a goal, with the question (check-in) it came from and the evidence ids.
+    # - questions.moment / goal_id / folded_at / reply_tone: a check-in is a question of origin "checkin" (so the
+    #   existing answer paths - the card's Answer, the agent's answer_question, conversation memory - carry its
+    #   answer), with the moment that woke it, the goal it is about, when its answer was folded into the goals, and
+    #   how the user took being asked (what lowers that kind's budget).
+    # Additive only.
+    """
+    CREATE TABLE goals (
+        id                  INTEGER PRIMARY KEY,
+        scope               TEXT NOT NULL,
+        day                 TEXT,
+        work_thread_id      INTEGER,
+        text_ciphertext     TEXT NOT NULL,
+        words_ciphertext    TEXT,
+        source              TEXT NOT NULL,
+        source_ref          TEXT,
+        status              TEXT NOT NULL,
+        evidence            TEXT,
+        due_at              REAL,
+        next_checkin_at     REAL,
+        last_checkin_at     REAL,
+        checkins            INTEGER NOT NULL DEFAULT 0,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL,
+        ended_at            REAL
+    );
+    CREATE INDEX goals_live ON goals(status, next_checkin_at);
+    CREATE INDEX goals_thread ON goals(work_thread_id);
+    CREATE INDEX goals_day ON goals(day);
+    CREATE TABLE goal_events (
+        id                  INTEGER PRIMARY KEY,
+        goal_id             INTEGER NOT NULL REFERENCES goals(id),
+        at                  REAL NOT NULL,
+        type                TEXT NOT NULL,
+        status              TEXT,
+        question_id         INTEGER,
+        evidence            TEXT,
+        note_ciphertext     TEXT
+    );
+    CREATE INDEX goal_events_goal ON goal_events(goal_id, at);
+    ALTER TABLE questions ADD COLUMN moment TEXT;
+    ALTER TABLE questions ADD COLUMN goal_id INTEGER;
+    ALTER TABLE questions ADD COLUMN folded_at REAL;
+    ALTER TABLE questions ADD COLUMN reply_tone TEXT;
     """,
 )
 
@@ -5988,6 +6099,7 @@ class Store:
             except (ValueError, TypeError):
                 return []
 
+        keys = r.keys()
         return QuestionRecord(
             id=r["id"], at=r["at"], created_at=r["created_at"], kind=r["kind"],
             subject=self.cipher.decrypt(r["subject_ciphertext"]), question=self.cipher.decrypt(r["question_ciphertext"]),
@@ -5996,6 +6108,10 @@ class Store:
             fact_ids=ids(r["fact_ids"]), status=r["status"], seen=int(r["seen"] or 1), nudge_id=r["nudge_id"],
             asked_at=r["asked_at"], answered_at=r["answered_at"], answer=self._dec(r["answer_ciphertext"]),
             answer_fact_id=r["answer_fact_id"], updated_at=r["updated_at"],
+            moment=r["moment"] if "moment" in keys else None,
+            goal_id=r["goal_id"] if "goal_id" in keys else None,
+            folded_at=r["folded_at"] if "folded_at" in keys else None,
+            reply_tone=r["reply_tone"] if "reply_tone" in keys else None,
         )
 
     def question_known_keys(self) -> set[str]:
@@ -6085,8 +6201,9 @@ class Store:
         return self._question_row(rows[0]) if rows else None
 
     def next_question(self, *, min_importance: int = 1, since: TimeArg = None) -> QuestionRecord | None:
-        """The open question to ask next: the most important, then the newest evidence."""
-        sql = "SELECT * FROM questions WHERE status='open' AND importance >= ?"
+        """The open question to ask next: the most important, then the newest evidence. Never a check-in (origin
+        ``checkin``: asked at its own moment by yuki.memory.checkins, never queued)."""
+        sql = "SELECT * FROM questions WHERE status='open' AND origin != 'checkin' AND importance >= ?"
         params: list[Any] = [int(min_importance)]
         if (s := _ts(since)) is not None:
             sql += " AND at >= ?"
@@ -6104,6 +6221,15 @@ class Store:
         if row is None or row["status"] not in ("open", "asked", "skipped", "expired", "dropped"):
             return None
         words = " ".join((words or "").split())
+        if outcome == "answered" and row["origin"] == "checkin":
+            # a check-in's answer is about the user's goals and their day, not a portrait correction: it waits for
+            # the fold-in (yuki.memory.checkins.fold_answers), which turns it into goals or updates of them
+            if not words:
+                return None
+            conn.execute(
+                "UPDATE questions SET status='answered', answered_at=?, answer_ciphertext=?, folded_at=NULL,"
+                " updated_at=? WHERE id=?", (float(at), self.cipher.encrypt(words), now, row["id"]))
+            return 0
         if outcome == "answered":
             if not words:
                 return None
@@ -6140,12 +6266,19 @@ class Store:
         return self._write(lambda conn: self._answer_question(conn, question_id, outcome, words, when, now))
 
     def reopen_unshown_questions(self) -> int:
-        """Questions whose card expired without ever being shown go back to ``open`` (asked at a later calm moment)."""
-        return self._write(lambda conn: conn.execute(
-            "UPDATE questions SET status='open', nudge_id=NULL, asked_at=NULL, updated_at=? WHERE status='asked'"
-            " AND nudge_id IN (SELECT id FROM nudges WHERE shown_at IS NULL AND reaction='expired')",
-            (time.time(),),
-        ).rowcount)
+        """Questions whose card expired without ever being shown go back to ``open`` (asked at a later calm moment).
+        A check-in belongs to its moment: one whose card expired unshown is ``expired``, never reopened."""
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> int:
+            unshown = "nudge_id IN (SELECT id FROM nudges WHERE shown_at IS NULL AND reaction='expired')"
+            conn.execute("UPDATE questions SET status='expired', updated_at=? WHERE status='asked'"
+                         " AND origin='checkin' AND " + unshown, (now,))
+            return conn.execute(
+                "UPDATE questions SET status='open', nudge_id=NULL, asked_at=NULL, updated_at=? WHERE status='asked'"
+                " AND origin != 'checkin' AND " + unshown, (now,)).rowcount
+
+        return self._write(op)
 
     def drop_question(self, question_id: int, fact_id: int | None = None) -> bool:
         """An open or asked question memory turned out to answer already (:func:`yuki.memory.questions.revet`):
@@ -6180,6 +6313,246 @@ class Store:
             "UPDATE questions SET status='expired', updated_at=? WHERE status='open' AND at < ?",
             (time.time(), float(before)),
         ).rowcount)
+
+    # -- the user's goals and Yuki's check-ins (migration 30, yuki.memory.checkins) ------------------
+
+    def _goal(self, r: sqlite3.Row) -> Goal:
+        try:
+            evidence = [str(x) for x in json.loads(r["evidence"] or "[]")]
+        except (ValueError, TypeError):
+            evidence = []
+        return Goal(
+            id=int(r["id"]), scope=r["scope"], day=r["day"], work_thread_id=r["work_thread_id"],
+            text=self._dec(r["text_ciphertext"]) or "", words=self._dec(r["words_ciphertext"]), source=r["source"],
+            source_ref=r["source_ref"], status=r["status"], evidence=evidence, due_at=r["due_at"],
+            next_checkin_at=r["next_checkin_at"], last_checkin_at=r["last_checkin_at"],
+            checkins=int(r["checkins"] or 0), created_at=float(r["created_at"]), updated_at=float(r["updated_at"]),
+            ended_at=r["ended_at"])
+
+    def goals(self, statuses: Sequence[str] | None = ("open", "unknown"), *, scope: str | None = None,
+              day: str | None = None, work_thread_id: int | None = None, ids: Iterable[int] | None = None,
+              limit: int | None = None) -> list[Goal]:
+        """The user's goals (``statuses`` None: all), most recently updated first; ``[]`` before migration 30."""
+        clauses, params = [], []
+        if statuses is not None:
+            clauses.append("status IN (%s)" % ",".join("?" * len(statuses)))
+            params.extend(statuses)
+        if scope is not None:
+            clauses.append("scope=?")
+            params.append(scope)
+        if day is not None:
+            clauses.append("day=?")
+            params.append(day)
+        if work_thread_id is not None:
+            clauses.append("work_thread_id=?")
+            params.append(int(work_thread_id))
+        if ids is not None:
+            wanted = sorted({int(i) for i in ids})
+            if not wanted:
+                return []
+            clauses.append("id IN (%s)" % ",".join("?" * len(wanted)))
+            params.extend(wanted)
+        sql = "SELECT * FROM goals" + (" WHERE " + " AND ".join(clauses) if clauses else "")
+        sql += " ORDER BY updated_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        try:
+            return [self._goal(r) for r in self._query(sql, params)]
+        except sqlite3.OperationalError:
+            return []
+
+    def goal(self, goal_id: int) -> Goal | None:
+        rows = self.goals(None, ids=[int(goal_id)])
+        return rows[0] if rows else None
+
+    def goal_events(self, goal_id: int) -> list[dict[str, Any]]:
+        """Every change to a goal, oldest first: ``{"id", "at", "type", "status", "question_id", "evidence", "note"}``."""
+        try:
+            rows = self._query("SELECT * FROM goal_events WHERE goal_id=? ORDER BY at, id", (int(goal_id),))
+        except sqlite3.OperationalError:
+            return []
+        out = []
+        for r in rows:
+            try:
+                evidence = [str(x) for x in json.loads(r["evidence"] or "[]")]
+            except (ValueError, TypeError):
+                evidence = []
+            out.append({"id": int(r["id"]), "at": float(r["at"]), "type": r["type"], "status": r["status"],
+                        "question_id": r["question_id"], "evidence": evidence, "note": self._dec(r["note_ciphertext"])})
+        return out
+
+    def _goal_event(self, conn: sqlite3.Connection, goal_id: int, at: float, type: str, *, status: str | None = None,
+                    question_id: int | None = None, evidence: Sequence[str] = (), note: str | None = None) -> None:
+        conn.execute("INSERT INTO goal_events(goal_id, at, type, status, question_id, evidence, note_ciphertext)"
+                     " VALUES (?,?,?,?,?,?,?)",
+                     (int(goal_id), float(at), type, status, int(question_id) if question_id is not None else None,
+                      json.dumps(list(dict.fromkeys(str(e) for e in evidence))) if evidence else None,
+                      self._enc(note) if note else None))
+
+    def _insert_goal(self, conn: sqlite3.Connection, *, scope: str, text: str, source: str, at: float,
+                     day: str | None = None, work_thread_id: int | None = None, words: str | None = None,
+                     source_ref: str | None = None, status: str = "unknown", evidence: Sequence[str] = (),
+                     due_at: float | None = None, next_checkin_at: float | None = None,
+                     question_id: int | None = None, note: str | None = None) -> int:
+        text = " ".join((text or "").split())
+        if scope not in GOAL_SCOPES or status not in GOAL_STATUSES or source not in GOAL_SOURCES or not text:
+            raise ValueError(f"bad goal (scope {scope!r}, status {status!r}, source {source!r}, text {bool(text)})")
+        now = time.time()
+        words = " ".join((words or "").split()) or None
+        ev = list(dict.fromkeys(str(e) for e in evidence if str(e).strip()))
+        cur = conn.execute(
+            "INSERT INTO goals(scope, day, work_thread_id, text_ciphertext, words_ciphertext, source, source_ref, status,"
+            " evidence, due_at, next_checkin_at, created_at, updated_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (scope, day, int(work_thread_id) if work_thread_id is not None else None, self.cipher.encrypt(text),
+             self._enc(words), source, source_ref, status, json.dumps(ev), due_at, next_checkin_at, float(at), now,
+             float(at) if status in ("done", "dropped") else None))
+        gid = int(cur.lastrowid)
+        self._goal_event(conn, gid, at, "created", status=status, question_id=question_id, evidence=ev, note=note)
+        return gid
+
+    def add_goal(self, scope: str, text: str, *, source: str, at: float | None = None, **kw: Any) -> int:
+        """Store one goal (``kw``: day, work_thread_id, words, source_ref, status, evidence, due_at,
+        next_checkin_at, question_id, note); returns its id. Only the check-in pipeline writes goals."""
+        when = float(at) if at is not None else time.time()
+        return self._write(lambda conn: self._insert_goal(conn, scope=scope, text=text, source=source, at=when, **kw))
+
+    #: "Leave this column as it is" for :meth:`update_goal` (None is a value there: no next check-in).
+    UNSET: Any = object()
+
+    def _update_goal(self, conn: sqlite3.Connection, goal_id: int, *, at: float, type: str, status: str | None = None,
+                     text: str | None = None, words: str | None = None, evidence: Sequence[str] = (),
+                     due_at: Any = UNSET, next_checkin_at: Any = UNSET, checked_in: bool = False,
+                     question_id: int | None = None, note: str | None = None, event: bool = True) -> bool:
+        row = conn.execute("SELECT * FROM goals WHERE id=?", (int(goal_id),)).fetchone()
+        if row is None:
+            return False
+        if status is not None and status not in GOAL_STATUSES:
+            raise ValueError(f"bad goal status {status!r}")
+        sets, params = ["updated_at=?"], [time.time()]
+        if status is not None:
+            sets += ["status=?", "ended_at=?"]
+            params += [status, float(at) if status in ("done", "dropped") else None]
+        if text and " ".join(text.split()):
+            sets.append("text_ciphertext=?")
+            params.append(self.cipher.encrypt(" ".join(text.split())))
+        if words and " ".join(words.split()):
+            sets.append("words_ciphertext=?")
+            params.append(self.cipher.encrypt(" ".join(words.split())))
+        new_ev = [str(e) for e in evidence if str(e).strip()]
+        if new_ev:
+            try:
+                old = [str(x) for x in json.loads(row["evidence"] or "[]")]
+            except (ValueError, TypeError):
+                old = []
+            sets.append("evidence=?")
+            params.append(json.dumps(list(dict.fromkeys([*old, *new_ev]))[-40:]))
+        if due_at is not self.UNSET:
+            sets.append("due_at=?")
+            params.append(due_at)
+        if next_checkin_at is not self.UNSET:
+            sets.append("next_checkin_at=?")
+            params.append(next_checkin_at)
+        if checked_in:
+            sets += ["last_checkin_at=?", "checkins=checkins+1"]
+            params.append(float(at))
+        conn.execute(f"UPDATE goals SET {', '.join(sets)} WHERE id=?", (*params, int(goal_id)))
+        if event:
+            self._goal_event(conn, goal_id, at, type, status=status, question_id=question_id, evidence=new_ev,
+                             note=note)
+        return True
+
+    def update_goal(self, goal_id: int, *, type: str = "updated", at: float | None = None, **kw: Any) -> bool:
+        """Change one goal (``kw``: status, text, words, evidence (added), due_at, next_checkin_at, checked_in,
+        question_id, note), with its event; False when it does not exist. Only the check-in pipeline calls it."""
+        when = float(at) if at is not None else time.time()
+        return bool(self._write(lambda conn: self._update_goal(conn, goal_id, at=when, type=type, **kw)))
+
+    def record_checkin_question(self, checkin: NudgeCheckin, nudge: NewNudge, question: NewQuestion, *,
+                                moment: str, goal: dict[str, Any] | None = None
+                                ) -> tuple[int, int | None, int, int | None]:
+        """One transaction for a check-in Yuki asks: its goal (``goal``: ``{"id": n}`` for one it is about, or
+        ``{"new": {scope, text, source, day, work_thread_id, source_ref, evidence, words}}`` for one memory shows
+        that has no row yet - stored ``unknown`` -, with ``next_checkin_at``), the question (origin ``checkin``,
+        status ``asked``, never deduped: a goal is checked on again), the card (kind ``question``, ``ref`` its
+        question) and the check-in's accounting. Returns ``(checkin_id, nudge_id, question_id, goal_id)``."""
+        if nudge.kind != "question":
+            raise ValueError("a check-in's card is a question card")
+
+        def op(conn: sqlite3.Connection) -> tuple[int, int | None, int, int | None]:
+            at = float(checkin.at)
+            goal_id: int | None = None
+            nxt = (goal or {}).get("next_checkin_at", self.UNSET)
+            if goal and goal.get("id") is not None:
+                if self._update_goal(conn, int(goal["id"]), at=at, type="checked_in", checked_in=True,
+                                     next_checkin_at=nxt, evidence=goal.get("evidence") or (), event=False):
+                    goal_id = int(goal["id"])
+            elif goal and goal.get("new"):
+                new = dict(goal["new"])
+                goal_id = self._insert_goal(
+                    conn, scope=new.get("scope") or "thread", text=new.get("text") or "",
+                    source=new.get("source") or "thread", at=at, day=new.get("day"),
+                    work_thread_id=new.get("work_thread_id"), words=new.get("words"),
+                    source_ref=new.get("source_ref"), status="unknown", evidence=new.get("evidence") or (),
+                    due_at=new.get("due_at"), next_checkin_at=None if nxt is self.UNSET else nxt)
+                conn.execute("UPDATE goals SET last_checkin_at=?, checkins=1 WHERE id=?", (at, goal_id))
+            subject, text = " ".join((question.subject or "").split()), " ".join((question.question or "").split())
+            if not subject or not text:
+                raise ValueError("a check-in question needs a subject and a question")
+            cur = conn.execute(
+                "INSERT INTO questions(at, created_at, kind, subject_ciphertext, subject_key, question_ciphertext,"
+                " evidence_ciphertext, reason_ciphertext, importance, origin, source_ids, fact_ids, status, seen,"
+                " updated_at, moment, goal_id) VALUES (?,?,?,?,?,?,?,?,?,'checkin',?,?,'asked',1,?,?,?)",
+                (at, at, question.kind if question.kind in QUESTION_KINDS else "fact", self.cipher.encrypt(subject),
+                 question_subject_key(self.cipher, f"checkin:{subject}"), self.cipher.encrypt(text),
+                 self._enc(" ".join((question.evidence or "").split()) or None),
+                 self._enc(" ".join((question.reason or "").split()) or None),
+                 min(10, max(1, int(question.importance))), json.dumps(sorted({int(i) for i in question.source_ids})),
+                 json.dumps(sorted({int(i) for i in question.fact_ids})), time.time(), moment, goal_id))
+            qid = int(cur.lastrowid)
+            if question.vector is not None:
+                self._put_vec(conn, "question_vec", "question_id", qid, question.vector, question.embed_model)
+            card = replace(nudge, ref=f"question:{qid}", inputs={**(nudge.inputs or {}), "question_id": qid,
+                                                                 "goal_id": goal_id, "moment": moment})
+            checkin_id, nudge_id = self._record_checkin(conn, checkin, card, (qid, "asked"))
+            if goal_id is not None:
+                self._goal_event(conn, goal_id, at, "checked_in", question_id=qid,
+                                 evidence=(goal or {}).get("evidence") or ())
+            return checkin_id, nudge_id, qid, goal_id
+
+        return self._write(op)
+
+    def checkin_questions(self, since: TimeArg = None, until: TimeArg = None) -> list[QuestionRecord]:
+        """Check-ins asked in ``[since, until)`` (origin ``checkin``), oldest first."""
+        sql, params = "SELECT * FROM questions WHERE origin='checkin'", []
+        if (s := _ts(since)) is not None:
+            sql += " AND created_at >= ?"
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            sql += " AND created_at < ?"
+            params.append(u)
+        return [self._question_row(r) for r in self._query(sql + " ORDER BY created_at, id", params)]
+
+    def checkin_answers_pending(self, limit: int = 20) -> list[QuestionRecord]:
+        """Check-ins the user answered, skipped or said not to ask about whose answer is not folded into the goals
+        yet, oldest answer first."""
+        rows = self._query("SELECT * FROM questions WHERE origin='checkin' AND status IN ('answered', 'skipped', 'never')"
+                           " AND folded_at IS NULL ORDER BY coalesce(answered_at, updated_at), id LIMIT ?",
+                           (int(limit),))
+        return [self._question_row(r) for r in rows]
+
+    def mark_checkin_folded(self, question_id: int, tone: str | None, at: float | None = None) -> bool:
+        """The check-in's answer was folded into the goals; ``tone``: how the user took being asked."""
+        when = float(at) if at is not None else time.time()
+        return bool(self._write(lambda conn: conn.execute(
+            "UPDATE questions SET folded_at=?, reply_tone=coalesce(?, reply_tone), updated_at=? WHERE id=?"
+            " AND origin='checkin'", (when, tone, time.time(), int(question_id))).rowcount))
+
+    def expire_checkins(self, before: float) -> int:
+        """Check-ins asked before ``before`` and still unanswered are ``expired`` (answering is always optional)."""
+        return self._write(lambda conn: conn.execute(
+            "UPDATE questions SET status='expired', updated_at=? WHERE origin='checkin' AND status='asked'"
+            " AND asked_at < ?", (time.time(), float(before))).rowcount)
 
     # -- the weekly review (yuki.memory.review) --------------------------------
 

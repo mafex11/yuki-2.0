@@ -143,14 +143,14 @@ say what they will do. Not something that was done within the same \
 exchange, not something Yuki refused or said it cannot do, and not an offer or question of \
 Yuki's ("want me to send it to Slack?") that the user did not take up: an offer becomes a \
 commitment only when the user accepts it in a NEW exchange.
-- feedback: what the user said back to one of Yuki's cards - the short messages Yuki's coach \
-puts on screen by itself (praise, a notice, a nudge or call-back, a break suggestion, a \
-reminder, a welcome back, a question) - or about the coach's messages in general. It is about \
+- feedback: what the user said back to one of Yuki's cards - the short messages Yuki itself \
+puts on screen (a notice, a nudge or call-back, a break suggestion, a reminder, a welcome back, \
+a question, a check-in) - or about Yuki's cards in general. It is about \
 that kind of card, never a rule about everything Yuki says: "stfu" in reply to a call-back that \
 misread what they were doing means fewer, surer call-backs, not silence. card is the number n \
-of the card it answers (CARD N<n> under the exchange), or 0 when it is about the coach's cards \
+of the card it answers (CARD N<n> under the exchange), or 0 when it is about Yuki's cards \
 in general; subject names the kind of card as the card shows it ("call-back after a switch", \
-"break suggestion", "reminder from a call"); text says what it tells the coach about that kind \
+"break suggestion", "reminder from a call"); text says what it tells Yuki about that kind \
 of card; quote holds their words.
 - resource: one of the user's OWN things they name or use in the exchanges, that Yuki should know \
 next time without asking: their websites and portfolio, their accounts, usernames and email \
@@ -177,11 +177,11 @@ item for that card (or UPDATE the feedback already recorded on the same kind of 
 the reply, even when it is rude or one word. Nothing else changes because of a reply to a card: \
 it withdraws no rule, preference or commitment.
 
-The coach going quiet: a complaint that Yuki has gone quiet or sends nothing ("no messages \
-from you", "why so quiet", "where did you go") asks for the coach's messages back. INVALIDATE \
-as revoked each active preference or feedback that cut the coach's messages down - its quote \
+Yuki going quiet: a complaint that Yuki has gone quiet or sends nothing ("no messages \
+from you", "why so quiet", "where did you go") asks for Yuki's cards back. INVALIDATE \
+as revoked each active preference or feedback that cut Yuki's cards down - its quote \
 is the complaint's own words from the NEW exchange, never the old item's words - and ADD \
-feedback (card 0, the same quote) that they want to hear from the coach.
+feedback (card 0, the same quote) that they want to hear from Yuki.
 
 Rule or preference: when the user corrects how Yuki behaves and means it to hold from now on, \
 it is a rule, however it is phrased - "you don't have to...", "stop doing...", "no need \
@@ -199,7 +199,7 @@ Likewise a rule said about one app, one kind of task or one time of day stays ab
 "Then don't mention it", "don't bring that up" and the like refer to what Yuki just said: \
 ADD a rule about exactly that ("Do not comment on how much the user switches between \
 windows."), quoting their words - its own item, never folded into an item about something \
-else (feedback about the coach's cards is a different item).
+else (feedback about Yuki's cards is a different item).
 
 Rules, preferences and feedback come ONLY from the user's own words. Record one only when the \
 user said it themselves in a NEW exchange, and put their exact words in quote, copied character \
@@ -1011,7 +1011,7 @@ class ConversationWorker:
         if f.quote:
             line += f' | the user\'s words: "{safe(f.quote, 400)}"'
         if f.kind == "feedback":
-            line += f" | about card N{f.nudge_id}" if f.nudge_id else " | about the coach's cards in general"
+            line += f" | about card N{f.nudge_id}" if f.nudge_id else " | about Yuki's cards in general"
         return line
 
     @staticmethod

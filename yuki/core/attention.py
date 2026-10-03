@@ -5,8 +5,9 @@ hours and meeting / full-screen checks in ``yuki.memory.nudges``, the card queue
 ``yuki.ui.nudges``, the voice narrator's cooldown and settle in ``yuki.voice.narrator``. A rule
 tuned in one place silently diverged from the others. :class:`Attention` is the one place those
 rules live, per **channel** (``coach``, ``reminder``, ``standing_request``, ``question``,
-``voice_progress``, ``notice``, and the observation cards of :mod:`yuki.memory.presence`: ``stuck``,
-``recap``, ``followup``, ``recall``, ``thread``, all counted together in ``presence``), each with a
+``voice_progress``, ``notice``, ``checkin`` (:mod:`yuki.memory.checkins`), and the observation cards of
+:mod:`yuki.memory.presence`: ``stuck``, ``recap``, ``followup``, ``recall``, ``thread``, all counted together
+in ``presence``), each with a
 :class:`ChannelRule`:
 
 * **budget** - at most ``budget`` deliveries per ``window_s`` (rolling);
@@ -87,6 +88,9 @@ DEFAULT_RULES: dict[str, ChannelRule] = {
     "recall": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
     "thread": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=4 * 3600.0, card=True),
     "presence": ChannelRule(budget=2, window_s=3600.0, cooldown_s=1500.0, card=True),
+    # Yuki's check-ins about the user's goals and their day (yuki.memory.checkins, 2026-10-03): at most three a day
+    # (the [nudges] checkins_per_day tunes it), an hour apart at least; their own pacing by presence comes on top.
+    "checkin": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
     "voice_progress": ChannelRule(budget=4, window_s=60.0, cooldown_s=1.5, quiet=False, fullscreen=False,
                                   meeting=True),
 }

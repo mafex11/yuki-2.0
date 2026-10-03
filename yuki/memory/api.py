@@ -42,6 +42,12 @@ To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
     memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
     memory.snooze_nudges(minutes);  memory.nudge_status() -> dict
 
+The user's goals and Yuki's check-ins (migration 30, yuki.memory.checkins)::
+
+    memory.goals(scope=None, statuses=("open", "unknown"), today=False) -> list[dict]
+        # what the user is going for (today's, their work's), as their check-in answers said or inferred
+    standing_parts()["groups"]["goal"]                  # today's goals in the commitments block of every request
+
 Getting to know the user (yuki.memory.questions; asked on cards of kind "question")::
 
     memory.answer_question(ref, answer="", outcome="answered" | "skipped" | "never") -> dict
@@ -155,8 +161,14 @@ COACH_QUIET_S = 3 * 3600.0
 COACH_QUIET_LOOKS = 4
 RESUME_CONTEXT_CHARS = 4_000
 RESUME_EXCHANGES = 6
+#: The user's goals (migration 30, yuki.memory.checkins): today's and their work's, in the commitments block of every
+#: request (their own budget, so they never push a to-do or a rule out, nor the other way round).
+STANDING_GOALS_CHARS = 700
 #: The parts of the standing context, in the order they are shown (:meth:`MemoryClient.standing_parts`).
-STANDING_GROUPS: tuple[str, ...] = ("rule", "preference", "coach", "resource", "commitment", "todo")
+STANDING_GROUPS: tuple[str, ...] = ("rule", "preference", "coach", "resource", "commitment", "todo", "goal")
+#: The parts the one-string standing context (:meth:`MemoryClient.standing_context`, read by the voice talker
+#: through ``yuki.agent.memory.split_standing``) carries: the goals reach the agent through the parts only.
+STANDING_TEXT_GROUPS: tuple[str, ...] = ("rule", "preference", "coach", "resource", "commitment", "todo")
 #: Which of them are the user's own instructions for how Yuki talks or behaves: the agent's cached rules layer.
 STANDING_RULE_GROUPS: tuple[str, ...] = ("rule", "preference")
 #: The heading above each part (a fixed format of memory's own; ``yuki.agent.memory.split_standing`` reads it).
@@ -171,6 +183,12 @@ STANDING_HEADINGS: dict[str, str] = {
     "todo": ("The user's own to-dos (their plans and work, not Yuki's: bring one up only when they ask about "
              "their plans, never offer to do one):"),
 }
+#: The goal part's heading (migration 30): kept apart from :data:`STANDING_HEADINGS`, whose set the one-string
+#: context's reader mirrors (``yuki.agent.memory.STANDING_SECTION_HEADINGS``); the goals reach the agent through the
+#: parts only, whose ``headings`` carry it.
+STANDING_GOAL_HEADING = ("The user's goals - today's and their work's - as they told you on your check-ins, or as you "
+                         "inferred (unknown: not confirmed by them); context for what they are going for, never a "
+                         "list to read out:")
 #: Short texts whose vectors :meth:`MemoryClient.similarity` keeps (a to-do list is a few dozen lines).
 TEXT_VEC_CACHE = 256
 
@@ -179,7 +197,7 @@ def render_standing(parts: dict[str, Any], groups: tuple[str, ...] = STANDING_GR
     """The standing context text from :meth:`MemoryClient.standing_parts` (only ``groups``), with the coach's
     state last; ``""`` when there is nothing."""
     header = parts.get("header") or "[Standing rules and open commitments, from Yuki's conversations with the user]"
-    headings = parts.get("headings") or STANDING_HEADINGS
+    headings = parts.get("headings") or {**STANDING_HEADINGS, "goal": STANDING_GOAL_HEADING}
     lines: list[str] = []
     for g in groups:
         rows = [str(item.get("line") or "") for item in (parts.get("groups") or {}).get(g) or [] if item.get("line")]
@@ -1014,7 +1032,7 @@ class MemoryClient:
         applies to every reply" (09 §3.4). Never raises (empty groups when memory cannot be read).
         """
         header = "[Standing rules and open commitments, from Yuki's conversations with the user]"
-        out: dict[str, Any] = {"header": header, "headings": dict(STANDING_HEADINGS),
+        out: dict[str, Any] = {"header": header, "headings": {**STANDING_HEADINGS, "goal": STANDING_GOAL_HEADING},
                                "groups": {g: [] for g in STANDING_GROUPS}, "coach_state": None}
         try:
             facts = self.store.conversation_facts(STANDING_KINDS)
@@ -1059,10 +1077,54 @@ class MemoryClient:
             out["groups"][group(f)].append({"ref": ref, "line": line, "text": " ".join((f.text or "").split()),
                                             "due_at": f.due_at})
         try:
+            out["groups"]["goal"] = self._goal_items()
+        except Exception:
+            out["groups"]["goal"] = []
+        try:
             out["coach_state"] = self.coach_context() or None
         except Exception:
             out["coach_state"] = None
         return out
+
+    def _goal_items(self, now: float | None = None) -> list[dict[str, Any]]:
+        """The standing parts' goal group: today's goals, then their work's open or unconfirmed ones, within
+        :data:`STANDING_GOALS_CHARS` (whole lines)."""
+        from yuki.memory.checkins import current_goals, goal_line
+
+        now = time.time() if now is None else float(now)
+        day_start = self._nudges_config().resume_day_start
+        goals = current_goals(self.store, now, day_start)
+        titles: dict[int, str] = {}
+        wanted = [g.work_thread_id for g in goals if g.work_thread_id]
+        if wanted:
+            titles = {t.id: t.title for t in self.store.work_threads(None, ids=wanted)}
+        items, used = [], 0
+        for g in goals:
+            line = "- " + goal_line(g, now, lambda v, n: " ".join(str(v or "").split())[:n], day_start, titles)
+            if used + len(line) > STANDING_GOALS_CHARS:
+                break
+            used += len(line)
+            items.append({"ref": g.ref, "line": line, "text": g.text, "due_at": g.due_at})
+        return items
+
+    def goals(self, scope: str | None = None, statuses: Any = ("open", "unknown"), today: bool = False,
+              limit: int = 30) -> list[dict]:
+        """The user's goals (migration 30, yuki.memory.checkins), most recently updated first: ``scope`` day | thread
+        | project; ``statuses`` (None: all); ``today``: only today's day goals. Each: ``{"id": "G12", "scope", "day",
+        "today", "thread": "W5" | None, "text", "words" (their own words), "source", "source_ref", "status",
+        "evidence", "due", "next_checkin", "last_checkin", "checkins", "since", "updated"}``. Read-only, never
+        raises (``[]``)."""
+        from yuki.memory.checkins import goal_dict, user_day
+
+        try:
+            day_start = self._nudges_config().resume_day_start
+            now = time.time()
+            day = user_day(now, day_start) if today else None
+            rows = self.store.goals(tuple(statuses) if statuses else None, scope="day" if today else scope, day=day,
+                                    limit=limit)
+            return [goal_dict(g, now, day_start) for g in rows]
+        except Exception:
+            return []
 
     def standing_context(self) -> str:
         """The user's active rules and preferences for Yuki, and Yuki's open commitments, as one block.
@@ -1079,7 +1141,7 @@ class MemoryClient:
         The same text as ever, built from :meth:`standing_parts` (the voice talker reads it through
         ``yuki.agent.memory.split_standing``, which keeps only the rule and preference sections as rules).
         """
-        return render_standing(self.standing_parts())
+        return render_standing(self.standing_parts(), STANDING_TEXT_GROUPS)
 
     def similarity(self, query: str, texts: Any, embed_wait_s: float | None = None) -> list[float] | None:
         """Cosine of each text to ``query`` on the shared embedder (measured relevance, no words matched), or
@@ -1567,7 +1629,9 @@ class MemoryClient:
         ``outcome``: ``answered`` (``answer`` is the user's own words; it becomes a
         user-origin portrait correction that states the question it answers, and the
         portrait folds it into the facts it concerns within about a minute - the
-        ``render_portrait`` flag - superseding a wrong one), ``skipped`` (not now:
+        ``render_portrait`` flag - superseding a wrong one; the answer to one of Yuki's
+        check-ins (origin ``checkin``) goes into the user's goals instead, folded by the
+        service's card worker, yuki.memory.checkins), ``skipped`` (not now:
         not asked again) or ``never`` (don't ask about this). Returns ``{"saved":
         bool, "question": ref, "outcome", "correction_id", "why"}``; never raises for
         a question that is unknown or already answered (``saved`` false, ``why`` says).
@@ -1588,7 +1652,7 @@ class MemoryClient:
         if fact_id is None:
             return {"saved": False, "question": q.ref, "outcome": outcome, "correction_id": None,
                     "why": f"already {q.status}"}
-        if outcome == "answered":
+        if outcome == "answered" and q.origin != "checkin":   # a check-in's answer goes into the goals instead
             request_render(self.store.path)
         return {"saved": True, "question": q.ref, "outcome": outcome, "correction_id": fact_id or None,
                 "subject": q.subject, "asked": q.question, "why": None}
@@ -1732,10 +1796,11 @@ class MemoryClient:
         now = time.time() if now is None else float(now)
         try:
             since = now - COACH_QUIET_S
-            from yuki.memory.nudges import PRESENCE_TRIGGERS
+            from yuki.memory.nudges import CHECKIN_TRIGGERS, PRESENCE_TRIGGERS
 
             checks = [c for c in self.store.checkin_reasons(since, limit=60)
-                      if c["trigger"] not in ("reminder", "review", "question", "confirm", "resume", *PRESENCE_TRIGGERS)]
+                      if c["trigger"] not in ("reminder", "review", "question", "confirm", "resume", *PRESENCE_TRIGGERS,
+                                              *CHECKIN_TRIGGERS)]
             last = self.store.nudges(until=now + 1.0, kinds=("praise", "nudge", "resume", "reminder", "question"),
                                      limit=1)
             quiet = self.store.nudge_state("quiet_until")
@@ -1745,7 +1810,7 @@ class MemoryClient:
         if quiet is not None:
             try:
                 if float(quiet) > now:
-                    lines.append(f"- The coach is snoozed until {datetime.fromtimestamp(float(quiet)):%H:%M}.")
+                    lines.append(f"- Your cards are snoozed until {datetime.fromtimestamp(float(quiet)):%H:%M}.")
             except ValueError:
                 pass
         silent = [c for c in checks if (c["outcome"] == "none" or c["outcome"].startswith(("suppressed", "skipped")))
@@ -1754,13 +1819,13 @@ class MemoryClient:
             when = (f"the last card was {last[-1].kind} at {datetime.fromtimestamp(last[-1].at):%a %H:%M}" if last
                     else "no card yet")
             said = [c for c in silent if c["reason"]][-3:]
-            lines.append(f"- The coach looked {len(silent)} times in the last {COACH_QUIET_S / 3600:.0f} h and said "
-                         f"nothing ({when})" + (". Its latest reasons:" if said else "."))
+            lines.append(f"- You looked {len(silent)} times in the last {COACH_QUIET_S / 3600:.0f} h and showed "
+                         f"nothing ({when})" + (". Your latest reasons:" if said else "."))
             for c in said:
                 lines.append(f"  - {datetime.fromtimestamp(c['at']):%H:%M} {_clip_sentences(c['reason'], 220) or ''}")
         if not lines:
             return ""
-        head = "Yuki's coach (the cards it puts on screen by itself) right now:"
+        head = "Your own cards (what you put on screen by yourself) right now:"
         text = "\n".join([head, *lines])
         while len(text) > COACH_CONTEXT_CHARS and len(lines) > 1:
             lines.pop()
