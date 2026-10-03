@@ -115,8 +115,8 @@ def rhythm(*counts: int | None) -> tuple[list, dict]:
 
 def build() -> dict:
     call_start = ago(46 * M + 4)
-    rh = {"Riya": rhythm(14, 9, 22, 18, 11, 16, 25, 19, 12), "Dev": rhythm(3, 0, 1, 4, 0, 2, 6, 3, 2),
-          "Mira": rhythm(2, 4, 3, 5, 1, 0, 6, 3, 0), "Noor": rhythm(1, 6, 2, 1, 0, 3, 4, 0, 1),
+    rh = {"Riya": rhythm(8, 13, 17, 6, 20, 15, 11, 23, 9), "Dev": rhythm(3, 0, 1, 4, 0, 2, 5, 3, 2),
+          "Mira": rhythm(1, 3, 0, 4, 2, 5, 0, 2, 1), "Noor": rhythm(0, 2, 5, 1, 0, 2, 3, 1, 4),
           "Theo": rhythm(0, 1, 0, 0, 2, 0, 1, 3, 0), "Ines": rhythm(0, 0, 0, 2, 0, 1, 0, 0, 0)}
     run_start = ago(41)
     autonomy = policy.describe(dict(policy.DEFAULTS))
@@ -307,7 +307,7 @@ def build() -> dict:
         "learning": {"runs_24h": 9, "cost_today_usd": 0.021, "passes_today": 3},
         "proposals": [
             {"ref": "pb:31", "kind": "habit", "title": "Message Riya: the Signal chat first",
-             "basis": "78 of your 125 messages to her went there; Telegram only for the climbing crew. Seen 3 times, 30 Sep; I’ll use it once you say so.",
+             "basis": "Most of your messages to her went there; Telegram only for the climbing crew. Seen 3 times, 30 Sep; I’ll use it once you say so.",
              "steps": ["Open the chat with @riyaclimbs", "Type in your style: short, lowercase", "Wait for you to say send"], "app": "Signal"},
         ],
         "procedures": [
