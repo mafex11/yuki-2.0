@@ -91,9 +91,10 @@ WEIGHTS: dict[str, float] = {"less": -1.0, "not_now": -0.5, "stopped": -1.0, "un
 OFF_AT = -3.0
 #: A request sent from an ``ask`` suggestion and stopped within this long counts as not wanted.
 STOP_WITHIN_S = 60.0
-#: Kinds of cards with offers: the observation cards (their channel is the trigger), the welcome back, and a
-#: check-in (a question card of trigger "checkin", yuki.memory.checkins: at most a todo_add).
-OFFER_CARD_KINDS: tuple[str, ...] = ("notice", "resume", "question")
+#: Kinds of cards with offers: the observation cards (their channel is the trigger), the welcome back, a
+#: check-in (a question card of trigger "checkin", yuki.memory.checkins: at most a todo_add), and a break card after
+#: the user replied to the last one (yuki.memory.nudges.break_reply, revamp 09 P3.6: at most a todo_add).
+OFFER_CARD_KINDS: tuple[str, ...] = ("notice", "resume", "question", "nudge")
 
 #: nudge_state key: what Undo needs per card (``{nudge id: {"todo": id}}``), kept for the last cards only.
 UNDO_STATE = "offers_undo"

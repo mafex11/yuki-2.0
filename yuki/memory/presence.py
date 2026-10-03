@@ -95,12 +95,22 @@ from yuki.memory.personality import nature_mark, normalize_nature, usable
 from yuki.memory.store import NewNudge, NudgeCheckin, Store
 
 #: The observation channels, in the order they are looked at (the most time-bound first).
-CHANNELS: tuple[str, ...] = ("recap", "stuck", "notice", "recall", "followup", "thread")
+CHANNELS: tuple[str, ...] = ("recap", "plans", "stuck", "notice", "recall", "followup", "thread")
 #: What each channel is called on its card (the UI reads ``trigger``).
 CHANNEL_TITLES: dict[str, str] = {
     "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
-    "recall": "From memory", "thread": "Your work",
+    "recall": "From memory", "thread": "Your work", "plans": "Coming up",
 }
+
+#: plans (revamp 09 P3.1): a plan of the user's - one they said on a call or told Yuki (a dated commitment of theirs),
+#: a goal with a day, a vetted personal event - whose moment is at most PLANS_AHEAD_S and at least PLANS_MIN_LEAD_S
+#: ahead (a numeric trigger; an all-day plan's moment is the start of its day, so it comes the day before) may get one
+#: card offering a reminder; not when a to-do of theirs is due within PLANS_TODO_NEAR_S of it (a reminder is set), not
+#: when they already answered the call plan's own "want a reminder?" card, once per plan.
+PLANS_AHEAD_S = 24 * 3600.0
+PLANS_MIN_LEAD_S = 45 * 60.0
+PLANS_TODO_NEAR_S = 3 * 3600.0
+PLANS_AGAIN_S = 7 * 86400.0
 
 #: stuck: a fact counts as coming back when this similar (cosine of the stored embeddings) to the fresh one.
 STUCK_COSINE = 0.75
@@ -196,7 +206,8 @@ THREAD_AGAIN_S = 3 * 86400.0
 STALE_MIN_IMPORTANCE = 8
 
 #: Most model looks per kind in one day (the cost and the noise bounded before any budget of cards).
-LOOK_CAPS: dict[str, int] = {"recap": 4, "stuck": 6, "notice": 6, "recall": 6, "followup": 4, "thread": 3}
+LOOK_CAPS: dict[str, int] = {"recap": 4, "stuck": 6, "notice": 6, "recall": 6, "followup": 4, "thread": 3,
+                             "plans": 2}
 
 #: "Less of these" and kept offers are counted over this long when a kind's budget is tuned.
 FEEDBACK_WINDOW_S = 14 * 86400.0
@@ -251,8 +262,15 @@ step and they are on it, or it is a chat, a feed or routine repetition: none.
 - recap: the digest of a call is ready. Only the user's own microphone was ever recorded, never \
 anyone else: say the gist in a few words and what the USER said they would do, as their own words \
 show it; never what anyone else said, thinks or will do. The offer, if any: a reminder for one of their \
-own plans with its time (todo_add), or the call's notes (show_memory). A social call with nothing to \
-carry forward: none.
+own plans with its time (todo_add), or the call's notes (show_memory). A personal call counts as much \
+as a work one: when the user stated a plan with a day or a time on it (a setup call on Sunday, starting \
+on the 12th, a trip, a visit), name that plan and offer the reminder - never an amount of money, never \
+what the other person said or owes. A social call with no plan of theirs to carry forward: none.
+- plans: something the user planned - a plan they said on a call or told you, a goal with a day, a \
+personal event of theirs - is within a day (THE PLAN, with when). Say notice when a friend would mention \
+it now: name the plan, who it is with and when, and offer a reminder at a time that helps (todo_add, refs \
+PLAN, due the day and time before it that fits their routine). Never an amount of money, never what \
+anyone else said. A plan the data shows already done, dropped, or covered by a reminder on TO-DOS: none.
 - notice: the journal just recorded something the user finished, shipped, merged, fixed or sent. Never \
 tell them what they just did - they know. Say something only when the finish connects to something \
 ELSE that matters now: someone waiting on it (a question on the PR, an ask in a chat), what is still \
@@ -355,7 +373,10 @@ go only in evidence, mentions and refs.
 - Names of people, places, schools, programs, apps, repos and PRs exactly as the data spells them - never a \
 spelling, an expansion or a guess of your own. When lines disagree, a later correction and the portrait win \
 over an earlier line ("Hollis, not NIST": say Hollis).
-- recap: only the user's own words and plans ("you said you'd ..."), never what anyone else said.
+- recap: only the user's own words and plans ("you said you'd ..."), never what anyone else said, never an \
+amount of money.
+- plans: one short line naming the plan, who it is with and when, then the reminder question ("Tomorrow's the \
+setup call you set with Sam before his restart on the 12th - want a reminder at 8 pm?"); never an amount.
 - followup: a question, like a friend asking how it went.
 - No praise, no verdict, no preamble, no "hey", no emojis unless their rules ask; never mention your \
 data, the journal, triggers, cards, lists or budgets; never call yourself a coach; never "let me know if".
@@ -1131,8 +1152,83 @@ class PresenceWorker:
             look.lines.append("ITS LATEST FACTS:")
             look.lines += [self._fact_line(f, look) for f in facts[-8:]]
 
-    DETECTORS: tuple[tuple[str, str], ...] = (("recap", "_recap"), ("stuck", "_stuck"), ("notice", "_moment"),
-                                              ("recall", "_recall"), ("followup", "_followup"), ("thread", "_thread"))
+    # -- plans ahead (revamp 09 P3.1) ----------------------------------------------------------------
+
+    def _plans(self, now: float, config: Any, view: Any, items: Sequence[Any]) -> Look | None:
+        """A plan of the user's within a day (:data:`PLANS_AHEAD_S`, at least :data:`PLANS_MIN_LEAD_S` ahead): their
+        own dated commitments (a plan said on a call or told Yuki), goals with a day, vetted personal events not yet
+        asked about. Numbers only: when it is, whether a timed to-do of theirs sits near it, whether they already
+        answered its own "want a reminder?" card. The soonest one first."""
+        cands: list[dict[str, Any]] = []
+        for item in items:
+            if getattr(item, "status", "") != "open" or getattr(item, "due_at", None) is None:
+                continue
+            if getattr(item, "source", "") not in ("call", "chat"):   # the user's own plan; Yuki's promises remind
+                continue
+            day_start = datetime.fromtimestamp(item.due_at).replace(hour=0, minute=0, second=0).timestamp()
+            cands.append({"ref": item.ref, "at": day_start if item.all_day else float(item.due_at),
+                          "all_day": bool(item.all_day), "due": float(item.due_at), "text": item.text,
+                          "evidence": item.evidence, "what": ("their own plan, said on a call" if item.source == "call"
+                                                              else "their own plan, told to you")})
+        try:
+            for g in self.store.goals(("open", "unknown"), limit=20):
+                if g.due_at is not None:
+                    at, all_day = float(g.due_at), False
+                elif g.day:
+                    at, all_day = datetime.strptime(g.day, "%Y-%m-%d").timestamp(), True
+                else:
+                    continue
+                cands.append({"ref": g.ref, "at": at, "all_day": all_day, "due": at, "text": g.text,
+                              "evidence": f"their words: \"{g.words}\"" if g.words else None,
+                              "what": f"a goal of theirs ({g.status})"})
+        except Exception:
+            pass
+        for ev in self._events():
+            if ev.get("asked") or not ev.get("at"):
+                continue
+            at = float(ev["at"])
+            cands.append({"ref": f"event:{ev.get('id')}", "at": at, "all_day": bool(ev.get("all_day")), "due": at,
+                          "text": ev.get("what"), "evidence": None, "what": "a personal event of theirs"})
+        todos = [float(i.due_at) for i in items if getattr(i, "source", "") == "user" and i.status == "open"
+                 and getattr(i, "due_at", None) is not None]
+        for c in sorted(cands, key=lambda c: c["at"]):
+            lead = c["at"] - now
+            if not PLANS_MIN_LEAD_S <= lead <= PLANS_AHEAD_S:
+                continue
+            if any(abs(t - c["due"]) <= PLANS_TODO_NEAR_S for t in todos):
+                continue   # a timed to-do of theirs already sits by it
+            key = f"plans:{c['ref']}"
+            if self._looked(key, now, PLANS_AGAIN_S) or self._confirm_answered(c["ref"], now):
+                continue
+            when = datetime.fromtimestamp(c["due"]).strftime("%A %Y-%m-%d" if c["all_day"] else "%A %Y-%m-%d %H:%M")
+            from yuki.memory.timeline import format_duration
+
+            look = Look("plans", key, meta={"plan": c["ref"], "at": c["due"]},
+                        trigger=(f"plans - a plan of the user's is {format_duration(lead)} ahead ({when}"
+                                 f"{', no time given' if c['all_day'] else ''}): one card may mention it with a "
+                                 "reminder they can add, if a friend would."))
+            look.lines.append(f"THE PLAN [PLAN] ({c['what']}; {when}{', no time given' if c['all_day'] else ''}): "
+                              f"{_squash(c['text'], 300)}")
+            if c.get("evidence"):
+                look.lines.append(f"  where it comes from: {_squash(c['evidence'], 300)}")
+            look.ids["PLAN"] = c["due"]
+            look.required = {"PLAN"}
+            return look
+        return None
+
+    def _confirm_answered(self, ref: str, now: float) -> bool:
+        """The plan's own "want a reminder?" card (the coach's ``confirm``) got an answer: replied, pressed, dismissed
+        or "Less of these" (only shown or faded is no answer)."""
+        try:
+            cards = self.store.nudges(now - 14 * 86400.0, now + 1.0, kinds=("reminder",))
+        except Exception:
+            return False
+        return any(n.ref == ref and n.trigger == "confirm" and n.reaction in ("replied", "accepted", "dismissed",
+                                                                                "less") for n in cards)
+
+    DETECTORS: tuple[tuple[str, str], ...] = (("recap", "_recap"), ("plans", "_plans"), ("stuck", "_stuck"),
+                                              ("notice", "_moment"), ("recall", "_recall"), ("followup", "_followup"),
+                                              ("thread", "_thread"))
 
     # -- the personal events (followup) --------------------------------------------------------
 
@@ -1523,7 +1619,7 @@ class PresenceWorker:
         parts.append("")
         parts.append("TO-DOS (open):")
         parts += _todo_lines(items, now, safe)
-        parts.append("ABOUT THE USER (portrait facts):")
+        parts.append("ABOUT THE USER (your brief on them, written nightly; else portrait facts):")
         parts += _about_lines(self.store, PRESENCE_ABOUT_KINDS, safe)
         parts.append("RECENT CARDS (last 24 h, oldest first, with what the user did):")
         recent = self.store.nudges(now - 86400.0, now + 1.0, limit=10)

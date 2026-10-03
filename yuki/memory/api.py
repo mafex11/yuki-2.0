@@ -87,6 +87,15 @@ People and routes (migration 28, yuki.memory.contacts; SQL only, no model call):
     memory.prefer_route(ref, "route:N", words) -> dict   # the user's lasting route choice, in their own words
     memory.frame_facts(words, said=, screen=, apps=)     # what the task frame needs (yuki.agent.frame)
 
+The personal brief and personal-ness (yuki.memory.brief; written by the nightly portrait render, migration 31)::
+
+    memory.brief() -> dict | None                        # with_him, people, own_bits, now, routine, careful
+    memory.brief_for("thinker" | "talker" | "cards") -> str   # the slice for one consumer ("" before the first)
+    memory.brief_slice(consumer) -> {"text", "ids", "at"}     # the same with its line ids (the personal-ness log)
+    memory.record_surfaced(kind, ref, brief_ids, fact_ids, session_id=, at=, brief_at=) -> int
+        # which brief lines and memory items a reply or card was written from (ids only; the nightly judge)
+    memory.activity_header(since=None, until=None) -> dict    # threads touched, things finished, dates ahead
+
 Practice memory (migration 29, yuki.memory.practice; learned by the service's practice worker, yuki.memory.practice_learn)::
 
     memory.record_run(run) -> dict                       # one agent request's step trace (the agent loop writes it)
@@ -433,6 +442,46 @@ class MemoryClient:
         For consumers that need one part, not the page."""
         portrait = self.store.latest_portrait()
         return dict(portrait.sections) if portrait and portrait.sections else None
+
+    # -- the personal brief (revamp 09 P1, yuki.memory.brief) ---------------------------------------------------------
+
+    def brief(self) -> dict | None:
+        """The personal brief as stored (``with_him``, ``people``, ``own_bits``, ``now``, ``routine``, ``careful``),
+        written by the nightly render with the portrait, or ``None`` before the first render that wrote one."""
+        portrait = self.store.latest_portrait()
+        return dict(portrait.brief) if portrait and portrait.brief else None
+
+    def brief_slice(self, consumer: str = "thinker") -> dict:
+        """The brief cut for one consumer (``thinker`` | ``talker`` | ``cards``): ``{"text", "ids", "at"}``, ``text``
+        "" when there is no brief yet (``yuki.memory.brief.slice_for``). ``ids`` are the brief lines in it (what the
+        personal-ness log records). Never raises for a known consumer."""
+        from yuki.memory.brief import slice_for
+
+        try:
+            portrait = self.store.latest_portrait()
+        except Exception:
+            portrait = None
+        brief = portrait.brief if portrait else None
+        return slice_for(brief, consumer, at=portrait.at if portrait else None)
+
+    def brief_for(self, consumer: str = "thinker") -> str:
+        """The brief cut for one consumer, as a plain string ("" when there is none yet): ``thinker`` the whole
+        brief (the agent's profile layer), ``talker`` tone and names only, at most ~2,100 characters, labelled
+        "tone and names, never news" (the voice talker's prompt, builder 3b), ``cards`` the whole brief as ABOUT THE
+        USER lines."""
+        return str(self.brief_slice(consumer).get("text") or "")
+
+    def record_surfaced(self, kind: str, ref: str, brief_ids: Any = (), fact_ids: Any = (), *,
+                        session_id: str | None = None, at: float | None = None,
+                        brief_at: float | None = None) -> int:
+        """Record which brief lines and memory items one reply or card was written from (ids only; the nightly
+        personal-ness judge reads them, ``yuki.memory.brief.PersonalJudge``). Returns the row id, 0 when it could
+        not be kept. Never raises."""
+        try:
+            return self.store.add_surfaced(kind, ref, at=at, brief_ids=list(brief_ids or ()),
+                                           fact_ids=list(fact_ids or ()), session_id=session_id, brief_at=brief_at)
+        except Exception:
+            return 0
 
     def correct_portrait(self, text: str) -> int:
         """Record a user-confirmed correction to the portrait; returns its fact id.
@@ -1404,6 +1453,66 @@ class MemoryClient:
         for span in agg.get("meetings", []):
             span["start"], span["end"] = _iso(span["start"]), _iso(span["end"])
         return agg
+
+    #: The activity header's sizes: threads touched, things finished, dates ahead (and how far ahead), open items each.
+    HEADER_THREADS = 6
+    HEADER_DONE = 6
+    HEADER_AHEAD = 6
+    HEADER_AHEAD_DAYS = 7
+    HEADER_OPEN_ITEMS = 2
+
+    def activity_header(self, since=None, until=None, *, now: float | None = None) -> dict:
+        """What changed and what is open in ``[since, until)`` (revamp 09 P2.1), for the head of the ``activity``
+        result, so "what did I do / what's left / where was I" is answered from content first, not app minutes:
+
+            {"since", "until",
+             "threads": [{"ref": "W12", "title", "status", "state", "open": [...], "touched", "last"}],  # most events
+             "done": [{"ref": "J345", "at", "app", "text"}],          # what the user finished, shipped, merged, sent
+             "ahead": [{"ref", "at", "text", "kind"}]}                # dated items from now to a week ahead
+
+        Code only assembles stored rows (thread events, the journal's milestone mark, dated commitments, goals,
+        to-dos); the model words the answer. Never raises (empty lists)."""
+        now = time.time() if now is None else float(now)
+        s, u = self._window(since, until)
+        out: dict[str, Any] = {"since": _iso(s), "until": _iso(u), "threads": [], "done": [], "ahead": []}
+        try:
+            for tid, n, last in self.store.work_threads_touched(s, u, limit=self.HEADER_THREADS):
+                t = self.store.work_thread(tid)
+                if t is None or t.status in ("merged", "dismissed"):
+                    continue
+                out["threads"].append({"ref": f"W{t.id}", "title": t.title, "status": t.status, "state": t.state,
+                                       "open": list(t.open_items[: self.HEADER_OPEN_ITEMS]), "touched": n,
+                                       "last": _iso(last)})
+        except Exception:
+            pass
+        try:
+            ids = [i for i, _at in self.store.milestones_since(0, s, u)]
+            for j in self.store.journal_by_ids(ids[-self.HEADER_DONE:]):
+                out["done"].append({"ref": f"J{j.id}", "at": _iso(j.at), "app": j.app, "text": j.fact})
+        except Exception:
+            pass
+        horizon = now + self.HEADER_AHEAD_DAYS * 86400.0
+        ahead: list[dict[str, Any]] = []
+        try:
+            from yuki.memory.nudges import todo_items
+
+            for item in todo_items(self.store, now=now):
+                if item.status == "open" and item.due_at is not None and now - 3600.0 <= item.due_at <= horizon:
+                    ahead.append({"ref": item.ref, "at": item.due_at, "text": item.text, "kind": item.source})
+        except Exception:
+            pass
+        try:
+            for g in self.store.goals(("open", "unknown"), limit=20):
+                when = g.due_at
+                if when is None and g.day:
+                    when = datetime.strptime(g.day, "%Y-%m-%d").timestamp()
+                if when is not None and now - 3600.0 <= when <= horizon:
+                    ahead.append({"ref": g.ref, "at": when, "text": g.text, "kind": "goal"})
+        except Exception:
+            pass
+        ahead.sort(key=lambda a: a["at"])
+        out["ahead"] = [{**a, "at": _iso(a["at"])} for a in ahead[: self.HEADER_AHEAD]]
+        return out
 
     def _add_calls(self, agg: dict, rows: list, since: float, until: float, group_by: str) -> None:
         """``calls``, ``background`` and the items' ``call_s`` (yuki.memory.callspans); never raises."""
@@ -2845,7 +2954,12 @@ class MemoryClient:
         * ``pitfalls``: what did not work before in the apps in play (know-how's "Not:" part: the app in front, the
           ``apps`` given, the apps of the people's usual routes), newest first.
 
-        Every person comes as ``{"id", "ref", "name", "relation", "heard"}``. Never raises (missing parts are empty)."""
+        Every person comes as ``{"id", "ref", "name", "relation", "heard"}``. A route and a group or channel nearby
+        also carry ``tags`` / ``last_tag`` (how often the user named the person in their own messages there) and a
+        place ``theirs`` (the person's own messages there); the usual route the user's last two lines (``samples``).
+        Never raises (missing parts are empty)."""
+        from dataclasses import replace as _dc_replace
+
         from yuki.memory import contacts as _c
 
         started = time.perf_counter()
@@ -2932,16 +3046,35 @@ class MemoryClient:
                 ranking = _c.rank_routes(self.store, c, now=now)
             except Exception:
                 continue
-            # the group chats on the same apps the user writes in most ("tag him in my usual channel")
+            # the group chats and channels on the same apps: first where the user tags this person (how often, when
+            # last: "tag him in my usual channel" went to his DM in every eval run), then where the user writes most
+            nearby: list[tuple[Any, int, float | None]] = []
             try:
                 if place_rows is None:
                     place_rows = [_c.measure_route(self.store, p, None, now) for p in _c.places(self.store)]
                 services = {r.service for r in ranking.routes}
                 keys = {r.key for r in ranking.routes}
-                nearby = sorted((p for p in place_rows if p.service in services and p.key not in keys and p.score > 0),
-                                key=lambda p: -p.score)[:2]
+                same = [p for p in place_rows if p.service in services and p.key not in keys]
+                tagged = []
+                for p in same:
+                    n, last = _c.tags_in(self.store, p, c)
+                    # this person's own messages there (their sender names, as a group route with them measures it)
+                    theirs = _c.measure_route(self.store, _dc_replace(p, thread_ids=list(p.thread_ids)), c, now).theirs
+                    tagged.append((p, n, last, theirs))
+                nearby = sorted((x for x in tagged if x[1] > 0 or x[3] > 0 or x[0].score > 0),
+                                key=lambda x: (-x[1], -(x[2] or 0.0), -(x[3] > 0), -x[0].score))[:3]
             except Exception:
                 nearby = []
+            route_tags: dict[int, tuple[int, float | None]] = {}
+            for r in ranking.routes[:4]:
+                try:
+                    route_tags[r.id] = _c.tags_in(self.store, r, c)
+                except Exception:
+                    route_tags[r.id] = (0, None)
+            try:   # how the user writes to them: their own last lines on the usual route ("write it like me")
+                said = [s["text"] for s in _c.samples(self.store, ranking.routes[0], 2)] if ranking.routes else []
+            except Exception:
+                said = []
             out["routes"][c.id] = {
                 "name": c.name, "relation": c.relation, "margin": ranking.margin, "close": ranking.close,
                 "preferred": ranking.preferred,
@@ -2954,8 +3087,11 @@ class MemoryClient:
                             "known_as": next((n for n in (r.handle, r.chat if r.kind == "dm" else None)
                                               if n and _c.tokens(n) != _c.tokens(c.name)
                                               and not _c.span_in(c.name, n)), None),
+                            "tags": route_tags.get(r.id, (0, None))[0], "last_tag": route_tags.get(r.id, (0, None))[1],
                             "in_front": thread is not None and thread in r.thread_ids} for r in ranking.routes[:4]],
-                "places": [{"ref": p.ref, "label": p.label(with_service=True), "mine": p.mine} for p in nearby]}
+                "places": [{"ref": p.ref, "label": p.label(with_service=True), "kind": p.kind, "mine": p.mine,
+                            "tags": n, "last_tag": last, "theirs": theirs} for p, n, last, theirs in nearby],
+                "samples": said}
             if ranking.usual is not None:
                 route_apps += self._route_processes(ranking.usual.thread_ids)
         # what did not work before in the apps in play: the usual routes' apps when a person is in play, else the

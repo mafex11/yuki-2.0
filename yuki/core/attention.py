@@ -87,6 +87,8 @@ DEFAULT_RULES: dict[str, ChannelRule] = {
     "followup": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=3 * 3600.0, card=True),
     "recall": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
     "thread": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=4 * 3600.0, card=True),
+    # a plan of the user's within a day (yuki.memory.presence._plans, revamp 09 P3.1): at most one a day
+    "plans": ChannelRule(budget=1, window_s=DAY_S, cooldown_s=0.0, card=True),
     "presence": ChannelRule(budget=2, window_s=3600.0, cooldown_s=1500.0, card=True),
     # Yuki's check-ins about the user's goals and their day (yuki.memory.checkins, 2026-10-03): at most three a day
     # (the [nudges] checkins_per_day tunes it), an hour apart at least; their own pacing by presence comes on top.
@@ -95,7 +97,7 @@ DEFAULT_RULES: dict[str, ChannelRule] = {
                                   meeting=True),
 }
 #: The observation channels (yuki.memory.presence), each also counted in ``presence``.
-PRESENCE_CHANNELS: tuple[str, ...] = ("notice", "stuck", "recap", "followup", "recall", "thread")
+PRESENCE_CHANNELS: tuple[str, ...] = ("notice", "stuck", "recap", "followup", "recall", "thread", "plans")
 
 
 @dataclass(frozen=True)

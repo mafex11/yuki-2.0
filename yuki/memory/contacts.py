@@ -1194,6 +1194,47 @@ def _sender_counts(store: Store, thread_id: int) -> dict[str, list[float]]:
     return counts
 
 
+#: Per process: ``(db, thread id, the names) -> (newest message id read, tags, last tag at)`` (:func:`tags_in`).
+_TAGS: dict[tuple[str, int, tuple[str, ...]], tuple[int, int, float | None]] = {}
+
+
+def tags_in(store: Store, route: Route, contact: Contact) -> tuple[int, float | None]:
+    """How often the user named this person in their own messages on a group chat or channel (a tag: "@Quasar40404
+    kab aayega"), and when last: ``(count, last at)``. A person's name, an alias or the route's handle as whole words
+    of the user's own message - a comparison with memory's own stored strings, never a word list. ``(0, None)`` for a
+    DM (every message there is to them). Decrypted once per message, then only new ones (a per-process cache)."""
+    if route.kind == "dm" or not route.thread_ids:
+        return 0, None
+    names = tuple(sorted({" ".join(tokens(n)) for n in contact.names + ([route.handle] if route.handle else [])
+                          if tokens(n)}))
+    if not names:
+        return 0, None
+    wanted = [tokens(n) for n in names]
+    total, last = 0, None
+    for tid in route.thread_ids:
+        key = (_db_key(store), int(tid), names)
+        after, count, when = _TAGS.get(key, (0, 0, None))
+        try:
+            rows = store._query(f"SELECT id, text_ciphertext, {MSG_TIME_SQL} AS t FROM messages WHERE thread_id=?"
+                                " AND is_me=1 AND id > ? AND text_ciphertext IS NOT NULL ORDER BY id", (int(tid), after))
+        except Exception:
+            rows = []
+        for r in rows:
+            after = max(after, int(r["id"]))
+            try:
+                words = tokens(store.cipher.decrypt(r["text_ciphertext"]))
+            except Exception:
+                continue
+            if any(span_in(w, words) for w in wanted):
+                count += 1
+                when = float(r["t"]) if when is None else max(when, float(r["t"]))
+        _TAGS[key] = (after, count, when)
+        total += count
+        if when is not None:
+            last = when if last is None else max(last, when)
+    return total, last
+
+
 def measure_route(store: Store, route: Route, contact: Contact | None, now: float) -> Route:
     """Fill a route's numbers from its messages (SQL aggregates; group senders from :func:`_sender_counts`)."""
     ids = route.thread_ids

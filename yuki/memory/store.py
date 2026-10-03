@@ -105,9 +105,19 @@ Portrait (worker and Yuki)::
     store.finish_portrait_run(run_id, run: PortraitRunStats) -> None
     store.portrait_checkpoint() -> int                                    # highest journal id a run consumed
     store.last_portrait_run_at(kinds=None) -> float | None                # latest successful run start
-    store.save_portrait(text, *, run_id=None, model=None, fact_count=0, at=None) -> int
-    store.latest_portrait() -> Portrait | None
+    store.save_portrait(text, *, run_id=None, model=None, fact_count=0, at=None, sections=None, brief=None) -> int
+    store.latest_portrait() -> Portrait | None        # .sections (migration 27), .brief (the personal brief)
+    store.portrait_at(at) -> Portrait | None          # the page (and its brief) current at a moment
     store.activity_slots(since, until, slot_s=900) -> dict                # foreground presence for routines
+
+What each reply and card was written from (migration 31, yuki.memory.brief)::
+
+    note_card_context(brief_ids, fact_ids, brief_at=)  # a card writer notes its context; the next card stored in
+                                                        # that thread writes it (record_checkin), ids only
+    store.add_surfaced(kind, ref, *, at, brief_ids, fact_ids, session_id, brief_at) -> int   # a reply's row
+    store.surfaced(since, until, *, unjudged=False, kinds=None) -> list[dict]
+    store.judge_surfaced(id, verdict, judge=None) -> bool   # the nightly judge: personal | generic | wrong | plain
+    store.work_threads_touched(since, until, limit=8) -> [(thread id, events, last at)]   # the activity header
 
 Know-how and open loops::
 
@@ -805,6 +815,42 @@ class Portrait:
     #: The page's sections as fields (migration 27; ``yuki.memory.portrait.PORTRAIT_FIELDS``), ``None`` for a page
     #: rendered before.
     sections: dict[str, str] | None = None
+    #: The personal brief written by the same render (``yuki.memory.brief``: with_him, people, own_bits, now, routine,
+    #: careful), stored inside the sections' JSON under :data:`BRIEF_SECTION`; ``None`` for a page rendered before it.
+    brief: dict[str, Any] | None = None
+
+
+#: The key the personal brief is kept under inside a portrait's sections JSON (no column of its own: migration-free).
+BRIEF_SECTION = "_brief"
+
+#: The card context noted by the card writers in this thread (``note_card_context``), written with the next card
+#: stored from it (:meth:`Store.record_checkin`): which brief lines and memory items the card was written from.
+_CARD_CONTEXT = threading.local()
+#: A noted context older than this when the card is stored belongs to a look that never made a card.
+CARD_CONTEXT_MAX_AGE_S = 300.0
+
+
+def note_card_context(brief_ids: Sequence[str] = (), fact_ids: Sequence[str] = (), *,
+                      brief_at: float | None = None) -> None:
+    """Note, for the card about to be written in this thread, the ids of the brief lines and memory items its
+    writer was shown (revamp 09 P4.1). Ids only; never raises."""
+    try:
+        prev = getattr(_CARD_CONTEXT, "value", None)
+        fresh = prev is not None and time.time() - prev["noted"] <= CARD_CONTEXT_MAX_AGE_S
+        brief = list(dict.fromkeys([*(prev["brief_ids"] if fresh else []), *(str(i) for i in brief_ids if i)]))
+        facts = list(dict.fromkeys([*(prev["fact_ids"] if fresh else []), *(str(i) for i in fact_ids if i)]))
+        _CARD_CONTEXT.value = {"noted": time.time(), "brief_ids": brief, "fact_ids": facts,
+                               "brief_at": brief_at if brief_at is not None else (prev or {}).get("brief_at")}
+    except Exception:
+        pass
+
+
+def _take_card_context() -> dict[str, Any] | None:
+    value = getattr(_CARD_CONTEXT, "value", None)
+    _CARD_CONTEXT.value = None
+    if value is None or time.time() - value["noted"] > CARD_CONTEXT_MAX_AGE_S:
+        return None
+    return value
 
 
 @dataclass
@@ -2696,6 +2742,30 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE questions ADD COLUMN folded_at REAL;
     ALTER TABLE questions ADD COLUMN reply_tone TEXT;
     """,
+    # 31 (2026-10-03, making Yuki personal, docs/research/revamp-2026-10-02/30c-build-D-personal.md; yuki.memory.brief):
+    # - surfaced: for each reply and each card, which lines of the personal brief and which memory items were in the
+    #   context it was written from (ids only, never text: ``brief_ids`` like "people.2", ``fact_ids`` like "F12",
+    #   "J345", "W12"), and, once the nightly judge read it (at most 20 a night), its verdict (personal | generic |
+    #   wrong) with the judge's reading (encrypted). ``ref`` is "nudge:N" for a card, "turn:<session>:<request>" for a
+    #   reply. Written by code only (the card store, the agent's turn writer); pruned with the captures.
+    # Additive only.
+    """
+    CREATE TABLE surfaced (
+        id                  INTEGER PRIMARY KEY,
+        at                  REAL NOT NULL,
+        kind                TEXT NOT NULL,
+        ref                 TEXT NOT NULL,
+        session_id          TEXT,
+        brief_at            REAL,
+        brief_ids           TEXT NOT NULL,
+        fact_ids            TEXT NOT NULL,
+        judged_at           REAL,
+        verdict             TEXT,
+        judge_ciphertext    TEXT
+    );
+    CREATE INDEX surfaced_at ON surfaced(at);
+    CREATE INDEX surfaced_ref ON surfaced(ref);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -4145,12 +4215,16 @@ class Store:
 
     def save_portrait(
         self, text: str, *, run_id: int | None = None, model: str | None = None, fact_count: int = 0,
-        at: float | None = None, sections: dict[str, str] | None = None,
+        at: float | None = None, sections: dict[str, str] | None = None, brief: dict[str, Any] | None = None,
     ) -> int:
         """Store a rendered portrait (encrypted); the newest one is the current portrait. ``sections``: the page's
-        fields (migration 27)."""
+        fields (migration 27); ``brief``: the personal brief the same render wrote (``yuki.memory.brief``), kept in
+        the sections' JSON under :data:`BRIEF_SECTION`."""
         when = float(at) if at is not None else time.time()
-        sealed = self.cipher.encrypt(json.dumps(sections, ensure_ascii=False)) if sections else None
+        payload: dict[str, Any] = dict(sections or {})
+        if brief:
+            payload[BRIEF_SECTION] = brief
+        sealed = self.cipher.encrypt(json.dumps(payload, ensure_ascii=False)) if payload else None
         return self._write(lambda conn: int(conn.execute(
             "INSERT INTO portraits(at, run_id, model, text_ciphertext, chars, fact_count, sections_ciphertext)"
             " VALUES (?,?,?,?,?,?,?)",
@@ -4164,14 +4238,39 @@ class Store:
             return None
         r = rows[0]
         sections = None
+        brief = None
         if "sections_ciphertext" in r.keys() and r["sections_ciphertext"]:
             try:
                 value = json.loads(self.cipher.decrypt(r["sections_ciphertext"]))
-                sections = {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else None
+                if isinstance(value, dict):
+                    raw_brief = value.pop(BRIEF_SECTION, None)
+                    brief = raw_brief if isinstance(raw_brief, dict) and raw_brief else None
+                    sections = {str(k): str(v) for k, v in value.items()} or None
             except Exception:
                 sections = None
         return Portrait(id=r["id"], at=r["at"], text=self.cipher.decrypt(r["text_ciphertext"]),
-                        run_id=r["run_id"], model=r["model"], fact_count=r["fact_count"], sections=sections)
+                        run_id=r["run_id"], model=r["model"], fact_count=r["fact_count"], sections=sections,
+                        brief=brief)
+
+    def portrait_at(self, at: float) -> Portrait | None:
+        """The portrait that was current at ``at`` (the newest rendered at or before it), or ``None``; the brief a
+        reply or card of that moment was written with (the personal-ness judge)."""
+        rows = self._query("SELECT id FROM portraits WHERE at <= ? ORDER BY at DESC, id DESC LIMIT 1", (float(at),))
+        if not rows:
+            return None
+        latest = self.latest_portrait()
+        if latest is not None and latest.id == rows[0]["id"]:
+            return latest
+        r = self._query("SELECT * FROM portraits WHERE id=?", (rows[0]["id"],))[0]
+        brief = None
+        try:
+            value = json.loads(self.cipher.decrypt(r["sections_ciphertext"])) if r["sections_ciphertext"] else {}
+            raw = value.get(BRIEF_SECTION) if isinstance(value, dict) else None
+            brief = raw if isinstance(raw, dict) and raw else None
+        except Exception:
+            brief = None
+        return Portrait(id=r["id"], at=r["at"], text=self.cipher.decrypt(r["text_ciphertext"]), run_id=r["run_id"],
+                        model=r["model"], fact_count=r["fact_count"], sections=None, brief=brief)
 
     def activity_slots(self, since: TimeArg, until: TimeArg, slot_s: float = 900.0) -> dict[str, Any]:
         """Foreground presence in fixed slots: which apps/sites the watcher read, when.
@@ -5796,6 +5895,9 @@ class Store:
             )
             nudge_id = int(cur.lastrowid)
             conn.execute("UPDATE nudge_checkins SET nudge_id=? WHERE id=?", (nudge_id, checkin_id))
+            self._surfaced_card(conn, nudge_id, nudge, c.at)
+        else:
+            _take_card_context()   # a look that ended in none: its noted context goes with it
         if question is not None:
             qid, status = question
             conn.execute(
@@ -5805,6 +5907,80 @@ class Store:
                 (status, nudge_id, status, c.at, time.time(), int(qid)),
             )
         return checkin_id, nudge_id
+
+    # -- what each reply and card was written from (migration 31, yuki.memory.brief) ---------------------------------
+
+    def _surfaced_card(self, conn: sqlite3.Connection, nudge_id: int, nudge: NewNudge, at: float) -> None:
+        """The surfaced row of a card just stored: the brief lines and memory items its writer noted
+        (:func:`note_card_context`) plus the ids the card itself cites. Never raises (a missing table: no row)."""
+        ctx = _take_card_context() or {}
+        inputs = nudge.inputs if isinstance(nudge.inputs, dict) else {}
+        cited = [str(i) for key in ("evidence", "mentions") for i in (inputs.get(key) or []) if i]
+        facts = list(dict.fromkeys([*ctx.get("fact_ids", []), *cited]))
+        try:
+            conn.execute("INSERT INTO surfaced(at, kind, ref, session_id, brief_at, brief_ids, fact_ids)"
+                         " VALUES (?,?,?,?,?,?,?)",
+                         (float(at), "card", f"nudge:{int(nudge_id)}", None, ctx.get("brief_at"),
+                          json.dumps(ctx.get("brief_ids") or []), json.dumps(facts)))
+        except sqlite3.Error:
+            pass
+
+    def add_surfaced(self, kind: str, ref: str, *, at: float | None = None, brief_ids: Sequence[str] = (),
+                     fact_ids: Sequence[str] = (), session_id: str | None = None,
+                     brief_at: float | None = None) -> int:
+        """Record what one reply (``kind`` "reply", ``ref`` "turn:<session>:<request>") or card was written from:
+        ids only (revamp 09 P4.1). Returns the row id (0 before migration 31)."""
+        try:
+            return int(self._write(lambda conn: conn.execute(
+                "INSERT INTO surfaced(at, kind, ref, session_id, brief_at, brief_ids, fact_ids) VALUES (?,?,?,?,?,?,?)",
+                (float(at if at is not None else time.time()), str(kind), str(ref), session_id, brief_at,
+                 json.dumps([str(i) for i in brief_ids if i]), json.dumps([str(i) for i in fact_ids if i]))
+            ).lastrowid))
+        except sqlite3.Error:
+            return 0
+
+    def surfaced(self, since: TimeArg = None, until: TimeArg = None, *, unjudged: bool = False,
+                 kinds: Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """Surfaced rows in ``[since, until)``, oldest first: ``{"id", "at", "kind", "ref", "session_id", "brief_at",
+        "brief_ids", "fact_ids", "judged_at", "verdict", "judge"}``; ``[]`` before migration 31."""
+        sql, params = "SELECT * FROM surfaced WHERE 1=1", []
+        if (s := _ts(since)) is not None:
+            sql += " AND at >= ?"
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            sql += " AND at < ?"
+            params.append(u)
+        if unjudged:
+            sql += " AND judged_at IS NULL"
+        if kinds:
+            sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            params.extend(kinds)
+        try:
+            rows = self._query(sql + " ORDER BY at, id", params)
+        except sqlite3.Error:
+            return []
+        out = []
+        for r in rows:
+            try:
+                judge = json.loads(self._dec(r["judge_ciphertext"]) or "null")
+            except (ValueError, TypeError):
+                judge = None
+            out.append({"id": int(r["id"]), "at": float(r["at"]), "kind": r["kind"], "ref": r["ref"],
+                        "session_id": r["session_id"], "brief_at": r["brief_at"],
+                        "brief_ids": json.loads(r["brief_ids"] or "[]"), "fact_ids": json.loads(r["fact_ids"] or "[]"),
+                        "judged_at": r["judged_at"], "verdict": r["verdict"], "judge": judge})
+        return out
+
+    def judge_surfaced(self, row_id: int, verdict: str, judge: dict[str, Any] | None = None,
+                       at: float | None = None) -> bool:
+        """Keep the nightly judge's verdict on one surfaced row (``personal`` | ``generic`` | ``wrong``)."""
+        try:
+            return bool(self._write(lambda conn: conn.execute(
+                "UPDATE surfaced SET judged_at=?, verdict=?, judge_ciphertext=? WHERE id=?",
+                (float(at if at is not None else time.time()), str(verdict),
+                 self._enc(json.dumps(judge, ensure_ascii=False)) if judge else None, int(row_id))).rowcount))
+        except sqlite3.Error:
+            return False
 
     def nudges(
         self, since: TimeArg = None, until: TimeArg = None, *, kinds: Sequence[str] | None = None,
@@ -7961,6 +8137,8 @@ class Store:
             # run traces (migration 29) share the captures' TTL: a 30-day buffer for the learners, not an archive
             # (what they learned stays in the playbooks and their ledger)
             conn.execute("DELETE FROM runs WHERE at < ?", (cutoff,))
+            # what each reply and card was written from (migration 31): a measure for the nightly judge, not an archive
+            conn.execute("DELETE FROM surfaced WHERE at < ?", (cutoff,))
             return int(deleted)
 
         return self._write(op)
@@ -8146,6 +8324,31 @@ class Store:
             if tid is not None and tid not in out:
                 out.append(tid)
         return out[: int(limit)]
+
+    def work_threads_touched(self, since: TimeArg, until: TimeArg = None, *, limit: int = 8
+                             ) -> list[tuple[int, int, float]]:
+        """``(thread id, events, last event at)`` of the threads of work touched in ``[since, until)``, most events
+        first (merged threads resolved to the thread they went into): content-free, for the ``activity`` header."""
+        sql, params = "SELECT work_thread_id, count(*) AS n, max(at) AS a FROM work_thread_events WHERE at >= ?", \
+            [_ts(since) or 0.0]
+        if (u := _ts(until)) is not None:
+            sql += " AND at < ?"
+            params.append(u)
+        try:
+            rows = self._query(sql + " GROUP BY work_thread_id ORDER BY n DESC, a DESC LIMIT ?",
+                               (*params, int(limit) * 2))
+        except sqlite3.OperationalError:
+            return []
+        out: dict[int, list[float]] = {}
+        for r in rows:
+            tid = self.resolve_work_thread(int(r[0]))
+            if tid is None:
+                continue
+            got = out.setdefault(tid, [0, 0.0])
+            got[0] += int(r[1])
+            got[1] = max(got[1], float(r[2]))
+        ranked = sorted(out.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))[: int(limit)]
+        return [(tid, int(n), float(a)) for tid, (n, a) in ranked]
 
     def work_thread_events(self, work_thread_id: int, *, limit: int = 200) -> list[dict[str, Any]]:
         """A thread's events, oldest first: ``{"id", "at", "action", "batch_id", "thread_id", "app", "host",

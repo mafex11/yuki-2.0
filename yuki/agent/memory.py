@@ -143,6 +143,9 @@ PORTRAIT_TTL_S = 300.0
 #: How long the people directory (``MemoryClient.people_directory``, a cached prompt layer) is reused in-process.
 PEOPLE_TTL_S = 300.0
 
+#: How long a fetched brief slice (``MemoryClient.brief_slice``, a cached prompt layer) is reused in-process.
+BRIEF_TTL_S = 300.0
+
 #: Bound on the task frame's memory read (``MemoryClient.frame_facts``: SQL only, a few ms on the real memory).
 FRAME_TIMEOUT_S = 0.5
 
@@ -246,6 +249,13 @@ class MemoryContext:
     #: The people directory (``MemoryClient.people_directory``: who the user talks to and where), for the profile
     #: layer; ``None`` when memory has no people index.
     people: str | None = None
+    #: The personal brief's thinker slice (``MemoryClient.brief_slice("thinker")``, revamp 09 P1): the whole brief, for
+    #: the profile layer in place of the Personality section and the persona; ``None`` before the first render that
+    #: wrote one (then the profile layer is as before).
+    brief: str | None = None
+    #: The ids of the brief lines in it and the brief's version (for the personal-ness log, ``record_surfaced``).
+    brief_ids: list[str] = field(default_factory=list)
+    brief_at: float | None = None
     #: Practice memory for this request (``MemoryClient.practice``: procedures and a habit or style note near the
     #: words, pitfalls of the apps in play), for the task frame; ``None`` from an older memory (then know-how lines
     #: come as before).
@@ -327,6 +337,8 @@ class MemoryAccess:
         self._portrait: tuple[str | None, float] | None = None
         #: ``(text, monotonic time fetched)`` of the last people directory fetched.
         self._people: tuple[str | None, float] | None = None
+        #: ``{consumer: (slice dict, monotonic time fetched)}`` of the brief slices fetched (``brief_slice``).
+        self._briefs: dict[str, tuple[dict[str, Any], float]] = {}
         self._installed: bool | None = None
         #: The last failure, for the tray and the logs.
         self.last_error: str | None = None
@@ -495,6 +507,45 @@ class MemoryAccess:
         """Forget the cached directory (after the user chose a route)."""
         with self._cache_lock:
             self._people = None
+
+    def brief_slice(self, consumer: str = "thinker", *, timeout_s: float = TRAY_TIMEOUT_S) -> dict[str, Any]:
+        """The personal brief cut for one consumer (``MemoryClient.brief_slice``: ``{"text", "ids", "at"}``), reused
+        for :data:`BRIEF_TTL_S` (it changes nightly). ``{"text": "", "ids": [], "at": None}`` when memory has none or
+        cannot say (an older memory, slow, absent). Never raises."""
+        empty: dict[str, Any] = {"text": "", "ids": [], "at": None}
+        with self._cache_lock:
+            hit = self._briefs.get(consumer)
+            if hit is not None and time.monotonic() - hit[1] <= BRIEF_TTL_S:
+                return dict(hit[0])
+        if "brief_slice" in self._absent:
+            return empty
+        try:
+            got = self.call_method("brief_slice", consumer, timeout_s=timeout_s)
+        except MemoryUnavailable:
+            with self._cache_lock:
+                return dict(self._briefs[consumer][0]) if consumer in self._briefs else empty
+        cut = got if isinstance(got, dict) else empty
+        cut = {"text": str(cut.get("text") or ""), "ids": [str(i) for i in cut.get("ids") or []], "at": cut.get("at")}
+        with self._cache_lock:
+            self._briefs[consumer] = (cut, time.monotonic())
+        return dict(cut)
+
+    def brief_for(self, consumer: str = "thinker", *, timeout_s: float = TRAY_TIMEOUT_S) -> str:
+        """The brief cut for one consumer as a plain string ("" when there is none): ``thinker`` the whole brief,
+        ``talker`` tone and names only (at most ~2,100 characters, "tone and names, never news"; the voice talker's
+        prompt), ``cards`` the ABOUT THE USER lines. Cached like :meth:`brief_slice`; never raises."""
+        return str(self.brief_slice(consumer, timeout_s=timeout_s).get("text") or "")
+
+    def record_surfaced(self, *, kind: str, ref: str, brief_ids: Any = (), fact_ids: Any = (),
+                        at: float | None = None, brief_at: float | None = None,
+                        on_done: Callable[[dict[str, Any]], None] | None = None) -> bool:
+        """Queue the personal-ness log row of one reply or card (``MemoryClient.record_surfaced``: which brief lines
+        and memory items it was written from, ids only), on the turn writer after the exchange. Returns at once;
+        ``False`` when memory is not installed."""
+        payload = {"kind": kind, "ref": ref, "brief_ids": [str(i) for i in brief_ids or ()],
+                   "fact_ids": [str(i) for i in fact_ids or ()], "at": time.time() if at is None else float(at),
+                   "brief_at": brief_at}
+        return self._queue_write("record_surfaced", payload, on_done)
 
     def frame_facts(self, words: str, *, said: Any = (), screen: Any = None, apps: Any = (),
                     timeout_s: float = FRAME_TIMEOUT_S) -> dict[str, Any] | None:
@@ -678,6 +729,11 @@ class MemoryAccess:
                 try:
                     if method == "record_run":
                         got = self.call_method("record_run", turn["run"], timeout_s=TURN_LOG_TIMEOUT_S)
+                    elif method == "record_surfaced":
+                        got = self.call_method("record_surfaced", turn["kind"], turn["ref"], turn.get("brief_ids"),
+                                               turn.get("fact_ids"), session_id=turn.get("session_id"),
+                                               at=turn.get("at"), brief_at=turn.get("brief_at"),
+                                               timeout_s=TURN_LOG_TIMEOUT_S)
                     else:
                         kwargs = {k: turn.get(k) for k in ("at", "app", "target", "words", "why", "request_id")}
                         got = self.call_method("record_hand_trace", turn.get("session_id"), turn["name"],
@@ -838,6 +894,13 @@ class MemoryAccess:
             if hit and stale:
                 result.portrait, result.source = stale, "stale_cache"
         if result.source != "unavailable" or result.error is None:
+            if "brief_slice" not in self._absent:
+                # first after the portrait (one read, cached): the brief replaces the Personality section and the
+                # persona in the profile layer, so the slower lookups below must never starve it
+                cut = self.brief_slice("thinker", timeout_s=max(deadline - time.perf_counter(), 0.05))
+                result.brief = cut["text"] or None
+                result.brief_ids = list(cut["ids"]) if cut["text"] else []
+                result.brief_at = cut["at"] if cut["text"] else None
             remaining = max(deadline - time.perf_counter(), 0.05)
             if "practice" not in self._absent:
                 # practice memory (Phase C) replaces the know-how lines: procedures near the words, pitfalls of the
@@ -1323,20 +1386,27 @@ class MemoryAccess:
             raise _BadInput("'since' must be before 'until'")
         asked = {"since": tool_input.get("since"), "until": tool_input.get("until"), "group_by": group_by}
 
-        def look(c: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        def look(c: Any) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+            header = None
+            if hasattr(c, "activity_header"):   # what changed and what is open, first (revamp 09 P2.1)
+                try:
+                    header = c.activity_header(since=since, until=until)
+                except Exception:
+                    header = None
             return (
                 c.activity(since=since, until=until, group_by=group_by, limit=ACTIVITY_ITEMS),
                 c.episodes(since=since, until=until, limit=ACTIVITY_EPISODES),
+                header,
             )
 
         try:
-            usage, episodes = self.call("activity", look, timeout_s=TOOL_TIMEOUT_S)
+            usage, episodes, header = self.call("activity", look, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             text = f"Memory could not be read: {exc}"
             return _fail("activity", text, {"asked": asked, "error": str(exc)})
         usage = usage if isinstance(usage, dict) else {}
         episodes = [e for e in (episodes or []) if isinstance(e, dict)]
-        text = format_activity(usage, episodes)
+        text = format_activity(usage, episodes, header=header if isinstance(header, dict) else None)
         present = (usage.get("totals") or {}).get("present_s") or 0.0
         return ToolOutcome(
             name="activity",
@@ -1346,7 +1416,7 @@ class MemoryAccess:
                 f"episode{'' if len(episodes) == 1 else 's'}"
             ),
             content=[{"type": "text", "text": text}],
-            payload={"asked": asked, "activity": usage, "episodes": episodes},
+            payload={"asked": asked, "activity": usage, "episodes": episodes, "header": header},
         )
 
     def _calls(self, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -2359,8 +2429,47 @@ POWER_TEXT: dict[str, str] = {
 }
 
 
-def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> str:
-    """The ``activity`` tool's text: totals, one line per activity, back and forth, episodes."""
+#: The head of the ``activity`` result when memory gives what changed (revamp 09 P2.1): content first.
+ACTIVITY_HEADER_LABEL = ("What changed and what is open in this time (lead with this when they ask what they did, "
+                         "what is left or where they were: what changed and what is open, then dates ahead; the time "
+                         "use below is detail for when they ask about time):")
+
+
+def format_activity_header(header: dict[str, Any] | None) -> list[str]:
+    """The ``activity`` result's head from ``MemoryClient.activity_header``: threads touched (where each stands,
+    what is open), things finished, dates ahead. ``[]`` when it holds nothing."""
+    if not header:
+        return []
+    lines: list[str] = []
+    done = [d for d in header.get("done") or [] if isinstance(d, dict) and d.get("text")]
+    if done:
+        lines.append("- Finished, shipped, merged or sent: " + "; ".join(
+            f"{_clock(d.get('at'))} {' '.join(str(d['text']).split())[:160]}" for d in done))
+    for t in header.get("threads") or []:
+        if not isinstance(t, dict) or not t.get("title"):
+            continue
+        state = " ".join(str(t.get("state") or "").split())[:160]
+        opened = [" ".join(str(x).split())[:120] for x in t.get("open") or [] if x]
+        lines.append(f"- [{t.get('ref')}] \"{t['title']}\" ({t.get('status')}, touched {t.get('touched')} times, last "
+                     f"{_clock(t.get('last'))}): {state or 'no state yet'}" + (f"; open: {'; '.join(opened)}" if opened
+                                                                              else ""))
+    ahead = [a for a in header.get("ahead") or [] if isinstance(a, dict) and a.get("text")]
+    if ahead:
+        lines.append("- Dates ahead: " + "; ".join(
+            f"[{a.get('ref')}] {_when(a.get('at'))} {' '.join(str(a['text']).split())[:140]}" for a in ahead))
+    return [ACTIVITY_HEADER_LABEL, *lines] if lines else []
+
+
+def format_activity(usage: dict[str, Any], episodes: list[dict[str, Any]],
+                    header: dict[str, Any] | None = None) -> str:
+    """The ``activity`` tool's text: what changed and what is open (when memory gives it), then totals, one line per
+    activity, back and forth, episodes."""
+    head_lines = format_activity_header(header)
+    body = _format_activity_body(usage, episodes)
+    return "\n".join([*head_lines, body]) if head_lines else body
+
+
+def _format_activity_body(usage: dict[str, Any], episodes: list[dict[str, Any]]) -> str:
     totals = usage.get("totals") or {}
     group_by = usage.get("group_by") or "site"
     head = f"Time use from {_when(usage.get('since'))} to {_when(usage.get('until'))}, by {group_by}:"
