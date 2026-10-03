@@ -162,6 +162,7 @@ class WindowModel:
     ceiling: int = -1
     #: id -> ``(role, name, last read number)`` for every id the window has had.
     seen: dict[int, tuple[str, str, int]] = field(default_factory=dict)
+    mapping: dict[int, int] = field(default_factory=dict)
 
     def carry(self, elements: list[Any], read: int, *, partial: bool = False) -> list[Any]:
         """Carry ids into a new read's ``elements`` and make it the latest; returns the renumbered elements.
@@ -176,8 +177,12 @@ class WindowModel:
             self.ceiling = top
             self.lineage.add(read)
         else:
+            mapping = {int(fact(e, "id")): int(fact(e, "id")) for e in elements}
             self.ceiling = max([self.ceiling, *(int(fact(e, "id")) for e in elements)])
             self.lineage = {read}
+        #: The last read's own ids -> the carried ids (what refers to elements by id - a read's left-out notes -
+        #: follows the same mapping).
+        self.mapping = mapping
         self.read = read
         self.latest = {int(fact(e, "id")): e for e in elements}
         if partial:

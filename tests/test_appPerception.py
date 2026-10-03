@@ -708,3 +708,19 @@ def test_enter_after_typing_is_judged_by_the_chat_moving_to_show_the_message(mon
     reads = desk.reads
     d.dispatch("type_text", {"text": "draft", "expect_hwnd": 7001})
     assert desk.reads == reads
+
+
+def test_left_out_notes_follow_the_carried_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = chat_window(messages=60, visible_from=40, doc_scrolls=True)
+    desk = _PlayerDesk(monkeypatch, window=window)
+    d = _dispatcher(desk, verify=False)
+    first = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    chat = _ids(first, "Messages in @Sam")
+    # something new above the chat shifts every position in the next read
+    doc = next(n for n in window.walk() if n.role == "Document")
+    doc.children.insert(0, Node("Button", "Invented banner", (500, 150, 900, 190), invoke=True))
+    second = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    assert _ids(second, "Messages in @Sam") == chat
+    lines = second.splitlines()
+    at = next(i for i, ln in enumerate(lines) if '"Messages in @Sam"' in ln)
+    assert "off screen: 40 above" in lines[at + 1]

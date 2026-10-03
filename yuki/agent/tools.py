@@ -2467,8 +2467,18 @@ class Dispatcher:
         elements = list(_field(tree, "elements") or [])
         if not elements or not all(isinstance(_field(e, "id"), int) for e in elements):
             return tree
-        return _tree_with(tree, self.window_model(hwnd).carry(elements, self._reads,
-                                                              partial=bool(_field(tree, "truncated"))))
+        model = self.window_model(hwnd)
+        carried = _tree_with(tree, model.carry(elements, self._reads, partial=bool(_field(tree, "truncated"))))
+        left_out = _field(tree, "left_out")
+        if left_out:
+            # the read's notes of what it left out name their parent by the read's own ids: carry them too
+            moved = [{**entry, "parent": model.mapping.get(int(entry.get("parent", -1)), -1)
+                      if int(entry.get("parent", -1)) >= 0 else -1} for entry in left_out if isinstance(entry, dict)]
+            if isinstance(carried, dict):
+                carried["left_out"] = moved
+            else:
+                carried.left_out = moved
+        return carried
 
     def _format_tree(self, tree: Any, within: int | None = None) -> str:
         """The backend's own text for a tree; ``within`` lists one element's part in full (a backend whose formatter
