@@ -252,17 +252,25 @@ class InventedMemory:
                 "cap": 5, "reviewed_today": 1, "left_today": 4, "waiting": 9, "merged": {"count": 3, "since": ago(7 * D)}}
 
     def misheard(self, days: float = 7, limit: int = 8, now: float | None = None) -> dict:
+        # the feedback round 3 (W6): only real mishearings, each with what was heard and the guess (memory's shapes)
         return {"items": [
             {"id": 812, "ref": "journal:812", "at": ago(1 * D + 5 * H), "app": "Mumble", "nature": "uncertain",
-             "text": "Said “the hair loom swap”, maybe “the heirloom swap”.", "call": "call:7",
-             "source": {"quote": "the hair loom swap", "call": "call:7"}, "heard_in": ROOM, "channel_known": True,
-             "people": ["Noor"]},
-            {"id": 815, "ref": "journal:815", "at": ago(5 * H), "app": "Firefox", "nature": "uncertain",
-             "text": "Said “seed swop” while the forum was open.", "call": None, "source": {"quote": "seed swop"},
-             "heard_in": "Firefox", "channel_known": False, "people": []}], "total": 2}
+             "text": "The user said they would bring the hair loom seeds.", "call": "call:7",
+             "source": {"quote": "the hair loom seeds", "call": "call:7"}, "heard_in": ROOM, "channel_known": True,
+             "people": ["Noor"], "heard": "hair loom", "guess": "heirloom", "guess_is_name": False,
+             "why": "You were planning the seed swap, where people bring heirloom seeds.",
+             "shown": "You said you would bring the heirloom seeds."},
+            {"id": 815, "ref": "journal:815", "at": ago(5 * H), "app": "Signal", "nature": "uncertain",
+             "text": "The user said nor would send the bass part.", "call": "call:9", "source": {"quote": "nor"},
+             "heard_in": "Signal", "channel_known": False, "people": [], "heard": "nor", "guess": "Noor",
+             "guess_is_name": True, "why": "Noor plays bass in your band and sends you the parts.",
+             "shown": "You said Noor would send the bass part."}], "total": 2}
 
     def resolve_heard(self, ref, verdict, *, correction_id=None) -> dict:
         return {"ok": True}
+
+    def correct_item(self, ref, words) -> dict:
+        return {"ok": True, "ref": ref, "correction_id": 91, "state": "updating"}
 
     def pin_fact(self, ref, on=True) -> dict:
         return {"ok": True, "pinned": on}
@@ -306,7 +314,10 @@ def build() -> dict:
     }
     home = {
         "now": {
-            "front": {"app": "VS Code", "title": "garden-planner · beds.ts, the watering schedule", "since_at": ago(12 * M)},
+            # the current work thread (the 4 Oct decision: it replaced "In front")
+            "thread": {"ref": "thread:12", "title": "Garden planner: watering schedule", "app": "VS Code", "since_at": ago(42 * M),
+                       "min": 42, "in_front": True, "next": "Write the timer that waters each bed on its own days",
+                       "shown": "The schedule screen is half built; the timer logic isn’t started."},
             "playing": {"status": "paused", "title": "Rain Study No. 4", "artist": "The Lo-Fi Trio", "app": "Music"},
             "call": {"app": "Signal", "started_at": call_start, "recording": True,
                      "note": "Only your mic. Turned into text when the PC is free. Cards are held."},
@@ -379,8 +390,12 @@ def build() -> dict:
          ["Send take 2 to Noor"], ["Noor", "Audacity"]),
         ("thread:3", "Photo backup", "active", 2 * H, "The phone photos up to August are on the external drive. September is still only on the phone.",
          ["Copy September", "Check the drive’s free space"], ["Files"]),
-        ("thread:2", "Old laptop for Dev", "done", 2 * D, "Wiped, fresh system installed, handed over on Thursday.", [], ["Dev"]),
     ]
+    # memory's next step per thread (the feedback round 3, W1c); one not written yet (the checklist's next shows)
+    nexts = {"thread:12": "Write the timer that waters each bed on its own days",
+             "thread:15": "Reply on the forum with who brings what", "thread:9": "Ask Theo for the new rent figure",
+             "thread:18": "Add the train tickets for the 24th", "thread:7": "Fix the case-insensitive search test",
+             "thread:21": "Pick between the two books you saved", "thread:5": "Send take 2 to Noor"}
     people_names = {"Riya", "Noor", "Theo", "Mira", "Dev"}
     done_counts = {"thread:12": 3, "thread:15": 2, "thread:9": 1, "thread:18": 1, "thread:7": 2, "thread:21": 0,
                    "thread:5": 1, "thread:3": 1, "thread:2": 4}
@@ -392,10 +407,13 @@ def build() -> dict:
         return {"done": done, "total": total, "next": open_items[0] if open_items else None} if total else None
 
     work = {
-        "threads": [{"ref": r, "title": t, "status": s, "last_at": ago(a), "state": st, "open": o, "involves": inv,
+        "threads": [{"ref": r, "title": t, "status": s, "last_at": ago(a), "state": st, "next": nexts.get(r), "open": o, "involves": inv,
                      "people": [e for e in inv if e in people_names], "apps": [e for e in inv if e not in people_names],
                      "checks": checks(r, o), "goal": goals.get(r)}
                     for r, t, s, a, st, o, inv in threads],
+        "closed": [{"ref": "thread:2", "title": "Old laptop for Dev", "status": "done", "closed_at": ago(2 * D), "by_you": True},
+                   {"ref": "thread:4", "title": "Watching a cooking video", "status": "dismissed", "closed_at": ago(3 * D), "by_you": False}],
+        "pending": {}, "can": {"close": True, "cont": True, "correct": True},
         "week": {"days": [{"dow": d, "today": i == 6, "pc": pc, "a": a, "f": f} for i, (d, pc, a, f) in enumerate(
             [("Sun", 210, 90, 40), ("Mon", 520, 360, 80), ("Tue", 470, 330, 0), ("Wed", 560, 380, 90), ("Thu", 430, 300, 0),
              ("Fri", 610, 360, 150), ("Sat", 452, 230, 114)])],
@@ -405,20 +423,25 @@ def build() -> dict:
         "date_label": "Saturday 3 Oct", "today": True, "first": "12 AM", "last": "9:49 PM", "now_min": 21 * 60 + 52,
         "off": [{"from": "1:31 AM", "to": "9:40 AM"}],
         "buckets": buckets(),
+        # the feedback round 3 (W2): memory's short distinct title per session and its one- or two-sentence summary
+        # (the last one not written yet: the app is the title, the narrative's first sentence the detail)
         "sessions": [
-            {"a": 0, "b": 90, "start": "00:00", "end": "01:30", "title": "Reading the seed-swap forum", "app": "Firefox", "mode": "active",
-             "apps": [["Firefox", 61], ["Signal", 14]]},
-            {"a": 580, "b": 750, "start": "09:40", "end": "12:30", "title": "Garden planner: bed sizes", "app": "VS Code", "mode": "active",
-             "apps": [["VS Code", 104], ["Firefox", 31], ["Notes", 9], ["Signal", 4]],
-             "full": "Garden planner: you finished the bed sizes screen and checked it against the balcony beds Riya measured."},
-            {"a": 800, "b": 1030, "start": "13:20", "end": "17:10", "title": "Budget sheet, then the Rust exercise", "app": "Calc", "mode": "active",
-             "apps": [["VS Code", 72], ["Calc", 66], ["Firefox", 40], ["Music", 12]],
-             "full": "Budget sheet, then the Rust exercise: October\u2019s rent and groceries went in, then chapter 12\u2019s case-insensitive search."},
-            {"a": 1120, "b": 1230, "start": "18:40", "end": "20:30", "title": "Hollow Knight", "app": "Hollow Knight", "mode": "full",
-             "apps": [["Hollow Knight", 104]]},
-            {"a": 1230, "b": 1312, "start": "20:30", "end": "21:52", "title": "Garden planner: watering schedule", "app": "VS Code", "mode": "active",
-             "apps": [["VS Code", 44], ["Signal", 12], ["Music", 6]]},
+            {"a": 0, "b": 90, "start": "00:00", "end": "01:30", "title": "Seed-swap forum", "app": "Firefox", "mode": "active",
+             "apps": [["Firefox", 61], ["Signal", 14]], "ref": "episode:301",
+             "summary": "You read the seed-swap forum and asked who has spare basil seeds."},
+            {"a": 580, "b": 750, "start": "09:40", "end": "12:30", "title": "Bed sizes screen", "app": "VS Code", "mode": "active",
+             "apps": [["VS Code", 104], ["Firefox", 31], ["Notes", 9], ["Signal", 4]], "ref": "episode:305",
+             "summary": "You finished the bed sizes screen of the garden planner and checked it against the beds Riya measured."},
+            {"a": 800, "b": 1030, "start": "13:20", "end": "17:10", "title": "October budget and Rust", "app": "Calc", "mode": "active",
+             "apps": [["VS Code", 72], ["Calc", 66], ["Firefox", 40], ["Music", 12]], "ref": "episode:309",
+             "summary": "You put October\u2019s rent and groceries in the budget, then worked on the Rust exercise\u2019s search."},
+            {"a": 1120, "b": 1230, "start": "18:40", "end": "20:30", "title": "Hollow Knight evening", "app": "Hollow Knight", "mode": "full",
+             "apps": [["Hollow Knight", 104]], "ref": "episode:312", "summary": "You played Hollow Knight, full screen."},
+            {"a": 1230, "b": 1312, "start": "20:30", "end": "21:52", "title": "VS Code", "app": "VS Code", "mode": "active",
+             "apps": [["VS Code", 44], ["Signal", 12], ["Music", 6]],
+             "full": "Garden planner: you started on the watering schedule screen."},
         ],
+        "pending": {}, "can": {"correct": True},
         "calls": [
             {"a": 1140, "b": 1210, "start": "19:00", "end": "20:10", "app": "Mumble", "live": False, "recorded": True, "min": 70,
              "where": "Mumble, #seed-swap voice (Allotment Club)", "people": ["Noor", "maybe Dev"],
@@ -622,6 +645,27 @@ def build() -> dict:
         "call_pref": {"ok": True}, "stop_call": {"ok": True},
         "pin": {"ok": True, "pinned": True}, "resolve_heard": {"ok": True, "correction_id": None},
         "review_mark": {"ok": True, "correction_id": None}, "day_answer": {"ok": True, "sent": True},
+        # the feedback round 3: a thread's close and Undo / Reopen, Correct from your words and its Undo, Continue
+        "close_thread": {"ok": True, "status": "done"}, "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"},
+        "cancel_correction": {"ok": True}, "open_page": {"ok": True},
+        "thread_continue": {"ok": True, "cont": {
+            "ref": "thread:15", "title": "Seed-swap meetup on the 18th", "shown": "The venue is confirmed; the list of who brings what isn’t.",
+            "next": "Reply on the forum with who brings what", "open": ["Reply to the forum thread"], "last_at": ago(4 * M),
+            "ask": "Help me continue Seed-swap meetup on the 18th. Where it stands: The venue is confirmed; the list of who brings what "
+                   "isn’t. Next: Reply on the forum with who brings what",
+            "places": [{"kind": "page", "app": "Firefox", "title": "Seed swap on the 18th, the forum thread", "page": True, "last_at": ago(20 * M)}]},
+            "by_ref": {"thread:12": {"ok": True, "cont": {
+                "ref": "thread:12", "title": "Garden planner: watering schedule",
+                "shown": "Bed sizes and soil types are in. The schedule screen is half built; the timer logic isn’t started.",
+                "next": "Write the timer that waters each bed on its own days", "open": ["Write the watering schedule"],
+                "last_at": ago(5 * M),
+                "ask": "Help me continue Garden planner: watering schedule. Where it stands: Bed sizes and soil types are in. The "
+                       "schedule screen is half built; the timer logic isn’t started. Next: Write the timer that waters each bed on "
+                       "its own days",
+                "places": [{"kind": "window", "app": "VS Code", "title": "garden-planner, schedule.ts", "page": False, "last_at": ago(5 * M)},
+                           {"kind": "page", "app": "Firefox", "title": "Watering needs by plant, a gardening guide", "page": True,
+                            "last_at": ago(31 * M)},
+                           {"kind": "window", "app": "Notes", "title": "Balcony beds", "page": False, "last_at": ago(1 * D)}]}}}},
         "thread_days": {"ok": True, "connector": {
             "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
             "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",

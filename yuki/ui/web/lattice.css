@@ -876,3 +876,46 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
   .main { padding: 0 72px 80px 48px; }
   .grid3 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
+
+/* ---------- the 4 Oct feedback round 3 (appWin1): Correct in your words, thread cards and Continue, the closed
+   and paused folds, misheard guesses, Home's current-thread tile ---------- */
+.fixline { display: inline-flex; align-items: center; gap: 6px; color: var(--live); min-width: 0; }
+.fixline .ic { width: 10px; height: 10px; flex: none; }
+.fixline.fixed { color: var(--text-2); }
+.fixline.fixed .ic { color: var(--live); }
+.fixline.failed { color: var(--text-2); }
+.fixline .key { margin-left: 4px; }
+.fixbox { max-width: 620px; }
+.rv > .fixbox, .fact.mh > .fixbox { grid-column: 1 / -1; margin-top: 8px; }
+.rv.editing > .acts, .fact.mh.editing > .acts { display: none; }
+.thread .tnext b { color: var(--text); font-weight: 500; }
+.thread .tfix { margin-top: 10px; font-size: 12.5px; }
+.thread .fixslot:empty { display: none; }
+.thread .fixslot .fixbox { margin: 10px 0 0; }
+.thread .tacts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hair); }
+.thread.editing .tacts { display: none; }
+.thread.resolved { min-height: 0; justify-content: center; }
+.thread.flash { box-shadow: 0 0 0 1.5px var(--live); border-radius: 14px; transition: box-shadow 1.2s; }
+.thread .tcont { margin-top: 12px; padding: 12px 12px 10px; border: 1px dashed var(--hair-2); border-radius: 10px; display: flex; flex-direction: column; gap: 10px; }
+.tc-ask { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+.tc-q { color: var(--text); line-height: 1.45; }
+.tc-places { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+.tc-pl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.tc-tick { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 3px 0; border: 0; background: transparent; color: var(--text); text-align: left; font: inherit; }
+.tc-tick .box { width: 12px; height: 12px; flex: none; border: 1px solid var(--hair-2); border-radius: 3px; display: inline-flex; align-items: center; justify-content: center; }
+.tc-tick .box .ic { width: 8px; height: 8px; opacity: 0; color: var(--bg); }
+.tc-tick[aria-checked="true"] .box { background: var(--lit); border-color: var(--lit); }
+.tc-tick[aria-checked="true"] .box .ic { opacity: 1; }
+.tc-tick .tc-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.tc-tick .t3 { flex: none; }
+.tcont .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.tfolds { margin-top: 28px; display: flex; flex-direction: column; }
+.tfold > .fx-h .tx { font-size: 13px; color: var(--text-2); }
+.tfold > .fx-d > .grid3 { margin-top: 8px; }
+.crow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 14px; align-items: center; padding: 7px 0; border-top: 1px solid var(--hair); font-size: 13px; }
+.crow:first-child { border-top: 0; }
+.crow .tx { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mh-g b { font-weight: 600; }
+.mh-why { grid-column: 1; font-size: 12.5px; color: var(--text-2); line-height: 1.4; }
+.now > .nowthread { text-align: left; border: 0; color: inherit; font: inherit; cursor: pointer; display: block; width: 100%; }
+.now > .nowthread:hover, .now > .nowthread:focus-visible { --m: var(--live); }

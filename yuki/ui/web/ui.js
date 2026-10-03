@@ -221,9 +221,84 @@
   }
   function pop(el) { if (el && !reduced() && el.animate) el.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 240, easing: EASE }); return el; }
 
+  /* ---------- Correct (the 4 Oct feedback round 3, W3): you tell Yuki what's wrong in a few words ----------
+     Everywhere an item can be corrected (facts, a person's summary, routines, threads, sessions, misheard entries)
+     its row carries data-cref (the item's ref) and data-cpage (the page data it lives in); its Correct button
+     (data-do="correct") opens one small "What's wrong?" line under it. Enter sends your words to memory
+     (correct_item), the row says "Got it, fixing it" (with Undo while the pass waits), and when the correction pass
+     lands the page's live refresh shows the corrected text. The item's text is never opened for editing by hand.
+     A row may set data-cask / data-cph (its own question and hint: a misheard entry asks "What was it?"); a rule
+     (data-kind="rule") is said again in your words instead (rule_edit). */
+  const FIX_WORDS = {
+    fixing: (w) => `Got it, fixing it${w ? ': “' + w + '”' : '.'}`,
+    fixed: (w) => `Fixed${w ? ' from what you said: “' + w + '”' : '.'}`,
+    failed: (w) => `I couldn’t fix it${w ? ' from “' + w + '”' : ''}. Try saying it another way.`
+  };
+  /* the row's status line for a correction you sent (the page data's pending[ref]) */
+  function fixLine(p) {
+    if (!p || (p.kind && p.kind !== 'correct')) return null;
+    const st = FIX_WORDS[p.state] ? p.state : 'fixing';
+    return h('span', { class: 'fixline ' + st }, ic(st === 'failed' ? 'x' : st === 'fixed' ? 'check' : 'edit'), h('span', { text: FIX_WORDS[st](p.words || '') }),
+      st === 'fixing' && p.cid != null ? key('Undo', { cls: 'xs ghost', data: { do: 'fix-undo', cid: p.cid }, title: 'Take it back before I start on it' }) : null);
+  }
+  const correctKey = (label, title) => key(label || 'Correct', { cls: 'xs', data: { do: 'correct' }, title: title || 'Tell me what’s wrong in a few words' });
+  const fixRow = (t) => t.closest('[data-cref]');
+  const fixPage = (row) => row.dataset.cpage || (window.Yk.openKey ? window.Yk.openKey() : '');
+  const actions = {};
+  actions.correct = (t) => {
+    const row = fixRow(t); if (!row) return;
+    const open = row.querySelector('.fixbox input');
+    if (open) { open.focus(); return; }
+    const rule = row.dataset.kind === 'rule';
+    const ask = row.dataset.cask || (rule ? 'Say the rule your way' : 'What’s wrong?');
+    const hint = row.dataset.cph || (rule ? 'the rule, in a few words' : 'a few words, like “that was last week”');
+    row.classList.add('editing');
+    if (row.classList.contains('fx') && !row.classList.contains('open')) { row.classList.add('open'); window.Yk.S.open.add('f:' + row.dataset.fold); }
+    const inp = h('input', { class: 'fact-in fix-in', data: { enter: 'fix-send', escape: 'fix-cancel' }, attrs: { 'aria-label': ask, placeholder: hint, autocomplete: 'off', maxlength: 300 } });
+    const box = h('div', { class: 'fx-edit fixbox' }, h('div', { class: 'label' }, ic('edit'), ask), h('div', { class: 'fx-edit-r one' }, inp),
+      h('div', { class: 'acts inline' }, key(rule ? 'Save' : 'Fix it', { cls: 'xs pri', data: { do: 'fix-send' } }), key('Cancel', { cls: 'xs ghost', data: { do: 'fix-cancel' } })));
+    const slot = row.querySelector('.fixslot') || row.querySelector(':scope > .fx-d');
+    if (slot) slot.prepend(box); else row.append(box);
+    pop(box); inp.focus(); window.Yk.remeasure();
+  };
+  function fixClose(row) {
+    const box = row && row.querySelector('.fixbox');
+    if (box) box.remove();
+    if (row) row.classList.remove('editing');
+    window.Yk.remeasure();
+  }
+  actions['fix-cancel'] = (t) => fixClose(fixRow(t));
+  actions['fix-send'] = (t) => {
+    const Y = window.Yk, row = fixRow(t), inp = row && row.querySelector('.fixbox input');
+    if (!inp || inp.disabled) return;
+    const words = inp.value.replace(/\s+/g, ' ').trim();
+    if (!words) { inp.focus(); return; }
+    const ref = row.dataset.cref, page = fixPage(row), rule = row.dataset.kind === 'rule';
+    inp.disabled = true;
+    Y.act(rule ? 'rule_edit' : 'correct_item', { ref, words, title: row.dataset.title || '', text: row.dataset.text || '' }).then((r) => {
+      if (!r.ok) { inp.disabled = false; inp.focus(); toast(r.error || 'Couldn’t send that. Memory didn’t answer.', true); return; }
+      fixClose(row);
+      if (rule) { toast('Saved your rule as you said it.'); Y.renderMain(); return; }
+      const d = Y.D.pages[page];
+      if (d) { d.pending = d.pending || {}; d.pending[ref] = { kind: 'correct', words, state: 'fixing', cid: r.correction_id != null ? r.correction_id : null, at: Date.now() / 1000 }; }
+      Y.renderMain();
+    });
+  };
+  actions['fix-undo'] = (t) => {
+    const Y = window.Yk, row = fixRow(t); if (!row) return;
+    const ref = row.dataset.cref, page = fixPage(row);
+    t.disabled = true;
+    Y.act('cancel_correction', { ref, correction_id: Number(t.dataset.cid) }).then((r) => {
+      if (!r.ok) { toast(r.error || 'Too late to undo.', true); return; }
+      const d = Y.D.pages[page]; if (d && d.pending) delete d.pending[ref];
+      toast('Taken back. Nothing changed.');
+      Y.renderMain();
+    });
+  };
+
   window.Yk = Object.assign(window.Yk || {}, {
     h, append, s, ic, key, clearing, label, sec, rightLabel, empty, fold, rhythm, dotProgress, bar, meter, fmt,
-    confirmRow, morph, restore, hasOrig, leave, toast, pop, EASE, pages: {}, actions: {},
+    confirmRow, morph, restore, hasOrig, leave, toast, pop, fixLine, correctKey, EASE, pages: {}, actions,
     remeasure() { /* set by app.js */ }
   });
 })();
