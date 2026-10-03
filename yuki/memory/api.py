@@ -3219,7 +3219,10 @@ class MemoryClient:
         return {"ref": f"thread:{t.id}", "id": t.id, "title": t.title, "status": t.status, "state": t.state,
                 "open": list(t.open_items), "involves": list(t.entities), "first_seen": _iso(t.first_seen),
                 "last_seen": _iso(t.last_seen), "events": t.events, "importance": t.importance,
-                "line": thread_line(t), "shown": getattr(t, "shown", None)}
+                "line": thread_line(t), "shown": getattr(t, "shown", None),
+                # migration 35 (the feedback round 3, W1): the next step said to the user, and who closed it
+                "next": getattr(t, "next", None), "closed_by": getattr(t, "closed_by", None),
+                "closed_at": _iso(getattr(t, "closed_at", None))}
 
     @staticmethod
     def thread_id_of(ref: Any) -> int | None:
@@ -3301,6 +3304,41 @@ class MemoryClient:
             "links": [{"url": link.url, "title": link.title, "line": _links.describe(link, secs.get(link.id))}
                       for link in d["links"]],
         }
+
+    def close_thread(self, ref: Any, how: str) -> dict:
+        """The user's own close of a thread of work (the feedback round 3, W1a), at once, no model: ``how`` = ``done``
+        (finished), ``dismiss`` (not a piece of work: it stops being a thread, its facts stay) or ``reopen`` (either
+        taken back exactly: the window's Undo and its Reopen). Returns ``{"ok", "ref", "status", "how"}``; ``ok`` False
+        with ``error`` (plain words) when nothing could be done. Never raises."""
+        from yuki.memory.workthreads import close_thread
+
+        tid = self.thread_id_of(ref)
+        if tid is None:
+            return {"ok": False, "ref": str(ref or ""), "status": None, "how": str(how or ""), "error": "not a thread"}
+        try:
+            return close_thread(self.store, tid, how)
+        except Exception as exc:
+            return {"ok": False, "ref": f"thread:{tid}", "status": None, "how": str(how or ""),
+                    "error": f"memory: {type(exc).__name__}"}
+
+    def thread_continue(self, ref: Any) -> dict | None:
+        """What a thread's Continue shows and does (the feedback round 3, W1d): ``{"ref", "title", "status", "shown"
+        (what you were doing and where it stands, said to you; None until written), "next" (the concrete next step;
+        None until written or when it only waits on someone), "open", "last_at", "last_label" ("Saturday 3 October"),
+        "places": [{"kind": "page" | "window", "app", "title", "url" (pages), "last_at"}] (the windows and pages worth
+        bringing back, newest first, at most 5), "ask" (the request to hand Yuki to continue it)}``. ``None`` for an
+        unknown thread (merged ones followed). Read only, no model."""
+        from yuki.memory.workthreads import continue_context
+
+        tid = self.thread_id_of(ref)
+        tid = self.store.resolve_work_thread(tid) if tid is not None else None
+        t = self.store.work_thread(tid) if tid is not None else None
+        if t is None:
+            return None
+        try:
+            return continue_context(self.store, t)
+        except Exception:
+            return None
 
     def before(self, at: Any = None, event: str = "break", minutes: float = 90.0) -> dict:
         """What the user was doing before a moment: the break nearest ``at`` (or, with no ``at``, the latest
