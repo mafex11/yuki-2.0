@@ -330,6 +330,29 @@ def test_include_pinned_rewrites_a_pinned_summary_and_keeps_its_pin(store):
     assert meera.id != ids["meera"] and meera.pinned and "roster" not in meera.text
 
 
+def test_an_unpinned_user_fact_is_rewritten_unpinned_and_undone_as_it_was(store):
+    """A user-origin summary the user unpinned: the rewrite does not pin it again, and the undo brings back its words
+    and its origin without the pin a user origin would give a new version."""
+    from yuki.memory.people_summary import PeoplePass
+
+    ids = people(store)
+    [(ok, kiran)] = store.commit_portrait_changes(None, [FactChange("UPDATE", ids["kiran"], "person", "Kiran", KIRAN,
+                                                                    0.9, [], T0 + 10, "user")])
+    store.set_fact_pinned(kiran, False)
+    answers = answer(ids)
+    answers["write_people"][0]["people"][1].update(
+        rewrite=True, text=KIRAN + " He is into chess.", shown="Kiran is your friend from school.",
+        label="School friend in Pune", dropped=["not_useful"])
+    worker, _client = worker_with(store, answers)
+    result = PeoplePass(worker).run(now=T0 + 3600)
+    assert result.ok and result.rewritten == 2
+    new = next(f for f in store.portrait_facts(["person"]) if f.subject == "Kiran")
+    assert new.id != kiran and not new.pinned and new.origin == "model"
+    PeoplePass(worker).undo(result.run_id, now=T0 + 7200)
+    back = next(f for f in store.portrait_facts(["person"]) if f.subject == "Kiran")
+    assert back.text == KIRAN and back.origin == "user" and not back.pinned
+
+
 def test_a_pinned_other_fact_is_reported_not_retired(store):
     from yuki.memory.people_summary import PeoplePass
 
