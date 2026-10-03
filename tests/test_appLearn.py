@@ -117,6 +117,28 @@ class SyncThread:
         self.target(*self.args)
 
 
+class FakeWaiter:
+    """:class:`yuki.ui.learned_wait.LearnedWaiter` with its waits recorded: the test plays the learner's signal by
+    calling the armed check."""
+
+    def __init__(self) -> None:
+        self.armed: list[tuple[Any, float]] = []
+        self.cancelled = 0
+
+    def prepare(self) -> bool:
+        return True
+
+    def arm(self, check: Any, within_s: float) -> bool:
+        self.armed.append((check, within_s))
+        return True
+
+    def cancel(self) -> None:
+        self.cancelled += 1
+
+    def stop(self) -> None:
+        pass
+
+
 class Timers:
     """``QTimer`` with ``singleShot`` recorded: run now when ``run_now``, else kept (the late read is checked apart)."""
 
@@ -155,6 +177,7 @@ def _ui(qapp: Any, monkeypatch: Any, page: Any) -> Any:
     monkeypatch.setattr(app_mod, "QTimer", timers)
     monkeypatch.setattr(threading, "Thread", SyncThread)
     ui.reads, ui.timers = reads, timers
+    ui._learned_waiter = ui.waiter = FakeWaiter()
     return ui
 
 
@@ -168,7 +191,7 @@ def test_a_stopped_runs_return_card_has_no_learned_box_and_reads_nothing(qapp, m
     ui._queue_return_card(4, "Stopped.", "stopped", {"started": 0.0, "calls": CLOSED})
     card = ui.return_card
     assert card is not None and card.learn.isHidden() and ui.island.lesson_available is False
-    assert ui.reads == [] and ui.timers.kept == []                              # no memory read, no late read
+    assert ui.reads == [] and ui.timers.kept == [] and ui.waiter.armed == []   # no memory read, no wait
     card.close()
 
 
@@ -213,7 +236,7 @@ def test_a_verified_success_makes_one_learned_card_and_a_playbook_procedure(qapp
     ui = _ui(qapp, monkeypatch, page)
     monkeypatch.setattr("time.time", lambda: NOW + 22)   # the run started at NOW and took 22 s
     ui._queue_return_card(5, "Playing it.", "done", {"started": __import__("time").monotonic() - 22, "calls": CLOSED})
-    assert ui.reads == ["workflows"] and ui.timers.kept == []                   # found at once: no late read
+    assert ui.reads == ["workflows"] and ui.waiter.armed == []                  # found at once: no wait
     assert not ui.return_card.learn.isHidden() and ui.return_card.learn.ref == procs[0].ref
     assert ui.island.lesson_available is True
     ui.return_card.close()
@@ -228,18 +251,22 @@ def test_a_run_that_ended_done_but_its_last_step_was_not_verified_teaches_no_way
     assert P.workflows(store)["learned"] == []
 
 
-def test_a_done_run_learned_later_gets_its_learned_box_from_one_late_read(qapp, monkeypatch, store):
-    """The learner writes a run's way after its follow-up window: the run's card asks once more, later, and shows it."""
+def test_a_done_run_learned_later_gets_its_learned_box_when_the_learner_signals(qapp, monkeypatch, store):
+    """The learner writes a run's way after its follow-up window (other runs' passes may come first): the run's card
+    waits for the learner's signal, reads once per signal, and shows the box when its success taught a way."""
+    from yuki.ui import app as app_mod
+
     pages = [{"available": True, "learned": []}]
     ui = _ui(qapp, monkeypatch, lambda: pages[-1])
     monkeypatch.setattr("time.time", lambda: NOW + 30)
     ui._queue_return_card(6, "Playing it.", "done", {"started": __import__("time").monotonic() - 20, "calls": CLOSED})
-    assert ui.return_card.learn.isHidden() and len(ui.timers.kept) == 1
-    ms, late = ui.timers.kept[0]
-    assert ms == 150_000
+    assert ui.return_card.learn.isHidden() and ui.timers.kept == [] and len(ui.waiter.armed) == 1
+    late, within = ui.waiter.armed[0]
+    assert within == app_mod.LEARNED_WAIT_S
+    assert late() is False and ui.return_card.learn.isHidden()                 # a signal for another run: wait on
     pages.append({"available": True, "learned": [{"id": "pb:9", "kind": "procedure", "title": "play one of your "
                   "playlists in Spotify", "learned_at": NOW + 140, "why": ""}]})
-    late()                                                                      # the one late read
+    assert late() is True                                                       # this run's success: the wait ends
     assert not ui.return_card.learn.isHidden() and ui.return_card.learn.ref == "pb:9"
     assert ui.island.lesson_available is True and ui._return_learned["id"] == "pb:9"
     # once a later run has ended, an earlier run's late learning never lands on a card
@@ -259,11 +286,11 @@ def test_a_done_run_with_nothing_else_to_tell_gets_a_card_only_for_what_it_learn
     monkeypatch.setattr("time.time", lambda: NOW + 10)
     ui._queue_return_card(8, "Closed it.", "done", {"started": __import__("time").monotonic() - 10,
                                                    "calls": CLICK_ONLY})
-    assert ui.return_card is None and len(ui.timers.kept) == 1                  # no card yet, one late read armed
+    assert ui.return_card is None and len(ui.waiter.armed) == 1                 # no card yet, the wait armed
     pages.append({"available": True, "learned": [{"id": "pb:11", "kind": "procedure", "run_at": NOW,
                   "title": "close the lyrics view in Spotify", "learned_at": NOW + 150,
                   "why": "clicking the Lyrics toggle again and again"}]})
-    ui.timers.kept[0][1]()
+    assert ui.waiter.armed[0][0]() is True
     card = ui.return_card
     assert card is not None and not card.learn.isHidden() and card.learn.ref == "pb:11"
     assert card.learn.why.text() == "What didn’t work: clicking the Lyrics toggle again and again"
@@ -271,7 +298,7 @@ def test_a_done_run_with_nothing_else_to_tell_gets_a_card_only_for_what_it_learn
     # a stopped run with nothing to tell: no card, no read, nothing armed
     ui2 = _ui(qapp, monkeypatch, lambda: pages[-1])
     ui2._queue_return_card(9, "Stopped.", "stopped", {"started": 0.0, "calls": CLICK_ONLY})
-    assert ui2.return_card is None and ui2.reads == [] and ui2.timers.kept == []
+    assert ui2.return_card is None and ui2.reads == [] and ui2.waiter.armed == []
 
 
 # -- a failure, then the same request succeeded ------------------------------------------------------------------------
@@ -446,3 +473,150 @@ def test_a_quote_from_the_users_answer_to_a_question_is_not_a_correction(store):
                    vector=vec("the volume slider in spotify"), now=NOW + 200)
     assert P.corrected_by_quote(store, key) is False and P.judged_ok(store, key) is True
     assert P.stamp_successes(store) == [(pid, key)]
+
+
+# -- review fixes (F2): the late Learned box comes on the learner's signal --------------------------------------------
+
+
+def test_the_learner_signals_only_for_a_run_that_taught_or_marked_a_way(store, monkeypatch):
+    signals: list[int] = []
+    monkeypatch.setattr(P, "signal_learned", lambda: signals.append(1) or True)
+    worker = Worker(store)
+    learn_failed(store, worker)
+    assert signals == []                                                        # a failed run: nothing to announce
+    P.record_run(store, playlist_run())
+    worker.answers.append({"outcome": "worked", "operations": [PLAYLIST_PROC], "used": []})
+    res = L.Learner(worker).run_once(now=NOW + 200)
+    assert res[0].succeeded is True and signals == [1]
+
+
+def test_the_tray_and_memory_name_the_same_event():
+    from yuki.ui.learned_wait import LEARNED_EVENT_NAME
+
+    assert LEARNED_EVENT_NAME == P.LEARNED_EVENT_NAME
+
+
+def _wait_until(cond: Any, timeout_s: float = 5.0) -> bool:
+    import time
+
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+def test_the_waiter_reads_once_per_signal_until_the_run_is_found():
+    """A real named event (a name of the test's own; nothing else waits on it), set as memory sets it."""
+    import uuid
+
+    from yuki.memory.store import signal_event
+    from yuki.ui.learned_wait import LearnedWaiter
+
+    name = r"Local\YukiLearnedTest-" + uuid.uuid4().hex
+    waiter = LearnedWaiter(name)
+    answers = [False, True]
+    calls: list[int] = []
+
+    def check() -> bool:
+        calls.append(1)
+        return answers[len(calls) - 1]
+
+    try:
+        assert waiter.arm(check, 30.0) and waiter.waiting
+        assert signal_event(name) and _wait_until(lambda: len(calls) == 1)
+        assert waiter.waiting                                                   # not this run's yet: wait on
+        assert signal_event(name) and _wait_until(lambda: not waiter.waiting)
+        assert len(calls) == 2
+        # at the deadline, one last read (a signal may have come before the event existed)
+        late: list[int] = []
+        assert waiter.arm(lambda: late.append(1) or False, 0.2)
+        assert _wait_until(lambda: not waiter.waiting) and late == [1]
+        # a newer run's wait ends the one before without reading for it
+        first: list[int] = []
+        assert waiter.arm(lambda: first.append(1) or False, 30.0)
+        second: list[int] = []
+        assert waiter.arm(lambda: second.append(1) or True, 30.0)
+        assert signal_event(name) and _wait_until(lambda: second == [1])
+        assert first == [] and _wait_until(lambda: not waiter.waiting)
+    finally:
+        waiter.stop()
+
+
+# -- review fixes (F3, F4): the late card's Save key and time ---------------------------------------------------------
+
+
+def test_a_quick_question_after_the_run_never_offers_its_lesson_and_the_late_card_keeps_the_runs_time(qapp, monkeypatch,
+                                                                                                    store):
+    from datetime import datetime
+
+    from yuki.ui import app as app_mod
+
+    stamps: list[datetime] = []
+    real_clock = app_mod.clock
+    monkeypatch.setattr(app_mod, "clock", lambda d: stamps.append(d) or real_clock(d))
+    pages = [{"available": True, "learned": []}]
+    ui = _ui(qapp, monkeypatch, lambda: pages[-1])
+    monkeypatch.setattr("time.time", lambda: NOW + 10)                         # the run ended at NOW + 10
+    ui._queue_return_card(12, "Closed it.", "done", {"started": __import__("time").monotonic() - 10,
+                                                    "calls": CLICK_ONLY})
+    assert ui.return_card is None and len(ui.waiter.armed) == 1
+    # a quick question, no actions (no return card of its own), started and answered
+    ui._on_started("front_desk", 13, "what time is it")
+    ui._runs.pop(13, None)
+    pages.append({"available": True, "learned": [{"id": "pb:12", "kind": "procedure", "run_at": NOW,
+                  "title": "close the lyrics view in Spotify", "learned_at": NOW + 150, "why": ""}]})
+    monkeypatch.setattr("time.time", lambda: NOW + 160)                        # the learner's signal, 2.5 min on
+    assert ui.waiter.armed[0][0]() is True
+    card = ui.return_card
+    assert card is not None and card.learn.ref == "pb:12"                      # the success is still announced
+    assert ui.island.lesson_available is False                                 # ...but the question's card never saves it
+    assert stamps and stamps[-1] == datetime.fromtimestamp(NOW + 10)           # "Done · <when the run ended>"
+    card.close()
+
+
+def test_no_late_card_comes_up_over_a_request_still_going(qapp, monkeypatch, store):
+    pages = [{"available": True, "learned": []}]
+    ui = _ui(qapp, monkeypatch, lambda: pages[-1])
+    monkeypatch.setattr("time.time", lambda: NOW + 10)
+    ui._queue_return_card(14, "Closed it.", "done", {"started": __import__("time").monotonic() - 10,
+                                                    "calls": CLICK_ONLY})
+    ui._on_started("worker", 15, "tidy my downloads")                          # still going
+    pages.append({"available": True, "learned": [{"id": "pb:14", "kind": "procedure", "run_at": NOW,
+                  "title": "close the lyrics view in Spotify", "learned_at": NOW + 150, "why": ""}]})
+    ui.waiter.armed[0][0]()
+    assert ui.return_card is None and ui.island.lesson_available is False
+
+
+# -- review: the island's "using your lesson" chip never names a quiet note --------------------------------------------
+
+
+def test_the_island_never_names_a_pitfall_as_your_lesson(qapp, monkeypatch, store):
+    from test_island import _island
+
+    from yuki.ui import app as app_mod
+
+    learn_failed(store, Worker(store))
+    pit = P.live(store, ["pitfall"])[0]
+    ui = _ui(qapp, monkeypatch, lambda: P.workflows(store))
+    got: list[dict] = []
+    ui._lessons = SimpleNamespace(done=SimpleNamespace(emit=got.append))
+    app_mod.YukiUi._fetch_lessons(ui)
+    assert got and got[0][pit.ref] == ""                                       # known, and quiet
+    isl = _island(qapp)
+    try:
+        isl.strip.start_run(16, steps=0)
+        isl.strip.run_step(16, "Clicking Lyrics", 1)
+        isl.step_meta(16, "click", {"name": "Lyrics", "playbook": pit.ref})
+        isl.step_meta(16, "click", {"name": "Close", "playbook": "pb:999"})
+        isl.set_lessons({**got[0], "pb:999": "close it with the Close lyrics button"})
+        assert isl.lesson_refs() == []
+        one = SimpleNamespace(label="Clicking — Lyrics", name="click", running=False, ok=True, key="s1", result="",
+                              seconds=lambda: 0.4)
+        item = SimpleNamespace(real_steps=lambda: [one], step_times=lambda: ({}, None))
+        isl.model = SimpleNamespace(item_for_job=lambda _id: item)
+        chips = [c for st in isl._steps(isl.inputs.run) for c in st["chips"]]
+        assert chips == [("lesson", "using your lesson: close it with the Close lyrics button")]
+    finally:
+        isl.stop()

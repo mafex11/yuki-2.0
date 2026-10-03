@@ -121,6 +121,16 @@ WORKED_OUTCOMES: tuple[str, ...] = ("worked", "worked_after_trouble")
 WRONG_OUTCOMES: tuple[str, ...] = ("corrected", "failed", "cancelled")
 #: The Learned announcements :func:`workflows` returns at most (newest first).
 LEARNED_SHOWN = 5
+#: The named auto-reset event the learner sets when a run it read taught a way or marked one a success (appLearn review):
+#: the tray waits on it, only while a done run's Learned box is still to come (``yuki.ui.learned_wait``, its own copy).
+LEARNED_EVENT_NAME = "Local\\YukiLearnedReady"
+
+
+def signal_learned() -> bool:
+    """Wake the tray's wait for a run's learning (:data:`LEARNED_EVENT_NAME`); ``False`` when nobody waits."""
+    from yuki.memory.store import signal_event
+
+    return signal_event(LEARNED_EVENT_NAME)
 #: Half-life of an object's evidence, days: app mechanics change with app updates, personal defaults drift slowly.
 HALF_LIFE_DAYS: dict[str, float] = {"procedure": 60.0, "pitfall": 60.0, "habit": 180.0, "style": 180.0}
 #: Clean uses (cited, then ran_ok with no negative evidence after them) before an active object is trusted.
@@ -1628,5 +1638,6 @@ __all__ = [
     "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
     "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
     "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
+    "LEARNED_EVENT_NAME", "signal_learned",
     "stamp_successes",
 ]

@@ -2328,7 +2328,10 @@ class Island(QObject):
             for chip in run.chips.get(k, []):
                 icon, text = chip[0], chip[1]
                 if len(chip) > 2 and chip[2]:   # a playbook the step follows: its title from memory, once known
-                    text = f"using your lesson: {self._lesson_text(str(chip[2]))}"
+                    title = self._lessons.get(str(chip[2]))
+                    if not title:
+                        continue   # not known yet, or a quiet note (a pitfall: never shown as learning, appLearn)
+                    text = f"using your lesson: {title}"
                 chips.append((icon, text))
             out.append({"kind": kind, "verb": verb.strip(), "obj": obj.strip(), "ms": ms, "note": note[:160],
                         "chips": chips})
