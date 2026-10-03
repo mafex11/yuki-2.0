@@ -1117,19 +1117,30 @@ def judged_ok(store: Store, key: str) -> bool | None:
     return outcome not in WRONG_OUTCOMES
 
 
-def _success_sets(store: Store) -> tuple[set[int], set[int], dict[int, float]]:
-    """``(ids learned from a run, ids resting on a success, {id: when it was last marked a verified success})`` - two
-    indexed reads for every object at once (the hot path reads these, never each object's ledger)."""
-    from_run = {int(r[0]) for r in store._query(
-        "SELECT DISTINCT playbook_id FROM playbook_events WHERE type='observed' AND run_key IS NOT NULL"
-        " AND substr(run_key, 1, ?) != ?", (len(MIGRATION_RUN_PREFIX), MIGRATION_RUN_PREFIX))}
+def _success_sets(store: Store, ids: Sequence[int]) -> tuple[set[int], set[int], dict[int, float]]:
+    """For these objects: ``(ids learned from a run, ids resting on a success, {id: when it was last marked a verified
+    success})`` - one read over their ledgers (the ``playbook_events_pb`` index), never each object's ledger apart."""
+    ids = sorted({int(i) for i in ids})
+    from_run: set[int] = set()
     proven: set[int] = set()
     succeeded: dict[int, float] = {}
-    for r in store._query("SELECT playbook_id, type, max(at) FROM playbook_events WHERE type IN (%s)"
-                          " GROUP BY playbook_id, type" % ",".join("?" * len(SUCCESS_EVENTS)), SUCCESS_EVENTS):
-        proven.add(int(r[0]))
-        if r[1] == "succeeded":
-            succeeded[int(r[0])] = float(r[2] or 0.0)
+    types = ("observed", *SUCCESS_EVENTS)
+    for start in range(0, len(ids), 400):
+        part = ids[start:start + 400]
+        rows = store._query(
+            "SELECT playbook_id, type, max(at), sum(CASE WHEN run_key IS NOT NULL AND substr(run_key, 1, ?) != ?"
+            " THEN 1 ELSE 0 END) FROM playbook_events WHERE playbook_id IN (%s) AND type IN (%s)"
+            " GROUP BY playbook_id, type" % (",".join("?" * len(part)), ",".join("?" * len(types))),
+            (len(MIGRATION_RUN_PREFIX), MIGRATION_RUN_PREFIX, *part, *types))
+        for r in rows:
+            pid, type_ = int(r[0]), r[1]
+            if type_ == "observed":
+                if int(r[3] or 0):
+                    from_run.add(pid)
+                continue
+            proven.add(pid)
+            if type_ == "succeeded":
+                succeeded[pid] = float(r[2] or 0.0)
     return from_run, proven, succeeded
 
 
@@ -1173,7 +1184,7 @@ def stamp_successes(store: Store, *, run_keys: Sequence[str] | None = None, ok: 
     if not pairs:
         return []
     ways = {o.id for o in live(store, WAY_KINDS, include_disabled=True)}
-    _from_run, done, _succeeded = _success_sets(store)
+    _from_run, done, _succeeded = _success_sets(store, [pid for pid, _key in pairs if pid in ways])
     out: list[tuple[int, str]] = []
     judged: dict[str, bool] = {}
     for pid, key in pairs:
@@ -1368,7 +1379,7 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     now = _now(now)
     in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
     objs = live(store)
-    from_run, proven, _succeeded = _success_sets(store)
+    from_run, proven, _succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
     q = None
     if query_vec is not None:
         q = np.asarray(query_vec, dtype=np.float32).ravel()
@@ -1454,7 +1465,7 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
             o.confidence = ev["confidence"]
             o.state = "disabled" if o.disabled_at is not None else ev["state"]
         cards = [_card(o) for o in objs]
-        from_run, proven, succeeded = _success_sets(store)
+        from_run, proven, succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
         ways = {o.id for o in objs if _is_way(store, o, from_run, proven)}
         unsure = ("candidate", "probation")
         procedures = [c for c, o in zip(cards, objs) if o.id in ways and o.state not in unsure]
