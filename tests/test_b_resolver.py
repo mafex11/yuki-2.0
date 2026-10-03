@@ -87,7 +87,10 @@ def world(store: Store) -> dict[str, int]:
         FactChange("ADD", None, "person", "Bro", "Bro is the user's brother, whom they talk to on WhatsApp about football "
                    "plans.", 0.9, [], NOW - 5 * DAY)])
     t["f_hemanth"], t["f_elina"], t["f_bro"] = [f for _ok, f in facts]
-    store.add_alias("Himanth", "Hemanth", why="speech recognition misheard his name")
+    # written like the rest of this world, never by the wall clock: a fact or alias stamped "now" looked newer than a
+    # run at NOW once the real time passed 3 Oct 12:00, and the "nothing changed" refreshes ran a model call
+    store._write(lambda conn: conn.execute("UPDATE portrait_facts SET created_at=?", (NOW - 5 * DAY,)))
+    store.add_alias("Himanth", "Hemanth", why="speech recognition misheard his name", at=NOW - 5 * DAY)
     return t
 
 
@@ -304,6 +307,26 @@ def test_the_nightly_pass_refreshes_the_index_only_when_memory_changed(store):
     _msg(store, t["bro"], 999, sender="Bro", me=False, at=NOW + 60)          # a new message arrives
     sched._contacts("nightly")
     assert len(worker.calls) == 2 and logged[-1].get("counts", {}).get("updated") == 3
+
+
+def test_a_person_fact_written_after_the_run_counts_as_a_change_whatever_its_evidence_date(store):
+    """The nightly audit writes person facts dated by their evidence (last week's chat): the refresh must still see
+    them, by when they were written; and one retired after the run (its valid_to is the evidence time) too."""
+    from yuki.memory.contacts import Linker
+
+    built(store)                                                          # the run is at NOW
+    linker = Linker(_Worker(store, {}))
+    last = store.last_portrait_run_at(["contacts"])
+    assert last == NOW and not linker.changed_since(last)
+    [(_ok, fid)] = store.commit_portrait_changes(None, [FactChange(
+        "ADD", None, "person", "Ravi", "Ravi is someone the user plays with on Discord.", 0.7, [], NOW - 4 * DAY)])
+    store._write(lambda conn: conn.execute("UPDATE portrait_facts SET created_at=? WHERE id=?", (NOW + 600, fid)))
+    assert linker.changed_since(last)                                     # valid_from is 4 days before the run
+    store._write(lambda conn: conn.execute("UPDATE portrait_facts SET created_at=? WHERE id=?", (NOW - DAY, fid)))
+    assert not linker.changed_since(last)
+    store._write(lambda conn: conn.execute("UPDATE portrait_facts SET valid_to=?, expired_at=? WHERE id=?",
+                                           (NOW - 2 * DAY, NOW + 900, fid)))  # retired tonight, evidence older
+    assert linker.changed_since(last)
 
 
 def test_ambiguous_merges_become_questions_through_the_pipeline(store, monkeypatch):
