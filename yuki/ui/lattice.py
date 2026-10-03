@@ -203,6 +203,14 @@ def font_px(f: QFont) -> float:
 # -- the one loop ---------------------------------------------------------------------------------------
 
 
+def stop_timer(timer: QTimer | None) -> None:
+    """Stop a shared timer from a hide: at interpreter exit Qt deletes the timers before the widgets it hides."""
+    from shiboken6 import isValid
+
+    if timer is not None and isValid(timer):
+        timer.stop()
+
+
 class Loop(QObject):
     """One timer for every animated dot surface (the design's ``Loop``): at most 30 frames a second.
 
@@ -243,7 +251,7 @@ class Loop(QObject):
     def remove(self, fn: Callable[[float], bool]) -> None:
         self.subs.pop(id(fn), None)
         if not self.subs:
-            self._timer.stop()
+            stop_timer(self._timer)
 
     def tick(self) -> None:
         t0 = time.perf_counter()
@@ -310,7 +318,7 @@ class Blinker(QObject):
         if w in self.widgets:
             self.widgets.remove(w)
         if not self.widgets:
-            self._timer.stop()
+            stop_timer(self._timer)
             self.on = True
 
     @property
@@ -486,8 +494,8 @@ class Spinner(Icon):
         super().hideEvent(e)
         if self in Spinner._all:
             Spinner._all.remove(self)
-        if not Spinner._all and Spinner._timer is not None:
-            Spinner._timer.stop()
+        if not Spinner._all:
+            stop_timer(Spinner._timer)
 
 
 # -- keys, chips, kbd ------------------------------------------------------------------------------------

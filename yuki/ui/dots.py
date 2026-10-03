@@ -322,7 +322,7 @@ class FaceWidget(QWidget):
 
     def hideEvent(self, e: object) -> None:  # noqa: D102 - no timer, no frame while hidden
         super().hideEvent(e)
-        self._blink_timer.stop()
+        L.stop_timer(self._blink_timer)
         L.Loop.shared().remove(self._frame_fn)
 
     # -- frames ----------------------------------------------------------------------------------------

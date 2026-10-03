@@ -2071,9 +2071,8 @@ class Island(QObject):
 
     def _visibility_changed(self, visible: bool) -> None:
         if not visible:
-            self._clock.stop()
-            self._hover_in.stop()
-            self._hover_out.stop()
+            for timer in (self._clock, self._hover_in, self._hover_out):
+                L.stop_timer(timer)
             if self.hovered and not self.window._leaving:
                 self.hovered = False
         elif self.window.spec is not None:
