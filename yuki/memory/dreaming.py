@@ -28,14 +28,15 @@ Dreaming also retires facts that fail the portrait's admission bar
 (:data:`yuki.memory.portrait.ADMISSION_BAR`: durable, about the person, useful; never a tool's readings, metrics or
 words), within the same caps. The **bar pass** (:class:`BarPass`, report 50) is the one-off sweep for that: every
 fact judged against the bar, the failing ones retired (pinned facts reported, never retired - unless the pass is run
-with ``--include-pinned``, the user's yes to rewriting or retiring pinned facts that fail: then a failing pinned fact
-is retired like any other and its lasting line keeps the pin), each with a diary line (pass ``bar``), the whole pass
-reversible (``--undo-bar``: a pinned fact comes back pinned).
+with ``--include-pinned --pinned-ids F12,F34``, the user's yes to rewriting or retiring those pinned facts if they
+fail: then each named failing pinned fact is retired like any other and its lasting line keeps the pin; other pinned
+facts stay, reported), each with a diary line (pass ``bar``), the whole pass reversible (``--undo-bar``: a pinned fact
+comes back pinned).
 
 Run it by hand: ``python -m yuki.memory.dreaming [--db PATH] [--dry-run]``; the bar pass:
-``python -m yuki.memory.dreaming --bar [--include-pinned] [--db PATH] [--dry-run [--save FILE]]``; ``--bar --apply
-FILE [--include-pinned]`` writes exactly the decisions a dry run kept (no new judgement); taken back with
-``--undo-bar RUN_ID``.
+``python -m yuki.memory.dreaming --bar [--include-pinned --pinned-ids IDS] [--db PATH] [--dry-run [--save FILE]]``;
+``--bar --apply FILE [--include-pinned --pinned-ids IDS]`` writes exactly the decisions a dry run kept (no new
+judgement); taken back with ``--undo-bar RUN_ID``.
 """
 
 from __future__ import annotations
@@ -529,17 +530,22 @@ class BarPass:
     line the judge gives for it, if any, is written as a new fact citing the same evidence. A pinned fact is never
     retired: it is reported - unless ``include_pinned`` (the user said yes to rewriting or retiring pinned facts that
     fail the bar, appClean): then it is decided like any other, and its lasting line keeps the pin (the pin was about
-    what it says, and its lasting part is that). Each retirement writes a diary line (pass ``bar``) and :meth:`undo`
-    takes a whole pass back (a retired pinned fact comes back with its pin). Run by hand: ``python -m
-    yuki.memory.dreaming --bar [--include-pinned] [--db PATH] [--dry-run]``."""
+    what it says, and its lasting part is that); ``pinned_ids`` limits that to the pinned facts the user named. Each
+    retirement writes a diary line (pass ``bar``) and :meth:`undo` takes a whole pass back (a retired pinned fact
+    comes back with its pin). Run by hand: ``python -m yuki.memory.dreaming --bar [--include-pinned --pinned-ids IDS]
+    [--db PATH] [--dry-run]``."""
 
     def __init__(self, worker: Any, *, chunk_chars: int = BAR_CHUNK_CHARS,
-                 max_retire_fraction: float = BAR_MAX_RETIRE_FRACTION, include_pinned: bool = False) -> None:
+                 max_retire_fraction: float = BAR_MAX_RETIRE_FRACTION, include_pinned: bool = False,
+                 pinned_ids: Sequence[int] | None = None) -> None:
         self.worker = worker
         self.store = worker.store
         self.chunk_chars = int(chunk_chars)
         self.max_retire_fraction = float(max_retire_fraction)
         self.include_pinned = bool(include_pinned)
+        #: With :attr:`include_pinned`, only these pinned facts may be retired (the ones the user said yes to; review
+        #: F4); ``None``: every failing pinned fact. Others stay pinned and are only reported, as without the option.
+        self.pinned_ids: set[int] | None = None if pinned_ids is None else {int(i) for i in pinned_ids}
 
     def eligible(self) -> list[PortraitFact]:
         return [f for f in self.store.portrait_facts() if f.kind not in UNTOUCHED_KINDS]
@@ -630,8 +636,8 @@ class BarPass:
 
     def _decide(self, verdicts: Sequence[Any], current: dict[int, PortraitFact], result: BarResult
                 ) -> list[dict[str, Any]]:
-        """The retirements to make: never a pinned fact (reported instead) unless :attr:`include_pinned`, at most the
-        pass's cap, one lasting line per wording."""
+        """The retirements to make: never a pinned fact (reported instead) unless :attr:`include_pinned` (and, when
+        :attr:`pinned_ids` names some, it is one of them), at most the pass's cap, one lasting line per wording."""
         cap = max(1, int(len(current) * self.max_retire_fraction))
         changes: list[dict[str, Any]] = []
         lines: set[str] = set()
@@ -641,7 +647,7 @@ class BarPass:
                 continue
             if f.pinned:
                 result.pinned.append({"id": f.id, "kind": f.kind, "category": v.category})
-                if not self.include_pinned:
+                if not self.include_pinned or (self.pinned_ids is not None and f.id not in self.pinned_ids):
                     continue
             if len(changes) >= cap:
                 result.rejected.append(f"F{f.id}: over the pass's cap of {cap} retirements")
@@ -783,8 +789,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="take back the admission-bar pass of this portrait run")
     parser.add_argument("--include-pinned", action="store_true",
                         help="--bar: pinned facts that fail the bar are retired too (their lasting line keeps the pin)"
-                             " instead of only reported")
+                             " instead of only reported; needs --pinned-ids")
+    parser.add_argument("--pinned-ids", default=None, metavar="IDS",
+                        help="--include-pinned: the pinned facts the user agreed to, comma-separated (F12,F34 or "
+                             "12,34); other failing pinned facts stay pinned and are only reported")
     args = parser.parse_args(argv)
+    pinned_ids = None
+    if args.pinned_ids is not None:
+        try:
+            pinned_ids = [int(p.strip().lstrip("Ff")) for p in args.pinned_ids.split(",") if p.strip()]
+        except ValueError:
+            parser.error("--pinned-ids takes fact numbers, e.g. F12,F34")
+        if not pinned_ids or not args.include_pinned:
+            parser.error("--pinned-ids goes with --include-pinned and names at least one fact")
+    elif args.include_pinned:
+        parser.error("--include-pinned needs --pinned-ids: name the pinned facts the user agreed to "
+                     "(a --bar --dry-run without it lists the failing pinned facts)")
     from yuki.memory.embed import get_embedder
     from yuki.memory.portrait import PortraitWorker
     from yuki.memory.store import Store
@@ -802,10 +822,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.apply and args.dry_run:
                 parser.error("--apply writes the saved plan; leave out --dry-run")
             plan = load_plan(store, args.apply) if args.apply else None
-            bar = BarPass(worker, include_pinned=args.include_pinned).run(
+            texts = {f.id: f.text for f in store.portrait_facts()} if args.dry_run else {}
+            bar = BarPass(worker, include_pinned=args.include_pinned, pinned_ids=pinned_ids).run(
                 reason=("by hand" if plan is None else "saved plan") + (", pinned included" if args.include_pinned
                                                                          else ""),
                 dry_run=args.dry_run, plan=plan)
+            if args.dry_run:
+                # which pinned facts fail, with their words, so the ones the user agreed to can be named (private)
+                bar.pinned = [{**p, "text": texts.get(p["id"])} for p in bar.pinned]
             saved = None
             if args.dry_run and bar.ok:
                 saved = str(save_plan(store, bar.decisions, args.save or _default_plan_path()))
@@ -815,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": bar.ok, "run_id": bar.run_id, "judged": bar.judged, "calls": bar.calls,
                               "retired": bar.retired, "lasting": bar.lasting, "categories": bar.categories,
                               "would_retire": len(bar.decisions), "pinned_failing": bar.pinned,
-                              "pinned_included": bool(args.include_pinned),
+                              "pinned_included": sorted(pinned_ids or []),
                               "rejected": bar.rejected, "cost_usd": round(bar.cost_usd, 4), "error": bar.error,
                               "plan_saved": saved, "decisions": bar.decisions if args.dry_run else None},
                              ensure_ascii=False, indent=1))

@@ -64,12 +64,13 @@ Public API::
     stamp_successes(store, *, run_keys=None, ok=None, dry_run=False) -> [(id, run_key)]
     provenance(store, obj) -> (verdict, why);  pitfall_overflow(store, pitfalls, cap=) -> [id]   # appClean
     retire_cleaned(store, items, *, run_key) -> [id];  cap_pitfalls(store, *, cap=, dry_run=False) -> [id]
+    cap_enabled(store) -> bool;  set_clean_state(store, "applied" | "undone", run)   # the daily cap's gate
 
 **Cleaning what is saved** (appClean, 4 Oct): :mod:`yuki.memory.practice_clean` re-judges every saved object - a way
 stays only on the user's word, a success or what the user does (:func:`provenance`, code), near-duplicates merge into
 the one that worked, kept procedures become a title and numbered steps - and pitfalls are capped per app
-(:data:`PITFALLS_PER_APP`, also daily: :func:`cap_pitfalls`). Each change is a ``cleaned`` ledger event under
-``clean:<run>`` and can be taken back.
+(:data:`PITFALLS_PER_APP`; also daily once a pass was applied: :func:`cap_pitfalls`, :func:`cap_enabled`). Each
+change is a ``cleaned`` ledger event under ``clean:<run>`` and can be taken back.
 """
 
 from __future__ import annotations
@@ -136,6 +137,10 @@ LEARNED_SHOWN = 5
 #: The run key prefix of the clean-up pass's ledger events (appClean): ``clean:<portrait run id>``, or
 #: ``clean:daily-<day>`` for the daily pitfall cap. Never a run's evidence (:func:`_run_evidence`).
 CLEAN_RUN_PREFIX = "clean:"
+#: The checkpoint that turns the daily pitfall cap on (appClean review F3): ``applied:<run id>`` once a clean-up pass
+#: has been written (its merges done first, after the user's reviewed dry run); ``undone:<run>`` once a pass or a day's
+#: cap is taken back, so the cap does not retire again what the undo restored. Unset (before any pass): the cap waits.
+CLEAN_CHECKPOINT = "practice_clean_state"
 #: Most live pitfalls kept per app (appClean, 4 Oct; the user: "theres too many spotify lessons"): a request is shown
 #: at most :data:`MAX_PITFALLS` of an app in play, so more than one spare per app only crowds the ranking. The
 #: weakest (no words of the user's, lowest confidence, least evidence, oldest evidence) are retired past it.
@@ -1364,6 +1369,17 @@ def retire_cleaned(store: Store, items: Sequence[dict[str, Any]], *, run_key: st
     return store._write(op)
 
 
+def cap_enabled(store: Store) -> bool:
+    """Whether the daily pitfall cap runs (:data:`CLEAN_CHECKPOINT`): only after a clean-up pass was applied and while
+    no undo has come since."""
+    return str(store.source_checkpoint(CLEAN_CHECKPOINT) or "").startswith("applied:")
+
+
+def set_clean_state(store: Store, state: str, run: Any) -> None:
+    """Record a clean-up pass applied (``"applied"``) or a pass / day's cap taken back (``"undone"``)."""
+    store.set_source_checkpoint(CLEAN_CHECKPOINT, f"{state}:{run}")
+
+
 def cap_pitfalls(store: Store, *, cap: int = PITFALLS_PER_APP, dry_run: bool = False,
                  now: float | None = None) -> list[int]:
     """The daily pitfall cap (the practice worker's refresh, appClean): live pitfalls past :data:`PITFALLS_PER_APP` per
@@ -1769,5 +1785,5 @@ __all__ = [
     "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
     "LEARNED_EVENT_NAME", "signal_learned",
     "stamp_successes", "provenance", "provenance_rank", "pitfall_rank", "pitfall_overflow", "retire_cleaned",
-    "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX",
+    "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX", "CLEAN_CHECKPOINT", "cap_enabled", "set_clean_state",
 ]

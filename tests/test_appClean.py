@@ -251,6 +251,88 @@ def test_between_two_ways_of_equal_standing_the_models_choice_stays(store):
     assert got.merge == [{"id": a, "into": b, "why": "same job"}]
 
 
+def test_a_saved_habit_never_absorbs_the_procedure_that_worked(store):
+    """Review F1: without the user's words (or when the model does not call the saved habit unwanted), a merge of the
+    saved lyrics-first habit with the procedure that worked keeps the procedure, whichever one the model named."""
+    ids = seed(store)
+    items = {it.obj.id: it for it in C.gather(store, P.live(store))}
+    for keep, drop in ((ids["good"], ids["saved"]), (ids["saved"], ids["good"])):
+        got = C.check({"merge": [{"keep": keep, "drop": [drop], "why": "same job"}], "retire": [], "reshape": []},
+                      items, [])
+        assert got.merge == [{"id": ids["saved"], "into": ids["good"], "why": "same job"}]
+    res = C.CleanPass(Worker(store, [{"merge": [{"keep": ids["good"], "drop": [ids["saved"]], "why": "same job"}],
+                                      "retire": [], "reshape": []}])).run(now=NOW + 3600)
+    assert res.ok, res.error
+    assert P.get(store, ids["good"]).valid_to is None
+    assert P.get(store, ids["saved"]).superseded_by == ids["good"]
+    [spot] = [c for c in P.workflows(store)["procedures"] + P.workflows(store)["proposals"]
+              if c["title"].startswith("Drag Spotify")]
+    assert len(spot["steps"]) == 3 and "lyrics" not in json.dumps(spot).lower()
+
+
+def test_a_reshape_keeps_the_avoid_line_unless_it_rewrites_it(store):
+    """Review F2: an empty or missing avoid keeps what did not work; a rewrite replaces it."""
+    pid = P.add_playbook(store, {"kind": "procedure", "intent": "Mute the video call by clicking the toolbar button",
+                                 "apps": ["zoom"], "body": {"steps": ["Bring the call to the front",
+                                                                      "Click the Microphone button in the toolbar"]},
+                                 "avoid": "do not click the Mute All button", "origin": "postmortem"},
+                         events=[{"type": "succeeded", "run_key": "r-mute", "at": NOW}], vector=vec("mute"), now=NOW)
+    items = {it.obj.id: it for it in C.gather(store, P.live(store))}
+    for extra in ({}, {"avoid": ""}):
+        got = C.check({"merge": [], "retire": [], "reshape": [{"id": pid, "title": "Mute yourself on a call",
+                                                               "steps": ["Bring the call to the front",
+                                                                         "Click the Microphone button"], **extra}]},
+                      items, [])
+        assert got.reshape[0]["avoid"] == "do not click the Mute All button"
+    got = C.check({"merge": [], "retire": [], "reshape": [{"id": pid, "title": "Mute yourself on a call",
+                                                           "steps": ["Click the Microphone button"],
+                                                           "avoid": "not Mute All"}]}, items, [])
+    assert got.reshape[0]["avoid"] == "not Mute All"
+    res = C.CleanPass(Worker(store, [{"merge": [], "retire": [], "reshape": [
+        {"id": pid, "title": "Mute yourself on a call", "steps": ["Click the Microphone button"]}]}])).run(now=NOW + 60)
+    assert res.ok, res.error
+    [new] = [o for o in P.live(store, ["procedure"]) if o.apps == ["zoom"]]
+    assert new.id != pid and new.avoid == "do not click the Mute All button"
+
+
+def test_a_procedure_with_no_steps_gets_a_title_only(store):
+    """Review F5: no invented steps for a procedure that had none."""
+    pid = P.add_playbook(store, {"kind": "procedure", "intent": "the default way to open the notes app every morning",
+                                 "apps": ["notes"], "body": {"steps": []}, "origin": "postmortem"},
+                         events=[{"type": "succeeded", "run_key": "r-notes", "at": NOW}], vector=vec("notes"), now=NOW)
+    items = {it.obj.id: it for it in C.gather(store, P.live(store))}
+    five = {"merge": [], "retire": [], "reshape": [{"id": pid, "title": "Open your notes", "steps": list("abcde")}]}
+    got = C.check(five, items, [])
+    assert got.reshape == [] and any("0 steps" in r or "5 steps" in r for r in got.rejected)
+    title = {"merge": [], "retire": [], "reshape": [{"id": pid, "title": "Open your notes", "steps": []}]}
+    got = C.check(title, items, [])
+    assert got.reshape == [{"id": pid, "title": "Open your notes", "steps": [], "avoid": None}]
+
+
+def test_a_saved_plan_merges_into_the_survivors_current_version(store, tmp_path):
+    """Review F6: the survivor got a newer version between the dry run and the apply: the merge points at it, never at
+    history; a survivor that ended with no newer version leaves the duplicate as it is."""
+    ids = seed(store)
+    dry = C.CleanPass(Worker(store, [answer(ids)]), user_words=[USER_WORDS]).run(now=NOW + 3600, dry_run=True)
+    plan = C.load_plan(store, C.save_plan(store, dry.decisions, tmp_path / "plan.json"))
+    good = P.get(store, ids["good"])
+    newer = P.add_playbook(store, {"kind": "procedure", "intent": good.intent, "apps": good.apps,
+                                   "body": dict(good.body), "origin": good.origin}, vector=vec(good.intent),
+                           supersedes=good.id, now=NOW + 3650)
+    res = C.CleanPass(Worker(store)).run(now=NOW + 3700, plan=plan)
+    assert res.ok, res.error
+    assert P.get(store, ids["seen"]).superseded_by == newer and P.get(store, newer).valid_to is None
+    # the other way round: the survivor (a pitfall) ended without a newer version
+    p = ids["pits"]
+    st = [d for d in plan if d.get("action") == "merge" and d.get("into") == p[6]]
+    assert st
+    C.undo(store, res.run_id, now=NOW + 3800)
+    P.retire_cleaned(store, [{"id": p[6], "action": "retire", "category": "not_useful"}], run_key="clean:test",
+                     now=NOW + 3850)
+    res = C.CleanPass(Worker(store)).run(now=NOW + 3900, plan=st)
+    assert P.get(store, p[5]).valid_to is None and any("no longer current" in r for r in res.rejected)
+
+
 def test_the_daily_cap_retires_the_weakest_pitfalls_and_can_be_taken_back(store):
     ids = seed(store)
     p = ids["pits"]
@@ -262,15 +344,40 @@ def test_the_daily_cap_retires_the_weakest_pitfalls_and_can_be_taken_back(store)
     assert out["restored"] == 3 and len(P.live(store, ["pitfall"])) == 7
 
 
-def test_the_practice_worker_caps_pitfalls_once_a_day(store):
+def test_the_practice_worker_caps_pitfalls_once_a_day_only_after_a_pass_was_applied(store):
+    """Review F3: the daily cap waits for the user's reviewed pass (its merges first); after that it runs daily."""
     from yuki.memory import practice_learn as L
 
-    ids = seed(store)
+    seed(store)
     worker = Worker(store)
-    pw = L.PracticeWorker(store, worker, clock=lambda: NOW + 86400)
+    clock = [NOW + 86400]
+    pw = L.PracticeWorker(store, worker, clock=lambda: clock[0])
+    out = pw.tick()
+    assert not out.get("capped") and len(P.live(store, ["pitfall"])) == 7     # no pass applied yet: the cap waits
+    P.set_clean_state(store, "applied", 1)
+    clock[0] += 86400
     out = pw.tick()
     assert len(out.get("capped") or []) == 3
     assert len(P.live(store, ["pitfall"])) == P.PITFALLS_PER_APP
+
+
+def test_undoing_a_pass_lasts_the_daily_cap_does_not_retire_again(store):
+    """Review F3: undo restores the capped pitfalls, and the next daily refresh leaves them, until a pass is applied
+    again."""
+    from yuki.memory import practice_learn as L
+
+    ids = seed(store)
+    assert not P.cap_enabled(store)
+    res = C.CleanPass(Worker(store, [answer(ids)]), user_words=[USER_WORDS]).run(now=NOW + 3600)
+    assert P.cap_enabled(store)
+    C.undo(store, res.run_id, now=NOW + 4000)
+    assert not P.cap_enabled(store) and len(P.live(store, ["pitfall"])) == 7
+    pw = L.PracticeWorker(store, Worker(store), clock=lambda: NOW + 2 * 86400)
+    out = pw.tick()
+    assert not out.get("capped") and len(P.live(store, ["pitfall"])) == 7
+    # a dry run never turns the cap on
+    C.CleanPass(Worker(store, [answer(ids)]), user_words=[USER_WORDS]).run(now=NOW + 5000, dry_run=True)
+    assert not P.cap_enabled(store)
 
 
 # -- (3) the bar pass with pinned facts ----------------------------------------------------------------------------------
@@ -336,3 +443,37 @@ def test_a_saved_bar_plan_with_a_pinned_fact_needs_the_option_again(tmp_path):
         assert res.retired == 1 and advice not in {f.id for f in st.portrait_facts()}
     finally:
         st.close()
+
+
+def test_the_bar_pass_retires_only_the_pinned_facts_the_user_named(tmp_path):
+    """Review F4: with pinned_ids, a failing pinned fact the user did not name stays pinned and is only reported."""
+    from pathlib import Path
+
+    from test_portrait_bar import RENDER, T0, _facts, fail, worker_with
+    from yuki.memory.dreaming import BarPass
+    from yuki.memory.store import Store
+
+    st = Store.open(Path(tmp_path) / "memory.db")
+    try:
+        _j, ids = _facts(st)
+        _quota, mix, _sister, _work, _habit, advice, _loop = ids
+        assert st.mark_fact_reviewed(mix, T0, pin=True)                    # a second pinned fact that also fails
+        verdicts = [{"failing": [fail(f"F{mix}", "usage_metrics"), fail(f"F{advice}", "ai_tool_output")]}]
+        worker, _c = worker_with(st, {"judge_bar": list(verdicts), **RENDER})
+        res = BarPass(worker, include_pinned=True, pinned_ids=[advice]).run(now=T0 + 7300)
+        assert res.ok, res.error
+        assert res.retired == 1 and sorted(p["id"] for p in res.pinned) == sorted([mix, advice])
+        current = {f.id: f for f in st.portrait_facts()}
+        assert advice not in current and mix in current and current[mix].pinned
+    finally:
+        st.close()
+
+
+def test_the_bar_command_needs_the_pinned_ids_with_include_pinned(capsys):
+    from yuki.memory import dreaming as D
+
+    for argv in (["--bar", "--include-pinned"], ["--bar", "--pinned-ids", "F1"],
+                 ["--bar", "--include-pinned", "--pinned-ids", "F1,x"]):
+        with pytest.raises(SystemExit) as e:
+            D.main(argv)
+        assert e.value.code == 2
