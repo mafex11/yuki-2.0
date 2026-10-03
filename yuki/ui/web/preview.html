@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- The window's pages outside WebView2, from file://, with invented data (fixtures/window.js): for screenshots in
+     a headless browser and for designing. The real window loads index.html, which never loads the fixture.
+     Knobs: preview.html?page=work/day&thread=1&empty=1&state=working&scrub=1180&motion=reduced&accent=orange&perf=1 -->
+<html lang="en" data-motion="full">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self' https://fonts.yuki.example; img-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuki (preview, invented data)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="lattice.css">
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+<div id="app"></div>
+<script src="fixtures/window.js"></script>
+<script src="lattice/field.js"></script>
+<script src="bridge.js"></script>
+<script src="ui.js"></script>
+<script src="pages/home.js"></script>
+<script src="pages/work.js"></script>
+<script src="pages/me.js"></script>
+<script src="pages/playbook.js"></script>
+<script src="pages/activity.js"></script>
+<script src="pages/settings.js"></script>
+<script src="pages/drawer.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

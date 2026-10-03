@@ -1,7 +1,12 @@
-/* Copied unchanged from the Lattice design (docs/ui-mockups/revamp-2026-10/3-lattice/field.js, gitignored;
-   2026-10-02 refinement round) for the E2 WebView2 spike. It reads no data of its own: the skyline figure
-   asks window.YK, which the window does not define. Keep in step with the design when E3 ports the pages. */
-/* Lattice: the living dot field, the halo under the island, Yuki's dot-matrix face, and dot icons.
+/* From the Lattice design (docs/ui-mockups/revamp-2026-10/3-lattice/field.js, gitignored; 2026-10-02 refinement
+   round), changed for the real window (E3/E16, 2026-10-03):
+   - the skyline figure draws the page's own data (``el.__sky``, from memory's day timeline), not window.YK;
+   - the live state figure (listening, working, ...) is no longer drawn on the full-window canvas: it has its own
+     small canvas over the state region (LiveLayer, 15 fps). Measured in WebView2 by the E2 spike: the full-window
+     field animating a live state cost ~15% of one core; see docs/research/revamp-2026-10-02/28-build-E3-E4.md;
+   - while the window is not in front (Focus.on false) every surface draws one still frame, as reduced motion does;
+     the face blinks only while the window is in front;
+   - the live colour follows the accent (``--live``) instead of a fixed mint.
    Budget:
    - one shared loop on a 33 ms timer (<= 30 fps by construction); it stops when every subscriber
      has settled and while the page is hidden;
@@ -12,13 +17,33 @@
   'use strict';
   const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
   const COL = { lit: [242, 239, 233], live: [111, 235, 196], mid: [150, 147, 140], base: [38, 41, 44] };
+  /* the live colour from the stylesheet (the accent setting picks it); rebuilt by Lattice.refreshColors() */
+  function readLive() {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue('--live').trim();
+      const rgb = v.length === 7 && v[0] === '#' ? [1, 3, 5].map((k) => parseInt(v.slice(k, k + 2), 16)) : null;
+      if (rgb && rgb.every((n) => n >= 0 && n <= 255)) COL.live = rgb;
+    } catch (e) { /* keep the default */ }
+  }
 
   /* ---------------- motion preference ---------------- */
   const mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
   const Motion = {
     reduced: mq.matches,
-    set(v) { this.reduced = !!v; document.documentElement.dataset.motion = v ? 'reduced' : 'full'; Loop.kick(); }
+    set(v) { this.reduced = !!v; document.documentElement.dataset.motion = v ? 'reduced' : 'full'; Loop.kick(); LiveLayer.kickAll(); }
   };
+
+  /* ---------------- is the window in front? ----------------
+     Not in front: one still frame everywhere (the field, the live layer, the faces), no blinks. ``force`` keeps the
+     focused behaviour for the off-screen measurement window, which never takes focus by design. */
+  const Focus = {
+    on: document.hasFocus ? document.hasFocus() : true, force: false,
+    get live() { return this.on || this.force; },
+    set(v) { const was = this.live; this.on = !!v; if (this.live !== was) { Loop.kick(); LiveLayer.kickAll(); } }
+  };
+  window.addEventListener('focus', () => Focus.set(true));
+  window.addEventListener('blur', () => Focus.set(false));
+  const still = () => Motion.reduced || !Focus.live;
 
   /* ---------------- perf counters (read by the ?perf=1 HUD) ---------------- */
   const Perf = {
@@ -40,11 +65,14 @@
       Loop.subs.forEach((fn) => { if (fn(t0 / 1000)) more = true; });
       const dt = performance.now() - t0;
       Perf.ticks++; Perf.ms += dt; if (dt > Perf.maxMs) Perf.maxMs = dt;
-      if (more && !Motion.reduced) setTimeout(Loop.tick, Math.max(4, Loop.frameMs - dt));
+      if (more && !still()) setTimeout(Loop.tick, Math.max(4, Loop.frameMs - dt));
       else Loop.running = false;
     }
   };
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) Loop.kick(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { Loop.kick(); LiveLayer.kickAll(); } });
+
+  /* every field and face, so a new accent colour can rebuild their sprites (Lattice.refreshColors) */
+  const SURFACES = new Set();
 
   /* ---------------- dot sprites (pre-rendered, blitted per cell) ---------------- */
   function makeSprites(size, maxR, minR, crisp) {
@@ -97,13 +125,17 @@
       this.anchor = null; this.base = document.createElement('canvas');
       this.frame = this.frame.bind(this);
       this.resize();
+      SURFACES.add(this);
       if (this.kind === 'window') {
         let rq = 0;
         window.addEventListener('resize', () => { clearTimeout(rq); rq = setTimeout(() => { this.resize(); this.measure(); }, 60); });
         this.ro = window.ResizeObserver ? new ResizeObserver(() => this.remeasure()) : null;
+        this.live = new LiveLayer(this);   // the live state figure: its own small canvas (E16)
       }
     }
+    recolor() { const size = Math.ceil(this.pitch * DPR); this.sp = makeSprites(size, this.pitch * 0.3 * DPR, 1.3 * DPR, false); this.full = true; Loop.add(this.frame); if (this.live) this.live.kick(); }
     resize() {
+      readLive();
       const w = this.fixedW || window.innerWidth, h = this.fixedH || window.innerHeight;
       this.w = w; this.h = h;
       this.c.width = Math.round(w * DPR); this.c.height = Math.round(h * DPR);
@@ -111,7 +143,7 @@
       this.base.width = this.c.width; this.base.height = this.c.height;
       this.cols = Math.ceil(w / this.pitch); this.rows = Math.ceil(h / this.pitch);
       const n = this.cols * this.rows;
-      this.cur = new Float32Array(n); this.fig = new Float32Array(n); this.figTone = new Uint8Array(n);
+      this.cur = new Float32Array(n); this.fig = new Float32Array(n); this.figTone = new Uint8Array(n); this.figDim = new Uint8Array(n);
       this.delay = new Float32Array(n); this.mask = new Float32Array(n).fill(1); this.tone = new Uint8Array(n);
       this.stamp = new Uint32Array(n); this.gen = 1;
       this.figIdx = new Int32Array(0); this.lit = [];
@@ -123,9 +155,9 @@
     remeasure() { if (this._mq) return; this._mq = setTimeout(() => { this._mq = 0; this.measure(); }, 16); }
     setState(s, opts) {
       if (opts && opts.step) this.step = opts.step;
-      if (s === this.state) { Loop.add(this.frame); return; }
-      this.state = s; this.stateT0 = performance.now() / 1000;
+      if (s !== this.state) { this.state = s; this.stateT0 = performance.now() / 1000; }
       Loop.add(this.frame);
+      if (this.live) this.live.set(s);
     }
     /* read the DOM once: clearings, figure anchors, the state anchor */
     measure() {
@@ -152,7 +184,7 @@
       });
       const a = document.querySelector('[data-anchor]');
       if (a) { const r = a.getBoundingClientRect(); this.anchor = { x: r.left - o.left + r.width / 2, y: r.top - o.top + r.height / 2 }; }
-      else this.anchor = { x: this.w / 2, y: 120 };
+      else this.anchor = { x: Math.max(this.w / 2, this.w - 230), y: 130 };   // no figure on the page: the header's top right, where the numerals sit
       const F = 20, M = 4;
       for (const r of rects) {
         const x0 = Math.max(0, Math.floor((r.left - F - M) / P)), x1 = Math.min(C - 1, Math.ceil((r.right + F + M) / P));
@@ -174,11 +206,12 @@
       this.drawBase();
       this.full = true;
       Loop.add(this.frame);
+      if (this.live) this.live.place();
     }
     rasterFigures(o) {
       const P = this.pitch, C = this.cols, R = this.rows;
       const fig = this.fig, tone = this.figTone, delay = this.delay;
-      fig.fill(0); tone.fill(0); delay.fill(0);
+      fig.fill(0); tone.fill(0); delay.fill(0); this.figDim.fill(0);
       this.figs = []; this.maxDelay = 0;
       const idx = [];
       document.querySelectorAll('[data-figure]').forEach((el) => {
@@ -190,7 +223,7 @@
           if (i < 0 || j < 0 || i >= C || j >= R) return;
           const k = j * C + i;
           if (fig[k] === 0) idx.push(k);
-          if (v > fig[k]) { fig[k] = v; tone[k] = t || 0; delay[k] = d || 0; if (d > this.maxDelay) this.maxDelay = d; }
+          if (v > fig[k]) { fig[k] = v; tone[k] = t || 0; this.figDim[k] = f.kind === "skyline" ? 0 : 1; delay[k] = d || 0; if (d > this.maxDelay) this.maxDelay = d; }
         };
         if (f.kind === 'num') {
           const s2 = String(el.dataset.value || '0'), sc = Number(el.dataset.scale || 2);
@@ -210,12 +243,13 @@
             ox += (q.w + 1) * sc;
           });
         } else if (f.kind === 'week') {
-          const days = JSON.parse(el.dataset.days || '[]');
-          const max = 660, H = f.cj;
+          // minutes per day: at the PC (pc), of which active (a) and full screen (f); the page passes el.__week
+          const days = el.__week || [];
+          const max = Math.max(360, ...days.map((d) => d.pc || 0)), H = f.cj;
           days.forEach((d, n) => {
             const x0 = f.i0 + n * 4;
-            const total = Math.max(1, Math.round((d.pc / max) * H));
-            const work = Math.round((d.work / max) * H), game = Math.round((d.game / max) * H);
+            const total = d.pc > 0 ? Math.max(1, Math.round((d.pc / max) * H)) : 0;
+            const work = Math.round(((d.a || 0) / max) * H), game = Math.round(((d.f || 0) / max) * H);
             for (let y = 0; y < total; y++) {
               const t = y < work ? 0 : y < work + game ? 2 : 3;
               const v = t === 0 ? 1 : t === 2 ? 0.85 : 0.32;
@@ -229,32 +263,26 @@
       this.figIdx = Int32Array.from(idx);
       this.figT0 = performance.now() / 1000;
     }
+    /* The day as dot columns, from the page's data (el.__sky): ``buckets`` cover the day in equal slices, each
+       ``{p: 0..1 of the slice at the PC, m: active | full | away | off | gap | future, c: 0 | 1 call | 2 live call}``.
+       Height is the measured share at the PC; full screen draws striped, away and off are dotted ground. */
     rasterSkyline(f, put) {
-      const Y = window.YK; if (!Y) return;
-      const cols = f.ci, H = f.cj, spanMin = 24 * 60, per = spanMin / cols;
+      const sky = f.el.__sky; if (!sky || !sky.buckets || !sky.buckets.length) return;
+      const B = sky.buckets, cols = f.ci, H = f.cj, spanMin = 24 * 60, per = spanMin / cols, bl = spanMin / B.length;
       f.per = per;
-      const H_KIND = { work: 0.78, gaming: 0.6, music: 0.46, video: 0.34, call: 0.3, away: 0 };
-      const noise = (n) => (Math.sin(n * 12.9898) * 43758.5453) % 1;
+      const avail = H - 5;
       for (let c = 0; c < cols; c++) {
         const m = c * per + per / 2;
-        const s = Y.sessions.find((x) => m >= x.a && m < x.b);
-        const call = Y.callsToday.find((x) => x.kind === 'call' && m >= x.a && m < x.b);
-        const gv = Y.callsToday.find((x) => x.kind !== 'call' && m >= x.a && m < x.b);
+        const b = B[Math.min(B.length - 1, Math.floor(m / bl))] || {};
         const d = c * 0.012;
-        if (call) { for (let y = 0; y < 2; y++) put(f.i0 + c, f.j0 + y, call.live ? 1 : 0.9, call.live ? 1 : 0, d); }
-        else if (gv) put(f.i0 + c, f.j0 + 1, 0.5, 2, d);
-        const avail = H - 5;
-        if (!s || s.kind === 'away') { if (c % 2 === 0) put(f.i0 + c, f.j0 + H - 1, 0.32, 2, d); continue; }
-        const blk = s.blocks.find((b) => m >= Y.fmt.toMin(b.start) && m < Y.fmt.toMin(b.end));
-        const jitter = blk ? 0.08 * (noise(blk.start.length + Y.fmt.toMin(blk.start)) + 0.5) : 0;
-        const h = Math.max(2, Math.round(avail * Math.min(1, (H_KIND[s.kind] || 0.4) + jitter)));
+        if (b.c) { for (let y = 0; y < 2; y++) put(f.i0 + c, f.j0 + y, b.c === 2 ? 1 : 0.9, b.c === 2 ? 1 : 0, d); }
+        if (b.m === 'future') continue;
+        if (b.m === 'away') { put(f.i0 + c, f.j0 + H - 1, 0.5, 2, d); if (b.p > 0.02) put(f.i0 + c, f.j0 + H - 2, 0.3, 2, d); continue; }
+        if (b.m === 'off' || b.m === 'gap' || !(b.p > 0)) { if (c % 2 === 0) put(f.i0 + c, f.j0 + H - 1, 0.32, 2, d); continue; }
+        const h = Math.max(2, Math.round(avail * Math.min(1, b.p)));
         for (let y = 0; y < h; y++) {
-          let v = 1, t = 0;
-          if (s.kind === 'gaming') { v = y === h - 1 ? 1 : (y % 2 === 0 ? 0.9 : 0.16); }
-          else if (s.kind === 'music') { v = 0.9; t = 2; }
-          else if (s.kind === 'video') { v = 0.7; t = 2; }
-          else if (s.kind === 'call') { v = 0.8; t = 2; }
-          put(f.i0 + c, f.j0 + H - 1 - y, v, t, d + y * 0.006);
+          const v = b.m === 'full' ? (y === h - 1 ? 1 : (y % 2 === 0 ? 0.9 : 0.16)) : 1;
+          put(f.i0 + c, f.j0 + H - 1 - y, v, 0, d + y * 0.006);
         }
       }
     }
@@ -357,7 +385,7 @@
           return 0;
         }
         case 'done-flash': {
-          const age = Motion.reduced ? 1 : t - this.stateT0;
+          const age = still() ? 1 : t - this.stateT0;
           const x = Math.floor((u + 7) / 2), y = Math.floor((v + 5) / 2);
           if (u + 7 < 0 || v + 5 < 0 || x > 6 || y > 4) return 0;
           if (CHECK[y][x] !== '1') return 0;
@@ -369,9 +397,11 @@
     frame(t) {
       if (!this.c.isConnected) { Loop.remove(this.frame); return false; }
       const P = this.pitch, C = this.cols, R = this.rows, cur = this.cur, fig = this.fig, mask = this.mask, tone = this.tone;
-      const s = this.state, reduced = Motion.reduced;
+      const s = this.state, reduced = still();
       const live = s !== 'idle' && s !== 'hidden-armed';
-      const dyn = DYN.has(s) && !(s === 'done-flash' && t - this.stateT0 > 1.2);
+      // the window's state figure lives on its LiveLayer; this canvas only dims its figures while a state is live
+      const own = this.kind !== 'window';
+      const dyn = own && DYN.has(s) && !(s === 'done-flash' && t - this.stateT0 > 1.2);
       const target = live ? 1 : 0;
       this.blend += (target - this.blend) * 0.16;
       if (Math.abs(target - this.blend) < 0.002) this.blend = target;
@@ -388,9 +418,10 @@
         const i = n % C, j = (n - i) / C;
         let tg = 0, tn = 0;
         const fv = fig[n];
-        if (fv > 0 && (reduced || ft > this.delay[n])) { tg = fv * figK; tn = this.figTone[n]; }
+        if (fv > 0 && (reduced || ft > this.delay[n])) { tg = fv * (this.figDim[n] ? figK : 1);   // a live state dims the header figure it shares the anchor with, never the skyline
+          tn = this.figTone[n]; }
         if (hc >= 0 && fv > 0 && i === hc) tg = Math.min(1, tg + 0.35);
-        if (this.blend > 0 && Math.abs(i - ai) <= RX && Math.abs(j - aj) <= RY) {
+        if (own && this.blend > 0 && Math.abs(i - ai) <= RX && Math.abs(j - aj) <= RY) {
           out.t = 0;
           const sv = this.stateVal(s === 'idle' || s === 'hidden-armed' ? this.lastLive || 'idle' : s, i - ai, j - aj, tt, out) * this.blend;
           if (sv > tg) { tg = sv; tn = out.t; }
@@ -407,7 +438,7 @@
       if (live) this.lastLive = s;
       // candidates: figure cells, the state region, and whatever was lit last frame
       const fi = this.figIdx; for (let q = 0; q < fi.length; q++) visit(fi[q]);
-      if (this.blend > 0) {
+      if (own && this.blend > 0) {
         const i0 = Math.max(0, ai - RX), i1 = Math.min(C - 1, ai + RX), j0 = Math.max(0, aj - RY), j1 = Math.min(R - 1, aj + RY);
         for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) visit(j * C + i);
       }
@@ -453,6 +484,99 @@
   }
 
   /* ================================================================
+     LiveLayer: the window's live state figure on its own small canvas (E16).
+     The full-window field animating a state cost ~15% of one core in WebView2 (raster and compositing of a
+     1440 x 900 canvas at 30 fps). The figure only ever lives in the state region around the anchor (57 x 25 cells),
+     so it gets a canvas of that size, aligned to the field's grid, drawn at 15 fps; the big canvas stays still.
+     Transparent: it adds the state dots over the field's resting dots exactly as the field itself did.
+     ================================================================ */
+  const LIVE_FPS = 15, RXW = 28, RYW = 12;
+  const LAYERS = new Set();
+  class LiveLayer {
+    constructor(field) {
+      this.f = field; this.state = 'idle'; this.lastLive = 'idle'; this.blend = 0; this.timer = 0;
+      this.c = document.createElement('canvas'); this.c.id = 'livefield'; this.c.setAttribute('aria-hidden', 'true');
+      this.x = this.c.getContext('2d');
+      field.c.after(this.c);
+      this.i0 = -1; this.j0 = -1; this.cw = 0; this.ch = 0; this.cur = new Float32Array(0); this.tone = new Uint8Array(0);
+      this.drawn = false;
+      LAYERS.add(this);
+    }
+    static kickAll() { LAYERS.forEach((l) => l.kick()); }
+    /* the state region in the field's grid, around the anchor (moved by a measure, e.g. a scroll) */
+    place() {
+      const f = this.f, P = f.pitch;
+      const ai = f.anchor ? Math.round(f.anchor.x / P - 0.5) : Math.round(f.cols / 2), aj = f.anchor ? Math.round(f.anchor.y / P - 0.5) : 8;
+      const i0 = Math.max(0, ai - RXW), i1 = Math.min(f.cols - 1, ai + RXW), j0 = Math.max(0, aj - RYW), j1 = Math.min(f.rows - 1, aj + RYW);
+      this.ai = ai; this.aj = aj;
+      const cw = Math.max(0, i1 - i0 + 1), ch = Math.max(0, j1 - j0 + 1);
+      if (i0 !== this.i0 || j0 !== this.j0 || cw !== this.cw || ch !== this.ch) {
+        const old = { i0: this.i0, j0: this.j0, cw: this.cw, cur: this.cur, tone: this.tone, ch: this.ch };
+        this.i0 = i0; this.j0 = j0; this.cw = cw; this.ch = ch;
+        this.cur = new Float32Array(cw * ch); this.tone = new Uint8Array(cw * ch);
+        for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) {   // keep the figure where it was on screen
+          const oi = i0 + i - old.i0, oj = j0 + j - old.j0;
+          if (oi >= 0 && oj >= 0 && oi < old.cw && oj < old.ch) { this.cur[j * cw + i] = old.cur[oj * old.cw + oi]; this.tone[j * cw + i] = old.tone[oj * old.cw + oi]; }
+        }
+        this.c.width = Math.round(cw * P * DPR); this.c.height = Math.round(ch * P * DPR);
+        this.c.style.width = (cw * P) + 'px'; this.c.style.height = (ch * P) + 'px';
+        this.c.style.transform = `translate(${i0 * P}px, ${j0 * P}px)`;
+      }
+      this.kick();
+    }
+    set(s) { if (s !== this.state) { this.state = s; } this.kick(); }
+    kick() {
+      if (this.timer || document.hidden || !this.c.isConnected) return;
+      if (this.state === 'idle' && this.blend === 0 && !this.drawn) return;
+      this.timer = setTimeout(() => this.tick(), 0);
+    }
+    tick() {
+      this.timer = 0;
+      if (document.hidden || !this.c.isConnected) return;
+      const t0 = performance.now();
+      const more = this.frame(t0 / 1000);
+      const dt = performance.now() - t0;
+      Perf.ticks++; Perf.ms += dt; if (dt > Perf.maxMs) Perf.maxMs = dt;
+      if (more && !still()) this.timer = setTimeout(() => this.tick(), Math.max(4, 1000 / LIVE_FPS - dt));
+    }
+    frame(t) {
+      const f = this.f, P = f.pitch, s = this.state, reduced = still();
+      const live = s !== 'idle' && s !== 'hidden-armed';
+      if (live) this.lastLive = s;
+      const fig = live ? s : this.lastLive;
+      const dyn = live && DYN.has(s) && !(s === 'done-flash' && t - f.stateT0 > 1.2);
+      const target = live ? 1 : 0;
+      this.blend += (target - this.blend) * 0.3;               // the field's 0.16 per frame at 30 fps, at 15 fps
+      if (Math.abs(target - this.blend) < 0.002 || reduced) this.blend = target;
+      const k = reduced ? 1 : 0.36, tt = reduced ? 1.2 : t, out = { t: 0 };
+      const cw = this.cw, ch = this.ch, cur = this.cur, tone = this.tone, mask = f.mask, C = f.cols;
+      let maxD = 0;
+      const x = this.x, sp = f.sp, s2 = sp.s;
+      x.clearRect(0, 0, this.c.width, this.c.height);
+      let lit = 0;
+      for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) {
+        const n = j * cw + i, gi = this.i0 + i, gj = this.j0 + j;
+        out.t = 0;
+        const tg = this.blend > 0 ? f.stateVal(fig, gi - this.ai, gj - this.aj, tt, out) * this.blend : 0;
+        const c0 = cur[n], dl = tg - c0;
+        if (dl > 0.002 || dl < -0.002) { cur[n] = c0 + dl * k; if (Math.abs(cur[n]) < 0.003 && tg === 0) cur[n] = 0; const ad = dl < 0 ? -dl : dl; if (ad > maxD) maxD = ad; }
+        else cur[n] = tg;
+        if (tg > 0.02) tone[n] = out.t;
+        const v = cur[n] * mask[gj * C + gi];
+        if (v < 0.04) continue;
+        lit++;
+        const l = Math.min(sp.LV - 1, Math.floor(v * sp.LV));
+        const row = tone[n] === 1 ? 1 : 0;
+        x.drawImage(sp.cv, l * s2, row * s2, s2, s2, Math.round((i * P + P / 2) * DPR - s2 / 2), Math.round((j * P + P / 2) * DPR - s2 / 2), s2, s2);
+      }
+      this.drawn = lit > 0;
+      Perf.drew();
+      const settled = maxD < 0.003 && this.blend === target;
+      return dyn || !settled;
+    }
+  }
+
+  /* ================================================================
      Face: Yuki's 17 x 7 dot-matrix face. Every expression is a waveform.
      Off cells stay visible (a real matrix); lit cells attack fast and release slowly,
      so motion leaves a short phosphor trail.
@@ -465,7 +589,7 @@
       this.g = new Float32Array(FACE_W * FACE_H); this.tn = new Uint8Array(FACE_W * FACE_H);
       this.blinkAt = -10; this.t0 = performance.now() / 1000; this.step = { n: 2, of: 5 };
       this.frame = this.frame.bind(this);
-      this.setPitch(pitch || 4);
+      this.setPitch(pitch || 4); SURFACES.add(this);
       this.scheduleBlink();
       Loop.add(this.frame);
     }
@@ -483,8 +607,8 @@
       clearTimeout(this.bt);
       this.bt = setTimeout(() => {
         if (!this.c.isConnected) { this.bt = 0; return; }
-        this.blinkAt = performance.now() / 1000;
-        if (this.blinks() && !Motion.reduced) Loop.add(this.frame);
+        // the face blinks only while the window is in front: idle and behind other windows, nothing redraws
+        if (this.blinks() && !still()) { this.blinkAt = performance.now() / 1000; Loop.add(this.frame); }
         this.scheduleBlink();
       }, 3800 + Math.random() * 3200);
     }
@@ -501,8 +625,8 @@
       const L = (i, j, v, k) => { if (i >= 0 && j >= 0 && i < W && j < H && v > g[j * W + i]) { g[j * W + i] = v; tn[j * W + i] = k || 0; } };
       const eye = (cx, rows, v, k) => { for (const r of rows) { L(cx, r, v, k); L(cx + 1, r, v, k); } };
       const eyes = (rows, v, k, dx) => { eye(4 + (dx || 0), rows, v, k); eye(11 + (dx || 0), rows, v, k); };
-      const blink = !Motion.reduced && t >= this.blinkAt && (t - this.blinkAt) < 0.14;
-      const age = Motion.reduced ? 2 : t - this.t0;
+      const blink = !still() && t >= this.blinkAt && (t - this.blinkAt) < 0.14;
+      const age = still() ? 2 : t - this.t0;
       const pulse = (f, ph) => 0.5 + 0.5 * Math.sin(t * f + (ph || 0));
       switch (this.state) {
         case 'woke': {
@@ -596,10 +720,10 @@
       }
     }
     frame(t) {
-      if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; return false; }
-      this.target(Motion.reduced ? 1.3 : t);
+      if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; SURFACES.delete(this); return false; }
+      this.target(still() ? 1.3 : t);
       const W = FACE_W, H = FACE_H, x = this.x, dp = this.dp, g = this.g, tn = this.tn, cur = this.cur;
-      const ka = Motion.reduced ? 1 : 0.6, kr = Motion.reduced ? 1 : 0.17;
+      const ka = still() ? 1 : 0.6, kr = still() ? 1 : 0.17;
       let maxD = 0;
       for (let n = 0; n < W * H; n++) {
         const d = g[n] - cur[n];
@@ -622,7 +746,7 @@
       }
       const dyn = this.state === 'listening' || this.state === 'hearing' || this.state === 'thinking' || this.state === 'working' || this.state === 'speaking' || this.state === 'needs-you' || (this.state === 'woke' && t - this.t0 < 0.6) || (this.state === 'done-flash' && t - this.t0 < 0.8);
       const blinking = this.blinks() && (t - this.blinkAt) < 0.5;
-      return !Motion.reduced && (dyn || blinking || maxD > 0.003);
+      return !still() && (dyn || blinking || maxD > 0.003);
     }
   }
 
@@ -683,5 +807,6 @@
     step(performance.now());
   }
 
-  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, icon, reveal, DPR, FACE_W, FACE_H };
+  function refreshColors() { readLive(); SURFACES.forEach((s) => { if (!s.c.isConnected) { SURFACES.delete(s); return; } if (s instanceof Face) s.setPitch(s.p); else s.recolor(); }); }
+  window.Lattice = { Field, Face, Core: Face, LiveLayer, Loop, Motion, Focus, Perf, icon, reveal, refreshColors, DPR, FACE_W, FACE_H };
 })();
