@@ -87,16 +87,19 @@ def test_each_state_draws_the_designs_parts():
     card = spec_for("working", IslandInputs(run=run, call=call), expanded=True)
     assert card.body == "run" and card.width == 600 and card.halo is None and card.exp
     done = spec_for("done-flash", IslandInputs(call=call, final=FinalInfo("Renamed 12 exports.")))
-    assert done.chip == "done" and not done.rec and done.halo == "done-flash"   # the design: its chip only
+    assert done.chip == "done" and not done.rec and done.halo is None   # the design: its chip only, no halo (item 20)
     stopped = spec_for("done-flash", IslandInputs(final=FinalInfo("Stopped.", "stopped")))
     assert stopped.face == "handed" and stopped.halo is None and stopped.chip == "stopped"
     lis = spec_for("listening", IslandInputs(voice="listening", call=call), voice_key="Ctrl+Alt+Y")
     assert lis.body == "caption" and lis.exp and lis.sub.startswith("Ctrl+Alt+Y to stop") and lis.rec
+    assert lis.halo is None                                        # not in the wake before your first word
     vs = spec_for("voice-stopped", IslandInputs(voice_error="The microphone was unplugged."))
     assert vs.keys == ("retry", "settings") and vs.sub == "The microphone was unplugged." and not vs.rec
     q = spec_for("quiet-in-call", IslandInputs(call=call, listening="call_off"))
-    assert q.line == "Quiet. You’re on Discord." and "isn't listening" in q.sub
-    assert spec_for("hidden-armed", IslandInputs()).mini and spec_for("game-quiet", IslandInputs()).hidden
+    assert q.hidden and q.why_hidden == "in a call"                # nothing stays on screen in a call (item 20)
+    rest = spec_for("hidden-armed", IslandInputs())
+    assert rest.mini and rest.resting and spec_for("hidden-armed", IslandInputs(), resting=False).hidden
+    assert spec_for("game-quiet", IslandInputs()).hidden and spec_for("not-listening", IslandInputs()).hidden
 
 
 def test_unsure_words_are_dimmed_in_the_caption():
@@ -123,7 +126,7 @@ def test_the_call_timer_counts_from_the_session_and_never_resets_through_a_game(
         isl.screen_state = lambda: (5, "accepts")                 # back on the desktop
         isl.on_foreground(0)
         after = isl.call_time()
-        assert isl.state == "quiet-in-call"
+        assert isl.state in ("call-notice", "quiet-in-call")         # (the start notice may still be up)
         assert first <= during <= after and after.startswith("1:35")   # the same clock, only counting up
     finally:
         isl.stop()
@@ -176,7 +179,10 @@ def test_the_strip_interface_drives_the_island_and_frees_the_corner_when_done(qa
         strip.show_final("Opened it.", tone="final", outcome="done")
         assert strip.run_id is None and isl.state == "done-flash" and strip.isVisible()
         strip.set_meta("3 s, 1 step, 1¢")
+        assert isl.current_spec().word == "Opened it."                # the pill: the result in a few words
+        isl.hovered = True                                            # the open island: its sub line
         assert isl.current_spec().sub == "3 s, 1 step, 1¢"
+        isl.hovered = False
         strip.dismiss()
         assert not strip.isVisible() and freed and isl.state == "hidden-armed"
         strip.ask(4, "Which planner?", voice=True)
@@ -375,22 +381,24 @@ def test_the_ask_bar_shows_resolved_chips_and_unsent_words(qapp):
 def test_the_tray_says_one_state_with_the_same_priorities():
     from yuki.ui.tray import tray_state
 
-    assert tray_state("working", recording=True, waiting=2, listening="off") == "working"
+    assert tray_state("working", recording=True, listening="off") == "working"
     assert tray_state("listening", recording=True) == "listening"
-    assert tray_state("needs-you", recording=True) == "waiting"
-    assert tray_state("quiet-in-call", recording=True, waiting=1) == "recording"
-    assert tray_state("hidden-armed", waiting=1) == "waiting"
+    assert tray_state("hearing") == "hearing" and tray_state("speaking") == "speaking"
+    assert tray_state("needs-you", recording=True) == "needs-you"
+    assert tray_state("voice-stopped") == "stopped"
+    assert tray_state("quiet-in-call", recording=True) == "call"
+    assert tray_state("quiet-in-call", asking=True) == "call-ask"
     assert tray_state("not-listening", listening="quiet") == "off"
-    assert tray_state("game-quiet", recording=True) == "recording"   # the island is away: the tray keeps the call
-    assert tray_state("hidden-armed") == "armed"
+    assert tray_state("game-quiet", recording=True) == "game"     # the island is away: the tray's game face (+ rec)
+    assert tray_state("hidden-armed") == "resting" and tray_state("done-flash") == "resting"
 
 
-def test_each_tray_state_has_its_own_mark(qapp):
-    from yuki.ui.tray import TRAY_STATES, tray_icon
+def test_each_tray_state_has_its_own_face(qapp):
+    from yuki.ui.tray import TRAY_STATES, tray_face_image
 
-    images = {s: tray_icon(s != "off", s).pixmap(64, 64).toImage() for s in TRAY_STATES}
-    assert len({img.bits().tobytes() if hasattr(img.bits(), "tobytes") else bytes(img.constBits())
-                for img in images.values()}) == len(TRAY_STATES)
+    for size in (16, 20, 24):
+        images = {s: tray_face_image(s, size) for s in TRAY_STATES if s != "call-ask"}
+        assert len({bytes(img.constBits()) for img in images.values()}) == len(images)
 
 
 def test_the_tray_carries_the_call_while_a_game_hides_the_island(qapp):
@@ -404,14 +412,14 @@ def test_the_tray_carries_the_call_while_a_game_hides_the_island(qapp):
         watch = TrayWatch(tray, isl, waiting=lambda: 0, extra=lambda: "sonnet · effort high")
         isl.update(call=_call(47))
         watch.refresh()
-        assert watch.state == "recording" and "Call, your side · Discord · 47:" in tray.tip
+        assert watch.state == "call" and watch.badge == "rec" and "On Discord · 47:" in tray.tip
         isl.screen_state = lambda: (3, "d3d_full_screen")
         isl.on_foreground(0)
-        assert isl.state == "game-quiet" and watch._poll.isActive()          # the hover card can come
+        assert isl.state == "game-quiet" and watch.state == "game" and watch.badge == "rec"
         assert "Quiet while you play" in tray.tip and "47:" in tray.tip
         isl.screen_state = lambda: (5, "accepts")
         isl.on_foreground(0)
-        assert not watch._poll.isActive()                                    # nothing looks at the pointer now
+        assert watch.state == "call"
     finally:
         isl.stop()
 
@@ -444,10 +452,17 @@ def test_a_hidden_or_settled_island_runs_no_timer(qapp):
     isl = _island(qapp)
     loop = L.Loop.shared()
     try:
+        from yuki.ui.island import RunInfo
+
         isl.update(voice="listening", call=_call(5))
         qapp.processEvents()
-        assert isl.window.isVisible() and loop.running and isl._clock.isActive()   # live: the loop and the clock
-        isl.screen_state = lambda: (2, "busy")
+        assert isl.window.isVisible() and loop.running and not isl._clock.isActive()   # the pill: no clock
+        isl.update(voice="off", run=RunInfo(8, time.monotonic(), steps=1, line="Opening it"))
+        isl.pointer(True, now=True)
+        assert isl._clock.isActive()                               # the open bar's run time ticks
+        isl.update(run=None, voice="listening")
+        isl.hovered = False
+        isl.screen_state = lambda: (3, "d3d_full_screen")
         isl.on_foreground(0)                                       # a full screen: the island leaves
         deadline = time.monotonic() + 2.0
         while isl.window.isVisible() and time.monotonic() < deadline:

@@ -1522,11 +1522,11 @@ class IslandWindow(QWidget):
         self._apply_opacity()
         self.move(self._origin + QPoint(0, -10))
         self.show()
+        self._move_kind = "enter"     # set first: changing a stopped animation's values emits valueChanged
         self._move.setDuration(ENTER_MS)
         self._move.setEasingCurve(L.ease_curve())
         self._move.setStartValue(0.0)
         self._move.setEndValue(1.0)
-        self._move_kind = "enter"
         self._move.start()
         self._settle.start(SETTLE_CHECK_MS)
 
@@ -1548,14 +1548,19 @@ class IslandWindow(QWidget):
         self._leaving = True
         self._origin = self.pos()
         self._move.stop()
+        self._move_kind = "leave"
         self._move.setDuration(LEAVE_MS)
         self._move.setEasingCurve(L.ease_curve())
         self._move.setStartValue(0.0)
         self._move.setEndValue(1.0)
-        self._move_kind = "leave"
         self._move.start()
 
     def _on_move(self, v: Any) -> None:
+        # Only a running animation moves the window: Qt also emits valueChanged when a stopped animation's start or
+        # end value is set (the old code then applied the previous move's kind: an enter could jump the window to
+        # the leave's opacity and offset before it started).
+        if self._move.state() != QVariantAnimation.State.Running:
+            return
         k = float(v)
         if self._move_kind == "enter":
             self._fade = k

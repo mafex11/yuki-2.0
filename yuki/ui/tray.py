@@ -728,7 +728,7 @@ class TrayWatch(QObject):
             self.card.listen_toggled.connect(self._on_listen)
         if self.card.isVisible() and not self.card.closing:
             return
-        self._fill_card()
+        self.card.set_info(self.card_info())
         try:
             rect = self.tray.geometry()
         except Exception:
