@@ -425,11 +425,10 @@ def test_the_menu_has_the_mocks_items_and_pause_only_in_a_call(qapp):
                             set_call_off=lambda on: calls.append(("call_off", on)))
     ui = SimpleNamespace(voice=voice, window_host=SimpleNamespace(open_window=lambda page=None: calls.append(page)))
     app = SimpleNamespace(quit=lambda: calls.append("quit"))
-    more = QMenu()
-    menu = build_menu(ui, app, more=more)
+    menu = build_menu(ui, app)
+    assert isinstance(menu, QMenu)
     words = [a.text().split("\t")[0] for a in menu.actions() if not a.isSeparator()]
-    assert words == ["Open Yuki", "Listen for “Yuki”", "Pause listening for this call", "Settings", "More",
-                     "Quit Yuki"]
+    assert words == ["Open Yuki", "Listen for “Yuki”", "Pause listening for this call", "Settings", "Quit Yuki"]
     pause = menu.actions()[2]
     assert not pause.isVisible()
     voice.call_active = True
