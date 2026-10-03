@@ -91,6 +91,28 @@ MUTEX_NAME = "Local\\YukiUiSingleInstance"
 #: (yuki.memory.offers.STOP_WITHIN_S).
 ASK_STOP_WITHIN_S = 60.0
 
+#: appLearn (4 Oct): a way a verified success taught is written by practice memory's learner only once the run's
+#: follow-up window has passed (90 s, then its 30 s tick and one model pass). A run that ended done asks once more this
+#: long after it ended and shows its return card's Learned box then, if the success taught a way. One read per run that
+#: ended done; no polling.
+LATE_LEARNED_MS = 150_000
+
+
+def learned_for_card(page: Any, since: float) -> dict | None:
+    """The Learned box for a run's return card from practice memory's ``workflows()``: the newest way a verified
+    success taught since ``since`` (the run's start; ``learned`` holds only those, appLearn), or ``None``. Never a
+    pitfall, never a tentative proposal of any other kind: a failed or stopped run announces nothing."""
+    rows = (page or {}).get("learned") if isinstance(page, dict) else None
+    fresh = [c for c in rows or [] if isinstance(c, dict) and str(c.get("id") or "").startswith("pb:")
+             and float(c.get("learned_at") or 0) >= since - 1]
+    if not fresh:
+        return None
+    newest = max(fresh, key=lambda c: float(c.get("learned_at") or 0))
+    title = " ".join(str(newest.get("title") or newest.get("text") or "").split())
+    why = " ".join(str(newest.get("why") or "").split())
+    return {"id": str(newest["id"]), "text": title[:1].upper() + title[1:],
+            "why": f"What didn’t work: {why}" if why else ""}
+
 
 def hotkey_words(combo: str) -> str:
     """``alt+shift+x`` -> ``Alt+Shift+X`` (a hotkey spec, for the strip's one-time stop hint)."""
@@ -1228,8 +1250,11 @@ class YukiUi(QObject):
                            by: str | None = None) -> None:
         """A run that acted ended: the return card says how it really ended (done, stopped, didn't finish, handed
         back) and what it changed that the user cares about, in plain words (:func:`yuki.ui.step_words.return_view`:
-        effects as rows, the opening steps folded into one line, no undo of any kind), with what practice memory
-        learned since the run began. Nothing to tell beyond the strip's final word, no card."""
+        effects as rows, the opening steps folded into one line, no undo of any kind). **Learned** only for a run that
+        ended done, and only a way a verified success taught (:func:`learned_for_card`, appLearn): a failed, stopped or
+        handed-back run announces nothing (no memory read either). The learner writes a run's way after its follow-up
+        window, so a done run asks once more :data:`LATE_LEARNED_MS` later. Nothing to tell beyond the strip's final
+        word, no card."""
         view = return_view(outcome, text, list((run or {}).get("calls") or []))
         if not view["worth"]:
             return
@@ -1237,26 +1262,34 @@ class YukiUi(QObject):
         started_wall = time.time() - took
         self._return_pending = {"id": request_id, "view": view, "outcome": outcome, "by": by,
                                 "took": took_words(took) if run else "", "since": started_wall}
+        if outcome != "done":   # the card comes at the same moment, with no Learned box and no memory read
+            QTimer.singleShot(1500, lambda: self._returns.done.emit({"id": request_id, "learned": None}))
+            return
         memory = self.runtime.memory
         import threading
 
-        def fetch() -> None:
-            learned = None
+        def fetch(late: bool) -> None:
             try:
-                data = memory.call_method("workflows", timeout_s=8.0) or {}
-                fresh = [c for c in data.get("proposals") or []
-                         if isinstance(c, dict) and float(c.get("since") or 0) >= started_wall - 1
-                         and str(c.get("id") or "").startswith("pb:")]
-                if fresh:
-                    newest = max(fresh, key=lambda c: float(c.get("since") or 0))
-                    learned = {"id": newest.get("id"), "text": newest.get("text") or newest.get("title")}
+                learned = learned_for_card(memory.call_method("workflows", timeout_s=8.0), started_wall)
             except Exception:
                 learned = None
+            if late:
+                if learned:
+                    self._returns.done.emit({"id": request_id, "learned": learned, "late": True, "view": view,
+                                             "outcome": outcome, "took": took_words(took) if run else ""})
+                return
             self._returns.done.emit({"id": request_id, "learned": learned})
 
-        QTimer.singleShot(1500, lambda: threading.Thread(target=fetch, name="yuki-ui-return", daemon=True).start())
+        # the late read, armed on the GUI thread once the first read found nothing (:meth:`_on_return_ready`)
+        self._return_pending["late"] = lambda: threading.Thread(target=fetch, args=(True,), name="yuki-ui-return-late",
+                                                                daemon=True).start()
+        QTimer.singleShot(1500, lambda: threading.Thread(target=fetch, args=(False,), name="yuki-ui-return",
+                                                         daemon=True).start())
 
     def _on_return_ready(self, payload: object) -> None:
+        if isinstance(payload, dict) and payload.get("late"):
+            self._on_late_learned(payload)
+            return
         pending = getattr(self, "_return_pending", None)
         if not isinstance(payload, dict) or pending is None or pending.get("id") != payload.get("id"):
             return
@@ -1264,6 +1297,13 @@ class YukiUi(QObject):
         learned = payload.get("learned")
         self.island.lesson_available = bool(learned)
         self._return_learned = learned
+        if learned is None and callable(pending.get("late")):
+            QTimer.singleShot(LATE_LEARNED_MS, pending["late"])
+        self._show_return_card(pending["id"], pending["view"], pending["outcome"], str(pending["took"]), learned,
+                               by=pending.get("by"))
+
+    def _show_return_card(self, request_id: int, view: dict, outcome: str, took: str, learned: dict | None, *,
+                          by: str | None = None, late: bool = False) -> None:
         if self.overlay.isVisible() or self.island.inputs.fullscreen:
             return   # the answer is in the open ask bar; in a full screen no card shows
         from datetime import datetime
@@ -1274,11 +1314,35 @@ class YukiUi(QObject):
             self.return_card = ReturnCard()
             self.return_card.learned.connect(self._on_learned)
             self.return_card.why.connect(lambda: self.window_host.open_window("activity"))
-        view = pending["view"]
         self.return_card.show_run(icon=view["icon"], head=view["head"], title=view["title"], at=clock(datetime.now()),
-                                  rows=view["rows"], more=view["more"], learned=learned, took=str(pending["took"]))
-        self.ui_log.event("return_card", id=pending["id"], outcome=pending["outcome"], by=pending.get("by"),
-                          rows=len(view["rows"]) + view["more"], learned=bool(learned))
+                                  rows=view["rows"], more=view["more"], learned=learned, took=took)
+        self._return_card_id = request_id
+        self.ui_log.event("return_card", id=request_id, outcome=outcome, by=by,
+                          rows=len(view["rows"]) + view["more"], learned=bool(learned), late=late or None)
+
+    def _on_late_learned(self, payload: dict) -> None:
+        """A done run's success taught a way after its return card went out (the learner's pass came later): the
+        Learned box on the card still showing that run, or the run's card once more with it. A later run's own card
+        is never replaced (its learning, if any, is its own)."""
+        learned = payload.get("learned")
+        if not isinstance(learned, dict) or not learned.get("id"):
+            return
+        rid = payload.get("id")
+        card = self.return_card
+        showing = card is not None and card.isVisible() and not card.closing
+        if showing and getattr(self, "_return_card_id", None) != rid:
+            return
+        if getattr(self, "_return_pending", None) is not None:
+            return   # another run's card is about to show
+        self._return_learned = learned
+        self.island.lesson_available = True
+        if showing:
+            card.learn.set_learned(learned)
+            card.fit_height(animate=True)
+            self.ui_log.event("return_card", id=rid, outcome=payload.get("outcome"), learned=True, late=True)
+            return
+        self._show_return_card(rid, payload["view"], str(payload.get("outcome") or "done"), str(payload.get("took") or ""),
+                               learned, late=True)
 
     def _on_learned(self, ref: str, action: str, words: str) -> None:
         """Save / Edit / No on a Learned proposal (applied once the card went, so Undo could take it back)."""

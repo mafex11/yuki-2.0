@@ -1223,10 +1223,16 @@ def _top_full(v: Any) -> str:
 
 #: NEW blocks on the Playbook page at most (the design shows one); more tentative items go to their lists.
 PROPOSALS_SHOWN = 2
-#: How each practice object came to be (``playbooks.origin``), in the words the Playbook page's side line uses.
+#: How each practice object came to be (``playbooks.origin``), in the words the Playbook page's side line uses. Every
+#: way on the page rests on a success (appLearn: a post-mortem's way is the one that worked in the end); a style note
+#: is the user's own words.
 ORIGIN_WORDS = {"distill": "From a run that worked", "run": "From a run that worked",
-                "postmortem": "From a time I got it wrong", "user": "In your words", "taught": "You taught me",
+                "postmortem": "From a run that worked in the end", "slider": "From a run that worked",
+                "user": "In your words", "taught": "You taught me",
                 "miner": "Seen in what you do", "knowhow": "From what I learned before"}
+#: The kinds the Playbook page and the Activity rows may show (appLearn): ways and the user's style notes. A pitfall
+#: is a quiet note for Yuki's own use, never shown as something learned.
+SHOWN_KINDS = ("procedure", "habit", "style", "question")
 
 
 def app_words(apps: list[Any]) -> str:
@@ -1240,7 +1246,7 @@ def app_words(apps: list[Any]) -> str:
 def _learned_line(c: dict[str, Any]) -> str:
     """Where a playbook came from and how much evidence it has, e.g. ``From a run that worked, 29 Sep · seen on 3
     days``."""
-    head = ORIGIN_WORDS.get(str(c.get("origin") or ""), "Learned")
+    head = "In your words" if c.get("kind") == "style" else ORIGIN_WORDS.get(str(c.get("origin") or ""), "Learned")
     since = short_day(epoch_of(c.get("since")))
     ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
     bits = []
@@ -1299,25 +1305,31 @@ def proposal_view(c: dict[str, Any]) -> dict[str, Any]:
 
 def build_playbook(memory: Any) -> dict[str, Any]:
     """The Playbook page from practice memory (``workflows()``, Phase C): NEW proposals (seen once, or a question),
-    procedures and habits ("How you do things"), lessons (pitfalls and style notes), with uses, last use and
-    confidence; then the standing rules and requests. Without practice memory, today's know-how instead (probed)."""
+    procedures and habits ("How you do things"), lessons (the user's style notes), with uses, last use and
+    confidence; then the standing rules and requests. Without practice memory, today's know-how instead (probed).
+    Only what Yuki learned from a success shows (appLearn): memory sends no pitfall, and none is drawn if one came."""
     from yuki.ui.window.data import learned_items
 
     workflows = getattr(memory, "workflows", None)
     wf = _safe(workflows, {}) if callable(workflows) else {}
     wf = wf if isinstance(wf, dict) else {}
     available = bool(wf.get("available"))
-    procs = [procedure_view(c) for c in wf.get("procedures") or [] if isinstance(c, dict)] if available else []
-    lessons = [lesson_view(c) for c in wf.get("lessons") or [] if isinstance(c, dict)] if available else []
+
+    def shown(key: str) -> list[dict[str, Any]]:
+        return [c for c in wf.get(key) or [] if isinstance(c, dict) and c.get("kind") in SHOWN_KINDS] if available \
+            else []
+
+    procs = [procedure_view(c) for c in shown("procedures") if c.get("kind") in WAY_KINDS]
+    lessons = [lesson_view(c) for c in shown("lessons") if c.get("kind") == "style"]
     # what Yuki is not sure of yet: questions first, at most PROPOSALS_SHOWN as the NEW blocks (the design shows one);
     # the other tentative ways and lessons stay visible in their own lists, marked as seen once
-    pending = [c for c in wf.get("proposals") or [] if isinstance(c, dict)] if available else []
+    pending = shown("proposals")
     pending.sort(key=lambda c: c.get("kind") != "question")
     props = [proposal_view(c) for c in pending[:PROPOSALS_SHOWN]]
     for c in pending[PROPOSALS_SHOWN:]:
         if c.get("kind") in WAY_KINDS:
             procs.append({**procedure_view(c), "conf_word": "tentative, seen once", "tentative": True})
-        elif c.get("kind") in ("pitfall", "style"):
+        elif c.get("kind") == "style":
             lessons.append({**lesson_view(c), "tentative": True})
     know = [] if available else [{"title": k.title, "line": k.line, "app": k.app}
                                  for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
@@ -1444,8 +1456,9 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float,
     stopped = str(run.get("outcome") or "") in ("cancelled", "withdrawn", "abandoned")
     for i, s in enumerate(steps):
         result, status = step_result(s, stopped=stopped)
+        # a way it followed, or the user's style note; a pitfall it kept clear of is Yuki's own quiet note (appLearn)
         chips = [{"kind": "memory" if c.get("kind") in WAY_KINDS else "lesson", "text": c.get("title") or ""}
-                 for c in s.get("cited") or [] if c.get("title")]
+                 for c in s.get("cited") or [] if c.get("title") and c.get("kind") in SHOWN_KINDS]
         row = {"id": f"run:{run.get('key')}:{s.get('step')}", "kind": "action", "f": "failed" if status == "failed" else "did",
                "at": float(s.get("at") or run.get("at") or now), "what": step_what(s),
                "where": s.get("app_name") or ("Yuki" if s.get("kind") == "memory" else "Windows"),
