@@ -657,16 +657,40 @@ def words_text(words: Sequence[dict[str, Any]], *, now: float | None = None) -> 
     return "\n".join(out)
 
 
+def call_facts(name: str, tool_input: dict[str, Any] | None, target: dict[str, Any] | None = None, *,
+               files_read: bool = False) -> list[str]:
+    """The machine facts that sent a call to the judge, said plainly in its request (review 34: H2, M1, M2), so the
+    judge does not have to spot them in the call's JSON. Characters, roles, schemes and the tool sequence only."""
+    from yuki.agent.tools import COMMITTING_ROLES, _line_break_in, _web_address
+
+    tool_input, target = tool_input or {}, target or {}
+    out = []
+    if name == "type_text" and _line_break_in(tool_input.get("text")) and tool_input.get("press_enter") is not True:
+        out.append("its text holds a line break, which types as Enter (Ctrl+Enter for a line feed): in a chat or mail "
+                   "box the text before it is sent")
+    if name == "click" and str(target.get("role") or "") in COMMITTING_ROLES:
+        out.append(f"it clicks a {target.get('role')}, which can send, delete, close or confirm")
+    if name == "click" and target.get("typed_pending"):
+        out.append("text Yuki typed into this window is still waiting there: this click can send it")
+    if name == "open_url" and not _web_address(tool_input.get("url")):
+        out.append("it opens a file or a non-web address with its default program, which can run it")
+    if name == "fetch_url" and files_read:
+        out.append("a file was read earlier in this request: a web address can carry what it says out")
+    return out
+
+
 def judge_request(words: Sequence[dict[str, Any]], name: str, tool_input: dict[str, Any], *,
                   target: dict[str, Any] | None, levels: dict[str, str], traits: Traits, model: str,
-                  cache: bool = True, review: bool = False, earlier: Sequence[str] = ()) -> dict[str, Any]:
+                  cache: bool = True, review: bool = False, earlier: Sequence[str] = (),
+                  files_read: bool = False) -> dict[str, Any]:
     """The judge's request: its cached prompt, both tools (the quick verdict and the careful review; ``review``
     chooses which is forced), and one user message (words, settings, Yuki's earlier calls of this request - the calls
-    only, never what they returned, as auto mode's classifier sees the agent's tool calls - and the proposed call)."""
+    only, never what they returned, as auto mode's classifier sees the agent's tool calls - and the proposed call,
+    with the machine facts that sent it here, :func:`call_facts`)."""
     kinds = list(dict.fromkeys([*traits.kinds, "send_messages"] if traits.reaches else traits.kinds))
     settings = "; ".join(f"{KIND_WORDS.get(k, k)}: {LEVEL_WORDS.get(levels.get(k, ''), levels.get(k, '?'))}"
                          for k in kinds) or "(none apply)"
-    what = []
+    what = call_facts(name, tool_input, target, files_read=files_read)
     if traits.destroys:
         what.append("it can close, end, delete or overwrite something")
     if traits.reaches:
@@ -961,7 +985,7 @@ class Authorizer:
             return v
         model = str(getattr(self.settings, "judge_model", "") or "")
         params = judge_request(words, name, tool_input, target=target, levels=levels, traits=traits, model=model,
-                               earlier=earlier)
+                               earlier=earlier, files_read=files_read)
         try:
             client = self._client()
         except Exception as exc:  # noqa: BLE001 - fail closed below
@@ -998,7 +1022,8 @@ class Authorizer:
             # decides. It costs time only on what the first stage flagged.
             first = v
             again = decide(client, judge_request(words, name, tool_input, target=target, levels=levels,
-                                                 traits=traits, model=model, review=True, earlier=earlier),
+                                                 traits=traits, model=model, review=True, earlier=earlier,
+                                                 files_read=files_read),
                            timeout_s=float(getattr(self.settings, "judge_timeout_s", 8.0)) + 2.0,
                            need=("sends",) if traits.reaches else (), on_rest=rest)
             self.calls += 1
@@ -1050,5 +1075,5 @@ class Authorizer:
 
 __all__ = ["Authorizer", "JUDGE_PROMPT", "LEVELS", "MAX_CONSECUTIVE_DENIALS", "MAX_TOTAL_DENIALS", "POLICY_CEILINGS",
            "POLICY_DEFAULTS", "PolicyReader", "Verdict", "VERDICT_TOOL", "acts_in_app", "app_names", "app_off_line",
-           "app_switched_off", "call_text", "clean_apps", "clean_levels", "decide", "gate_reasons",
+           "app_switched_off", "call_facts", "call_text", "clean_apps", "clean_levels", "decide", "gate_reasons",
            "input_refused_in", "judge_request", "memo_key", "policy_path", "suggest_only", "words_text"]

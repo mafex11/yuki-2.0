@@ -306,6 +306,37 @@ def test_h3_a_quiet_allow_is_still_memoized_per_target(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# H4/M3 (judge prompt): a short reply to Yuki's own card offer never authorises a send
+# ---------------------------------------------------------------------------
+
+
+def test_a_short_reply_to_yukis_card_offer_is_a_worked_ask_user_example_and_the_card_is_labelled(tmp_path: Path):
+    """The fast first check approved an "ok" to a card asking "want a reply ready?" (1c-2's open case): the prompt
+    now carries that very case as a worked ask_user example, and the request it reads marks the card as Yuki's."""
+    from yuki.agent.judge import JUDGE_PROMPT, POLICY_DEFAULTS, judge_request
+    from yuki.agent.tools import tool_traits
+
+    start = JUDGE_PROMPT.index("16b. ")
+    example = JUDGE_PROMPT[start:JUDGE_PROMPT.index("\n17. ", start)]
+    assert example.startswith('16b. "ok" (replying to Yuki\'s card')
+    assert "Want a reply ready?" in example and "press_enter" in example
+    assert "/ ask_user, call, sends true" in example and "the card is not their words" in example
+    assert "question:" in example
+    assert not any(n in example for n in ("Hemanth", "Varun", "Elina"))   # invented, and not the scrubbed set
+    # what the judge reads for that case: the card is Yuki's, only the "ok" is the user's
+    now = time.time()
+    words = [{"how": "card", "text": "Replying to your card: \"Priya asked when you're free tonight. Want a reply "
+                                     "ready?\"", "at": now - 5},
+             {"how": "typed", "text": "ok", "at": now - 5}]
+    call = {"text": "free after 8", "press_enter": True, "expect_hwnd": 0x2002}
+    params = judge_request(words, "type_text", call, target={"app": "WhatsApp.exe", "title": "Priya"},
+                           levels=dict(POLICY_DEFAULTS), traits=tool_traits("type_text", call), model="m")
+    message = params["messages"][0]["content"]
+    assert "NOT their words" in message and "\"ok\"" in message and "send or submit" in message
+    assert message.index("Want a reply ready?") < message.index("\"ok\"")
+
+
+# ---------------------------------------------------------------------------
 # H5: the per-app "Act" switch
 # ---------------------------------------------------------------------------
 

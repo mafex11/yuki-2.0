@@ -2766,6 +2766,16 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX surfaced_at ON surfaced(at);
     CREATE INDEX surfaced_ref ON surfaced(ref);
     """,
+    # 32 (2026-10-03, review 34 fixes, docs/research/revamp-2026-10-02/35-build-review-fixes.md): two indexes.
+    # - journal(batch_id, thread_id): withdrawn_journal looks up the batch that replaced an entry (M9: a correlated
+    #   SCAN of the whole journal per id before; also the re-journal readers that ask by batch).
+    # - messages(thread_id, first_seen): the People list's per-route and per-day counts read a thread's messages in a
+    #   time range (M11).
+    # Additive only.
+    """
+    CREATE INDEX IF NOT EXISTS journal_batch_thread ON journal(batch_id, thread_id);
+    CREATE INDEX IF NOT EXISTS messages_thread_seen ON messages(thread_id, first_seen);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
