@@ -1503,15 +1503,21 @@ class WebWindow:
         """Your answer to the connector line ("Yesterday you were fixing X. Still on it?"). "Still on it" keeps it
         open: nothing in memory is wrong, so nothing is sent. "Done" reaches memory the way your words about what it
         knows always do, as a correction its fold applies (memory has no direct "done" for a day's open item yet);
-        sent after the line's Undo window, like Forget."""
+        sent after the line's Undo window, like Forget. The day is the connector's own (memory's label for it: it can
+        be an older day when yesterday has no digest yet), and the press is said as a press, never as words you typed
+        (review F5)."""
         verdict, item = str(m.get("verdict") or ""), " ".join(str(m.get("item") or "").split())
         if verdict == "still":
             return {"sent": False}
         if verdict != "done" or not item:
             return {"ok": False, "error": "Nothing to mark."}
-        from yuki.ui.window.actions import correction_text
-
-        fid = self._memory().correct_portrait(correction_text("what was still open yesterday", item, "That's done now."))
+        mem, day = self._memory(), str(m.get("day") or "")
+        conn = getattr(mem, "day_connector", None)
+        c = (conn(day=day) if callable(conn) and day else None) or {}
+        label = " ".join(str((c.get("label") if isinstance(c, dict) else "") or m.get("label") or day).split())[:40]
+        when = "yesterday" if label.casefold() in ("", "yesterday") else f"on {label}"
+        fid = mem.correct_portrait(f'About "what was still open {when}" (memory had: "{item}"), the user pressed Done '
+                                   f'on it: it is finished now. They typed no words of their own.')
         self.refresh("me")
         return {"sent": True, "correction_id": fid}
 

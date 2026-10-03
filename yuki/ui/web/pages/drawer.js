@@ -206,7 +206,7 @@
       T.answered[day] = verdict;
       Y.renderDrawer();
       if (verdict !== 'done') return;
-      Y.act('day_answer', { day, verdict, item }).then((r) => { if (!r.ok) { delete T.answered[day]; Y.renderDrawer(); Y.toast(r.error || 'Couldn’t send that.', true); } });
+      Y.act('day_answer', { day, verdict, item, label: c.label || '' }).then((r) => { if (!r.ok) { delete T.answered[day]; Y.renderDrawer(); Y.toast(r.error || 'Couldn’t send that.', true); } });
     }, UNDO_S * 1000);
     box.__res = timer;   // held through a redraw while its Undo is open (app.js holdsHands)
     Y.morph(box, h('div', { class: 'confirm' }, ic('check'), h('span', { text: verdict === 'done' ? 'Marked done.' : 'Okay, I’ll keep it open.' }),

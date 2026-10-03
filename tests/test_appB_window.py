@@ -305,6 +305,9 @@ class _ActMemory:
         return {"ok": True, "correction_id": None}
 
     def day_connector(self, day=None, now=None):
+        if day == "2026-10-01":    # an older day (yesterday had no digest yet)
+            return {"day": day, "label": "Thursday 1 October", "text": "On Thursday you sowed beans.", "memory": "",
+                    "open": [{"text": "Label the bean rows", "thread": None}]}
         return {"day": "2026-10-02", "label": "Yesterday", "text": "Yesterday you finished the bed sizes screen.", "memory": "",
                 "open": [{"text": "Write the watering timer", "thread": "thread:12"}]}
 
@@ -337,8 +340,13 @@ def test_pin_resolve_review_and_the_threads_days_go_straight_to_memory(tmp_path)
     assert turns[0]["user"] == "add chalk to my list" and turns[0]["reply"] == "Added chalk."   # Yuki's own block taken off
     assert win.a_day_answer({"verdict": "still", "item": "Write the watering timer"}) == {"sent": False}
     assert not any(c[0] == "correct" for c in mem.calls)                              # "Still on it" sends nothing
-    done = win.a_day_answer({"verdict": "done", "item": "Write the watering timer"})
+    done = win.a_day_answer({"day": "2026-10-02", "verdict": "done", "item": "Write the watering timer"})
     assert done == {"sent": True, "correction_id": 77} and "Write the watering timer" in mem.calls[-1][1]
+    # review F5: the connector's own day, and a press said as a press (never as words you typed)
+    assert "still open yesterday" in mem.calls[-1][1] and "in their own words" not in mem.calls[-1][1]
+    assert "pressed Done" in mem.calls[-1][1] and "That's done now" not in mem.calls[-1][1]
+    win.a_day_answer({"day": "2026-10-01", "verdict": "done", "item": "Label the bean rows", "label": "Thursday 1 October"})
+    assert "still open on Thursday 1 October" in mem.calls[-1][1] and "yesterday" not in mem.calls[-1][1]
     assert "todo_undo" not in web_window.WebWindow.ACTIONS                            # no Undo on Activity
 
 
