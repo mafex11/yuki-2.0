@@ -1040,13 +1040,98 @@ def test_the_fallback_reads_only_stamps_and_builds_only_when_a_stamp_moved(tmp_p
         live.stamps["day"] = "s2"                                            # the timeline moved
         live.settle(0.5)
         assert live.built == ["day"]
-        win.shell["call"] = {"recording": True}                              # a call records: no fallback reads
+        win.client, win.call_status = object(), {"recording": True}          # a call records: no fallback reads
         reads = len(live.stamp_reads)
         win._arm_fallback()
         live.settle(0.6)
         assert len(live.stamp_reads) == reads
     finally:
+        win.client = None
         live.close()
+
+
+def test_a_restore_with_the_tray_down_makes_one_connection_not_three(tmp_path, monkeypatch):
+    """Review F1: on_shown, the page's shown want and the woken scheduler each used to connect."""
+    live = _Live(tmp_path, monkeypatch, open_page="home")
+    win = live.win
+    attempts: list[str] = []
+
+    def connect_once():
+        attempts.append(threading.current_thread().name)
+        time.sleep(0.05)
+        win.client = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(win, "_connect_once", connect_once)
+    try:
+        win._scheduler_on = True
+        live.shown = False                                                   # minimised while the tray restarted
+        win.cipher, win.want_connect = object(), True
+        live.settle(0.2)
+        assert attempts == []                                                # nothing while hidden
+        live.shown = True
+        win.on_shown("restore")
+        win.on_message({"op": "want", "page": "home", "shown": True})
+        live.settle(0.4)
+        assert len(attempts) == 1, attempts
+        # an older connection's goodbye arriving late leaves the current one alone
+        current = win.client
+        win._on_tray_closed(SimpleNamespace())
+        assert win.client is current
+    finally:
+        win.client = None
+        live.close()
+
+
+def test_the_tray_going_away_mid_call_clears_the_chip_and_rereads_from_memory(tmp_path, monkeypatch):
+    """Review F2: a stale 'recording' chip stayed for good and switched the fallback off."""
+    live = _Live(tmp_path, monkeypatch, open_page="home")
+    win = live.win
+    try:
+        tray = SimpleNamespace(close=lambda: None)
+        win.client = tray
+        win.on_call_status({"call": {"id": 4, "status": "recording", "app": "Invented"}, "recording": True})
+        assert win.shell["call"]["recording"] is True and win._recording() is True
+        live.settle()
+        live.built.clear()
+        win._on_tray_closed(tray)
+        assert win.shell["call"] is None and win.client is None and win._recording() is False
+        assert live.host.kinds("live")[-1]["shell"]["call"] is None             # the chip goes at once
+        live.settle(0.5)
+        assert "shell" in live.built and "home" in live.built                   # read from memory again
+    finally:
+        live.close()
+
+
+def test_a_failed_build_of_the_open_page_keeps_its_fallback(tmp_path, monkeypatch):
+    """Review F7: one exception used to switch the open page's fallback off until you navigated away."""
+    monkeypatch.setattr(web_window, "FALLBACK_S", {"day": 0.2})
+    live = _Live(tmp_path, monkeypatch, open_page="day")
+    win = live.win
+    tries: list[str] = []
+
+    def build(name):
+        tries.append(name)
+        raise RuntimeError("memory busy (invented)")
+    monkeypatch.setattr(win, "build", build)
+    try:
+        win._arm_fallback()
+        live.settle(0.9)
+        assert tries.count("day") >= 2, tries                                 # tried again on the next fallback
+    finally:
+        live.close()
+
+
+def test_a_build_you_asked_for_sends_the_volatile_fields_events_do_not(tmp_path, monkeypatch):
+    """Settings' 'Yuki right now' and Home's 'since' stay out of the hash for events and the fallback, but a revisit
+    (or your own action) shows them current."""
+    win, host = _window(tmp_path, monkeypatch)
+    win.booted = True
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 80}}) is True
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 81}}) is False             # an event: not sent
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 82}}, asked=True) is True  # you opened it
+    assert win.send_page("settings", {"voice": {}, "usage": {"mb": 82}}, asked=True) is False # exactly the same
+    assert win.send_page("home", {"needs": [], "since": 1.0}) is True
+    assert win.send_page("home", {"needs": [], "since": 2.0}, asked=True) is True
+    assert [m["data"].get("usage", {}).get("mb") for m in host.kinds("data") if m["page"] == "settings"] == [80, 82]
 
 
 def test_tray_focus_refreshes_the_open_page_not_home(tmp_path, monkeypatch):
@@ -1149,9 +1234,10 @@ def test_page_refreshes_are_logged_content_free(tmp_path, monkeypatch):
     finally:
         live.close()
     lines = [json.loads(x) for x in (tmp_path / "window-refresh.jsonl").read_text(encoding="utf-8").splitlines()]
-    pages = [x for x in lines if x["event"] == "web_page"]
+    assert lines[0]["type"] == "session_start" and all(x["type"] == "ui" for x in lines[1:])   # UiLog's writer and shape
+    pages = [x for x in lines if x.get("event") == "web_page"]
     assert pages and {"page", "reason", "topic", "ms", "result"} <= set(pages[0]) and pages[0]["topic"] == "cards"
-    assert {x["event"] for x in lines} >= {"web_page", "web_hold", "web_restore"}
+    assert {x.get("event") for x in lines} >= {"web_page", "web_hold", "web_restore"}
     text = json.dumps(lines)
     assert "Invented private words" not in text and '"v"' not in text
 
@@ -1187,6 +1273,10 @@ def test_page_stamps_move_on_each_write_and_stay_cheap(tmp_path):
                 assert web_data.page_stamps(m, page) is not None
             assert (time.perf_counter() - t) / 20 < 0.005, page               # under 5 ms a check
         assert web_data.page_stamps(m, "settings") is None                    # no stamps: built (and hash-skipped)
+        # review F3: Work's week figure and Activity's "Seen today" read the timeline, so it moves their stamps
+        work0, act0 = web_data.page_stamps(m, "work"), web_data.page_stamps(m, "activity")
+        insert("timeline")
+        assert web_data.page_stamps(m, "work") != work0 and web_data.page_stamps(m, "activity") != act0
         del conn
     finally:
         m.close()

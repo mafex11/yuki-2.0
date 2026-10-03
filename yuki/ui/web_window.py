@@ -124,6 +124,8 @@ FALLBACK_S: dict[str, float] = {"home": 300.0, "work": 300.0, "day": 120.0, "act
 #: Fields that change on every build without anything to show (wrong 4 of the verification): left out of the
 #: "did it change" hash. The page's ticker draws the clock-driven ones itself.
 VOLATILE: dict[str, tuple[str, ...]] = {"home": ("since",), "day": ("now_min",), "settings": ("usage",)}
+#: The reasons that mean you asked for the page (opened it, pressed something): see :meth:`WebWindow.send_page`.
+ASKED = frozenset({"want", "action"})
 #: Messages held while the window can't be seen (minimised, hidden, covered by a full-screen app); one catch-up on show.
 HOLD_KINDS = frozenset({"data", "live", "chat"})
 #: The tray's state fields the Settings page shows (a change in any of them rebuilds Settings if it is open).
@@ -309,16 +311,21 @@ class WebWindow:
         self._first: dict[str, float] = {}
         self._last_build: dict[str, float] = {}
         self.posted: dict[str, str] = {}
+        self.posted_full: dict[str, str] = {}  # the same, volatile fields included (sent on a build you asked for)
         self.seen_stamps: dict[str, Any] = {}
         self._clock_at: dict[str, float] = {}
         self._fallback_at = float("inf")
-        self.covered = False                  # a full-screen app is in front (from _watch_cover)
+        self._connecting = threading.Lock()   # one connect at a time (review F1: three at once on a restore)
+        self._connect_soon = False            # catch_up asks the scheduler to look for the tray now
+        self._scheduler_on = False
+        self.covered = False                 # a full-screen app is in front (from _watch_cover)
         self._held: set[str] = set()          # kinds of messages held while the window can't be seen
         self._held_pages: set[str] = set()
         self._settings_sig = self._settings_state()
         self.playing: dict[str, Any] | None = None
         self._media_at = 0.0
-        self._log_path: Path | None = None
+        self._logger: Any = None             # the refresh log (log): opened on its first line
+        self._log_lock = threading.Lock()
         self.pending: dict[str, dict[str, Any]] = {}
         self.metrics: dict[str, Any] = {"t0": t0, "pid": os.getpid(), "frozen": bool(getattr(sys, "frozen", False)),
                                         "python": sys.version.split()[0], "fixture": fixture is not None}
@@ -393,6 +400,7 @@ class WebWindow:
             self.booted = True
             for k, v in pages.items():   # what the page has: fresh data equal to it is not sent again
                 self.posted.setdefault(k, page_hash(k, v))
+                self.posted_full.setdefault(k, page_hash("", v))
         chat = self.chat_payload() if self.model is not None else None
         self.post({"kind": "boot", "source": "snapshot", "shell": self.shell, "pages": pages, "chat": chat,
                    "appearance": appearance(), "page": self.page})
@@ -400,10 +408,14 @@ class WebWindow:
             self.post({"kind": "focus", "page": self.page, "thread": True})
         self.marks["boot_sent"] = time.time()
 
-    def send_page(self, name: str, data: Any, source: str = "memory", built_at: float | None = None) -> bool:
+    def send_page(self, name: str, data: Any, source: str = "memory", built_at: float | None = None,
+                  asked: bool = False) -> bool:
         """Keep ``data`` as the page's and send it, unless the page already has exactly this (the hash of the data,
-        less its :data:`VOLATILE` fields). Returns whether it was sent."""
+        less its :data:`VOLATILE` fields). A build you asked for (``asked``: you opened the page, or pressed
+        something) also sends a change in the volatile fields alone, so Settings' "Yuki right now" and Home's "since"
+        are current on a revisit; an event or a fallback never sends those alone. Returns whether it was sent."""
         digest = page_hash(name, data)
+        full = page_hash("", data) if VOLATILE.get(name) else digest
         with self._lock:
             self.pages[name] = data
             self.stamps[name] = time.time()
@@ -412,10 +424,11 @@ class WebWindow:
             if name == "home" and isinstance(data, dict):
                 self.shell["needs"] = len(data.get("needs") or [])
             booted = self.booted
-            if self.posted.get(name) == digest:
+            if self.posted.get(name) == digest and not (asked and self.posted_full.get(name) != full):
                 return False
             if booted:
                 self.posted[name] = digest
+                self.posted_full[name] = full
         if booted:
             self.post({"kind": "data", "page": name, "data": data, "source": source,
                        **({"built_at": round(built_at, 3)} if built_at else {})})
@@ -486,6 +499,7 @@ class WebWindow:
                      "settings", "playbook", "day"):
             self._enqueue(name, "open")
         self._arm_fallback()
+        self._scheduler_on = True
         threading.Thread(target=self._scheduler, name="yuki-web-refresh", daemon=True).start()
 
     # -- page data (one worker, one read at a time) -------------------------------------------------------------
@@ -550,6 +564,8 @@ class WebWindow:
         except Exception as exc:  # noqa: BLE001 - one page failing never stops the others
             self.event("web_page_failed", page=name, error=f"{type(exc).__name__}: {exc}")
             self.log("web_page_failed", page=name, reason=reason, error=type(exc).__name__)
+            if name == self.open_page:   # the fallback was disarmed for this build: armed again (review F7)
+                self._arm_fallback()
             return
         ms = round((time.time() - t) * 1000)
         self.event("web_page", page=name, ms=ms)
@@ -566,7 +582,8 @@ class WebWindow:
             self.log("web_page", page=name, reason=reason, topic=",".join(topics), ms=ms,
                      result="posted" if changed else "unchanged")
             return
-        posted = self.send_page(name, data, built_at=t)
+        asked = bool(ASKED & set(topics)) or reason.split("+")[0] in ASKED
+        posted = self.send_page(name, data, built_at=t, asked=asked)
         self._clock_at[name] = next_boundary(data, time.time())
         if name == self.open_page:
             self._arm_fallback()
@@ -776,8 +793,11 @@ class WebWindow:
                 if name in self.dirty or name in self.maybe:
                     self._schedule(name, now, True)
                     scheduled.append(name)
+            if self.want_connect and self.client is None and self.cipher is not None:
+                self._connect_soon = True   # the scheduler (woken here) looks for the tray now, one connect at a time
             self._cv.notify()
-        if self.want_connect and self.client is None and self.cipher is not None:
+        if self._connect_soon and not self._scheduler_on:   # no memory, so no scheduler: a thread of its own
+            self._connect_soon = False
             threading.Thread(target=self._connect, name="yuki-web-connect", daemon=True).start()
         if held or pages or scheduled:   # an alt-tab with nothing waiting is not worth a line
             self.log("web_restore", page=self.open_page, reason=reason, held=sorted(held), pages=sorted(pages),
@@ -790,8 +810,10 @@ class WebWindow:
             self._cv.notify()
 
     def _recording(self) -> bool:
-        call = self.shell.get("call")
-        return bool(isinstance(call, dict) and call.get("recording"))
+        """A call records now: the tray's last forwarded status while it is connected (it forwards every change).
+        The tray is what records, so with no tray nothing does (review F2: a stale chip once stopped every read)."""
+        status = self.call_status
+        return bool(self.client is not None and isinstance(status, dict) and status.get("recording"))
 
     def _scheduler(self) -> None:
         """The refresh clock: due builds (debounced), the open page's fallback stamp check, its next time boundary,
@@ -837,8 +859,9 @@ class WebWindow:
                 last_pending = now
                 self._check_pending()
             if visible and self.want_connect and self.client is None and self.cipher is not None \
-                    and now - last_connect >= RECONNECT_S:
+                    and (self._connect_soon or now - last_connect >= RECONNECT_S):
                 last_connect = now
+                self._connect_soon = False
                 self._connect()
             with self._cv:
                 waits = [self._fallback_at]
@@ -906,28 +929,52 @@ class WebWindow:
 
     def log(self, kind: str, **fields: Any) -> None:
         """One content-free line in the window's own small log (page names, topics, reasons, times; never data):
-        every refresh, skip, hold and catch-up, so a refresh can be proven from disk (42 R8). Beside a test memory's
-        ``ui.json``, else ``<logs>/sessions/<date>-window.jsonl``."""
+        every refresh, skip, hold and catch-up, so a refresh can be proven from disk (42 R8). Written through the
+        same writer and record shape as the tray's UI log (:class:`yuki.ui.uilog.UiLog`: a quiet
+        :class:`~yuki.log.events.SessionLogger`, ``type="ui"``, ``event=<kind>``), in a session file of this window
+        process's own (``<sessions>/<start time>-window.jsonl``: two processes never share one file); beside a test
+        memory's ``ui.json`` as ``window-refresh.jsonl``."""
         self.event(kind, **fields)
-        try:
-            if self._log_path is None:
-                if self.ui_path is not None:
-                    self._log_path = Path(self.ui_path).parent / "window-refresh.jsonl"
-                else:
-                    from yuki.core.paths import logs_dir
+        with self._log_lock:
+            try:
+                if self._logger is None:
+                    from yuki.log.events import SessionLogger
 
-                    self._log_path = logs_dir() / "sessions" / f"{time.strftime('%Y%m%d')}-window.jsonl"
-                self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps({"ts": round(time.time(), 3), "type": "ui", "event": kind, "pid": os.getpid(), **fields},
-                              default=str)
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
+                    if self.ui_path is not None:
+                        where, sid = Path(self.ui_path).parent, "window-refresh"
+                    else:
+                        where, sid = self._sessions_dir(), time.strftime("%Y%m%d-%H%M%S") + "-window"
+                    self._logger = SessionLogger(where, session_id=sid, quiet=True)
+                self._logger.log("ui", event=kind, pid=os.getpid(), **fields)
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _sessions_dir() -> Path:
+        try:
+            from yuki.config import Settings
+
+            return Settings().sessions_dir
+        except Exception:  # noqa: BLE001
+            from yuki.core.paths import logs_dir
+
+            return logs_dir() / "sessions"
 
     # -- the pipe to the tray -------------------------------------------------------------------------------------
 
     def _connect(self) -> None:
+        """Find the tray's pipe. One attempt at a time (review F1): a restore used to start up to three, each kept
+        a live client and every chat event arrived several times. A caller that finds one running returns."""
+        if not self._connecting.acquire(blocking=False):
+            return
+        try:
+            if self.client is not None:
+                return
+            self._connect_once()
+        finally:
+            self._connecting.release()
+
+    def _connect_once(self) -> None:
         from yuki.ui.window_ipc import WindowClient, auth_key, pipe_name
 
         try:
@@ -935,7 +982,10 @@ class WebWindow:
         except Exception as exc:  # noqa: BLE001
             self.event("web_pipe_failed", error=type(exc).__name__)
             return
-        client = WindowClient(key, address, on_event=self._on_tray_event, on_closed=self._on_tray_closed)
+        box: list[Any] = []
+        client = WindowClient(key, address, on_event=self._on_tray_event,
+                              on_closed=lambda: self._on_tray_closed(box[0] if box else None))
+        box.append(client)
         if not client.connect(1.5):
             if not self.shell.get("connected") is False:
                 self.shell["connected"] = False
@@ -948,11 +998,18 @@ class WebWindow:
         self.ops = set(hello.get("ops") or [])
         self.post_live()
 
-    def _on_tray_closed(self) -> None:
+    def _on_tray_closed(self, client: Any = None) -> None:
+        if client is not None and self.client is not None and client is not self.client:
+            return   # an older connection's goodbye: the current one stays
         self.client = None
         self.call_status = None   # no more forwards: pages read the call from memory again
-        self.shell.update(connected=False, runs=[])
+        # the tray records calls: with it gone nothing records, and the forwarded chip is stale (review F2). The
+        # chip goes now; the rail and the call's pages are read from memory again
+        self.shell.update(connected=False, runs=[], call=None)
         self.post_live()
+        self.mark("shell", "tray_closed", topics=("tray_closed",))
+        self.topic("call", "tray_closed")
+        self.mark("home", "tray_closed", topics=("tray_closed",))
 
     def _on_tray_event(self, msg: dict[str, Any]) -> None:
         """An unasked message from the tray (the pipe's reader thread)."""
@@ -1625,6 +1682,9 @@ class WebWindow:
                 self.memory.close()
             except Exception:  # noqa: BLE001
                 pass
+        with self._log_lock:
+            if self._logger is not None:
+                self._logger.close()   # a late line from a thread finds it closed and is dropped (log)
 
 
 def workflow_action(ref: str, verb: str, words: str = "") -> str | None:

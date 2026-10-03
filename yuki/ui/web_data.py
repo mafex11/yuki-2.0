@@ -1274,15 +1274,16 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 
 # -- change stamps (the window's live refresh: 42-window-live-refresh.md §6.2) -------------------------------------
 
-#: Each page's memory tables (the ones its builder reads). The Work page leaves the timeline out: the week figure
-#: moves every minute at the PC and is read again on the next visit; Day is where the timeline is live.
+#: Each page's memory tables (the ones its builder reads). Work's week figure and Activity's "Seen today, by app"
+#: read the timeline, so it is in their stamps (review F3): a revisit after STALE_S, or the open page's slow fallback,
+#: rebuilds them while you are at the PC; the hash still skips a build that shows nothing new.
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
     "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls"),
-    "work": ("work_threads", "goals"),
+    "work": ("work_threads", "goals", "timeline"),
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
     "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
-    "activity": ("runs", "nudges", "todos", "calls"),
+    "activity": ("runs", "nudges", "todos", "calls", "timeline"),
     "shell": ("questions",),
 }
 
