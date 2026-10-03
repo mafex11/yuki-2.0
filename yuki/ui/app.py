@@ -135,6 +135,13 @@ def tray_icon(listening: bool = True, state: str | None = None) -> QIcon:
     return _icon(listening, state)
 
 
+def _island_resting() -> bool:
+    """Settings → Island: the tiny resting pill when idle (``ui.json`` ``island_resting``, on by default)."""
+    from yuki.ui import ui_settings
+
+    return bool(getattr(ui_settings.current(), "island_resting", True))
+
+
 #: The tray tooltip's line for each "not listening" state (v3.16, 04 F6); ``on`` has none.
 NOT_LISTENING_LINES = {"off": "Yuki isn't listening (switched off: Listen for ‘Yuki’ turns it on)",
                        "quiet": "Yuki isn't listening (quiet for a while)",
@@ -168,6 +175,8 @@ class YukiUi(QObject):
         #: The island (Lattice, phase E6): one window top centre for voice, runs and the call. Its adapters stand
         #: where the run strip, the voice pill and the call pill stood, so the wiring below is theirs.
         self.island = Island()
+        self.island.log = ui_log.event     # content-free: states, sizes, flags (why it hides, topmost, full screen)
+        self.island.resting = _island_resting()
         self.strip = self.island.strip
         self.runtime = runtime or AgentRuntime(settings, ui_log)
         self.memory = memory_control or MemoryControl(self.runtime.memory, ui_log)
@@ -385,6 +394,7 @@ class YukiUi(QObject):
 
     def reload_hotkeys(self) -> None:
         """The user set a new "Open Yuki anywhere" shortcut in the window (``ui.json``): listen for it now."""
+        self.island.set_resting(_island_resting())   # ui.json changed: Settings → Island (the resting pill) too
         bindings = user_bindings(hotkey_bindings(self._settings_for_keys))
         if bindings == self.bindings:
             return
@@ -1209,7 +1219,10 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     Returns:
         The tray icon, which the caller must keep a reference to.
     """
-    tray = QSystemTrayIcon(icon or tray_icon(), app)
+    from yuki.ui.tray import build_menu, make_tray
+
+    # Yuki's own tray icon on Windows (the face, the hover card in every state); the menu below becomes "More"
+    tray = make_tray(app, icon or tray_icon())
     nudge_queue = getattr(ui.nudges, "queue_changed", None)
     from yuki.ui.surface import current_theme
     from yuki.ui.window.widgets import Menu, menu_css
@@ -1355,7 +1368,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     from yuki.ui.tray import TrayWatch
 
     watch = TrayWatch(tray, ui.island, waiting=lambda: len(getattr(ui.nudges, "queue", []) or []),
-                      extra=lambda: tray_tip())
+                      extra=lambda: tray_tip(), voice=ui.voice, open_window=lambda: ui.window_host.open_window())
     tray._lattice_watch = watch   # kept alive with the tray
     if nudge_queue is not None:   # cards waiting for a free screen: the "waiting" badge
         nudge_queue.connect(lambda _n: watch.refresh())
@@ -1536,7 +1549,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     quit_action.triggered.connect(app.quit)
     menu.addAction(quit_action)
 
-    tray.setContextMenu(menu)
+    tray.setContextMenu(build_menu(ui, app, more=menu))   # Open Yuki, Listen, Pause for this call, Settings, More, Quit
     refresh_ticks()
     show_listening()   # v3.16: a listener that is off shows in the icon from the start (04 F6)
     tray.activated.connect(   # a left click opens the Yuki window (its own process)

@@ -39,6 +39,7 @@ class UiSettings:
     window_engine: str = "web"          # what a tray click opens: "web" (the Lattice HTML window) | "qt" (native)
     web_window: list[int] | None = None  # the HTML window's x, y, w, h (physical px) when it last closed
     web_maximized: bool = False
+    island_resting: bool = True         # Settings → Island: the tiny resting pill when idle (False: nothing on screen)
 
 
 #: The window engines a settings file may hold (``window_engine``); anything else reads as "web".
@@ -63,7 +64,7 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
         isinstance(v, (int, float)) for v in web[:4]) else None
     return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last,
                       accent if accent in ACCENT_NAMES else "green", engine if engine in WINDOW_ENGINES else "web",
-                      web, bool(raw.get("web_maximized", False)))
+                      web, bool(raw.get("web_maximized", False)), bool(raw.get("island_resting", True)))
 
 
 def load(path: Path | None = None) -> UiSettings:
