@@ -136,9 +136,17 @@ SHOWN_EXAMPLES = (
 #: A shown form is kept when it is non-empty, not cut off and at most this long (plumbing, nothing matched): as long
 #: as the longest facts (1,626 characters on the 3 Oct copy), which the app opens on click under their headline.
 SHOWN_MAX_CHARS = 1_800
+#: A person fact is that person's summary on the Me page (report 55, the person bar in yuki.memory.portrait): its shown
+#: form is the same summary said to the user, a few sentences (invented example).
+PERSON_SHOWN_RULE = (
+    "A person fact is that person's summary on the app's Me page: say the same summary to the user in a few "
+    "natural sentences about the person (\"Kiran is your friend from school. He's from Pune and studies mechanical "
+    "engineering there; you play Valorant together most nights and talk on Discord and WhatsApp. He has semester "
+    "exams in October.\")."
+)
 SHOWN_FIELD = ("The fact as the user's app shows it to them, from the text you wrote: " + SHOWN_RULES
                + " For example \"On 25 September, from about 2 AM to 3:22 AM, you prepared a maths chapter to go "
-               "over with your friend Kiran.\"")
+               "over with your friend Kiran.\" " + PERSON_SHOWN_RULE)
 GIST_SHOWN_FIELD = ("The gist as the user's app shows it to them, at most 25 words, beside the call's date, time and "
                     "place (so it leaves those out): " + SHOWN_RULES
                     + " For example \"A heated game where your friends chose killing people for fun, which shocked "
@@ -167,7 +175,8 @@ a promise of Yuki's, or a way Yuki learned to do something on the PC. Each line 
 - a summary: AT MOST {SUMMARY_MAX_WORDS} WORDS, best four to six - the gist, not every detail. \
 "Founding AI engineer at Corvana", "Plays Valorant most nights with friends", "Teases Rohan about his \
 aim", "Streams Minecraft to friends on Discord". A person: who they are to the user or what they share, \
-only as the item says it ("Colleague who reviews the demo videos"). A way Yuki learned: the way that \
+only as the item says it ("Colleague who reviews the demo videos", "School friend studying engineering \
+in Pune") - never one moment, something shared once or a figure. A way Yuki learned: the way that \
 works ("Pass the link as a launch argument"). The row shows the item's HEADING (a person's name, a \
 topic) right above its summary, so a summary never repeats the heading: "Colleague who reviews the demo \
 videos" under the heading Varun, never "Varun, colleague ..." or "Chats with Varun ...". Say what matters \
@@ -216,6 +225,7 @@ fact about the user (their work, interests, routines, preferences, personality, 
 something owed), where a thread of their work stands, or the gist of one of their calls. Rewrite each in \
 the shown form, changing only the voice, the dates and times and what the rules below ask:
 {SHOWN_RULES}
+{PERSON_SHOWN_RULE}
 A line may come with CALLS: who was on the calls the item rests on, and where (the app, the server and \
 the voice channel) - use them to say who a call was with, and "other friends" when the person the item \
 is about was not on it. A call gist comes with WHO WAS ON IT and the call's timeline topics: "they" in a \

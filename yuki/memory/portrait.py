@@ -68,6 +68,12 @@ written as its lasting line. A failed gate call lets the versions
 through (logged); dreaming retires failures nightly and the bar pass
 (:class:`yuki.memory.dreaming.BarPass`) sweeps the existing facts once.
 
+The bar ends with :data:`PERSON_BAR` (report 55): a person fact is that person's summary (the Me page shows it) -
+who they are to the user, what they do, where they are from, what they are like and into, the apps, what is going
+on with them - never one call's moments, who shared what, records and figures (attendance, fees, marks) or raw
+screen data. The same writers and judges apply it; the people pass (:mod:`yuki.memory.people_summary`) rewrites
+the existing summaries under it once.
+
 User corrections (:meth:`Store.add_correction`, from Yuki's ``update_portrait``
 tool) are facts of kind ``correction`` with origin ``user``: the render follows
 them at once, and the next run folds them into the facts they concern (the
@@ -214,11 +220,53 @@ RELATIONSHIP_CHARS = 8_000
 #: Behaviour candidates of weekly reviews at most this old are given to a run (yuki.memory.review).
 REVIEW_CANDIDATE_DAYS = 14
 
+#: What a person fact is (report 55, appPeople, 4 Oct 2026: the Me page's summary of a person retold what the user
+#: said on one Discord call, who shared what with whom, and a student portal's term, attendance and tuition figures;
+#: the user: "it should write about the people: who they are, what they do, where they are from"). A person fact is
+#: that person's one summary - the Me page shows it (its shown form) and every prompt that reads the portrait reads
+#: it. Part of :data:`ADMISSION_BAR`, so every writer and judge of facts has it: the operations and audit prompts,
+#: the bar gate, dreaming, the bar pass and the people pass (:mod:`yuki.memory.people_summary`). Model judgement
+#: on worked examples (invented people and numbers), no word lists.
+PERSON_BAR = """\
+THE PERSON BAR. A person fact is that person's summary: what Yuki knows about someone in the user's \
+life, and what the user's app shows about them. One fact per person, a few natural sentences that say, \
+as far as the evidence states it in words:
+- who they are to the user and how they know each other (a friend from school, a cousin, a colleague \
+on a team);
+- what they do (what and where they study, their work or role);
+- where they are from or live;
+- what they are like and into, and what they and the user do together (the games they play, the music \
+they make);
+- how the user usually talks with them (the apps);
+- what is going on with them now that matters to the user, with its time ("has semester exams in \
+October 2026", "moved to Pune in September 2026").
+Never in a person fact: a moment from one call or chat ("in a call the user said ...", what they \
+talked about one evening), who shared, sent or showed what, records and figures about them \
+(attendance or class counts, fees and tuition, marks, grades, scores, ranks, balances, roll or account \
+numbers), the dates and clock times of single events, raw screen data (a portal's table, a profile's \
+fields, a page's numbers), or an AI tool's output. Such evidence can still show one lasting thing \
+about the person - that they study engineering, that they are in their final year: keep that, without \
+the figures or the moment. What the user did once with or for them is not who they are; something owed \
+between them is an open loop; a story about the user is personality.
+Worked examples (invented):
+- FAILS: "Ravi talks with the user on Discord. On a Discord call on 2026-09-30 the user said they had \
+shared the lab notes with Ravi and that Ravi sent them a playlist. Ravi is currently in term 4 of 5 \
+years, with 98 of 112 classes attended and total tuition of 3,10,000." - one call's talk, who shared \
+what, and a student portal's figures: none of it says who Ravi is. Rewritten to what lasts: "Ravi is \
+a student in the fourth year of a five-year course; the user talks with him on Discord."
+- FAILS: "On 2026-09-25 from 02:00 to 03:22 the user went over a maths chapter with Kiran." - one \
+evening with him. What lasts, if the evidence shows it across days: "The user helps Kiran with maths."
+- PASSES: "Kiran is the user's friend from school. He is from Pune and studies mechanical engineering \
+there. They play Valorant together most nights and talk on Discord and WhatsApp; Kiran has semester \
+exams in October 2026." - who, what, where, what they share, the apps, what is going on.
+- PASSES: "Meera is the user's elder sister; she works as a nurse in Eastvale, is into baking and \
+calls the user on WhatsApp most Sundays." - who, what, where, what she is into, how they talk."""
+
 #: What may enter the portrait at all (report 50, appA2, 3 Oct 2026: a "work" fact on Me retold one evening's
 #: Claude quota readings, burn rate, a coding tool's projection and a week's spend from its usage dashboard). One
 #: text, judged by the model, shared by the operations prompt, the bar gate on every run's new versions
 #: (:meth:`PortraitWorker._bar_gate`), dreaming and the bar pass (:class:`yuki.memory.dreaming.BarPass`).
-#: The examples are invented.
+#: The examples are invented. It ends with :data:`PERSON_BAR` (report 55): what a person fact, a person's summary, is.
 ADMISSION_BAR = """\
 THE ADMISSION BAR. The portrait is Yuki's one-page model of the person: who they are, their work, \
 interests, people, routines, preferences, personality and what is open with them - what someone who \
@@ -257,7 +305,9 @@ their work." - their work and how they work.
 - PASSES: "On 4 of the last 5 weekday evenings the user practised the cello from about 19:30 to 20:30." - \
 a habit of theirs across days; its numbers describe them.
 - PASSES: "Asha, the user's sister, talks with them on WhatsApp most evenings about her exams." - a \
-person in their life."""
+person in their life.
+
+""" + PERSON_BAR
 
 OPS_SYSTEM_PROMPT = """\
 You maintain the portrait that Yuki keeps of its user. Yuki is a personal assistant living \
@@ -269,9 +319,12 @@ The portrait is a set of facts. Each fact has one kind:
 and collaborators.
 - interest: topics, hobbies, media, creators, channels, artists, games, markets they \
 follow. Name them specifically.
-- person: one person in their life. Subject is the person's name as shown; the text says \
-who they are to the user, where they talk (app) and what about. Anything owed between \
-them and the user is an open_loop fact, never part of the person text.
+- person: one person in their life, and that person's summary (see the person bar below). \
+Subject is the person's name as shown; the text says who they are to the user, what they do, \
+where they are from or live, what they are like and into, how the user talks with them (the \
+apps) and what is going on with them now - a few sentences, folding new evidence into the \
+summary rather than adding events to it. Anything owed between them and the user is an \
+open_loop fact, never part of the person text.
 - routine: when they do what - time-of-day and weekday patterns, recurring sessions.
 - preference: how they like things: the apps, tools, sites and settings they choose, \
 languages, formats, tastes.
@@ -369,7 +422,10 @@ INVALIDATE of an open_loop that fails the bar above).
 
 """ + ADMISSION_BAR + """
 Every ADD and UPDATE must meet the admission bar; a new version that fails it is refused. When \
-the journal is full of a tool's readings, write nothing from them, or the one lasting line.
+the journal is full of a tool's readings, write nothing from them, or the one lasting line. A \
+person fact must meet the person bar as well: when an entry shows a call, a chat or a page about \
+someone, fold into their summary only what it says lastingly about who they are, and leave the \
+moment, the shared things and the figures out.
 
 What makes a good portrait fact:
 - Durable: it should still help Yuki a week from now. One video watched is an event, not \
@@ -377,7 +433,7 @@ an interest; several on one theme, or a channel they keep returning to, is. An a
 once is not a routine; activity on most weekday evenings is.
 - Specific and self-contained: names, titles, channels, tickers, project and company \
 names, as the journal gives them. One idea per fact, one or two sentences, third person \
-("The user ...").
+("The user ..."); a person fact is the person's summary, a few sentences.
 - Merged: when an existing fact covers the same thing, UPDATE it instead of adding a \
 near-duplicate. Keep one fact per person.
 - Honest about evidence: confidence (0 to 1) is how well the evidence supports the fact - \
@@ -513,7 +569,8 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                         "text": {
                             "type": "string",
                             "description": (
-                                "ADD and UPDATE: the complete fact, one or two sentences, third person. "
+                                "ADD and UPDATE: the complete fact, one or two sentences (a person fact: "
+                                "their summary, a few sentences), third person. "
                                 "INVALIDATE and NOOP: empty."
                             ),
                         },
@@ -605,8 +662,9 @@ sentences, trivia dropped first - so nothing is cut. Every section has its own r
 crowds out who the user is (People, Preferences, Relationship) or their interests and routines. \
 The personality field is written separately (see below); never put it in another field.
 
-- People: each person, who they are to the user, where they talk and what about; what \
-they did stays in the past tense with its date, as the facts give it.
+- People: each person, who they are to the user, what they do and where they are from, where \
+they talk and what about, what is going on with them; what they did stays in the past tense with \
+its date, as the facts give it. Never one call's moments, who shared what, or figures about them.
 - Behaviour: the observed patterns in how the user spends their time, with their numbers; \
 describe what they do, never label their character.
 - Relationship: how the user likes Yuki to talk to them and behave, and the running themes \
@@ -667,7 +725,7 @@ _FIELD_WHAT = {
     "interests": "Interests: hobbies, media, things they follow, current apart from earlier",
     "routines": "Routines: when they sleep, eat, play, take breaks (what the facts give)",
     "behaviour": "Behaviour: observed patterns in how they spend their time, with their numbers",
-    "people": "People: each person, who they are to the user, where they talk and what about",
+    "people": "People: each person, who they are to the user, what they do, where they talk and what about",
     "preferences": "Preferences: how they like things done (apps, tools, ways of working)",
     "relationship": "Relationship: how they like Yuki to talk and behave, from the RELATIONSHIP data only",
     "personality": "The Personality section's parts and bullets (see the personality field rules), no heading",
@@ -989,7 +1047,8 @@ for their own sake - folding in new evidence is the nightly run's job; operate o
 finding needs it, one operation per fact, each naming its finding.
 
 How the operations work (the portrait's own rules): kinds work, interest, person (one per \
-person: who they are to the user, where they talk, what about), routine, behaviour, \
+person, their summary by the person bar: who they are to the user, what they do, where they \
+are from, what they are like, the apps, what is going on with them), routine, behaviour, \
 preference, personality (with its aspect), open_loop (something owed by or to the user, with \
 its loop evidence; one owed by or to someone else is not the user's loop). UPDATE gives the \
 complete new text; the old version is kept as history. Who someone is to the user, what a \
@@ -1009,7 +1068,8 @@ that an excerpt may show.
 """ + ADMISSION_BAR + """
 Every ADD and UPDATE must meet the admission bar; a new version that fails it is refused. Never \
 write or refresh a fact from a tool's readings (newer quota, usage, cost or count figures from \
-RECENT JOURNAL): at most its one lasting line, when no fact says it yet.
+RECENT JOURNAL): at most its one lasting line, when no fact says it yet. A person fact you \
+UPDATE meets the person bar: who they are, never one call's moments, who shared what or figures.
 
 Questions: neutral and third person with no guess inside ("Whose student account was open \
 in the browser on <date>?", "Who is <name> to the user?"), about what the \
@@ -1101,6 +1161,9 @@ BAR_CATEGORIES = (
     "tooling_telemetry",   # a machine's or tool's status readings (disk, battery, builds, logs)
     "not_about_user",      # about a tool, a page or someone else, nothing about the person
     "not_useful",          # true and lasting, but would change nothing in how Yuki helps them
+    # the person bar (report 55): what a person's summary never carries
+    "person_moment",       # a moment from one call or chat, who shared, sent or showed what
+    "person_figures",      # records and figures about someone: attendance, fees, marks, scores, numbers; raw screen data
 )
 #: The bar gate's model: one forced call (no thinking) per operations call that wrote new versions.
 BAR_GATE_MAX_TOKENS = 4_000
@@ -1118,16 +1181,23 @@ journal entries it rests on (app, and whether an entry is text for or from anoth
 each fact on its own words and that evidence: what it says about the person, not how it was \
 written. Most facts pass. Never fail a fact for being about work with AI tools, about money \
 or about a tool the user built: fail it for being a tool's readings, a tool's words or one evening's \
-state. A fact that mixes lasting points with metrics fails as written; give its lasting line.
+state. A fact that mixes lasting points with metrics fails as written; give its lasting line. A \
+person fact is judged by the person bar as well: one that carries a call's or chat's moments, who \
+shared what, or figures and records about them fails as written, and its lasting line is their \
+summary without those - who they are to the user, what they do, where they are from, what they are \
+like and into, the apps, what is going on with them - in a few sentences.
 
 Call judge_bar once, listing only the facts that fail, each with:
 - category: why it fails (the first that fits): transient_state (one evening or session), \
 usage_metrics (quotas, usage, costs, burn rates, projections, counts, model mixes), ai_tool_output (an \
 AI tool's analysis, advice, report or dashboard text), tooling_telemetry (machine or tool status), \
-not_about_user, not_useful.
+not_about_user, not_useful, person_moment (a person fact's moments from one call or chat, who shared, \
+sent or showed what), person_figures (a person fact's records and figures: attendance, fees, marks, \
+scores, numbers, raw screen data).
 - lasting: the fact rewritten to only what is lasting about the person - every durable point it \
-carries (their tools and preferences, how they work, who they are), one to three sentences, third \
-person ("The user ..."), without the numbers, the evening's clock times or the tool's words; a status \
+carries (their tools and preferences, how they work, who they are), one to three sentences (a person \
+fact: up to four), third person ("The user ...", "Ravi is ..."), without the numbers, the evening's \
+clock times or the tool's words; a status \
 keeps when it was true ("in October 2026"), a past piece of work stays past. Null only when \
 nothing lasting is left or other listed facts already say all of it; nothing durable may be lost. Facts \
 resting on the same evidence share one lasting line: give it once. Never stretch one day into a habit \
