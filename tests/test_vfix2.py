@@ -1099,3 +1099,26 @@ def test_n9_a_spoken_request_reads_the_people_lately_once_and_reuses_it(tmp_path
     first = agent._people_lately()
     assert first and first[0].startswith("Hemanth (best friend); last in touch")
     assert agent._people_lately() == first and Client.reads == 1
+
+
+def test_n10_a_plain_text_ending_is_held_like_done_and_whatever_is_left_is_said(tmp_path: Path) -> None:
+    """Review (N10 not done): a reply in plain text (no done) no longer ends a request whose list has items left
+    unsaid; after the two holds the closing words name what is left, so nothing is dropped without the user hearing."""
+    desk, mem = _sam(None)
+    plan = [{"what": "open YouTube", "state": "done"}, {"what": "message Sam on Discord", "state": "todo"}]
+
+    def plain(text: str) -> SimpleNamespace:
+        return SimpleNamespace(content=[_block("text", text=text)], stop_reason="end_turn", usage=_usage(), id="m",
+                               model="m", role="assistant", model_dump=lambda **_: {})
+
+    seen: list[str] = []
+
+    def second(params: dict) -> SimpleNamespace:
+        seen.append(_texts(params))
+        return plain("YouTube is open.")
+
+    brain = Brain([_response(_use("tasks", items=plan)), plain("YouTube is open."), second, plain("All set.")])
+    events = _run(_agent(brain, tmp_path, desk, memory=_memory(mem)), "open youtube, then message sam on discord")
+    assert "your reply above was not sent and the request did not end" in seen[0]
+    finals = [e for e in events if isinstance(e, Final)]
+    assert finals and finals[-1].text == "All set. Still left from your list: message Sam on Discord."

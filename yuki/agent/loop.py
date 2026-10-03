@@ -902,6 +902,15 @@ class Agent:
         return [str(t.get("what") or "") for t in getattr(self, "_tasks", None) or []
                 if t.get("state") in ("todo", "doing")]
 
+    def _with_list_left(self, text: str) -> str:
+        """N10 (review): the closing words, with what the kept list still has when the request ends anyway (after the
+        two holds): nothing is dropped without the user hearing it. Fixed words over the list's own items; logged."""
+        left = [" ".join(x.split()) for x in self._tasks_left() if x.strip()]
+        if not left:
+            return text
+        self.logger.log("tasks_left_said", left=left)
+        return f"{text.rstrip()} Still left from your list: {'; '.join(left)}.".strip()
+
     def cancel(self, reason: str = CANCELLED) -> None:
         """Ask the run to stop. Safe to call from any thread, at any time.
 
@@ -1865,8 +1874,9 @@ class Agent:
                     window_view=view,
                 )
                 if turn.finished:
-                    self.logger.final(turn.finished[0])
-                    yield Final(turn.finished[0])
+                    final = self._with_list_left(turn.finished[0])
+                    self.logger.final(final)
+                    yield Final(final)
                     return
                 continue
 
@@ -1908,7 +1918,19 @@ class Agent:
                 self.context.add_note("Your reply was empty and nothing ran. Make the tool call now as a real tool "
                                       "call, or finish with done.")
                 continue
+            left = self._tasks_left()
+            if text and left and self._tasks_held < 2:
+                # N10 (review): a reply in plain text ends the request like done, so the kept list holds it the same way
+                self._tasks_held += 1
+                self.logger.log("tasks_held", left=left, message=text)
+                self.context.add_note(
+                    f"{CHECK_LABEL}: your reply above was not sent and the request did not end: your list still has, "
+                    f"in order: {'; '.join(left)}. Do it now. Only when their own words dropped an item, mark it "
+                    f"dropped in tasks with those words and say so in done; when all is done, mark it done in tasks "
+                    f"alongside done.")
+                continue
             if text:
+                text = self._with_list_left(text)
                 self.logger.final(text)
                 yield Final(text)
             else:
