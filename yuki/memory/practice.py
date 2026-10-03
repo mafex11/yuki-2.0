@@ -1197,7 +1197,15 @@ def stamp_successes(store: Store, *, run_keys: Sequence[str] | None = None, ok: 
             out.append((pid, key))
             done.add(pid)
     if out and not dry_run:
-        add_events(store, [{"playbook_id": pid, "type": "succeeded", "run_key": key, "at": now,
+        def when(key: str) -> float:
+            # the learner's mark is now (it just read the run); the backfill's is the run's own end, so an old way
+            # marked today is never taken for something a run in progress just taught (the return card's Learned box)
+            if run_keys is not None:
+                return now
+            head = store._query("SELECT at, ended_at FROM runs WHERE run_key=? AND step=0", (key,))
+            return float(head[0]["ended_at"] or head[0]["at"]) if head else now
+
+        add_events(store, [{"playbook_id": pid, "type": "succeeded", "run_key": key, "at": when(key),
                             "refs": {"via": "the run ended done and its last action verified"}}
                            for pid, key in out], now=now)
     return out

@@ -346,5 +346,7 @@ def test_the_backfill_marks_ways_from_verified_runs_and_its_dry_run_writes_nothi
     assert P.stamp_successes(store) == []                                       # once
     page = P.workflows(store)
     assert [c["id"] for c in page["learned"]] == [f"pb:{good}"]
+    # dated by the run's own end: an old way marked today is never "just learned" on a running job's card
+    assert page["learned"][0]["learned_at"] == NOW + 20
     assert f"pb:{bad}" not in page_text({k: page[k] for k in ("procedures", "proposals", "learned")})
     assert P.learned_way("procedure", P.ledger(store, bad)) is False
