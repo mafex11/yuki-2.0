@@ -307,7 +307,7 @@ class WebWindow:
         self.covered = False                  # a full-screen app is in front (from _watch_cover)
         self._held: set[str] = set()          # kinds of messages held while the window can't be seen
         self._held_pages: set[str] = set()
-        self._settings_sig = ""
+        self._settings_sig = self._settings_state()
         self.playing: dict[str, Any] | None = None
         self._media_at = 0.0
         self._log_path: Path | None = None
