@@ -298,7 +298,11 @@ def target_candidate(store: Any, target: str | None) -> "Candidate | None":
             if not rows:
                 return None
             j = rows[0]
-            return Candidate(f"J{j.id}", "J", j.id, j.fact, label=f"journal fact, {_day(j.at)}, {j.app}", obj=j)
+            # a misheard entry (W6): the words speech recognition heard are the subject, so the judge can point at
+            # them even where memory's sentence paraphrased them, and the alias check finds them
+            heard = (j.source or {}).get("heard") if isinstance(j.source, dict) else None
+            return Candidate(f"J{j.id}", "J", j.id, j.fact, f'heard "{heard}"' if heard else "",
+                             label=f"journal fact, {_day(j.at)}, {j.app}", obj=j)
         if letter == "C":
             f = next((f for f in store.conversation_facts(("rule", "preference", "commitment", "feedback", "resource"))
                       if f.id == n), None)
@@ -529,7 +533,7 @@ class CorrectionApplier:
         out = []
         for a in aliases:
             heard, name = a["heard"].casefold(), a["name"].casefold()
-            if any(c.get("ok") and c.get("op") == "rewrite" and heard in (c.get("old") or "").casefold()
+            if any(c.get("ok") and c.get("op") == "rewrite" and heard in (c.get("held") or c.get("old") or "").casefold()
                    and name in (c.get("new") or "").casefold() for c in changes):
                 out.append(a)
         return out
@@ -550,7 +554,8 @@ class CorrectionApplier:
         def record(e: dict[str, Any], new_id: int | None, ok: bool = True) -> None:
             c = e["cand"]
             changes.append({"surface": SURFACE_NAMES[c.surface], "ref": c.ref, "op": e["op"], "old_id": c.item_id,
-                            "new_id": new_id, "ok": ok, "old": c.text, "new": e["text"], "reason": e["reason"]})
+                            "new_id": new_id, "ok": ok, "old": c.text, "new": e["text"], "reason": e["reason"],
+                            "held": f"{c.subject} {c.text}".strip()})
 
         journal = [e for e in edits if e["cand"].surface == "J"]
         if journal:
@@ -691,7 +696,8 @@ class CorrectionApplier:
                     edits, result.rejected = self.validate(raw, cands)
                 if dry_run:
                     result.changes = [{"surface": SURFACE_NAMES[e["cand"].surface], "ref": e["cand"].ref, "op": e["op"],
-                                       "old": e["cand"].text, "new": e["text"], "reason": e["reason"]} for e in edits]
+                                       "old": e["cand"].text, "new": e["text"], "reason": e["reason"],
+                                       "held": f"{e['cand'].subject} {e['cand'].text}".strip()} for e in edits]
                     result.aliases = self.confirmed_aliases(result.aliases, [dict(c, ok=True) for c in result.changes])
                 else:
                     result.changes = self._apply(correction, edits, run_id, stats, now)

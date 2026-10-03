@@ -569,6 +569,8 @@ RECENT_DAYS = 2.0
 RECENT_LINES = 24
 #: A saved plan's marker (``--consolidate --dry-run --save FILE`` writes one, ``--apply FILE`` reads it).
 PLAN_KIND = "yuki-threads-plan"
+#: Days a pass run's undo images are kept (each nightly pass prunes older ones; the user's own closes are kept).
+UNDO_KEEP_DAYS = 30.0
 
 CONSOLIDATE_SYSTEM_PROMPT = """\
 You tidy the user's threads of work. Yuki is a personal assistant on the user's Windows PC; a \
@@ -743,7 +745,8 @@ class Consolidator:
             facts = self.store.journal_for_work_thread(t.id, limit=8)
         except Exception:
             return []
-        return [j for j in facts if usable(j) and not getattr(j, "by_yuki", False)][:NEWEST_FACTS]
+        # (oldest first from the store: the newest are the last ones)
+        return [j for j in facts if usable(j) and not getattr(j, "by_yuki", False)][-NEWEST_FACTS:]
 
     def recent_activity(self, now: float) -> list[str]:
         """What the user did on the PC in the last :data:`RECENT_DAYS` days, newest last: each work session's title (or
@@ -1001,10 +1004,16 @@ class Consolidator:
                     text = f"Wrote what {result.cards} open thread(s) stand at and their next step, said to you."
                     diary.append({"pass": "threads", "action": "present", "fact_ids": cards, "text": text})
                     result.diary.append(text)
-                diary += self._auto_pause(threads, {i for ch in changes if ch["action"] != "present"
-                                                    for i in (ch.get("ids") or [ch.get("id")])}, now, result, run_id)
+                if plan is None:   # a saved plan writes only what was reviewed (its dry run showed no auto pause)
+                    diary += self._auto_pause(threads, {i for ch in changes if ch["action"] != "present"
+                                                        for i in (ch.get("ids") or [ch.get("id")])}, now, result,
+                                              run_id)
                 if diary:
                     self.store.add_diary(run_id, diary, now=now)
+                try:   # images of runs a month old are past taking back (the nightly cards would pile up)
+                    self.store.prune_undo_images(older_than_days=UNDO_KEEP_DAYS, now=now)
+                except Exception:
+                    pass
                 result.asked = self._ask(asks, current, now)
             stats.outcome = "ok"
         except Exception as exc:

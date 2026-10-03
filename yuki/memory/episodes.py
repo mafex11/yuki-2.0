@@ -174,8 +174,9 @@ at an away break.
 Each episode also gets the two lines the user's app shows for it (the app shows the start, the end \
 and the time in every app beside them, so these never repeat them):
 - title: what the stretch was, in 2 to 5 words, as a person would name it ("Yuki voice fixes", \
-"Valorant with friends", "Maths prep for Kiran"), different from the other episodes' titles; a name, \
-never a sentence and never the summary cut short.
+"Valorant with friends", "Maths prep for Kiran"), different from the other episodes' titles and \
+from every title in TITLES ALREADY USED TODAY (a long day of one piece of work: name what this \
+stretch did that the earlier ones did not); a name, never a sentence and never the summary cut short.
 - summary: the gist, said to the user, in one or two short sentences (about 30 words at most): what \
 they did and how it went - second person ("you"), in English whatever language the journal quotes, \
 plain words, no clock times, no minutes or per-app times, no stretch-by-stretch account. Example: \
@@ -461,9 +462,11 @@ def _sequence_lines(seq: Sequence[dict[str, Any]], safe) -> list[str]:
 
 
 def build_user_message(
-    window: Window, facts: dict[str, Any], journal: Sequence[JournalEntry], nonce: str | None = None
+    window: Window, facts: dict[str, Any], journal: Sequence[JournalEntry], nonce: str | None = None,
+    used_titles: Sequence[str] = (),
 ) -> str:
-    """The fenced user message for one window."""
+    """The fenced user message for one window. ``used_titles``: the titles of the day's earlier sessions (W2: a
+    long day of one piece of work is cut into windows, and each window's titles must differ from them)."""
     nonce = nonce or str(uuid.uuid4()).upper()
     begin = f"===BEGIN_UNTRUSTED_DATA_{nonce}==="
     end = f"===END_UNTRUSTED_DATA_{nonce}==="
@@ -511,6 +514,9 @@ def build_user_message(
         journal_lines.append(line)
         used += len(line)
     parts += journal_lines or ["(none)"]
+    parts.append("TITLES ALREADY USED TODAY (earlier sessions; give each episode here a different title, naming "
+                 "what is new in it - \"Yuki voice fixes\" before becomes \"Yuki wake word tests\"):")
+    parts += [f"- {safe(t, 80)}" for t in used_titles] or ["(none)"]
     data = "\n".join(parts)
     state = (
         "finished (ended by a break or the window cap)" if window.final
@@ -669,6 +675,16 @@ class EpisodeWorker:
 
     # -- one window ------------------------------------------------------------
 
+    def _used_titles(self, window: Window) -> list[str]:
+        """The titles of the day's sessions before this window (its local calendar day, as the sessions backfill
+        groups them), oldest first, each once. Never raises."""
+        day = datetime.fromtimestamp(window.start).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        try:
+            eps = self.store.episodes_between(day, window.start)
+        except Exception:
+            return []
+        return list(dict.fromkeys(e.title for e in eps if getattr(e, "title", None) and e.started_at < window.start))
+
     def run_window(self, window: Window, now: float | None = None) -> EpisodeResult:
         """Write the episodes of one window (or record it empty / given up)."""
         now = time.time() if now is None else float(now)
@@ -690,7 +706,7 @@ class EpisodeWorker:
             else:
                 # an item that may be misheard or ambiguous is never evidence (yuki.memory.personality)
                 journal = [j for j in self.store.journal_between(window.start, window.end) if usable(j)]
-                user = build_user_message(window, facts, journal)
+                user = build_user_message(window, facts, journal, used_titles=self._used_titles(window))
                 request = {
                     "model": self.model,
                     "max_tokens": MAX_OUTPUT_TOKENS,

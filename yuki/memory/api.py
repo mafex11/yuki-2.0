@@ -2934,25 +2934,30 @@ class MemoryClient:
         leaves :meth:`misheard` at once (answered entries are never listed again). Returns ``{"ok", "ref", "verdict",
         "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered.
 
-        With Yuki's guess (the feedback round 3, W6): ``right`` means the GUESS is right - the entry is settled at once
-        and the correction pass is queued with the user's words "It was 'Ciara', not 'sea ra'" and the entry as
-        its target (the entry reworded, the name alias learned once a rewrite carries it; ``correction_id``; Undo
-        cancels it while it waits); ``as_heard`` keeps the words as heard (the old Right); ``wrong`` retires it as
-        before; a correction in the user's own words goes through :meth:`correct_item`."""
+        With Yuki's guess (the feedback round 3, W6): ``guess_right`` means the GUESS is right - the entry leaves the
+        list at once but stays uncertain (``nature`` stays ``uncertain``, never used as a fact) while the correction
+        pass, queued with the user's words "It was 'Ciara', not 'sea ra'" and the entry as its target, rewrites it
+        (the new version is settled as a fact and the name alias learned once the rewrite carries it;
+        ``correction_id``; Undo cancels it while it waits). ``right`` keeps its meaning (taken as said, as heard;
+        ``as_heard`` is the same); ``wrong`` retires it; a correction in the user's own words goes through
+        :meth:`correct_item`. ``guess_right`` on an entry with no guess is ``right``."""
         jid = self._journal_id(ref)
         verdict = str(verdict or "").strip().lower()
         out: dict[str, Any] = {"ok": False, "ref": f"journal:{jid}" if jid else str(ref or ""), "verdict": verdict,
                                "nature": None, "correction_id": None}
-        if jid is None or verdict not in ("right", "as_heard", "wrong", "undo"):
-            out["error"] = "say right, as_heard, wrong or undo for a journal entry"
+        if jid is None or verdict not in ("right", "as_heard", "guess_right", "wrong", "undo"):
+            out["error"] = "say right, guess_right, wrong or undo for a journal entry"
             return out
         guess: dict[str, Any] | None = None
-        if verdict == "right":
+        if verdict == "guess_right":
             from yuki.memory.misheard import is_listed
 
             rows = self.store.journal_by_ids([jid])
             if rows and is_listed(rows[0].source):
                 guess = rows[0].source
+                verdict = "pending"
+            else:
+                verdict = "right"
         if verdict == "as_heard":
             verdict = "right"
         if verdict == "undo" and correction_id:   # the ripple first: once its pass started, the answer stands (A3)

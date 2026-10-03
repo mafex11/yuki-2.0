@@ -592,7 +592,7 @@ WORK_STATUSES: tuple[str, ...] = ("active", "paused", "done", "merged", "dismiss
 #: ``seen``: the thread came up only in a window beside the one in front or a popup (migration 24): what it said
 #: may update where the thread stands, but the user's own last touch and its status stay as they were.
 WORK_ACTIONS: tuple[str, ...] = ("starts", "continues", "pauses", "ends", "reopens", "merged", "closed", "renamed",
-                                 "seen")
+                                 "seen", "undone")
 
 
 @dataclass
@@ -6162,7 +6162,8 @@ class Store:
     def resolve_journal(self, journal_id: int, verdict: str, *, now: float | None = None) -> dict[str, Any] | None:
         """The user's verdict on a "maybe misheard" journal entry (migration 33), deterministic, no model:
         ``right`` - its nature becomes ``fact`` and ``reviewed_at`` is set (in place: a classification the user just
-        confirmed, nothing is reworded); ``wrong`` - it is retired now (kept, superseded by a no-model batch, like a
+        confirmed, nothing is reworded); ``pending`` - answered (``reviewed_at``) but still uncertain, while the
+        correction pass rewrites it (Yuki's guess confirmed); ``wrong`` - it is retired now (kept, superseded by a no-model batch, like a
         correction's retirement); ``undo`` - either is taken back (a retirement only while it is the latest state of
         that entry). A diary line each (pass ``heard``). Returns ``{"id", "verdict", "nature", "text"}`` or ``None``
         when the entry is not there (or already resolved the other way)."""
@@ -6178,6 +6179,13 @@ class Store:
                     return None
                 conn.execute("UPDATE journal SET nature='fact', reviewed_at=? WHERE id=?", (now, int(journal_id)))
                 line = "confirmed what it heard"
+            elif verdict == "pending":
+                # Yuki's guess confirmed (W6): answered, off the list, but still uncertain (never used as a fact)
+                # until the correction pass rewrites it - a rejected rewrite leaves no misheard words as a fact
+                if row["superseded_at"] is not None:
+                    return None
+                conn.execute("UPDATE journal SET reviewed_at=? WHERE id=?", (now, int(journal_id)))
+                line = "said Yuki's guess was right (the rewrite follows)"
             elif verdict == "wrong":
                 if row["superseded_at"] is not None:
                     return None
@@ -6205,6 +6213,7 @@ class Store:
             self._insert_diary(conn, None, now, {"pass": "heard", "action": verdict, "fact_ids": [int(journal_id)],
                                                  "text": f"The user {line} for J{int(journal_id)}."})
             nature = "fact" if verdict == "right" else ("uncertain" if verdict == "undo" else row["nature"])
+            # (pending keeps its nature: row["nature"])
             return {"id": int(journal_id), "verdict": verdict, "nature": nature, "text": text,
                     "app": _shown(row["app"]) if row["app"] else ""}
 
@@ -9372,12 +9381,62 @@ class Store:
                             " AND origin IN ('journal', 'backfill') AND action != 'seen' LIMIT 1",
                             (int(tid), float(at), float(at))).fetchone() is not None
 
+    #: What a thread shows (its after-image, compared plaintext): a later change to any of these since an image was
+    #: kept means the image is no longer the thread's latest state, and putting it back would undo that change.
+    _WORK_FACE_COLUMNS = ("title_ciphertext", "kind", "status", "state_ciphertext", "open_ciphertext",
+                          "shown_ciphertext", "next_ciphertext", "merged_into", "closed_by")
+
+    def _thread_face(self, conn: sqlite3.Connection, tid: int) -> dict[str, Any] | None:
+        row = conn.execute(f"SELECT {', '.join(self._WORK_FACE_COLUMNS)} FROM work_threads WHERE id=?",
+                           (int(tid),)).fetchone()
+        if row is None:
+            return None
+        return {c: (self._dec(row[c]) if c.endswith("_ciphertext") else row[c]) for c in self._WORK_FACE_COLUMNS}
+
+    def _seal_thread_after(self, conn: sqlite3.Connection, mark: int) -> None:
+        """Keep the after-image (:data:`_WORK_FACE_COLUMNS`) on each thread image taken since ``mark``."""
+        for snap in conn.execute("SELECT id, item_id FROM undo_images WHERE id > ? AND surface='thread'"
+                                 " AND after_ciphertext IS NULL", (int(mark),)).fetchall():
+            face = self._thread_face(conn, int(snap["item_id"]))
+            if face is not None:
+                conn.execute("UPDATE undo_images SET after_ciphertext=? WHERE id=?",
+                             (self.cipher.encrypt(json.dumps({"face": face}, default=str)), int(snap["id"])))
+
+    def _thread_diverged(self, conn: sqlite3.Connection, snap: sqlite3.Row) -> bool:
+        """Whether something changed a thread after this image was kept, so putting it back would undo that: the user
+        worked on it (a journal event), a later image of it still stands (another run's card, rename or close, the
+        user's own close), or what it shows differs from the image's after-image (the user's Reopen, a correction)."""
+        tid = int(snap["item_id"])
+        if self._touched_since(conn, tid, float(snap["at"])):
+            return True
+        if conn.execute("SELECT 1 FROM undo_images WHERE surface IN ('thread', 'thread_card') AND item_id=? AND id > ?"
+                        " AND undone_at IS NULL LIMIT 1", (tid, int(snap["id"]))).fetchone() is not None:
+            return True
+        if snap["after_ciphertext"]:
+            after = json.loads(self.cipher.decrypt(snap["after_ciphertext"])).get("face")
+            if after is not None and self._thread_face(conn, tid) != after:
+                return True
+        return False
+
+    def prune_undo_images(self, *, older_than_days: float = 30.0, now: float | None = None) -> int:
+        """Drop pass images older than ``older_than_days`` (and images already taken back): a pass run is undone
+        within days or not at all, and the nightly cards would otherwise grow the table without end. The user's own
+        closes (no run) are kept, so an old close can still be reopened with its facts. Returns how many."""
+        now = time.time() if now is None else float(now)
+        cut = now - float(older_than_days) * 86400.0
+        return int(self._write(lambda conn: conn.execute(
+            "DELETE FROM undo_images WHERE at < ? AND (run_id IS NOT NULL OR undone_at IS NOT NULL)",
+            (cut,)).rowcount))
+
     def undo_work_threads(self, run_id: int, *, now: float | None = None) -> dict[str, Any]:
         """Take back what one pass run did to the threads of work (migration 35): :meth:`undo_run` for threads only.
         Returns ``{"restored", "diverged": [thread ids], "threads": [thread ids]}``."""
-        got = self.undo_run(run_id, surfaces=("thread",), now=now)
-        return {"restored": got["restored"], "diverged": got["diverged"].get("thread", []),
-                "threads": got["items"].get("thread", [])}
+        got = self.undo_run(run_id, surfaces=("thread", "thread_card"), now=now)
+
+        def both(d: dict[str, list[int]]) -> list[int]:
+            return sorted({*d.get("thread", []), *d.get("thread_card", [])})
+
+        return {"restored": got["restored"], "diverged": both(got["diverged"]), "threads": both(got["items"])}
 
     #: The simple surfaces an image keeps (migration 35): ``surface -> (table, key column, columns)``.
     _IMAGE_SURFACES: dict[str, tuple[str, str, tuple[str, ...]]] = {
@@ -9426,7 +9485,8 @@ class Store:
     def undo_run(self, run_id: int, *, surfaces: Sequence[str] | None = None, now: float | None = None
                  ) -> dict[str, Any]:
         """Take back everything one pass run changed (migration 35's images), newest change first: a thread gets its
-        before-image back unless the user worked on it since (a journal event after the change); a simple surface
+        before-image back unless anything changed it since (:meth:`_thread_diverged`: the user's work, their close or
+        Reopen, a later run's change); a simple surface
         gets its old values back only while the run's values still stand (a later change is never undone). Returns
         ``{"restored", "items": {surface: [ids]}, "diverged": {surface: [ids]}}``."""
         now = time.time() if now is None else float(now)
@@ -9442,7 +9502,7 @@ class Store:
                 if surfaces is not None and surface not in surfaces:
                     continue
                 if surface == "thread":
-                    if self._touched_since(conn, item, float(snap["at"])):
+                    if self._thread_diverged(conn, snap):
                         diverged.setdefault(surface, []).append(item)
                         continue
                     self._restore_work_thread(conn, snap, now)
@@ -9463,9 +9523,10 @@ class Store:
                 restored += 1
                 if item not in items.setdefault(surface, []):
                     items[surface].append(item)
+            # logged as "undone", never a touch (WORK_TOUCHES): taking a pass back is not the user working on the thread
             for tid in items.get("thread", []):
                 conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
-                             " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "reopens", None, "undo", now))
+                             " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "undone", None, "undo", now))
             return {"restored": restored, "items": items,
                     "diverged": {k: sorted(set(v)) for k, v in diverged.items()}}
 
@@ -9473,8 +9534,9 @@ class Store:
 
     def reopen_work_thread(self, thread_id: int, *, now: float | None = None) -> dict[str, Any] | None:
         """The user's Reopen (or the Undo of their close or dismiss, migration 35): the thread is open again as it was
-        before it was closed - its before-image back when one was kept (a dismissed thread gets its facts, links and
-        vector back), else it is made active. Returns ``{"id", "status"}`` or ``None`` when it is not closed (or gone,
+        before it was closed - its before-image back when one was kept and nothing changed the thread since (a
+        dismissed thread gets its facts, links and vector back); else only the close is taken back (status and who
+        closed it), so a later rename or card stays. Returns ``{"id", "status"}`` or ``None`` when it is not closed (or gone,
         or merged into another)."""
         now = time.time() if now is None else float(now)
 
@@ -9485,8 +9547,11 @@ class Store:
             snap = conn.execute("SELECT * FROM undo_images WHERE surface='thread' AND item_id=? AND undone_at IS NULL"
                                 " AND action IN ('close', 'dismiss') ORDER BY id DESC LIMIT 1",
                                 (int(thread_id),)).fetchone()
-            if snap is not None and not self._touched_since(conn, int(thread_id), float(snap["at"])):
-                self._restore_work_thread(conn, snap, now)
+            if snap is not None:
+                if not self._thread_diverged(conn, snap):
+                    self._restore_work_thread(conn, snap, now)
+                else:   # changed since the close (a rename, a card): only the close is taken back, never those
+                    conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, int(snap["id"])))
             status = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()["status"]
             if status not in ("active", "paused"):
                 status = "active"
@@ -9538,6 +9603,12 @@ class Store:
         who = by or ("user" if origin == "user" else "model")
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            first = int(conn.execute("SELECT coalesce(max(id), 0) FROM undo_images").fetchone()[0])
+            body(conn)
+            self._seal_thread_after(conn, first)   # what each changed thread shows now: a later change is never undone
+            return out
+
+        def body(conn: sqlite3.Connection) -> None:
             for ch in changes:
                 action = ch.get("action")
                 touched = ([int(i) for i in ch.get("ids") or []] if action == "merge"
@@ -9548,7 +9619,7 @@ class Store:
                     conn.execute("DELETE FROM undo_images WHERE id > ?", (mark,))   # nothing changed: no undo
                     out.append({**{k: v for k, v in ch.items() if k not in ("vector",)}, "ok": False, "why": why})
 
-                for tid in touched:
+                for tid in touched if action != "present" else ():   # a card keeps a small image of its own
                     if conn.execute("SELECT 1 FROM work_threads WHERE id=? AND status NOT IN ('merged', 'dismissed')",
                                     (tid,)).fetchone() is not None:
                         self._snapshot_work_thread(conn, tid, run_id=run_id, action=str(action), by=who, now=now)
@@ -9617,11 +9688,19 @@ class Store:
                         continue
                     if action == "present":
                         # where it stands and the next step, said to the user; the state and its date stay
+                        # (only the two card columns' before- and after-image are kept: the whole thread's every
+                        # night would grow undo_images without end)
                         shown = " ".join(str(ch.get("shown") or "").split())
                         nxt = " ".join(str(ch.get("next") or "").split())
-                        conn.execute("UPDATE work_threads SET shown_ciphertext=coalesce(?, shown_ciphertext),"
-                                     " next_ciphertext=?, updated_at=? WHERE id=?",
-                                     (self._enc(shown or None), self._enc(nxt or None), now, tid))
+                        after = {"shown_ciphertext": self._enc(shown or None) or row["shown_ciphertext"],
+                                 "next_ciphertext": self._enc(nxt or None)}
+                        conn.execute("UPDATE work_threads SET shown_ciphertext=?, next_ciphertext=?, updated_at=?"
+                                     " WHERE id=?", (after["shown_ciphertext"], after["next_ciphertext"], now, tid))
+                        before = {c: row[c] for c in ("shown_ciphertext", "next_ciphertext")}
+                        conn.execute("INSERT INTO undo_images(run_id, surface, item_id, action, by, at,"
+                                     " before_ciphertext, after_ciphertext) VALUES (?,?,?,?,?,?,?,?)",
+                                     (run_id, "thread_card", tid, "present", who, now,
+                                      self.cipher.encrypt(json.dumps(before)), self.cipher.encrypt(json.dumps(after))))
                         out.append({"action": action, "id": tid, "ok": True})
                         continue
                     if action == "close":
@@ -9651,7 +9730,6 @@ class Store:
                                  " created_at) VALUES (?,?,?,?,?,?)",
                                  (tid, now, event, self._enc(ch.get("state") or ch.get("reason") or None), origin, now))
                     out.append({"action": action, "id": tid, "ok": True})
-            return out
 
         return self._write(op) if changes else []
 
