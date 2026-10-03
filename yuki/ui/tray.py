@@ -17,9 +17,9 @@ working        eyes under a dim lid, the mouth is the step bar (4 x 300 ms)
 needs-you      raised eyes, a mint "o" mouth
 stopped        squeezed "> <" eyes: voice stopped
 call-ask       shut eyes, a soft mouth, no rec dot (the consent card waits)
-call           shut eyes, a soft mouth, the mint rec dot (your mic is recorded)
+call           shut eyes, a soft mouth, the mint rec dot (the call is recorded: what is kept, in the card)
 off            the whole face dim, a hollow corner ring: not listening
-game           shut eyes, no mouth; the rec dot only while a call records
+game           shut eyes, no mouth; the rec dot only while a call or the game's voice chat records
 =============  ==========================================================
 
 **The hover card** grows out of the icon in every state when the pointer rests on it: Windows says so
@@ -258,7 +258,7 @@ class TrayCardInfo:
     timer: str = ""                   # the call's running time inside ``line`` (drawn in the live colour)
 
 
-LISTEN_OFF_TEXT = ("I can't hear you or talk. Typing still works. Call notes still record your mic; "
+LISTEN_OFF_TEXT = ("I can't hear you or talk. Typing still works. Call notes still record; "
                    "right-click → Pause listening for this call to skip one.")
 
 
@@ -589,8 +589,10 @@ class TrayWatch(QObject):
     # -- the state -----------------------------------------------------------------------------------------------
 
     def _recording(self) -> bool:
-        call = self.island.inputs.call
-        return bool(call) and call.get("status") == "recording"
+        """Something is kept now: the mic, or any app's own sound (``call_status()``'s top-level ``recording``)."""
+        from yuki.ui.island import call_rec
+
+        return call_rec(self.island.inputs.call)
 
     def current(self) -> str:
         i = self.island.inputs
@@ -657,10 +659,15 @@ class TrayWatch(QObject):
 
     def card_info(self) -> TrayCardInfo:
         """The card's rows for the state now, from what the island and the voice know (no content is logged)."""
+        from yuki.ui.call_words import call_line, session_name, where_words
+
         i = self.island.inputs
         state = self.current()
-        app = str((i.call or {}).get("app") or getattr(i, "call_asking", "") or "the call")
+        call = i.call or {}
         timer = self.island.call_time() if self._recording() else ""
+        # what is kept, from call_status()'s mic and tracks: "Recording · Discord + you" (yuki.ui.call_words)
+        kept_line = call_line(call) if call else ""
+        timed = " · ".join(x for x in (kept_line, timer) if x)
         hot = self._hotkey()
         info = TrayCardInfo(state=state, listen=bool(getattr(self.voice, "wake_enabled", i.listening != "off")),
                             game=state == "game", timer=timer)
@@ -702,18 +709,21 @@ class TrayWatch(QObject):
             info.line, info.sub = "Voice stopped", i.voice_error or "Something broke"
             info.task, info.task_kind = "Try again, or pick a microphone in Settings", "voice"
         elif state == "call-ask":
-            info.line, info.sub = f"On {app} · not recording", "Waiting for your answer on the card"
+            asking = {"app": getattr(i, "call_asking", ""), "kind": getattr(i, "call_asking_kind", "") or "call"}
+            info.line, info.sub = f"{session_name(asking)} · not recording", "Waiting for your answer on the card"
         elif state == "call":
-            info.line, info.sub = f"On {app} · {timer} · recording only your mic", ""
+            info.line = " · ".join(x for x in (where_words(call), timer) if x)
+            info.sub = kept_line
         elif state == "off":
             info.line = "Not listening for “Yuki”"      # the mock (item 21)
             paused = bool(getattr(self.voice, "call_off", False)) or i.listening == "call_off"
             info.sub = "Paused for this call" if paused else "Quiet for a while" if i.listening == "quiet" else ""
-            if timer:                    # call notes still record your mic: the card keeps the call's time
-                info.sub = f"Call notes · {app} · {timer}"
+            if timer:                    # call notes still record: the card keeps what is kept and the call's time
+                kept_words = str(call.get("kept") or "") or session_name(call)
+                info.sub = f"Call notes · {kept_words} · {timer}"
         elif state == "game":
             info.line = "Quiet while you play"
-            info.sub = f"On {app} · {timer} · your mic only" if timer else "Cards wait until you’re back"
+            info.sub = timed if timer else "Cards wait until you’re back"
         return info
 
     def show_card(self) -> None:
@@ -788,7 +798,8 @@ class TrayWatch(QObject):
 
 
 def _call_recording(ui: Any) -> bool:
-    """Whether call notes are recording the user's mic now (the call controller knows)."""
+    """Whether call notes keep anything now: the mic, a call app's own sound or a game's voice chat (the call
+    controller follows ``call_status()``'s top-level ``recording``), so the menu's way to stop them is there."""
     return bool(getattr(getattr(ui, "calls", None), "recording", False))
 
 

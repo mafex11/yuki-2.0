@@ -844,7 +844,11 @@ def build_status(memory: Any, *, real_db: Path | None = None) -> StatusView:
     except Exception:
         sww = None
     waiting = memory.call_audio_waiting()
-    call = memory.call_status().get("call")
+    # the row being recorded with what is kept ("Recording · Discord + you", yuki.ui.call_words), else the call
+    from yuki.ui.call_words import live_view
+
+    cs = memory.call_status() or {}
+    call = live_view(cs) or cs.get("call")
     return StatusView(
         running, st["paused"], st["captures_today"], st["facts_today"], epoch(st["last_capture_at"]),
         epoch(st["portrait_updated_at"]), st["memory_cost_today_usd"], waiting,
@@ -895,6 +899,9 @@ class SettingsView:
     start_with_windows: bool | None
     model: str
     effort: str
+    #: The privacy file's [calls] knobs (``record_others``, ``game_voice``): what a recorded call keeps, as text.
+    #: A default (a class attribute), so a snapshot pickled before it still reads.
+    call_knobs: Any = None
 
 
 def build_settings(memory: Any) -> SettingsView:
@@ -911,11 +918,13 @@ def build_settings(memory: Any) -> SettingsView:
     except Exception:
         sww = None
     alias = next((a for a, m in MODEL_ALIASES.items() if m == DEFAULT_MODEL), DEFAULT_MODEL)
+    from yuki.ui.web_data import call_knobs
+
     return SettingsView(
         prefs.get("mic_device") or "System default", prefs.get("speaker_device") or "System default",
         prefs.get("tts_voice") or "", bool(prefs.get("wake", True)), bool(nudges.get("enabled", True)),
         nudges.get("quiet_start", "00:30"), nudges.get("quiet_end", "08:00"),
         bool(nudges.get("questions_enabled", True)), memory.call_prefs(), list(user.get("blocked_apps", [])),
         list(user.get("blocked_domains", [])), memory.status()["paused"], sww, alias.capitalize(),
-        DEFAULT_EFFORT.capitalize(),
+        DEFAULT_EFFORT.capitalize(), call_knobs(privacy),
     )

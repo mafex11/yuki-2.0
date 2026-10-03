@@ -922,11 +922,19 @@ class WindowHost(QObject):
 
 def call_signature(status: dict[str, Any]) -> str:
     """What of a ``call_status()`` the window shows (machine fields only): the call, its status, recording, the
-    app, when its session began, and the transcripts waiting. Equal signatures need no forward."""
+    app, when its session began, what is kept (the mic's and each app track's state, the rows that go on: a game
+    joining a call changes the words), and the transcripts waiting. Equal signatures need no forward (the speech
+    seconds, which grow with every chunk, are left out)."""
     call = status.get("call") if isinstance(status.get("call"), dict) else {}
     waiting = status.get("waiting") if isinstance(status.get("waiting"), dict) else {}
+    mic = status.get("mic") if isinstance(status.get("mic"), dict) else {}
+    tracks = tuple((t.get("call_id"), t.get("app"), t.get("track_kind"), t.get("state"))
+                   for t in status.get("tracks") or [] if isinstance(t, dict))
+    sessions = tuple((s.get("id"), s.get("app"), s.get("kind"), s.get("status"))
+                     for s in status.get("sessions") or [] if isinstance(s, dict))
     return repr((call.get("id"), call.get("status"), bool(call.get("asking")), bool(status.get("recording")),
-                 call.get("app"), call.get("session_started_at"), call.get("recording_since"),
+                 call.get("app"), call.get("kind"), call.get("session_started_at"), call.get("recording_since"),
+                 mic.get("state"), mic.get("reason"), mic.get("call_id"), tracks, sessions,
                  waiting.get("calls"), waiting.get("minutes")))
 
 

@@ -19,7 +19,8 @@ working, thinking   a request runs: "Working · step 2" (no plan, so never "of N
                     the brain's own live line of what it checks or does and why, the step, the time, Stop and the
                     run card
 done-flash          the run ended: the result in a few words for 3 s, a stamped check
-call-notice         a call started recording: "Recording your mic · Discord" for 2.5 s, then nothing
+call-notice         a call or a game's voice chat started recording: what is kept ("Recording · Discord + you",
+                    "Recording · VALORANT voice + you") for 2.5 s, then nothing; said again when a game joins a call
 quiet-in-call       a call is recorded and nothing else goes on: hidden (the timer is in the tray's hover card)
 not-listening       Yuki isn't listening (switched off, quiet, off for this call): hidden (the tray says it)
 hidden-armed        listening for its name only: the tiny resting pill (click-through), or nothing (a setting)
@@ -60,6 +61,7 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect, QLineEdit, QSizePolicy, QW
 
 from yuki.ui import lattice as L
 from yuki.ui import tokens as T
+from yuki.ui.call_words import call_rec
 from yuki.ui.dots import FACE_W, HALO_GAP, HALO_H, HALO_W, FaceWidget, HaloWidget
 from yuki.ui.lattice_cards import SendCard
 
@@ -227,8 +229,9 @@ class IslandInputs:
     fullscreen: bool = False
     fullscreen_title: str = ""
     fullscreen_kind: str = ""                # "locked" | "d3d" | "presentation" | "window" (why it hides; logged)
-    notice: str = ""                         # the call's start notice ("Recording your mic · Discord"), 2.5 s
+    notice: str = ""                         # the call's start notice ("Recording · Discord + you"), 2.5 s
     call_asking: str = ""                    # the app of a call whose consent card waits ("" when none)
+    call_asking_kind: str = ""               # that card's row: "call" | "game" (a game's voice chat)
     final: FinalInfo | None = None
     transient: str = ""
     spoken: str = ""
@@ -267,7 +270,9 @@ def resolve(i: IslandInputs) -> str:
 
 
 def call_on(call: dict | None) -> bool:
-    return bool(call) and call.get("status") in ("recording", "waiting_headphones")
+    """A call session is on the island: something is kept (``recording``, the status's top-level flag that
+    :func:`yuki.ui.call_words.live_view` carries), or its row may record (recording, waiting for headphones)."""
+    return bool(call) and (call.get("recording") is True or call.get("status") in ("recording", "waiting_headphones"))
 
 
 def call_since(call: dict | None) -> float | None:
@@ -368,7 +373,7 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
     it; needs-you and voice-stopped always show the full bar. ``resting``: the setting for idle (the tiny pill, or
     nothing)."""
     now = time.monotonic() if now is None else now
-    rec = bool(i.call) and (i.call or {}).get("status") == "recording"
+    rec = call_rec(i.call)
     run = i.run
     app = str((i.call or {}).get("app") or "the call")
     if state == "game-quiet":
@@ -391,9 +396,9 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
             face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
         # the halo belongs to the open island: the pill never carries it
         return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=step_of(run),
-                    title=compact_word(state, i))
+                    title=_notice_title(i) if state == "call-notice" else compact_word(state, i))
     if state == "call-notice":
-        return Spec(state, face="quiet-in-call", compact=True, word=i.notice, rec=rec, title=i.notice)
+        return Spec(state, face="quiet-in-call", compact=True, word=i.notice, rec=rec, title=_notice_title(i))
     if state == "listening":
         starting = i.voice == "starting"
         sub = (f"{voice_key} to stop · dim words are unsure" if voice_key else "dim words are unsure")
@@ -463,6 +468,33 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         return Spec(state, face="handed", line=f.text, sub=f.meta or _final_sub(f), chip=f.outcome, keys=keys)
     del app
     return Spec("hidden-armed", face="idle", hidden=True, why_hidden="unknown state")
+
+
+def _notice_title(i: IslandInputs) -> str:
+    """The call notice's tooltip: the whole line ("Recording · Discord + VALORANT voice + you"), even when the pill
+    shows its shorter form."""
+    from yuki.ui.call_words import call_line
+
+    return (call_line(i.call) if i.call else "") or i.notice
+
+
+def notice_words(call: dict | None, avail: float | None = None) -> str:
+    """The call notice's words for the compact pill: the short line ("Recording · Discord + VALORANT + you"); when
+    it measures wider than the pill's room (``avail`` px, the pill's widest less its face, gaps and rec dot), the
+    words alone (the rec dot already says recording). Measured on the pill's own font."""
+    from yuki.ui.call_words import call_line
+
+    call = call or {}
+    line = str(call.get("short") or "") or call_line(call)
+    words = str(call.get("short_words") or "")
+    if not words or avail is None:
+        return line
+    return line if QFontMetricsF(L.ui_font(13.5, 500)).horizontalAdvance(line) <= avail else words
+
+
+#: The compact pill's room for its words while the rec dot shows (COMPACT_MAX_W less the face, pads and gaps).
+NOTICE_ROOM = COMPACT_MAX_W - (1 + COMPACT_PAD + FACE_W * COMPACT_PITCH + COMPACT_GAP + 4 + COMPACT_GAP + 7
+                               + COMPACT_PAD_R + 1)
 
 
 def _final_sub(f: FinalInfo) -> str:
@@ -1268,7 +1300,7 @@ class RecDot(QWidget):
         super().__init__(parent)
         self.setFixedSize(7, 7)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setToolTip("Recording your mic")
+        self.setToolTip("Recording")
 
     def set_time(self, _text: str) -> None:   # the old rec chip's interface: no timer on the island any more
         return
@@ -2058,20 +2090,26 @@ class Island(QObject):
         self.refresh()
 
     def _call_changed(self, before: dict | None, now: dict | None) -> None:
-        """A call that starts recording says so for 2.5 s ("Recording your mic · Discord"), once per call session;
-        after that nothing about the call stays on screen (the tray's icon and hover card carry it)."""
-        recording = bool(now) and (now or {}).get("status") == "recording"
-        if not recording:
+        """A call (or a game's voice chat) that starts recording says what is kept for 2.5 s ("Recording · Discord
+        + you"), once per call session, and once more when a game joins the call or the call ends while the game
+        goes on (the kinds of rows that may record changed); after that nothing about the call stays on screen (the
+        tray's icon and hover card carry it). While the notice shows, its words follow the status (an app's sound
+        that was still opening joins them)."""
+        if not call_rec(now):
             if self.inputs.notice:
                 self._notice_timer.stop()
                 self.inputs = replace(self.inputs, notice="")
             return
-        key = (now or {}).get("session_started_at") or (now or {}).get("id") or (now or {}).get("detected_at")
+        now = now or {}
+        session = now.get("session_started_at") or now.get("id") or now.get("detected_at")
+        key = (session, tuple(now.get("kinds") or ()))
+        words = notice_words(now, NOTICE_ROOM)
         if key == self._noticed_call:
+            if self.inputs.notice and self._notice_timer.isActive() and words != self.inputs.notice:
+                self.inputs = replace(self.inputs, notice=words)
             return
         self._noticed_call = key
-        app = str((now or {}).get("app") or "").strip()
-        self.inputs = replace(self.inputs, notice=f"Recording your mic · {app}" if app else "Recording your mic")
+        self.inputs = replace(self.inputs, notice=words)
         self._notice_timer.start(CALL_NOTICE_MS)
         del before
 
@@ -2821,13 +2859,21 @@ class IslandCallIndicator(QObject):
 
 
 def on_call_status(island: Island, status: Any) -> None:
-    """``CallController.changed``: the call being recorded (or waiting for headphones) goes on the island."""
-    call = (status or {}).get("call") if isinstance(status, dict) else None
-    asking = str(call.get("app") or "a call") if isinstance(call, dict) and call.get("asking") else ""
-    island.update(call=call if call_on(call) else None, call_asking=asking)
+    """``CallController.changed``: the session being recorded (or waiting for headphones) goes on the island, as
+    :func:`yuki.ui.call_words.live_view` says it (what is kept: the mic, the call's own sound, a game's voice chat);
+    a consent card that waits (the live call's, or a game's right after its session) makes the tray's call-ask."""
+    from yuki.ui.call_words import card_target, live_view
+
+    status = status if isinstance(status, dict) else {}
+    view = live_view(status)
+    target = card_target(status)
+    asking = str(target.get("app") or "a call") if target else ""
+    island.update(call=view if call_on(view) else None, call_asking=asking,
+                  call_asking_kind=str((target or {}).get("kind") or "call") if target else "")
 
 
 __all__ = ["BAR_H", "FinalInfo", "ForegroundWatch", "Island", "IslandCallIndicator", "IslandInputs", "IslandStrip",
-           "IslandVoice", "IslandWindow", "RunInfo", "STATES", "Spec", "Steer", "active_screen", "call_since",
-           "caption_spans", "clock", "compact_word", "elapsed", "fullscreen_kind", "on_call_status", "pick_screen",
+           "IslandVoice", "IslandWindow", "RunInfo", "STATES", "Spec", "Steer", "active_screen", "call_on",
+           "call_rec", "call_since", "caption_spans", "clock", "compact_word", "elapsed", "fullscreen_kind",
+           "notice_words", "on_call_status", "pick_screen",
            "resolve", "spec_for", "WindowFacts", "window_facts"]

@@ -442,7 +442,7 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     assert rows["c41"]["why"] == "rule: “Tell me when the forum thread gets a reply.”"
     assert rows["c42"]["why"] == "you stopped mid-way"
     call = next(r for r in d["rows"] if r["kind"] == "call")
-    assert call["why"] == "rule: Signal calls, your mic only" and call["f"] == "calls" and call["result"] == "turned into text"
+    assert call["why"] == "rule: always for Signal calls" and call["f"] == "calls" and call["result"] == "turned into text"
     assert len([r for r in d["rows"] if r["kind"] == "call"]) == 1   # an unrecorded meeting is nothing Yuki did
     assert d["counts"]["did_today"] >= 4 and d["counts"]["no_reason"] == 0
 

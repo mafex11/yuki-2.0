@@ -127,7 +127,7 @@
   /* a call today: when, where, who; opened, what was said (the gists, said to you) */
   function callRow(c) {
     const head = [h('span', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }), h('span', { class: 'tt' }, h('span', { class: 'tx', text: c.where || c.app || 'Call' }),
-      h('span', { class: 'kind', text: c.recorded ? 'your side kept' : 'not recorded' }), c.live && c.started_at ? Y.recChip(c.started_at) : null)];
+      h('span', { class: 'kind', text: c.recorded ? 'recorded' : 'not recorded' }), c.live && c.started_at ? Y.recChip(c.started_at) : null)];
     const gists = c.gists || [];
     const body = [(c.people || []).length ? h('div', { class: 'who', text: 'with ' + c.people.join(', ') }) : null,
       gists.length ? h('ul', { class: 'gists' }, gists.map((g) => h('li', { text: g }))) : h('div', { class: 't2', text: c.recorded ? (c.live ? 'Live now. Turned into text when the PC is free.' : 'Waiting to be turned into text.') : `${fmt.dur(c.min || 0)}, not recorded.` })];
@@ -171,7 +171,7 @@
       h('div', { class: 'tt', text: s ? (s.title || app || 'At the PC') : (b.m === 'off' ? 'The PC was off' : b.m === 'away' ? 'Away from the keyboard' : b.m === 'future' ? 'Not yet' : 'Nothing recorded') }),
       s ? h('div', { class: 'b', text: `${s.start}–${s.end}${app && app !== s.title ? ' · ' + app : ''}` }) : null,
       s && (s.apps || []).length > 1 ? h('div', { class: 'b t3', text: s.apps.slice(1, 4).map(([n, m]) => `${n} ${fmt.dur(m)}`).join(', ') }) : null,
-      call ? h('div', { class: 'b' }, h('b', { text: `${call.app || ''} call` }), ` ${call.start}–${call.live ? 'now' : call.end}${call.recorded ? '' : ', not recorded'}`) : null]);
+      call ? h('div', { class: 'b' }, h('b', { text: `${call.app || ''} ${call.kind === 'game' ? 'voice chat' : 'call'}` }), ` ${call.start}–${call.live ? 'now' : call.end}${call.recorded ? '' : ', not recorded'}`) : null]);
     const tw = 300, y = ev ? Math.max(0, Math.min(r.height - 130, ev.clientY - r.top - 60)) : 96;
     const left = x + 18 + tw > r.width ? x - 18 - tw : x + 18;
     tip.style.transform = `translate(${Math.round(left)}px, ${Math.round(y)}px)`;

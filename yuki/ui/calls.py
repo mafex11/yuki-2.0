@@ -1,26 +1,30 @@
-"""Calls, "just my side": the consent card, the "remembering your side" indicator, and Stop.
+"""Calls, both sides: the consent card, the "what is being kept" indicator, and Stop.
 
-The memory service (:mod:`yuki.memory.calls`) detects a call and writes a
-``calls`` row; it sets the named auto-reset event
-:data:`CALL_EVENT_NAME` whenever the call's state changes. :class:`CallWatcher`
-waits on it (and looks every :data:`FALLBACK_POLL_S` anyway) and fetches
-``call_status()``.
+Since 3 Oct 2026 (handbook rule 9, report 60) a call is recorded on both sides: the user's microphone (headphones
+only) and the call app's own sound; a game's own voice chat is a session of its own (``kind`` "game") with its own
+track. The memory service (:mod:`yuki.memory.calls`) detects a call or a game's voice chat and writes a ``calls``
+row; it sets the named auto-reset event :data:`CALL_EVENT_NAME` whenever their state changes. :class:`CallWatcher`
+waits on it (and looks every :data:`FALLBACK_POLL_S` anyway) and fetches ``call_status()``.
 
-:class:`CallController` shows, bottom-right and never taking focus:
+:class:`CallController` shows, never taking focus:
 
-* :class:`CallConsentCard` while memory is asking - "Remember what you say in
-  this call?" with Yes, No, Always for <app>, Never for <app>; when the output
-  is not headphones it says recording only happens with headphones. Every
-  press goes to ``answer_call`` exactly once; a card left alone goes away after
-  the call's ``ask_timeout_s`` and is answered ``none`` (nothing recorded).
-* :class:`CallIndicator`, a small pill, while memory records the user's side
-  (or waits for headphones), out of the way of cards and full-screen apps.
+* :class:`CallConsentCard` while memory is asking (:func:`yuki.ui.call_words.card_target`): a call's card ("You're
+  on a Discord call." - your mic and Discord's sound, turned into text later on this PC), a game's ("Remember
+  VALORANT voice chat?" - your mic and the game's voice chat as their own track), never for a game still waiting
+  to be seen (``ask_later``), and the card of a game session that ended before it could be shown
+  (``pending_card``). Without headphones it says the mic waits for them while the app's sound is kept either way.
+  Record / Not this call and Always for <app> (Record = yes or always, Not = no or never); every press goes to
+  ``answer_call`` exactly once; a card left alone goes away after its ``ask_timeout_s`` and is answered ``none``
+  (nothing recorded).
+* The indicator (the island now, :mod:`yuki.ui.island`; :class:`CallIndicator` is the older pill) while anything
+  is kept or a row waits for headphones: "Recording · Discord + you", "Recording · VALORANT voice + you",
+  "Recording · Discord (your mic waits for headphones)" (:mod:`yuki.ui.call_words`, from ``mic`` and ``tracks``).
 
-The tray's "Stop remembering this call" calls :meth:`CallController.stop_call`; while
-call audio waits for the deferred transcriber the tray shows "N calls waiting
-to be remembered" (also on the Today panel) and offers "Erase waiting call
-audio" (:meth:`CallController.erase_waiting`).
-Nothing here reads, sends or shows anything that was said.
+The tray's way to stop (Pause listening for this call, the window's Stop remembering) calls
+:meth:`CallController.stop_call`; :attr:`CallController.recording` follows the status's top-level ``recording``, so
+Stop is there whenever anything is kept (an app's own sound alone too). While call audio waits for the deferred
+transcriber the tray shows "N calls waiting to be remembered" (also on the Today panel) and offers "Erase waiting
+call audio" (:meth:`CallController.erase_waiting`). Nothing here reads, sends or shows anything that was said.
 """
 
 from __future__ import annotations
@@ -33,6 +37,8 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
+from yuki.ui.call_words import (RECORDING_STATUSES, call_rec, card_keys, card_target, consent_text, head_label,
+                                indicator_text, is_game, live_view)
 from yuki.ui.surface import SurfaceWindow
 from yuki.ui.lattice_cards import LatticeCard
 from yuki.ui.nudges import BUSY_NOTIFICATION_STATES, NudgeWatcher, notification_state
@@ -51,21 +57,6 @@ INDICATOR_WIDTH = 236
 INDICATOR_HEIGHT = 40
 _GAP = 8
 
-HEADPHONES_NOTE = "Only with headphones, so other people's voices aren't picked up."
-
-
-def consent_text(call: dict[str, Any]) -> tuple[str, str, str]:
-    """``(question, detail, headphones note or "")`` for a ``call_status()["call"]``."""
-    app = str(call.get("app") or "this app")
-    # the Lattice design's words: the call, then the question with what is kept and when it becomes text
-    detail = ("Keep a private timeline of what you say? Only your mic, never theirs. I transcribe it later, "
-              "when the GPU is idle.")
-    note = ""
-    if call.get("headphones") is False:
-        output = call.get("form_factor") or "not headphones"
-        note = f"{HEADPHONES_NOTE} Your sound is on {output} now, so I'd wait for headphones."
-    return f"You’re on a {app} call." if call.get("app") else "You’re on a call.", detail, note
-
 
 def waiting_text(waiting: Any) -> str:
     """``"2 calls waiting to be remembered"`` for ``call_status()["waiting"]``; ``""`` when none."""
@@ -79,11 +70,9 @@ def waiting_text(waiting: Any) -> str:
 NOT_LISTENING_TEXT = "Yuki isn't listening"
 
 
-def indicator_text(call: dict[str, Any]) -> str:
-    app = str(call.get("app") or "")
-    if call.get("status") == "waiting_headphones":
-        return f"Waiting for headphones, {app}" if app else "Waiting for headphones"
-    return f"Remembering your side, {app}" if app else "Remembering your side"
+def _waiting_only(call: dict[str, Any]) -> bool:
+    """Nothing is kept this moment and the row waits for headphones: the pill has no rec dot and no timer."""
+    return call.get("status") == "waiting_headphones" and not call_rec(call)
 
 
 class CallWatcher(NudgeWatcher):
@@ -113,8 +102,11 @@ class CallWatcher(NudgeWatcher):
 
 class CallConsentCard(LatticeCard):
     """The consent card in the Lattice design (top right, the design's ``.card.top``): "Call · Discord · 21:06", the
-    question in 17 px, what is and is not recorded, **Record my side** and **Not this call**, and a check
-    "Always for Discord" (checked: Record answers ``always``, Not this call answers ``never``). Never takes focus.
+    question in 17 px, what is recorded (your mic and Discord's sound, :func:`yuki.ui.call_words.consent_text`),
+    **Record this call** and **Not this call**, and a check "Always for Discord" (checked: Record answers
+    ``always``, Not this call answers ``never``). A game's voice chat: "Game voice · VALORANT · 21:06", "Remember
+    VALORANT voice chat?", **Record it** / **Not this time**; a game that already ended (its card could not be shown
+    over it): **Yes** / **No**, Always holding for the next one. Never takes focus.
 
     Signals:
         answered: ``(call, answer)`` -- ``yes`` | ``no`` | ``always`` | ``never``, or ``none``
@@ -147,7 +139,7 @@ class CallConsentCard(LatticeCard):
         acts = QHBoxLayout()
         acts.setContentsMargins(0, 14, 0, 0)
         acts.setSpacing(6)
-        self.yes_button = L.Key("Record my side", variant="pri", size="sm", icon="rec", parent=self)
+        self.yes_button = L.Key("Record this call", variant="pri", size="sm", icon="rec", parent=self)
         self.no_button = L.Key("Not this call", size="sm", parent=self)
         self.always_button = L.Check("Always for this app", self)
         #: Kept for older callers: "never" is Not this call with the check on.
@@ -170,16 +162,26 @@ class CallConsentCard(LatticeCard):
         self.update()
 
     def set_call(self, call: dict[str, Any]) -> None:
-        """Fill the card for one call and size it (no showing)."""
+        """Fill the card for one row (a call, a game's voice chat, or a game that already ended) and size it (no
+        showing)."""
         self.call = call
         question, detail, note = consent_text(call)
         from yuki.ui.memory import local_moment
 
         app_name = str(call.get("app") or "")
-        self.title.setText(f"{app_name} started a call" if app_name else "A call started")
+        game = is_game(call)
+        if game:
+            self.title.setText(f"{app_name} voice chat" if app_name else "Game voice chat")
+        else:
+            self.title.setText(f"{app_name} started a call" if app_name else "A call started")
         moment = local_moment(call.get("detected_at"))
         self.when.setText(moment.strftime("%H:%M") if moment else "")
-        self.set_head("call", " · ".join(x for x in ("Call", app_name, self.when.text()) if x))
+        ended = local_moment(call.get("ended_at")) if call.get("ended") else None
+        when = f"{self.when.text()}–{ended:%H:%M}" if ended is not None and self.when.text() else self.when.text()
+        self.set_head("call", " · ".join(x for x in (head_label(call), when) if x))
+        yes, no = card_keys(call)
+        self.yes_button.set_parts(yes)
+        self.no_button.set_parts(no)
         self.question.set_text(question)
         self.detail.set_text(detail)
         self.note.set_text(note)
@@ -221,9 +223,9 @@ class CallConsentCard(LatticeCard):
 
 
 class CallIndicator(SurfaceWindow):
-    """The call pill (Horizon x Field Unit): the accent recording dot, a small grey wave, the call's running
-    time on a dot-matrix timer (37:12) and "Remembering your side, Discord". Waiting for headphones: no dot,
-    no timer, the words say it. Never takes focus.
+    """The call pill (Horizon x Field Unit; the island stands in for it in the app): the accent recording dot, a
+    small grey wave, the call's running time on a dot-matrix timer (37:12) and what is kept ("Recording · Discord +
+    you"). Nothing kept while it waits for headphones: no dot, no timer, the words say it. Never takes focus.
 
     The timer ticks once a second and the wave moves only while the pill is shown (a full-screen game hides
     it, and then nothing runs). It counts from the call **session**'s start (``session_started_at``: the first
@@ -280,7 +282,7 @@ class CallIndicator(SurfaceWindow):
 
     def _fit(self) -> None:
         fm = self.label.fontMetrics()
-        waiting = (self.call or {}).get("status") == "waiting_headphones"
+        waiting = _waiting_only(self.call or {})
         width = 14 + (0 if waiting else 8 + 11) + 30 + 11 + (0 if waiting else self.timer_label.width() + 11)
         width += fm.horizontalAdvance(self.label.text()) + 22
         width = max(INDICATOR_WIDTH, width)
@@ -306,7 +308,7 @@ class CallIndicator(SurfaceWindow):
 
         self.call = call
         self.label.setText(self._text(call))
-        waiting = call.get("status") == "waiting_headphones"
+        waiting = _waiting_only(call)
         # The session's start (05 §7.4): a call row the service had to cut and reopen keeps one running time.
         start = local_moment(call.get("session_started_at") or call.get("detected_at") or call.get("recording_since"))
         self._since = start.timestamp() if start is not None else None
@@ -451,8 +453,16 @@ class CallController(QObject):
 
     @property
     def recording(self) -> bool:
+        """Stop must be reachable: anything is kept (the status's top-level ``recording``: the mic, a call app's own
+        sound or a game's voice chat, even while the call row itself asks or waits), or the row may record (waiting
+        for headphones)."""
         call = self.status.get("call") or {}
-        return call.get("status") in ("recording", "waiting_headphones")
+        return bool(self.status.get("recording")) or call.get("status") in RECORDING_STATUSES
+
+    @property
+    def view(self) -> dict[str, Any] | None:
+        """What the indicators show (:func:`yuki.ui.call_words.live_view`), or None."""
+        return live_view(self.status)
 
     # -- state -------------------------------------------------------------
 
@@ -460,34 +470,45 @@ class CallController(QObject):
         return (STRIP_HEIGHT + _GAP) if self._strip_up() else 0
 
     def offer(self, status: object, why: str = "") -> None:
-        """A fresh ``call_status()``: show, update or take down the card and the indicator."""
+        """A fresh ``call_status()``: show, update or take down the card and the indicator. The card is the live
+        call's while it asks, else the card of a game session that ended before it could be shown (``pending_card``);
+        a game still waiting to be seen (``ask_later``) never has one. Each is answered once, through
+        ``answer_call``."""
         status = status if isinstance(status, dict) else {}
-        before = (self.status.get("call") or {}).get("status")
+        view_before = live_view(self.status) or {}
+        before = ((self.status.get("call") or {}).get("status"), view_before.get("line"))
         self.status = status
         call = status.get("call") or None
-        if (call or {}).get("status") != before:
+        view = live_view(status) or {}
+        if ((call or {}).get("status"), view.get("line")) != before:
             self.ui_log.event("call_status", via=why, call_id=(call or {}).get("id"), app=(call or {}).get("app"),
-                              status=(call or {}).get("status"))
-        asking = bool(call and call.get("asking") and call.get("id") not in self._answered)
-        if asking and not self.card_up:
-            self.card.show_call(call, above=self._above())
-            self.ui_log.event("call_consent_shown", call_id=call.get("id"), app=call.get("app"),
-                              headphones=call.get("headphones"))
-        elif not asking and self.card_up:
+                              status=(call or {}).get("status"), kind=(call or {}).get("kind"),
+                              recording=bool(status.get("recording")), kept=list(view.get("kinds") or ()),
+                              pending_card=(status.get("pending_card") or {}).get("id"))
+        target = card_target(status)
+        if target is not None and target.get("id") in self._answered:
+            target = None
+        shown = (self.card.call or {}).get("id") if self.card_up else None
+        if target is not None and (not self.card_up or shown != target.get("id")):
+            self.card.show_call(target, above=self._above())
+            self.ui_log.event("call_consent_shown", call_id=target.get("id"), app=target.get("app"),
+                              headphones=target.get("headphones"), kind=target.get("kind") or "call",
+                              ended=bool(target.get("ended")), keeps_sound=bool(target.get("keeps_sound")))
+        elif target is None and self.card_up:
             self.card.withdraw()
         self.place_indicator()
-        if call:
+        if call or target is not None or status.get("recording"):
             self._tick.start()
         else:
             self._tick.stop()
         self.changed.emit(status)
 
     def place_indicator(self) -> None:
-        call = self.status.get("call") or {}
-        on = call.get("status") in ("recording", "waiting_headphones")
+        call = self.view
+        on = call is not None
         value, _name = self._screen_state()
         hidden = self.card_up or self._covered() or value in BUSY_NOTIFICATION_STATES
-        if on and not hidden:
+        if call is not None and on and not hidden:
             self.indicator.set_call(call)
             target = self.indicator.anchor(above=self._above())
             if not self.indicator.isVisible() or self.indicator.closing:
@@ -518,15 +539,19 @@ class CallController(QObject):
         return thread
 
     def _on_answered(self, call: dict[str, Any], answer: str) -> None:
+        """Every card's answer (a call's, a game's, a game's that already ended) goes the one way: ``answer_call``."""
         call_id = call.get("id")
         self._answered.add(call_id)
-        self.ui_log.event("call_consent_answer", call_id=call_id, app=call.get("app"), answer=answer)
+        self.ui_log.event("call_consent_answer", call_id=call_id, app=call.get("app"), answer=answer,
+                          kind=call.get("kind") or "call", ended=bool(call.get("ended")))
         self._background("call_answer", lambda: self.memory.call_method(
             "answer_call", call_id, answer, timeout_s=TRAY_TIMEOUT_S))
 
     def stop_call(self) -> threading.Thread:
-        """The tray's "Stop remembering this call"."""
-        self.ui_log.event("call_stop_requested", call_id=(self.status.get("call") or {}).get("id"))
+        """Stop remembering what records now (the tray's Pause for this call, the window's Stop): memory's
+        ``stop_call`` stops every row recording, the microphone and every app's own sound."""
+        self.ui_log.event("call_stop_requested", call_id=(self.status.get("call") or {}).get("id"),
+                          recording=bool(self.status.get("recording")))
         return self._background("call_stop", lambda: self.memory.call_method("stop_call", timeout_s=TRAY_TIMEOUT_S))
 
     @property
@@ -546,4 +571,4 @@ class CallController(QObject):
 
 
 __all__ = ["CallController", "CallConsentCard", "CallIndicator", "CallWatcher", "CALL_EVENT_NAME",
-           "consent_text", "indicator_text", "waiting_text"]
+           "card_target", "consent_text", "indicator_text", "live_view", "waiting_text"]
