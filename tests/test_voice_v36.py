@@ -369,7 +369,7 @@ def test_no_early_start_on_doubtful_words_or_while_a_task_is_open(tmp_path: Path
     conv = Conversation(settings=Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv"), bridge=bridge,
                         transport=None, memory=None, mouth_memory=MouthMemory(), log=None,
                         speech_end=lambda: None, on_state=lambda *a: None, session="t")
-    conv.observer.heard = "unsure of 'hemanth' (0.41)"
+    conv.observer.heard = "unsure of 'tarnesh' (0.41)"
     conv._early_handoff("a")
     conv.observer.heard = None
     bridge.has_open_voice_job = lambda: True
@@ -640,8 +640,8 @@ def test_yukis_own_name_is_never_a_doubtful_word_and_the_cut_first_word_is_forgi
 
     conv = Conversation(settings=Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv"),
                         bridge=SimpleNamespace(), transport=None, memory=None, mouth_memory=MouthMemory(), log=None,
-                        speech_end=lambda: None, on_state=lambda *a: None, session="t", keyterms=["Hemanth"])
-    assert "Yuki" not in conv.observer.keyterms and "Hemanth" in conv.observer.keyterms
+                        speech_end=lambda: None, on_state=lambda *a: None, session="t", keyterms=["Tarnesh"])
+    assert "Yuki" not in conv.observer.keyterms and "Tarnesh" in conv.observer.keyterms
     words = [{"word": "yucky", "confidence": 0.95}, {"word": "open", "confidence": 0.97},
              {"word": "system", "confidence": 0.93}, {"word": "setting", "confidence": 0.9}]
     assert heard_note(words, conv.observer.keyterms)[0] is None

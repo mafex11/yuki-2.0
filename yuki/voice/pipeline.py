@@ -28,6 +28,7 @@ spoken exchange to memory's turn log (encrypted), marked as voice:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from pathlib import Path
 import os
 import time
@@ -376,10 +377,17 @@ class LlmCall:
     early_say: float | None = None      # a call's say_first went to the voice while the call was being written
     route: str | None = None            # E3a (v3.17): the router's decision for this turn (thinker / talker / None)
     route_ms: float | None = None       # and how long it took from its request
+    # v3.18: practice memory's lines in the volatile block (yuki.voice.practice): which lookup, its wait, and what the
+    # block held (kinds and ids, size); the text itself only goes into the request
+    practice: str = "off"               # final | partial | previous | none | off
+    practice_wait_ms: float | None = None
+    practice_block: str | None = None   # content: the request only, never a log
+    talker_block: str = ""              # "pitfall:7;habit:9;skill:12"
+    talker_block_chars: int = 0
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
-SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation"})
+SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation", "run_skill"})
 
 
 def early_words(partial_json: str) -> str | None:
@@ -464,7 +472,7 @@ def one_stop_per_turn(base: type) -> type:
 
 
 #: A word recognized with less confidence than this is named to the mouth (measured 2026-09-27 on 44 clips:
-#: misheard names 0.40-0.74, e.g. "harsh" 0.40, "Hemish" 0.48, "Varez" 0.49; words of clear commands mostly
+#: misheard contacts' names 0.40-0.74 (the cases are in docs/, not in code); words of clear commands mostly
 #: >= 0.9, a few 0.64-0.86).
 LOW_WORD_CONFIDENCE = 0.7
 #: ... but only for words of at least this many letters; a shorter word only below :data:`VERY_LOW_CONFIDENCE`.
@@ -472,13 +480,13 @@ LOW_WORD_CONFIDENCE = 0.7
 #: 12 of 100 turns were flagged, mostly on short words said right ("can", "the", "pass", "What", "made"), and
 #: each flag cost the reply ~2 s (its words held, a second mouth run). With the length rule 7 of 100, and 6 of
 #: those 7 were real mistranscriptions ("You can me OTP" for "you key in the OTP", "Soaki", "picoris"); the
-#: misheard names of v3.5 are all 5+ letters ("harsh" 0.40, "Hemish", "Varez", "savvy", "letter path").
+#: misheard names of v3.5 are all 5+ letters.
 LOW_WORD_MIN_LETTERS = 5
 VERY_LOW_CONFIDENCE = 0.4
 #: A heard word (or two adjacent ones) this similar to a keyterm, without being it, is named as sounding close
-#: (measured: "Hemish" / "harsh" / "Hemant" 0.83-0.92 and "hey meant" 0.67 against Hemanth, "Komala" 0.83
-#: against Komal, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every name). A
-#: similarity measure, no word list.
+#: (measured: three mishearings of one contact's name 0.83-0.92 and the same name heard as two English words 0.67
+#: against it, another contact's 0.83, "cloud" 0.73 against Claude; the words of clear commands <= 0.5 against every
+#: name). A similarity measure, no word list.
 NEAR_TERM_RATIO = 0.65
 
 
@@ -538,8 +546,8 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     exact = {i for i, w in enumerate(spoken) if key(w) in terms}
     exact |= {j for i in range(len(spoken) - 1) if key(spoken[i] + spoken[i + 1]) in terms for j in (i, i + 1)}
     def closest(k: str) -> str | None:
-        # The same first sound and most of the letters: misheard names keep their start ("Hemish", "hey
-        # meant" for Hemanth, "cloud" for Claude); a word that merely contains a name's letters does not
+        # The same first sound and most of the letters: misheard names keep their start ("tar niche" for
+        # Tarnesh, "cloud" for Claude); a word that merely contains a name's letters does not
         # ("after" in "Father"). Measures of the two strings, no word list.
         best = max((t for t in terms if t[:1] == k[:1] and k not in t and t not in k),
                    key=lambda t: difflib.SequenceMatcher(None, k, t).ratio(), default=None)
@@ -919,7 +927,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
                 named=bool(hook("named", default=False)), work=hook("work", default=None),
                 cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
-                channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None)))
+                channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None),
+                practice=getattr(self._yuki_call, "practice_block", None)))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -1411,6 +1420,8 @@ class TurnObserver:
         self._last_words = ""
         self._words_at: float | None = None
         self.grounder: Any = None
+        #: Practice memory's lookups for the talker (:class:`yuki.voice.practice.PracticeLookup`, v3.18), or ``None``.
+        self.practice: Any = None
         self.hands: Any = None
         self.state = "starting"
         self.fatal: str | None = None
@@ -1442,6 +1453,12 @@ class TurnObserver:
         self._said_turn: str | None = None
         #: The user's latest final words (for the spoken-line check's context; content, never logged).
         self.last_user_text = ""
+        #: The user's last final utterances in this conversation, oldest first (v3.18: what a hand's trace says they
+        #: asked, the words a learned way may type or send, and what the authorization check of a hand reads; content,
+        #: RAM only).
+        self.recent_words: deque[str] = deque(maxlen=8)
+        #: ``(words)``: the user's turn ended with these words (the thinker's request pack is built then, v3.18).
+        self.on_final_words: Callable[[str], None] | None = None
         #: The conversation's spoken-line check (yuki.voice.speechguard), or ``None``.
         self.guard: Any = None
         #: Names on the screen in front (yuki.voice.screennames, v3.10): a heard word close to one is named too.
@@ -1621,6 +1638,9 @@ class TurnObserver:
             self._words_at = time.monotonic()  # when speech recognition last heard a new word
         if self.grounder is not None:
             self.grounder.interim(transcript)
+        # v3.18: practice memory is looked up on the final words only (their lookup, ~10-35 ms measured, fits inside the
+        # grounding wait the talker's call has anyway); a lookup per interim transcript was CPU spent on every word of
+        # every utterance, a call's talk to the others included (lightweight rule)
         if self.hands is not None and hasattr(self.hands, "prefetch_desk"):
             self.hands.prefetch_desk()  # the reply's desktop block, read while they talk (v3.7)
 
@@ -1744,6 +1764,11 @@ class TurnObserver:
             "desk": c.desk if c else None, "desk_ms": c.desk_ms if c else None,
             "desk_chars": c.desk_chars if c else None,
             "desk_tabs_ms": c.desk_tabs_ms if c else None,
+            # v3.18: practice memory's lines in the talker's volatile block (kinds and ids, size; never their text)
+            "practice": c.practice if c else None,
+            "practice_wait_ms": c.practice_wait_ms if c else None,
+            "talker_block": (c.talker_block or None) if c else None,
+            "talker_block_chars": c.talker_block_chars if c else None,
             "llm_prep_ms": ms(c.grounded, c.sent) if c else None,
             "llm_open_ms": ms(c.sent, c.opened) if c else None,
             "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
@@ -1795,7 +1820,11 @@ class TurnObserver:
             # is stored as "others" and never extracted into memory; the thinker is never handed it either
             # (``quiet_answered``).
             memory, log = self.memory, self.log
-            fields = dict(request_id=f"voice-{self.session}-{turn.n}", at=time.time(), user_text=turn.user_text,
+            # v3.18: the turn is dated when it opened (the user's final words, or the reply a result turn began), not
+            # when this row is written (the next turn's opening): practice memory's learners read "what the user said
+            # next" after a hand's trace by these times, and a turn dated at its close came after its own hand.
+            opened_at = time.time() - (time.monotonic() - turn.opened)
+            fields = dict(request_id=f"voice-{self.session}-{turn.n}", at=opened_at, user_text=turn.user_text,
                           reply_text=reply, actions=[f"{name} (by voice)" for name in turn.tools], outcome="voice",
                           addressed=addressed)
 
@@ -1862,6 +1891,8 @@ class TurnObserver:
                 self.turn.cut = True
             if self.grounder is not None:
                 self.grounder.new_turn()
+            if self.practice is not None:
+                self.practice.new_turn()
             if self.hands is not None:
                 self.hands.prefetch()  # the tabs for the reply's desktop block, read while they talk
             self.set_state("hearing")
@@ -1881,6 +1912,8 @@ class TurnObserver:
                 cut_before=self.cut_before(), screen=self.screen_terms)
             self.heard_plain = bool(self.heard and not (turn.heard_low or turn.heard_near))
             self.last_user_text = turn.user_text
+            if turn.user_text.strip():
+                self.recent_words.append(turn.user_text.strip())
             if self.guard is not None:
                 self.guard.new_turn()
             self._last_words, self._words_at = "", None
@@ -1888,6 +1921,13 @@ class TurnObserver:
             turn.eager_at, self._eager_at = self._eager_at, None
             if self.grounder is not None:
                 self.grounder.final(turn.user_text)  # before the aggregator hands the context over
+            if self.practice is not None:
+                self.practice.final(turn.user_text)
+            if self.on_final_words is not None and turn.user_text.strip():
+                try:
+                    self.on_final_words(turn.user_text)   # only puts work on a pre-started thread
+                except Exception:  # noqa: BLE001 - a head start only
+                    pass
             if self.hands is not None:
                 self.hands.new_user_turn()  # a hand halted by a wrong effect may act again
             pending, self._pending_call = self._pending_call, None
@@ -2024,7 +2064,18 @@ class _Hooks:
         hands = getattr(self.c.bridge, "hands", None) if self.c.settings.voice_hands else None
         desk_task = (asyncio.ensure_future(hands.for_call(self.c.settings.voice_desk_wait_ms))
                      if hands is not None else None)
+        practice = getattr(self.c, "practice", None)
+        if practice is not None and user_turn:
+            # the final words' lookup starts here, with the call (the observer sees the transcript a moment later:
+            # Pipecat calls observers from a queue of its own); a lookup of the same words already running is reused
+            words = _last_user_text(context)
+            if words.strip():
+                practice.final(words)
+        practice_task = (asyncio.ensure_future(self._practice_for(practice, user_turn))
+                         if practice is not None else None)
         lookup_text = await self._lookup(call, user_turn)
+        if practice_task is not None:
+            self._practice(call, *(await practice_task))
         desk_text = None
         if desk_task is not None:
             snap, how = await desk_task
@@ -2051,6 +2102,36 @@ class _Hooks:
         text = lookup.block if lookup.block is not None else format_facts(lookup.facts)
         call.grounding_chars = len(text or "")   # (lookup.block: the whole-memory block for the talker, v3.14)
         return text
+
+    async def _practice_for(self, practice: Any, user_turn: bool) -> tuple[Any, str, float]:
+        """The practice lookup for this call, waiting at most as long as the grounding lookup: ``(lookup, how, ms)``."""
+        started = time.monotonic()
+        try:
+            found, how = await practice.for_call(self.c.settings.voice_grounding_wait_ms if user_turn else 0.0,
+                                                 user_turn=user_turn)
+        except Exception:  # noqa: BLE001 - a hint; never block the reply on it
+            found, how = None, "none"
+        return found, how, (time.monotonic() - started) * 1000
+
+    def _practice(self, call: LlmCall, found: Any, how: str, wait_ms: float) -> None:
+        """Practice memory's lines for this call (v3.18): into the volatile block, offered skills registered for
+        run_skill, and what the block held on the call (kinds, ids, size) for the turn log; a content-free event."""
+        call.practice = how
+        call.practice_wait_ms = round(wait_ms, 1)
+        self.c._shown_ids = []
+        if found is None:
+            return
+        block = found.block
+        call.practice_block = block or None
+        call.talker_block = found.kinds_ids()
+        call.talker_block_chars = len(block or "")
+        self.c._shown_ids = found.ids()
+        practice = getattr(self.c, "practice", None)
+        if practice is not None and found.skills:
+            practice.offer(found, self.c.observer.user_turns)
+        facts = found.facts()
+        self.c.log.event("practice", op="block", session=self.c.session, how=how, user_turn=call.user_turn,
+                         wait_ms=call.practice_wait_ms, **facts)
 
     def call_started(self, call: LlmCall) -> None:
         self.c.observer.call_started(call)
@@ -2238,6 +2319,26 @@ def _last_role(context: Any) -> str | None:
     return None
 
 
+def _last_user_text(context: Any) -> str:
+    """The newest user message's words in the talker's context (``""`` when the newest message is not the user's)."""
+    try:
+        messages = context.get_messages()
+    except Exception:  # noqa: BLE001
+        return ""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "developer", "tool"):
+            continue
+        if message.get("role") != "user":
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        return ""
+    return ""
+
+
 class Conversation:
     """One conversation's pipeline, run on the current asyncio loop.
 
@@ -2351,6 +2452,11 @@ class Conversation:
         #: Why and how the conversation ended (content-free, for the ``session stop`` event; 04 F3).
         self.stop_facts: dict[str, Any] = {}
         self.observer.on_audible = self._on_audible
+        # -- v3.18 -------------------------------------------------------------------------------------------
+        #: Practice memory's lookups for the talker (lessons, learned ways; :mod:`yuki.voice.practice`), made in run.
+        self.practice: Any = None
+        #: The playbook ids the talker's latest call was shown (a hand's trace carries them as ``injected``).
+        self._shown_ids: list[int] = []
 
     def _on_activity(self) -> None:
         self._activity.set()
@@ -2509,12 +2615,22 @@ class Conversation:
         bridge.more_held = self.more_held   # H2: the talker's own held words, for more_of_result
         bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
             self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
+        # v3.18: the thinker's request pack (Agent.build_pack) built when the user's turn ends, when the agent takes one
+        prefetch = getattr(bridge, "prefetch_pack", None)
+        self.observer.on_final_words = prefetch if callable(prefetch) else None
         hands = getattr(bridge, "hands", None)
         if hands is not None:
             hands.on_action = self.observer.hand_acted
             hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
                 "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name,
                 "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok, "result": report, "ms": ms})
+            # v3.18: practice memory sees the hands (their run traces) and the hands run the learned ways offered
+            hands.memory = self.memory if getattr(self.settings, "voice_hand_traces", True) else None
+            hands.words = lambda: list(self.observer.recent_words)
+            hands.turn_key = self.observer.turn_id
+            hands.shown = lambda: list(self._shown_ids)
+            hands.user_turn = lambda: self.observer.user_turns
+            hands.practice = self.practice
 
     def _awake(self) -> None:
         """What a live conversation starts with (built awake, or woken from standby): all in the background."""
@@ -2759,6 +2875,11 @@ class Conversation:
         self._tts = tts
         self._llm_context: Any = None
         hand_tools = HAND_TOOLS if (self.settings.voice_hands and getattr(self.bridge, "hands", None)) else []
+        if not (getattr(self.settings, "voice_skills", True) and getattr(self.settings, "voice_practice", True)
+                and self.memory is not None):
+            # v3.18: run_skill only where learned ways can be offered (fixed for the conversation: the tools head the
+            # cached prefix)
+            hand_tools = [t for t in hand_tools if t["name"] != "run_skill"]
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
@@ -2888,6 +3009,19 @@ class Conversation:
                                      source=str(getattr(s, "voice_grounding_source", "relevant") or "relevant"))
             self.grounder.warm()
             self.observer.grounder = self.grounder
+        if getattr(s, "voice_practice", True) and self.memory is not None:
+            # v3.18: practice memory for the talker (lessons from its mistakes, learned ways its hands can run)
+            from yuki.voice.practice import LESSONS_CHARS, SKILL_MIN_CONFIDENCE, SKILL_MIN_COSINE, PracticeLookup
+
+            hands = getattr(self.bridge, "hands", None)
+            self.practice = PracticeLookup(
+                self.memory, apps=self._apps_in_play, log=self.log,
+                min_cosine=float(getattr(s, "voice_skill_min_cosine", SKILL_MIN_COSINE)),
+                min_confidence=float(getattr(s, "voice_skill_min_confidence", SKILL_MIN_CONFIDENCE)),
+                lessons_chars=int(getattr(s, "voice_lessons_chars", LESSONS_CHARS)),
+                skills=bool(getattr(s, "voice_skills", True) and s.voice_hands and hands is not None))
+            self.practice.warm()
+            self.observer.practice = self.practice
         self.observer.idle_state = lambda: "working" if self.bridge.open_voice_jobs() else "listening"
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
@@ -2944,6 +3078,16 @@ class Conversation:
                 self.log.event("grounding", op="summary", lookups=len(timings), unloaded=unloaded,
                                p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
                                max_ms=round(timings[-1], 1) if timings else None)
+            if self.practice is not None:
+                self.practice.release()
+                timings = sorted(self.practice.timings)
+                hands = getattr(self.bridge, "hands", None)
+                self.log.event("practice", op="summary", lookups=len(timings),
+                               p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
+                               max_ms=round(timings[-1], 1) if timings else None,
+                               traces=getattr(hands, "traces_queued", None))
+                if self._bound and hands is not None and getattr(hands, "practice", None) is self.practice:
+                    hands.practice = None
             self.log.event("narrator", op="summary", **self.gate.stats)
             cache = getattr(self, "_tts_cache", None)
             if cache is not None:
@@ -3612,6 +3756,18 @@ class Conversation:
         if held and self.observer.user_turns - int(getattr(self, "_held_at_turn", 0)) <= self.HELD_TURNS:
             state["held"] = held
         return state
+
+    # -- v3.18: practice memory and the thinker's request pack -----------------------------------------------------
+
+    def _apps_in_play(self) -> list[str]:
+        """The open windows' processes from the hands' latest desktop summary, the one in front first (practice
+        memory's apps in play; a summary read while they talked, no read here)."""
+        hands = getattr(self.bridge, "hands", None)
+        snap = getattr(hands, "last", None)
+        apps = dict(getattr(snap, "apps", None) or {})
+        front = getattr(snap, "foreground", None)
+        ordered = ([apps.pop(front)] if front in apps else []) + list(apps.values())
+        return list(dict.fromkeys(a for a in ordered if a))
 
     def more_held(self, max_sentences: int = 2, max_chars: int = 280) -> tuple[str, bool] | None:
         """H2: the next part of the talker's held words (``(part, more left)``), taken; ``None`` when nothing is held."""

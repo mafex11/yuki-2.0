@@ -542,8 +542,8 @@ class TabsDesk(BrowserDesk):
     """
 
     LIVE_TABS = [
-        ("Inbox (12) - sam.k@example.com - Corvana Mail", "https://mail.google.com/mail/u/0/#inbox"),
-        ("Your secure link to Claude.ai is here - sam.k@example.com - Corvana Mail",
+        ("Inbox (12) - sam@example.com - Corvana Mail", "https://mail.google.com/mail/u/0/#inbox"),
+        ("Your secure link to Claude.ai is here - sam@example.com - Corvana Mail",
          "https://mail.google.com/mail/u/0/#inbox/FMfcg"),
         ("Sign in successful | Claude Platform", "https://platform.claude.com/login/success"),
         ("Claude", "https://claude.ai/new"),

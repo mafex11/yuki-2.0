@@ -416,13 +416,15 @@ Claude tab), when their words match no title (speech recognition mishears: "cloc
 been "Claude tabs"), or when you are not sure which, ask in a few words, naming the tabs you think \
 they mean, or hand it to the thinker.
 
-Volume is three different things. The system volume is the whole PC's output level, every app at \
+Volume is four different things. The system volume is the whole PC's output level, every app at \
 once: media_key volumeup, volumedown, volumemute. An app's own volume is its level in Windows' volume \
 mixer, only that app (only Chrome, so only the YouTube video playing in it; only Spotify): app_volume, \
 with the app as the app volumes line names it; it touches nothing on the screen, so it is right even \
-while a game is in front. A player's own control, like YouTube's slider inside the page, is inside a \
-window. When they name an app or what is playing in it ("the YouTube volume", "Spotify is too loud", \
-"the video"), they mean that app's own volume; the system volume is for when they mean the whole PC.
+while a game is in front. Your own voice is one: its app volumes entry says (your own voice); "your volume" means \
+it. A player's own control, like YouTube's slider inside the page, is inside a window. When they name an app or what \
+is playing in it ("the YouTube volume", "Spotify is too loud", "the video"), they mean that app's own volume; the \
+system volume is for when they plainly mean the whole PC. When it is unclear which, ask, naming them ("The video, or \
+my voice?").
 
 Stopping a video or music is pausing it: media_key playpause with want paused (a browser has no stop). \
 When the media line shows no session for what is playing (a video in a browser that just started often \
@@ -436,7 +438,15 @@ desktop" lines say what your hands and the thinker already \
 did in this conversation, verified or not: they say which tab "the one we just opened" is. A repeat \
 ("again", "more", "a bit more", "keep going") of one step a hand did is that hand again, yourself.
 
-Everything else goes to the thinker as before: two or more steps, anything that needs what is \
+A Lessons line is what went wrong here before and what to do instead (your own mistakes, their corrections): never \
+repeat one; when it says ask, ask. A Learned ways line is a way you did this before here that fits their words: \
+run_skill runs it as your hand, alone, its steps written as the way gives them (a control by its role and name, keys \
+by name, text only from their words or the way; expect: words the step says will show, else ""). Each step is \
+checked; at the first that does not fit the screen the thinker takes over by itself: say nothing more then. When the \
+way does not fit what they asked, hand it to the thinker. sends: true for a way that sends, posts or replies; then \
+to and what are their own words, both said plainly, else hand it over.
+
+Everything else goes to the thinker as before: two or more steps (but a learned way), anything that needs what is \
 inside a window (a message, a button, a file, a playlist, which tab holds something the tabs line \
 does not say), anything about their memory or their day, anything you are not sure one hand does, \
 and a window or tab you cannot pick out of the block for certain. When they point at something inside \
@@ -467,6 +477,11 @@ say_when_done="Turned it down.") alone
 Good: user "reduce the YouTube volume", the app volumes line has "chrome.exe 100% playing". You: \
 app_volume(app="chrome.exe", change=-20, say_when_done="Turned YouTube down.") alone
 Bad: the same, you: media_key(key="volumedown", times=5, ...) (that is the whole PC, not YouTube)
+Good: user "lower your volume", the app volumes line has '<app> 100% playing (your own voice)'. You: \
+app_volume(app="<app>", change=-20, say_when_done="Turned myself down.") alone
+Good: they ask for what a Learned ways line's '- pb:<n> ...: 1. <keys> 2. Type <slot> 3. <keys>: <what shows>' does. \
+You: run_skill(say_first="", skill="pb:<n>", steps=[{"do":"keys","keys":[...]}, {"do":"type","text":"<their \
+words>"}, {"do":"keys","keys":[...],"expect":"<what shows>"}], sends=false, say_when_done="") alone
 Bad: user "open Spotify and play my focus playlist". You: open_app(say_first="Opening Spotify.", \
 name="Spotify", say_when_done="Spotify's open.") (two steps, and finding the playlist needs what is \
 on the screen)
@@ -505,7 +520,7 @@ of them sounds like their words ("brochure" and a chat named Bro, "rest chat", "
 Res, "cloud tabs" and two Claude tabs), that is what they meant: act on it with that name (hand it over with \
 screen true and the name in the request), no question. Ask back only when nothing on the screen or in what you \
 know fits and a word that matters for something that changes things (an action, a message and who it goes to, \
-closing, sending, deleting) may be misheard ("Hemanth, on WhatsApp?", "sorry, which chat?"). The question \
+closing, sending, deleting) may be misheard ("Priya, on WhatsApp?", "sorry, which chat?"). The question \
 is your whole reply, with no call: nothing is done until they answer, and then you act on their \
 answer together with what they asked. When the meaning is clear anyway, or it is small talk, \
 just carry on: a clear request gets no question. Never tell them what recognition heard or was unsure of, \
@@ -522,8 +537,8 @@ Good: "close the cloud tabs", the Speech line says 'cloud' sounds close to Claud
 "Sign in successful | Claude Platform" and 4 "Claude", and a close is not undone lightly -> "The two Claude \
 tabs?" and nothing else; they say "yeah" -> tab(action="close", tabs=[3, 4], ...)
 Bad: the same -> "The Claude tabs?" + tab(action="close", ...) (acting before they answer)
-Good: you asked "Hemanth, on WhatsApp?" and they say "yes, Anish" (the Speech line: 'Anish' sounds close \
-to Hemanth) -> tell_yuki for Hemanth: their yes confirms what you asked
+Good: you asked "Priya, on WhatsApp?" and they say "yes, Riya" (the Speech line: 'Riya' sounds close \
+to Priya) -> tell_yuki for Priya: their yes confirms what you asked
 Good: their answer is garbled again -> "Sorry, one more time: who should I message?"
 Good: "increase the system volume a bit", no Speech line -> media_key(...) at once, no question"""
 
@@ -1165,6 +1180,9 @@ class MouthMemory:
     #: The people the user deals with and how to reach each (``MemoryClient.people_directory`` when memory has it,
     #: v3.17): names to resolve, never news to bring up.
     people: str | None = None
+    #: The personal brief's slice for the talker (``MemoryClient.brief_for("talker")`` when memory has it, v3.18): it
+    #: takes the place of the personality and the persona in the cached profile layer.
+    brief: str | None = None
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -1177,6 +1195,7 @@ class MouthMemory:
             "personality_chars": len(self.personality or ""),
             "persona_chars": len(self.persona or ""),
             "people_chars": len(self.people or ""),
+            "brief_chars": len(self.brief or ""),
             "standing_chars": len(self.standing or ""),
             "resume_chars": len(self.resume or ""),
             "todos": len(self.todos or []),
@@ -1236,6 +1255,7 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         resume=ctx.resume,
         todos=todos or None,
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
+        brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
@@ -1280,6 +1300,38 @@ def fetch_people(memory: Any, *, timeout_s: float = 1.5) -> str | None:
         out.append(line)
         size += len(line) + 1
     return "\n".join(out) or None
+
+
+#: The personal brief's slice in the talker's cached profile layer is cut to this (whole sentences): the room the
+#: personality and the persona had together (:data:`PERSONALITY_CHARS` + :data:`PERSONA_CHARS`).
+BRIEF_CHARS = 2700
+#: Who the brief is for (``MemoryClient.brief_for(audience)``: builder 1c-2's personal brief, revamp D8).
+BRIEF_AUDIENCE = "talker"
+
+
+def fetch_brief(memory: Any, *, timeout_s: float = 1.5) -> str | None:
+    """The personal brief's slice for the talker (``MemoryClient.brief_for("talker")``), when memory has one.
+
+    Probed with ``getattr``, never assumed (v3.18: memory's builder adds it in parallel): an older memory without it,
+    a failure or an empty answer all give ``None``, and the profile layer keeps the personality and the persona as
+    before. Cut to :data:`BRIEF_CHARS` at a sentence. Blocking; off the loop."""
+    call = getattr(memory, "call", None)
+    if not callable(call):
+        return None
+
+    def read(client: Any) -> Any:
+        fn = getattr(client, "brief_for", None)
+        return fn(BRIEF_AUDIENCE) if callable(fn) else None
+
+    try:
+        got = call("talker brief", read, timeout_s=timeout_s)
+    except Exception:  # noqa: BLE001 - the talker goes with the personality and persona
+        return None
+    if isinstance(got, dict):
+        got = got.get("text")
+    if not isinstance(got, str) or not got.strip():
+        return None
+    return _cut(got.strip(), BRIEF_CHARS)
 
 
 def mouth_rules(standing: str | None) -> str:
@@ -1348,7 +1400,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    named: bool = False, work: str | None = None,
                    cut: dict[str, str] | None = None, after_goodbye: bool = False,
                    channel: str | None = None, rerun: bool = False,
-                   state: dict[str, Any] | None = None) -> dict[str, Any]:
+                   state: dict[str, Any] | None = None, practice: str | None = None) -> dict[str, Any]:
     """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
     It goes at the end of the newest user message, after every cache breakpoint, so
@@ -1370,6 +1422,10 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     did not take effect or was refused a moment ago: :data:`HAND_TROUBLE_NOTE`), ``closed`` (a tab or window was closed
     in this conversation: :data:`REOPEN_GUIDE`), ``held`` (H2: the words of its last reply that were held back, too long
     to say at once: :data:`HELD_NOTE`).
+
+    ``practice`` (v3.18): practice memory's lines for these words (:mod:`yuki.voice.practice`): the Lessons line (the
+    apps in play's pitfalls and habits, at most 400 characters) and, when one qualifies, the Learned ways line; they go
+    right before the desktop block they are about.
     """
     state = state or {}
     now = now or datetime.now()
@@ -1407,6 +1463,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += "\n" + RERUN_NOTE
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
+    if practice and practice.strip():
+        text += "\n\n" + practice.strip()
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
     if (channel or "").strip().lower() == "marker":
@@ -1462,11 +1520,15 @@ def mouth_system_blocks(
     names = [n for n in (memory.names or []) if n]
     if names:
         profile.append(f"The user is {names[0]}" + (f"; apps also show them as {', '.join(names[1:])}." if names[1:] else "."))
-    if memory.personality:
-        profile.append(memory.personality)
-    if memory.persona:
-        profile.append("How you talk with them (your own way with this user, learned from your conversations):\n"
-                       + memory.persona)
+    if memory.brief:
+        # v3.18: memory's personal brief for the talker replaces the personality and the persona (D8)
+        profile.append(memory.brief)
+    else:
+        if memory.personality:
+            profile.append(memory.personality)
+        if memory.persona:
+            profile.append("How you talk with them (your own way with this user, learned from your conversations):\n"
+                           + memory.persona)
     if memory.people:
         profile.append(f"{PEOPLE_LABEL}\n{memory.people}")
     last: dict[str, Any] | None = None
@@ -1509,6 +1571,26 @@ SAVED_NOTE = "Saved. You already reacted to it; do not bring it up."
 #: Heads the user's correction of how Yuki did something (``tell_yuki``'s ``corrects``) in a request.
 #: The brain's prompt keys on it to keep the lesson (remember_how); docs/VOICE.md §7.
 CORRECTION_MARK = "[Correction from the user: how Yuki did this earlier in this conversation was wrong."
+
+
+_FINISH_CONTRACT: str | None = None
+
+
+def finish_contract() -> str:
+    """How the thinker's action tools take a finish (probed once, never assumed: revamp D's output diet, 30b-build §2
+    S4): ``"boolean"`` when ``finishes_with`` is a boolean beside ``finish_words`` (the line written by code from the
+    verified report), else ``"string"`` (v3.10-v3.17: the model writes the outcome)."""
+    global _FINISH_CONTRACT
+    if _FINISH_CONTRACT is None:
+        try:
+            from yuki.agent import tools as agent_tools
+
+            schema = getattr(agent_tools, "FINISHES_SCHEMA", None)
+            _FINISH_CONTRACT = ("boolean" if getattr(agent_tools, "FINISH_WORDS_FIELD", None)
+                                and isinstance(schema, dict) and schema.get("type") == "boolean" else "string")
+        except Exception:  # noqa: BLE001 - the older contract's words still work
+            _FINISH_CONTRACT = "string"
+    return _FINISH_CONTRACT
 
 
 def brain_request(request: str, heard: list[str] | str | None, *, context: str | None = None,
@@ -1560,18 +1642,28 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
                  "just opened', not instructions:\n" + done_before.strip() + "]")
     if remember:
         return text + REMEMBER_NOTE
+    lean = finish_contract() == "boolean"
+    step_rule = (
+        "Give say_now only to a step they would wait on (an app or a page opening, a slow read), never to a quick "
+        "click or key. " if lean else "Give each action or slower read its say_now, first. ")
+    finish_rule = (
+        "when one action does what they asked, mark it finishes_with true: its line is written from the action's "
+        "own verified report and spoken the moment it verifies; add finish_words only when that report cannot name "
+        "the outcome the way they asked (a key, a click). If it fails or its report cannot show the effect you get "
+        "the result to check first. " if lean else
+        "when one action does what they asked, give it finishes_with, worded as the outcome; it is spoken the moment "
+        "the action's own report verifies it, and if it fails or its report cannot show the effect you get the "
+        "result to check first. ")
     text += (
         "\n[Your say_now step lines, say lines and done message are spoken to the user in Yuki's one voice, as its "
         "own words: they are heard, not read. Write them to the user as you would say them to their face: "
         "never about them, and never a word about the voice, a thinker, speech recognition, tools, ids or tab "
-        "numbers. Give each action or slower read its say_now, first. Answer what the user's own words ask, in one "
+        "numbers. " + step_rule + "Answer what the user's own words ask, in one "
         "or two short spoken sentences "
         "with the point that matters most. Your done message is said to them word for word, so it ends with the "
         "outcome itself: ask a question only when you need their answer to go on (which one? send it?), never to "
         "offer more (when there is more, Yuki's voice offers it). They are waiting in "
-        "silence while you work: when one action does what they asked, give it finishes_with, worded "
-        "as the outcome; it is spoken the moment the action's own report verifies it, and if it fails or its report "
-        "cannot show the effect you get the result to check first. When "
+        "silence while you work: " + finish_rule + "When "
         "their words name the target plainly (an app, a site, a settings page, a window the desktop "
         "overview above shows) and one action reaches it, take that action in your first reply, from "
         "the overview you already have: looking at a window first only makes them wait. What they name is resolved "

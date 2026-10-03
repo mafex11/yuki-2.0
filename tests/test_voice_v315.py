@@ -71,7 +71,7 @@ def test_alone_in_a_call_reaches_voice_as_no_call_mode_and_a_friend_joining_turn
     def judge(screen):   # stand-in for the screen model: the names under the call, minus the user's own
         joined = "Disconnect" in screen.controls
         return Verdict(in_call=joined, service="Discord" if joined else "",
-                       others=(sum(c in ("Hemanth", "Rohan") for c in screen.controls) if joined else None))
+                       others=(sum(c in ("Tarnesh", "Rohan") for c in screen.controls) if joined else None))
 
     store = Store.open(tmp_path / "memory.db")
     try:
@@ -91,7 +91,7 @@ def test_alone_in_a_call_reaches_voice_as_no_call_mode_and_a_friend_joining_turn
         call = MemoryClient(store).call_status()["call"]
         assert call["others"] == 0 and call_facing(call) == (None, None, True)          # normal mode
         w.evidence._judged_at = {k: _time.monotonic() - 9.0 for k in w.evidence._judged_at}
-        see(now + 1, ["Voice Connected", "Disconnect", "mafex", "Hemanth"])            # he joined
+        see(now + 1, ["Voice Connected", "Disconnect", "mafex", "Tarnesh"])            # he joined
         w.step(now + 2)                                    # alone: judged again after 8 s, not a minute
         call = MemoryClient(store).call_status()["call"]
         assert call["others"] == 1 and call_facing(call) == ("Discord", "fresh", False)  # call mode

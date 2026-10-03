@@ -48,6 +48,9 @@ from yuki.voice.progress import JobLog, step_of
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
     "queued", "running", "waiting_for_answer", "done", "failed", "cancelled")
 OPEN_STATES = (QUEUED, RUNNING, WAITING)
+#: A request pack built when the user's turn ended goes with that turn's hand-off only this soon after (s); the agent
+#: itself reads the screen again when a pack is older than its own ``pack_max_age_s`` (20 s).
+PACK_MAX_AGE_S = 15.0
 
 #: Finished jobs kept in the table ("it finished a minute ago", "want the rest?").
 KEEP_FINISHED = 6
@@ -344,6 +347,14 @@ class VoiceBridge(QObject):
         self.more_held: Callable[[], tuple[str, bool] | None] | None = None
         #: When the thinker last closed a tab or window (monotonic), for the talker's guidance (v3.17).
         self.closed_at: float | None = None
+        #: The thinker's request pack built when the user's turn ended (``Agent.build_pack``, v3.18, 07 §6 E2):
+        #: ``(pack, built at, words)``; passed with this turn's hand-off only when the runtime and the agent take one.
+        self._pack: tuple[Any, float, str] | None = None
+        self._pack_ok: bool | None = None
+        #: Whether the runtime takes the heard words apart (``submit(user_words=)``, 34-review H4); probed once.
+        self._user_words_ok: bool | None = None
+        self._pack_building = False
+        self._pack_lean = not bool(getattr(settings, "voice_brain_portrait", True))
         #: When a call of the mouth's was held until the user answers (doubtful words; monotonic), set by the
         #: conversation: the run that report starts owes them words (a question, or the call again), never silence.
         self.held_at: float | None = None
@@ -419,6 +430,7 @@ class VoiceBridge(QObject):
             self.held_at = None
             self.held_call = None
             self.ledger = None
+            self._pack = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -711,7 +723,8 @@ class VoiceBridge(QObject):
         if lane == "worker" and not remember:
             self._pass_over_questions(lane)   # a question they went past would hold this behind it for good
         words = _memory_words(request, heard)
-        self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words))
+        self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words,
+                                       user_words=heard))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
                   request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
                   done_before_chars=len(done_before), heard_turns=len(heard), corrects_chars=len(corrects or ""),
@@ -992,7 +1005,7 @@ class VoiceBridge(QObject):
         origin = self._foreground()
         view = (origin or self._desk_foreground()) if (screen or self._just_used_desk()) else None
         words = _memory_words(request, heard)
-        self._gui(lambda: self._submit(job, text, origin, view=view, memory_query=words))
+        self._gui(lambda: self._submit(job, text, origin, view=view, memory_query=words, user_words=heard))
         self._log("bridge", op="submit", token=job.token, call=call_id, intent="routed" if routed else "early",
                   request_chars=len(request), context_chars=0, origin_hwnd=origin, done_before_chars=len(done_before),
                   heard_turns=len(heard), early=True, screen=bool(screen), tabs_chars=len(tabs or ""))
@@ -1424,16 +1437,27 @@ class VoiceBridge(QObject):
     # -- GUI thread -------------------------------------------------------------
 
     def _submit(self, job: Job, text: str, origin: int | None, *, lane: str | None = None,
-                view: int | None = None, memory_query: str | None = None) -> None:
+                view: int | None = None, memory_query: str | None = None,
+                user_words: list[str] | None = None) -> None:
         extra: dict[str, Any] = {}
         if lane:
             extra["lane"] = lane
+        words = [" ".join(str(t).split()) for t in (user_words or []) if str(t).strip()]
+        if words and self._takes_user_words():
+            # 34-review H4: what speech recognition heard, labelled as the user's own words, apart from the request
+            # (the talker's reading of them, which never authorizes a send); the judge reads these
+            extra["user_words"] = [{"how": "voice", "text": t} for t in words]
         if view:
             extra["view_hwnd"] = view
         if memory_query:
             # 22 §4 (v3.17): memory is searched with the user's own words (``memory_words``), passed explicitly, so it
             # never depends on the hand-off's format.
             extra["memory_query"] = memory_query
+        pack = self._take_pack()
+        if pack is not None:
+            # v3.18 (07 §6 E2): what the thinker's first call needs (Agent.build_pack), built while the user's turn
+            # ended, handed over with the request so it is not read again (only when the runtime and the agent take it)
+            extra["pack"] = pack
         try:
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
         except TypeError:
@@ -1441,6 +1465,10 @@ class VoiceBridge(QObject):
                 raise
             extra.pop("memory_query")   # a stand-in runtime without the argument: the agent takes them from the text
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
+        if "pack" in extra:
+            age = getattr(extra["pack"], "age_s", None)
+            self._log("bridge", op="pack", token=job.token, age_s=round(age, 2) if isinstance(age, float) else None,
+                      build_ms=getattr(extra["pack"], "build_ms", None))
         with self._lock:
             self._unsubmitted.pop(job.token, None)
             job.job_id, job.lane = job_id, lane
@@ -1451,6 +1479,67 @@ class VoiceBridge(QObject):
         self._log("bridge", op="submitted", token=job.token, job_id=job_id, lane=lane)
         self._changed()
         self._job_event(job, "submitted", job.request)
+
+    def _takes_user_words(self) -> bool:
+        """Whether ``runtime.submit`` names a ``user_words`` parameter (34-review H4; probed once, never assumed)."""
+        if self._user_words_ok is None:
+            self._user_words_ok = _takes(getattr(self.runtime, "submit", None), "user_words")
+            self._log("bridge", op="user_words_probe", supported=self._user_words_ok)
+        return bool(self._user_words_ok)
+
+    def _pack_agent(self) -> Any:
+        """The worker's agent when the thinker takes a request pack (v3.18, revamp D S5): ``runtime.submit`` names a
+        ``pack`` parameter, and the agent has ``build_pack`` and its ``run`` names ``pack`` (probed once, never
+        assumed); else ``None``."""
+        if self._pack_ok is None:
+            agent = getattr(getattr(self.runtime, "worker", None), "agent", None)
+            self._pack_ok = bool(_takes(getattr(self.runtime, "submit", None), "pack") and agent is not None
+                                 and callable(getattr(agent, "build_pack", None))
+                                 and _takes(getattr(agent, "run", None), "pack"))
+            self._log("bridge", op="pack_probe", supported=self._pack_ok)
+        return getattr(getattr(self.runtime, "worker", None), "agent", None) if self._pack_ok else None
+
+    def prefetch_pack(self, words: str) -> None:
+        """The user's turn just ended with ``words``: build the thinker's request pack now, off every loop, so a
+        hand-off of this turn starts its first model call with the screen, the origin and memory's part already read
+        (``Agent.build_pack``; 07 §6 E2: ~0.4 s of the thinker's start). Only when the thinker takes a pack and its
+        worker is idle (a pack is built by the thread-safe reads of an idle agent); one at a time; returns at once."""
+        agent = self._pack_agent()
+        text = " ".join(str(words or "").split())
+        if agent is None or not text or self._pack_building:
+            return
+        busy = getattr(self.runtime, "worker_busy", None)
+        if callable(busy) and busy():
+            return
+        if self.call_mode is not None and self.call_mode():
+            return   # in a call most words are for the others: no reads for a hand-off that rarely comes
+        self._pack_building = True
+        origin = self._foreground()
+        lean = self._pack_lean
+
+        def build() -> None:
+            try:
+                pack = agent.build_pack(text, origin_hwnd=origin, memory_query=text, voice=True, lean=lean)
+                with self._lock:
+                    self._pack = (pack, time.monotonic(), text)
+            except Exception as exc:  # noqa: BLE001 - the agent reads what it needs itself
+                self._log("bridge", op="pack_build", error=type(exc).__name__)
+            finally:
+                self._pack_building = False
+
+        from yuki.voice.workers import shared
+
+        shared().submit(build)
+
+    def _take_pack(self) -> Any:
+        """The pack built for this turn, once (``None`` when there is none, it is older than :data:`PACK_MAX_AGE_S`,
+        or the thinker takes none)."""
+        with self._lock:
+            got, self._pack = self._pack, None
+        if got is None or self._pack_agent() is None:
+            return None
+        pack, at, _words = got
+        return pack if time.monotonic() - at <= PACK_MAX_AGE_S else None
 
     def _steer(self, job: Job, job_id: int, text: str) -> None:
         if not self.runtime.steer(job_id, text):
@@ -1700,7 +1789,7 @@ class VoiceBridge(QObject):
         with self._lock:
             self._unsubmitted[follow.token] = follow
         self._submit(follow, "\n".join(texts) + "\n\n[Added by voice right after the previous request finished.]",
-                     None)
+                     None, user_words=[str(t) for t in texts])
         self._log("bridge", op="late_follow_up", job_id=job_id, new_id=follow.job_id)
         loop = self._loop
         if loop is not None and self.announce is not None and follow.events is not None:
@@ -2016,7 +2105,7 @@ class VoiceBridge(QObject):
             self._arm_wait(job, self._wait_again_s)   # the next one, after as much silence again
 
     async def escalate(self, params: Any, name: str, args: dict[str, Any], report: str,
-                       acked: bool = False) -> bool:
+                       acked: bool = False, context: str | None = None) -> bool:
         """A hand of the talker's did not take effect: hand the same request to the thinker now, by code (v3.9).
 
         Live 2026-09-27 14:18 the talker narrated every failed try ("The stop key didn't take. Let me pause it
@@ -2024,12 +2113,16 @@ class VoiceBridge(QObject):
         Now the thinker gets the user's words with the hand's report and the window in front already read, and
         the user hears one outcome (and one "still on it" only if it takes a while). Returns whether a job was
         started (``False`` with no conversation loop or no runtime).
+
+        ``context`` (v3.18): what to tell the thinker instead of the one-step note: a learned way the talker ran that
+        stopped at a step (what was done, where it deviated, the way's steps), so it carries on and never redoes them.
         """
         if self._loop is None:
             return False
         heard = heard_words(params.context, skip=self.not_heard)
         request = heard[-1] if heard else _action_words(name, args)
-        context = f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}"
+        context = (" ".join(str(context).split())[:1200] if context else
+                   f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}")
         said = spoken_words(params.context)
         text = brain_request(request, heard, context=context, done_before=self.actions.text(), said=said,
                              tabs=self.tabs_for_thinker())
@@ -2043,7 +2136,7 @@ class VoiceBridge(QObject):
         self._pass_over_questions("worker")   # the talker acted on these words: not the answer to a question
         words = _memory_words(request, heard)
         self._gui(lambda: self._submit(job, text, origin, lane="worker", view=origin or self._desk_foreground(),
-                                       memory_query=words))
+                                       memory_query=words, user_words=heard))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent="escalated", hand=name,
                   request_chars=len(request), context_chars=len(context), origin_hwnd=origin, heard_turns=len(heard))
         self._changed()
@@ -2068,8 +2161,11 @@ class VoiceBridge(QObject):
         origin = self._foreground()
         view = (origin or self._desk_foreground()) if args.get("screen") is True else None
         lane = "worker" if args.get("acts") is True else None
-        words = _memory_words(request, heard)
-        self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words))
+        query = _memory_words(request, heard)
+        # (v3.18: bound by its own name - the lambda runs later on the GUI thread, and the say_first below used to
+        # take this variable's name, so the held run searched memory with Yuki's own words)
+        self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=query,
+                                       user_words=heard))
         words = str(args.get("say_first") or "").strip()
         if words and self.speak is not None:
             await self.speak(words)
@@ -2160,6 +2256,18 @@ class VoiceBridge(QObject):
                 await deliver(not self_spoken, False)
             if kind in ("done", "failed"):
                 return
+
+
+def _takes(fn: Any, name: str) -> bool:
+    """Whether ``fn`` names a parameter ``name`` (a catch-all ``**kwargs`` is not enough: it may drop it unread)."""
+    if not callable(fn):
+        return False
+    try:
+        import inspect
+
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _memory_words(request: str, heard: Any) -> str | None:
