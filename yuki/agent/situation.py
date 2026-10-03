@@ -96,8 +96,9 @@ SITUATION_TOOL: dict[str, Any] = {
 QUESTION = (
     "Now, before you act, answer from what is above what a good assistant would notice: is it already done (the same "
     "thing already said or sent, already closed)? Does it conflict with something here? Is there something they "
-    "would want to know first? Is there a better way? If something turns up, do not act: tell them or ask in one "
-    "short line naming what you saw and when, with ask_user, or done when that answers them. If nothing does, go "
+    "would want to know first? Is there a better way? If something turns up, do not act: ask them in one short "
+    "line naming what you saw and when, by its time as shown (\"at 6:08 PM\"), with ask_user, and wait for their "
+    "answer: the choice is theirs, so never decide for them that it is not needed. If nothing does, go "
     "ahead now, without asking. Examples: they ask to tell Sam the build is fixed, and they wrote \"build's fixed\" "
     "to him at 6:08 PM -> \"You already told Sam the build's fixed, at 6:08 PM. Send it again?\"; they ask to ask "
     "Maya if she is free tonight, and her message 10 minutes ago says she is out of town -> \"Maya just said she's "
@@ -109,9 +110,10 @@ QUESTION = (
 #: same response, whose result was not read before the step).
 REFUSAL = (
     "{label}: not run: this step {what}, and nothing in this request has looked at the situation yet (a check sent "
-    "in the same response as the step does not count: its result was not read). Call check_situation first, alone "
-    "or with steps before this one (action: what you are about to do with its content; hwnd: the window it happens "
-    "in; about: the person or thing), then decide from what it shows: act, or tell or ask them first.")
+    "in the same response as the step does not count: its result was not read). This is your own look, not a "
+    "question for the user: call check_situation now, alone (action: what you are about to do with its content; "
+    "hwnd: the window it happens in; about: the person or thing), then decide from what it shows: act at once when "
+    "nothing turns up, or ask them when something does.")
 
 
 # ---------------------------------------------------------------------------

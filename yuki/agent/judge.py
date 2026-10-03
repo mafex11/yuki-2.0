@@ -1056,6 +1056,19 @@ class Authorizer:
             self._log("judge_warm", error=f"{type(exc).__name__}: {exc}"[:200])
             return None
 
+    def forget_denials(self) -> int:
+        """New words of the user's arrived (an answer to Yuki's question, words added mid-run): a call held before is
+        judged again on them instead of replaying the hold from the memo (vfix2: live-like replay, a send held for
+        a name the user had not said was held again after they answered "yes, Hemanth", and the request stopped on
+        three denials). Allows stay memoized as before. Returns how many holds were forgotten."""
+        with self._lock:
+            held = [k for k, v in self.memo.items() if not v.allowed]
+            for k in held:
+                del self.memo[k]
+        if held:
+            self._log("judge_memo", op="forget_denials", count=len(held))
+        return len(held)
+
     @property
     def stopped(self) -> str | None:
         """Why the request must stop now (too many denials), or ``None``."""

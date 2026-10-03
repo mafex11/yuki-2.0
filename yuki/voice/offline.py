@@ -662,12 +662,39 @@ class ChatPlayerDesk(StubDesktop):
         self.lyrics_full = False
         self.bar_revealed = False
         self.clicks: list[str] = []
+        #: N6: the user's own playlists in the sidebar, and which one plays (``None``: whatever played before)
+        self.playlists = ["Gym Mix", "J-Pop Nights", "Focus Lofi"]
+        self.playing: str | None = None
         self.mixer = MixerStub({"Spotify.exe": mixer_level, "Discord.exe": 70.0}, playing={"Spotify.exe"}, system=40.0)
 
     # -- perception -------------------------------------------------------------
 
+    #: A browser for the list replays (``with_browser``): its title follows what was opened in it.
+    BROWSER = 0x2003
+    with_browser = False
+    browser_title = "New Tab - Google Chrome"
+
     def _windows(self) -> list[tuple[int, str, str]]:
-        return [(self.CHAT, "Discord.exe", f"@{self.handle} - Discord"), (self.PLAYER, "Spotify.exe", "Spotify Premium")]
+        wins = [(self.CHAT, "Discord.exe", f"@{self.handle} - Discord"), (self.PLAYER, "Spotify.exe", "Spotify Premium")]
+        if self.with_browser:
+            wins.insert(0, (self.BROWSER, "chrome.exe", self.browser_title))
+        return wins
+
+    def launch_app(self, query: str, **kwargs: Any) -> StubResult:
+        if "chrome" in query.casefold():
+            self.with_browser = True
+        result = self._act("launch_app", f"launched {query}; its window is in front", query, **kwargs)
+        result.details = {"hwnd": self.BROWSER if self.with_browser else 0, "verified": True}
+        return result
+
+    def open_url(self, url: str, **kwargs: Any) -> StubResult:
+        self.with_browser = True
+        if "youtube" in url.casefold():
+            self.browser_title = "YouTube - Google Chrome"
+        result = self._act("open_url", f"opened {url}; window {self.BROWSER} \"{self.browser_title}\" is in front",
+                           url, **kwargs)
+        result.details = {"hwnd": self.BROWSER, "page_verified": True, "verified": True}
+        return result
 
     def get_desktop_overview(self) -> dict[str, Any]:
         wins = self._windows()
@@ -699,10 +726,22 @@ class ChatPlayerDesk(StubDesktop):
             self._el(out, "Edit", f"Message @{self.handle}", (260, 980, 1620, 1020), patterns=["value"],
                      value=self.composer)
             process = "Discord.exe"
+        elif int(hwnd) == self.BROWSER:
+            self._el(out, "Document", self.browser_title.replace(" - Google Chrome", ""), (0, 110, 1920, 1040))
+            for i, name in enumerate(("Ocean drive - 4 minutes", "Night walk - 7 minutes", "City lights - 3 minutes")):
+                self._el(out, "Hyperlink", name, (300 + 420 * i, 300, 700 + 420 * i, 520), patterns=["invoke"])
+            process = "chrome.exe"
         else:
+            # the library in the sidebar, as live: each playlist a Button "<name> Playlist • <owner>" with a play Button
+            self._el(out, "Group", "Your Library", (111, 120, 430, 860))
+            for i, name in enumerate(self.playlists):
+                y = 220 + 56 * i
+                self._el(out, "Button", f"{name} Playlist • you", (117, y, 425, y + 50), patterns=["invoke"])
+                self._el(out, "Button", f"Play {name}", (123, y + 6, 160, y + 44), patterns=["invoke"])
             if not self.lyrics_full or self.bar_revealed:
                 self._el(out, "Group", "Now playing bar", (111, self.BAR_TOP, 1501, 945))
-                self._el(out, "Group", "Now playing: Song A by Artist B", (117, 896, 529, 939))
+                song = f"{self.playing}, track 1 by Various" if self.playing else "Song A by Artist B"
+                self._el(out, "Group", f"Now playing: {song}", (117, 896, 529, 939))
                 for name, x in (("Lyrics", 1278), ("Queue", 1302)):
                     self._el(out, "Button", name, (x, 905, x + 25, 930), patterns=["toggle"],
                              states=["on" if self.toggles[name] else "off"])
@@ -731,7 +770,14 @@ class ChatPlayerDesk(StubDesktop):
         return "\n".join(lines)
 
     def window_at(self, x: int, y: int) -> int:
-        return self.PLAYER if x < 0 else self.CHAT
+        """Every window fills the screen: the one in front is at any point."""
+        return int(getattr(self, "front", 0) or self._windows()[0][0])
+
+    def focus_window(self, hwnd: int, **kwargs: Any) -> StubResult:
+        self.front = int(hwnd)
+        result = self._act("focus_window", f"window {hwnd} is in front", hwnd, **kwargs)
+        result.details = {"hwnd": int(hwnd), "verified": True}
+        return result
 
     # -- actions ----------------------------------------------------------------
 
@@ -751,10 +797,15 @@ class ChatPlayerDesk(StubDesktop):
     def click(self, x: int, y: int, **kwargs: Any) -> StubResult:
         result = self._act("click", f"clicked at ({x}, {y})", x, y, **kwargs)
         tree = self.get_window_tree(self.PLAYER)
-        hit = next((e for e in tree["elements"][1:] if e["role"] == "Button"
-                    and e["bounds"][0] <= x < e["bounds"][2] and e["bounds"][1] <= y < e["bounds"][3]), None)
+        hits = [e for e in tree["elements"][1:] if e["role"] == "Button"
+                and e["bounds"][0] <= x < e["bounds"][2] and e["bounds"][1] <= y < e["bounds"][3]]
+        hit = min(hits, key=lambda e: (e["bounds"][2] - e["bounds"][0]) * (e["bounds"][3] - e["bounds"][1]),
+                  default=None)   # the innermost button under the point (a play button inside its row)
         if hit is not None:
             self.clicks.append(hit["name"])
+            if hit["name"].startswith("Play ") and hit["name"][5:] in self.playlists:
+                self.playing = hit["name"][5:]
+                result.details = {"state_changed": True, "verified": True}
             if hit["name"] in self.toggles:
                 self.toggles[hit["name"]] = not self.toggles[hit["name"]]
                 if hit["name"] == "Lyrics":

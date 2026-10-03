@@ -3235,6 +3235,8 @@ class Agent:
             if question:
                 entry["question"] = question
             self._user_words.append(entry)
+            if how in ("answer", "added") and getattr(self, "authorizer", None) is not None:
+                self.authorizer.forget_denials()   # their new words: a held call is judged again, not replayed
 
     def _note_request_words(self, request: str, query: str, user_words: Any = None) -> None:
         """A new request's words for the judge, each labelled by whose they are (review 34 H4, M3). A card the request

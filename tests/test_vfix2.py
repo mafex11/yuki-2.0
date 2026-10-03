@@ -648,10 +648,9 @@ def test_n9_the_talker_and_thinker_are_told_to_judge_names_by_sound_and_situatio
     from yuki.agent.prompt import VOICE_LAYER
     from yuki.voice.mouth import RECOGNITION_GUIDE
 
-    for text in (VOICE_LAYER, RECOGNITION_GUIDE):
-        assert "hey meant" in text and "Hemanth" in text and "best guess first" in text.replace("best guess first",
-                                                                                                "best guess first")
-    assert "heard_as" in VOICE_LAYER
+    assert "hey meant" in VOICE_LAYER and "best guess first" in VOICE_LAYER and "heard_as" in VOICE_LAYER
+    # the talker (a fast model) hands an unsure name over as heard; the thinker resolves it from their people
+    assert "hey meant" in RECOGNITION_GUIDE and "who a message goes to is the thinker's to resolve" in RECOGNITION_GUIDE
 
 
 # ---------------------------------------------------------------------------
@@ -779,3 +778,12 @@ def test_n10_the_talker_keeps_a_list_through_a_quick_interjection() -> None:
 
     assert "a quick thing is never instead" in WORK_GUIDE and "the message to Sam is dropped" in WORK_GUIDE
     assert "instead only when their words drop" in TELL_YUKI["properties"]["intent"]["description"]
+
+
+def test_n9_after_the_users_answer_a_held_send_is_judged_again_not_replayed_from_the_memo(tmp_path: Path) -> None:
+    from yuki.agent.judge import Authorizer, PolicyReader, Verdict
+
+    auth = Authorizer(lambda: None, SimpleNamespace(judge_model="m"), policy=PolicyReader(tmp_path / "a.json"))
+    auth.memo["k1"] = Verdict(decision="ask_user", question="Send it to Hemanth?")
+    auth.memo["k2"] = Verdict(decision="allow")
+    assert auth.forget_denials() == 1 and list(auth.memo) == ["k2"]
