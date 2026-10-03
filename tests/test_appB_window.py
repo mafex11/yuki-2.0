@@ -83,8 +83,17 @@ class _MeMemory:
                            "call": "call:7", "source": {"quote": "the hair loom swap"}, "heard_in": "Mumble",
                            "channel_known": True, "people": []},
                           {"id": 815, "ref": "journal:815", "at": NOW - H, "app": "Firefox", "text": "Said “seed swop”.",
-                           "call": None, "source": {}, "heard_in": "Firefox", "channel_known": False, "people": []}],
-                "total": 3}
+                           "call": None, "source": {}, "heard_in": "Firefox", "channel_known": False, "people": []},
+                          {"id": 816, "ref": "journal:816", "at": NOW - 2 * H, "app": "Firefox", "text": "Seed swap moved.",
+                           "call": None, "source": {"kind": "page", "where": "Allotment notes in Firefox"},
+                           "heard_in": "Allotment notes in Firefox", "channel_known": False, "people": []},
+                          {"id": 817, "ref": "journal:817", "at": NOW - 3 * H, "app": "Yuki", "text": "Said “tomato”.",
+                           "call": None, "source": {"kind": "chat", "where": "a conversation with Yuki"},
+                           "heard_in": "a conversation with Yuki", "channel_known": False, "people": []},
+                          {"id": 818, "ref": "journal:818", "at": NOW - 4 * H, "app": "Discord", "text": "Said “swop”.",
+                           "call": None, "source": {"kind": "call", "where": "Discord call"},
+                           "heard_in": "Discord call", "channel_known": False, "people": []}],
+                "total": 6}
 
     def resolve_heard(self, *a, **k):
         return {"ok": True}
@@ -129,11 +138,15 @@ def test_me_shows_memorys_words_one_summary_per_person_and_each_fact_once():
 def test_maybe_misheard_says_where_it_was_heard_in_one_format():
     me = W.build_me(_MeMemory(), now=NOW)
     m = me["misheard"]
-    assert m["total"] == 3 and m["direct"] is True
-    call, typed = m["items"]
+    assert m["total"] == 6 and m["direct"] is True
+    call, unknown_src, page, chat, call_no_id = m["items"]
     assert call["quote"] == "the hair loom swap"
     assert call["prov"] == "Heard in Mumble, #seed-swap voice (Allotment Club), yesterday, 9:52 PM, with Noor and maybe Dev"
-    assert typed["prov"] == "You said it to me while Firefox was open, today, 8:52 PM"
+    # review F1: only a chat with me is "you said it to me"; read off the screen is "Seen in"; no source claims neither
+    assert unknown_src["prov"] == "Noted while Firefox was open, today, 8:52 PM"
+    assert page["prov"] == "Seen in Allotment notes in Firefox, today, 7:52 PM"
+    assert chat["prov"] == "You said it to me, today, 6:52 PM"
+    assert call_no_id["prov"] == "Heard on a Discord call, today, 5:52 PM"
     unknown = W.heard_line("Discord", {"label": "", "app": "Discord", "people": []}, NOW - DAY, now=NOW)
     assert unknown == "Heard on a Discord call, yesterday, 9:52 PM"
 

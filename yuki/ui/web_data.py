@@ -635,10 +635,13 @@ def _call_id(ref: Any) -> int | None:
 
 
 def heard_line(app: str, call: dict[str, Any] | None, at: float | None, *, channel_known: bool = True,
-               label: str = "", now: float | None = None) -> str:
-    """Where something was said, in the one format every row uses (the 3 Oct feedback item 8): "Heard in Discord,
-    #general voice (Friends), 1 October, 2:07 AM, with Riya and Dev"; a call whose channel the screen never showed
-    "Heard on a Discord call, …"; said with no call, "You said it to me while WhatsApp was open, …"."""
+               label: str = "", now: float | None = None, kind: str = "", where: str = "") -> str:
+    """Where something was said or seen, in the one format every row uses (the 3 Oct feedback item 8): "Heard in
+    Discord, #general voice (Friends), 1 October, 2:07 AM, with Riya and Dev"; a call whose channel the screen never
+    showed "Heard on a Discord call, …". With no call it follows the entry's source ``kind`` (memory's provenance):
+    ``chat`` (said to me) "You said it to me, …"; read off the screen (``page``, ``message``, ``list``, ``command``)
+    "Seen in #general in Slack, …" (``where``, else the app; a command names only the app); no source at all
+    "Noted while Chrome was open, …". Never claims you said what was only seen (review F1)."""
     from yuki.ui.window.data import nat_when
 
     when = nat_when(at, today=datetime.fromtimestamp(time.time() if now is None else now).date())
@@ -649,8 +652,15 @@ def heard_line(app: str, call: dict[str, Any] | None, at: float | None, *, chann
         people = (call or {}).get("people") or []
         tail = f", with {_and(people)}" if people else ""
         return f"{head}{', ' + when if when else ''}{tail}"
-    return f"You said it to me while {app} was open{', ' + when if when else ''}" if app else (
-        f"You said it to me, {when}" if when else "You said it to me")
+    tail = f", {when}" if when else ""
+    if kind == "call":
+        return f"Heard on a {app or 'voice'} call{tail}"
+    if kind == "chat":
+        return f"You said it to me{tail}"
+    if kind in ("page", "message", "list", "command"):
+        place = app if kind == "command" else (where or app)
+        return f"Seen in {place}{tail}" if place else f"Seen on your screen{tail}"
+    return f"Noted while {app} was open{tail}" if app else f"Noted{tail}"
 
 
 def _and(names: list[str]) -> str:
@@ -765,7 +775,8 @@ def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[
                     "people": call_people(m.get("people") or [], lookup or {})}
         items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))), "quote": quote,
                       "prov": heard_line(str(m.get("app") or ""), call, m.get("at"),
-                                         channel_known=bool(m.get("channel_known", True)), now=now)})
+                                         channel_known=bool(m.get("channel_known", True)), now=now,
+                                         kind=str(src.get("kind") or ""), where=str(src.get("where") or ""))})
     return {"items": items, "total": int(got.get("total") or len(items)), "direct": callable(getattr(memory, "resolve_heard", None))}
 
 
