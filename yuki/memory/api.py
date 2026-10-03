@@ -100,8 +100,9 @@ The personal brief and personal-ness (yuki.memory.brief; written by the nightly 
 Practice memory (migration 29, yuki.memory.practice; learned by the service's practice worker, yuki.memory.practice_learn)::
 
     memory.record_run(run) -> dict                       # one agent request's step trace (the agent loop writes it)
-    memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=) -> dict
-    memory.practice(words, apps=, open_apps=) -> dict    # procedures / habits and pitfalls for the apps in play
+    memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=,
+                             injected=, cited=, control=) -> dict
+    memory.practice(words, apps=, open_apps=, detail=False) -> dict    # ways / habits and pitfalls for the apps in play
     memory.workflows() -> dict                           # the window's Playbook page
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
@@ -3184,26 +3185,32 @@ class MemoryClient:
     def record_hand_trace(self, session_id: str | None, name: str, args: dict | None, ok: bool, verified: bool | None,
                           report: str, ms: float, *, at: float | None = None, app: str | None = None,
                           target: str | None = None, words: str | None = None, why: str | None = None,
-                          request_id: str | None = None) -> dict:
+                          request_id: str | None = None, injected: Any = None, cited: Any = None,
+                          control: Any = None) -> dict:
         """Keep one voice hand (the talker's instant single step) as a run of one action, so the learners see the hands
         too: ``name`` and ``args`` as the hand got them (window ids, element ids and coordinates are kept apart, never
         as meaning), ``ok`` / ``verified`` / ``report`` / ``ms`` as it measured, ``app`` the process it acted in,
-        ``target`` the control's role and name, ``words`` what the user said for it. Fast (one small write); never
-        raises."""
+        ``target`` the control's role and name, ``words`` what the user said for it; ``injected`` the playbooks shown
+        to the talker for it and ``cited`` those it followed (ids or ``pb:N``: the ledger weighs them as for an agent
+        run), ``control`` the control it acted on (``"role|name"`` or ``{"role", "name"}``). Fast (one small write);
+        never raises."""
         from yuki.memory import practice as _p
 
         return _p.record_hand_trace(self.store, session_id=session_id, name=name, args=args, ok=ok, verified=verified,
                                     report=report, ms=ms, at=at, app=app, target=target, words=words, why=why,
-                                    request_id=request_id)
+                                    request_id=request_id, injected=injected, cited=cited, control=control)
 
     def practice(self, words: str = "", *, apps: Any = (), open_apps: Any = (), embed_wait_s: float | None = None,
-                 now: float | None = None) -> dict:
+                 now: float | None = None, detail: bool = False) -> dict:
         """What practice memory holds for one request (``yuki.memory.practice.relevant``): ``{"ways": [procedures, then
         a habit or style note], "pitfalls": [...], "apps": [the apps in play], "named": [apps named in the words],
         "measured": bool, "ms"}``. The apps in play are the apps named in ``words`` (whole words of an app name memory
         has stored), ``apps`` (the caller's: apps the request names) and ``open_apps`` (the open windows' process
         names) - not the window in front alone. Ways clear a similarity floor to the words (the same vector as the
-        related memories); pitfalls of an app in play always come. Never raises (empty lists)."""
+        related memories); pitfalls of an app in play always come. ``detail``: each item also carries its structured
+        body (``steps``, ``run`` - a procedure's executable steps for the talker's skill runner, ``slots``, ``what``,
+        ``instead``, ``default``, ``ask``, ``avoid``), so a caller renders it without the Playbook page. Never raises
+        (empty lists)."""
         from yuki.memory import practice as _p
 
         started = time.perf_counter()
@@ -3215,7 +3222,7 @@ class MemoryClient:
             intent = _p.intent_words(self.store, text, known) if text else ""
             vec = self._embed(intent or text, embed_wait_s) if text else None
             named = _p.apps_named(self.store, text, known)
-            out = _p.relevant(self.store, query_vec=vec, apps_in_play=[*named, *known], now=now)
+            out = _p.relevant(self.store, query_vec=vec, apps_in_play=[*named, *known], now=now, detail=bool(detail))
             out["named"] = named
             out["measured"] = vec is not None
         except Exception as exc:

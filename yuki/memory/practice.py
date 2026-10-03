@@ -14,7 +14,8 @@ durable object; retrieval followed the window in front. This module is the store
   the user's words, the outcome, the measured signals (:func:`run_signals`), the playbooks shown and cited, and where
   learning stands. Secret-filtered, then encrypted; pruned with the captures (30 days).
 * **Practice objects** (``playbooks``), four kinds: *procedure* (steps by visible control name and role, slots for what
-  changes), *habit* (a default with its alternatives and counts, or "no single default: ask"), *pitfall* (what failed,
+  changes; and, when every step was a hand the talker has, the same steps as the skill runner runs them - ``run``,
+  :func:`executable_step`), *habit* (a default with its alternatives and counts, or "no single default: ask"), *pitfall* (what failed,
   what it actually did, what to do instead, generalised to its family), *style* (how the user wants something
   written). Bi-temporal like know-how: a new version supersedes the old one and takes its ledger with it.
 * **The ledger** (``playbook_events``): every piece of evidence and every use, with its weight (:data:`WEIGHTS`).
@@ -41,15 +42,16 @@ Public API::
     run_key(source, session_id, request_id) -> str
     input_summary(tool_input) -> (text, numbers)
     run_signals(steps, *, outcome, steers=0, breaker=0) -> dict
-    record_run(store, run) -> dict;  record_hand_trace(store, ...) -> dict
+    record_run(store, run) -> dict;  record_hand_trace(store, ..., injected=, cited=, control=) -> dict
     run_header(store, key) / run_steps(store, key) / pending_runs(store, ...)
+    executable_step(step, slot=, literal_ok=) -> dict | None;  clean_run(steps) -> [dict]   # skill-runner steps
     add_playbook(store, obj, *, events, vector=None, embed_model=None, supersedes=None, now=None) -> int
     add_events(store, events, *, now=None) -> int;  recompute(store, ids, *, now=None)
     evaluate(kind, events, *, created_at, now) -> dict
     live(store, kinds=None, include_disabled=False) -> [Playbook];  get(store, ref) -> Playbook | None
     vectors(store, ids) -> {id: vector};  near(store, vec, *, kinds=None, limit=8) -> [Playbook]
     apps_named(store, words, known=()) -> [app_key]
-    relevant(store, *, query_vec, apps_in_play, now=None) -> dict
+    relevant(store, *, query_vec, apps_in_play, now=None, detail=False) -> dict
     workflows(store, *, now=None) -> dict;  workflow_edit(store, ref, action, words="", *, now=None) -> dict
 """
 
@@ -137,7 +139,7 @@ NOTE_KEYS: frozenset[str] = frozenset({"say_now", "risk", "finishes_with", "fini
                                        "say_when_done",
                                        "about", "learned"})
 NUMBER_KEYS: frozenset[str] = frozenset({"hwnd", "expect_hwnd", "element", "read", "x", "y", "window", "tab_id",
-                                         "dx", "dy"})
+                                         "dx", "dy", "item"})
 #: The rendered body of an object (the frame, the Playbook page).
 BODY_CHARS = 600
 MAX_PROC_STEPS = 8
@@ -276,12 +278,32 @@ def run_signals(steps: Sequence[dict[str, Any]], *, outcome: str, steers: int = 
     }
 
 
+def control_parts(control: Any) -> tuple[str, str]:
+    """``(role, name)`` of a step's control as the callers give it: ``"role|name"`` (the agent loop's own fixed format)
+    or ``{"role", "name"}``."""
+    if isinstance(control, dict):
+        return " ".join(str(control.get("role") or "").split()), " ".join(str(control.get("name") or "").split())
+    role, sep, name = str(control or "").partition("|")
+    return (" ".join(role.split()), " ".join(name.split())) if sep else ("", " ".join(role.split()))
+
+
 def _step_input(s: dict[str, Any]) -> tuple[str, list[int]]:
-    """A step's input as kept: a raw tool input (dict) is summarised here (:func:`input_summary`), a summary as given."""
+    """A step's input as kept: a raw tool input (dict) is summarised here (:func:`input_summary`), a summary as given.
+    The control a step acted on (its role and name, from the dispatcher's read) joins a raw input that names none, so a
+    procedure learned from the run can name it again (:func:`executable_step`)."""
     raw = s.get("input")
     if isinstance(raw, dict):
+        role, name = control_parts(s.get("control"))
+        if name and not raw.get("name"):
+            raw = {**raw, "role": role, "name": name}
         return input_summary(raw)
     return _clip(_redact(raw), INPUT_CHARS), []
+
+
+def _cites(s: dict[str, Any]) -> list[int]:
+    """The playbooks one step cites (its ``playbook``: one ref, or a list of them)."""
+    pb = s.get("playbook")
+    return _ids(pb if isinstance(pb, (list, tuple)) else [pb])
 
 
 def _step_row(key: str, run: dict[str, Any], i: int, s: dict[str, Any], at: float) -> tuple:
@@ -293,7 +315,7 @@ def _step_row(key: str, run: dict[str, Any], i: int, s: dict[str, Any], at: floa
             None if s.get("verdict") is None else int(bool(s.get("verdict"))),
             _clip(s.get("why"), 160) or None, _clip(_redact(s.get("result")), RESULT_CHARS) or None,
             float(s.get("ms") or 0.0), s.get("cost_usd"),
-            json.dumps({"cited": _ids([s.get("playbook")]), "sig": s.get("sig"), "expected": bool(s.get("expected")),
+            json.dumps({"cited": _cites(s), "sig": s.get("sig"), "expected": bool(s.get("expected")),
                         **({"control": s["control_key"]} if s.get("control_key") else {}),
                         **({"confirmed": True} if s.get("confirmed") else {})}))
 
@@ -365,7 +387,7 @@ def record_run(store: Store, run: dict[str, Any], *, now: float | None = None) -
         signals["numbers"] = sorted(set(numbers))[:300]
         signals["wall_s"] = round(float(run.get("wall_s") or 0.0), 2)
         injected = _ids(run.get("injected"))
-        cited = list(dict.fromkeys(_ids(run.get("cited")) + [i for s in steps for i in _ids([s.get("playbook")])]))
+        cited = list(dict.fromkeys(_ids(run.get("cited")) + [i for s in steps for i in _cites(s)]))
         learn = "pending" if (signals["actions"] or signals["asks"] or cited) and outcome != "parked" else "skipped"
         note = {"learned": _clip(_redact(run.get("note")), NOTE_CHARS) or None, "steers": steers}
         enc = store._enc
@@ -416,20 +438,31 @@ def record_run(store: Store, run: dict[str, Any], *, now: float | None = None) -
 def record_hand_trace(store: Store, *, session_id: str | None, name: str, args: dict[str, Any] | None, ok: bool,
                       verified: bool | None, report: str, ms: float, at: float | None = None, app: str | None = None,
                       target: str | None = None, words: str | None = None, why: str | None = None,
-                      request_id: str | None = None, now: float | None = None) -> dict[str, Any]:
+                      request_id: str | None = None, injected: Sequence[Any] | None = None,
+                      cited: Sequence[Any] | None = None, control: Any = None,
+                      now: float | None = None) -> dict[str, Any]:
     """One voice hand (an instant single step the talker ran) as a run of one action, so the learners see the hands
     too (03 §7.2: the volume mistake of 26 Sep and 2 Oct was a hand's). ``words``: what the user said for it, when the
-    caller has them. Never raises."""
+    caller has them. ``injected``: the playbooks shown to the talker for it (its Lessons and Learned ways lines);
+    ``cited``: those it said it followed - both go to the ledger as for an agent run, so the learner weighs what was
+    shown against what happened (fx2, 29-build §3 item 2). ``control``: the control it acted on (``"role|name"`` or
+    ``{"role", "name"}``), kept with the step's input. Never raises."""
     when = _now(at)
-    summary, numbers = input_summary(args)
+    raw = dict(args or {})
+    role, cname = control_parts(control)
+    if cname and not raw.get("name"):
+        raw.update(role=role, name=cname)
+    summary, numbers = input_summary(raw)
+    cites = _ids(cited)
     step = {"tool": name, "kind": "action", "app": app, "target": target, "input": summary, "ok": bool(ok),
             "verdict": verified, "why": why or ("its own report verified it" if verified else (
                 "its own report did not verify it" if verified is False else "its report could not tell")),
-            "result": report, "ms": ms, "at": when}
+            "result": report, "ms": ms, "at": when, **({"playbook": cites} if cites else {}),
+            **({"control": f"{role}|{cname}"} if cname else {})}
     run = {"source": "hand", "session_id": session_id, "request_id": request_id or f"hand-{int(when * 1000)}",
            "lane": "voice", "at": when, "ended_at": when + float(ms or 0) / 1000.0, "words": words or "",
            "reply": "", "outcome": "final" if ok else "error", "steps": [step], "wall_s": float(ms or 0) / 1000.0,
-           "numbers": numbers, "app": app}
+           "numbers": numbers, "app": app, "injected": _ids(injected), "cited": cites}
     return record_run(store, run, now=now)
 
 
@@ -518,6 +551,104 @@ def run_steps(store: Store, key: str) -> list[RunStep]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Executable steps: a procedure's steps in the form the talker's skill runner runs as they are (fx2, 29-build §3 item 3)
+# ---------------------------------------------------------------------------
+
+#: What an executable step does: the talker's own verified hands (``yuki.voice.skills.SKILL_DOS``).
+SKILL_DOS: tuple[str, ...] = ("click", "type", "keys", "scroll", "open_app", "open_url")
+#: An executable procedure holds at most this many steps (the skill runner's own cap).
+MAX_RUN_STEPS = 8
+RUN_FIELD_CHARS = 120
+
+
+def _input_dict(text: str | None) -> dict[str, Any] | None:
+    """A kept step input (compact JSON, :func:`input_summary`) back as a dict; ``None`` when it was clipped or is not
+    JSON (a fixed machine format: no guessing)."""
+    try:
+        got = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def executable_step(s: RunStep | dict[str, Any], *, slot: str | None = None, literal_ok: bool = True
+                    ) -> dict[str, Any] | None:
+    """One trace step that ran ok as a skill step: ``{"do", "role", "name", "keys", "url", "app", "direction",
+    "slot"}`` (only the fields its ``do`` uses), or ``None`` when the talker's hands cannot do it as it is (a tool they
+    do not have, a control with no name, a scroll by pixels, an input clipped in the trace).
+
+    Targets are a control's role and visible name, keys by name, an app by name; **never a window number, element id
+    or coordinate** (those were never kept in the input). Typed text is never kept: a type step names the slot it fills
+    from the user's words (``slot``; ``""`` = their words). An address is kept only when ``literal_ok`` (a procedure
+    with no slots: nothing in it changes from one request to the next). Machine fields only; no text is judged."""
+    if isinstance(s, RunStep):
+        tool, kind, ok, verdict, inp, app = s.tool, s.kind, s.ok, s.verdict, _input_dict(s.input), s.app
+    else:
+        tool, kind, ok, verdict = s.get("tool"), s.get("kind"), s.get("ok"), s.get("verdict")
+        raw = s.get("input")
+        inp, app = (raw if isinstance(raw, dict) else _input_dict(raw)), s.get("app")
+    if kind != "action" or not ok or verdict is False or inp is None:
+        return None
+    tool = str(tool or "")
+    do = str(inp.get("do") or "")   # a skill run's own step kept as it was written
+    if do not in SKILL_DOS:
+        do = {"click": "click", "type_text": "type", "type": "type", "hotkey": "keys", "press_keys": "keys",
+              "press": "keys", "launch_app": "open_app", "open_app": "open_app", "open_url": "open_url",
+              "scroll": "scroll"}.get(tool, "")
+    if not do:
+        return None
+
+    def clip(v: Any) -> str:
+        return _clip(_redact(v), RUN_FIELD_CHARS)
+
+    if do == "click":
+        name = clip(inp.get("name"))
+        return {"do": "click", "role": clip(inp.get("role")), "name": name} if name else None
+    if do == "type":
+        return {"do": "type", "slot": _clip(slot or "", 40)}
+    if do == "keys":
+        keys = inp.get("keys")
+        if not isinstance(keys, list) and inp.get("key"):
+            if int(inp.get("times") or 1) != 1:
+                return None   # one key several times is no single combination
+            keys = [inp.get("key")]
+        keys = [clip(k).casefold() for k in (keys or []) if clip(k)]
+        return {"do": "keys", "keys": keys[:4]} if 1 <= len(keys) <= 4 else None
+    if do == "open_app":
+        name = clip(inp.get("name") or inp.get("query") or app)
+        return {"do": "open_app", "name": name} if name else None
+    if do == "open_url":
+        url = clip(inp.get("url"))
+        if not url or not literal_ok:
+            return None
+        return {"do": "open_url", "url": url, **({"app": clip(inp.get("app"))} if inp.get("app") else {})}
+    direction = str(inp.get("direction") or "").casefold()
+    return {"do": "scroll", "direction": direction} if direction in ("up", "down") else None
+
+
+def clean_run(steps: Any) -> list[dict[str, Any]]:
+    """An executable step list as stored (validated again; anything not a skill step drops the whole list: a
+    procedure runs whole or not at all)."""
+    if not isinstance(steps, list) or not steps or len(steps) > MAX_RUN_STEPS:
+        return []
+    out = []
+    for s in steps:
+        if not isinstance(s, dict) or s.get("do") not in SKILL_DOS:
+            return []
+        keep = {"do": s["do"]}
+        for k in ("role", "name", "url", "app", "direction", "slot", "expect"):
+            if s.get(k):
+                keep[k] = _clip(_redact(s[k]), RUN_FIELD_CHARS)
+        if s.get("keys"):
+            keep["keys"] = [_clip(k, 30) for k in s["keys"] if str(k).strip()][:4]
+        if (s["do"] == "click" and not keep.get("name")) or (s["do"] == "keys" and not keep.get("keys")) or (
+                s["do"] == "open_app" and not keep.get("name")) or (s["do"] == "open_url" and not keep.get("url")):
+            return []
+        out.append(keep)
+    return out
+
+
 def pending_runs(store: Store, *, limit: int = 20) -> list[RunHeader]:
     """Runs waiting for the learner, oldest first."""
     rows = store._query("SELECT * FROM runs WHERE step=0 AND learn='pending' ORDER BY at LIMIT ?", (int(limit),))
@@ -583,6 +714,21 @@ class Playbook:
     @property
     def steps(self) -> list[str]:
         return [str(s) for s in (self.body.get("steps") or []) if str(s).strip()]
+
+    @property
+    def run(self) -> list[dict[str, Any]]:
+        """A procedure's executable steps (:func:`executable_step`; ``[]``: text only, the thinker's)."""
+        return clean_run(self.body.get("run")) if self.kind == "procedure" else []
+
+    def detail(self) -> dict[str, Any]:
+        """The object's structured body for a caller that renders it itself (fx2: the voice's lines): ``steps`` (text),
+        ``run`` (executable steps), ``slots``, ``what`` (a pitfall's what happened, a habit's or style note's text,
+        without the rendering), ``instead``, ``default``, ``ask``, ``avoid``."""
+        b = self.body or {}
+        return {"steps": self.steps, "run": self.run, "slots": [str(x) for x in b.get("slots") or []],
+                "what": str(b.get("text") or "") if self.kind != "procedure" else "",
+                "instead": str(b.get("instead") or "") or None, "default": b.get("default"), "ask": bool(b.get("ask")),
+                "avoid": self.avoid}
 
     def text(self, cap: int = BODY_CHARS) -> str:
         """The object in plain words: a procedure's numbered steps, a habit's default (or "ask"), a pitfall's what
@@ -662,6 +808,11 @@ def _clean_obj(obj: dict[str, Any]) -> dict[str, Any]:
         body["steps"] = [_clip(_redact(s), STEP_CHARS) for s in (body.get("steps") or []) if str(s).strip()][
             :MAX_PROC_STEPS]
         body["slots"] = [_clip(s, 40) for s in (body.get("slots") or []) if str(s).strip()][:6]
+        run = clean_run(body.pop("run", None))
+        if run:
+            body["run"] = run
+    else:
+        body.pop("run", None)
     for k in ("text", "instead", "default"):
         if body.get(k) is not None:
             body[k] = _clip(_redact(body[k]), BODY_CHARS)
@@ -1031,16 +1182,19 @@ def apps_named(store: Store, words: str | None, known: Sequence[str] = ()) -> li
     return sorted(found)
 
 
-def _item(o: Playbook, cosine: float | None, why: str) -> dict[str, Any]:
-    return {"id": o.id, "ref": o.ref, "kind": o.kind, "intent": o.intent, "apps": list(o.apps),
-            "text": o.text(440 if o.kind == "pitfall" else BODY_CHARS),
-            "family": o.family, "state": o.state, "label": o.label(), "confidence": o.confidence,
-            "cosine": None if cosine is None else round(float(cosine), 3), "why": why}
+def _item(o: Playbook, cosine: float | None, why: str, detail: bool = False) -> dict[str, Any]:
+    out = {"id": o.id, "ref": o.ref, "kind": o.kind, "intent": o.intent, "apps": list(o.apps),
+           "text": o.text(440 if o.kind == "pitfall" else BODY_CHARS),
+           "family": o.family, "state": o.state, "label": o.label(), "confidence": o.confidence,
+           "cosine": None if cosine is None else round(float(cosine), 3), "why": why}
+    if detail:
+        out.update(o.detail())
+    return out
 
 
 def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequence[str] = (),
              now: float | None = None, ways: int = MAX_WAYS, habits: int = MAX_HABITS,
-             pitfalls: int = MAX_PITFALLS) -> dict[str, Any]:
+             pitfalls: int = MAX_PITFALLS, detail: bool = False) -> dict[str, Any]:
     """What practice memory holds for one request: ``{"ways": [...], "pitfalls": [...], "apps": [...], "ms"}``.
 
     *Ways* (procedures, then at most ``habits`` habit or style note) clear a similarity floor to the request's words:
@@ -1092,9 +1246,9 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     way_hits.sort(key=lambda x: -x[0])
     habit_hits.sort(key=lambda x: -x[0])
     pit_hits.sort(key=lambda x: (-x[0][0], -x[0][1]))
-    out_ways = [_item(o, c, why) for _r, o, c, why in way_hits[:ways]]
-    out_ways += [_item(o, c, why) for _r, o, c, why in habit_hits[:habits]]
-    out_pits = [_item(o, c, why) for _r, o, c, why in pit_hits[:pitfalls]]
+    out_ways = [_item(o, c, why, detail) for _r, o, c, why in way_hits[:ways]]
+    out_ways += [_item(o, c, why, detail) for _r, o, c, why in habit_hits[:habits]]
+    out_pits = [_item(o, c, why, detail) for _r, o, c, why in pit_hits[:pitfalls]]
     return {"ways": out_ways, "pitfalls": out_pits, "apps": in_play, "objects": len(objs),
             "ms": round((time.perf_counter() - started) * 1000, 2)}
 
@@ -1105,7 +1259,7 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
 
 
 def _card(o: Playbook) -> dict[str, Any]:
-    return {"id": o.ref, "kind": o.kind, "title": o.intent, "text": o.text(), "steps": o.steps,
+    return {"id": o.ref, "kind": o.kind, "title": o.intent, "text": o.text(), "steps": o.steps, "run": o.run,
             "default": (o.body or {}).get("default"), "ask": bool((o.body or {}).get("ask")),
             "instead": (o.body or {}).get("instead"), "avoid": o.avoid, "family": o.family, "apps": list(o.apps),
             "people": list(o.entities), "uses": o.n_used, "last_used": o.last_used_at,
@@ -1240,5 +1394,6 @@ __all__ = [
     "KINDS", "WEIGHTS", "HALF_LIFE_DAYS", "Playbook", "RunHeader", "RunStep", "run_key", "input_summary",
     "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
     "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
-    "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record",
+    "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
+    "executable_step", "clean_run", "SKILL_DOS",
 ]

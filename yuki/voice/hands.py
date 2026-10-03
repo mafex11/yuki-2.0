@@ -170,6 +170,34 @@ _SAY_FIRST = {
     "type": "string",
     "description": "Written first: the few words said as it starts (\"Opening it.\"). Call it alone.",
 }
+#: fx2: the rest of a request an opening hand does not do. "Open Chrome and restore the pages." went 0 for 5 in 3b's
+#: replays (29-build §4), and 0 for 5 at 756ba4a with no learned way (37-build-fx2 §3): the talker opened Chrome alone,
+#: and a verified hand ends the talker's turn (its done line, or silence, and no second call), so the second part was
+#: never done by anyone. The talker says what is left (its judgement, as it judges say_when_done); with it, the
+#: opening's verified result goes back to the talker with the screen as it is once it settled, and the talker does the
+#: rest with one hand or hands it over.
+OPEN_HANDS = ("open_app", "open_url")
+_THEN = {
+    "type": "string",
+    "description": "What else their request asks once it is open, in their words (\"restore the pages\"), else \"\". "
+                   "Then you get the new screen to do it.",
+}
+#: What the talker reads when an opening with a rest verified (fx2).
+_THEN_NOTE = (
+    "It is open, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your desktop block "
+    "now shows the screen as it is: when one of your hands does that on what it shows (an item of a popup or of the "
+    "window in front, a tab, a learned way's remaining steps), do it now, alone, with say_when_done for the whole; "
+    "otherwise hand it to the thinker now with tell_yuki (screen true, that part as they said it, and in context what "
+    "you opened and what the block shows now for it, or that it shows nothing for it). Never say again that it is "
+    "open, never say it is done before a hand verified it."
+)
+#: After an opening with a rest, the screen is read again once it has settled: its windows, the window in front and
+#: the popups unchanged for SETTLE_QUIET_S, at most SETTLE_MAX_S (a launch is verified once its window takes input; a
+#: crash bubble or a page's dialog can come a moment later). Polled every SETTLE_POLL_S. Not measured live yet: every
+#: settle is logged (``hands op=open_settle``: ms, changes, popups) for that.
+SETTLE_QUIET_S = 0.6
+SETTLE_MAX_S = 2.5
+SETTLE_POLL_S = 0.15
 
 #: The hands' schemas (Pipecat standard function schema fields).
 HAND_TOOLS: list[dict[str, Any]] = [
@@ -263,17 +291,19 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "say_first": _SAY_FIRST,
             "url": {"type": "string", "description": "The full address."},
             "app": {"type": "string", "description": "Optional: the app, as the Start menu names it."},
+            "then": _THEN,
             "say_when_done": _DONE_LINE,
         },
-        "required": ["say_first", "url", "say_when_done"],
+        "required": ["say_first", "url", "then", "say_when_done"],
     },
     {
         "name": "open_app",
         "description": "Your hand: open or bring up an app by its Start menu name. Verified once its window is in front.",
         "properties": {"say_first": _SAY_FIRST,
                        "name": {"type": "string", "description": "The app's name as they said it."},
+                       "then": _THEN,
                        "say_when_done": _DONE_LINE},
-        "required": ["say_first", "name", "say_when_done"],
+        "required": ["say_first", "name", "then", "say_when_done"],
     },
     {
         "name": "click",
@@ -1242,7 +1272,9 @@ class Hands:
         if confirmed and name in ("open_url", "open_app"):
             self._opened = {k: v for k, v in self._opened.items() if started - v[0] < _OPEN_REPEAT_S}
             self._opened[key] = (time.monotonic(), report)
-        speak = bool(line) and confirmed
+        # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request
+        rest = " ".join(str(args.get("then") or "").split()) if name in OPEN_HANDS else ""
+        speak = bool(line) and confirmed and not rest
         if speak:
             words = " ".join(line.casefold().split())
             now = time.monotonic()
@@ -1270,6 +1302,17 @@ class Hands:
         elif not facts.get("refused"):
             self._trace(name, args, ok=ok, verified=verified, report=report, facts=facts, ms=ms,
                         call=params.tool_call_id)
+        if confirmed and rest:
+            # fx2: the rest of their request is still to do: the talker gets its turn back (run_llm) with the screen
+            # as it is once it settled (the new window's items, a popup that came with it), and does the rest with
+            # one hand or hands it over - never a done line for half of it
+            settle = await asyncio.to_thread(self.settle_after_open)
+            if self.log is not None:
+                self.log.event("hands", op="open_settle", hand=name, rest_chars=len(rest), call=params.tool_call_id,
+                               **settle)
+            await params.result_callback({"done": report[:700], "then": rest[:200],
+                                          "how_to_handle_it": _THEN_NOTE.format(rest=rest[:200])})
+            return
         if confirmed and not line:
             from pipecat.frames.frames import FunctionCallResultProperties
 
@@ -1337,6 +1380,47 @@ class Hands:
                 return
         await params.result_callback({key: report[:700], "how_to_say_it": note})
 
+    def settle_after_open(self) -> dict[str, Any]:
+        """Blocking (off the loop): wait until the screen settles after an opening - the windows, the one in front and
+        memory's popups unchanged for :data:`SETTLE_QUIET_S`, at most :data:`SETTLE_MAX_S` - then read the window in
+        front's items, so the talker's next call sees what the opening brought up (fx2). Measured facts only:
+        ``{"settle_ms", "changes", "popups", "settled", "items"}``."""
+        started = time.monotonic()
+        last, quiet_since, changes, popups = None, started, 0, 0
+        front, title = None, ""
+        while True:
+            try:
+                _text, payload, _ms = self._dispatcher.overview_text()
+            except Exception:  # noqa: BLE001 - then the next call reads what it can
+                payload = {}
+            board = self._now_board() or {}
+            pops = sorted(int(p["hwnd"]) for p in board.get("popups") or [] if isinstance(p, dict) and p.get("hwnd"))
+            wins = sorted(int(w["hwnd"]) for w in payload.get("windows") or [] if isinstance(w, dict) and w.get("hwnd"))
+            front = int(payload.get("foreground_hwnd") or 0) or None
+            title = next((str(w.get("title") or "") for w in payload.get("windows") or []
+                          if isinstance(w, dict) and w.get("hwnd") == front), "")
+            now = time.monotonic()
+            sig = (front, title, tuple(wins), tuple(pops))
+            if sig != last:
+                if last is not None:
+                    changes += 1
+                last, quiet_since = sig, now
+            popups = len(pops)
+            settled = now - quiet_since >= SETTLE_QUIET_S
+            if settled or now - started >= SETTLE_MAX_S:
+                break
+            time.sleep(SETTLE_POLL_S)
+        items = 0
+        if front:
+            try:
+                self._read_items(front, title)   # the new window's items line for the talker's next call
+                with self._lock:
+                    items = len(self.items.items) if self.items is not None and self.items.hwnd == front else 0
+            except Exception:  # noqa: BLE001 - a window with no tree (an app that draws itself)
+                items = 0
+        return {"settle_ms": round((time.monotonic() - started) * 1000), "changes": changes, "popups": popups,
+                "settled": settled, "items": items}
+
     # -- v3.18: run traces for practice memory --------------------------------------------------------------------
 
     def _call_safely(self, fn: Any, default: Any) -> Any:
@@ -1381,16 +1465,21 @@ class Hands:
                    "report": str(report or "")[:600], "ms": float(ms or 0.0), "at": at, "app": app,
                    "target": target, "words": " / ".join(words[-2:]) or None, "why": why, "request_id": request_id}
 
+        control = facts.get("control")
+
         def write() -> None:
             try:
-                if shown and _takes_kw(getattr(memory, "record_hand_trace", None), "injected"):
-                    memory.record_hand_trace(**payload, injected=shown)
+                record = getattr(memory, "record_hand_trace", None)
+                extra = {"control": control} if control and _takes_kw(record, "control") else {}
+                if shown and _takes_kw(record, "injected"):
+                    # fx2: memory takes the playbooks shown with the hand itself (29-build §3 item 2)
+                    memory.record_hand_trace(**payload, injected=shown, **extra)
                 elif shown and callable(getattr(memory, "record_run", None)):
                     # the same one-step run record_hand_trace keeps, with the playbooks shown (it has no such field)
                     memory.record_run(hand_run(payload, session_id=getattr(memory, "session_id", None),
                                                injected=shown))
                 else:
-                    memory.record_hand_trace(**payload)
+                    memory.record_hand_trace(**payload, **extra)
             except Exception as exc:  # noqa: BLE001 - memory never breaks a hand
                 if self.log is not None:
                     self.log.event("hand_trace", op="error", name=name, error=type(exc).__name__)
@@ -1901,6 +1990,7 @@ class Hands:
             items, item = found
         role_name = f'{item.get("role") or "control"} "{str(item.get("name") or "")[:80]}"'
         facts["target"] = role_name + (f' in "{title[:60]}"' if title else "")
+        facts["control"] = f'{item.get("role") or ""}|{item.get("name") or ""}'   # the trace's control (fx2)
         facts["app"] = facts.get("app") or self._app_at(hwnd)
         self._refuse_if_act_off(facts["app"])          # 34-review H5
         # 34-review H1/H2: a click on a button, a menu item or a link can send, delete or buy: Yuki's own check reads
@@ -2378,7 +2468,7 @@ def _step_key(name: str, args: dict[str, Any]) -> str:
     """What a hand acts on, for telling one step from the same step again (its words left out)."""
     import json
 
-    keep = {k: v for k, v in (args or {}).items() if k not in ("say_first", "say_when_done", "named")}
+    keep = {k: v for k, v in (args or {}).items() if k not in ("say_first", "say_when_done", "named", "then")}
     if isinstance(keep.get("url"), str):
         keep["url"] = keep["url"].strip().rstrip("/").casefold()
     if isinstance(keep.get("name"), str):

@@ -353,6 +353,8 @@ class VoiceBridge(QObject):
         self._pack_ok: bool | None = None
         #: Whether the runtime takes the heard words apart (``submit(user_words=)``, 34-review H4); probed once.
         self._user_words_ok: bool | None = None
+        #: Whether the runtime takes the talker's "only finds out" mark (``submit(needs_hands=)``, fx2); probed once.
+        self._needs_hands_ok: bool | None = None
         self._pack_building = False
         self._pack_lean = not bool(getattr(settings, "voice_brain_portrait", True))
         #: When a call of the mouth's was held until the user answers (doubtful words; monotonic), set by the
@@ -723,8 +725,9 @@ class VoiceBridge(QObject):
         if lane == "worker" and not remember:
             self._pass_over_questions(lane)   # a question they went past would hold this behind it for good
         words = _memory_words(request, heard)
+        reads = args.get("acts") is False and not remember   # the talker's own mark: it only finds out or answers
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words,
-                                       user_words=heard))
+                                       user_words=heard, needs_hands=False if reads else None))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
                   request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
                   done_before_chars=len(done_before), heard_turns=len(heard), corrects_chars=len(corrects or ""),
@@ -1438,10 +1441,15 @@ class VoiceBridge(QObject):
 
     def _submit(self, job: Job, text: str, origin: int | None, *, lane: str | None = None,
                 view: int | None = None, memory_query: str | None = None,
-                user_words: list[str] | None = None) -> None:
+                user_words: list[str] | None = None, needs_hands: bool | None = None) -> None:
         extra: dict[str, Any] = {}
         if lane:
             extra["lane"] = lane
+        elif needs_hands is False and self._takes_needs_hands():
+            # fx2 (revamp D 30b §2): the talker said it only finds out or answers (acts false): the reader lane takes
+            # it even while the worker is idle (the runtime decides by who is free; a reader that needs hands hands
+            # it to the worker)
+            extra["needs_hands"] = False
         words = [" ".join(str(t).split()) for t in (user_words or []) if str(t).strip()]
         if words and self._takes_user_words():
             # 34-review H4: what speech recognition heard, labelled as the user's own words, apart from the request
@@ -1479,6 +1487,13 @@ class VoiceBridge(QObject):
         self._log("bridge", op="submitted", token=job.token, job_id=job_id, lane=lane)
         self._changed()
         self._job_event(job, "submitted", job.request)
+
+    def _takes_needs_hands(self) -> bool:
+        """Whether ``runtime.submit`` names ``needs_hands`` (fx2, the reader lane; probed once, never assumed)."""
+        if self._needs_hands_ok is None:
+            self._needs_hands_ok = _takes(getattr(self.runtime, "submit", None), "needs_hands")
+            self._log("bridge", op="needs_hands_probe", supported=self._needs_hands_ok)
+        return bool(self._needs_hands_ok)
 
     def _takes_user_words(self) -> bool:
         """Whether ``runtime.submit`` names a ``user_words`` parameter (34-review H4; probed once, never assumed)."""
@@ -2165,7 +2180,7 @@ class VoiceBridge(QObject):
         # (v3.18: bound by its own name - the lambda runs later on the GUI thread, and the say_first below used to
         # take this variable's name, so the held run searched memory with Yuki's own words)
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=query,
-                                       user_words=heard))
+                                       user_words=heard, needs_hands=False if args.get("acts") is False else None))
         words = str(args.get("say_first") or "").strip()
         if words and self.speak is not None:
             await self.speak(words)
