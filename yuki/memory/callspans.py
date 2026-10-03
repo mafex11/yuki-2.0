@@ -98,7 +98,9 @@ def _merge(rows: list[CallRecord], now: float) -> list[dict[str, Any]]:
                     continue
             current = {"app": r.app or key, "process": key, "service": r.service, "start": r.detected_at,
                        "end": end, "ongoing": ongoing, "stop_reason": r.stop_reason, "pieces": [(r.detected_at, end)],
-                       "call_ids": [r.id], "hold_since": getattr(r, "hold_since", None)}
+                       "call_ids": [r.id], "hold_since": getattr(r, "hold_since", None),
+                       # call | game: a game's own voice chat is a voice session too (migration 34)
+                       "kind": getattr(r, "kind", None) or "call"}
             spans.append(current)
     return sorted(spans, key=lambda s: s["start"])
 
@@ -156,6 +158,7 @@ def call_spans(store: Store, since: float, until: float, *, now: float | None = 
             "window_background_s": round(max(0.0, window_s - win_front), 1),
             "meanwhile": [{"app": a, "seconds": round(v, 1)} for a, v in others.most_common(MEANWHILE) if v >= 60],
             "drops": drops, "power": [p for p in power if p["seconds"] >= 1], "call_ids": s["call_ids"],
+            "kind": s.get("kind", "call"),
         })
     return out
 
@@ -188,7 +191,7 @@ def open_calls(store: Store, now: float | None = None) -> list[dict[str, Any]]:
     now = time.time() if now is None else float(now)
     # no timeline needed: the calls table alone (a few rows), on the path of every request
     return [{"app": s["app"], "process": s["process"], "service": s["service"], "since": s["start"],
-             "seconds": round(now - s["start"], 1)}
+             "seconds": round(now - s["start"], 1), "kind": s.get("kind", "call")}
             for s in _merge(store.calls_overlapping(now - CONTEXT_S, now + 1.0), now) if s["ongoing"]]
 
 

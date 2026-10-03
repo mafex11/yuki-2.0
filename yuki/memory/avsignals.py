@@ -38,7 +38,9 @@ microphone holder is the **full-screen app in front**, it shows no web page, it 
 camera, and it **draws like a game** - its own share of the GPU's compute (NVML, last 10 s) is at
 least :data:`GAME_GPU_SHARE`. A full-screen meeting or video barely uses the GPU's compute and stays
 a meeting; without a GPU reading, full screen + microphone + no camera + no page counts as gaming.
-A call in another app (Discord in the background) is untouched.
+A call in another app (Discord in the background) is untouched. Since 3 Oct 2026 the call worker
+records such a game's voice chat as a game voice session of its own (``calls.kind`` "game",
+:mod:`yuki.memory.calls`), never as a call.
 """
 
 from __future__ import annotations
@@ -459,8 +461,15 @@ def gaming_with_voice(holder: Holder, *, fullscreen: bool, shows_page: bool, cam
     return share >= GAME_GPU_SHARE, facts
 
 
+#: The full-screen window's process path, per (window, process), so a game in front is opened (for its path) once,
+#: not on every poll of the call worker (``{(hwnd, pid): (monotonic, exe)}``).
+_FRONT_EXE: dict[tuple[int, int], tuple[float, str]] = {}
+_FRONT_EXE_S = 600.0
+
+
 def foreground_fullscreen() -> dict[str, Any] | None:
-    """The window in front when it is full screen: ``{"hwnd", "pid", "exe"}``; ``None`` otherwise."""
+    """The window in front when it is full screen: ``{"hwnd", "pid", "exe"}``; ``None`` otherwise. The process's
+    path is read once per window and process (cached 10 min): a game in front is not opened again on every poll."""
     try:
         user32 = ctypes.WinDLL("user32")
         user32.GetForegroundWindow.restype = ctypes.c_void_p
@@ -473,7 +482,16 @@ def foreground_fullscreen() -> dict[str, Any] | None:
             return None
         pid = ctypes.c_ulong(0)
         user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
-        exe, _family = _pid_identity(int(pid.value)) if pid.value else ("", "")
+        key = (hwnd, int(pid.value))
+        mono = time.monotonic()
+        hit = _FRONT_EXE.get(key)
+        if hit is not None and mono - hit[0] < _FRONT_EXE_S:
+            exe = hit[1]
+        else:
+            exe, _family = _pid_identity(int(pid.value)) if pid.value else ("", "")
+            if len(_FRONT_EXE) > 64:
+                _FRONT_EXE.clear()
+            _FRONT_EXE[key] = (mono, exe)
         return {"hwnd": hwnd, "pid": int(pid.value), "exe": exe}
     except Exception:
         return None

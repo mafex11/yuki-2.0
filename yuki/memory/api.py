@@ -2288,19 +2288,61 @@ class MemoryClient:
         card should be up (no answer yet); ``status`` is ``asking`` |
         ``recording`` | ``waiting_headphones`` (said yes, output is not
         headphones: the microphone stays closed) | ``declined`` |
-        ``unanswered`` | ``not_asked`` (nudges were snoozed) | ``stopped``.
+        ``unanswered`` | ``not_asked`` (nudges were snoozed) | ``stopped`` |
+        ``ask_later`` (a game's voice chat whose card waits until it can be seen).
         Content-free. The service sets ``Local\\YukiCallReady`` whenever it
         changes. Never raises.
+
+        Since 3 Oct 2026 a voice session can hold several rows at once (a call
+        and a game's voice chat, ``kind`` "call" | "game") and records the
+        other side too. ``call`` is a row still going on: the one whose card is
+        up (asking, no answer), else one that records (``recording`` |
+        ``waiting_headphones``: the indicator and Stop follow it), else the
+        call (any status, as before). A game's row is ``call`` only while it
+        records or its card is up: a declined, never, not-asked or waiting
+        (``ask_later``) game is never ``call`` (voice treats any ``call`` as
+        call mode). An ended row is never ``call``. ``recording`` is True
+        whenever anything is being kept: a row recording, the microphone or any
+        app track recording.
+        Added: ``pending_card`` (the card of a game session that ended before
+        it could be shown, up now: ``{"id", "app", "kind", "status", "asking",
+        "consent", "detected_at", "ended_at", "ask_timeout_s",
+        "can_remember_choice"}`` or None - the UI shows it like ``call``'s card;
+        its answer goes to ``answer_call`` the same way), ``sessions`` (every
+        row still going on, and a pending card's row with ``"ended": True``:
+        ``{"id", "app", "kind", "status", "asking", "ended"}``), ``mic``
+        (``{"state": "recording" | "paused" | "off" | "asking", "call_id",
+        "reason": "not_headphones" | "mic_released" | "call_not_consented" |
+        "game_closed" | "game_not_in_use" | "mic_error" | None, "speech_s"}``:
+        the user's microphone, recorded once for the session) and ``tracks``
+        (``[{"call_id", "app", "process", "track_kind": "call" | "game",
+        "state": "recording" | "starting" | "paused" | "off" | "unavailable" |
+        "asking", "reason", "speech_s"}]``: each app's own audio, the other
+        people).
         """
         try:
             from yuki.memory.calls import CallConfig
             from yuki.memory.store import CALL_OPEN_STATUSES
 
             waiting = self.call_audio_waiting()
-            rows = self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1)
-            if not rows:
-                return {"call": None, "recording": False, "waiting": waiting}
-            c = rows[0]
+            opened = self.store.calls(statuses=CALL_OPEN_STATUSES, limit=8)
+            rows = [r for r in opened if r.ended_at is None]
+            # a game session that ended before its card could be shown: the card is up now, the session is over
+            pending = next((r for r in opened if r.ended_at is not None and r.status == "asking"
+                            and r.consent is None), None)
+            off = {"state": "off", "call_id": None, "reason": None, "speech_s": 0.0}
+            if not rows and pending is None:
+                return {"call": None, "recording": False, "waiting": waiting, "sessions": [], "mic": off,
+                        "tracks": [], "pending_card": None}
+
+            def asking(r: Any) -> bool:
+                return r.status == "asking" and r.consent is None
+
+            # a game's row is "call" only while it records or its card is up; a call's row whatever its status
+            live = [r for r in rows if r.kind != "game" or r.status in ("recording", "waiting_headphones") or asking(r)]
+            c = (next((r for r in live if asking(r)), None)
+                 or next((r for r in live if r.status in ("recording", "waiting_headphones")), None)
+                 or next((r for r in live if r.kind == "call"), None))
             timeout = CallConfig().ask_timeout_s
             try:
                 from types import SimpleNamespace
@@ -2312,6 +2354,23 @@ class MemoryClient:
                                          CallConfig.from_dict).get().ask_timeout_s
             except Exception:
                 pass
+            mic, tracks = self._call_tracks(rows) if rows else (dict(off), [])
+            sessions = [{"id": r.id, "app": r.app, "kind": r.kind, "status": r.status, "asking": asking(r),
+                         "ended": False} for r in rows]
+            card = None
+            if pending is not None:
+                sessions.append({"id": pending.id, "app": pending.app, "kind": pending.kind, "status": pending.status,
+                                 "asking": True, "ended": True})
+                card = {"id": pending.id, "app": pending.app, "kind": pending.kind, "status": pending.status,
+                        "asking": True, "consent": pending.consent, "detected_at": _iso(pending.detected_at),
+                        "ended_at": _iso(pending.ended_at), "ask_timeout_s": timeout,
+                        "can_remember_choice": bool(pending.process)}
+            # anything being kept: a row recording, the microphone, or any app's own audio (Stop must be reachable)
+            recording = (any(r.status == "recording" for r in rows) or mic.get("state") == "recording"
+                         or any(t.get("state") == "recording" for t in tracks))
+            if c is None:
+                return {"call": None, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
+                        "tracks": tracks, "pending_card": card}
             session_start = None
             try:   # the call session this row is in: its first row of the same hold (or merged), for the pill
                 from yuki.memory.callspans import session_start as _session_start
@@ -2334,10 +2393,40 @@ class MemoryClient:
                 # Other people in the call as its screen shows (0: the user is alone in it; None: not shown). Voice
                 # treats a call with nobody else in it as no call (v3.15).
                 "others": self._call_others(c.id),
+                # call | game (a game's own voice chat, migration 34)
+                "kind": c.kind,
             }
-            return {"call": call, "recording": c.status == "recording", "waiting": waiting}
+            return {"call": call, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
+                    "tracks": tracks, "pending_card": card}
         except Exception:
             return {"call": None, "recording": False, "waiting": None}
+
+    def _call_tracks(self, rows: list) -> tuple[dict, list[dict]]:
+        """The microphone's and each app track's state for the open rows (the call worker's ``call_tracks`` state,
+        when it is about these rows), with the speech kept so far per track. Content-free."""
+        import json as _json
+
+        from yuki.memory.calls import TRACKS_STATE
+
+        ids = [r.id for r in rows]
+        try:
+            data = _json.loads(self.store.nudge_state(TRACKS_STATE) or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict) or not set(data.get("rows") or []) & set(ids):
+            data = {}
+        speech = self.store.track_speech(ids)
+        mic = dict(data.get("mic") or {"state": "off", "call_id": None, "reason": None})
+        mic["speech_s"] = round(sum(v for (side, _p), v in speech.items() if side != "others"), 1)
+        known = {int(t.get("call_id") or 0): t for t in (data.get("tracks") or []) if isinstance(t, dict)}
+        tracks = []
+        for r in rows:
+            t = known.get(r.id) or {}
+            state = t.get("state") or ("asking" if r.status in ("asking", "ask_later") and r.consent is None else "off")
+            tracks.append({"call_id": r.id, "app": r.app, "process": r.process, "track_kind": r.kind, "state": state,
+                           "reason": t.get("reason"),
+                           "speech_s": round(speech.get(("others", r.process or ""), 0.0), 1)})
+        return mic, tracks
 
     def _call_others(self, call_id: int) -> int | None:
         try:
@@ -2478,6 +2567,7 @@ class MemoryClient:
         places = list(dict.fromkeys(place_label(c.get("place")) for c in contexts if c.get("place")))
         return {
             "ref": f"call:{ids[0]}", "call_ids": ids, "app": span["app"], "service": span.get("service"),
+            "kind": span.get("kind", "call"),   # call | game (a game's own voice chat)
             "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
             "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
             "recorded": recorded, "consent": consent,

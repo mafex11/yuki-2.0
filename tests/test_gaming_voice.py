@@ -112,7 +112,9 @@ def _front(pid: int, exe: str):
     return lambda: {"hwnd": 1, "pid": pid, "exe": exe}
 
 
-def test_valorant_voice_is_not_a_call_but_discord_in_the_background_still_is(store):
+def test_valorant_voice_is_a_game_session_not_a_call_and_discord_in_the_background_still_is(store):
+    """Since 3 Oct 2026 (owner's decision) a full-screen game's own voice chat is a game voice session of its own,
+    asked with the per-app consent - never a call; before, it was skipped."""
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", VALORANT, now - 60)
@@ -121,13 +123,28 @@ def test_valorant_voice_is_not_a_call_but_discord_in_the_background_still_is(sto
     w.foreground_fn = _front(10, VALORANT)
     w.gpu_fn = lambda pids: 65.0
     w.step(now)
-    assert w.active is None                                  # gaming with voice: no call, no consent card
+    assert w.active is None                                  # gaming with voice: no call
+    assert w.game is not None and w.game.kind == "game" and w.game.pid == 10
+    row = store.call_record(w.game.call_id)
+    assert row.kind == "game" and row.status == "ask_later" and row.consent is None   # no card over the game
     stubs.hold("mic", DISCORD, now - 30)                     # the squad joins a Discord call
     stubs.play(4242, DISCORD)
     shows(w, DISCORD, now - 20)                              # its voice-connected panel was seen when joining
     shows(w, VALORANT, now + 1)                              # (a game screen showing call controls stays gaming)
     w.step(now + 5)
     assert w.active is not None and w.active.key == "discord"
+    assert w.game is not None and w.game.key == "valorant-win64-shipping" and len(store.calls()) == 2
+
+
+def test_game_voice_off_skips_the_game_as_before(store):
+    now = time.time()
+    stubs = Stubs()
+    stubs.hold("mic", VALORANT, now - 60)
+    w = _worker(store, stubs, game_voice=False)
+    w.foreground_fn = _front(10, VALORANT)
+    w.gpu_fn = lambda pids: 65.0
+    w.step(now)
+    assert w.active is None and w.game is None and not store.calls()
 
 
 def test_a_full_screen_call_app_with_low_gpu_stays_a_call(store):
