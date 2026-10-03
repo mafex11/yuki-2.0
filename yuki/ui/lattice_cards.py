@@ -416,8 +416,10 @@ class CardFoot(QWidget):
 class ReturnCard(LatticeCard):
     """How a run ended (the design's return card, revamp 38 §8b-c): the header by the real outcome ("Done", "Stopped",
     "Didn't finish", "Handed back") and the time, one plain sentence, **Changed** (the effects the user cares about in
-    plain words, the opening steps folded into one line, "+N more"), **Needs you**, a **Learned** proposal from
-    practice memory with Save / Edit / No (applied when the card goes), and a footer of the run's time and Why.
+    plain words, the opening steps folded into one line, "+N more"), **Needs you**, a **Learned** box with Save / Edit
+    / No (applied when the card goes) - only ever a way this run's verified success taught, with what didn't work on
+    the way there; a failed or stopped run never has one (appLearn, :func:`yuki.ui.app.learned_for_card`) - and a
+    footer of the run's time and Why.
     No undo of any kind: no chips, no Undo keys, no "can't undo" text (the user, 3 Oct 19:10). A run with nothing to
     tell shows no card (the tray decides, :func:`yuki.ui.step_words.return_view`).
 
@@ -484,7 +486,7 @@ class ReturnCard(LatticeCard):
             icon, head: The header by the real outcome.
             more: Changes that did not fit ("+2 more").
             needs: What needs the user, if anything.
-            learned: A practice-memory proposal to Save / Edit / No.
+            learned: A way this run's verified success taught, to Save / Edit / No (``id``, ``text``, ``why``).
             took: The run's time ("41 s").
         """
         self.set_head(icon, f"{head} · {at}" if at else head)
