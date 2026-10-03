@@ -197,7 +197,11 @@ class SessionLabeler:
                     result.decisions += got
                     if dry_run or not got:
                         continue
-                    n = store.set_episode_labels({d["id"]: (d["title"], d["summary"]) for d in got})
+                    # each with its before-image (undo_run), and only where no title was written meanwhile
+                    n = store.write_with_images(
+                        "episode", {d["id"]: {"title_ciphertext": d["title"], "summary_ciphertext": d["summary"]}
+                                    for d in got}, run_id=run_id, action="label", now=now,
+                        only_if={d["id"]: {"title_ciphertext": None} for d in got})
                     result.written += n
                     store.add_diary(run_id, [{"pass": SESSIONS_PASS, "action": "label",
                                               "fact_ids": [d["id"] for d in got],
@@ -218,18 +222,16 @@ class SessionLabeler:
         return result
 
     def undo(self, run_id: int, *, now: float | None = None) -> dict[str, Any]:
-        """Take a sessions pass back: the titles and summaries it wrote are cleared again (they were empty before:
-        the pass only fills missing ones). One diary line."""
+        """Take a sessions pass back: each title and summary it wrote is put back as it was (empty), unless it was
+        changed since (a correction): those are left and counted in ``diverged``. One diary line."""
         now = time.time() if now is None else float(now)
-        lines = [d for d in self.store.changelog(pass_=SESSIONS_PASS, limit=100_000)
-                 if d["run_id"] == int(run_id) and d["action"] == "label"]
-        ids = sorted({int(i) for d in lines for i in d["fact_ids"]})
-        n = self.store.restore_episode_labels({i: (None, None) for i in ids})
+        got = self.store.undo_run(int(run_id), surfaces=("episode",), now=now)
+        ids = got["items"].get("episode", [])
         if ids:
             self.store.add_diary(None, [{"pass": SESSIONS_PASS, "action": "undo", "fact_ids": ids,
-                                         "text": f"Took back the sessions pass of run {int(run_id)}: {n} title(s) "
-                                                 f"cleared."}], now=now)
-        return {"cleared": n}
+                                         "text": f"Took back the sessions pass of run {int(run_id)}: {len(ids)} "
+                                                 f"title(s) cleared."}], now=now)
+        return {"cleared": len(ids), "diverged": len(got["diverged"].get("episode", []))}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

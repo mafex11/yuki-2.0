@@ -2901,9 +2901,10 @@ MIGRATIONS: tuple[str, ...] = (
     #   written with its shown form (the nightly review, the titles pass); cleared with it when the state changes.
     # - work_threads.closed_by / closed_at: who closed or dismissed it last (user | model | code) and when; cleared
     #   when the thread is reopened. A thread the user closed is offered to the journal as such.
-    # - undo_images: the before-image of a thread a change touched (its row, the journal facts, events and
-    #   links that pointed at it, its vector), per pass run (run_id) or per user op (run_id NULL): every close,
-    #   dismiss, merge, rename and rewrite is reversible (Reopen, --undo RUN_ID).
+    # - undo_images: the before-image (and after-image) of an item a pass or the user's own op changed, per pass run
+    #   (run_id) or per user op (run_id NULL): a thread (its row, the journal facts, events and links that pointed at
+    #   it, its vector), a shown form, a session's title and summary, a journal row's provenance. Every close,
+    #   dismiss, merge, rename and rewrite is reversible (Reopen, --undo RUN_ID); a later change is never undone.
     # - episodes.title_ciphertext / summary_ciphertext: a work session's short distinct title (a few words) and its
     #   concise summary said to the user (one or two short sentences, English), written by the episode call itself.
     # - correction_passes.target: the item the user was correcting in their own words (W12, E40, P7, J300): the
@@ -2916,11 +2917,13 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE TABLE undo_images (
         id                 INTEGER PRIMARY KEY,
         run_id             INTEGER,
-        work_thread_id     INTEGER NOT NULL,
+        surface            TEXT NOT NULL,          -- thread | fact | gist | episode | journal
+        item_id            INTEGER NOT NULL,
         action             TEXT NOT NULL,
-        by                 TEXT NOT NULL,
+        by                 TEXT NOT NULL,          -- user | model | code
         at                 REAL NOT NULL,
         before_ciphertext  TEXT NOT NULL,
+        after_ciphertext   TEXT,
         undone_at          REAL
     );
     CREATE INDEX undo_images_run ON undo_images(run_id);
@@ -8708,16 +8711,6 @@ class Store:
 
         return int(self._write(op)) if rows else 0
 
-    def restore_episode_labels(self, rows: dict[int, tuple[str | None, str | None]]) -> int:
-        """Put sessions' titles and summaries back as they were (``None`` clears them): the undo of a sessions pass."""
-
-        def op(conn: sqlite3.Connection) -> int:
-            return sum(conn.execute("UPDATE episodes SET title_ciphertext=?, summary_ciphertext=? WHERE id=?",
-                                    (self._enc(t or None), self._enc(s or None), int(eid))).rowcount
-                       for eid, (t, s) in rows.items())
-
-        return int(self._write(op)) if rows else 0
-
     def episodes_without_labels(self, since: TimeArg = None) -> list[EpisodeRecord]:
         """Current episodes without a session title (migration 35), oldest first."""
         where, params = self._episode_filter(since, None)
@@ -9348,15 +9341,15 @@ class Store:
             "vec": None if vec is None else {"model": vec["model"], "dim": vec["dim"],
                                              "blob": base64.b64encode(bytes(vec["vec_ciphertext"])).decode("ascii")},
         }
-        conn.execute("INSERT INTO undo_images(run_id, work_thread_id, action, by, at, before_ciphertext)"
-                     " VALUES (?,?,?,?,?,?)", (run_id, int(tid), str(action), str(by), now,
-                                               self.cipher.encrypt(json.dumps(before, default=str))))
+        conn.execute("INSERT INTO undo_images(run_id, surface, item_id, action, by, at, before_ciphertext)"
+                     " VALUES (?,?,?,?,?,?,?)", (run_id, "thread", int(tid), str(action), str(by), now,
+                                                 self.cipher.encrypt(json.dumps(before, default=str))))
 
     def _restore_work_thread(self, conn: sqlite3.Connection, snap: sqlite3.Row, now: float) -> None:
         """Put one before-image back (inside the caller's transaction) and mark it undone."""
         import base64
 
-        tid = int(snap["work_thread_id"])
+        tid = int(snap["item_id"])
         before = json.loads(self.cipher.decrypt(snap["before_ciphertext"]))
         cols = [c for c in self._WORK_SNAPSHOT_COLUMNS if c in before["row"]]
         conn.execute(f"UPDATE work_threads SET {', '.join(f'{c}=?' for c in cols)}, updated_at=? WHERE id=?",
@@ -9380,29 +9373,101 @@ class Store:
                             (int(tid), float(at), float(at))).fetchone() is not None
 
     def undo_work_threads(self, run_id: int, *, now: float | None = None) -> dict[str, Any]:
-        """Take back what one pass run did to the threads of work (migration 35): each thread it touched gets its
-        before-image back (row, facts, events, links, vector), newest change first. A thread the user worked on since
-        (a journal event after the change) is left as it is and reported in ``diverged``. Returns ``{"restored",
-        "diverged": [thread ids], "threads": [thread ids]}``."""
+        """Take back what one pass run did to the threads of work (migration 35): :meth:`undo_run` for threads only.
+        Returns ``{"restored", "diverged": [thread ids], "threads": [thread ids]}``."""
+        got = self.undo_run(run_id, surfaces=("thread",), now=now)
+        return {"restored": got["restored"], "diverged": got["diverged"].get("thread", []),
+                "threads": got["items"].get("thread", [])}
+
+    #: The simple surfaces an image keeps (migration 35): ``surface -> (table, key column, columns)``.
+    _IMAGE_SURFACES: dict[str, tuple[str, str, tuple[str, ...]]] = {
+        "fact": ("portrait_facts", "id", ("shown_ciphertext",)),
+        "gist": ("call_digests", "call_id", ("gist_shown_ciphertext",)),
+        "episode": ("episodes", "id", ("title_ciphertext", "summary_ciphertext")),
+        "journal": ("journal", "id", ("source_ciphertext",)),
+        "thread_card": ("work_threads", "id", ("shown_ciphertext", "next_ciphertext")),
+    }
+
+    def write_with_images(self, surface: str, rows: dict[int, dict[str, Any]], *, run_id: int | None, action: str,
+                          by: str = "model", now: float | None = None, only_if: dict[int, dict[str, Any]] | None = None
+                          ) -> int:
+        """Write plaintext values into one simple surface's columns (:data:`_IMAGE_SURFACES`), ``{item id: {column:
+        text or None}}``, keeping each item's before- and after-image under ``run_id`` (:meth:`undo_run` puts the old
+        values back while the new ones still stand). ``only_if``: ``{item id: {column: plaintext}}`` the item must
+        still hold (a value changed since a dry run is left). Returns how many items were written."""
+        table, key, columns = self._IMAGE_SURFACES[surface]
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for item_id, values in rows.items():
+                cols = [c for c in values if c in columns]
+                if not cols:
+                    continue
+                row = conn.execute(f"SELECT {', '.join(columns)} FROM {table} WHERE {key}=?", (item_id,)).fetchone()
+                if row is None:
+                    continue
+                want = (only_if or {}).get(item_id)
+                if want and any(self._dec(row[c]) != want.get(c) for c in want if c in columns):
+                    continue
+                enc = {c: (self.cipher.encrypt(str(values[c])) if values[c] not in (None, "") else None) for c in cols}
+                conn.execute(f"UPDATE {table} SET {', '.join(f'{c}=?' for c in cols)} WHERE {key}=?",
+                             (*(enc[c] for c in cols), item_id))
+                before = {c: row[c] for c in cols}
+                conn.execute("INSERT INTO undo_images(run_id, surface, item_id, action, by, at, before_ciphertext,"
+                             " after_ciphertext) VALUES (?,?,?,?,?,?,?,?)",
+                             (run_id, surface, int(item_id) if str(item_id).isdigit() else 0, action, by, now,
+                              self.cipher.encrypt(json.dumps(before)), self.cipher.encrypt(json.dumps(enc))))
+                n += 1
+            return n
+
+        return int(self._write(op)) if rows else 0
+
+    def undo_run(self, run_id: int, *, surfaces: Sequence[str] | None = None, now: float | None = None
+                 ) -> dict[str, Any]:
+        """Take back everything one pass run changed (migration 35's images), newest change first: a thread gets its
+        before-image back unless the user worked on it since (a journal event after the change); a simple surface
+        gets its old values back only while the run's values still stand (a later change is never undone). Returns
+        ``{"restored", "items": {surface: [ids]}, "diverged": {surface: [ids]}}``."""
         now = time.time() if now is None else float(now)
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             snaps = conn.execute("SELECT * FROM undo_images WHERE run_id=? AND undone_at IS NULL ORDER BY id DESC",
                                  (int(run_id),)).fetchall()
-            restored, diverged, threads = 0, [], []
+            restored = 0
+            items: dict[str, list[int]] = {}
+            diverged: dict[str, list[int]] = {}
             for snap in snaps:
-                tid = int(snap["work_thread_id"])
-                if self._touched_since(conn, tid, float(snap["at"])):
-                    diverged.append(tid)
+                surface, item = snap["surface"], int(snap["item_id"])
+                if surfaces is not None and surface not in surfaces:
                     continue
-                self._restore_work_thread(conn, snap, now)
+                if surface == "thread":
+                    if self._touched_since(conn, item, float(snap["at"])):
+                        diverged.setdefault(surface, []).append(item)
+                        continue
+                    self._restore_work_thread(conn, snap, now)
+                else:
+                    table, key, columns = self._IMAGE_SURFACES[surface]
+                    before = json.loads(self.cipher.decrypt(snap["before_ciphertext"]))
+                    after = json.loads(self.cipher.decrypt(snap["after_ciphertext"])) if snap["after_ciphertext"] else {}
+                    row = conn.execute(f"SELECT {', '.join(columns)} FROM {table} WHERE {key}=?", (item,)).fetchone()
+                    # the run's value still stands (ciphertexts are random: compare what they say)
+                    if row is None or any(self._dec(row[c]) != (self._dec(after[c]) if after.get(c) else None)
+                                          for c in before):
+                        diverged.setdefault(surface, []).append(item)
+                        continue
+                    cols = list(before)
+                    conn.execute(f"UPDATE {table} SET {', '.join(f'{c}=?' for c in cols)} WHERE {key}=?",
+                                 (*(before[c] for c in cols), item))
+                    conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, int(snap["id"])))
                 restored += 1
-                if tid not in threads:
-                    threads.append(tid)
-            for tid in threads:
+                if item not in items.setdefault(surface, []):
+                    items[surface].append(item)
+            for tid in items.get("thread", []):
                 conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
                              " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "reopens", None, "undo", now))
-            return {"restored": restored, "diverged": sorted(set(diverged)), "threads": threads}
+            return {"restored": restored, "items": items,
+                    "diverged": {k: sorted(set(v)) for k, v in diverged.items()}}
 
         return self._write(op)
 
@@ -9417,8 +9482,9 @@ class Store:
             row = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()
             if row is None or row["status"] not in ("done", "paused", "dismissed"):
                 return None
-            snap = conn.execute("SELECT * FROM undo_images WHERE work_thread_id=? AND undone_at IS NULL AND"
-                                " action IN ('close', 'dismiss') ORDER BY id DESC LIMIT 1", (int(thread_id),)).fetchone()
+            snap = conn.execute("SELECT * FROM undo_images WHERE surface='thread' AND item_id=? AND undone_at IS NULL"
+                                " AND action IN ('close', 'dismiss') ORDER BY id DESC LIMIT 1",
+                                (int(thread_id),)).fetchone()
             if snap is not None and not self._touched_since(conn, int(thread_id), float(snap["at"])):
                 self._restore_work_thread(conn, snap, now)
             status = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()["status"]

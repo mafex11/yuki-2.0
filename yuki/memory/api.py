@@ -2886,13 +2886,24 @@ class MemoryClient:
         Each is :meth:`_journal_dict` plus ``ref`` (``journal:N``, what :meth:`resolve_heard` takes), ``heard_in`` (a
         label: the voice channel for an entry said on a call when the digest saw it, "Discord, #general voice
         (Friends)"; else the call app or the window's app), ``channel_known`` and ``people`` (who the call screen showed
-        on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises."""
+        on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises.
+
+        Since the feedback round 3 (W6, :mod:`yuki.memory.misheard`) only real mishearings are listed: entries whose
+        provenance holds the words as heard and Yuki's guess. Each item also has ``heard`` ("hey meant", Latin
+        letters), ``guess`` ("Hemanth"), ``why`` (who or what makes it fit, English), ``guess_is_name`` and ``shown``
+        (the entry said to the user in English, or None: show ``text`` then). The raw transcript (``source.quote``)
+        is provenance, never for showing."""
+        from yuki.memory.misheard import is_listed
         from yuki.memory.titles import place_label
 
         now = time.time() if now is None else float(now)
         try:
-            entries, total = self.store.uncertain_journal(now - float(days) * 86400.0, limit=max(0, int(limit)))
-            dicts = [self._journal_dict(j) for j in entries]
+            entries, _all = self.store.uncertain_journal(now - float(days) * 86400.0)
+            entries = [j for j in entries if is_listed(j.source)]
+            total = len(entries)
+            dicts = [{**self._journal_dict(j), "heard": j.source.get("heard"), "guess": j.source.get("meant"),
+                      "why": j.source.get("meant_why") or None, "guess_is_name": bool(j.source.get("meant_name")),
+                      "shown": j.source.get("shown") or None} for j in entries[: max(0, int(limit))]]
             calls = {}
             ids = {int(d["call"][5:]) for d in dicts if str(d.get("call") or "").startswith("call:")
                    and str(d["call"])[5:].isdigit()}
@@ -2921,14 +2932,29 @@ class MemoryClient:
         - either is taken back, and a queued pass (``correction_id``) is cancelled first; once that pass started, nothing
         is taken back (``ok`` False, :data:`TOO_LATE_TO_UNDO`); an entry never answered has nothing to undo. The item
         leaves :meth:`misheard` at once (answered entries are never listed again). Returns ``{"ok", "ref", "verdict",
-        "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered."""
+        "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered.
+
+        With Yuki's guess (the feedback round 3, W6): ``right`` means the GUESS is right - the entry is settled at once
+        and the correction pass is queued with the user's words "It was 'Hemanth', not 'hey meant'" and the entry as
+        its target (the entry reworded, the name alias learned once a rewrite carries it; ``correction_id``; Undo
+        cancels it while it waits); ``as_heard`` keeps the words as heard (the old Right); ``wrong`` retires it as
+        before; a correction in the user's own words goes through :meth:`correct_item`."""
         jid = self._journal_id(ref)
         verdict = str(verdict or "").strip().lower()
         out: dict[str, Any] = {"ok": False, "ref": f"journal:{jid}" if jid else str(ref or ""), "verdict": verdict,
                                "nature": None, "correction_id": None}
-        if jid is None or verdict not in ("right", "wrong", "undo"):
-            out["error"] = "say right, wrong or undo for a journal entry"
+        if jid is None or verdict not in ("right", "as_heard", "wrong", "undo"):
+            out["error"] = "say right, as_heard, wrong or undo for a journal entry"
             return out
+        guess: dict[str, Any] | None = None
+        if verdict == "right":
+            from yuki.memory.misheard import is_listed
+
+            rows = self.store.journal_by_ids([jid])
+            if rows and is_listed(rows[0].source):
+                guess = rows[0].source
+        if verdict == "as_heard":
+            verdict = "right"
         if verdict == "undo" and correction_id:   # the ripple first: once its pass started, the answer stands (A3)
             out["cancelled"] = self.store.cancel_correction(int(correction_id))
             if not out["cancelled"]:
@@ -2946,6 +2972,16 @@ class MemoryClient:
         if verdict == "wrong":
             out["correction_id"] = self._ripple(done.get("app") or "what Yuki heard", done["text"],
                                                 "That was misheard. It's wrong, forget it")
+        elif guess is not None:
+            from yuki.memory.misheard import right_words
+
+            try:
+                text = (f'About "what Yuki heard" (memory had: "{" ".join(done["text"].split())}"), '
+                        f'the user said in their own words: "{right_words(guess)}"')
+                out["correction_id"] = self.store.add_correction(secret_filter.redact_text(text), target=f"J{jid}")
+                self.rerender_portrait()   # wakes the service for the pass
+            except Exception:
+                pass
         return out
 
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:

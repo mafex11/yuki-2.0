@@ -324,8 +324,12 @@ def test_misheard_lists_the_voice_channel_and_resolves_at_once_without_a_model(s
     cid = _call_row(store, started_at=NOW - 7200, people=["Ana"],
                     place={"app": "Discord", "kind": "voice", "channel": "late-night", "server": "Ana's server"})
     heard = _journal(store, "Said what sounded like 'the build is green'.", at=NOW - 7000, nature="uncertain",
-                     source={"kind": "call", "where": "Discord call", "call": f"call:{cid}", "unclear": True})
-    other = _journal(store, "Said what sounded like a name.", at=NOW - 6000, nature="uncertain", app="WhatsApp")
+                     source={"kind": "call", "where": "Discord call", "call": f"call:{cid}", "unclear": True,
+                             "heard": "the build is green", "meant": "the bill is green", "meant_why": "a guess"})
+    other = _journal(store, "Said what sounded like a name.", at=NOW - 6000, nature="uncertain", app="WhatsApp",
+                     source={"kind": "call", "heard": "hey meant", "meant": "Hemanth", "meant_name": True})
+    # the feedback round 3 (W6): an uncertain line with no mishearing and no guess is never listed
+    _journal(store, "Said something unclear about the weekend.", at=NOW - 5000, nature="uncertain")
     m = client.misheard(now=NOW)
     assert m["total"] == 2 and [i["id"] for i in m["items"]] == [other, heard]            # newest first
     item = m["items"][1]
@@ -333,7 +337,7 @@ def test_misheard_lists_the_voice_channel_and_resolves_at_once_without_a_model(s
     assert item["heard_in"] == "Discord, #late-night voice (Ana's server)" and item["channel_known"]
     assert item["people"] == ["Ana"] and m["items"][0]["heard_in"] == "WhatsApp"
     t0 = time.perf_counter()
-    out = client.resolve_heard(f"journal:{heard}", "right")
+    out = client.resolve_heard(f"journal:{heard}", "as_heard")    # the words as heard (Right before the guesses)
     assert time.perf_counter() - t0 < 1.0
     assert out["ok"] and out["nature"] == "fact" and out["correction_id"] is None
     assert [i["id"] for i in client.misheard(now=NOW)["items"]] == [other]                 # gone at once
