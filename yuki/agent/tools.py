@@ -767,6 +767,13 @@ def call_traits(name: str, tool_input: dict[str, Any] | None = None, *, role: st
     return traits
 
 
+def sends_for_certain(traits: Traits) -> bool:
+    """The call sends something to someone for certain, not only might (revamp 38 §8c: the return card's "Nothing
+    was sent."): text typed with Enter, or a click while Yuki's typed text waits in that window. A key or a click on
+    a button only may send, so it does not count. The traits' identity, never words."""
+    return traits is OP_TRAITS[("type_text", "submit")] or traits is PENDING_TEXT_CLICK_TRAITS
+
+
 #: Tools some operation of which can destroy or reach someone: they carry the ``risk`` field (revamp D, 07 E1: the
 #: rest no longer spend output tokens on it).
 RISK_TOOLS: tuple[str, ...] = tuple(
@@ -804,7 +811,30 @@ for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional fields on each ac
     if _name in RISK_TOOLS:
         _props[RISK_FIELD] = RISK_SCHEMA
     _props[PLAYBOOK_FIELD] = PLAYBOOK_SCHEMA
-TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", RISK_FIELD]
+
+#: The step in the brain's own plain words (revamp 38 §8c, the user's 3 Oct feedback 12 and 14: "no technical things
+#: for users"): what a call whose input says nothing a person reads (a shell command, keys, typed text) does for the
+#: user, verb first, as they would say it ("close Slack", "open the address bar"). Every place the user sees a step
+#: (the strip, the island, the chat's steps, the return card, the Activity ledger) shows it instead of the input; a
+#: note, not what the call does, so it is left out wherever calls are compared (``yuki.agent.loopguard.NOTE_FIELDS``).
+#: Required on run_powershell, optional on the key and typing tools.
+WHAT_FIELD = "what"
+WHAT_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": "What this does for them, in plain words, verb first, at most 6 words (\"close Slack\", \"open "
+                   "the address bar\"): never a command, key name, path, id or number.",
+}
+WHAT_TOOLS: tuple[str, ...] = ("run_powershell", "type_text", "hotkey", "press")
+for _name in WHAT_TOOLS:
+    TOOLS_BY_NAME[_name]["input_schema"]["properties"][WHAT_FIELD] = WHAT_SCHEMA
+TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", WHAT_FIELD, RISK_FIELD]
+
+#: What the agent knows about a call's target that a person can read, added by the loop to the ``tool_call`` event's
+#: input (never sent by the model, never run): the control's role and name from the latest read, the app's name, the
+#: tab's name, the call's traits (sends / destroys / reaches) and the brain's declared ``risk.effect``. The UI builds
+#: its step words from this and the call's ``what`` only (``yuki.ui.status.describe_tool``), never from the
+#: command, typed text or address.
+STEP_ABOUT_FIELD = "_about"
 
 #: The voice's step line (docs/VOICE.md v3.14): the few words Yuki's voice says as a step starts. Only on a spoken
 #: request's tools (:func:`with_step_lines`), optional there since revamp D (07 E1: heard 0 of 9 times when required;

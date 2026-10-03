@@ -46,7 +46,8 @@ class Thinking:
 
 @dataclass(frozen=True)
 class ToolCall:
-    """The model asked for a tool."""
+    """The model asked for a tool. For an action, ``input`` also carries the agent's ``_about`` (what a person can read
+    about the target: ``yuki.agent.tools.STEP_ABOUT_FIELD``) next to the brain's ``what``: the UI's step words."""
 
     name: str
     input: dict[str, Any]
@@ -63,6 +64,9 @@ class ToolResult:
     kind: Literal["tool_result"] = "tool_result"
     #: The tool's structured result (for the UI to name what it worked on); not compared or printed.
     payload: Any = field(default=None, compare=False, repr=False)
+    #: The step's words for the UI (revamp 38 §8c), the same as on its call: the brain's ``what`` and the agent's
+    #: ``_about`` (the target's names, sends / changes); never the command, typed text or address.
+    about: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
