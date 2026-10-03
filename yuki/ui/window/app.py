@@ -1190,6 +1190,11 @@ def main(argv: list[str] | None = None) -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(_Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Yuki")
+    icon = Path(__file__).resolve().parents[1] / "yuki.ico"   # the app icon, every size (packaging/make_icon.py)
+    if icon.exists():
+        from PySide6.QtGui import QIcon
+
+        app.setWindowIcon(QIcon(str(icon)))
     from yuki.ui.window.theme import app_font
 
     app.setFont(app_font())   # Segoe UI Variable with its real weights (and Doto, Nirmala UI) for every widget
