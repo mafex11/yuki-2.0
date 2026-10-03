@@ -1,7 +1,12 @@
-/* Copied unchanged from the Lattice design (docs/ui-mockups/revamp-2026-10/3-lattice/field.js, gitignored;
-   2026-10-02 refinement round) for the E2 WebView2 spike. It reads no data of its own: the skyline figure
-   asks window.YK, which the window does not define. Keep in step with the design when E3 ports the pages. */
-/* Lattice: the living dot field, the halo under the island, Yuki's dot-matrix face, and dot icons.
+/* From the Lattice design (docs/ui-mockups/revamp-2026-10/3-lattice/field.js, gitignored; 2026-10-02 refinement
+   round). Every animation is the design's own: the same loop, rates, easing, sweeps, reveal and live figures. Changed
+   for the real window (E3, 2026-10-03), and only this:
+   - the skyline and week figures draw the page's data (el.__sky, el.__week from memory), not window.YK;
+   - the live colour follows the accent setting (--live; Lattice.refreshColors);
+   - Motion.quiet: while a full-screen app covers the window (the host tells the page), one still frame, as reduced
+     motion draws; minimised or hidden, the loop stops as before (document.hidden);
+   - a face can be told not to blink while idle (face.idleBlink = false): nothing live, nothing redraws.
+   Lattice: the living dot field, the halo under the island, Yuki's dot-matrix face, and dot icons.
    Budget:
    - one shared loop on a 33 ms timer (<= 30 fps by construction); it stops when every subscriber
      has settled and while the page is hidden;
@@ -12,12 +17,24 @@
   'use strict';
   const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
   const COL = { lit: [242, 239, 233], live: [111, 235, 196], mid: [150, 147, 140], base: [38, 41, 44] };
+  /* Yuki: the live colour follows the accent setting (--live); Lattice.refreshColors() rebuilds the sprites */
+  function readLive() {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue('--live').trim();
+      const rgb = v.length === 7 && v[0] === '#' ? [1, 3, 5].map((k) => parseInt(v.slice(k, k + 2), 16)) : null;
+      if (rgb && rgb.every((n) => n >= 0 && n <= 255)) COL.live = rgb;
+    } catch (e) { /* keep the default */ }
+  }
+  const SURFACES = new Set();
 
   /* ---------------- motion preference ---------------- */
   const mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
   const Motion = {
-    reduced: mq.matches,
-    set(v) { this.reduced = !!v; document.documentElement.dataset.motion = v ? 'reduced' : 'full'; Loop.kick(); }
+    pref: mq.matches, quiet: false,
+    get reduced() { return this.pref || this.quiet; },
+    set(v) { this.pref = !!v; document.documentElement.dataset.motion = v ? 'reduced' : 'full'; Loop.kick(); },
+    /* Yuki: a full-screen app covers the window (the host checks): draw one still frame, pause CSS live dots */
+    setQuiet(v) { if (!!v === this.quiet) return; this.quiet = !!v; document.documentElement.classList.toggle('quiet', this.quiet); Loop.kick(); }
   };
 
   /* ---------------- perf counters (read by the ?perf=1 HUD) ---------------- */
@@ -97,13 +114,16 @@
       this.anchor = null; this.base = document.createElement('canvas');
       this.frame = this.frame.bind(this);
       this.resize();
+      SURFACES.add(this);
       if (this.kind === 'window') {
         let rq = 0;
         window.addEventListener('resize', () => { clearTimeout(rq); rq = setTimeout(() => { this.resize(); this.measure(); }, 60); });
         this.ro = window.ResizeObserver ? new ResizeObserver(() => this.remeasure()) : null;
       }
     }
+    recolor() { const size = Math.ceil(this.pitch * DPR); this.sp = makeSprites(size, this.pitch * 0.3 * DPR, 1.3 * DPR, false); this.full = true; Loop.add(this.frame); }
     resize() {
+      readLive();
       const w = this.fixedW || window.innerWidth, h = this.fixedH || window.innerHeight;
       this.w = w; this.h = h;
       this.c.width = Math.round(w * DPR); this.c.height = Math.round(h * DPR);
@@ -210,7 +230,8 @@
             ox += (q.w + 1) * sc;
           });
         } else if (f.kind === 'week') {
-          const days = JSON.parse(el.dataset.days || '[]');
+          // Yuki: the page's week (el.__week: minutes at the PC, of which active a / full screen f), the design's scale
+          const days = (el.__week || JSON.parse(el.dataset.days || '[]')).map((d) => ({ pc: d.pc || 0, work: d.work != null ? d.work : d.a || 0, game: d.game != null ? d.game : d.f || 0 }));
           const max = 660, H = f.cj;
           days.forEach((d, n) => {
             const x0 = f.i0 + n * 4;
@@ -229,32 +250,25 @@
       this.figIdx = Int32Array.from(idx);
       this.figT0 = performance.now() / 1000;
     }
+    /* Yuki: the day from the page's data (el.__sky.buckets: equal slices, each {p: share of it at the PC, m: active |
+       full | away | off | gap | future, c: 0 | 1 call | 2 live call}); the design's drawing and sweep delays. Height is
+       the measured share at the PC; full screen draws as the design's striped gaming columns. */
     rasterSkyline(f, put) {
-      const Y = window.YK; if (!Y) return;
-      const cols = f.ci, H = f.cj, spanMin = 24 * 60, per = spanMin / cols;
+      const sky = f.el.__sky; if (!sky || !sky.buckets || !sky.buckets.length) return;
+      const B = sky.buckets, cols = f.ci, H = f.cj, spanMin = 24 * 60, per = spanMin / cols, bl = spanMin / B.length;
       f.per = per;
-      const H_KIND = { work: 0.78, gaming: 0.6, music: 0.46, video: 0.34, call: 0.3, away: 0 };
-      const noise = (n) => (Math.sin(n * 12.9898) * 43758.5453) % 1;
       for (let c = 0; c < cols; c++) {
         const m = c * per + per / 2;
-        const s = Y.sessions.find((x) => m >= x.a && m < x.b);
-        const call = Y.callsToday.find((x) => x.kind === 'call' && m >= x.a && m < x.b);
-        const gv = Y.callsToday.find((x) => x.kind !== 'call' && m >= x.a && m < x.b);
+        const b = B[Math.min(B.length - 1, Math.floor(m / bl))] || {};
         const d = c * 0.012;
-        if (call) { for (let y = 0; y < 2; y++) put(f.i0 + c, f.j0 + y, call.live ? 1 : 0.9, call.live ? 1 : 0, d); }
-        else if (gv) put(f.i0 + c, f.j0 + 1, 0.5, 2, d);
+        if (b.c) { for (let y = 0; y < 2; y++) put(f.i0 + c, f.j0 + y, b.c === 2 ? 1 : 0.9, b.c === 2 ? 1 : 0, d); }
         const avail = H - 5;
-        if (!s || s.kind === 'away') { if (c % 2 === 0) put(f.i0 + c, f.j0 + H - 1, 0.32, 2, d); continue; }
-        const blk = s.blocks.find((b) => m >= Y.fmt.toMin(b.start) && m < Y.fmt.toMin(b.end));
-        const jitter = blk ? 0.08 * (noise(blk.start.length + Y.fmt.toMin(blk.start)) + 0.5) : 0;
-        const h = Math.max(2, Math.round(avail * Math.min(1, (H_KIND[s.kind] || 0.4) + jitter)));
+        if (b.m === 'future') continue;
+        if (!(b.p > 0) || b.m === 'away' || b.m === 'off' || b.m === 'gap') { if (c % 2 === 0) put(f.i0 + c, f.j0 + H - 1, 0.32, 2, d); continue; }
+        const h = Math.max(2, Math.round(avail * Math.min(1, b.p)));
         for (let y = 0; y < h; y++) {
-          let v = 1, t = 0;
-          if (s.kind === 'gaming') { v = y === h - 1 ? 1 : (y % 2 === 0 ? 0.9 : 0.16); }
-          else if (s.kind === 'music') { v = 0.9; t = 2; }
-          else if (s.kind === 'video') { v = 0.7; t = 2; }
-          else if (s.kind === 'call') { v = 0.8; t = 2; }
-          put(f.i0 + c, f.j0 + H - 1 - y, v, t, d + y * 0.006);
+          const v = b.m === 'full' ? (y === h - 1 ? 1 : (y % 2 === 0 ? 0.9 : 0.16)) : 1;
+          put(f.i0 + c, f.j0 + H - 1 - y, v, 0, d + y * 0.006);
         }
       }
     }
@@ -466,6 +480,7 @@
       this.blinkAt = -10; this.t0 = performance.now() / 1000; this.step = { n: 2, of: 5 };
       this.frame = this.frame.bind(this);
       this.setPitch(pitch || 4);
+      SURFACES.add(this);
       this.scheduleBlink();
       Loop.add(this.frame);
     }
@@ -488,7 +503,7 @@
         this.scheduleBlink();
       }, 3800 + Math.random() * 3200);
     }
-    blinks() { return this.state === 'idle' || this.state === 'listening' || this.state === 'speaking' || this.state === 'hearing'; }
+    blinks() { return (this.state === 'idle' && this.idleBlink !== false) || this.state === 'listening' || this.state === 'speaking' || this.state === 'hearing'; }
     set(s, step) {
       if (step) this.step = step;
       if (!this.bt) this.scheduleBlink();
@@ -596,7 +611,7 @@
       }
     }
     frame(t) {
-      if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; return false; }
+      if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; SURFACES.delete(this); return false; }
       this.target(Motion.reduced ? 1.3 : t);
       const W = FACE_W, H = FACE_H, x = this.x, dp = this.dp, g = this.g, tn = this.tn, cur = this.cur;
       const ka = Motion.reduced ? 1 : 0.6, kr = Motion.reduced ? 1 : 0.17;
@@ -683,5 +698,9 @@
     step(performance.now());
   }
 
-  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, icon, reveal, DPR, FACE_W, FACE_H };
+  function refreshColors() {
+    readLive();
+    SURFACES.forEach((s) => { if (!s.c.isConnected) { SURFACES.delete(s); return; } if (s instanceof Face) s.setPitch(s.p); else s.recolor(); });
+  }
+  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, icon, reveal, refreshColors, DPR, FACE_W, FACE_H };
 })();

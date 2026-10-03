@@ -41,13 +41,16 @@ VERSION = 2
 #: Every request op the tray serves (:meth:`yuki.ui.window_host.WindowHost._handle`). Version 1's, then the E5
 #: ones: ``stop(job)``, ``steer(job, text)``, ``now``, ``plan(card)``, ``card_feedback(card, kind)``,
 #: ``activity(filter)``, ``threads``, ``people``, ``workflows``, ``workflow_edit``, ``permissions_get``,
-#: ``permissions_set(kind, level)``, ``forget(object)``. Unasked events the tray may send: ``snapshot``,
+#: ``permissions_set(kind, level)``, ``forget(object)``; then the HTML window's (E3/E4): ``offer(card)`` and
+#: ``offer_undo(card)`` (an offer's button and Undo, as the corner card's), ``askbar(text)`` (the ask bar with text
+#: in it, unsent). Unasked events the tray may send: ``snapshot``,
 #: ``chat``, ``state``, ``focus`` and (E5) ``permissions`` (the policy changed).
 OPS: tuple[str, ...] = (
     "hello", "state", "submit", "nudge_do", "cancel", "voice_set", "voice_toggle", "devices", "model", "effort",
     "ui_settings", "ensure_memory", "open_logs", "snooze",
     "stop", "steer", "now", "plan", "card_feedback", "activity", "threads", "people", "workflows",
     "workflow_edit", "permissions_get", "permissions_set", "forget",
+    "offer", "offer_undo", "askbar",
 )
 _BUF = 1 << 16
 #: Largest message either side accepts.
@@ -58,9 +61,11 @@ REQUEST_WAIT_S = 6.0
 
 def pipe_name(db_path: str | Path | None) -> str:
     """The pipe for the memory at ``db_path``: per database and per Windows user."""
-    from yuki.memory.store import default_db_path
+    if db_path is None:   # imported only when needed: the store is a heavy import the HTML window avoids
+        from yuki.memory.store import default_db_path
 
-    db = Path(db_path) if db_path is not None else default_db_path()
+        db_path = default_db_path()
+    db = Path(db_path)
     user = os.environ.get("USERNAME", "")
     digest = hashlib.sha1(f"{user}|{str(db.resolve()).lower()}".encode()).hexdigest()[:16]
     return rf"\\.\pipe\YukiWindow-{digest}"

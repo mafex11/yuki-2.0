@@ -102,7 +102,8 @@ class _Nudges:
 
 
 class _Client:
-    """A stand-in MemoryClient: records calls; ``people_directory`` only when told to have it."""
+    """A stand-in MemoryClient: records calls; the people index (``people_list``, ``contact``) only when told to have
+    it, with the shapes stream 1a's index returns; ``people_directory`` (a prompt string) is never what the op uses."""
 
     def __init__(self, *, people: bool = False) -> None:
         self.calls: list[tuple] = []
@@ -113,9 +114,16 @@ class _Client:
                                   "wont": "I won't touch either sheet."}},
                        {"id": 10, "kind": "question", "text": "Is the call at 10?", "shown_at": "2026-10-03T11:00:00",
                         "reaction": "shown", "ref": "question:4"}]
+        self.people_directory = lambda: "PEOPLE YOU KNOW: Riya (Chat app)..."   # a string: never iterated
         if people:
-            self.people_directory = lambda: [{"name": "Riya", "routes": [{"app": "Chat app", "count": 12}]}]
-            self.contact = lambda who: {"name": who, "routes": []}
+            self.people_list = lambda limit=40: [
+                {"ref": "person:2", "name": "Riya", "relation": "friend", "aliases": ["riyaclimbs"], "tone": "",
+                 "routes": [{"ref": "route:1", "label": "Riya", "app": "Chat app", "kind": "dm", "mine": 78,
+                             "theirs": 47, "last_mine": "2026-10-03T10:00:00", "last_theirs": "2026-10-03T09:58:00",
+                             "share": 0.62, "preferred": True}],
+                 "usual": "Chat app DM", "margin": 0.3, "close": True, "last_contact": "2026-10-03T10:00:00"}][:limit]
+            self.contact = lambda who, near=None: ({"found": True, "ref": "person:5", "name": who, "routes": []}
+                                                   if who == "Dev" else {"found": False, "people": ["Riya"]})
 
     def recent_nudges(self, hours=12):
         self.calls.append(("recent_nudges", hours))
@@ -326,14 +334,19 @@ def test_activity_filters_requests_cards_time_and_calls(qapp, tmp_path):
 # -- threads, people, workflows ---------------------------------------------------------------------------------
 
 
-def test_threads_and_people_come_from_memory_and_people_waits_for_stream_1a(qapp, tmp_path):
+def test_threads_and_people_come_from_memory_and_people_uses_the_index(qapp, tmp_path):
     host, ui = _host(qapp, tmp_path)
     assert host._handle({"op": "threads", "limit": 5})["threads"][0]["ref"] == "thread:1"
     assert ui.client.calls[-1] == ("threads", ("active", "paused"), None, 5)
+    # a build without the people index: nothing, said plainly (people_directory's prompt string is never listed)
     assert host._handle({"op": "people"}) == {"available": False, "people": []}
+    assert host._handle({"op": "people", "person": "Dev"}) == {"available": False, "person": None}
     host2, _ = _host(qapp, tmp_path, people=True)
-    assert host2._handle({"op": "people"})["people"][0]["name"] == "Riya"
+    listed = host2._handle({"op": "people", "limit": 5})["people"]
+    assert listed[0]["name"] == "Riya" and listed[0]["routes"][0]["mine"] == 78
     assert host2._handle({"op": "people", "person": "Dev"})["person"]["name"] == "Dev"
+    assert host2._handle({"op": "people", "person": "Nobody"})["person"]["found"] is False
+    assert host2._handle({"op": "people", "limit": "x"})["ok"] is False
     assert host._handle({"op": "workflows"}) == {"available": False, "workflows": []}
     assert host._handle({"op": "workflow_edit", "ref": "w:1"})["ok"] is False
 

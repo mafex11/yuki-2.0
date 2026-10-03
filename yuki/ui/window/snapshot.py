@@ -7,6 +7,10 @@ is as private as the database, a copied file is unreadable elsewhere, and a tamp
 anything is unpickled. It lives next to ``ui.json`` (``window-snapshot.bin``), is written off the GUI thread
 when the window closes, and is read off the GUI thread when it opens. A snapshot from another database, an
 older format or a day that is over (Today) is ignored.
+
+The HTML window (:mod:`yuki.ui.web_window`) keeps its pages' JSON in the same file, with its own format tag
+(:data:`WEB_FORMAT`): whichever window engine wrote it last, the other reads nothing from it and paints from
+memory instead (one cold paint after switching engines).
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ from typing import Any
 FORMAT = 2
 #: Pages worth keeping (chat is live; its history is read afresh).
 PAGES = ("today", "me", "yuki", "status", "settings")
+#: The HTML window's format tag and pages (plain JSON-able dicts, one per page).
+WEB_FORMAT = "web-1"
+WEB_PAGES = ("shell", "home", "work", "day", "me", "playbook", "activity", "settings")
 #: A snapshot older than this is not shown (it would only mislead for a moment).
 MAX_AGE_S = 3 * 86400
 
@@ -33,13 +40,14 @@ def path_for(ui_path: Path | None) -> Path:
     return (ui_path or ui_settings.settings_path()).parent / "window-snapshot.bin"
 
 
-def save(path: Path, cipher: Any, views: dict[str, Any], *, db: str) -> bool:
-    """Write the views (the pages in :data:`PAGES` only). False when it could not."""
-    keep = {k: v for k, v in views.items() if k in PAGES and v is not None}
+def save(path: Path, cipher: Any, views: dict[str, Any], *, db: str, pages: tuple[str, ...] = PAGES,
+         fmt: Any = FORMAT) -> bool:
+    """Write the views (the pages in ``pages`` only). False when it could not."""
+    keep = {k: v for k, v in views.items() if k in pages and v is not None}
     if not keep:
         return False
     try:
-        raw = pickle.dumps({"format": FORMAT, "db": db, "at": time.time(), "day": date.today().isoformat(),
+        raw = pickle.dumps({"format": fmt, "db": db, "at": time.time(), "day": date.today().isoformat(),
                             "views": keep}, protocol=pickle.HIGHEST_PROTOCOL)
         blob = cipher.encrypt_bytes(zlib.compress(raw, 3))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,15 +59,16 @@ def save(path: Path, cipher: Any, views: dict[str, Any], *, db: str) -> bool:
         return False
 
 
-def load(path: Path, cipher: Any, *, db: str) -> dict[str, Any]:
-    """The views of the last snapshot for this database ({} when none, stale, foreign or unreadable)."""
+def load(path: Path, cipher: Any, *, db: str, fmt: Any = FORMAT) -> dict[str, Any]:
+    """The views of the last snapshot for this database ({} when none, stale, foreign or unreadable). A snapshot
+    written on another day has no ``today`` (Qt) and no ``day`` or ``home`` (web): they would say the wrong day."""
     try:
         blob = path.read_bytes()
         raw = zlib.decompress(cipher.decrypt_bytes(blob))   # authenticated before anything is unpickled
         data = pickle.loads(raw)  # noqa: S301 - our own file, authenticated by memory's key
     except Exception:
         return {}
-    if not isinstance(data, dict) or data.get("format") != FORMAT or data.get("db") != db:
+    if not isinstance(data, dict) or data.get("format") != fmt or data.get("db") != db:
         return {}
     if time.time() - float(data.get("at") or 0) > MAX_AGE_S:
         return {}
@@ -67,4 +76,7 @@ def load(path: Path, cipher: Any, *, db: str) -> dict[str, Any]:
     today_view = views.get("today")
     if today_view is not None and getattr(today_view, "day", None) != date.today():
         views.pop("today", None)   # yesterday's Today would say the wrong day
+    if fmt == WEB_FORMAT and data.get("day") != date.today().isoformat():
+        views.pop("day", None)
+        views.pop("home", None)
     return views

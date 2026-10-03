@@ -1,0 +1,5 @@
+/* The preview only (file://): the bundled faces straight from disk, never the window's virtual font host (which a
+   browser can't reach, and whose failed fetch would delay the page's clock in timed captures). */
+@font-face { font-family: 'Doto'; src: url(../fonts/Doto.ttf) format('truetype'); font-weight: 100 900; font-display: block; }
+@font-face { font-family: 'Instrument Sans'; src: url(../fonts/InstrumentSans.ttf) format('truetype'); font-weight: 400 700; font-stretch: 75% 100%; font-display: block; }
+@font-face { font-family: 'JetBrains Mono'; src: url(../fonts/JetBrainsMono.ttf) format('truetype'); font-weight: 100 800; font-display: block; }

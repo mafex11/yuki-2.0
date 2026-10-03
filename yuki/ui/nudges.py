@@ -58,6 +58,11 @@ from yuki.ui.surface import SurfaceWindow
 from yuki.ui.memory import local_moment
 from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
+# What a card says and offers, as plain data (no Qt): shared with the HTML window's process (re-exported here).
+from yuki.ui.cards import (  # noqa: F401 - re-exported: chatview, window_host and tests import them from here
+    KIND_TITLES, NOTICE_TITLES, OFFER_DOS, OFFER_FAILED, card_offer, card_title, kind_title, offer_expired,
+    offer_label, offer_lines, offer_open,
+)
 
 #: The named event the memory service sets when it writes a nudge.
 NUDGE_EVENT_NAME = "Local\\YukiNudgeReady"
@@ -97,16 +102,6 @@ COACH_NOTE_REASON_CHARS = 200
 #: Reactions after which a nudge counts as answered (no implicit reply to it).
 ANSWERED_REACTIONS: frozenset[str] = frozenset({"replied", "dismissed", "snoozed", "accepted", "less"})
 
-#: Heading per nudge kind.
-KIND_TITLES: dict[str, str] = {
-    "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
-    "resume": "Welcome back", "question": "Getting to know you", "notice": "Noticed",
-}
-#: An observation card's heading by its channel (the nudge's ``trigger``, yuki.memory.presence).
-NOTICE_TITLES: dict[str, str] = {
-    "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
-    "recall": "From memory", "thread": "Your work",
-}
 #: A card with an offer: not now, fewer of this kind (observation cards and the welcome back). The action
 #: button is named for the action (the offer's own label), never "Do it".
 OFFER_BUTTONS: tuple[str, str] = ("Not now", "Less of these")
@@ -118,14 +113,6 @@ OFFER_LINGER_EXTRA_MS = 6_000
 RESULT_LINGER_MS = 8_000
 #: A card that expanded something to read (a draft, what Yuki holds) stays this long untouched.
 EXPANDED_LINGER_MS = 45_000
-#: What the card says when its offer could not run (memory's ``why``), plain words.
-OFFER_FAILED: dict[str, str] = {
-    "expired": "This offer expired. Nothing ran.",
-    "gone": "That's no longer there. Nothing ran.",
-    "off": "Offers are turned off. Nothing ran.",
-    "already": "Already done.",
-    "error": "That didn't work. Nothing ran.",
-}
 #: The opening of a request sent from a card's suggestion unchanged: the words are Yuki's, the user sent them
 #: (memory never stores them as the user's words: ``yuki.memory.conversations.YUKI_WORDS_MARKS``).
 SUGGESTION_MARK = "[Yuki's own suggestion"
@@ -147,73 +134,6 @@ BUSY_NOTIFICATION_STATES: frozenset[int] = frozenset({1, 2, 3, 4})
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_TIMEOUT = 0x00000102
 _WAIT_FAILED = 0xFFFFFFFF
-
-
-def kind_title(kind: Any) -> str:
-    """The small heading for a nudge kind."""
-    return KIND_TITLES.get(str(kind or ""), "Yuki")
-
-
-def card_title(nudge: dict[str, Any]) -> str:
-    """The heading of one card: its kind's, or for an observation card its channel's."""
-    kind = str(nudge.get("kind") or "")
-    if kind == "notice":
-        return NOTICE_TITLES.get(str(nudge.get("trigger") or ""), KIND_TITLES["notice"])
-    return kind_title(kind)
-
-
-#: The offer kinds the UI knows how to run (memory's closed list, yuki.memory.offers.OFFER_DOS).
-OFFER_DOS: frozenset[str] = frozenset({"todo_add", "show_memory", "bring_back", "draft", "ask"})
-
-
-def card_offer(nudge: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The card's typed offer (``pending_nudges()``'s ``offer``: ``do``, ``label``, ``steps``, ``wont``, ...), or
-    None: no offer, or a free-text one from before 2026-10-03 (no button: a sentence is not something to run)."""
-    offer = (nudge or {}).get("offer")
-    if not isinstance(offer, dict) or offer.get("do") not in OFFER_DOS:
-        return None
-    return offer
-
-
-def offer_label(nudge: dict[str, Any] | None) -> str:
-    """The action button's text: the offer's own label (named for the action), ``""`` without an offer."""
-    offer = card_offer(nudge)
-    return " ".join(str((offer or {}).get("label") or "").split()) if offer else ""
-
-
-def offer_lines(nudge: dict[str, Any] | None) -> str:
-    """What the card says its button will and won't do: ``Will: ...`` (the offer's steps, as written) and
-    ``Won't: ...`` (memory's fixed line for the kind); ``""`` without an offer."""
-    offer = card_offer(nudge)
-    if offer is None:
-        return ""
-    steps = [" ".join(str(x).split()) for x in offer.get("steps") or [] if str(x).strip()]
-    lines = []
-    if steps:
-        lines.append("Will: " + "; ".join(steps))
-    if offer.get("wont"):
-        lines.append(f"Won't: {offer['wont']}")
-    return "\n".join(lines)
-
-
-def offer_expired(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
-    """Whether a card's offer is past its time (``expires_at``): its button is gone, also in the history."""
-    offer = card_offer(nudge)
-    if offer is None:
-        return False
-    at = _epoch(offer.get("expires_at"))
-    return at is not None and (time.time() if now is None else now) > at
-
-
-def offer_open(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
-    """Whether a card's offer button may still be pressed: a typed offer, not expired, nothing done with it yet,
-    and the card was not dismissed or given "Less of these"."""
-    if card_offer(nudge) is None or offer_expired(nudge, now):
-        return False
-    n = nudge or {}
-    if n.get("_offer_state") or n.get("outcome"):
-        return False
-    return str(n.get("reaction") or "") not in ("dismissed", "less", "snoozed")
 
 
 def suggestion_request(nudge: dict[str, Any], text: str) -> str:
@@ -1311,6 +1231,12 @@ class NudgeController(QObject):
                 opened = _open_page(str(result.get("url") or ""))
                 if not opened:
                     result = {**result, "message": "Couldn't open that page.", "undo": False}
+        # what the press did, kept on the card's one dict: the Yuki window's offer op answers with it (E3)
+        stored["_offer_result"] = {k: result.get(k) for k in ("ok", "do", "state", "why", "message", "undo", "text",
+                                                               "items", "title") if result.get(k) is not None}
+        stored["_offer_result"]["do"] = do
+        if ok:
+            stored["_outcome_at"] = time.time()
         self.ui_log.event("nudge_offer_result", id=stored.get("id"), via=via, do=do, ok=ok, state=state,
                           why=result.get("why"), ms=result.get("ms"), error=result.get("error"))
         if ok and do == "ask":
@@ -1358,6 +1284,7 @@ class NudgeController(QObject):
     def _on_undone(self, stored: dict[str, Any], result: dict[str, Any]) -> None:
         state = "undone" if result.get("ok") else "done"
         stored["_offer_state"] = state
+        stored["_undo_result"] = dict(result)
         if result.get("ok"):
             stored["outcome"] = "undone"
         self.ui_log.event("nudge_offer_undo", id=stored.get("id"), ok=bool(result.get("ok")), why=result.get("why"))

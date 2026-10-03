@@ -61,7 +61,7 @@ WS_OVERLAPPEDWINDOW = 0x00CF0000
 WS_POPUP = 0x80000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
-SW_SHOWNORMAL, SW_SHOWNOACTIVATE = 1, 4
+SW_SHOWNORMAL, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SW_RESTORE = 1, 3, 4, 9
 WM_DESTROY, WM_MOVE, WM_SIZE, WM_CLOSE = 0x0002, 0x0003, 0x0005, 0x0010
 WM_MOUSEACTIVATE, WM_DPICHANGED, WM_APP = 0x0021, 0x02E0, 0x8000
 MA_NOACTIVATE = 3
@@ -79,6 +79,26 @@ class WNDCLASSEXW(ctypes.Structure):
                 ("cbWndExtra", c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
                 ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
                 ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", wintypes.HICON)]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", c_uint), ("flags", c_uint), ("showCmd", c_uint), ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT), ("rcNormalPosition", wintypes.RECT)]
+
+
+def _on_a_monitor(rect: tuple[int, int, int, int]) -> bool:
+    """Whether a remembered window rect still overlaps a monitor (one may have been unplugged)."""
+    try:
+        x, y, w, h = (int(v) for v in rect)
+        if w < 400 or h < 300:
+            return False
+        r = wintypes.RECT(x, y, x + w, y + h)
+        fn = ctypes.windll.user32.MonitorFromRect
+        fn.argtypes = [POINTER(wintypes.RECT), c_uint]
+        fn.restype = c_void_p
+        return bool(fn(byref(r), 0))   # MONITOR_DEFAULTTONULL
+    except Exception:
+        return False
 
 
 class GUID(ctypes.Structure):
@@ -319,6 +339,10 @@ class HostOptions:
     user_data_dir: Path                      # WebView2's profile folder
     title: str = "Yuki"
     size: tuple[int, int] = (1440, 900)      # logical px
+    #: Where the window was when it last closed (x, y, w, h in physical px, ``ui.json`` ``window``) and whether it
+    #: was maximized; used for the normal placement when the rect is still on a monitor.
+    rect: tuple[int, int, int, int] | None = None
+    maximized: bool = False
     #: ``normal``: a framed window, shown and brought forward (the tray let this process take the foreground);
     #: ``offscreen``: a frameless tool window beyond the left edge of every monitor, shown without activation and
     #: refusing activation (measurements and tests: it never takes focus and is never seen).
@@ -357,6 +381,8 @@ class WebView2Host:
         self.exit_code = 0
         self._closing = False
         self._low = False   # the memory target is Low (set while minimised)
+        #: Called on the UI thread when the window starts to close, before it is destroyed (read its placement).
+        self.on_closing: Callable[[], Any] | None = None
 
     # -- thread-safe API ------------------------------------------------------------------------------
 
@@ -378,6 +404,27 @@ class WebView2Host:
             ctypes.windll.user32.PostMessageW(wintypes.HWND(self.hwnd), WM_YUKI_CALL, 0, 0)
 
     # -- UI-thread API ---------------------------------------------------------------------------------
+
+    def bring_forward(self) -> None:
+        """Restore the window if minimised and bring it to the front (the tray passed this process the right to;
+        never for the off-screen window). UI thread."""
+        if not self.hwnd or self.o.placement == "offscreen":
+            return
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(wintypes.HWND(self.hwnd)):
+            user32.ShowWindow(wintypes.HWND(self.hwnd), SW_RESTORE)
+        user32.SetForegroundWindow(wintypes.HWND(self.hwnd))
+
+    def placement_now(self) -> tuple[tuple[int, int, int, int] | None, bool]:
+        """(the restored rect x, y, w, h in physical px, maximized) to remember for the next opening. UI thread."""
+        if not self.hwnd or self.o.placement == "offscreen":
+            return None, False
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not ctypes.windll.user32.GetWindowPlacement(wintypes.HWND(self.hwnd), byref(wp)):
+            return None, False
+        r = wp.rcNormalPosition
+        return (r.left, r.top, r.right - r.left, r.bottom - r.top), wp.showCmd == SW_SHOWMAXIMIZED
 
     def set_memory_low(self, low: bool) -> bool:
         """``MemoryUsageTargetLevel`` Low or Normal (WebView2 trims caches and lets the OS page memory out)."""
@@ -480,6 +527,8 @@ class WebView2Host:
         else:
             sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
             ex, style, x, y = 0, WS_OVERLAPPEDWINDOW, max(0, (sw - w) // 2), max(0, (sh - h) // 2)
+            if self.o.rect and _on_a_monitor(self.o.rect):
+                x, y, w, h = self.o.rect
         hwnd = user32.CreateWindowExW(ex, self._class, self.o.title, style, x, y, w, h, None, None, hinst, None)
         if not hwnd:
             raise ctypes.WinError()
@@ -488,7 +537,7 @@ class WebView2Host:
             dark = c_int(1)   # a dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(self.hwnd), 20, byref(dark), 4)
         user32.ShowWindow(wintypes.HWND(self.hwnd), SW_SHOWNOACTIVATE if self.o.placement == "offscreen"
-                          else SW_SHOWNORMAL)
+                          else SW_SHOWMAXIMIZED if self.o.maximized else SW_SHOWNORMAL)
         if self.o.placement != "offscreen":
             user32.SetForegroundWindow(wintypes.HWND(self.hwnd))
         self.marks["window"] = time.time()
@@ -559,6 +608,11 @@ class WebView2Host:
         if self._closing:
             return
         self._closing = True
+        if self.on_closing is not None:
+            try:
+                self.on_closing()
+            except Exception as exc:  # noqa: BLE001
+                self._handler_error("on_closing", exc)
         if self._controller:
             try:
                 self._controller.call(CTL_CLOSE)

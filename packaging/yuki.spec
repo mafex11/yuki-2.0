@@ -55,6 +55,25 @@ hiddenimports += ["win32timezone", "pythoncom", "pywintypes", "win32com.client",
 datas = []
 datas += collect_data_files("yuki", includes=["**/*.toml"])   # no shaders since the flat UI (2026-09-27)
 datas += collect_data_files("yuki", includes=["ui/fonts/*.ttf", "ui/fonts/*.txt"])   # Doto (SIL OFL) + licence
+# The Lattice window (E3/E17): its static bundle (HTML, CSS, JS, the invented preview fixture), served from disk by
+# WebView2's virtual host mapping (yuki.ui.webview2), and the official WebView2Loader.dll, which
+# yuki.ui.webview2.loader_path() finds under webview2/ in the bundle. The loader comes from the installed pywebview
+# package (BSD, redistributable); nothing else of pywebview is bundled or imported.
+datas += [(str(ROOT / "yuki" / "ui" / "web"), "yuki/ui/web")]
+
+
+def _webview2_loader() -> list[tuple[str, str]]:
+    import importlib.util
+
+    spec = importlib.util.find_spec("webview")
+    if spec is None or not spec.submodule_search_locations:
+        print("[yuki.spec] pywebview is not installed: no WebView2Loader.dll (the window falls back to Qt)")
+        return []
+    dll = Path(list(spec.submodule_search_locations)[0]) / "lib" / "runtimes" / "win-x64" / "native" / "WebView2Loader.dll"
+    if not dll.exists():
+        print(f"[yuki.spec] {dll} is missing (the window falls back to Qt)")
+        return []
+    return [(str(dll), "webview2")]
 datas += collect_data_files("pipecat", includes=["**/*.onnx", "**/*.json", "**/*.txt"])
 datas += collect_data_files("faster_whisper")              # its Silero VAD onnx
 datas += collect_data_files("sherpa_onnx")
@@ -72,7 +91,7 @@ for dist in ("pipecat-ai", "fastembed", "deepgram-sdk", "pydantic", "huggingface
     except Exception as exc:
         print(f"[yuki.spec] no metadata for {dist}: {exc}")
 
-binaries = []
+binaries = _webview2_loader()
 for pkg in ("sherpa_onnx", "livekit", "ctranslate2", "onnxruntime", "av", "tokenizers", "soxr", "_sounddevice_data",
             "sentencepiece"):
     try:
@@ -97,6 +116,8 @@ QT_UNUSED = [
 EXCLUDES = QT_UNUSED + [
     "tkinter", "_tkinter", "pytest", "_pytest", "IPython", "matplotlib", "numba", "llvmlite", "resampy",
     "onnxruntime.transformers", "onnxruntime.quantization", "onnxruntime.tools", "PyInstaller",
+    # pywebview is only the source of WebView2Loader.dll (above): its .NET/WinForms backend never ships
+    "webview", "clr", "clr_loader", "pythonnet", "bottle", "proxy_tools",
 ]
 
 a = Analysis(                                     # noqa: F821
