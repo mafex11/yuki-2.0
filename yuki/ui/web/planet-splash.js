@@ -8,7 +8,8 @@
      PlanetSplash.still(canvas, { colorSet: 'night', width: 1040, height: 600 });   // the final frame, e.g. for a PNG
 
    options: colorSet 'mint' | 'night' | 'bang', onDone(), background (default '#0B0B0C'; null leaves it transparent),
-   name (false hides it), reduced (true forces the still frame), autoplay (false: show the still frame and wait
+   name (false hides it), reduced (true forces the still frame; a function is asked at each play, so a replay
+   follows the current setting), autoplay (false: show the still frame and wait
    for replay(), e.g. in Settings -> About). If el has no height of its own, the canvas keeps the 520:300 shape. */
 (function () {
   'use strict';
@@ -144,7 +145,7 @@
     F.clear(); sc.anim.draw(F.ctx, final); drawName(F.ctx, sc, D.state.ramp, final ? null : e, frame);
     D.state.ramp = keep;
   }
-  const reducedNow = (opt) => opt.reduced || D.REDUCED || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const reducedNow = (opt) => (typeof opt.reduced === 'function' ? opt.reduced() : opt.reduced) || D.REDUCED || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   function still(cv, opt) {
     opt = opt || {};

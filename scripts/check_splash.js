@@ -61,7 +61,8 @@ async function main() {
     let port = null;
     for (let i = 0; i < 100 && !port; i++) {
       const f = path.join(profile, 'DevToolsActivePort');
-      if (fs.existsSync(f)) port = fs.readFileSync(f, 'utf8').split('\n')[0].trim();
+      // Chrome may still hold the file (EBUSY) or be mid-write: retry until it is readable and has its second line
+      try { const t = fs.readFileSync(f, 'utf8'); if (t.includes('\n')) port = t.split('\n')[0].trim(); } catch (e) { /* not there or busy yet */ }
       if (!port) await sleep(100);
     }
     if (!port) throw new Error('the headless shell did not open its DevTools port: ' + stderr.slice(-500));
@@ -239,6 +240,28 @@ async function main() {
       await T.sleep(250);
       const cv2 = document.querySelector('#main .about-splash canvas');
       T.check('opening Settings again plays a new one', !!cv2 && cv2 !== cv && T.lit(cv2) > 50, cv2 && T.lit(cv2));
+    });
+
+    // J: Settings opened under a full-screen app shows the still frame; once that app is gone a press animates
+    await scenario('about-after-quiet', '', async (T) => {
+      T.boot({ version: '9.8.7' });
+      await T.sleep(200);
+      window.__push({ kind: 'quiet', on: true });
+      await T.sleep(50);
+      location.hash = '#settings';
+      await T.sleep(250);
+      const box = document.querySelector('#main .about-splash');
+      const cv = box && box.querySelector('canvas');
+      T.check('under a full-screen app About shows the still frame at once', !!cv && T.lit(cv) > 50, cv && T.lit(cv));
+      const still = cv && T.sig(cv);
+      window.__push({ kind: 'quiet', on: false });
+      await T.sleep(50);
+      box.scrollIntoView({ block: 'center' });
+      box.click();
+      await T.sleep(500);
+      T.check('after the full-screen app is gone a press plays it (not the still frame again)', !!cv && T.sig(cv) !== still);
+      await T.sleep(1300);
+      T.check('and it settles on the still frame', !!cv && T.sig(cv) === still);
     });
 
     if (shots) {   // pictures for the report: the splash mid-play over the page, and Settings -> About
