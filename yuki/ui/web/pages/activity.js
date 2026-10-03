@@ -15,7 +15,7 @@
       const data = r.undo.todo ? { do: 'todo-undo', todo: r.undo.todo } : { do: 'offer-undo', card: r.undo.card };
       return [key(r.undo.label || 'Undo', { cls: 'xs', data }), ' ', h('span', { text: `${left} min left` })];
     }
-    return r.cant_undo ? 'can’t undo' : '';
+    return '';   // no "can't undo" talk (the user, 3 Oct): only a real Undo shows
   }
   function whyCell(r) {
     const chips = (r.chips || []).filter((c) => c.text);

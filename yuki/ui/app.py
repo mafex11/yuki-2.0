@@ -66,7 +66,7 @@ from yuki.ui.island import Island, on_call_status
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import describe_summary, describe_tool
-from yuki.ui.step_words import clock, label_input, return_view, took_words
+from yuki.ui.step_words import FAILED_TITLE, achievement, clock, label_input, return_view, took_words
 from yuki.ui.uilog import UiLog
 from yuki.ui.window_host import WindowHost
 from yuki.voice.session import VoiceSession
@@ -574,7 +574,7 @@ class YukiUi(QObject):
         """Stop on the strip (or the window's run card, the ``stop`` pipe op): cancel that request (and its voice, if
         it is the voice's). Returns how (``running`` / ``queued`` / ``unknown``, :meth:`AgentRuntime.cancel`)."""
         self._stopped.setdefault(int(request_id), "strip")
-        how = self.runtime.cancel(int(request_id))
+        how = self.runtime.cancel(int(request_id), by="strip")
         if self.voice.owns(request_id):
             self.voice.interrupt()
         self.ui_log.event("strip_stop", id=request_id, how=how)
@@ -725,6 +725,18 @@ class YukiUi(QObject):
         outcome = "handed" if handed else "stopped" if tone == "stopped" else "failed" if tone == "error" else "done"
         self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
         shown = self._end_run(request_id)
+        # A run that acted ends on one plain line, the same on the strip, the thread and the return card: what it
+        # achieved (never the reply or a bare "Done"), or the plain reason it did not finish (never the loop's error
+        # text, which stays in the log).
+        final = text
+        if acted and outcome == "done":
+            line = achievement(list((run or {}).get("calls") or []))
+            final = line or text
+            host = getattr(self, "window_host", None)
+            if line and callable(getattr(host, "emit", None)):
+                host.emit({"type": "achieved", "job": request_id, "text": line})
+        elif acted and outcome == "failed":
+            final = FAILED_TITLE
         card = self.cards.pop(request_id, None)
         if card is not None:
             card.set_body(text, tone="error" if tone == "error" else "reply")
@@ -740,12 +752,13 @@ class YukiUi(QObject):
             # over it for a moment, then that run comes back
             other = self.strip.run_id if self.strip.run_id not in (None, request_id) else None
             self.nudges.make_way()
-            self.strip.show_final(text, tone="error" if tone == "error" else "final", outcome=outcome)
+            self.strip.show_final(final, tone="error" if tone == "error" else "final", outcome=outcome)
             self._settled[request_id] = None
             if other is not None:
                 QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=other: self._strip_run(rid)
                                   if rid in self._runs and self.strip.run_id is None else None)
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text, by=stopped_by,
+                          shown=final if final != text else None,
                           steps=run["steps"] if run else None,
                           wall_s=round(time.monotonic() - run["started"], 1) if run else None)
         if acted and getattr(self, "island", None) is not None:

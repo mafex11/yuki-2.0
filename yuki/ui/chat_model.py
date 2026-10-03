@@ -35,6 +35,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
+from yuki.ui.step_words import result_words
+
 #: Oldest bubbles are dropped past this (the window pages older ones in from memory).
 MAX_ITEMS = 1000
 #: A step's result line is kept to this many characters.
@@ -419,7 +421,7 @@ class ChatModel:
         for s in reversed(item.steps):
             if s.job == job and s.kind == "tool" and s.running and (not name or s.name == name):
                 s.ended, s.ok = at, bool(ev.get("ok"))
-                s.result = _short(ev.get("summary"))
+                s.result = result_words(s.ok)   # never the tool's summary (shell output, timings): plain words only
                 self._changed(item)
                 return
 
@@ -463,9 +465,10 @@ class ChatModel:
                 return
         if state == "tool":
             n = sum(1 for s in item.steps if s.key.startswith(key + ":"))
-            name, _sep, summary = text.partition(": ")
-            step = Step(f"{key}:{n}", "helper", name or "tool", name or text, at, ended=at,
-                        ok=bool(ev.get("ok", True)), result=_short(summary), depth=depth + 1, job=job)
+            name = text.partition(": ")[0]   # the host sends the tool use's words only (window_host)
+            ok = bool(ev.get("ok", True))
+            step = Step(f"{key}:{n}", "helper", name or "tool", name or "Looking into it", at, ended=at,
+                        ok=ok, result=result_words(ok), depth=depth + 1, job=job)
             # under its own helper (helpers run side by side, so their steps interleave in time)
             last = max(i for i, s in enumerate(item.steps) if s.key == key or s.key.startswith(key + ":"))
             item.steps.insert(last + 1, step)
@@ -514,8 +517,8 @@ class ChatModel:
         item = self._by_id.get(self._job_item.get(job, ""))
         if key is not None and item is not None:
             for s in item.steps:
-                if s.key == key:
-                    s.ended, s.ok, s.result = at, not failed, _short(text)
+                if s.key == key:   # the job's answer (the brain's words); a failure's error text is never shown
+                    s.ended, s.ok, s.result = at, not failed, "Didn’t finish" if failed else _short(text)
             for s in item.steps:   # a cancelled job leaves no step spinning
                 if s.job == job and s.running:
                     s.ended, s.ok = at, False if failed else s.ok
@@ -536,6 +539,21 @@ class ChatModel:
 
     def _on_finished(self, ev: dict[str, Any], at: float) -> None:
         self._settle(ev, at, failed=False)
+
+    def _on_achieved(self, ev: dict[str, Any], at: float) -> None:
+        """A run that acted finished: what it achieved ("Closed Slack", ``yuki.ui.step_words.achievement``) is the
+        last line of its steps, the same line as the strip's final word and the return card's title."""
+        job = ev.get("job")
+        text = " ".join(str(ev.get("text") or "").split())
+        item = self._by_id.get(self._job_item.get(job, "")) if isinstance(job, int) else None
+        if item is None or not text:
+            return
+        key = f"achieved:{job}"
+        if any(s.key == key for s in item.steps):
+            return
+        item.steps.append(Step(key, "say", "achieved", text, at, ended=at, ok=True,
+                               depth=1 if job in self._voice_job else 0, job=job))
+        self._changed(item)
 
     def _on_failed(self, ev: dict[str, Any], at: float) -> None:
         self._settle(ev, at, failed=True)
@@ -717,7 +735,7 @@ class ChatModel:
         if ev.get("phase") == "end":
             step.ended = step.started + ms / 1000.0 if isinstance(ms, (int, float)) else at
             step.ok = bool(ev.get("ok"))
-            step.result = _short(ev.get("result"))
+            step.result = result_words(step.ok)   # never the hand's report
             if item.status == "running" and not any(s.running for s in item.steps):
                 item.status = "done"
                 item.ended_at = at
@@ -868,7 +886,7 @@ def history_from_session_log(path: Any, *, limit: int = 40, source: str = "histo
                 ms = r.get("elapsed_ms")
                 step.ended = step.started + (float(ms) / 1000.0 if isinstance(ms, (int, float)) else 0.0)
                 step.ok = bool(r.get("ok"))
-                step.result = _short(r.get("summary"))
+                step.result = result_words(step.ok)
         elif t == "ask_user":
             cur.steps.append(Step(f"h:{n}", "say", "ask_user", str(r.get("question") or ""), ts, ended=ts))
         elif t == "final":

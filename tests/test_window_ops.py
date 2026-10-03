@@ -45,9 +45,13 @@ class _Runtime:
         self.running = {"worker": 31, "front_desk": None}
         self.worker_busy = True
 
-    def cancel(self, job, reason="cancelled") -> str:
+    def cancel(self, job, reason="cancelled", *, by="") -> str:
         self.cancelled.append(job)
+        self.by = by
         return "running"
+
+    def cancel_worker(self) -> None:
+        self.cancelled.append("worker")
 
     def steer(self, job, text) -> bool:
         self.steered.append((job, text))
@@ -239,6 +243,19 @@ def test_stop_goes_through_the_strips_stop_and_steer_reaches_the_runtime(qapp, t
     assert ui.runtime.steered == [(31, "the other Riya")]
     assert host._handle({"op": "steer", "job": 99, "text": "x"}) == {"job": 99, "delivered": False}
     assert host._handle({"op": "steer", "job": 31, "text": "  "})["ok"] is False
+
+
+def test_the_windows_cancel_stops_the_workers_run_as_a_stop_by_the_window(qapp, tmp_path):
+    """appC1 review F8: the native window's Stop (op cancel, no job) is a stop by the window, so the run ends as
+    "Stopped" and never as "Cancelled by the user." in red."""
+    host, ui = _host(qapp, tmp_path)
+    assert host._handle({"op": "cancel"}) == {}
+    assert ui.runtime.cancelled == [31] and ui.runtime.by == "window"     # the running worker's request, by the window
+    host._handle({"op": "cancel", "job": 12})
+    assert ui.runtime.cancelled[-1] == 12 and ui.runtime.by == "window"
+    ui.runtime.running = {"worker": None, "front_desk": None}
+    host._handle({"op": "cancel"})                                     # nothing running: the worker's cancel, as before
+    assert ui.runtime.cancelled[-1] == "worker"
 
 
 def test_now_is_the_live_trace_from_the_chat_thread(qapp, tmp_path):

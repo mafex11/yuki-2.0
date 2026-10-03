@@ -883,7 +883,21 @@ ABOUT_SCHEMA: dict[str, Any] = {
                    "each read or acted on with a verified result in this request. [] for none.",
 }
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][ABOUT_FIELD] = ABOUT_SCHEMA
-TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD]
+
+#: What the request achieved, in the brain's plain words, past tense (the user's 3 Oct return-card feedback: "it just
+#: says done ... it should have said something which it achieved"): the return card's title, the strip's final word
+#: and the thread's final line (``yuki.ui.step_words.achievement``). Never run, never compared, never spoken; the
+#: ``message`` stays the reply. A line under two words, or one that looks like a command or path, is not shown (the
+#: card falls back to the run's own effect steps).
+ACHIEVED_FIELD = "achieved"
+ACHIEVED_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": "What you got done for them, plain past tense, verb first, at most 8 words, naming who or what "
+                   "(\"Messaged Ana on Discord\", \"Turned Spotify up to 60%\", \"Closed Slack\"); for an answer, what "
+                   "you found (\"Found when your call started\"). Never just \"Done\", never a command, path or id.",
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][ACHIEVED_FIELD] = ACHIEVED_SCHEMA
+TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD]
 
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})

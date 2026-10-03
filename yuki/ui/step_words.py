@@ -17,6 +17,10 @@ path here reads ``command``, ``text`` or ``url`` (``tests/test_appC1_run_text.py
 like data (digits, an address, a path, a long sentence) is left out and the step says what kind of thing it was
 ("Clicking a button"). Pure functions, no Qt and no agent import at module load (the HTML window's process uses
 them for the ledger).
+
+A finished run's one closing line (the return card's title, the strip's final word, the thread's final line) is
+:func:`achievement`: the brain's plain past-tense ``achieved`` on ``done``, else the done words of the effect that
+happened; never the reply and never a bare "Done". A voice hand reads the same way (:func:`describe_hand`).
 """
 
 from __future__ import annotations
@@ -35,10 +39,17 @@ NAME_CHARS = 32
 NAME_WORDS = 5
 #: The model's ``what`` is cut to this many characters.
 WHAT_CHARS = 60
+#: The brain's plain past-tense line of what a finished run achieved (``yuki.agent.tools.ACHIEVED_FIELD`` on ``done``):
+#: the return card's title, the strip's final word and the thread's final line.
+ACHIEVED = "achieved"
+#: It is cut to this many characters; fewer words than this is not a line that says what was achieved ("Done.").
+ACHIEVED_CHARS = 80
+ACHIEVED_MIN_WORDS = 2
 #: The input fields the words are built from (a run surface keeps only these of a call: never the command, typed text
-#: or address).
-LABEL_KEYS = frozenset({WHAT, ABOUT, "query", "app", "action", "press_enter", "mute", "change", "level", "dy", "dx",
-                        "button", "clicks", "kind", "since", "until", "before", "after", "day", "start", "end"})
+#: or address). ``media`` and ``want`` are a voice hand's media key enum (:func:`hand_input`).
+LABEL_KEYS = frozenset({WHAT, ABOUT, ACHIEVED, "query", "app", "action", "press_enter", "mute", "change", "level", "dy",
+                        "dx", "button", "clicks", "kind", "since", "until", "before", "after", "day", "start", "end",
+                        "media", "want"})
 
 
 def label_input(tool_input: Any) -> dict[str, Any]:
@@ -179,24 +190,103 @@ def _ed(verb: str) -> str:
     return verb + "ed"
 
 
+#: An irregular past form -> its verb (``sent`` -> ``send``); a verb whose past is the same word maps to itself.
+_PAST_BASE: dict[str, str] = {past: base for base, past in _PAST.items()}
+#: Letters English doubles naturally at a verb's end (``call``, ``pass``, ``buzz``, ``stuff``): never undoubled.
+_NATURAL_DOUBLES = "lsfz"
+
+
+def _unsuffix(word: str, n: int) -> str:
+    """The verb under ``word`` minus an ``-ed``/``-ing`` ending of ``n`` letters, by English spelling: a doubled last
+    consonant is undoubled (``stopp`` -> ``stop``) and a dropped ``e`` comes back (``clos`` -> ``close``)."""
+    stem = word[:-n]
+    s = stem.casefold()
+    if len(s) >= 3 and s[-1] == s[-2] and s[-1] not in _VOWELS + _NATURAL_DOUBLES and _doubles(s[:-1]):
+        return stem[:-1]
+    if _doubles(s) and s not in _DOUBLES:
+        return stem + "e"   # "clos" would have doubled ("clossed"); it did not, so the verb ends in e
+    return stem
+
+
+def _verb(word: str) -> tuple[str, str]:
+    """``(verb, form)`` of the first word of a ``what``, by English spelling: ``form`` is ``past`` (``closed``,
+    ``sent``), ``ing`` (``closing``), ``s`` (``sends``, the third person) or ``base`` (``close``)."""
+    w = word.casefold()
+    if w in _PAST or w in _ING:
+        return word, "base"
+    if w in _PAST_BASE:
+        return _PAST_BASE[w], "past"
+    if len(w) > 4 and w.endswith("ing"):
+        return _unsuffix(word, 3), "ing"
+    if len(w) > 3 and w.endswith("ied"):
+        return word[:-3] + "y", "past"
+    if len(w) > 3 and w.endswith("ed") and not w.endswith("eed"):
+        return _unsuffix(word, 2), "past"
+    if len(w) > 3 and w.endswith("ies"):
+        return word[:-3] + "y", "s"
+    if len(w) > 3 and w.endswith(("ches", "shes", "sses", "xes", "zzes", "oes")):
+        return word[:-2], "s"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return word[:-1], "s"
+    return word, "base"
+
+
+#: Characters a plain sentence never has but a command, path, switch or expression does (a fixed character set).
+CODE_CHARS = frozenset("/\\|_$=;{}[]<>`@*~^")
+
+
+def _looks_like_code(text: str) -> bool:
+    """Character tests on fixed formats, never words: an address, a path or pipe, a dotted token (a host, a file, a
+    member), a switch (``-Force``) or a PowerShell ``Verb-Noun`` name."""
+    if "://" in text or any(ch in CODE_CHARS for ch in text):
+        return True
+    for tok in text.split():
+        core = tok.strip(".,:!?\"'()")
+        if "." in core or (core.startswith("-") and len(core) > 1):
+            return True
+        _head, sep, tail = core.partition("-")
+        if sep and tail[:1].isupper():
+            return True
+    return False
+
+
+def _cut(text: str, chars: int) -> str:
+    return text if len(text) <= chars else text[: chars - 1].rstrip() + "…"
+
+
 def plain_what(value: Any) -> str:
-    """The brain's ``what`` when it is plain words (verb first, no digits, address or path), else ``""``."""
+    """The brain's ``what`` when it is plain words (verb first; no digits, address, path, switch or command name),
+    else ``""``."""
     text = _squash(value).strip(" .")
-    if not text or any(ch.isdigit() for ch in text) or "://" in text or "\\" in text:
+    if not text or any(ch.isdigit() for ch in text) or _looks_like_code(text):
         return ""
-    return text if len(text) <= WHAT_CHARS else text[: WHAT_CHARS - 1].rstrip() + "…"
+    return _cut(text, WHAT_CHARS)
+
+
+def plain_achieved(value: Any) -> str:
+    """The brain's ``achieved`` line when it says what was done in plain words (at least
+    :data:`ACHIEVED_MIN_WORDS` words, so never just "Done."; no address, path, switch or command name; a number a
+    person says, "60%", is fine), first letter capital, else ``""``."""
+    text = _squash(value).strip(" .!")
+    if len(text.split()) < ACHIEVED_MIN_WORDS or _looks_like_code(text):
+        return ""
+    text = _cut(text, ACHIEVED_CHARS)
+    return text[:1].upper() + text[1:]
 
 
 def say_what(what: str, *, done: bool) -> str:
-    """``close Slack`` -> ``Closing Slack`` (running) or ``Closed Slack`` (done): its first word inflected by
-    English spelling rules, the rest as the brain wrote it."""
+    """``close Slack`` -> ``Closing Slack`` (running) or ``Closed Slack`` (done): its first word in the matching
+    tense by English spelling rules (a first word already in that tense is kept as written: ``closed Slack`` stays
+    ``Closed Slack``; ``sends Ana a message`` reads ``Sending``/``Sent``), the rest as the brain wrote it."""
     first, _sep, rest = what.partition(" ")
     if not first.isalpha():
         word = first
-    elif first.casefold().endswith("ing") and len(first) > 4:
-        word = first   # already "closing ..." (a habit of the model): kept as written
     else:
-        word = _ed(first) if done else _ing(first)
+        verb, form = _verb(first)
+        if done:
+            word = first if form == "past" else _ed(verb)
+        else:
+            word = first if form == "ing" else _ing(verb)
     line = f"{word} {rest}".strip()
     return line[:1].upper() + line[1:]
 
@@ -271,6 +361,8 @@ def _tab(args: dict[str, Any], about: dict[str, Any], done: bool) -> str:
     tab = plain_name(about.get("tab"))
     if args.get("action") == "close":
         return f"{_two(done, 'Closing', 'Closed')} {tab or 'a tab'}"
+    if args.get("action") == "reopen":
+        return _two(done, "Reopening a tab", "Reopened a tab")
     return f"{_two(done, 'Switching to', 'Switched to')} {tab}" if tab else _two(done, "Switching tabs",
                                                                                   "Switched tabs")
 
@@ -308,13 +400,37 @@ def _window(args: dict[str, Any], about: dict[str, Any], done: bool) -> str:
     return pair[1 if done else 0].format(app_name(about.get("app")) or "a window")
 
 
-#: The action tools (``yuki.agent.tools.ACTION_TOOL_NAMES``), each with its builder.
+#: A voice hand's media key (``yuki.voice.hands.MEDIA_KEYS``, a fixed enum) as (running, done) words.
+MEDIA_WORDS: dict[str, tuple[str, str]] = {
+    "playpause": ("Playing or pausing the music", "Played or paused the music"),
+    "nexttrack": ("Skipping to the next track", "Skipped to the next track"),
+    "prevtrack": ("Going back a track", "Went back a track"), "stop": ("Stopping the music", "Stopped the music"),
+    "volumeup": ("Turning the sound up", "Turned the sound up"),
+    "volumedown": ("Turning the sound down", "Turned the sound down"),
+    "volumemute": ("Muting the sound", "Muted the sound"),
+}
+
+
+def _media(args: dict[str, Any], about: dict[str, Any], done: bool) -> str:
+    want = args.get("want")
+    if args.get("media") == "playpause" and want == "playing":
+        return _two(done, "Playing the music", "Played the music")
+    if args.get("media") == "playpause" and want == "paused":
+        return _two(done, "Pausing the music", "Paused the music")
+    pair = MEDIA_WORDS.get(str(args.get("media") or ""))
+    return pair[1 if done else 0] if pair else _two(done, "Pressing a media key", "Pressed a media key")
+
+
+#: The action tools (``yuki.agent.tools.ACTION_TOOL_NAMES``), each with its builder; then the voice hands that are no
+#: thinker tool (:func:`hand_input` maps the others onto the thinker's).
 ACTION_WORDS = {
     "launch_app": _launch, "open_url": _open_url, "focus_window": _focus, "click": _click, "type_text": _type,
     "hotkey": _hotkey, "press": _press, "scroll": _scroll, "run_powershell": _shell, "tab": _tab, "hover": _hover,
     "app_volume": _volume, "window_action": _window,
     "write_clipboard": lambda a, b, done: _two(done, "Copying that", "Copied that"),
     "open_yuki": lambda a, b, done: _two(done, "Opening my window", "Opened my window"),
+    "media_key": _media,
+    "run_skill": lambda a, b, done: _two(done, "Doing it the way I learned", "Did it the way I learned"),
 }
 
 #: Yuki's own tools, done (the ledger's memory steps), by name; the to-do tool by its ``action`` enum.
@@ -325,7 +441,10 @@ DONE_WORDS: dict[str, str] = {
     "about": "Checked who that is", "todo": "Changed your list", "say": "Told you", "ask_user": "Asked you",
 }
 TODO_DONE: dict[str, str] = {"add": "Added to your list", "done": "Marked done on your list",
-                             "not_needed": "Took off your list", "wrong": "Took off your list"}
+                             "not_needed": "Took off your list", "wrong": "Took off your list",
+                             "list": "Checked your list"}
+#: The to-do tool's actions that change the list (its ``action`` enum minus ``list``, a read).
+TODO_WRITES = frozenset({"add", "done", "not_needed", "wrong"})
 
 
 def _registry_label(name: str, args: dict[str, Any]) -> str:
@@ -431,18 +550,90 @@ OPENING_TOOLS = frozenset({"launch_app", "open_url"})
 KEEPING_TOOLS = frozenset({"todo", "remember_rule", "forget_rule", "watch_for", "correct_memory", "remember_how"})
 
 
+#: ``window_action``'s actions that change what the user sees (``focus`` only switches: getting there).
+WINDOW_CHANGES = frozenset({"minimize", "maximize", "fullscreen", "restore", "close"})
+#: The card's title for a finished run when no step says what it achieved (never just "Done").
+FINISHED_TITLE = "Finished what you asked."
+#: The plain reason for a run that did not finish, whatever the loop's own error text said (that text stays in the
+#: log; the card, the strip and the thread's final line never show it).
+FAILED_TITLE = "I couldn’t finish that."
+NOTHING_SENT = "Nothing was sent."
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def changes_state(name: str, tool_input: dict[str, Any] | None) -> bool:
+    """A step that is itself what the user asked for: an app's volume set, changed or muted, a window minimised,
+    maximised, made full screen, restored or closed. Machine fields only (the tool's name and its fixed fields)."""
+    args = tool_input if isinstance(tool_input, dict) else {}
+    if name == "app_volume":
+        return _number(args.get("level")) or (_number(args.get("change")) and bool(args.get("change"))) or \
+            isinstance(args.get("mute"), bool)
+    if name == "window_action":
+        return str(args.get("action") or "") in WINDOW_CHANGES
+    return False
+
+
 def is_effect(name: str, tool_input: dict[str, Any] | None) -> bool:
     """A step whose result the user cares about after the run: the agent marked it as sending, closing or deleting
     for certain (``_about``: ``sends`` / ``changes``, from the tool's fixed traits), the brain declared its effect
-    (``risk.effect``), or it changed Yuki's own lists and rules. Opening, switching, clicking, scrolling and keys
-    are getting there, not results. Machine fields only."""
+    (``risk.effect``), it changed a volume or a window as asked (:func:`changes_state`), or it changed Yuki's own
+    lists and rules (the to-do tool only when it writes: ``list`` is a read). Opening, switching, clicking,
+    scrolling and keys are getting there, not results. Machine fields only."""
     args = tool_input if isinstance(tool_input, dict) else {}
     about = _about(args)
-    return bool(about.get("sends") or about.get("changes") or _squash(about.get("effect"))) or name in KEEPING_TOOLS
+    if about.get("sends") or about.get("changes") or _squash(about.get("effect")) or changes_state(name, args):
+        return True
+    if name == "todo":
+        return str(args.get("action") or "") in TODO_WRITES
+    return name in KEEPING_TOOLS
 
 
 def _joined(parts: list[str]) -> str:
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _opened(steps: list[dict[str, Any]]) -> list[str]:
+    """What the run's opening steps opened, in order, once each ("Discord", "a page in Arc")."""
+    out: list[str] = []
+    for st in steps:
+        name, args = str(st.get("name") or ""), st.get("input") or {}
+        if st.get("ok") is True and name in OPENING_TOOLS and not is_effect(name, args):
+            thing = describe_step(name, args, done=True).removeprefix("Opened ")
+            if thing not in out:
+                out.append(thing)
+    return out
+
+
+def achievement(steps: list[dict[str, Any]]) -> str:
+    """What a finished run achieved, in plain past tense ("Messaged Ana on Discord", "Closed Slack"): the return
+    card's title, the strip's final word and the thread's final line, one line for all three.
+
+    In order: the brain's ``achieved`` on its ``done`` call (:func:`plain_achieved`); else the done words of the
+    send that happened, else of the last effect that worked (:func:`is_effect`); else what the run opened. ``""``
+    when no step says (the caller keeps the reply). Never just "Done": every source is at least two words."""
+    for st in reversed(steps):
+        if str(st.get("name") or "") == "done":
+            line = plain_achieved((st.get("input") or {}).get(ACHIEVED))
+            if line:
+                return line
+            break
+    worked = [st for st in steps if st.get("ok") is True and is_effect(str(st.get("name") or ""), st.get("input"))]
+    sent = [st for st in worked if _about(st.get("input") or {}).get("sends")]
+    pick = (sent or worked)[-1] if (sent or worked) else None
+    if pick is not None:
+        return describe_step(str(pick.get("name") or ""), pick.get("input") or {}, done=True, limit=ACHIEVED_CHARS)
+    opened = _opened(steps)
+    return "Opened " + _joined(opened) if opened else ""
+
+
+def failed_row(name: str, tool_input: dict[str, Any] | None) -> str:
+    """An effect that did not happen: ``Didn’t finish closing Slack`` (the running words, whatever tense the brain's
+    ``what`` was in)."""
+    running = describe_step(name, tool_input)
+    return f"Didn’t finish {running[:1].lower() + running[1:]}"
 
 
 def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -450,18 +641,18 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
 
     Args:
         outcome: ``done`` | ``stopped`` | ``failed`` | ``handed`` (the real end, :meth:`YukiUi._settle`).
-        text: The closing text (the answer for ``done``; the plain reason for ``failed``).
-        steps: The run's calls in order: ``{"name", "input" (with ``_about``), "ok" (True / False / None: not
-            finished)}``.
+        text: The closing text, used only for a hand-back. A finished run's title is what it achieved
+            (:func:`achievement`), never the reply; a failed run's is :data:`FAILED_TITLE`, never the loop's error.
+        steps: The run's calls in order: ``{"name", "input" (with ``_about``; ``achieved`` on ``done``), "ok" (True /
+            False / None: not finished)}``.
 
     Returns:
         ``{"icon", "head", "title", "rows": [{"text", "icon"}] (at most :data:`RETURN_ROWS`; ``check`` for what
-        happened, ``dash`` for an effect that did not), "more" (how many rows did not fit), "worth"}``: ``worth`` is
-        False when there is nothing to tell beyond the strip's final word. No row carries an undo of any kind (the
-        user, 3 Oct 19:10: "dont show the undo options in this card").
+        happened, ``dash`` for an effect that did not; a row that only repeats the title is left out), "more" (how
+        many rows did not fit), "worth"}``: ``worth`` is False when there is nothing to tell beyond the strip's final
+        word. No row carries an undo of any kind (the user, 3 Oct 19:10: "dont show the undo options in this card").
     """
     icon, head = OUTCOME_HEADS.get(outcome, OUTCOME_HEADS["done"])
-    opened: list[str] = []
     rows: list[dict[str, str]] = []
     sent_ok = sent_missed = False
     for st in steps:
@@ -470,34 +661,72 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
         if about.get("sends"):
             sent_ok = sent_ok or ok is True
             sent_missed = sent_missed or ok is not True
-        if ok is True and name in OPENING_TOOLS and not is_effect(name, args):
-            thing = describe_step(name, args, done=True).removeprefix("Opened ")
-            if thing not in opened:
-                opened.append(thing)
-        elif is_effect(name, args):
-            if ok is True:
-                row = {"text": describe_step(name, args, done=True), "icon": "check"}
-            elif about.get("sends"):
-                continue   # said once, in the title ("Nothing was sent.")
-            else:
-                what = plain_what(args.get(WHAT))
-                running = describe_step(name, args)
-                row = {"text": f"Didn’t {what}" if what else f"Didn’t finish {running[:1].lower() + running[1:]}",
-                       "icon": "dash"}
-            if row not in rows:
-                rows.append(row)
+        if not is_effect(name, args):
+            continue
+        if ok is True:
+            row = {"text": describe_step(name, args, done=True), "icon": "check"}
+        elif about.get("sends"):
+            continue   # said once, in the title ("Nothing was sent.")
+        else:
+            row = {"text": failed_row(name, args), "icon": "dash"}
+        if row not in rows:
+            rows.append(row)
+    opened = _opened(steps)
     if opened:
         rows.insert(0, {"text": "Opened " + _joined(opened), "icon": "check"})
     nothing_sent = sent_missed and not sent_ok
-    title = " ".join(str(text or "").split())
+    worth = bool(rows) or nothing_sent
     if outcome == "stopped":
-        title = "Stopped before it finished." + (" Nothing was sent." if nothing_sent else "")
+        title = "Stopped before it finished." + (f" {NOTHING_SENT}" if nothing_sent else "")
     elif outcome == "failed":
-        title = (title or "I couldn’t finish that.") + (" Nothing was sent." if nothing_sent else "")
+        title = FAILED_TITLE + (f" {NOTHING_SENT}" if nothing_sent else "")
     elif outcome == "handed":
-        title = title or "Handed back. You have the controls."
+        title = " ".join(str(text or "").split()) or "Handed back. You have the controls."
+    else:
+        title = achievement(steps) or FINISHED_TITLE
+        rows = [r for r in rows if r["text"] != title]
     return {"icon": icon, "head": head, "title": title, "rows": rows[:RETURN_ROWS],
-            "more": max(0, len(rows) - RETURN_ROWS), "worth": bool(rows) or nothing_sent}
+            "more": max(0, len(rows) - RETURN_ROWS), "worth": worth}
+
+
+# -- a step's result, where a surface shows one beside its words ------------------------------------------------------
+
+
+def result_words(ok: bool | None) -> str:
+    """A finished step's result in plain words, from whether it worked only (the thread's step folds): nothing for a
+    step that worked (its words and the check mark say it), "Didn’t work" for one that failed. Never the tool's own
+    summary (shell output, timings, ids), which stays in the log."""
+    return "Didn’t work" if ok is False else ""
+
+
+# -- the voice's hands ----------------------------------------------------------------------------------------------
+
+#: The voice's hands (``yuki.voice.hands.HAND_NAMES``) whose thinker tool has another name (the map
+#: ``yuki.voice.hands.judged_call`` uses); the rest share the thinker tool's name or have their own words.
+HAND_AS_TOOL: dict[str, str] = {"window": "window_action", "type": "type_text", "open_app": "launch_app"}
+
+
+def hand_input(name: str, args: Any) -> tuple[str, dict[str, Any]]:
+    """A voice hand's call as ``(tool, input)`` for :func:`describe_step`: the thinker's tool name and the fields
+    the words are built from (an opened app's name as ``query``, a scroll's direction as the sign of ``dy``, a media
+    key's fixed enum as ``media``). Never the typed text, the address or the window and item numbers."""
+    a = args if isinstance(args, dict) else {}
+    out = label_input(a)
+    if name == "open_app" and isinstance(a.get("name"), str):
+        out["query"] = a["name"]
+    if name == "scroll" and a.get("direction") in ("up", "down"):
+        out["dy"] = 1 if a["direction"] == "up" else -1
+    if name == "media_key" and isinstance(a.get("key"), str):
+        out["media"] = a["key"]
+    return HAND_AS_TOOL.get(name, name), out
+
+
+def describe_hand(name: str, args: Any, *, app: Any = None, done: bool = True) -> str:
+    """A voice hand's step in the same words as the thinker's (``Closed Slack``, ``Turned Spotify down``)."""
+    tool, inp = hand_input(name, args)
+    if app:
+        inp[ABOUT] = {"app": app}
+    return describe_step(tool, inp, done=done)
 
 
 def took_words(seconds: float) -> str:

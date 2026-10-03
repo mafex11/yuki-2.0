@@ -74,8 +74,9 @@ class Runtime:
         self.worker_running: int | None = None
         self.next_id = 100
 
-    def cancel(self, request_id, reason="cancelled") -> str:
+    def cancel(self, request_id, reason="cancelled", *, by="") -> str:
         self.cancelled.append(request_id)
+        self.by = by
         return "running"
 
     def cancel_worker(self) -> None:
