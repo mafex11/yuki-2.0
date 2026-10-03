@@ -201,6 +201,9 @@ def acting_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 
 #: appPT: the longest ``now`` note passed on to the island (one line; the UI cuts it to fit).
 NOW_CHARS = 140
+#: appPT (review F7): how alike (difflib's ratio, casefolded, whitespace squashed) a send's text and the user's answer
+#: to a question must be for that answer to count as their go-ahead on the text (a fixed spelling or full stop aside).
+ANSWERED_TEXT_SIMILAR = 0.85
 
 
 def _now_line(value: Any) -> str:
@@ -1099,8 +1102,13 @@ class Agent:
         self._sends: list[dict[str, Any]] = []
         #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
         self._situation_checks: list[situation_check.CheckRecord] = []
-        #: appPT: the user answered a question in this request (theirs was the go-ahead: a send then needs no countdown).
-        self._asked_user = False
+        #: appPT: the questions the user answered in this request (``ask_user``: question, answer). A send whose exact
+        #: text they wrote in an answer needs no countdown (that was their go-ahead on it); an answer about who or
+        #: where ("which Sam?", "Discord or WhatsApp?") is no go-ahead on the text (review F7).
+        self._answered: list[tuple[str, str]] = []
+        #: appPT: the send stopped in its countdown this request: ``None`` (none), else whether its text was already in
+        #: the box (the run's cancel line then says plainly what did not happen, for the screen and the voice).
+        self._send_stopped: bool | None = None
         #: N10: the request's kept list (``tasks``), and how often a done was held for what is still on it.
         self._tasks: list[dict[str, Any]] = []
         self._tasks_held = 0
@@ -2274,6 +2282,12 @@ class Agent:
                                   "their newer request. Do not continue it or bring it up.")
             return ErrorEvent(message)
         message = "Cancelled by the user."
+        stopped = getattr(self, "_send_stopped", None)
+        if stopped is not None:
+            # appPT: stopped in the send countdown: what did not happen, plainly (the screen's end line and the words
+            # the voice gets for a stop it owns)
+            message += (" The message was not sent: it is still in the box." if stopped
+                        else " The message was not sent.")
         self.logger.error(message)
         self.context.add_note("The user cancelled that request. Stop and await new instructions.")
         return ErrorEvent(message)
@@ -2433,7 +2447,6 @@ class Agent:
                 self._note_words(answer, how="answer", question=question)
                 self._confirmed.add((name, call_signature(acting)))
                 turn.asked = True
-                self._asked_user = True
                 text = (f"Not run yet: you declared it irreversible and not asked for, so the user was asked "
                         f"'{question}' and answered: '{answer}'. If that is a yes, make this exact call again "
                         f"and it will run; if not, do not run it and go on as they said.")
@@ -2504,10 +2517,12 @@ class Agent:
                 turn.stop_after = True
                 return
 
-        if acts and sends and not confirmed and not self._asked_user and float(self.send_countdown_s or 0) > 0:
+        if (acts and sends and not confirmed and float(self.send_countdown_s or 0) > 0
+                and not self._text_approved(self._send_text(name, tool_input, target)[0])):
             # appPT: a plain send that passed the situation check and the judge shows who / where / the text for a few
-            # seconds to stop or swap (the user's 3 Oct "Sending to X ... 3 s to stop"). Never after the user answered
-            # a question in this request (that was their go-ahead), never for a draft (nothing is sent).
+            # seconds to stop or swap (the user's 3 Oct "Sending to X ... 3 s to stop"). Never when the user already
+            # gave the go-ahead on this text (they wrote it in an answer to Yuki's question, or confirmed this very
+            # call), never for a draft (nothing is sent).
             went = yield from self._send_countdown(name, tool_input, target)
             if went != "going":
                 if went == "stopped":
@@ -2617,7 +2632,9 @@ class Agent:
             self.logger.user_answer(answer)
             self._note_words(answer, how="answer", question=question)
             turn.asked = True
-            self._asked_user = True   # appPT: they answered; a send after it needs no countdown
+            # appPT: kept for the send countdown: a send whose text they wrote here goes without one; an answer about
+            # who or where does not count (review F7)
+            self._answered.append((str(question or ""), str(answer or "")))
             self._note_action("asked the user", True, f"{question} → {answer}")
             self.logger.tool_result(
                 name, ok=True, summary=f"answered: {answer}", result={"answer": answer},
@@ -3772,15 +3789,12 @@ class Agent:
         text (the call's own, else what Yuki typed into that window and has not sent), and the alternatives the
         resolver had (the frame's other people; the person's other routes). Facts of the request only; never raises."""
         hwnd = target.get("hwnd")
-        held = str(getattr(self, "_typed", {}).get(int(hwnd or 0), "") or "")
-        if name == "type_text":
-            own = str(tool_input.get("text") or "")
-            typed = bool(held.strip()) and not tool_input.get("clear")
-            text = (held if typed else "") + own
-        else:
-            text, typed = held, bool(held.strip())
-        info: dict[str, Any] = {"who": "", "where": "", "app": _app_display(target.get("app")), "text": text.strip(),
-                                "typed": typed, "who_alts": (), "where_alts": (), "from_memory": False}
+        text, typed = self._send_text(name, tool_input, target)
+        # review F1: the chat the target window itself shows (its title, as the app writes it, read again now), so a
+        # wrong chat in front is on the card whatever the brain believes it is sending to
+        info: dict[str, Any] = {"who": "", "where": "", "app": _app_display(target.get("app")), "text": text,
+                                "typed": typed, "who_alts": (), "where_alts": (), "from_memory": False,
+                                "window": self._live_title(hwnd, target.get("title")), "route_apps": {}}
         try:
             checks = [c for c in getattr(self, "_situation_checks", None) or [] if c.about]
             same = [c for c in checks if hwnd is not None and c.hwnd == hwnd] or checks
@@ -3800,12 +3814,59 @@ class Agent:
             info["where"] = str(mine["label"]) if mine else info["app"]
             info["where_alts"] = tuple(dict.fromkeys(str(r["label"]) for r in routes if r is not mine
                                                      and str(r["label"]) != info["where"]))[:2]
+            # each route's own app, so a "where" swap names the app it switches to (review F6)
+            info["route_apps"] = {str(r["label"]): _app_display(r.get("app")) or str(r["label"]) for r in routes}
             others = [str(p["name"]) for p in persons if p is not person]
             others += [str(getattr(c, "label", "") or "") for c in (getattr(frame, "people", None) or [])]
             info["who_alts"] = tuple(dict.fromkeys(o for o in others if o and o.casefold() != who.casefold()))[:2]
         except Exception as exc:  # noqa: BLE001 - the countdown still shows the text and the app
             self.logger.log("send_countdown_info_failed", error=f"{type(exc).__name__}: {exc}")
         return info
+
+    def _send_text(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> tuple[str, bool]:
+        """appPT: the exact text a send call puts out, and whether it is already in the box: the call's own text after
+        what Yuki typed into that window and has not sent (unless the call clears the box first), or, for a key or a
+        click, what Yuki typed there. Plumbing on the request's own record; never raises."""
+        hwnd = target.get("hwnd")
+        held = str(getattr(self, "_typed", {}).get(int(hwnd or 0), "") or "")
+        if name == "type_text":
+            typed = bool(held.strip()) and not tool_input.get("clear")
+            return ((held if typed else "") + str(tool_input.get("text") or "")).strip(), typed
+        return held.strip(), bool(held.strip())
+
+    def _text_approved(self, text: str) -> bool:
+        """appPT (review F7): whether the user already gave the go-ahead on this exact text in this request: they wrote
+        it in an answer to Yuki's question ("message Sam" -> "what should I say?" -> the text). Measured on characters
+        (casefolded, whitespace squashed: the whole text inside their answer, or :data:`ANSWERED_TEXT_SIMILAR` alike),
+        never on words; an answer that only picked who or where is no go-ahead on the text."""
+        import difflib
+
+        def squash(s: str) -> str:
+            return " ".join(str(s or "").split()).casefold()
+
+        x = squash(text)
+        if not x:
+            return False
+        for _question, answer in getattr(self, "_answered", None) or []:
+            y = squash(answer)
+            if y and (x in y or difflib.SequenceMatcher(None, x, y).ratio() >= ANSWERED_TEXT_SIMILAR):
+                return True
+        return False
+
+    def _live_title(self, hwnd: Any, fallback: Any = "") -> str:
+        """The target window's title read again now (on the real desktop), else the overview's: the chat it shows, as
+        the app writes it. Whitespace squashed; never raises."""
+        title = str(fallback or "")
+        try:
+            if hwnd and isinstance(getattr(self.dispatcher, "backend", None), _real_backend_type()):
+                from yuki.perception.windows import window_info
+
+                info = window_info(int(hwnd))
+                if info is not None and info.title:
+                    title = str(info.title)
+        except Exception:  # noqa: BLE001 - the overview's title stands
+            pass
+        return " ".join(title.split())
 
     def _send_countdown(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> Iterator[AgentEvent]:
         """appPT: the send countdown. Yields :class:`SendPending` ``counting`` (and, for a spoken request, one short
@@ -3818,7 +3879,8 @@ class Agent:
         with self._send_lock:
             self._send_open, self._send_choice = info, None
         self._send_wake.clear()
-        event = {k: info[k] for k in ("who", "where", "app", "text", "who_alts", "where_alts", "typed", "from_memory")}
+        event = {k: info[k] for k in ("who", "where", "app", "text", "who_alts", "where_alts", "typed", "from_memory",
+                                      "window")}
         self.logger.log("send_countdown", state="counting", tool=name, seconds=seconds, chars=len(info["text"]),
                         who_alts=len(info["who_alts"]), where_alts=len(info["where_alts"]), typed=info["typed"])
         if getattr(self, "_request_voice", False) and info["who"]:
@@ -3847,24 +3909,41 @@ class Agent:
         self._waited_s += time.monotonic() - started
         if state == "swapped" and choice is not None:
             kind, value = choice
-            who, where = info["who"] or "them", info["where"] or info["app"]
+            who, where, app = info["who"] or "them", info["where"] or info["app"], info["app"]
             if kind == "who":
-                words = f"Not {who}: send it to {value} instead" + (f", on {where}" if where else "") + "."
+                # the new person in the same app, never on the old person's own chat (review F2: "Discord DM @sam_99"
+                # is Sam's route, not Maya's)
+                words = f"Not {who}: send it to {value} instead" + (f", on {app}" if app else "") + "."
+                avoid = f"Do not send it to {who}."
                 event = {**event, "who": value, "who_alts": tuple(x for x in (who, *info["who_alts"])
                                                                    if x and x != value)[:2]}
             else:
                 words = f"Send it to {who} on {value} instead of {where}."
-                event = {**event, "where": value, "where_alts": tuple(x for x in (where, *info["where_alts"])
-                                                                      if x and x != value)[:2]}
+                avoid = f"Do not send it on {where}."
+                # the app the chosen route is in, so the switching card names it (review F6)
+                event = {**event, "where": value, "app": (info.get("route_apps") or {}).get(value) or value,
+                         "where_alts": tuple(x for x in (where, *info["where_alts"]) if x and x != value)[:2]}
+            event["window"] = ""   # the window it was going into is not where it goes now
+            left = ""
+            hwnd = target.get("hwnd")
+            if info["typed"] and hwnd is not None:
+                # review F3: the text sat in the first chat's box; that box is no longer the target, so it is not
+                # the next send's text (a click to the new chat is no send), and the brain hears it is still there
+                getattr(self, "_typed", {}).pop(int(hwnd), None)
+                left = (" The text you typed is still in the message box of the chat you were in, not sent: clear "
+                        "that box before you leave that chat (it must not stay there or go to them), then type the "
+                        "text in the new chat.")
             self.steer(f"{words} (tapped on the send countdown)")
             note = (f"{CHECK_LABEL}: not run: in the send countdown the user tapped to change "
                     f"{'who it goes to' if kind == 'who' else 'where it goes'}: {words} Their words come next. Send "
                     f"the same text there: go to that chat first (another window needs its own check), then send. "
-                    f"Do not send it to {who} on {where}.")
+                    f"{avoid}{left}")
             self.logger.log("send_countdown", state="swapped", swap=kind, after_ms=round((time.monotonic() - started)
                                                                                           * 1000))
             yield SendPending("swapped", seconds=seconds, **event)
             return note
+        if state == "stopped":
+            self._send_stopped = bool(info["typed"])   # the run's cancel line says plainly what did not happen
         self.logger.log("send_countdown", state=state, after_ms=round((time.monotonic() - started) * 1000))
         yield SendPending(state, seconds=seconds, **event)
         return state
@@ -4084,6 +4163,8 @@ class Agent:
                         if first_token_at is None and kind in ("content_block_start", "content_block_delta"):
                             first_token_at = time.perf_counter()   # revamp D: the first token, measured
                         part = stream_partial(event, live)
+                        if part is not None and part.what == "now":
+                            part = Partial("now", _now_line(part.text)) if _now_line(part.text) else None
                         if part is not None:
                             yield part
                         if pending is not None and kind in (

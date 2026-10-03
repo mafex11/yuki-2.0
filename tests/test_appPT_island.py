@@ -353,3 +353,95 @@ def test_the_drain_leaves_the_shared_loop_when_it_stops(qapp) -> None:
     bar.start(0.05)
     _pump(qapp, 0.3)
     assert id(bar._frame_fn) not in loop.subs and bar.left == 0.0      # drained: it took itself off
+
+
+# -- review fixes (report 49 "Review fixes") -------------------------------------------------------------------------
+
+
+def test_the_card_shows_the_window_the_text_goes_into(qapp) -> None:
+    """F1: the target window's own title (the chat it shows) is on the card while it counts, gone while switching."""
+    isl = _island()
+    try:
+        isl.strip.start_run(5, line="Typing your message", request="tell sam omw")
+        isl.show_send(5, {**SEND, "window": "@maya_k   - Discord"})
+        card = isl.window.send
+        assert card.into.text() == "into the window “@maya_k - Discord”" and card.into.isVisibleTo(card)
+        isl.show_send(5, {**SEND, "state": "swapped", "who": "Maya", "window": ""})
+        assert not card.into.isVisibleTo(card)
+    finally:
+        isl.stop()
+
+
+def test_the_card_keeps_line_breaks_and_never_cuts_the_text_silently(qapp) -> None:
+    """F9: a line break stays a line break; a text longer than the card ends in a visible "…"."""
+    isl = _island()
+    try:
+        isl.strip.start_run(5, line="Typing your message", request="tell sam omw")
+        isl.show_send(5, {**SEND, "text": "line  one\nline two"})
+        assert isl.inputs.send.text == "line one\nline two"
+        card = isl.window.send
+        assert card.msg.text() == "“line one line two”"
+        assert len(card.msg._lines(560)) == 2                          # two lines, as it will be typed
+        isl.show_send(5, {**SEND, "text": "every word of this goes out " * 30})
+        card.height_for(618)
+        assert card.msg.text().endswith("…”") and len(card.msg.text()) < len("every word of this goes out " * 30)
+    finally:
+        isl.stop()
+
+
+def test_switching_names_the_new_app_and_says_typed_text_stays_in_the_first_box(qapp) -> None:
+    """F6 / F3: a where swap names the app it switches to; text already typed is said to stay in the first box."""
+    isl = _island()
+    try:
+        isl.strip.start_run(5, line="Typing your message", request="tell sam omw")
+        isl.show_send(5, {**SEND, "state": "swapped", "where": "WhatsApp", "app": "WhatsApp", "typed": True})
+        spec = isl.window.spec
+        assert spec.line == "Switching to Sam on WhatsApp…"
+        assert "stays there, not sent" in spec.sub
+        assert isl.window.send.tx.text() == "Getting it ready for Sam on WhatsApp…"
+    finally:
+        isl.stop()
+
+
+def test_the_thinking_line_before_the_first_step_is_what_yuki_worked_out(qapp) -> None:
+    """F4: before the brain's first step, the thinking line shows the resolver's line (who, their usual route) rather
+    than a canned "Thinking…"; the brain's own note replaces it, and the first step starts clean."""
+    from yuki.ui.island import spec_for
+
+    isl = _island()
+    try:
+        isl.strip.start_run(5, line="", request="tell sam omw")
+        frame = {"persons": [{"name": "Sam", "routes": [{"label": "Discord DM", "app": "Discord.exe", "mine": 12}]}]}
+        isl.set_frame(5, frame)
+        assert isl.inputs.run.steps == 0 and isl.state == "thinking"
+        assert isl.inputs.run.thought == "From memory: you message Sam on Discord DM, 12 times"
+        assert spec_for("thinking", isl.inputs).line == "From memory: you message Sam on Discord DM, 12 times"
+        isl.set_thought(5, "Opening Sam's chat to check it first")      # streamed before its step starts
+        assert spec_for("thinking", isl.inputs).line == "Opening Sam's chat to check it first"
+        isl.strip.run_step(5, "Opening Discord", 1)
+        assert isl.inputs.run.thought == ""
+    finally:
+        isl.stop()
+
+
+def test_the_html_window_draws_no_step_total() -> None:
+    """F5: the window's face and field draw the steps so far from the shell's real step, never a fixed "2 of 5"."""
+    from pathlib import Path
+
+    web = Path(__file__).resolve().parents[1] / "yuki" / "ui" / "web"
+    app = (web / "app.js").read_text(encoding="utf-8")
+    field = (web / "lattice" / "field.js").read_text(encoding="utf-8")
+    assert "of: 5" not in app and "of: 5" not in field
+    assert "step.of" not in field                                       # nothing is drawn against a total
+    assert "stepNow()" in app and "+r.step" in app
+
+
+def test_the_shell_runs_carry_the_step_they_are_on() -> None:
+    from yuki.ui.web_data import runs_of
+
+    step = SimpleNamespace(running=True, label="Typing your message", started=1.0)
+    item = SimpleNamespace(kind="assistant", running=True, id=3, jobs=[], at=1.0, steps=[step], status="running",
+                           question=None, thinking="", real_steps=lambda: [step, step])
+    user = SimpleNamespace(kind="user", text="tell sam omw")
+    runs = runs_of(SimpleNamespace(items=[user, item]), now=5.0)
+    assert runs[0]["step"] == 2

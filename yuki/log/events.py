@@ -141,6 +141,8 @@ class SendPending:
     where_alts: tuple[str, ...] = ()
     typed: bool = False
     from_memory: bool = False
+    #: The title of the window the text goes into (the chat it shows, as the app writes it; review F1); "" on a swap.
+    window: str = ""
     kind: Literal["send_pending"] = "send_pending"
 
 

@@ -1779,7 +1779,8 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
                 (item.question and "Waiting for your answer") or (" ".join((item.thinking or "").split())[:120] or "Thinking…"))
         title = request_title(user.text) if user is not None else "Working on your request"
         out.append({"item": item.id, "jobs": list(item.jobs or []), "title": title, "line": line,
-                    "started_at": min([item.at] + [s.started for s in item.steps]), "status": item.status})
+                    "started_at": min([item.at] + [s.started for s in item.steps]), "status": item.status,
+                    "step": len(steps)})   # the step it is on, no total: the face's and field's figures (appPT)
     return out
 
 

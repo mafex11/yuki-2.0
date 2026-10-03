@@ -501,7 +501,8 @@ class Lane(QThread):
                 runtime.send_pending.emit(self.name, job.id, {
                     "state": event.state, "who": event.who, "where": event.where, "app": event.app,
                     "text": event.text, "seconds": event.seconds, "who_alts": list(event.who_alts),
-                    "where_alts": list(event.where_alts), "typed": event.typed, "from_memory": event.from_memory})
+                    "where_alts": list(event.where_alts), "typed": event.typed, "from_memory": event.from_memory,
+                    "window": event.window})
             elif isinstance(event, HelperStep):
                 # A read-only helper's step (yuki.agent.subagents): its own signal, and as a step of
                 # the request (tool name "helper") for a chat that lists tool calls. Emitted directly,
@@ -628,7 +629,7 @@ class AgentRuntime(QObject):
     #: their usual route, the playbooks shown), once, before its first step; the island's "from memory" chip.
     framed = Signal(str, int, dict)
     #: appPT: ``(lane, id, send)``: the send countdown (``yuki.log.events.SendPending`` as a dict: ``state`` counting |
-    #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory).
+    #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory, window).
     send_pending = Signal(str, int, dict)
 
     def __init__(

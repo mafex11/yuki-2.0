@@ -195,6 +195,9 @@ class SendInfo:
     typed: bool = False
     from_memory: bool = False
     started: float = 0.0                     # time.monotonic() when this countdown began
+    #: The title of the window the text goes into, as the app writes it (the chat it shows): a wrong chat in front is
+    #: on the card whatever Yuki believes it is sending to (review F1). "" while switching.
+    window: str = ""
 
 
 @dataclass
@@ -417,7 +420,9 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
                 " · tap a chip to swap" if swaps else f" · {int(round(s.seconds))} s to stop")
         else:
             line = f"Switching to {target}…"
-            sub = "the countdown starts again once it's ready there"
+            # review F3: text already typed stays in the first chat's box until it is cleared: said, never hidden
+            sub = ("the text typed in the first chat stays there, not sent, until it is cleared" if s.typed
+                   else "the countdown starts again once it's ready there")
         return Spec(state, face="speaking", exp=True, width=SEND_W, line=line, sub=sub, rec=rec, body="send",
                     title=line)
     if state == "voice-stopped":
@@ -2354,10 +2359,12 @@ class Island(QObject):
         def alts(key: str) -> tuple[str, ...]:
             return tuple(str(x) for x in (send.get(key) or ()) if str(x).strip())[:2]
 
+        # the exact text: spaces tidied within each line, its line breaks kept (one may go out as Enter: review F9)
+        lines = [" ".join(part.split()) for part in str(send.get("text") or "").splitlines()]
         fields = {"who": str(send.get("who") or ""), "where": str(send.get("where") or ""),
-                  "app": str(send.get("app") or ""), "text": " ".join(str(send.get("text") or "").split()),
+                  "app": str(send.get("app") or ""), "text": "\n".join(lines).strip("\n"),
                   "who_alts": alts("who_alts"), "where_alts": alts("where_alts"), "typed": bool(send.get("typed")),
-                  "from_memory": bool(send.get("from_memory"))}
+                  "from_memory": bool(send.get("from_memory")), "window": " ".join(str(send.get("window") or "").split())}
         if state == "counting":
             self._send_restart = True
             self._log("send_countdown", state=state, swaps=len(fields["who_alts"]) + len(fields["where_alts"]))
@@ -2388,7 +2395,7 @@ class Island(QObject):
         restart, self._send_restart = self._send_restart, False
         self.window.send.set_send(phase=s.phase, who=s.who, where=s.where, app=s.app, text=s.text, said=said,
                                   seconds=s.seconds, who_swap=bool(s.who_alts), where_swap=bool(s.where_alts),
-                                  restart=restart and s.phase == "counting")
+                                  restart=restart and s.phase == "counting", window=s.window)
 
     def _on_send_stop(self) -> None:
         s = self.inputs.send
@@ -2490,6 +2497,11 @@ class Island(QObject):
         chip = _route_chip(frame)
         if chip:
             run.chips.setdefault(1, []).insert(0, ("memory", chip))
+        if chip and run.steps == 0 and not run.thought:
+            # review F4: before the first step the brain has written nothing yet; what Yuki already worked out (who,
+            # and their usual route, from memory) is the thinking line's real source until its own note arrives
+            self.update(run=replace(run, thought=chip[:1].upper() + chip[1:]))
+            return
         if self.expanded:
             self._render(animate=False)
 

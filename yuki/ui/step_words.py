@@ -250,6 +250,22 @@ def _looks_like_code(text: str) -> bool:
     return False
 
 
+#: appPT (review F8): a run of this many digits is a number nobody says (a window handle, an id), not a time or count.
+ID_DIGITS = 5
+
+
+def _looks_like_id(text: str) -> bool:
+    """Character tests on fixed formats, never words: a run of :data:`ID_DIGITS` digits or more (``655432``), or a token
+    where a letter runs straight into a digit (``e12``, ``hwnd3``): window and element numbers. Times, counts and
+    "4pm" / "2nd" (a digit first) are fine."""
+    run = 0
+    for ch in text:
+        run = run + 1 if ch.isdigit() else 0
+        if run >= ID_DIGITS:
+            return True
+    return any(a.isalpha() and b.isdigit() for tok in text.split() for a, b in zip(tok, tok[1:]))
+
+
 def _cut(text: str, chars: int) -> str:
     return text if len(text) <= chars else text[: chars - 1].rstrip() + "…"
 
@@ -282,9 +298,9 @@ def plain_thought(value: Any) -> str:
     """The brain's live note of what it checks or does and why (appPT: the island's thinking and working line, the run
     card's current step) when it is a plain line: one line, no address, path, switch or command name (character tests
     on fixed formats, never words), first letter capital, no closing full stop; else ``""``. Times and counts a
-    person says ("6:08 PM", "3 messages") are fine."""
+    person says ("6:08 PM", "3 messages") are fine; a window or element number is not (review F8)."""
     text = _squash(value).strip(" .")
-    if not text or _looks_like_code(text):
+    if not text or _looks_like_code(text) or _looks_like_id(text):
         return ""
     text = _cut(text, THOUGHT_CHARS)
     return text[:1].upper() + text[1:]

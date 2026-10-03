@@ -1291,13 +1291,19 @@ class SendCard(QWidget):
     swap = Signal(str)          # "who" | "where"
 
     PAD_X, PAD_T, PAD_B = 18, 12, 16
+    #: The most lines of the message shown; a longer one ends in a visible "…" (review F9).
+    MSG_LINES = 4
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.said = L.Para("", font=L.mono_font(11.5, 500), color=L.TEXT3, line_height=1.3, parent=self, max_lines=1)
         self.who = ResChip("who", self)
         self.where = ResChip("where", self)
-        self.msg = L.Para("", font=L.ui_font(18), line_height=1.35, parent=self, max_lines=3)
+        #: The window the text goes into, its title as the app writes it (review F1): a wrong chat shows here.
+        self.into = L.Para("", font=L.mono_font(11.5, 500), color=L.TEXT3, line_height=1.3, parent=self, max_lines=1)
+        self.msg = L.Para("", font=L.ui_font(18), line_height=1.35, parent=self, max_lines=self.MSG_LINES)
+        self._text = ""
+        self._fit_w = -1   # the width the message was last fitted to (``_fit``)
         self.up = L.Icon("up", 13, L.TEXT, self)
         self.tx = L.Para("", font=L.ui_font(14, 600), line_height=1.3, parent=self, max_lines=1)
         self.k_stop = L.Key("Stop", variant="stop", size="sm", icon="stop", kbd="Esc", parent=self)
@@ -1313,8 +1319,9 @@ class SendCard(QWidget):
         self._rule_y = 0
 
     def set_send(self, *, phase: str, who: str, where: str, app: str, text: str, said: str, seconds: float,
-                 who_swap: bool, where_swap: bool, restart: bool) -> None:
-        """Fill the card. ``restart``: a new countdown begins (the drain starts over)."""
+                 who_swap: bool, where_swap: bool, restart: bool, window: str = "") -> None:
+        """Fill the card. ``restart``: a new countdown begins (the drain starts over). ``window``: the title of the
+        window the text goes into (the chat it shows), as the app writes it. ``text`` keeps its line breaks."""
         self.phase = phase
         self.said.set_text(f"you said “{said}”" if said else "", [L.Span(9, len(said) + 2, color=L.TEXT2)]
                            if said else None)
@@ -1323,7 +1330,12 @@ class SendCard(QWidget):
         self.who.setVisible(bool(who))
         self.where.set_value(where, can_swap=where_swap and phase == "counting")
         self.where.setVisible(bool(where))
-        self.msg.set_text(f"“{text}”" if text else "")
+        self.into.set_text(f"into the window “{window}”" if window and phase == "counting" else "")
+        self.into.setVisible(bool(window) and phase == "counting")
+        # line breaks as the layout's own line separator (a plain newline does not break a QTextLayout line)
+        self._text = f"“{text}”".replace("\r\n", "\n").replace("\n", " ") if text else ""
+        self._fit_w = -1
+        self.msg.set_text(self._text)
         self.msg.setVisible(bool(text))
         target = f"{who} on {app}" if who and app else (who or app or "them")
         counting = phase == "counting"
@@ -1351,6 +1363,23 @@ class SendCard(QWidget):
         super().resizeEvent(e)
         self._place(self.width())
 
+    def _fit(self, inner: int) -> None:
+        """The message in at most :data:`MSG_LINES` lines at ``inner``; a longer one is cut at the last character that
+        fits with a visible "…" (never cut silently: review F9). Once per text and width."""
+        if not self._text or getattr(self, "_fit_w", -1) == inner:
+            return
+        self._fit_w = inner
+        self.msg.set_text(self._text)
+        cut = self.msg.laid_chars(inner)
+        while 0 < cut < len(self._text):
+            shown = self._text[:cut].rstrip("  ") + "…”"
+            self.msg.set_text(shown)
+            if self.msg.laid_chars(inner) >= len(shown):
+                return
+            cut -= 1
+        if cut <= 0:
+            self.msg.set_text("…")
+
     def _place(self, w: int, apply: bool = True) -> int:
         inner = w - 2 * self.PAD_X
         x0 = self.PAD_X
@@ -1369,8 +1398,15 @@ class SendCard(QWidget):
                     c.move(x, y)
                 x += c.width() + 8
             y += ResChip.H
+        if self.into.isVisibleTo(self):
+            y += 8
+            ih = int(round(11.5 * 1.3))
+            if apply:
+                self.into.setGeometry(x0, y, inner, ih)
+            y += ih
         if self.msg.isVisibleTo(self):
             y += 12
+            self._fit(inner)
             mh = self.msg.heightForWidth(inner)
             if apply:
                 self.msg.setGeometry(x0, y, inner, mh)

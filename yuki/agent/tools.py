@@ -919,8 +919,8 @@ STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 NOW_FIELD = "now"
 NOW_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "description": "Optional, shown to them as it runs: what you check or do and why, plain words, at most 12, no "
-                   "tool names",
+    "description": "Optional, shown to them live: what you check or do and why, plain words, at most 12, no tool "
+                   "names or ids",
 }
 #: The actions, the situation check and the reads a step usually waits on (the rarer reads go without it).
 NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(ACTION_TOOL_NAMES + (

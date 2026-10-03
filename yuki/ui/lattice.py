@@ -969,6 +969,15 @@ class Para(QWidget):
             out.append(r)
         return out
 
+    def laid_chars(self, width: int) -> int:
+        """How many characters of the text the lines at ``width`` hold (fewer than its length when ``max_lines`` cut
+        it), so a caller can end a cut text with a visible ellipsis."""
+        lines = self._lines(max(1, int(width)))
+        if not lines:
+            return 0
+        last = lines[-1][0]
+        return int(last.textStart() + last.textLength())
+
     def _lines(self, width: int) -> list[tuple[Any, float]]:
         """The laid-out lines for ``width``: ``(QTextLine, top)`` (cached per width)."""
         if self._cache is not None and self._cache[0] == width:

@@ -734,7 +734,7 @@ def test_the_drawer_gets_every_step_with_its_time_and_the_runs():
     assert items[1]["steps"][0]["ok"] is True and items[1]["running"] and items[1]["work_line"].startswith("working")
     runs = web_data.runs_of(m, now=103.0)
     assert runs == [{"item": items[1]["id"], "jobs": [3], "title": "“Open the forum”", "line": "Step 1 · Opening an app, Firefox",
-                     "started_at": 100.0, "status": "running"}]
+                     "started_at": 100.0, "status": "running", "step": 1}]   # appPT: the step, no total
     m.apply({"type": "finished", "job": 3, "text": "The forum's up.", "at": 104.0})
     assert web_data.runs_of(m) == []
 

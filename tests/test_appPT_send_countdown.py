@@ -383,3 +383,208 @@ def test_plain_thought_keeps_plain_lines_and_drops_code() -> None:
     assert plain_thought("Get-Process slack | Stop-Process") == ""
     assert plain_thought("open C:\\Users\\x\\a.txt") == ""
     assert plain_thought(None) == ""
+
+
+# -- review fixes (report 49 "Review fixes") -------------------------------------------------------------------------
+
+
+def _frame_with_maya(monkeypatch: pytest.MonkeyPatch, routes: list[dict[str, Any]] | None = None) -> None:
+    from yuki.agent import frame as task_frame
+    from yuki.agent.frame import Candidate, TaskFrame
+
+    real = task_frame.build
+
+    def build(*a: Any, **k: Any) -> TaskFrame:          # the resolver had Sam first, Maya close behind (invented)
+        frame = real(*a, **k)
+        frame.persons = [{"id": 1, "name": "Sam", "routes": routes or [
+            {"label": "Discord DM @sam_99", "app": "Discord.exe"}, {"label": "WhatsApp", "app": "WhatsApp.exe"}]}]
+        frame.people = [Candidate("person", "Sam", "said_user", "you said", 5.0, 1.0),
+                        Candidate("person", "Maya", "recent", "a chat 4 min ago", 240.0, 0.8)]
+        return frame
+
+    monkeypatch.setattr(task_frame, "build", build)
+
+
+def _tap_once(kind: str, value: str, taps: list[bool]) -> Any:
+    def tap(a: Any, _ev: SendPending) -> None:
+        if not taps:
+            taps.append(False)
+            threading.Timer(0.05, lambda: taps.__setitem__(0, a.send_choice(kind, value))).start()
+
+    return tap
+
+
+def test_the_card_names_the_chat_the_window_really_shows(tmp_path: Path) -> None:
+    """F1: the brain believes it is Sam's chat, the window in front is Maya's: the card shows the window's own title."""
+    desk = ChatPlayerDesk(friend="Maya", handle="maya_k", history=[("Maya", NOW - 3000, "hey")])
+    brain = Brain([_check(), _response(_send(), _done()), _response(_done(1))])
+    events = _run(_agent(brain, tmp_path, desk, countdown=0.1), "tell sam omw")
+    first = _sends(events)[0]
+    assert first.who == "Sam" and first.window == "@maya_k - Discord"   # the wrong chat is on the card, as is
+
+
+def test_a_who_swap_never_names_the_old_persons_chat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2: "send it to Maya instead, on Discord", never "on Discord DM @sam_99" (Sam's own chat)."""
+    _frame_with_maya(monkeypatch)
+    seen: dict[str, str] = {}
+
+    def after(params: dict) -> SimpleNamespace:
+        seen["text"] = _texts(params)
+        return _response(_done(3))
+
+    brain = Brain([_check(), _response(_send()), after, _response(_done(4))])
+    taps: list[bool] = []
+    _run(_agent(brain, tmp_path, _desk(), countdown=0.5), "tell sam omw", on_send=_tap_once("who", "Maya", taps))
+    lines = [ln for ln in seen["text"].splitlines() if "Maya" in ln]
+    assert taps == [True] and any("send it to Maya instead, on Discord." in ln for ln in lines)
+    assert "@sam_99" not in "\n".join(lines) and "Do not send it to Sam." in seen["text"]
+
+
+def test_a_where_swap_names_the_new_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F6: after a swap to WhatsApp the switching card says WhatsApp, not the old app."""
+    _frame_with_maya(monkeypatch)
+    brain = Brain([_check(), _response(_send()), _response(_done(3)), _response(_done(4))])
+    taps: list[bool] = []
+    events = _run(_agent(brain, tmp_path, _desk(), countdown=0.5), "tell sam omw",
+                  on_send=_tap_once("where", "WhatsApp", taps))
+    swapped = [p for p in _sends(events) if p.state == "swapped"]
+    assert taps == [True] and swapped and swapped[0].where == "WhatsApp" and swapped[0].app == "WhatsApp"
+    assert swapped[0].window == ""                                 # not the window it was going into any more
+
+
+def test_a_swap_after_typing_drops_the_old_box_and_says_the_text_is_still_there(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F3: typed "omw", Enter counts down, swap to Maya: the old box's text is no longer the next send's text, a click
+    to the new chat is no send (no countdown for it), and the brain hears the text is still in the old box."""
+    _frame_with_maya(monkeypatch, routes=[{"label": "Discord DM @sam_99", "app": "Discord.exe"}])
+    desk = _desk()
+    seen: dict[str, str] = {}
+
+    def after_swap(params: dict) -> SimpleNamespace:
+        seen["text"] = _texts(params)
+        return _check(3, about="Maya")
+
+    brain = Brain([_check(),
+                   _response(_use("type_text", 1, text="omw", expect_hwnd=CHAT)),
+                   _response(_use("type_text", 2, text="", press_enter=True, expect_hwnd=CHAT)),
+                   after_swap,
+                   _response(_use("click", 5, x=10, y=10, expect_hwnd=CHAT)),
+                   _response(_use("type_text", 4, text="omw", press_enter=True, expect_hwnd=CHAT), _done()),
+                   _response(_done(5))])
+    taps: list[bool] = []
+    events = _run(_agent(brain, tmp_path, desk, countdown=0.4), "tell sam omw", on_send=_tap_once("who", "Maya", taps))
+    got = [(p.state, p.who, p.text, p.typed) for p in _sends(events)]
+    assert got[0] == ("counting", "Sam", "omw", True) and got[1][0] == "swapped"
+    assert got[2:] == [("counting", "Maya", "omw", False), ("going", "Maya", "omw", False)]   # never "omwomw"
+    assert "still in the message box of the chat you were in, not sent" in seen["text"]
+
+
+def test_an_answer_about_who_or_where_is_no_go_ahead_on_the_text(tmp_path: Path) -> None:
+    """F7: "Discord or WhatsApp?" -> "Discord" picks a place; the plain send still gets its countdown."""
+    desk = _desk()
+    brain = Brain([_response(_use("ask_user", question="Sam on Discord or Sam on WhatsApp?")), _check(),
+                   _response(_send(), _done()), _response(_done(1))])
+    events = _run(_agent(brain, tmp_path, desk, countdown=0.1), "send omw, 10 min to sam", answers=["Discord"])
+    assert [p.state for p in _sends(events)] == ["counting", "going"] and desk.sent == [TEXT]
+
+
+def test_a_stop_in_the_countdown_ends_the_run_saying_nothing_was_sent(tmp_path: Path) -> None:
+    """The run's cancel line (what the screen and the voice get) says plainly that the message was not sent."""
+    brain = Brain([_check(), _response(_send(), _done()), _response(_done(1))])
+    agent = _agent(brain, tmp_path, _desk(), countdown=5.0)
+    events = _run(agent, "tell sam omw", on_send=lambda a, _ev: threading.Timer(0.05, a.cancel).start())
+    assert isinstance(events[-1], ErrorEvent) and events[-1].text.startswith("Cancelled by the user.")
+    assert "The message was not sent." in events[-1].text
+
+
+def test_the_now_note_streams_out_before_its_step_starts() -> None:
+    """F4: the brain's note the moment its string is complete in the streaming call, before the ToolCall: the island's
+    thinking line has it before the first step. The key, never the same word as another field's value."""
+    from yuki.agent.stream_partial import stream_partial, string_value
+
+    state: dict[str, Any] = {}
+    start = SimpleNamespace(type="content_block_start", content_block=SimpleNamespace(type="tool_use", name="click"))
+    assert stream_partial(start, state) is None
+    parts = []
+    for chunk in ('{"x": 4, "y": 9, "now": "Opening Sam', "'s chat to check it first\"", ', "expect_hwnd": 3}'):
+        p = stream_partial(SimpleNamespace(type="input_json", partial_json=chunk, snapshot={}), state)
+        if p is not None:
+            parts.append((p.what, p.text))
+    assert parts == [("now", "Opening Sam's chat to check it first")]
+    assert string_value('{"text": "now", "what": "x"}', "now") is None
+    done = SimpleNamespace(type="content_block_start", content_block=SimpleNamespace(type="tool_use", name="done"))
+    stream_partial(done, state)
+    assert stream_partial(SimpleNamespace(type="input_json", partial_json='{"now": "x"', snapshot={}), state) is None
+
+
+def test_plain_thought_drops_window_and_element_numbers() -> None:
+    """F8: ids never show; times, counts and "4pm" do."""
+    from yuki.agent.tools import NOW_SCHEMA
+    from yuki.ui.step_words import plain_thought
+
+    assert plain_thought("Reading hwnd 655432 to find Sam") == ""
+    assert plain_thought("Looking at element e12 in the tree") == ""
+    assert plain_thought("Your last message was at 6:08 PM, 3 messages ago") == \
+        "Your last message was at 6:08 PM, 3 messages ago"
+    assert plain_thought("Meeting at 4pm on the 2nd") == "Meeting at 4pm on the 2nd"
+    assert "ids" in NOW_SCHEMA["description"]
+
+
+def test_the_talker_knows_a_send_is_counting_down_so_stop_is_for_it() -> None:
+    """Item 1 "saying stop cancels": while the countdown runs, the talker's thinker line says the job is about to send
+    and that their stop is for that send (cancel_tell_yuki); the line goes back to normal once it went or stopped."""
+    import asyncio
+
+    from PySide6.QtCore import QCoreApplication, QObject, Signal
+
+    from yuki.voice.bridge import VoiceBridge
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+
+    class Runtime(QObject):
+        started = Signal(str, int, str)
+        tool_called = Signal(str, int, str, dict)
+        send_pending = Signal(str, int, dict)
+
+        def submit(self, text: str, **kw: Any) -> tuple[str, int]:
+            return "worker", 7
+
+    class Params:
+        def __init__(self) -> None:
+            self.arguments = {"screen": False, "say_first": "On it.", "request": "Tell Sam omw", "intent": "new_task",
+                              "acts": True}
+            self.tool_call_id, self.function_name = "call-1", "tell_yuki"
+            self.context = SimpleNamespace(get_messages=lambda: [{"role": "user", "content": "tell sam omw"}])
+            self.llm = SimpleNamespace(push_frame=None)
+
+        async def result_callback(self, result: dict, properties: Any = None) -> None:
+            pass
+
+    async def settle() -> None:
+        for _ in range(8):
+            app.processEvents()
+            await asyncio.sleep(0)
+
+    async def main() -> None:
+        rt = Runtime()
+        bridge = VoiceBridge(rt, foreground=lambda: 42)
+        bridge.attach(asyncio.get_running_loop())
+        task = asyncio.create_task(bridge.tell_yuki(Params()))
+        await settle()
+        rt.started.emit("worker", 7, "x")
+        rt.tool_called.emit("worker", 7, "type_text", {"text": TEXT, "press_enter": True})
+        await settle()
+        rt.send_pending.emit("worker", 7, {"state": "counting", "who": "Sam"})
+        await settle()
+        line = bridge.work_line() or ""
+        assert "about to send it to Sam" in line and "cancel_tell_yuki" in line
+        rt.send_pending.emit("worker", 7, {"state": "going", "who": "Sam"})
+        await settle()
+        assert "about to send" not in (bridge.work_line() or "")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())

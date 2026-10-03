@@ -101,6 +101,9 @@ class Job:
     #: 28 Sept "Still on it, switching tabs now." came from the tab tool's label while it was closing a tab).
     step_line: str | None = None
     step_running: bool = False
+    #: appPT: who a send of this job goes to while its send countdown runs (the island's "3 s to stop"), else
+    #: ``None``: the talker's thinker line says so, so their "stop" in those seconds is taken for that send.
+    sending: str | None = None
     #: Handed over with intent ``remember`` (a rule, correction or life fact to keep).
     remember: bool = False
     #: The desktop action it is running now, in a few words (for the shared action log).
@@ -393,7 +396,7 @@ class VoiceBridge(QObject):
             ("said", self._on_said), ("asked", self._on_asked), ("finished", self._on_finished),
             ("failed", self._on_failed), ("withdrawn", self._on_withdrawn), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
-            ("partial", self._on_partial), ("resumed", self._on_resumed),
+            ("partial", self._on_partial), ("resumed", self._on_resumed), ("send_pending", self._on_send_pending),
         ):
             signal = getattr(runtime, name, None)
             if signal is not None:
@@ -573,7 +576,9 @@ class VoiceBridge(QObject):
                 parts.append(f'{name} "{j.brief()}" waiting for their answer to: {j.question or "its question"} '
                              f'(asked already, never again: words that are not its answer are a new request)')
             else:
-                step = (f', now: "{j.step_line}"' if j.step_line and j.step_running else
+                step = (f", now: about to send it to {j.sending}, a few seconds left to stop it (their stop or no now "
+                        f"is for this send: cancel_tell_yuki)" if j.sending else
+                        f', now: "{j.step_line}"' if j.step_line and j.step_running else
                         f", now: {j.step.lower()}" if j.step else ", starting")
                 left = _tasks_left(j.tasks)
                 parts.append(f'{name} "{j.brief()}" running for {ago} s{step}'
@@ -1688,6 +1693,18 @@ class VoiceBridge(QObject):
             except Exception:  # noqa: BLE001 - only a head start
                 started = False
             self._log("bridge", op="prefetch", job_id=job.job_id, chars=len(sentence), started=started)
+
+    def _on_send_pending(self, lane: str, job_id: int, send: dict) -> None:
+        """appPT: a send of the job counts down (``counting``: who it goes to is on the thinker line, so the user's
+        "stop" in those seconds is taken for it) or ended (going, stopped, swapped: off the line again)."""
+        job = self._job(job_id)
+        if job is None:
+            return
+        send = send if isinstance(send, dict) else {}
+        job.sending = (" ".join(str(send.get("who") or "").split()) or "them") \
+            if send.get("state") == "counting" else None
+        self._log("bridge", op="send_countdown", job_id=job_id, state=send.get("state"))
+        self._changed()
 
     def _on_tool_called(self, lane: str, job_id: int, name: str, tool_input: dict) -> None:
         from yuki.agent.tools import ACTION_TOOL_NAMES, FINISHES_FIELD, STEP_FIELD

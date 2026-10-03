@@ -28,7 +28,7 @@ import lattice_shots as LS  # noqa: E402
 
 SEND = {"state": "counting", "who": "Sam", "where": "Discord DM", "app": "Discord",
         "text": "I'll hop on VC after this match", "seconds": 3.0, "who_alts": ["Maya", "Nico"],
-        "where_alts": ["WhatsApp"], "typed": False, "from_memory": True}
+        "where_alts": ["WhatsApp"], "typed": False, "from_memory": True, "window": "@sam_99 - Discord"}
 
 
 def _crop(src: Path, box: str, dest: Path) -> Path | None:
