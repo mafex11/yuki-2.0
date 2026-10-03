@@ -23,7 +23,7 @@ KIND_TITLES: dict[str, str] = {
 #: An observation card's heading by its channel (the nudge's ``trigger``, yuki.memory.presence).
 NOTICE_TITLES: dict[str, str] = {
     "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
-    "recall": "From memory", "thread": "Your work",
+    "recall": "From memory", "thread": "Your work", "plans": "Coming up",
 }
 #: A check-in's heading by the moment Yuki itself wrote on its card (``yuki.memory.checkins.MOMENTS``; the card's
 #: ``moment``), and the heading of a check-in whose moment is not on its row.

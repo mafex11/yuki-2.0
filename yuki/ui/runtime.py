@@ -37,7 +37,7 @@ import queue
 import time
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Iterable
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -161,6 +161,18 @@ class Job:
     #: the words heard, without the hand-off's notes), and the previous request's; ``None``: the agent's own.
     memory_query: str | None = None
     previous_query: str | None = None
+    #: What the user actually said or typed, for the authorization judge (``Agent.run(user_words=)``; voice: the heard
+    #: turns, never the talker's own reading of them); ``None``: the agent takes the request's own words.
+    user_words: tuple[str, ...] | None = None
+
+
+def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
+    """The user's words as a tuple of non-empty strings (``None`` when there are none)."""
+    if words is None:
+        return None
+    items = [words] if isinstance(words, str) else list(words)
+    out = tuple(str(w).strip() for w in items if str(w or "").strip())
+    return out or None
 
 
 class Lane(QThread):
@@ -389,6 +401,7 @@ class Lane(QThread):
             **({"voice": True} if voice else {}),
             **({"memory_query": job.memory_query} if job.memory_query else {}),
             **({"previous_query": job.previous_query} if job.previous_query else {}),
+            **({"user_words": list(job.user_words)} if job.user_words else {}),
         )
         while True:
             try:
@@ -576,6 +589,7 @@ class AgentRuntime(QObject):
         self._sources: dict[int, str] = {}
         #: The memory query each front-desk request came with, kept across a hand-off to the worker.
         self._memory_queries: dict[int, str] = {}
+        self._user_words: dict[int, tuple[str, ...]] = {}   # front-desk requests' heard words, kept for a hand-off
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -683,6 +697,7 @@ class AgentRuntime(QObject):
     def submit(
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
+        user_words: "Iterable[str] | str | None" = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -703,6 +718,8 @@ class AgentRuntime(QObject):
             memory_query: The user's own words for the memory lookup (see :class:`Job`); ``None``: the agent
                 takes them from the request itself.
             previous_query: The previous request's words, for a follow-up.
+            user_words: What the user actually said (voice: the heard turns) for the authorization judge; the
+                talker's own reading of them never counts as the user's words.
 
         Returns:
             ``(lane name, request id)``.
@@ -715,8 +732,11 @@ class AgentRuntime(QObject):
             self._sources[request_id] = source  # kept if the front desk hands it to the worker
             if memory_query:
                 self._memory_queries[request_id] = memory_query
+        words = _words_tuple(user_words)
+        if words and lane is not self.worker:
+            self._user_words[request_id] = words
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query))
+                                   previous_query, words))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -724,7 +744,7 @@ class AgentRuntime(QObject):
         return lane.name, request_id
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
-                         memory_query: str | None = None) -> int:
+                         memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -738,7 +758,8 @@ class AgentRuntime(QObject):
         """
         request_id = next(self._ids)
         self._worker_outstanding.append(request_id)
-        waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query))
+        waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
+                                          user_words=_words_tuple(user_words)))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
         )
@@ -870,10 +891,12 @@ class AgentRuntime(QObject):
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
-                                           memory_query=self._memory_queries.pop(request_id, None))
+                                           memory_query=self._memory_queries.pop(request_id, None),
+                                           user_words=self._user_words.pop(request_id, None))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
         else:
             self._sources.pop(request_id, None)
+            self._user_words.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
 
 
