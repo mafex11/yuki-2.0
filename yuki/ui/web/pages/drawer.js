@@ -200,7 +200,7 @@
       ? key('Stop', { cls: 'stop sm', icon: 'stop', data: { do: 'stop', job: run.job }, title: 'Stop it (Esc on an empty box, or Alt+Shift+X)', aria: { label: 'Stop the request' } })
       : key('Send', { cls: 'sm send', data: { do: 'send' }, disabled: !connected, title: 'Enter', aria: { label: 'Send' } });
     return { input, row: h('label', { class: 'inp', data: { face: face } },
-      h('canvas', { data: { core: face, pitch: 3 }, attrs: { role: 'img', 'aria-label': FACE_WORDS[face] || 'Yuki', title: FACE_WORDS[face] || '' } }), input, btn) };
+      h('canvas', { data: { core: face, pitch: 4 }, attrs: { role: 'img', 'aria-label': FACE_WORDS[face] || 'Yuki', title: FACE_WORDS[face] || '' } }), input, btn) };
   }
 
   /* the days and the connector, read when the drawer opens (a read: nothing is sent), again after a while or a new day */
