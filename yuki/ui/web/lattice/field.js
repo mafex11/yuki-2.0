@@ -53,22 +53,35 @@
   };
 
   /* ---------------- one loop for everything ---------------- */
+  /* A subscriber returns 0/false (settled), 1/true (in transition: a sweep, a morph, a state change) or 2 (a steady
+     live animation: a waveform that never settles). Transitions run at ``frameMs`` (30 fps); while only steady ones
+     remain the loop runs at ``steadyMs``. Measured in WebView2 (E16, 28-build-E3-E4.md): every frame the page produces
+     costs about the same whatever its size (software compositing), so the window sets steadyMs to 125 ms (8 fps)
+     and every surface draws in the same tick: one frame for the face, the live figure and the field together. */
   const Loop = {
-    subs: new Set(), running: false, frameMs: 1000 / 30,
+    subs: new Set(), running: false, frameMs: 1000 / 30, steadyMs: 1000 / 30,
     add(fn) { this.subs.add(fn); this.kick(); },
     remove(fn) { this.subs.delete(fn); },
-    kick() { if (this.running || document.hidden) return; this.running = true; setTimeout(Loop.tick, 0); },
+    kick() {
+      if (document.hidden) return;
+      if (this.running) { if (this.slow) { clearTimeout(this.timer); this.timer = setTimeout(Loop.tick, 0); } return; }
+      this.running = true; this.timer = setTimeout(Loop.tick, 0);
+    },
     tick() {
       if (document.hidden) { Loop.running = false; return; }
       const t0 = performance.now();
-      let more = false;
-      Loop.subs.forEach((fn) => { if (fn(t0 / 1000)) more = true; });
+      let fast = false, steady = false;
+      Loop.subs.forEach((fn) => { const r = fn(t0 / 1000); if (r === 2) steady = true; else if (r) fast = true; });
       const dt = performance.now() - t0;
       Perf.ticks++; Perf.ms += dt; if (dt > Perf.maxMs) Perf.maxMs = dt;
-      if (more && !still()) setTimeout(Loop.tick, Math.max(4, Loop.frameMs - dt));
-      else Loop.running = false;
+      if ((fast || steady) && !still()) {
+        Loop.slow = !fast;
+        Loop.timer = setTimeout(Loop.tick, Math.max(4, (fast ? Loop.frameMs : Loop.steadyMs) - dt));
+      } else Loop.running = false;
     }
   };
+  /* per-frame easing that keeps its speed at any frame rate: k is the step at 30 fps, dt the frame in ms */
+  const kdt = (k, dt) => 1 - Math.pow(1 - k, Math.max(0.5, Math.min(8, dt / (1000 / 30))));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { Loop.kick(); LiveLayer.kickAll(); } });
 
   /* every field and face, so a new accent colour can rebuild their sprites (Lattice.refreshColors) */
@@ -130,7 +143,8 @@
         let rq = 0;
         window.addEventListener('resize', () => { clearTimeout(rq); rq = setTimeout(() => { this.resize(); this.measure(); }, 60); });
         this.ro = window.ResizeObserver ? new ResizeObserver(() => this.remeasure()) : null;
-        this.live = new LiveLayer(this);   // the live state figure: its own small canvas (E16)
+        // the live state figure: its own small canvas (E16); liveLayer: false draws it here, as the design did (A/B checks)
+        if (opts.liveLayer !== false) this.live = new LiveLayer(this);
       }
     }
     recolor() { const size = Math.ceil(this.pitch * DPR); this.sp = makeSprites(size, this.pitch * 0.3 * DPR, 1.3 * DPR, false); this.full = true; Loop.add(this.frame); if (this.live) this.live.kick(); }
@@ -400,16 +414,18 @@
       const s = this.state, reduced = still();
       const live = s !== 'idle' && s !== 'hidden-armed';
       // the window's state figure lives on its LiveLayer; this canvas only dims its figures while a state is live
-      const own = this.kind !== 'window';
+      const own = this.kind !== 'window' || !this.live;
       const dyn = own && DYN.has(s) && !(s === 'done-flash' && t - this.stateT0 > 1.2);
       const target = live ? 1 : 0;
-      this.blend += (target - this.blend) * 0.16;
+      const dtMs = this.lastT ? (t - this.lastT) * 1000 : 1000 / 30;
+      this.lastT = t;
+      this.blend += (target - this.blend) * kdt(0.16, dtMs);
       if (Math.abs(target - this.blend) < 0.002 || reduced) this.blend = target;   // a still frame shows the end state
       const figK = 1 - this.blend * (this.kind === 'window' ? 0.92 : 1);
       const ft = t - this.figT0;
       const ai = this.anchor ? Math.round(this.anchor.x / P - 0.5) : Math.round(C / 2), aj = this.anchor ? Math.round(this.anchor.y / P - 0.5) : 8;
       const RX = this.kind === 'halo' ? Math.floor(C / 2) : 28, RY = this.kind === 'halo' ? Math.floor(R / 2) : 14;
-      const out = { t: 0 }, k = reduced ? 1 : 0.2, tt = reduced ? 1.2 : t, hc = this.hoverCol;
+      const out = { t: 0 }, k = reduced ? 1 : kdt(0.2, dtMs), tt = reduced ? 1.2 : t, hc = this.hoverCol;
       const gen = ++this.gen, stamp = this.stamp;
       let maxD = 0, bx0 = 1e9, by0 = 1e9, bx1 = -1, by1 = -1;
       const newLit = [];
@@ -471,7 +487,9 @@
         Perf.drew();
       }
       const settled = maxD < 0.003 && this.blend === target && (reduced || ft > this.maxDelay + 0.05);
-      return (dyn && live) || !settled;
+      if (!settled && !(dyn && live && t - this.stateT0 > 0.7)) return 1;   // a sweep, a morph: full rate
+      if (settled) this.lastT = 0;
+      return dyn && live ? 2 : !settled ? 1 : 0;
     }
     setHover(col) { if (col !== this.hoverCol) { this.hoverCol = col; Loop.add(this.frame); } }
     figureAt(clientX, clientY, kind) {
@@ -485,16 +503,17 @@
 
   /* ================================================================
      LiveLayer: the window's live state figure on its own small canvas (E16).
-     The full-window field animating a state cost ~15% of one core in WebView2 (raster and compositing of a
-     1440 x 900 canvas at 30 fps). The figure only ever lives in the state region around the anchor (57 x 25 cells),
-     so it gets a canvas of that size, aligned to the field's grid, drawn at 15 fps; the big canvas stays still.
-     Transparent: it adds the state dots over the field's resting dots exactly as the field itself did.
+     The full-window field animating a state cost ~15% of one core in WebView2. The figure only ever lives in the
+     state region around the anchor (57 x 25 cells), so it gets a canvas of that size, aligned to the field's grid; it
+     draws in the shared loop's tick (with the face: one frame for both), at the loop's steady rate while the state
+     only animates. Transparent: it adds the state dots over the field's resting dots exactly as the field did.
      ================================================================ */
-  const LIVE_FPS = 15, RXW = 28, RYW = 12;
+  const RXW = 28, RYW = 12;
   const LAYERS = new Set();
   class LiveLayer {
     constructor(field) {
-      this.f = field; this.state = 'idle'; this.lastLive = 'idle'; this.blend = 0; this.timer = 0;
+      this.f = field; this.state = 'idle'; this.lastLive = 'idle'; this.blend = 0; this.lastT = 0;
+      this.frame = this.frame.bind(this);
       this.c = document.createElement('canvas'); this.c.id = 'livefield'; this.c.setAttribute('aria-hidden', 'true');
       this.x = this.c.getContext('2d');
       field.c.after(this.c);
@@ -526,29 +545,23 @@
     }
     set(s) { if (s !== this.state) { this.state = s; } this.kick(); }
     kick() {
-      if (this.timer || document.hidden || !this.c.isConnected) return;
-      if (this.state === 'idle' && this.blend === 0 && !this.drawn) return;
-      this.timer = setTimeout(() => this.tick(), 0);
-    }
-    tick() {
-      this.timer = 0;
       if (document.hidden || !this.c.isConnected) return;
-      const t0 = performance.now();
-      const more = this.frame(t0 / 1000);
-      const dt = performance.now() - t0;
-      Perf.ticks++; Perf.ms += dt; if (dt > Perf.maxMs) Perf.maxMs = dt;
-      if (more && !still()) this.timer = setTimeout(() => this.tick(), Math.max(4, 1000 / LIVE_FPS - dt));
+      if (this.state === 'idle' && this.blend === 0 && !this.drawn) return;
+      Loop.add(this.frame);
     }
     frame(t) {
+      if (!this.c.isConnected) { Loop.remove(this.frame); return 0; }
       const f = this.f, P = f.pitch, s = this.state, reduced = still();
       const live = s !== 'idle' && s !== 'hidden-armed';
+      const dtMs = this.lastT ? (t - this.lastT) * 1000 : 1000 / 30;
+      this.lastT = t;
       if (live) this.lastLive = s;
       const fig = live ? s : this.lastLive;
       const dyn = live && DYN.has(s) && !(s === 'done-flash' && t - f.stateT0 > 1.2);
       const target = live ? 1 : 0;
-      this.blend += (target - this.blend) * 0.3;               // the field's 0.16 per frame at 30 fps, at 15 fps
+      this.blend += (target - this.blend) * kdt(0.16, dtMs);
       if (Math.abs(target - this.blend) < 0.002 || reduced) this.blend = target;
-      const k = reduced ? 1 : 0.36, tt = reduced ? 1.2 : t, out = { t: 0 };
+      const k = reduced ? 1 : kdt(0.2, dtMs), tt = reduced ? 1.2 : t, out = { t: 0 };
       const cw = this.cw, ch = this.ch, cur = this.cur, tone = this.tone, mask = f.mask, C = f.cols;
       let maxD = 0;
       const x = this.x, sp = f.sp, s2 = sp.s;
@@ -572,7 +585,10 @@
       this.drawn = lit > 0;
       Perf.drew();
       const settled = maxD < 0.003 && this.blend === target;
-      return dyn || !settled;
+      if (reduced) return 0;
+      if (!settled && !(dyn && t - f.stateT0 > 0.7)) return 1;   // the state changing: full rate
+      if (!dyn && settled) { Loop.remove(this.frame); this.lastT = 0; return 0; }
+      return dyn ? 2 : 1;
     }
   }
 
@@ -723,7 +739,9 @@
       if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; SURFACES.delete(this); return false; }
       this.target(still() ? 1.3 : t);
       const W = FACE_W, H = FACE_H, x = this.x, dp = this.dp, g = this.g, tn = this.tn, cur = this.cur;
-      const ka = still() ? 1 : 0.6, kr = still() ? 1 : 0.17;
+      const dtMs = this.lastT ? (t - this.lastT) * 1000 : 1000 / 30;
+      this.lastT = t;
+      const ka = still() ? 1 : kdt(0.6, dtMs), kr = still() ? 1 : kdt(0.17, dtMs);
       let maxD = 0;
       for (let n = 0; n < W * H; n++) {
         const d = g[n] - cur[n];
@@ -746,7 +764,12 @@
       }
       const dyn = this.state === 'listening' || this.state === 'hearing' || this.state === 'thinking' || this.state === 'working' || this.state === 'speaking' || this.state === 'needs-you' || (this.state === 'woke' && t - this.t0 < 0.6) || (this.state === 'done-flash' && t - this.t0 < 0.8);
       const blinking = this.blinks() && (t - this.blinkAt) < 0.5;
-      return !still() && (dyn || blinking || maxD > 0.003);
+      if (still()) return 0;
+      if (t - this.t0 < 0.7) return 1;                       // a new expression: full rate while it forms
+      if (dyn || blinking) return 2;                         // a waveform or a blink: the loop's steady rate
+      if (maxD > 0.003) return 1;
+      this.lastT = 0;
+      return 0;
     }
   }
 

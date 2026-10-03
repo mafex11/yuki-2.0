@@ -11,7 +11,8 @@
   const L = window.Lattice, B = window.YukiBridge, Y = window.Yk;
   const { h, ic, key, fmt } = Y;
   const $app = document.getElementById('app');
-  const field = new L.Field(document.getElementById('field'), { kind: 'window', pitch: 12 });
+  const Q0 = new URLSearchParams(location.search);
+  const field = new L.Field(document.getElementById('field'), { kind: 'window', pitch: 12, liveLayer: Q0.get('livelayer') !== '0' });
   const Q = new URLSearchParams(location.search);     // preview knobs only (screenshots of the file:// bundle)
   const PAGES = ['home', 'work', 'me', 'playbook', 'activity', 'settings'];
   const S = { page: 'home', sub: '', person: null, filter: 'all', chat: false, open: new Set(), touched: 0, booted: false,
@@ -20,6 +21,10 @@
   const marks = { ready: 0, boot: 0, element: 0, frame: 0 };
   const epoch = () => performance.timeOrigin + performance.now();
   Object.assign(Y, { S, D, field, B });
+  /* E16: continuous live animation (a listening face, the live figure) runs at 8 fps in the window: each frame costs
+     the same whatever its size here (measured in WebView2), and the window is a review surface (the island is the
+     live one). Transitions (a page's sweep, a state change) still run at 30 fps. */
+  L.Loop.steadyMs = 125;
   Y.remeasure = () => field.remeasure();
   Y.act = (action, fields) => B.request('act', Object.assign({ action: action }, fields || {}));
   Y.go = go;
@@ -186,8 +191,10 @@
   }
   Y.renderMain = renderMain; Y.renderRail = renderRail; Y.renderDrawer = renderDrawer; Y.render = render;
 
-  /* ================= live ticker: only while something counts ================= */
-  let tickT = 0, blinkT = 0;
+  /* ================= live ticker: only while something counts =================
+     One tick a second updates every timer and toggles the live dots' blink together (one frame a second); with no
+     timer or live dot on the page it wakes once a minute for the clock. Never a CSS animation (25-build §2). */
+  let tickT = 0;
   function tick() {
     tickT = 0;
     const now = Date.now() / 1000;
@@ -195,26 +202,17 @@
     document.querySelectorAll('[data-from]').forEach((el) => { need = true; const v = fmt.clock(now - Number(el.dataset.from)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-since]').forEach((el) => { need = true; const v = fmt.secs(now - Number(el.dataset.since)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-clock]').forEach((el) => { const v = fmt.nowClock(); if (el.textContent !== v) el.textContent = v; });
+    const dots = document.querySelectorAll('.recdot');
+    const blink = dots.length && !L.Motion.reduced && L.Focus.live;
+    if (blink) { const dim = !dots[0].classList.contains('dim'); dots.forEach((d) => d.classList.toggle('dim', dim)); need = true; }
+    else dots.forEach((d) => d.classList.remove('dim'));
     if (document.hidden) return;
-    // next tick: each second while a timer is on the page, else at the next minute (the clock)
     tickT = setTimeout(tick, need ? 1000 - (Date.now() % 1000) + 5 : 60000 - (Date.now() % 60000) + 50);
-    blinker();
   }
   function tickSoon() { clearTimeout(tickT); tickT = setTimeout(tick, 0); }
-  /* live dots blink by a class toggled every 800 ms (one frame per change), only while in front */
-  function blinker() {
-    const want = !document.hidden && !L.Motion.reduced && L.Focus.live && document.querySelector('.recdot');
-    if (want && !blinkT) blinkT = setInterval(() => {
-      const dots = document.querySelectorAll('.recdot');
-      if (!dots.length || !L.Focus.live || document.hidden) { clearInterval(blinkT); blinkT = 0; dots.forEach((d) => d.classList.remove('dim')); return; }
-      const dim = !dots[0].classList.contains('dim');
-      dots.forEach((d) => d.classList.toggle('dim', dim));
-    }, 800);
-    if (!want && blinkT) { clearInterval(blinkT); blinkT = 0; document.querySelectorAll('.recdot.dim').forEach((d) => d.classList.remove('dim')); }
-  }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tickSoon(); else { clearTimeout(tickT); tickT = 0; blinker(); } });
-  window.addEventListener('focus', () => blinker());
-  window.addEventListener('blur', () => blinker());
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tickSoon(); else { clearTimeout(tickT); tickT = 0; } });
+  window.addEventListener('focus', () => tickSoon());
+  window.addEventListener('blur', () => tickSoon());
 
   /* ================= appearance ================= */
   function applyAppearance(a) {
@@ -231,8 +229,18 @@
 
   /* ================= the bridge ================= */
   const live = new Set(['voice', 'call', 'runs', 'connected']);
+  /* preview knobs for invented data only (the file:// preview and the window's --fixture runs): no runs, no call,
+     an empty inbox */
+  function knobs(m) {
+    if (m.source !== 'fixture') return;
+    const home = (m.pages || {}).home || {};
+    if (Q.get('runs') === '0' || Q.get('empty') === '1') m.shell.runs = [];
+    if (Q.get('call') === '0') { m.shell.call = null; if (home.now) home.now.call = null; home.running = (home.running || []).filter((r) => r.kind !== 'call'); }
+    if (Q.get('empty') === '1') Object.assign(home, { needs: [], running: [], offers: [], away: [] });
+  }
   B.on('boot', (m) => {
     marks.boot = epoch();
+    knobs(m);
     applyAppearance(m.appearance);
     Object.assign(D.shell, m.shell || {});
     for (const [k, v] of Object.entries(m.pages || {})) { D.pages[k] = v; D.source[k] = m.source || 'snapshot'; D.stamp[k] = Date.now(); }

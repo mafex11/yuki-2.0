@@ -80,6 +80,8 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=3, help="warm first-paint runs")
     ap.add_argument("--exe", type=Path, default=None)
     ap.add_argument("--cpu-window", type=float, default=20.0)
+    ap.add_argument("--case", action="append", default=[],
+                    help="name=query: one CPU run of the fixture with these page knobs, in front (repeatable)")
     args = ap.parse_args()
     out = Path(tempfile.gettempdir()) / "yuki-web-perf" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
@@ -90,7 +92,13 @@ def main() -> int:
     profile = out / "profile"
     win = args.cpu_window
     try:
-        if args.try_db:
+        if args.case:
+            for case in args.case:
+                name, _, query = case.partition("=")
+                behind = name.endswith("-behind")
+                results.append(runner.launch(name, profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
+                                             cpu=("a", "b"), extra=["--fixture", "--query", query] + ([] if behind else ["--assume-focus"])))
+        elif args.try_db:
             db = temp_memory(out)
             results.append(runner.launch("try-empty-memory", profile, None, 7.0, at=(("6s", 6.0),),
                                          extra=["--db", str(db), "--no-connect", "--shot", str(out / "try.png"), "--shot-delay", "4"]))
@@ -115,6 +123,10 @@ def main() -> int:
                 results.append(runner.launch(f"live-{state}-in-front", profile, None, 10 + win,
                                              at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
                                              extra=["--fixture", "--query", f"state={state}&runs=0&call=0", "--assume-focus"]))
+            # the same live state drawn the design's way (the full-window canvas at 30 fps): the E2 spike's ~15%
+            results.append(runner.launch("live-listening-full-canvas", profile, None, 10 + win,
+                                         at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
+                                         extra=["--fixture", "--query", "state=listening&runs=0&call=0&livelayer=0", "--assume-focus"]))
             results.append(runner.launch("live-listening-behind", profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
                                          cpu=("a", "b"), extra=["--fixture", "--query", "state=listening&runs=0&call=0"]))
             # the busiest real page: a call timer ticking and a run's dot blinking, in front

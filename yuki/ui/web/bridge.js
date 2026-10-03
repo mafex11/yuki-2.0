@@ -58,12 +58,6 @@
       const pages = shiftTimes(F.pages, delta, '');
       const shell = shiftTimes(F.shell, delta, '');
       const chat = shiftTimes(F.chat, delta, '');
-      if (q.get('runs') === '0') shell.runs = [];
-      if (q.get('call') === '0') { shell.call = null; pages.home.now.call = null; }
-      if (q.get('empty') === '1') {
-        Object.assign(pages.home, { needs: [], running: [], offers: [], away: [] });
-        shell.runs = [];
-      }
       later({ kind: 'boot', source: 'fixture', shell: shell, pages: pages, chat: chat,
         appearance: { accent: q.get('accent') || 'green', reduce_motion: q.get('motion') === 'reduced' }, engine: 'web' });
       return;
