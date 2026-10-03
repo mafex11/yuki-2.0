@@ -11,7 +11,22 @@ Once a mark is picked:
    and under (round dots at every size, never square pixels), the sampled dot field at 64 and 256 px. Commit them, so
    a build needs neither Node nor the (gitignored) gallery.
 2. ``python packaging/make_icon.py`` (build.ps1 runs it on every build) draws each size from its own SVG, pixel for
-   pixel (no resampling), and writes them into ``yuki.ico`` as PNG entries: 16, 20, 24, 32, 40, 48, 64 and 256 px.
+   pixel (no resampling), and writes them into ``yuki.ico``: 16, 20, 24, 32, 40, 48, 64 and 256 px.
+
+**The badge** (``mark`` ``badge`` or ``02g``, the user's pick of 3 Oct: YU over Ki in round dots, every size) has its
+own source of truth, ``packaging/icon/badge/yuki-icon-grids.json`` (every dot of every size, from the gallery's
+``marks-badge.js``), and its frames are committed PNGs, ``packaging/icon/badge-<ramp>/<size>.png``:
+
+1. ``--export`` refreshes the grids from the gallery when it is here (Node), then draws every frame from the grids in
+   a headless browser (:func:`find_browser`; ``packaging/icon/render.js``: the gallery's own SVG drawn 1:1 on a
+   canvas, the way its ``export/yuki-icon-<size>.png`` were made, so the frames match them byte for byte).
+2. A build packs the committed frames into ``yuki.ico`` unchanged (no browser, no Node, no gallery).
+
+Every build also copies the icon to ``yuki/ui/yuki.ico``, the copy the app itself loads (the window's title bar and
+taskbar button; :mod:`yuki.ui.webview2`).
+
+``--installer-images`` draws the installer's wizard images (``packaging/installer/``) from the startup splash's still
+frame (``yuki/ui/web/planet-splash.js``) in the same headless browser, at each size Inno Setup picks from per DPI.
 
 ``--mark`` / ``--ramp`` override icon.json for one run; ``--out`` writes elsewhere (a preview).
 """
@@ -21,17 +36,44 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import io
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent
+ROOT = PKG.parent
 ICON_DIR = PKG / "icon"
 CONFIG = ICON_DIR / "icon.json"
-GALLERY = PKG.parent / "docs" / "ui-mockups" / "revamp-2026-10" / "logo"
+GALLERY = ROOT / "docs" / "ui-mockups" / "revamp-2026-10" / "logo"
 SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
+#: The badge's ids in the logo gallery, its grids (the source of truth) and the browser script that draws them.
+BADGE_IDS = ("badge", "02g")
+GRIDS = ICON_DIR / "badge" / "yuki-icon-grids.json"
+RENDER_JS = ICON_DIR / "render.js"
+#: The copy of the icon the app loads at run time (bundled with yuki/ui by yuki.spec).
+APP_ICON = ROOT / "yuki" / "ui" / "yuki.ico"
+WEB_DIR = ROOT / "yuki" / "ui" / "web"
+INSTALLER_DIR = PKG / "installer"
+#: The wizard images Inno Setup chooses from by the size of its image area (it keeps 164:314 and a square; the
+#: sizes are its 100 %, 125 % and 150 % areas, before 6.6 and since): ``win`` is how many of the splash's 520 x 300
+#: layout px span the width, ``cx``/``cy`` the layout point at the centre. The large image shows the planet over the
+#: name; the small one only the planet.
+WIZARD = ((164, 314), (202, 386), (240, 459), (336, 643))
+WIZARD_SMALL = (58, 77, 97, 124)
+WIZARD_WIN, SMALL_WIN = 214.0, 118.0
+PLANET_CENTRE = (260.0, 113.6)   # planet-splash.js: column 50, row round(57 * 0.36) of the 5.2 px field
+
+
+def is_badge(mark: str) -> bool:
+    return mark.strip().casefold() in BADGE_IDS
+
+
+def badge_dir(ramp: str) -> Path:
+    return ICON_DIR / f"badge-{ramp}"
 
 
 def load_config() -> dict:
@@ -89,21 +131,166 @@ def render_png(svg: Path, size: int) -> bytes:
     return bytes(data)
 
 
+def dib(png: bytes) -> bytes:
+    """One frame as the classic .ico bitmap: a 32-bit BGRA DIB (straight alpha, bottom-up) and its AND mask. Exactly
+    the PNG's pixels; every Windows reader and resource tool takes it (some older ones refuse small PNG frames)."""
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(png)).convert("RGBA")
+    w, h = im.size
+    px = im.tobytes()
+    rows, mask_rows = [], []
+    stride = ((w + 31) // 32) * 4
+    for y in range(h - 1, -1, -1):
+        row = px[y * w * 4:(y + 1) * w * 4]
+        bgra = bytearray(row)
+        bgra[0::4], bgra[2::4] = row[2::4], row[0::4]
+        rows.append(bytes(bgra))
+        bits = bytearray(stride)
+        for x in range(w):
+            if row[x * 4 + 3] == 0:
+                bits[x // 8] |= 0x80 >> (x % 8)
+        mask_rows.append(bytes(bits))
+    xor, mask = b"".join(rows), b"".join(mask_rows)
+    header = struct.pack("<IiiHHIIiiII", 40, w, h * 2, 1, 32, 0, len(xor) + len(mask), 0, 0, 0, 0)
+    return header + xor + mask
+
+
 def write_ico(pngs: dict[int, bytes], out: Path) -> None:
-    """An .ico of PNG entries (Windows Vista and later read PNG at every size)."""
+    """An .ico of every size: bitmap frames under 256 px, a PNG frame at 256 (the usual layout), each exactly its
+    source's pixels."""
     sizes = sorted(pngs)
     header = struct.pack("<HHH", 0, 1, len(sizes))
     offset = 6 + 16 * len(sizes)
     entries, blobs = b"", b""
     for s in sizes:
-        blob = pngs[s]
+        blob = pngs[s] if s >= 256 else dib(pngs[s])
         dim = 0 if s >= 256 else s
         entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(blob), offset + len(blobs))
         blobs += blob
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(header + entries + blobs)
 
 
+# -- the headless browser (the badge's frames and the installer's images; never a visible window) ----------------
+
+
+def find_browser() -> str | None:
+    """A Chromium to draw with, headless: ``YUKI_SHOT_CHROME``, else Playwright's chrome-headless-shell (its own
+    binary, never the user's browser profile), else Chrome or Edge. Each run gets a throwaway profile."""
+    env = os.environ.get("YUKI_SHOT_CHROME")
+    if env and Path(env).exists():
+        return env
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    shells = sorted((local / "ms-playwright").glob("chromium_headless_shell-*/*/chrome-headless-shell.exe"), reverse=True)
+    if shells:
+        return str(shells[0])
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), str(local)):
+        for rel in (r"Google\Chrome\Application\chrome.exe", r"Microsoft\Edge\Application\msedge.exe"):
+            if base and (Path(base) / rel).exists():
+                return str(Path(base) / rel)
+    return None
+
+
+def browser_run(job: dict, scripts: list[Path], browser: str | None = None, timeout: float = 90.0) -> dict:
+    """Run ``render.js`` (after ``scripts``) on ``job`` in a headless browser; its JSON answer."""
+    exe = browser or find_browser()
+    if exe is None:
+        raise SystemExit("No Chromium to draw with: install Chrome, or set YUKI_SHOT_CHROME to a chrome-headless-shell")
+    body = "".join(f"<script>{p.read_text(encoding='utf-8')}</script>\n" for p in [*scripts, RENDER_JS])
+    page = ('<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out"></pre>\n'
+            f"<script>window.JOB = {json.dumps(job)};</script>\n{body}</body></html>")
+    with tempfile.TemporaryDirectory(prefix="yuki-icon-") as tmp:
+        html = Path(tmp) / "render.html"
+        html.write_text(page, encoding="utf-8")
+        cmd = [exe, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run", "--force-device-scale-factor=1",
+               f"--user-data-dir={Path(tmp) / 'profile'}", "--virtual-time-budget=20000", "--dump-dom", html.as_uri()]
+        done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    import html as _html
+
+    text = done.stdout or ""
+    tag = '<pre id="out">'
+    start = text.find(tag)
+    end = text.find("</pre>", start)
+    answer = _html.unescape(text[start + len(tag):end]) if start >= 0 and end > start else ""
+    if not (answer.startswith("BEGIN") and answer.endswith("END")):
+        raise SystemExit(f"The browser drew nothing ({done.returncode}): {(done.stderr or '')[-400:]}")
+    res = json.loads(answer[5:-3])
+    if "error" in res:
+        raise SystemExit(f"Drawing failed in the browser: {res['error']}")
+    return res
+
+
+def _png(data_url: str) -> bytes:
+    import base64
+
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+
+def render_badge(ramp: str = "mint", grids: Path = GRIDS, browser: str | None = None) -> dict[int, bytes]:
+    """Every size of the badge from its grids, as PNG bytes (``render.js``: the gallery's own drawing)."""
+    data = json.loads(grids.read_text(encoding="utf-8"))
+    if ramp not in data.get("colourSets", {}):
+        raise SystemExit(f"unknown colour set: {ramp} (have {', '.join(data.get('colourSets', {}))})")
+    res = browser_run({"kind": "badge", "grids": data, "set": ramp}, [], browser)
+    return {int(s): _png(u) for s, u in res.items()}
+
+
+def export_badge(ramp: str, gallery: Path = GALLERY, browser: str | None = None) -> Path:
+    """Refresh the grids from the gallery (when it and Node are here), then draw and save every frame."""
+    node = shutil.which("node")
+    if node is not None and (gallery / "marks-badge.js").exists():
+        cmd = [node, str(ICON_DIR / "export_mark.js"), "--logo", str(gallery), "--mark", "badge", "--out", str(GRIDS.parent)]
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise SystemExit((done.stderr or done.stdout or "export failed").strip())
+        print(done.stdout.strip())
+    elif not GRIDS.exists():
+        raise SystemExit(f"No badge grids at {GRIDS} and no gallery to export them from")
+    out = badge_dir(ramp)
+    out.mkdir(parents=True, exist_ok=True)
+    for s, png in render_badge(ramp, browser=browser).items():
+        (out / f"{s}.png").write_bytes(png)
+    print(f"drew the badge ({ramp}) at {', '.join(str(s) for s in SIZES)} px into {out}")
+    return out
+
+
+def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) -> list[Path]:
+    """The installer's wizard images from the splash's still frame: 24-bit BMPs (every Inno Setup 6 reads them),
+    each drawn at its own size."""
+    from PIL import Image
+
+    specs = [{"file": f"wizard-{w}x{h}.bmp", "w": w, "h": h, "win": WIZARD_WIN, "cx": 260.0, "cy": 150.0}
+             for w, h in WIZARD]
+    specs += [{"file": f"wizard-small-{s}.bmp", "w": s, "h": s, "win": SMALL_WIN, "cx": PLANET_CENTRE[0],
+               "cy": PLANET_CENTRE[1], "text": False} for s in WIZARD_SMALL]
+    res = browser_run({"kind": "installer", "images": specs, "set": "mint"},
+                      [WEB_DIR / "dots.js", WEB_DIR / "planet-splash.js"], browser)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for spec in specs:
+        im = Image.open(io.BytesIO(_png(res[spec["file"]]))).convert("RGBA")
+        flat = Image.new("RGB", im.size, (0x0B, 0x0B, 0x0C))
+        flat.paste(im, mask=im.getchannel("A"))
+        path = out_dir / spec["file"]
+        flat.save(path, format="BMP")
+        written.append(path)
+    print(f"drew {len(written)} installer images into {out_dir}")
+    return written
+
+
+def badge_frames(ramp: str) -> dict[int, bytes]:
+    src = badge_dir(ramp)
+    missing = [s for s in SIZES if not (src / f"{s}.png").exists()]
+    if missing:
+        raise SystemExit(f"No badge frames for {ramp} in {src} ({missing}): run make_icon.py --export first")
+    return {s: (src / f"{s}.png").read_bytes() for s in SIZES}
+
+
 def build(mark: str, ramp: str, out: Path, *, allow_export: bool = True) -> Path:
+    if is_badge(mark):
+        write_ico(badge_frames(ramp), out)
+        return out
     src = svg_dir(mark, ramp)
     if not all((src / f"{s}.svg").exists() for s in SIZES):
         if not allow_export:
@@ -141,9 +328,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mark", help="a mark id or number from the logo gallery (overrides icon.json)")
     ap.add_argument("--ramp", help="the colour set: mint | night | bang (overrides icon.json)")
-    ap.add_argument("--export", action="store_true", help="export the mark's SVGs from the gallery (needs Node)")
+    ap.add_argument("--export", action="store_true",
+                    help="export the mark from the gallery (SVGs: Node; the badge: its grids, then frames in a headless browser)")
+    ap.add_argument("--installer-images", action="store_true",
+                    help="draw the installer's wizard images from the splash's still frame (a headless browser)")
+    ap.add_argument("--browser", default=None, help="the Chromium to draw with (default: found by find_browser)")
     ap.add_argument("--out", type=Path, default=PKG / "yuki.ico")
     args = ap.parse_args(argv)
+    if args.installer_images:
+        installer_images(browser=args.browser)
     cfg = load_config()
     mark = (args.mark if args.mark is not None else str(cfg.get("mark") or "")).strip()
     ramp = (args.ramp or str(cfg.get("ramp") or "mint")).strip()
@@ -155,8 +348,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no logo picked yet (packaging/icon/icon.json \"mark\"): keeping {args.out}")
         return 0
     if args.export:
-        export(mark, ramp)
+        if is_badge(mark):
+            export_badge(ramp, browser=args.browser)
+        else:
+            export(mark, ramp)
     print(build(mark, ramp, args.out))
+    if args.out.resolve() == (PKG / "yuki.ico").resolve():
+        APP_ICON.parent.mkdir(parents=True, exist_ok=True)
+        if not APP_ICON.exists() or APP_ICON.read_bytes() != args.out.read_bytes():
+            shutil.copyfile(args.out, APP_ICON)
+            print(f"copied to {APP_ICON} (the icon the app loads)")
     return 0
 
 

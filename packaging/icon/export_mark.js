@@ -19,6 +19,24 @@ const out = arg('out', '');
 const sizes = (arg('sizes', '16,20,24,32,40,48,64,256')).split(',').map(Number);
 if (!logo || !want || !out) { console.error('usage: --logo DIR --mark ID --ramp RAMP --out DIR'); process.exit(2); }
 
+// 02g Badge, refined (the user's logo): its own module (marks-badge.js, require()-able, no browser needed) gives
+// every dot of every size as data. Written as packaging/icon/badge/yuki-icon-grids.json, the icon's source of
+// truth, in the gallery's own layout (one dot per line). make_icon.py draws the frames from it.
+if (want === 'badge' || want === '02g') {
+  const file = path.join(logo, 'marks-badge.js');
+  if (!fs.existsSync(file)) { console.error('marks-badge.js not found in ' + logo); process.exit(3); }
+  const J = require(path.resolve(file)).exportJSON();
+  const c = (v) => JSON.stringify(v);
+  const icons = J.sizes.map((s) => '    ' + c(String(s)) + ': {\n      "tile": ' + c(J.icons[s].tile) + ',\n      "dots": [\n' +
+    J.icons[s].dots.map((d) => '        ' + c(d)).join(',\n') + '\n      ]\n    }');
+  const text = '{\n  "name": ' + c(J.name) + ',\n  "about": ' + c(J.about) + ',\n  "sizes": ' + c(J.sizes) + ',\n  "colourSets": ' +
+    c(J.colourSets) + ',\n  "icons": {\n' + icons.join(',\n') + '\n  }\n}\n';
+  fs.mkdirSync(out, { recursive: true });
+  fs.writeFileSync(path.join(out, 'yuki-icon-grids.json'), text);
+  console.log('exported 02g badge grids to ' + path.join(out, 'yuki-icon-grids.json'));
+  process.exit(0);
+}
+
 // the gallery runs in a browser: give it the little it reads (no page, no canvas is drawn for SVG output)
 const sandbox = { console, Math, Float32Array, Uint8Array, Array, Object, String, Number, JSON, URLSearchParams,
   location: { search: '?ramp=' + encodeURIComponent(ramp) }, devicePixelRatio: 1 };
