@@ -171,8 +171,10 @@ def test_the_gate_is_tool_metadata_and_the_stored_policy_never_words(tmp_path: P
     assert not gated("window_action", {"hwnd": 1, "action": "minimize"})
     assert not gated("tab", {"hwnd": 1, "tab": "a", "action": "select"})
     assert not gated("launch_app", {"query": "spotify"}) and not gated("open_url", {"url": "https://x"})
-    # "Click and type: ask before doing" (the default) sends clicks and typing to the judge; "do it" does not
-    assert gated("click", {"element": 3}) and gated("type_text", {"text": "hi"})
+    # "Click and type: do it and tell me" (the default) does not judge clicks and typing; "ask before doing" does
+    assert not gated("click", {"element": 3}) and not gated("type_text", {"text": "hi"})
+    strict = {**levels, "click_type": "ask"}
+    assert gated("click", {"element": 3}, strict) and gated("type_text", {"text": "hi"}, strict)
     relaxed = {**levels, "click_type": "do_and_tell"}
     assert not gated("click", {"element": 3}, relaxed) and not gated("type_text", {"text": "hi"}, relaxed)
     assert gated("type_text", {"text": "hi", "press_enter": True}, relaxed)   # a send stays judged
@@ -348,7 +350,11 @@ def test_a_window_grant_covers_later_quiet_steps_but_never_a_send(tmp_path: Path
     from yuki.agent.judge import Authorizer, PolicyReader
 
     client = Client([], judge=lambda p: {"decision": "allow", "sends": False, "scope": "window", "why": "steps"})
-    auth = Authorizer(lambda: client, _settings(tmp_path), policy=PolicyReader(tmp_path / "none.json"))
+    from yuki.ui import policy as ui_policy
+
+    strict = tmp_path / "strict.json"                                # "Click and type: ask before doing"
+    ui_policy.save({"click_type": "ask"}, strict)
+    auth = Authorizer(lambda: client, _settings(tmp_path), policy=PolicyReader(strict))
     auth.check("click", {"element": 1}, words=[], target={"hwnd": 7}, signature="a")
     deadline = time.monotonic() + 2
     while 7 not in auth.grants and time.monotonic() < deadline:   # the rest of an early allow lands on its thread

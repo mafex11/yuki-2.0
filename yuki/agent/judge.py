@@ -47,7 +47,7 @@ from yuki.agent.tools import Traits, tool_traits
 #: The rungs, least to most on its own (``yuki.ui.policy.LEVELS``).
 LEVELS: tuple[str, ...] = ("suggest", "show_plan", "ask", "do_and_tell")
 #: Each kind's default and ceiling (``yuki.ui.policy.KINDS``; a test keeps the two in step).
-POLICY_DEFAULTS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell", "click_type": "ask",
+POLICY_DEFAULTS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell", "click_type": "do_and_tell",
                                    "send_messages": "ask", "files": "show_plan", "money": "suggest"}
 POLICY_CEILINGS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell",
                                    "click_type": "do_and_tell", "send_messages": "ask", "files": "do_and_tell",
