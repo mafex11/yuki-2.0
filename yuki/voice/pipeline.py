@@ -2283,8 +2283,14 @@ class _Hooks:
 
     def last_line(self) -> dict[str, str] | None:
         """V9: Yuki's last spoken line (``{"written", "heard"}``), so a reply that repeats it word for word is not
-        said (content, RAM only); ``None`` before anything was heard."""
-        return getattr(self.c.observer, "last_said", None)
+        said (content, RAM only); ``None`` before anything was heard. ``None`` too on the rerun of a turn whose reply
+        was held as a repeat: that rerun was told so, and decides by itself whether to say the line again (they may
+        have asked to hear it again: review F10, a code rule never overrides that)."""
+        obs = self.c.observer
+        turn = getattr(obs, "turn", None)
+        if turn is not None and getattr(turn, "repeat_dropped", False):
+            return None
+        return getattr(obs, "last_said", None)
 
     def state(self) -> dict[str, Any]:
         """The measured states that bring their guidance into this call's volatile block (``mouth.volatile_block``)."""

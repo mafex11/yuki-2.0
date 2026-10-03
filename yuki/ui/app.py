@@ -390,14 +390,7 @@ class YukiUi(QObject):
                     self.strip.stopping()
             self.runtime.cancel_worker()
             self.voice.interrupt()
-            try:   # V7: a page scrolling on by itself stops too
-                from yuki.actions.scrolling import stop_continuous
-
-                stopped = stop_continuous("stop", wait_s=0.0)
-                if stopped is not None:
-                    self.ui_log.event("keep_scrolling", stopped="stop", steps=stopped.get("steps"))
-            except Exception:  # noqa: BLE001 - the cancel itself already happened
-                pass
+            self._stop_keep_scrolling("hotkey")
             return
         if action == "voice":
             self.voice.toggle_conversation("hotkey")
@@ -577,7 +570,20 @@ class YukiUi(QObject):
         if self.voice.owns(request_id):
             self.voice.interrupt()
         self.ui_log.event("strip_stop", id=request_id, how=how)
+        self._stop_keep_scrolling("strip")   # review F7: Stop stops a page scrolling on by itself too
         return how
+
+    def _stop_keep_scrolling(self, via: str) -> None:
+        """V7: a page scrolling on by itself (``yuki.actions.scrolling``) stops on the Stop hotkey and on Stop (the
+        strip or the window's run card); the stop is set at once, nothing waits on the GUI thread."""
+        try:
+            from yuki.actions.scrolling import stop_continuous
+
+            stopped = stop_continuous("stop", wait_s=0.0)
+            if stopped is not None:
+                self.ui_log.event("keep_scrolling", stopped="stop", via=via, steps=stopped.get("steps"))
+        except Exception:  # noqa: BLE001 - the cancel itself already happened
+            pass
 
     def _on_parked(self, lane_name: str, request_id: int, text: str) -> None:
         """Set aside on a question nobody answered: the run is over for now (an answer later starts a new one)."""

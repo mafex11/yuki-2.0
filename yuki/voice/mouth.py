@@ -1488,9 +1488,11 @@ MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, al
 RERUN_NOTE = ("[Nothing of your last reply to these words reached them (it was not spoken, or not heard). Answer them "
               "now, in a few words.]")
 #: V9 (3 Oct): the rerun of a turn whose reply was word for word the line said just before (it was not said again).
-REPEAT_NOTE = ("[Your last reply to these words was, word for word, what you had just said to them, so it was not said "
-               "again: they heard it already. Answer their latest words with something new and short, or a word or "
-               "two if nothing more is needed. Never that line again.]")
+REPEAT_NOTE = ("[Your last reply to these words was, word for word, the line you had just said, so it was held back, "
+               "not said. If their latest words ask to hear it again (\"what?\", \"say that again\", \"sorry?\"), say "
+               "it again now. Otherwise answer their latest words with something new and short, or a word or two if "
+               "nothing more is needed. Good: you said \"It's ten past four.\", they say \"sorry, what?\" -> \"It's ten "
+               "past four.\" Good: you said \"The music's paused.\", they say \"cool, thanks\" -> \"Anytime.\"]")
 
 
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,

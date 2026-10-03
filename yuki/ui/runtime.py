@@ -219,6 +219,9 @@ class Lane(QThread):
         self._waiting: list[int] = []
         #: Queued ids cancelled (or withdrawn) before they started, with why: skipped when dequeued.
         self._skip: dict[int, str] = {}
+        #: V4: the app named for the running job after it became current (:meth:`name_app_job`), given to the agent
+        #: again once its run has begun, so the run's own start cannot overwrite it (review F9).
+        self._named_late: dict[int, str] = {}
         #: v3.14b: the request this lane set aside while it waited for an answer that did not come, as
         #: ``(job, question)``; a later answer carries it on as a new request (:meth:`AgentRuntime.answer`).
         self._parked: tuple[Job, str] | None = None
@@ -285,9 +288,13 @@ class Lane(QThread):
 
     def name_app_job(self, job_id: int, app: str) -> bool:
         """V4: the app the user named, for the running job's agent (:meth:`Agent.set_app_named`); ``False`` if that
-        job is not running here."""
+        job is not running here. Also kept for :meth:`_drive` to give again once the run has begun: a job is current
+        a moment before ``Agent.run``'s body starts, and that start sets the request's named app from its own argument
+        (review F9)."""
         with self._state:
             running = self._current is not None and self._current.id == job_id
+            if running:
+                self._named_late[job_id] = app
         setter = getattr(self.agent, "set_app_named", None)
         if running and callable(setter):
             setter(app)
@@ -378,6 +385,7 @@ class Lane(QThread):
             finally:
                 with self._state:
                     self._current = None
+                    self._named_late.pop(job.id, None)
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
                 )
@@ -425,6 +433,7 @@ class Lane(QThread):
             **({"app_named": named} if (named := job.app_named or getattr(runtime, "_apps_named", {}).get(job.id))
                else {}),
         )
+        begun = False
         while True:
             try:
                 event = next(events)
@@ -433,6 +442,15 @@ class Lane(QThread):
             except Exception as exc:  # the agent handles its own; this is ours
                 runtime.failed.emit(self.name, job.id, f"{type(exc).__name__}: {exc}")
                 break
+            if not begun:
+                # Review F9: the run's body has begun (its first event comes before any action is judged): an app
+                # named for this job after it became current is given again, so the body's start did not lose it.
+                begun = True
+                with self._state:
+                    late = self._named_late.pop(job.id, None)
+                setter = getattr(self.agent, "set_app_named", None)
+                if late and callable(setter):
+                    setter(late)
 
             if isinstance(event, Partial):
                 runtime.partial.emit(self.name, job.id, event.what, event.text)

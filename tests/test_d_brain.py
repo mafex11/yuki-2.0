@@ -858,6 +858,41 @@ def test_mouse_moves_alone_never_hold_yuki_back() -> None:
     assert result["ok"] and result["real"] is False and result["ms"] <= 300 and said == []
 
 
+def test_a_keystroke_just_before_the_wait_counts_while_the_cursor_stays_still() -> None:
+    # Review F3: the user typed or clicked 0.3 s before Yuki's action and nothing since, the cursor still. That input
+    # made the gate look; its kind is not known, so it counts: Yuki waits until 0.8 s after it (main's quiet), never
+    # going ahead 0.25 s into a typing pause.
+    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05)
+    gate.age = lambda: 0.3 + clock["t"]   # the last input stays where it was
+    said: list[str] = []
+    result = gate.wait(notify=said.append)
+    assert result["ok"] and result["real"] is True and said == []
+    assert 450 <= result["ms"] <= 600            # 0.8 s after the keystroke, not 0.25 s into the wait
+    # the same with the cursor moving during the look: that input was the mouse, Yuki goes ahead
+    moving, mclock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05,
+                                   cursor=lambda: (int(mclock["t"] * 1000), 300))
+    moving.age = lambda: 0.3 + mclock["t"]
+    result = moving.wait()
+    assert result["ok"] and result["real"] is False and result["ms"] <= 300
+
+
+def test_real_input_counts_a_press_since_the_last_look_but_not_one_before_the_first() -> None:
+    # Review F4: a move and a quick click inside one tick read as the mouse moving; a key or button that went down since
+    # the last look (Windows' "pressed since" bit, reported through held) counts, but the first look is a baseline
+    from yuki.actions.leases import RealInput
+
+    clock = {"t": 0.0}
+    presses = iter([True, False, True])
+    spots = iter([(0, 0), (40, 0), (90, 0)])   # the cursor moving on every look
+    watch = RealInput(age=lambda: 0.0, held=lambda: next(presses), cursor=lambda: next(spots),
+                      now=lambda: clock["t"])
+    assert watch.poll() is None                 # an old press: baseline only
+    clock["t"] = 0.1
+    assert watch.poll() is None and watch.cursor_moved   # only the mouse moved
+    clock["t"] = 0.2
+    assert watch.poll() == 0.2                  # a click came with the move: real
+
+
 def test_a_held_key_or_button_counts_as_real_input_and_a_long_one_stops_the_action() -> None:
     gate, _clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=1.0, poll_s=0.1, held=lambda: True,
                                  cursor=lambda: None)

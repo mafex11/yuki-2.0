@@ -2709,6 +2709,7 @@ def scroll(
         return _result(False, "nothing to scroll: dy and dx are both 0", details, started)
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
+        details["refused"] = "foreground"   # review F6: a continuous scroll stops at once when its window left the front
         return _result(False, refusal, details, started)
     from yuki.actions.scrolling import describe, scroll_at
 
@@ -2743,4 +2744,6 @@ click = _leased(click)
 type_text = _leased(type_text)
 hotkey = _leased(hotkey)
 press = _leased(press)
-scroll = _leased(scroll)
+# review F4: a scroll stamps only its own wheel moment (yuki.actions.scrolling.wheel_at): a ScrollPattern scroll sends
+# no input, and the target find and the watch around the wheel send nothing either
+scroll = _leased(scroll, stamp=False)

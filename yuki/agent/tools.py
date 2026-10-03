@@ -2814,7 +2814,16 @@ class Dispatcher:
 
     def _before_input(self, name: str) -> None:
         """Wait while the user is typing or using the mouse before global input (:attr:`input_gate`); one line goes
-        to :attr:`notices`. Raises :class:`ToolError` (nothing sent) when they keep going past the gate's limit."""
+        to :attr:`notices`. Raises :class:`ToolError` (nothing sent) when they keep going past the gate's limit.
+
+        A page scrolling on by itself (V7) stops first: Yuki now acts on the desktop, and a page moving under the next
+        click or read would make its positions stale (review F6)."""
+        try:
+            from yuki.actions.scrolling import stop_continuous
+
+            stop_continuous("acting", wait_s=0.0)
+        except Exception:  # noqa: BLE001 - the action goes on either way (the input lease keeps them apart)
+            pass
         gate = self.input_gate
         if gate is None:
             return
@@ -3027,6 +3036,18 @@ class Dispatcher:
         dy, dx = self._opt_int(tool_input, "dy", 0), self._opt_int(tool_input, "dx", 0)
         if not dy and not dx:
             return first
+        # Review F6: by raw x,y with no expect_hwnd the steps had no window guard and wheeled into whatever window came
+        # to that point later. The scroll goes on only in the window it started in (the one at the point, else the
+        # one in front); once another window is in front its steps are refused and it stops.
+        if not guard:
+            try:
+                guard = self._pointed_window(x, y) or self.foreground_hwnd()
+            except Exception:  # noqa: BLE001 - no window known: it does not go on (below)
+                guard = None
+        if not guard:
+            note = "It could not tell which window that was, so it did not go on scrolling by itself."
+            return dataclasses.replace(first, summary=f"{first.summary}; {note}",
+                                       content=[*first.content, {"type": "text", "text": note}])
         backend = self.backend
 
         def step() -> Any:
@@ -3044,11 +3065,13 @@ class Dispatcher:
             pass
         notches = abs(dy or dx)
         pace = "fast" if notches >= 6 else "slow" if notches <= 3 else "normal"
+        watch = input_watch()
         start_continuous(ContinuousScroll(step, where=where, direction="up" if dy > 0 else "down", pace=pace,
-                                          hold=voice_hold, took_over=input_watch(), steps_done=1,
-                                          started_by="thinker"))
-        note = ("It now goes on scrolling by itself in steps until they say stop (Yuki's voice stops it), take over or "
-                "the page ends: nothing more to do for the scrolling; finish with done.")
+                                          hold=voice_hold, took_over=watch, moving=getattr(watch, "moving", None),
+                                          steps_done=1, started_by="thinker"))
+        note = ("It now goes on scrolling by itself in steps until they say stop (Yuki's voice stops it), press a key "
+                "or click, or the page ends: nothing more to do for the scrolling; finish with done, and say in a few "
+                "words how it stops (say stop, or press any key).")
         return dataclasses.replace(first, summary=f"{first.summary}; {note}",
                                    content=[*first.content, {"type": "text", "text": note}])
 

@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from yuki.agent.tools import Traits, call_traits, tool_traits
+from yuki.agent.tools import TOOL_TRAITS, Traits, call_traits, tool_traits
 
 # ---------------------------------------------------------------------------
 # The stored autonomy policy (yuki.ui.policy's file, read without importing the UI)
@@ -945,16 +945,31 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
     return verdict
 
 
-def combine_stages(first: Verdict, review: Verdict, traits: Traits) -> Verdict:
+def firm_lasting(name: str | None, traits: Traits) -> bool:
+    """The call's own facts, beyond what its tool can do in general, say it destroys or reaches someone: an Enter
+    that submits typed text, a click on a committing control or while typed text waits, a close, a local open, a fetch
+    after a file read (:func:`yuki.agent.tools.call_traits` differs from the tool's own :data:`TOOL_TRAITS` entry). A
+    key or a shell can do anything by its tool alone, so there the review's ``lasting`` answer is the only reading of
+    this one call. ``name`` ``None``: any destroying or reaching metadata is firm. Metadata only."""
+    if not (traits.destroys or traits.reaches):
+        return False
+    return name is None or traits != TOOL_TRAITS.get(name, Traits())
+
+
+def combine_stages(first: Verdict, review: Verdict, traits: Traits, name: str | None = None) -> Verdict:
     """The one verdict of a call the quick check held back and the review looked at again (V5, fail closed).
 
-    The review decides, with one exception: when it allows an action that can have a lasting effect (its own
-    ``lasting`` answer, or - when that is not known - the call's metadata says it destroys or reaches someone) that the
-    quick check held back, the two looks disagree about a lasting effect, and doubt is an ask. Live 3 Oct both sends of
-    one request came out "allow" while the reason shown argued for asking: the reason was the quick check's, the
-    decision the review's. The decision, its why and its question now always belong together: an allow carries the
-    review's why and no question; an ask carries the question of the stage that asked. Facts of the two verdicts only."""
-    lasting = review.lasting if isinstance(review.lasting, bool) else bool(traits.destroys or traits.reaches)
+    The review decides, with one exception: when it allows an action that can have a lasting effect that the quick
+    check held back, the two looks disagree about a lasting effect, and doubt is an ask. Lasting: the review's own
+    ``lasting`` answer, or the call's own facts (:func:`firm_lasting`) whatever the review answered - review F1: a
+    review that answers ``lasting`` false on a send (Enter read as a search submit) cannot overrule them - or, when the
+    review did not answer, the tool's metadata. For a call whose facts are quiet (a navigation key, a list item the
+    user's settings sent to the judge) the review's ``lasting`` answer stands. Live 3 Oct both sends of one request
+    came out "allow" while the reason shown argued for asking: the reason was the quick check's, the decision the
+    review's. The decision, its why and its question now always belong together: an allow carries the review's why and
+    no question; an ask carries the question of the stage that asked. Facts of the two verdicts only."""
+    lasting = bool(review.lasting is True or firm_lasting(name, traits)
+                   or (review.lasting is None and (traits.destroys or traits.reaches)))
     out = Verdict(decision=review.decision, scope=review.scope, sends=review.sends or first.sends, why=review.why,
                   question=review.question if not review.allowed else "", source="review",
                   ms=round(first.ms + review.ms, 1), first_ms=first.first_ms, usage=dict(review.usage),
@@ -1103,7 +1118,7 @@ class Authorizer:
             # (only for the request it was asked in). For the review (``first``: the quick check that held it), what
             # counts is the two stages combined: an allow they disagree on grants and memoizes nothing (V5).
             self._cost(model, full)
-            final = combine_stages(first, full, traits) if first is not None and full.error is None else full
+            final = combine_stages(first, full, traits, name) if first is not None and full.error is None else full
             with self._lock:
                 if generation == self._generation and final.error is None and final.allowed:
                     if final.scope == "window" and grantable:
@@ -1137,7 +1152,7 @@ class Authorizer:
             if again.why or not again.allowed or again.error is not None:
                 self._cost(model, again)
             if again.error is None:
-                v = combine_stages(first, again, traits)
+                v = combine_stages(first, again, traits, name)
                 v.reasons = reasons
         self.ms.append(v.ms)
         if v.error is not None:

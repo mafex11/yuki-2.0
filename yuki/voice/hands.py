@@ -2357,16 +2357,13 @@ class Hands:
 
     # -- V7: keep scrolling until they say stop ---------------------------------------------------------------------
 
-    #: What is said by code when a continuous scroll stopped by itself (a measured outcome of their own request; a stop
-    #: they asked for, or their taking over, is silent).
-    SCROLL_STOPPED_LINES = {"end": "That's the end of the page.", "limit": "I'll stop scrolling there.",
-                            "failed": "It's stopped scrolling."}
-
     def _keep_scrolling(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         """Start the continuous scroll (:class:`yuki.actions.scrolling.ContinuousScroll`) on a window the talker was
-        shown: the first step runs here and is the hand's report; the rest run on their own thread."""
+        shown: the first step runs here and is the hand's report; the rest run on their own thread. The scroll is
+        claimed before that first step, so a keep stop said during it stops it (review F8)."""
         from yuki.actions.scrolling import (
-            PACES, ContinuousScroll, input_watch, start_continuous, step_result, voice_hold,
+            PACES, ContinuousScroll, claim_continuous, drop_continuous, input_watch, start_continuous,
+            step_result, stopped_words, voice_hold,
         )
         from yuki.agent.finish import app_name
 
@@ -2382,19 +2379,37 @@ class Hands:
         def step() -> Any:
             return step_result(backend.scroll(x, y, dy=dy, expect_hwnd=hwnd))
 
+        title = self._title_shown(hwnd)
+        where = f"{app_name(self._app_at(hwnd))} \"{title[:60]}\"" if title else app_name(self._app_at(hwnd))
+        watch = input_watch()
+        scroller = ContinuousScroll(step, where=where, direction=direction, pace=pace, hold=voice_hold,
+                                    took_over=watch, moving=getattr(watch, "moving", None),
+                                    on_stop=self._scroll_stopped)
+        claim_continuous(scroller)
         facts["sent_at"] = time.monotonic()
-        first = step()
+        try:
+            first = step()
+        except Exception:
+            drop_continuous(scroller)
+            raise
+        if not scroller.running:
+            # a stop came while the first step ran: it never goes on
+            drop_continuous(scroller)
+            scroller.steps = 1 if first.ok else 0
+            facts["verified"], facts["settled"] = first.moved, True
+            return True, f"{lead}{first.report}; {stopped_words(scroller.report())}", facts
         if not first.ok or (first.moved is False and not first.at_end):
+            drop_continuous(scroller)
             facts["verified"] = False
             return False, lead + first.report, facts
         if first.at_end:
+            drop_continuous(scroller)
             facts["verified"], facts["settled"] = False, True
             return True, (f"{lead}{first.report}: already at the {'bottom' if direction == 'down' else 'top'}, "
                           f"nothing more to scroll"), facts
-        title = self._title_shown(hwnd)
-        where = f"{app_name(self._app_at(hwnd))} \"{title[:60]}\"" if title else app_name(self._app_at(hwnd))
-        start_continuous(ContinuousScroll(step, where=where, direction=direction, pace=pace, hold=voice_hold,
-                                          took_over=input_watch(), on_stop=self._scroll_stopped, steps_done=1))
+        scroller.steps = 1
+        scroller.stills = 1 if first.still else 0   # a web page that did not move counts toward its end (review F5)
+        start_continuous(scroller)
         facts["verified"] = first.moved            # True when the page reports its position; None on a web page
         facts["settled"] = facts["continuous"] = True   # it goes on by itself: nothing to hand over
         if first.moved is not True:
@@ -2412,25 +2427,18 @@ class Hands:
         return True, (stopped_words(report) if report else "nothing was scrolling, so there was nothing to stop"), facts
 
     def _scroll_stopped(self, report: dict[str, Any]) -> None:
-        """A continuous scroll stopped by itself (its own thread): into the action log, and a short line by code when it
-        reached the end, its limit, or would not scroll any more."""
+        """A continuous scroll stopped by itself (its own thread): into the action log (the talker's "done on the
+        desktop" lines, so it can say so on its next turn) and the session log. Nothing is said by code: a line spoken
+        up to 5 minutes later, unprompted, could land in a call or over the user's own talk (review F11; Yuki never
+        speaks first)."""
         from yuki.actions.scrolling import stopped_words
 
         why = str(report.get("why") or "")
         self.actions.add("your hand", "scroll keep (stopped by itself)", stopped_words(report)[:400],
-                         ok=why != "failed", verified=None)
+                         ok=why not in ("failed", "error"), verified=None)
         if self.log is not None:
             self.log.event("hands", op="scroll_keep", stopped=why, steps=report.get("steps"),
                            seconds=report.get("seconds"))
-        line = self.SCROLL_STOPPED_LINES.get(why)
-        bridge = self.bridge
-        speak = getattr(bridge, "speak", None) if bridge is not None else None
-        loop = getattr(bridge, "_loop", None) if bridge is not None else None
-        if line and callable(speak) and loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(speak(line), loop)
-            except Exception:  # noqa: BLE001 - the action log has it anyway
-                pass
 
     def _scroll_point(self, hwnd: int) -> tuple[int, int]:
         """The window's centre: its content, whatever the cursor is over (plumbing: where to look for it)."""

@@ -87,11 +87,14 @@ class Outcome:
     #: V6 (3 Oct): the wheel went into a web page that takes no UI Automation scrolling, so its scrolling cannot be
     #: watched from here: expected-unverifiable, never "did not scroll" (live the page scrolled and Yuki said it had not).
     page: bool = False
+    #: On such a page, an element inside it was watched the whole time and did not move (review F5: several of these in
+    #: a row are how a continuous scroll learns the page has stopped, at its end or stuck).
+    still: bool = False
 
     def facts(self) -> dict[str, Any]:
         return {"moved": self.moved, "how": self.how, "before": _r(self.before), "after": _r(self.after),
                 "at_end": self.at_end, "shift_px": self.shift_px, "scroller": self.target, "note": self.note,
-                "page": self.page}
+                "page": self.page, "still": self.still}
 
 
 def _r(value: float | None) -> float | None:
@@ -154,16 +157,19 @@ def wheel_at(x: int, y: int, *, send: Callable[[], None], marker: Callable[[], i
              cursor: Callable[[], tuple[int, int] | None], move: Callable[[int, int], None],
              watch_s: float = WATCH_S, back_after_s: float = CURSOR_BACK_S, poll_s: float = POLL_S,
              clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-             page: bool = False) -> Outcome:
+             page: bool = False, own: Callable[[bool], None] | None = None) -> Outcome:
     """The wheel at (x, y) with the cursor put back after; ``marker()`` is the top edge of what was under the point.
 
     ``page`` (V6): the point is inside a web page that takes no UI Automation scrolling. Its elements' positions are not
     a reliable read-back there (the page itself never moves, and a browser may report its content's new positions
     late): a marker that moved still verifies it, one that did not makes it unverifiable (``moved`` None), never "it
-    did not scroll"."""
+    did not scroll"; ``still`` says a marker was watched and did not move. ``own(True)`` / ``own(False)``: Yuki's own
+    input begins (the cursor jump and the wheel) and ends (the cursor is back), so only that moment is taken for
+    Yuki's input, never the watch around it (review F4)."""
     out = _wheel(x, y, send=send, marker=marker, cursor=cursor, move=move, watch_s=watch_s, back_after_s=back_after_s,
-                 poll_s=poll_s, clock=clock, sleep=sleep)
+                 poll_s=poll_s, clock=clock, sleep=sleep, own=own)
     if page and out.moved is not True:
+        out.still = out.moved is False
         out.moved, out.page = None, True
         out.note = ("a web page here does not report its scroll position, so whether it moved could not be checked "
                     "(expected for this kind of page, not a failure)")
@@ -173,25 +179,39 @@ def wheel_at(x: int, y: int, *, send: Callable[[], None], marker: Callable[[], i
 def _wheel(x: int, y: int, *, send: Callable[[], None], marker: Callable[[], int | None],
            cursor: Callable[[], tuple[int, int] | None], move: Callable[[int, int], None],
            watch_s: float, back_after_s: float, poll_s: float,
-           clock: Callable[[], float], sleep: Callable[[float], None]) -> Outcome:
+           clock: Callable[[], float], sleep: Callable[[float], None],
+           own: Callable[[bool], None] | None = None) -> Outcome:
+    def mark(running: bool) -> None:
+        if own is not None:
+            try:
+                own(running)
+            except Exception:  # noqa: BLE001 - bookkeeping only
+                pass
+
     before = marker()
     home = cursor()
-    move(x, y)
-    send()
-    started = clock()
     back = False
-    after = marker()
-    while clock() - started < watch_s:
-        if not back and (clock() - started >= back_after_s or (after is not None and after != before)):
+    mark(True)
+    try:
+        move(x, y)
+        send()
+        started = clock()
+        after = marker()
+        while clock() - started < watch_s:
+            if not back and (clock() - started >= back_after_s or (after is not None and after != before)):
+                if home is not None:
+                    move(*home)
+                back = True
+                mark(False)
+            if after is not None and before is not None and after != before:
+                break
+            sleep(poll_s)
+            after = marker()
+    finally:
+        if not back:
             if home is not None:
                 move(*home)
-            back = True
-        if after is not None and before is not None and after != before:
-            break
-        sleep(poll_s)
-        after = marker()
-    if not back and home is not None:
-        move(*home)
+            mark(False)
     if before is None or after is None:
         return Outcome(moved=None, how="wheel", note="nothing under the point could be watched")
     return Outcome(moved=after != before, how="wheel", shift_px=abs(after - before))
@@ -451,8 +471,21 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
             except Exception:  # noqa: BLE001
                 return None
 
+        span: dict[str, float] = {}
+
+        def own(running: bool) -> None:
+            # review F4: only the jump, the wheel and the jump back are Yuki's own input (the scroll action itself is
+            # leased without a whole-call stamp, yuki.actions.input)
+            from yuki.actions.leases import note_own_input
+
+            if running:
+                span["begin"] = time.monotonic()
+                note_own_input(span["begin"], None)
+            else:
+                note_own_input(span.get("begin") or time.monotonic(), time.monotonic())
+
         shared["outcome"] = wheel_at(x, y, send=_wheel_sender(dy if vertical else 0, 0 if vertical else dx),
-                                     marker=_marker(watched), cursor=cursor, move=_move, page=page)
+                                     marker=_marker(watched), cursor=cursor, move=_move, page=page, own=own)
 
     pending = _Pending(job, "yuki-scroll", budget_s)
     shared = pending.wait()
@@ -507,9 +540,11 @@ def _pct(value: float | None) -> str:
 # Live 3 Oct "keep scrolling until I say stop" could not be done: the thinker scrolled once, tried page down, and gave
 # up. A continuous scroll is one object here, shared by the talker's keep_scrolling hand and the thinker's scroll with
 # until_stopped: it scrolls the window in steps on its own thread, pauses while the user talks (their words may be
-# "stop"), and stops when the talker calls stop, when the Stop hotkey cancels, when the user really takes over (a key or
-# a click: :class:`yuki.actions.leases.RealInput`), when the page ends, after two failed steps, or at its limits. Its
-# report says where it stopped. Measured facts only; no words are read here.
+# "stop"), and stops when the talker calls stop, when the Stop hotkey or the Stop button cancels, when the user really
+# takes over (a key or a click: :class:`yuki.actions.leases.RealInput`, watched on its own thread during steps too),
+# when Yuki goes on to act on the desktop, when its window leaves the front, when the page ends or stops moving, after
+# two failed steps, or at its limits. It waits while the user moves the mouse. Its report says where it stopped.
+# Measured facts only; no words are read here.
 
 #: Paces: (seconds between steps, wheel notches per step; a screenful is about 10).
 PACES: dict[str, tuple[float, int]] = {"slow": (2.6, 3), "normal": (1.7, 4), "fast": (1.0, 6)}
@@ -518,10 +553,17 @@ MAX_STEPS = 150
 MAX_S = 300.0
 #: Two failed steps in a row end it (the window went away, or nothing scrolls there).
 MAX_FAILURES = 2
-#: How often the loop looks at its stop, pause and take-over signals while it waits between steps (s).
+#: Steps in a row on a web page whose watched element did not move: the page has stopped, at its end or stuck (review
+#: F5: a page without UI Automation scrolling never reports its end, so it ran on to the 5-minute limit).
+MAX_STILL = 3
+#: How often the loop looks at its stop and pause signals, and the watch thread at the user's input (s).
 TICK_S = 0.1
-#: Why it stopped, when it stopped by itself (the rest are a stop someone asked for: voice, stop, replaced, ended).
-SELF_STOPS = ("end", "limit", "failed", "user_input", "error")
+#: After the user moved the mouse, steps wait until the cursor has been still this long (review F4: a step jumps the
+#: cursor to the scroll point and back, never under a moving hand).
+MOUSE_STILL_S = 1.0
+#: Why it stopped, when it stopped by itself (the rest are a stop someone asked for: voice, stop, replaced, ended,
+#: acting).
+SELF_STOPS = ("end", "still", "window", "limit", "failed", "user_input", "error")
 
 
 @dataclass
@@ -533,6 +575,10 @@ class StepResult:
     at_end: bool = False
     percent: float | None = None
     report: str = ""
+    #: A web page's watched element did not move (review F5).
+    still: bool = False
+    #: The step was refused because its window is no longer in front (review F6).
+    gone: bool = False
 
 
 def step_result(result: Any) -> StepResult:
@@ -544,7 +590,8 @@ def step_result(result: Any) -> StepResult:
     return StepResult(ok=bool(getattr(result, "ok", False)), moved=details.get("verified"),
                       at_end=bool(first.get("at_end")),
                       percent=float(after) if isinstance(after, (int, float)) and after >= 0 else None,
-                      report=str(getattr(result, "summary", "") or "")[:300])
+                      report=str(getattr(result, "summary", "") or "")[:300],
+                      still=bool(first.get("still")), gone=details.get("refused") == "foreground")
 
 
 class ContinuousScroll:
@@ -555,24 +602,28 @@ class ContinuousScroll:
         where: The window as people say it (``Arc "YouTube"``), for its state line and report.
         direction: ``down`` / ``up``; ``pace``: a key of :data:`PACES`.
         hold: While it says True the scroll waits (the user is talking: their words may be "stop").
-        took_over: Says True once the user really used the keyboard or mouse buttons (they took over).
+        took_over: Says True once the user really used the keyboard or mouse buttons (they took over). Polled on a
+            watch thread of its own every tick, during steps too (review F4), never on two threads at once.
+        moving: While it says True the scroll waits (the user is moving the mouse; :class:`InputWatch`).
         on_stop: Called with :meth:`report` when it stopped by itself (:data:`SELF_STOPS`), off its own thread.
         steps_done: Steps already taken before it started (the caller's first step).
     """
 
     def __init__(self, step: Callable[[], StepResult], *, where: str, direction: str = "down", pace: str = "normal",
                  hold: Callable[[], bool] | None = None, took_over: Callable[[], bool] | None = None,
+                 moving: Callable[[], bool] | None = None,
                  on_stop: Callable[[dict[str, Any]], None] | None = None, max_steps: int = MAX_STEPS,
                  max_s: float = MAX_S, steps_done: int = 0, started_by: str = "voice",
                  sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic) -> None:
         self.step_fn, self.where = step, where
         self.direction = direction if direction in ("down", "up") else "down"
         self.pace = pace if pace in PACES else "normal"
-        self.hold, self.took_over, self.on_stop = hold, took_over, on_stop
+        self.hold, self.took_over, self.moving, self.on_stop = hold, took_over, moving, on_stop
         self.max_steps, self.max_s, self.started_by = int(max_steps), float(max_s), started_by
         self.sleep, self.now = sleep, now
         self.steps = int(steps_done)
         self.failures = 0
+        self.stills = 0
         self.percent: float | None = None
         self.last = ""
         self.why: str | None = None
@@ -580,6 +631,7 @@ class ContinuousScroll:
         self.stopped_at: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._watcher: threading.Thread | None = None
 
     @property
     def running(self) -> bool:
@@ -588,6 +640,21 @@ class ContinuousScroll:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="yuki-keep-scrolling", daemon=True)
         self._thread.start()
+        if self.took_over is not None:
+            self._watcher = threading.Thread(target=self._watch, name="yuki-keep-scrolling-watch", daemon=True)
+            self._watcher.start()
+
+    def _watch(self) -> None:
+        """The user's take-over, looked at every tick for as long as it runs, steps included (review F4: looked at only
+        between steps, a click during the 1-2 s of a step was gone by the next look)."""
+        while not self._stop.is_set():
+            try:
+                if self.took_over is not None and self.took_over():
+                    self._end("user_input")
+                    return
+            except Exception:  # noqa: BLE001 - a broken read never stops the scroll by itself
+                pass
+            self._stop.wait(TICK_S)
 
     def stop(self, why: str = "stop", wait_s: float = 2.0) -> dict[str, Any]:
         """Stop it (``why``: voice / stop / replaced / ended); returns the report."""
@@ -607,15 +674,23 @@ class ContinuousScroll:
         self._stop.set()
 
     def _wait(self, seconds: float) -> bool:
-        """Wait between steps, looking at the signals every tick; False once it must stop."""
+        """Wait between steps, looking at the stop every tick; False once it must stop (the take-over is the watch
+        thread's)."""
         until = self.now() + seconds
         while not self._stop.is_set():
-            if self.took_over is not None and self.took_over():
-                self._end("user_input")
-                return False
             if self.now() >= until:
                 return True
             self.sleep(TICK_S)
+        return False
+
+    def _held(self) -> bool:
+        """The user is talking, or moving the mouse: the next step waits."""
+        for signal in (self.hold, self.moving):
+            try:
+                if signal is not None and signal():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
         return False
 
     def _run(self) -> None:
@@ -627,7 +702,7 @@ class ContinuousScroll:
                 if self.steps >= self.max_steps or self.now() - self.started_at >= self.max_s:
                     self._end("limit")
                     break
-                if self.hold is not None and self.hold():
+                if self._held():
                     if not self._wait(TICK_S):
                         break
                     continue
@@ -636,6 +711,16 @@ class ContinuousScroll:
                     break
                 self.steps += 1
                 self.last = result.report
+                if result.gone:
+                    self._end("window")   # its window left the front: never on into another window (review F6)
+                    break
+                if result.still:
+                    self.stills += 1
+                    if self.stills >= MAX_STILL:
+                        self._end("still")
+                        break
+                else:
+                    self.stills = 0
                 if not result.ok:
                     self.failures += 1
                     if self.failures >= MAX_FAILURES:
@@ -685,6 +770,9 @@ def stopped_words(report: dict[str, Any] | None) -> str:
     far = f", about {report['percent']}% of the way {report['direction']}" if report.get("percent") is not None else ""
     why = {"voice": "stopped as they asked", "stop": "stopped", "replaced": "replaced by a new scroll",
            "ended": "stopped when the conversation ended", "end": "reached the end of the page",
+           "still": f"stopped: the page showed no movement for {MAX_STILL} steps (its end, or it would not scroll)",
+           "window": "stopped: that window was no longer in front",
+           "acting": "stopped when Yuki went on to act on the desktop",
            "limit": "stopped at its limit", "failed": "stopped: the page would not scroll any more",
            "user_input": "stopped: they took over the keyboard or mouse", "error": "stopped on an error"}
     return (f"scrolled {report.get('where')} {report.get('direction')} for {report.get('steps')} steps in "
@@ -718,14 +806,34 @@ def voice_hold() -> bool:
         return False
 
 
-def start_continuous(scroller: ContinuousScroll) -> dict[str, Any] | None:
-    """Start ``scroller``; a continuous scroll already running is stopped first (its report is returned)."""
+def claim_continuous(scroller: ContinuousScroll) -> dict[str, Any] | None:
+    """Make ``scroller`` the continuous scroll before its first step runs, so a stop said during that step stops it
+    (review F8: "stop" during the first step found nothing running, then the scroll started). A continuous scroll
+    already running is stopped first (its report is returned)."""
     global _RUNNING
     with _LOCK:
         old, _RUNNING = _RUNNING, scroller
-    report = old.stop("replaced") if old is not None and old.running else None
+    return old.stop("replaced") if old is not None and old is not scroller and old.running else None
+
+
+def start_continuous(scroller: ContinuousScroll) -> dict[str, Any] | None:
+    """Start ``scroller`` (claimed first unless :func:`claim_continuous` already did); a continuous scroll already
+    running is stopped first (its report is returned). One stopped while it was claimed is never started."""
+    with _LOCK:
+        claimed = _RUNNING is scroller
+    report = None if claimed else claim_continuous(scroller)
+    if not scroller.running:
+        _forget(scroller)   # a stop came during its first step
+        return report
     scroller.start()
     return report
+
+
+def drop_continuous(scroller: ContinuousScroll) -> None:
+    """A claimed scroller that will not go on (its first step failed or the page was at its end): forgotten, quietly."""
+    if scroller.running:
+        scroller.stop("not_started", wait_s=0.0)
+    _forget(scroller)
 
 
 def stop_continuous(why: str = "stop", wait_s: float = 2.0) -> dict[str, Any] | None:
@@ -748,18 +856,45 @@ def continuous_state() -> str | None:
     return running.line() if running is not None else None
 
 
-def input_watch() -> Callable[[], bool]:
-    """A "they took over" signal from now on: real keyboard or mouse-button input of the user's (never Yuki's own,
-    never the mouse merely moving; :class:`yuki.actions.leases.RealInput`)."""
-    from yuki.actions.leases import RealInput
+class InputWatch:
+    """The user's input while a continuous scroll runs (review F4), looked at on the scroll's watch thread every tick.
 
-    watch = RealInput()
-    watch.poll()   # the baseline: input before now does not count
-    watch.last_real = None
-    since = time.monotonic()
+    Called, it says whether they took over: a key or a mouse button went down (or was pressed since the last look),
+    or other input came with the cursor still (:class:`yuki.actions.leases.RealInput`; Yuki's own wheel moment is left
+    out). :meth:`moving`: they moved the cursor within :data:`MOUSE_STILL_S` (Yuki's own cursor jump left out), so the
+    next step waits and never jumps the cursor under their hand. Measured facts only; no hook.
 
-    def took_over() -> bool:
-        last = watch.poll()
-        return last is not None and last > since
+    Args:
+        real: The input reader (tests pass one on stubs).
+        own_now: Whether one of Yuki's own input moments is running or just ended
+            (:func:`yuki.actions.leases.own_input_now`).
+    """
 
-    return took_over
+    def __init__(self, real: Any = None, *, own_now: Callable[[float], bool] | None = None,
+                 now: Callable[[], float] = time.monotonic) -> None:
+        from yuki.actions.leases import RealInput, own_input_now
+
+        self.real = real if real is not None else RealInput()
+        self.own_now = own_now or own_input_now
+        self.now = now
+        self.moved_at: float | None = None
+        self.real.poll()   # the baseline: input before now does not count
+        self.real.last_real = None
+        self.since = self.now()
+
+    def __call__(self) -> bool:
+        before = self.real.cursor_seen
+        last = self.real.poll()
+        after = self.real.cursor_seen
+        t = self.now()
+        if before is not None and after is not None and after != before and not self.own_now(t):
+            self.moved_at = t
+        return last is not None and last > self.since
+
+    def moving(self) -> bool:
+        return self.moved_at is not None and self.now() - self.moved_at < MOUSE_STILL_S
+
+
+def input_watch() -> InputWatch:
+    """A "they took over" signal from now on (:class:`InputWatch`; its ``moving`` is the mouse-moving hold)."""
+    return InputWatch()

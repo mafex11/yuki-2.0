@@ -68,9 +68,24 @@ def own_input_at() -> float:
     return time.monotonic() if end is None and start else float(end or 0.0)
 
 
-def leased(fn: Callable[..., Any]) -> Callable[..., Any]:
+def own_input_now(now: float | None = None, *, span: Callable[[], tuple[float, float | None]] | None = None) -> bool:
+    """Whether one of Yuki's own input moments is running, or ended less than :data:`OWN_INPUT_SLACK_S` ago (a cursor
+    that moved then was moved by Yuki)."""
+    start, end = (span or own_input_span)()
+    if not start:
+        return False
+    t = time.monotonic() if now is None else now
+    return end is None or t <= end + OWN_INPUT_SLACK_S
+
+
+def leased(fn: Callable[..., Any], *, stamp: bool = True) -> Callable[..., Any]:
     """Wrap a global-input action: it holds the input lease (and its ``expect_hwnd`` window's lease) while it runs, and
-    its span is recorded as Yuki's own input. A lease that cannot be had in time is an ``ok=False`` result."""
+    its span is recorded as Yuki's own input. A lease that cannot be had in time is an ``ok=False`` result.
+
+    ``stamp`` False: the action records its own input moments itself (:func:`note_own_input` around each send). A
+    scroll spends most of its time finding its target and watching the page, sending nothing; stamped whole, every
+    input of the user's in that time was taken for Yuki's (review F4: a click to take over a running "keep
+    scrolling" was missed)."""
     import functools
 
     @functools.wraps(fn)
@@ -78,6 +93,8 @@ def leased(fn: Callable[..., Any]) -> Callable[..., Any]:
         hwnd = kwargs.get("expect_hwnd")
         try:
             with input_lease(int(hwnd) if isinstance(hwnd, int) and not isinstance(hwnd, bool) and hwnd else None):
+                if not stamp:
+                    return fn(*args, **kwargs)
                 begin = time.monotonic()
                 note_own_input(begin, None)
                 try:
@@ -203,11 +220,17 @@ _REAL_INPUT_VKS: tuple[int, ...] = (1, 2, 4, 5, 6, *range(8, 255))
 
 
 def key_or_button_down() -> bool | None:
-    """Whether a keyboard key or a mouse button is held down right now (``GetAsyncKeyState``'s high bit, polled only
-    while Yuki waits to act: no input hook), ``None`` when Windows cannot say. A moving mouse holds nothing down."""
+    """Whether a keyboard key or a mouse button is held down right now, or went down since the last look
+    (``GetAsyncKeyState``'s high bit, and its low bit "pressed since the last call"; polled only while Yuki waits to act
+    or a continuous scroll runs: no input hook), ``None`` when Windows cannot say. A moving mouse presses nothing.
+
+    The low bit catches a quick click between two looks that a move hid (review F4: a move and a click inside one
+    tick read as the mouse moving). It is Windows' best effort (another program's call can take it first), so it only
+    adds to the high bit; the first look of a watch is a baseline (:class:`RealInput`), since it may be old."""
     try:
         get = ctypes.windll.user32.GetAsyncKeyState
-        return any(get(vk) & 0x8000 for vk in _REAL_INPUT_VKS)
+        # every key is asked each look (no early stop), so no key's "pressed since" bit is left over for the next one
+        return bool(sum(1 for vk in _REAL_INPUT_VKS if get(vk) & 0x8001))
     except Exception:  # noqa: BLE001 - not on Windows
         return None
 
@@ -229,8 +252,9 @@ class RealInput:
     """When the user last really used the PC: a key or a mouse button (V8, 3 Oct). ``GetLastInputInfo`` also counts
     every mouse move (and input another machine sends through a shared mouse), so live Yuki said twice "you're using the
     keyboard or mouse" while the user touched nothing. Polled while Yuki waits to act (no hook): an input that came
-    while the cursor stayed where it was (a key, a click, the wheel) or while a key or button was held down counts; one
-    that came with the cursor moving and nothing held down is the mouse moving, and does not. Measured facts only."""
+    while the cursor stayed where it was (a key, a click, the wheel) or while a key or button was down (or went down
+    since the last look) counts; one that came with the cursor moving and nothing pressed is the mouse moving, and does
+    not. The first look is a baseline (what was pressed before it does not count). Measured facts only."""
 
     def __init__(self, *, age: Callable[[], float | None] = user_input_age_s,
                  held: Callable[[], bool | None] = key_or_button_down,
@@ -240,7 +264,14 @@ class RealInput:
         self.last_real: float | None = None   # when real input was last seen (monotonic), None: not yet
         self._last_input: float | None = None
         self._cursor: tuple[int, int] | None = None
+        #: The cursor was seen at two different places on two looks in a row (the mouse moved while watched).
+        self.cursor_moved = False
         self.polls = 0
+
+    @property
+    def cursor_seen(self) -> tuple[int, int] | None:
+        """Where the cursor was on the latest look (``None``: not looked yet, or unknown)."""
+        return self._cursor
 
     def poll(self) -> float | None:
         """Look once; returns :attr:`last_real`."""
@@ -249,12 +280,14 @@ class RealInput:
         last = None if seconds is None or seconds == float("inf") else t - seconds
         where = self.cursor()
         down = self.held()
-        if down:
+        if down and self.polls:
             self.last_real = t
         elif last is not None and self._last_input is not None and last > self._last_input + 0.005:
             # new input since the last look: real unless the cursor moved with it
             if where is not None and self._cursor is not None and where == self._cursor:
                 self.last_real = max(self.last_real or 0.0, last)
+        if where is not None and self._cursor is not None and where != self._cursor:
+            self.cursor_moved = True
         if last is not None:
             self._last_input = last if self._last_input is None else max(self._last_input, last)
         self._cursor = where
@@ -275,8 +308,10 @@ class InputGate:
         quiet_s: How long they must be still (no key, no click) before Yuki's input goes in.
         max_s: The longest wait; then the action is not sent.
         age: Seconds since the user's last input (:func:`user_input_age_s`; tests pass a stub).
-        probe_s: How long the gate watches recent input to tell a key or click from the mouse moving; with no real
-            input seen in that time, Yuki goes ahead.
+        probe_s: How long the gate watches recent input to tell a key or click from the mouse moving. With no real
+            input seen in that time and the cursor seen moving, the input that made it look was the mouse: Yuki goes
+            ahead. With the cursor still the whole time, that input was a key, a click or the wheel, and Yuki waits
+            until ``quiet_s`` after it (review F3: it went ahead 0.25 s after a keystroke, inside a typing pause).
         notify_after_s: The one notice is said only when the wait has lasted this long (~3 s).
         held, cursor: The key-or-button and cursor reads (:class:`RealInput`; tests pass stubs).
     """
@@ -300,6 +335,7 @@ class InputGate:
         if first is None or first >= self.recent_s:
             return {"waited": False, "ok": True, "ms": 0.0}
         started = self.now()
+        trigger = started - float(first)   # the input that made the gate look: its kind is not known yet
         watch = RealInput(age=self.age, held=self.held, cursor=self.cursor, now=self.now)
         notified = False
         while True:
@@ -310,7 +346,11 @@ class InputGate:
             t = self.now()
             ms = round((t - started) * 1000)
             if last_real is None and t - started >= self.probe_s:
-                return {"waited": ms > 0, "ok": True, "ms": ms, "real": False}   # only the mouse moved: go ahead
+                if watch.cursor_moved:
+                    return {"waited": ms > 0, "ok": True, "ms": ms, "real": False}   # only the mouse moved: go ahead
+                # the cursor stayed still while watched (or cannot be read): the input that made the gate look was a
+                # key, a click or the wheel, never told apart from the mouse moving, so it counts
+                last_real = watch.last_real = trigger
             if last_real is not None and t - last_real >= self.quiet_s:
                 return {"waited": True, "ok": True, "ms": ms, "real": True}
             if t - started >= self.max_s:
@@ -326,5 +366,5 @@ class InputGate:
 
 
 __all__ = ["INPUT_LEASE_S", "InputGate", "LeaseBusy", "WINDOW_LEASE_S", "input_held_elsewhere", "input_lease",
-           "last_input_age_s", "leased", "note_own_input", "own_input_at", "own_input_span", "user_input_age_s",
-           "window_lease"]
+           "last_input_age_s", "leased", "note_own_input", "own_input_at", "own_input_now", "own_input_span",
+           "user_input_age_s", "window_lease"]

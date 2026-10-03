@@ -125,16 +125,68 @@ def test_v5_a_clean_allow_still_returns_early_and_the_review_may_allow_a_step_th
     rest: list[Any] = []
     v = decide(client, params, need=("sends",), on_rest=rest.append)
     assert v.allowed and v.sends and v.question == ""
-    # a navigation click the quick check held and the review called lasting-nothing: the review's allow stands
+    # a navigation click (quiet metadata: a list item, sent to the judge only by the user's "ask" setting for clicks)
+    # the quick check held and the review called lasting-nothing: the review's allow stands
+    from yuki.agent.judge import Authorizer, PolicyReader
+
     click_client = _JudgeClient({"decision": "ask_user", "question": "Click it?", "sends": False, "scope": "call",
                                  "why": "unsure"},
                                 {"asked": "open the list", "toward": True, "lasting": False, "asked_effect": False,
                                  "question": "", "sends": False, "scope": "call"})
-    auth = _authorizer(tmp_path, click_client)
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"levels": {"click_type": "ask"}}), encoding="utf-8")
+    settings = SimpleNamespace(judge_model="m", judge_timeout_s=5.0, estimate_cost=lambda m, u: 0.001)
+    auth = Authorizer(lambda: click_client, settings, policy=PolicyReader(policy))
     v = auth.check("click", {"element": 4}, words=_WORDS,
-                   target={"hwnd": 7002, "app": "Chirp.exe", "title": "Chirp", "role": "Button",
-                           "element": 'Button "More"'})
-    assert v.allowed and v.doubt is None and v.question == ""
+                   target={"hwnd": 7002, "app": "Chirp.exe", "title": "Chirp", "role": "ListItem",
+                           "element": 'ListItem "Pinned"'})
+    assert v is not None and v.allowed and v.doubt is None and v.question == ""
+    assert len(click_client.calls) == 2   # it did go through both stages
+
+
+@pytest.mark.parametrize("name,tool_input,target_extra", [
+    ("type_text", _SEND, {}),                                                          # press_enter: submits
+    ("click", {"element": 9}, {"role": "Button", "element": 'Button "Send"'}),        # a committing button
+    ("click", {"element": 9}, {"role": "Pane", "typed_pending": True}),               # typed text is waiting
+])
+def test_v5_a_review_saying_lasting_false_cannot_overrule_a_send_the_quick_check_held(
+        tmp_path: Any, name: str, tool_input: dict[str, Any], target_extra: dict[str, Any]) -> None:
+    """Review F1: the quick check held a call whose metadata says it reaches someone; the review allowed it but
+    answered lasting=false (it read Enter as a search submit). The call's facts still count: the stages disagree,
+    so it is an ask, and nothing is granted or memoized."""
+    client = _JudgeClient(
+        {"decision": "ask_user", "question": "Send \"running late\" to Mira?", "sends": True, "scope": "call",
+         "why": "they did not name this chat"},
+        {"asked": "say they're running late", "toward": True, "lasting": False, "asked_effect": False,
+         "question": "", "sends": False, "scope": "window"})
+    auth = _authorizer(tmp_path, client)
+    target = {**_TARGET, **target_extra}
+    v = auth.check(name, dict(tool_input), words=_WORDS, target=target)
+    time.sleep(0.2)   # the review's rest is read on the judge's thread
+    assert v is not None and not v.allowed and v.decision == "ask_user"
+    assert v.doubt == "stages_disagree" and v.question.startswith("Send")
+    assert 7001 not in auth.grants and all(not m.allowed for m in auth.memo.values())
+
+
+def test_v5_combine_stages_keeps_the_reviews_lasting_answer_only_on_quiet_metadata() -> None:
+    from yuki.agent.judge import Verdict, combine_stages
+    from yuki.agent.tools import Traits, call_traits
+
+    first = Verdict(decision="ask_user", why="unsure", question="Do it?")
+    review = Verdict(decision="allow", why="asked for", lasting=False)
+    assert combine_stages(first, review, call_traits("click", {"element": 2}, role="ListItem"), "click").allowed
+    for name, tool_input, extra in (("type_text", {"text": "on my way", "press_enter": True}, {}),
+                                    ("click", {"element": 2}, {"role": "Button"}),
+                                    ("click", {"element": 2}, {"typed_pending": True}),
+                                    ("window_action", {"action": "close"}, {})):
+        out = combine_stages(first, review, call_traits(name, tool_input, **extra), name)
+        assert not out.allowed and out.doubt == "stages_disagree" and out.question == "Do it?"
+    # a key can do anything by its tool alone: for a navigation key the review's own "lasts nothing" stands
+    assert combine_stages(first, review, call_traits("hotkey", {"keys": ["ctrl", "tab"]}), "hotkey").allowed
+    # no lasting answer at all: the tool's metadata decides, as before
+    assert combine_stages(first, Verdict(decision="allow"), Traits(("click_type",), "input"), "click").allowed
+    assert not combine_stages(first, Verdict(decision="allow"), call_traits("press", {"key": "enter"}),
+                              "press").allowed
 
 
 def test_v5_a_review_with_a_question_is_its_own_doubt() -> None:
@@ -652,3 +704,324 @@ def test_v11_the_open_hands_ask_for_the_rest_of_the_request() -> None:
     for name in ("open_app", "open_url"):
         tool = next(t for t in HAND_TOOLS if t["name"] == name)
         assert "then" in tool["required"]
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (F3-F13; F1 is with the V5 tests above, F3's gate tests are in test_d_brain)
+# ---------------------------------------------------------------------------
+
+
+def test_f4_a_take_over_during_a_step_is_seen_and_the_scroll_stops(fast_scroll: Any) -> None:
+    # the watch runs on its own thread, so a click while a step runs (the step lasts much longer than a click) counts
+    s = fast_scroll
+    took = {"now": False}
+    in_step = threading.Event()
+    steps: list[int] = []
+    stops: list[dict[str, Any]] = []
+
+    def step() -> Any:
+        steps.append(1)
+        in_step.set()
+        time.sleep(0.25)        # a step's UIA find and wheel watch
+        return s.StepResult(ok=True, moved=None)
+
+    s.start_continuous(s.ContinuousScroll(step, where="Feed", took_over=lambda: took["now"], on_stop=stops.append))
+    assert in_step.wait(3.0)
+    took["now"] = True          # they click while the step runs ...
+    time.sleep(0.03)
+    took["now"] = False         # ... and let go before it ends
+    assert _wait_for(lambda: bool(stops)) and stops[-1]["why"] == "user_input"
+    assert len(steps) == 1      # no further step after the take-over
+
+
+def test_f4_only_the_wheel_moment_is_yukis_own_input_and_the_scroll_is_leased_without_a_whole_stamp() -> None:
+    from yuki.actions import input as actions_input
+    from yuki.actions.leases import user_input_age_s
+    from yuki.actions.scrolling import wheel_at
+
+    marks: list[tuple[str, bool]] = []
+    clock = {"t": 0.0}
+
+    def move(x: int, y: int) -> None:
+        marks.append(("move", (x, y) == (960, 520)))
+
+    out = wheel_at(960, 520, send=lambda: marks.append(("send", True)), marker=lambda: 500, cursor=lambda: (5, 5),
+                   move=move, clock=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                   own=lambda running: marks.append(("own", running)))
+    assert [m[0] for m in marks] == ["own", "move", "send", "move", "own"]
+    assert marks[0] == ("own", True) and marks[-1] == ("own", False) and out.moved is False
+    # a click of the user's 1 s after Yuki's wheel moment is theirs, even though the scroll call was still running
+    assert user_input_age_s(age=lambda: 0.2, span=lambda: (98.0, 98.2), now=lambda: 100.0) == pytest.approx(0.2)
+    assert getattr(actions_input.scroll, "__wrapped_by_lease__", False)
+
+
+def test_f4_the_scroll_waits_while_the_user_moves_the_mouse_but_not_for_yukis_own_jump(fast_scroll: Any) -> None:
+    from yuki.actions.leases import RealInput
+    from yuki.actions.scrolling import InputWatch
+
+    clock = {"t": 0.0}
+    spot = {"at": (100, 100)}
+    own = {"now": False}
+    real = RealInput(age=lambda: float("inf"), held=lambda: False, cursor=lambda: spot["at"], now=lambda: clock["t"])
+    watch = InputWatch(real, own_now=lambda t: own["now"], now=lambda: clock["t"])
+    own["now"], spot["at"] = True, (960, 520)       # Yuki's own jump to the scroll point
+    clock["t"] = 0.1
+    assert watch() is False and not watch.moving()
+    own["now"], spot["at"] = False, (100, 100)      # (the jump back is inside the slack too)
+    own["now"] = True
+    clock["t"] = 0.2
+    assert watch() is False and not watch.moving()
+    own["now"], spot["at"] = False, (140, 120)      # the user moves the mouse
+    clock["t"] = 0.3
+    assert watch() is False and watch.moving()      # not a take-over by itself, but the next step waits
+    clock["t"] = 0.3 + fast_scroll.MOUSE_STILL_S + 0.05
+    assert watch() is False and not watch.moving()  # still again: it goes on
+    # the scroll itself holds while moving says so
+    s = fast_scroll
+    moving = {"on": True}
+    steps: list[int] = []
+    s.start_continuous(s.ContinuousScroll(lambda: (steps.append(1), s.StepResult(ok=True))[1], where="Feed",
+                                          moving=lambda: moving["on"]))
+    time.sleep(0.15)
+    assert steps == []
+    moving["on"] = False
+    assert _wait_for(lambda: len(steps) >= 2)
+
+
+def test_f5_a_web_page_that_stops_moving_ends_the_scroll(fast_scroll: Any) -> None:
+    from yuki.actions.scrolling import step_result, wheel_at
+
+    clock = {"t": 0.0}
+    out = wheel_at(960, 520, send=lambda: None, marker=lambda: 500, cursor=lambda: (1, 1), move=lambda x, y: None,
+                   clock=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s), page=True)
+    assert out.moved is None and out.page and out.still and out.facts()["still"] is True
+    blind = wheel_at(960, 520, send=lambda: None, marker=lambda: None, cursor=lambda: (1, 1), move=lambda x, y: None,
+                     clock=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s), page=True)
+    assert blind.moved is None and not blind.still     # nothing measurable: it may run on to its limits
+    result = SimpleNamespace(ok=True, summary="sent", details={"verified": None, "unverifiable": "page",
+                                                               "scrolls": [{"moved": None, "page": True, "still": True}]})
+    assert step_result(result).still and step_result(result).ok
+    s = fast_scroll
+    stops: list[dict[str, Any]] = []
+    marks = iter([False, False, True, True, True, True])   # moved twice, then stopped moving
+    s.start_continuous(s.ContinuousScroll(lambda: s.StepResult(ok=True, still=next(marks, True)), where="Feed",
+                                          on_stop=stops.append))
+    assert _wait_for(lambda: bool(stops)) and stops[-1]["why"] == "still" and stops[-1]["steps"] == 5
+    assert "no movement" in s.stopped_words(stops[-1])
+
+
+@pytest.fixture()
+def stub_window_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scroll's label never reads a real window (the stub desk's handles are invented)."""
+    from yuki.perception import windows
+
+    monkeypatch.setattr(windows, "window_info", lambda hwnd: SimpleNamespace(process_name="browser.exe",
+                                                                             title="Feed"))
+
+
+def test_f6_f13_the_thinkers_until_stopped_scroll_is_guarded_and_stops_when_the_window_leaves(
+        fast_scroll: Any, stub_window_names: None) -> None:
+    from yuki.agent.tools import Dispatcher
+    from yuki.voice.offline import BrowserDesk
+
+    desk = BrowserDesk(action_delay_s=0.005)
+    d = Dispatcher(desk)
+    out = d.dispatch("scroll", {"x": 960, "y": 600, "dy": -1, "until_stopped": True})
+    assert out.ok and "goes on scrolling by itself" in out.summary and "press any key" in out.summary
+    running = fast_scroll.continuous_running()
+    assert running is not None and running.started_by == "thinker"
+    assert _wait_for(lambda: running.steps >= 4)
+    scrolls = [c for c in desk.calls if c[0] == "scroll"]
+    assert all(c[2].get("expect_hwnd") == desk.CHROME for c in scrolls[1:])   # every step is guarded
+    desk.front = desk.DISCORD                       # another window comes to the front
+    assert _wait_for(lambda: not running.running)
+    assert running.why in ("failed", "window")
+    assert desk.tabs[desk.selected]["scroll"] < 100.0   # it never ran on to the page's end
+
+
+def test_f6_the_scroll_stops_when_the_thinker_goes_on_to_act(fast_scroll: Any, stub_window_names: None) -> None:
+    from yuki.agent.tools import Dispatcher
+    from yuki.voice.offline import BrowserDesk
+
+    desk = BrowserDesk(action_delay_s=0.005)
+    d = Dispatcher(desk)
+    assert d.dispatch("scroll", {"x": 960, "y": 600, "dy": -1, "until_stopped": True}).ok
+    running = fast_scroll.continuous_running()
+    assert running is not None
+    d.dispatch("press", {"key": "pagedown"})
+    assert not running.running and running.why == "acting"
+    assert "Yuki went on to act" in fast_scroll.stopped_words(running.report())
+
+
+def test_f6_a_step_refused_because_the_window_left_the_front_ends_it_at_once(fast_scroll: Any) -> None:
+    s = fast_scroll
+    refused = SimpleNamespace(ok=False, summary="Foreground window changed; input not sent",
+                              details={"refused": "foreground"})
+    assert s.step_result(refused).gone
+    stops: list[dict[str, Any]] = []
+    s.start_continuous(s.ContinuousScroll(lambda: s.step_result(refused), where="Feed", on_stop=stops.append))
+    assert _wait_for(lambda: bool(stops)) and stops[-1]["why"] == "window" and stops[-1]["steps"] == 1
+
+
+def test_f7_stop_on_the_strip_stops_a_page_scrolling_on_by_itself(fast_scroll: Any) -> None:
+    from yuki.ui.app import YukiUi
+
+    s = fast_scroll
+    s.start_continuous(s.ContinuousScroll(lambda: s.StepResult(ok=True), where="Feed"))
+    events: list[tuple[str, dict[str, Any]]] = []
+    ui = SimpleNamespace(_stopped=set(), runtime=SimpleNamespace(cancel=lambda rid: "unknown"),
+                         voice=SimpleNamespace(owns=lambda rid: False, interrupt=lambda: None),
+                         ui_log=SimpleNamespace(event=lambda name, **f: events.append((name, f))))
+    ui._stop_keep_scrolling = lambda via: YukiUi._stop_keep_scrolling(ui, via)
+    assert YukiUi._on_strip_stop(ui, 7) == "unknown"
+    assert s.continuous_state() is None
+    assert any(name == "keep_scrolling" and f.get("via") == "strip" and f.get("stopped") == "stop"
+               for name, f in events)
+
+
+class _SlowFirstScrollDesk:
+    """Wraps a BrowserDesk: the first scroll waits until the test lets it go (a stop said during the first step)."""
+
+    def __init__(self) -> None:
+        from yuki.voice.offline import BrowserDesk
+
+        self.inner = BrowserDesk(action_delay_s=0)
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.scrolls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def scroll(self, *a: Any, **k: Any) -> Any:
+        self.scrolls += 1
+        if self.scrolls == 1:
+            self.entered.set()
+            self.release.wait(3.0)
+        return self.inner.scroll(*a, **k)
+
+
+def test_f8_a_stop_said_during_the_first_step_keeps_it_from_starting(fast_scroll: Any) -> None:
+    from yuki.voice.hands import Hands
+
+    desk = _SlowFirstScrollDesk()
+    hands = Hands(desk)
+    hands.snapshot()
+    start = _P("scroll", {"window": desk.inner.CHROME, "direction": "down", "keep": "start", "say_when_done": ""})
+    runner = threading.Thread(target=lambda: asyncio.run(hands.handle(start)), daemon=True)
+    runner.start()
+    assert desk.entered.wait(3.0)
+    assert fast_scroll.continuous_running() is not None      # claimed before its first step
+    stop = _P("scroll", {"window": desk.inner.CHROME, "direction": "down", "keep": "stop", "say_when_done": ""})
+    asyncio.run(hands.handle(stop))
+    assert "stopped as they asked" in stop.results[-1][0]["done"]
+    desk.release.set()
+    runner.join(3.0)
+    assert "stopped as they asked" in start.results[-1][0]["done"]
+    time.sleep(0.1)
+    assert fast_scroll.continuous_state() is None and desk.scrolls == 1   # it never went on
+
+
+def test_f9_an_app_named_between_the_job_starting_and_its_run_beginning_is_kept() -> None:
+    from yuki.agent.loop import Agent
+    from yuki.log.events import Final
+    from yuki.ui.runtime import Job, Lane
+
+    signal = SimpleNamespace(emit=lambda *a, **k: None)
+    runtime = SimpleNamespace(settings=SimpleNamespace(), started=signal, finished=signal, failed=signal,
+                              partial=signal, thought=signal, said=signal, _apps_named={})
+    job = Job(3, "Text Meera", None, "voice")
+    lane = SimpleNamespace(blocked=None, allowed_tools=None, runtime=runtime, name="worker",
+                           _state=threading.Lock(), _named_late={}, _current=job)
+
+    class _Agent:
+        cancelled = False
+
+        def __init__(self) -> None:
+            self._request_app_named: str | None = None
+            self.seen: list[str | None] = []
+
+        def set_app_named(self, app: str | None) -> None:
+            Agent.set_app_named(self, app)
+
+        def run(self, request: str, **kw: Any) -> Any:
+            body = self._body(kw.get("app_named"))
+            Lane.name_app_job(lane, 3, "Telegram")   # the talker's call lands here, before the body has begun
+            return body
+
+        def _body(self, app_named: str | None) -> Any:
+            self._request_app_named = app_named      # as Agent.run's body does at its start
+            yield Final(text="ok")
+            self.seen.append(self._request_app_named)   # what the judge reads on the first action
+
+    lane.agent = _Agent()
+    Lane._drive(lane, job)
+    assert lane.agent.seen == ["Telegram"] and lane._named_late == {}
+
+
+def test_f10_a_held_repeat_is_left_to_the_rerun_which_may_say_it_again_when_asked() -> None:
+    from yuki.voice.mouth import REPEAT_NOTE
+    from yuki.voice.pipeline import _Hooks
+
+    hooks = _Hooks.__new__(_Hooks)
+    said = {"written": "It's ten past four.", "heard": "It's ten past four."}
+    hooks.c = SimpleNamespace(observer=SimpleNamespace(turn=SimpleNamespace(repeat_dropped=False), last_said=said))
+    assert hooks.last_line() == said                     # a fresh reply is guarded
+    hooks.c.observer.turn.repeat_dropped = True
+    assert hooks.last_line() is None                     # the rerun decides by itself
+    assert "say that again" in REPEAT_NOTE and "say it again now" in REPEAT_NOTE
+    assert "Never that line again" not in REPEAT_NOTE
+
+
+def test_f11_a_scroll_that_stops_by_itself_is_logged_never_spoken() -> None:
+    from yuki.voice.hands import Hands
+    from yuki.voice.offline import BrowserDesk
+
+    hands = Hands(BrowserDesk(action_delay_s=0))
+    spoken: list[str] = []
+    hands.bridge = SimpleNamespace(speak=lambda line: spoken.append(line), _loop=object())
+    entries: list[tuple[Any, ...]] = []
+    hands.actions = SimpleNamespace(add=lambda *a, **k: entries.append(a))
+    hands._scroll_stopped({"where": "Browser \"Feed\"", "direction": "down", "steps": 40, "seconds": 300.0,
+                           "percent": None, "why": "limit"})
+    assert spoken == [] and entries and "stopped at its limit" in entries[-1][2]
+
+
+def test_f13_the_conversation_end_stops_a_running_scroll_and_the_hold_follows_the_turn_observer(
+        fast_scroll: Any) -> None:
+    from yuki.config import Settings
+    from yuki.voice.pipeline import Conversation, TurnObserver
+
+    s = fast_scroll
+    obs = TurnObserver(settings=Settings(), log=None, memory=None, session="t", speech_end=lambda: None,
+                       on_state=lambda *a: None, tts_provider="x", activity=lambda: None)
+    logged: list[dict[str, Any]] = []
+    convo = SimpleNamespace(observer=obs, SCROLL_TALK_HOLD_S=Conversation.SCROLL_TALK_HOLD_S,
+                            log=SimpleNamespace(event=lambda name, **f: logged.append(f)))
+    Conversation._scroll_hold(convo, True)
+    obs.last_user_at = time.monotonic() - 60.0
+    assert s.voice_hold() is False
+    obs.user_speaking = True
+    assert s.voice_hold() is True
+    obs.user_speaking, obs.generating = False, True
+    assert s.voice_hold() is True
+    obs.generating, obs.last_user_at = False, time.monotonic()
+    assert s.voice_hold() is True                        # their words just ended (they may be "stop")
+    obs.last_user_at = time.monotonic() - 60.0
+    s.start_continuous(s.ContinuousScroll(lambda: s.StepResult(ok=True), where="Feed", hold=s.voice_hold))
+    assert s.continuous_running() is not None
+    Conversation._scroll_hold(convo, False)              # the conversation ends
+    assert s.continuous_state() is None and logged and logged[-1]["stopped"] == "ended"
+    assert s.voice_hold() is False                       # no conversation: nothing holds it
+
+
+def test_f13_an_empty_goodbye_ends_the_conversation_in_about_a_third_of_a_second() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    stops: list[str] = []
+    convo = SimpleNamespace(observer=SimpleNamespace(bot_speaking=False), QUICK_END_S=Conversation.QUICK_END_S,
+                            log=SimpleNamespace(event=lambda *a, **k: None), session="t",
+                            _set_stop=lambda why: stops.append(why))
+    started = time.monotonic()
+    asyncio.run(Conversation._end_after_speech(convo, quick=True))
+    took = time.monotonic() - started
+    assert stops == ["user_asked"] and 0.25 <= took < 0.8
