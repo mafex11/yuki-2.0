@@ -46,6 +46,47 @@ WATCH_S = 0.6
 POLL_S = 0.05
 #: How far (px) the live element's rectangle may sit from the read's before it is not the same element.
 BOUNDS_SLACK = 24
+#: The job does not start acting this close to the end of its budget (s), so an answer that comes after the caller
+#: gave up (and may have clicked with the mouse instead) never acts a second time.
+ACT_MARGIN_S = 0.3
+_UIA_RUNTIME_ID = 30000
+_TREE_SCOPE_SUBTREE = 7
+
+
+def by_runtime_id(automation: Any, element: dict[str, Any], start: Any, root: int, request: Any) -> Any:
+    """The live element with the read element's RuntimeId (report 58), searched below ``start`` (the element at the
+    read's point: on Chromium the renderer's pane, an ancestor of every web control) when it lies in the same window,
+    else below the window's own root; ``None`` when the read has no RuntimeId or nothing has it now. The match is
+    checked by role too (an id the provider gave to a new element after the old one went is not that element)."""
+    import array
+
+    rid = element.get("runtime_id")
+    if not rid:
+        return None
+    try:
+        condition = automation.CreatePropertyCondition(_UIA_RUNTIME_ID, array.array("i", [int(p) for p in rid]))
+    except Exception:  # noqa: BLE001
+        return None
+    starts = []
+    if start:
+        try:
+            native = int(_facts(start)["native"] or 0)
+            if not native or _root(native) == root:
+                starts.append(start)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        starts.append(automation.ElementFromHandleBuildCache(int(root), request))
+    except Exception:  # noqa: BLE001
+        pass
+    for base in starts:
+        try:
+            found = base.FindFirstBuildCache(_TREE_SCOPE_SUBTREE, condition, request)
+        except Exception:  # noqa: BLE001
+            continue
+        if found and _facts(found)["role"] == str(element.get("role") or ""):
+            return found
+    return None
 
 #: The verb -> the patterns that carry it, in order of preference (the read's pattern labels, yuki.perception.tree).
 VERB_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -150,6 +191,8 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
     title_before = _title(root)
     pid = _window_pid(root) if verb == "click" else 0
     windows_before = _process_top_windows(pid) if pid else {}
+    #: Past this the job never starts acting (the caller has given up waiting for it at BUDGET_S).
+    stop_at = time.monotonic() + BUDGET_S - ACT_MARGIN_S
 
     def job(automation: Any, shared: dict) -> None:
         from ctypes import wintypes
@@ -161,7 +204,7 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
         for prop in (_UIA_CONTROL_TYPE, _UIA_NAME, _UIA_NATIVE_WINDOW_HANDLE, _UIA_BOUNDING_RECT):
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
-        current = automation.ElementFromPointBuildCache(wintypes.POINT(x, y), request)
+        at_point = current = automation.ElementFromPointBuildCache(wintypes.POINT(x, y), request)
         walker = automation.ControlViewWalker
         found = None
         for _ in range(MATCH_LEVELS + 1):
@@ -173,7 +216,15 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
                 break
             current = walker.GetParentElementBuildCache(current, request)
         if found is None:
+            # report 58: on Chromium/CEF the point answers with the renderer's whole pane, an ancestor of every web
+            # control, so the climb above never meets the control; its RuntimeId finds it below that pane
+            found = by_runtime_id(automation, element, at_point, root, request)
+        if found is None:
             shared["missing"] = "no element at its point matches the read (it moved, or something covers it)"
+            return
+        if time.monotonic() >= stop_at:
+            # found too late: the caller has stopped waiting and may use the mouse; never act twice
+            shared["missing"] = "finding it took too long"
             return
         try:
             import win32gui

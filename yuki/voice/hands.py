@@ -652,7 +652,9 @@ class Hands:
         self.actions = actions if actions is not None else ActionLog()
         # One tree read of the window in front serves the names line and the items line (v3.14); its element ids
         # are this dispatcher's own, so a click by item resolves against the very read the talker was shown.
-        self._dispatcher = Dispatcher(backend, max_tree_elements=300, tree_timeout_s=0.8)
+        # appPerception (report 58): the voice's quick hands keep their speed; the before/after account of an action
+        # is the thinker's (turn it on here with verify_outcomes=True once measured live)
+        self._dispatcher = Dispatcher(backend, max_tree_elements=300, tree_timeout_s=0.8, verify_outcomes=False)
         from yuki.voice.workers import shared
 
         #: Where the background reads run (yuki.voice.workers): started here, off every loop.

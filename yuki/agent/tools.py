@@ -1060,8 +1060,6 @@ OUTCOME_QUIET_S = 0.25
 OUTCOME_CAP_S = 1.5
 #: Read budgets for those two reads (s).
 OUTCOME_READ_S = 2.0
-#: Without events, a read of the window this recent (s), with no action since, stands in for the read before.
-BEFORE_FRESH_S = 1.0
 #: Lines of "what changed" put into an action's result.
 OUTCOME_LINES = 4
 #: A read of the window at most this old (s), compared with a fresh read just before the action, tells which
@@ -1784,8 +1782,10 @@ class Dispatcher:
         tool_timeout_s: float = 20.0,
         max_tree_elements: int = TREE_ELEMENTS,
         tree_timeout_s: float = 6.0,
+        verify_outcomes: bool | None = None,
     ) -> None:
         self.backend = backend if backend is not None else default_backend()
+        self._verify_choice = verify_outcomes
         self.screenshot_policy = screenshot_policy
         self.tool_timeout_s = tool_timeout_s
         self.max_tree_elements = max_tree_elements
@@ -1808,11 +1808,14 @@ class Dispatcher:
         #: the real desktop; a stub desk turns it on to test it). ``events``: the UI Automation event hub that says
         #: whether a read is still current and when a window has settled (yuki.perception.events; the process's
         #: shared one on the real desktop, None: reads instead).
-        self.verify_outcomes = isinstance(self.backend, _LazyRealBackend)
+        self.verify_outcomes = (isinstance(self.backend, _LazyRealBackend) if self._verify_choice is None
+                                else bool(self._verify_choice))
         self.use_events = True
         self.events: Any = None
-        #: hwnd -> (event generation, monotonic time, opaque) when the model's latest observation of it was taken.
+        #: hwnd -> (event generation, monotonic time, opaque) when the model's latest observation of it was taken,
+        #: and that read itself (reused by the view after actions while the window's events show no change).
         self._observed: dict[int, tuple[int | None, float, bool]] = {}
+        self._observed_trees: dict[int, Any] = {}
         #: The window of the most recent tree read, the default for an element id.
         self._latest_tree_hwnd: int | None = None
         #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
@@ -2282,6 +2285,11 @@ class Dispatcher:
     def _note_observed(self, hwnd: int, generation: int | None, at: float, tree: Any) -> None:
         if str(_field(tree, "status") or "ok") == "ok":
             self._observed[int(hwnd)] = (generation, at, bool(_field(tree, "opaque")))
+            self._observed_trees[int(hwnd)] = tree
+            if len(self._observed_trees) > 16:
+                for old in sorted(self._observed_trees, key=lambda h: self._observed.get(h, (None, 0.0))[1])[:4]:
+                    if old != int(hwnd):
+                        self._observed_trees.pop(old, None)
 
     def _observe(self, hwnd: int, *, timeout_s: float = OUTCOME_READ_S) -> list[Any] | None:
         """A read of ``hwnd`` for the screen model only (not handed to the model as a read): its ids carried, so the
@@ -2302,17 +2310,15 @@ class Dispatcher:
 
     def _current(self, hwnd: int) -> tuple[list[Any] | None, bool]:
         """The window as it is now, for the read before an action: ``(elements, fresh)``. The model's latest
-        observation when the window's events show nothing happened since it was taken (or, without events, when it
-        is under :data:`BEFORE_FRESH_S` old and Yuki has not acted on the window since); else a new read."""
+        observation when the window's events show nothing happened since it was taken; else a new read."""
         model = self.window_model(int(hwnd))
         seen = self._observed.get(int(hwnd))
         if model.latest and seen is not None:
             generation = self._generation(hwnd)
             if generation is not None and seen[0] == generation:
                 return list(model.latest.values()), False
-            facts = self._read_facts.get(int(hwnd)) or {}
-            if generation is None and time.monotonic() - seen[1] < BEFORE_FRESH_S and not facts.get("acted"):
-                return list(model.latest.values()), False
+        # Without events a fresh read is the only way to know the window as it is now, and comparing it with the
+        # thinker's read is what shows the elements that change on their own (a clock, a progress bar).
         return self._observe(hwnd), True
 
     def _settled_after(self, hwnd: int, generation: int | None) -> None:
@@ -2651,15 +2657,22 @@ class Dispatcher:
         started = time.perf_counter()
         deadline = started + max(cap_s, 0.0)
         generation, observed_at = self._generation(hwnd), time.monotonic()
-        tree = self.backend.get_window_tree(
+        reused = self._still_current(hwnd, generation)
+        tree = reused if reused is not None else self.backend.get_window_tree(
             hwnd, max_elements=self.max_tree_elements, timeout_s=max(cap_s, 0.1)
         )
-        reads = 1
+        reads = 0 if reused is not None else 1
         signature = _tree_signature(tree)
         changed_at = time.perf_counter()
         settled = False
         hub = self._hub()
-        if not settle:
+        if reused is not None:
+            # report 58: the read taken after the last action (it already waited for the window to go quiet) is
+            # still current by the window's events: nothing is read again
+            settled = True
+            reason = "the read after the last action, still current by the window's events"
+            observed_at = self._observed[int(hwnd)][1]
+        elif not settle:
             reason = "one read: the action had already reported the content ready"
         elif signature[0] != "ok":
             reason = f"one read: the window's status is {signature[0]}"
@@ -2750,6 +2763,15 @@ class Dispatcher:
             changes=changes_text is not None,
             full_chars=len(full),
         )
+
+    def _still_current(self, hwnd: int, generation: int | None) -> Any:
+        """The tree of the latest observation of ``hwnd`` (the read after an action) when the window's events show
+        nothing changed since it was taken, else ``None``."""
+        seen = self._observed.get(int(hwnd))
+        tree = self._observed_trees.get(int(hwnd))
+        if generation is None or seen is None or tree is None or seen[0] != generation:
+            return None
+        return tree
 
     def _cut_short(self, tree: Any) -> bool:
         """Whether a read was stopped by the clock (truncated with fewer elements than the cap)."""
@@ -3544,6 +3566,28 @@ class Dispatcher:
 
         return act() if system else self._bracketed("press", self._key_window(tool_input), act)
 
+    def _scroller_at(self, hwnd: int | None, x: int, y: int) -> tuple[int, str] | None:
+        """``(id, label)`` of the smallest scrollable element of the window's latest read whose box holds (x, y), when
+        it has a RuntimeId to be found again by; ``None`` otherwise."""
+        if not hwnd or int(hwnd) not in self._latest_trees:
+            return None
+        model = self._models.get(int(hwnd))
+        pool = model.latest.values() if model is not None and model.latest else self._latest_trees[int(hwnd)][1].values()
+        best: tuple[int, int, dict[str, Any]] | None = None
+        for raw in pool:
+            element = raw if isinstance(raw, dict) else _plain(raw)
+            b = element.get("bounds")
+            if not element.get("is_scrollable") or not element.get("runtime_id") or not b or len(b) != 4:
+                continue
+            if not (int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3])):
+                continue
+            area = (int(b[2]) - int(b[0])) * (int(b[3]) - int(b[1]))
+            if best is None or area < best[0]:
+                best = (area, int(element["id"]), element)
+        if best is None:
+            return None
+        return best[1], f"[{best[1]}] {self._short_label(best[2])} (the scrolling area at ({x},{y}))"
+
     def _key_window(self, tool_input: dict[str, Any]) -> int | None:
         """The window keys go to: ``expect_hwnd``, else the one in front (``None`` when it cannot be told)."""
         hwnd = self._opt_hwnd(tool_input)
@@ -3574,6 +3618,17 @@ class Dispatcher:
                                           dx=self._opt_int(tool_input, "dx", 0))
                 if via is not None:
                     return self._labelled(via, label)
+            else:
+                # report 58: at a raw point, the scrolling area the latest read shows there is scrolled through its
+                # pattern, found again by its RuntimeId (on Chromium the point itself answers with the renderer pane)
+                area = self._scroller_at(window, x, y)
+                if area is not None:
+                    via = self._pattern_first("scroll", {**tool_input, "element": area[0], "expect_hwnd": window},
+                                              "scroll", dy=self._opt_int(tool_input, "dy", 0),
+                                              dx=self._opt_int(tool_input, "dx", 0))
+                    if via is not None and via.ok:
+                        return self._labelled(via, area[1])
+                    # it would not scroll that way: the wheel at the point, as before
             self._before_input("scroll")
             return self._labelled(
                 self._from_action(

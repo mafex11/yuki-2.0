@@ -51,6 +51,8 @@ class Change:
     """What differs between two reads of one window (ids carried)."""
 
     target: int | None = None
+    #: How the target is named in the account (``Button "Lyrics"``), from the read before the action.
+    target_label: str = ""
     #: The target's own differences: ``[(kind, before, after)]`` (kind: state, value, range, name, gone).
     target_changes: list[tuple[str, Any, Any]] = field(default_factory=list)
     #: Roots of what appeared / went (an element whose parent did not also appear / go), with how many elements
@@ -153,6 +155,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         noisy |= {i for i in r if i in b and _shown(r[i]) != _shown(b[i])}
     # the target
     if target is not None and target in b:
+        change.target_label = label(b[target])
         if target not in a:
             change.target_changes.append(("gone", fact(b[target], "name"), None))
         else:
@@ -198,6 +201,9 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         left = sum(1 for i in gone if _scrollers_of(i, b) == scroller)
         container = a.get(scroller) if scroller >= 0 else (after[0] if after else None)
         change.moved.append((container, dy, dx, came, left))
+        # what came into view or left it there is part of the movement, counted with it, not listed apart
+        change.appeared = [(e, n) for e, n in change.appeared if _scrollers_of(fact(e, "id"), a) != scroller]
+        change.gone = [(e, n) for e, n in change.gone if _scrollers_of(fact(e, "id"), b) != scroller]
     t0 = fact(before[0], "name") if before else ""
     t1 = fact(after[0], "name") if after else ""
     if before and after and fact(before[0], "depth", 0) == 0 and t0 != t1:
@@ -274,19 +280,13 @@ def describe(change: Change, *, target_label: str = "") -> list[str]:
     """What changed, in plain sentences, most telling first (the target, then what appeared or went, movement, other
     changes, the title and page); ``["nothing visible changed in the window"]`` when nothing did."""
     lines: list[str] = []
-    subject = target_label or "it"
+    subject = target_label or change.target_label or "it"
     for kind, before, after in change.target_changes:
         lines.append(_one_change(subject, kind, before, after))
     if change.page:
         lines.append(f"the page is now {_clip(change.page[1], 90) or 'gone'} (was {_clip(change.page[0], 90)})")
     elif change.title:
         lines.append(f'the window\'s title is now "{_clip(change.title[1], 90)}"')
-    for element, size in change.appeared[:NAMED_CHANGES]:
-        inside = f" with {size - 1} element(s) inside" if size > 1 else ""
-        lines.append(f"{label(element)} appeared{inside}")
-    if len(change.appeared) > NAMED_CHANGES:
-        rest = sum(n for _e, n in change.appeared[NAMED_CHANGES:])
-        lines.append(f"and {rest} more element(s) appeared")
     for container, dy, dx, came, left in change.moved:
         way = []
         if dy:
@@ -300,13 +300,16 @@ def describe(change: Change, *, target_label: str = "") -> list[str]:
             counts.append(f"{left} left it")
         lines.append(f"the content of {label(container)} moved {' and '.join(way)}"
                      + (f": {', '.join(counts)}" if counts else ""))
-    moved_counts = bool(change.moved)
+    for element, size in change.appeared[:NAMED_CHANGES]:
+        inside = f" with {size - 1} element(s) inside" if size > 1 else ""
+        lines.append(f"{label(element)} appeared{inside}")
+    if len(change.appeared) > NAMED_CHANGES:
+        rest = sum(n for _e, n in change.appeared[NAMED_CHANGES:])
+        lines.append(f"and {rest} more element(s) appeared")
     for element, size in change.gone[:NAMED_CHANGES]:
-        if moved_counts:
-            break   # what scrolled out of view is already counted with the movement
         inside = f" with {size - 1} element(s) inside" if size > 1 else ""
         lines.append(f"{label(element)} went away{inside}")
-    if not moved_counts and len(change.gone) > NAMED_CHANGES:
+    if len(change.gone) > NAMED_CHANGES:
         rest = sum(n for _e, n in change.gone[NAMED_CHANGES:])
         lines.append(f"and {rest} more element(s) went away")
     for element, diffs in change.changed[:NAMED_CHANGES]:

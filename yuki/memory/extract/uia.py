@@ -946,6 +946,13 @@ def snapshot_from_tree(tree: object) -> Snapshot:
             is_focused=element.is_focused,
             is_selected="selected" in (element.states or ()),
             is_invokable="invoke" in (element.patterns or ()),
+            # appPerception (report 58): the same identity and facts the agent's reader keeps; a control the app
+            # hides in place (a slider's input inside its label) is never text
+            automation_id=getattr(element, "automation_id", "") or "",
+            runtime_id=tuple(getattr(element, "runtime_id", None) or ()) or None,
+            sr_only=bool(getattr(element, "hidden", False)),
+            pos_in_set=(getattr(element, "position", None) or (0, 0))[0],
+            size_of_set=(getattr(element, "position", None) or (0, 0))[1],
         )
         nodes[element.id] = node
         parent = nodes.get(getattr(element, "parent", -1))

@@ -39,6 +39,7 @@ class Node:
     aid: str = ""
     enabled: bool = True
     control: bool = True
+    pos: tuple[int, int] | None = None
     children: list["Node"] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -89,6 +90,8 @@ class Node:
             T._P_RANGE_VALUE_IS_READONLY: False,
             T._P_AUTOMATION_ID: self.aid,
             T._P_IS_CONTROL_ELEMENT: self.control,
+            T._P_POSITION_IN_SET: self.pos[0] if self.pos else 0,
+            T._P_SIZE_OF_SET: self.pos[1] if self.pos else 0,
         }
         return table.get(pid)
 
@@ -302,20 +305,50 @@ def player_window(*, volume: float = 0.6, lyrics_on: bool = False, slider_box: s
     return window
 
 
-def chat_window(*, messages: int = 60, visible_from: int = 40, offset: int = 0) -> Node:
+def chat_window(*, messages: int = 60, visible_from: int = 40, offset: int = 0, doc_scrolls: bool = False,
+                positions: bool = False, rids: dict | None = None) -> Node:
     """A Discord-like DM: a scrolling List of message ListItems (rendered beyond the view, as a virtualised list keeps
     a margin), oldest first, and the message box.  Items before ``visible_from`` lie above the list's box (off-screen);
-    ``offset`` shifts every item up by that many px (a scroll)."""
-    window = Node("Window", "@Sam - Discord", (229, 138, 1645, 890))
-    doc = Node("Document", "@Sam", (237, 138, 1637, 882), value="https://discord.com/channels/@me/1")
-    chat = Node("List", "Messages in @Sam", (500, 200, 1600, 800), scroll=True, focusable=True)
+    ``offset`` shifts every item up by that many px (a scroll).  ``doc_scrolls``: the Document reports a scroll
+    pattern, as Chromium's did on 3-4 Oct (the walk then reads it level by level).  ``positions``: the items carry
+    the app's own numbering (k of n).  ``rids``: RuntimeIds by item index, kept between two builds."""
+    window = Node("Window", "@Sam - Discord", (229, 138, 1645, 890), rid=(42, 1))
+    doc = Node("Document", "@Sam", (237, 138, 1637, 882), value="https://discord.com/channels/@me/1",
+               scroll=doc_scrolls, rid=(42, 2))
+    chat = Node("List", "Messages in @Sam", (500, 200, 1600, 800), scroll=True, focusable=True, rid=(42, 3))
+    rids = rids if rids is not None else {}
     for i in range(messages):
         y = 200 + (i - visible_from) * 40 - offset
         box = (500, y, 1600, y + 40)
         off = box[3] <= 200 or box[1] >= 800
-        chat.add(Node("ListItem", f"Sam: invented message number {i + 1}", box, offscreen=off).add(
-            Node("Text", f"invented message number {i + 1}", (560, y + 10, 1200, y + 30), offscreen=off)))
-    box = Node("Edit", "Message @Sam", (500, 820, 1600, 860), value="", readonly=False, focusable=True)
+        item_rid = rids.setdefault(i, (42, 100 + 2 * i))
+        chat.add(Node("ListItem", f"Sam: invented message number {i + 1}", box, offscreen=off, rid=item_rid,
+                      pos=(i + 1, messages) if positions else None).add(
+            Node("Text", f"invented message number {i + 1}", (560, y + 10, 1200, y + 30), offscreen=off,
+                 rid=(item_rid[0], item_rid[1] + 1))))
+    box = Node("Edit", "Message @Sam", (500, 820, 1600, 860), value="", readonly=False, focusable=True, rid=(42, 4))
     doc.add(chat, box)
     window.add(doc)
+    return window
+
+
+def feed_window(*, offset: int = 0, rows: int = 30) -> Node:
+    """A YouTube-like home page in a browser window: the page Document scrolls (as Chromium reports it), holding a
+    grid of video links four to a row; ``offset`` px scrolled down.  Items wholly outside the view report
+    off-screen.  RuntimeIds are fixed per item, so two builds are two reads of one page."""
+    window = Node("Window", "Arc", (-8, -8, 1928, 1088), rid=(7, 1))
+    pane = Node("Pane", "Arc", (0, 0, 1920, 1080), rid=(7, 2))
+    doc = Node("Document", "(12) YouTube", (0, 32, 1920, 1072), value="https://www.youtube.com/", scroll=True,
+               rid=(7, 3))
+    grid = Node("Group", "", (0, 32, 1920, 1072), rid=(7, 4))
+    for r in range(rows):
+        for c in range(4):
+            top = 100 + r * 300 - offset
+            box = (40 + c * 470, top, 470 + c * 470, top + 260)
+            off = box[3] <= 32 or box[1] >= 1072
+            grid.add(Node("Hyperlink", f"Invented video {r * 4 + c + 1}", box, invoke=True, offscreen=off,
+                          value=f"https://www.youtube.com/watch?v=v{r * 4 + c + 1}", rid=(7, 1000 + r * 4 + c)))
+    doc.add(grid)
+    pane.add(doc)
+    window.add(pane)
     return window

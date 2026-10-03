@@ -2896,6 +2896,9 @@ def _walk_window(
     )
     if not thin or len(best.elements) >= max_elements or time.monotonic() >= deadline:
         return best
+    # Report 58: a content window that exposed nothing is asked once more, the way a screen reader asks (an MSAA
+    # client request): some providers build their whole tree only for such a client.
+    _wake_accessibility(child_handles, best.viewport)
     if not young and measured_opaque(hwnd):
         # Measured opaque minutes ago and not just opened: it was already watched
         # for a tree to wake, and polling it again only costs the reader time.
@@ -2950,6 +2953,69 @@ def _walk_window(
             break  # populated, and has stopped growing
     best.passes = passes
     return best
+
+
+#: Content windows already asked by :func:`_wake_accessibility`, with when (monotonic): each is asked at most once
+#: in this long (s).
+_WAKE_MEMO_S = 600.0
+_woken: dict[int, float] = {}
+_OBJID_CLIENT = 0xFFFFFFFC
+_IID_IACCESSIBLE = "{618736E0-3C3D-11CF-810C-00AA00389B71}"
+
+
+def _wake_accessibility(handles: list[int], viewport: tuple[int, int, int, int] | None) -> int:
+    """Ask each large descendant window that a thin read found empty for its accessible object, as an assistive
+    technology does (``AccessibleObjectFromWindow(OBJID_CLIENT)``), once per :data:`_WAKE_MEMO_S`.
+
+    Chromium and the apps built on it (Electron, CEF) turn on their accessibility tree when a client asks for it;
+    a renderer window can answer UI Automation's own first question with an empty root and build the tree only for
+    a client request.  This is that request, made only for a content window that a read just found empty (the thin
+    read's gap), never on every read: an app's accessibility mode is the app's cost, and the reads of 3-4 Oct show
+    the tree complete once it is on.  Returns how many windows were asked.  Window facts only; nothing here knows
+    which program drew them.
+    """
+    if not handles:
+        return 0
+    try:
+        import comtypes
+        from comtypes import GUID, IUnknown
+
+        oleacc = ctypes_oleacc()
+    except Exception:
+        return 0
+    view_area = _area(viewport) if viewport else 0
+    now = time.monotonic()
+    asked = 0
+    for handle in handles[:_MAX_CHILD_WINDOWS]:
+        rect = _window_rect(handle)
+        if rect is None or (view_area and _area(_overlap(rect, viewport) if viewport else rect)
+                            < _SURFACE_MIN_SHARE * view_area):
+            continue
+        with _fresh_lock:
+            if now - _woken.get(handle, -_WAKE_MEMO_S) < _WAKE_MEMO_S:
+                continue
+            _woken[handle] = now
+            if len(_woken) > 256:
+                for stale in [h for h, at in _woken.items() if now - at >= _WAKE_MEMO_S]:
+                    _woken.pop(stale, None)
+        try:
+            import ctypes
+
+            pointer = comtypes.POINTER(IUnknown)()
+            oleacc.AccessibleObjectFromWindow(ctypes.c_void_p(handle), ctypes.c_ulong(_OBJID_CLIENT),
+                                              ctypes.byref(GUID(_IID_IACCESSIBLE)), ctypes.byref(pointer))
+            asked += 1
+            del pointer   # released at once: the request is the point, not the object
+        except Exception:
+            continue
+    return asked
+
+
+def ctypes_oleacc() -> object:
+    """``oleacc.dll`` (the MSAA client library), loaded once."""
+    import ctypes
+
+    return ctypes.oledll.oleacc
 
 
 def _has_content(walker: object) -> bool:
