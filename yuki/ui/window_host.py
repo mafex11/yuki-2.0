@@ -497,7 +497,10 @@ class WindowHost(QObject):
         found = self._on_gui(local)
         if found is not None:
             return found
-        rows = self._memory_call("recent_nudges", hours=24 * 7) or []
+        try:
+            rows = self._memory_call("recent_nudges", hours=24 * 7) or []
+        except RuntimeError:   # memory not answering: the card can't be found
+            return None
         return next((n for n in rows if isinstance(n, dict) and str(n.get("id")) == key), None)
 
     def _op_plan(self, req: dict[str, Any]) -> dict[str, Any]:

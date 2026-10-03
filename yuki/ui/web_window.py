@@ -1141,7 +1141,14 @@ def main(argv: list[str] | None = None) -> int:
     from yuki.ui import ui_settings
 
     ui = ui_settings.load()
-    win = WebWindow(db_path=args.db, page=page, thread=thread,
+    # another memory (a test copy, a measurement) keeps its window files (snapshot, pending corrections) beside it,
+    # never in the user's own ui.json folder
+    ui_path = None
+    db = Path(args.db) if args.db is not None else default_db_path()
+    users = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "Yuki" / "memory" / "memory.db"
+    if db.resolve() != users.resolve():
+        ui_path = db.resolve().parent / "ui.json"
+    win = WebWindow(db_path=args.db, page=page, thread=thread, ui_path=ui_path,
                     fixture=load_fixture(Path(args.fixture)) if args.fixture else None,
                     connect=not args.no_connect, t0=args.t0, metrics_path=args.metrics, shot=args.shot,
                     exit_after=args.exit_after, memory_low_after=args.memory_low_after, assume_focus=args.assume_focus,
