@@ -519,7 +519,8 @@ def test_the_frame_resolves_him_to_the_dm_in_front_with_routes_preconditions_and
     assert "Close call between the first two" in elina.text            # her DM and RES are about even
     # "my usual channel": the group chats on the same apps as the person's routes come with them
     tag = frame.build(client.frame_facts("tag Hemanth in my usual channel", now=NOW), now=NOW)
-    assert "Group chats on the same apps the user writes in most:" in tag.text and "after-hours" in tag.text
+    assert "Group chats and channels on the same apps" in tag.text and "after-hours" in tag.text
+    assert "never the DM" in tag.text                                  # revamp D personal: the channel example
     # a person only remembered from the conversation keeps one line with the usual route, no block, no action
     later = frame.build(client.frame_facts("lower your volume", said=[{"at": NOW - 200, "text": "Hemanth is your best "
                                                                        "friend.", "who": "yuki"}], now=NOW), now=NOW)

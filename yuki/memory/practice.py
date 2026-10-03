@@ -74,7 +74,17 @@ KINDS: tuple[str, ...] = ("procedure", "habit", "pitfall", "style")
 #: "How to do it" kinds (the Playbook page's procedures) and lessons (pitfalls and style notes).
 WAY_KINDS: tuple[str, ...] = ("procedure", "habit")
 LESSON_KINDS: tuple[str, ...] = ("pitfall", "style")
-STATES: tuple[str, ...] = ("candidate", "active", "trusted", "stale", "retired", "disabled")
+STATES: tuple[str, ...] = ("probation", "candidate", "active", "trusted", "stale", "retired", "disabled")
+#: Probation (revamp D personal, 30c-build-D-personal.md): objects migrated from the old know-how rows (origin
+#: "knowhow") start here, at low confidence, and are never shown to the brain until a successful run confirms them -
+#: a run that worked with it (``ran_ok``), a run the distiller learned the same thing from (an ``observed`` event of a
+#: run, or a new version that supersedes it), or the user's own Save (``taught`` from the Playbook page). One migrated
+#: row ("drag the YouTube player's slider") made "lower your volume" worse in two of three eval runs (27 §4.3).
+PROBATION_ORIGINS: tuple[str, ...] = ("knowhow",)
+PROBATION_CONFIDENCE = 0.35
+#: The run key prefix of the evidence the migration itself wrote (yuki.memory.practice_learn.Intake): never a
+#: confirmation.
+MIGRATION_RUN_PREFIX = "knowhow:"
 #: The ledger's weights: positive evidence that the object is true and useful, negative evidence against it; the rest
 #: (use and bookkeeping) weigh nothing. ``observed``: Yuki's own run showed it (the steps a procedure came from, the
 #: failed step a pitfall names); ``observed_day``: the nightly miner saw it recur, counted once per distinct day;
@@ -600,6 +610,8 @@ class Playbook:
 
     def label(self) -> str:
         """How sure memory is, in words for the brain and the page."""
+        if self.state == "probation":
+            return "from old notes, not confirmed by a run yet"
         if self.state == "candidate":
             return "tentative, seen once"
         if self.state == "stale":
@@ -736,7 +748,19 @@ class Event:
     day: str | None = None
 
 
-def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float | None = None) -> dict[str, Any]:
+def confirmed(events: Sequence[Any]) -> bool:
+    """Whether a migrated object has evidence from after its migration: a run that worked with it (``ran_ok``), a
+    run that showed the same thing (``observed`` with a run's key), or the user's own word (``taught`` not written by
+    the migration). The miner's recurring days alone never confirm it (they are no run)."""
+    for e in events:
+        key = str(getattr(e, "run_key", None) or "")
+        if e.type == "ran_ok" or (e.type in ("observed", "taught") and not key.startswith(MIGRATION_RUN_PREFIX)):
+            return True
+    return False
+
+
+def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float | None = None,
+             origin: str | None = None) -> dict[str, Any]:
     """Confidence, state and counts from the ledger (code only).
 
     ``confidence = (S + 1) / (S + F + 2) * 0.5 ** (age_days / half-life)``: S is the positive weight (``observed_day``
@@ -744,7 +768,9 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
     is no evidence). State: *retired* when the confidence is under :data:`RETIRE_BELOW` with at least
     :data:`RETIRE_NEGATIVES` negative events; *stale* past one half-life without evidence; *active* with two independent
     sources (runs or days) or the user's own words, *trusted* once :data:`TRUST_USES` uses worked with no negative event
-    since the first of them; else *candidate*."""
+    since the first of them; else *candidate*. An object migrated from the old know-how (``origin`` in
+    :data:`PROBATION_ORIGINS`) is *probation* - its confidence at most :data:`PROBATION_CONFIDENCE`, never shown to the
+    brain - until :func:`confirmed` (a retire or a stale state still wins)."""
     now = _now(now)
     pos = neg = 0.0
     seen_days: set[str] = set()
@@ -799,6 +825,9 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
         state = "trusted" if len(clean_after) >= TRUST_USES else "active"
     else:
         state = "candidate"
+    if origin in PROBATION_ORIGINS and state not in ("retired", "stale") and not confirmed(events):
+        state = "probation"
+        conf = min(conf, PROBATION_CONFIDENCE)
     return {"confidence": round(conf, 4), "state": state, "n_observed": counts["observed"] + counts["observed_day"],
             "n_days": len(seen_days), "n_ran_ok": counts["ran_ok"], "n_ran_trouble": counts["ran_trouble"],
             "n_corrected": counts["user_corrected"], "n_used": len(cited_runs), "last_evidence_at": last_ev,
@@ -818,10 +847,11 @@ def recompute(store: Store, ids: Iterable[int], *, now: float | None = None) -> 
     now = _now(now)
     out: dict[int, dict[str, Any]] = {}
     for pid in dict.fromkeys(int(i) for i in ids):
-        rows = store._query("SELECT kind, created_at, valid_to, disabled_at FROM playbooks WHERE id=?", (pid,))
+        rows = store._query("SELECT kind, created_at, valid_to, disabled_at, origin FROM playbooks WHERE id=?", (pid,))
         if not rows or rows[0]["valid_to"] is not None:
             continue
-        ev = evaluate(rows[0]["kind"], ledger(store, pid), created_at=float(rows[0]["created_at"]), now=now)
+        ev = evaluate(rows[0]["kind"], ledger(store, pid), created_at=float(rows[0]["created_at"]), now=now,
+                      origin=rows[0]["origin"])
         state = "disabled" if rows[0]["disabled_at"] is not None else ev["state"]
         retire = ev["state"] == "retired" and rows[0]["disabled_at"] is None
 
@@ -1040,6 +1070,8 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     habit_hits: list[tuple[float, Playbook, float, str]] = []
     pit_hits: list[tuple[tuple[float, float], Playbook, float | None, str]] = []
     for o in objs:
+        if o.state == "probation":   # migrated know-how: never shown until a successful run confirms it
+            continue
         c = cos(o)
         hit = bool(set(o.apps) & set(in_play))
         if o.kind == "pitfall":
@@ -1094,13 +1126,14 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
         now = _now(now)
         objs = live(store, include_disabled=True)[:limit]
         for o in objs:   # decay moves with the clock: the page shows it as of now (read only; the worker writes it)
-            ev = evaluate(o.kind, ledger(store, o.id), created_at=o.created_at, now=now)
+            ev = evaluate(o.kind, ledger(store, o.id), created_at=o.created_at, now=now, origin=o.origin)
             o.confidence = ev["confidence"]
             o.state = "disabled" if o.disabled_at is not None else ev["state"]
         cards = [_card(o) for o in objs]
-        procedures = [c for c, o in zip(cards, objs) if o.kind in WAY_KINDS and o.state != "candidate"]
-        lessons = [c for c, o in zip(cards, objs) if o.kind in LESSON_KINDS and o.state != "candidate"]
-        proposals = [c for c, o in zip(cards, objs) if o.state == "candidate"]
+        unsure = ("candidate", "probation")
+        procedures = [c for c, o in zip(cards, objs) if o.kind in WAY_KINDS and o.state not in unsure]
+        lessons = [c for c, o in zip(cards, objs) if o.kind in LESSON_KINDS and o.state not in unsure]
+        proposals = [c for c, o in zip(cards, objs) if o.state in unsure]
         try:
             for q in store.questions(("open", "asked"), limit=20):
                 if q.origin == "practice":

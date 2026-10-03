@@ -139,6 +139,16 @@ CHECK_LABEL = "[Yuki's check, not the user]"
 #: framed as theirs, so it reads as the user's words and not as a tool's output.
 STEER_LABEL = "[The user added while you were working]"
 
+#: The judge's words (review 34 H4, M3; ``Agent._note_words``): the kinds a request's own words are noted as, how long
+#: an earlier request's words stay in view once a new request begins (a quick follow-up still reads them; this
+#: morning's never), and the most heard turns of a spoken request given to it.
+REQUEST_WORD_KINDS: frozenset[str] = frozenset({"typed", "heard", "reading", "card", "suggestion"})
+USER_WORDS_WINDOW_S = 120.0
+USER_WORDS_HEARD = 3
+#: The opening of a request sent from a card's suggestion unchanged (``yuki.ui.nudges.SUGGESTION_MARK``, Yuki's own
+#: format): its words are Yuki's offer, never typed by the user.
+SUGGESTION_MARK = "[Yuki's own suggestion"
+
 #: Why a run was stopped (:meth:`Agent.cancel`): the user stopped it, or it was withdrawn because
 #: the user's newer request replaced it (voice: "no, close the tab instead"). A withdrawn run ends
 #: quietly: its caller shows it as cancelled, never as an error, and nothing of it is spoken.
@@ -453,8 +463,10 @@ class Agent:
         #: The authorization judge (revamp D, S1, yuki.agent.judge): its per-request memo, grants and denial counts.
         self.authorizer = Authorizer(lambda: self.client, self.settings, log=self.logger.log) \
             if getattr(self.settings, "judge", True) else None
-        #: The user's own words in this conversation, oldest first (what the judge sees): request words, words added
-        #: mid-run, answers to questions. ``{"how": typed | voice | added | answer, "text", "question"?}``.
+        #: What was said in this conversation, oldest first (what the judge sees), each labelled by whose words it is:
+        #: the user's (typed, heard, added mid-run, an answer) or Yuki's context (reading, card, suggestion).
+        #: ``{"how", "text", "at", "request", "question"?}``; an earlier request's words leave after
+        #: :data:`USER_WORDS_WINDOW_S` (``_note_words``).
         self._user_words: deque[dict[str, Any]] = deque(maxlen=24)
         self._client = client
         self._client_lock = threading.Lock()
@@ -499,6 +511,9 @@ class Agent:
         #: ``(portrait text, turn)`` of the last portrait attached in full to
         #: this conversation; an identical one is not sent again.
         self._portrait_sent: tuple[str, int] | None = None
+        #: What this request's reply was written from, for memory's personal-ness log (revamp 09 P4.1, ids only):
+        #: the brief lines in the profile layer, the memories attached, the playbooks the frame showed.
+        self._surfaced: dict[str, Any] = {"brief_ids": [], "brief_at": None, "fact_ids": []}
         #: Requests this conversation has started (1 on the first).
         self._requests = 0
         #: The previous request's words (fast memory also searches them: a follow-up names nothing itself).
@@ -871,6 +886,7 @@ class Agent:
         view_hwnd: int | None = None, escalate: tuple[str | None, bool | None] | None = None,
         voice: bool = False, memory_query: str | None = None, previous_query: str | None = None,
         memory_apps: Iterable[str] | None = None, pack: "RequestPack | None" = None,
+        user_words: Iterable[str] | str | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -921,6 +937,10 @@ class Agent:
                 memory are used instead of being built now. A pack older than
                 ``Settings.pack_max_age_s`` has its screen half (overview, origin,
                 view) read again; its memory half is kept.
+            user_words: A spoken request's heard turns (speech to text, oldest first): what the authorization judge
+                reads as the user's own words, while the talker's ``request`` is shown to it as Yuki's reading, which
+                never authorises a send (review 34 H4). ``None``: the heard turns in the hand-off's own notes; a typed
+                request's own text is the user's words.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -1002,7 +1022,7 @@ class Agent:
         drive: Iterator[AgentEvent] | None = None
         try:
             query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
-            self._note_words(query, how="voice" if self._request_voice else "typed")
+            self._note_request_words(request, query, user_words)   # whose words each is, for the judge
             fresh = pack is not None and pack.age_s <= float(getattr(self.settings, "pack_max_age_s", 20.0))
             if pack is not None:
                 self.logger.log("request_pack", age_s=round(pack.age_s, 2), fresh=fresh, build_ms=pack.build_ms,
@@ -1073,6 +1093,7 @@ class Agent:
                 request, reply=reply, outcome=outcome, at=started_epoch
             )
             self._record_run(request, reply=reply, outcome=outcome, at=started_epoch)
+            self._record_surfaced(reply=reply, at=started_epoch)
             words = self._this_query or memory_query_of(request)
             if words:
                 self._said.append({"at": started_epoch, "text": words, "who": "user"})
@@ -1420,6 +1441,22 @@ class Agent:
             trace.append(step)
         except Exception as exc:  # noqa: BLE001 - the trace never breaks a request
             self.logger.log("trace_step_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
+
+    def _record_surfaced(self, *, reply: str, at: float) -> None:
+        """After the reply is out: which brief lines and memories this reply was written from, to memory's personal-ness
+        log (``MemoryClient.record_surfaced``, revamp 09 P4.1; the nightly judge reads a sample). Ids only; a request
+        with no reply records nothing. Returns at once; never raises."""
+        record = getattr(self.memory, "record_surfaced", None)
+        if not (reply or "").strip() or not callable(record) or not getattr(self.memory, "installed", False):
+            return
+        try:
+            ctx = getattr(self, "_surfaced", None) or {}
+            session = getattr(self.memory, "session_id", None)
+            record(kind="reply", ref=f"turn:{session}:{self.lane}-{self._requests}",
+                   brief_ids=list(ctx.get("brief_ids") or []), fact_ids=list(ctx.get("fact_ids") or []), at=at,
+                   brief_at=ctx.get("brief_at"))
+        except Exception as exc:  # noqa: BLE001 - the log never breaks a request
+            self.logger.log("surfaced_failed", error=f"{type(exc).__name__}: {exc}")
 
     def _record_run(self, request: str, *, reply: str, outcome: str, at: float) -> None:
         """After the reply is out: this request's run trace to memory's background writer (practice memory, Phase C;
@@ -2706,6 +2743,7 @@ class Agent:
         self._profile_layer = profile_text(self.settings.user_names, None)
         self._rules_layer = None
         self._frame = None
+        self._surfaced = {"brief_ids": [], "brief_at": None, "fact_ids": []}
         try:
             if prefetched is not None:
                 screen = prefetched.get("screen")
@@ -2732,8 +2770,17 @@ class Agent:
             rest, personality = _split_personality(fetched.portrait)
             rules = standing_rules_text(fetched)
             commitments = standing_commitments_text(fetched)
-            self._profile_layer = profile_text(self.settings.user_names, personality, fetched.persona,
-                                               getattr(fetched, "people", None))
+            brief = getattr(fetched, "brief", None)
+            # the personal brief (revamp 09 P1) is the thinker's "who they are and how to be with them": it takes the
+            # place of the Personality section and the persona, typed and voice alike; without one, as before
+            self._profile_layer = profile_text(self.settings.user_names, None if brief else personality,
+                                               None if brief else fetched.persona, getattr(fetched, "people", None),
+                                               brief=brief)
+            self._surfaced = {"brief_ids": list(getattr(fetched, "brief_ids", None) or []) if brief else [],
+                              "brief_at": getattr(fetched, "brief_at", None) if brief else None,
+                              "fact_ids": [f"{r.get('kind')}:{r.get('id')}" for r in fetched.relevant
+                                           if isinstance(r, dict) and r.get("id") is not None]
+                              + [f"pb:{i}" for i in frame.playbooks]}
             if fetched.source != "unavailable" and rules is not None:
                 self._rules_layer = rules_text(rules)
             background = replace(fetched, portrait=None if lean else ((rest or "").strip() or None),
@@ -2767,6 +2814,7 @@ class Agent:
         resume_chars = len(fetched.resume or "") if text else 0
         if text and background.portrait and repeated is None:
             self._portrait_sent = (background.portrait, self.logger.turn)
+            self._surfaced["fact_ids"].append("portrait")
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         self._memory_info = {
             "source": fetched.source,
@@ -2790,6 +2838,8 @@ class Agent:
             "relevant_ms": fetched.relevant_ms,
             "persona_chars": len(fetched.persona or ""),
             "people_chars": len(getattr(fetched, "people", None) or ""),
+            "brief_chars": len(getattr(fetched, "brief", None) or ""),
+            "brief_ids": list(getattr(fetched, "brief_ids", None) or []),
             "action": action,
             "own_discounted": int((fetched.related or {}).get("own_discounted") or 0),
             "frame": frame.info(),
@@ -2824,6 +2874,8 @@ class Agent:
             relevant_ms=fetched.relevant_ms,
             persona_chars=len(fetched.persona or ""),
             people_chars=len(getattr(fetched, "people", None) or ""),
+            brief_chars=len(getattr(fetched, "brief", None) or ""),
+            brief_ids=list(getattr(fetched, "brief_ids", None) or []),
             action=action,
             own_discounted=int((fetched.related or {}).get("own_discounted") or 0),
             frame=frame.info(),
@@ -2933,13 +2985,59 @@ class Agent:
             pass
 
     def _note_words(self, text: str | None, *, how: str, question: str | None = None) -> None:
-        """One piece of the user's own words for the judge (request words, words added mid-run, an answer)."""
+        """One piece of what was said, for the judge (``yuki.agent.judge.words_text`` labels it): the user's own words
+        (``typed``, ``heard``, ``added`` mid-run, an ``answer``) or context that is never theirs (``reading``: the
+        voice talker's rendering; ``card`` / ``suggestion``: Yuki's own card text the request carried). Each entry
+        keeps its request number and time; when a new request's words arrive, words of earlier requests older than
+        :data:`USER_WORDS_WINDOW_S` before it are dropped (review 34 M3: this morning's "tell sam I'm late" must not
+        authorise a send in a later request)."""
         text = " ".join(str(text or "").split())
         if text:
-            entry: dict[str, Any] = {"how": how, "text": text, "at": time.time()}
+            now = time.time()
+            if how in REQUEST_WORD_KINDS and not any(w.get("request") == self._requests for w in self._user_words):
+                keep = [w for w in self._user_words if now - float(w.get("at") or 0.0) <= USER_WORDS_WINDOW_S]
+                self._user_words.clear()
+                self._user_words.extend(keep)
+            entry: dict[str, Any] = {"how": how, "text": text, "at": now, "request": self._requests}
             if question:
                 entry["question"] = question
             self._user_words.append(entry)
+
+    def _note_request_words(self, request: str, query: str, user_words: Any = None) -> None:
+        """A new request's words for the judge, each labelled by whose they are (review 34 H4, M3). A card the request
+        opens with (Yuki's own bracketed card: a reply to it, or its suggestion sent unchanged) is noted as Yuki's,
+        never the user's words. Typed: the rest is the user's words. Spoken: the heard turns (``user_words``, the
+        speech-to-text the voice passes; else the heard words in the hand-off's own notes) are the user's words, and
+        the talker's rendering is noted as Yuki's reading of it, which never authorises a send."""
+        from yuki.agent.memory import VOICE_HEARD_MARK
+
+        text = (request or "").strip()
+        suggestion = text.startswith(SUGGESTION_MARK)
+        while text.startswith("[") and "]\n" in text:   # Yuki's own card lines first (its own request format)
+            card, text = text[1:].split("]\n", 1)
+            if not suggestion:
+                self._note_words(card, how="card")
+            text = text.strip()
+        cut = text.find("\n\n[")
+        head, notes = (text[:cut], text[cut:]) if cut >= 0 else (text, "")
+        if suggestion:   # the card's own words, sent unchanged: Yuki's offer, never typed by the user
+            self._note_words(head or query, how="suggestion")
+            return
+        if not self._request_voice:
+            self._note_words(head or query, how="typed")
+            return
+        heard = [user_words] if isinstance(user_words, str) else list(user_words or [])
+        heard = [" ".join(str(h).split()) for h in heard if h and str(h).strip()]
+        if not heard and VOICE_HEARD_MARK in notes:   # the hand-off's own notes carry the heard turns
+            block = notes[notes.find(VOICE_HEARD_MARK):]
+            block = block[: block.find("]\n")] if "]\n" in block else block
+            colon = block.find("): ")
+            if colon >= 0:
+                quoted = block[colon + 3:].strip().rstrip("]").strip()
+                heard = [t.strip().strip('"') for t in quoted.split('" / "') if t.strip().strip('"')]
+        for h in heard[-USER_WORDS_HEARD:]:
+            self._note_words(h, how="heard")
+        self._note_words(head or query, how="reading")
 
     def _call_target(self, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         """The window a call acts on (from its own arguments, the element's window, else the window in front) and the

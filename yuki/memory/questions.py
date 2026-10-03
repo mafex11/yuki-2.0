@@ -702,7 +702,8 @@ they work.
 3. It is not operational trivia of a task thread: which folder, drive, option, port, branch, file, setting or \
 wording; what an error was; what a tool found or will find; whether one step of a task is done.
 4. It does not repeat or relay a question another AI tool (T3 Code, Claude, a Warp agent, ChatGPT) or another \
-person asked the user, and does not chase an answer the user owes someone else.
+person asked the user, and does not chase an answer the user owes someone else - or one someone else owes the \
+user: what another person replied is theirs, not the user's goal.
 5. It is not drawn from text an AI agent wrote - its plans, narration, questions, status reports (FROM and ITS \
 OWN EVIDENCE show where it came from) - unless it asks about the user's own goal behind that work.
 When any of them fails: not_worth, and say in why which one. Judge what it asks and where it came from; no word \
@@ -716,6 +717,15 @@ for approval, one step of a task (3, 4).
 - not_worth: "What was the root cause of the error in T3 Code's options test run?" - what a tool found (3, 5).
 - not_worth: "Did the user finish marking the secret-scanning blocks as used in tests?" - one step T3 Code was \
 waiting on (3, 4).
+- not_worth (a check-in): "Priya's reply on the dashboard metrics - did that land, or still waiting on her?" - a \
+follow-up about someone else's reply, not the user's own goal (4). What is worth asking is the user's goal behind \
+it ("Are the Dashboard charts done, or still on them?") - only when memory does not already say.
+- not_worth (a check-in): "The account-switching fix tested clean on Mac and PC last night - holding up so far \
+today?" - a status check of an agent's fix, one step of a task (3, 5); a human assistant asks about the user's \
+goal, not whether a tool's patch still works.
+- not_worth (a check-in): "Looks like it's been VALORANT and Discord most of the evening - anything planned for \
+tomorrow?" - it opens by commenting on how the user spent their evening, which reads as being watched, not cared \
+for (2). A check-in never remarks on how they spent their time off (games, calls, videos, the evening).
 - worth asking: "Who is Bro to the user?" - a person they keep talking to.
 - worth asking: "What got the user into music production?" - who they are.
 - worth asking (a check-in): "Did the user's Story Editor short-reply fix land, or is the user still on it?", \

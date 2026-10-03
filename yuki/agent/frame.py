@@ -348,7 +348,8 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
             frame.persons.append({"id": p.get("id"), "name": p.get("name") or r.get("name"), "why": why,
                                   "relation": r.get("relation") or p.get("relation"), "routes": r.get("routes") or [],
                                   "margin": r.get("margin"), "close": bool(r.get("close")),
-                                  "preferred": r.get("preferred"), "places": r.get("places") or []})
+                                  "preferred": r.get("preferred"), "places": r.get("places") or [],
+                                  "samples": r.get("samples") or []})
         lines = _referent_lines(frame, routes, {p["id"] for p in frame.persons})
         lines += _person_lines(frame, overview)
         tail: list[str] = []
@@ -406,6 +407,18 @@ def _referent_lines(frame: TaskFrame, routes: dict[Any, Any] | None = None, show
     return lines
 
 
+#: How a route's kind reads in the frame (memory's people index: dm | group | channel).
+KIND_WORDS: dict[str, str] = {"dm": "a DM", "group": "a group chat", "channel": "a channel"}
+
+
+def _tags(n: Any, last: Any) -> str:
+    """"the user tagged them here 9 times, last Wed 30 Sep 21:30" (their name in the user's own messages there)."""
+    if not n:
+        return ""
+    return f"the user tagged them here {int(n)} time{'' if int(n) == 1 else 's'}" + (
+        f", last {_day(last)}" if last else "")
+
+
 def _person_lines(frame: TaskFrame, overview: Any) -> list[str]:
     lines: list[str] = []
     for p in frame.persons:
@@ -414,18 +427,24 @@ def _person_lines(frame: TaskFrame, overview: Any) -> list[str]:
         if not routes:
             lines.append(f"{head} - {p['why']}: no chat with them in memory (about({p['name']!r}) for what memory has).")
             continue
+        # the name each app knows them by: what a search or a mention needs (Sam may be "samk77" on Discord)
+        known = list(dict.fromkeys(f"{r.get('app') or 'the app'} knows them as \"{r['known_as']}\""
+                                   for r in routes[:MAX_ROUTES] if r.get("known_as")))
         lines.append(f"{head} - {p['why']}. Where the user talks with them, most used lately first:")
+        if known:
+            lines.append("  " + "; ".join(known) + f": search for and mention that name, not \"{p['name']}\".")
         for i, r in enumerate(routes[:MAX_ROUTES], 1):
             notes = []
-            if r.get("known_as"):
-                notes.append(f"{r.get('app') or 'the app'} knows them as \"{r['known_as']}\", not \"{p['name']}\"")
             if r.get("preferred"):
                 notes.append("the user chose this one")
             if r.get("in_front"):
                 notes.append("in front now")
             last = f", last yours {_day(r.get('last_mine'))}" if r.get("last_mine") else ""
-            lines.append(f"  {i}. [{r.get('ref')}] {r.get('label')}: the user {r.get('mine')} / them {r.get('theirs')}"
-                         f"{last}" + (f" ({'; '.join(notes)})" if notes else ""))
+            kind = KIND_WORDS.get(str(r.get("kind") or ""), str(r.get("kind") or "a chat"))
+            tagged = _tags(r.get("tags"), r.get("last_tag"))
+            lines.append(f"  {i}. [{r.get('ref')}] {r.get('label')} - {kind}: the user {r.get('mine')} / them "
+                         f"{r.get('theirs')}{last}" + (f"; {tagged}" if tagged else "")
+                         + (f" ({'; '.join(notes)})" if notes else ""))
         if p.get("preferred") and routes[0].get("preferred"):
             lines.append("  Usual: the one the user chose (\"" + _one((p.get("preferred") or {}).get("quote"), 60) + "\").")
         elif len(routes) > 1 and p.get("close"):
@@ -434,13 +453,52 @@ def _person_lines(frame: TaskFrame, overview: Any) -> list[str]:
         elif len(routes) > 1:
             lines.append(f"  Usual: the first, clearly (margin {float(p.get('margin') or 0):.2f}).")
         places = [x for x in p.get("places") or [] if isinstance(x, dict)]
+        channel = _channel_example(p, routes, places)
+        if channel:
+            lines.append("  " + channel)
+        said = [s for s in p.get("samples") or [] if s]
+        if said:
+            lines.append("  The user's own last messages on the usual route (draft to them like these, and say so in "
+                         "a few words): " + " | ".join(f"\"{_one(s, 90)}\"" for s in said[:2]))
         if places:
-            lines.append("  Group chats on the same apps the user writes in most: "
-                         + "; ".join(f"[{x.get('ref')}] {x.get('label')} (the user {x.get('mine')})" for x in places))
+            lines.append("  Group chats and channels on the same apps (where the user tags them first, then where the "
+                         "user writes most): " + "; ".join(_place_text(x) for x in places))
         lines += ["  " + x for x in preconditions(p, overview)]
         whom = "everyone in that group" if routes[0].get("kind") in ("group", "channel") else p["name"]
         lines.append(f"  Stakes: a message sent on the usual route reaches {whom}; once sent it cannot be taken back.")
     return lines
+
+
+def _place_text(x: dict[str, Any]) -> str:
+    """One group chat or channel near a person: its id and label, its kind, the user's tags of them, their messages."""
+    kind = KIND_WORDS.get(str(x.get("kind") or ""), "a group")
+    notes = [_tags(x.get("tags"), x.get("last_tag")) if x.get("tags") else "",
+             f"they wrote {x.get('theirs')}" if x.get("theirs") else "", f"the user wrote {x.get('mine')}"]
+    return f"[{x.get('ref')}] {x.get('label')} - {kind} ({'; '.join(n for n in notes if n)})"
+
+
+def _channel_example(p: dict[str, Any], routes: Sequence[dict[str, Any]], places: Sequence[dict[str, Any]]) -> str:
+    """A worked example from this person's own data for a request that names a channel or a group ("tag him in my
+    usual channel", "where I tag him"): the group or channel where the user tags them most, else the one the user
+    writes in most - never their DM. Which one the request means stays the model's judgement; "" with no group or
+    channel on record."""
+    # a group route of theirs is one they are in; a place counts when the user tagged them there or they write there
+    rooms = [{**r, "theirs": r.get("theirs") or 1} for r in routes if r.get("kind") in ("group", "channel")]
+    rooms += [x for x in places if int(x.get("tags") or 0) > 0 or int(x.get("theirs") or 0) > 0]
+    head = ("When the request names a channel or a group (\"my usual channel\", \"where I tag him\"), it means a group "
+            "or channel, never the DM")
+    if not rooms:
+        if not places:
+            return ""
+        return (f"{head}; memory has no group or channel with them in it (no tags of them, no messages of theirs): "
+                "ask which one, naming the group chats listed here.")
+    best = max(rooms, key=lambda r: (int(r.get("tags") or 0), float(r.get("last_tag") or 0.0),
+                                     int(r.get("theirs") or 0) > 0, int(r.get("mine") or 0)))
+    why = (_tags(best.get("tags"), best.get("last_tag")) if best.get("tags") else
+           f"no tags of them on record; they write there and so does the user ({best.get('mine')})")
+    return (f"{head}: here [{best.get('ref')}] {best.get('label')} ({why}). Example: \"tag {p['name']} in my usual "
+            "channel\" -> go to that channel, mention them by the name the app knows them by, send there, and say "
+            "which channel.")
 
 
 #: Practice memory in the frame (Phase C): the procedures and habits shown, then the pitfalls of the apps in play.

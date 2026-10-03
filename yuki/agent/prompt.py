@@ -163,9 +163,10 @@ VOICE_LAYER = """\
 This request came by voice: the user is listening, not watching. Yuki's voice speaks your done message, your say \
 lines and your step lines as its own words. Your done is one or two short spoken sentences with the point that \
 matters most for what they asked, then a few words offering the rest when there is more; no lists, no markdown, no \
-symbols, never a round-up. When a step will take a moment, its say_now gives the few words said as it starts, first \
-person and present tense ("Opening your Warp tabs."), never an outcome or a guess, never the same line twice. Answer \
-the question they asked at the scope they asked it: the hand-off's wording can be wider than their own words, and \
+symbols, never a round-up. Asked what they did, what is left or where they were, those sentences say what changed \
+and what is open, not minutes per app. When a step will take a moment, its say_now gives the few words said as it \
+starts, first person and present tense ("Opening your Warp tabs."), never an outcome or a guess, never the same \
+line twice. Answer the question they asked at the scope they asked it: the hand-off's wording can be wider than their own words, and \
 their words win. A spoken outcome is heard the instant it arrives, so the everyday spoken jobs take one call: when one \
 action does the job (minimizing a window, pausing the music), give it finishes_with true instead of reading the \
 result; make a shell command fail when its effect did not happen; answer from what you already have with done. A \
@@ -209,17 +210,22 @@ def identity_text(names: Any) -> str | None:
 
 
 def profile_text(names: Any = None, personality: str | None = None, persona: str | None = None,
-                 people: str | None = None) -> str | None:
+                 people: str | None = None, *, brief: str | None = None) -> str | None:
     """The profile layer: identity, the portrait's Personality section, Yuki's own persona and the people directory
     (``MemoryClient.people_directory``: who the user talks to and where, revamp Phase B2), or ``None``.
 
-    All change rarely (the names are settings; the portrait and the persona are re-written about
+    ``brief``: the personal brief's thinker slice (``MemoryClient.brief_for("thinker")``, revamp 09 P1: how to be
+    with them, their people, their own bits, what is live, routine, what is private). It takes the place of the
+    Personality section and the persona (callers pass those as ``None`` with it); the directory stays (it carries the
+    routes the brief does not).
+
+    All change rarely (the names are settings; the portrait, the brief and the persona are re-written about
     daily; the directory when the people index or its order changes), so this block is cached on its own, after the
     frozen prompt and before the rules.
     """
     voice = f"{PERSONA_HEADING}\n{persona.strip()}" if persona and persona.strip() else None
-    parts = [p for p in (identity_text(names), (personality or "").strip() or None, voice,
-                         (people or "").strip() or None) if p]
+    parts = [p for p in (identity_text(names), (brief or "").strip() or None, (personality or "").strip() or None,
+                         voice, (people or "").strip() or None) if p]
     if not parts:
         return None
     return PROFILE_LABEL + "\n" + "\n\n".join(parts) + "\n" + PROFILE_END
