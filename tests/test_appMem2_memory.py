@@ -191,6 +191,115 @@ def test_w1b_undo_leaves_a_thread_the_user_worked_on_since(store):
     assert undo["diverged"] == [old] and store.work_thread(old).state == "The user came back to it."
 
 
+def test_review_f1_undo_of_an_earlier_run_never_undoes_the_users_later_close(store):
+    tid = _thread(store, "Seed-swap app", "The user made saving work.", at=NOW - 86400)
+    [oc] = store.change_work_threads([{"action": "present", "id": tid, "shown": "You made saving work.",
+                                       "next": "Fix uploads."}], now=NOW - 600, run_id=901)
+    assert oc["ok"]
+    MemoryClient(store).close_thread(f"thread:{tid}", "done")
+    undo = store.undo_work_threads(901, now=NOW)
+    assert undo["threads"] == [tid]                         # the run's card is taken back (it still stood) ...
+    t = store.work_thread(tid)
+    assert t.status == "done" and t.closed_by == "user" and t.shown is None   # ... the user's close never
+    # a full image (a model close) taken back after the user's later rename and reopen is left as it is
+    tid2 = _thread(store, "Old resume", "The user resumed it.", at=NOW - 86400)
+    store.change_work_threads([{"action": "close", "id": tid2, "status": "done", "reason": "moved on"}],
+                              now=NOW - 500, run_id=906)
+    MemoryClient(store).close_thread(f"thread:{tid2}", "done")                 # the user closes it themselves
+    assert store.undo_work_threads(906, now=NOW)["diverged"] == [tid2]
+    assert store.work_thread(tid2).closed_by == "user"
+    # and a run whose change still stands is undone
+    other = _thread(store, "Garden planner", "The user drew the beds.", at=NOW - 86400)
+    store.change_work_threads([{"action": "close", "id": other, "status": "paused", "reason": "quiet"}],
+                              now=NOW - 300, run_id=902)
+    assert store.undo_work_threads(902, now=NOW)["threads"] == [other]
+    assert store.work_thread(other).status == "active"
+
+
+def test_review_f1_reopen_keeps_a_later_rename_and_its_undo_never_closes_again(store):
+    client = MemoryClient(store)
+    tid = _thread(store, "Maths prep", "The user worked through chapter 1.", at=NOW - 86400)
+    client.close_thread(f"thread:{tid}", "done")
+    store.change_work_threads([{"action": "rename", "id": tid, "title": "Maths prep chapter 1 done",
+                                "reason": "clearer"}], now=NOW - 100, run_id=903)
+    assert client.close_thread(f"thread:{tid}", "reopen")["status"] == "active"
+    t = store.work_thread(tid)
+    assert t.title == "Maths prep chapter 1 done" and t.status == "active" and t.closed_by is None
+    undo = store.undo_work_threads(903, now=NOW)
+    assert undo["diverged"] == [tid]
+    t = store.work_thread(tid)
+    assert t.status == "active" and t.title == "Maths prep chapter 1 done"
+
+
+def test_review_f2_an_undo_is_never_a_touch(store):
+    from yuki.memory.workthreads import Consolidator
+
+    ids = [_thread(store, f"Old thing {i}", "The user did it.", at=NOW - 10 * 86400) for i in range(3)]
+    store.change_work_threads([{"action": "present", "id": i, "shown": f"You did thing {i}.", "next": ""}
+                               for i in ids], now=NOW - 60, run_id=904)
+    store.change_work_threads([{"action": "close", "id": ids[0], "status": "done", "reason": "finished"}],
+                              now=NOW - 50, run_id=904)
+    before = len(store.latest_work_events(since=NOW - 3600))
+    out = Consolidator(_Worker(store)).undo(904, now=NOW)
+    assert sorted(out["threads"]) == sorted(ids) and out["diverged"] == []
+    assert len(store.latest_work_events(since=NOW - 3600)) == before            # nothing looks just touched
+    assert store.work_thread(ids[0]).status == "active" and store.work_thread(ids[1]).shown is None
+
+
+def test_review_f4_a_card_is_written_from_the_newest_facts(store):
+    from yuki.memory.workthreads import NEWEST_FACTS, Consolidator
+
+    tid = _thread(store, "Seed-swap app", "The user built it.", at=NOW - 86400)
+    for i in range(8):
+        _journal(store, f"Fact number {i} about the seed-swap app.", at=NOW - 8000 + i * 600, work=tid)
+    got = Consolidator(_Worker(store))._newest_facts(store.work_thread(tid))
+    assert [j.fact for j in got] == [f"Fact number {i} about the seed-swap app." for i in range(8 - NEWEST_FACTS, 8)]
+
+
+def test_review_f5_a_card_keeps_a_small_image_and_old_images_are_pruned(store):
+    tid = _thread(store, "Seed-swap app", "The user built it.", at=NOW - 86400)
+    for i in range(5):
+        _journal(store, f"Fact {i}.", at=NOW - 5000 + i, work=tid)
+    store.change_work_threads([{"action": "present", "id": tid, "shown": "You built it.", "next": "Ship it."}],
+                              now=NOW - 40 * 86400, run_id=905)
+    rows = store._query("SELECT surface, before_ciphertext FROM undo_images")
+    assert [r["surface"] for r in rows] == ["thread_card"]
+    assert "journal" not in store.cipher.decrypt(rows[0]["before_ciphertext"])   # only the two card columns
+    MemoryClient(store).close_thread(f"thread:{tid}", "done")                    # the user's own: kept
+    store._write(lambda c: c.execute("UPDATE undo_images SET at=? WHERE run_id IS NULL", (NOW - 60 * 86400,)))
+    assert store.prune_undo_images(older_than_days=30, now=NOW) == 1
+    assert [r["surface"] for r in store._query("SELECT surface FROM undo_images")] == ["thread"]
+
+
+def test_review_f6_a_saved_plan_writes_no_auto_pause_it_did_not_show(store):
+    from yuki.memory.workthreads import Consolidator
+
+    quiet = _thread(store, "Quiet thing", "The user set it up.", at=NOW - 9 * 86400)
+    card = _thread(store, "Seed-swap app", "The user built it.", at=NOW - 600)
+    plan = [{"action": "present", "id": card, "shown": "You built the seed-swap app.", "next": "", "reason": "card"}]
+    res = Consolidator(_Worker(store)).run(now=NOW, plan=plan)
+    assert res.ok and res.cards == 1 and store.work_thread(quiet).status == "active"
+    # the nightly pass (no plan) still pauses it
+    answer = {"decisions": [], "questions": [], "open_threads": []}
+    Consolidator(_Worker(store, [answer])).run(now=NOW + 60)
+    assert store.work_thread(quiet).status == "paused"
+
+
+def test_review_f7_the_episode_call_sees_the_days_earlier_titles(store):
+    from yuki.memory.episodes import EpisodeWorker, Window, build_user_message, window_facts
+
+    day = time.mktime(time.strptime(time.strftime("%Y-%m-%d", time.localtime(NOW - 86400)) + " 09:00",
+                                    "%Y-%m-%d %H:%M"))
+    _episode(store, day, day + 3 * 3600, "x", title="Yuki voice fixes")
+    _episode(store, day + 3 * 3600, day + 6 * 3600, "y", title="Yuki wake word tests")
+    w = EpisodeWorker(store, client=object(), embedder=object(), log_dir=Path(store.path).parent)
+    win = Window(start=day + 6 * 3600, end=day + 9 * 3600, final=True, trigger="test")
+    titles = w._used_titles(win)
+    assert titles == ["Yuki voice fixes", "Yuki wake word tests"]
+    msg = build_user_message(win, window_facts(store, win.start, win.end), [], used_titles=titles)
+    assert "TITLES ALREADY USED TODAY" in msg and "- Yuki wake word tests" in msg
+
+
 def test_w1c_the_titles_pass_writes_a_thread_card_and_its_next_step(store):
     from yuki.memory.titles import Titler
 
@@ -445,12 +554,34 @@ def test_w6_only_real_mishearings_are_listed_and_a_right_guess_queues_the_correc
     [item] = m["items"]
     assert (item["heard"], item["guess"], item["why"], item["guess_is_name"]) == (
         "sea ra", "Ciara", "Ciara is on this call", True)
-    out = client.resolve_heard(f"journal:{jid}", "right")
+    out = client.resolve_heard(f"journal:{jid}", "guess_right")
     assert out["ok"] and out["correction_id"] and client.misheard(now=NOW)["items"] == []
+    # (review F8) answered but still uncertain until the pass rewrites it: never a fact with the misheard words
+    assert out["nature"] == "uncertain" and store.journal_by_ids([jid])[0].nature == "uncertain"
     assert store.correction_target(out["correction_id"]) == f"J{jid}"
     assert "It was 'Ciara', not 'sea ra'" in store.portrait_fact(out["correction_id"]).text
     undo = client.resolve_heard(f"journal:{jid}", "undo", correction_id=out["correction_id"])
     assert undo["ok"] and undo["cancelled"] and client.misheard(now=NOW)["total"] == 1
+    # (review F3) Right keeps its meaning for the window as it is: taken as heard, no correction queued
+    plain = client.resolve_heard(f"journal:{jid}", "right")
+    assert plain["ok"] and plain["nature"] == "fact" and plain["correction_id"] is None
+
+
+def test_w6_the_judge_can_point_at_the_heard_words_of_a_paraphrased_entry(store):
+    """Review F8: memory's sentence paraphrased the words, so the judge points at the heard words (the subject)."""
+    from yuki.memory.corrections import CorrectionApplier, target_candidate
+
+    jid = _journal(store, "The user asked to message someone on Discord about the trip.", at=NOW - 60,
+                   nature="uncertain", source={"kind": "call", "heard": "sea ra", "meant": "Ciara", "meant_name": True})
+    cand = target_candidate(store, f"J{jid}")
+    assert cand.subject == 'heard "sea ra"'
+    edits, rejected = CorrectionApplier.validate(
+        [{"id": f"J{jid}", "op": "rewrite", "wrong": "sea ra", "reason": "misheard name",
+          "text": "The user asked to message Ciara on Discord about the trip."}], [cand])
+    assert rejected == [] and len(edits) == 1
+    change = {"ok": True, "op": "rewrite", "old": cand.text, "held": f"{cand.subject} {cand.text}",
+              "new": edits[0]["text"]}
+    assert CorrectionApplier.confirmed_aliases([{"heard": "sea ra", "name": "Ciara", "why": "x"}], [change])
 
 
 def test_w6_the_misheard_backfill_finds_guesses_drops_random_lines_and_undoes(store):

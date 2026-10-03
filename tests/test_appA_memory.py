@@ -337,7 +337,7 @@ def test_misheard_lists_the_voice_channel_and_resolves_at_once_without_a_model(s
     assert item["heard_in"] == "Discord, #late-night voice (Ana's server)" and item["channel_known"]
     assert item["people"] == ["Ana"] and m["items"][0]["heard_in"] == "WhatsApp"
     t0 = time.perf_counter()
-    out = client.resolve_heard(f"journal:{heard}", "as_heard")    # the words as heard (Right before the guesses)
+    out = client.resolve_heard(f"journal:{heard}", "right")    # Right: the words as heard (the guess has guess_right)
     assert time.perf_counter() - t0 < 1.0
     assert out["ok"] and out["nature"] == "fact" and out["correction_id"] is None
     assert [i["id"] for i in client.misheard(now=NOW)["items"]] == [other]                 # gone at once
