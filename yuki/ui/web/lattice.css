@@ -514,6 +514,7 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .rt-key + .fx { border-top: 0; }
 .rt-sure { color: var(--text-2); }
 .notrt-h { margin: 14px 0 2px 14px; }
+.notrt-say { margin: 2px 0 6px 14px; max-width: 520px; font-size: 12.5px; line-height: 1.45; color: var(--text-3); }
 .notrt .fx-h .tx { color: var(--text-2); }
 .kf { margin-top: 14px; }
 .kf .label { margin-bottom: 6px; }
@@ -651,6 +652,41 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .howto .side { grid-row: 1 / span 2; grid-column: 2; font: 500 11.5px/1.6 var(--f-mono); color: var(--text-3); text-align: right; }
 .proc.off, .lesson.off { opacity: .5; }
 .howto .side b { color: var(--text); font-weight: 500; }
+/* the 4 Oct item W7: procedures full width as cards (a title, numbered steps, one quiet line), app choices said
+   plainly, lessons folded to a title and one line; the blocks under them in two balanced columns */
+.how-sec { margin-bottom: 28px; }
+.procs { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 0 28px; }
+.proc2 { padding: 16px 0; border-top: 1px solid var(--hair); min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.proc2 h4 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.proc2 .when { font-size: 12.5px; color: var(--text-2); }
+.proc2 .nsteps { margin: 8px 0 2px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; font-size: 13px; line-height: 1.45; }
+.proc2 .nsteps li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.proc2 .nsteps .n { font-size: 14px; color: var(--text-3); text-align: right; }
+.proc2 .nsteps .s { overflow-wrap: anywhere; }
+.proc2 .nosteps { font-size: 12.5px; margin-top: 4px; }
+.proc2 .pmeta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; font: 500 11px/1.5 var(--f-mono); color: var(--text-3); }
+.proc2 .pmeta b { color: var(--text-2); font-weight: 500; }
+.proc2 .pmeta .cf { display: inline-flex; gap: 6px; align-items: center; }
+.proc2 .pmeta .meter { margin-top: 0; }
+.proc2 .plearn { font: 500 11px/1.5 var(--f-mono); }
+.proc2.off { opacity: .5; }
+.proc2.tent h4::after { content: ' · seen once'; font: 500 11px/1 var(--f-mono); color: var(--text-3); }
+.choice { padding: 10px 0; border-top: 1px solid var(--hair); min-width: 0; }
+.sec-h + .choice { border-top: 0; padding-top: 0; }
+.choice .c1 { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.choice .c2 { font-size: 12px; color: var(--text-3); margin-top: 2px; overflow-wrap: anywhere; }
+.choice.off { opacity: .5; }
+.lessons2 > .fx:first-child { border-top: 0; }
+.lesson2 > .fx-h { align-items: flex-start; }
+.lesson2 > .fx-h > .ic { margin-top: 6px; }
+.lesson2 .fx-h .tx { display: flex; flex-direction: column; gap: 2px; min-width: 0; white-space: normal; }
+.lesson2 .fx-h .lt { font-weight: 600; overflow-wrap: anywhere; }
+.lesson2 .fx-h .ln { color: var(--text-2); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lesson2.open .fx-h .ln { display: none; }
+.lesson2 .fx-d .d { max-width: none; }
+.lesson2 .fx-d .z { margin-top: 6px; font-size: 13.5px; line-height: 1.5; }
+.lesson2 .fx-d .z b { font: 500 11px/1 var(--f-mono); color: var(--text-3); }
+.lesson2.off { opacity: .5; }
 
 /* ---------- Activity ---------- */
 .ledger { padding: 6px 22px 14px; }
@@ -704,6 +740,12 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .srow .v { font: 500 12px/1.3 var(--f-mono); color: var(--text-2); text-align: right; }
 .srow small { display: block; font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .srow .ctl { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+/* quiet hours (the 4 Oct item W10): the switch row, then From [time] to [time] */
+.srow.quiet-h small { max-width: 420px; line-height: 1.45; }
+.srow.quiet-t { padding-top: 0; border-top: 0; justify-content: flex-start; }
+.quiet-range { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
+.quiet-range .pick { width: 112px; }
+.srow.quiet-t.off .quiet-range { opacity: .45; }
 .pick { max-width: 230px; height: 28px; padding: 0 26px 0 10px; border-radius: 8px; border: 1px solid var(--hair-2); background: var(--raise); color: var(--text); font: 500 12px/1 var(--f-mono); appearance: none; background-image: radial-gradient(circle, var(--text-3) 1.2px, transparent 1.5px), radial-gradient(circle, var(--text-3) 1.2px, transparent 1.5px), radial-gradient(circle, var(--text-3) 1.2px, transparent 1.5px); background-size: 4px 4px; background-repeat: no-repeat; background-position: right 15px top 10px, right 11px top 13px, right 7px top 10px; }
 .pick:focus { outline: 1.5px solid var(--live); outline-offset: 1px; }
 .pick option { background: var(--bg); color: var(--text); }

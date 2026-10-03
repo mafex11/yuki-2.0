@@ -1274,6 +1274,36 @@ def procedure_view(c: dict[str, Any]) -> dict[str, Any]:
             "state": c.get("state"), "disabled": bool(c.get("disabled")), "learned": _learned_line(c)}
 
 
+def choice_view(c: dict[str, Any]) -> dict[str, Any]:
+    """A habit from ``workflows()`` as an app choice on the Playbook page (the 4 Oct item W7b): what the choice is about
+    (the first thing it names - a site, an app, a person - else its title), the default it settles on, or that Yuki
+    asks; never the counts behind it (the miner's text, "39.3 minutes by 39 visits over 3 days", stays memory's). The
+    page says it as "YouTube: usually Chrome"."""
+    about = [str(e).strip() for e in c.get("people") or [] if str(e).strip()]
+    title = " ".join(str(c.get("title") or "").split())
+    default = " ".join(str(c.get("default") or "").split())
+    uses = int(c.get("uses") or 0)
+    out = {"ref": c.get("id"), "kind": "habit", "title": title, "subject": about[0] if about else title,
+           "default": default, "ask": bool(c.get("ask")) and not default, "app": app_words(c.get("apps") or []),
+           "uses": uses, "last": short_day(epoch_of(c.get("last_used"))), "conf": c.get("confidence"),
+           "conf_word": conf_word(c.get("confidence")) or str(c.get("label") or ""), "disabled": bool(c.get("disabled")),
+           "learned": _learned_line(c)}
+    out["line"] = choice_words(out)
+    return out
+
+
+def choice_words(ch: dict[str, Any]) -> str:
+    """An app choice in one plain sentence: "YouTube: usually Chrome.", "Riya: I ask which one.", or just what it is
+    about when there is no default yet."""
+    subject = str(ch.get("subject") or ch.get("title") or "")
+    subject = subject[:1].upper() + subject[1:]
+    if ch.get("default"):
+        return f"{subject}: usually {ch['default']}."
+    if ch.get("ask"):
+        return f"{subject}: I ask which one."
+    return f"{subject}." if subject else ""
+
+
 def lesson_view(c: dict[str, Any]) -> dict[str, Any]:
     """A pitfall or style note as a Lessons row: what it is about (bold), what went wrong, what to do instead, how
     often it was used and where it came from."""
@@ -1296,6 +1326,8 @@ def proposal_view(c: dict[str, Any]) -> dict[str, Any]:
     ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
     seen = int(ev.get("seen") or 0)
     basis = " ".join(str(c.get("text") or "").split()) if not steps else ""
+    if c.get("kind") == "habit":   # an app choice: said plainly, never the counts behind it (the 4 Oct item W7b)
+        basis = choice_words(choice_view(c))
     when = short_day(epoch_of(c.get("since")))
     tail = f"Seen {seen} time{'s' if seen != 1 else ''}" if seen else "Seen once"
     return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "",
@@ -1319,7 +1351,10 @@ def build_playbook(memory: Any) -> dict[str, Any]:
         return [c for c in wf.get(key) or [] if isinstance(c, dict) and c.get("kind") in SHOWN_KINDS] if available \
             else []
 
-    procs = [procedure_view(c) for c in shown("procedures") if c.get("kind") in WAY_KINDS]
+    # the 4 Oct item W7: procedures are a title and numbered steps; habits are app choices said plainly ("Slack:
+    # usually Chrome"), never their counts
+    procs = [procedure_view(c) for c in shown("procedures") if c.get("kind") == "procedure"]
+    choices = [choice_view(c) for c in shown("procedures") if c.get("kind") == "habit"]
     lessons = [lesson_view(c) for c in shown("lessons") if c.get("kind") == "style"]
     # what Yuki is not sure of yet: questions first, at most PROPOSALS_SHOWN as the NEW blocks (the design shows one);
     # the other tentative ways and lessons stay visible in their own lists, marked as seen once
@@ -1327,8 +1362,10 @@ def build_playbook(memory: Any) -> dict[str, Any]:
     pending.sort(key=lambda c: c.get("kind") != "question")
     props = [proposal_view(c) for c in pending[:PROPOSALS_SHOWN]]
     for c in pending[PROPOSALS_SHOWN:]:
-        if c.get("kind") in WAY_KINDS:
+        if c.get("kind") == "procedure":
             procs.append({**procedure_view(c), "conf_word": "tentative, seen once", "tentative": True})
+        elif c.get("kind") == "habit":
+            choices.append({**choice_view(c), "conf_word": "tentative, seen once", "tentative": True})
         elif c.get("kind") == "style":
             lessons.append({**lesson_view(c), "tentative": True})
     know = [] if available else [{"title": k.title, "line": k.line, "app": k.app}
@@ -1339,7 +1376,7 @@ def build_playbook(memory: Any) -> dict[str, Any]:
         text = " ".join(str(r.get("quote") or r.get("condition") or "").split())
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
-    return {"proposals": props, "procedures": procs, "know_how": know, "lessons": lessons, "rules": rules,
+    return {"proposals": props, "procedures": procs, "choices": choices, "know_how": know, "lessons": lessons, "rules": rules,
             "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None}
 
 
@@ -1720,7 +1757,9 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                   "devices": devices, "hotkey": ""},
         "offers": {"enabled": str(nudges.get("offers", "yuki_only")) != "off"},
         "coach": {"enabled": bool(nudges.get("enabled", True)), "questions": bool(nudges.get("questions_enabled", True)),
-                  "quiet_start": str(nudges.get("quiet_start", "00:30")), "quiet_end": str(nudges.get("quiet_end", "08:00"))},
+                  "quiet_start": str(nudges.get("quiet_start", "00:30")), "quiet_end": str(nudges.get("quiet_end", "08:00")),
+                  # the hours an on-switch brings back after they were turned off (equal start and end = none)
+                  "quiet_last": list(ui.quiet_last) if ui.quiet_last else None},
         "privacy": {"paused": bool(st.get("paused")), "seen_min": seen_min,
                     "seen_apps": len([i for i in today_act.get("items") or [] if float(i.get("present_s") or 0) >= 30]),
                     "blocked_sites": len([s for s in user.get("blocked_domains", []) if str(s).strip()])},

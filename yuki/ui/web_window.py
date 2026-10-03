@@ -57,6 +57,7 @@ import queue
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1278,11 +1279,11 @@ class WebWindow:
         "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
-        "motion": "a_motion", "call_pref": "a_call_pref",
+        "motion": "a_motion", "call_pref": "a_call_pref", "quiet": "a_quiet",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
-                                  "pause", "accent", "motion", "call_pref"})
+                                  "pause", "accent", "motion", "call_pref", "quiet"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -1640,6 +1641,53 @@ class WebWindow:
     def a_questions(self, m: dict[str, Any]) -> dict[str, Any]:
         return self._privacy("questions_enabled", bool(m.get("enabled")))
 
+    #: Quiet hours when they are first turned on (the memory service's own defaults, NudgeConfig).
+    QUIET_DEFAULT = ("00:30", "08:00")
+
+    def a_quiet(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Quiet hours (the 4 Oct item W10): ``[nudges] quiet_start`` / ``quiet_end`` in the privacy file, the setting
+        the memory service's card gates read (:func:`yuki.memory.nudges.in_quiet_hours`, the shared attention rules:
+        check-ins, questions, observation cards and offers are held; reminders and "tell me when" requests are not).
+        ``{"on": false}`` turns them off (an equal start and end is none, as memory reads it) and remembers the hours;
+        ``{"on": true}`` brings the remembered hours back; ``{"start", "end"}`` ("HH:MM") sets them. Both keys go in
+        one write of the file, so memory never reads half a change."""
+        from yuki.ui import ui_settings
+        from yuki.ui.window import settings_io
+
+        nudges = settings_io.read_privacy().get("nudges", {}) or {}
+        cur = (str(nudges.get("quiet_start", self.QUIET_DEFAULT[0])), str(nudges.get("quiet_end", self.QUIET_DEFAULT[1])))
+        if "start" in m or "end" in m:
+            start, end = _hhmm(m.get("start", cur[0])), _hhmm(m.get("end", cur[1]))
+            if start is None or end is None:
+                return {"ok": False, "error": "That isn't a time."}
+            if start == end:
+                return {"ok": False, "error": "Pick a different end time; the same time means no quiet hours."}
+        elif m.get("on"):
+            last = ui_settings.load(self.ui_path).quiet_last or []
+            start, end = (_hhmm(last[0]), _hhmm(last[1])) if len(last) >= 2 else (None, None)
+            if start is None or end is None or start == end:
+                start, end = self.QUIET_DEFAULT
+        else:
+            start = end = cur[0]
+        if start != end:   # remembered, so off and on again brings these hours back
+            ui_settings.update(self.ui_path, quiet_last=[start, end])
+        elif cur[0] != cur[1]:
+            ui_settings.update(self.ui_path, quiet_last=list(cur))
+        path = settings_io.privacy_path()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        new = settings_io.set_toml_key(settings_io.set_toml_key(text, "nudges", "quiet_start", start), "nudges", "quiet_end", end)
+        table = tomllib.loads(new).get("nudges", {})   # never write a file the service could not read
+        if (table.get("quiet_start"), table.get("quiet_end")) != (start, end):
+            return {"ok": False, "error": "The privacy file didn't take the change."}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, path)
+        return {"quiet_start": start, "quiet_end": end}
+
     def a_pause(self, m: dict[str, Any]) -> dict[str, Any]:
         self._memory().set_paused(bool(m.get("paused")))
         self.refresh("shell")
@@ -1878,6 +1926,15 @@ def plan_text(thread: dict[str, Any]) -> str:
     if open_items:
         parts.append(f"Next: {open_items[0]}")
     return " ".join(parts)
+
+
+def _hhmm(value: Any) -> str | None:
+    """A clock time as the privacy file keeps it ("HH:MM", 24-hour), or ``None`` when it isn't one."""
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 2 or not all(p.isdigit() and 1 <= len(p) <= 2 for p in parts):
+        return None
+    h, mi = int(parts[0]), int(parts[1])
+    return f"{h:02d}:{mi:02d}" if 0 <= h < 24 and 0 <= mi < 60 else None
 
 
 def derived(m: dict[str, Any]) -> dict[str, float | None]:

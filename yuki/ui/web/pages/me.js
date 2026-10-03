@@ -148,7 +148,10 @@
         r.prov ? h('span', { text: r.prov }) : null), factActs(isPinned(r.ref, r.pinned), { inline: true, noPin: !(d.can || {}).pin })],
       { cls: 'rt notrt', data: { fact: '', ref: r.ref, kind: 'behaviour', title: r.h || '', text: r.d || r.h || '' } }));
     const body = h('div', { class: 'rts' }, R.length ? [legend, R.map((r) => routineRow(r, d))] : Y.empty('No routines yet. They come from what you do most days.'),
-      N.length ? [h('div', { class: 'label notrt-h', text: 'Not routines: what you’ve been doing lately' }), notRt] : null);
+      N.length ? [h('div', { class: 'label notrt-h', text: 'Not routines: what you’ve been doing lately' }),
+        // what they are and how I use them, in one plain line (the 4 Oct item W4)
+        h('div', { class: 'notrt-say', text: 'Things I’ve seen you do lately, not habits yet. I use them as context when you ask me something and when I choose what to put on a card.' }),
+        notRt] : null);
     return Y.sec('Routines', R.length, body, Y.rightLabel('your preferences and rules are in your portrait'));
   }
 
