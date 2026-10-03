@@ -115,7 +115,8 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
-from yuki.memory.titles import SUMMARY_FIELD as TITLES_SUMMARY_FIELD, fact_label
+from yuki.memory.titles import SHOWN_FIELD as TITLES_SHOWN_FIELD, SUMMARY_FIELD as TITLES_SUMMARY_FIELD
+from yuki.memory.titles import call_lines, fact_label, fact_shown
 from yuki.memory.personality import ASPECT_TITLES, ASPECTS, PERSONALITY_HEADING, nature_mark
 from yuki.memory.brief import BRIEF_FIELD_SCHEMA, BRIEF_RENDER_RULES, brief_inputs, validate_brief
 from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema, vet_new
@@ -325,6 +326,14 @@ a single passing mention is low, repeated or explicit evidence is high. Do not s
 guesses as facts.
 - Labelled: every ADD and UPDATE carries a summary, the few words the user's app shows for the \
 fact (see its field): the gist in plain words, never the fact cut short.
+- Shown: every ADD and UPDATE also carries shown, the same fact as the user's app shows it to \
+them - said to them ("you", "your father", "your friend Kiran"), natural dates and 12-hour times \
+("on 25 September, from about 2 AM to 3:22 AM"), and for anything said on a call who was on it, or \
+"on a call with other friends" when the person the fact is about was not on that call (a journal \
+entry said on a call shows [call: ...] with where it was and who was on it). The text stays third \
+person for Yuki; only shown speaks to the user.
+- One pattern, one fact: a day that continues a pattern an existing fact describes ("continued on \
+2 Oct") is an UPDATE of that fact, never a new fact.
 - Rated: importance (1-10) on every ADD and UPDATE is how much the fact matters for Yuki \
 helping the user later, on the journal's scale: 1-2 trivia, 3-4 ordinary, 5-6 a clear signal \
 about their work, interests, people or who they are, 7-8 commitments, deadlines, plans, the \
@@ -383,7 +392,8 @@ reviewed it" - and never call it the user heads down, their longest focused stre
 own coding unless the journal shows the user's own work.
 
 Origin "user" marks facts the user stated themselves; they outrank anything inferred. \
-Change one only when journal entries dated after it show that it is no longer true. A \
+A fact marked pinned is one the user pinned to keep. Change a pinned fact only when journal \
+entries dated after it show that it is no longer true. A \
 fact of kind correction is the user's own words fixing the portrait: carry it out by \
 operating on the facts it concerns - UPDATE or INVALIDATE what it contradicts, ADD what it \
 states that no fact covers - and list the correction's id in based_on_facts of each such \
@@ -413,7 +423,7 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": [
-                        "op", "fact_id", "kind", "subject", "text", "summary", "confidence", "importance",
+                        "op", "fact_id", "kind", "subject", "text", "summary", "shown", "confidence", "importance",
                         "journal_ids", "episode_ids", "based_on_facts", "reason", "loop", "aspect",
                     ],
                     "properties": {
@@ -451,6 +461,10 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                         "summary": {
                             "anyOf": [{"type": "string"}, {"type": "null"}],
                             "description": "ADD and UPDATE: " + TITLES_SUMMARY_FIELD + " INVALIDATE and NOOP: null.",
+                        },
+                        "shown": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "description": "ADD and UPDATE: " + TITLES_SHOWN_FIELD + " INVALIDATE and NOOP: null.",
                         },
                         "confidence": {"type": "number", "description": "0 to 1."},
                         "importance": {
@@ -658,9 +672,9 @@ def withdrawn_facts(store: Any, facts: Sequence[Any]) -> set[int]:
     """The ids of the facts whose evidence was withdrawn (revamp A9): model-written facts that cite no episode and
     whose every cited journal entry was re-journaled or marked as text for or from another AI tool or a sample page
     (:meth:`Store.withdrawn_journal`). What such a fact says rests on nothing now: the card writers leave it out and
-    ``python -m yuki.memory.recheck`` retires it. The user's own facts and corrections never are."""
-    candidates = [f for f in facts if getattr(f, "origin", "model") != "user" and f.kind != CORRECTION_KIND
-                  and f.source_ids and not getattr(f, "episode_ids", None)]
+    ``python -m yuki.memory.recheck`` retires it. The user's own facts, pinned facts and corrections never are."""
+    candidates = [f for f in facts if getattr(f, "origin", "model") != "user" and not getattr(f, "pinned", False)
+                  and f.kind != CORRECTION_KIND and f.source_ids and not getattr(f, "episode_ids", None)]
     if not candidates:
         return set()
     gone = store.withdrawn_journal({i for f in candidates for i in f.source_ids})
@@ -1406,14 +1420,20 @@ class PortraitWorker:
         mark = (f" [rests on re-journaled entries {', '.join(f'J{i}' for i in redone)}: see their corrected "
                 f"versions in JOURNAL]") if redone else ""
         return (
-            f"F{f.id} [{kind}] subject={safe(f.subject, 120)!r} confidence={conf} origin={f.origin} "
+            f"F{f.id} [{kind}] subject={safe(f.subject, 120)!r} confidence={conf} origin={f.origin}"
+            f"{' pinned' if getattr(f, 'pinned', False) else ''} "
             f"since {_local(f.valid_from, '%Y-%m-%d')}: {safe(f.text, 1200)}{mark}"
         )
 
     @staticmethod
-    def _journal_line(j: JournalEntry, safe: Callable[[str | None, int], str], cap: int = 1500) -> str:
+    def _journal_line(j: JournalEntry, safe: Callable[[str | None, int], str], cap: int = 1500,
+                      calls: dict[int, str] | None = None) -> str:
+        """One journal entry as the operations see it; ``calls``: :func:`yuki.memory.titles.call_lines` of the batch
+        (who was on the call an entry was said on, and where: report 38 §2c, item 5 of the 3 Oct feedback)."""
         where = j.app + (f" / {j.host}" if j.host else "")
-        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]: "
+        call = (calls or {}).get(j.id)
+        on_call = f" [call: {safe(call, 300)}]" if call else ""
+        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]{on_call}: "
                 f"{safe(j.fact, cap)}")
 
     def _ops_message(
@@ -1438,7 +1458,8 @@ class PortraitWorker:
             + (f" [last evidence {_local(seen[f.id], '%Y-%m-%d')}]" if f.id in seen else "")
             for f in facts
         ] or ["(none yet)"]
-        journal_lines = [self._journal_line(j, safe) for j in journal]
+        calls = call_lines(self.store, journal, now)
+        journal_lines = [self._journal_line(j, safe, calls=calls) for j in journal]
         window = {
             "first": "everything in the journal so far (first portrait)",
             "weekly": "the whole last 7 days (weekly review: look for patterns across days)",
@@ -1604,7 +1625,7 @@ class PortraitWorker:
                 changes.append(FactChange(
                     "ADD", None, out.kind, out.subject, out.text, 1.0 if corrections else confidence, known, at,
                     origin, corrections, episode_ids=known_episodes, aspect=aspect, importance=importance,
-                    summary=fact_label(out.kind, item),
+                    summary=fact_label(out.kind, item), shown=fact_shown(item),
                 ))
                 continue
             target = current.get(fact_id) if fact_id is not None else None
@@ -1623,17 +1644,19 @@ class PortraitWorker:
                 continue
             # an open loop that fails the bar may be dropped on the rules alone, citing nothing, and so may
             # a fact whose journal evidence was all read again (re-journaled) and now supports nothing
-            dropping_loop = out.op == "INVALIDATE" and target.kind == LOOP_KIND and target.origin != "user"
-            dropping_redone = (out.op == "INVALIDATE" and target.origin != "user" and bool(target.source_ids)
+            # the user's pin (migration 33; before it, origin user) protects a fact from the model's rewrites: only a
+            # later correction or later evidence changes it, and it is never dropped on the rules alone
+            dropping_loop = out.op == "INVALIDATE" and target.kind == LOOP_KIND and not target.pinned
+            dropping_redone = (out.op == "INVALIDATE" and not target.pinned and bool(target.source_ids)
                                and all(i in rejournaled for i in target.source_ids) and not target.episode_ids)
             if not evidenced and not (dropping_loop or dropping_redone):
                 reject(unfit)
                 continue
-            if target.origin == "user":
+            if target.pinned:
                 newer_correction = any(current[c].valid_from > target.valid_from for c in corrections)
                 newer_evidence = latest_evidence is not None and latest_evidence > target.valid_from
                 if not (newer_correction or newer_evidence):
-                    reject("user-confirmed fact; no later evidence or correction")
+                    reject("pinned fact; no later evidence or correction")
                     continue
             if out.op == "UPDATE":
                 if not out.text:
@@ -1655,6 +1678,7 @@ class PortraitWorker:
                     1.0 if corrections else confidence, known, latest_evidence or now,
                     "user" if corrections else "model", corrections, episode_ids=known_episodes,
                     aspect=new_aspect, importance=importance, summary=fact_label(kind, item),
+                    shown=fact_shown(item),
                 ))
             else:
                 changes.append(FactChange(
@@ -2156,7 +2180,7 @@ class PortraitWorker:
 
     def _expire_loops(self, run_id: int | None, now: float, stats: PortraitRunStats) -> list[OpOutcome]:
         """Invalidate model-inferred loops with no evidence for :data:`LOOP_EXPIRE_DAYS`; rows become ``expired``."""
-        loops = [f for f in self.store.portrait_facts([LOOP_KIND]) if f.origin != "user"]
+        loops = [f for f in self.store.portrait_facts([LOOP_KIND]) if not f.pinned]
         seen = self.loop_last_seen(loops)
         old = [f for f in loops if seen[f.id] < now - LOOP_EXPIRE_DAYS * 86400.0]
         if not old:
@@ -2675,10 +2699,13 @@ class PortraitWorker:
                 line += f" UNDER REVIEW ({reasons.get(f.id, '')}; cites {', '.join(f'J{i}' for i in sorted(f.source_ids)[-AUDIT_CITED:]) or 'no entry'})"
             fact_lines.append(line)
 
+        calls = call_lines(self.store, [*evidence, *recent], now)
+
         def jline(j: JournalEntry, cap: int = 900) -> str:
             where = j.app + (f" / {j.host}" if j.host else "")
+            call = f" [call: {safe(calls[j.id], 300)}]" if j.id in calls else ""
             return (f"J{j.id} {_local(j.at)} {safe(where, 120)}{self._thread_label(j.thread_id, labels, safe)} "
-                    f"[importance {j.importance}, {_nature_label(j)}]: {safe(j.fact, cap)}")
+                    f"[importance {j.importance}, {_nature_label(j)}]{call}: {safe(j.fact, cap)}")
 
         shown = {j.id for j in evidence}
         evidence_lines = [jline(j) for j in sorted(evidence, key=lambda j: (j.at, j.id))]
@@ -3004,6 +3031,9 @@ class PortraitScheduler:
         self.render_path = flag_path(db_path, RENDER_FLAG)
         self.pause_path = flag_path(db_path, PAUSE_FLAG)
         self.audit_path = flag_path(db_path, AUDIT_FLAG)
+        from yuki.memory.daydigest import DAYDIGEST_FLAG
+
+        self.daydigest_path = flag_path(db_path, DAYDIGEST_FLAG)
         self.render_debounce_s = float(render_debounce_s)
         self.loop_check_every_s = float(loop_check_every_s)
         #: Earliest next loop check (the first one comes soon after start).
@@ -3036,6 +3066,10 @@ class PortraitScheduler:
         self._titles_at = 0.0
         #: The waiting questions' re-check against memory (questions.revet): earliest next pass.
         self._revet_at = 0.0
+        #: The user day (yuki.memory.daydigest.today) whose rollover pass already ran (None: not yet in this run),
+        #: and the failed digest attempts per day in this run (review A1, A6).
+        self._digest_day: str | None = None
+        self._digest_tries: dict[str, int] = {}
 
     def _log(self, type: str, **fields: Any) -> None:
         if self._log_fn is not None:
@@ -3175,9 +3209,63 @@ class PortraitScheduler:
             return self._run(kind, reason)
         if now >= self._loop_check_at and self.worker.loop_check_pending():
             return self._check_loops(now)
+        if self._daydigest_rollover(now):
+            ran = self._daydigest("day rollover")
+            if ran:
+                return ran
+        if self._daydigest_wanted():
+            return self._daydigest("connector asked")
         if now >= self._titles_at:
             return self._titles("idle")
         return None
+
+    def _daydigest_wanted(self) -> bool:
+        """The window asked for yesterday's connector line and there was none (the ``day_digest`` flag, written by
+        :meth:`yuki.memory.api.MemoryClient.day_connector`): taken (deleted) here, built once in the background."""
+        try:
+            self.daydigest_path.unlink()
+            return True
+        except OSError:
+            return False
+
+    def _daydigest_rollover(self, now: float) -> bool:
+        """True once per user day, at the first check after it began (04:00) or after the service started: the day
+        that just ended gets its digest by morning. The nightly slot (``nightly_hour``, 22:00) comes before the user
+        day ends, so it can only cover the days before (review A1). Content-free; a day already written costs one
+        indexed read and no call."""
+        from yuki.memory.daydigest import today
+
+        day = today(now)
+        if day == self._digest_day:
+            return False
+        self._digest_day = day
+        return True
+
+    def _daydigest(self, kind: str) -> str | None:
+        """The day digests of the last completed days that have none (:class:`yuki.memory.daydigest.DayDigester`, one
+        Haiku call a day); a day whose call failed :data:`yuki.memory.daydigest.MAX_TRIES_PER_DAY` times in this run
+        is left alone (review A6: the connector asks again on every window request). Logs and never raises."""
+        from yuki.memory.daydigest import MAX_TRIES_PER_DAY, NIGHT_DAYS, DayDigester, previous_days
+
+        if not hasattr(self.worker, "_call"):
+            return None
+        now = self.clock()
+        days = [d for d in previous_days(NIGHT_DAYS, now) if self._digest_tries.get(d, 0) < MAX_TRIES_PER_DAY]
+        if not days:
+            return None
+        try:
+            result = DayDigester(self.worker).run(days=days, now=now,
+                                                  reason=f"after the {kind} run" if kind in JOURNAL_RUN_KINDS else kind)
+        except Exception as exc:
+            self._log("error", where="portrait_daydigest", error=f"{type(exc).__name__}: {exc}",
+                      traceback=traceback.format_exc())
+            return None
+        for d in result.failed:
+            self._digest_tries[d] = self._digest_tries.get(d, 0) + 1
+        self._log("portrait_run", kind="daydigest", ok=result.ok, run_id=result.run_id, days=len(result.days),
+                  failed=len(result.failed), calls=result.calls, cost_usd=round(result.cost_usd, 6),
+                  error=result.error)
+        return "daydigest" if result.calls else None
 
     def _titles(self, reason: str, *, gated: bool = True) -> str | None:
         """The batched labels pass (:class:`yuki.memory.titles.Titler`) for items without their short label.
@@ -3191,7 +3279,7 @@ class PortraitScheduler:
         try:
             if gated and self.idle_fn() < titles.IDLE_S:
                 return None
-            if not any(self.store.labels_missing().values()):
+            if not any(self.store.labels_missing().values()) and not any(self.store.shown_missing().values()):
                 self._titles_at = now + titles.EVERY_S
                 return None
             if self._titler is None:
@@ -3203,12 +3291,13 @@ class PortraitScheduler:
             self._log("error", where="portrait_titles", error=f"{type(exc).__name__}: {exc}",
                       traceback=traceback.format_exc())
             return None
-        if not result.pending:
+        if not (result.pending or result.shown_pending):   # a pass of shown forms only is a run too (review A8)
             return None
         if not result.ok:
             self._titles_at = now + self.retry_after_s
         self._log("portrait_run", kind="titles", ok=result.ok, run_id=result.run_id, reason=reason,
-                  pending=result.pending, written=result.written, calls=result.calls,
+                  pending=result.pending, written=result.written, shown_pending=result.shown_pending,
+                  shown_written=result.shown_written, calls=result.calls,
                   cost_usd=round(result.cost_usd, 6), rejected=len(result.rejected), error=result.error)
         return "titles"
 
@@ -3314,10 +3403,12 @@ class PortraitScheduler:
         """After the nightly (or weekly/first) run and its audit: dreaming tidies the portrait, the routines pass
         keeps the Routines true to the measured timeline, the threads of work are tidied (merged, closed,
         renamed, asked about), the people index is refreshed from what changed (yuki.memory.contacts: no call when
-        nothing did), then the persona pass writes how Yuki talks. Each logs and never raises (a failure waits for
-        the next night)."""
+        nothing did), the day digests of the last completed days are written (yuki.memory.daydigest: the line that
+        connects one day's chat to the next), then the persona pass writes how Yuki talks. Each logs and never
+        raises (a failure waits for the next night)."""
         for name, fn in (("dream", self._dream), ("routines", self._routines), ("threads", self._threads),
-                         ("contacts", self._contacts), ("persona", self._persona), ("personal", self._personal)):
+                         ("contacts", self._contacts), ("daydigest", self._daydigest), ("persona", self._persona),
+                         ("personal", self._personal)):
             try:
                 fn(kind)
             except Exception as exc:

@@ -451,7 +451,8 @@ def test_dreaming_merges_keeps_citations_caps_and_writes_the_diary(store):
                             log_dir=Path(tempfile.mkdtemp()))
     result = Dreamer(worker, max_changes=3).run(now=T0 + 3600)
     assert result.ok and result.applied == 3
-    assert any("user-confirmed" in r for r in result.rejected) and any("open loops" in r for r in result.rejected)
+    # a fact the user stated starts pinned (migration 33): dreaming leaves it alone
+    assert any("pinned" in r for r in result.rejected) and any("open loops" in r for r in result.rejected)
     current = {f.id: f for f in store.portrait_facts()}
     merged = [f for f in current.values() if f.kind == "personality"]
     assert len(merged) == 1 and sorted(merged[0].source_ids) == sorted([j[0], j[1], j[2]])

@@ -157,6 +157,22 @@ def _clean(value: Any, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
 
 
+#: A route's "what you use it for" sentence: at most this many words (migration 33; a longer one is dropped, never
+#: cut).
+USE_MAX_WORDS = 12
+
+
+def route_use(value: Any) -> str | None:
+    """The linking call's ``use`` sentence for a route, kept as written when it is whole and within
+    :data:`USE_MAX_WORDS` words (whitespace counted); None otherwise. Plumbing: nothing is matched."""
+    text = " ".join(str(value or "").split())
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    if not text or text.endswith("…") or len(text.split()) > USE_MAX_WORDS:
+        return None
+    return text
+
+
 def _words_clip(value: Any, cap: int) -> str:
     """``value`` within ``cap`` characters, cut after a whole word (with an ellipsis) when it is longer."""
     text = " ".join(str(value or "").split())
@@ -382,15 +398,18 @@ naming the handle, an alias the user confirmed, a DM whose name is theirs, the s
 different spelling is not proof; when two names might be one person and nothing says so, keep them apart \
 and ask (questions, at most two, only when it matters: the user talks with them). For each person:
 - name: how the user names them (a person fact's subject, else how the chat shows them), exactly.
-- relation: who they are to the user, as a short phrase of two to eight words copied word for word from \
-a cited person fact ("best friend", "brother", "colleague on the Acme team", "music collaborator"); \
+- relation: who they are to the user, as a short phrase of one to eight words copied word for word from \
+a cited person fact ("best friend", "brother", "father", "colleague on the Acme team", "music collaborator"); \
 at most two such phrases joined by "; " ("Varun's wife; colleague on the Acme team"); "" when no \
-fact says.
+fact says. Copy only the words for the relationship, never "the user's" or "their" in front of it: \
+from "X is the user's father" the relation is "father".
 - aliases: their other names exactly as the data shows them - handles, display names, spellings, the \
 misheard forms in ALIASES.
 - routes: every chat where the user talks with them: their DM; a group or channel where they write; a \
 group where they never wrote only when a journal entry from it names them (cite it). Each with the handle \
-they show there (a sender name exactly as listed, or the DM's name).
+they show there (a sender name exactly as listed, or the DM's name), and use: what the user uses that chat \
+for with them, in at most twelve words said to the user, from the user's own lines there ("Code questions \
+and review links.", "Weekend game nights."); "" when their lines do not show it.
 - tone: how the user writes to them, from the user's own lines in their chats (language and script, \
 register, casing, length), in a few plain words ("Hinglish, lowercase, short and casual"); "" when the user \
 has no lines with them.
@@ -438,11 +457,16 @@ LINK_TOOL: dict[str, Any] = {
                             "type": "array",
                             "items": {
                                 "type": "object", "additionalProperties": False,
-                                "required": ["threads", "handle", "journal"],
+                                "required": ["threads", "handle", "journal", "use"],
                                 "properties": {
                                     "threads": {"type": "array", "items": {"type": "integer"},
                                                 "description": "T numbers of the chat (its threads)."},
                                     "handle": {"type": "string", "description": "How they show there, or \"\"."},
+                                    "use": {"type": "string", "description": (
+                                        f"At most {USE_MAX_WORDS} words, said to the user: what they use this chat "
+                                        "for with this person, from their own lines there (\"Code questions and "
+                                        "review links.\", \"Plans for the weekend game nights.\"); \"\" when their "
+                                        "lines do not show it.")},
                                     "journal": {"type": "array", "items": {"type": "integer"},
                                                 "description": "J numbers naming them there (a group where they "
                                                                "never wrote), else []."},
@@ -744,7 +768,8 @@ def validate(tool_input: Any, c: Candidates) -> Linked:
             if not ok:
                 out.rejected.append(f"person {name!r}: route {chat['name']!r}: {why}")
                 continue
-            routes.append({"chat": chat, "handle": handle or (theirs[0] if theirs else None), "evidence": evidence})
+            routes.append({"chat": chat, "handle": handle or (theirs[0] if theirs else None), "evidence": evidence,
+                           "use": route_use(r.get("use"))})
         if not routes and not facts:
             out.rejected.append(f"person {name!r}: no route and no person fact")
             continue
@@ -798,13 +823,14 @@ def apply(store: Store, linked: Linked, *, run_id: int | None, now: float, rebui
                 conn.execute("UPDATE contact_routes SET ended_at=? WHERE contact_id=? AND ended_at IS NULL", (now, r["id"]))
                 counts["retired"] += n
 
-        def add_route(contact_id: int | None, chat: dict[str, Any], handle: str | None, evidence: list[int]) -> None:
+        def add_route(contact_id: int | None, chat: dict[str, Any], handle: str | None, evidence: list[int],
+                      use: str | None = None) -> None:
             conn.execute(
                 "INSERT INTO contact_routes(contact_id, route_key, service, kind, chat_ciphertext, handle_ciphertext,"
-                " thread_ids, evidence, run_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " thread_ids, evidence, run_id, created_at, updated_at, use_ciphertext) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (contact_id, route_key(store, chat["service"], chat["name"]), chat["service"], chat["kind"],
                  store.cipher.encrypt(chat["name"]), enc(handle) if handle else None, json.dumps(chat["threads"]),
-                 json.dumps(evidence) if evidence else None, run_id, now, now))
+                 json.dumps(evidence) if evidence else None, run_id, now, now, enc(use) if use else None))
 
         for p in linked.people:
             fields = (name_key(store, p["name"]), store.cipher.encrypt(p["name"]),
@@ -824,7 +850,7 @@ def apply(store: Store, linked: Linked, *, run_id: int | None, now: float, rebui
                     (*fields, now, now)).lastrowid)
                 counts["added"] += 1
             for r in p["routes"]:
-                add_route(cid, r["chat"], r["handle"], r["evidence"])
+                add_route(cid, r["chat"], r["handle"], r["evidence"], r.get("use"))
                 counts["routes"] += 1
         for chat in linked.chats:
             if chat["kind"] in ("group", "channel"):
@@ -995,10 +1021,18 @@ class Route:
     weight_theirs: float = 0.0
     share: float = 1.0
     preferred: bool = False
+    #: One sentence, said to the user: what they use this chat for with the person (migration 33), or None.
+    use: str | None = None
 
     @property
     def ref(self) -> str:
         return f"route:{self.id}"
+
+    def human(self) -> str:
+        """How the route reads to the user (no ids, no quotes): "Discord DM", "WhatsApp group RES"."""
+        kind = {"dm": "DM", "group": "group", "channel": "channel"}.get(self.kind, self.kind)
+        app = self.app or self.service
+        return f"{app} {kind}" if self.kind == "dm" else f"{app} {kind} {self.chat}"
 
     def label(self, *, with_service: bool = False) -> str:
         """How the route reads to the model: "Discord DM "@Quasar40404"", "WhatsApp group "RES""."""
@@ -1061,11 +1095,13 @@ def all_routes(store: Store) -> list[Route]:
         try:
             chat = store.cipher.decrypt(r["chat_ciphertext"])
             handle = store._dec(r["handle_ciphertext"])
+            use = store._dec(r["use_ciphertext"]) if "use_ciphertext" in r.keys() else None
         except Exception:
             continue
         out.append(Route(id=int(r["id"]), contact_id=r["contact_id"], key=r["route_key"], service=r["service"],
                          kind=r["kind"], chat=chat, handle=handle,
-                         thread_ids=_thread_target(store, _ints(r["thread_ids"])), evidence=_ints(r["evidence"])))
+                         thread_ids=_thread_target(store, _ints(r["thread_ids"])), evidence=_ints(r["evidence"]),
+                         use=use))
     return out
 
 
@@ -1442,24 +1478,85 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
             "first_mine": r.first_mine, "last_mine": r.last_mine, "first_theirs": r.first_theirs,
             "last_theirs": r.last_theirs, "score": r.score, "share": round(r.share, 3), "preferred": r.preferred,
             "in_front": near_thread is not None and near_thread in r.thread_ids, "evidence": r.evidence,
-            "samples": samples(store, r, with_samples) if with_samples else []})
+            "samples": samples(store, r, with_samples) if with_samples else [],
+            "human": r.human(), "use": r.use})
     facts = []
+    mine: list[Any] = []
     try:
         current = person_facts if person_facts is not None else {
             f.id: f for f in store.portrait_facts(["person"], include_corrections=False)}
-        facts = [_clean(current[f].text, 400) for f in contact.fact_ids if f in current]
+        mine = person_facts_of(contact, current)
+        facts = [_clean(f.text, 400) for f in mine]
     except Exception:
         pass
-    return {"ref": contact.ref, "name": contact.name, "relation": contact.relation,
+    about = mine[0] if mine else None
+    summary = None if about is None else {
+        "ref": f"fact:{about.id}", "headline": about.summary, "text": about.shown, "pinned": bool(about.pinned)}
+    # the window's other facts about them (never the summary's own fact again: report 38 §3), said to the user
+    more = [{"ref": f"fact:{f.id}", "headline": f.summary, "text": f.shown or f.summary} for f in mine[1:]
+            if f.shown or f.summary]
+    usual = usual_label(routes, contact.tone)
+    return {"ref": contact.ref, "name": contact.name,
+            # the user-facing relation is the person fact's own short label (written to the user, "Your father"),
+            # else the linking call's phrase; the agent's card text keeps the memory form (relation_memory)
+            "relation": (about.summary if about is not None and about.summary else contact.relation),
+            "relation_memory": contact.relation,
             "aliases": [a["name"] for a in contact.aliases if a.get("how") != "heard"], "heard": contact.heard(),
-            "tone": contact.tone, "facts": facts, "routes": routes, "margin": ranking.margin, "close": ranking.close,
-            "usual": routes[0]["ref"] if routes else None, "preferred": ranking.preferred,
+            "tone": contact.tone, "facts": facts, "summary": summary, "facts_shown": more, "routes": routes,
+            "margin": ranking.margin,
+            # ``usual`` stays a plain line any window can print as it is ("Slack DM. Code questions go on the PR.");
+            # the structured form is ``usual_route`` (review A2: a window that passes ``usual`` through as a string
+            # must never print an object)
+            "close": ranking.close, "usual": usual_line(usual), "usual_route": usual,
+            "usual_ref": routes[0]["ref"] if routes else None, "preferred": ranking.preferred,
             "calls": calls_with(store, contact, seen=calls_seen)}
+
+
+def person_facts_of(contact: Contact, current: dict[int, Any]) -> list[Any]:
+    """The current person facts about this contact: the ones the linking call cited, else the person fact whose
+    subject is their name or an alias (the join key a fact written after the last link run attaches by: report 38 §3,
+    a stale ``fact_ids``). Whole-name comparison of stored strings, as :func:`resolve` does."""
+    out = [current[f] for f in contact.fact_ids if f in current]
+    if out:
+        return out
+    names = [tokens(n) for n in contact.names if tokens(n)]
+    return [f for f in current.values() if getattr(f, "kind", "person") == "person" and tokens(f.subject or "")
+            and tokens(f.subject) in names]
+
+
+def usual_label(routes: Sequence[dict[str, Any]], tone: str | None = None) -> dict[str, Any] | None:
+    """How the user usually reaches someone, as the app shows it (report 38 §1; never a ``route:N``): ``{"ref",
+    "label": "Discord DM", "sub": the handle or chat, "use": the "what you use it for" sentence or None, "mine",
+    "theirs", "last_at", "tone"}`` of the first route (the user's choice or the most used lately); None without
+    routes."""
+    if not routes:
+        return None
+    r = routes[0]
+    sub = r.get("handle") or (r.get("chat") if r.get("kind") == "dm" else "")
+    last = max([t for t in (r.get("last_mine"), r.get("last_theirs")) if t], default=None)
+    return {"ref": r.get("ref"), "label": r.get("human") or r.get("label"), "sub": sub or None, "use": r.get("use"),
+            "mine": r.get("mine"), "theirs": r.get("theirs"), "last_at": last, "tone": tone or None,
+            "preferred": bool(r.get("preferred"))}
+
+
+def usual_line(usual: dict[str, Any] | None) -> str | None:
+    """The usual route as one plain line (deterministic formatting of :func:`usual_label`): the route's name, then
+    what the user uses it for when the linking call wrote it ("Slack DM. Code questions go on the PR."), else the
+    handle or chat ("Discord DM · @dev"). None without routes."""
+    if not usual or not usual.get("label"):
+        return None
+    label = " ".join(str(usual["label"]).split())
+    use = " ".join(str(usual.get("use") or "").split())
+    if use:
+        return f"{label.rstrip('.')}. {use}"
+    sub = " ".join(str(usual.get("sub") or "").split())
+    return f"{label} · {sub}" if sub else label
 
 
 def card_text(c: dict[str, Any]) -> str:
     """The card as the agent's ``about`` tool shows it."""
-    head = c["name"] + (f" - {c['relation']}" if c.get("relation") else "")
+    relation = c.get("relation_memory", c.get("relation"))
+    head = c["name"] + (f" - {relation}" if relation else "")
     lines = [head]
     if c.get("aliases"):
         lines.append("Also shown as: " + ", ".join(c["aliases"]))

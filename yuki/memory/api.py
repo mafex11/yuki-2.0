@@ -107,6 +107,20 @@ Practice memory (migration 29, yuki.memory.practice; learned by the service's pr
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
+The 3 Oct feedback (migration 33; docs/research/revamp-2026-10-02/38 and 43-build-appA-memory.md). Direct ops, no model
+on the click path; every text a list returns has a ``shown`` form said to the user (None until written)::
+
+    memory.pin_fact("fact:N", on=True) -> {"ok", "ref", "pinned"}          # pin AND unpin (its own flag)
+    memory.misheard(days=7, limit=8) -> {"items": [journal dict + "ref", "heard_in", "channel_known", "people"],
+                                         "total"}
+    memory.resolve_heard("journal:N", "right" | "wrong" | "undo", correction_id=None)
+        -> {"ok", "ref", "verdict", "nature", "correction_id"}            # leaves misheard() at once
+    memory.review_queue() -> {"items": [...], "cap": 5, "reviewed_today", "left_today", "waiting", "merged"}
+    memory.review_mark("fact:N", "right" | "wrong" | "notmine" | "undo", correction_id=None) -> dict
+    memory.day_connector(day=None) -> {"day", "label", "text", "memory", "open", "threads", "exchanges"} | None
+    memory.chat_days(days=14) -> [{"day", "count", "first", "last"}];  memory.turns_on(day) -> [turn dict]
+    memory.people_list() / memory.contact(ref)   # "usual" a plain line, "usual_route" its label object, one "summary"
+
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
     memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, times, speech, gists
@@ -174,6 +188,21 @@ COACH_QUIET_S = 3 * 3600.0
 COACH_QUIET_LOOKS = 4
 RESUME_CONTEXT_CHARS = 4_000
 RESUME_EXCHANGES = 6
+#: When the last exchange is older than the resume window: the last day digest (and open promises) instead, at most
+#: this long, from a day at most this many days back (migration 33, report 38 §9.3).
+RESUME_FALLBACK_CHARS = 1_000
+RESUME_FALLBACK_DAYS = 7
+#: The "To review" queue (report 38 §12.3; the mock: at most 5 a day): facts written in the last this-many days,
+#: "unsure" at or below this confidence; open loops are to-dos and are never reviewed here.
+REVIEW_PER_DAY = 5
+REVIEW_WITHIN_DAYS = 14
+REVIEW_UNSURE = 0.6
+REVIEW_SKIP_KINDS = ("open_loop",)
+#: An Undo that came after the Wrong's correction pass started (review A3): the answer stands, the item stays gone.
+TOO_LATE_TO_UNDO = "Too late to undo: Yuki is already updating memory from your answer."
+#: "Maybe misheard" (report 38 §5): uncertain entries of the last this-many days, this many listed (newest first).
+MISHEARD_DAYS = 7
+MISHEARD_SHOWN = 8
 #: The user's goals (migration 30, yuki.memory.checkins): today's and their work's, in the commitments block of every
 #: request (their own budget, so they never push a to-do or a rule out, nor the other way round).
 STANDING_GOALS_CHARS = 700
@@ -528,6 +557,143 @@ class MemoryClient:
         one render; every call restarts the wait. Non-blocking; never raises.
         """
         request_render(self.store.path)
+
+    # -- the user's own verdicts on what memory holds (migration 33; report 38 §4, §5, §12.3) -------------
+    # Direct, deterministic ops: one transaction each, no model call on the click path. A "wrong" also queues the
+    # correction pass (the ripple through derived items) in the background, exactly as a Forget did; its Undo within
+    # the window takes the verdict back and cancels the queued pass.
+
+    @staticmethod
+    def _fact_id(ref: Any) -> int | None:
+        text = str(ref or "").strip().strip("[]").split(":")[-1].lstrip("FfPp")
+        return int(text) if text.isdigit() else None
+
+    @staticmethod
+    def _journal_id(ref: Any) -> int | None:
+        text = str(ref or "").strip().strip("[]").split(":")[-1].lstrip("Jj")
+        return int(text) if text.isdigit() else None
+
+    def pin_fact(self, ref: Any, on: bool = True) -> dict:
+        """Pin (``on``) or unpin a current portrait fact - a routine, a fact, a person's fact (``fact:N``). The pin is
+        its own flag (never ``origin``, which says "you told me"); a pinned fact changes only on the user's
+        correction or later evidence. One UPDATE and a diary line (pass ``pin``), synchronous, no model. Returns
+        ``{"ok", "ref", "pinned"}`` (``ok`` False with ``error`` when it is not a current fact)."""
+        fid = self._fact_id(ref)
+        if fid is None:
+            return {"ok": False, "ref": str(ref or ""), "error": "not a fact"}
+        ok = self.store.set_fact_pinned(fid, bool(on))
+        out = {"ok": ok, "ref": f"fact:{fid}", "pinned": bool(on) if ok else None}
+        if not ok:
+            out["error"] = "That fact has changed since; open it again."
+        # no re-render: the pin changes no word of the page Yuki reads (a render is a model call)
+        return out
+
+    def _ripple(self, subject: str, memory_had: str, words: str) -> int | None:
+        """Queue the correction pass for a "wrong" verdict (the fold and the reword reach derived items), in the
+        Me page's fixed correction format; the pass runs in the service, never on the click path. Never raises."""
+        try:
+            text = (f'About "{" ".join(str(subject or "this").split())}" (memory had: "{" ".join(memory_had.split())}"), '
+                    f'the user said in their own words: "{words}"')
+            return self.store.add_correction(secret_filter.redact_text(text))
+        except Exception:
+            return None
+
+    def review_queue(self, now: float | None = None) -> dict:
+        """The day's "To review" queue (report 38 §12.3, the mock's design): current facts Yuki wrote that the user
+        has not answered or pinned, written in the last :data:`REVIEW_WITHIN_DAYS` days, ranked by importance x
+        (1 - confidence) then newest, at most :data:`REVIEW_PER_DAY` a day (answers today count against it). Returns
+        ``{"items": [{"ref": "fact:N", "id", "kind", "aspect", "subject", "headline" (the short label), "text" (the
+        shown form; None until written), "flag": "unsure" | "new", "confidence", "importance", "since",
+        "created_at"}], "cap", "reviewed_today", "left_today", "waiting" (how many qualify in all), "merged":
+        {"count", "since"} (facts the nightly tidy merged in the last 7 days: "I merged N similar facts")}``.
+        Read only, no model. Never raises (an empty queue)."""
+        from yuki.memory.checkins import day_boundary, user_day
+
+        now = time.time() if now is None else float(now)
+        out = {"items": [], "cap": REVIEW_PER_DAY, "reviewed_today": 0, "left_today": REVIEW_PER_DAY, "waiting": 0,
+               "merged": {"count": 0, "since": now - 7 * 86400.0}}
+        try:
+            start = day_boundary(user_day(now))
+            done = self.store.review_counts(start)
+            since = now - REVIEW_WITHIN_DAYS * 86400.0
+            pool = [f for f in self.store.portrait_facts(include_corrections=False)
+                    if f.kind not in REVIEW_SKIP_KINDS and f.origin != "user" and not f.pinned
+                    and f.reviewed_at is None and (f.created_at or 0.0) >= since]
+
+            def rank(f: Any) -> tuple[float, float]:
+                conf = 0.5 if f.confidence is None else float(f.confidence)
+                return (-(float(f.importance or 3) * (1.0 - conf)), -(f.created_at or 0.0))
+
+            pool.sort(key=rank)
+            left = max(0, REVIEW_PER_DAY - done)
+            out.update(reviewed_today=done, left_today=left, waiting=len(pool))
+            out["items"] = [{"ref": f"fact:{f.id}", "id": f.id, "kind": f.kind, "aspect": f.aspect,
+                             "subject": f.subject, "headline": f.summary, "text": f.shown,
+                             "flag": "unsure" if (f.confidence is not None and f.confidence <= REVIEW_UNSURE) else "new",
+                             "confidence": f.confidence, "importance": f.importance, "since": f.valid_from,
+                             "created_at": f.created_at} for f in pool[:left]]
+            merges = self.store.changelog(since=out["merged"]["since"], pass_="dream", limit=200)
+            out["merged"]["count"] = sum(max(0, len(m.get("fact_ids") or []) - 1) for m in merges
+                                         if m.get("action") == "merge")
+        except Exception:
+            pass
+        return out
+
+    def review_mark(self, ref: Any, verdict: str, *, correction_id: int | None = None) -> dict:
+        """The user's answer to one "To review" fact, at once and without a model: ``right`` - reviewed and pinned
+        (it stays as it is); ``wrong`` / ``notmine`` - retired now, and the correction pass queued for the ripple
+        (returns its ``correction_id``); ``undo`` (within the window's Undo) - takes it back: a retired fact is
+        current again and the queued pass (``correction_id``) is cancelled - only while it has not started: once it has,
+        nothing is restored and ``ok`` is False with :data:`TOO_LATE_TO_UNDO` (the window keeps the item removed).
+        Returns ``{"ok", "ref", "verdict", "correction_id", "cancelled"?}``, ``ok`` False with ``error`` when nothing
+        could be done."""
+        fid = self._fact_id(ref)
+        verdict = str(verdict or "").strip().lower()
+        out: dict[str, Any] = {"ok": False, "ref": f"fact:{fid}" if fid else str(ref or ""), "verdict": verdict,
+                               "correction_id": None}
+        if fid is None or verdict not in ("right", "wrong", "notmine", "undo"):
+            out["error"] = "say right, wrong, notmine or undo for a fact"
+            return out
+        now = time.time()
+        fact = self.store.portrait_fact(fid)
+        if fact is None:
+            out["error"] = "no such fact"
+            return out
+        if verdict == "right":
+            out["ok"] = self.store.mark_fact_reviewed(fid, now, pin=True, note=f"The user confirmed F{fid} (review).")
+        elif verdict in ("wrong", "notmine"):
+            if fact.valid_to is not None:
+                out["error"] = "That fact has changed since; open it again."
+                return out
+            from yuki.memory.store import FactChange
+
+            self.store.mark_fact_reviewed(fid, now, note=f"The user said F{fid} is {'not theirs' if verdict == 'notmine' else 'wrong'} (review).")
+            [(ok, _new)] = self.store.commit_portrait_changes(
+                None, [FactChange("INVALIDATE", fid, fact.kind, fact.subject, "", None, [], now, "user")])
+            out["ok"] = bool(ok)
+            if ok:
+                words = "That isn't about me. It's not mine." if verdict == "notmine" else "It's just wrong, forget it"
+                out["correction_id"] = self._ripple(fact.subject or fact.kind, fact.text, words)
+                self.rerender_portrait()
+        else:
+            # the queued ripple is taken back first: once its pass started, the answer stands (review A3: a restore
+            # with the "forget it" pass still running would be undone again by that pass)
+            if correction_id:
+                out["cancelled"] = self.store.cancel_correction(int(correction_id))
+                if not out["cancelled"]:
+                    out["error"] = TOO_LATE_TO_UNDO
+                    return out
+            if fact.valid_to is None:
+                out["ok"] = self.store.mark_fact_reviewed(fid, None, pin=False if fact.origin != "user" else None,
+                                                          note=f"The user took back their answer on F{fid}.")
+            else:
+                out["ok"] = self.store.restore_fact(fid) and self.store.mark_fact_reviewed(
+                    fid, None, note=f"The user took back their answer on F{fid}.")
+                if out["ok"]:
+                    self.rerender_portrait()
+        if not out["ok"] and "error" not in out:
+            out["error"] = "That fact has changed since; open it again."
+        return out
 
     # -- know-how ----------------------------------------------------------
 
@@ -1241,12 +1407,16 @@ class MemoryClient:
         Hard cap 4,000 characters (~1,000 tokens): long messages are cut after
         whole sentences (or shown as "a long message") and, when still over,
         the oldest exchanges are dropped whole. Never raises (``None`` on errors).
+
+        When the last exchange is older than ``within_hours`` (a new day), the block is the last day digest and the
+        open promises instead (:meth:`_resume_from_day`, at most :data:`RESUME_FALLBACK_CHARS`; migration 33), so
+        the first request of the day knows yesterday; ``None`` when there is no recent digest either.
         """
         try:
             latest = self.store.latest_turn()
             now = time.time()
             if latest is None or now - latest.at > float(within_hours) * 3600.0:
-                return None
+                return self._resume_from_day(now)
             sid = latest.session_id
             turns = self.store.turns_for_session(sid, limit=RESUME_EXCHANGES)
             start, end, count = self.store.session_span(sid)
@@ -1295,6 +1465,49 @@ class MemoryClient:
         if len(render(blocks, summary)) > RESUME_CONTEXT_CHARS:
             summary = ""
         return render(blocks, summary)
+
+    def _resume_from_day(self, now: float) -> str | None:
+        """The resume block when the last exchange is older than the window (report 38 §9.3): the last day digest -
+        the same line the user sees at the top of the new chat - and the open promises, at most
+        :data:`RESUME_FALLBACK_CHARS`; None when there is none from the last :data:`RESUME_FALLBACK_DAYS` days.
+
+        It says which day the digest is from and never calls an older day "the last day": when yesterday had
+        activity and its digest is not written yet, it asks for it (the flag, as :meth:`day_connector` does) and says
+        that yesterday's is missing (review A1: Yuki and the page must not disagree about yesterday)."""
+        from yuki.memory.daydigest import day_window, previous_days, today
+
+        try:
+            asked = self._ask_day_digest(now)
+            if asked:   # say so only when they talked with Yuki yesterday (journal entries alone may make no digest)
+                y_start, y_end = day_window(previous_days(1, now)[0])
+                asked = bool(self.store.turn_times(y_start, y_end))
+            found = self.store.day_digests(before=today(now), limit=1)
+            if not found or found[0]["day"] < previous_days(RESUME_FALLBACK_DAYS, now)[-1]:
+                return None
+            d = found[0]
+            start, _end = day_window(d["day"])
+            when = f"{datetime.fromtimestamp(start + 6 * 3600):%A %d %B}"
+            if d["day"] == previous_days(1, now)[0]:
+                head = f"[Yesterday ({when}) with the user, from memory's day digest; this is a new chat]"
+            else:
+                head = (f"[From memory's day digest of {when}, the latest one written"
+                        + ("; the user also talked with you yesterday, whose digest is not written yet" if asked
+                           else "")
+                        + "; this is a new chat]")
+            parts = [head, _clip_sentences(d["text"], 600) or ""]
+            opened = [o.get("text") for o in (d.get("refs") or {}).get("open") or [] if isinstance(o, dict)]
+            if opened:
+                parts.append("Still open then: " + "; ".join(str(o) for o in opened if o))
+            promises = [f.title or f.text for f in self.store.conversation_facts(("commitment",))][-5:]
+            if promises:
+                parts.append("Open promises and to-dos: " + "; ".join(self._message(p, 120) for p in promises))
+            text = "\n".join(p for p in parts if p)
+            while len(text) > RESUME_FALLBACK_CHARS and len(parts) > 2:
+                parts.pop()
+                text = "\n".join(p for p in parts if p)
+            return text[:RESUME_FALLBACK_CHARS] if text else None
+        except Exception:
+            return None
 
     def remember_rule(self, text: str, source_turn: int | None = None, supersedes: int | None = None) -> int:
         """Store a standing rule the user just gave, in the user's words; returns its id.
@@ -2231,7 +2444,8 @@ class MemoryClient:
                 speech += float(d["speech_s"] or 0.0)
                 state = "timeline written" if d["status"] == "ok" else "nothing worth a line"
                 if d.get("gist"):
-                    gists.append({"call_id": cid, "gist": d["gist"]})
+                    # ``shown``: the gist said to the user (migration 33), None until written
+                    gists.append({"call_id": cid, "gist": d["gist"], "shown": d.get("gist_shown")})
             elif r.recording_started_at is None:
                 state = ("not recorded (the user said no)" if r.consent in ("no", "never") else
                          "not recorded (no headphones, or stopped)" if r.consent in ("yes", "always") else
@@ -2258,13 +2472,17 @@ class MemoryClient:
         contexts = [(digests.get(c) or {}).get("context") or {} for c in ids]
         people = merge_people(*(c.get("people") or [] for c in contexts))
         where = list(dict.fromkeys(c["where"] for c in contexts if c.get("where")))
+        from yuki.memory.titles import place_label
+
+        # the structured place (migration 33's digests) as a label, "Discord, #general voice (Friends)"
+        places = list(dict.fromkeys(place_label(c.get("place")) for c in contexts if c.get("place")))
         return {
             "ref": f"call:{ids[0]}", "call_ids": ids, "app": span["app"], "service": span.get("service"),
             "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
             "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
             "recorded": recorded, "consent": consent,
             "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
-            "gists": gists, "rows": parts, "people": people, "where": where,
+            "gists": gists, "rows": parts, "people": people, "where": where, "places": [p for p in places if p],
         }
 
     def calls_in(self, since=None, until=None, limit: int = 30) -> list[dict]:
@@ -2476,8 +2694,16 @@ class MemoryClient:
 
     @staticmethod
     def _journal_dict(j: JournalEntry) -> dict:
+        """One journal entry for the window. ``source`` (migration 17's provenance: ``{"kind", "by", "where", "call",
+        "unclear", "quote"}`` or None), ``call`` (``call:N`` when it was said on a call, joins :meth:`calls_in` and
+        the digest's place) and ``where`` (the provenance's where, "Discord call") since migration 33."""
+        src = j.source if isinstance(j.source, dict) else None
+        source = None if src is None else {k: src.get(k) for k in ("kind", "by", "where", "call", "unclear", "quote")
+                                           if src.get(k) not in (None, "")}
         return {"id": j.id, "at": j.at, "app": j.app, "text": j.fact, "nature": j.nature, "importance": j.importance,
-                "by_yuki": bool(j.by_yuki), "milestone": bool(j.milestone)}
+                "by_yuki": bool(j.by_yuki), "milestone": bool(j.milestone), "source": source,
+                "call": (src or {}).get("call") or None, "where": (src or {}).get("where") or None,
+                "reviewed_at": getattr(j, "reviewed_at", None)}
 
     def journal_entries(self, since: Any = None, until: Any = None) -> list[dict]:
         """Journal facts in ``[since, until)`` (decrypted), oldest first."""
@@ -2488,13 +2714,84 @@ class MemoryClient:
         wanted = sorted({int(i) for i in ids or () if str(i).isdigit() or isinstance(i, int)})
         return [self._journal_dict(j) for j in self.store.journal_by_ids(wanted)] if wanted else []
 
+    def misheard(self, days: float = MISHEARD_DAYS, limit: int = MISHEARD_SHOWN, now: float | None = None) -> dict:
+        """The "Maybe misheard" list (report 38 §5-§6): journal entries of the last ``days`` marked uncertain (possibly
+        misheard or ambiguous) that the user has not answered, newest first, at most ``limit``, and how many in all.
+        Each is :meth:`_journal_dict` plus ``ref`` (``journal:N``, what :meth:`resolve_heard` takes), ``heard_in`` (a
+        label: the voice channel for an entry said on a call when the digest saw it, "Discord, #general voice
+        (Friends)"; else the call app or the window's app), ``channel_known`` and ``people`` (who the call screen showed
+        on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises."""
+        from yuki.memory.titles import place_label
+
+        now = time.time() if now is None else float(now)
+        try:
+            entries, total = self.store.uncertain_journal(now - float(days) * 86400.0, limit=max(0, int(limit)))
+            dicts = [self._journal_dict(j) for j in entries]
+            calls = {}
+            ids = {int(d["call"][5:]) for d in dicts if str(d.get("call") or "").startswith("call:")
+                   and str(d["call"])[5:].isdigit()}
+            if ids:
+                calls = self.store.call_contexts(ids)
+            items = []
+            for d in dicts:
+                ctx = calls.get(int(str(d["call"])[5:])) if d.get("call") and str(d["call"])[5:].isdigit() else None
+                label = place_label(ctx.get("place"), ctx.get("where") or "") if ctx else ""
+                # a channel is known when the digest's place names one, or its free text says more than the app
+                channel = bool(ctx and ((ctx.get("place") or {}).get("channel") or (
+                    label and label.casefold() != str(ctx.get("app") or "").casefold())))
+                items.append({**d, "ref": f"journal:{d['id']}",
+                              "heard_in": label or d.get("where") or d.get("app") or "",
+                              "channel_known": channel,
+                              "people": [p["name"] for p in (ctx or {}).get("people") or []
+                                         if p.get("how") == "on_call_screen"]})
+            return {"items": items, "total": total}
+        except Exception:
+            return {"items": [], "total": 0}
+
+    def resolve_heard(self, ref: Any, verdict: str, *, correction_id: int | None = None) -> dict:
+        """The user's Right / Wrong on a "maybe misheard" entry, at once, with no model on the click path:
+        ``right`` - the entry is taken as said (its nature becomes ``fact``; nothing is reworded); ``wrong`` - it is
+        retired now and the correction pass is queued for the ripple (``correction_id``); ``undo`` (the window's Undo)
+        - either is taken back, and a queued pass (``correction_id``) is cancelled first; once that pass started, nothing
+        is taken back (``ok`` False, :data:`TOO_LATE_TO_UNDO`); an entry never answered has nothing to undo. The item
+        leaves :meth:`misheard` at once (answered entries are never listed again). Returns ``{"ok", "ref", "verdict",
+        "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered."""
+        jid = self._journal_id(ref)
+        verdict = str(verdict or "").strip().lower()
+        out: dict[str, Any] = {"ok": False, "ref": f"journal:{jid}" if jid else str(ref or ""), "verdict": verdict,
+                               "nature": None, "correction_id": None}
+        if jid is None or verdict not in ("right", "wrong", "undo"):
+            out["error"] = "say right, wrong or undo for a journal entry"
+            return out
+        if verdict == "undo" and correction_id:   # the ripple first: once its pass started, the answer stands (A3)
+            out["cancelled"] = self.store.cancel_correction(int(correction_id))
+            if not out["cancelled"]:
+                out["error"] = TOO_LATE_TO_UNDO
+                return out
+        try:
+            done = self.store.resolve_journal(jid, verdict)
+        except Exception as exc:
+            out["error"] = f"memory: {type(exc).__name__}"
+            return out
+        if done is None:
+            out["error"] = "That entry has changed since; open it again."
+            return out
+        out.update(ok=True, nature=done["nature"])
+        if verdict == "wrong":
+            out["correction_id"] = self._ripple(done.get("app") or "what Yuki heard", done["text"],
+                                                "That was misheard. It's wrong, forget it")
+        return out
+
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
         """The current portrait facts, each with the journal entries it rests on (newest first).
 
         Each: ``{"id", "ref": "fact:N", "kind", "subject", "text", "summary", "aspect", "origin", "confidence",
-        "since", "evidence": [journal dict, ...]}``. ``summary`` is the app's short line for the fact (at most
-        eight words; an open loop's is its title), model-written (migration 21, yuki.memory.titles), ``None``
-        until written. Corrections waiting to be folded in are left out.
+        "since", "shown", "pinned", "reviewed_at", "importance", "created_at", "evidence": [journal dict, ...]}``.
+        ``summary`` is the app's short line for the fact (at most eight words; an open loop's is its title),
+        model-written (migration 21, yuki.memory.titles), ``None`` until written. ``shown`` is the fact said to the
+        user (second person, natural dates; migration 33), ``None`` until written - show it instead of ``text``.
+        ``pinned`` is the user's own pin (:meth:`pin_fact`), separate from ``origin == "user"`` ("you told me").
+        Corrections waiting to be folded in are left out.
         """
         facts = self.store.portrait_facts(include_corrections=False)
         ids = sorted({i for f in facts for i in f.source_ids})
@@ -2504,6 +2801,8 @@ class MemoryClient:
             ev = sorted((entries[i] for i in f.source_ids if i in entries), key=lambda j: -j.at)
             out.append({"id": f.id, "ref": f"fact:{f.id}", "kind": f.kind, "subject": f.subject, "text": f.text,
                         "summary": f.summary, "aspect": f.aspect, "origin": f.origin, "confidence": f.confidence, "since": f.valid_from,
+                        "shown": f.shown, "pinned": bool(f.pinned), "reviewed_at": f.reviewed_at,
+                        "importance": f.importance, "created_at": f.created_at,
                         "evidence": [self._journal_dict(j) for j in ev[:evidence_per_fact]]})
         return out
 
@@ -2526,6 +2825,94 @@ class MemoryClient:
                 return []
             session_id = latest.session_id
         turns = self.store.turns_for_session(session_id, limit=max(1, int(limit)))
+        return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
+                 "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
+                 "outcome": t.outcome} for t in turns]
+
+    # -- a new chat every day, with memory between days (migration 33; report 38 §9) ---------------------------
+
+    def day_connector(self, day: str | None = None, now: float | None = None) -> dict | None:
+        """The line at the top of a new day's chat: the digest of the user's last day before today (or of ``day``,
+        ``YYYY-MM-DD``; days start at 04:00), said to them. ``{"day", "label" ("Yesterday", "Thursday 1 October"),
+        "text" (the shown form; may be None until written), "memory" (Yuki's form), "open": [{"text", "thread":
+        "thread:N" | None}], "threads": ["thread:N"...], "exchanges"}`` or None. When the last completed day with
+        anything in it has no digest yet, asks the service to write it (a flag; one Haiku call in the background,
+        never on this path) and returns the newest older one, if any, within :data:`RESUME_FALLBACK_DAYS`.
+        Read only otherwise. Never raises."""
+        from yuki.memory.daydigest import day_window, previous_days, today
+
+        now = time.time() if now is None else float(now)
+        try:
+            if day is None:
+                self._ask_day_digest(now)
+                found = self.store.day_digests(before=today(now), limit=1)
+            else:
+                found = self.store.day_digests(days=[str(day)], limit=1)
+            if not found:
+                return None
+            d = found[0]
+            if day is None and d["day"] < previous_days(RESUME_FALLBACK_DAYS, now)[-1]:
+                return None
+            start, _end = day_window(d["day"])
+            from yuki.memory.titles import natural_day
+
+            label = "Yesterday" if d["day"] == previous_days(1, now)[0] else natural_day(start + 6 * 3600, now)
+            refs = d.get("refs") or {}
+            return {"day": d["day"], "label": label, "text": d.get("shown"), "memory": d["text"],
+                    "open": [{"text": o.get("text"), "thread": f"thread:{o['thread']}" if o.get("thread") else None}
+                             for o in refs.get("open") or [] if isinstance(o, dict) and o.get("text")],
+                    "threads": [f"thread:{t}" for t in refs.get("threads") or []],
+                    "exchanges": refs.get("exchanges")}
+        except Exception:
+            return None
+
+    def _ask_day_digest(self, now: float) -> bool:
+        """Yesterday had exchanges or journal entries and has no digest yet: write the ``day_digest`` flag (the
+        service's scheduler builds it in the background, one Haiku call; never on this path). True when it asked.
+        Content-free reads. Never raises."""
+        from yuki.memory.daydigest import DAYDIGEST_FLAG, day_window, previous_days
+
+        try:
+            yesterday = previous_days(1, now)[0]
+            if self.store.day_digests(days=[yesterday], limit=1):
+                return False
+            start, end = day_window(yesterday)
+            if not (self.store.turn_times(start, end) or self.store.journal_count(start, end)):
+                return False
+            path = self._flag(DAYDIGEST_FLAG)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    def chat_days(self, days: int = 14, now: float | None = None) -> list[dict]:
+        """The user days with exchanges in the last ``days`` (days start at 04:00), newest first: ``{"day", "count",
+        "first", "last"}`` (epoch seconds) - the drawer's day dividers and folds. Content-free. Never raises."""
+        from yuki.memory.checkins import user_day
+
+        now = time.time() if now is None else float(now)
+        try:
+            out: dict[str, dict[str, Any]] = {}
+            for at, _sid in self.store.turn_times(now - int(days) * 86400.0 - 86400.0, now + 60.0):
+                d = user_day(at)
+                row = out.setdefault(d, {"day": d, "count": 0, "first": at, "last": at})
+                row["count"] += 1
+                row["first"], row["last"] = min(row["first"], at), max(row["last"], at)
+            return sorted(out.values(), key=lambda r: r["day"], reverse=True)[: int(days) + 1]
+        except Exception:
+            return []
+
+    def turns_on(self, day: str, limit: int = 200) -> list[dict]:
+        """One user day's exchanges with Yuki (``YYYY-MM-DD``, from 04:00), oldest first, in :meth:`recent_turns`'
+        shape - loaded when the user opens an earlier day's fold. Never raises (``[]``)."""
+        from yuki.memory.daydigest import day_window
+
+        try:
+            start, end = day_window(str(day))
+            turns = self.store.turns_between(start, end)[-max(1, int(limit)):]
+        except Exception:
+            return []
         return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
                  "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
                  "outcome": t.outcome} for t in turns]
@@ -2742,7 +3129,7 @@ class MemoryClient:
         return {"ref": f"thread:{t.id}", "id": t.id, "title": t.title, "status": t.status, "state": t.state,
                 "open": list(t.open_items), "involves": list(t.entities), "first_seen": _iso(t.first_seen),
                 "last_seen": _iso(t.last_seen), "events": t.events, "importance": t.importance,
-                "line": thread_line(t)}
+                "line": thread_line(t), "shown": getattr(t, "shown", None)}
 
     @staticmethod
     def thread_id_of(ref: Any) -> int | None:
@@ -2906,17 +3293,31 @@ class MemoryClient:
                 card["rhythm"] = _c.rhythm(self.store, [found[0]]).get(found[0].id)
             except Exception:
                 card["rhythm"] = None
-            return {"found": True, **card, "text": _c.card_text(card), "others": [p.name for p in found[1:4]]}
+            text = _c.card_text(card)   # the agent's card: every fact, in memory's form
+            # the window's dossier shows one summary per person (``summary``) and only the other facts, said to the
+            # user (report 38 §3: the same person fact was shown twice, once "you", once "the user")
+            card["facts"] = list(card.pop("facts_shown", None) or [])
+            return {"found": True, **card, "text": text, "others": [p.name for p in found[1:4]]}
         except Exception:
             return None
 
     def people_list(self, *, limit: int = 40) -> list[dict]:
         """The people the user talks to, as structured rows for the Yuki window's Me page (no message text is
-        decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "app", "kind",
-        "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...], "usual", "margin", "close",
-        "last_contact", "rhythm"}]``, most recently in touch first; ``rhythm`` is their messages a day both ways over 14
-        days (``yuki.memory.contacts.rhythm``: ``days``, ``total``, ``known_days``, ``peak``...). ``[]`` when memory has
-        no people index yet. Never raises."""
+        decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "human", "use",
+        "app", "kind", "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...],
+        "usual", "usual_route", "usual_ref", "summary", "margin", "close", "last_contact", "rhythm"}]``, most recently in
+        touch first;
+        ``rhythm`` is their messages a day both ways over 14 days (``yuki.memory.contacts.rhythm``: ``days``, ``total``,
+        ``known_days``, ``peak``...). ``[]`` when memory has no people index yet. Never raises.
+
+        Since migration 33 (the 3 Oct feedback): ``usual`` is one plain line, never a ``route:N``
+        (:func:`yuki.memory.contacts.usual_line`: "Slack DM. Code questions go on the PR.", or None) and
+        ``usual_route`` its structured form (:func:`yuki.memory.contacts.usual_label`: ``{"ref", "label": "Discord
+        DM", "sub", "use", "mine", "theirs", "last_at", "tone", "preferred"}`` or None; ``usual_ref`` is the bare
+        ref); ``relation`` is the person fact's
+        short label written to the user ("Your father") when there is one; ``summary`` is the one summary per person
+        (``{"ref": "fact:N", "headline", "text" (shown form, may be None), "pinned"}`` or None); a route's ``use`` is
+        one sentence of what the user uses that chat for with them (None until the contacts rebuild writes it)."""
         from yuki.memory import contacts as _c
 
         try:
@@ -2935,12 +3336,15 @@ class MemoryClient:
                 facts = None
             for person in persons:
                 c = _c.card(self.store, person, with_samples=0, calls_seen=seen, person_facts=facts)
-                routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "chat", "handle", "mine", "theirs",
-                                                 "last_mine", "last_theirs", "share", "preferred")} for r in c["routes"]]
+                routes = [{k: r.get(k) for k in ("ref", "label", "human", "use", "app", "kind", "chat", "handle",
+                                                 "mine", "theirs", "last_mine", "last_theirs", "share", "preferred")}
+                          for r in c["routes"]]
                 last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),
                            default=None)
                 rows.append({"ref": c["ref"], "name": c["name"], "relation": c["relation"], "aliases": c["aliases"],
-                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "margin": c["margin"],
+                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "usual_route": c["usual_route"],
+                             "usual_ref": c["usual_ref"],
+                             "summary": c["summary"], "margin": c["margin"],
                              "close": c["close"], "last_contact": last, "rhythm": rhythms.get(person.id)})
             rows.sort(key=lambda r: r["last_contact"] or 0, reverse=True)
             return rows[:limit]

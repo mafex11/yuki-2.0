@@ -1,0 +1,66 @@
+{
+ "note": "Recorded from a dry run of yuki.memory.titles (shown forms, Haiku) over invented facts (tests/test_appA_memory.py); no real data.",
+ "recorded": "2026-10-03",
+ "items": [
+  {
+   "ref": "P8",
+   "text": "On 2026-10-01 the user stayed at the PC until 04:10, mostly in a full-screen game.",
+   "shown": "On 1 October, you stayed at the PC until 4:10 AM, mostly in a full-screen game."
+  },
+  {
+   "ref": "P5",
+   "text": "The user watches chess streams and plays rapid games on most evenings from about 21:00 to 23:30.",
+   "shown": "You watch chess streams and play rapid games on most evenings from about 9 PM to 11:30 PM."
+  },
+  {
+   "ref": "P9",
+   "text": "Send Priya the demo video (asked by Priya in Slack on 2026-10-02).",
+   "shown": "Send Priya the demo video (she asked you on Slack on 2 October)."
+  },
+  {
+   "ref": "P2",
+   "text": "Dev is the user's father; they talk with the user about the user's future plans on WhatsApp (2026-09-28).",
+   "shown": "Your father Dev talks with you about your future plans (WhatsApp, 28 September)."
+  },
+  {
+   "ref": "P3",
+   "text": "In a Discord call on 2026-09-30 the user said they became guarded after Leo left the group.",
+   "shown": "On 30 September, on a Discord call with Ana and Sam, you said you became guarded after Leo left the group."
+  },
+  {
+   "ref": "P10",
+   "text": "Ana is a friend the user plays games with on Discord; they talked about a trip on 2026-09-27.",
+   "shown": "Your friend Ana plays games with you on Discord; you talked about a trip on 27 September."
+  },
+  {
+   "ref": "P7",
+   "text": "The user teases their friend Sam about his aim in shooter games (Discord calls, 2026-09-29).",
+   "shown": "You tease your friend Sam about his aim in shooter games (Discord calls, 29 September)."
+  },
+  {
+   "ref": "P6",
+   "text": "The user prefers short replies in lowercase and dislikes being called formal names.",
+   "shown": "You prefer short replies in lowercase and dislike being called formal names."
+  },
+  {
+   "ref": "P1",
+   "text": "On 2026-09-25 from about 02:00 to 03:22 the user prepared a maths chapter to go over with their friend Kiran. Says this is not their daily routine.",
+   "shown": "On 25 September, from about 2 AM to 3:22 AM, you prepared a maths chapter to go over with your friend Kiran. You said this isn't a daily routine."
+  },
+  {
+   "ref": "P4",
+   "text": "The user is the founding engineer at Acme and reviews pull requests most mornings around 10:30 (as of September 2026).",
+   "shown": "You're the founding engineer at Acme and review pull requests most mornings around 10:30 AM."
+  },
+  {
+   "ref": "W1",
+   "text": "The user merged the replies fix on 2026-10-02; the demo video for Priya is still to send.",
+   "shown": "You merged the replies fix on 2 October; the demo video for Priya is still to send."
+  },
+  {
+   "ref": "G1",
+   "text": "Played a heated game where they chose killing people for fun, which shocked the user.",
+   "shown": "A heated game where your friends chose killing people for fun, which shocked you."
+  }
+ ]
+}
