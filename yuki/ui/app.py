@@ -98,13 +98,28 @@ ASK_STOP_WITHIN_S = 60.0
 LATE_LEARNED_MS = 150_000
 
 
-def learned_for_card(page: Any, since: float) -> dict | None:
+#: How far apart the tray's clock of a run's start and the agent's own may be (s): the tray stamps it as the request
+#: goes out, the agent as it begins.
+RUN_START_SLACK_S = 3.0
+
+
+def learned_for_card(page: Any, since: float, until: float | None = None) -> dict | None:
     """The Learned box for a run's return card from practice memory's ``workflows()``: the newest way a verified
-    success taught since ``since`` (the run's start; ``learned`` holds only those, appLearn), or ``None``. Never a
-    pitfall, never a tentative proposal of any other kind: a failed or stopped run announces nothing."""
+    success taught (``learned`` holds only those, appLearn) whose successful run is this one - it started between
+    ``since`` and ``until`` (the run's start and end, :data:`RUN_START_SLACK_S` either side) - or, when that run's
+    trace is gone, that was marked since ``since``. ``None`` otherwise. Never a pitfall, never another run's learning:
+    a failed or stopped run announces nothing."""
     rows = (page or {}).get("learned") if isinstance(page, dict) else None
+
+    def this_run(c: dict) -> bool:
+        run_at = c.get("run_at")
+        if run_at is None:
+            return float(c.get("learned_at") or 0) >= since - 1
+        return since - RUN_START_SLACK_S <= float(run_at) <= (until if until is not None else float("inf")) \
+            + RUN_START_SLACK_S
+
     fresh = [c for c in rows or [] if isinstance(c, dict) and str(c.get("id") or "").startswith("pb:")
-             and float(c.get("learned_at") or 0) >= since - 1]
+             and this_run(c)]
     if not fresh:
         return None
     newest = max(fresh, key=lambda c: float(c.get("learned_at") or 0))
@@ -1270,7 +1285,8 @@ class YukiUi(QObject):
 
         def fetch(late: bool) -> None:
             try:
-                learned = learned_for_card(memory.call_method("workflows", timeout_s=8.0), started_wall)
+                learned = learned_for_card(memory.call_method("workflows", timeout_s=8.0), started_wall,
+                                           started_wall + took)
             except Exception:
                 learned = None
             if late:

@@ -1461,8 +1461,9 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
     user's style notes (active, trusted, stale or disabled); proposals are what Yuki is not sure of yet - ways seen once
     (tentative) and the teach-back questions waiting for the user. A pitfall is never on the page: it is a quiet
     internal note for the brain, seen only as a way's "what didn't work" (appLearn). ``learned``: the ways a verified
-    success taught, newest first (each card with ``learned_at``, when that success marked it, and ``why``, what did
-    not work on the way there), the only thing the return card may announce. Each card: id (``pb:N``), kind, title,
+    success taught, newest first (each card with ``learned_at``, when that success marked it, ``run_at``, when the
+    run that succeeded started - ``None`` once its trace is pruned - and ``why``, what did not work on the way there),
+    the only thing the return card may announce. Each card: id (``pb:N``), kind, title,
     text, steps, apps, uses, last use, confidence, state and its evidence counts. ``workflows`` keeps every object
     (titles for the run card's chips). Never raises."""
     try:
@@ -1484,6 +1485,13 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
                           if o.id in ways and o.id in succeeded and o.disabled_at is None
                           and o.state not in ("retired", "stale")),
                          key=lambda c: -float(c["learned_at"]))[:LEARNED_SHOWN]
+        for c in learned:   # the run whose success taught it, so a run's card names only its own learning
+            pid = parse_ref(c["id"])
+            last = store._query("SELECT run_key FROM playbook_events WHERE playbook_id=? AND type='succeeded'"
+                                " ORDER BY at DESC, id DESC LIMIT 1", (pid,))
+            key = last[0]["run_key"] if last else None
+            head = store._query("SELECT at FROM runs WHERE run_key=? AND step=0", (key,)) if key else []
+            c["run_at"] = float(head[0]["at"]) if head else None
         try:
             for q in store.questions(("open", "asked"), limit=20):
                 if q.origin == "practice":

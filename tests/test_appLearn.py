@@ -211,7 +211,7 @@ def test_a_verified_success_makes_one_learned_card_and_a_playbook_procedure(qapp
     assert card == {"id": procs[0].ref, "text": "Play one of your playlists in Spotify", "why": ""}
     # on the return card: a done run whose success taught it shows exactly this one Learned box
     ui = _ui(qapp, monkeypatch, page)
-    monkeypatch.setattr("time.time", lambda: NOW + 202)
+    monkeypatch.setattr("time.time", lambda: NOW + 22)   # the run started at NOW and took 22 s
     ui._queue_return_card(5, "Playing it.", "done", {"started": __import__("time").monotonic() - 22, "calls": CLOSED})
     assert ui.reads == ["workflows"] and ui.timers.kept == []                   # found at once: no late read
     assert not ui.return_card.learn.isHidden() and ui.return_card.learn.ref == procs[0].ref
@@ -270,7 +270,8 @@ def test_failure_then_success_one_card_for_the_success_with_what_did_not_work(st
     assert "EXISTING PLAYBOOKS" in worker.calls[-1]["user"] and "Lyrics toggle" in worker.calls[-1]["user"]
     page = P.workflows(store, now=NOW + 801)
     assert len(page["learned"]) == 1
-    card = learned_for_card(page, NOW + 600)
+    card = learned_for_card(page, NOW + 600, NOW + 630)
+    assert learned_for_card(page, NOW, NOW + 30) is None                        # never on the failed run's card
     assert card["text"] == "Close the lyrics view in Spotify"
     assert card["why"] == "What didn’t work: clicking the Lyrics toggle again and again"
     view = build_playbook(MemoryClient(store))
