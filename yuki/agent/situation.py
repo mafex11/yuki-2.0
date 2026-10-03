@@ -271,8 +271,9 @@ class Situation:
         F2: the same words sent to someone else are not already done for this person. Ids only, never words."""
         person = self.person or {}
         thread = message.get("thread")
-        if not person.get("found") or thread is None:
-            return None, "in a chat not tied to anyone named here"
+        routes = [r for r in person.get("routes") or [] if isinstance(r, dict)]
+        if not person.get("found") or thread is None or not any("thread_ids" in r for r in routes):
+            return None, "in a chat not tied to anyone named here"   # an older memory without route threads, too
         for r in person.get("routes") or []:
             if isinstance(r, dict) and thread in (r.get("thread_ids") or []):
                 label = r.get("label") or r.get("app") or "their chat"
@@ -308,16 +309,26 @@ class Situation:
         elif self.about and self.person is not None:
             parts.append(f"Memory has no one called \"{self.about}\" in its people index.")
         if self.own:
-            rows = [f"The user's own messages captured in {self.process or 'that app'} in the last "
-                    f"{self.hours:g} h, the ones most like what you are about to do first, each with the chat it "
-                    f"went to:"]
-            for m in self.own[:OWN_MESSAGES]:
-                close = m.get("similarity")
-                mark = f" (similar to what you are about to send: {close:.2f})" if isinstance(close, float) \
-                    and close >= SIMILAR_MARK else ""
-                rows.append(f"- {when(m.get('at'), self.now)}, {self.chat_of(m)[1]}: "
-                            f"\"{str(m.get('text') or '')[:LINE_CHARS]}\"{mark}")
-            parts.append("\n".join(rows))
+            # review F2: messages that went to other people are listed apart, as such (a fact of memory's threads)
+            here = [m for m in self.own[:OWN_MESSAGES] if self.chat_of(m)[0] is not False]
+            elsewhere = [m for m in self.own[:OWN_MESSAGES] if self.chat_of(m)[0] is False]
+            if here:
+                rows = [f"The user's own messages captured in {self.process or 'that app'} in the last "
+                        f"{self.hours:g} h, the ones most like what you are about to do first:"]
+                for m in here:
+                    close = m.get("similarity")
+                    mark = f" (similar to what you are about to send: {close:.2f})" if isinstance(close, float) \
+                        and close >= SIMILAR_MARK else ""
+                    rows.append(f"- {when(m.get('at'), self.now)}, {self.chat_of(m)[1]}: "
+                                f"\"{str(m.get('text') or '')[:LINE_CHARS]}\"{mark}")
+                parts.append("\n".join(rows))
+            if elsewhere:
+                name = (self.person or {}).get("name") or "this person"
+                rows = [f"Sent in other chats, to other people (so not already sent to {name}; the same words going "
+                        f"to several people is normal):"]
+                rows += [f"- {when(m.get('at'), self.now)}: \"{str(m.get('text') or '')[:LINE_CHARS]}\""
+                         for m in elsewhere]
+                parts.append("\n".join(rows))
         if self.facts.strip():
             parts.append(f"Memory's facts of the last {self.hours:g} h near this:\n{self.facts.strip()[:FACTS_CHARS]}")
         if not parts:
@@ -339,12 +350,12 @@ class Situation:
             bits.append(f"memory: {len(samples)} of the user's own messages to {person.get('name')}"
                         + (f", newest {when(newest, self.now)}" if newest else ""))
         if self.own:
-            best = max(self.own, key=lambda m: m.get("similarity") or 0.0)
-            score = float(best.get("similarity") or 0.0)
-            same = self.chat_of(best)[0]
-            where = "" if same is None else (" in this chat" if same else " in another chat")
+            here = [m for m in self.own if self.chat_of(m)[0] is not False]
+            others = len(self.own) - len(here)
+            score = max((float(m.get("similarity") or 0.0) for m in here), default=0.0)
             bits.append(f"{len(self.own)} own messages in the app in {self.hours:g} h"
-                        + (f", one {score:.2f} similar to this{where}" if score >= SIMILAR_MARK else ""))
+                        + (f", one {score:.2f} similar to this" if score >= SIMILAR_MARK else "")
+                        + (f", {others} of them to other people" if others else ""))
         if self.facts.strip():
             bits.append("related facts")
         return "Checked first: " + ("; ".join(bits) if bits else "nothing could be read")

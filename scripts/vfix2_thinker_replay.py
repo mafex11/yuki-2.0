@@ -51,6 +51,9 @@ class StandInMemory:
 
     def __init__(self, desk: ChatPlayerDesk, own: list[dict[str, Any]]) -> None:
         self.desk, self.own = desk, list(own)
+        #: each person's Discord thread in the capture (the open DM is the desk's thread 3)
+        self.threads = {desk.friend: 3, **{p: 10 + i for i, p in enumerate(("Sam", "Hemanth", "Nichol"))
+                                           if p != desk.friend}}
         self.aliases: list[tuple[str, str]] = []
         self.store = SimpleNamespace(add_alias=lambda h, n, **k: self.aliases.append((h, n)) or 1)
 
@@ -66,6 +69,7 @@ class StandInMemory:
                 return {"found": True, "name": person, "relation": rel, "routes": [
                     {"label": f"Discord DM @{handle}" if person != "Nichol" else f"Slack DM {handle}",
                      "app": "Discord.exe" if person != "Nichol" else "slack.exe",
+                     "thread_ids": [self.threads.get(person, 90)],
                      "last_mine": max((m["at"] for m in mine), default=NOW - 86400 * 2),
                      "last_theirs": NOW - 2400, "samples": [{"text": m["text"], "at": m["at"]} for m in mine]}]}
         return {"found": False, "people": ["Sam", "Hemanth", "Nichol", "Kabir"]}
@@ -75,6 +79,22 @@ class StandInMemory:
         rows += [{"text": t, "at": at, "first_seen": time.time(), "thread": 3, "status": None}
                  for who, at, t in self.desk.history if who == "me" and all(t != m["text"] for m in self.own)]
         return [r for r in rows if float(r["first_seen"]) >= since]
+
+    def people_list(self, *, limit: int = 40) -> list[dict]:
+        def row(name: str, rel: str, ago: float, label: str, total: int) -> dict:
+            return {"name": name, "relation": rel, "aliases": [], "last_contact": NOW - ago, "routes": [],
+                    "usual_route": {"label": label}, "rhythm": {"total": total, "known_days": 14}}
+
+        return [row("Hemanth", "close friend", 1200, "Discord DM @hemanth_k", 350),
+                row("Sam", "best friend", 2400, "Discord DM @sam_99", 280),
+                row("Nichol", "coworker", 3 * 86400, "Slack DM nichol.r", 20),
+                row("Kabir", "friend", 6 * 86400, "Slack DM kabir.r", 10)][:limit]
+
+    def calls_in(self, since: Any = None, until: Any = None, limit: int = 30) -> list[dict]:
+        from datetime import datetime
+
+        return [{"app": "Discord.exe", "service": "Discord", "start": datetime.fromtimestamp(NOW - 3900).isoformat(),
+                 "people": [{"name": "Hemanth", "how": "in the call window"}]}]
 
     def recall(self, query: str, **kw: Any) -> list[dict]:
         if any(w in query.casefold() for w in ("playlist", "japanese")):   # the stand-in memory's only fact
@@ -91,7 +111,10 @@ def _desk(case: str) -> tuple[ChatPlayerDesk, list[dict[str, Any]]]:
         at = NOW - 3600
         history += [("me", at, EARLIER), ("Sam", at + 420, "lol it's fine, happens")]
         own = [{"text": EARLIER, "at": at, "to": "Sam", "thread": 3, "status": None}]
-    friend, handle = ("Hemanth", "hemanth_k") if case == "hey_meant" else ("Sam", "sam_99")
+    if case == "dup_other_chat":   # the same words went to Sam ten minutes ago, in his chat; now Hemanth's is open
+        own = [{"text": EARLIER, "at": NOW - 600, "to": "Sam", "thread": 10, "status": None}]
+    friend, handle = (("Hemanth", "hemanth_k") if case in ("hey_meant", "hey_meant_bare", "dup_other_chat")
+                      else ("Sam", "sam_99"))
     desk = ChatPlayerDesk(friend=friend, handle=handle, history=history, volume=30.0, mixer_level=100.0)
     if case == "lyrics_close":
         desk.toggles["Lyrics"] = True
@@ -121,6 +144,13 @@ CASES: dict[str, dict[str, Any]] = {
                       context="'hey meant' may be Nichol or Hemanth (as heard)",
                       heard=["message hey meant on discord that I fell asleep on the call, sorry"],
                       answer="yes, Hemanth"),
+    # review N9: no hint from the talker; the thinker has only its people and the frame's who-lately block
+    "hey_meant_bare": dict(request="Message hey meant on Discord that I fell asleep on the call, sorry",
+                           app="Discord", heard=["message hey meant on discord that I fell asleep on the call, sorry"],
+                           answer="yes, Hemanth"),
+    # review F2: the same words sent to someone else are not done for this person: sent, no question
+    "dup_other_chat": dict(request=f"Tell Hemanth: {EARLIER}", app="Discord",
+                           heard=[f"tell hemanth {EARLIER}"], answer="yes"),
 }
 
 
@@ -148,7 +178,9 @@ def _score(case: str, desk: ChatPlayerDesk, tools: list[str], asks: list[str], f
         ok = (desk.volume > 30.0 or offered) and "run_powershell" not in tools
     elif case == "playlist":
         ok = desk.playing == "J-Pop Nights"
-    elif case == "hey_meant":
+    elif case == "dup_other_chat":
+        ok = len(desk.sent) == 1 and not asks
+    elif case in ("hey_meant", "hey_meant_bare"):
         ok = (len(desk.sent) == 1 and not any("nichol" in q.casefold().split("hemanth")[0] for q in asks)) or (
             bool(asks) and "hemanth" in asks[0].casefold() and asks[0].casefold().find("hemanth") <
             (asks[0].casefold().find("nichol") if "nichol" in asks[0].casefold() else 10 ** 6))

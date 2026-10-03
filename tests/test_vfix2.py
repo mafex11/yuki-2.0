@@ -348,7 +348,8 @@ def _sam(minutes_ago: float | None = 60.0) -> tuple[ChatPlayerDesk, FakeMemoryCl
         own = [{"text": EARLIER, "at": at, "first_seen": at, "thread": 3, "status": None}]
     desk = ChatPlayerDesk(friend="Sam", handle="sam_99", history=history)
     person = {"name": "Sam", "aka": ["sam", "sam_99"], "relation": "best friend", "routes": [
-        {"label": "Discord DM @sam_99", "app": "Discord.exe", "last_mine": own[0]["at"] if own else NOW - 86400,
+        {"label": "Discord DM @sam_99", "app": "Discord.exe", "thread_ids": [3],
+         "last_mine": own[0]["at"] if own else NOW - 86400,
          "last_theirs": NOW - 3000, "samples": [{"text": m["text"], "at": m["at"]} for m in own]}]}
     mem = FakeMemoryClient(own=own, person=person)
     mem.desk = desk
@@ -367,7 +368,12 @@ def test_n0_situation_gather_reads_the_chat_and_memory_and_marks_the_similar_mes
     assert f"You, {stamp}, {EARLIER}" in text                      # the chat's latest messages, newest last
     assert text.index("you joining the call?") < text.index("lol no worries")
     assert "the user's last message there" in text and "60 min ago" in text
-    assert "(similar to what you are about to send: 1.00)" in text
+    assert f"to Sam, Discord DM @sam_99: \"{EARLIER}\" (similar to what you are about to send: 1.00)" in text
+    # an older memory whose routes carry no threads: the chat is not told, never guessed as "another chat"
+    mem.person["routes"][0].pop("thread_ids")
+    older = gather({"action": f"send Sam: {EARLIER}", "hwnd": CHAT, "about": "Sam"}, read_tree=desk.get_window_tree,
+                   memory_call=lambda method, *a, timeout_s: getattr(mem, method)(*a), now=NOW).evidence_text()
+    assert "in a chat not tied to anyone named here" in older and "another chat" not in older
     assert sit.summary().startswith("Checked first: read the window") and "one 1.00 similar" in sit.summary()
     assert EARLIER not in sit.summary()                           # the trace line names what was looked at, no content
 
@@ -878,10 +884,11 @@ def test_f2_the_users_own_messages_name_the_chat_they_went_to() -> None:
                  read_tree=desk.get_window_tree, process_of=lambda h: ("Discord.exe", "@maya_k - Discord"),
                  memory_call=lambda method, *a, timeout_s: getattr(mem, method)(*a), now=NOW)
     text = sit.evidence_text()
-    assert f"3 min ago, in another chat, not with Maya: \"{line}\" (similar to what you are about to send: 1.00)" \
-        in text
-    assert "to Maya, Discord DM @maya_k: \"ok cool\"" in text
-    assert sit.summary().endswith("one 1.00 similar to this in another chat")
+    other = text.split("Sent in other chats, to other people (so not already sent to Maya", 1)
+    assert len(other) == 2 and f"3 min ago: \"{line}\"" in other[1]
+    assert "similar to what you are about to send" not in text      # the only near one went to someone else
+    assert "to Maya, Discord DM @maya_k: \"ok cool\"" in other[0]
+    assert sit.summary().endswith("2 own messages in the app in 24 h, 1 of them to other people")
     assert "it is not done for Maya" in QUESTION
 
 
