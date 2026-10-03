@@ -97,9 +97,10 @@
     if (el && el.textContent !== (r.line || '')) el.textContent = r.line || 'Thinking…';
   });
 
+  /* a row's own key when it has one (the day's AI cost card: its total changes, its row stays) */
   function awayRow(r) {
-    return h('div', { class: 'item', data: { item: '', k: `away:${r.kind}:${r.at}` } },
-      h('div', { class: 'away-h' }, h('div', { class: 'tt', text: r.title }), h('span', { class: 'when', text: r.at ? fmt.natTime(r.at) : '' })),
+    return h('div', { class: 'item', data: { item: '', k: `away:${r.kind}:${r.key || r.at}` } },
+      h('div', { class: 'away-h' }, h('div', { class: 'tt', text: r.title }), h('span', { class: 'when', text: r.at ? fmt.natTime(r.at) : (r.when || '') })),
       (r.changed || []).map((c) => h('div', { class: 'chg' }, h('span', { class: 'chg-t' }, ic(c.state === 'failed' ? 'x' : 'check'), h('span', { text: c.text })),
         c.undo && c.undo.until * 1000 > Date.now() ? h('span', { class: 'chg-u' }, key(c.undo.label || 'Undo', { cls: 'xs', data: { do: 'offer-undo', card: c.undo.card } }),
           h('span', { class: 'until', data: { until: c.undo.until }, text: `${Math.max(1, Math.round((c.undo.until * 1000 - Date.now()) / 60000))} min left` })) : null)),   // counted down by the ticker

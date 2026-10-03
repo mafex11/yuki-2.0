@@ -363,3 +363,42 @@ def test_the_fixture_has_the_new_shapes_and_no_third_person_or_route_refs():
     assert act["groups"] and not any("undo" in r for r in act["rows"])
     assert any(s.get("full") for s in data["pages"]["day"]["sessions"])
     assert all(k in data["replies"] for k in ("pin", "resolve_heard", "review_mark", "thread_days", "chat_day", "day_answer"))
+
+
+# -- Home: the AI cost card in plain words, away rows say how long they took ---------------------------------------------
+
+
+def test_home_has_the_days_ai_cost_in_plain_words_and_away_rows_say_how_long(tmp_path):
+    import csv
+    import io
+
+    today = date.today()
+    logs = tmp_path / "logs"
+    (logs / "memory").mkdir(parents=True)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["timestamp", "session", "lane", "request", "wall_s", "tool_calls", "cost_usd", "outcome"])
+    w.writerow([datetime.now().replace(microsecond=0).isoformat(), "s", "worker", "open my budget", 7.0, "open_app=2 done=1", 0.08, "final"])
+    (logs / "requests.csv").write_text(buf.getvalue(), encoding="utf-8")
+    stamp = today.strftime("%Y%m%d")
+    (logs / "memory" / f"journal-{stamp}.jsonl").write_text(
+        "\n".join(json.dumps({"type": "journal_call", "cost_usd": c}) for c in (0.5, 0.42)) + "\n", encoding="utf-8")
+    (logs / "memory" / f"portrait-{stamp}.jsonl").write_text(json.dumps({"type": "portrait_call", "cost_usd": 0.51}) + "\n",
+                                                              encoding="utf-8")
+    (logs / "memory" / f"brandnew-{stamp}.jsonl").write_text(json.dumps({"type": "x_call", "cost_usd": 0.03}) + "\n",
+                                                              encoding="utf-8")
+
+    class _Home:   # a memory with nothing in it
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    home = W.build_home(_Home(), requests_csv=logs / "requests.csv", call_status={})
+    req = next(a for a in home["away"] if a["kind"] == "request")
+    assert req["cost"] == "took 7 s"                                         # never "7.0 s, 3 steps, 8¢"
+    cost = home["away"][-1]
+    assert cost["kind"] == "notice" and cost["key"] == f"cost:{today.isoformat()}" and cost["when"] == "today"
+    assert cost["title"] == "My AI use today: about $1.54"
+    assert cost["note"] == "Daily notes $0.92, your profile $0.51, your requests $0.08, other memory work $0.03."
+    for word in ("journal", "portrait", "brandnew", "_call", "agent"):
+        assert word not in json.dumps(cost)
+    assert W.ai_cost_row(None) is None

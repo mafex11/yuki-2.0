@@ -325,18 +325,71 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
         away.append({"kind": "card", "title": {"done": "Done from a card", "undone": "Undone"}[n["outcome"]],
                      "at": epoch_of(n.get("outcome_at")) or at, "state": n["outcome"], "changed": [change]})
     for r in (read_request_log(requests_csv, since, limit=INBOX_MAX) if requests_csv else []):
-        words, cost = request_row_words(r)
+        words, _cost = request_row_words(r)
+        took = took_words(r.get("wall_s"))
+        # how long it took, as a person says it; never the raw "7.0 s, 3 steps, 8¢" line (the 3 Oct feedback)
         away.append({"kind": "request", "title": request_title(r.get("what") or ""), "at": r["at"], "state": r["state"],
-                     "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}], "cost": cost})
+                     "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}],
+                     "cost": f"took {took}" if took else ""})
     away.sort(key=lambda x: x.get("at") or 0, reverse=True)
+    away = away[:INBOX_MAX]
+    cost_row = ai_cost_row(Path(requests_csv).parent if requests_csv else None, now)
+    if cost_row is not None:
+        away.append(cost_row)
     now_strip["goals"] = goals_today(memory)
     # when Home next changes with the clock alone: an open offer running out, the oldest "since you were away" row
     # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
     moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
-    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away[:INBOX_MAX] if a.get("at")]
+    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away if a.get("at")]
     next_at = min((m for m in moments if m and m > now), default=None)
-    return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away[:INBOX_MAX],
+    return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away,
             "people": (people or [])[:6], "since": since, "next_at": next_at}
+
+
+#: Where the day's AI spend went, in plain words (``yuki.core.cost``'s parts: memory's worker log names, the agent,
+#: the voice). A part not listed is "other memory work". Display names only: nothing is decided from them.
+COST_PARTS = {"journal": "daily notes", "portrait": "your profile", "nudges": "cards and check-ins",
+              "calldigest": "call summaries", "transcribe": "turning calls into text",
+              "conversations": "remembering our chats", "episodes": "the story of your day",
+              "recheck": "double-checking notes", "titles": "short titles", "daydigest": "day summaries",
+              "agent": "your requests", "voice": "talking with you"}
+#: The cost ledger is incremental (each log read from where it stopped); one per logs folder, kept for the process.
+_cost_ledgers: dict[str, Any] = {}
+
+
+def ai_cost_row(logs: Path | None, now: float | None = None) -> dict[str, Any] | None:
+    """Home's AI cost card (the 3 Oct feedback: plain words): "My AI use today: about $1.84" and where it went,
+    "Daily notes $0.92, your profile $0.51, …", read from the logs Yuki already writes (``yuki.core.cost``'s ledger,
+    incremental: only new lines are read). A "notice" row of Since you were away, keyed by the day (its total
+    changes; its row stays). None with no logs or under a cent."""
+    if logs is None:
+        return None
+    from yuki.core.cost import CostLedger
+
+    try:
+        ledger = _cost_ledgers.get(str(logs))
+        if ledger is None:
+            ledger = _cost_ledgers[str(logs)] = CostLedger(Path(logs))
+        spend = ledger.refresh()
+    except Exception:  # noqa: BLE001 - a cost line must never break Home
+        return None
+    parts: dict[str, float] = {}
+    for kind, usd in (spend.memory or {}).items():
+        name = COST_PARTS.get(kind, "other memory work")
+        parts[name] = parts.get(name, 0.0) + float(usd or 0)
+    parts[COST_PARTS["agent"]] = parts.get(COST_PARTS["agent"], 0.0) + spend.agent + spend.agent_startup
+    parts[COST_PARTS["voice"]] = parts.get(COST_PARTS["voice"], 0.0) + spend.voice_mouth
+    total = spend.model_total
+    if total < 0.01:
+        return None
+    shown = [(n, v) for n, v in sorted(parts.items(), key=lambda kv: -kv[1]) if v >= 0.01]
+    note = ", ".join(f"{n} ${v:.2f}" for n, v in shown[:4])
+    note = note[:1].upper() + note[1:]
+    rest = sum(v for _n, v in shown[4:])
+    if rest >= 0.01:
+        note += f", the rest ${rest:.2f}"
+    return {"kind": "notice", "key": f"cost:{spend.day}", "title": f"My AI use today: about ${total:.2f}", "at": None,
+            "when": "today", "state": "done", "changed": [], "note": note + "." if note else ""}
 
 
 #: Goals the Now strip shows at most (today's, open first).
