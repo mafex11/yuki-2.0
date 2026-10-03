@@ -246,6 +246,10 @@ class MemoryContext:
     #: The people directory (``MemoryClient.people_directory``: who the user talks to and where), for the profile
     #: layer; ``None`` when memory has no people index.
     people: str | None = None
+    #: Practice memory for this request (``MemoryClient.practice``: procedures and a habit or style note near the
+    #: words, pitfalls of the apps in play), for the task frame; ``None`` from an older memory (then know-how lines
+    #: come as before).
+    practice: dict[str, Any] | None = None
     #: Wall time of the fast-memory lookup (embedding + ranking), ms.
     relevant_ms: float = 0.0
     #: What the whole memory holds for this moment (``MemoryClient.related``: the user's words, their screen,
@@ -612,6 +616,39 @@ class MemoryAccess:
         self._turns.put((turn, on_done))
         return True
 
+    def record_run(self, run: dict[str, Any], *, on_done: Callable[[dict[str, Any]], None] | None = None) -> bool:
+        """Queue one request's structured trace for ``MemoryClient.record_run`` (practice memory, Phase C). Returns at
+        once; written by the same background writer as the exchanges, after the request's own exchange (so the learner
+        reads them in order). ``False`` when memory is not installed."""
+        return self._queue_write("record_run", {"run": dict(run)}, on_done)
+
+    def record_hand_trace(self, *, name: str, args: dict[str, Any] | None, ok: bool, verified: bool | None,
+                          report: str, ms: float, at: float | None = None, app: str | None = None,
+                          target: str | None = None, words: str | None = None, why: str | None = None,
+                          request_id: str | None = None,
+                          on_done: Callable[[dict[str, Any]], None] | None = None) -> bool:
+        """Queue one voice hand's trace for ``MemoryClient.record_hand_trace`` (practice memory: the learners see the
+        talker's single steps too), under this app run's session. Returns at once; never raises. For the voice hands
+        (builder 3b wires it); ``False`` when memory is not installed."""
+        payload = {"session_id": self.session_id, "name": name, "args": dict(args or {}), "ok": bool(ok),
+                   "verified": verified, "report": str(report or ""), "ms": float(ms or 0.0),
+                   "at": time.time() if at is None else float(at), "app": app, "target": target, "words": words,
+                   "why": why, "request_id": request_id}
+        return self._queue_write("record_hand_trace", payload, on_done)
+
+    def _queue_write(self, method: str, payload: dict[str, Any],
+                     on_done: Callable[[dict[str, Any]], None] | None) -> bool:
+        if not self.installed:
+            return False
+        item = {"_write": method, "session_id": self.session_id, "request_id": payload.get("request_id")
+                or (payload.get("run") or {}).get("request_id"), **payload}
+        with self._turn_lock:
+            self._turns_pending += 1
+            if self._turn_writer is None or not self._turn_writer.is_alive():
+                self._start_turn_writer(locked=True)
+        self._turns.put((item, on_done))
+        return True
+
     def _start_turn_writer(self, locked: bool = False) -> None:
         def start() -> None:
             self._turn_writer = threading.Thread(target=self._write_turns, name="yuki-memory-turns", daemon=True)
@@ -635,6 +672,35 @@ class MemoryAccess:
                 "row": None,
                 "error": None,
             }
+            if turn.get("_write"):
+                # a practice trace (record_run / record_hand_trace), in the same order as the exchanges
+                method = str(turn["_write"])
+                try:
+                    if method == "record_run":
+                        got = self.call_method("record_run", turn["run"], timeout_s=TURN_LOG_TIMEOUT_S)
+                    else:
+                        kwargs = {k: turn.get(k) for k in ("at", "app", "target", "words", "why", "request_id")}
+                        got = self.call_method("record_hand_trace", turn.get("session_id"), turn["name"],
+                                               turn.get("args"), turn["ok"], turn.get("verified"), turn.get("report"),
+                                               turn.get("ms"), timeout_s=TURN_LOG_TIMEOUT_S, **kwargs)
+                    report["row"] = (got or {}).get("id") if isinstance(got, dict) else got
+                    report["result"] = got if isinstance(got, dict) else None
+                    if isinstance(got, dict) and not got.get("ok", True):
+                        report["error"] = got.get("error")
+                except Exception as exc:  # never kill the writer
+                    report["error"] = str(exc) if isinstance(exc, MemoryUnavailable) else (
+                        f"{type(exc).__name__}: {exc}")
+                report["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+                if on_done is not None:
+                    try:
+                        on_done(report)
+                    except Exception:
+                        pass
+                with self._turn_lock:
+                    self._turns_pending -= 1
+                    if self._turns_pending <= 0:
+                        self._turns_idle.notify_all()
+                continue
             try:
                 report["row"] = self.call_method(
                     "log_turn",
@@ -728,8 +794,9 @@ class MemoryAccess:
         gate: bool | None = None,
         now: float | None = None,
         action: bool = False,
+        open_apps: Any = (),
     ) -> MemoryContext:
-        """Portrait, know-how, standing context and (asked for) resume context. Never raises.
+        """Portrait, practice memory (or know-how), standing context and (asked for) resume context. Never raises.
 
         The lookups share one bound. When the portrait cannot be fetched but an
         older one was, that one is used (``stale_cache``); know-how, standing
@@ -754,6 +821,8 @@ class MemoryAccess:
             action: The request asks Yuki to act (the caller's measure: a spoken hand-off, or a task frame that
                 resolved a person, a route or a referent): Yuki's own past exchanges from other days weigh less in
                 the whole-memory ranking (``yuki.memory.related.ACTION_OWN_DISCOUNT``).
+            open_apps: The open windows' process names: with the apps the words name and ``apps``, the apps in play
+                whose pitfalls practice memory always shows (``MemoryClient.practice``).
         """
         started = time.perf_counter()
         deadline = started + timeout_s
@@ -770,10 +839,23 @@ class MemoryAccess:
                 result.portrait, result.source = stale, "stale_cache"
         if result.source != "unavailable" or result.error is None:
             remaining = max(deadline - time.perf_counter(), 0.05)
-            try:
-                result.knowhow = self._knowhow_lines(app, query, remaining, gate=gate, apps=apps)
-            except MemoryUnavailable as exc:
-                result.error = result.error or str(exc)
+            if "practice" not in self._absent:
+                # practice memory (Phase C) replaces the know-how lines: procedures near the words, pitfalls of the
+                # apps in play (named in the words, the open windows, the caller's) - not the window in front alone
+                try:
+                    found = self.call_method(
+                        "practice", query, apps=[str(a) for a in (apps or ()) if a],
+                        open_apps=[str(a) for a in (open_apps or ()) if a] + ([app] if app else []),
+                        embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
+                    result.practice = found if isinstance(found, dict) else None
+                except MemoryUnavailable:
+                    result.practice = None
+            if result.practice is None:
+                try:
+                    result.knowhow = self._knowhow_lines(app, query, max(deadline - time.perf_counter(), 0.05),
+                                                         gate=gate, apps=apps)
+                except MemoryUnavailable as exc:
+                    result.error = result.error or str(exc)
             if "standing_parts" not in self._absent:
                 try:
                     parts = self.call_method("standing_parts", timeout_s=max(deadline - time.perf_counter(), 0.05))

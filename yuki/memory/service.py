@@ -71,6 +71,13 @@ uses the GPU. The ``paused`` flag stops both at once. Once a call's words are
 journaled, :mod:`yuki.memory.calldigest` (thread ``yuki-memory-calldigest``)
 writes its timeline digest with Haiku, never while a call is open or something
 is full screen.
+
+Practice memory (:mod:`yuki.memory.practice_learn`, thread ``yuki-memory-practice``,
+with the portrait): Yuki's run traces become procedures and pitfalls (Haiku, after a
+run's follow-up window, measured triggers only), the old know-how rows are taken in,
+the user's Playbook-page edits are applied, and once a night - idle, never during a
+call or a game - the miner turns recurring activity into habits or a teach-back
+question. Budgeted (about $0.15 a day in all), nothing while ``paused``.
 """
 
 from __future__ import annotations
@@ -525,6 +532,27 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # capture and journal run on without it
                 log("error", where="portrait_start", error=f"{type(exc).__name__}: {exc}")
                 portrait = None
+
+        if not (args.no_journal or args.no_portrait):
+            try:   # practice memory (Phase C): learns from Yuki's runs and the user's activity; Haiku/Sonnet, budgeted
+                from yuki.memory.embed import get_embedder as _practice_embedder
+                from yuki.memory.portrait import PortraitWorker as _PracticeModel
+                from yuki.memory.practice_learn import PracticeWorker
+                from yuki.memory.watcher import user_idle_s as _practice_idle
+
+                def practice_fullscreen() -> dict[str, Any]:
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"fullscreen": bool(st.get("fullscreen"))}
+
+                practice_model = (portrait.worker if portrait is not None
+                                  else _PracticeModel(store, embedder=_practice_embedder()))
+                practice = PracticeWorker(store, practice_model, db_path=db_path, log=log, idle_fn=_practice_idle,
+                                          live_fn=practice_fullscreen, embedder=_practice_embedder())
+                threading.Thread(target=_guarded(practice.run, log, "practice"), args=(stop,),
+                                 name="yuki-memory-practice", daemon=True).start()
+            except Exception as exc:  # everything else runs on without it
+                log("error", where="practice_start", error=f"{type(exc).__name__}: {exc}")
 
         if timeline is not None and not (args.no_journal or args.no_episodes):
             try:

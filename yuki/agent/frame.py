@@ -15,9 +15,12 @@ request, the same for typed and voice:
 * **The person and route** (B4): a person the request names (memory's people index, whole words, misheard forms the
   user corrected included), else the strongest person referent: their routes most used lately first with counts,
   and how clearly the usual one leads (``yuki.memory.contacts.ROUTE_MARGIN``).
-* 0-2 **procedures** (the request's know-how, already gated by relevance), 0-3 **pitfalls** for the apps in play
-  (know-how's "Not:" part), **preconditions** (is the route's app open, which window) and **stakes** (acting reaches
-  another person; a sent message cannot be taken back).
+* **preconditions** (is the route's app open, which window) and **stakes** (acting reaches another person; a sent
+  message cannot be taken back).
+* **Practice memory** (Phase C, ``yuki.memory.practice``): 0-2 **procedures** and at most one habit or style note near
+  the request's words, and 0-3 **pitfalls** of the apps in play (named in the words, open as windows), each with its
+  id and how sure memory is. They come last and are kept whole when the frame is over its size (the person block gives
+  way first). An older memory without practice memory gives know-how lines and know-how's "Not:" part instead.
 
 Every part has a floor and the frame is empty (zero lines) when nothing clears one; it stays within
 :data:`FRAME_CHARS`. Which candidate a request means is the model's judgement (the prompt's resolver paragraph).
@@ -96,6 +99,8 @@ class TaskFrame:
     action: bool = False           # a person, route or referent is in play (the request may act on it)
     procedures: int = 0
     pitfalls: int = 0
+    #: The practice objects the frame shows (ids; ``yuki.memory.practice``), for the ledger's ``injected``.
+    playbooks: list[int] = field(default_factory=list)
     ms: float = 0.0
     error: str | None = None
 
@@ -105,7 +110,8 @@ class TaskFrame:
                 "persons": len(self.persons), "close_people": self.close_people, "close_things": self.close_things,
                 "routes": sum(len(p.get("routes") or []) for p in self.persons),
                 "margins": [p.get("margin") for p in self.persons], "action": self.action,
-                "procedures": self.procedures, "pitfalls": self.pitfalls, "ms": self.ms, "error": self.error}
+                "procedures": self.procedures, "pitfalls": self.pitfalls, "playbooks": list(self.playbooks),
+                "ms": self.ms, "error": self.error}
 
 
 def strength(source: str, age_s: float | None) -> float:
@@ -311,10 +317,12 @@ def preconditions(person: dict[str, Any], overview: Any) -> list[str]:
 
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
-          chars: int = FRAME_CHARS) -> TaskFrame:
+          chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
-    metadata (:func:`clipboard_meta`), the request's know-how lines (already gated by relevance) and the desktop
-    overview. Code only; never raises (a failure is an empty frame with ``error``)."""
+    metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
+    words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
+    older memory without it still gives) and the desktop overview. Code only; never raises (a failure is an empty
+    frame with ``error``)."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
@@ -343,19 +351,27 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                                   "preferred": r.get("preferred"), "places": r.get("places") or []})
         lines = _referent_lines(frame, routes, {p["id"] for p in frame.persons})
         lines += _person_lines(frame, overview)
-        proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
-        if proc:
-            lines.append("How it worked before on this PC (know-how near the request):")
-            lines += [f"- {_one(k.split(' Not: ', 1)[0], 300)}" for k in proc]
-        frame.procedures = len(proc)
-        pits = [p for p in facts.get("pitfalls") or [] if isinstance(p, dict)][:MAX_PITFALLS]
-        if pits:
-            lines.append("What did not work before in the apps in play:")
-            lines += [f"- [{p.get('app')}] {_one(p.get('text'), 260)}" for p in pits]
-        frame.pitfalls = len(pits)
+        tail: list[str] = []
+        if isinstance(practice, dict):
+            # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
+            # always reach the brain (the person block gives way first)
+            tail = _practice_lines(frame, practice)
+        else:   # an older memory: know-how lines and their "Not:" part
+            proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
+            if proc:
+                lines.append("How it worked before on this PC (know-how near the request):")
+                lines += [f"- {_one(k.split(' Not: ', 1)[0], 300)}" for k in proc]
+            frame.procedures = len(proc)
+            pits = [p for p in facts.get("pitfalls") or [] if isinstance(p, dict)][:MAX_PITFALLS]
+            if pits:
+                lines.append("What did not work before in the apps in play:")
+                lines += [f"- [{p.get('app')}] {_one(p.get('text'), 260)}" for p in pits]
+            frame.pitfalls = len(pits)
         # an action request (the caller's measure for the related ranking): a person named or in front, a selection
         frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"])
-        frame.text = _fit(lines, chars)
+        frame.text = _fit(lines, chars, keep=tail)
+        # what was shown, as the ledger records it (our own "[pb:N]" marks in the text that survived the size limit)
+        frame.playbooks = [i for i in frame.playbooks if f"[pb:{i}]" in frame.text]
     except Exception as exc:
         frame.text, frame.error = "", f"{type(exc).__name__}: {exc}"
     frame.ms = round((time.perf_counter() - started) * 1000, 2)
@@ -427,19 +443,55 @@ def _person_lines(frame: TaskFrame, overview: Any) -> list[str]:
     return lines
 
 
-def _fit(lines: list[str], chars: int) -> str:
-    """The frame within ``chars`` (the label and end line included); the last lines go first when it is over. ``""``
-    for no lines."""
-    if not lines:
+#: Practice memory in the frame (Phase C): the procedures and habits shown, then the pitfalls of the apps in play.
+PLAYBOOK_HEAD = ("How this was done before on this PC (playbooks - your first attempt: check its first step against "
+                 "the screen, adapt when the screen differs, ask when it names no single default; put its id in the "
+                 "playbook field of the actions that follow it):")
+PITFALL_HEAD = "Your own earlier mistakes in the apps in play (never repeat one; do what it says instead):"
+
+
+def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
+    """The practice part of the frame: at most :data:`MAX_PROCEDURES` procedures plus one habit or style note, then
+    at most :data:`MAX_PITFALLS` pitfalls, each with its id, how sure memory is and the apps it is about."""
+    lines: list[str] = []
+    ways = [w for w in practice.get("ways") or [] if isinstance(w, dict) and w.get("text")][:MAX_PROCEDURES + 1]
+    pits = [p for p in practice.get("pitfalls") or [] if isinstance(p, dict) and p.get("text")][:MAX_PITFALLS]
+    if ways:
+        lines.append(PLAYBOOK_HEAD)
+        for w in ways:
+            apps = f" [{', '.join(w.get('apps') or [])}]" if w.get("apps") else ""
+            lines.append(f"- [{w.get('ref')}] {w.get('kind')} \"{_one(w.get('intent'), 80)}\"{apps} "
+                         f"({w.get('label')}): {_one(w.get('text'), 420)}")
+    if pits:
+        lines.append(PITFALL_HEAD)
+        for p in pits:
+            apps = ", ".join(p.get("apps") or []) or "any app"
+            lines.append(f"- [{p.get('ref')}] [{apps}] \"{_one(p.get('intent'), 80)}\" ({p.get('label')}): "
+                         f"{_one(p.get('text'), 440)}")
+    frame.procedures = len(ways)
+    frame.pitfalls = len(pits)
+    frame.playbooks = [int(x["id"]) for x in [*ways, *pits] if isinstance(x.get("id"), int)]
+    return lines
+
+
+def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
+    """The frame within ``chars`` (the label and end line included); when it is over, the last lines of ``lines`` go
+    first and ``keep`` (placed after them) only once ``lines`` are gone, its own last lines first. ``""`` for no lines."""
+    body, tail = list(lines), list(keep)
+    if not body and not tail:
         return ""
-    body = list(lines)
-    while body:
-        while body and body[-1].rstrip().endswith(":"):   # a heading whose items were cut goes with them
-            body.pop()
-        if not body:
+
+    def trim(xs: list[str]) -> None:
+        while xs and xs[-1].rstrip().endswith(":"):   # a heading whose items were cut goes with them
+            xs.pop()
+
+    while body or tail:
+        trim(body)
+        trim(tail)
+        if not body and not tail:
             break
-        text = LABEL + "\n" + "\n".join(body) + "\n" + END
+        text = LABEL + "\n" + "\n".join(body + tail) + "\n" + END
         if len(text) <= chars:
             return text
-        body.pop()
+        (body if body else tail).pop()
     return ""

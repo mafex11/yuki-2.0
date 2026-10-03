@@ -572,9 +572,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "that finish the job is the normal thing to do, not a gamble: if one of "
             "them fails your message is discarded and you get the results back to "
             "react to instead. You can never end up having claimed something that "
-            "did not happen. When the user had to correct how you did it before it "
-            "worked, or you had to work out the way, call remember_how in this same "
-            "turn too: what worked, and what your first try did instead."
+            "did not happen."
         ),
         "input_schema": _obj(
             {
@@ -586,11 +584,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "learned": {
                     "type": "string",
-                    "description": "Required when this request took 3 or more actions, or an action "
-                    "failed or was not verified before it worked (you are told when): the fastest "
-                    "way to do this in this app next time, from what you saw work (the keys, the "
-                    "field, the order), and what not to do again. One or two sentences. Saved as "
-                    "know-how for the app; never said to the user.",
+                    "description": "Optional, never said to the user: when the way to do this was not "
+                    "obvious, one sentence on what worked and what did not. A hint for Yuki's learner, "
+                    "which reads the job's own steps.",
                 },
             },
             ["message"],
@@ -659,11 +655,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "remember_how",
         "label": "Saving how it's done",
         "description": (
-            "Save a short procedure that worked on this PC, so next time you can do "
-            "it directly — e.g. how an app accepts a URL, where something lives. "
-            "Call it in the turn a task worked after the user corrected how you did it, "
-            "or after you had to find the way: what worked, and what not to do if your "
-            "first try did something else. Only record what you actually confirmed."
+            "Save a way of doing something on this PC that the user tells you or asks you "
+            "to remember (how an app accepts a URL, where something lives, the steps they "
+            "take), in their words. Your own jobs teach Yuki by themselves; this is for what "
+            "the user teaches. Only record what they said or you confirmed."
         ),
         "input_schema": _obj(
             {
@@ -1128,9 +1123,19 @@ RISK_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+#: The brain's own declaration that an action follows a playbook the task frame showed (``playbook``: its id, "pb:12"),
+#: like ``risk``: model judgement, never text matching. The loop records it in the run trace and memory's ledger logs it
+#: as ``cited``, so whether a playbook was ever used - and how that went - is measured (revamp Phase C, 03 §7.4).
+PLAYBOOK_FIELD = "playbook"
+PLAYBOOK_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": "Optional: the id (pb:N) of the task frame's playbook this action follows; leave it out otherwise.",
+}
+
 for _name in ACTION_TOOL_NAMES:  # plumbing: the same optional fields on each action's schema
     TOOLS_BY_NAME[_name]["input_schema"]["properties"][FINISHES_FIELD] = FINISHES_SCHEMA
     TOOLS_BY_NAME[_name]["input_schema"]["properties"][RISK_FIELD] = RISK_SCHEMA
+    TOOLS_BY_NAME[_name]["input_schema"]["properties"][PLAYBOOK_FIELD] = PLAYBOOK_SCHEMA
 TOOLS_BY_NAME["run_powershell"]["input_schema"]["required"] = ["command", RISK_FIELD]
 
 #: The optional first field of the thinker's actions and slower reads (docs/VOICE.md v3.14, "one voice narrates
@@ -2962,6 +2967,26 @@ class Dispatcher:
         return self._from_action(
             "focus_window", self.backend.focus_window(self._need_int(tool_input, "hwnd"))
         )
+
+    def element_info(self, tool_input: dict[str, Any]) -> dict[str, Any] | None:
+        """The role and name of the element an input names (``element``, from the latest read of its window, as
+        :meth:`_element_target` resolves it), or ``None``: what the run trace keeps as the target instead of an id or a
+        point (practice memory, Phase C). Never raises."""
+        try:
+            element_id = tool_input.get("element")
+            if element_id is None or isinstance(element_id, bool):
+                return None
+            hwnd = self._opt_hwnd(tool_input)
+            if hwnd is None:
+                hwnd = self._latest_tree_hwnd
+            if hwnd is None or hwnd not in self._latest_trees:
+                return None
+            element = self._latest_trees[hwnd][1].get(int(element_id))
+            if not element:
+                return None
+            return {"role": str(element.get("role") or ""), "name": str(element.get("name") or "")[:80]}
+        except Exception:  # noqa: BLE001 - a trace detail, never an error
+            return None
 
     def _element_target(self, tool_input: dict[str, Any]) -> tuple[int, int, int, str] | None:
         """``(x, y, hwnd, label)`` of the ``element`` an input names, or ``None``.
