@@ -40,7 +40,10 @@ Write-Host "Yuki $Version  (python: $Python)"
 & $Python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller is not installed for $Python (uv pip install --python $Python pyinstaller)" }
 
-if (-not (Test-Path (Join-Path $Pkg "yuki.ico"))) { & $Python (Join-Path $Pkg "make_icon.py") }
+# the app icon: the logo picked in packaging/icon/icon.json ("mark"), drawn from its committed SVGs at every size;
+# no pick yet keeps the current yuki.ico (make_icon.py)
+& $Python (Join-Path $Pkg "make_icon.py")
+if ($LASTEXITCODE -ne 0) { throw "make_icon.py failed ($LASTEXITCODE)" }
 if ($Clean) { Remove-Item -Recurse -Force $Dist, $Work -ErrorAction SilentlyContinue }
 
 $App = Join-Path $Dist "Yuki"

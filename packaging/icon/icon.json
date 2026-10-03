@@ -1,0 +1,5 @@
+{
+ "mark": "",
+ "ramp": "mint",
+ "note": "The app icon is one parameter: set mark to the picked logo id or number from the logo gallery (e.g. planet or 06a), then run python packaging/make_icon.py --export and commit packaging/icon/<mark>-<ramp>/ and yuki.ico. Empty keeps the current yuki.ico."
+}
