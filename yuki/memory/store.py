@@ -617,6 +617,11 @@ class WorkThread:
     score: float | None = None
     #: Where it stands, said to the user (migration 33); ``None`` until written or after the state changed.
     shown: str | None = None
+    #: The concrete next step to continue it, said to the user (migration 35); ``None`` until written.
+    next: str | None = None
+    #: Who closed or dismissed it last (``user`` | ``model`` | ``code``) and when (migration 35); ``None`` when open.
+    closed_by: str | None = None
+    closed_at: float | None = None
 
 
 @dataclass
@@ -964,6 +969,9 @@ class NewEpisode:
     aggregates: dict[str, Any]
     vector: np.ndarray | None = None
     embed_model: str | None = None
+    #: The session's short title and its concise summary said to the user (migration 35), or ``None``.
+    title: str | None = None
+    summary: str | None = None
 
 
 @dataclass
@@ -982,6 +990,9 @@ class EpisodeRecord:
     created_at: float
     superseded_by: int | None = None
     score: float | None = None       # cosine, set by search_episodes
+    #: A few words naming the stretch, and one or two short sentences said to the user (migration 35), or ``None``.
+    title: str | None = None
+    summary: str | None = None
 
 
 #: Kinds of conversation facts (``conversation_facts.kind``). ``rule`` and
@@ -2884,6 +2895,40 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX mic_spans_time ON mic_spans(started_at);
     """,
+    # 35 (2026-10-04, the user's feedback round 3 W1-W3, docs/research/revamp-2026-10-02/56-build-appMem2.md):
+    # threads you can close, sessions with a title, corrections in your own words.
+    # - work_threads.next_ciphertext: the concrete next step to continue the thread, said to the user (English),
+    #   written with its shown form (the nightly review, the titles pass); cleared with it when the state changes.
+    # - work_threads.closed_by / closed_at: who closed or dismissed it last (user | model | code) and when; cleared
+    #   when the thread is reopened. A thread the user closed is offered to the journal as such.
+    # - work_thread_undo: the before-image of a thread a change touched (its row, the journal facts, events and
+    #   links that pointed at it, its vector), per pass run (run_id) or per user op (run_id NULL): every close,
+    #   dismiss, merge, rename and rewrite is reversible (Reopen, --undo RUN_ID).
+    # - episodes.title_ciphertext / summary_ciphertext: a work session's short distinct title (a few words) and its
+    #   concise summary said to the user (one or two short sentences, English), written by the episode call itself.
+    # - correction_passes.target: the item the user was correcting in their own words (W12, E40, P7, J300): the
+    #   correction pass always judges it first.
+    # Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    ALTER TABLE work_threads ADD COLUMN next_ciphertext TEXT;
+    ALTER TABLE work_threads ADD COLUMN closed_by TEXT;
+    ALTER TABLE work_threads ADD COLUMN closed_at REAL;
+    CREATE TABLE work_thread_undo (
+        id                 INTEGER PRIMARY KEY,
+        run_id             INTEGER,
+        work_thread_id     INTEGER NOT NULL,
+        action             TEXT NOT NULL,
+        by                 TEXT NOT NULL,
+        at                 REAL NOT NULL,
+        before_ciphertext  TEXT NOT NULL,
+        undone_at          REAL
+    );
+    CREATE INDEX work_thread_undo_run ON work_thread_undo(run_id);
+    CREATE INDEX work_thread_undo_thread ON work_thread_undo(work_thread_id, at);
+    ALTER TABLE episodes ADD COLUMN title_ciphertext TEXT;
+    ALTER TABLE episodes ADD COLUMN summary_ciphertext TEXT;
+    ALTER TABLE correction_passes ADD COLUMN target TEXT;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -4090,12 +4135,15 @@ class Store:
         )
         return cur.rowcount == 1
 
-    def add_correction(self, text: str, at: float | None = None, *, apply: bool = True) -> int:
+    def add_correction(self, text: str, at: float | None = None, *, apply: bool = True,
+                       target: str | None = None) -> int:
         """Store a user-confirmed correction (kind ``correction``, origin ``user``, confidence 1).
 
         ``apply``: queue the correction-apply pass for it in the same transaction (migration 18,
         :mod:`yuki.memory.corrections`: every place the corrected thing appears is superseded with corrected
         wording within minutes). False for a correction that only closes something (a loop marked done).
+        ``target`` (migration 35): the item the user was correcting (``W12``, ``E40``, ``P7``, ``J300``), which the pass
+        judges first.
         """
         now = time.time()
         when = float(at) if at is not None else now
@@ -4106,9 +4154,19 @@ class Store:
                 confidence=1.0, origin="user", run_id=None, now=now,
             )
             self._queue_pass(conn, fact_id, now, status="queued" if apply else "skipped")
+            if target:
+                conn.execute("UPDATE correction_passes SET target=? WHERE correction_id=?", (str(target), fact_id))
             return fact_id
 
         return self._write(op)
+
+    def correction_target(self, correction_id: int) -> str | None:
+        """The item a correction was made on (migration 35), ``W12`` / ``E40`` / ``P7`` / ``J300``, or ``None``."""
+        try:
+            rows = self._query("SELECT target FROM correction_passes WHERE correction_id=?", (int(correction_id),))
+        except sqlite3.OperationalError:
+            return None
+        return rows[0]["target"] if rows and rows[0]["target"] else None
 
     def _queue_pass(self, conn: sqlite3.Connection, correction_id: int, now: float, status: str = "queued") -> None:
         conn.execute("INSERT OR IGNORE INTO correction_passes(correction_id, status, queued_at, updated_at)"
@@ -5049,11 +5107,12 @@ class Store:
             for ep in episodes:
                 cur = conn.execute(
                     "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext,"
-                    " aggregates_ciphertext, run_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " aggregates_ciphertext, run_id, created_at, title_ciphertext, summary_ciphertext)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (float(ep.started_at), float(ep.ended_at), float(ep.window_start), float(ep.window_end),
                      int(bool(ep.final)), self.cipher.encrypt(ep.text),
                      self.cipher.encrypt(json.dumps(ep.aggregates, ensure_ascii=False, default=str)),
-                     run_id, now),
+                     run_id, now, self._enc(ep.title or None), self._enc(ep.summary or None)),
                 )
                 eid = int(cur.lastrowid)
                 ids.append(eid)
@@ -5083,6 +5142,8 @@ class Store:
             window_end=r["window_end"], final=bool(r["final"]), text=self.cipher.decrypt(r["text_ciphertext"]),
             aggregates=aggregates if isinstance(aggregates, dict) else {}, run_id=r["run_id"],
             created_at=r["created_at"], superseded_by=r["superseded_by"], score=score,
+            title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
+            summary=self._dec(r["summary_ciphertext"]) if "summary_ciphertext" in r.keys() else None,
         )
 
     def _episode_filter(self, since: TimeArg, until: TimeArg, include_superseded: bool = False) -> tuple[str, list]:
@@ -6159,6 +6220,17 @@ class Store:
             sql += " LIMIT ?"
             params.append(int(limit))
         return [self._entry(r) for r in self._query(sql, params)], total
+
+    def set_journal_sources(self, sources: dict[int, dict[str, Any] | None]) -> int:
+        """Replace journal rows' provenance (``{journal id: source dict or None}``), in place: metadata about a row (the
+        misheard words and Yuki's guess, :mod:`yuki.memory.misheard`), never its words. Returns how many."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            return sum(conn.execute("UPDATE journal SET source_ciphertext=? WHERE id=?",
+                                    (None if src is None else self.cipher.encrypt(json.dumps(src, ensure_ascii=False)),
+                                     int(jid))).rowcount for jid, src in sources.items())
+
+        return int(self._write(op)) if sources else 0
 
     def work_events_between(self, since: float, until: float, *, limit: int = 200) -> list[dict[str, Any]]:
         """What happened to the threads of work in ``[since, until)``, oldest first: ``{"thread_id", "title", "status",
@@ -8592,9 +8664,11 @@ class Store:
             self._forget_withdrawn()
 
     def supersede_episode(self, episode_id: int, text: str, *, vector: np.ndarray | None = None,
-                          embed_model: str | None = None) -> int | None:
+                          embed_model: str | None = None, title: str | None = None,
+                          summary: str | None = None) -> int | None:
         """A corrected version of one current episode (same span, window, aggregates and run); the old one
-        expires, superseded by it. Returns the new id, or None when it was no longer current."""
+        expires, superseded by it. ``title`` / ``summary`` (migration 35): the corrected session title and summary;
+        each left out keeps the old one. Returns the new id, or None when it was no longer current."""
 
         def op(conn: sqlite3.Connection) -> int | None:
             row = conn.execute("SELECT * FROM episodes WHERE id=? AND expired_at IS NULL", (int(episode_id),)).fetchone()
@@ -8603,15 +8677,53 @@ class Store:
             now = time.time()
             new_id = int(conn.execute(
                 "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext,"
-                " aggregates_ciphertext, run_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " aggregates_ciphertext, run_id, created_at, title_ciphertext, summary_ciphertext)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (row["started_at"], row["ended_at"], row["window_start"], row["window_end"], row["final"],
-                 self.cipher.encrypt(text), row["aggregates_ciphertext"], row["run_id"], now)).lastrowid)
+                 self.cipher.encrypt(text), row["aggregates_ciphertext"], row["run_id"], now,
+                 self._enc(title) if title else row["title_ciphertext"],
+                 self._enc(summary) if summary else row["summary_ciphertext"])).lastrowid)
             if vector is not None:
                 self._put_vec(conn, "episode_vec", "episode_id", new_id, vector, embed_model)
             conn.execute("UPDATE episodes SET expired_at=?, superseded_by=? WHERE id=?", (now, new_id, int(episode_id)))
             return new_id
 
         return self._write(op)
+
+    def set_episode_labels(self, rows: dict[int, tuple[str | None, str | None]], *, overwrite: bool = False) -> int:
+        """Write sessions' titles and summaries (migration 35), ``{episode id: (title, summary)}``, current episodes
+        only; without ``overwrite`` an episode that has a title already is left. Returns how many were written."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for eid, (title, summary) in rows.items():
+                title, summary = " ".join(str(title or "").split()), " ".join(str(summary or "").split())
+                if not title or not summary:
+                    continue
+                guard = "" if overwrite else " AND title_ciphertext IS NULL"
+                n += conn.execute(f"UPDATE episodes SET title_ciphertext=?, summary_ciphertext=? WHERE id=? AND"
+                                  f" expired_at IS NULL{guard}",
+                                  (self.cipher.encrypt(title), self.cipher.encrypt(summary), int(eid))).rowcount
+            return n
+
+        return int(self._write(op)) if rows else 0
+
+    def restore_episode_labels(self, rows: dict[int, tuple[str | None, str | None]]) -> int:
+        """Put sessions' titles and summaries back as they were (``None`` clears them): the undo of a sessions pass."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            return sum(conn.execute("UPDATE episodes SET title_ciphertext=?, summary_ciphertext=? WHERE id=?",
+                                    (self._enc(t or None), self._enc(s or None), int(eid))).rowcount
+                       for eid, (t, s) in rows.items())
+
+        return int(self._write(op)) if rows else 0
+
+    def episodes_without_labels(self, since: TimeArg = None) -> list[EpisodeRecord]:
+        """Current episodes without a session title (migration 35), oldest first."""
+        where, params = self._episode_filter(since, None)
+        where += (" AND " if where else " WHERE ") + "e.title_ciphertext IS NULL"
+        return [self._episode(r) for r in self._query("SELECT e.* FROM episodes e" + where
+                                                      + " ORDER BY e.started_at, e.id", params)]
 
     def retire_episodes(self, pairs: Sequence[tuple[int, int]]) -> int:
         """Expire episodes that retell a stretch another one tells (``(retold id, kept id)``): kept as history,
@@ -8783,7 +8895,10 @@ class Store:
             last_seen=float(r["last_seen"]), importance=r["importance"], origin=r["origin"],
             merged_into=r["merged_into"], events=int(r["events"] or 0), created_at=float(r["created_at"]),
             updated_at=float(r["updated_at"]), score=score,
-            shown=self._dec(r["shown_ciphertext"]) if "shown_ciphertext" in r.keys() else None)
+            shown=self._dec(r["shown_ciphertext"]) if "shown_ciphertext" in r.keys() else None,
+            next=self._dec(r["next_ciphertext"]) if "next_ciphertext" in r.keys() else None,
+            closed_by=r["closed_by"] if "closed_by" in r.keys() else None,
+            closed_at=r["closed_at"] if "closed_at" in r.keys() else None)
 
     def work_threads(self, statuses: Sequence[str] | None = ("active", "paused"), *, since: TimeArg = None,
                      limit: int | None = None, ids: Iterable[int] | None = None) -> list[WorkThread]:
@@ -9096,15 +9211,19 @@ class Store:
                     status, touched, event = row["status"], float(row["last_seen"]), "seen"
                 if op.action == "continues" and row["status"] in ("paused", "done") and not older and not glimpsed:
                     event = "reopens"
-                # a new state makes the shown one stale (migration 33): cleared, the titles pass writes it again
+                # a new state makes the shown one and its next step stale (migrations 33, 35): cleared, the titles
+                # pass writes them again; a thread back at work is no longer closed by anyone
                 conn.execute(
                     "UPDATE work_threads SET status=?, state_ciphertext=coalesce(?, state_ciphertext), open_ciphertext=?,"
                     " entities_ciphertext=?, first_seen=min(first_seen, ?), last_seen=max(last_seen, ?),"
                     " importance=?, events=events+1, updated_at=?,"
-                    " shown_ciphertext=CASE WHEN ? THEN NULL ELSE shown_ciphertext END WHERE id=?",
+                    " shown_ciphertext=CASE WHEN ? THEN NULL ELSE shown_ciphertext END,"
+                    " next_ciphertext=CASE WHEN ? THEN NULL ELSE next_ciphertext END,"
+                    " closed_by=CASE WHEN ?='active' THEN NULL ELSE closed_by END,"
+                    " closed_at=CASE WHEN ?='active' THEN NULL ELSE closed_at END WHERE id=?",
                     (status, self._enc(state or None), self.cipher.encrypt(json.dumps(open_items)),
                      self.cipher.encrypt(json.dumps(entities)), min(first, touched), touched,
-                     max(rated) if rated else None, now, int(bool(state)), tid))
+                     max(rated) if rated else None, now, int(bool(state)), int(bool(state)), status, status, tid))
                 op.outcome = {"continues": "continued", "pauses": "paused", "ends": "ended"}[op.action]
                 if event == "reopens":
                     op.outcome = "reopened"
@@ -9196,23 +9315,177 @@ class Store:
         enc = self.cipher.encrypt(shown) if shown else None
         return enc, enc, int(bool(ch.get("state")))
 
+    def _next_args(self, ch: dict[str, Any]) -> tuple[Any, Any, int]:
+        """The same three parameters for ``next_ciphertext`` (migration 35): the change's next step, else cleared when
+        the state changed."""
+        nxt = " ".join(str(ch.get("next") or "").split())
+        enc = self.cipher.encrypt(nxt) if nxt else None
+        return enc, enc, int(bool(ch.get("state")))
+
+    #: work_threads columns a before-image keeps (migration 35): everything a change can touch.
+    _WORK_SNAPSHOT_COLUMNS = ("title_ciphertext", "kind", "status", "state_ciphertext", "open_ciphertext",
+                              "entities_ciphertext", "first_seen", "last_seen", "importance", "merged_into", "events",
+                              "shown_ciphertext", "next_ciphertext", "closed_by", "closed_at")
+
+    def _snapshot_work_thread(self, conn: sqlite3.Connection, tid: int, *, run_id: int | None, action: str, by: str,
+                              now: float) -> None:
+        """Keep a thread's before-image (migration 35's ``work_thread_undo``): its row, the journal facts, events and
+        links that point at it, and its vector, encrypted; :meth:`undo_work_threads` and :meth:`reopen_work_thread`
+        put it back."""
+        import base64
+
+        row = conn.execute("SELECT * FROM work_threads WHERE id=?", (int(tid),)).fetchone()
+        if row is None:
+            return
+        vec = conn.execute("SELECT model, dim, vec_ciphertext FROM work_thread_vec WHERE work_thread_id=?",
+                           (int(tid),)).fetchone()
+        before = {
+            "row": {c: row[c] for c in self._WORK_SNAPSHOT_COLUMNS if c in row.keys()},
+            "journal": [int(r[0]) for r in conn.execute("SELECT id FROM journal WHERE work_thread_id=?", (int(tid),))],
+            "events": [int(r[0]) for r in conn.execute("SELECT id FROM work_thread_events WHERE work_thread_id=?",
+                                                       (int(tid),))],
+            "links": [int(r[0]) for r in conn.execute("SELECT id FROM links_seen WHERE work_thread_id=?", (int(tid),))],
+            "vec": None if vec is None else {"model": vec["model"], "dim": vec["dim"],
+                                             "blob": base64.b64encode(bytes(vec["vec_ciphertext"])).decode("ascii")},
+        }
+        conn.execute("INSERT INTO work_thread_undo(run_id, work_thread_id, action, by, at, before_ciphertext)"
+                     " VALUES (?,?,?,?,?,?)", (run_id, int(tid), str(action), str(by), now,
+                                               self.cipher.encrypt(json.dumps(before, default=str))))
+
+    def _restore_work_thread(self, conn: sqlite3.Connection, snap: sqlite3.Row, now: float) -> None:
+        """Put one before-image back (inside the caller's transaction) and mark it undone."""
+        import base64
+
+        tid = int(snap["work_thread_id"])
+        before = json.loads(self.cipher.decrypt(snap["before_ciphertext"]))
+        cols = [c for c in self._WORK_SNAPSHOT_COLUMNS if c in before["row"]]
+        conn.execute(f"UPDATE work_threads SET {', '.join(f'{c}=?' for c in cols)}, updated_at=? WHERE id=?",
+                     (*(before["row"][c] for c in cols), now, tid))
+        for table, key in (("journal", "journal"), ("work_thread_events", "events"), ("links_seen", "links")):
+            ids = [int(i) for i in before.get(key) or []]
+            for start in range(0, len(ids), 500):
+                part = ids[start:start + 500]
+                conn.execute(f"UPDATE {table} SET work_thread_id=? WHERE id IN ({','.join('?' * len(part))})",
+                             (tid, *part))
+        vec = before.get("vec")
+        if vec:
+            conn.execute("INSERT OR REPLACE INTO work_thread_vec(work_thread_id, model, dim, vec_ciphertext)"
+                         " VALUES (?,?,?,?)", (tid, vec["model"], vec["dim"], base64.b64decode(vec["blob"])))
+        conn.execute("UPDATE work_thread_undo SET undone_at=? WHERE id=?", (now, int(snap["id"])))
+
+    def _touched_since(self, conn: sqlite3.Connection, tid: int, at: float) -> bool:
+        """The user's own work reached the thread after ``at`` (a journal or backfill event, never a pass's own)."""
+        return conn.execute("SELECT 1 FROM work_thread_events WHERE work_thread_id=? AND at > ? AND created_at > ?"
+                            " AND origin IN ('journal', 'backfill') AND action != 'seen' LIMIT 1",
+                            (int(tid), float(at), float(at))).fetchone() is not None
+
+    def undo_work_threads(self, run_id: int, *, now: float | None = None) -> dict[str, Any]:
+        """Take back what one pass run did to the threads of work (migration 35): each thread it touched gets its
+        before-image back (row, facts, events, links, vector), newest change first. A thread the user worked on since
+        (a journal event after the change) is left as it is and reported in ``diverged``. Returns ``{"restored",
+        "diverged": [thread ids], "threads": [thread ids]}``."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            snaps = conn.execute("SELECT * FROM work_thread_undo WHERE run_id=? AND undone_at IS NULL ORDER BY id DESC",
+                                 (int(run_id),)).fetchall()
+            restored, diverged, threads = 0, [], []
+            for snap in snaps:
+                tid = int(snap["work_thread_id"])
+                if self._touched_since(conn, tid, float(snap["at"])):
+                    diverged.append(tid)
+                    continue
+                self._restore_work_thread(conn, snap, now)
+                restored += 1
+                if tid not in threads:
+                    threads.append(tid)
+            for tid in threads:
+                conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
+                             " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "reopens", None, "undo", now))
+            return {"restored": restored, "diverged": sorted(set(diverged)), "threads": threads}
+
+        return self._write(op)
+
+    def reopen_work_thread(self, thread_id: int, *, now: float | None = None) -> dict[str, Any] | None:
+        """The user's Reopen (or the Undo of their close or dismiss, migration 35): the thread is open again as it was
+        before it was closed - its before-image back when one was kept (a dismissed thread gets its facts, links and
+        vector back), else it is made active. Returns ``{"id", "status"}`` or ``None`` when it is not closed (or gone,
+        or merged into another)."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            row = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()
+            if row is None or row["status"] not in ("done", "paused", "dismissed"):
+                return None
+            snap = conn.execute("SELECT * FROM work_thread_undo WHERE work_thread_id=? AND undone_at IS NULL AND"
+                                " action IN ('close', 'dismiss') ORDER BY id DESC LIMIT 1", (int(thread_id),)).fetchone()
+            if snap is not None and not self._touched_since(conn, int(thread_id), float(snap["at"])):
+                self._restore_work_thread(conn, snap, now)
+            status = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()["status"]
+            if status not in ("active", "paused"):
+                status = "active"
+            conn.execute("UPDATE work_threads SET status=?, closed_by=NULL, closed_at=NULL, updated_at=? WHERE id=?",
+                         (status, now, int(thread_id)))
+            conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
+                         " created_at) VALUES (?,?,?,?,?,?)", (int(thread_id), now, "reopens", None, "user", now))
+            return {"id": int(thread_id), "status": status}
+
+        return self._write(op)
+
+    def set_thread_next(self, texts: dict[int, str], *, overwrite: bool = False) -> int:
+        """Write threads' next steps (migration 35), ``{thread id: text}``; without ``overwrite`` a next step stored
+        meanwhile is kept. Returns how many were written."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for tid, text in texts.items():
+                text = " ".join(str(text or "").split())
+                if not text:
+                    continue
+                guard = "" if overwrite else " AND next_ciphertext IS NULL"
+                n += conn.execute(f"UPDATE work_threads SET next_ciphertext=? WHERE id=?{guard}",
+                                  (self.cipher.encrypt(text), int(tid))).rowcount
+            return n
+
+        return int(self._write(op)) if texts else 0
+
     def change_work_threads(self, changes: Sequence[dict[str, Any]], *, now: float | None = None,
-                            origin: str = "consolidate") -> list[dict[str, Any]]:
-        """The nightly pass's validated decisions, in one transaction; returns what happened to each.
+                            origin: str = "consolidate", run_id: int | None = None,
+                            by: str | None = None) -> list[dict[str, Any]]:
+        """The nightly pass's validated decisions (or the user's own close), in one transaction; returns what happened
+        to each.
 
         Each change: ``{"action": "merge", "ids": [...], "keep": id, "title", "state", "open", "vector",
         "embed_model"}`` (the others end ``merged`` into ``keep``; their facts, events and links move to it),
-        ``{"action": "close", "id", "status": "paused" | "done"}``, ``{"action": "rename", "id", "title",
-        "vector", "embed_model"}``, ``{"action": "update", "id", "state", "open", "vector", "embed_model"}``.
-        A merge or update may carry ``shown`` (the state said to the user, migration 33); a new state without one
-        clears the old shown form (the titles pass writes it again).
+        ``{"action": "close", "id", "status": "paused" | "done"}``, ``{"action": "dismiss", "id"}``,
+        ``{"action": "rename", "id", "title", "vector", "embed_model"}``, ``{"action": "update", "id", "state",
+        "open", "vector", "embed_model"}``, ``{"action": "present", "id", "shown", "next"}`` (migration 35: where it
+        stands and the next step said to the user, the state as it is).
+        A merge or update may carry ``shown`` (the state said to the user, migration 33) and ``next`` (migration 35);
+        a new state without them clears the old ones (the titles pass writes them again).
+        ``by`` (``user`` | ``model`` | ``code``; default ``user`` for origin ``user``, else ``model``): who closed or
+        dismissed it. Every change keeps the thread's before-image (``work_thread_undo``, with ``run_id``), so
+        :meth:`undo_work_threads` (a run) and :meth:`reopen_work_thread` (one thread) take it back.
         """
         now = time.time() if now is None else float(now)
         out: list[dict[str, Any]] = []
+        who = by or ("user" if origin == "user" else "model")
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             for ch in changes:
                 action = ch.get("action")
+                touched = ([int(i) for i in ch.get("ids") or []] if action == "merge"
+                           else [int(ch["id"])] if ch.get("id") is not None else [])
+                mark = int(conn.execute("SELECT coalesce(max(id), 0) FROM work_thread_undo").fetchone()[0])
+
+                def failed(why: str, ch: dict[str, Any] = ch, mark: int = mark) -> None:
+                    conn.execute("DELETE FROM work_thread_undo WHERE id > ?", (mark,))   # nothing changed: no undo
+                    out.append({**{k: v for k, v in ch.items() if k not in ("vector",)}, "ok": False, "why": why})
+
+                for tid in touched:
+                    if conn.execute("SELECT 1 FROM work_threads WHERE id=? AND status NOT IN ('merged', 'dismissed')",
+                                    (tid,)).fetchone() is not None:
+                        self._snapshot_work_thread(conn, tid, run_id=run_id, action=str(action), by=who, now=now)
                 if action == "merge":
                     keep = int(ch["keep"])
                     others = [int(i) for i in ch["ids"] if int(i) != keep]
@@ -9220,8 +9493,7 @@ class Store:
                         "SELECT * FROM work_threads WHERE status NOT IN ('merged', 'dismissed') AND id IN (%s)"
                         % ",".join("?" * (len(others) + 1)), (keep, *others)).fetchall()}
                     if keep not in rows or not all(o in rows for o in others):
-                        out.append({**{k: v for k, v in ch.items() if k not in ("vector",)}, "ok": False,
-                                    "why": "not all current"})
+                        failed("not all current")
                         continue
                     group = [rows[keep], *(rows[o] for o in others)]
                     entities = self._json_list(rows[keep]["entities_ciphertext"])
@@ -9234,7 +9506,8 @@ class Store:
                         "UPDATE work_threads SET title_ciphertext=?, state_ciphertext=coalesce(?, state_ciphertext),"
                         " open_ciphertext=coalesce(?, open_ciphertext), entities_ciphertext=?, status=?,"
                         " first_seen=?, last_seen=?, events=?, importance=coalesce(?, importance), updated_at=?,"
-                        " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END"
+                        " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END,"
+                        " next_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE next_ciphertext END"
                         " WHERE id=?",
                         (self.cipher.encrypt(str(ch.get("title") or self._dec(rows[keep]["title_ciphertext"]) or "")),
                          self._enc(ch.get("state") or None),
@@ -9243,7 +9516,7 @@ class Store:
                          self.cipher.encrypt(json.dumps(entities)), status,
                          min(r["first_seen"] for r in group), max(r["last_seen"] for r in group),
                          sum(int(r["events"] or 0) for r in group), ch.get("importance"), now,
-                         *self._shown_args(ch), keep))
+                         *self._shown_args(ch), *self._next_args(ch), keep))
                     conn.execute(f"UPDATE work_threads SET status='merged', merged_into=?, updated_at=? WHERE id IN ({marks})",
                                  (keep, now, *others))
                     conn.execute(f"UPDATE journal SET work_thread_id=? WHERE work_thread_id IN ({marks})", (keep, *others))
@@ -9258,9 +9531,10 @@ class Store:
                     out.append({"action": "merge", "keep": keep, "ids": [keep, *others], "ok": True})
                 elif action == "dismiss":
                     tid = int(ch["id"])
-                    if conn.execute("UPDATE work_threads SET status='dismissed', updated_at=? WHERE id=?"
-                                    " AND status NOT IN ('merged', 'dismissed')", (now, tid)).rowcount != 1:
-                        out.append({"action": action, "id": tid, "ok": False, "why": "not current"})
+                    if conn.execute("UPDATE work_threads SET status='dismissed', closed_by=?, closed_at=?, updated_at=?"
+                                    " WHERE id=? AND status NOT IN ('merged', 'dismissed')",
+                                    (who, now, now, tid)).rowcount != 1:
+                        failed("not current")
                         continue
                     conn.execute("UPDATE journal SET work_thread_id=NULL WHERE work_thread_id=?", (tid,))
                     conn.execute("UPDATE links_seen SET work_thread_id=NULL WHERE work_thread_id=?", (tid,))
@@ -9269,15 +9543,25 @@ class Store:
                                  " created_at) VALUES (?,?,?,?,?,?)", (tid, now, "closed", self._enc(ch.get("reason") or None),
                                                                        origin, now))
                     out.append({"action": action, "id": tid, "ok": True})
-                elif action in ("close", "rename", "update"):
+                elif action in ("close", "rename", "update", "present"):
                     tid = int(ch["id"])
                     row = conn.execute("SELECT * FROM work_threads WHERE id=? AND status NOT IN ('merged', 'dismissed')", (tid,)).fetchone()
                     if row is None:
-                        out.append({"action": action, "id": tid, "ok": False, "why": "not current"})
+                        failed("not current")
+                        continue
+                    if action == "present":
+                        # where it stands and the next step, said to the user; the state and its date stay
+                        shown = " ".join(str(ch.get("shown") or "").split())
+                        nxt = " ".join(str(ch.get("next") or "").split())
+                        conn.execute("UPDATE work_threads SET shown_ciphertext=coalesce(?, shown_ciphertext),"
+                                     " next_ciphertext=?, updated_at=? WHERE id=?",
+                                     (self._enc(shown or None), self._enc(nxt or None), now, tid))
+                        out.append({"action": action, "id": tid, "ok": True})
                         continue
                     if action == "close":
                         status = ch.get("status") if ch.get("status") in ("paused", "done") else "paused"
-                        conn.execute("UPDATE work_threads SET status=?, updated_at=? WHERE id=?", (status, now, tid))
+                        conn.execute("UPDATE work_threads SET status=?, closed_by=?, closed_at=?, updated_at=? WHERE id=?",
+                                     (status, who, now, now, tid))
                         event = "closed"
                     elif action == "rename":
                         conn.execute("UPDATE work_threads SET title_ciphertext=?, updated_at=? WHERE id=?",
@@ -9287,11 +9571,14 @@ class Store:
                         conn.execute(
                             "UPDATE work_threads SET state_ciphertext=coalesce(?, state_ciphertext),"
                             " open_ciphertext=coalesce(?, open_ciphertext), updated_at=?,"
-                            " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END"
+                            " title_ciphertext=coalesce(?, title_ciphertext),"
+                            " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END,"
+                            " next_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE next_ciphertext END"
                             " WHERE id=?",
                             (self._enc(ch.get("state") or None),
                              self.cipher.encrypt(json.dumps(list(ch["open"])[: self.WORK_OPEN_MAX]))
-                             if ch.get("open") is not None else None, now, *self._shown_args(ch), tid))
+                             if ch.get("open") is not None else None, now, self._enc(ch.get("title") or None),
+                             *self._shown_args(ch), *self._next_args(ch), tid))
                         event = "renamed" if ch.get("title") else "continues"
                     self._put_work_vec(conn, tid, ch.get("vector"), ch.get("embed_model"))
                     conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"

@@ -136,6 +136,12 @@ def test_migration_33_runs_on_a_v32_file_with_rows_and_pins_user_facts_only(tmp_
                           ("call_chunks", "track_call_id")):
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute("DROP TABLE mic_spans")
+    # migration 35 (threads you can close, session titles, correction targets) too
+    for table, column in (("work_threads", "next_ciphertext"), ("work_threads", "closed_by"),
+                          ("work_threads", "closed_at"), ("episodes", "title_ciphertext"),
+                          ("episodes", "summary_ciphertext"), ("correction_passes", "target")):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute("DROP TABLE work_thread_undo")
     conn.execute("PRAGMA user_version=32")
     conn.close()
     s = Store.open(db)
