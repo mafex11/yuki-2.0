@@ -39,12 +39,12 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
 
 from yuki.ui import lattice as L
 from yuki.ui import tokens as T
-from yuki.ui.dots import FACE_H, FACE_W, HALO_GAP, HALO_H, HALO_W, FaceWidget, HaloWidget
+from yuki.ui.dots import FACE_W, HALO_GAP, HALO_H, HALO_W, FaceWidget, HaloWidget
 
 # -- geometry and timing (tokens ``island`` / ``motion``; the design's CSS) ---------------------------------
 
@@ -1142,6 +1142,7 @@ class IslandWindow(QWidget):
             self._from, self._to = QRect(self._rect), target
             self.setFixedHeight(max(self._rect.height(), h))
             self._morph.stop()
+            self._set_rect(self._from)   # the new contents in the old box at once; the box then morphs
             self._morph.start()
         else:
             self._morph.stop()
@@ -1164,6 +1165,8 @@ class IslandWindow(QWidget):
         a, b = self._from, self._to
         w = int(round(a.width() + (b.width() - a.width()) * k))
         h = int(round(a.height() + (b.height() - a.height()) * k))
+        if self.spec is not None and not self.spec.mini:
+            w = max(MIN_W, w)    # the design's island keeps its min-width while it morphs (from the mini: 360 at once)
         self._set_rect(QRect((WIN_W - w) // 2, 0, w, h))
 
     def _morph_done(self) -> None:

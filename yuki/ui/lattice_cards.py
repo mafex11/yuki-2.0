@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QFontMetricsF, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 
 from yuki.ui import lattice as L

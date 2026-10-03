@@ -18,13 +18,12 @@ import time
 from typing import Any, Sequence
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from yuki.config import MODEL_ALIASES, Settings
 from yuki.ui import startup
 from yuki.ui.calls import CallController
-from yuki.ui.surface import ACCENT
 from yuki.ui.hotkey import HotkeyListener, hotkey_bindings
 
 

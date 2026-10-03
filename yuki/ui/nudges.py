@@ -49,12 +49,11 @@ from ctypes import wintypes
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QEnterEvent, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QWidget
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
-from yuki.ui.surface import SurfaceWindow
 from yuki.ui.lattice_cards import LatticeCard
 from yuki.ui.memory import local_moment
 from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH

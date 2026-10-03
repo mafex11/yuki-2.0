@@ -44,7 +44,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeyEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,

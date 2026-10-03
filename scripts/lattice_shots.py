@@ -133,7 +133,7 @@ class FakeModel:
         return self.item
 
 
-def island_state(island, state: str, t: float):
+def island_state(island, state: str, t: float, animate: bool = False):
     """Put the island in ``state`` with invented data, as of animation time ``t``."""
     from yuki.ui import lattice as L
     from yuki.ui.island import FinalInfo, IslandInputs, RunInfo, Steer
@@ -162,8 +162,111 @@ def island_state(island, state: str, t: float):
     }[state]
     island.expanded = False
     island.inputs = inputs
-    island.refresh(animate=False)
+    island.refresh(animate=animate)
     return island
+
+
+# -- transitions: the same moments as the mock's frames (+0, +60, +150, +300, +600, +1300 ms after the switch) ----
+
+SWITCH_T = 1.5
+TRANSITIONS = [("quiet-in-call", "listening"), ("hidden-armed", "listening"), ("listening", "thinking"),
+               ("thinking", "working"), ("working", "run"), ("working", "done-flash"),
+               ("quiet-in-call", "game-quiet"), ("listening", "needs-you")]
+OFFSETS = (0, 60, 150, 300, 600, 1300)
+
+
+def _paused(anims):
+    for a in anims:
+        if a.state() == a.State.Running:
+            a.pause()
+
+
+def _step(island, a: float, b: float, anims: list, t0: float) -> None:
+    """Frames from ``a`` to ``b`` on the design's 33 ms loop, the paused animations moved to the same moment."""
+    from yuki.ui import lattice as L
+
+    w = island.window
+    t = a
+    while True:
+        L.set_clock(lambda tt=t: tt)
+        if w.face.isVisible():
+            w.face.frame(t)
+        if w.halo_win.isVisible():
+            w.halo_win.halo.frame(t)
+        for anim in anims:
+            if anim.state() != anim.State.Stopped:
+                anim.setCurrentTime(int(round(max(0.0, t - t0) * 1000)))
+        if t >= b - 1e-6:
+            break
+        t = min(b, t + L.FRAME_MS / 1000.0)
+
+
+def island_transition(app, src: str, dst: str, ms: int, backdrop: Path | None):
+    from yuki.ui import lattice as L
+    from yuki.ui.island import Island
+
+    isl = Island(bindings={"voice": "ctrl+alt+y", "cancel": "alt+shift+x"})
+    isl.screen_state = lambda: (5, "accepts")
+    island_state(isl, src, SWITCH_T)
+    app.processEvents()
+    w = isl.window
+    anims = [w._morph, w._move, w.halo_win._fade]
+    for a in anims:
+        a.stop()
+    _step(isl, SWITCH_T - 1.9, SWITCH_T, [], SWITCH_T)
+    L.set_clock(lambda: SWITCH_T)
+    if dst == "run":
+        isl.toggle_card()
+    elif dst == "game-quiet":
+        isl.screen_state = lambda: (3, "d3d_full_screen")
+        isl.on_foreground(0)
+    else:
+        island_state(isl, dst, SWITCH_T + 1.9, animate=True)
+        L.set_clock(lambda: SWITCH_T)
+    _paused(anims)
+    _step(isl, SWITCH_T, SWITCH_T + ms / 1000.0, anims, SWITCH_T)
+    layers = []
+    if w.isVisible():
+        dy = w.pos().y() - w._origin.y() if w._move.state() != w._move.State.Stopped else 0
+        op = w.windowOpacity()
+        layers.append((_grab(w), VIEW_W // 2 - w.width() // 2, 12 + dy, op))
+        hw = w.halo_win
+        if hw.isVisible():
+            layers.append((_grab(hw), VIEW_W // 2 - hw.width() // 2, 12 + dy + w._rect.height() + 2,
+                           hw.windowOpacity() * (op if op < 1 else 1)))
+    img = composite(backdrop, "runcard" if dst == "run" else "island", layers)
+    isl.stop()
+    w.close()
+    w.halo_win.close()
+    return img
+
+
+def card_transition(app, which: str, ms: int, backdrop: Path | None):
+    """A corner card coming in (the design's ``cardin``: 520 ms, a 10 px rise), at ``ms`` after it was shown."""
+    from yuki.ui.nudges import NudgeCard
+
+    c = NudgeCard(linger_ms=60_000)
+    if which == "offer-todo":
+        todo = {"do": "todo_add", "label": "Add to list", "steps": ["Add “Sort the planner exports” to your list, due Mon 5 Oct."],
+                "wont": "Won’t open, type into or send anything.", "undo": True, "expires_at": _soon()}
+        n = {"id": 7, "kind": "notice", "trigger": "thread", "at": _ago(3), "offer": todo,
+             "text": "Next on the garden planner is the export cleanup: 34 old files into one folder, sorted by date, "
+                     "so the backup stops failing. Due Monday."}
+    else:
+        n = {"id": 9, "kind": "question", "at": _ago(1), "ref": "question:4",
+             "text": "Is the garden planner a side project or work? You named it in both your chats and your mail."}
+    from PySide6.QtCore import QPoint, Qt
+
+    c.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    c.set_nudge(n)
+    target = QPoint(VIEW_W - 20 - c.width(), VIEW_H - 64 - c.height())
+    c.fade_in(target)
+    c._anim.pause()
+    c._anim.setCurrentTime(ms)
+    dy = c.pos().y() - target.y()
+    img = composite(backdrop, "card", [(_grab(c), target.x(), target.y() + dy, c.windowOpacity())])
+    c.close()
+    return img
 
 
 def run_card(island, mode: str, t: float):
@@ -329,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path(os.environ.get("TEMP", ".")) / "yuki-2c" / "qt")
     ap.add_argument("--only", default="")
     ap.add_argument("--t", type=float, default=2.0)
+    ap.add_argument("--transitions", action="store_true", help="the state changes, frame by frame, next to the mock's")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     app = _app()
@@ -338,6 +442,33 @@ def main(argv: list[str] | None = None) -> int:
     L.REDUCED_OVERRIDE[0] = False
     crops = args.mock / "crops"
     backdrop = args.mock / "backdrop-desk.png"
+    if args.transitions:
+        results = []
+        for src, dst in TRANSITIONS:
+            if args.only and args.only not in f"{src}-{dst}":
+                continue
+            for ms_ in OFFSETS:
+                img = island_transition(app, src, dst, ms_, backdrop)
+                name = f"tr-{src}-{dst}-{ms_}"
+                img.save(str(args.out / f"{name}.png"))
+                suffix = "-island" if dst == "run" else ""
+                mock_dst = "run" if dst == "run" else dst
+                cand = crops / f"tr-{src}-{mock_dst}-{ms_}.png"
+                score = side_by_side(cand, img, args.out / f"sbs-{name}.png")
+                results.append((name, score))
+                del suffix
+        for which in ("offer-todo", "question"):
+            if args.only and args.only not in which:
+                continue
+            for ms_ in OFFSETS:
+                img = card_transition(app, which, ms_, backdrop)
+                name = f"tr-hidden-armed-{which}-{ms_}"
+                img.save(str(args.out / f"{name}.png"))
+                score = side_by_side(crops / f"{name}.png", img, args.out / f"sbs-{name}.png")
+                results.append((name, score))
+        for name, score in results:
+            print(f"{name:44s} mean |diff| {score:6.1f}")
+        return 0
     island = Island(bindings={"voice": "ctrl+alt+y", "cancel": "alt+shift+x"})
     island.screen_state = lambda: (5, "accepts")
     results = []
