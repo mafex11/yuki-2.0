@@ -530,6 +530,41 @@ def test_the_learner_holds_runs_past_the_daily_budget(store):
     assert P.run_header(store, "agent:S1:worker-1").learn == "held"
 
 
+def test_post_mortems_have_their_own_budget_and_hitting_a_limit_is_logged_once(store):
+    """3 Oct: the shared budget was spent by 19:09 and every troubled run after it was held. A stopped run is still
+    post-mortemed from its own pool; when that pool is spent too the run is held, logged once, and not looked at again
+    until there is room."""
+    def spend(kind: str, usd: float, at: float) -> None:
+        store._write(lambda c: c.execute("INSERT INTO portrait_runs(at, kind, model, outcome, cost_usd) VALUES"
+                                         " (?, ?, 'x', 'ok', ?)", (at, kind, usd)))
+
+    spend("practice_distill", 0.2, NOW + 100)                         # the shared pool is spent
+    P.record_run(store, tag_run(outcome="cancelled", request_id="worker-7"))
+    worker = Worker(store, [{"outcome": "cancelled", "operations": [], "used": []}])
+    learner = L.Learner(worker)
+    [res] = learner.run_once(now=NOW + 200)
+    assert res.mode == "postmortem" and res.skipped is None and len(worker.calls) == 1
+    assert L.spent_today(store, NOW + 200, "postmortem")[1] == 1 and L.spent_today(store, NOW + 200, "shared")[0] == 0.2
+    assert not [t for t, _f in worker.logged if t == "practice_budget"]
+    # the post-mortems' own pool spent too: held, the limit logged once
+    spend("practice_postmortem", L.POSTMORTEM_BUDGET_USD, NOW + 300)
+    for n in (8, 9):
+        P.record_run(store, tag_run(outcome="cancelled", request_id=f"worker-{n}", at=NOW + 300 + n,
+                                    ended_at=NOW + 340 + n))
+    out = learner.run_once(now=NOW + 3600)
+    assert [r.skipped for r in out] == ["budget", "budget"] and len(worker.calls) == 1
+    hits = [f for t, f in worker.logged if t == "practice_budget"]
+    assert len(hits) == 1 and hits[0]["pool"] == "postmortem" and hits[0]["cap_usd"] == L.POSTMORTEM_BUDGET_USD
+    assert store._query("SELECT learn_note FROM runs WHERE run_key='agent:S1:worker-8' AND step=0")[0][0].startswith(
+        "budget (postmortem)")
+    # still spent: the held runs are not decided again (no embedding, no write) and nothing more is logged
+    assert learner.run_once(now=NOW + 3700) == [] and len(hits) == 1
+    # the next local day the pool has room again and the held runs are learned
+    worker.answers = [{"outcome": "cancelled", "operations": [], "used": []} for _ in range(2)]
+    out = learner.run_once(now=NOW + DAY)
+    assert [r.mode for r in out] == ["postmortem", "postmortem"] and len(worker.calls) == 3
+
+
 def test_used_outcomes_reach_the_ledger_and_a_correction_counts_against_what_was_followed(store):
     ids = _seed(store)
     run = tag_run(injected=[ids["tag"], ids["warp"], ids["paste"]],
@@ -692,6 +727,23 @@ def test_the_worker_never_mines_during_a_call_a_game_or_while_the_user_is_busy(s
     assert pw.blocked() in (None, "call")   # (a just-ended call may still linger while its app holds the mic)
     (tmp_path / "paused").write_text("x")
     assert pw.tick() == {"paused": True}
+
+
+def test_the_intake_and_the_miner_wait_while_the_shared_budget_is_spent(store, tmp_path):
+    """Every practice call but the user's own Playbook edits is inside a daily pool, so the day's total is bounded."""
+    store.add_knowhow("spotify", "Focus the Spotify window first before clicking Pause.")
+    store._write(lambda c: c.execute("INSERT INTO portrait_runs(at, kind, model, outcome, cost_usd) VALUES"
+                                     " (?, 'practice_distill', 'x', 'ok', ?)", (NOW - 60, L.DAILY_BUDGET_USD)))
+    worker = Worker(store, [])
+    pw = L.PracticeWorker(store, worker, db_path=tmp_path / "memory.db", idle_fn=lambda: 9999.0,
+                          live_fn=lambda: {}, clock=lambda: NOW)
+    out = pw.tick()
+    assert "intake" not in out and "miner" not in out and not worker.calls
+    assert L.Intake(worker).waiting()                                    # the row waits for a day with room
+    hits = [f for t, f in worker.logged if t == "practice_budget"]
+    assert len(hits) == 1 and hits[0]["pool"] == "shared"
+    pw.tick()
+    assert len([t for t, _f in worker.logged if t == "practice_budget"]) == 1   # logged once a day
 
 
 # -- the Playbook page ------------------------------------------------------------------------------------------------
