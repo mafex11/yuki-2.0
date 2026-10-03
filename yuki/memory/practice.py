@@ -60,7 +60,7 @@ Public API::
     apps_named(store, words, known=()) -> [app_key]
     relevant(store, *, query_vec, apps_in_play, now=None, detail=False) -> dict
     workflows(store, *, now=None) -> dict;  workflow_edit(store, ref, action, words="", *, now=None) -> dict
-    learned_way(kind, events) -> bool;  verified_run(store, key) -> bool;  judged_ok(store, key) -> bool | None
+    learned_way(kind, events) -> bool;  verified_run(store, key) -> bool;  judged_ok(store, key) -> bool | None;  corrected_by_quote(store, key) -> bool
     stamp_successes(store, *, run_keys=None, ok=None, dry_run=False) -> [(id, run_key)]
 """
 
@@ -1112,9 +1112,37 @@ def judged_ok(store: Store, key: str) -> bool | None:
     if learn != "done":
         return None
     mode, _sep, outcome = note.partition(": ")
-    if mode == "postmortem":
-        return outcome in WORKED_OUTCOMES
-    return outcome not in WRONG_OUTCOMES
+    ok = outcome in WORKED_OUTCOMES if mode == "postmortem" else outcome not in WRONG_OUTCOMES
+    # a run judged before the learner noted its full verdict (a post-mortem the model labelled worked, whose lesson
+    # quotes the user's correction) is still a corrected run: it never makes a way
+    return ok and not corrected_by_quote(store, key)
+
+
+def corrected_by_quote(store: Store, key: str) -> bool:
+    """Whether a lesson written from this run quotes the user's correction of it (their next words after it, or words
+    they added while it ran): the measured half of the learner's correction test
+    (:func:`yuki.memory.practice_learn.corrected_run`), read back from the ledger (a lesson's ``taught`` event keeps
+    its quote). One indexed read; the follow-ups only when such a quote exists."""
+    rows = store._query("SELECT e.refs_ciphertext FROM playbook_events e JOIN playbooks p ON p.id = e.playbook_id"
+                        " WHERE e.run_key=? AND e.type='taught' AND p.kind IN (%s)" % ",".join("?" * len(LESSON_KINDS)),
+                        (key, *LESSON_KINDS))
+    quotes = []
+    for r in rows:
+        try:
+            refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
+        except Exception:
+            continue
+        if isinstance(refs, dict) and str(refs.get("quote") or "").strip():
+            quotes.append(str(refs["quote"]))
+    if not quotes:
+        return False
+    h = run_header(store, key)
+    if h is None:
+        return False
+    from yuki.memory import practice_learn as PL
+
+    words = [f["words"] for f in PL.followups(store, h)] + [t for t in (h.note.get("steers") or []) if t]
+    return any(PL.quote_ok(q, words) for q in quotes)
 
 
 def _success_sets(store: Store, ids: Sequence[int]) -> tuple[set[int], set[int], dict[int, float]]:
@@ -1599,6 +1627,6 @@ __all__ = [
     "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
     "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
     "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
-    "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok",
+    "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
     "stamp_successes",
 ]

@@ -376,3 +376,73 @@ def test_the_backfill_marks_ways_from_verified_runs_and_its_dry_run_writes_nothi
     assert page["learned"][0]["learned_at"] == NOW + 20
     assert f"pb:{bad}" not in page_text({k: page[k] for k in ("procedures", "proposals", "learned")})
     assert P.learned_way("procedure", P.ledger(store, bad)) is False
+
+
+# -- review fixes (F1): the learner's full verdict, not only the model's outcome word ---------------------------------
+
+
+CORRECTION = "no, the other slider, the song's own"
+SLIDER_PIT = {"op": "ADD", "kind": "pitfall", "intent": "turn the volume up inside spotify", "apps": ["spotify"],
+              "text": "the window's volume slider is not the song's own", "from": [1], "quote": CORRECTION,
+              "instead": "use the song's own slider"}
+
+
+def _corrected_slider(store: Any) -> tuple[str, int]:
+    P.record_run(store, slider_run("worker-1", at=NOW))
+    key = P.run_key("agent", "S5", "worker-1")
+    pid = slider_way(store, key, NOW + 6)
+    store.add_turn("S5", "worker-1", NOW, "turn the volume up inside spotify", "It's at 80% now.", ["set_slider"],
+                   "final")
+    store.add_turn("S5", "worker-2", NOW + 15, CORRECTION, "Okay.", [], "final")
+    return key, pid
+
+
+def _never_a_way(store: Any, key: str, pid: int) -> None:
+    assert P.judged_ok(store, key) is False and P.corrected_by_quote(store, key) is True
+    got = P.relevant(store, query_vec=vec("turn the volume up inside spotify"), apps_in_play=["spotify"])
+    assert pid not in [w["id"] for w in got["ways"]]
+    page = P.workflows(store, now=NOW + 201)
+    assert page["learned"] == [] and f"pb:{pid}" not in {c["id"] for c in page["proposals"] + page["procedures"]}
+    assert P.stamp_successes(store) == []                                       # the daily backfill marks nothing
+    assert P.workflows(store, now=NOW + 202)["learned"] == []
+
+
+def test_a_run_corrected_by_quote_is_never_a_way_even_when_the_pass_labelled_it_worked(store):
+    """The model's outcome word varies: a post-mortem labelled worked_after_trouble whose pitfall quotes the user's
+    correction is a corrected run. The learner notes its own verdict, so nothing reads the run as a success later."""
+    key, pid = _corrected_slider(store)
+    worker = Worker(store, [{"outcome": "worked_after_trouble", "cause": "the wrong slider at first",
+                             "operations": [SLIDER_PIT], "used": []}])
+    res = L.Learner(worker).run_once(now=NOW + 200)
+    assert res[0].mode == "postmortem" and res[0].succeeded is False and res[0].stamped == []
+    note = store._query("SELECT learn_note FROM runs WHERE run_key=? AND step=0", (key,))[0]["learn_note"]
+    assert note == "postmortem: corrected"
+    _never_a_way(store, key, pid)
+
+
+def test_a_run_judged_before_the_fix_whose_lesson_quotes_the_correction_is_not_backfilled(store):
+    """A run the older learner noted only by the model's word ("postmortem: worked_after_trouble") whose pitfall quotes
+    the user's correction: read back from the ledger, still a corrected run."""
+    key, pid = _corrected_slider(store)
+    P.set_learned(store, key, "done", "postmortem: worked_after_trouble")
+    P.add_playbook(store, {"kind": "pitfall", "intent": "turn the volume up inside spotify", "apps": ["spotify"],
+                           "origin": "postmortem", "body": {"text": SLIDER_PIT["text"]}},
+                   events=[{"type": "observed", "run_key": key}, {"type": "taught", "run_key": key,
+                                                                  "refs": {"quote": CORRECTION}}],
+                   vector=vec("the volume slider in spotify"), now=NOW + 200)
+    _never_a_way(store, key, pid)
+
+
+def test_a_quote_from_the_users_answer_to_a_question_is_not_a_correction(store):
+    """Only the user's next or added words count: a lesson quoting something else leaves a worked run a success."""
+    P.record_run(store, slider_run("worker-1", at=NOW))
+    key = P.run_key("agent", "S5", "worker-1")
+    pid = slider_way(store, key, NOW + 6)
+    P.set_learned(store, key, "done", "postmortem: worked_after_trouble")
+    P.add_playbook(store, {"kind": "pitfall", "intent": "turn the volume up inside spotify", "apps": ["spotify"],
+                           "origin": "postmortem", "body": {"text": "ask which slider first"}},
+                   events=[{"type": "observed", "run_key": key}, {"type": "taught", "run_key": key,
+                                                                  "refs": {"quote": "the song's own"}}],
+                   vector=vec("the volume slider in spotify"), now=NOW + 200)
+    assert P.corrected_by_quote(store, key) is False and P.judged_ok(store, key) is True
+    assert P.stamp_successes(store) == [(pid, key)]
