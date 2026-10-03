@@ -409,7 +409,9 @@ misheard forms in ALIASES.
 group where they never wrote only when a journal entry from it names them (cite it). Each with the handle \
 they show there (a sender name exactly as listed, or the DM's name), and use: what the user uses that chat \
 for with them, in at most twelve words said to the user, from the user's own lines there ("Code questions \
-and review links.", "Weekend game nights."); "" when their lines do not show it.
+and review links.", "Weekend game nights."): what the chat is for across days, never one moment, \
+something sent or shared once, or a figure ("You sent him the lab notes on Friday." is not a use); "" \
+when their lines do not show it.
 - tone: how the user writes to them, from the user's own lines in their chats (language and script, \
 register, casing, length), in a few plain words ("Hinglish, lowercase, short and casual"); "" when the user \
 has no lines with them.
@@ -465,8 +467,9 @@ LINK_TOOL: dict[str, Any] = {
                                     "use": {"type": "string", "description": (
                                         f"At most {USE_MAX_WORDS} words, said to the user: what they use this chat "
                                         "for with this person, from their own lines there (\"Code questions and "
-                                        "review links.\", \"Plans for the weekend game nights.\"); \"\" when their "
-                                        "lines do not show it.")},
+                                        "review links.\", \"Plans for the weekend game nights.\"): what the chat "
+                                        "is for across days, never one moment, something shared once or a "
+                                        "figure; \"\" when their lines do not show it.")},
                                     "journal": {"type": "array", "items": {"type": "integer"},
                                                 "description": "J numbers naming them there (a group where they "
                                                                "never wrote), else []."},
@@ -1487,7 +1490,7 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
     try:
         current = person_facts if person_facts is not None else {
             f.id: f for f in store.portrait_facts(["person"], include_corrections=False)}
-        mine = person_facts_of(contact, current)
+        mine = person_facts_of(contact, current, store)
         facts = [_clean(f.text, 400) for f in mine]
     except Exception:
         pass
@@ -1514,11 +1517,36 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
             "calls": calls_with(store, contact, seen=calls_seen)}
 
 
-def person_facts_of(contact: Contact, current: dict[int, Any]) -> list[Any]:
-    """The current person facts about this contact: the ones the linking call cited, else the person fact whose
+def current_version(store: Store | None, fact_id: int, *, depth: int = 32) -> int | None:
+    """The current version of a portrait fact: itself, or the version that superseded it (followed through its
+    ``superseded_by`` chain by primary key: a few lookups), or None when it was ended without a successor. A contact's
+    ``fact_ids`` name the versions current at the last link run; an UPDATE since (the nightly run, the people pass)
+    gave the fact a new id (report 55)."""
+    if store is None:
+        return None
+    fid: int | None = int(fact_id)
+    for _ in range(depth):
+        rows = store._query("SELECT valid_to, superseded_by FROM portrait_facts WHERE id=?", (fid,))
+        if not rows:
+            return None
+        if rows[0]["valid_to"] is None:
+            return fid
+        fid = rows[0]["superseded_by"]
+        if fid is None:
+            return None
+    return None
+
+
+def person_facts_of(contact: Contact, current: dict[int, Any], store: Store | None = None) -> list[Any]:
+    """The current person facts about this contact: the ones the linking call cited (each followed to its current
+    version when ``store`` is given: an UPDATE since the link run gave it a new id), else the person fact whose
     subject is their name or an alias (the join key a fact written after the last link run attaches by: report 38 §3,
     a stale ``fact_ids``). Whole-name comparison of stored strings, as :func:`resolve` does."""
-    out = [current[f] for f in contact.fact_ids if f in current]
+    out: list[Any] = []
+    for f in contact.fact_ids:
+        fid = f if f in current else current_version(store, f)
+        if fid in current and current[fid] not in out:
+            out.append(current[fid])
     if out:
         return out
     names = [tokens(n) for n in contact.names if tokens(n)]
