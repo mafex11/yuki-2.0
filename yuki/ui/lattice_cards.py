@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QFontMetricsF, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QMenu, QSizePolicy, QVBoxLayout, QWidget
 
@@ -1139,5 +1139,264 @@ class TrayMenu(QMenu):
         act.setText(words + (f"\t{right}" if right else ""))
 
 
-__all__ = ["CARD_W", "CardFoot", "CloseKey", "ChangedRow", "ConfirmRow", "Detail", "DotProgress", "LatticeCard",
-           "LearnedBox", "ReturnCard", "Toggle", "TrayHoverCard", "TrayMenu"]
+# -- the send countdown (appPT) ------------------------------------------------------------------------------------
+
+
+class ResChip(QWidget):
+    """A resolved chip of the send countdown (the mock's ``.res``): 30 px pill on the raised fill with a hair border,
+    a mono key ("who", "where"), the value in 13.5 / 600 and, when the resolver had alternatives, a swap end behind a
+    hair rule. A click on the swap end emits :attr:`swap`; the rest of the chip does nothing."""
+
+    swap = Signal()
+    H = 30
+    SWAP_W = 30
+
+    def __init__(self, key: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.key, self.value, self.can_swap, self._hot = key, "", False, False
+        self._kf, self._vf = L.mono_font(10.5, 500), L.ui_font(13.5, 600)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+        self.setFixedHeight(self.H)
+        self._fit()
+
+    def set_value(self, value: str, *, can_swap: bool) -> None:
+        self.value, self.can_swap = str(value or ""), bool(can_swap)
+        self.setToolTip(f"Swap the {'person' if self.key == 'who' else 'app'}" if self.can_swap else "")
+        self._fit()
+        self.update()
+
+    def _fit(self) -> None:
+        kw = QFontMetricsF(self._kf).horizontalAdvance(self.key)
+        vw = QFontMetricsF(self._vf).horizontalAdvance(self.value)
+        self.setFixedWidth(int(1 + 11 + kw + 6 + vw + 8 + (self.SWAP_W if self.can_swap else 4) + 1))
+
+    def _swap_rect(self) -> QRectF:
+        return QRectF(self.width() - 1 - self.SWAP_W, 1, self.SWAP_W, self.H - 2)
+
+    def mouseMoveEvent(self, e: Any) -> None:  # noqa: D102
+        on = self.can_swap and self._swap_rect().contains(e.position())
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on else Qt.CursorShape.ArrowCursor)
+        if on != self._hot:
+            self._hot = on
+            self.update()
+
+    def leaveEvent(self, e: Any) -> None:  # noqa: D102
+        if self._hot:
+            self._hot = False
+            self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e: Any) -> None:  # noqa: D102
+        if self.can_swap and e.button() == Qt.MouseButton.LeftButton and self._swap_rect().contains(e.position()):
+            self.swap.emit()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def paintEvent(self, _e: Any) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.fillPath(path, L.RAISE)
+        p.setClipPath(path)
+        hot = self.can_swap and self._hot
+        if hot:
+            p.fillRect(self._swap_rect(), L.RAISE2)
+        p.setClipping(False)
+        p.setPen(QPen(L.HAIR2, 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        kw = QFontMetricsF(self._kf).horizontalAdvance(self.key)
+        p.setFont(self._kf)
+        p.setPen(L.TEXT3)
+        p.drawText(QRectF(12, 0, kw + 2, self.H), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.key)
+        p.setFont(self._vf)
+        p.setPen(L.TEXT)
+        p.drawText(QRectF(12 + kw + 6, 0, self.width(), self.H),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.value)
+        if self.can_swap:
+            s = self._swap_rect()
+            p.setPen(QPen(L.HAIR2, 1.0))
+            p.drawLine(QPointF(s.left() + 0.5, 1), QPointF(s.left() + 0.5, self.H - 1))
+            L.paint_icon(p, QRectF(s.center().x() - 5, s.center().y() - 5, 10, 10), "swap",
+                         L.TEXT if hot else L.TEXT2)
+        p.end()
+
+
+class DrainBar(QWidget):
+    """The send countdown's dotted drain (the mock's ``.drain``: live dots r 1.4 every 7 px, 5 px tall, shrinking from
+    the left edge over the countdown). Drawn on the shared 30 fps loop only while it drains; reduce motion: still."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(5)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.left = 1.0
+        self._t0 = 0.0
+        self._secs = 0.0
+        self.on_tick: Any = None   # ``fn(seconds_left)``: the label beside it follows the same clock
+
+    def start(self, seconds: float) -> None:
+        self._t0, self._secs, self.left = L.now(), max(0.1, float(seconds)), 1.0
+        L.Loop.shared().add(self._frame)
+        self.update()
+
+    def stop(self) -> None:
+        L.Loop.shared().remove(self._frame)
+
+    def hideEvent(self, e: Any) -> None:  # noqa: D102 - nothing runs while hidden
+        self.stop()
+        super().hideEvent(e)
+
+    def _frame(self, t: float) -> bool:
+        if L.reduced():
+            self.left = 1.0
+            self.update()
+            return False
+        gone = max(0.0, t - self._t0)
+        self.left = max(0.0, 1.0 - gone / self._secs)
+        if callable(self.on_tick):
+            self.on_tick(max(0.0, self._secs - gone))
+        self.update()
+        return self.left > 0.0
+
+    def paintEvent(self, _e: Any) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(L.live())
+        w = self.width() * self.left
+        x = 3.5
+        while x + 1.4 <= w:
+            p.drawEllipse(QPointF(x, 2.5), 1.4, 1.4)
+            x += 7.0
+        p.end()
+
+
+class SendCard(QWidget):
+    """The send countdown under the island's bar (the mock's ``#desktop/resolve``, the user's 3 Oct screenshot): what
+    you said, the who / where chips (a swap end on each the resolver had alternatives for), the exact text, and
+    "Sending to Sam on Discord" with the dotted drain, "3 s to stop" and Stop (Esc). Stop and a swap are signals; the
+    island's controller carries them out. ``phase`` ``counting`` or ``switching`` (a chip was tapped: it waits for the
+    send to be ready for the new person or place, then the countdown starts again)."""
+
+    stop = Signal()
+    swap = Signal(str)          # "who" | "where"
+
+    PAD_X, PAD_T, PAD_B = 18, 12, 16
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.said = L.Para("", font=L.mono_font(11.5, 500), color=L.TEXT3, line_height=1.3, parent=self, max_lines=1)
+        self.who = ResChip("who", self)
+        self.where = ResChip("where", self)
+        self.msg = L.Para("", font=L.ui_font(18), line_height=1.35, parent=self, max_lines=3)
+        self.up = L.Icon("up", 13, L.TEXT, self)
+        self.tx = L.Para("", font=L.ui_font(14, 600), line_height=1.3, parent=self, max_lines=1)
+        self.k_stop = L.Key("Stop", variant="stop", size="sm", icon="stop", kbd="Esc", parent=self)
+        self.drain = DrainBar(self)
+        self.drain_t = L.Para("", font=L.mono_font(11, 500), color=L.TEXT3, line_height=1.0, parent=self, max_lines=1)
+        self.drain.on_tick = self._tick
+        self.k_stop.clicked.connect(self.stop.emit)
+        self.k_stop.setToolTip("Stop: nothing is sent")
+        self.who.swap.connect(lambda: self.swap.emit("who"))
+        self.where.swap.connect(lambda: self.swap.emit("where"))
+        self.phase = "counting"
+        self._shown_s = -1
+        self._rule_y = 0
+
+    def set_send(self, *, phase: str, who: str, where: str, app: str, text: str, said: str, seconds: float,
+                 who_swap: bool, where_swap: bool, restart: bool) -> None:
+        """Fill the card. ``restart``: a new countdown begins (the drain starts over)."""
+        self.phase = phase
+        self.said.set_text(f"you said “{said}”" if said else "", [L.Span(9, len(said) + 2, color=L.TEXT2)]
+                           if said else None)
+        self.said.setVisible(bool(said))
+        self.who.set_value(who, can_swap=who_swap and phase == "counting")
+        self.who.setVisible(bool(who))
+        self.where.set_value(where, can_swap=where_swap and phase == "counting")
+        self.where.setVisible(bool(where))
+        self.msg.set_text(f"“{text}”" if text else "")
+        self.msg.setVisible(bool(text))
+        target = f"{who} on {app}" if who and app else (who or app or "them")
+        counting = phase == "counting"
+        self.tx.set_text(f"Sending to {target}" if counting else f"Getting it ready for {target}…")
+        self.drain.setVisible(counting)
+        self.drain_t.setVisible(counting)
+        if counting and restart:
+            self._shown_s = -1
+            self._tick(seconds)
+            self.drain.start(seconds)
+        elif not counting:
+            self.drain.stop()
+        self._place(self.width() or 620)
+
+    def _tick(self, left: float) -> None:
+        n = max(0, int(-(-left // 1)))   # whole seconds left, rounded up: 3, 2, 1
+        if n != self._shown_s:
+            self._shown_s = n
+            self.drain_t.set_text(f"{n} s to stop" if n else "sending")
+
+    def height_for(self, w: int) -> int:
+        return self._place(w, apply=False)
+
+    def resizeEvent(self, e: Any) -> None:  # noqa: D102
+        super().resizeEvent(e)
+        self._place(self.width())
+
+    def _place(self, w: int, apply: bool = True) -> int:
+        inner = w - 2 * self.PAD_X
+        x0 = self.PAD_X
+        y = 1 + self.PAD_T
+        if self.said.isVisibleTo(self):
+            sh = int(round(11.5 * 1.3))
+            if apply:
+                self.said.setGeometry(x0, y, inner, sh)
+            y += sh
+        chips = [c for c in (self.who, self.where) if c.isVisibleTo(self)]
+        if chips:
+            y += 12
+            x = x0
+            for c in chips:
+                if apply:
+                    c.move(x, y)
+                x += c.width() + 8
+            y += ResChip.H
+        if self.msg.isVisibleTo(self):
+            y += 12
+            mh = self.msg.heightForWidth(inner)
+            if apply:
+                self.msg.setGeometry(x0, y, inner, mh)
+            y += mh
+        y += 16
+        self._rule_y = y
+        y += 14
+        kw = self.k_stop.width()
+        col = inner - kw - 14
+        th = int(round(14 * 1.3))
+        row_h = th + (8 + 11 if self.drain.isVisibleTo(self) else 0)
+        if apply:
+            self.up.move(x0, y + (th - 13) // 2)
+            self.tx.setGeometry(x0 + 13 + 10, y, max(10, col - 23), th)
+            self.k_stop.move(x0 + inner - kw, y + (row_h - self.k_stop.height()) // 2)
+            if self.drain.isVisibleTo(self):
+                tw = int(self.drain_t.natural_width()) + 4 if self.drain_t.text() else 70
+                tw = max(tw, 70)
+                self.drain.setGeometry(x0, y + th + 8 + 3, max(10, col - tw - 10), 5)
+                self.drain_t.setGeometry(x0 + col - tw, y + th + 8, tw, 11)
+        y += max(row_h, self.k_stop.height())
+        return y + self.PAD_B
+
+    def paintEvent(self, _e: Any) -> None:  # noqa: D102
+        p = QPainter(self)
+        p.fillRect(QRectF(0, 0, self.width(), 1), L.HAIR)
+        if self._rule_y:
+            p.fillRect(QRectF(self.PAD_X, self._rule_y, self.width() - 2 * self.PAD_X, 1), L.HAIR)
+        p.end()
+
+
+__all__ = ["CARD_W", "CardFoot", "CloseKey", "ChangedRow", "ConfirmRow", "Detail", "DotProgress", "DrainBar",
+           "LatticeCard", "LearnedBox", "ResChip", "ReturnCard", "SendCard", "Toggle", "TrayHoverCard", "TrayMenu"]

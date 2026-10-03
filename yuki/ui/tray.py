@@ -189,7 +189,7 @@ def tray_state(island_state: str, *, listening: str = "on", recording: bool = Fa
     """The tray's face from the island's state (:func:`yuki.ui.island.resolve`) and what the island doesn't show: a
     request running or a question wins, then a broken voice, then your turn and Yuki speaking, then "not listening",
     then a full screen, then a call (recorded, or its consent card waiting), else resting."""
-    if island_state in ("working", "thinking"):
+    if island_state in ("working", "thinking", "send-countdown"):   # a send countdown is a request running
         return "working"
     if island_state == "needs-you":
         return "needs-you"
@@ -688,9 +688,9 @@ class TrayWatch(QObject):
             info.line = f"Working on: {asked}" if asked else "Working"
             if run is not None:
                 n = max(1, run.steps)
-                info.sub = f"step {n} of {run.of}" if run.of else f"step {n}"
-                info.task, info.task_kind = (run.line or "Getting ready…"), "run"
-                info.of = run.of if run.of else max(n, 1)
+                info.sub = f"step {n}"   # no plan, so never "of N" (appPT): the dots are the steps so far
+                info.task, info.task_kind = (run.thought or run.line or "Getting ready…"), "run"
+                info.of = n
                 info.done, info.cur = n - 1, n - 1
             else:
                 info.sub = i.transient or "Working it out"

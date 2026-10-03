@@ -319,6 +319,20 @@ class YukiUi(QObject):
         framed = getattr(runtime_signals, "framed", None)
         if framed is not None:
             framed.connect(self._on_framed)
+        # appPT: the send countdown (who / where / the text, 3 s to stop or swap) and the brain's live reasoning line
+        #: Requests whose send was stopped in its countdown: ``id -> the text was already in the box`` (their end line).
+        self._send_stopped: dict[int, bool] = {}
+        #: Esc, held only while a send counts down (``esc_listener`` builds it; a test passes its own).
+        self._esc: Any = None
+        self.esc_listener: Any = lambda: HotkeyListener({"send_stop": "esc"})
+        send_pending = getattr(runtime_signals, "send_pending", None)
+        if send_pending is not None:
+            send_pending.connect(self._on_send_pending)
+        partial = getattr(runtime_signals, "partial", None)
+        if partial is not None:
+            partial.connect(self._on_partial)
+        self.island.send_stop.connect(self._on_send_stop)
+        self.island.send_swap.connect(self._on_send_swap)
         # the ask bar's own keys and its foot's call timer (the island's clock)
         speak = getattr(self.overlay, "speak", None)
         if speak is not None:
@@ -375,6 +389,9 @@ class YukiUi(QObject):
         self.nudges.stop()
         self.calls.stop()
         self.hotkeys.stop()
+        if getattr(self, "_esc", None) is not None:   # appPT: Esc is never left held past the app
+            esc, self._esc = self._esc, None
+            esc.stop()
         self.runtime.stop()
         self.overlay.hide()
         self._notice_retry.stop()
@@ -739,6 +756,12 @@ class YukiUi(QObject):
         getattr(self, "_handed", set()).discard(request_id)
         if stopped and tone == "error":
             text, tone = ("Handed back. You have the controls." if handed else "Stopped."), "stopped"
+        typed = self._send_stopped.pop(request_id, None) if hasattr(self, "_send_stopped") else None
+        if typed is not None and tone == "stopped" and not handed:
+            # appPT: stopped in the send countdown: say plainly what did not happen
+            text = "Stopped. Your message is in the box, not sent." if typed else "Stopped. Nothing was sent."
+        if getattr(self, "_esc", None) is not None:
+            self._esc_off()
         outcome = "handed" if handed else "stopped" if tone == "stopped" else "failed" if tone == "error" else "done"
         self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
         shown = self._end_run(request_id)
@@ -1096,6 +1119,83 @@ class YukiUi(QObject):
             from yuki.ui.island import _clean
 
             self.overlay.show_resolved(_clean(run.request), frame)
+
+    # -- the send countdown and the live reasoning line (appPT) ---------------------------------------------------
+
+    def _on_send_pending(self, _lane: str, request_id: int, send: dict) -> None:
+        """The runtime's ``send_pending``: the island opens the send countdown on its own (``counting``), keeps it as
+        "Switching to …" after a chip swap, and closes it when the send goes or was stopped. Esc stops it only while
+        it counts down."""
+        send = dict(send or {})
+        state = str(send.get("state") or "")
+        rid = int(request_id)
+        self.island.show_send(rid, send)
+        if state == "counting":
+            self.nudges.make_way()
+            self._esc_on()
+        else:
+            self._esc_off()
+        if state == "stopped":
+            self._send_stopped[rid] = bool(send.get("typed"))
+        self.ui_log.event("send_countdown", id=rid, state=state, typed=bool(send.get("typed")),
+                          swaps=len(send.get("who_alts") or []) + len(send.get("where_alts") or []))
+
+    def _on_send_stop(self, request_id: int) -> None:
+        """Stop (or Esc) on the send countdown: the request is stopped before anything is sent."""
+        rid = int(request_id)
+        self._esc_off()
+        self._stopped.setdefault(rid, "send")
+        how = self.runtime.cancel(rid, by="send")
+        if self.voice.owns(rid):
+            self.voice.interrupt()
+        self.ui_log.event("send_stop", id=rid, how=how)
+
+    def _on_send_swap(self, request_id: int, kind: str, value: str) -> None:
+        """A chip tapped on the send countdown: the running request sends to the new person or place instead."""
+        send = getattr(self.runtime, "send_choice", None)
+        ok = bool(send(int(request_id), str(kind), str(value))) if callable(send) else False
+        self.ui_log.event("send_swap", id=int(request_id), kind=kind, delivered=ok)
+
+    def _on_esc(self, _action: str) -> None:
+        s = self.island.inputs.send
+        if s is not None and s.phase == "counting":
+            self._on_send_stop(s.request_id)
+
+    def _esc_on(self) -> None:
+        if self._esc is not None:
+            return
+        try:
+            esc = self.esc_listener()
+            esc.pressed.connect(self._on_esc)
+            failed = getattr(esc, "failed", None)
+            if failed is not None:
+                failed.connect(lambda action, reason: self.ui_log.event("hotkey_failed", action=action, reason=reason))
+            esc.start()
+            self._esc = esc
+        except Exception as exc:  # noqa: BLE001 - Stop on the card still works
+            self.ui_log.event("hotkey_failed", action="send_stop", reason=f"{type(exc).__name__}: {exc}")
+
+    def _esc_off(self, esc: Any = None, tries: int = 20) -> None:
+        """Let Esc go again. A listener whose thread has not reached its message loop yet is stopped a moment later
+        (stopping it before then would leave Esc held)."""
+        if esc is None:
+            esc, self._esc = self._esc, None
+        if esc is None:
+            return
+        threads = list(getattr(esc, "threads", None) or [])
+        if tries > 0 and any(t.isRunning() and getattr(t, "_thread_id", 1) is None for t in threads):
+            QTimer.singleShot(50, lambda: self._esc_off(esc, tries - 1))
+            return
+        try:
+            esc.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_partial(self, _lane: str, request_id: int, what: str, text: str) -> None:
+        """The brain's live one-line reasoning (``now``: its own note on a step, or the situation check's plain line):
+        the island's thinking / working line and the run card's current step show it."""
+        if what == "now":
+            self.island.set_thought(int(request_id), text)
 
     def _call_line(self) -> tuple[str, str] | None:
         """The call being recorded, for the ask bar's foot: ``(timer, app)`` from the island's one clock."""
