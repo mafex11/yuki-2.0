@@ -869,7 +869,7 @@ def test_f7_stop_on_the_strip_stops_a_page_scrolling_on_by_itself(fast_scroll: A
     s = fast_scroll
     s.start_continuous(s.ContinuousScroll(lambda: s.StepResult(ok=True), where="Feed"))
     events: list[tuple[str, dict[str, Any]]] = []
-    ui = SimpleNamespace(_stopped=set(), runtime=SimpleNamespace(cancel=lambda rid: "unknown"),
+    ui = SimpleNamespace(_stopped={}, runtime=SimpleNamespace(cancel=lambda rid: "unknown"),
                          voice=SimpleNamespace(owns=lambda rid: False, interrupt=lambda: None),
                          ui_log=SimpleNamespace(event=lambda name, **f: events.append((name, f))))
     ui._stop_keep_scrolling = lambda via: YukiUi._stop_keep_scrolling(ui, via)
