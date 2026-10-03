@@ -143,6 +143,46 @@ def set_level(kind: str, level: str, path: Path | None = None) -> dict[str, str]
     return save(levels, path)
 
 
+def app_acts(path: Path | None = None) -> dict[str, bool]:
+    """Per app, whether Yuki may click and type in it (Settings > App access, the "act" column): ``{app name,
+    casefolded: allowed}``; an app not listed is allowed (inside the click-and-type level above). Stored under
+    ``apps`` in the same file; the agent reads it later (E14 / 1c), like the levels."""
+    try:
+        raw = json.loads((path or policy_path()).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    apps = raw.get("apps") if isinstance(raw, dict) else None
+    if not isinstance(apps, dict):
+        return {}
+    return {str(k).casefold(): bool(v.get("act", True)) for k, v in apps.items()
+            if isinstance(v, dict) and str(k).strip()}
+
+
+def set_app_act(app: str, allowed: bool, path: Path | None = None) -> dict[str, bool]:
+    """Allow or refuse clicking and typing in one app (by the name Settings shows); returns every app's switch."""
+    name = " ".join(str(app or "").split())
+    if not name:
+        raise PolicyError("an app needs a name")
+    path = path or policy_path()
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    apps = old.get("apps") if isinstance(old.get("apps"), dict) else {}
+    apps[name.casefold()] = {"name": name, "act": bool(allowed)}
+    old["apps"] = apps
+    old.setdefault("version", VERSION)
+    old.setdefault("levels", load(path))
+    old.setdefault("fixed_rules", list(FIXED_RULES))
+    old["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(old, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+    return app_acts(path)
+
+
 def reset(path: Path | None = None) -> dict[str, str]:
     """Every kind back to its default."""
     return save(dict(DEFAULTS), path)
@@ -161,5 +201,5 @@ def describe(levels: dict[str, str] | None = None, path: Path | None = None) -> 
     }
 
 
-__all__ = ["LEVELS", "LEVEL_WORDS", "KINDS", "BY_KEY", "DEFAULTS", "FIXED_RULES", "Kind", "PolicyError",
+__all__ = ["LEVELS", "LEVEL_WORDS", "KINDS", "BY_KEY", "DEFAULTS", "FIXED_RULES", "Kind", "PolicyError", "app_acts", "set_app_act",
            "policy_path", "load", "save", "set_level", "reset", "describe", "clean"]

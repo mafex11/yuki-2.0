@@ -98,7 +98,7 @@ def build() -> dict:
     run_start = ago(41)
     autonomy = policy.describe(dict(policy.DEFAULTS))
     shell = {
-        "user": {"name": "Sam", "initial": "S"}, "memory_line": "remembering", "connected": True,
+        "user": {"name": "Sam", "initial": "S"}, "memory_line": "memory on", "connected": True,
         "voice": {"state": "off", "wake": True, "conversation": False, "quiet_until": 0},
         "call": {"app": "Signal", "started_at": call_start, "recording": True},
         "runs": [{"item": "a41", "jobs": [31], "title": "“Rename the March invoices by client”",

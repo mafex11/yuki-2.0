@@ -1,5 +1,5 @@
 """The UI's own settings: ``%LOCALAPPDATA%\\Yuki\\ui.json`` (motion, the window's place, the overlay's shortcut,
-the accent colour).
+the accent colour, which window a tray click opens: ``window_engine``).
 
 Written by the Yuki window's Settings page; read by the window and by yuki-ui,
 which applies a change live when the window tells it over the pipe
@@ -36,7 +36,13 @@ class UiSettings:
     open_hotkey: str = ""               # "Open Yuki anywhere": the overlay's shortcut ("" = the built-in default)
     quiet_last: list[str] | None = None  # the quiet hours to bring back when they are turned on again
     accent: str = "green"               # the one accent colour: "green" (olive, default) | "orange"
+    window_engine: str = "web"          # what a tray click opens: "web" (the Lattice HTML window) | "qt" (native)
+    web_window: list[int] | None = None  # the HTML window's x, y, w, h (physical px) when it last closed
+    web_maximized: bool = False
 
+
+#: The window engines a settings file may hold (``window_engine``); anything else reads as "web".
+WINDOW_ENGINES: tuple[str, ...] = ("web", "qt")
 
 #: The accent names a settings file may hold (the one token source, ``yuki/ui/web/tokens.json`` ``accent``;
 #: "green" is the Lattice mint; the colours are in :data:`yuki.ui.window.theme.ACCENTS`).
@@ -51,8 +57,13 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     last = raw.get("quiet_last")
     last = [str(v) for v in last][:2] if isinstance(last, list) and len(last) >= 2 else None
     accent = str(raw.get("accent") or "green").strip().lower()
+    engine = str(raw.get("window_engine") or "web").strip().lower()
+    web = raw.get("web_window")
+    web = [int(v) for v in web][:4] if isinstance(web, list) and len(web) >= 4 and all(
+        isinstance(v, (int, float)) for v in web[:4]) else None
     return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last,
-                      accent if accent in ACCENT_NAMES else "green")
+                      accent if accent in ACCENT_NAMES else "green", engine if engine in WINDOW_ENGINES else "web",
+                      web, bool(raw.get("web_maximized", False)))
 
 
 def load(path: Path | None = None) -> UiSettings:
@@ -108,4 +119,4 @@ def reload() -> UiSettings:
     return current()
 
 
-__all__ = ["UiSettings", "RETIRED", "ACCENT_NAMES", "settings_path", "load", "save", "update", "current", "reload", "replace"]
+__all__ = ["UiSettings", "RETIRED", "ACCENT_NAMES", "WINDOW_ENGINES", "settings_path", "load", "save", "update", "current", "reload", "replace"]

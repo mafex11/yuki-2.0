@@ -404,7 +404,7 @@
       const dyn = own && DYN.has(s) && !(s === 'done-flash' && t - this.stateT0 > 1.2);
       const target = live ? 1 : 0;
       this.blend += (target - this.blend) * 0.16;
-      if (Math.abs(target - this.blend) < 0.002) this.blend = target;
+      if (Math.abs(target - this.blend) < 0.002 || reduced) this.blend = target;   // a still frame shows the end state
       const figK = 1 - this.blend * (this.kind === 'window' ? 0.92 : 1);
       const ft = t - this.figT0;
       const ai = this.anchor ? Math.round(this.anchor.x / P - 0.5) : Math.round(C / 2), aj = this.anchor ? Math.round(this.anchor.y / P - 0.5) : 8;

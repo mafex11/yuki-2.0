@@ -46,6 +46,8 @@ FROZEN_CLI_EXE = "yuki-cli.exe"
 TRAY = "yuki.ui.boot"
 SERVICE = "yuki.memory.service"
 WINDOW = "yuki.ui.window"
+#: The Lattice window in HTML (WebView2): what a tray click opens unless ui.json says window_engine "qt".
+WEB_WINDOW = "yuki.ui.web_window"
 TRANSCRIBER = "yuki.memory.transcribe"
 MCP = "yuki.mcp.server"
 ONBOARDING = "yuki.onboarding"
@@ -269,7 +271,7 @@ def subprocess_line(argv: list[str]) -> str:
 
 
 __all__ = [
-    "FROZEN_APP_EXE", "FROZEN_CLI_EXE", "TRAY", "SERVICE", "WINDOW", "TRANSCRIBER", "MCP", "ONBOARDING",
+    "FROZEN_APP_EXE", "FROZEN_CLI_EXE", "TRAY", "SERVICE", "WINDOW", "WEB_WINDOW", "TRANSCRIBER", "MCP", "ONBOARDING",
     "interpreter", "module_command", "command_line", "yuki_executables", "module_of", "effective_module",
     "is_yuki_process",
     "find", "stop",

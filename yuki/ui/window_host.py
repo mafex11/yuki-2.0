@@ -32,6 +32,8 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, Signal
 
 from yuki.ui.chat_model import ChatModel
+# The request log and card rows (no Qt: the HTML window's process uses them too); re-exported for the ops' tests.
+from yuki.ui.ledger import REQUEST_LOG_TAIL, REQUEST_STATES, card_row, read_request_log  # noqa: F401
 
 #: How long an op that must run on the GUI thread may take before the window is told "busy".
 GUI_WAIT_S = 5.0
@@ -47,78 +49,12 @@ MEMORY_WAIT_S = 8.0
 
 #: The ``activity`` op's filters (the Lattice Activity page: Yuki did / failed / cards / saw / calls).
 ACTIVITY_FILTERS = ("all", "did", "failed", "cards", "saw", "calls")
-#: A finished request's ``outcome`` (``requests.csv``, :mod:`yuki.agent.loop`) as the ledger states it.
-REQUEST_STATES = {"final": "done", "error": "failed", "cancelled": "stopped", "withdrawn": "replaced",
-                  "abandoned": "abandoned"}
 #: ``card_feedback`` kinds: Less of these, Not now (``dismissed``), a question's Skip and Don't ask.
 FEEDBACK_KINDS = ("less", "dismissed", "skip", "never")
 #: What ``forget`` can forget, each through memory's own correction API (never by editing memory).
 FORGET_KINDS = ("fact", "rule", "todo", "standing")
 #: ``forget`` on a to-do: how it ended (``MemoryClient.end_todo``).
 TODO_ENDINGS = ("wrong", "not_needed", "done")
-#: Bytes read from the end of ``requests.csv`` for ``activity`` (thousands of rows; the file only grows).
-REQUEST_LOG_TAIL = 512 * 1024
-
-
-def read_request_log(path: Path, since: float | None = None, limit: int = 50,
-                     tail_bytes: int = REQUEST_LOG_TAIL) -> list[dict[str, Any]]:
-    """The newest finished requests from ``requests.csv`` (written by the agent, one row per request), newest
-    first, as ledger rows: ``{"kind": "request", "at", "what", "where", "state", "outcome", "wall_s", "cost_usd",
-    "tools", "model", "session"}``. Reads only the file's tail; a missing or broken file gives ``[]``."""
-    import csv
-    import io
-    from datetime import datetime
-
-    try:
-        with open(path, "rb") as f:
-            header = f.readline().decode("utf-8", "replace")
-            size = f.seek(0, 2)
-            start = max(len(header.encode("utf-8")), size - tail_bytes)
-            f.seek(start)
-            body = f.read().decode("utf-8", "replace")
-    except OSError:
-        return []
-    if start > len(header.encode("utf-8")):
-        body = body.split("\n", 1)[1] if "\n" in body else ""   # the first line read is a partial one
-    def num(row: dict[str, Any], key: str) -> float | None:
-        try:
-            return float(row.get(key) or "")
-        except ValueError:
-            return None
-
-    rows: list[dict[str, Any]] = []
-    for row in csv.DictReader(io.StringIO(header + body)):
-        try:
-            at = datetime.fromisoformat(str(row.get("timestamp") or "")).timestamp()
-        except ValueError:
-            continue
-        if since is not None and at < since:
-            continue
-        tools: dict[str, int] = {}
-        for pair in str(row.get("tool_calls") or "").split():   # "name=count name=count": our own fixed format
-            name, _, count = pair.partition("=")
-            if name and count.isdigit():
-                tools[name] = int(count)
-        outcome = str(row.get("outcome") or "")
-        rows.append({"kind": "request", "at": at, "what": row.get("request") or "", "where": row.get("lane") or "",
-                     "state": REQUEST_STATES.get(outcome, outcome or "unknown"), "outcome": outcome,
-                     "wall_s": num(row, "wall_s"), "cost_usd": num(row, "cost_usd"), "tools": tools,
-                     "model": row.get("model") or "", "session": row.get("session") or ""})
-    rows.sort(key=lambda r: r["at"], reverse=True)
-    return rows[:max(0, int(limit))]
-
-
-def card_row(nudge: dict[str, Any]) -> dict[str, Any]:
-    """A card (nudge) as the window's ledger and inbox show it: what it said, its offer and what became of it."""
-    from yuki.ui.nudges import card_offer, card_title, offer_lines, offer_open
-
-    offer = card_offer(nudge)
-    at = nudge.get("_seen_at") or nudge.get("shown_at") or nudge.get("at")
-    return {"kind": "card", "card": nudge.get("id"), "at": at, "card_kind": nudge.get("kind"),
-            "title": card_title(nudge), "text": nudge.get("text") or "", "why": nudge.get("reason") or "",
-            "reaction": nudge.get("reaction"), "outcome": nudge.get("outcome") or nudge.get("_offer_state"),
-            "offer": ({k: offer.get(k) for k in ("do", "label", "steps", "wont", "expires_at")} if offer else None),
-            "lines": offer_lines(nudge), "open": offer_open(nudge), "missed": bool(nudge.get("missed"))}
 
 
 class WindowHost(QObject):
@@ -411,6 +347,18 @@ class WindowHost(QObject):
                     v.set_device("render", req["speaker"] or None)
                 if "tts_voice" in req:
                     v.set_tts_voice(str(req["tts_voice"] or ""))
+                if "end_tone" in req and callable(getattr(v, "set_end_tone", None)):
+                    v.set_end_tone(bool(req["end_tone"]))
+                if "tts_provider" in req:   # read when the next conversation starts (voice.json, the voice's prefs)
+                    from yuki.voice.session import PROVIDERS, load_prefs, save_prefs
+
+                    provider = str(req["tts_provider"] or "").strip().lower()
+                    prefs = load_prefs()
+                    if provider in PROVIDERS:
+                        prefs["tts_provider"] = provider
+                    else:
+                        prefs.pop("tts_provider", None)
+                    save_prefs(prefs)
                 return self.state()
             return {"state": self._on_gui(apply)}
         if op == "voice_toggle":
@@ -463,6 +411,8 @@ class WindowHost(QObject):
         "card_feedback": "_op_card_feedback", "activity": "_op_activity", "threads": "_op_threads",
         "people": "_op_people", "workflows": "_op_workflows", "workflow_edit": "_op_workflow_edit",
         "permissions_get": "_op_permissions_get", "permissions_set": "_op_permissions_set", "forget": "_op_forget",
+        # E3/E4 (the HTML window's pages): an offer's button and its Undo, the ask bar
+        "offer": "_op_offer", "offer_undo": "_op_offer_undo", "askbar": "_op_askbar",
     }
     #: The autonomy policy file (``None``: :func:`yuki.ui.policy.policy_path`); tests point it at a temp file.
     policy_path: Path | None = None
@@ -644,16 +594,25 @@ class WindowHost(QObject):
         return {"threads": self._memory_call("threads", statuses=statuses, query=query, limit=limit) or []}
 
     def _op_people(self, req: dict[str, Any]) -> dict[str, Any]:
-        """``people``: the people Yuki knows and how the user reaches them. Empty, ``available: false``, until
-        memory has ``people_directory`` / ``contact`` (stream 1a); probed on the client, never assumed."""
+        """``people``: the people Yuki knows and how the user reaches them, from memory's people index (stream 1a):
+        ``people_list()`` for the list (most recently in touch first; each with ``routes`` and their message
+        counts, ``usual``, ``last_contact``) and ``contact(person)`` for one person's card. Probed on the client with
+        ``getattr``, never assumed: on a build without the index it is ``{"available": false, "people": []}``.
+        ``people_directory()`` is a prompt string for the agent, never used here."""
         person = str(req.get("person") or "").strip()
+        try:
+            limit = min(200, max(1, int(req.get("limit") or 40)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "limit must be a number"}
 
         def fn(client: Any) -> dict[str, Any]:
-            directory, contact = getattr(client, "people_directory", None), getattr(client, "contact", None)
-            if person and callable(contact):
+            people_list, contact = getattr(client, "people_list", None), getattr(client, "contact", None)
+            if person:
+                if not callable(contact):
+                    return {"available": False, "person": None}
                 return {"available": True, "person": contact(person)}
-            if callable(directory):
-                return {"available": True, "people": list(directory() or [])}
+            if callable(people_list):
+                return {"available": True, "people": list(people_list(limit=limit) or [])}
             return {"available": False, "people": []}
         try:
             return self._memory().call("people", fn, timeout_s=MEMORY_WAIT_S)
@@ -728,6 +687,76 @@ class WindowHost(QObject):
         self._log("window_op", op="forget", what=kind, ok=out.get("ok", True))
         return out
 
+    def _op_offer(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``offer(card)``: the offer's button from the window (Home, Activity), the same press as the corner card's:
+        the nudge controller acknowledges it and memory runs it by code (``offer_act``: never the agent, never a
+        model call); a ``bring_back`` page is opened and an ``ask`` goes into the ask bar, unsent, by the tray as
+        for the corner card. Waits for memory's answer (bounded) and returns it: ``{"result": {"ok", "do", "state",
+        "message", "undo", ...} or {"ok": false, "why"}}``. Once per card: a second press runs nothing."""
+        if req.get("card") is None:
+            return {"ok": False, "error": "offer needs a card (a nudge id)"}
+        nudge = self._find_card(req.get("card"))
+        if nudge is None:
+            return {"ok": False, "error": "no such card"}
+
+        def press() -> tuple[Any, dict[str, Any]]:
+            ctl = self.ui.nudges
+            thread = ctl.accept_offer(nudge, via="window")
+            return thread, ctl.record_delivery(nudge, "window")
+        thread, stored = self._on_gui(press)
+        if thread is None:   # refused: already pressed, expired, dismissed, or not a typed offer
+            from yuki.ui.cards import card_offer, offer_expired
+
+            why = "no_offer" if card_offer(nudge) is None else "expired" if offer_expired(stored) else "already"
+            return {"result": {"ok": False, "why": why, "state": stored.get("_offer_state") or stored.get("outcome")}}
+        thread.join(MEMORY_WAIT_S + 2.0)
+        # memory's answer reaches the controller's _on_acted on the GUI thread (a queued signal, emitted before this
+        # hop), which keeps it on the card's dict
+        result = self._on_gui(lambda: dict(stored.get("_offer_result") or {}))
+        self._log("window_op", op="offer", card=nudge.get("id"), ok=bool(result.get("ok")), why=result.get("why"))
+        return {"result": result or {"ok": False, "why": "error"}}
+
+    def _op_offer_undo(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``offer_undo(card)``: Undo on an offer that ran (``todo_add``: the to-do ends as a wrong capture;
+        ``bring_back``: the window that was in front comes back), through the nudge controller as the card's Undo.
+        Memory refuses it after its undo window (``too_late``)."""
+        if req.get("card") is None:
+            return {"ok": False, "error": "offer_undo needs a card (a nudge id)"}
+        nudge = self._find_card(req.get("card"))
+        if nudge is None:
+            return {"ok": False, "error": "no such card"}
+
+        def press() -> tuple[Any, dict[str, Any]]:
+            ctl = self.ui.nudges
+            stored = ctl.record_delivery(nudge, "window")
+            if stored.get("_offer_state") is None and nudge.get("outcome") == "done":
+                stored["_offer_state"] = "done"   # it ran in an earlier tray run: memory still holds its undo
+            return ctl.undo_offer(stored), stored
+        thread, stored = self._on_gui(press)
+        if thread is None:
+            return {"result": {"ok": False, "why": "not_done", "state": stored.get("_offer_state")}}
+        thread.join(MEMORY_WAIT_S + 2.0)
+        result = self._on_gui(lambda: dict(stored.get("_undo_result") or {}))
+        self._log("window_op", op="offer_undo", card=nudge.get("id"), ok=bool(result.get("ok")))
+        return {"result": result or {"ok": False, "why": "error"}}
+
+    def _op_askbar(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``askbar(text)``: open the ask bar, with ``text`` in it **unsent** (Work's Continue puts a plan there;
+        nothing runs until the user presses Enter). The window granted the foreground before asking."""
+        text = str(req.get("text") or "").strip()
+
+        def show() -> None:
+            overlay = self.ui.overlay
+            overlay.open()
+            if text:
+                overlay.input.setPlainText(text)
+                cursor = overlay.input.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                overlay.input.setTextCursor(cursor)
+        self._on_gui(show)
+        self._log("window_op", op="askbar", chars=len(text))
+        return {}
+
     # -- the window's process ----------------------------------------------------------------------
 
     def open_from_anywhere(self, page: str) -> bool:
@@ -747,9 +776,11 @@ class WindowHost(QObject):
             self._log("window", state="focus", pid=self.proc.pid, **({"page": page} if page else {}))
             return True
         from yuki.core.paths import app_dir
-        from yuki.core.procs import WINDOW, module_command
+        from yuki.core.procs import WEB_WINDOW, WINDOW, module_command
 
-        cmd = module_command(WINDOW, *(["--page", page] if page else []))   # Yuki.exe -m ... when installed
+        engine = self.window_engine()
+        module = WEB_WINDOW if engine == "web" else WINDOW
+        cmd = module_command(module, *(["--page", page] if page else []))   # Yuki.exe -m ... when installed
         root = app_dir()
         flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         try:
@@ -757,11 +788,43 @@ class WindowHost(QObject):
             self.proc = subprocess.Popen(cmd, cwd=str(root), creationflags=flags, close_fds=True,
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
-            self._log("window", state="launched", pid=self.proc.pid)
+            self._log("window", state="launched", pid=self.proc.pid, engine=engine)
             return True
         except OSError as exc:
-            self._log("window", state="launch_failed", error=f"{type(exc).__name__}: {exc}")
+            self._log("window", state="launch_failed", engine=engine, error=f"{type(exc).__name__}: {exc}")
             return False
+
+    #: Whether the WebView2 runtime can host the HTML window (checked once per tray run; ``None``: not yet).
+    _web_ok: bool | None = None
+
+    def window_engine(self) -> str:
+        """Which window a click opens: ``ui.json`` ``window_engine`` (``web``, the Lattice HTML window, by default;
+        ``qt``, the native window), with an automatic fall back to ``qt`` when the WebView2 runtime is missing (the
+        web window itself also falls back when its runtime fails to start, :mod:`yuki.ui.web_window`)."""
+        from yuki.ui import ui_settings
+
+        try:
+            wanted = ui_settings.load().window_engine
+        except Exception:
+            wanted = "web"
+        if wanted != "web":
+            return "qt"
+        if WindowHost._web_ok is None:
+            WindowHost._web_ok = web_runtime_available()
+            if not WindowHost._web_ok:
+                self._log("window", state="web_unavailable", fallback="qt")
+        return "web" if WindowHost._web_ok else "qt"
+
+
+def web_runtime_available() -> bool:
+    """Whether the WebView2 runtime and its loader are installed (a version string from the official loader)."""
+    try:
+        from yuki.ui.webview2 import loader_path, runtime_version
+
+        loader = loader_path()
+        return loader.exists() and runtime_version(loader) is not None
+    except Exception:
+        return False
 
 
 def _allow_foreground(pid: int) -> None:
