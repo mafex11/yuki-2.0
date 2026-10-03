@@ -9,7 +9,7 @@
   function stepRow(s) {
     const bad = s.ok === false;
     return h('div', { class: 'st' + (bad ? ' bad' : '') + (s.running ? ' run' : '') + (s.depth ? ' d1' : '') },
-      s.running ? ic('retry') : bad ? ic('x') : ic('check'),
+      s.running ? h('span', { class: 'spin' }, ic('retry')) : bad ? ic('x') : ic('check'),
       h('span', null, s.label || s.name || '', s.result ? h('small', { text: s.result }) : null),
       s.running && s.started ? h('span', { class: 'ms', data: { since: s.started }, text: fmt.secs(Date.now() / 1000 - s.started) }) : h('span', { class: 'ms', text: s.seconds != null ? fmt.secs(s.seconds) : '' }));
   }

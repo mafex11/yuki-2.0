@@ -115,7 +115,11 @@ def test_every_asset_is_there_and_the_real_page_never_loads_the_fixture():
 def test_no_infinite_animation_no_markup_from_data_no_network():
     css = (WEB / "lattice.css").read_text(encoding="utf-8")
     rules = "".join(part.split("*/", 1)[-1] for part in css.split("/*"))   # the stylesheet without its comments
-    assert "infinite" not in rules and "animation: rec" not in rules     # idle CPU (25-build-E1-E2-E5.md §2)
+    # endless animations only on what exists while something is live (the design's rec dot and step spinner), and
+    # paused while a full-screen app covers the window: an idle page never redraws (25-build-E1-E2-E5.md §2)
+    endless = [line.split("{")[0].strip() for line in rules.splitlines() if "infinite" in line]
+    assert endless == [".recdot", ".spin"], endless
+    assert "html.quiet .recdot, html.quiet .spin { animation: none !important; }" in rules
     for js in _js_files():
         source = js.read_text(encoding="utf-8")
         for bad in ("eval(", "fetch(", "XMLHttpRequest", "new Function", "document.write", "outerHTML", "insertAdjacentHTML"):

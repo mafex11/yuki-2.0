@@ -26,8 +26,7 @@ One window at a time, whichever engine: the same single-instance mutex and focus
 
 Options for tests and measurements (all optional): ``--fixture`` (invented data, no memory, no pipe), ``--db``,
 ``--page``, ``--offscreen`` (a frameless tool window beyond every monitor that never activates), ``--profile``,
-``--browser-args``, ``--query`` (preview knobs for the page, e.g. ``state=listening``), ``--assume-focus`` (animate
-as if in front: the off-screen window never has focus), ``--t0``, ``--metrics``, ``--shot``, ``--exit-after``,
+``--browser-args``, ``--query`` (preview knobs for the page, e.g. ``state=listening``), ``--t0``, ``--metrics``, ``--shot``, ``--exit-after``,
 ``--memory-low-after``.
 """
 
@@ -175,14 +174,13 @@ class WebWindow:
                  fixture: dict[str, Any] | None = None, connect: bool = True, ui_path: Path | None = None,
                  t0: float | None = None, metrics_path: Path | None = None, shot: Path | None = None,
                  exit_after: float | None = None, memory_low_after: float | None = None,
-                 assume_focus: bool = False, policy_path: Path | None = None, shot_delay: float = 0.0) -> None:
+                 policy_path: Path | None = None, shot_delay: float = 0.0) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.page, self.thread_open = page, thread
         self.fixture = fixture
         self.want_connect = connect and fixture is None
         self.ui_path = ui_path
         self.policy_path = policy_path
-        self.assume_focus = assume_focus
         self.host: WebView2Host | None = None
         self.cipher: Any = None
         self.memory: Any = None
@@ -250,7 +248,7 @@ class WebWindow:
             self.booted = True
             self.post({"kind": "boot", "source": "fixture", "shell": shift_times(f["shell"], delta),
                        "pages": shift_times(f["pages"], delta), "chat": shift_times(f.get("chat") or {}, delta),
-                       "appearance": {**appearance(), "assume_focus": self.assume_focus}, "page": self.page})
+                       "appearance": appearance(), "page": self.page})
             return
         self._snapshot_done.wait(1.5)   # read in parallel with the browser's start; ~0.1 s
         with self._lock:
@@ -258,7 +256,7 @@ class WebWindow:
             self.booted = True
         chat = self.chat_payload() if self.model is not None else None
         self.post({"kind": "boot", "source": "snapshot", "shell": self.shell, "pages": pages, "chat": chat,
-                   "appearance": {**appearance(), "assume_focus": self.assume_focus}, "page": self.page})
+                   "appearance": appearance(), "page": self.page})
         if self.thread_open:
             self.post({"kind": "focus", "page": self.page, "thread": True})
         self.marks["boot_sent"] = time.time()
@@ -281,6 +279,7 @@ class WebWindow:
 
     def start(self) -> None:
         """Begin the background work (before the window exists: it all runs while the browser starts)."""
+        threading.Thread(target=self._watch_cover, name="yuki-web-cover", daemon=True).start()
         if self.fixture is not None:
             self._snapshot_done.set()
             return
@@ -452,6 +451,27 @@ class WebWindow:
             home = dict(home)
             home["now"] = {**(home.get("now") or {}), "playing": playing}
             self.send_page("home", home)
+
+    def _watch_cover(self) -> None:
+        """While a full-screen app (a game, a presentation, a full-screen video) is in front and this window is not,
+        the window can't be seen: the page draws one still frame (``quiet``) until that ends. Minimised or hidden,
+        WebView2 marks the page hidden and its loop stops by itself. Windows' own answer, checked every 2 s."""
+        shell32, user32 = ctypes.windll.shell32, ctypes.windll.user32
+        quiet = False
+        while not self._closing.wait(2.0):
+            host = self.host
+            if host is None or not host.hwnd or not self.booted:
+                continue
+            state = ctypes.c_int(0)
+            try:
+                busy = shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in (2, 3, 4)
+            except Exception:  # noqa: BLE001
+                busy = False
+            now_quiet = busy and int(user32.GetForegroundWindow() or 0) != host.hwnd
+            if now_quiet != quiet:
+                quiet = now_quiet
+                self.post({"kind": "quiet", "on": quiet})
+                self.event("web_quiet", on=quiet)
 
     def _timers(self) -> None:
         """Home every minute; the pending corrections every 15 s while there are some; the pipe again while down."""
@@ -1148,7 +1168,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--browser-args", default=DEFAULT_BROWSER_ARGS,
                     help=f"Chromium switches (default {DEFAULT_BROWSER_ARGS!r}; an empty value: none)")
     ap.add_argument("--query", default="", help="preview knobs for the page (state=listening, motion=reduced, ...)")
-    ap.add_argument("--assume-focus", action="store_true", help="animate as if in front (off-screen measurements)")
     ap.add_argument("--no-connect", action="store_true", help="never connect to the tray")
     ap.add_argument("--t0", type=float, default=None)
     ap.add_argument("--metrics", type=Path, default=None)
@@ -1185,7 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
     win = WebWindow(db_path=args.db, page=page, thread=thread, ui_path=ui_path,
                     fixture=load_fixture(Path(args.fixture)) if args.fixture else None,
                     connect=not args.no_connect, t0=args.t0, metrics_path=args.metrics, shot=args.shot,
-                    exit_after=args.exit_after, memory_low_after=args.memory_low_after, assume_focus=args.assume_focus,
+                    exit_after=args.exit_after, memory_low_after=args.memory_low_after,
                     shot_delay=args.shot_delay)
     win.start()
     url = START_URL + (("?" + args.query) if args.query else "")

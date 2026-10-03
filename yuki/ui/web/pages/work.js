@@ -151,7 +151,7 @@
     mount: (main, S, D) => {
       if (S.sub !== 'day') return;
       const d = D.pages.day; if (!d) return;
-      setTimeout(() => setHover(S.scrub != null ? S.scrub : (d.today && d.now_min != null ? Math.max(0, d.now_min - 30) : 720), null), 40);
+      setTimeout(() => setHover(S.scrub != null ? S.scrub : (d.today && d.now_min != null ? Math.max(0, d.now_min - 30) : 720), null), 30);   // the design: 30 ms after mount
     }
   };
 })();

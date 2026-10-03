@@ -11,8 +11,7 @@
   const L = window.Lattice, B = window.YukiBridge, Y = window.Yk;
   const { h, ic, key, fmt } = Y;
   const $app = document.getElementById('app');
-  const Q0 = new URLSearchParams(location.search);
-  const field = new L.Field(document.getElementById('field'), { kind: 'window', pitch: 12, liveLayer: Q0.get('livelayer') !== '0' });
+  const field = new L.Field(document.getElementById('field'), { kind: 'window', pitch: 12 });
   const Q = new URLSearchParams(location.search);     // preview knobs only (screenshots of the file:// bundle)
   const PAGES = ['home', 'work', 'me', 'playbook', 'activity', 'settings'];
   const S = { page: 'home', sub: '', person: null, filter: 'all', chat: false, open: new Set(), touched: 0, booted: false,
@@ -21,10 +20,6 @@
   const marks = { ready: 0, boot: 0, element: 0, frame: 0 };
   const epoch = () => performance.timeOrigin + performance.now();
   Object.assign(Y, { S, D, field, B });
-  /* E16: continuous live animation (a listening face, the live figure) runs at 8 fps in the window: each frame costs
-     the same whatever its size here (measured in WebView2), and the window is a review surface (the island is the
-     live one). Transitions (a page's sweep, a state change) still run at 30 fps. */
-  L.Loop.steadyMs = 125;
   Y.remeasure = () => field.remeasure();
   Y.act = (action, fields) => B.request('act', Object.assign({ action: action }, fields || {}));
   Y.go = go;
@@ -142,7 +137,8 @@
   function mountFaces(root) {
     root.querySelectorAll('canvas[data-core]').forEach((cv) => {
       if (cv.__face) return;
-      const f = new L.Face(cv, +cv.dataset.pitch || 4); f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
+      // idle faces do not blink in the window: with nothing live, nothing redraws (the design's idle shots had a quiet face)
+      const f = new L.Face(cv, +cv.dataset.pitch || 4); f.idleBlink = false; f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
     });
   }
   function afterMain(main, nav) {
@@ -192,9 +188,10 @@
   }
   Y.renderMain = renderMain; Y.renderRail = renderRail; Y.renderDrawer = renderDrawer; Y.render = render;
 
-  /* ================= live ticker: only while something counts =================
-     One tick a second updates every timer and toggles the live dots' blink together (one frame a second); with no
-     timer or live dot on the page it wakes once a minute for the clock. Never a CSS animation (25-build §2). */
+  /* ================= live ticker =================
+     Each second while a timer is on the page (a call, a running step), else once a minute for the clock. The live
+     dots blink by the design's own CSS animation (recdot), which only exists while something is live; the host
+     pauses it (html.quiet) while a full-screen app covers the window, and it stops whenever the window is hidden. */
   let tickT = 0;
   function tick() {
     tickT = 0;
@@ -203,17 +200,11 @@
     document.querySelectorAll('[data-from]').forEach((el) => { need = true; const v = fmt.clock(now - Number(el.dataset.from)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-since]').forEach((el) => { need = true; const v = fmt.secs(now - Number(el.dataset.since)); if (el.textContent !== v) el.textContent = v; });
     document.querySelectorAll('[data-clock]').forEach((el) => { const v = fmt.nowClock(); if (el.textContent !== v) el.textContent = v; });
-    const dots = document.querySelectorAll('.recdot');
-    const blink = dots.length && !L.Motion.reduced && L.Focus.live;
-    if (blink) { const dim = !dots[0].classList.contains('dim'); dots.forEach((d) => d.classList.toggle('dim', dim)); need = true; }
-    else dots.forEach((d) => d.classList.remove('dim'));
     if (document.hidden) return;
     tickT = setTimeout(tick, need ? 1000 - (Date.now() % 1000) + 5 : 60000 - (Date.now() % 60000) + 50);
   }
   function tickSoon() { clearTimeout(tickT); tickT = setTimeout(tick, 0); }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) tickSoon(); else { clearTimeout(tickT); tickT = 0; } });
-  window.addEventListener('focus', () => tickSoon());
-  window.addEventListener('blur', () => tickSoon());
 
   /* ================= appearance ================= */
   function applyAppearance(a) {
@@ -223,7 +214,6 @@
     L.refreshColors();
     const want = !!a.reduce_motion || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
     if (want !== L.Motion.reduced) L.Motion.set(want); else root.dataset.motion = want ? 'reduced' : 'full';
-    if (a.assume_focus) L.Focus.force = true;
     D.appearance = a;
   }
   Y.applyAppearance = applyAppearance;
@@ -238,6 +228,7 @@
     if (Q.get('runs') === '0' || Q.get('empty') === '1') m.shell.runs = [];
     if (Q.get('call') === '0') { m.shell.call = null; if (home.now) home.now.call = null; home.running = (home.running || []).filter((r) => r.kind !== 'call'); }
     if (Q.get('empty') === '1') Object.assign(home, { needs: [], running: [], offers: [], away: [] });
+    if (Q.get('quiet') === '1') L.Motion.setQuiet(true);   // as if a full-screen app covered the window
   }
   B.on('boot', (m) => {
     marks.boot = epoch();
@@ -250,6 +241,8 @@
     S.booted = true;
     render(true);
     reportPaint();
+    // preview knob (transition captures): switch tab after N ms, e.g. goto=work&gotoAt=1500
+    if (m.source === 'fixture' && Q.get('goto')) setTimeout(() => { const [pg, sub] = Q.get('goto').split('/'); go(pg, sub || ''); }, Math.max(0, Number(Q.get('gotoAt') || 1500) - performance.now()));   // on the page's own clock
   });
   B.on('data', (m) => {
     if (!m.page) return;
@@ -284,6 +277,7 @@
   B.on('focus', (m) => { if (m.page && PAGES.includes(m.page)) go(m.page, m.sub || ''); if (m.thread) go(S.page, S.sub, { chat: true }); });
   B.on('appearance', (m) => { applyAppearance(m.appearance); render(false); });
   B.on('toast', (m) => Y.toast(m.text, !!m.warn));
+  B.on('quiet', (m) => L.Motion.setQuiet(!!m.on));   // a full-screen app covers the window: one still frame
   B.on('permissions', (m) => { if (D.pages.settings) { D.pages.settings.autonomy = m.permissions; if (S.page === 'settings') renderMain(); } });
 
   /* ================= clicks and keys ================= */

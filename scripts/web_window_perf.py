@@ -6,8 +6,8 @@ msedgewebview2 child):
 
 * click-to-first-paint (the page's own Element Timing of the page title, after its data and fonts);
 * private bytes, private working set (USS) and working set, a few seconds after the paint;
-* CPU as % of one core over a window: idle (nothing live), live (a live state animating, as if the window were in
-  front: ``--assume-focus``), and live behind other windows (the same state, not in front: one still frame).
+* CPU as % of one core and canvas redraws per second over a window: idle (nothing live), each live state at the
+  design's 30 fps, and a live state while a full-screen app covers the window (one still frame).
 
 Data: the invented fixture (``--fixture``: no memory, no pipe) or a fresh empty memory in a temp folder (``--db``:
 the real startup path: key, snapshot, memory open, every page built). The real memory database is never opened.
@@ -78,6 +78,23 @@ def redraws(result: dict[str, Any], out: Path) -> None:
         result["loop_ticks_per_s"] = round((last["ticks"] - first["ticks"]) / span, 2)
 
 
+#: name -> page knobs: idle (nothing live), each live state at the design's 30 fps, a live state while a full-screen
+#: app covers the window (quiet: one still frame), and the busiest real page (a run, a call timer, live dots).
+CASES = [("idle-home", "runs=0&call=0"),
+         ("live-listening", "state=listening&face=listening&runs=0&call=0"),
+         ("live-working", "state=working&face=working&runs=0&call=0"),
+         ("live-speaking", "state=speaking&face=speaking&runs=0&call=0"),
+         ("live-listening-covered-by-full-screen", "state=listening&face=listening&runs=0&call=0&quiet=1"),
+         ("live-run-call-and-dots", "state=working")]
+
+
+def cpu_case(runner: Runner, results: list[dict[str, Any]], out: Path, profile: Path, name: str, query: str,
+             win: float) -> None:
+    results.append(runner.launch(name, profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
+                                 extra=["--fixture", "--query", query + "&perfreport=1"]))
+    redraws(results[-1], out)
+
+
 def summarize(results: list[dict[str, Any]]) -> str:
     lines = []
     for r in results:
@@ -115,11 +132,7 @@ def main() -> int:
         if args.case:
             for case in args.case:
                 name, _, query = case.partition("=")
-                behind = name.endswith("-behind")
-                results.append(runner.launch(name, profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
-                                             cpu=("a", "b"), extra=["--fixture", "--query", query + "&perfreport=1"]
-                                             + ([] if behind else ["--assume-focus"])))
-                redraws(results[-1], out)
+                cpu_case(runner, results, out, profile, name, query, win)
         elif args.try_db:
             db = temp_memory(out)
             results.append(runner.launch("try-empty-memory", profile, None, 7.0, at=(("6s", 6.0),),
@@ -138,23 +151,9 @@ def main() -> int:
             for i in range(args.runs):
                 results.append(runner.launch(f"warm-empty-memory-{i + 1}", profile, None, 6.0, at=(("5s", 5.0),),
                                              extra=["--db", str(db), "--no-connect"]))
-            # idle CPU with the fixture's page (no live state): nothing should redraw
-            results.append(runner.launch("idle-home", profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
-                                         cpu=("a", "b"), extra=["--fixture", "--query", "runs=0&call=0", "--assume-focus"]))
-            for state in ("listening", "working", "speaking"):
-                results.append(runner.launch(f"live-{state}-in-front", profile, None, 10 + win,
-                                             at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
-                                             extra=["--fixture", "--query", f"state={state}&runs=0&call=0", "--assume-focus"]))
-            # the same live state drawn the design's way (the full-window canvas at 30 fps): the E2 spike's ~15%
-            results.append(runner.launch("live-listening-full-canvas", profile, None, 10 + win,
-                                         at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
-                                         extra=["--fixture", "--query", "state=listening&runs=0&call=0&livelayer=0", "--assume-focus"]))
-            results.append(runner.launch("live-listening-behind", profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
-                                         cpu=("a", "b"), extra=["--fixture", "--query", "state=listening&runs=0&call=0"]))
-            # the busiest real page: a call timer ticking and a run's dot blinking, in front
-            results.append(runner.launch("live-call-and-run-in-front", profile, None, 10 + win,
-                                         at=(("a", 8.0), ("b", 8.0 + win)), cpu=("a", "b"),
-                                         extra=["--fixture", "--assume-focus"]))
+            # CPU and redraws with the invented page (the window off-screen and never focused: as visible, uncovered)
+            for name, query in CASES:
+                cpu_case(runner, results, out, profile, name, query, win)
     finally:
         watch.stop.set()
     paints = [((r.get("metrics") or {}).get("derived") or {}).get("first_paint") for r in results if r["name"].startswith("warm")]

@@ -149,7 +149,7 @@
     const h1 = box.offsetHeight;
     if (!reduced()) {
       box.animate([{ height: h0 + 'px' }, { height: h1 + 'px' }], { duration: 240, easing: EASE });
-      if (node.animate) node.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: EASE });
+      if (box.firstElementChild) box.firstElementChild.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: EASE });
     }
     clearTimeout(box.__fade);
     if (o.fade) box.__fade = setTimeout(() => leave(o.fadeEl || box), o.fade);
@@ -160,8 +160,9 @@
     clearTimeout(box.__fade);
     const kids = ORIG.get(box); if (!kids) return;
     ORIG.delete(box);
-    morph(box, h('div')); box.replaceChildren(...kids); ORIG.delete(box);
-    Yk.remeasure();
+    const back = document.createDocumentFragment();
+    back.append(...kids);
+    morph(box, back); ORIG.delete(box);   // the design's restore: morph back to what was there
   }
   const hasOrig = (box) => ORIG.has(box);
   function leave(el) {
@@ -170,7 +171,7 @@
     if (reduced()) return done();
     const hh = el.offsetHeight;
     el.style.overflow = 'hidden';
-    el.animate([{ opacity: 1, height: hh + 'px' }, { opacity: 0, transform: 'translateY(8px)', height: hh + 'px', offset: 0.6 },
+    el.animate([{ opacity: 1, transform: 'none', height: hh + 'px' }, { opacity: 0, transform: 'translateY(8px)', height: hh + 'px', offset: 0.6 },
       { opacity: 0, transform: 'translateY(8px)', height: '0px', paddingTop: '0px', paddingBottom: '0px', marginTop: '0px' }],
     { duration: 420, easing: EASE }).onfinish = done;
   }
@@ -179,7 +180,7 @@
     const t = h('div', { class: 'toast' + (warn ? ' warn' : ''), attrs: { role: 'status' } }, ic(warn ? 'x' : 'check'), h('span', { text }));
     document.body.append(t);
     if (!reduced()) t.animate([{ opacity: 0, transform: 'translate(-50%,8px)' }, { opacity: 1, transform: 'translate(-50%,0)' }], { duration: 220, easing: EASE });
-    setTimeout(() => leave(t), warn ? 4200 : 2600);
+    setTimeout(() => leave(t), warn ? 4200 : 2200);   // the design's 2.2 s
   }
   function pop(el) { if (el && !reduced() && el.animate) el.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 240, easing: EASE }); return el; }
 

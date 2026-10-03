@@ -152,7 +152,9 @@
       return;
     }
     const undo = res.undo ? { label: 'Undo', do: 'offer-undo', data: { card: o.card } } : null;
-    Y.morph(box, h('div', null, Y.confirmRow(res.message || STATE_WORDS[res.state] || 'Done.', { undo })), undo ? null : { fade: 3200, fadeEl: box });
+    // the design's Add to list / Bring back: the confirmation with Undo, then the card leaves after 3.2 s (it stays in
+    // Since you were away and Activity, where Undo is still there for its 10 minutes)
+    Y.morph(box, h('div', null, Y.confirmRow(res.message || STATE_WORDS[res.state] || 'Done.', { undo })), { fade: 3200, fadeEl: box });
   }
   A.offer = (t) => {
     const card = t.dataset.card;
@@ -174,7 +176,7 @@
     const box = boxOf(t);
     Y.act('card_feedback', { card, kind }).then((r) => {
       const words = r.ok ? (kind === 'less' ? 'Got it. Fewer like this.' : 'Okay, not now. It stays in Activity.') : (r.error || 'Couldn’t send that.');
-      Y.morph(box, h('div', null, Y.confirmRow(words, { icon: r.ok ? 'check' : 'x' })), r.ok ? { fade: 1600, fadeEl: box } : null);
+      Y.morph(box, h('div', null, Y.confirmRow(words, { icon: r.ok ? 'check' : 'x' })), r.ok ? { fade: 1500, fadeEl: box } : null);
     });
   };
   A.copy = (t) => Y.act('copy', { text: t.dataset.text || '' }).then((r) => Y.toast(r.ok ? 'Copied. Paste it where you want it; I haven’t sent anything.' : 'Couldn’t reach the clipboard. Select the text and press Ctrl+C.', !r.ok));
@@ -186,8 +188,8 @@
   }
   A.answer = (t) => answered(t, t.dataset.words);
   A['answer-typed'] = (t) => answered(t, t.value.trim());
-  A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1800, fadeEl: box } : null)); };
-  A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1800, fadeEl: box } : null)); };
+  A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
+  A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
   /* Learned proposals (Phase C writes them; the workflow ops say so until then) */
   function learnedAct(t, verb, words) {

@@ -4,9 +4,10 @@
    under a strict Content-Security-Policy (style-src 'self'); sizes that depend on data are set from script through
    CSSOM properties (el.style.x = ...), which the CSP allows.
 
-   Rule kept from the E2 spike (25-build-E1-E2-E5.md §2): **no infinite CSS animation**. A keyframe animation that
-   never ends keeps Chromium compositing every frame (measured: ~12.8% of one core with the page otherwise still).
-   Live dots blink by a class the page toggles (app.js), running steps show a still glyph and a counting time. */
+   Motion is the design's own (timings, easing, keyframes). The only endless animations are on things that exist
+   only while something is live (the rec dot, a running step's spinner): an idle page has none, so it never redraws
+   (25-build-E1-E2-E5.md §2: an endless animation keeps Chromium compositing). They stop while the window is hidden and
+   pause (html.quiet) while a full-screen app covers it. */
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden; }
@@ -79,9 +80,11 @@ button { cursor: pointer; }
 .chip.rec { border-color: rgba(111,235,196,.4); color: var(--live); }
 .chip.rec .doto { font-size: 15px; font-weight: 800; letter-spacing: .04em; }
 .chip.ent { height: 20px; padding: 0 7px; border-radius: 10px; font: 400 11.5px/1 var(--f-ui); }
-/* The live dot blinks by a class app.js toggles every 800 ms (one frame per change): never a CSS animation. */
-.recdot { width: 7px; height: 7px; border-radius: 50%; background: var(--live); flex: none; display: inline-block; }
-.recdot.dim { opacity: .3; }
+.recdot { width: 7px; height: 7px; border-radius: 50%; background: var(--live); flex: none; display: inline-block; animation: rec 1.6s steps(2, jump-none) infinite; }
+@keyframes rec { 50% { opacity: .3; } }
+.spin { display: block; animation: spin 1.2s steps(8) infinite; transform-origin: 50% 50%; }
+@keyframes spin { to { transform: rotate(360deg); } }
+html.quiet .recdot, html.quiet .spin { animation: none !important; }
 .waitdot { width: 7px; height: 7px; border-radius: 50%; border: 1px solid var(--text-3); flex: none; display: inline-block; }
 
 .label { font: 500 var(--t-xs)/1.2 var(--f-mono); color: var(--text-3); letter-spacing: .02em; display: flex; align-items: center; gap: 8px; }
@@ -212,7 +215,7 @@ button { cursor: pointer; }
 /* ---------- Work: threads ---------- */
 .thread { padding: 18px 18px 16px; display: flex; flex-direction: column; min-height: 232px; min-width: 0; }
 .thread .top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-.thread .top .when { font: 500 11px/1 var(--f-mono); color: var(--text-3); white-space: nowrap; }
+.thread .top .when { font: 400 11px/1.45 var(--f-mono); color: var(--text-3); white-space: nowrap; }
 .st-tag { display: inline-flex; align-items: center; gap: 7px; font: 500 11px/1 var(--f-mono); color: var(--text-2); }
 .st-tag i { width: 7px; height: 7px; border-radius: 50%; background: var(--lit); }
 .st-tag.paused i { background: transparent; border: 1px solid var(--text-3); }
@@ -497,7 +500,7 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .confirm .key { margin-left: auto; }
 .confirm.sm { display: inline-flex; min-height: 0; padding: 0; font-size: 12.5px; color: var(--text-2); gap: 6px; }
 .confirm.sm .key { margin-left: 4px; }
-.toast { position: fixed; z-index: 30; left: 50%; bottom: 34px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--bg); border: 1px solid var(--panel-border); border-radius: 12px; font-size: 13.5px; max-width: 640px; }
+.toast { position: fixed; z-index: 30; left: 50%; bottom: 74px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--bg); border: 1px solid var(--panel-border); border-radius: 12px; font-size: 13.5px; max-width: 640px; }
 .toast .ic { width: 12px; height: 12px; color: var(--live); flex: none; }
 .toast.warn .ic { color: var(--text); }
 .peek { margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--hair-2); border-radius: 10px; font-size: 13px; color: var(--text-2); }
