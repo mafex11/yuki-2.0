@@ -374,6 +374,8 @@ class LlmCall:
     desk_chars: int = 0
     desk_tabs_ms: float | None = None   # reading the foreground window's tabs for it
     early_say: float | None = None      # a call's say_first went to the voice while the call was being written
+    route: str | None = None            # E3a (v3.17): the router's decision for this turn (thinker / talker / None)
+    route_ms: float | None = None       # and how long it took from its request
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -837,6 +839,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             await super().push_frame(frame, direction)
             if direction != FrameDirection.DOWNSTREAM:
                 return
+            if isinstance(frame, LLMFullResponseEndFrame):
+                # E3a: the reply is over (its calls already ran): a router start it did not take is withdrawn, unless
+                # the reply was speculative and its calls wait for the turn to be confirmed.
+                hook("reply_done", bool(self._yuki_early_pending or self._yuki_held_calls))
             if isinstance(frame, UserStoppedSpeakingFrame):
                 pending, self._yuki_early_pending = self._yuki_early_pending, None
                 if pending is not None:
@@ -877,6 +883,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             self._yuki_context = context
             call = LlmCall(entered=time.monotonic())
             self._yuki_call = call
+            # E3a (v3.17): the router decides alongside this call whether the turn needs the thinker (off by default).
+            call.user_turn = _last_role(context) == "user"
+            hook("route_turn", context, call)
             try:
                 self._yuki_lookup, self._yuki_desk = await hooks.before_call(context, call)
             except Exception:  # noqa: BLE001 - grounding is a hint; never block the reply on it
@@ -902,7 +911,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             channel = hook("channel", default="guard")
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call,
                                                    call_evidence=hook("call_evidence", default=None),
-                                                   channel=channel)
+                                                   channel=channel, hands=bool(hook("hands", default=True)))
             messages = params.get("messages")
             if channel == "marker":
                 messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
@@ -910,7 +919,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
                 named=bool(hook("named", default=False)), work=hook("work", default=None),
                 cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
-                channel=channel, rerun=bool(hook("rerun", default=False))))
+                channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None)))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -1010,11 +1019,13 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # v3.16, the marker channel: only text after a say marker line reaches the voice (and so the context);
             # the marker lines and any scratch are taken out of the stream here, before anything downstream sees
             # them, so every stream fact (first text, words in the reply, an early say_first) is about speech only.
-            channel = ReplyChannel() if hook("channel", default="guard") == "marker" else None
+            channel = (ReplyChannel(cap_words=int(hook("reply_cap", default=0) or 0))
+                       if hook("channel", default="guard") == "marker" else None)
 
             async def timed() -> Any:
                 tool_id, args, said = None, "", True
                 early_wait = False  # a tell_yuki whose early thinker start waits for its screen field (v3.9)
+                last_text: Any = None   # the latest text delta (the shape a channel's leftover words go out in)
                 try:
                     async for event in response:
                         now = time.monotonic()
@@ -1025,12 +1036,18 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             call.first_content = now
                         if channel is not None:
                             if kind == "content_block_delta" and hasattr(getattr(event, "delta", None), "text"):
+                                last_text = event
                                 speech = channel.feed(getattr(event.delta, "text", "") or "")
                                 if not speech:
                                     continue   # a marker line or scratch: never spoken, never in the conversation
                                 event = _with_text(event, speech)
                             elif kind in ("content_block_stop", "message_delta", "message_stop"):
-                                channel.finish()
+                                leftover = channel.finish()
+                                if leftover and last_text is not None:
+                                    # A line start held while it could have been the more divider (v3.17), said now.
+                                    if call.first_text is None:
+                                        call.first_text = now
+                                    yield _with_text(last_text, leftover)
                         if call.first_text is None and kind == "content_block_delta" and hasattr(event.delta, "text"):
                             call.first_text = now
                             if call.user_turn:
@@ -1750,6 +1767,8 @@ class TurnObserver:
                        "replied": bool(reply), "cut_by_user": turn.cut})
         # v3.16: what was really heard, the marker channel, and an unheard turn answered again (content-free)
         row["audible_chars"] = len(strip_tags("".join(turn.audible)).strip())
+        if c is not None and (c.route is not None or c.route_ms is not None):
+            row.update(router=c.route, router_ms=c.route_ms)   # E3a (v3.17)
         if turn.marker is not None or turn.unmarked or turn.scratch:
             row.update(marker=turn.marker, unmarked=turn.unmarked, scratch_chars=turn.scratch)
         if turn.rerun:
@@ -2097,6 +2116,7 @@ class _Hooks:
 
     def early_withdrawn(self) -> None:
         """The reply was cut (a barge-in, a withdrawn speculation): an early start whose call never ran is void."""
+        self.c._cancel_route()
         self.c.bridge.drop_early()
 
     def calls_made(self, ids: set[str]) -> None:
@@ -2160,6 +2180,28 @@ class _Hooks:
     def marker_report(self, call: LlmCall, channel: Any) -> None:
         """A reply's text was read by the marker channel: record it on its turn and log it (content-free)."""
         self.c._marker_report(call, channel)
+
+    # -- v3.17: the prompt by measured state (H1) and the answer's length (H2) --------------------------------
+
+    def hands(self) -> bool:
+        """Whether the talker has hands this conversation (its hands block is in the prompt only then)."""
+        return bool(self.c.settings.voice_hands and getattr(self.c.bridge, "hands", None) is not None)
+
+    def reply_cap(self) -> int:
+        """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none)."""
+        return int(getattr(self.c.settings, "voice_reply_words_cap", 0) or 0)
+
+    def state(self) -> dict[str, Any]:
+        """The measured states that bring their guidance into this call's volatile block (``mouth.volatile_block``)."""
+        return self.c._prompt_state()
+
+    # -- v3.17: the hand-off router (E3a) ---------------------------------------------------------------------
+
+    def route_turn(self, context: Any, call: LlmCall) -> None:
+        self.c._route_turn(context, call)
+
+    def reply_done(self, pending: bool = False) -> None:
+        self.c._reply_done(pending)
 
 
 def quiet_answered(messages: list[Any] | None) -> set[int]:
@@ -2460,6 +2502,11 @@ class Conversation:
         bridge.user_turns = lambda: self.observer.user_turns
         bridge.quiet_for = self._quiet_for
         bridge.speak = self._speak
+        # v3.17: a short or verified result said by code (C1), its sentences fetched by the voice ahead (C2).
+        bridge.speak_result = self._speak_result
+        fetch = getattr(tts, "prefetch", None) if tts is not None else None
+        bridge.prefetch_speech = fetch if callable(fetch) else None
+        bridge.more_held = self.more_held   # H2: the talker's own held words, for more_of_result
         bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
             self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
         hands = getattr(bridge, "hands", None)
@@ -2864,7 +2911,9 @@ class Conversation:
         try:
             await runner.run()
         finally:
+            self._cancel_route()
             self._unboost()
+            self._log_audio_qos()
             watch.cancel()
             warm.cancel()
             lag.cancel()
@@ -2980,21 +3029,57 @@ class Conversation:
             self.log.event("keyterms", op="screen", error=type(exc).__name__)
 
     def _boost(self) -> None:
-        """While the conversation is live, the process runs above normal priority (v3.14b, yuki.voice.priority)."""
-        if getattr(self, "_boosted", False) or not getattr(self.settings, "voice_priority_boost", True):
+        """While the conversation is live, the process runs above normal priority (v3.14b, yuki.voice.priority), out of
+        Windows' power throttling, with the voice loop's thread in the MMCSS "Audio" task (D7, v3.17, yuki.voice.qos).
+        Called on the voice loop's own thread (MMCSS is per thread)."""
+        if getattr(self, "_boosted", False):
             return
-        from yuki.voice import priority
-
         self._boosted = True
-        self.log.event("priority", **priority.boost())
+        if getattr(self.settings, "voice_priority_boost", True):
+            from yuki.voice import priority
+
+            self._prioritised = True
+            self.log.event("priority", **priority.boost())
+        if getattr(self.settings, "voice_qos", True):
+            from yuki.voice import qos
+
+            self._loop_qos = qos.ThreadQos()
+            self.log.event("qos", **qos.process_high_qos())
+            self.log.event("qos", op="loop", **self._loop_qos.apply(mmcss=bool(getattr(self.settings, "voice_mmcss",
+                                                                                      True))))
 
     def _unboost(self) -> None:
         if not getattr(self, "_boosted", False):
             return
-        from yuki.voice import priority
-
         self._boosted = False
-        self.log.event("priority", **priority.restore())
+        if getattr(self, "_prioritised", False):
+            from yuki.voice import priority
+
+            self._prioritised = False
+            self.log.event("priority", **priority.restore())
+        handle = getattr(self, "_loop_qos", None)
+        if handle is not None:
+            from yuki.voice import qos
+
+            self._loop_qos = None
+            self.log.event("qos", op="loop_end", **handle.revert())
+            self.log.event("qos", **qos.process_default_qos())
+
+    def _log_audio_qos(self) -> None:
+        """What D7 did for the speaker's writer and the microphone's callback threads (content-free)."""
+        try:
+            out = self.transport.output() if self.transport is not None else None
+            mic = getattr(self.transport.input(), "_mic", None) if self.transport is not None else None
+        except Exception:  # noqa: BLE001
+            return
+        speaker, heard = getattr(out, "qos_facts", None), getattr(mic, "qos_facts", None)
+        if speaker or heard:
+            self.log.event("qos", op="audio", speaker=speaker, mic=heard)
+        tts = getattr(self, "_tts", None)
+        stats = getattr(tts, "stats", None)
+        if isinstance(stats, dict) and stats.get("prefetched"):
+            self.log.event("tts_prefetch", op="summary", prefetched=stats.get("prefetched"),
+                           used=stats.get("prefetch_used"), wasted=stats.get("prefetch_wasted"))
 
     async def _lag_monitor(self, every_s: float = 0.05, report_ms: float = 100.0) -> None:
         """How late the voice loop wakes up (a blocked loop delays every stage). Logs stalls and a summary."""
@@ -3177,6 +3262,10 @@ class Conversation:
         is complete). Exactly one side acts: from here the thinker owns the request, and the talker's window
         hands wait while it runs (``VoiceBridge.desk_job``).
         """
+        adopt = getattr(self.bridge, "adopt_routed", None)
+        if callable(adopt) and adopt(str(call_id)):
+            self.log.event("router", op="adopted", call=call_id)   # E3a: the router had started it already
+            return
         if (self.observer.heard and not getattr(self.observer, "heard_plain", False)) or self.bridge.has_open_voice_job():
             return
         from yuki.voice.bridge import heard_words
@@ -3191,6 +3280,117 @@ class Conversation:
             started = self.bridge.begin_early(call_id, heard)
         if started:
             self.observer.handoff_started(time.monotonic())
+
+    # -- E3a (v3.17): the hand-off router ------------------------------------------------------------------------
+
+    def _route_turn(self, context: Any, call: Any) -> None:
+        """The talker's call for the user's turn begins: the router decides alongside it whether the turn needs the
+        thinker (``voice_router``; yuki.voice.router). Not on words recognition was unsure of (a call may be held until
+        they answer), not while a voice task is open (a follow-up routes by that task's state), not while dormant."""
+        if not getattr(self.settings, "voice_router", False) or self.dormant or not getattr(call, "user_turn", False):
+            return
+        self._cancel_route()
+        pending = getattr(self.bridge, "routed_job", None)
+        if callable(pending) and pending() is not None:
+            # an earlier start the talker never took (this is a new run for the turn): withdrawn before a new one
+            self.log.event("router", op="withdrawn", why="new_run")
+            self.bridge.drop_early(getattr(self.bridge, "ROUTE_KEY", "router"))
+        if (self.observer.heard and not getattr(self.observer, "heard_plain", False)) or self.bridge.has_open_voice_job():
+            return
+        from yuki.voice.bridge import heard_words
+        from yuki.voice.router import router_request
+
+        heard = heard_words(context, skip=getattr(self.bridge, "not_heard", None))
+        if not heard:
+            return
+        history: list[tuple[str, str]] = []
+        try:
+            messages = list(context.get_messages() or [])
+        except Exception:  # noqa: BLE001
+            messages = []
+        for message in messages[:-1][-8:]:
+            if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+                continue
+            content = message.get("content")
+            text = content if isinstance(content, str) else " ".join(
+                str(p.get("text") or "") for p in (content or []) if isinstance(p, dict) and p.get("type") == "text")
+            if str(text or "").strip():
+                history.append(("they" if message["role"] == "user" else "Yuki", str(text)))
+        hands = getattr(self.bridge, "hands", None)
+        snap = getattr(hands, "last", None) if hands is not None else None
+        s = self.settings
+        request = router_request(heard[-1], history=history, desk=getattr(snap, "text", None) or None,
+                                 call=self.call_app,
+                                 model=str(getattr(s, "voice_router_model", "") or s.voice_mouth_model))
+        turn = self.observer.user_turns
+        self._router_task = asyncio.ensure_future(self._route(request, heard, context, call, turn))
+
+    async def _route(self, request: dict[str, Any], heard: list[str], context: Any, call: Any, turn: int) -> None:
+        from yuki.voice.bridge import spoken_words
+        from yuki.voice.router import decide
+
+        route = await decide(self._client, request)
+        call.route, call.route_ms = route.to, route.ms
+        self.log.event("router", op="decided", to=route.to, screen=route.screen, ms=route.ms, error=route.error)
+        if route.to != "thinker":
+            return
+        llm = getattr(self, "_llm", None)
+        waited = 0.0
+        while llm is not None and getattr(getattr(llm, "_speculation_gate", None), "is_speculating", False):
+            if waited >= 3.0:
+                return   # a speculation that is neither confirmed nor withdrawn: let the talker's own hand-off decide
+            await asyncio.sleep(0.02)
+            waited += 0.02
+        if self._stop.is_set() or self.observer.user_turns != turn or self.bridge.has_open_voice_job():
+            return   # they spoke again, or the talker already handed it over
+        begin = getattr(self.bridge, "begin_early", None)
+        key = getattr(self.bridge, "ROUTE_KEY", "router")
+        try:
+            started = bool(callable(begin) and begin(key, heard, screen=route.screen, said=spoken_words(context),
+                                                     routed=True))
+        except TypeError:   # a stand-in bridge without routed starts
+            started = False
+        if not started:
+            return
+        self.observer.handoff_started(time.monotonic())
+        self.log.event("router", op="started", screen=route.screen, after_call_ms=round(
+            (time.monotonic() - call.entered) * 1000))
+        adopt_s = float(getattr(self.settings, "voice_router_adopt_s", 2.5) or 2.5)
+        loop = asyncio.get_running_loop()
+        self._route_timer = loop.call_later(adopt_s, self._route_timeout)
+
+    def _route_timeout(self) -> None:
+        """The talker did not take the router's start in time: withdrawn before the thinker can act on it."""
+        self._route_timer = None
+        routed = getattr(self.bridge, "routed_job", None)
+        if callable(routed) and routed() is not None:
+            self.log.event("router", op="withdrawn", why="not_adopted_in_time")
+            self.bridge.drop_early(getattr(self.bridge, "ROUTE_KEY", "router"))
+
+    def _reply_done(self, pending: bool) -> None:
+        """The talker's reply ended: a router start it did not take (it answered, used a hand, stayed quiet) is void."""
+        if pending:
+            return
+        routed = getattr(self.bridge, "routed_job", None)
+        if callable(routed) and routed() is not None:
+            task = getattr(self, "_router_task", None)
+            self.log.event("router", op="withdrawn", why="talker_chose_otherwise")
+            self.bridge.drop_early(getattr(self.bridge, "ROUTE_KEY", "router"))
+            if task is not None and not task.done():
+                task.cancel()
+        else:
+            task = getattr(self, "_router_task", None)
+            if task is not None and not task.done():
+                task.cancel()   # the talker answered first: a late "thinker" must start nothing
+                self.log.event("router", op="cancelled", why="reply_first")
+
+    def _cancel_route(self) -> None:
+        task, self._router_task = getattr(self, "_router_task", None), None
+        if task is not None and not task.done():
+            task.cancel()
+        timer, self._route_timer = getattr(self, "_route_timer", None), None
+        if timer is not None:
+            timer.cancel()
 
     async def _hand_or_hold(self, params: Any) -> None:
         """A hand, unless recognition was unsure of the user's words and the mouth spoke with the call.
@@ -3365,8 +3565,65 @@ class Conversation:
             unguard(text)
         await self._speak(text)
 
+    async def _speak_result(self, lines: list[str]) -> None:
+        """C1 (v3.17): a result's sentences said by code in the one voice, each its own piece (so each starts the moment
+        its audio is ready, and a sentence fetched ahead, C2, is found by its words); the thinker's own words, never
+        held by a blocking line check (as an owed outcome's)."""
+        tts = getattr(self, "_tts", None)
+        unguard = getattr(tts, "unguard", None)
+        if lines and not self.observer.bot_speaking:
+            self.observer.speech_pending_since = time.monotonic()   # words on their way: Yuki is about to speak
+        for line in lines:
+            if not line.strip():
+                continue
+            if callable(unguard):
+                unguard(line)
+            await self._speak(line)
+
     def _owed_pending(self) -> int:
         return len(self.ledger.pending) if self.ledger is not None else 0
+
+    # -- v3.17: the talker's prompt by measured state (H1) and its held words (H2) --------------------------------
+
+    #: A hand of the talker's that did not take effect this recently (s) brings its guidance into the next calls.
+    HAND_TROUBLE_S = 60.0
+    #: A close this recently (s) brings the guidance on getting a closed tab back into the talker's calls.
+    CLOSED_S = 900.0
+    #: Held words of a reply are offered for this many user turns after it.
+    HELD_TURNS = 2
+
+    def _prompt_state(self) -> dict[str, Any]:
+        """Measured states for the talker's volatile block (``mouth.volatile_block``): never the words."""
+        state: dict[str, Any] = {}
+        now = time.monotonic()
+        hands = getattr(self.bridge, "hands", None)
+        if hands is not None:
+            if getattr(hands, "halted", None):
+                state["hand_trouble"] = True
+            else:
+                at = getattr(hands, "trouble_at", None)
+                if at is not None and now - at <= self.HAND_TROUBLE_S:
+                    state["hand_trouble"] = True
+        closed = [x for x in (getattr(hands, "closed_at", None), getattr(self.bridge, "closed_at", None))
+                  if isinstance(x, (int, float))]
+        if closed and now - max(closed) <= self.CLOSED_S:
+            state["closed"] = True
+        held = getattr(self, "_held_more", None)
+        if held and self.observer.user_turns - int(getattr(self, "_held_at_turn", 0)) <= self.HELD_TURNS:
+            state["held"] = held
+        return state
+
+    def more_held(self, max_sentences: int = 2, max_chars: int = 280) -> tuple[str, bool] | None:
+        """H2: the next part of the talker's held words (``(part, more left)``), taken; ``None`` when nothing is held."""
+        held = getattr(self, "_held_more", None)
+        if not held:
+            return None
+        from yuki.voice.narrator import condense
+
+        head, rest = condense(held, max_sentences=max_sentences, max_chars=max_chars)
+        self._held_more = rest or None
+        self._held_at_turn = self.observer.user_turns
+        return head, bool(rest)
 
     def _held_pending(self, now: float) -> int:
         """1 while a hand the talker held until the user answers waits for that answer (04 F1), else 0.
@@ -3382,8 +3639,13 @@ class Conversation:
         return 0 if (self.observer.last_user_at or 0.0) > at else 1
 
     def _marker_report(self, call: Any, channel: Any) -> None:
-        """A reply's text read by the marker channel (v3.16): kept on its turn, logged content-free."""
+        """A reply's text read by the marker channel (v3.16): kept on its turn, logged content-free. H2 (v3.17): what it
+        held back (after its more line, or past the word cap) is kept for the next turn and for more_of_result."""
         facts = channel.facts()
+        held = str(getattr(channel, "held", "") or "").strip()
+        if held:
+            self._held_more = held
+            self._held_at_turn = self.observer.user_turns
         turn = self.observer.turn
         if turn is not None:
             turn.marker = facts.get("marker") or turn.marker

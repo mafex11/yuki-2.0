@@ -310,6 +310,67 @@ ITEMS_AHEAD_S = 3.0
 #: from memory's Now picture (the watcher already reads the window in front on every settle), not from a second
 #: read here. Live 2026-09-30 the talker read Discord 53 times in 15 minutes, ~730 ms each, one of them 6.4 s.
 HEAVY_READ_MS = 500.0
+#: D7 (v3.17): memory's Now picture keeps at most this many control names of a window (``yuki.memory.now``'s
+#: ``CONTROLS_KEPT``), in the order the tree has them (the window's own bar first). An entry with fewer is the whole
+#: window, and serves the items line with no read here; one at the cap may have lost the page's own items, so a light
+#: window is read here as before (a heavy one still comes from Now).
+NOW_CONTROLS_CAP = 30
+#: F1 (v3.17): popups (a "Restore pages?" bubble, a toast, a dialog) and other visible windows from memory's Now
+#: picture go on the items line too, so the talker's click hand reaches them: at most this many popups and other
+#: windows, and this many items each.
+EXTRA_POPUPS = 3
+EXTRA_WINDOWS = 2
+EXTRA_ITEMS = 8
+#: A window not in front is listed only when at least this share of it can be seen (the Now layout's own measure).
+EXTRA_MIN_SHARE = 0.25
+
+
+def _is_real_backend(backend: Any) -> bool:
+    """Whether ``backend`` is the real desktop's (only then does memory's Now picture describe what it acts on)."""
+    try:
+        from yuki.agent.tools import _LazyRealBackend
+    except Exception:  # noqa: BLE001
+        return False
+    inner = getattr(backend, "_inner", None) if isinstance(backend, _AppVolumeBackend) else backend
+    return isinstance(inner, _LazyRealBackend)
+
+
+def _window_shown(hwnd: Any) -> bool:
+    """Whether a window still exists and is shown (two OS facts; a popup the board saw may be gone)."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        handle = int(hwnd or 0)
+        return bool(handle and user32.IsWindow(handle) and user32.IsWindowVisible(handle))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def real_now_board(wait_s: float = 0.05) -> dict[str, Any] | None:
+    """Memory's Now picture of the real screen (``yuki.memory.now``), popups no longer shown left out; ``None`` without
+    a service or an answer within ``wait_s`` (p50 2-5 ms measured)."""
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        board = client.now(wait_s=wait_s) if client is not None else None
+    except Exception:  # noqa: BLE001 - then the windows are read here
+        return None
+    if board and board.get("popups"):
+        board = dict(board, popups=[p for p in board["popups"] if isinstance(p, dict) and _window_shown(p.get("hwnd"))])
+    return board
+
+
+def now_source_for(backend: Any) -> Any:
+    """Where the hands take memory's Now picture from: the backend's own (a test desk's ``now_board``), memory's service
+    for the real desktop, else nowhere (a stand-in desk never reaches the real screen's picture, rule 7)."""
+    own = getattr(backend, "now_board", None)
+    if callable(own):
+        return own
+    if _is_real_backend(backend):
+        return real_now_board
+    return None
 
 
 @dataclass
@@ -377,14 +438,18 @@ _ROLE_WORDS = {"Hyperlink": "link", "Button": "button", "ListItem": "item", "Dat
                "TabItem": "tab", "MenuItem": "menu item"}
 
 
-def items_line(items: ScreenItems) -> str:
-    """The desktop block's items line (``""`` without items)."""
+def items_line(items: ScreenItems, *, popup: str | None = None) -> str:
+    """The desktop block's items line (``""`` without items). ``popup``: the window in front is a popup of that app (no
+    window of the list), said so, so its own [hwnd] is the one a click takes (v3.17, F1)."""
     if not items.items:
         return ""
     parts = []
     for n, item in enumerate(items.items, 1):
         name = item["name"] if len(item["name"]) <= ITEM_NAME_CHARS else item["name"][:ITEM_NAME_CHARS - 1] + "…"
         parts.append(f'{n} "{name}" {_ROLE_WORDS.get(item["role"], item["role"].casefold())}'.rstrip())
+    if popup is not None:
+        return (f"popup [{items.hwnd}] {popup} in front (it has the keyboard; no window of the list), numbered for your "
+                f"click hand, click it with window {items.hwnd}: " + "; ".join(parts))
     return (f"items on the screen in [{items.hwnd}], numbered for your click hand (page content first): "
             + "; ".join(parts))
 
@@ -496,6 +561,11 @@ class Hands:
         self._workers = shared()
         #: The window in front's clickable items (``ScreenItems``, v3.14), read with the names; ``None`` before.
         self.items: ScreenItems | None = None
+        #: F1 (v3.17): the items of popups and other visible windows the last summary listed, by hwnd (from memory's
+        #: Now picture: no element ids, a click finds its item in a read of its own).
+        self.extra_items: dict[int, ScreenItems] = {}
+        #: ``() -> board | None``: memory's Now picture of the screen (:func:`now_source_for`; ``None``: none).
+        self.now_source: Any = now_source_for(backend)
         self._items_lock = threading.Lock()
         #: The time of each window's last own tree read here (ms), to tell a heavy window (v3.15).
         self._read_ms: dict[int, float] = {}
@@ -531,6 +601,10 @@ class Hands:
         self._opened: dict[str, tuple[float, str]] = {}
         #: Done lines said lately, by their words (case and spacing aside): ``{words: said at}`` (v3.14).
         self._lines_said: dict[str, float] = {}
+        #: H1 (v3.17): when a hand last did not take effect or was refused, and when a tab or window was last closed
+        #: (monotonic): measured states that bring their guidance into the talker's next calls.
+        self.trouble_at: float | None = None
+        self.closed_at: float | None = None
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -573,11 +647,22 @@ class Hands:
                 parts.append(screen_line(names_app, names))
             with self._lock:
                 items = self.items
+            board = self._now_board()
             if (items is not None and items.hwnd == snap.foreground
                     and items.title == titles.get(snap.foreground or 0, "")):
-                line = items_line(items)
+                popup = None
+                if snap.foreground is not None and snap.foreground not in titles:
+                    # a popup in front, no window of the list (Chrome's "Restore pages?" bubble had the keyboard on
+                    # 2 Oct): said so, with its app, so a click takes its own hwnd (F1)
+                    seen = next((p for p in (board or {}).get("popups") or []
+                                 if isinstance(p, dict) and int(p.get("hwnd") or 0) == snap.foreground), None)
+                    popup = str((seen or {}).get("app") or "a popup")
+                line = items_line(items, popup=popup)
                 if line:
                     parts.append(line)
+                    if snap.foreground is not None:
+                        snap.hwnds.add(snap.foreground)   # a popup in front (no user window) is clickable too (F1)
+            parts.extend(self._extra_lines(snap, board))   # F1: popups and other visible windows
             focus = self._focus_line(snap.foreground)
             if focus:
                 parts.append(focus)
@@ -839,6 +924,10 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
+        if not confirmed and not facts.get("settled"):
+            self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
+        if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
+            self.closed_at = time.monotonic()
         if confirmed and name in ("open_url", "open_app"):
             self._opened = {k: v for k, v in self._opened.items() if started - v[0] < _OPEN_REPEAT_S}
             self._opened[key] = (time.monotonic(), report)
@@ -1076,26 +1165,34 @@ class Hands:
             return ok, report, facts
         raise _Refused(f"no hand called {name!r}")
 
-    def _now_items(self, hwnd: int, title: str) -> tuple[ScreenItems, dict[str, Any]] | None:
+    def _now_board(self) -> dict[str, Any] | None:
+        """Memory's Now picture (:attr:`now_source`), or ``None`` (no source, no service, no answer in time)."""
+        source = self.now_source
+        if source is None:
+            return None
+        try:
+            board = source()
+        except Exception:  # noqa: BLE001 - then the windows are read here
+            return None
+        return board if isinstance(board, dict) else None
+
+    def _now_items(self, hwnd: int, title: str, board: dict[str, Any] | None = None
+                   ) -> tuple[ScreenItems, dict[str, Any], bool] | None:
         """The window's names from memory's Now picture, when its entry is fresh (read after its last change).
 
-        ``(items, tree)``: the items have no element ids (``read`` 0: a click finds its item in a read of its own),
-        the tree is the names as list items, for the screen names. None: no service, no answer in 50 ms, no entry
-        or a stale one (then the caller reads the window itself).
+        ``(items, tree, whole)``: the items have no element ids (``read`` 0: a click finds its item in a read of its
+        own), the tree is the names as list items, for the screen names; ``whole`` says the entry kept every control
+        name the window had (fewer than :data:`NOW_CONTROLS_CAP`). None: no service, no answer in 50 ms, no entry or a
+        stale one (then the caller reads the window itself).
         """
-        try:
-            from yuki.memory.now import shared_client
-
-            client = shared_client()
-            board = client.now(wait_s=0.05) if client is not None else None
-        except Exception:  # noqa: BLE001 - then the window is read here
-            return None
+        board = self._now_board() if board is None else board
         entry = next((w for w in (board or {}).get("windows") or []
                       if isinstance(w, dict) and int(w.get("hwnd") or 0) == int(hwnd)), None)
-        if not entry or entry.get("stale") or entry.get("read_at") is None:
+        if not entry or entry.get("stale") or entry.get("read_at") is None or entry.get("blocked"):
             return None
+        controls = list(entry.get("controls") or [])
         names: list[str] = []
-        for name in [*(entry.get("controls") or []),
+        for name in [*controls,
                      *(str(m.get("sender") or "") for m in entry.get("messages") or [] if isinstance(m, dict))]:
             name = " ".join(str(name or "").split())
             if name and name != "the user" and name.casefold() not in {n.casefold() for n in names}:
@@ -1105,44 +1202,126 @@ class Hands:
                             at=time.monotonic(), version=self.actions.version)
         tree = {"elements": [{"id": i, "role": "ListItem", "name": n, "depth": 1, "parent": -1,
                               "is_interactive": True} for i, n in enumerate(names)]}
-        return items, tree
+        return items, tree, len(controls) < NOW_CONTROLS_CAP
+
+    def _read_tree(self, hwnd: int) -> tuple[dict[str, Any], int, float] | None:
+        """One bounded UI Automation read of ``hwnd`` here, through the hands' dispatcher: ``(tree, read, ms)``, or
+        ``None``. Blocking (a few hundred ms at most); off every loop. Its element ids are good for that read only."""
+        try:
+            outcome = self._dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
+        except Exception:  # noqa: BLE001 - the items are a hint
+            return None
+        self._read_ms[int(hwnd)] = float(outcome.elapsed_ms or 0.0)
+        if not outcome.ok or not isinstance(outcome.payload, dict):
+            return None
+        latest = getattr(self._dispatcher, "_latest_trees", {}).get(int(hwnd))
+        return outcome.payload, (int(latest[0]) if latest else 0), float(outcome.elapsed_ms or 0.0)
 
     def _read_items(self, hwnd: int, title: str, *, own: bool = False) -> Any:
-        """One bounded tree read of ``hwnd`` through the hands' dispatcher: keeps its items, returns the tree (or None).
+        """The window in front's items: kept as :attr:`items`; returns the tree (or None).
 
-        Blocking (a few hundred ms at most); call it off every loop. One read at a time. A window measured heavy
-        (:data:`HEAVY_READ_MS`) is taken from memory's Now picture instead, when that is fresh (v3.15); ``own``
-        reads it here regardless (a click finding its item).
+        D7 (v3.17, 07 §6 I): from memory's Now picture first (a pipe answer in a few ms; the watcher reads the window in
+        front on every settle), whenever its entry is fresh and whole (or the window is heavy, v3.15). Otherwise one
+        bounded tree read here, as before (live 2 Oct: 22 reads of ~220 ms in 165 s of talk, inside the voice's process).
+        ``own`` reads it here regardless (a click finding its item). Blocking; call it off every loop. One at a time.
         """
         with self._items_lock:
-            if not own and self._read_ms.get(int(hwnd), 0.0) >= HEAVY_READ_MS:
+            why = "own"
+            if not own:
+                heavy = self._read_ms.get(int(hwnd), 0.0) >= HEAVY_READ_MS
                 started = time.perf_counter()
                 got = self._now_items(hwnd, title)
-                if got is not None:
-                    items, tree = got
+                if got is not None and (got[2] or heavy):
+                    items, tree, whole = got
                     with self._lock:
                         self.items = items
                     if self.log is not None:
                         self.log.event("hands", op="items_read", hwnd=int(hwnd), items=len(items.items),
-                                       ms=round((time.perf_counter() - started) * 1000), source="now")
+                                       ms=round((time.perf_counter() - started) * 1000), source="now",
+                                       whole=whole, heavy=heavy)
                     return tree
-            try:
-                outcome = self._dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
-            except Exception:  # noqa: BLE001 - the items are a hint
+                why = "no_now" if got is None else "now_capped"
+            read = self._read_tree(hwnd)
+            if read is None:
                 return None
-            self._read_ms[int(hwnd)] = float(outcome.elapsed_ms or 0.0)
-            if not outcome.ok or not isinstance(outcome.payload, dict):
-                return None
-            latest = getattr(self._dispatcher, "_latest_trees", {}).get(int(hwnd))
-            read = int(latest[0]) if latest else 0
-            items = ScreenItems(hwnd=int(hwnd), title=title, read=read, items=items_from_tree(outcome.payload),
+            payload, number, ms = read
+            items = ScreenItems(hwnd=int(hwnd), title=title, read=number, items=items_from_tree(payload),
                                 at=time.monotonic(), version=self.actions.version)
             with self._lock:
                 self.items = items
             if self.log is not None:
-                self.log.event("hands", op="items_read", hwnd=int(hwnd), items=len(items.items),
-                               ms=round(outcome.elapsed_ms))
-            return outcome.payload
+                self.log.event("hands", op="items_read", hwnd=int(hwnd), items=len(items.items), ms=round(ms),
+                               source="uia", why=why)
+            return payload
+
+    def _extra_lines(self, snap: Snapshot, board: dict[str, Any] | None) -> list[str]:
+        """F1 (v3.17, 07 §6 F): popups and other visible windows from memory's Now picture, numbered for the click hand.
+
+        Live 2 Oct "Restore the pages." went to the thinker (5.7 s to its click) because Chrome's "Restore pages?"
+        bubble is a window of its own, never on the items line. Popups first (what just appeared, newest first), then
+        the windows not in front that can mostly be seen; each with its control names as the board read them, fresh
+        reads only. Their hwnds join the summary's windows so the click hand may act on them. Plumbing: what is on the
+        screen and how fresh, never what the names say.
+        """
+        extra: dict[int, ScreenItems] = {}
+        lines: list[str] = []
+        if not board:
+            with self._lock:
+                self.extra_items = extra
+            return lines
+        now = time.monotonic()
+
+        def names_of(entry: dict[str, Any]) -> list[str]:
+            out: list[str] = []
+            for name in entry.get("controls") or []:
+                name = " ".join(str(name or "").split())
+                if name and name.casefold() not in {n.casefold() for n in out}:
+                    out.append(name)
+            return out[:EXTRA_ITEMS]
+
+        def add(hwnd: int, title: str, names: list[str], head: str) -> None:
+            items = ScreenItems(hwnd=hwnd, title=title, read=0, items=[{"id": None, "role": "", "name": n}
+                                                                       for n in names], at=now,
+                                version=self.actions.version)
+            extra[hwnd] = items
+            snap.hwnds.add(hwnd)
+            parts = [f'{n} "{name if len(name) <= ITEM_NAME_CHARS else name[:ITEM_NAME_CHARS - 1] + "…"}"'
+                     for n, name in enumerate(names, 1)]
+            lines.append(f"{head}, numbered for your click hand: " + "; ".join(parts))
+
+        popups = [p for p in (board.get("popups") or []) if isinstance(p, dict) and p.get("hwnd")]
+        popups.sort(key=lambda p: float(p.get("age_s") or 0.0))
+        for p in popups:
+            if len(extra) >= EXTRA_POPUPS:
+                break
+            hwnd = int(p["hwnd"])
+            names = names_of(p)
+            if hwnd == snap.foreground or hwnd in extra or not names:
+                continue
+            title = " ".join(str(p.get("title") or "").split())[:60]
+            body = " ".join(str(p.get("text") or "").split())[:120]
+            age = p.get("age_s")
+            add(hwnd, title, names, f'popup [{hwnd}] {p.get("app") or ""} "{title}"'
+                + (f" saying \"{body}\"" if body else "") + (f" (appeared {round(float(age))} s ago)" if age is not None
+                                                            else ""))
+        others = 0
+        for w in board.get("windows") or []:
+            if others >= EXTRA_WINDOWS:
+                break
+            if not isinstance(w, dict) or w.get("foreground") or w.get("blocked") or w.get("stale"):
+                continue
+            hwnd = int(w.get("hwnd") or 0)
+            if not hwnd or hwnd == snap.foreground or hwnd in extra or float(w.get("share") or 0.0) < EXTRA_MIN_SHARE:
+                continue
+            names = names_of(w)
+            if not names:
+                continue
+            title = " ".join(str(w.get("live_title") or w.get("title") or "").split())[:60]
+            add(hwnd, title, names, f'items in [{hwnd}] {w.get("app") or ""} "{title}" (visible, not in front)')
+            others += 1
+        with self._lock:
+            self.extra_items = extra
+        return lines
 
     def _focus(self, timeout_s: float = 0.25) -> Any:
         """What has the keyboard (the backend's ``focus_snapshot``), or ``None`` when it cannot say."""
@@ -1174,7 +1353,7 @@ class Hands:
         """Click an item of the items line, by the read it came from; found again, or refused, when that read is old."""
         hwnd = self._window(args)
         with self._lock:
-            items = self.items
+            items = self.items if self.items is not None and self.items.hwnd == hwnd else self.extra_items.get(hwnd)
         try:
             number = int(args.get("item"))
         except (TypeError, ValueError):
@@ -1184,19 +1363,19 @@ class Hands:
                            f"clicked", stale=True)
         item = items.items[number - 1]
         title = self._title(hwnd)
+        if not title and not items.read:
+            title = items.title   # a popup is in no window list: its title is the one the board read
+        title = title or ""
         if (title != items.title or items.version != self.actions.version or not items.read
                 or time.monotonic() - items.at > ITEMS_FRESH_S):
             # The read is old, or the window changed since, or the items came from memory's Now picture (no element
-            # ids, v3.15): find the same item (its role and name; the name alone from Now) in a fresh read here.
-            self._read_items(hwnd, title, own=True)
-            with self._lock:
-                fresh = self.items
-            same = [i for i in (fresh.items if fresh is not None and fresh.hwnd == hwnd else [])
-                    if (not item["role"] or i["role"] == item["role"]) and i["name"] == item["name"]]
-            if len(same) != 1:
+            # ids, v3.15; popups and other windows, v3.17): find the same item (its role and name; the name alone from
+            # Now) in a fresh read of that window here.
+            found = self._find_item(hwnd, title, item)
+            if found is None:
                 raise _Refused(f"the window changed since it was read and \"{item['name'][:60]}\" is not on it once "
                                f"now; nothing was clicked", stale=True)
-            items, item = fresh, same[0]
+            items, item = found
         lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("click", {"element": item["id"], "read": items.read, "expect_hwnd": hwnd})
@@ -1208,6 +1387,42 @@ class Hands:
         if not outcome.ok:
             facts["stale"] = True   # nothing was clicked (a newer read came in between): the thinker reads afresh
         return outcome.ok, f"{lead}clicked \"{item['name'][:80]}\" ({item['role']}): {outcome.summary} ({why})", facts
+
+    def _find_item(self, hwnd: int, title: str, item: dict[str, Any]
+                   ) -> tuple[ScreenItems, dict[str, Any]] | None:
+        """``item`` found again, once, in a fresh read of ``hwnd`` here: ``(that read's items, the item)``, else ``None``.
+
+        By its role (when known) and its name: the whole name, or a name memory's Now picture cut at its length
+        (``yuki.memory.extract``'s 80 characters). Every named element of the read is looked at, not only the items line's
+        first twenty; an interactive one wins over a label with the same name. Plumbing: identity of strings."""
+        read = self._read_tree(hwnd)
+        if read is None:
+            return None
+        payload, number, _ms = read
+        name, role = str(item.get("name") or ""), str(item.get("role") or "")
+        cut = len(name) >= 80
+
+        def same(e: dict[str, Any]) -> bool:
+            have = " ".join(str(e.get("name") or "").split())
+            if role and str(e.get("role") or "") != role:
+                return False
+            return have == name or (cut and have.startswith(name))
+
+        elements = [e for e in (payload.get("elements") or []) if isinstance(e, dict) and isinstance(e.get("id"), int)]
+        hits = [e for e in elements if same(e)]
+        if len(hits) > 1:
+            hits = [e for e in hits if e.get("is_interactive", True)] or hits
+        if len(hits) != 1:
+            return None
+        hit = hits[0]
+        found = {"id": int(hit["id"]), "role": str(hit.get("role") or ""), "name": " ".join(str(hit.get("name") or
+                                                                                                 "").split())}
+        items = ScreenItems(hwnd=int(hwnd), title=title, read=number, items=items_from_tree(payload),
+                            at=time.monotonic(), version=self.actions.version)
+        with self._lock:
+            if self.items is not None and self.items.hwnd == hwnd:
+                self.items = items   # the window in front's line keeps up with what was just read
+        return items, found
 
     def _type(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         """Type the words into the text field that has the keyboard in the window named; verified by reading it back."""

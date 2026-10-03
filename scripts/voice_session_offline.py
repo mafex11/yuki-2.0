@@ -194,6 +194,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     if scenario in ("call", "call2"):
         session.on_call_status({"call": {"app": "Discord", "status": "recording"}})
     session.wake_enabled = True
+    io_seen = install_io_audit() if getattr(args, "audit_io", False) else None
     t_start = time.monotonic()
     session.start()
     if args.prewarm:
@@ -264,9 +265,49 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 del nxt
             rows.append(row)
         report["latency"] = rows
+    if io_seen is not None:
+        report["loop_io"] = sorted(({"event": k[0], "where": k[1], "what": k[2], "n": n} for k, n in io_seen.items()),
+                                   key=lambda r: -r["n"])
     out = args.out / f"{scenario}-{variant}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     return report
+
+
+#: Audit events that touch the disk (v3.17, D7: none may run on the voice loop's own thread).
+IO_EVENTS = frozenset({"open", "os.mkdir", "os.rename", "os.replace", "os.remove", "os.rmdir", "os.listdir",
+                       "os.scandir", "shutil.copyfile", "shutil.move", "sqlite3.connect"})
+
+
+def install_io_audit() -> dict[tuple[str, str, str], int]:
+    """Count every disk access made on a thread that runs an asyncio loop (the voice loop), by event, by where in the
+    code (the innermost frames of Yuki's and Pipecat's own files) and by what (the file's name, its folder cut away).
+    A process-wide audit hook (``sys.addaudithook``); content-free."""
+    import asyncio
+    import os
+    import threading
+
+    seen: dict[tuple[str, str, str], int] = {}
+    get_loop = asyncio._get_running_loop
+
+    def hook(event: str, args: tuple) -> None:
+        if event not in IO_EVENTS or get_loop() is None:
+            return
+        first = args[0] if args else ""
+        if isinstance(first, int):
+            return   # a file descriptor: no new file is touched
+        what = os.path.basename(str(first or "")) or str(first or "")[-40:]
+        frame = sys._getframe(1)
+        where: list[str] = []
+        while frame is not None and len(where) < 4:
+            name = frame.f_code.co_filename.replace(chr(92), "/")
+            if "/yuki/" in name or "/pipecat/" in name or "/scripts/" in name:
+                where.append(f"{os.path.basename(name)}:{frame.f_lineno}:{frame.f_code.co_name}")
+            frame = frame.f_back
+        key = (event, " < ".join(where) or threading.current_thread().name, what)
+        seen[key] = seen.get(key, 0) + 1
+
+    sys.addaudithook(hook)
+    return seen
 
 
 def summary(report: dict[str, Any]) -> str:
@@ -294,6 +335,10 @@ def summary(report: dict[str, Any]) -> str:
         lines.append("latency: " + json.dumps(report["latency"]))
     lines.append("session timings: " + json.dumps(report["session_timings_ms"]))
     lines.append(f"mic levels: {report['mic_levels']}")
+    if report.get("loop_io") is not None:
+        lines.append(f"disk on the voice loop: {len(report['loop_io'])} places")
+        for row in report["loop_io"][:20]:
+            lines.append(f"   {row['n']:4d} {row['event']:16s} {row['what'][:40]:40s} {row['where']}")
     return "\n".join(lines)
 
 
@@ -313,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prewarm", action="store_true", help="latency: prewarm in the background before the first wake")
     ap.add_argument("--breath", default="", help="latency: a one-breath clip with its name_end in the manifest (v3.11)")
     ap.add_argument("--no-standby", dest="no_standby", action="store_true", help="v3.11: build on the wake (before)")
+    ap.add_argument("--audit-io", dest="audit_io", action="store_true",
+                    help="v3.17: count every disk access on the voice loop's thread (where in the code, which file)")
     ap.add_argument("--one-breath", dest="one_breath", action="store_true",
                     help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
     args = ap.parse_args(argv)

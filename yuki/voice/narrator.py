@@ -69,6 +69,48 @@ def sentences(text: str) -> list[str]:
     return [s for s in out if s]
 
 
+#: Marks that end a sentence as a question (Latin and full-width).
+_ASKS = "?？"
+
+
+def ends_sentence(text: str) -> bool:
+    """Whether ``text`` ends with a sentence's own closing mark (closing quotes and brackets aside)."""
+    tail = (text or "").rstrip().rstrip(_CLOSERS)
+    return bool(tail) and tail[-1] in _ENDS
+
+
+def asks(text: str) -> bool:
+    """Whether a sentence of ``text`` ends as a question (its own closing mark; punctuation, never words)."""
+    for sentence in sentences(text):
+        if sentence.rstrip(_CLOSERS + " ").endswith(tuple(_ASKS)):
+            return True
+    return False
+
+
+def machine_text(text: str) -> bool:
+    """Whether ``text`` carries an address or a path (a URL, ``www.`` site, Windows path): a voice describes those, it
+    never reads them out. Parsing fixed machine formats only."""
+    from urllib.parse import urlsplit
+
+    for raw in (text or "").split():
+        token = raw.strip("\"'()[]<>{},.;!?“”‘’")
+        if len(token) < 4:
+            continue
+        if token.casefold().startswith("www.") and token.count(".") >= 2:
+            return True
+        if token[0].isalpha() and token[1] == ":" and token[2] in "\\/":
+            return True   # C:\Users\...
+        if token.startswith("\\\\"):
+            return True   # \\server\share
+        try:
+            parts = urlsplit(token)
+        except ValueError:
+            continue
+        if parts.scheme and parts.netloc:
+            return True
+    return False
+
+
 def _cut_long(sentence: str, limit: int) -> str:
     """One over-long sentence cut at the last clause or word boundary before ``limit``."""
     head = sentence[:limit]
@@ -428,6 +470,10 @@ class Owed:
     state: str = "owed"
     #: How it was resolved: ``talker`` (its run was heard), ``code`` (said by code), ``pill`` (shown with a sound).
     via: str = ""
+    #: When its job finished (monotonic; ``None``: unknown): the heard event says how long after that (v3.17).
+    done_at: float | None = None
+    #: Said by code from the start (C1, v3.17): a short or verified result, no talker run at all.
+    direct: bool = False
 
 
 class OwedLedger:
@@ -460,7 +506,8 @@ class OwedLedger:
     def pending(self) -> list[Owed]:
         return [i for i in self.items if i.state == "owed"]
 
-    def owe(self, token: int, kind: str, text: str, user_turns: int, now: float | None = None) -> Owed | None:
+    def owe(self, token: int, kind: str, text: str, user_turns: int, now: float | None = None, *,
+            done_at: float | None = None) -> Owed | None:
         """An outcome was handed to the talker to be said now. A newer one of the same job replaces an older one."""
         text = " ".join(str(text or "").split())
         if kind not in OWED_KINDS or not text:
@@ -469,12 +516,30 @@ class OwedLedger:
         for old in self.pending:
             if old.token == token:
                 old.state = "dropped"   # the job's newer outcome (its final after its question) is what is owed now
-        item = Owed(token=token, kind=kind, text=text, at=now, user_turns=int(user_turns), next_at=now)
+        item = Owed(token=token, kind=kind, text=text, at=now, user_turns=int(user_turns), next_at=now,
+                    done_at=done_at)
         self.items.append(item)
         del self.items[:-24]
         self.stats["owed"] += 1
         self._log(op="owed", job=token, kind=kind, chars=len(text))
         return item
+
+    def said_by_code(self, token: int, now: float | None = None) -> Owed | None:
+        """C1 (v3.17): the job's owed outcome is being said by code right now, with no talker run (a short or verified
+        result). It counts as the first of its :attr:`CODE_TRIES`: if it is not heard, it is said once more, then shown.
+        """
+        now = time.monotonic() if now is None else now
+        for item in self.pending:
+            if item.token == token and item.spoken_at is None:
+                item.attempts += 1
+                item.spoken_at = now
+                item.next_at = now + self.RETRY_GAP_S
+                item.direct = True
+                self.stats["direct"] = self.stats.get("direct", 0) + 1
+                self._log(op="said_by_code", job=token, kind=item.kind, direct=True,
+                          after_done_ms=round((now - item.done_at) * 1000) if item.done_at is not None else None)
+                return item
+        return None
 
     def drop(self, token: int) -> None:
         """The job was withdrawn or stopped: nothing of it is owed any more."""
@@ -508,7 +573,9 @@ class OwedLedger:
                 item.state, item.via = "heard", ("code" if by_code else "talker")
                 self.stats["heard_code" if by_code else "heard_talker"] += 1
                 self._log(op="heard", job=item.token, kind=item.kind, via=item.via, attempts=item.attempts,
-                          after_ms=round((now - item.at) * 1000))
+                          after_ms=round((now - item.at) * 1000), direct=item.direct,
+                          # the job's end to its outcome's first heard words (07 §8 ``outcome_audible_ms``)
+                          since_done_ms=round((now - item.done_at) * 1000) if item.done_at is not None else None)
 
     def expire(self, user_turns: int) -> list[Owed]:
         """Items the user has measurably moved on from (``stale_turns`` user turns since): let go, logged."""

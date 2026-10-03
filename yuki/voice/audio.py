@@ -30,6 +30,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from yuki.voice.qos import ensure_thread as _qos_thread
+
 #: The pipeline's input format.
 RATE = 16_000
 BLOCK_MS = 20
@@ -219,6 +221,12 @@ class SharedMic:
         self.input_latency_s = 0.02
         #: Facts about the stream as opened (rate, channels), for the log.
         self.format: dict[str, Any] = {}
+        #: D7 (v3.17): put PortAudio's callback thread on time (out of power throttling, in the MMCSS "Audio" task) on
+        #: its first block (:func:`yuki.voice.qos.ensure_thread`); ``False``: leave it as PortAudio made it.
+        self.qos = True
+        self.mmcss = True
+        #: What that did, for the log (``None`` until a block came).
+        self.qos_facts: dict[str, Any] | None = None
 
     @property
     def is_open(self) -> bool:
@@ -330,6 +338,10 @@ class SharedMic:
 
     def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         del frames, time_info
+        if self.qos:
+            facts = _qos_thread(mmcss=self.mmcss)   # once per callback thread (a reopened stream: a new one)
+            if facts is not None:
+                self.qos_facts = facts
         if status and status.input_overflow:
             self.stats.overflows += 1
         block = indata

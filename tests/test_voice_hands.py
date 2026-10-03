@@ -168,13 +168,14 @@ def test_scroll_again_is_the_same_hand_twice() -> None:
 
 def test_instant_hands_are_called_without_words_and_the_slow_ones_with() -> None:
     from yuki.voice.hands import HAND_TOOLS, INSTANT_HANDS
-    from yuki.voice.mouth import MOUTH_PROMPT
+    from yuki.voice.mouth import HANDS_PROMPT, MOUTH_PROMPT
 
     for tool in HAND_TOOLS:
         says = "no words before it" in tool["description"]
         assert says == (tool["name"] in INSTANT_HANDS), tool["name"]
     assert "made alone, with no words written before it" in MOUTH_PROMPT  # v3.5: every call, say_first carries words
-    assert "A repeat" in MOUTH_PROMPT and "A tab is not a window" in MOUTH_PROMPT
+    # v3.17 (H1): the hands' part is its own block, sent whenever the talker has hands
+    assert "A repeat" in HANDS_PROMPT and "A tab is not a window" in HANDS_PROMPT
 
 
 # -- "What's up?": a result is always the newest thing ---------------------------------------------

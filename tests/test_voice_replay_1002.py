@@ -376,10 +376,11 @@ def test_the_2_oct_call_replayed_every_job_is_heard_and_no_call_idle_cuts_a_requ
     # then the call idled out, with nothing owed or unanswered
     assert found["reason"] == "call_idle"
     assert found["stop"]["unanswered"] is False and found["stop"]["owed"] == 0 and found["stop"]["held"] is False
+    # v3.17 (C1): both outcomes are short, so each is said by code word for word the moment it is ready, with no talker
+    # run at all (before: "Pages restored." after the talker's stay_quiet, the day's result behind a guard verdict or
+    # by the talker); the ledger saw each one heard.
+    direct = [f.get("via") for f in log.of("owed", op="heard") if f.get("direct")]
+    assert direct == ["code", "code"]
     if channel == "marker":
         # the talker's own reasoning never reached the voice: the reply had no marker line
         assert log.of("marker", unmarked=True)
-        assert log.of("speech_guard", op="caught", shadow=True)   # its "Busy day:" verdict, measured, not blocking
-        assert any(f.get("via") == "talker" for f in log.of("owed", op="heard"))
-    else:
-        assert any(f.get("via") == "code" for f in log.of("owed", op="heard"))

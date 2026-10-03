@@ -351,7 +351,8 @@ def test_a_result_after_the_user_moved_on_is_framed_as_the_earlier_request() -> 
     asyncio.run(main())
 
 
-def test_a_result_on_time_goes_to_the_talker_once_and_bound_to_its_request() -> None:
+def test_a_verified_result_on_time_is_said_once_by_code_and_bound_to_its_request() -> None:
+    """v3.17 (C1): a verified finish is said by code, word for word, once (was v3.10: the talker said it)."""
     async def main() -> None:
         rt, bridge = _bridge()
         bridge.user_turns = lambda: 1
@@ -366,9 +367,10 @@ def test_a_result_on_time_goes_to_the_talker_once_and_bound_to_its_request() -> 
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle()
         await asyncio.wait_for(task, 1)
-        assert [f.text for f in params.pushed] == []  # v3.10: only the talker speaks, never code for the thinker
+        assert [f.text for f in params.pushed] == ["Paused it."]   # by code, once (C1)
         result, props = params.results[-1]
-        assert result["verified"] is True and result["for_request"] == "Pause the video" and props.run_llm is True
+        assert result["verified"] is True and result["for_request"] == "Pause the video" and props.run_llm is False
+        assert result["said"] is True
 
     asyncio.run(main())
 
@@ -584,15 +586,16 @@ def test_a_hand_that_did_not_take_is_passed_to_the_thinker_without_a_talker_run(
         job, text, kw = rt.submitted[0]
         assert kw.get("lane") == "worker" and kw.get("view_hwnd") == 42
         assert "did not take effect" in text and "play the make up my mind mix" in text
-        # the thinker's own finishing line is the one outcome, said once, by the talker (v3.10: never by code)
+        # the thinker's own finishing line is the one outcome, said once, by code (v3.17 C1; v3.10: by the talker)
         rt.started.emit("worker", job, "x")
         rt.tool_called.emit("worker", job, "press", {"key": "k", "finishes_with": "Paused it."})
         rt.tool_finished.emit("worker", job, "press", True, "pressed k")
         rt.finished.emit("worker", job, "Paused it.")
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle(20)
-        assert spoken == []
-        assert announced and announced[-1][0].get("verified") is True and announced[-1][1] is True
+        assert spoken == ["Paused it."]
+        assert announced and announced[-1][0].get("verified") is True and announced[-1][0].get("said") is True
+        assert announced[-1][1] is False   # no talker run for it
 
     asyncio.run(main())
 
@@ -671,7 +674,9 @@ def test_tell_yuki_writes_screen_first_and_can_replace_work() -> None:
     assert props[0] == "screen" and "screen" in TELL_YUKI["required"]
     assert "instead" in TELL_YUKI["properties"]["intent"]["enum"]
     assert "replaces" in props and "acts" in props
-    assert "Your name alone" in MOUTH_PROMPT and "never argue" in MOUTH_PROMPT
+    from yuki.voice.mouth import HANDS_PROMPT
+
+    assert "Your name alone" in MOUTH_PROMPT and "never argue" in HANDS_PROMPT   # v3.17: the hands' own block
 
 
 def test_the_volatile_block_carries_the_thinker_line() -> None:
@@ -896,6 +901,8 @@ def test_silence_is_refused_once_when_the_user_is_waiting() -> None:
         assert "still waiting" in p.results[-1][0]["not_quiet"]
         await bridge.stay_quiet(p)  # quiet again on a held hand-off: it is done after all, never silence
         await _settle()
-        assert spoken == ["Finding it."] and _rt.submitted[-1][2] == {"lane": "worker", "view_hwnd": 42}
+        assert spoken == ["Finding it."]
+        assert {k: v for k, v in _rt.submitted[-1][2].items() if k != "memory_query"} == {"lane": "worker",
+                                                                                         "view_hwnd": 42}
 
     asyncio.run(main())

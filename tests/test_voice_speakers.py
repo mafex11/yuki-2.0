@@ -387,14 +387,16 @@ def test_the_call_note_is_there_only_in_a_call() -> None:
     plain = mouth_system_blocks(memory, tail=["tail"])
     call = mouth_system_blocks(memory, tail=["tail"], call="Discord")
     assert [b["text"] for b in plain] == [b["text"] for b in call if not b["text"].startswith("[Private note")]
-    assert call[1]["text"] == CALL_LAYER.format(app="Discord") and "cache_control" not in call[1]
+    layer = next(b for b in call if b["text"].startswith("[Private note"))   # v3.17: after the core and the hands
+    assert layer["text"] == CALL_LAYER.format(app="Discord") and "cache_control" not in layer
     assert "voice call on Discord" in volatile_block(call="Discord")["text"]
     # v3.10: the note is private (never said); stale screen evidence gets the unsure layer
     from yuki.voice.mouth import CALL_LAYER_UNSURE
 
     stale = mouth_system_blocks(memory, tail=["tail"], call="Discord", call_evidence="stale")
-    assert stale[1]["text"] == CALL_LAYER_UNSURE.format(app="Discord")
-    assert "never to be said" in call[1]["text"] and "never to be said" in stale[1]["text"]
+    unsure = next(b for b in stale if b["text"].startswith("[Private note"))
+    assert unsure["text"] == CALL_LAYER_UNSURE.format(app="Discord")
+    assert "never to be said" in layer["text"] and "never to be said" in unsure["text"]
     assert "voice call" not in volatile_block()["text"]
     assert "people on the call" in STAY_QUIET["description"]
 

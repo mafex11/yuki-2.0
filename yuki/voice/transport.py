@@ -168,7 +168,8 @@ class SpeakerOutput(BaseOutputTransport):
     conversation with the error tone.
     """
 
-    def __init__(self, speaker: Speaker | None, params: TransportParams) -> None:
+    def __init__(self, speaker: Speaker | None, params: TransportParams, *, qos: bool = True,
+                 mmcss: bool = True) -> None:
         super().__init__(params)
         #: ``(error) -> bool``: reopen the speaker (the session's); ``True`` when it opened again. ``None``: no reopen.
         self.on_write_failing: Any = None
@@ -184,13 +185,39 @@ class SpeakerOutput(BaseOutputTransport):
         # conversations were mute ("'SpeakerOutput' object has no attribute '_executor'", 615 frames), and the
         # user's "Oh, answer, what the fuck?" was said to a reply he never heard (v3.15).
         self._executor: ThreadPoolExecutor | None = None
+        #: D7 (v3.17): the writer thread on time (out of power throttling, in the MMCSS "Audio" task) while it lives.
+        self.qos = qos
+        self.mmcss = mmcss
+        self._thread_qos: Any = None
+        #: What that did, for the log.
+        self.qos_facts: dict[str, Any] | None = None
         if speaker is not None:
             self._start_writer()
 
     def _start_writer(self) -> None:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-out")
-            self._executor.submit(lambda: None)   # its thread starts now, not on the loop's first write (v3.14)
+            # Its thread starts now, not on the loop's first write (v3.14), and is put on time there (v3.17).
+            self._executor.submit(self._writer_started)
+
+    def _writer_started(self) -> None:
+        if not self.qos:
+            return
+        try:
+            from yuki.voice.qos import ThreadQos
+
+            self._thread_qos = ThreadQos()
+            self.qos_facts = self._thread_qos.apply(mmcss=self.mmcss)
+        except Exception as exc:  # noqa: BLE001 - scheduling hints never break audio
+            self.qos_facts = {"error": type(exc).__name__}
+
+    def _writer_ending(self) -> None:
+        handle, self._thread_qos = self._thread_qos, None
+        if handle is not None:
+            try:
+                handle.revert()
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_speaker(self, speaker: Speaker) -> None:
         self._speaker = speaker
@@ -240,6 +267,10 @@ class SpeakerOutput(BaseOutputTransport):
             await super().cleanup()
         finally:
             if self._executor is not None:
+                try:
+                    self._executor.submit(self._writer_ending)   # on its own thread, after the last write
+                except RuntimeError:   # already shut down
+                    pass
                 self._executor.shutdown(wait=False)
 
 
