@@ -1323,7 +1323,7 @@ CALL_KINDS: tuple[str, ...] = ("call", "game")
 def user_side_text(kind: str | None, text: str | None) -> str | None:
     """A capture's text as the generic readers may show it: a call transcript (:data:`CALL_SIDE_KIND`) without its
     ``lines`` - only the user's own ``utterances``, as every capture read before 3 Oct 2026 - so the other people's
-    words reach no prompt until the call readers are taught who spoke (report 53). Other kinds unchanged."""
+    words reach no prompt until the call readers are taught who spoke (report 61). Other kinds unchanged."""
     if kind != CALL_SIDE_KIND or not text:
         return text
     try:
@@ -2853,7 +2853,7 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at          REAL NOT NULL
     );
     """,
-    # 34 (2026-10-03, calls record both sides, docs/research/revamp-2026-10-02/52-build-call-others-capture.md;
+    # 34 (2026-10-03, calls record both sides, docs/research/revamp-2026-10-02/60-build-call-others-capture.md;
     # the owner's decision, handbook rule 9): the user's microphone plus the call app's own audio (process
     # loopback), and a game's own voice chat as a voice session of its own.
     # - calls.kind: call | game (a game's voice chat, started by the measured gaming_with_voice signal, asked with

@@ -408,7 +408,7 @@ def test_capture_session_events_reach_the_watch_through_com():
     assert session.unregistered == 1
 
 
-# -- review fixes (report 52, "Review fixes") ------------------------------------------------------------------
+# -- review fixes (report 60, "Review fixes") ------------------------------------------------------------------
 
 
 class FakeOperation(COMObject):

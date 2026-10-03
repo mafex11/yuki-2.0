@@ -1,4 +1,4 @@
-"""Calls, both sides (owner's decision 3 Oct 2026; docs/research/revamp-2026-10-02/52-build-call-others-capture.md).
+"""Calls, both sides (owner's decision 3 Oct 2026; docs/research/revamp-2026-10-02/60-build-call-others-capture.md).
 
 The user's microphone plus each consented app's own audio (process loopback) as tracks of one voice session; a
 full-screen game's voice chat as a session of its own, asked only when a card can be seen; every line attributed
@@ -715,7 +715,7 @@ def test_spool_names_carry_the_track_and_spans_are_pruned_with_the_spool(store):
         assert conn.execute("SELECT count(*) FROM mic_spans").fetchone()[0] == 1
 
 
-# -- review fixes (report 52, "Review fixes") ------------------------------------------------------------------
+# -- review fixes (report 60, "Review fixes") ------------------------------------------------------------------
 
 
 def _mic(store: Store) -> dict:
