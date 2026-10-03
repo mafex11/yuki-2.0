@@ -1598,8 +1598,30 @@ class Agent:
                 self._session_lessons.append((time.time(), lessons))
                 self.logger.log("session_lessons", apps=sorted(lessons), lines=sum(len(v) for v in lessons.values()))
                 self._keep_pitfalls(outcome=outcome, at=at, lessons=lessons)
+            self._keep_slider_way(outcome=outcome, at=at)
         except Exception as exc:  # noqa: BLE001 - a lesson never breaks a request
             self.logger.log("session_lessons", error=f"{type(exc).__name__}: {exc}"[:200])
+
+    def _keep_slider_way(self, *, outcome: str, at: float) -> None:
+        """N2 (report 47, review): after one success, the way a slider of that app was moved (which control of the read
+        holds it, set by its value or its own keys and read back) as a practice procedure for that app, so the next
+        request goes straight to it. Practice memory's distiller learns only runs of three actions or more; this is
+        one. Learned from the run's verified step, never hard-coded per app."""
+        if outcome != "final" or not getattr(self.memory, "installed", False):
+            return
+        objects: dict[str, dict[str, Any]] = {}
+        for s in getattr(self, "_trace", None) or []:
+            if (s.get("tool") == "set_slider" and s.get("kind") == "action" and s.get("ok") is True
+                    and s.get("verdict") is True and s.get("app")):
+                control = str(s.get("target") or "").split(", window ", 1)[0].strip()
+                if not control or control.startswith("window "):
+                    continue
+                objects[str(s["app"])] = {"kind": "procedure", "body": {"steps": [   # each step at most 160 chars
+                    "Read the window",
+                    f"set_slider on {control[:70]} with to (percent) or by (points); it reads the value back",
+                    "Never drag the slider or script the mouse"]}}
+        if objects:
+            self._write_practice(objects, origin="slider", outcome=outcome, at=at)
 
     #: How long the background write of a run's pitfalls may take (s; off the request's path).
     PITFALL_WRITE_S = 8.0
@@ -1618,28 +1640,44 @@ class Agent:
                                            steers=list(getattr(self, "_steer_texts", None) or []))
         if not pits:
             return
+        objects = {app: {"kind": "pitfall", "body": {"text": pit["text"], "instead": pit["instead"] or None}}
+                   for app, pit in pits.items()}
+
+        def kept(_ids: list[int]) -> None:
+            for app in pits:   # practice memory shows it now: the session copy would only repeat it
+                if lessons is not None:
+                    lessons.pop(app, None)
+
+        self._write_practice(objects, origin="session", outcome=outcome, at=at, on_done=kept)
+
+    def _write_practice(self, objects: dict[str, dict[str, Any]], *, origin: str, outcome: str, at: float,
+                        on_done: Any = None) -> None:
+        """Write practice objects learned by code from this run (``{app: {"kind", "body"}}``; the intent is the
+        request's words through memory's secret filter) with one ``observed`` event of this run, through the existing
+        practice store (``practice.add_playbook``; no migration). A near-identical live object of the same kind, app and
+        ``origin`` is superseded, not piled up. On a daemon thread, off the request's path; never raises."""
         intent = " ".join(str(self._this_query or "").split())[:120] or "a task"
         key = f"agent:{getattr(self.memory, 'session_id', None) or ''}:{self.lane}-{self._requests}"
         logger = self.logger
+        memory = self.memory
 
         def write(client: Any) -> list[int]:
             from yuki.memory import practice as practice_store
 
             ids = []
             what = practice_store._redact(intent) or "a task"   # memory's secret filter, as for every trace
-            for app, pit in pits.items():
-                embed = getattr(client, "_embed", None)
-                vec = embed(practice_store.vector_text(client.store, what)) if callable(embed) else None
+            embed = getattr(client, "_embed", None)
+            vec = embed(practice_store.vector_text(client.store, what)) if callable(embed) else None
+            for app, obj in objects.items():
                 supersedes = None
                 if vec is not None:
-                    near = practice_store.near(client.store, vec, kinds=["pitfall"], limit=4)
-                    same = [o for o in near if o.origin == "session" and practice_store.app_key(app) in o.apps
+                    near = practice_store.near(client.store, vec, kinds=[obj["kind"]], limit=4)
+                    same = [o for o in near if o.origin == origin and practice_store.app_key(app) in o.apps
                             and (o.score or 0.0) >= practice_store.SUPERSEDE_COSINE]
                     supersedes = same[0].id if same else None
                 ids.append(practice_store.add_playbook(
-                    client.store, {"kind": "pitfall", "intent": what, "apps": [app], "origin": "session",
-                                   "body": {"text": pit["text"], "instead": pit["instead"] or None},
-                                   "sources": [key]},
+                    client.store, {"kind": obj["kind"], "intent": what, "apps": [app], "origin": origin,
+                                   "body": obj["body"], "sources": [key]},
                     events=[{"type": "observed", "run_key": key, "refs": {"outcome": outcome}, "at": at}],
                     vector=vec, embed_model=getattr(getattr(client, "_embedder", None), "model_name", None),
                     supersedes=supersedes))
@@ -1647,15 +1685,14 @@ class Agent:
 
         def run() -> None:
             try:
-                ids = self.memory.call("session_pitfalls", write, timeout_s=self.PITFALL_WRITE_S)
-                logger.log("session_pitfalls", ok=True, apps=sorted(pits), ids=list(ids or []))
-                for app in pits:   # practice memory shows it now: the session copy would only repeat it
-                    if lessons is not None:
-                        lessons.pop(app, None)
+                ids = memory.call(f"practice_{origin}", write, timeout_s=self.PITFALL_WRITE_S)
+                logger.log("practice_written", origin=origin, ok=True, apps=sorted(objects), ids=list(ids or []))
+                if on_done is not None:
+                    on_done(list(ids or []))
             except Exception as exc:  # noqa: BLE001 - memory never breaks a request
-                logger.log("session_pitfalls", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
+                logger.log("practice_written", origin=origin, ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
 
-        threading.Thread(target=run, name="yuki-session-pitfalls", daemon=True).start()
+        threading.Thread(target=run, name=f"yuki-practice-{origin}", daemon=True).start()
 
     #: N9: how long the people-lately block is reused (s), and how long a request waits for it the first time (s; a
     #: slower answer is kept for the next request when it lands).

@@ -1122,3 +1122,42 @@ def test_n10_a_plain_text_ending_is_held_like_done_and_whatever_is_left_is_said(
     assert "your reply above was not sent and the request did not end" in seen[0]
     finals = [e for e in events if isinstance(e, Final)]
     assert finals and finals[-1].text == "All set. Still left from your list: message Sam on Discord."
+
+
+def test_n2_a_slider_moved_once_is_kept_as_that_apps_way_in_practice_memory(tmp_path: Path) -> None:
+    """Review (N2 not done): after one verified set_slider the way (which control holds the slider) is a practice
+    procedure for that app, learned from the run (the distiller learns only runs of three actions or more)."""
+    import numpy as np
+
+    from yuki.memory import practice as P
+    from yuki.memory.api import MemoryClient
+    from yuki.memory.store import Store
+
+    class Words:
+        model_name = "stub-words"
+
+        def embed(self, texts: list[str], wait_s: float | None = None) -> Any:
+            out = np.zeros((len(texts), 64), dtype=np.float32)
+            for i, text in enumerate(texts):
+                for w in str(text).casefold().split():
+                    out[i, sum(map(ord, w)) % 64] += 1.0
+            return out
+
+    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
+    client._embedder = Words()
+    desk = ChatPlayerDesk(volume=30.0)
+    volume = _ids(desk.get_window_tree(PLAYER))["Change volume"]
+    brain = Brain([_response(_use("look_at_window", hwnd=PLAYER)),
+                   _response(_use("set_slider", element=volume, expect_hwnd=PLAYER, to=80)),
+                   _response(_use("done", message="Spotify's own volume is at 80% now.", about=[], states=[]))])
+    try:
+        _run(_agent(brain, tmp_path, desk, memory=_memory(client)), "turn the volume up inside spotify")
+        assert desk.volume == 80.0
+        deadline = time.time() + 5
+        while time.time() < deadline and not P.live(client.store, ["procedure"]):
+            time.sleep(0.05)
+        ways = P.live(client.store, ["procedure"])
+        assert len(ways) == 1 and ways[0].origin == "slider" and ways[0].apps == ["spotify"]
+        assert "set_slider on Text \"Change volume\"" in ways[0].text() and "Never drag" in ways[0].text()
+    finally:
+        client.store.close()
