@@ -498,8 +498,9 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .fg-more .grow { flex: 1; }
 .fg-sort { display: inline-flex; gap: 4px; margin-left: 6px; }
 .rt .fx-h { align-items: center; }
-.rt .fx-h .tx { white-space: normal; overflow: visible; display: flex; flex-direction: column; gap: 2px; }
+.rt .fx-h .tx { white-space: normal; overflow: visible; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0; }
 .rt .fx-h .tx .rt-t { font-weight: 600; }
+.rt .fx-h .tx .rt-w { color: var(--text-3); white-space: pre; }
 .conf { display: inline-flex; gap: 2px; align-items: center; position: relative; }
 .conf i { width: 4px; height: 4px; border-radius: 50%; background: var(--dot); }
 .conf i.on { background: var(--text-2); }

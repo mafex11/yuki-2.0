@@ -402,3 +402,20 @@ def test_home_has_the_days_ai_cost_in_plain_words_and_away_rows_say_how_long(tmp
     for word in ("journal", "portrait", "brandnew", "_call", "agent"):
         assert word not in json.dumps(cost)
     assert W.ai_cost_row(None) is None
+
+
+def test_a_routine_says_when_from_its_own_evidence_times():
+    def at(day, hh, mm=0):   # 2026-09-28 is a Monday
+        return datetime(2026, 9, 28 + day, hh, mm).timestamp() if day < 3 else datetime(2026, 10, day - 2, hh, mm).timestamp()
+
+    weekdays = {"evidence": [{"at": at(d, 19, 5)} for d in (0, 1, 2, 3)]}
+    assert W.routine_when(weekdays) == "weekdays, around 7 PM"
+    late = {"evidence": [{"at": at(0, 23, 50)}, {"at": at(1, 0, 20)}, {"at": at(5, 23, 40)}]}   # across midnight, one routine
+    assert W.routine_when(late) == "around 12 AM"
+    desk = {"evidence": [{"at": at(d, 20, 40)} for d in (0, 1, 5)]}
+    assert W.routine_when(desk) == "around 8:30 PM"
+    weekend = {"evidence": [{"at": at(5, h)} for h in (9, 13)] + [{"at": at(6, 18)}, {"at": datetime(2026, 9, 27, 11).timestamp()}]}
+    assert W.routine_when(weekend) == "weekends"                       # times don't agree: only the days
+    assert W.routine_when({"evidence": [{"at": at(0, 9)}, {"at": at(1, 9)}]}) == ""     # too few to say
+    view = W.fact_view({"ref": "fact:1", "kind": "behaviour", "text": "Sorted seeds.", "evidence": desk["evidence"]}, {})
+    assert view["days_seen"] == 3

@@ -171,8 +171,14 @@ class InventedMemory:
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
         today = [_ev(ago(h * H), "VS Code") for h in (1, 3)]
 
-        def week(app: str, days: tuple[int, ...]) -> list[dict]:
-            return [_ev(ago(d * D + 2 * H), app) for d in days]
+        def week(app: str, days: tuple[int, ...], at: tuple[int, int] | None = None) -> list[dict]:
+            """Evidence on those days ago: 2 h before NOW's time of day, or at ``at`` (hour, minute) of each day."""
+            if at is None:
+                return [_ev(ago(d * D + 2 * H), app) for d in days]
+            from datetime import datetime, timedelta
+
+            midnight = datetime.fromtimestamp(NOW).replace(hour=0, minute=0, second=0, microsecond=0)
+            return [_ev(round((midnight - timedelta(days=d)).timestamp() + at[0] * H + at[1] * M, 1), app) for d in days]
 
         call = [_ev(ago(1 * D + 5 * H), "call:mumble", 7)]
         return [
@@ -221,10 +227,10 @@ class InventedMemory:
                   "You write to friends in lowercase, short lines.", ago_s=3 * D, ev=week("Signal", (3,)), aspect="talk"),
             _fact(31, "routine", "Evenings", "Evenings at the desk from 8:30 PM",
                   "Most evenings you sit down at the PC from about 8:30 PM and often stay past midnight.", ago_s=5 * D,
-                  ev=week("VS Code", (0, 1, 2, 4, 5, 6)), confidence=0.86),
+                  ev=week("VS Code", (0, 1, 2, 4, 5, 6), at=(20, 40)), confidence=0.86),
             _fact(32, "routine", "Games", "A game most weekday evenings",
                   "On most weekday evenings you play a game full screen, roughly 7 PM to 8:30 PM.", ago_s=6 * D,
-                  ev=week("Hollow Knight", (0, 2, 4, 5)), confidence=0.72),
+                  ev=week("Hollow Knight", (2, 3, 4, 5), at=(19, 5)), confidence=0.72),
             _fact(33, "routine", "Mornings", "Late starts at weekends",
                   "At weekends you’re first at the PC after 9:30 AM.", ago_s=6 * D, ev=week("Firefox", (0, 6)), confidence=0.58),
             _fact(34, "behaviour", "Seed packets", "Sorted seed packets on 1 October",

@@ -752,12 +752,9 @@ def fact_prov(f: dict[str, Any], calls: dict[int, dict[str, Any]]) -> str:
 def week_seen(f: dict[str, Any], now: float | None = None) -> list[bool]:
     """The last 7 days (today last): on which of them the evidence a fact rests on was seen (the routine's week
     dots: "days seen in the last 7", measured from its cited entries)."""
-    from yuki.ui.window.data import epoch
-
     now = time.time() if now is None else now
     today = datetime.fromtimestamp(now).date()
-    days = {datetime.fromtimestamp(t).date() for e in f.get("evidence") or [] if isinstance(e, dict)
-            and (t := epoch(e.get("at"))) is not None}
+    days = evidence_days(f)
     return [today - timedelta(days=6 - i) in days for i in range(7)]
 
 
@@ -779,7 +776,52 @@ def fact_view(f: dict[str, Any], calls: dict[int, dict[str, Any]], now: float | 
     if f.get("kind") == "routine":
         out["week"] = week_seen(f, now)
         out["conf_word"] = conf_word(conf) or ("you told me" if f.get("origin") == "user" else "")
+        out["when"] = routine_when(f)
+    if f.get("kind") == "behaviour":
+        out["days_seen"] = len(evidence_days(f))
     return out
+
+
+def evidence_days(f: dict[str, Any]) -> set[Any]:
+    """The days the evidence a fact rests on was seen (its cited entries' times)."""
+    from yuki.ui.window.data import epoch
+
+    return {datetime.fromtimestamp(t).date() for e in f.get("evidence") or [] if isinstance(e, dict)
+            and (t := epoch(e.get("at"))) is not None}
+
+
+#: A routine's "when" is said only from this many cited times, and a time of day only when they sit this close.
+WHEN_MIN_TIMES, WHEN_SPAN_H = 3, 3.0
+
+
+def routine_when(f: dict[str, Any]) -> str:
+    """When a routine happens, measured from the times of the entries it rests on (memory keeps no "when" field):
+    "weekdays, around 9 PM", "around 7 AM", "weekends", or "" when the times don't agree. Arithmetic on its own
+    evidence: the hours' circular spread (a routine across midnight stays one), the weekdays of distinct days."""
+    import math
+
+    from yuki.ui.window.data import epoch
+
+    times = sorted(t for e in f.get("evidence") or [] if isinstance(e, dict) and (t := epoch(e.get("at"))) is not None)
+    if len(times) < WHEN_MIN_TIMES:
+        return ""
+    stamps = [datetime.fromtimestamp(t) for t in times]
+    hours = [s.hour + s.minute / 60 for s in stamps]
+    ang = [h / 24 * 2 * math.pi for h in hours]
+    mean = (math.degrees(math.atan2(sum(map(math.sin, ang)), sum(map(math.cos, ang)))) / 15) % 24
+    spread = max(min(abs(h - mean), 24 - abs(h - mean)) for h in hours) * 2
+    bits = []
+    days = {s.date() for s in stamps}
+    if len(days) >= WHEN_MIN_TIMES:
+        if all(d.weekday() < 5 for d in days):
+            bits.append("weekdays")
+        elif all(d.weekday() >= 5 for d in days):
+            bits.append("weekends")
+    if spread <= WHEN_SPAN_H:
+        half = int(round(mean * 2)) % 48          # to the nearest half hour
+        hour, mins = divmod(half * 30, 60)
+        bits.append(f"around {hour % 12 or 12}{':30' if mins else ''} {'AM' if hour < 12 else 'PM'}")
+    return ", ".join(bits)
 
 
 def review_view(q: dict[str, Any], facts_by_ref: dict[str, dict[str, Any]]) -> dict[str, Any]:

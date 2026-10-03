@@ -130,7 +130,8 @@
   function routineRow(r, d) {
     const p = (d.pending || {})[r.ref];
     const pinned = isPinned(r.ref, r.pinned), n = (r.week || []).filter(Boolean).length;
-    const head = h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: (p && p.kind === 'correct' && p.words) || r.h }));
+    const head = h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: (p && p.kind === 'correct' && p.words) || r.h }),
+      r.when ? h('span', { class: 'rt-w', text: ' · ' + r.when }) : null);   /* title · when (measured from its evidence) */
     const meta = [r.week ? wkDots(r.week) : null, r.conf_word ? confMeter(r.conf_word) : null, pinMark()];
     const body = [r.d ? h('div', { class: 'd', text: r.d }) : null,
       h('div', { class: 'meta2' }, pendingMeta(p), h('span', { class: 'rt-sure', text: `${cap(r.conf_word || 'still learning')} · seen ${n} of the last 7 days` }), r.prov ? h('span', { text: r.prov }) : null),
@@ -143,10 +144,11 @@
     const legend = h('div', { class: 'rt-key' }, h('span', null, h('span', { class: 'wkdots' }, h('i', { class: 'on' }), h('i', { class: 'on' }), h('i')), 'days I saw it, last 7'),
       h('span', null, h('span', { class: 'conf' }, h('i', { class: 'on' }), h('i', { class: 'on' }), h('i')), 'how sure I am'), h('span', { class: 't3', text: 'click one for the detail' }));
     const notRt = N.map((r) => Y.fold(r.ref, h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: r.h })), null,
-      [r.d ? h('div', { class: 'd', text: r.d }) : null, h('div', { class: 'meta2' }, r.prov ? h('span', { text: r.prov }) : null), factActs(isPinned(r.ref, r.pinned), { inline: true, noPin: !(d.can || {}).pin })],
+      [r.d ? h('div', { class: 'd', text: r.d }) : null, h('div', { class: 'meta2' }, r.days_seen ? h('span', { text: `seen on ${fmt.plural(r.days_seen, 'day')}` }) : null,
+        r.prov ? h('span', { text: r.prov }) : null), factActs(isPinned(r.ref, r.pinned), { inline: true, noPin: !(d.can || {}).pin })],
       { cls: 'rt notrt', data: { fact: '', ref: r.ref, kind: 'behaviour', title: r.h || '', text: r.d || r.h || '' } }));
     const body = h('div', { class: 'rts' }, R.length ? [legend, R.map((r) => routineRow(r, d))] : Y.empty('No routines yet. They come from what you do most days.'),
-      N.length ? [h('div', { class: 'label notrt-h', text: 'Not routines: things I saw on a day or two' }), notRt] : null);
+      N.length ? [h('div', { class: 'label notrt-h', text: 'Not routines: what you’ve been doing lately' }), notRt] : null);
     return Y.sec('Routines', R.length, body, Y.rightLabel('your preferences and rules are in your portrait'));
   }
 
