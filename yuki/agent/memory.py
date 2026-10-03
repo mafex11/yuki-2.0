@@ -2082,9 +2082,48 @@ def format_recall(
     return "\n".join(lines)
 
 
-#: Said once in every call result: whose words these are (docs/MEMORY.md, "Calls: just my side").
-CALL_SIDE_NOTE = ("Only the user's own microphone is ever recorded: this is their side of the call; nobody "
-                  "else's words are known.")
+#: Said once in every call result: whose words these are (docs/MEMORY.md, "Calls: both sides"). Since 3 Oct 2026 a
+#: call keeps the user's microphone and the call app's own sound, every line labelled; before, the user's alone.
+CALL_SIDE_NOTE = ("Whose words: lines marked [others on <app>] (or [game on <app>]) are that app's own sound - anyone "
+                  "on the call, maybe several people: name one only when the line or the screen around the call "
+                  "shows who. The rest are the user's. Never give someone else's words as the user's; where only the "
+                  "user's side was kept, never guess the others'.")
+#: Said too when a game's voice chat is in the result (its own session, a game track, or a line from one).
+GAME_SIDE_NOTE = ("A game's others are teammates and the game's own voice lines. In a game the user may be talking to "
+                  "teammates or to friends on a call: tell which from the time, the words and the apps their "
+                  "microphone was open to (mic open to, in the exact words); if it stays unclear, say so.")
+
+
+def call_line_mark(line: dict[str, Any], user: str = "") -> str:
+    """Who spoke a call line, as the call texts mark it: ``[others on Discord]``, ``[game on VALORANT]``, or
+    ``user`` for the user's own (a line with no ``who`` - written before 3 Oct 2026 - is the user's)."""
+    if line.get("who") != "others":
+        return user
+    app = line.get("app") or "the call"
+    return f"[game on {app}]" if line.get("track_kind") == "game" else f"[others on {app}]"
+
+
+def _has_game(c: dict[str, Any]) -> bool:
+    """Whether a call result holds a game's voice chat: its own session, a game track, or a game's line."""
+    if c.get("kind") == "game":
+        return True
+    if any(isinstance(t, dict) and t.get("track_kind") == "game" for t in c.get("tracks") or []):
+        return True
+    lines = [*(c.get("lines") or []), *(ln for b in c.get("blocks") or [] if isinstance(b, dict)
+                                          for ln in b.get("lines") or [])]
+    return any(isinstance(ln, dict) and ln.get("track_kind") == "game" for ln in lines)
+
+
+def _side_notes(*results: dict[str, Any]) -> str:
+    """:data:`CALL_SIDE_NOTE`, and :data:`GAME_SIDE_NOTE` when a game's voice chat is among the results."""
+    return CALL_SIDE_NOTE + (f" {GAME_SIDE_NOTE}" if any(_has_game(r) for r in results) else "")
+
+
+def _track_names(c: dict[str, Any]) -> str:
+    """``Discord, VALORANT game``: the apps whose own sound was kept on a call."""
+    names = [f"{t['app']} game" if t.get("track_kind") == "game" else str(t["app"])
+             for t in c.get("tracks") or [] if isinstance(t, dict) and t.get("app")]
+    return ", ".join(dict.fromkeys(names))
 
 
 def _stamp(value: Any) -> datetime | None:
@@ -2116,16 +2155,25 @@ def _call_head(c: dict[str, Any]) -> str:
         return (f"[meeting, no transcript] {name}{where}, {_span_text(c.get('start'), c.get('end'))} "
                 f"({_duration(c.get('seconds'))}; the app held the microphone in front, but nothing of it was "
                 "recorded)")
+    game = c.get("kind") == "game"
     rows = f"call row {ids[0]}" if len(ids) == 1 else f"one session, call rows {ids[0]}-{ids[-1]}"
-    head = f"[{c.get('ref')}] {c.get('app') or 'a call'}"
+    head = f"[{c.get('ref')}] {c.get('app') or 'a call'}" + (" game voice chat" if game else "")
     if c.get("service") and c.get("service") != c.get("app"):
         head += f" ({c['service']})"
     head += f", {_span_text(c.get('start'), None if c.get('ongoing') else c.get('end'))}"
-    head += f" ({rows}; on the call {_duration(c.get('seconds'))}"
-    if c.get("recorded"):
-        head += f"; the user spoke about {_duration(c.get('speech_s'))}"
+    head += f" ({rows}; {'in the game' if game else 'on the call'} {_duration(c.get('seconds'))}"
+    user = c.get("user_recorded", c.get("recorded"))      # an older memory: "recorded" was the user's microphone
+    apps = _track_names(c)
+    if user and c.get("others_recorded"):
+        head += (f"; both sides kept: the user spoke about {_duration(c.get('speech_s'))}, the others about "
+                 f"{_duration(c.get('others_speech_s'))}" + (f" ({apps})" if apps else ""))
+    elif user:
+        head += f"; the user spoke about {_duration(c.get('speech_s'))}; only the user's side was kept"
+    elif c.get("others_recorded"):
+        head += (f"; only the others' side was kept ({apps + ', ' if apps else ''}about "
+                 f"{_duration(c.get('others_speech_s'))}): the user's microphone was not recorded")
     else:
-        head += "; their side was not recorded"
+        head += "; not recorded"
     return head + ")"
 
 
@@ -2155,7 +2203,7 @@ def call_people_text(c: dict[str, Any]) -> str:
         parts.append("Where: " + "; ".join(where))
     people = [p for p in c.get("people") or [] if p.get("name")]
     if people:
-        parts.append("With (read from the screen around the call, never from their audio): " + ", ".join(
+        parts.append("With (read from the screen around the call, not from the voices): " + ", ".join(
             f"{p['name']} ({_PEOPLE_HOW_TEXT.get(p.get('how'), p.get('how') or '')})" for p in people))
     return " | ".join(parts)
 
@@ -2165,9 +2213,9 @@ def format_calls(calls: list[dict[str, Any]], *, since: datetime | None = None, 
     scope = " ".join(p for p in (f"since {_when(since)}" if since else "", f"before {_when(until)}" if until else "")
                      if p)
     if not calls:
-        return f"No calls or meetings in memory {scope or 'in that time'}. {CALL_SIDE_NOTE}"
+        return f"No calls or meetings in memory {scope or 'in that time'}."
     lines = [f"{len(calls)} call{'' if len(calls) == 1 else 's'} or meeting{'' if len(calls) == 1 else 's'} "
-             f"{scope} (rows of one continuous session merged). {CALL_SIDE_NOTE}"]
+             f"{scope} (rows of one continuous session merged). {_side_notes(*calls)}"]
     for c in calls:
         lines.append(f"- {_call_head(c)}")
         gists = [g.get("gist") for g in c.get("gists") or [] if g.get("gist")]
@@ -2184,10 +2232,10 @@ def format_calls(calls: list[dict[str, Any]], *, since: datetime | None = None, 
 
 
 def format_call_timeline(t: dict[str, Any]) -> str:
-    """The ``call_timeline`` text, already in the shape a written answer takes: the call, whose side it is, the
-    gists, then stretch by stretch (its time range and topics as a heading line), one line per moment with its
-    time, and the quiet hours between stretches."""
-    out = [_call_head(t), CALL_SIDE_NOTE]
+    """The ``call_timeline`` text, already in the shape a written answer takes: the call, which sides were kept and
+    whose words the lines are, the gists, then stretch by stretch (its time range and topics as a heading line), one
+    line per moment with its time (someone else's marked with who), and the quiet hours between stretches."""
+    out = [_call_head(t), _side_notes(t)]
     if t.get("since") or t.get("until"):
         out.append(f"Only the part {_span_text(t.get('since') or t.get('start'), t.get('until') or t.get('end'))}.")
     gists = [g.get("gist") for g in t.get("gists") or [] if g.get("gist")]
@@ -2237,7 +2285,8 @@ def format_call_timeline(t: dict[str, Any]) -> str:
                 at = _stamp(ln.get("at"))
                 mark = {"humor": " [joke]", "uncertain": " [uncertain]", "story": " [a story they told]"}.get(
                     str(ln.get("nature")), "")
-                chunk.append(f"      {hm(at) if at else '?'} {ln.get('text')}{mark}")
+                who = call_line_mark(ln)
+                chunk.append(f"      {hm(at) if at else '?'} {who + ' ' if who else ''}{ln.get('text')}{mark}")
         text = "\n".join(chunk)
         if size + len(text) > TIMELINE_MAX_CHARS:
             out.append(f"[Timeline cut here for length: {len(groups) - i} more stretches from {hm(start)}. Call "
@@ -2257,12 +2306,25 @@ def format_call_timeline(t: dict[str, Any]) -> str:
 
 
 def format_call_transcript(t: dict[str, Any]) -> str:
-    """One page of a call's exact transcript: time, words, and marks for unclear lines and repeated loops."""
+    """One page of a call's exact transcript: time, who spoke (the user's lines with the apps their microphone was
+    open to), words, and marks for unclear lines, repeated loops and speech said to Yuki."""
     lines = t.get("lines") or []
-    head = (f"The user's exact words on the {t.get('app') or ''} call [{t.get('ref')}] "
+    what = f"{t.get('app') or ''} game voice chat" if t.get("kind") == "game" else f"{t.get('app') or ''} call"
+    sides = t.get("sides") if isinstance(t.get("sides"), dict) else {}
+    counts = (f" ({sides.get('user', 0)} the user's, {sides.get('others', 0)} the others')"
+              if t.get("others_recorded") else "")
+    head = (f"The exact words on the {what} [{t.get('ref')}] "
             f"{_span_text(t.get('since') or t.get('start'), t.get('until') or t.get('end'))}, as the speech "
             f"recogniser heard them (noisy; Hindi often in Devanagari): page {t.get('page')} of {t.get('pages')}, "
-            f"{t.get('total')} lines in all. {CALL_SIDE_NOTE}")
+            f"{t.get('total')} lines{' kept' if t.get('who') in ('user', 'others') else ''}{counts}. "
+            f"Each line: time, who ([user]: their microphone, with the apps it was open to when known), words. "
+            f"{_side_notes(t)}")
+    if t.get("who") == "user":
+        head += " Only the user's lines here; the others' are left out."
+    elif t.get("who") == "others":
+        head += " Only the others' lines here; the user's are left out."
+    if "others_recorded" in t and not t.get("others_recorded"):
+        head += " Only the user's side was kept on this call."
     if not lines:
         return head + "\nNo words stored for this stretch (nothing said, or past the 30-day limit)."
     out = [head]
@@ -2281,7 +2343,12 @@ def format_call_transcript(t: dict[str, Any]) -> str:
         elif ln.get("to_yuki"):
             marks.append("Yuki was listening: maybe said to Yuki")
         tail = f" [{', '.join(marks)}]" if marks else ""
-        out.append(f"{at.strftime('%H:%M:%S') if at else '?'} {ln.get('text')}{tail}")
+        who = call_line_mark(ln)
+        if not who:   # the user's own line, with the apps their microphone was open to when that was measured
+            heard = ln.get("heard_by")
+            who = ("[user]" if not isinstance(heard, list) else
+                   f"[user; mic open to {', '.join(str(h) for h in heard) or 'no app'}]")
+        out.append(f"{at.strftime('%H:%M:%S') if at else '?'} {who} {ln.get('text')}{tail}")
     if int(t.get("page") or 1) < int(t.get("pages") or 1):
         out.append(f"[More: page={int(t.get('page') or 1) + 1}]")
     return "\n".join(out)

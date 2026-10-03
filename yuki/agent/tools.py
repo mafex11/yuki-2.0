@@ -435,11 +435,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "until and with_time_use: the measured time use of that window comes back with the facts.\n"
             "- activity: time per site, app or page (group_by), longest stretches, away time and episodes in "
             "since..until (default today). An app's window in front, its calls and its background use come apart.\n"
-            "- calls: the calls and meetings in since..until (default 7 days): app, start, end, how long they spoke, "
-            "a gist. For what happened on one, open it with call_timeline.\n"
+            "- calls: the calls, meetings and game voice chats in since..until (default 7 days): app, start, end, "
+            "how long each side spoke, a gist. For what happened on one, open it with call_timeline.\n"
             "- call_timeline: one call (call, e.g. call:16), the whole session, in stretches with times; words true "
-            "gives their exact words a page at a time. Only the user's own microphone is recorded: it is their "
-            "side alone. Written, keep the shape it comes in: each stretch's time range as its own line, then one "
+            "gives the exact words a page at a time. Both sides are kept, each line saying who spoke (a game's "
+            "others: teammates, its voice lines); never give the others' words as the user's. Written, keep the "
+            "shape it comes in: each stretch's time range as its own line, then one "
             "short line per moment starting with its time, the quiet hours in a few words, for example\n"
             "**13:24-13:51** Claude work, MCP deadline\n- 13:28 said five Claude sessions were running at once\n"
             "(quiet 15:46-18:32)\nSpoken: the two or three moments that matter, with their times.\n"
@@ -463,7 +464,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "with_time_use": {"type": "boolean", "description": "recall: also the measured time use (needs since)."},
                 "group_by": {"type": "string", "enum": ["site", "app", "page"]},
                 "call": {"type": "string", "description": "call_timeline: the call's id, e.g. call:16."},
-                "words": {"type": "boolean", "description": "call_timeline: their exact words instead."},
+                "words": {"type": "boolean", "description": "call_timeline: the exact words instead."},
                 "page": {"type": "integer"},
                 "action": {"type": "string", "enum": ["list", "search", "open"]},
                 "thread": {"type": "string", "description": "threads: an id, e.g. thread:12."},
