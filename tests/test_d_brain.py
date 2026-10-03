@@ -595,7 +595,7 @@ def test_the_schemas_got_lighter_where_tool_metadata_allows() -> None:
     assert STEP_FIELD in voice["click"]["input_schema"]["properties"]
     assert STEP_FIELD not in voice["click"]["input_schema"]["required"]    # optional now
     typed = len(json.dumps(tool_params(cacheable=False, screenshot_policy="never")))
-    assert typed < 35_000, typed   # was 70,190 characters; vfix2 (report 47) added check_situation, set_slider, tasks
+    assert typed < 36_000, typed   # was 70,190; vfix2 (report 47): +4.1k for check_situation, set_slider, tasks, states
 
 
 def test_a_finishing_call_ends_with_a_line_written_by_code_that_the_voice_reads_as_verified(tmp_path: Path) -> None:
