@@ -9,10 +9,10 @@
 Every write goes through a parameter (``env``, ``local_dir``, ``memory_dir``) so
 tests and trial runs point at scratch locations. Slow work (the key test, the
 download) runs on plain threads and reports back through queued Qt signals.
-Colours and fonts are copied from ``yuki.ui.window.theme`` rather than imported,
-so this window does not depend on the UI package. The steps are four small hardware keys across the top;
-the current one's LED is lit in the accent (olive green #748F42, the default; the wizard runs before any
-setting).
+Colours and the UI family come from the one token source (:mod:`yuki.ui.tokens`, plain Python, no Qt) rather
+than from ``yuki.ui.window.theme``, so this window does not depend on the Qt theme. The steps are four small
+hardware keys across the top; the current one's LED is lit in the live colour (the default accent: the wizard
+runs before any setting).
 """
 
 from __future__ import annotations
@@ -42,31 +42,39 @@ from PySide6.QtWidgets import (
 
 import yuki.onboarding as ob
 from yuki.onboarding import consent as consent_mod
+from yuki.ui import tokens as _tokens
 from yuki.onboarding import prefs
 from yuki.onboarding.envvars import UserEnv
 
-# -- look (Horizon x Field Unit, the tokens of yuki.ui.window.theme) ------------------------------------------
+# -- look (Lattice: the one token source, yuki/ui/web/tokens.json via yuki.ui.tokens) -------------------------
+# The palette only; the wizard's own re-skin is Phase E15. It runs before any ui.json exists: default accent.
 
-BG = "#07080A"
-PANEL = "#0C0E11"
-FIELD = "#050607"
-LINE = "#181B21"
-KEY = "#101216"
-KEY_ON = "#16191F"
-MUTED_BG = "#101216"
-TEXT = "#E4E6E9"
-TEXT_2 = "#A4AAB3"
-MUTED = "#6B717B"
-FAINT = "#393E47"
-LED_OFF = "#23272E"
-PRIMARY = "#E4E6E9"
-PRIMARY_FG = "#07080A"
-RING = "#6B717B"
-ACCENT_LED = "#748F42"   # the default accent (olive green): the current step's LED only
-ACCENT = TEXT_2          # links: ink, underlined (the accent is for live states)
+_C = _tokens.COLOR
+_LIVE = _tokens.ACCENTS[_tokens.DEFAULT_ACCENT]["live"]
+_LIVE_RGB = tuple(int(_LIVE[i:i + 2], 16) for i in (1, 3, 5))
+BG = _C["bg"]
+PANEL = _C["panel"]
+FIELD = _C["raise"]
+LINE = _C["hair2"]
+KEY = _C["raise"]
+KEY_ON = _C["raise2"]
+MUTED_BG = _C["raise"]
+TEXT = _C["text"]
+TEXT_2 = _C["text2"]
+MUTED = _C["text3"]
+FAINT = _C["mark"]
+LED_OFF = _C["dot"]
+PRIMARY = _C["lit"]
+PRIMARY_FG = _C["bg"]
+RING = _LIVE             # Lattice: the focus ring is the live colour
+ACCENT_LED = _LIVE       # the current step's LED only
+ACCENT = TEXT_2          # links: ink, underlined (the live colour is for live states)
 GOOD = TEXT_2            # "Key works." in words, no colour
-BAD = "#E5736B"
-FONT = '"IBM Plex Sans", "Segoe UI", "Nirmala UI"'   # the bundled UI face (yuki.ui.fonts), loaded by the wizard
+BAD = _C["text"]         # an error in words, in the brightest ink (Lattice has one colour, and it means live)
+SELECTION = f"rgba({_LIVE_RGB[0]},{_LIVE_RGB[1]},{_LIVE_RGB[2]},0.28)"
+UI_FAMILY = _tokens.TYPE["family"]["ui"]
+FONT_FAMILIES = [UI_FAMILY, "IBM Plex Sans", "Segoe UI", "Nirmala UI"]
+FONT = ", ".join(f'"{f}"' for f in FONT_FAMILIES)   # the bundled UI face (yuki.ui.fonts), loaded by the wizard
 FONT_DISPLAY = FONT
 
 STYLE = f"""
@@ -79,15 +87,15 @@ QLabel#section {{ font-family: {FONT_DISPLAY}; font-weight: 400; font-size: 17px
 QLabel#bad {{ color: {BAD}; }}
 QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 18px; }}
 QLineEdit {{ background: {FIELD}; border: 1px solid {LINE}; border-radius: 14px; padding: 7px 14px;
-            selection-background-color: #262B33; }}
+            selection-background-color: {SELECTION}; }}
 QLineEdit:focus {{ border: 1px solid {RING}; }}
 QPushButton {{ background: transparent; color: {TEXT_2}; border: 1px solid {LINE}; border-radius: 17px;
               padding: 6px 16px; min-height: 20px; font-size: 13px; }}
 QPushButton:hover {{ background: {KEY}; color: {TEXT}; }}
 QPushButton:disabled {{ color: {FAINT}; background: transparent; }}
 QPushButton#primary {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: {PRIMARY_FG}; font-weight: 500; }}
-QPushButton#primary:hover {{ background: #C6CBD1; border-color: #C6CBD1; }}
-QPushButton#primary:disabled {{ background: #393E47; border-color: transparent; color: #181B21; }}
+QPushButton#primary:hover {{ background: #FFFFFF; border-color: #FFFFFF; }}
+QPushButton#primary:disabled {{ background: {FAINT}; border-color: transparent; color: {KEY_ON}; }}
 QPushButton#flat {{ background: transparent; border: none; color: {MUTED}; }}
 QPushButton#flat:hover {{ color: {TEXT}; background: {KEY}; }}
 QPushButton#small {{ padding: 5px 12px; font-size: 13px; }}
@@ -122,8 +130,8 @@ class StepKeys(QWidget):
     def paintEvent(self, _e: object) -> None:  # noqa: D102
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        f = QFont("IBM Plex Sans")
-        f.setFamilies(["IBM Plex Sans", "Segoe UI", "Nirmala UI"])
+        f = QFont(UI_FAMILY)
+        f.setFamilies(FONT_FAMILIES)
         f.setPixelSize(12)
         p.setFont(f)
         fm = QFontMetrics(f)
@@ -313,7 +321,7 @@ class OnboardingDialog(QDialog):
         self._bridge.downloaded.connect(self._on_downloaded)
 
         self.setWindowTitle("Set up Yuki")
-        try:   # the bundled UI face (IBM Plex Sans) and the Devanagari fallback, before the style names them
+        try:   # the bundled UI face (Instrument Sans) and the Devanagari fallback, before the style names them
             from yuki.ui.fonts import load_fonts
 
             load_fonts()

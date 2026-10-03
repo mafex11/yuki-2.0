@@ -34,8 +34,21 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-#: Protocol version, sent in ``hello`` (a window from another version still gets its reply).
-VERSION = 1
+#: Protocol version, sent in ``hello`` (a window from another version still gets its reply). 2: the Lattice
+#: window's ops (Phase E5), listed in :data:`OPS` and sent in ``hello`` so a window can tell what the tray serves.
+VERSION = 2
+
+#: Every request op the tray serves (:meth:`yuki.ui.window_host.WindowHost._handle`). Version 1's, then the E5
+#: ones: ``stop(job)``, ``steer(job, text)``, ``now``, ``plan(card)``, ``card_feedback(card, kind)``,
+#: ``activity(filter)``, ``threads``, ``people``, ``workflows``, ``workflow_edit``, ``permissions_get``,
+#: ``permissions_set(kind, level)``, ``forget(object)``. Unasked events the tray may send: ``snapshot``,
+#: ``chat``, ``state``, ``focus`` and (E5) ``permissions`` (the policy changed).
+OPS: tuple[str, ...] = (
+    "hello", "state", "submit", "nudge_do", "cancel", "voice_set", "voice_toggle", "devices", "model", "effort",
+    "ui_settings", "ensure_memory", "open_logs", "snooze",
+    "stop", "steer", "now", "plan", "card_feedback", "activity", "threads", "people", "workflows",
+    "workflow_edit", "permissions_get", "permissions_set", "forget",
+)
 _BUF = 1 << 16
 #: Largest message either side accepts.
 MAX_MESSAGE = 16 << 20

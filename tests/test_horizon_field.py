@@ -1,5 +1,5 @@
 """The Horizon x Field Unit redesign (2026-09-28): the skyline's data and its picked moment, the waves that
-stop when hidden, the accent setting, the bundled fonts (IBM Plex Sans and Doto), the GUI stall watchdog, the
+stop when hidden, the accent setting, the bundled fonts (Instrument Sans, Doto; Plex as the fallback), the GUI stall watchdog, the
 encrypted page snapshot, the placeholders that keep their size, and round 2's dashboard cards that lead to the
 other pages and the Me/Yuki rows that fold open. Offscreen only (rule 7), temporary files only."""
 
@@ -204,21 +204,21 @@ def test_the_accent_setting_is_saved_and_repaints_the_window(qapp, tmp_path):
     from yuki.ui.window.app import WindowApp
     from yuki.ui.window.theme import ACCENTS, DEFAULT_ACCENT, accent_name, theme
 
-    assert DEFAULT_ACCENT == "green" and ACCENTS == {"green": "#748F42", "orange": "#E4571C"}
+    assert DEFAULT_ACCENT == "green" and ACCENTS == {"green": "#6FEBC4", "orange": "#FFA46B"}   # Lattice live colours
     path = tmp_path / "ui.json"
     assert ui_settings.load(path).accent == "green"                    # the default
     ui_settings.update(path, accent="orange")
     assert ui_settings.load(path).accent == "orange"
     ui_settings.update(path, accent="blue")                             # not a choice any more: back to green
     assert ui_settings.load(path).accent == "green"
-    assert accent_name("orange") == "orange" and theme(accent="orange").accent.name() == "#e4571c"
+    assert accent_name("orange") == "orange" and theme(accent="orange").accent.name() == "#ffa46b"
     memory = MemoryClient.open(tmp_path / "memory.db")
     try:
         ctrl = WindowApp(memory, db_path=tmp_path / "memory.db", connect=False, ui_path=path)
         ctrl.set_accent("orange")
         assert ui_settings.load(path).accent == "orange"
-        assert ctrl.t.accent.name() == "#e4571c" and ctrl.win.sidebar.t.accent.name() == "#e4571c"
-        assert all(k.t.accent.name() == "#e4571c" for k in ctrl.win.sidebar.items.values())
+        assert ctrl.t.accent.name() == "#ffa46b" and ctrl.win.sidebar.t.accent.name() == "#ffa46b"
+        assert all(k.t.accent.name() == "#ffa46b" for k in ctrl.win.sidebar.items.values())
         ctrl.set_accent("teal")                                          # ignored
         assert ui_settings.load(path).accent == "orange"
         ctrl.win.close()
@@ -381,23 +381,24 @@ def test_a_long_thread_paints_its_newest_bubbles_first_and_fills_in_above(qapp):
     view.close()
 
 
-# -- round 2: the UI face ------------------------------------------------------------------------------------
+# -- the UI face (Lattice, 2026-10-03: Instrument Sans; IBM Plex Sans stays bundled as the fallback) -----------
 
 
-def test_ibm_plex_sans_is_the_bundled_ui_face_with_nirmala_after_it(qapp):
+def test_instrument_sans_is_the_bundled_ui_face_with_nirmala_after_it(qapp):
     from PySide6.QtGui import QFontInfo
 
     from yuki.ui import fonts
     from yuki.ui.window import theme
 
-    assert (fonts.font_dir() / "IBMPlexSans.ttf").exists()
-    assert "SIL Open Font License" in (fonts.font_dir() / "IBMPlexSans-OFL.txt").read_text(encoding="utf-8")
+    for name in ("InstrumentSans", "JetBrainsMono", "IBMPlexSans", "Doto"):
+        assert (fonts.font_dir() / f"{name}.ttf").exists()
+        assert "SIL Open Font License" in (fonts.font_dir() / f"{name}-OFL.txt").read_text(encoding="utf-8")
     assert fonts.load_fonts() and fonts.ui_available() and fonts.dot_available()
-    assert theme.family() == "IBM Plex Sans"
+    assert theme.family() == "Instrument Sans"
     body = theme.font("body")
-    assert QFontInfo(body).family() == "IBM Plex Sans" and "Nirmala UI" in body.families()
-    assert body.pixelSize() == 13                                         # Plex set a step smaller (it runs wider)
-    assert theme.font("body_strong").weight() < 600                      # labels Medium, no walls of bold
+    assert QFontInfo(body).family() == "Instrument Sans" and "Nirmala UI" in body.families()
+    assert body.pixelSize() == 14                                         # the design's own body size
+    assert theme.font("body_strong").weight() <= 600                     # Semibold at most, no walls of bold
     assert QFontInfo(theme.dot_font(40)).family() == "Doto"              # the displays keep Doto
     spec = (fonts.font_dir().parents[2] / "packaging" / "yuki.spec").read_text(encoding="utf-8")
     assert "ui/fonts/*.ttf" in spec and "ui/fonts/*.txt" in spec

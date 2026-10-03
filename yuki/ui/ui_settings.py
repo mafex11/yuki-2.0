@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
+from yuki.ui import tokens as _tokens
+
 #: Keys of the retired glass Appearance settings: ignored on load, removed on save.
 RETIRED = frozenset({"glass", "bend", "blur", "transparency", "appearance", "background"})
 
@@ -36,8 +38,9 @@ class UiSettings:
     accent: str = "green"               # the one accent colour: "green" (olive, default) | "orange"
 
 
-#: The accent names a settings file may hold (the colours are in :data:`yuki.ui.window.theme.ACCENTS`).
-ACCENT_NAMES = ("green", "orange")
+#: The accent names a settings file may hold (the one token source, ``yuki/ui/web/tokens.json`` ``accent``;
+#: "green" is the Lattice mint; the colours are in :data:`yuki.ui.window.theme.ACCENTS`).
+ACCENT_NAMES: tuple[str, ...] = tuple(_tokens.ACCENTS)
 
 
 def _clean(raw: dict[str, Any]) -> UiSettings:

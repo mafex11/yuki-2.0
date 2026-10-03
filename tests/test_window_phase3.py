@@ -269,12 +269,16 @@ def test_pills_say_their_state_in_words_with_a_wave(qapp):
     assert "245,158,11" not in waiting.label.styleSheet()                 # no amber anywhere
     pill = VoicePill()
     pill.show_state("speaking")
-    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "228,230,233" in pill.label.styleSheet()
+    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "242,239,233" in pill.label.styleSheet()   # Lattice bone ink
     pill.show_state("thinking")
     assert pill.wave.kind == "think"
     pill.show_state("error", "The microphone is in use")
     assert pill.label.text().startswith("The microphone") and pill.wave.isHidden()
-    assert "229,115,107" in pill.label.styleSheet()                        # the error red
+    # Lattice has one colour and it means live: an error is said in words, in the brightest ink (theme.danger)
+    from yuki.ui.window.theme import theme
+
+    d = theme().danger
+    assert f"{d.red()},{d.green()},{d.blue()}" in pill.label.styleSheet()
     for w in (ind, waiting, pill):
         w.close()
 

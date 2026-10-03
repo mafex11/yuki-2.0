@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from yuki.ui import tokens as _tokens
 from yuki.ui.surface import (
     ANIM_MS,
     CARD_BG,
@@ -82,12 +83,12 @@ MAX_CARDS = 5
 #: screen, so stack + input end well above the taskbar at any screen size.
 MAX_CARDS_FRACTION = 0.55
 
-#: The stack's scrollbar: thin, only there when it can scroll.
+#: The stack's scrollbar: thin, only there when it can scroll (Lattice hairline greys, :mod:`yuki.ui.tokens`).
 SCROLL_STYLE = (
     "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }"
     "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px 0 2px 0; }"
-    "QScrollBar::handle:vertical { background: #16191F; border-radius: 4px; min-height: 24px; }"
-    "QScrollBar::handle:vertical:hover { background: #393E47; }"
+    f"QScrollBar::handle:vertical {{ background: {_tokens.COLOR['hair2']}; border-radius: 4px; min-height: 24px; }}"
+    f"QScrollBar::handle:vertical:hover {{ background: {_tokens.COLOR['mark']}; }}"
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
     "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
 )
@@ -128,11 +129,13 @@ class AskInput(QPlainTextEdit):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.setTabChangesFocus(True)
+        from yuki.ui.window.theme import css, theme
+
         self.setStyleSheet(
             "QPlainTextEdit {"
             "  background: transparent;"
-            "  color: #E4E6E9;"
-            "  selection-background-color: #262B33;"
+            f"  color: {_tokens.COLOR['text']};"
+            f"  selection-background-color: {css(theme().accent_soft)};"
             "  border: none; padding: 0px;"
             "}"
         )

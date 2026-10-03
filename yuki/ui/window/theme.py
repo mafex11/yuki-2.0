@@ -1,25 +1,29 @@
-"""Yuki's design system, "Horizon x Field Unit", in code.
+"""Yuki's design system in code: the **Lattice** palette and type (2026-10-03), read from the one token source.
 
 One module holds every visual decision the Yuki window and yuki-ui's floating surfaces (overlay, cards,
 voice pill, call pill, strip, tray menu) and the first-run wizard make: colour tokens, the type scale,
 spacing, corner radii and control sizes. Widgets never invent a colour or a size; they ask the
-:class:`Theme` for a role. The approved mockups are ``docs/ui-mockups/drafts/mix/`` (gitignored: they hold
-personal data); ``mix.css`` there is the source of these tokens.
+:class:`Theme` for a role.
 
-The look (2026-09-28, replacing flat shadcn at the user's request):
+**Where the values come from.** ``yuki/ui/web/tokens.json`` (the Lattice design's token file,
+docs/ui-mockups/revamp-2026-10/3-lattice/) is the single source; ``python -m yuki.ui.tokens_build`` generates
+``yuki/ui/web/tokens.css`` for the HTML window and :mod:`yuki.ui.tokens` for Python, which this module reads.
+The role names below are the ones the widgets have always asked for (``card``, ``text_2``, ``key_on``...);
+:data:`PALETTE` maps each to a Lattice token, so a widget repaints in Lattice without changing.
 
-* **Horizon's palette.** Navy-charcoal: the window ``#0B0E13``, flat panels ``#10141B`` with a 1 px
-  ``#1E2632`` line, inset "glass" displays ``#06090D``, ink ``#E6E9EE`` / ``#AEB6C2`` / ``#6F7886``. Floating
-  dialogs are the same panel colour with 14 px corners and a soft shadow.
-* **Field Unit's hardware.** Dot-matrix displays in Doto (bundled, SIL OFL: :mod:`yuki.ui.fonts`), keys
-  with a 2 px bottom edge and a status LED.
-* **One accent**, olive green ``#8FAF5A`` by default or orange ``#FF5B14`` (Settings > General > Accent),
-  used only on dot-matrix displays, live and recording states, the current or selected moment, the
-  selected key and the speaking wave. No amber or yellow anywhere, no decorative dashes, no gradients,
-  glass, blur or light mode.
-* **Type.** IBM Plex Sans (bundled, SIL OFL: :mod:`yuki.ui.fonts`; the user's pick, round 2): titles
-  Light or Regular, body Regular, labels Medium, never a wall of bold; Nirmala UI as the fallback family so
-  Devanagari never shows as boxes. Without the bundled file, Segoe UI Variable, then Segoe UI.
+The look:
+
+* **Graphite and bone.** The field ``#0B0B0C`` (panels are the field itself), raised keys ``#121214`` /
+  ``#18191B``, hairlines ``#1E2023`` / ``#2B2E32``, resting dots ``#26292C``, ink ``#F2EFE9`` / ``#B4B0A8`` /
+  ``#8A8780``. Floating surfaces are the field with a ``#2A2D31`` border. No gradients, glass, blur, shadows
+  or light mode.
+* **One live colour**, signal mint ``#6FEBC4`` (Settings > General > Accent "green"; "orange" ``#FFA46B`` keeps
+  the older choice working), and only for something live: listening, the working head, recording, needs-you,
+  Stop, the focus ring. Primary keys are lit bone, never coloured. Errors are said in words in the brightest
+  ink (Lattice has no red).
+* **Type.** Instrument Sans for the UI, JetBrains Mono for labels, times and data, Doto for the dot-matrix
+  displays (all bundled, SIL OFL: :mod:`yuki.ui.fonts`); Nirmala UI as the fallback family so Devanagari
+  never shows as boxes. Without the bundled files, IBM Plex Sans, Segoe UI Variable, then Segoe UI.
 
 Everything is in logical pixels.
 """
@@ -30,6 +34,8 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase
+
+from yuki.ui import tokens as T
 
 # -- spacing, radii, sizes ---------------------------------------------------------
 
@@ -64,25 +70,32 @@ SIDEBAR_W = 96
 #: Page padding (mockup ``main``: 34 36 40 32).
 PAGE_PAD = (32, 34, 36, 40)
 
-#: The accent choices (Settings > General > Accent). Olive green is the default (the user, 2026-09-28:
-#: "forest green or olive green", then round 2: "darker, richer"; #748F42 still lights the dot-matrix digits
-#: on the near-black base); orange, deepened the same way.
-ACCENTS: dict[str, str] = {"green": "#748F42", "orange": "#E4571C"}
-DEFAULT_ACCENT = "green"
+#: The accent choices (Settings > General > Accent): the live colour (``tokens.json`` ``accent``). "green" is
+#: Lattice's signal mint and the default; "orange" keeps the older choice working, tuned to the same lightness.
+ACCENTS: dict[str, str] = {name: c["live"] for name, c in T.ACCENTS.items()}
+#: Ink on the live colour (a key or chip filled with it).
+ACCENT_INK: dict[str, str] = {name: c["liveInk"] for name, c in T.ACCENTS.items()}
+#: The accent names as the Settings page words them.
+ACCENT_LABELS: dict[str, str] = {name: c["label"] for name, c in T.ACCENTS.items()}
+DEFAULT_ACCENT = T.DEFAULT_ACCENT
 
-#: Horizon x Field Unit tokens, round 2 (the user: "make it DARK"): a near-black charcoal with only a trace of
-#: navy, panels a small step up from it (low contrast between panel and window), not grey-blue.
+_C = T.COLOR
+#: Every colour role the widgets ask for, as a Lattice token (:mod:`yuki.ui.tokens`). The role names are the
+#: older Horizon ones, so no widget had to change; the values are Lattice's.
 PALETTE = {
-    "bg": "#07080A", "panel": "#0C0E11", "key": "#101216", "key_on": "#16191F", "line": "#181B21",
-    "line2": "#121418", "glass": "#050607", "glass_border": "#15181D", "ink": "#E4E6E9", "ink2": "#A4AAB3",
-    "mute": "#6B717B", "faint": "#393E47", "led_off": "#23272E",
-    # floating dialogs
-    "float_border": "#1B1F26", "float_sep": "#15181D", "bubble": "#13161B", "menu_ink": "#CDD1D6",
-    # the skyline
-    "cool": "#848E9C", "sky_far": "#0F1216", "sky_near": "#1A1E25", "ridge": "#5F6774", "sky_base": "#1F232A",
-    "sky_gap": "#343941", "tick": "#525862", "peak": "#747B87", "call_track": "#14171C",
-    # errors are said in words, in a quiet red (never amber)
-    "danger": "#E5736B", "destructive": "#3A1A1D",
+    "bg": _C["bg"], "panel": _C["panel"], "key": _C["raise"], "key_on": _C["raise2"], "line": _C["hair"],
+    "line2": _C["raise2"], "glass": _C["bg"], "glass_border": _C["hair"], "ink": _C["text"], "ink2": _C["text2"],
+    "mute": _C["text3"], "faint": _C["mark"], "led_off": _C["dot"],
+    # floating surfaces: the field with a border (Lattice cards, the island)
+    "float_border": _C["surfaceBorder"], "float_sep": _C["hair"], "bubble": _C["raise"], "menu_ink": _C["text"],
+    # the skyline and the call band: the dot greys
+    "cool": _C["midTone"], "sky_far": _C["raise"], "sky_near": _C["raise2"], "ridge": _C["mark"],
+    "sky_base": _C["dot"], "sky_gap": _C["hair2"], "tick": _C["mark"], "peak": _C["text3"], "call_track": _C["raise"],
+    # Lattice has one colour, and it means "live": an error is said in words, in the brightest ink
+    "danger": _C["text"], "destructive": _C["raise2"],
+    # Lattice names for new native code (the island, cards v2)
+    "hair2": _C["hair2"], "dot": _C["dot"], "dot_face": _C["dotFace"], "lit": _C["lit"], "mark": _C["mark"],
+    "panel_border": _C["panelBorder"],
 }
 
 
@@ -188,18 +201,20 @@ class Theme:
 
 def _make(accent: str) -> Theme:
     P = {k: hexa(v) for k, v in PALETTE.items()}
-    acc = hexa(ACCENTS.get(accent, ACCENTS[DEFAULT_ACCENT]))
+    name = accent if accent in ACCENTS else DEFAULT_ACCENT
+    acc = hexa(ACCENTS[name])
     clear = QColor(0, 0, 0, 0)
     text, text_2, text_3 = P["ink"], P["ink2"], P["mute"]
-    grey_series = tuple(hexa(v) for v in ("#AEB6C2", "#8C9BB0", "#6F7886", "#56606E", "#3E4858", "#6A7B92",
-                                          "#7D899B", "#283140"))
+    # the dot greys of the design, lightest to darkest (the skyline is monochrome)
+    grey_series = tuple(hexa(v) for v in (_C["text2"], _C["midTone"], _C["text3"], "#6E6B66", _C["mark"],
+                                          _C["hair2"], _C["dot"], _C["raise2"]))
     t = Theme(
-        name="dark", dark=True, accent_name=accent if accent in ACCENTS else DEFAULT_ACCENT,
+        name="dark", dark=True, accent_name=name,
         bg=P["bg"], card=P["panel"], border=P["line"], muted=P["key_on"], subtle=P["key"],
-        ring=hexa(PALETTE["ink2"], 0.45),
-        primary=P["ink"], primary_fg=P["bg"], destructive=P["destructive"], danger=P["danger"],
-        text=text, text_2=text_2, text_3=text_3, text_on_accent=P["bg"],
-        accent=acc, accent_soft=hexa("#262B33"),
+        ring=acc,   # Lattice: the focus ring is the live colour
+        primary=P["lit"], primary_fg=P["bg"], destructive=P["destructive"], danger=P["danger"],
+        text=text, text_2=text_2, text_3=text_3, text_on_accent=hexa(ACCENT_INK[name]),
+        accent=acc, accent_soft=hexa(ACCENTS[name], 0.28),
         # monochrome: the kind of a card is said in words; only an error has a colour of its own
         kinds={
             "praise": text_2, "nudge": text_2, "reminder": text_2, "review": text_2, "resume": text_2,
@@ -213,18 +228,18 @@ def _make(accent: str) -> Theme:
         unrecorded=hexa(PALETTE["ink"], 0.025),
         sky={k: P[k] for k in ("sky_far", "sky_near", "ridge", "sky_base", "sky_gap", "tick", "peak",
                                "call_track", "cool")},
-        surfaces={
+        surfaces={   # Lattice: panels are the field; keys and inputs are raised with the brighter hairline
             "card": Surface(P["panel"], P["line"]),
-            "popover": Surface(P["panel"], P["float_border"]),
+            "popover": Surface(P["bg"], P["float_border"]),
             "sidebar": Surface(P["bg"], clear),
             "muted": Surface(P["glass"], P["glass_border"]),
-            "input": Surface(P["glass"], P["line"]),
+            "input": Surface(P["key"], P["hair2"]),
             "selected": Surface(P["key_on"], clear),
-            "secondary": Surface(P["key"], P["line"]),
-            "primary": Surface(P["ink"], clear),
+            "secondary": Surface(P["key"], P["hair2"]),
+            "primary": Surface(P["lit"], clear),
             "display": Surface(P["glass"], P["glass_border"]),
-            "key": Surface(P["key"], P["line"]),
-            "key_on": Surface(P["key_on"], P["line"]),
+            "key": Surface(P["key"], P["hair2"]),
+            "key_on": Surface(P["key_on"], P["hair2"]),
         },
     )
     return replace(t, surfaces={k: replace(v, name=k) for k, v in t.surfaces.items()})
@@ -285,12 +300,20 @@ _WEIGHTS = {"Light": QFont.Weight.Light, "Regular": QFont.Weight.Normal, "Medium
             "Semibold": QFont.Weight.DemiBold, "Bold": QFont.Weight.Bold}
 #: The weight axis value of each weight word (variable fonts).
 _WGHT = {"Light": 300.0, "Regular": 400.0, "Medium": 500.0, "Semibold": 600.0, "Bold": 700.0}
+#: The UI, data and display families (``tokens.json`` ``type.family``).
+UI_FAMILY: str = T.TYPE["family"]["ui"]
+MONO_FAMILY: str = T.TYPE["family"]["mono"]
+DISPLAY_FAMILY: str = T.TYPE["family"]["display"]
 #: Per family: how much smaller to set it than the Segoe scale above (Plex runs wider and has a taller
-#: x-height; measured on the Today and Me pages: 0.94 reads the same size and nothing clips).
-FAMILY_SCALE: dict[str, float] = {"IBM Plex Sans": 0.94}
-#: Per family: weight words set lighter (Plex's Semibold reads as bold; a label is its Medium).
-FAMILY_WEIGHTS: dict[str, dict[str, float]] = {"IBM Plex Sans": {"Semibold": 520.0, "Bold": 600.0,
-                                                                  "Light": 300.0}}
+#: x-height; measured on the Today and Me pages: 0.94 reads the same size and nothing clips). Instrument Sans
+#: is set at the design's own sizes (body 14 px).
+FAMILY_SCALE: dict[str, float] = {"IBM Plex Sans": 0.94, "Instrument Sans": 1.0}
+#: Per family: weight words set lighter or heavier (Plex's Semibold reads as bold; a label is its Medium).
+#: Instrument Sans runs 400-700: it has no Light, so Light is its Regular.
+FAMILY_WEIGHTS: dict[str, dict[str, float]] = {
+    "IBM Plex Sans": {"Semibold": 520.0, "Bold": 600.0, "Light": 300.0},
+    "Instrument Sans": {"Light": 400.0},
+}
 
 
 def ensure_fonts() -> bool:
@@ -298,9 +321,9 @@ def ensure_fonts() -> bool:
     try:
         from yuki.ui.fonts import _LOADED, load_fonts
 
-        first = not _LOADED
+        before = len(_LOADED)
         ok = load_fonts()
-        if first:
+        if len(_LOADED) != before:
             _families.cache_clear()   # the bundled families are in the database now
         return ok
     except Exception:
@@ -322,15 +345,34 @@ def set_family(name: str | None) -> None:
 
 
 def family() -> str:
-    """The UI family: the chosen one, else the bundled IBM Plex Sans, else Segoe UI Variable, else Segoe UI."""
+    """The UI family: the chosen one, else the bundled Instrument Sans (Lattice), else IBM Plex Sans, else
+    Segoe UI Variable, else Segoe UI."""
     if _FAMILY[0]:
         return _FAMILY[0]
     ensure_fonts()
     fams = _families()
-    for name in ("IBM Plex Sans", "Segoe UI Variable"):
+    for name in (UI_FAMILY, "IBM Plex Sans", "Segoe UI Variable"):
         if name in fams:
             return name
     return "Segoe UI"
+
+
+def mono_font(px: float, weight: float = 500.0) -> QFont:
+    """JetBrains Mono, the data face (labels, times, provenance, costs; Lattice 11-12.5 px, weight 500). Loaded
+    the first time it is asked for, so a process that never shows data type never loads it."""
+    try:
+        from yuki.ui.fonts import load_mono
+
+        if load_mono():
+            _families.cache_clear()
+    except Exception:
+        pass
+    f = QFont(MONO_FAMILY)
+    f.setFamilies([MONO_FAMILY, "Cascadia Mono", "Consolas"])
+    f.setPixelSize(max(1, int(round(px))))
+    f.setVariableAxis(QFont.Tag("wght"), weight)
+    f.setWeight(QFont.Weight(int(weight)))
+    return f
 
 
 def _fallbacks(name: str) -> list[str]:

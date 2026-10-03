@@ -37,6 +37,88 @@ from yuki.ui.chat_model import ChatModel
 GUI_WAIT_S = 5.0
 #: Events of the thread a newly connected window receives (its snapshot's size).
 SNAPSHOT_ITEMS = 300
+#: How long an op waits on memory (it runs on the pipe's reader thread, never the GUI thread).
+MEMORY_WAIT_S = 8.0
+
+# -- the Lattice window's ops (Phase E5) ----------------------------------------------------------------------
+# Scaffolding for the HTML window's pages (E3/E4). Each op is a closed name from the window; the arguments are
+# fixed machine fields (ids, a filter name from ACTIVITY_FILTERS, a kind from FEEDBACK_KINDS / FORGET_KINDS). No
+# op reads what a message, card or memory says to decide anything.
+
+#: The ``activity`` op's filters (the Lattice Activity page: Yuki did / failed / cards / saw / calls).
+ACTIVITY_FILTERS = ("all", "did", "failed", "cards", "saw", "calls")
+#: A finished request's ``outcome`` (``requests.csv``, :mod:`yuki.agent.loop`) as the ledger states it.
+REQUEST_STATES = {"final": "done", "error": "failed", "cancelled": "stopped", "withdrawn": "replaced",
+                  "abandoned": "abandoned"}
+#: ``card_feedback`` kinds: Less of these, Not now (``dismissed``), a question's Skip and Don't ask.
+FEEDBACK_KINDS = ("less", "dismissed", "skip", "never")
+#: What ``forget`` can forget, each through memory's own correction API (never by editing memory).
+FORGET_KINDS = ("fact", "rule", "todo", "standing")
+#: ``forget`` on a to-do: how it ended (``MemoryClient.end_todo``).
+TODO_ENDINGS = ("wrong", "not_needed", "done")
+#: Bytes read from the end of ``requests.csv`` for ``activity`` (thousands of rows; the file only grows).
+REQUEST_LOG_TAIL = 512 * 1024
+
+
+def read_request_log(path: Path, since: float | None = None, limit: int = 50,
+                     tail_bytes: int = REQUEST_LOG_TAIL) -> list[dict[str, Any]]:
+    """The newest finished requests from ``requests.csv`` (written by the agent, one row per request), newest
+    first, as ledger rows: ``{"kind": "request", "at", "what", "where", "state", "outcome", "wall_s", "cost_usd",
+    "tools", "model", "session"}``. Reads only the file's tail; a missing or broken file gives ``[]``."""
+    import csv
+    import io
+    from datetime import datetime
+
+    try:
+        with open(path, "rb") as f:
+            header = f.readline().decode("utf-8", "replace")
+            size = f.seek(0, 2)
+            start = max(len(header.encode("utf-8")), size - tail_bytes)
+            f.seek(start)
+            body = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    if start > len(header.encode("utf-8")):
+        body = body.split("\n", 1)[1] if "\n" in body else ""   # the first line read is a partial one
+    def num(row: dict[str, Any], key: str) -> float | None:
+        try:
+            return float(row.get(key) or "")
+        except ValueError:
+            return None
+
+    rows: list[dict[str, Any]] = []
+    for row in csv.DictReader(io.StringIO(header + body)):
+        try:
+            at = datetime.fromisoformat(str(row.get("timestamp") or "")).timestamp()
+        except ValueError:
+            continue
+        if since is not None and at < since:
+            continue
+        tools: dict[str, int] = {}
+        for pair in str(row.get("tool_calls") or "").split():   # "name=count name=count": our own fixed format
+            name, _, count = pair.partition("=")
+            if name and count.isdigit():
+                tools[name] = int(count)
+        outcome = str(row.get("outcome") or "")
+        rows.append({"kind": "request", "at": at, "what": row.get("request") or "", "where": row.get("lane") or "",
+                     "state": REQUEST_STATES.get(outcome, outcome or "unknown"), "outcome": outcome,
+                     "wall_s": num(row, "wall_s"), "cost_usd": num(row, "cost_usd"), "tools": tools,
+                     "model": row.get("model") or "", "session": row.get("session") or ""})
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    return rows[:max(0, int(limit))]
+
+
+def card_row(nudge: dict[str, Any]) -> dict[str, Any]:
+    """A card (nudge) as the window's ledger and inbox show it: what it said, its offer and what became of it."""
+    from yuki.ui.nudges import card_offer, card_title, offer_lines, offer_open
+
+    offer = card_offer(nudge)
+    at = nudge.get("_seen_at") or nudge.get("shown_at") or nudge.get("at")
+    return {"kind": "card", "card": nudge.get("id"), "at": at, "card_kind": nudge.get("kind"),
+            "title": card_title(nudge), "text": nudge.get("text") or "", "why": nudge.get("reason") or "",
+            "reaction": nudge.get("reaction"), "outcome": nudge.get("outcome") or nudge.get("_offer_state"),
+            "offer": ({k: offer.get(k) for k in ("do", "label", "steps", "wont", "expires_at")} if offer else None),
+            "lines": offer_lines(nudge), "open": offer_open(nudge), "missed": bool(nudge.get("missed"))}
 
 
 class WindowHost(QObject):
@@ -279,6 +361,9 @@ class WindowHost(QObject):
         """One request from a window (its reader thread)."""
         op = str(req.get("op") or "")
         ui = self.ui
+        method = self.E5_OPS.get(op)
+        if method is not None:
+            return getattr(self, method)(req)
         if op == "hello":
             peer = req.get("_peer")
 
@@ -288,9 +373,9 @@ class WindowHost(QObject):
                                            "state": self.state(),
                                            "session": getattr(ui.ui_log.logger, "session_id", None)})
             self._on_gui(send_snapshot)
-            from yuki.ui.window_ipc import VERSION
+            from yuki.ui.window_ipc import OPS, VERSION
 
-            return {"version": VERSION}
+            return {"version": VERSION, "ops": list(OPS)}
         if op == "state":
             return {"state": self._on_gui(self.state)}
         if op == "submit":
@@ -368,6 +453,280 @@ class WindowHost(QObject):
             self._on_gui(lambda: ui.snooze_nudges(minutes))
             return {}
         return {"ok": False, "error": f"unknown op {op!r}"}
+
+    # -- the Lattice window's ops (Phase E5) ----------------------------------------------------------
+
+    #: op -> method. Each runs on the pipe's reader thread; GUI-thread state is read through :meth:`_on_gui`,
+    #: memory through the tray's :class:`~yuki.agent.memory.MemoryAccess` (bounded waits, never the GUI thread).
+    E5_OPS: dict[str, str] = {
+        "stop": "_op_stop", "steer": "_op_steer", "now": "_op_now", "plan": "_op_plan",
+        "card_feedback": "_op_card_feedback", "activity": "_op_activity", "threads": "_op_threads",
+        "people": "_op_people", "workflows": "_op_workflows", "workflow_edit": "_op_workflow_edit",
+        "permissions_get": "_op_permissions_get", "permissions_set": "_op_permissions_set", "forget": "_op_forget",
+    }
+    #: The autonomy policy file (``None``: :func:`yuki.ui.policy.policy_path`); tests point it at a temp file.
+    policy_path: Path | None = None
+
+    @staticmethod
+    def _job(req: dict[str, Any]) -> int | None:
+        job = req.get("job")
+        return job if isinstance(job, int) and not isinstance(job, bool) else None
+
+    def _memory(self) -> Any:
+        return self.ui.runtime.memory
+
+    def _memory_call(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """``MemoryClient.<name>(...)`` through the tray's memory access; raises ``RuntimeError`` in plain words."""
+        try:
+            return self._memory().call_method(name, *args, timeout_s=MEMORY_WAIT_S, **kwargs)
+        except Exception as exc:   # MemoryUnavailable, a timeout, or the method raised
+            raise RuntimeError(f"memory: {exc}") from exc
+
+    def _op_stop(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``stop(job)``: the run card's Stop, the same path as the strip's Stop (marks it stopped so it reads
+        "Stopped.", cancels the request, stops its voice)."""
+        job = self._job(req)
+        if job is None:
+            return {"ok": False, "error": "stop needs a job (a request id)"}
+
+        def run() -> str:
+            stop = getattr(self.ui, "_on_strip_stop", None)
+            how = stop(job) if callable(stop) else self.ui.runtime.cancel(job)
+            return str(how or "unknown")
+        how = self._on_gui(run)
+        self._log("window_op", op="stop", job=job, how=how)
+        return {"job": job, "how": how}
+
+    def _op_steer(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``steer(job, text)``: something the user adds to a running request (:meth:`AgentRuntime.steer`, read at
+        the next step). ``delivered`` is false when that request is not running."""
+        job = self._job(req)
+        text = str(req.get("text") or "").strip()
+        if job is None or not text:
+            return {"ok": False, "error": "steer needs a job and some text"}
+        delivered = bool(self._on_gui(lambda: self.ui.runtime.steer(job, text)))
+        return {"job": job, "delivered": delivered}
+
+    def _op_now(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``now``: the live task trace, from the chat thread (:class:`ChatModel`): every response still running,
+        with its steps (label, running/ok, seconds), elapsed time and step count, and which request each lane
+        drives."""
+        def build() -> dict[str, Any]:
+            at = time.time()
+            runs = []
+            for item in self.model.items:
+                if item.kind != "assistant" or not item.running:
+                    continue
+                times, tail = item.step_times(at)
+                steps = item.real_steps()
+                runs.append({
+                    "item": item.id, "jobs": list(item.jobs), "status": item.status, "source": item.source,
+                    "started": item.at, "elapsed_s": round(item.work_seconds(at), 1), "line": item.work_line(at),
+                    "thinking": item.thinking, "question": item.question, "step": len(steps),
+                    "steps": [{"key": s.key, "kind": s.kind, "name": s.name, "label": s.label, "depth": s.depth,
+                               "running": s.running, "ok": s.ok, "result": s.result,
+                               "seconds": round(times.get(s.key, s.seconds(at)), 1)} for s in steps],
+                    "writing_s": round(tail[0], 1) if tail else None,
+                })
+            rt = self.ui.runtime
+            return {"at": at, "runs": runs, "lanes": dict(rt.running_ids()), "worker_busy": bool(rt.worker_busy)}
+        return {"now": self._on_gui(build)}
+
+    def _find_card(self, card: Any) -> dict[str, Any] | None:
+        """A card by id: the one the tray holds (on screen, queued, or delivered: the dict the corner card and the
+        thread share), else memory's recent ones (a week)."""
+        key = str(card)
+
+        def local() -> dict[str, Any] | None:
+            ctl = getattr(self.ui, "nudges", None)
+            if ctl is None:
+                return None
+            pool = [getattr(ctl, "showing", None)] + list(getattr(ctl, "queue", []) or []) \
+                + list((getattr(ctl, "delivered", {}) or {}).values())
+            return next((n for n in pool if isinstance(n, dict) and str(n.get("id")) == key), None)
+        found = self._on_gui(local)
+        if found is not None:
+            return found
+        rows = self._memory_call("recent_nudges", hours=24 * 7) or []
+        return next((n for n in rows if isinstance(n, dict) and str(n.get("id")) == key), None)
+
+    def _op_plan(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``plan(card)``: what a card's offer will and won't do (memory's typed offer: its steps, the fixed Won't
+        line, when it expires) and whether its button may still be pressed."""
+        if req.get("card") is None:
+            return {"ok": False, "error": "plan needs a card (a nudge id)"}
+        nudge = self._find_card(req.get("card"))
+        if nudge is None:
+            return {"ok": False, "error": "no such card"}
+        return {"plan": card_row(nudge)}
+
+    def _op_card_feedback(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``card_feedback(card, kind)``: Less of these (``less``), Not now (``dismissed``), a question's Skip
+        (``skip``) or Don't ask (``never``), from the window at any time, not only while the corner card is up.
+        Goes through the nudge controller's own handlers, so memory is told exactly as from the card."""
+        kind = str(req.get("kind") or "")
+        if kind not in FEEDBACK_KINDS:
+            return {"ok": False, "error": f"kind must be one of {', '.join(FEEDBACK_KINDS)}"}
+        nudge = self._find_card(req.get("card"))
+        if nudge is None:
+            return {"ok": False, "error": "no such card"}
+        if kind == "never" and str(nudge.get("kind") or "") != "question":
+            return {"ok": False, "error": "never is for questions; use less"}
+
+        def apply() -> dict[str, Any]:
+            ctl = self.ui.nudges
+            key = str(nudge.get("id"))
+            if isinstance(ctl.showing, dict) and str(ctl.showing.get("id")) == key:
+                ctl.card.close_card()   # the outcome is recorded below, once
+            ctl.queue[:] = [n for n in ctl.queue if str(n.get("id")) != key]
+            stored = ctl.record_delivery(nudge, "window")
+            handler = {"less": ctl._on_less, "dismissed": ctl._on_dismissed, "skip": ctl._on_dismissed,
+                       "never": ctl._on_never_ask}[kind]
+            handler(stored)
+            return card_row(stored)
+        row = self._on_gui(apply)
+        self._log("window_op", op="card_feedback", card=nudge.get("id"), feedback=kind)
+        return {"card": row}
+
+    def _op_activity(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``activity(filter)``: the ledger. ``did`` / ``failed`` / ``all``: finished requests (the request log)
+        and cards whose offer ran or failed; ``cards``: what Yuki put in front of the user and what became of it;
+        ``saw``: time by app (counts, no content); ``calls``: calls and meetings. ``hours`` (default 24, at most a
+        week) and ``limit`` (default 50) bound it; newest first."""
+        flt = str(req.get("filter") or "all")
+        if flt not in ACTIVITY_FILTERS:
+            return {"ok": False, "error": f"filter must be one of {', '.join(ACTIVITY_FILTERS)}"}
+        try:
+            hours = min(168.0, max(0.25, float(req.get("hours") or 24)))
+            limit = min(500, max(1, int(req.get("limit") or 50)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "hours and limit must be numbers"}
+        since = time.time() - hours * 3600.0
+        if flt == "saw":
+            return {"filter": flt, "rows": self._memory_call("activity", since=since, group_by="app", limit=limit)}
+        if flt == "calls":
+            return {"filter": flt, "rows": (self._memory_call("calls_in", since=since, limit=limit) or [])[::-1]}
+        rows: list[dict[str, Any]] = []
+        if flt in ("all", "did", "failed"):
+            path = getattr(self.ui.settings, "requests_csv_path", None)
+            requests = read_request_log(Path(path), since, limit) if path else []
+            rows += [r for r in requests if flt == "all" or (r["state"] == "failed") == (flt == "failed")]
+        cards = [card_row(n) for n in (self._memory_call("recent_nudges", hours=hours) or [])]
+        if flt == "cards":
+            rows += cards
+        elif flt in ("all", "did", "failed"):
+            ran = [c for c in cards if c["offer"] and c["outcome"]]
+            bad = ("expired", "gone", "off", "error")
+            rows += [c for c in ran if flt == "all" or (c["outcome"] in bad) == (flt == "failed")]
+
+        def when(r: dict[str, Any]) -> float:
+            at = r.get("at")
+            if isinstance(at, (int, float)):
+                return float(at)
+            try:
+                from datetime import datetime
+
+                return datetime.fromisoformat(str(at)).timestamp()
+            except ValueError:
+                return 0.0
+        rows.sort(key=when, reverse=True)
+        return {"filter": flt, "rows": rows[:limit]}
+
+    def _op_threads(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``threads``: the user's threads of work (memory's ``threads``: most recently touched first)."""
+        statuses = req.get("statuses")
+        statuses = tuple(str(s) for s in statuses) if isinstance(statuses, list) and statuses else ("active", "paused")
+        try:
+            limit = min(100, max(1, int(req.get("limit") or 24)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "limit must be a number"}
+        query = str(req.get("query") or "").strip() or None
+        return {"threads": self._memory_call("threads", statuses=statuses, query=query, limit=limit) or []}
+
+    def _op_people(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``people``: the people Yuki knows and how the user reaches them. Empty, ``available: false``, until
+        memory has ``people_directory`` / ``contact`` (stream 1a); probed on the client, never assumed."""
+        person = str(req.get("person") or "").strip()
+
+        def fn(client: Any) -> dict[str, Any]:
+            directory, contact = getattr(client, "people_directory", None), getattr(client, "contact", None)
+            if person and callable(contact):
+                return {"available": True, "person": contact(person)}
+            if callable(directory):
+                return {"available": True, "people": list(directory() or [])}
+            return {"available": False, "people": []}
+        try:
+            return self._memory().call("people", fn, timeout_s=MEMORY_WAIT_S)
+        except Exception as exc:
+            return {"ok": False, "error": f"memory: {exc}"}
+
+    def _op_workflows(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``workflows``: learned procedures. Empty until Phase C writes them."""
+        return {"available": False, "workflows": []}
+
+    def _op_workflow_edit(self, req: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": False, "error": "workflows are not available yet (Phase C)"}
+
+    def _op_permissions_get(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``permissions_get``: the autonomy policy (:mod:`yuki.ui.policy`)."""
+        from yuki.ui import policy
+
+        return {"permissions": policy.describe(path=self.policy_path)}
+
+    def _op_permissions_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``permissions_set(kind, level)``: one kind's level, inside its ceiling (sending is always ask; money is
+        never on its own). Every open window hears the new policy."""
+        from yuki.ui import policy
+
+        kind, level = str(req.get("kind") or ""), str(req.get("level") or "")
+        try:
+            levels = policy.set_level(kind, level, self.policy_path)
+        except policy.PolicyError as exc:
+            return {"ok": False, "error": str(exc)}
+        described = policy.describe(levels)
+        self._log("window_op", op="permissions_set", target=kind, level=level)
+        if self.server is not None:
+            self.server.broadcast({"ev": "permissions", "permissions": described})
+        return {"permissions": described}
+
+    def _op_forget(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``forget(object)``: forget one thing through memory's own correction APIs, never by editing memory:
+
+        * ``fact`` (``ref``, ``title``, ``text``): the user's "It's just wrong, forget it" as a correction in their
+          words (``correct_portrait``, as the Me page's Forget); memory applies it everywhere and reports progress
+          through ``correction_status(correction_id)``;
+        * ``rule`` (``ref`` = ``rule:N``): ``revoke_rule`` (history kept);
+        * ``todo`` (``ref``, ``how`` = wrong | not_needed | done, default wrong): ``end_todo``;
+        * ``standing`` (``ref`` = ``request:N``): ``cancel_standing_request``.
+        """
+        obj = req.get("object")
+        if not isinstance(obj, dict) or obj.get("kind") not in FORGET_KINDS:
+            return {"ok": False, "error": f"object.kind must be one of {', '.join(FORGET_KINDS)}"}
+        kind, ref = str(obj["kind"]), str(obj.get("ref") or "").strip()
+        if kind == "fact":
+            from yuki.ui.window.actions import correction_text
+
+            if not str(obj.get("text") or "").strip():
+                return {"ok": False, "error": "a fact needs the text memory had"}
+            words = correction_text(str(obj.get("title") or "this"), str(obj["text"]), "It's just wrong, forget it")
+            cid = self._memory_call("correct_portrait", words)
+            out = {"how": "correction", "correction_id": cid}
+        elif not ref:
+            return {"ok": False, "error": f"a {kind} needs its ref"}
+        elif kind == "rule":
+            rid = self._memory_call("revoke_rule", ref)
+            out = {"how": "revoked", "id": rid} if rid else {"ok": False, "error": "that rule was already gone"}
+        elif kind == "todo":
+            how = str(obj.get("how") or "wrong")
+            if how not in TODO_ENDINGS:
+                return {"ok": False, "error": f"how must be one of {', '.join(TODO_ENDINGS)}"}
+            got = self._memory_call("end_todo", ref, how)
+            out = {"how": how, "id": got} if got else {"ok": False, "error": "that one was already closed"}
+        else:
+            done = bool(self._memory_call("cancel_standing_request", ref))
+            out = {"how": "cancelled", "id": ref} if done else {"ok": False, "error": "that request was not open"}
+        self._log("window_op", op="forget", what=kind, ok=out.get("ok", True))
+        return out
 
     # -- the window's process ----------------------------------------------------------------------
 

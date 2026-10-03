@@ -559,13 +559,15 @@ class YukiUi(QObject):
                               if rid in self._runs and self.strip.run_id is None else None)
         return shown
 
-    def _on_strip_stop(self, request_id: int) -> None:
-        """Stop on the strip: cancel that request (and its voice, if it is the voice's)."""
+    def _on_strip_stop(self, request_id: int) -> str:
+        """Stop on the strip (or the window's run card, the ``stop`` pipe op): cancel that request (and its voice, if
+        it is the voice's). Returns how (``running`` / ``queued`` / ``unknown``, :meth:`AgentRuntime.cancel`)."""
         self._stopped.add(int(request_id))
         how = self.runtime.cancel(int(request_id))
         if self.voice.owns(request_id):
             self.voice.interrupt()
         self.ui_log.event("strip_stop", id=request_id, how=how)
+        return how
 
     def _on_parked(self, lane_name: str, request_id: int, text: str) -> None:
         """Set aside on a question nobody answered: the run is over for now (an answer later starts a new one)."""

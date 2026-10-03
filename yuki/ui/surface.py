@@ -1,11 +1,12 @@
 """The window base for every floating surface yuki-ui shows: the overlay, the strip, nudge, question and call
 cards, the call pill, the voice pill and the tray's panels.
 
-Each is a frameless, always-on-top tool window: a Horizon floating dialog (the navy
-panel ``#0C0E11`` with a 1 px ``#1B1F26`` line, 20 px corners, a soft shadow; pills are
-fully round) that fades and slides a few pixels when it appears. Opaque: whatever is
-behind it never shows through, so text reads the same over any screen. Dark only; the
-accent only on live and recording states (docs/UI-window.md).
+Each is a frameless, always-on-top tool window: a floating dialog painted from the theme's
+``popover`` surface (Lattice since 2026-10-03: the graphite field with a 1 px surface border,
+:mod:`yuki.ui.tokens`; 20 px corners, a soft shadow; pills are fully round) that fades and
+slides a few pixels when it appears. Opaque: whatever is behind it never shows through, so
+text reads the same over any screen. Dark only; the live colour only on live and recording
+states (docs/UI-window.md).
 
 The shadow is painted, not a ``QGraphicsDropShadowEffect`` (graphics effects on a
 translucent top-level window are unreliable), so the window keeps a transparent
@@ -41,6 +42,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QWidget
 
+from yuki.ui import tokens as _tokens
 from yuki.ui.focus import FocusResult, force_foreground, set_no_activate
 
 #: Duration of the show/hide transition, in milliseconds (0 with "Reduce motion").
@@ -60,13 +62,15 @@ def accent_color() -> QColor:
 
 #: The tray icon's mark: the accent as the app started (the rest of the UI reads it live).
 ACCENT = accent_color()
-#: Flat tokens for callers that paint with fixed colours (the card-stack overlay, the tray panels' HTML).
-TEXT_PRIMARY = QColor("#E4E6E9")
-TEXT_DIM = QColor("#A4AAB3")
-CARD_BG = QColor("#13161B")
-CARD_BORDER = QColor("#1B1F26")
-ERROR_BG = QColor("#221113")
-ERROR_BORDER = QColor("#4A2427")
+#: Flat tokens for callers that paint with fixed colours (the card-stack overlay, the tray panels' HTML), from the
+#: one token source (:mod:`yuki.ui.tokens`, Lattice). An error card has no colour of its own (Lattice has one, and
+#: it means live): a raised fill and the brighter panel border, and its words say what went wrong.
+TEXT_PRIMARY = QColor(_tokens.COLOR["text"])
+TEXT_DIM = QColor(_tokens.COLOR["text2"])
+CARD_BG = QColor(_tokens.COLOR["bg"])
+CARD_BORDER = QColor(_tokens.COLOR["surfaceBorder"])
+ERROR_BG = QColor(_tokens.COLOR["raise"])
+ERROR_BORDER = QColor(_tokens.COLOR["panelBorder"])
 
 
 def ui_font(size: int = 11, *, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:

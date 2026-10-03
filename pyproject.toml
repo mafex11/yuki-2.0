@@ -18,6 +18,9 @@ dependencies = [
     "psutil>=7.2.2",
     "pyautogui>=0.9.54",
     "pyside6>=6.11.2",
+    # The official WebView2Loader.dll for the HTML window (yuki.ui.webview2 locates it in this package; none of
+    # pywebview's own code is imported, so pythonnet/.NET never load). Phase E2, 2026-10-03.
+    "pywebview>=6.2.1",
     "pywin32>=312",
     "rich>=15.0.0",
     "sentencepiece>=0.2.1",

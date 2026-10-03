@@ -1,0 +1,55 @@
+{
+  "schema": "yuki-home/1",
+  "note": "Invented data for the E2 WebView2 spike and the tests. No real person, message or app use: nothing here comes from memory.",
+  "date": "Saturday 3 Oct",
+  "clock": "21:52",
+  "user": { "name": "Sam", "initial": "S", "place": "they · Pune" },
+  "state": { "yuki": "idle", "line": "listening for its name" },
+  "nowStrip": {
+    "front": { "app": "Code editor", "since": "21:40", "what": "notes.md in the garden-planner project" },
+    "playing": { "status": "paused", "title": "Rain Study No. 4", "artist": "The Lo Fi Trio" },
+    "call": null
+  },
+  "inbox": {
+    "needs": [
+      {
+        "kind": "question", "at": "21:31",
+        "title": "Is the Friday planning call still at 10?",
+        "why": "You moved it once last week. I want the weekly review to have the right time.",
+        "answers": ["Yes, 10:00", "Moved to 11:00"],
+        "placeholder": "Or say what changed"
+      },
+      {
+        "kind": "learned", "at": "20:58",
+        "title": "Open the tracker before you write the planning notes.",
+        "why": "You did it in that order three mornings running."
+      }
+    ],
+    "running": [
+      { "title": "Tidying the downloads folder", "detail": "Step 2 of 4 · sorting by file type", "live": true, "elapsed": "1:12" },
+      { "title": "Watching for the parcel email", "detail": "Waiting · I'll show it when it lands", "live": false, "meta": "since 18:05" }
+    ],
+    "offers": [
+      {
+        "obs": "Two budget sheets were open side by side for 40 minutes. The totals row differs by one line.",
+        "ev": [["21:10", " budget-2026.xlsx"], ["21:12", " budget-old.xlsx"]],
+        "will": "Add “check the budget totals row” to your list, due Monday.",
+        "wont": "I won't touch either sheet.",
+        "label": "Add to list"
+      }
+    ],
+    "away": [
+      {
+        "title": "Filed three receipts", "at": "19:40",
+        "changed": [["Moved receipt-0912.pdf to Receipts", "Undo"], ["Moved receipt-0914.pdf to Receipts", "Undo"]],
+        "note": "", "cost": "4 steps · 2¢"
+      }
+    ]
+  },
+  "people": [
+    { "name": "Riya", "route": "Chat app", "last": "2h ago", "rhythm": [null, null, null, 0, 2, 3, 1, 4, 2, 0, 5, 3, 2, 4] },
+    { "name": "Dev", "route": "Email", "last": "yesterday", "rhythm": [null, null, null, 1, 0, 0, 2, 1, 0, 0, 1, 0, 1, 0] },
+    { "name": "Mira", "route": "Chat app", "last": "3 days ago", "rhythm": [null, null, null, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0, 0] },
+    { "name": "Alex", "route": "Phone", "last": "last week", "rhythm": [null, null, null, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+  ]
+}

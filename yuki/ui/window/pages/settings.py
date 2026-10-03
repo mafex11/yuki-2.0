@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import SettingsView
-from yuki.ui.window.theme import PAGE_PAD, Theme
+from yuki.ui.window.theme import ACCENT_LABELS, PAGE_PAD, Theme
 from yuki.ui.window.widgets import (
     Button,
     Card,
@@ -43,8 +43,8 @@ DEFAULT_OPEN_HOTKEY = "alt+shift"
 #: Quiet-hour choices, every half hour.
 TIMES = tuple(f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30))
 
-#: The accent choices as the Settings page words them.
-ACCENT_WORDS = {"green": "Green", "orange": "Orange"}
+#: The accent choices as the Settings page words them (``tokens.json`` ``accent``: "green" is Lattice's mint).
+ACCENT_WORDS = dict(ACCENT_LABELS)
 
 
 def _voice_name(voice_id: str) -> str:
@@ -181,11 +181,11 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     motion.toggled.connect(act.set_reduce_motion)
     general.body.addWidget(SettingRow(t, "pause", "Reduce motion", "No sliding or fading: things just appear, and the "
                                       "waves hold still.", motion))
-    accent = Segmented(t, tuple(ACCENT_WORDS.values()), ACCENT_WORDS.get(getattr(ui, "accent", "green"), "Green"),
-                       small=True)
+    accent = Segmented(t, tuple(ACCENT_WORDS.values()),
+                       ACCENT_WORDS.get(getattr(ui, "accent", "green"), ACCENT_WORDS["green"]), small=True)
     accent.changed.connect(lambda word: act.set_accent({w: k for k, w in ACCENT_WORDS.items()}.get(word, "green")))
-    general.body.addWidget(SettingRow(t, "palette", "Accent", "The one colour Yuki uses: live states, the displays "
-                                      "and what's selected.", accent))
+    general.body.addWidget(SettingRow(t, "palette", "Accent", "The one colour Yuki uses, only for something live: "
+                                      "listening, working, recording, Stop.", accent))
     general.setParent(grid)
     cards.add(general, 0)
 

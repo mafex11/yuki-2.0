@@ -230,16 +230,16 @@ def test_retired_glass_settings_are_ignored_and_dropped(tmp_path):
     assert raw["future_key"] == 1 and raw["open_hotkey"] == "ctrl+space"
 
 
-def test_the_theme_is_horizon_field_unit_dark():
+def test_the_theme_is_lattice_dark():
     from yuki.ui.window.theme import ACCENTS, RADIUS, theme
 
     t = theme("light", accent="green")   # dark only: any name gives the one theme
-    # round 2: near-black charcoal, panels one small step up from it
-    assert t.dark and t.bg.name() == "#07080a" and t.card.name() == "#0c0e11" and t.border.name() == "#181b21"
-    assert t.text.name() == "#e4e6e9" and t.text_2.name() == "#a4aab3" and t.text_3.name() == "#6b717b"
-    assert t.primary.name() == "#e4e6e9" and t.primary_fg.name() == "#07080a"
-    assert t.accent.name() == ACCENTS["green"].lower() == "#748f42"
-    assert theme(accent="orange").accent.name() == "#e4571c"
+    # Lattice (2026-10-03, from yuki/ui/web/tokens.json): graphite field, panels are the field, bone ink
+    assert t.dark and t.bg.name() == "#0b0b0c" and t.card.name() == "#0b0b0c" and t.border.name() == "#1e2023"
+    assert t.text.name() == "#f2efe9" and t.text_2.name() == "#b4b0a8" and t.text_3.name() == "#8a8780"
+    assert t.primary.name() == "#f2efe9" and t.primary_fg.name() == "#0b0b0c"   # primary keys are lit, not coloured
+    assert t.accent.name() == ACCENTS["green"].lower() == "#6febc4"            # signal mint, live states only
+    assert theme(accent="orange").accent.name() == "#ffa46b"
     # low contrast between panel and window: no channel more than 8 apart
     assert max(abs(a - b) for a, b in zip(t.card.getRgb()[:3], t.bg.getRgb()[:3])) <= 8
     for name, surface in t.surfaces.items():   # opaque: nothing see-through anywhere
@@ -264,8 +264,8 @@ def test_surfaces_paint_opaque_with_a_border(qapp):
     img.fill(Qt.GlobalColor.transparent)
     card.render(img)
     inner = card.panel_rect().center()
-    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#0c0e11"
+    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#0b0b0c"   # Lattice: the field
     edge = img.pixelColor(QPoint(card.panel_rect().left() + 60, card.panel_rect().top()))
-    assert edge.name() == "#1b1f26"
+    assert edge.name() == "#2a2d31"                                                             # its surface border
     assert card.title.text() == "" and card.wave.kind == "checkin"   # a plain check-in: its wave says it
     card.close()
