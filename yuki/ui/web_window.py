@@ -27,13 +27,14 @@ One window at a time, whichever engine: the same single-instance mutex and focus
 Options for tests and measurements (all optional): ``--fixture`` (invented data, no memory, no pipe), ``--db``,
 ``--page``, ``--offscreen`` (a frameless tool window beyond every monitor that never activates), ``--profile``,
 ``--browser-args``, ``--query`` (preview knobs for the page, e.g. ``state=listening``), ``--t0``, ``--metrics``, ``--shot``, ``--exit-after``,
-``--memory-low-after``.
+``--memory-low-after``, ``--probe-frame`` (the off-screen frame: Windows' own hit test answers, 32-build-E11-E14.md §6).
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import queue
@@ -208,6 +209,7 @@ class WebWindow:
         self.shot_delay = shot_delay
         self.events: list[dict[str, Any]] = []
         self.marks: dict[str, float] = {}
+        self.probe_frame = False              # measurement: Windows' own answers about the frame (--probe-frame)
 
     # -- the page ------------------------------------------------------------------------------------------
 
@@ -232,6 +234,10 @@ class WebWindow:
                 self.refresh(page, stale_s=STALE_S)
         elif op == "act":
             threading.Thread(target=self._act, args=(message,), name="yuki-web-act", daemon=True).start()
+        elif op == "caption" and self.host is not None:   # where the page drew its title bar (Windows' hit test)
+            self.host.set_caption(message)
+        elif op == "window" and self.host is not None:    # a caption button or the title bar, on this (UI) thread
+            self.host.window_op(str(message.get("do") or ""))
         elif op == "perf":   # the page's redraw counters (a measurement knob)
             self.metrics.setdefault("perf", []).append({"at": time.time(), "draws": message.get("draws"),
                                                         "ticks": message.get("ticks"), "ms": message.get("ms")})
@@ -408,14 +414,8 @@ class WebWindow:
             return W.build_day(m)
         if name == "me":
             return W.build_me(m, pending=self.pending, people=self._people())
-        if name == "playbook":
-            data = W.build_playbook(m)
-            if self.client is not None and "workflows" in self.ops:   # Phase C's procedures, once the tray has them
-                reply = self.request("workflows", wait_s=4.0) or {}
-                if reply.get("ok") and reply.get("available"):
-                    data["procedures"] = list(reply.get("workflows") or [])
-                    data["workflows_available"] = True
-            return data
+        if name == "playbook":   # practice memory's workflows(), read by this window's own memory client
+            return W.build_playbook(m)
         if name == "activity":
             return W.build_activity(m, requests_csv=self.requests_csv())
         if name == "settings":
@@ -660,6 +660,7 @@ class WebWindow:
         "skip_question": "a_skip_question", "stop": "a_stop", "stop_call": "a_stop_call", "steer": "a_steer",
         "submit": "a_submit", "askbar": "a_askbar", "continue": "a_continue", "copy": "a_copy", "correct": "a_correct",
         "forget": "a_forget", "rule_edit": "a_rule_edit", "person": "a_person", "workflow_edit": "a_workflow_edit",
+        "todo_undo": "a_todo_undo",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
         "motion": "a_motion", "call_pref": "a_call_pref",
@@ -832,9 +833,34 @@ class WebWindow:
         return {"person": contact_card(card)}
 
     def a_workflow_edit(self, m: dict[str, Any]) -> dict[str, Any]:
-        if self.client is not None:
-            return self._tray("workflow_edit", ref=m.get("ref"), verb=m.get("verb"), words=m.get("words"))
-        return {"ok": False, "error": "Saving procedures comes with workflows, not built yet."}
+        """Playbook (and Home's Learned) Save / Edit / No on one practice object, through memory's own
+        ``workflow_edit`` (the ledger; an edit is queued in the user's words and the practice worker re-distills it).
+        A teach-back question is answered (Save / Edit with words) or skipped (No)."""
+        ref, words = str(m.get("ref") or ""), " ".join(str(m.get("words") or "").split())
+        action = workflow_action(ref, str(m.get("verb") or ""), words)
+        if action is None:
+            return {"ok": False, "error": "Say it in your words first." if m.get("verb") == "edit" else "Unknown choice."}
+        edit = getattr(self._memory(), "workflow_edit", None)
+        if not callable(edit):
+            return {"ok": False, "error": "This memory has no playbook yet."}
+        result = edit(ref, action, words) or {}
+        self.refresh("playbook")
+        self.refresh("home")
+        return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "state": result.get("state"),
+                "queued": bool(result.get("queued"))}
+
+    def a_todo_undo(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Activity's Undo on a to-do Yuki added: only one the ledger offered, inside its window; memory ends it as
+        not needed (``end_todo``)."""
+        ref = str(m.get("todo") or "")
+        rows = (self.pages.get("activity") or {}).get("rows") or []
+        row = next((r for r in rows if (r.get("undo") or {}).get("todo") == ref), None)
+        if row is None or float(row["undo"].get("until") or 0) < time.time():
+            return {"ok": False, "error": "Too late to undo (10 minutes)."}
+        done = self._memory().end_todo(ref, "not_needed")
+        self.refresh("activity")
+        self.refresh("home")
+        return {"ok": bool(done)} if done else {"ok": False, "error": "It was already off your list."}
 
     def a_permissions_set(self, m: dict[str, Any]) -> dict[str, Any]:
         kind, level = str(m.get("kind") or ""), str(m.get("level") or "")
@@ -1014,6 +1040,8 @@ class WebWindow:
                 threading.Timer(self.shot_delay, lambda: host.invoke(shoot)).start()
             else:
                 shoot()
+        if host is not None and self.probe_frame:
+            threading.Timer(1.0, lambda: host.invoke(lambda: self._probe_frame(host))).start()
         if host is not None and self.exit_after is not None:
             threading.Timer(max(0.0, self.exit_after), host.close).start()
         if host is not None and self.memory_low_after is not None:
@@ -1021,6 +1049,49 @@ class WebWindow:
                 self.metrics["memory_low"] = {"ok": host.set_memory_low(True), "at": time.time()}
                 self.write()
             threading.Timer(max(0.0, self.memory_low_after), lambda: host.invoke(low)).start()
+
+    def _probe_frame(self, host: WebView2Host) -> None:
+        """Measurement (``--probe-frame``, the off-screen window only): what Windows itself answers about the
+        frameless frame - the style bits, the client area against the window, and for points over the page's caption
+        buttons, its title bar, its top edge, the page and the left resize border: the window's own ``WM_NCHITTEST``
+        and the window ``WindowFromPoint`` gives the pointer to (ours, or WebView2's). Sends no input. UI thread."""
+        u = ctypes.windll.user32
+        hwnd = wintypes.HWND(host.hwnd)
+        win, cli = wintypes.RECT(), wintypes.RECT()
+        u.GetWindowRect(hwnd, ctypes.byref(win))
+        u.GetClientRect(hwnd, ctypes.byref(cli))
+        origin = wintypes.POINT(0, 0)
+        u.ClientToScreen(hwnd, ctypes.byref(origin))
+        u.GetWindowLongW.restype = ctypes.c_long
+        style = u.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF
+        u.WindowFromPoint.restype = wintypes.HWND
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.SendMessageW.restype = ctypes.c_ssize_t
+        u.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+        u.GetClassNameW.argtypes = [wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int]
+        lay = host.caption
+        points: dict[str, tuple[int, int]] = {f"{p}_button": (r[0] + r[2] // 2, r[1] + r[3] // 2) for p, r in lay.buttons.items()}
+        points.update({"title_bar": (cli.right // 2, max(lay.top + 2, lay.height // 2)), "top_edge": (cli.right // 2, 1),
+                       "page": (cli.right // 2, cli.bottom // 2)})
+        out: dict[str, Any] = {}
+        for name, (x, y) in points.items():
+            sx, sy = origin.x + x, origin.y + y
+            lp = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
+            under = u.WindowFromPoint(wintypes.POINT(sx, sy))
+            cls = ctypes.create_unicode_buffer(64)
+            if under:
+                u.GetClassNameW(under, cls, 64)
+            out[name] = {"nchittest": int(u.SendMessageW(hwnd, 0x0084, 0, lp)),
+                         "pointer_goes_to": "this window" if under and int(under) == host.hwnd else (cls.value or "none")}
+        sx, sy = win.left + 2, (win.top + win.bottom) // 2   # the invisible left resize border
+        out["left_border"] = {"nchittest": int(u.SendMessageW(hwnd, 0x0084, 0, ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)))}
+        self.metrics["frame"] = {
+            "style": hex(style), "thick_frame": bool(style & 0x00040000), "caption_style": bool(style & 0x00C00000),
+            "maximize_box": bool(style & 0x00010000), "window": [win.left, win.top, win.right - win.left, win.bottom - win.top],
+            "client_origin": [origin.x - win.left, origin.y - win.top], "client": [cli.right, cli.bottom],
+            "caption": {"h": lay.height, "top": lay.top, "buttons": {k: list(v) for k, v in lay.buttons.items()}},
+            "non_client_regions": host.non_client_regions, "points": out}
+        self.write()
 
     def event(self, kind: str, **fields: Any) -> None:
         self.events.append({"kind": kind, "at": round(time.time(), 3), **fields})
@@ -1060,6 +1131,23 @@ class WebWindow:
                 self.memory.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def workflow_action(ref: str, verb: str, words: str = "") -> str | None:
+    """The page's Save / Edit / No on a Playbook item as practice memory's ``workflow_edit`` action
+    (``yuki.memory.practice.EDIT_ACTIONS``): on a playbook (``pb:N``) Save keeps it (``save``), Edit is the user's own
+    words re-distilled (``edit``, words needed), No retires it (``forget``, its history kept); on a teach-back question
+    (``question:N``) Save or Edit answers it in the user's words (``save``) and No skips it (``disable``). ``None`` for
+    anything else."""
+    question = str(ref or "").lower().startswith("question:")
+    verb = str(verb or "").strip().lower()
+    if verb == "no":
+        return "disable" if question else "forget"
+    if verb == "edit" or (question and verb == "save"):
+        return "save" if question and words else ("edit" if words else None)
+    if verb == "save":
+        return "save"
+    return None
 
 
 def plan_text(thread: dict[str, Any]) -> str:
@@ -1180,6 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--memory-low-after", type=float, default=None)
     ap.add_argument("--dev-tools", action="store_true")
     ap.add_argument("--no-fallback", action="store_true", help="never open the Qt window instead")
+    ap.add_argument("--probe-frame", action="store_true", help="measure the frameless frame (off-screen)")
     args = ap.parse_args(argv)
     page, thread = page_name(args.page)
     handle = None if args.offscreen else single_instance()
@@ -1209,6 +1298,7 @@ def main(argv: list[str] | None = None) -> int:
                     connect=not args.no_connect, t0=args.t0, metrics_path=args.metrics, shot=args.shot,
                     exit_after=args.exit_after, memory_low_after=args.memory_low_after,
                     shot_delay=args.shot_delay)
+    win.probe_frame = bool(args.probe_frame and args.offscreen)
     win.start()
     url = START_URL + (("?" + args.query) if args.query else "")
     options = HostOptions(

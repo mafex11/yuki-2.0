@@ -1,30 +1,40 @@
-/* Activity: the ledger of what Yuki did (time, what, where, why, result, the Undo window, Wrong), what it saw
-   (time by app: counts only, no screen content), calls, and what failed. Data: the request log, the cards and their
-   offers, the timeline, the calls (Python builds the rows). */
+/* Activity: the ledger of what Yuki did (E14). Each row: time, what and where, why ("because you said …" in your own
+   words, the procedure it used or the lesson it kept, "because rule …" for your standing rules), the result, the Undo
+   window where memory can take it back (an offer that ran, a to-do it added), Wrong. Filters: All / Did / Saw (time
+   by app: counts only, no screen content) / Calls / Failed. Data: the run traces, the request log, the cards and
+   their offers, the calls (Python builds the rows). */
 (function () {
   'use strict';
   const Y = window.Yk, { h, ic, key, fmt } = Y;
   const FILTERS = [['all', 'All'], ['did', 'Did'], ['saw', 'Saw'], ['calls', 'Calls'], ['failed', 'Failed']];
-  const glyph = (s) => (s === 'done' ? ic('check') : s === 'failed' ? ic('x') : s === 'live' ? ic('rec') : ic('dash'));
+  const glyph = (s) => (s === 'verified' || s === 'done' ? ic('check') : s === 'failed' ? ic('x') : s === 'live' ? ic('rec') : ic('dash'));
 
   function undoCell(r) {
     if (r.undo && r.undo.until * 1000 > Date.now()) {
       const left = Math.max(1, Math.round((r.undo.until * 1000 - Date.now()) / 60000));
-      return [key(r.undo.label || 'Undo', { cls: 'xs', data: { do: 'offer-undo', card: r.undo.card } }), h('span', { text: `${left} min left` })];
+      const data = r.undo.todo ? { do: 'todo-undo', todo: r.undo.todo } : { do: 'offer-undo', card: r.undo.card };
+      return [key(r.undo.label || 'Undo', { cls: 'xs', data }), ' ', h('span', { text: `${left} min left` })];
     }
     return r.cant_undo ? 'can’t undo' : '';
+  }
+  function whyCell(r) {
+    const chips = (r.chips || []).filter((c) => c.text);
+    return h('span', { class: 'why' }, r.because ? [h('em', { text: r.because }), ' '] : null, r.why || '',
+      chips.length ? h('div', { class: 'chips' }, chips.map((c) => h('span', { class: 'chip mem' + (c.kind === 'lesson' ? ' lesson' : '') },
+        ic(c.kind === 'lesson' ? 'lesson' : 'memory'), c.kind === 'lesson' ? `lesson · ${c.text}` : c.text))) : null);
   }
   function row(r) {
     return h('div', { class: 'lrow', data: { row: r.id } },
       h('span', { class: 'tm', text: fmt.hm(r.at) }),
       h('span', { class: 'wh' }, r.what, h('span', { text: [r.where, r.cost].filter(Boolean).join(' · ') })),
-      h('span', { class: 'why' }, r.because ? [h('em', { text: r.because }), ' '] : null, r.why || ''),
+      whyCell(r),
       h('span', { class: 'rs ' + (r.status || '') }, glyph(r.status), h('span', { text: r.result || r.status || '' })),
       h('span', { class: 'un' }, undoCell(r)),
       h('span', null, r.status === 'live' ? null : key('Wrong', { cls: 'xs ghost', data: { do: 'wrong', row: r.id } })));
   }
-  function ledger(rows) {
-    if (!rows.length) return Y.clearing('section', 'ledger', Y.empty('Nothing here yet. Every request and every card Yuki shows lands in this ledger with why and what came of it.'));
+  function ledger(rows, f) {
+    if (!rows.length) return Y.clearing('section', 'ledger', Y.empty(f === 'failed' ? 'Nothing failed in the last 7 days.'
+      : 'Nothing here yet. Every request, every step it took and every card Yuki shows lands in this ledger with why and what came of it.'));
     let last = '';
     const out = [h('div', { class: 'lrow hd' }, ['Time', 'What, where', 'Why', 'Result', 'Undo', ''].map((t) => h('span', { text: t })))];
     rows.forEach((r) => { const d = fmt.dayRule(r.at); if (d !== last) { out.push(h('div', { class: 'lday', text: d })); last = d; } out.push(row(r)); });
@@ -56,11 +66,12 @@
     let body;
     if (f === 'saw') body = seen(d);
     else if (f === 'calls') body = calls(d);
-    else body = ledger(rows.filter((r) => f === 'all' || (f === 'failed' ? r.status === 'failed' : r.status !== 'failed')));
+    else body = ledger(rows.filter((r) => f === 'all' || (r.f || (r.status === 'failed' ? 'failed' : 'did')) === f), f);
     return [Y.head('Activity', meta, Y.numFig(did, 'actions today'), Y.seg(FILTERS, 'filter', f)), body];
   }
 
-  /* Wrong: a card gets "less like this"; a request opens the thread with your words to finish (nothing is sent) */
+  /* Wrong: a card gets "less like this"; a request or a step opens the thread with your words to finish (nothing is
+     sent) - the correction reaches practice memory as your next words, the way every correction does */
   Y.actions.wrong = (t) => {
     const d = Y.D.pages.activity || {}, r = (d.rows || []).find((x) => String(x.id) === t.dataset.row); if (!r) return;
     const cell = t.closest('.lrow').querySelector('.rs');
@@ -74,6 +85,14 @@
     Y.S.draft = r.wrong_text || `That wasn’t right: “${r.what}”. `;
     Y.go(Y.S.page, Y.S.sub, { chat: true });
     setTimeout(() => { const i = document.querySelector('.drawer-in'); if (i) { i.value = Y.S.draft; i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 80);
+  };
+  /* Undo on a to-do Yuki added (10 minutes): memory ends it as not needed */
+  Y.actions['todo-undo'] = (t) => {
+    t.disabled = true;
+    Y.act('todo_undo', { todo: t.dataset.todo }).then((r) => {
+      const host = t.closest('.un') || t.parentElement;
+      Y.morph(host, h('span', { class: 'confirm sm' }, ic(r.ok ? 'undo' : 'x'), h('span', { text: r.ok ? 'Undone. It’s off your list.' : (r.error || 'Couldn’t undo that.') })));
+    });
   };
 
   Y.pages.activity = { build };

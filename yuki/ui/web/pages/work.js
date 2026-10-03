@@ -7,6 +7,9 @@
   const Y = window.Yk, { h, ic, key, fmt } = Y;
   const tabs = (sub) => Y.seg([['', 'Threads'], ['day', 'Day']], 'sub', sub === 'day' ? 'day' : '');
 
+  /* the design's thread card: state tag and when, title, where it stands, the checklist as dot progress (milestones
+     that landed / open items, the next one), a quiet goal line, the people it involves as chips (people in your index,
+     matched by identity) and its apps and things as one mono line, Continue */
   function threadCard(t) {
     const open = t.open || [], checks = t.checks;
     let prog = null;
@@ -14,19 +17,23 @@
       prog = h('div', { class: 'tprog' }, Y.dotProgress(checks.done, checks.total), h('span', { class: 'mono', text: `${checks.done}/${checks.total}` }),
         h('span', { class: 'tnext', text: checks.next || 'all done' }));
     } else if (open.length) {
-      prog = h('div', { class: 'tprog' }, Y.dotProgress(0, open.length), h('span', { class: 'mono', text: `${open.length} open` }),
+      prog = h('div', { class: 'tprog' }, Y.dotProgress(0, open.length), h('span', { class: 'mono', text: `0/${open.length}` }),
         h('span', { class: 'tnext', text: open[0] }));
     }
-    const ents = (t.involves || []).slice(0, 4);
+    const people = (t.people || []).slice(0, 3);
+    const apps = (t.apps || (t.people ? [] : t.involves) || []).slice(0, 4);
     return Y.clearing('article', 'thread',
       h('div', { class: 'top' }, h('span', { class: 'st-tag ' + (t.status || '') }, h('i'), t.status || ''), h('span', { class: 'when', text: fmt.rel(t.last_at) })),
       h('h3', { text: t.title }),
       h('div', { class: 'stands' + (t.state ? '' : ' none'), text: t.state || 'Where it stands isn’t written yet.' }),
       prog,
+      t.goal ? h('div', { class: 'tgoal', title: 'Your goal for it', text: `goal · ${t.goal}` }) : null,
       h('div', { class: 'foot' },
-        h('div', null, ents.length ? h('div', { class: 'people-dots' }, ents.map((e) => h('span', { class: 'chip ent', text: e }))) : null),
+        h('div', null, people.length ? h('div', { class: 'people-dots' }, people.map((p) => h('span', { text: p }))) : null,
+          apps.length ? h('div', { class: 'apps', css: { marginTop: people.length ? '8px' : '0' }, text: apps.join(' · ') }) : null),
         t.status === 'done' ? h('span', { class: 'cost', text: 'done' })
-          : key('Continue', { cls: 'sm', data: { do: 'continue', ref: t.ref }, title: 'Opens the ask bar with a plan. Nothing runs until you press Enter.' })));
+          : h('button', { class: 'key sm', data: { do: 'continue', ref: t.ref }, attrs: { type: 'button' },
+            title: 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev'))));
   }
 
   function weekFig(w) {

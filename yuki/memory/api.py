@@ -86,6 +86,7 @@ People and routes (migration 28, yuki.memory.contacts; SQL only, no model call):
     memory.people_directory() -> str                     # the compact people block (<= ~900 chars) for cached layers
     memory.prefer_route(ref, "route:N", words) -> dict   # the user's lasting route choice, in their own words
     memory.frame_facts(words, said=, screen=, apps=)     # what the task frame needs (yuki.agent.frame)
+    memory.people_list() -> list[dict]                   # the window's Me page: routes, counts, "rhythm" (14 days)
 
 Practice memory (migration 29, yuki.memory.practice; learned by the service's practice worker, yuki.memory.practice_learn)::
 
@@ -94,6 +95,7 @@ Practice memory (migration 29, yuki.memory.practice; learned by the service's pr
     memory.practice(words, apps=, open_apps=) -> dict    # procedures / habits and pitfalls for the apps in play
     memory.workflows() -> dict                           # the window's Playbook page
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
+    memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
@@ -106,6 +108,7 @@ What happened on calls and meetings (timeline digests written by the service, yu
 from __future__ import annotations
 
 import ctypes
+import json
 import threading
 import time
 from datetime import date, datetime
@@ -2135,6 +2138,10 @@ class MemoryClient:
                 state = "nothing said"
             parts.append({"call_id": cid, "start": _iso(r.detected_at), "end": _iso(r.ended_at), "state": state})
         recorded = any(rows.get(c) is not None and rows[c].recording_started_at is not None for c in ids)
+        # the user's answer that let it record (or not): "always" / "never" = their standing call rule, "yes" / "no"
+        # = their answer on that call's card; the first row that has one (the Activity ledger's "because")
+        consent = next((rows[c].consent for c in ids if rows.get(c) is not None and getattr(rows[c], "consent", None)),
+                       None)
         from yuki.memory.calldigest import merge_people
 
         # who was on it and where, as the screen around the call showed (the digest's reading; migration 25)
@@ -2145,7 +2152,8 @@ class MemoryClient:
             "ref": f"call:{ids[0]}", "call_ids": ids, "app": span["app"], "service": span.get("service"),
             "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
             "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
-            "recorded": recorded, "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
+            "recorded": recorded, "consent": consent,
+            "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
             "gists": gists, "rows": parts, "people": people, "where": where,
         }
 
@@ -2633,11 +2641,28 @@ class MemoryClient:
         text = text.split(":")[-1].lstrip("Ww")
         return int(text) if text.isdigit() else None
 
+    def _thread_extras(self, rows: list[Any]) -> dict[int, dict[str, Any]]:
+        """The Yuki window's Work page per thread (revamp E12): ``checks`` (milestones landed / open items:
+        ``yuki.memory.workthreads.checklists``) and ``involves_typed`` (each involved name typed person / app / thing by
+        identity: ``typed_entities``). Read only; ``{}`` when they cannot be read."""
+        from yuki.memory.workthreads import checklists, typed_entities
+
+        out: dict[int, dict[str, Any]] = {int(t.id): {} for t in rows}
+        for key, fn in (("checks", checklists), ("involves_typed", typed_entities)):
+            try:
+                for tid, value in fn(self.store, rows).items():
+                    out.setdefault(int(tid), {})[key] = value
+            except Exception:
+                pass
+        return out
+
     def threads(self, statuses: Any = ("active", "paused"), query: str | None = None, limit: int = 12,
                 embed_wait_s: float | None = None) -> list[dict]:
         """The user's threads of work, most recently touched first (``query``: closest in meaning first, any
         status but merged). Each: ``{"ref": "thread:N", "id", "title", "status", "state", "open", "involves",
-        "first_seen", "last_seen", "events", "importance", "line"}``. Never raises."""
+        "first_seen", "last_seen", "events", "importance", "line", "checks", "involves_typed"}`` - ``checks``:
+        ``{"done", "open", "total", "next"}`` (milestones that landed on it / its open items); ``involves_typed``:
+        ``[{"name", "type": "person" | "app" | "thing"}]``. Never raises."""
         try:
             if query and query.strip():
                 pool = self.store.work_threads(("active", "paused", "done"))
@@ -2657,7 +2682,8 @@ class MemoryClient:
                 rows = pool[: max(0, int(limit))]
             else:
                 rows = self.store.work_threads(tuple(statuses) if statuses else None, limit=max(0, int(limit)))
-            return [self._thread_dict(t) for t in rows]
+            extras = self._thread_extras(rows)
+            return [{**self._thread_dict(t), **extras.get(int(t.id), {})} for t in rows]
         except Exception:
             return []
 
@@ -2676,6 +2702,7 @@ class MemoryClient:
         secs = _links.seconds_of(self.store, d["links"])
         return {
             **self._thread_dict(t),
+            **self._thread_extras([t]).get(int(t.id), {}),
             "events": [{"at": _iso(e["at"]), "action": e["action"], "app": e["app"], "host": e["host"],
                         "state": e["state"]} for e in d["events"]],
             "facts": [{"at": _iso(j.at), "app": j.app, "fact": j.fact, "nature": j.nature,
@@ -2765,28 +2792,39 @@ class MemoryClient:
             if not found:
                 return {"found": False, "ref": str(ref or ""), "people": [p.name for p in _c.people(self.store)][:20]}
             card = _c.card(self.store, found[0], near_thread=near_thread)
+            try:   # the Yuki window's dossier: messages a day both ways, 14 days (revamp E11)
+                card["rhythm"] = _c.rhythm(self.store, [found[0]]).get(found[0].id)
+            except Exception:
+                card["rhythm"] = None
             return {"found": True, **card, "text": _c.card_text(card), "others": [p.name for p in found[1:4]]}
         except Exception:
             return None
 
     def people_list(self, *, limit: int = 40) -> list[dict]:
-        """The people the user talks to, as structured rows for the Yuki window's Me page (no message is
+        """The people the user talks to, as structured rows for the Yuki window's Me page (no message text is
         decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "app", "kind",
-        "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...], "usual", "margin", "close",
-        "last_contact"}]``, most recently in touch first. ``[]`` when memory has no people index yet. Never raises."""
+        "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...], "usual", "margin", "close",
+        "last_contact", "rhythm"}]``, most recently in touch first; ``rhythm`` is their messages a day both ways over 14
+        days (``yuki.memory.contacts.rhythm``: ``days``, ``total``, ``known_days``, ``peak``...). ``[]`` when memory has
+        no people index yet. Never raises."""
         from yuki.memory import contacts as _c
 
         try:
             rows = []
-            for person in _c.people(self.store):
+            persons = _c.people(self.store)
+            try:
+                rhythms = _c.rhythm(self.store, persons)
+            except Exception:
+                rhythms = {}
+            for person in persons:
                 c = _c.card(self.store, person, with_samples=0)
-                routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "mine", "theirs", "last_mine",
-                                                 "last_theirs", "share", "preferred")} for r in c["routes"]]
+                routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "chat", "handle", "mine", "theirs",
+                                                 "last_mine", "last_theirs", "share", "preferred")} for r in c["routes"]]
                 last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),
                            default=None)
                 rows.append({"ref": c["ref"], "name": c["name"], "relation": c["relation"], "aliases": c["aliases"],
                              "tone": c["tone"], "routes": routes, "usual": c["usual"], "margin": c["margin"],
-                             "close": c["close"], "last_contact": last})
+                             "close": c["close"], "last_contact": last, "rhythm": rhythms.get(person.id)})
             rows.sort(key=lambda r: r["last_contact"] or 0, reverse=True)
             return rows[:limit]
         except Exception:
@@ -3067,6 +3105,84 @@ class MemoryClient:
         from yuki.memory import practice as _p
 
         return _p.workflow_edit(self.store, ref, action, words)
+
+    def run_ledger(self, since: Any = None, until: Any = None, limit: int = 80) -> list[dict]:
+        """What Yuki did, from the run traces (practice memory's ``runs``, migration 29), for the Yuki window's
+        Activity ledger (revamp E14): one entry per request in ``[since, until)`` (default today), newest first::
+
+            {"key", "source": "agent" | "hand", "lane", "at", "ended_at", "words" (what the user said), "outcome",
+             "cost_usd", "ms", "calls", "steps": [{"step", "at", "tool", "kind", "app", "app_name", "target", "input",
+             "ok", "verdict", "expected", "why", "result", "ms", "cited": [{"ref": "pb:N", "kind", "title"}]}]}
+
+        Steps are the ones that did something (``kind`` action or memory; reads and questions are left out); ``cited``
+        are the playbooks the step said it followed, with their kind (procedure / habit / pitfall / style) and title.
+        Read only, decrypted here for the user's own window; ``[]`` without traces. Never raises."""
+        try:
+            s, u = self._window(since, until)
+            heads = self.store._query("SELECT * FROM runs WHERE step=0 AND at >= ? AND at < ? ORDER BY at DESC LIMIT ?",
+                                      (s, u, max(1, int(limit))))
+        except Exception:
+            return []
+        if not heads:
+            return []
+        dec = self.store._dec
+        keys = [h["run_key"] for h in heads]
+        steps: dict[str, list[Any]] = {}
+        try:
+            for i in range(0, len(keys), 400):
+                part = keys[i:i + 400]
+                marks = ",".join("?" * len(part))
+                for r in self.store._query(f"SELECT * FROM runs WHERE step > 0 AND kind IN ('action', 'memory') AND"
+                                           f" run_key IN ({marks}) ORDER BY run_key, step", part):
+                    steps.setdefault(r["run_key"], []).append(r)
+        except Exception:
+            steps = {}
+
+        def cited_of(raw: Any) -> list[int]:
+            try:
+                return [int(v) for v in (json.loads(raw or "{}").get("cited") or []) if str(v).isdigit()]
+            except (ValueError, TypeError, AttributeError):
+                return []
+
+        ids = sorted({i for rows in steps.values() for r in rows for i in cited_of(r["playbooks"])})
+        books: dict[int, dict[str, Any]] = {}
+        if ids:
+            try:
+                marks = ",".join("?" * len(ids))
+                for r in self.store._query(f"SELECT id, kind, intent_ciphertext FROM playbooks WHERE id IN ({marks})", ids):
+                    books[int(r["id"])] = {"ref": f"pb:{r['id']}", "kind": r["kind"], "title": dec(r["intent_ciphertext"]) or ""}
+            except Exception:
+                books = {}
+        names: dict[str, str] = {}
+        try:
+            from yuki.core.appnames import app_key
+
+            for r in self.store._query("SELECT process, app, count(*) n FROM threads WHERE process IS NOT NULL AND app"
+                                       " IS NOT NULL GROUP BY process, app ORDER BY n"):
+                names[app_key(r["process"])] = r["app"]   # the most seen display name wins (ordered by count)
+        except Exception:
+            names = {}
+        out = []
+        for h in heads:
+            rows = []
+            for r in steps.get(h["run_key"], []):
+                meta = {}
+                try:
+                    meta = json.loads(r["playbooks"] or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                rows.append({"step": int(r["step"]), "at": float(r["at"]), "tool": r["tool"], "kind": r["kind"],
+                             "app": r["app"], "app_name": names.get(r["app"] or "", r["app"] or ""),
+                             "target": dec(r["target_ciphertext"]) or "", "input": dec(r["input_ciphertext"]) or "",
+                             "ok": None if r["ok"] is None else bool(r["ok"]),
+                             "verdict": None if r["verdict"] is None else bool(r["verdict"]),
+                             "expected": bool(meta.get("expected")), "why": dec(r["why_ciphertext"]) or "",
+                             "result": dec(r["result_ciphertext"]) or "", "ms": r["ms"],
+                             "cited": [books[i] for i in cited_of(r["playbooks"]) if i in books]})
+            out.append({"key": h["run_key"], "source": h["source"], "lane": h["lane"], "at": float(h["at"]),
+                        "ended_at": h["ended_at"], "words": dec(h["input_ciphertext"]) or "", "outcome": h["outcome"],
+                        "cost_usd": h["cost_usd"], "ms": h["ms"], "calls": h["calls"], "steps": rows})
+        return out
 
     def _route_processes(self, thread_ids: Any) -> list[str]:
         ids = [int(t) for t in thread_ids or [] if isinstance(t, int)]

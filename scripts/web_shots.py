@@ -44,6 +44,9 @@ SHOTS: dict[str, str] = {
     "settings-scrolled": "page=settings&scroll=600",
     "day-scrolled": "page=work/day&scroll=640&scrub=1185",
     "playbook-empty-memory": "page=playbook&empty=1",
+    # nothing live (no run): the state the design's window shots are in, for side-by-sides (E11-E14)
+    "home-idle": "page=home&runs=0", "work-idle": "page=work&runs=0", "me-idle": "page=me&runs=0",
+    "playbook-idle": "page=playbook&runs=0", "activity-idle": "page=activity&runs=0",
 }
 
 

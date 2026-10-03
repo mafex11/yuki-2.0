@@ -1,34 +1,44 @@
-/* Playbook: how you do things. Procedures (Phase C writes them with steps, uses and confidence; until then the
-   know-how Yuki keeps today), NEW proposals with Save / Edit / No, lessons, and standing rules. Honest empty states:
-   nothing here is invented to fill the page. */
+/* Playbook: how you do things, from practice memory (E13). NEW proposals (a way seen once, or a question Yuki would
+   like to ask) with Save / Edit / No - Edit is your own words, which memory re-distills into the next version;
+   procedures and habits ("How you do things": steps, the app, uses and last use, how sure, where it came from);
+   lessons (what went wrong and what to do instead); standing rules. Every choice goes to memory's own workflow_edit
+   through Python; nothing here edits memory. Without practice memory: the know-how Yuki keeps today. */
 (function () {
   'use strict';
   const Y = window.Yk, { h, ic, key, fmt } = Y;
 
   function proposal(p) {
+    const question = p.kind === 'question';
     const el = Y.clearing('section', 'proposal',
-      h('div', null, h('span', { class: 'newtag' }, ic('plus'), 'New · learned from watching you'), h('h3', { class: 'ltx', text: p.title }),
+      h('div', null, h('span', { class: 'newtag' }, ic('plus'), question ? 'New · a question for you' : 'New · learned from watching you'),
+        h('h3', { class: 'ltx', text: p.title }),
         p.basis ? h('div', { class: 't2', text: p.basis }) : null,
         (p.steps || []).length ? h('div', { class: 'steps-inline' }, p.steps.map((s, i) => h('span', null, h('span', { class: 'doto', text: i + 1 }), s))) : null),
-      h('div', { class: 'pacts' }, key('Save', { cls: 'pri', data: { do: 'learn-save' } }), key('Edit', { data: { do: 'learn-edit' } }), key('No', { cls: 'ghost', data: { do: 'learn-no' } })));
-    el.dataset.learned = ''; el.dataset.ref = p.ref || '';
+      h('div', { class: 'pacts' },
+        question ? key('Answer', { cls: 'pri', data: { do: 'learn-edit' } }) : key('Save', { cls: 'pri', data: { do: 'learn-save' } }),
+        question ? null : key('Edit', { data: { do: 'learn-edit' } }),
+        key(question ? 'Skip' : 'No', { cls: 'ghost', data: { do: 'learn-no' } })));
+    el.dataset.learned = ''; el.dataset.ref = p.ref || ''; el.dataset.kind = p.kind || '';
     return el;
   }
   function procedure(p) {
-    return h('div', { class: 'proc' }, h('div', null, h('h4', { text: p.title }), p.when ? h('div', { class: 'when', text: 'When ' + p.when }) : null,
-      (p.steps || []).length ? h('ol', null, p.steps.map((s) => h('li', { text: s }))) : null),
-    h('div', { class: 'side' }, p.app ? h('b', { text: p.app }) : null, p.app ? h('br') : null,
-      p.uses != null ? `used ${fmt.plural(p.uses, 'time')}${p.last ? ', last ' + p.last : ''}` : null, p.uses != null ? h('br') : null,
-      p.conf != null ? [Y.meter(p.conf), ' ', p.conf_word || '', h('br')] : null,
-      p.learned ? h('span', { text: p.learned }) : null));
+    return h('div', { class: 'proc' + (p.disabled ? ' off' : '') },
+      h('div', null, h('h4', { text: p.title }), p.when ? h('div', { class: 'when', text: p.when }) : null,
+        (p.steps || []).length ? h('ol', null, p.steps.map((s) => h('li', { text: s }))) : null),
+      h('div', { class: 'side' }, p.app ? h('b', { text: p.app }) : null, p.app ? h('br') : null,
+        `used ${fmt.plural(p.uses || 0, 'time')}${p.last ? ', last ' + p.last : ''}`, h('br'),
+        p.conf != null ? [Y.meter(p.conf), ' ', p.disabled ? 'off' : (p.conf_word || ''), h('br')] : null,
+        p.learned ? h('span', { class: 't3', text: p.learned }) : null));
   }
   function howto(k) {
     return h('div', { class: 'howto' }, h('h4', { text: k.title }), h('div', { class: 'line', text: k.line || '' }),
       h('div', { class: 'side' }, k.app ? h('b', { text: k.app }) : null, k.app ? h('br') : null, k.since ? 'learned ' + k.since : 'learned from a run that worked'));
   }
   function lesson(l) {
-    return h('div', { class: 'lesson' }, h('span', { class: 'd', text: l.dont }), l.because ? h('span', { class: 'b', text: ` because ${l.because}.` }) : null,
-      l.do ? h('div', { class: 'z', text: l.do }) : null, h('div', { class: 'm', text: [l.used != null ? `used ${fmt.plural(l.used, 'time')}` : '', l.from ? 'from ' + l.from : ''].filter(Boolean).join(' · ') }));
+    return h('div', { class: 'lesson' + (l.disabled ? ' off' : '') }, h('span', { class: 'd', text: l.dont }), l.because ? [' ', h('span', { class: 'b', text: l.because })] : null,
+      l.do ? h('div', { class: 'z', text: l.do }) : null,
+      h('div', { class: 'm', text: [l.tentative ? 'tentative, seen once' : '', `used ${fmt.plural(l.used || 0, 'time')}`,
+        l.from ? l.from.charAt(0).toLowerCase() + l.from.slice(1) : ''].filter(Boolean).join(' · ') }));
   }
   function ruleRow(r, i) {
     return h('div', { class: 'rule', data: { fact: '', ref: r.ref, kind: r.kind === 'standing' ? 'standing' : 'rule', text: r.text } },
@@ -39,13 +49,17 @@
   function build(d) {
     const props = d.proposals || [], procs = d.procedures || [], know = d.know_how || [], les = d.lessons || [];
     const rules = (d.rules || []).concat((d.standing || []).map((s) => Object.assign({ kind: 'standing' }, s)));
-    const nProc = procs.length || know.length;
+    const practice = !!d.workflows_available;
+    const nProc = practice ? procs.length : know.length;
     const meta = [h('span', { text: 'How you do things' }),
-      h('span', null, h('b', { text: nProc }), procs.length ? ' procedures, ' : ' things learned, ', h('b', { text: les.length }), ' lessons, ', h('b', { text: props.length }), ' new')];
-    const left = procs.length ? Y.sec('How you do things', procs.length, procs.map(procedure))
+      h('span', null, h('b', { text: nProc }), practice ? (nProc === 1 ? ' procedure, ' : ' procedures, ') : ' things learned, ', h('b', { text: les.length }),
+        les.length === 1 ? ' lesson, ' : ' lessons, ', h('b', { text: props.length }), ' new')];
+    const left = practice
+      ? Y.sec('How you do things', procs.length, procs.length ? procs.map(procedure)
+        : Y.empty('Nothing yet. When something works on this PC, how it was done lands here, with how often I used it.'))
       : Y.sec('What I learned to do', know.length, know.length ? know.map(howto)
-        : Y.empty('Nothing yet. When something works on this PC, how it was done lands here.'), Y.rightLabel(d.workflows_available ? '' : 'steps and counts come with workflows'));
-    return [Y.head('Playbook', meta, Y.numFig(nProc, procs.length ? (nProc === 1 ? 'procedure' : 'procedures') : 'learned')),
+        : Y.empty('Nothing yet. When something works on this PC, how it was done lands here.'));
+    return [Y.head('Playbook', meta, Y.numFig(nProc, practice ? (nProc === 1 ? 'procedure' : 'procedures') : 'learned')),
       props.map(proposal),
       h('div', { class: 'grid2' },
         h('div', { class: 'col' }, left),

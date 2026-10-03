@@ -84,8 +84,15 @@
     });
     return svg;
   }
-  const dotProgress = (done, total) => h('span', { class: 'dprog', aria: { label: `${done} of ${total} done` } },
-    Array.from({ length: Math.min(total, 9) }, (_, i) => h('i', { class: i < done ? 'on' : '' })));
+  /* the design's dot progress: one dot per item; past 9 items the dots stand for shares (never all lit while one is
+     open, never none lit once one is done) */
+  const DPROG_MAX = 9;
+  const dotProgress = (done, total) => {
+    const n = Math.min(total, DPROG_MAX);
+    let on = total <= DPROG_MAX ? done : Math.round((done / Math.max(1, total)) * n);
+    if (total > DPROG_MAX) on = Math.max(done > 0 ? 1 : 0, Math.min(done < total ? n - 1 : n, on));
+    return h('span', { class: 'dprog', aria: { label: `${done} of ${total} done` } }, Array.from({ length: n }, (_, i) => h('i', { class: i < on ? 'on' : '' })));
+  };
   const bar = (n, max, cells) => {
     const c = cells || 10, k = n > 0 ? Math.max(1, Math.round((n / Math.max(1, max)) * c)) : 0;
     return h('span', { class: 'bar' }, Array.from({ length: c }, (_, i) => h('i', { class: i < k ? '' : 'o' })));

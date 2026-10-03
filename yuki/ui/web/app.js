@@ -5,7 +5,13 @@
 
    Lightweight rules (E16): no infinite CSS animation; timers run only while something on the page needs them
    (a call timer, a running request); the field draws nothing while settled; the live state figure has its own
-   small canvas at 15 fps (field.js LiveLayer); behind other windows everything is one still frame. */
+   small canvas at 15 fps (field.js LiveLayer); behind other windows everything is one still frame; the idle face
+   blinks on one 1 Hz tick (two still draws a blink).
+
+   The frame (E11-E14 §6): the window has no Windows title bar; the page draws the design's caption buttons and title
+   bar (.titlebar, .dragbar, .resize-top), tells the host where they are (op "caption", for Windows' own hit test:
+   snap layouts over the maximize button where Windows can see it) and asks it to minimise, maximise, close, or start
+   the system's own move / size loop (op "window") when the pointer reaches the page first. */
 (function () {
   'use strict';
   const L = window.Lattice, B = window.YukiBridge, Y = window.Yk;
@@ -137,8 +143,11 @@
   function mountFaces(root) {
     root.querySelectorAll('canvas[data-core]').forEach((cv) => {
       if (cv.__face) return;
-      // idle faces do not blink in the window: with nothing live, nothing redraws (the design's idle shots had a quiet face)
-      const f = new L.Face(cv, +cv.dataset.pitch || 4); f.idleBlink = false; f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
+      // the idle face blinks as the design's does, but on the shared 1 Hz tick: two still draws a blink, no 30 fps
+      // loop (field.js Tick; 32-build-E11-E14.md §7); live faces blink through the loop they already run
+      const f = new L.Face(cv, +cv.dataset.pitch || 4);
+      if (Q.get('blink') === '0') f.idleBlink = false; else f.tickBlink();   // blink=0: the measurement baseline
+      f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
     });
   }
   function afterMain(main, nav) {
@@ -218,6 +227,55 @@
   }
   Y.applyAppearance = applyAppearance;
 
+  /* ================= the frame: the design's title bar (E11-E14 §6) =================
+     Built once, outside #app (pages redraw under it). The host answers Windows' hit test from what the page reports
+     here; when the pointer reaches the page first (WebView2 covers the window) the page asks the host directly. */
+  const CAPTION_H = 34;
+  function capGlyph(kind) {
+    const svg = Y.s('svg', { viewBox: '0 0 10 10', 'aria-hidden': 'true' });
+    if (kind === 'min') svg.append(Y.s('path', { d: 'M1 5h8' }));
+    else if (kind === 'max') svg.append(Y.s('rect', { x: 1.5, y: 1.5, width: 7, height: 7 }));
+    else if (kind === 'restore') svg.append(Y.s('path', { d: 'M3.5 1.5h5v5' }), Y.s('rect', { x: 1.5, y: 3.5, width: 5, height: 5 }));
+    else svg.append(Y.s('path', { d: 'M1.5 1.5l7 7M8.5 1.5l-7 7' }));
+    return svg;
+  }
+  const CAP_DO = { min: 'minimize', max: 'maximize', close: 'close' };
+  const capBtn = (part, label) => h('button', { data: { cap: part }, attrs: { type: 'button', 'aria-label': label } }, capGlyph(part));
+  const titlebar = h('div', { class: 'titlebar' }, capBtn('min', 'Minimize'), capBtn('max', 'Maximize'), capBtn('close', 'Close'));
+  const dragbar = h('div', { class: 'dragbar', attrs: { 'aria-hidden': 'true' } });
+  const resizeTop = h('div', { class: 'resize-top', attrs: { 'aria-hidden': 'true' } }, h('i', { class: 'tl' }), h('i', { class: 'tr' }));
+  document.body.append(dragbar, resizeTop, titlebar);
+  const rectOf = (el) => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; };
+  function reportCaption() {
+    if (!B.native) return;
+    const buttons = {};
+    titlebar.querySelectorAll('[data-cap]').forEach((b) => { buttons[b.dataset.cap] = rectOf(b); });
+    B.send('caption', { h: CAPTION_H, dpr: window.devicePixelRatio || 1, buttons, no_drag: [] });
+  }
+  let capT = 0;
+  window.addEventListener('resize', () => { clearTimeout(capT); capT = setTimeout(reportCaption, 120); });
+  B.on('caption', (m) => titlebar.querySelectorAll('[data-cap]').forEach((b) => {
+    b.toggleAttribute('data-hover', b.dataset.cap === m.hover);
+    b.toggleAttribute('data-pressed', b.dataset.cap === m.pressed);
+  }));
+  B.on('window', (m) => {
+    const maxed = !!m.maximized;
+    document.documentElement.classList.toggle('maximized', maxed);
+    const b = titlebar.querySelector('[data-cap="max"]');
+    b.replaceChildren(capGlyph(maxed ? 'restore' : 'max'));
+    b.setAttribute('aria-label', maxed ? 'Restore' : 'Maximize');
+  });
+  titlebar.addEventListener('click', (e) => { const b = e.target.closest('[data-cap]'); if (b) B.send('window', { do: CAP_DO[b.dataset.cap] }); });
+  // the title bar: a press starts the system's own move loop (its snap, double-click and menu); a second quick press
+  // maximizes, as a title bar's double-click does
+  dragbar.addEventListener('mousedown', (e) => { if (e.button !== 0) return; e.preventDefault(); B.send('window', { do: e.detail >= 2 ? 'maximize' : 'drag' }); });
+  resizeTop.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const c = e.target.classList;
+    B.send('window', { do: c.contains('tl') ? 'resize-topleft' : c.contains('tr') ? 'resize-topright' : 'resize-top' });
+  });
+
   /* ================= the bridge ================= */
   const live = new Set(['voice', 'call', 'runs', 'connected']);
   /* preview knobs for invented data only (the file:// preview and the window's --fixture runs): no runs, no call,
@@ -241,6 +299,7 @@
     S.booted = true;
     render(true);
     reportPaint();
+    reportCaption();
     // preview knob (transition captures): switch tab after N ms, e.g. goto=work&gotoAt=1500
     if (m.source === 'fixture' && Q.get('goto')) setTimeout(() => { const [pg, sub] = Q.get('goto').split('/'); go(pg, sub || ''); }, Math.max(0, Number(Q.get('gotoAt') || 1500) - performance.now()));   // on the page's own clock
   });

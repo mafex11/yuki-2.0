@@ -57,11 +57,27 @@
       h('thead', null, h('tr', null, ['App', 'Chat or handle', 'You sent', 'They sent', 'Last', ''].map((t) => h('th', { text: t })))),
       h('tbody', null, routes.map((r) => h('tr', null,
         h('td', null, h('span', { class: 'ap', text: r.app || r.kind || '' })),
-        h('td', null, r.label || ''),
+        h('td', null, r.label || '', r.sub ? [' ', h('span', { class: 't3 mono hsub', text: r.sub })] : null),
         h('td', { class: 'n' }, r.mine != null ? [String(r.mine), Y.bar((r.mine || 0) + (r.theirs || 0), max)] : '—'),
         h('td', { class: 'n', text: r.theirs != null ? String(r.theirs) : '—' }),
         h('td', { class: 't2 mono', text: fmt.rel(r.last_at) }),
         h('td', null, r.preferred ? h('span', { class: 'top-mark', text: 'usually' }) : null)))));
+  }
+
+  /* the design's contact rhythm: 14 days of messages a day both ways as a 5-row dot chart (hollow: before Yuki
+     watched), the axis (first day, the day Yuki started watching, today), the sum, the peak and its day, on how many
+     days you talked; then one small plain line on what the counts can see (E11) */
+  function rhythmBox(days, info) {
+    const known = days.filter((v) => v != null), sum = known.reduce((a, b) => a + b, 0), peak = known.length ? Math.max(...known) : 0;
+    const i = info || {};
+    const active = known.filter((v) => v > 0).length;
+    return h('div', { class: 'rhythm-box' }, Y.label('Contact rhythm · messages a day, both ways'), Y.rhythm(days, true),
+      h('div', { class: 'rh-axis' }, h('span', { text: i.start_label || '14 days ago' }),
+        i.watch_label ? h('span', { text: `${i.watch_label} · I started watching` }) : null, h('span', { text: 'today' })),
+      h('div', { class: 'rh-sum' }, h('span', null, h('b', { class: 'doto', text: sum }), ` in ${fmt.plural(known.length, 'day')}`),
+        h('span', null, 'peak ', h('b', { text: peak }), peak && i.peak_day ? ` on ${i.peak_day}` : ''),
+        known.length ? h('span', { text: active === known.length ? 'every day' : `talked on ${active} of ${known.length} days` }) : null),
+      h('div', { class: 'rh-note', text: 'Counts only chats Yuki saw on this PC: direct chats both ways, and what they wrote in groups.' }));
   }
 
   function dossier(p, d, D) {
@@ -70,8 +86,7 @@
     const pending = d.pending || {};
     const fact = p.fact || null;     // the portrait fact behind this person, for Correct / Forget / Not mine / Pin
     const pf = fact ? pending[fact.ref] : null;
-    const rhythm = p.rhythm || det.rhythm;
-    const known = (rhythm || []).filter((v) => v != null), sum = known.reduce((a, b) => a + b, 0), peak = known.length ? Math.max(...known) : 0;
+    const rhythm = det.rhythm || p.rhythm;
     const facts = (det.facts || []).slice(0, 4);
     const el = Y.clearing('div', 'dossier' + (pf && pf.kind === 'notmine' ? ' notmine' : '') + (pf && pf.kind === 'confirm' ? ' pinned' : ''),
       h('div', { class: 'hd' }, h('div', null, h('h2', { text: p.name, data: { reveal: '' } }),
@@ -83,9 +98,7 @@
       h('div', { class: 'prov meta2' }, pendingMeta(pf), p.prov ? h('span', null, h('b', { text: p.prov })) : null,
         p.count != null ? h('span', { text: fmt.plural(p.count, 'message') + ' seen' }) : null,
         p.last_at ? h('span', { text: 'last contact ' + fmt.rel(p.last_at) }) : null, h('span', { class: 'pinmeta' }, ic('pin'), 'pinned')),
-      rhythm ? h('div', { class: 'rhythm-box' }, Y.label('Contact rhythm · messages a day, both ways'), Y.rhythm(rhythm, true),
-        h('div', { class: 'rh-axis' }, h('span', { text: '14 days ago' }), h('span', { text: 'today' })),
-        h('div', { class: 'rh-sum' }, h('span', null, h('b', { class: 'doto', text: sum }), ` in ${known.length} days`), h('span', null, 'peak ', h('b', { text: peak })))) : null,
+      rhythm ? rhythmBox(rhythm, det.rhythm_info || p.rhythm_info) : null,
       routes.length ? routesTable(routes)
         : h('div', { class: 'routes-note' }, ic('memory'), h('span', { text: d.source === 'index' ? 'No route seen yet. I won’t guess one.' : 'Routes appear once Yuki has learned them: which app, which chat, how often you write each way.' })),
       (det.usual || p.usual) ? h('div', { class: 'usually' }, h('span', { class: 'label', text: 'Usually' }), h('span', { text: det.usual || p.usual })) : null,
