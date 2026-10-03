@@ -398,11 +398,12 @@ composing for an AI. Record what the user did ("The user asked ChatGPT to draft 
 script for a Gamma workspace video") as usual, with other_ai false; mark other_ai true on any fact \
 whose content comes from such a prompt or answer (what the prompt claims about a person, a plan, a \
 job, a place), so it is never taken as a fact about the user. Everything else is other_ai false. \
-A coding agent's or assistant's own answers count too, even about the user's real accounts, files or \
-machine: what it reports, measures, estimates, projects or advises (its analysis, a status table it \
-prints, a forecast of when something runs out, a recommendation) is the AI's text - record that the \
-user asked it and what about, and mark other_ai true on any fact that retells its findings, numbers or \
-advice. What the agent did (built, fixed, ran) stays as WHO DID IT says, other_ai false.
+A coding agent's or assistant's own figures about the user's tooling count too, even for the user's \
+real accounts: its measurements and forecasts of usage, quota, limits or spend (a usage or cost \
+breakdown it prints, when it expects an account to run out) and its advice on staying within them are \
+the AI's text - mark other_ai true on a fact that retells them. Everything else an agent reports about \
+the user's own work (what it found, built, fixed or ran, where a project stands, what is left to do) \
+is other_ai false as usual, with WHO DID IT saying who did it.
 
 SAMPLE, DEMO AND TEST CONTENT is the same: a page can be made-up content rather than the user's life - a \
 demo, a sample script or dialogue, a test transcript, example, mock or placeholder data, samples Yuki or a \

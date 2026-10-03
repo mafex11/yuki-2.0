@@ -310,6 +310,17 @@ def test_a_saved_dry_run_is_applied_exactly_with_no_new_judgement(store, tmp_pat
 # -- review fixes: the audit's operations, the gate's view of the portrait, dreaming's lasting lines -----------
 
 
+def test_the_journal_taints_only_an_agents_usage_figures_not_its_project_reports():
+    """Review A2-3: the AI-text rule covers an agent's usage, quota and spend figures and its advice on them; its
+    reports about the user's own work stay usable (other_ai false)."""
+    from yuki.memory.journal import OTHER_AI_GUIDANCE, system_prompt
+
+    assert "usage, quota, limits or spend" in OTHER_AI_GUIDANCE
+    assert "where a project stands" in OTHER_AI_GUIDANCE and "other_ai false as usual" in OTHER_AI_GUIDANCE
+    assert "what it reports, measures, estimates" not in OTHER_AI_GUIDANCE      # the earlier, wider wording
+    assert OTHER_AI_GUIDANCE.strip()[:60] in system_prompt(["Kai"])
+
+
 def test_the_audit_prompt_holds_the_bar_and_its_operations_go_through_the_gate(store):
     """Review A2-2: the portrait audit's ADDs and UPDATEs meet the bar like a nightly run's."""
     from yuki.memory.portrait import AUDIT_SYSTEM_PROMPT, ADMISSION_BAR, RunResult
