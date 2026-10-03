@@ -334,19 +334,19 @@ def test_w3_a_session_and_a_misheard_entry_corrected_by_the_pass(store):
     new_id = next(c["new_id"] for c in r.changes if c["ok"])
     new = store.episodes_by_ids([new_id])[0]
     assert new.title == "Valorant VOD review" and new.summary == "You watched a Valorant VOD."
-    jid = _journal(store, "The user asked to message 'hey meant' on Discord.", at=NOW - 60, nature="uncertain",
-                   source={"kind": "call", "heard": "hey meant", "meant": "Hemanth", "meant_name": True})
-    out = MemoryClient(store).correct_item(f"journal:{jid}", "it was Hemanth")
+    jid = _journal(store, "The user asked to message 'sea ra' on Discord.", at=NOW - 60, nature="uncertain",
+                   source={"kind": "call", "heard": "sea ra", "meant": "Ciara", "meant_name": True})
+    out = MemoryClient(store).correct_item(f"journal:{jid}", "it was Ciara")
     worker = _Worker(store, [
-        {"fixes": "hey meant is Hemanth", "aliases": [{"heard": "hey meant", "name": "Hemanth", "why": "misheard"}],
-         "search_terms": ["hey meant"], "elsewhere": True},
-        {"edits": [{"id": f"J{jid}", "op": "rewrite", "wrong": "'hey meant'",
-                    "text": "The user asked to message Hemanth on Discord.", "subject": "", "label": "", "shown": "",
+        {"fixes": "sea ra is Ciara", "aliases": [{"heard": "sea ra", "name": "Ciara", "why": "misheard"}],
+         "search_terms": ["sea ra"], "elsewhere": True},
+        {"edits": [{"id": f"J{jid}", "op": "rewrite", "wrong": "'sea ra'",
+                    "text": "The user asked to message Ciara on Discord.", "subject": "", "label": "", "shown": "",
                     "reason": "name"}]}])
     r = CorrectionApplier(worker).apply(out["correction_id"], now=NOW)
-    assert r.ok and [a["name"] for a in store.aliases()] == ["Hemanth"]
+    assert r.ok and [a["name"] for a in store.aliases()] == ["Ciara"]
     [entry] = store.journal_between(None, None)[-1:]
-    assert entry.fact == "The user asked to message Hemanth on Discord." and entry.nature == "fact"
+    assert entry.fact == "The user asked to message Ciara on Discord." and entry.nature == "fact"
     assert MemoryClient(store).misheard(now=NOW)["items"] == []            # settled: off the list
 
 
@@ -416,39 +416,39 @@ def test_w6_the_call_side_tool_asks_for_heard_and_the_guess_and_keeps_them(store
 
     req = RECORD_CALL_SIDE_TOOL["input_schema"]["properties"]["facts"]["items"]["required"]
     assert {"heard", "meant", "meant_why", "meant_is_name"} <= set(req)
-    assert source_fields({"heard": "hey meant", "meant": "Hemanth"}, "fact") == {}          # only uncertain facts
+    assert source_fields({"heard": "sea ra", "meant": "Ciara"}, "fact") == {}          # only uncertain facts
     assert source_fields({"heard": "x", "meant": "X"}, "uncertain") == {}                   # the same words
     w = JournalWorker(store, client=object(), embedder=object(), log_dir=Path(store.path).parent)
     thread = ThreadInfo(1, "Discord", None, "voice", None, NOW, NOW, scope="call:7")
     src = Source(at=NOW, capture=SimpleNamespace(by_yuki=False, trigger=None, at=NOW),
-                 utterance={"text": "message hey meant on discord"}, call_app="Discord")
-    facts = [{"text": "The user asked to message 'hey meant' on Discord.", "nature": "uncertain", "importance": 4,
-              "source": 1, "heard": "hey meant", "meant": "Hemanth", "meant_why": "Hemanth is on this call",
+                 utterance={"text": "message sea ra on discord"}, call_app="Discord")
+    facts = [{"text": "The user asked to message 'sea ra' on Discord.", "nature": "uncertain", "importance": 4,
+              "source": 1, "heard": "sea ra", "meant": "Ciara", "meant_why": "Ciara is on this call",
               "meant_is_name": True},
              {"text": "The user joked about a rich spouse.", "nature": "humor", "importance": 3, "source": 1,
               "heard": "", "meant": "", "meant_why": "", "meant_is_name": False}]
     response = SimpleNamespace(stop_reason="tool_use", content=[SimpleNamespace(
         type="tool_use", name="record_call_side", input={"facts": facts})])
     got = w._parse_facts(response, thread, [src], tool="record_call_side")
-    assert got[0].source["heard"] == "hey meant" and got[0].source["meant"] == "Hemanth"
+    assert got[0].source["heard"] == "sea ra" and got[0].source["meant"] == "Ciara"
     assert got[0].source["meant_name"] is True and "heard" not in got[1].source
 
 
 def test_w6_only_real_mishearings_are_listed_and_a_right_guess_queues_the_correction(store):
     client = MemoryClient(store)
-    jid = _journal(store, "The user asked to message 'hey meant' on Discord.", at=NOW - 60, nature="uncertain",
-                   source={"kind": "call", "quote": "message hey meant on discord", "heard": "hey meant",
-                           "meant": "Hemanth", "meant_why": "Hemanth is on this call", "meant_name": True})
+    jid = _journal(store, "The user asked to message 'sea ra' on Discord.", at=NOW - 60, nature="uncertain",
+                   source={"kind": "call", "quote": "message sea ra on discord", "heard": "sea ra",
+                           "meant": "Ciara", "meant_why": "Ciara is on this call", "meant_name": True})
     _journal(store, "Said something unclear.", at=NOW - 30, nature="uncertain", source={"kind": "call"})
     m = client.misheard(now=NOW)
     assert m["total"] == 1
     [item] = m["items"]
     assert (item["heard"], item["guess"], item["why"], item["guess_is_name"]) == (
-        "hey meant", "Hemanth", "Hemanth is on this call", True)
+        "sea ra", "Ciara", "Ciara is on this call", True)
     out = client.resolve_heard(f"journal:{jid}", "right")
     assert out["ok"] and out["correction_id"] and client.misheard(now=NOW)["items"] == []
     assert store.correction_target(out["correction_id"]) == f"J{jid}"
-    assert "It was 'Hemanth', not 'hey meant'" in store.portrait_fact(out["correction_id"]).text
+    assert "It was 'Ciara', not 'sea ra'" in store.portrait_fact(out["correction_id"]).text
     undo = client.resolve_heard(f"journal:{jid}", "undo", correction_id=out["correction_id"])
     assert undo["ok"] and undo["cancelled"] and client.misheard(now=NOW)["total"] == 1
 

@@ -327,7 +327,7 @@ def test_misheard_lists_the_voice_channel_and_resolves_at_once_without_a_model(s
                      source={"kind": "call", "where": "Discord call", "call": f"call:{cid}", "unclear": True,
                              "heard": "the build is green", "meant": "the bill is green", "meant_why": "a guess"})
     other = _journal(store, "Said what sounded like a name.", at=NOW - 6000, nature="uncertain", app="WhatsApp",
-                     source={"kind": "call", "heard": "hey meant", "meant": "Hemanth", "meant_name": True})
+                     source={"kind": "call", "heard": "sea ra", "meant": "Ciara", "meant_name": True})
     # the feedback round 3 (W6): an uncertain line with no mishearing and no guess is never listed
     _journal(store, "Said something unclear about the weekend.", at=NOW - 5000, nature="uncertain")
     m = client.misheard(now=NOW)

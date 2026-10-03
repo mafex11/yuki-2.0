@@ -2889,8 +2889,8 @@ class MemoryClient:
         on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises.
 
         Since the feedback round 3 (W6, :mod:`yuki.memory.misheard`) only real mishearings are listed: entries whose
-        provenance holds the words as heard and Yuki's guess. Each item also has ``heard`` ("hey meant", Latin
-        letters), ``guess`` ("Hemanth"), ``why`` (who or what makes it fit, English), ``guess_is_name`` and ``shown``
+        provenance holds the words as heard and Yuki's guess. Each item also has ``heard`` ("sea ra", Latin
+        letters), ``guess`` ("Ciara"), ``why`` (who or what makes it fit, English), ``guess_is_name`` and ``shown``
         (the entry said to the user in English, or None: show ``text`` then). The raw transcript (``source.quote``)
         is provenance, never for showing."""
         from yuki.memory.misheard import is_listed
@@ -2935,7 +2935,7 @@ class MemoryClient:
         "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered.
 
         With Yuki's guess (the feedback round 3, W6): ``right`` means the GUESS is right - the entry is settled at once
-        and the correction pass is queued with the user's words "It was 'Hemanth', not 'hey meant'" and the entry as
+        and the correction pass is queued with the user's words "It was 'Ciara', not 'sea ra'" and the entry as
         its target (the entry reworded, the name alias learned once a rewrite carries it; ``correction_id``; Undo
         cancels it while it waits); ``as_heard`` keeps the words as heard (the old Right); ``wrong`` retires it as
         before; a correction in the user's own words goes through :meth:`correct_item`."""
