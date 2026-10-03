@@ -485,7 +485,7 @@ class StatusStrip(SurfaceWindow):
         self.spinner.setVisible(True)
         self.fade_in(self.anchor())
 
-    def show_final(self, text: str, *, tone: str = "final") -> None:
+    def show_final(self, text: str, *, tone: str = "final", outcome: str | None = None) -> None:
         """Show the closing message, stop the spinner, and fade after a few seconds.
 
         Args:

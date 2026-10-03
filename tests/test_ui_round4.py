@@ -267,5 +267,7 @@ def test_surfaces_paint_opaque_with_a_border(qapp):
     assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#0b0b0c"   # Lattice: the field
     edge = img.pixelColor(QPoint(card.panel_rect().left() + 60, card.panel_rect().top()))
     assert edge.name() == "#2a2d31"                                                             # its surface border
-    assert card.title.text() == "" and card.wave.kind == "checkin"   # a plain check-in: its wave says it
+    # a plain check-in: no kind heading; the Lattice header says it as the design's break card (pause icon, "Break")
+    assert card.title.text() == "" and card.head.text().startswith("Break") and card.head_icon.name == "pause"
+    assert not card.do_button.isHidden() and card.do_button.text() == "Took one" and card.reply_button.isHidden()
     card.close()

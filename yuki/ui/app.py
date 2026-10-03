@@ -15,7 +15,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import time
-from typing import Sequence
+from typing import Any, Sequence
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPen, QPixmap
@@ -44,11 +44,7 @@ def user_bindings(bindings: dict[str, str]) -> dict[str, str]:
     return {**bindings, "toggle": own} if own else bindings
 from yuki.ui.memory import (
     STATUS_PENDING,
-    HealthWindow,
-    KnowsWindow,
     MemoryControl,
-    ReviewWindow,
-    TodayWindow,
     describe_memory_status,
     minutes_until_tomorrow,
     quiet_until,
@@ -67,12 +63,12 @@ from yuki.ui.nudges import (
     overlay_label,
     suggestion_request,
 )
+from yuki.ui.island import Island, on_call_status
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
-from yuki.ui.status import StatusStrip, describe_summary, describe_tool
+from yuki.ui.status import describe_summary, describe_tool
 from yuki.ui.uilog import UiLog
 from yuki.ui.window_host import WindowHost
-from yuki.voice.indicator import VoicePill
 from yuki.voice.session import VoiceSession
 
 #: The effort levels offered in the tray menu (all five stay reachable from the
@@ -82,8 +78,8 @@ TRAY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 #: run takes the strip over.
 FINAL_SWITCH_MS = 2_500
 
-class _HealthBridge(QObject):
-    """The health check's thread hands its result to the GUI thread through this."""
+class _Bridge(QObject):
+    """A worker thread hands its result to the GUI thread through this."""
 
     done = Signal(object)
 
@@ -131,34 +127,12 @@ def single_instance_handle(name: str = MUTEX_NAME) -> int | None:
     return int(handle)
 
 
-def tray_icon(listening: bool = True) -> QIcon:
-    """A small snowflake glyph, drawn rather than shipped as a file.
+def tray_icon(listening: bool = True, state: str | None = None) -> QIcon:
+    """The tray mark in the Lattice design (:func:`yuki.ui.tray.tray_icon`): a state badge, or struck through when
+    Yuki isn't listening (v3.16, 04 F6)."""
+    from yuki.ui.tray import tray_icon as _icon
 
-    ``listening`` False (v3.16, 04 F6): the glyph greyed with a slash through it, so "Yuki isn't listening" is
-    visible in the tray at a glance (it was only the menu item's text, and it stayed off for days unnoticed)."""
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setBrush(QColor(16, 17, 20, 235))
-    painter.setPen(QPen(QColor(255, 255, 255, 40), 2.0))
-    painter.drawRoundedRect(3, 3, 58, 58, 16, 16)
-    pen = QPen(ACCENT if listening else QColor(150, 150, 150), 5.0)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    painter.setPen(pen)
-    centre, arm = 32, 17
-    painter.drawLine(centre, centre - arm, centre, centre + arm)
-    for dx, dy in ((arm, arm), (arm, -arm)):
-        painter.drawLine(
-            int(centre - dx * 0.87), int(centre - dy * 0.5), int(centre + dx * 0.87), int(centre + dy * 0.5)
-        )
-    if not listening:
-        slash = QPen(QColor(235, 235, 235), 5.0)
-        slash.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(slash)
-        painter.drawLine(14, 50, 50, 14)
-    painter.end()
-    return QIcon(pixmap)
+    return _icon(listening, state)
 
 
 #: The tray tooltip's line for each "not listening" state (v3.16, 04 F6); ``on`` has none.
@@ -191,18 +165,12 @@ class YukiUi(QObject):
         self.settings = settings
         self.ui_log = ui_log
         self.overlay = Overlay()
-        self.strip = StatusStrip()
+        #: The island (Lattice, phase E6): one window top centre for voice, runs and the call. Its adapters stand
+        #: where the run strip, the voice pill and the call pill stood, so the wiring below is theirs.
+        self.island = Island()
+        self.strip = self.island.strip
         self.runtime = runtime or AgentRuntime(settings, ui_log)
         self.memory = memory_control or MemoryControl(self.runtime.memory, ui_log)
-        #: The "what Yuki knows" panel, built the first time it is asked for.
-        self.knows: KnowsWindow | None = None
-        self.memory.knows_ready.connect(self._on_knows_ready)
-        #: The "Today's list" panel, built the first time it is asked for.
-        self.today: TodayWindow | None = None
-        self.memory.today_ready.connect(self._on_today_ready)
-        #: The "This week's review" panel, built the first time it is asked for.
-        self.review: ReviewWindow | None = None
-        self.memory.review_ready.connect(self._on_review_ready)
         #: Memory's nudge cards, shown only while nothing else needs the screen.
         self.nudges = NudgeController(
             self.runtime.memory, ui_log, blocked=self._nudge_blocker, inline=self._nudge_inline,
@@ -218,8 +186,9 @@ class YukiUi(QObject):
         #: Calls, just the user's side: the consent card, the indicator and Stop.
         self.calls = CallController(
             self.runtime.memory, ui_log, covered=lambda: self.nudges.showing is not None,
-            strip_up=self.strip.isVisible,
+            strip_up=lambda: False, indicator=self.island.call_indicator,
         )
+        self.calls.changed.connect(lambda status: on_call_status(self.island, status))
         # The consent card has the corner: a nudge card up makes way (it goes back in the queue).
         self.calls.changed.connect(lambda _status: self.nudges.make_way() if self.calls.card_up else None)
         self.calls.card.faded_out.connect(self.nudges.try_show)
@@ -248,6 +217,14 @@ class YukiUi(QObject):
         #: from one (id -> (nudge, started)), for what became of it (the per-kind learning).
         self._pending_ask: dict | None = None
         self._ask_runs: dict[int, tuple[dict, float]] = {}
+        #: Requests the user handed back from the run card ("I'll take it from here"): they end as handed back.
+        self._handed: set[int] = set()
+        #: The corner card that says what a run changed (built the first time one is needed).
+        self.return_card: Any = None
+        self._lessons = _Bridge()
+        self._lessons.done.connect(self._on_lessons)
+        self._returns = _Bridge()
+        self._returns.done.connect(self._on_return_ready)
 
         self.overlay.submitted.connect(self._on_submitted)
         self.strip.stop_clicked.connect(self._on_strip_stop)
@@ -286,18 +263,44 @@ class YukiUi(QObject):
 
         self._settings_for_keys = settings
         self.bindings = user_bindings(hotkey_bindings(settings))
+        self.island.bindings = dict(self.bindings)
         self.hotkeys = self._listen(self.bindings)
         #: Voice (docs/VOICE.md): nothing runs until the tray, the hotkey or the
         #: wake word (if the user turned it on) starts it.
         self.voice = VoiceSession(settings, self.runtime, self.runtime.memory, ui_log)
-        self.voice_pill = VoicePill()
+        self.voice_pill = self.island.voice_pill
         self.voice.state_changed.connect(self._on_voice_state)
         self.voice.devices_changed.connect(self.voice_pill.set_devices)
+        self.voice.chat_event.connect(self.island.voice_pill.chat_event)
+        listening_changed = getattr(self.voice, "listening_changed", None)
+        if listening_changed is not None:
+            listening_changed.connect(lambda state: self.island.update(listening=str(state or "on")))
+        self.island.update(listening=str(getattr(self.voice, "listening_state", "on") or "on"))
         self.calls.changed.connect(self.voice.on_call_status)
         runtime_signals.said.connect(self._on_said)
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
         self.overlay.attach_thread(self.window_host.model)
+        self.island.attach_model(self.window_host.model)
+        # the island's own keys
+        self.island.handback_clicked.connect(self._on_handback)
+        self.island.steer_requested.connect(self._on_island_steer)
+        self.island.answer_clicked.connect(lambda _rid: self.overlay.open())
+        self.island.retry_voice.connect(lambda: self.voice.start_conversation("island"))
+        self.island.open_page.connect(lambda page: self.window_host.open_window(page))
+        self.island.ask_again.connect(self._prefill_ask)
+        self.island.save_lesson.connect(self._save_run_lesson)
+        steer_unread = getattr(runtime_signals, "steer_unread", None)
+        if steer_unread is not None:
+            steer_unread.connect(lambda _lane, rid, texts: self.island.steer_unread(int(rid), list(texts or [])))
+        framed = getattr(runtime_signals, "framed", None)
+        if framed is not None:
+            framed.connect(self._on_framed)
+        # the ask bar's own keys and its foot's call timer (the island's clock)
+        speak = getattr(self.overlay, "speak", None)
+        if speak is not None:
+            speak.connect(lambda: self.voice.start_conversation("askbar"))
+        self.overlay.call_line = self._call_line
         thread = getattr(self.overlay, "thread", None)
         if thread is not None and hasattr(thread, "undo_nudge"):   # Undo on a card in the overlay's chat thread
             thread.undo_nudge.connect(lambda nudge: self.nudges.undo_offer(nudge) if isinstance(nudge, dict) else None)
@@ -310,10 +313,6 @@ class YukiUi(QObject):
         notice = getattr(runtime_signals, "notice", None)
         if notice is not None:
             notice.connect(self.show_notice)
-        #: The tray's "Health check" panel (yuki doctor), built the first time it is asked for.
-        self.health: HealthWindow | None = None
-        self._health_bridge = _HealthBridge()
-        self._health_bridge.done.connect(self._on_health_ready)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -332,6 +331,7 @@ class YukiUi(QObject):
         self.calls.start()
         self.voice.start()
         self.window_host.start()
+        self.island.start()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -348,17 +348,16 @@ class YukiUi(QObject):
         self.ui_log.event("stop")
         self.window_host.stop()
         self.voice.shutdown()
-        self.voice_pill.hide()
+        self.island.stop()
         self.nudges.stop()
         self.calls.stop()
         self.hotkeys.stop()
         self.runtime.stop()
         self.overlay.hide()
-        self.strip.hide()
         self._notice_retry.stop()
-        for panel in (self.knows, self.today, self.review, self.health, self.notice_card):
-            if panel is not None:
-                panel.hide()
+        for card in (self.notice_card, self.return_card):
+            if card is not None:
+                card.hide()
 
     # -- input -------------------------------------------------------------
 
@@ -430,6 +429,7 @@ class YukiUi(QObject):
         if self._question is not None:
             lane_name, request_id = self._question
             self._question = None
+            self._island_answered(request_id)
             self.runtime.answer(lane_name, text)
             self.window_host.user_answer(request_id, text)
             card = self.overlay.add_card(text)
@@ -528,6 +528,9 @@ class YukiUi(QObject):
         # showed nothing for 9.6 s, and nothing on screen could stop it)
         self._runs[request_id] = {"lane": lane_name, "started": time.monotonic(), "steps": 0, "line": ""}
         self._strip_run(request_id)
+        setter = getattr(self.strip, "set_request", None)
+        if setter is not None:   # the island's run card shows what was asked
+            setter(request_id, request)
         self.ui_log.event("run_strip", id=request_id, lane=lane_name, state="started",
                           shown=self.strip.run_id == request_id)
 
@@ -571,6 +574,7 @@ class YukiUi(QObject):
 
     def _on_parked(self, lane_name: str, request_id: int, text: str) -> None:
         """Set aside on a question nobody answered: the run is over for now (an answer later starts a new one)."""
+        self._island_answered(request_id)
         if self._end_run(request_id):
             self.strip.dismiss()
 
@@ -583,6 +587,9 @@ class YukiUi(QObject):
             run["line"] = line
             if self.strip.run_id != request_id:
                 self._strip_run(request_id)   # the worker's run takes the strip over another lane's, never back
+        island = getattr(self, "island", None)
+        if island is not None and run is not None:
+            QTimer.singleShot(0, lambda: self._island_step(request_id, name, tool_input))
         if lane_name == WORKER:
             if request_id not in self._acting:
                 self._acting.add(request_id)
@@ -604,13 +611,19 @@ class YukiUi(QObject):
     def _on_asked(self, lane_name: str, request_id: int, question: str) -> None:
         """A lane needs an answer: bring the overlay back with the question."""
         self.ui_log.event("ask_user", id=request_id, lane=lane_name, question=question)
+        ask = getattr(self.strip, "ask", None)
         if self.voice.owns(request_id):
-            # Asked by voice: the voice says it and hears the answer. The strip
-            # shows it without taking focus, and an answer typed later still works.
+            # Asked by voice: the voice says it and hears the answer. The island shows it (needs-you) without
+            # taking focus, and an answer typed later still works.
             self._question = (lane_name, request_id)
-            self.strip.show_step(question)
+            if ask is not None:
+                ask(request_id, question, voice=True)
+            else:
+                self.strip.show_step(question)
             return
         self.strip.dismiss()
+        if ask is not None:
+            ask(request_id, question, voice=False)
         self._question = (lane_name, request_id)
         card = self.cards.get(request_id)
         if card is None:
@@ -658,14 +671,19 @@ class YukiUi(QObject):
     def _settle(self, lane_name: str, request_id: int, text: str, *, tone: str) -> None:
         """Put a closing message where the user is actually looking, saying honestly how the run ended: its answer
         (done), "Stopped." when the user stopped it (never shown as an error), or the error."""
+        acted = request_id in self._acting
         self._acting.discard(request_id)
         if self._question is not None and self._question[1] == request_id:
             self._question = None
+        self._island_answered(request_id)
         run = self._runs.get(request_id)
         stopped = request_id in self._stopped
         self._stopped.discard(request_id)
+        handed = request_id in getattr(self, "_handed", set())
+        getattr(self, "_handed", set()).discard(request_id)
         if stopped and tone == "error":
-            text, tone = "Stopped.", "stopped"
+            text, tone = ("Handed back. You have the controls." if handed else "Stopped."), "stopped"
+        outcome = "handed" if handed else "stopped" if tone == "stopped" else "failed" if tone == "error" else "done"
         self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
         shown = self._end_run(request_id)
         card = self.cards.pop(request_id, None)
@@ -683,7 +701,7 @@ class YukiUi(QObject):
             # over it for a moment, then that run comes back
             other = self.strip.run_id if self.strip.run_id not in (None, request_id) else None
             self.nudges.make_way()
-            self.strip.show_final(text, tone="error" if tone == "error" else "final")
+            self.strip.show_final(text, tone="error" if tone == "error" else "final", outcome=outcome)
             self._settled[request_id] = None
             if other is not None:
                 QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=other: self._strip_run(rid)
@@ -691,6 +709,8 @@ class YukiUi(QObject):
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text,
                           steps=run["steps"] if run else None,
                           wall_s=round(time.monotonic() - run["started"], 1) if run else None)
+        if acted and getattr(self, "island", None) is not None:
+            self._queue_return_card(request_id, text, outcome, run)
         self.nudges.try_show()
 
     def _ask_outcome(self, request_id: int, *, stopped: bool, failed: bool) -> None:
@@ -719,6 +739,9 @@ class YukiUi(QObject):
             return
         if target is None:
             self.strip.set_meta(text)
+            pending = getattr(self, "_return_pending", None)
+            if pending is not None and pending.get("id") == request_id:
+                pending["cost"] = text
             return
         try:
             target.set_meta(text)
@@ -864,6 +887,9 @@ class YukiUi(QObject):
         cursor = self.overlay.input.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self.overlay.input.setTextCursor(cursor)
+        unsent = getattr(self.overlay, "show_unsent", None)
+        if unsent is not None:   # the Intent card: in the ask bar, not sent
+            unsent(f"from an offer · {time.strftime('%H:%M')}")
         self._pending_ask = {"nudge": nudge, "text": text}
         self.ui_log.event("nudge_offer_prefilled", id=nudge.get("id"), chars=len(text))
 
@@ -894,48 +920,19 @@ class YukiUi(QObject):
         return self.runtime.set_effort(level)
 
     def show_knows(self) -> None:
-        """Open the "what Yuki knows" panel and fill it from memory."""
-        if self.knows is None:
-            self.knows = KnowsWindow()
-        self.knows.show_loading()
-        self.knows.open()
-        self.ui_log.event("knows", state="shown")
-        self.memory.fetch_knows()
-
-    def _on_knows_ready(self, portrait: object, knowhow: object, meta: str) -> None:
-        if self.knows is not None:
-            self.knows.show_knows(
-                portrait if isinstance(portrait, str) else None,
-                list(knowhow) if isinstance(knowhow, list) else [],
-                meta,
-            )
+        """"Show what Yuki knows": the window's Me page (the old tray panel is retired, E15)."""
+        self.ui_log.event("knows", state="window")
+        self.window_host.open_window("me")
 
     def show_today(self) -> None:
-        """Open the read-only "Today's list" panel and fill it from memory."""
-        if self.today is None:
-            self.today = TodayWindow()
-        self.today.show_loading()
-        self.today.open()
-        self.ui_log.event("today", state="shown")
-        self.memory.fetch_today()
-
-    def _on_today_ready(self, rows: object, meta: str) -> None:
-        if self.today is not None:
-            self.today.waiting_note = self.calls.waiting
-            self.today.show_today(list(rows) if isinstance(rows, list) else None, meta)
+        """"Today's list": the window's Home (the old tray panel is retired, E15)."""
+        self.ui_log.event("today", state="window")
+        self.window_host.open_window("today")
 
     def show_review(self) -> None:
-        """Open the read-only "This week's review" panel and fill it from memory."""
-        if self.review is None:
-            self.review = ReviewWindow()
-        self.review.show_loading()
-        self.review.open()
-        self.ui_log.event("review", state="shown")
-        self.memory.fetch_review()
-
-    def _on_review_ready(self, review: object, meta: str) -> None:
-        if self.review is not None:
-            self.review.show_review(review if isinstance(review, dict) else None, meta)
+        """"This week's review": the window's Work page, its week (the old tray panel is retired, E15)."""
+        self.ui_log.event("review", state="window")
+        self.window_host.open_window("day")
 
     # -- runtime notices and the health check ------------------------------
 
@@ -971,37 +968,168 @@ class YukiUi(QObject):
             self._notice_retry.stop()
 
     def show_health(self) -> None:
-        """The tray's "Health check": ``yuki doctor`` off the GUI thread, then its checklist in a panel."""
+        """"Health check": the window's Activity page, where failures and what to do show (the tray panel is retired,
+        E15)."""
+        self.ui_log.event("health_check", state="window")
+        self.window_host.open_window("status")
+
+    # -- the island and the return card ------------------------------------
+
+    def _island_answered(self, request_id: int) -> None:
+        answered = getattr(self.strip, "answered", None)
+        if answered is not None:
+            answered(request_id)
+
+    def _island_step(self, request_id: int, name: str, tool_input: dict) -> None:
+        """A step's fields for the island (a ``playbook`` it follows: the "using your lesson" chip)."""
+        island = getattr(self, "island", None)
+        if island is None:
+            return
+        island.step_meta(request_id, name, tool_input)
+        refs = island.lesson_refs()
+        if refs:
+            self._fetch_lessons()
+
+    def _fetch_lessons(self) -> None:
+        """The playbooks' titles (practice memory's ``workflows``), off the GUI thread, for the run card's chips."""
         import threading
 
-        if self.health is None:
-            self.health = HealthWindow()
-        self.health.show_loading()
-        self.health.open()
-        self.ui_log.event("health_check", state="started")
-        settings = self.settings
+        memory = self.runtime.memory
 
         def run() -> None:
-            started = time.monotonic()
+            out: dict[str, str] = {}
             try:
-                from yuki.core.doctor import format_report, run_checks
+                data = memory.call_method("workflows", timeout_s=8.0) or {}
+                for card in data.get("workflows") or []:
+                    if isinstance(card, dict) and card.get("id"):
+                        out[str(card["id"])] = str(card.get("title") or card.get("text") or card["id"])
+            except Exception:
+                pass
+            self._lessons.done.emit(out)
 
-                results = run_checks(settings)
-                report = format_report(results)
-            except Exception as exc:   # the check itself failing is shown, never raised into the tray
-                results, report = [], f"The health check couldn't run: {type(exc).__name__}: {exc}"
-            self._health_bridge.done.emit((results, report, time.monotonic() - started))
+        threading.Thread(target=run, name="yuki-ui-lessons", daemon=True).start()
 
-        threading.Thread(target=run, name="yuki-health-check", daemon=True).start()
+    def _on_lessons(self, lessons: object) -> None:
+        if isinstance(lessons, dict) and lessons:
+            self.island.set_lessons({**self.island._lessons, **lessons})
 
-    def _on_health_ready(self, payload: object) -> None:
-        results, report, took = payload if isinstance(payload, tuple) else ([], str(payload), 0.0)
-        if self.health is not None:
-            from datetime import datetime as _dt
+    def _on_framed(self, _lane: str, request_id: int, frame: dict) -> None:
+        """The request's task frame: the island's "from memory" chip, and (for a request typed in the open ask bar)
+        its resolved chips in the Intent card."""
+        frame = dict(frame or {})
+        self.island.set_frame(int(request_id), frame)
+        run = self.island.inputs.run
+        if self.overlay.isVisible() and not self.overlay.closing and run is not None and run.id == int(request_id) \
+                and int(request_id) in self.cards and hasattr(self.overlay, "show_resolved"):
+            from yuki.ui.island import _clean
 
-            self.health.show_checks(list(results), report, f"Checked at {_dt.now():%H:%M}, took {took:.1f} s")
-        self.ui_log.event("health_check", state="done", checks=len(results),
-                          problems=sum(getattr(c, "status", "") == "fail" for c in results))
+            self.overlay.show_resolved(_clean(run.request), frame)
+
+    def _call_line(self) -> tuple[str, str] | None:
+        """The call being recorded, for the ask bar's foot: ``(timer, app)`` from the island's one clock."""
+        call = self.island.inputs.call
+        if not call or call.get("status") != "recording":
+            return None
+        return self.island.call_time(), str(call.get("app") or "")
+
+    def _on_handback(self, request_id: int) -> None:
+        """"I'll take it from here" on the run card: stop the request; it ends as handed back."""
+        self._handed.add(int(request_id))
+        self._on_strip_stop(int(request_id))
+
+    def _on_island_steer(self, request_id: int, text: str) -> None:
+        """The run card's steer box: the words go to the running request (read at its next step)."""
+        ok = bool(self.runtime.steer(int(request_id), text))
+        self.island.steer_result(int(request_id), text, ok)
+
+    def _prefill_ask(self, text: str) -> None:
+        """Put words in the ask bar, unsent (the run card's "Ask again")."""
+        if not text.strip():
+            return
+        self.overlay.open()
+        self.overlay.input.setPlainText(text)
+        cursor = self.overlay.input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.overlay.input.setTextCursor(cursor)
+
+    def _queue_return_card(self, request_id: int, text: str, outcome: str, run: dict | None) -> None:
+        """A run that acted ended: the return card says what it changed (action steps only), with what practice
+        memory learned since the run began (a proposal), once its cost is known. Nothing to report, no card."""
+        from yuki.agent.tools import ACTION_TOOL_NAMES
+
+        model = getattr(self.window_host, "model", None)
+        item = model.item_for_job(request_id) if model is not None and hasattr(model, "item_for_job") else None
+        steps = item.real_steps() if item is not None else []
+        changed = [st.label for st in steps if st.name in ACTION_TOOL_NAMES and st.ok]
+        if not changed:
+            return
+        started_wall = time.time() - (time.monotonic() - run["started"]) if run else time.time()
+        self._return_pending = {"id": request_id, "title": text, "outcome": outcome, "changed": changed[:4],
+                                "cost": "", "since": started_wall}
+        memory = self.runtime.memory
+        import threading
+
+        def fetch() -> None:
+            learned = None
+            try:
+                data = memory.call_method("workflows", timeout_s=8.0) or {}
+                fresh = [c for c in data.get("proposals") or []
+                         if isinstance(c, dict) and float(c.get("since") or 0) >= started_wall - 1
+                         and str(c.get("id") or "").startswith("pb:")]
+                if fresh:
+                    newest = max(fresh, key=lambda c: float(c.get("since") or 0))
+                    learned = {"id": newest.get("id"), "text": newest.get("text") or newest.get("title")}
+            except Exception:
+                learned = None
+            self._returns.done.emit({"id": request_id, "learned": learned})
+
+        QTimer.singleShot(1500, lambda: threading.Thread(target=fetch, name="yuki-ui-return", daemon=True).start())
+
+    def _on_return_ready(self, payload: object) -> None:
+        pending = getattr(self, "_return_pending", None)
+        if not isinstance(payload, dict) or pending is None or pending.get("id") != payload.get("id"):
+            return
+        self._return_pending = None
+        learned = payload.get("learned")
+        self.island.lesson_available = bool(learned)
+        self._return_learned = learned
+        if self.overlay.isVisible() or self.island.inputs.fullscreen:
+            return   # the answer is in the open ask bar; in a full screen no card shows
+        from datetime import datetime
+
+        from yuki.ui.lattice_cards import ReturnCard
+
+        if self.return_card is None:
+            self.return_card = ReturnCard()
+            self.return_card.learned.connect(self._on_learned)
+            self.return_card.why.connect(lambda: self.window_host.open_window("activity"))
+        self.return_card.show_run(title=str(pending["title"]), at=datetime.now().strftime("%H:%M"),
+                                  changed=list(pending["changed"]), learned=learned, cost=str(pending["cost"]))
+        self.ui_log.event("return_card", id=pending["id"], outcome=pending["outcome"], changed=len(pending["changed"]),
+                          learned=bool(learned))
+
+    def _on_learned(self, ref: str, action: str, words: str) -> None:
+        """Save / Edit / No on a Learned proposal (applied once the card went, so Undo could take it back)."""
+        import threading
+
+        memory = self.runtime.memory
+        self.ui_log.event("learned", ref=ref, action=action, chars=len(words))
+
+        def run() -> None:
+            try:
+                memory.call_method("workflow_edit", ref, action, words, timeout_s=8.0)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, name="yuki-ui-learned", daemon=True).start()
+
+    def _save_run_lesson(self) -> None:
+        learned = getattr(self, "_return_learned", None)
+        if isinstance(learned, dict) and learned.get("id"):
+            self._on_learned(str(learned["id"]), "save", "")
+            from yuki.ui.toast import show_toast
+
+            show_toast("Saved to your playbook. I’ll show it when I use it.", icon="lesson")
 
     def open_logs(self) -> None:
         """Open the session log folder in the file manager."""
@@ -1020,6 +1148,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
         The tray icon, which the caller must keep a reference to.
     """
     tray = QSystemTrayIcon(icon or tray_icon(), app)
+    nudge_queue = getattr(ui.nudges, "queue_changed", None)
     from yuki.ui.surface import current_theme
     from yuki.ui.window.widgets import Menu, menu_css
 
@@ -1161,28 +1290,31 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     end_tone_item = QAction("End tone when a conversation ends", menu, checkable=True)
     end_tone_item.triggered.connect(lambda checked: ui.voice.set_end_tone(bool(checked)))
     menu.addAction(end_tone_item)
-    icons = {True: icon or tray_icon(True), False: tray_icon(False)}
+    from yuki.ui.tray import TrayWatch
+
+    watch = TrayWatch(tray, ui.island, waiting=lambda: len(getattr(ui.nudges, "queue", []) or []),
+                      extra=lambda: tray_tip())
+    tray._lattice_watch = watch   # kept alive with the tray
+    if nudge_queue is not None:   # cards waiting for a free screen: the "waiting" badge
+        nudge_queue.connect(lambda _n: watch.refresh())
+    ui.calls.changed.connect(lambda _status: watch.refresh())
 
     def show_listening(state: str | None = None) -> None:
-        """Whether Yuki listens for the name, in the tray icon, its tooltip, the menu and the call pill (04 F6)."""
+        """Whether Yuki listens for the name, in the tray icon, its tooltip, the menu and the island (04 F6)."""
         state = state or getattr(ui.voice, "listening_state", "on")
         on = state == "on"
-        tray.setIcon(icons[on])
         call_off_item.blockSignals(True)
         call_off_item.setChecked(state == "call_off")
         call_off_item.setVisible(bool(getattr(ui.voice, "call_active", False)) or state == "call_off")
         call_off_item.setEnabled(state in ("on", "call_off"))
         call_off_item.blockSignals(False)
-        tray.setToolTip(tray_tip())
         indicator = getattr(getattr(ui, "calls", None), "indicator", None)
         if indicator is not None and hasattr(indicator, "set_listening"):
             indicator.set_listening(on)
+        watch.refresh()
 
     def tray_tip() -> str:
-        state = getattr(ui.voice, "listening_state", "on")
-        line = NOT_LISTENING_LINES.get(state, "")
-        return (f"Yuki — {ui.settings.model} · effort {ui.settings.effort}\n{ui.voice.devices_text()}"
-                + (f"\n{line}" if line else ""))
+        return f"{ui.settings.model} · effort {ui.settings.effort}\n{ui.voice.devices_text()}"
 
     listening_changed = getattr(ui.voice, "listening_changed", None)
     if listening_changed is not None:
@@ -1299,7 +1431,7 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
             for key, item in items.items():
                 item.setChecked(key == current)
             group.setExclusive(True)
-        tray.setToolTip(tray_tip())
+        watch.refresh()
 
     def switch_model(alias: str) -> None:
         ui.set_model(alias)

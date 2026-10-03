@@ -378,6 +378,7 @@ class Lane(QThread):
         # escalated profile for its next calls only on a measured signal (docs/VOICE.md v3.14, Agent.run).
         escalate = ((getattr(settings, "voice_brain_escalate_effort", "") or None,
                      getattr(settings, "voice_brain_escalate_thinking", None)) if voice else None)
+        framed = False
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
             model=(getattr(settings, "voice_brain_model", "") or None) if voice else None,
@@ -405,6 +406,11 @@ class Lane(QThread):
             elif isinstance(event, ToolCall):
                 if allowed is not None and event.name not in allowed:
                     refused.append(event.name)
+                if not framed:   # the task frame is built before the first model call: the island's chips read it
+                    framed = True
+                    view = frame_view(self.agent)
+                    if view is not None:
+                        runtime.framed.emit(self.name, job.id, view)
                 runtime.tool_called.emit(self.name, job.id, event.name, dict(event.input))
             elif isinstance(event, ToolResult):
                 runtime.tool_finished.emit(self.name, job.id, event.name, event.ok, event.summary)
@@ -546,6 +552,9 @@ class AgentRuntime(QObject):
     #: ``(lane, job, what, text)``: the reply or the thinking written so far (``what``: reply | thinking), live
     partial = Signal(str, int, str, str)
     notice = Signal(str, str)
+    #: ``(lane, id, frame)``: the request's task frame as plain data (:func:`frame_view`: who it may be about and
+    #: their usual route, the playbooks shown), once, before its first step; the island's "from memory" chip.
+    framed = Signal(str, int, dict)
 
     def __init__(
         self,
@@ -866,3 +875,36 @@ class AgentRuntime(QObject):
         else:
             self._sources.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
+
+
+def frame_view(agent: Any) -> dict[str, Any] | None:
+    """The agent's task frame for the request now running (``yuki.agent.frame.TaskFrame``, read from the agent; a
+    frame from an older agent, or none, gives ``None``), as plain data for the island: the people with routes
+    (name and each route's label, app and how many messages the user sent there), the referent candidates' labels and
+    the playbook ids the frame showed. Read only; never raises."""
+    frame = getattr(agent, "_frame", None)
+    if frame is None:
+        return None
+    try:
+        persons = []
+        for p in list(getattr(frame, "persons", None) or [])[:2]:
+            if not isinstance(p, dict):
+                continue
+            routes = [{"label": r.get("label"), "app": r.get("app"), "mine": r.get("mine"), "ref": r.get("ref")}
+                      for r in (p.get("routes") or [])[:3] if isinstance(r, dict)]
+            persons.append({"name": p.get("name"), "routes": routes})
+        cands = list(getattr(frame, "people", None) or [])[:3]
+        people = [str(getattr(c, "label", "")) for c in cands]
+        where = ""
+        names = {str(p.get("name") or "") for p in persons}
+        for c in cands:   # where the frame found the person it names (the ask bar's "because")
+            if str(getattr(c, "label", "")) in names and getattr(c, "where", ""):
+                age = getattr(c, "age_s", None)
+                ago = "" if age is None else " now" if age < 10 else f" {int(age)} s ago" if age < 90 else \
+                    f" {int(round(age / 60))} min ago" if age < 5400 else f" {age / 3600:.1f} h ago"
+                where = f"{c.where}{ago}"
+                break
+        return {"persons": persons, "people": [x for x in people if x], "where": where,
+                "playbooks": [int(x) for x in getattr(frame, "playbooks", None) or [] if isinstance(x, int)]}
+    except Exception:
+        return None

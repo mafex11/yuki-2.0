@@ -69,7 +69,10 @@ class _Ticker:
     def remove(self, wave: "Wave") -> None:
         self.waves.discard(wave)
         if not self.waves and self.timer is not None:
-            self.timer.stop()
+            try:
+                self.timer.stop()
+            except RuntimeError:   # interpreter exit: the timer went first
+                self.timer = None
 
     @property
     def running(self) -> bool:

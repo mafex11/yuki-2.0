@@ -240,6 +240,11 @@ class ChatModel:
     def get(self, item_id: str) -> Item | None:
         return self._by_id.get(item_id)
 
+    def item_for_job(self, job: int) -> Item | None:
+        """The response a runtime request's work shows under (the island's run card reads its steps)."""
+        item_id = self._job_item.get(int(job)) if isinstance(job, int) else None
+        return self._by_id.get(item_id) if item_id else None
+
     def _new_id(self, prefix: str) -> str:
         self._seq += 1
         return f"{prefix}{self._seq}"

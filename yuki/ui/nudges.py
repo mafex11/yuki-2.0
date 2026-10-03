@@ -51,17 +51,18 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QEnterEvent, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
 from yuki.ui.surface import SurfaceWindow
+from yuki.ui.lattice_cards import LatticeCard
 from yuki.ui.memory import local_moment
 from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
 # What a card says and offers, as plain data (no Qt): shared with the HTML window's process (re-exported here).
 from yuki.ui.cards import (  # noqa: F401 - re-exported: chatview, window_host and tests import them from here
     KIND_TITLES, NOTICE_TITLES, OFFER_DOS, OFFER_FAILED, card_offer, card_title, kind_title, offer_expired,
-    offer_label, offer_lines, offer_open,
+    offer_label, offer_lines, offer_open, offer_steps,
 )
 
 #: The named event the memory service sets when it writes a nudge.
@@ -439,31 +440,51 @@ class NudgeWatcher(QObject):
         self.arrived.emit(rows, why)
 
 
-class NudgeCard(SurfaceWindow):
-    """One nudge, bottom-right (Horizon's check-in card): a small grey wave and the time, the text, then
-    Dismiss and Reply as pills. Never takes focus. A kind other than a plain check-in says its kind in quiet
-    words beside the wave ("Weekly review"); a question leads with the question, bold.
+#: A card's header icon per kind (the design's dot icons): an offer "from what I saw", a question, a break...
+KIND_ICONS: dict[str, str] = {"notice": "eye", "question": "lesson", "nudge": "pause", "reminder": "todo",
+                              "review": "day", "resume": "undo", "praise": "check"}
+#: A plain check-in (kind ``nudge``: the coach's break nudge since 2026-10-03) is headed as the design's break card.
+BREAK_TITLE = "Break"
+#: Its keys, the design's: Took one (accepted) and Later (dismissed); Less like this beside them.
+BREAK_BUTTONS: tuple[str, str] = ("Took one", "Later")
+#: The action key's dot icon per offer kind.
+OFFER_ICONS: dict[str, str] = {"todo_add": "todo", "bring_back": "window", "draft": "copy", "show_memory": "memory",
+                               "ask": "key"}
 
-    The whole text always shows (wrapped, never cut). It stays up for
-    :func:`linger_for` its text; the pointer on it stops the clock, and
-    leaving starts the full linger again.
+
+class NudgeCard(LatticeCard):
+    """One card, bottom right, in the Lattice design (the offer, question, break and notice cards): a mono header
+    (its kind's dot icon, the kind and the time) with a close key, the text, then by kind:
+
+    * an **offer** (a typed offer): **Will / Won't**, the action key named for the action, then a foot with Not now,
+      Less like this and "cards never start a run"; after the press the result in place with Undo;
+    * a **question**: what it rests on, an inline answer field with Answer (empty: Answer opens the ask bar), and Not
+      now / Don't ask this again;
+    * a **break** (a plain check-in): Took one, Later and Less like this (a reply goes through the ask bar's thread,
+      where the card also is);
+    * any other: Reply, and Dismiss (Less like this on observations and welcome-backs).
+
+    Never takes focus (only a click into the answer field lets it take the keyboard; Enter gives it back). The whole
+    text always shows (the card grows). It stays up for :func:`linger_for` its text; the pointer on it stops the
+    clock, and leaving starts the full linger again.
 
     Args:
-        linger_ms: A fixed linger for every nudge (offline checks); ``None``
-            (default) sizes it to each nudge's text.
+        linger_ms: A fixed linger for every nudge (offline checks); ``None`` (default) sizes it to each nudge's text.
 
     Signals:
-        replied: ``(nudge)`` -- the user pressed Reply.
-        dismissed: ``(nudge)`` -- the user pressed Dismiss.
+        replied: ``(nudge)`` -- the user pressed Reply (or Answer with nothing typed).
+        answered: ``(nudge, words)`` -- an answer typed into a question card.
+        dismissed: ``(nudge)`` -- Dismiss / Not now / Later / the close key.
         expired: ``(nudge)`` -- it faded on its own after :attr:`linger_ms`.
-        never_ask: ``(nudge)`` -- "Don't ask" on a question card (its Dismiss reads "Skip").
-        accepted: ``(nudge)`` -- the offer's button (named for the action) on a card with a typed offer; the card
+        never_ask: ``(nudge)`` -- "Don't ask this again" on a question card.
+        accepted: ``(nudge)`` -- the offer's key (named for the action), or Took one on a break; an offer's card
             stays up and shows the result (:meth:`show_result`).
-        less: ``(nudge)`` -- "Less of these" on an observation card or a welcome back.
+        less: ``(nudge)`` -- "Less like this".
         undo: ``(nudge)`` -- Undo after the offer ran (adding to the list, opening a page again).
     """
 
     replied = Signal(object)
+    answered = Signal(object, str)
     dismissed = Signal(object)
     expired = Signal(object)
     never_ask = Signal(object)
@@ -472,226 +493,252 @@ class NudgeCard(SurfaceWindow):
     undo = Signal(object)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
-        super().__init__(activates=False)
+        super().__init__(icon="dot")
         self.setObjectName("YukiNudgeCard")
         self.nudge: dict[str, Any] | None = None
         self._fixed_linger = linger_ms
         #: The linger of the nudge now up (set by :meth:`set_nudge`).
         self.linger_ms = linger_ms if linger_ms is not None else CARD_LINGER_BASE_MS
-        self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
+        from yuki.ui import lattice as L
+        from yuki.ui.island import TypingInput
+        from yuki.ui.lattice_cards import CardFoot, ConfirmRow, Detail
 
-        from yuki.ui.wave import Wave
-        from yuki.ui.window.theme import variable_font
-
-        column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 20, self.SHADOW + 16, self.SHADOW + 20, self.SHADOW + 16)
-        column.setSpacing(10)
-
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        self.wave = Wave("checkin", theme=self.theme, size=(120, 16), parent=self)
-        header.addWidget(self.wave, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.title = QLabel(self)
-        self.title.setFont(variable_font(12, "Regular"))
-        self.title.setTextFormat(Qt.TextFormat.PlainText)
-        header.addWidget(self.title)   # the kind, in quiet words (none for a plain check-in)
-        header.addStretch(1)
-        self.when = QLabel(self)
-        self.when.setFont(variable_font(12, "Regular"))
-        self.when.setTextFormat(Qt.TextFormat.PlainText)
-        header.addWidget(self.when)
-        column.addLayout(header)
-
-        self.body = QLabel(self)
-        self.body.setFont(variable_font(15, "Regular"))
-        self.body.setWordWrap(True)
-        self.body.setTextFormat(Qt.TextFormat.PlainText)
-        column.addWidget(self.body)
-        #: A question card: what the question rests on, small and dim under the bold question.
-        self.detail = QLabel(self)
-        self.detail.setFont(variable_font(13, "Regular"))
-        self.detail.setWordWrap(True)
-        self.detail.setTextFormat(Qt.TextFormat.PlainText)
-        self.detail.setVisible(False)
-        column.addWidget(self.detail)
-        #: What the offer did, in place: "Added to your list.", the draft, what Yuki holds, or why nothing ran.
-        self.result = QLabel(self)
-        self.result.setFont(variable_font(13.5, "Regular"))
-        self.result.setWordWrap(True)
-        self.result.setTextFormat(Qt.TextFormat.PlainText)
-        self.result.setVisible(False)
-        column.addWidget(self.result)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        buttons.setContentsMargins(0, 4, 0, 0)
-        buttons.addStretch(1)
-        self.never_button = self._button(QUESTION_BUTTONS[2])
-        self.never_button.setVisible(False)   # question cards only
-        self.less_button = self._button(OFFER_BUTTONS[1])
-        self.less_button.setVisible(False)    # observation cards and the welcome back
-        self.dismiss_button = self._button("Dismiss")
-        self.reply_button = self._button("Reply")
-        self.do_button = self._button("")
-        self.do_button.setVisible(False)      # cards with a typed offer only: its label names the action
-        self.undo_button = self._button("Undo")
-        self.copy_button = self._button("Copy")
-        self.close_button = self._button("Close")
-        for after in (self.undo_button, self.copy_button, self.close_button):
-            after.setVisible(False)           # after the offer ran
+        #: The kind's heading ("Your work", "Getting to know you"; none for a plain check-in) and the time: the
+        #: header says them with the icon (``title`` and ``when`` hold the words).
+        self.title = L.Label("", parent=self)
+        self.title.hide()
+        self.when = L.Label("", parent=self)
+        self.when.hide()
+        self.body = L.Para("", font=L.ui_font(15), line_height=1.45, parent=self)
+        self.content.addWidget(self.body)
+        #: An offer's Will / Won't, or what a question rests on.
+        self.detail = Detail(self)
+        self._detail_gap = QWidget(self)
+        self._detail_gap.setFixedHeight(12)
+        self.content.addWidget(self._detail_gap)
+        self.content.addWidget(self.detail)
+        #: What the offer did, in place: "Added to your list." with Undo, the draft, what Yuki holds, or why not.
+        self.result_gap = QWidget(self)
+        self.result_gap.setFixedHeight(10)
+        self.content.addWidget(self.result_gap)
+        self.result = ConfirmRow(self)
+        self.content.addWidget(self.result)
+        self.draft = L.Para("", font=L.ui_font(15), line_height=1.45, parent=self)
+        self.content.addWidget(self.draft)
+        acts = QHBoxLayout()
+        acts.setContentsMargins(0, 14, 0, 0)
+        acts.setSpacing(6)
+        self.do_button = L.Key("", variant="pri", size="sm", parent=self)
+        self.reply_button = L.Key("Reply", size="sm", parent=self)
+        self.later_button = L.Key(BREAK_BUTTONS[1], size="sm", parent=self)
+        self.copy_button = L.Key("Copy", variant="pri", size="sm", icon="copy", parent=self)
+        self.close_button = L.Key("Close", variant="ghost", size="sm", parent=self)
+        self.answer_input = TypingInput("Or say it in your words…", self)
+        self.answer_input.setFixedHeight(30)
+        self.answer_input.setMinimumWidth(150)
+        self.answer_input.setFont(L.ui_font(13))
+        self.answer_input.underline = True
+        self.answer_input.submitted.connect(self._on_answer_text)
+        self.less_inline = L.Key("Less like this", variant="ghost", size="xs", parent=self)
+        for w in (self.do_button, self.reply_button, self.later_button, self.copy_button, self.close_button):
+            acts.addWidget(w)
+        acts.addWidget(self.answer_input, 1)
+        self._stretch_at = acts.count()
+        acts.addStretch(1)
+        acts.addWidget(self.less_inline)
+        self.acts = acts
+        self.content.addLayout(acts)
+        self.foot_gap = QWidget(self)
+        self.foot_gap.setFixedHeight(12)
+        self.content.addWidget(self.foot_gap)
+        #: The foot (``.card-foot``: a rule, ghost keys, a note) reaches 8 px past the padding and 4 px into the
+        #: bottom one; a question's second row sits on the right without a rule.
+        self.foot_slot = QWidget(self)
+        self.foot_slot.setFixedHeight(1 + 10 + 22 - 4)
+        self.content.addWidget(self.foot_slot)
+        self.foot = CardFoot(self)
+        self.float_over(self.foot, self.foot_slot, (8, 0, 8, 4))
+        self.qrow_gap = QWidget(self)
+        self.qrow_gap.setFixedHeight(10)
+        self.content.addWidget(self.qrow_gap)
+        self.qrow = CardFoot(self, rule=False, align="right")
+        self.content.addWidget(self.qrow)
+        self.dismiss_button = L.Key("Dismiss", variant="ghost", size="xs", parent=self)
+        self.less_button = L.Key("Less like this", variant="ghost", size="xs", parent=self)
+        self.never_button = L.Key("Don’t ask this again", variant="ghost", size="xs", parent=self)
+        self.undo_button = L.Key("Undo", variant="ghost", size="xs")
+        self.result.add_key(self.undo_button)
         self.never_button.clicked.connect(self._on_never)
         self.less_button.clicked.connect(self._on_less)
+        self.less_inline.clicked.connect(self._on_less)
         self.dismiss_button.clicked.connect(self._on_dismiss)
+        self.later_button.clicked.connect(self._on_dismiss)
+        self.x_button.clicked.connect(self._on_dismiss)
         self.reply_button.clicked.connect(self._on_reply)
         self.do_button.clicked.connect(self._on_do)
         self.undo_button.clicked.connect(self._on_undo)
         self.copy_button.clicked.connect(self._on_copy)
         self.close_button.clicked.connect(self._on_close)
-        for button in (self.never_button, self.less_button, self.dismiss_button, self.reply_button, self.do_button,
-                       self.undo_button, self.copy_button, self.close_button):
-            buttons.addWidget(button)
-        column.addLayout(buttons)
         #: The offer ran (or was refused) on this card: what it says now is the result.
         self._acted = False
         #: A draft the card shows (for Copy).
         self._draft = ""
-
+        self._kind = "nudge"
         self._linger = QTimer(self)
         self._linger.setSingleShot(True)
         self._linger.timeout.connect(self._on_expire)
         #: True while the pointer is on the card and its clock is stopped.
         self._paused = False
-        self.restyle()
+        self.setFixedHeight(CARD_MIN_HEIGHT)
 
-    def _button(self, text: str) -> QPushButton:
-        from yuki.ui.window.theme import variable_font
-
-        button = QPushButton(text, self)
-        button.setFont(variable_font(13, "Regular"))
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        # The card never takes the keyboard; nor may its buttons.
-        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        return button
-
-    def _style_buttons(self) -> None:
-        self.reply_button.setStyleSheet(self.button_css("default"))
-        self.do_button.setStyleSheet(self.button_css("default"))
-        self.copy_button.setStyleSheet(self.button_css("default"))
-        quiet = self.button_css("ghost")
-        for button in (self.dismiss_button, self.never_button, self.less_button, self.undo_button, self.close_button):
-            button.setStyleSheet(quiet)
-        self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
-
-    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
-        self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
-        self.body.setStyleSheet(f"color: {self.ink_css('text')};")
-        self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
-        self.result.setStyleSheet(f"color: {self.ink_css('text')};")
-        self._style_buttons()
+    def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed: the live colour)
+        self.update()
 
     # -- content -----------------------------------------------------------
 
+    def _foot(self, keys: list[Any], note: str = "", *, row: bool = False) -> None:
+        for k in (self.dismiss_button, self.less_button, self.never_button):
+            k.setVisible(k in keys)
+        on = bool(keys) or bool(note)
+        (self.qrow if row else self.foot).set_keys(list(keys), note)
+        self.foot_slot.setVisible(on and not row)
+        self.foot_gap.setVisible(on and not row)
+        self.qrow.setVisible(on and row)
+        self.qrow_gap.setVisible(on and row)
+        self._place_floats()
+
     def set_nudge(self, nudge: dict[str, Any]) -> None:
         """Fill the card for one nudge and size it to its text (no showing)."""
+        from yuki.ui import lattice as L
+
         self.nudge = nudge
         kind = str(nudge.get("kind") or "nudge")
-        self.title.setText("" if kind == "nudge" else card_title(nudge))   # a plain check-in: the wave says it
-        question = str(nudge.get("kind") or "") == "question"
+        self._kind = kind
+        title = "" if kind == "nudge" else card_title(nudge)   # a plain check-in has no kind heading
+        self.title.setText(title)
+        question = kind == "question"
         offer = offer_open(nudge) and not question
+        brk = kind == "nudge"
         self._acted, self._draft = False, ""
-        self.reply_button.setText(QUESTION_BUTTONS[0] if question else "Reply")
-        self.reply_button.setVisible(not offer)
-        self.do_button.setText(offer_label(nudge) if offer else "")
+        when = when_label(nudge.get("at"))
+        self.when.setText(when)
+        # the design's headers: "Offer · from what I saw", "Question", "Break"; other kinds their own heading
+        head = ["Offer · from what I saw" if offer else "Question" if question else BREAK_TITLE if brk else title,
+                when]
+        self.set_head("eye" if offer else KIND_ICONS.get(kind, "dot"), " · ".join(x for x in head if x))
+        text = _squash(nudge.get("text"))
+        self.body._lh = 1.4 if brk else 1.45
+        self.body.set_font(L.ui_font(17 if brk else 15, 400))
+        if question:   # the question leads; what it rests on sits under it, small and dim
+            asked, rest = split_question(text)
+            self.body.set_text(asked)
+            self.detail.set_plain(rest)
+            self.detail.setVisible(bool(rest))
+            self._detail_gap.setFixedHeight(6)
+        else:
+            self.body.set_text(text)  # all of it: wrapped, the card grows to fit
+            if offer:   # what the key will and won't do, always in sight before the press
+                o = card_offer(nudge) or {}
+                self.detail.set_lines("; ".join(offer_steps(nudge)), " ".join(str(o.get("wont") or "").split()))
+            else:
+                self.detail.set_plain("")
+            self.detail.setVisible(offer)
+            self._detail_gap.setFixedHeight(12)
+        self._detail_gap.setVisible(not self.detail.isHidden())
+        do = str((card_offer(nudge) or {}).get("do") or "")
+        self.do_button.set_parts(offer_label(nudge) if offer else BREAK_BUTTONS[0] if brk else "",
+                                 icon=OFFER_ICONS.get(do) if offer else None)
         self.do_button.setEnabled(True)
-        self.do_button.setVisible(offer)
-        self.dismiss_button.setText(QUESTION_BUTTONS[1] if question else OFFER_BUTTONS[0] if offer else "Dismiss")
-        self.dismiss_button.setVisible(True)
-        self.never_button.setVisible(question)
-        self.less_button.setVisible(kind in LESS_KINDS)
+        self.do_button.setVisible(offer or brk)
+        self.reply_button.set_parts(QUESTION_BUTTONS[0] if question else "Reply", variant="pri" if question else "")
+        self.reply_button.setVisible(not offer and not brk)
+        self.later_button.setVisible(brk)
+        self.answer_input.setVisible(question)
+        self.acts.setStretch(self._stretch_at, 0 if question else 1)   # the answer field takes the row
+        self.answer_input.setText("")
+        self.less_inline.setVisible(brk)
         for after in (self.undo_button, self.copy_button, self.close_button):
             after.setVisible(False)
         self.result.setVisible(False)
-        self.result.setText("")
-        self.when.setText(when_label(nudge.get("at")))
-        text = _squash(nudge.get("text"))
-        from yuki.ui.window.theme import variable_font
-
-        if question:   # the question leads, bold and bright; what it rests on sits under it, small and dim
-            asked, rest = split_question(text)
-            self.body.setFont(variable_font(15, "Semibold"))
-            self.body.setText(asked)
-            self.detail.setText(rest)
-            self.detail.setVisible(bool(rest))
+        self.result.set_text("")
+        self.result_gap.setVisible(False)
+        self.draft.setVisible(False)
+        if offer:
+            self.dismiss_button.set_parts(OFFER_BUTTONS[0])
+            self._foot([self.dismiss_button, self.less_button], "cards never start a run")
+        elif question:
+            self.dismiss_button.set_parts("Not now")
+            self._foot([self.dismiss_button, self.never_button], row=True)
+        elif brk:
+            self._foot([])
         else:
-            self.body.setFont(variable_font(15, "Regular"))
-            self.body.setText(text)  # all of it: word-wrapped, the card grows to fit
-            # what the button will and won't do, always in sight before the press
-            self.detail.setText(offer_lines(nudge) if offer else "")
-            self.detail.setVisible(offer)
+            self.dismiss_button.set_parts("Dismiss")
+            self._foot([self.dismiss_button] + ([self.less_button] if kind in LESS_KINDS else []))
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
             linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0))
-        self.restyle()
         self._fit_height()
 
-    def _fit_height(self) -> None:
-        width = CARD_WIDTH + 2 * self.SHADOW
-        self.layout().activate()
-        wanted = self.layout().totalHeightForWidth(width) if self.layout().hasHeightForWidth() else (
-            self.layout().sizeHint().height()
-        )
-        height = max(CARD_MIN_HEIGHT + 2 * self.SHADOW, wanted)
-        if height != self.height():
-            bottom = self.geometry().bottom()
-            self.setFixedHeight(height)
-            if self.isVisible():   # grow upwards: the card stays on its corner
-                self.move(self.x(), bottom - height + 1)
+    def _fit_height(self, animate: bool = False) -> None:
+        self.fit_height(animate=animate)
         self.update()
 
     # -- the offer's result, in place ---------------------------------------
 
     def show_running(self) -> None:
-        """The offer's button was pressed: it says so until memory answers (typed offers answer at once)."""
+        """The offer's key was pressed: it says so until memory answers (typed offers answer at once)."""
         self._acted = True
         self._linger.stop()
-        self.do_button.setText("Running…")
+        self.do_button.set_parts("Running…", icon=None)
         self.do_button.setEnabled(False)
         for button in (self.dismiss_button, self.less_button, self.reply_button, self.never_button):
             button.setVisible(False)
+        self._foot([])
 
     def show_result(self, result: dict[str, Any]) -> None:
-        """What the offer did (``offer_act``'s answer): a line and Undo (added to the list, a page opened again),
-        the draft with Copy, what Yuki holds, or why nothing ran; then the card fades after a while."""
+        """What the offer did (``offer_act``'s answer), morphing in place (240 ms): a line and Undo (added to the
+        list, a page opened again), the draft with Copy, what Yuki holds, or why nothing ran; then the card fades
+        after a while."""
         self._acted = True
         self.do_button.setVisible(False)
-        for button in (self.dismiss_button, self.less_button, self.reply_button, self.never_button):
+        for button in (self.dismiss_button, self.less_button, self.reply_button, self.never_button,
+                       self.less_inline, self.later_button):
             button.setVisible(False)
+        self._foot([])
+        self.answer_input.setVisible(False)
         do = str(result.get("do") or (card_offer(self.nudge) or {}).get("do") or "")
         linger = RESULT_LINGER_MS
+        icon = "check"
         if not result.get("ok"):
             why = str(result.get("why") or "error")
             text = OFFER_FAILED.get(why, OFFER_FAILED["error"])
             if why == "already" and result.get("state") == "undone":
                 text = "Already undone."
-            self.result.setText(text)
+            icon = "x"
             self.close_button.setVisible(True)
         elif do == "draft":
             self._draft = str(result.get("text") or "")
-            self.result.setText(self._draft)
+            text = self._draft
+            icon = "copy"
             self.copy_button.setVisible(True)
             self.close_button.setVisible(True)
             linger = EXPANDED_LINGER_MS
         elif do == "show_memory":
             items = result.get("items") or []
-            self.result.setText("\n\n".join(f"{i.get('title')}: {i.get('text')}" for i in items if isinstance(i, dict)))
+            text = "\n\n".join(f"{i.get('title')}: {i.get('text')}" for i in items if isinstance(i, dict))
+            icon = "memory"
             self.close_button.setVisible(True)
             linger = EXPANDED_LINGER_MS
         else:
-            self.result.setText(str(result.get("message") or "Done."))
-            self.undo_button.setVisible(bool(result.get("undo")))
+            text = str(result.get("message") or "Done.")
+        self.undo_button.setVisible(bool(result.get("ok")) and do not in ("draft", "show_memory")
+                                    and bool(result.get("undo")))
+        self.result.set_text(text, icon)
         self.result.setVisible(True)
+        self.result_gap.setVisible(True)
         self.detail.setVisible(False)
+        self._detail_gap.setVisible(False)
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else linger
-        self._fit_height()
+        self._fit_height(animate=True)
         if self.underMouse():
             self._paused = True    # being read: the clock starts when the pointer leaves
         elif not self._paused:
@@ -700,19 +747,12 @@ class NudgeCard(SurfaceWindow):
     def show_undone(self, result: dict[str, Any]) -> None:
         """Undo's answer: "Undone." (or why not)."""
         self.undo_button.setVisible(False)
-        self.result.setText("Undone." if result.get("ok") else "Couldn't undo that.")
+        self.result.set_text("Undone." if result.get("ok") else "Couldn't undo that.",
+                             "undo" if result.get("ok") else "x")
         self.close_button.setVisible(True)
-        self._fit_height()
+        self._fit_height(animate=True)
         if not self._paused:
             self._linger.start(self._fixed_linger if self._fixed_linger is not None else RESULT_LINGER_MS)
-
-    def anchor(self) -> QPoint:
-        """Top-left to sit at: bottom-right of the primary screen's work area, like the strip."""
-        screen = QGuiApplication.primaryScreen()
-        area = screen.availableGeometry() if screen else self.geometry()
-        x = area.right() - self.width() + self.SHADOW - STRIP_MARGIN
-        y = area.bottom() - self.height() + self.SHADOW - STRIP_MARGIN
-        return QPoint(x, y)
 
     def show_nudge(self, nudge: dict[str, Any]) -> None:
         """Show one nudge, without activating, and start its linger timer."""
@@ -767,27 +807,46 @@ class NudgeCard(SurfaceWindow):
 
     def leaveEvent(self, event: object) -> None:  # noqa: D102 - Qt override
         super().leaveEvent(event)
-        if self._paused and self.nudge is not None:
+        if self._paused and self.nudge is not None and not self.answer_input.hasFocus():
             self._linger.start(self.linger_ms)
         self._paused = False
 
     # -- outcomes ----------------------------------------------------------
 
     def _on_expire(self) -> None:
+        if self.answer_input.hasFocus():   # being answered: never pulled away mid-sentence
+            self._linger.start(self.linger_ms)
+            return
         acted = self._acted
         nudge = self.close_card()
         if nudge is not None and not acted:   # after its offer ran the card's outcome is recorded already
             self.expired.emit(nudge)
 
     def _on_dismiss(self) -> None:
+        if self._acted:      # the result is on show: closing it records nothing more
+            self.close_card()
+            return
         nudge = self.close_card()
         if nudge is not None:
             self.dismissed.emit(nudge)
 
     def _on_reply(self) -> None:
+        if self._kind == "question" and self.answer_input.text().strip():
+            self._on_answer_text(self.answer_input.text().strip())
+            return
         nudge = self.close_card()
         if nudge is not None:
             self.replied.emit(nudge)
+
+    def _on_answer_text(self, words: str) -> None:
+        """An answer typed into the card: said back in place, then the card goes (memory records it)."""
+        nudge = self.nudge
+        if nudge is None or not words.strip():
+            return
+        self.answer_input.end_typing(give_back=True)
+        self.answered.emit(nudge, words.strip())
+        self.show_result({"ok": True, "do": "answer", "message": f"Saved your answer: “{words.strip()}”"})
+        self._linger.start(self._fixed_linger if self._fixed_linger is not None else 2600)
 
     def _on_never(self) -> None:
         nudge = self.close_card()
@@ -796,7 +855,14 @@ class NudgeCard(SurfaceWindow):
 
     def _on_do(self) -> None:
         nudge = self.nudge
-        if nudge is None or self._acted or not offer_open(nudge):
+        if nudge is None or self._acted:
+            return
+        if self._kind == "nudge":   # a break: Took one is the answer itself
+            self.accepted.emit(nudge)
+            self.show_result({"ok": True, "do": "break", "message": "Okay. Good."})
+            self._linger.start(self._fixed_linger if self._fixed_linger is not None else 1800)
+            return
+        if not offer_open(nudge):
             return
         self.show_running()   # the card stays: the result shows here (typed offers answer at once)
         self.accepted.emit(nudge)
@@ -808,8 +874,8 @@ class NudgeCard(SurfaceWindow):
 
     def _on_copy(self) -> None:
         QGuiApplication.clipboard().setText(self._draft)
-        self.copy_button.setText("Copied")
-        QTimer.singleShot(1500, lambda: self.copy_button.setText("Copy"))
+        self.copy_button.set_parts("Copied")
+        QTimer.singleShot(1500, lambda: self.copy_button.set_parts("Copy"))
 
     def _on_close(self) -> None:
         self.close_card()
@@ -830,14 +896,14 @@ class NoticeCard(NudgeCard):
     def show_notice(self, kind: str, text: str) -> None:
         self.set_nudge({"id": f"notice:{kind}", "kind": kind, "text": text, "at": None})
         self.title.setText(self.TITLES.get(kind, "Yuki"))
-        self.reply_button.hide()
-        self.never_button.hide()
-        self.do_button.hide()
-        self.less_button.hide()
-        self.undo_button.hide()
-        self.copy_button.hide()
-        self.close_button.hide()
-        self.dismiss_button.setText("OK")
+        self.set_head("bolt" if kind == "cost" else "settings", " · ".join(
+            x for x in (self.TITLES.get(kind, "Yuki"), when_label(time.time())) if x))
+        for b in (self.reply_button, self.never_button, self.do_button, self.less_button, self.undo_button,
+                  self.copy_button, self.close_button, self.later_button, self.less_inline, self.answer_input):
+            b.hide()
+        self.dismiss_button.set_parts("OK")
+        self._foot([self.dismiss_button])
+        self._fit_height()
         self._paused = False
         self.fade_in(self.anchor())
         self._attention(True)
@@ -877,6 +943,8 @@ class NudgeController(QObject):
     recent_ready = Signal(object)
     offer_state = Signal(object, str)
     ask_requested = Signal(object, str)
+    #: ``(count)``: how many cards wait for a free screen (the tray's "waiting" badge).
+    queue_changed = Signal(int)
     #: ``(event name, fields)`` from worker threads, written on the GUI thread.
     _logged = Signal(str, object)
     #: ``(nudge, result, via)`` / ``(nudge, result)``: memory's answer to a press / an Undo, back on the GUI thread.
@@ -924,7 +992,10 @@ class NudgeController(QObject):
         self.card.dismissed.connect(self._on_dismissed)
         self.card.replied.connect(self._on_replied)
         self.card.never_ask.connect(self._on_never_ask)
-        self.card.accepted.connect(self.accept_offer)
+        self.card.accepted.connect(self._on_card_accepted)
+        answered = getattr(self.card, "answered", None)
+        if answered is not None:
+            answered.connect(self._on_answered)
         self.card.less.connect(self._on_less)
         self.card.undo.connect(self.undo_offer)
         self._acted.connect(self._on_acted)
@@ -975,6 +1046,8 @@ class NudgeController(QObject):
                 "nudge_received", id=row.get("id"), kind=row.get("kind"), via=why,
                 queued=len(self.queue), text=row.get("text"), reason=row.get("reason"),
             )
+        if fresh:
+            self.queue_changed.emit(len(self.queue))
         if self.queue:
             self.try_show()
 
@@ -1017,6 +1090,7 @@ class NudgeController(QObject):
             return
         self._deferred = None
         nudge = self.record_delivery(self.queue.pop(0), "card")
+        self.queue_changed.emit(len(self.queue))
         self.card.show_nudge(nudge)
         self.ui_log.event(
             "nudge_shown", id=nudge.get("id"), kind=nudge.get("kind"), text=nudge.get("text"),
@@ -1321,6 +1395,35 @@ class NudgeController(QObject):
         self.ack(nudge, "less")
         if card_offer(nudge) is not None:
             self.offer_state.emit(nudge, "less")
+
+    def _on_card_accepted(self, nudge: dict[str, Any]) -> threading.Thread | None:
+        """The card's main key: a typed offer runs by code (:meth:`accept_offer`); a break's "Took one" (no offer)
+        is acknowledged ``accepted`` (the user took the suggestion)."""
+        if card_offer(nudge) is not None:
+            return self.accept_offer(nudge)
+        self.ui_log.event("nudge_accepted", id=nudge.get("id"), kind=nudge.get("kind"), via="card", do=None)
+        return self.ack(nudge, "accepted")
+
+    def _on_answered(self, nudge: dict[str, Any], words: str) -> threading.Thread:
+        """An answer typed into a question card: memory records it as the user's own words (``answer_question``,
+        the window's Needs-you path) and the card is acknowledged ``replied`` with them."""
+        ref = nudge.get("ref")
+        self.ui_log.event("question_answered", id=nudge.get("id"), ref=ref, via="card", chars=len(words))
+        self.ack(nudge, "replied", reply=words)
+
+        def work() -> None:
+            fields: dict[str, Any] = {"id": nudge.get("id"), "ref": ref}
+            try:
+                result = self.memory.call_method("answer_question", ref, words, timeout_s=TRAY_TIMEOUT_S)
+                fields.update(ok=True, saved=bool((result or {}).get("saved")) if isinstance(result, dict) else None)
+            except Exception as exc:  # never take the UI down
+                fields.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+            self._logged.emit("question_answer", fields)
+
+        thread = threading.Thread(target=work, name="yuki-ui-question-answer", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
 
     def _on_never_ask(self, nudge: dict[str, Any]) -> None:
         self.ui_log.event("nudge_dismissed", id=nudge.get("id"), via="card_never")
