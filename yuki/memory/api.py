@@ -1568,7 +1568,7 @@ class MemoryClient:
         moment = inputs.get("moment") if isinstance(inputs, dict) and n.trigger == "checkin" else None
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
                 "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None),
-                "moment": moment}
+                "moment": moment, "outcome_at": _iso(getattr(n, "outcome_at", None))}
 
     def _nudges_config(self) -> Any:
         """The user's ``[nudges]`` table (read only; the service applies the same), defaults when unreadable."""
