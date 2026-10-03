@@ -816,3 +816,191 @@ def test_n9_after_the_users_answer_a_held_send_is_judged_again_not_replayed_from
     auth.memo["k1"] = Verdict(decision="ask_user", question="Send it to Hemanth?")
     auth.memo["k2"] = Verdict(decision="allow")
     assert auth.forget_denials() == 1 and list(auth.memo) == ["k2"]
+
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (F1-F8)
+# ---------------------------------------------------------------------------
+
+
+def test_f1_a_check_left_behind_by_the_users_words_never_covers_a_later_send(tmp_path: Path) -> None:
+    """The N10 interjection case: the user speaks while check_situation reads; the read is left, its result never
+    reaches the model, so a send later in the request is still refused (a duplicate never goes out unasked)."""
+    desk, mem = _sam(60.0)
+    box: dict[str, Any] = {}
+    slow = desk.get_window_tree
+
+    def get_window_tree(hwnd: int, **kw: Any) -> dict[str, Any]:
+        if kw.get("max_elements") == 1200:                        # the check's own read
+            box["agent"].steer("turn the volume up")
+            time.sleep(0.4)
+        return slow(hwnd, **kw)
+
+    desk.get_window_tree = get_window_tree
+
+    def volume(params: dict) -> SimpleNamespace:
+        assert "Not finished" in _texts(params)                   # the model never saw the evidence
+        time.sleep(0.6)                                           # the left read finishes meanwhile
+        return _response(_use("app_volume", app="Spotify", change=10))
+
+    def send(params: dict) -> SimpleNamespace:
+        return _response(_use("type_text", text=EARLIER, press_enter=True, expect_hwnd=CHAT))
+
+    def after_refusal(params: dict) -> SimpleNamespace:
+        box["refused"] = "nothing in this request has looked at the situation yet" in _texts(params)
+        return _response(_use("done", message="Turned it up; I'll look at Sam's chat before sending.", about=[],
+                              states=[]))
+
+    brain = Brain([_response(_use("check_situation", action=f"send Sam: {EARLIER}", hwnd=CHAT, about="Sam")),
+                   volume, send, after_refusal])
+    agent = _agent(brain, tmp_path, desk, memory=_memory(mem))
+    box["agent"] = agent
+    _run(agent, "tell sam I fell asleep on the call, my alarm did not go off")
+    assert desk.sent == [] and box["refused"]
+    assert agent._situation_checks == []
+
+
+def test_f2_the_users_own_messages_name_the_chat_they_went_to() -> None:
+    from yuki.agent.situation import QUESTION, gather
+
+    desk = ChatPlayerDesk(friend="Maya", handle="maya_k", history=[("Maya", NOW - 4000, "see you later")])
+    line = "running 15 min late, sorry"
+    person = {"name": "Maya", "aka": ["maya"], "routes": [
+        {"label": "Discord DM @maya_k", "app": "Discord.exe", "thread_ids": [5], "last_mine": NOW - 9000,
+         "last_theirs": NOW - 4000, "samples": []}]}
+    mem = FakeMemoryClient(own=[{"text": line, "at": NOW - 180, "first_seen": NOW - 180, "thread": 99},
+                                {"text": "ok cool", "at": NOW - 9000, "first_seen": NOW - 9000, "thread": 5}],
+                           person=person)
+    sit = gather({"action": f"send Maya: {line}", "hwnd": CHAT, "about": "Maya"},
+                 read_tree=desk.get_window_tree, process_of=lambda h: ("Discord.exe", "@maya_k - Discord"),
+                 memory_call=lambda method, *a, timeout_s: getattr(mem, method)(*a), now=NOW)
+    text = sit.evidence_text()
+    assert f"3 min ago, in another chat, not with Maya: \"{line}\" (similar to what you are about to send: 1.00)" \
+        in text
+    assert "to Maya, Discord DM @maya_k: \"ok cool\"" in text
+    assert sit.summary().endswith("one 1.00 similar to this in another chat")
+    assert "it is not done for Maya" in QUESTION
+
+
+def test_f3_a_focusable_window_root_or_document_does_not_count_as_a_control_under_the_point() -> None:
+    from yuki.agent.tools import Dispatcher, ToolError
+
+    class FocusableRoots(ChatPlayerDesk):
+        """Top-level windows and web documents take the keyboard, so live reads mark them interactive."""
+
+        def _el(self, out: list[dict[str, Any]], role: str, name: str, bounds: tuple[int, int, int, int],
+                **kw: Any) -> None:
+            if role in ("Window", "Document", "Pane"):
+                kw.setdefault("is_interactive", True)
+            super()._el(out, role, name, bounds, **kw)
+
+    desk = FocusableRoots()
+    desk.toggles.update({"Lyrics": True})
+    d = Dispatcher(desk)
+    lyrics = next(e for e in desk.get_window_tree(PLAYER)["elements"] if e["name"] == "Lyrics")
+    desk.lyrics_full = True                                       # the bar is hidden now
+    d.dispatch("look_at_window", {"hwnd": PLAYER})
+    with pytest.raises(ToolError, match="nothing you can click is at"):
+        d._check_point_on_control(*lyrics["center"], PLAYER)
+    d.dispatch("look_at_window", {"hwnd": CHAT})
+    d._check_point_on_control(900, 1000, CHAT)                    # the message box still counts
+
+
+def test_f5_a_muted_app_at_its_top_is_said_to_be_muted_with_unmuting_offered() -> None:
+    from yuki.agent.finish import noop_line
+    from yuki.voice.offline import MixerStub
+
+    mixer = MixerStub({"Spotify.exe": 100.0}, playing={"Spotify.exe"}, system=40.0)
+    mixer.app_volume("Spotify", mute=True)
+    up = mixer.app_volume("Spotify", change=10)
+    assert up.details.get("noop") and up.details.get("muted_before")
+    assert noop_line("app_volume", up.details) == ("Spotify is already at 100% in Windows' volume mixer but muted "
+                                                   "there, so nothing changed. Want me to unmute it?")
+
+
+def test_f6_a_send_is_gated_by_its_own_traits_even_when_the_judge_says_it_sends_nothing(tmp_path: Path) -> None:
+    desk, mem = _sam(None)
+    box: dict[str, Any] = {}
+
+    def check(params: dict) -> SimpleNamespace:
+        box["refused"] = "nothing in this request has looked at the situation yet" in _texts(params)
+        return _response(_use("check_situation", action="send Sam: omw", hwnd=CHAT, about="Sam"))
+
+    brain = Brain([_response(_use("type_text", text="omw", press_enter=True, expect_hwnd=CHAT)), check,
+                   _response(_use("type_text", 1, text="omw", press_enter=True, expect_hwnd=CHAT),
+                             _use("done", message="Sent.", about=[], states=[]))],
+                  judge=lambda params: {"decision": "allow", "question": "", "sends": False, "scope": "call",
+                                        "why": "they asked"})
+    _run(_agent(brain, tmp_path, desk, memory=_memory(mem)), "tell sam omw")
+    assert box["refused"] and desk.sent == ["omw"]
+
+
+def test_f6_with_the_judge_off_a_send_still_needs_its_check(tmp_path: Path) -> None:
+    from yuki.agent.loop import Agent
+
+    desk, mem = _sam(None)
+    box: dict[str, Any] = {}
+
+    def check(params: dict) -> SimpleNamespace:
+        box["refused"] = "nothing in this request has looked at the situation yet" in _texts(params)
+        return _response(_use("done", message="Not sent yet.", about=[], states=[]))
+
+    settings = Settings(log_dir=tmp_path / "sessions", stream=False, requests_csv=tmp_path / "r.csv", judge=False,
+                        consult=False, send_confirm_s=0.2)
+    agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None),
+                  client=Brain([_response(_use("type_text", text="omw", press_enter=True, expect_hwnd=CHAT)), check]),
+                  backend=desk, prewarm=False, record_requests=False, memory=_memory(mem), lane="worker")
+    assert agent.authorizer is None
+    _run(agent, "tell sam omw")
+    assert box["refused"] and desk.sent == []
+
+
+def test_f7_the_slider_keys_stop_once_the_caller_has_stopped_waiting() -> None:
+    from yuki.actions.slider import KEYS_PER_BATCH, drive
+
+    s = FakeSlider(value=0.0, settable=False, small=1.0)
+    calls = {"n": 0}
+
+    def stopped() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1                                     # the budget ran out after the first batch
+
+    ok, _summary, details = drive(s, to=90, press=s.press, sleep=lambda _s: None, settle_s=0.0, stopped=stopped)
+    assert not ok and details["stopped"] and details["presses"] == KEYS_PER_BATCH and s.value == KEYS_PER_BATCH
+
+
+def test_f7_the_dispatchers_key_action_presses_nothing_after_the_result_went_back() -> None:
+    from yuki.agent.tools import Dispatcher
+    from yuki.voice.offline import StubResult
+
+    desk = ChatPlayerDesk(volume=30.0)
+    pressed: list[Any] = []
+    desk.press = lambda key, **kw: pressed.append(key)            # type: ignore[method-assign]
+    captured: dict[str, Any] = {}
+
+    def set_slider(hwnd: int, element: dict[str, Any], *, to: Any = None, by: Any = None, press: Any = None) -> Any:
+        captured["press"] = press
+        return StubResult(ok=False, summary="setting it did not finish", details={"verified": False})
+
+    desk.set_slider = set_slider                                  # type: ignore[method-assign]
+    d = Dispatcher(desk)
+    d.dispatch("look_at_window", {"hwnd": PLAYER})
+    d.dispatch("set_slider", {"element": _ids(desk.get_window_tree(PLAYER))["Change volume"], "expect_hwnd": PLAYER,
+                              "to": 80})
+    with pytest.raises(TimeoutError):
+        captured["press"]("right", 2, stopped=lambda: True)
+    captured["press"]("right", 2, stopped=lambda: False)
+    assert pressed == ["right"]
+
+
+def test_f8_a_hold_the_run_then_got_past_is_no_lesson() -> None:
+    from yuki.agent.frame import session_lessons
+
+    gate = {"kind": "control", "tool": "type_text", "app": "", "target": "Edit \"Message @sam_99\"", "ok": False,
+            "why": "not run: no situation check before a step that lasts"}
+    check = {"kind": "read", "tool": "check_situation", "app": "", "ok": True}
+    sent = {"kind": "action", "tool": "type_text", "app": "Discord.exe", "target": "Edit \"Message @sam_99\"",
+            "ok": True, "verdict": True}
+    assert session_lessons([gate, check, sent], outcome="final") == {}
+    assert session_lessons([gate, check], outcome="final")       # a hold never got past is still trouble
