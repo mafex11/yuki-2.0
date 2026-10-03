@@ -375,9 +375,6 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
             # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
             # always reach the brain (the person block gives way first)
             tail = _practice_lines(frame, practice)
-        fresh = [str(x) for x in lessons or () if str(x).strip()][:MAX_LESSONS]
-        if fresh:
-            tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         else:   # an older memory: know-how lines and their "Not:" part
             proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
             if proc:
@@ -389,6 +386,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                 lines.append("What did not work before in the apps in play:")
                 lines += [f"- [{p.get('app')}] {_one(p.get('text'), 260)}" for p in pits]
             frame.pitfalls = len(pits)
+        fresh = [str(x) for x in lessons or () if str(x).strip()][:MAX_LESSONS]
+        if fresh:   # N8: this session's lessons, kept whole with the pitfalls
+            tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         # an action request (the caller's measure for the related ranking): a person named or in front, a selection
         frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"])
         frame.text = _fit(lines, chars, keep=tail)

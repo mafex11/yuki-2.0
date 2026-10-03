@@ -354,7 +354,8 @@ def test_f1_the_title_is_what_was_achieved_never_just_done() -> None:
     from yuki.ui.step_words import ACHIEVED, LABEL_KEYS, achievement, return_view
 
     assert ACHIEVED_FIELD == ACHIEVED and ACHIEVED in LABEL_KEYS
-    assert TOOLS_BY_NAME["done"]["input_schema"]["required"] == ["message", "about", "achieved"]
+    # vfix2 (report 47, N3) adds "states": each state the message tells, with the step that showed it
+    assert TOOLS_BY_NAME["done"]["input_schema"]["required"] == ["message", "about", "achieved", "states"]
     closed = {"name": "run_powershell", "ok": True, "input": {"what": "close Slack", "_about": {"changes": True}}}
     # the reply is "Done." and the brain said nothing better: the step's own done words
     assert return_view("done", "Done.", [closed])["title"] == "Closed Slack"
