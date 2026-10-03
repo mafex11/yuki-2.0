@@ -437,7 +437,8 @@ async function inPage(F) {
   const ms = dr ? Array.from(dr.querySelectorAll('.fold .ms')).map((e) => e.textContent).filter(Boolean) : [];
   check('14 no step shows milliseconds or a sub-second time', ms.every((t) => !/ms|\d\.\d/.test(t)), ms.join(' | '));
   await go('#home');
-  check('no 24-hour clock in the page headers', !/\b\d{2}:\d{2}\b/.test(main().querySelector('.ph .meta').textContent), main().querySelector('.ph .meta').textContent);
+  // a clock time with no AM/PM after it is a 24-hour time ("10:11 PM" from 10 AM to 12:59 is fine)
+  check('no 24-hour clock in the page headers', !/\b\d{1,2}:\d{2}\b(?!\s*[AP]M)/.test(main().querySelector('.ph .meta').textContent), main().querySelector('.ph .meta').textContent);
 
   // ---- Me: pin <-> unpin, Right resolves at once with a 5 s Undo, an Undo too late keeps it removed ----
   await go('#me'); await sleep(500);
