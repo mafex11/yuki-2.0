@@ -545,6 +545,22 @@ async function inPage(F) {
     g.querySelector('.fx-h').click(); await sleep(80);
     check('C a group opens to its steps in plain words', g.classList.contains('open') && g.querySelector('.lstep .w1').textContent.length > 0);
   }
+  // ---- W8 (4 Oct): the Calls tab lays out cleanly: when | where and who | lines; opened, the timeline sits under
+  // the where column; nothing squeezed or overflowing ----
+  await go('#activity/calls'); await sleep(500);
+  const crs = Array.from(main().querySelectorAll('.callrow'));
+  const wOf = (el) => el.getBoundingClientRect().width;
+  check('W8 every call row spans the section, its where-and-who column wide', crs.length > 0 && crs.every((r) => wOf(r.querySelector('.fx-h')) >= wOf(r) - 4 && wOf(r.querySelector('.wh')) > 300),
+    crs.map((r) => `${Math.round(wOf(r.querySelector('.fx-h')))}/${Math.round(wOf(r))}/${Math.round(wOf(r.querySelector('.wh')))}`).join(' '));
+  const withLines = crs.find((r) => r.querySelector('.fx-meta .mono') && r.querySelector('.fx-meta .mono').textContent);
+  if (withLines) {
+    withLines.querySelector('.fx-h').click(); await sleep(120);
+    const tl = withLines.querySelector('.call-tl'), wh = withLines.querySelector('.wh');
+    check('W8 an opened call shows what was said as a timeline under the where column', !!tl && tl.querySelectorAll('li').length >= 1
+      && Math.abs(tl.getBoundingClientRect().left - wh.getBoundingClientRect().left) <= 2, tl ? `${tl.getBoundingClientRect().left} vs ${wh.getBoundingClientRect().left}` : 'no timeline');
+    check('W8 nothing in the Calls tab overflows sideways', crs.every((r) => r.scrollWidth <= r.clientWidth + 1) && main().scrollWidth <= main().clientWidth + 1);
+    withLines.querySelector('.fx-h').click(); await sleep(60);
+  }
   return results;
 }
 

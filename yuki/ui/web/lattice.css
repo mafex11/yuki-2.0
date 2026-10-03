@@ -560,12 +560,31 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .gwhy em { font-style: normal; color: var(--text); }
 .gnote { font-size: 12.5px; margin-top: 4px; }
 .gacts { margin-top: 10px; display: flex; gap: 6px; }
-.callrow.fx > .fx-h { display: grid; grid-template-columns: 170px minmax(0, 1fr) auto 10px; gap: 16px; align-items: start; padding: 12px 2px; }
-.callrow.fx .tm { font: 500 12px/1.5 var(--f-mono); color: var(--text-2); }
-.callrow.fx .tm b { display: block; color: var(--text); font-size: 13px; font-weight: 500; }
-.callrow.fx .w1 { display: flex; gap: 10px; align-items: center; font-weight: 600; }
-.callrow.fx > .fx-d { padding-left: 188px; }
-.callrow.fx .pend { font-size: 13px; color: var(--text-2); }
+/* Activity -> Calls (the 4 Oct item W8): one grid per row - when | where and who | lines | chevron - and, opened,
+   what was said as a timeline under the where column; nothing overflows at 1280-1920 px */
+.calls-sec .calls > .fx:first-child { border-top: 0; }
+.callrow.fx > .fx-h { display: grid; grid-template-columns: 172px minmax(0, 1fr) auto 10px; column-gap: 18px; align-items: start; padding: 13px 2px; }
+.callrow.fx > .fx-h > .ic { margin-top: 5px; }
+.callrow.fx .tm { display: flex; flex-direction: column; gap: 2px; min-width: 0; font: 500 11.5px/1.45 var(--f-mono); color: var(--text-3); }
+.callrow.fx .tm b { color: var(--text); font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.callrow.fx .wh { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.callrow.fx .w1 { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; min-width: 0; font-size: 14px; font-weight: 600; line-height: 1.35; }
+.callrow.fx .w1 .cw { min-width: 0; overflow-wrap: anywhere; }
+.callrow.fx .w1 .chip { flex: none; }
+.callrow.fx .w2 { white-space: normal; overflow-wrap: anywhere; }
+.callrow.fx > .fx-h .fx-meta { padding-top: 2px; }
+.callrow.fx > .fx-d { padding: 0 2px 16px 192px; }
+.callrow.unrec > .fx-h .w1 { color: var(--text-2); }
+.call-d { display: flex; flex-direction: column; gap: 8px; max-width: 760px; }
+.call-tl { list-style: none; margin: 0; padding: 0 0 0 16px; border-left: 1px solid var(--hair-2); display: flex; flex-direction: column; gap: 2px; }
+.call-tl .cl { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 4px 0; font-size: 13px; line-height: 1.5; color: var(--text-2); }
+.call-tl .cl.timed { grid-template-columns: 64px minmax(0, 1fr); }
+.call-tl .cl::before { content: ''; position: absolute; left: -19.5px; top: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--bg); border: 1px solid var(--text-3); }
+.call-tl .cl-t { font: 500 11px/1.9 var(--f-mono); color: var(--text-3); white-space: nowrap; }
+.call-tl .cl-x { min-width: 0; overflow-wrap: anywhere; }
+.call-tl .cl-w { font-weight: 600; color: var(--text); margin-right: 6px; }
+.callrow.fx .pend { font-size: 13px; color: var(--text-2); line-height: 1.5; }
+.call-m { display: flex; gap: 12px; flex-wrap: wrap; font: 500 11px/1.4 var(--f-mono); color: var(--text-3); }
 .chg-u { display: inline-flex; gap: 8px; align-items: center; flex: none; }
 .chg-u .until { font: 500 11px/1 var(--f-mono); color: var(--text-3); white-space: nowrap; }
 
@@ -658,14 +677,6 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .aprow .mono { font-size: 12px; color: var(--text-2); text-align: right; }
 .dbar { display: flex; gap: 3px; flex-wrap: nowrap; overflow: hidden; }
 .dbar i { width: 5px; height: 5px; border-radius: 50%; background: var(--lit); flex: none; }
-.callrow { padding: 16px 0; border-top: 1px solid var(--hair); display: grid; grid-template-columns: 160px 1fr; gap: 18px; }
-.callrow:first-of-type { border-top: 0; padding-top: 2px; }
-.callrow .tm { font: 500 12px/1.5 var(--f-mono); color: var(--text-2); }
-.callrow .tm b { display: block; color: var(--text); font-size: 13px; font-weight: 500; }
-.callrow .wh { display: flex; gap: 10px; align-items: center; font-weight: 600; }
-.callrow .who { font: 500 11.5px/1.4 var(--f-mono); color: var(--text-3); margin-top: 4px; }
-.callrow ul { margin: 6px 0 0; padding-left: 16px; color: var(--text-2); font-size: 13px; }
-.callrow .pend { font-size: 13px; color: var(--text-2); margin-top: 6px; }
 
 /* ---------- Settings ---------- */
 .set-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 28px; align-items: start; }
@@ -812,6 +823,8 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
   .dial-h { grid-template-columns: 160px repeat(4, 1fr); }
   .proc { grid-template-columns: 1fr 190px; }
   .drawer { width: 400px; }
+  .callrow.fx > .fx-h { grid-template-columns: 148px minmax(0, 1fr) auto 10px; column-gap: 14px; }
+  .callrow.fx > .fx-d { padding-left: 164px; }
 }
 @media (max-width: 1100px) {
   .grid2, .me-lower, .me-lower2 { grid-template-columns: 1fr; }
