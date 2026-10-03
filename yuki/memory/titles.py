@@ -120,7 +120,10 @@ SHOWN_RULES = (
     "02:00, 16:17, 19:00-21:00 or a bare 10:30. People who did something are named or called \"your friends\", never only \"they\" (\"your friends chose "
     "...\", not \"they chose ...\"). Something said on a call says who was "
     "on it (\"on a Discord call with Ana and Sam\", \"in #general voice\") and, when the person the item is about was "
-    "not on that call, \"on a call with other friends\" - it must never read as if the call was with them. Keep every "
+    "not on that call, \"on a call with other friends\" - it must never read as if the call was with them. What "
+    "someone else said on a call stays theirs (\"someone on your Discord call said ...\", or their name when the item "
+    "gives it), never \"you said\". A game's voice chat is with teammates, usually strangers: \"your teammates\", "
+    "never \"your friends\". Keep every "
     "name, number and specific the item states and add nothing it does not state; a joke stays a joke and a story a "
     "story; the user's own quoted words keep what they said. One or two plain sentences; no internal names, "
     "ids, codes or file paths (say what they mean). " + ENGLISH_RULE
@@ -138,6 +141,10 @@ SHOWN_EXAMPLES = (
     "became guarded after Leo left the group.\"\n"
     "- Call gist \"A heated game where they chose killing people for fun, which shocked the user.\" (with Ana and "
     "Sam) -> \"A heated game where your friends chose killing people for fun, which shocked you.\"\n"
+    "- \"Someone on the Discord call said the trek starts at 6 am on 2026-10-11.\" -> \"Someone on your Discord "
+    "call said the trek starts at 6 AM on 11 October.\"\n"
+    "- Game voice chat gist \"A close VALORANT match; the user led the callouts and their teammates lost it in "
+    "overtime.\" -> \"A close VALORANT match: you led the callouts, and your teammates lost it in overtime.\"\n"
     "- Thread \"The user merged the replies fix; the demo video for Priya is still to send.\" -> \"You merged the "
     "replies fix; the demo video for Priya is still to send.\""
 )
@@ -252,7 +259,8 @@ the shown form, changing only the voice, the dates and times and what the rules 
 A line may come with CALLS: who was on the calls the item rests on, and where (the app, the server and \
 the voice channel) - use them to say who a call was with, and "other friends" when the person the item \
 is about was not on it. A call gist comes with WHO WAS ON IT and the call's timeline topics: "they" in a \
-gist means the people on the call unless the gist names someone else. The app shows a gist on the call's \
+gist means the people on the call unless the gist names someone else; a gist marked GAME VOICE CHAT is a \
+game's own voice chat, whose people are teammates ("your teammates", never "your friends"). The app shows a gist on the call's \
 row, next to its date, time, place and who was on it, so a shown gist never repeats those: it says only \
 what happened ("A heated game where your friends chose killing people for fun, which shocked you."). In \
 a gist, never write "they" for the people on the call, even after naming them: write "your friends" or \
@@ -588,7 +596,13 @@ class Titler:
             topics = [str(b.get("topic") or "") for b in d.get("blocks") or [] if b.get("topic")][:8]
             # who was on it (to say who "they" are) and the topics; never when or where: the call's row shows them,
             # and a gist given them repeats them (measured on the 3 Oct copy: 37 of 37 gists began with the date)
-            context = (f"WHO WAS ON IT: {', '.join(people) if people else 'not recorded'}"
+            game = False
+            try:
+                game = getattr(store.call_record(cid), "kind", "call") == "game"
+            except Exception:
+                pass
+            context = (("GAME VOICE CHAT (teammates, usually strangers); " if game else "")
+                       + f"WHO WAS ON IT: {', '.join(people) if people else 'not recorded'}"
                        + (f"; TOPICS: {'; '.join(topics)}" if topics else ""))
             add(ShownPending(f"G{cid}", "gist", cid, "the gist of one of their calls, at most 25 words; the app shows "
                              "it on the call's row beside its date, time and place, so it leaves those out",

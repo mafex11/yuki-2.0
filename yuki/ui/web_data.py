@@ -150,21 +150,36 @@ def call_now(memory: Any) -> dict[str, Any] | None:
 
 
 def call_view(cs: dict[str, Any]) -> dict[str, Any] | None:
-    """:func:`call_now` from a ``call_status()`` already read (the tray forwards each change: no memory read)."""
+    """:func:`call_now` from a ``call_status()`` already read (the tray forwards each change: no memory read).
+
+    ``{"app", "kind", "label", "where", "started_at", "recording", "status", "status_words", "line", "title",
+    "sentence"}``: what is kept is said from the status's ``mic`` and ``tracks`` (:mod:`yuki.ui.call_words`):
+    ``line`` "Recording · Discord + you", ``title`` "Remembering the Discord call", ``sentence`` "Your mic and
+    Discord’s sound."; ``recording`` is the top-level flag (Stop is offered while it is True)."""
+    from yuki.ui import call_words as CW
+
     cs = cs if isinstance(cs, dict) else {}
-    call = cs.get("call")
-    if not call:
+    call = cs.get("call") if isinstance(cs.get("call"), dict) else None
+    view = CW.live_view(cs)
+    if not call and view is None:
         return None
-    status = str(call.get("status") or "")
+    row = view or call or {}   # the row being recorded (a game recording while a new call's card is up), else the call
+    base = {"app": row.get("app") or "", "kind": "game" if CW.is_game(row) else "call", "label": CW.head_label(row),
+            "where": CW.session_name(row)}
+    status = str(row.get("status") or "")
     if status in ("declined", "unanswered", "stopped", "not_asked") and not cs.get("recording"):
-        started = epoch_of(call.get("session_started_at")) or epoch_of(call.get("detected_at"))
-        return {"app": call.get("app") or "", "started_at": started, "recording": False, "status": status,
+        started = epoch_of(row.get("session_started_at")) or epoch_of(row.get("detected_at"))
+        return {**base, "started_at": started, "recording": False, "status": status,
                 "status_words": {"declined": "not recording: you said no", "unanswered": "not recording",
-                                 "stopped": "stopped remembering", "not_asked": "not recording"}.get(status, "")}
-    started = epoch_of(call.get("session_started_at")) or epoch_of(call.get("recording_since"))
-    words = {"asking": "asking if I may keep your side", "waiting_headphones": "waiting for headphones"}
-    return {"app": call.get("app") or "", "started_at": started, "recording": bool(cs.get("recording")),
-            "status": status, "status_words": words.get(status, "")}
+                                 "stopped": "stopped remembering", "not_asked": "not recording"}.get(status, ""),
+                "line": "", "title": "", "sentence": ""}
+    started = epoch_of(row.get("session_started_at")) or epoch_of(row.get("recording_since"))
+    line = (view or {}).get("line") or ""
+    words = {"asking": "asking if I may record it", "waiting_headphones": "waiting for headphones"}
+    recording = bool(cs.get("recording"))
+    return {**base, "started_at": started, "recording": recording, "status": status,
+            "status_words": line if (recording and line) else words.get(status, line),
+            "line": line, "title": CW.remembering_title(cs), "sentence": (view or {}).get("sentence") or ""}
 
 
 # -- Home --------------------------------------------------------------------------------------------------------
@@ -278,14 +293,16 @@ def home_call(call: dict[str, Any] | None, waiting: dict[str, Any] | None) -> tu
     """Home's call tile and its Running rows (the call being remembered, the transcripts waiting) from
     :func:`call_view` and the waiting audio; also how the window patches Home from the tray's forwarded status."""
     now_call = None
+    sentence = str((call or {}).get("sentence") or "")
     if call and (call.get("recording") or call.get("status") in ("asking", "waiting_headphones")):
-        note = "Only your mic. Turned into text when the PC is free. Cards are held." if call.get("recording") else ""
+        note = (" ".join(x for x in (sentence, "Turned into text when the PC is free. Cards are held.") if x)
+                if call.get("recording") else "")
         now_call = {**call, "note": note}
     running: list[dict[str, Any]] = []
-    if call and call.get("recording"):
+    if call and call.get("recording"):   # Stop remembering is on this row: there whenever anything is kept
         running.append({"kind": "call", "live": True, "recording": True, "started_at": call.get("started_at"),
-                        "title": f"Remembering your side of the {call.get('app') or ''} call".replace("  ", " "),
-                        "detail": "Only your mic. Turned into text later, when the PC is free."})
+                        "title": call.get("title") or f"Remembering the {call.get('where') or 'call'}",
+                        "detail": " ".join(x for x in (sentence, "Turned into text later, when the PC is free.") if x)})
     waiting = waiting or {}
     if int(waiting.get("calls") or 0):
         n = int(waiting["calls"])
@@ -1168,7 +1185,8 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
         if cs is None:
             continue
         calls.append({"a": int((max(cs, since) - since) // 60), "b": int((min(ce, since + 86400) - since) // 60),
-                      "start": hm(cs), "end": hm(ce), "app": c.get("app") or "", "live": bool(c.get("ongoing")),
+                      "start": hm(cs), "end": hm(ce), "app": c.get("app") or "", "kind": c.get("kind") or "call",
+                      "live": bool(c.get("ongoing")),
                       "recorded": bool(c.get("recorded")), "min": round(float(c.get("seconds") or 0) / 60),
                       "gists": call_gists(c), "where": call_where(c),
                       "people": call_people(c.get("people") or [], lookup), "started_at": cs})
@@ -1514,23 +1532,33 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float,
 
 
 def call_rows(calls: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
-    """The calls whose side Yuki kept, as ledger rows: what (recording or recorded), where, why (the user's standing
-    rule for that app, or their yes on the call's card), and what came of it."""
+    """The calls (and games' voice chats) Yuki recorded, as ledger rows: what (recording or recorded), where, why
+    (the user's standing rule for that app, or their yes on the card), and what came of it."""
+    from yuki.ui.call_words import is_game
+
     out = []
     for c in calls:
         if not c.get("recorded"):
             continue
-        app = c.get("app") or "a"
+        app = c.get("app") or ""
+        game = is_game(c)
+        name = (f"{app} voice chat" if app else "game voice chat") if game else (f"{app} calls" if app else "calls")
         consent = c.get("consent")
-        why = (f"rule: {app} calls, your mic only" if consent == "always" else
-               "you said yes on the call’s card" if consent == "yes" else "you said yes to keeping your side")
+        why = (f"rule: always for {name}" if consent == "always" else
+               f"you said yes on the {'game' if game else 'call'}’s card" if consent == "yes" else
+               "you said yes to recording it")
         live = bool(c.get("live"))
         mins = int(c.get("min") or 0)
         result = ("live" if live else "turned into text" if c.get("gists") else
                   c.get("status") or "waiting to be turned into text")
+        if game:
+            what = (f"Recording {app or 'game'} voice chat" if live else
+                    f"Recorded {dur_words(mins * 60)} of {app or 'game'} voice chat")
+        else:
+            what = (f"Recording a {app or 'voice'} call" if live else
+                    f"Recorded a {dur_words(mins * 60)} {app or 'voice'} call")
         out.append({"id": f"call:{c.get('start_at')}", "kind": "call", "f": "calls", "at": c.get("start_at") or now,
-                    "what": f"Recording your side of a {app} call" if live else
-                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": c.get("where") or app, "cost": "", "because": "because",
+                    "what": what, "where": c.get("where") or app, "cost": "", "because": "because",
                     "why": why, "chips": [], "result": result, "status": "live" if live else "verified"})
     return out
 
@@ -1612,13 +1640,13 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
         if cs is None:
             continue
         gists = call_gists(c)
-        status = "" if gists else ("Live now. Your side is kept; it’s turned into text when the PC is free."
+        status = "" if gists else ("Live now. Being recorded; it’s turned into text when the PC is free."
                                    if c.get("ongoing") and c.get("recorded") else
                                    "Waiting to be turned into text." if c.get("recorded") else "Not recorded.")
         calls.append({"start_at": cs, "end_at": None if c.get("ongoing") else epoch_of(c.get("end")),
                       "live": bool(c.get("ongoing")), "min": round(float(c.get("seconds") or 0) / 60),
                       "spoke_min": round(float(c.get("speech_s") or 0) / 60) if c.get("recorded") else None,
-                      "app": c.get("app") or "", "where": call_where(c),
+                      "app": c.get("app") or "", "kind": c.get("kind") or "call", "where": call_where(c),
                       "people": call_people(c.get("people") or [], lookup), "gists": gists[:6],
                       "recorded": bool(c.get("recorded")), "status": status, "consent": c.get("consent")})
     rows.extend(call_rows(calls, now))
@@ -1765,11 +1793,27 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                     "blocked_sites": len([s for s in user.get("blocked_domains", []) if str(s).strip()])},
         "calls": [{"app": c.get("name") or c.get("app") or "", "decision": c.get("decision") or "ask", "key": c.get("app")}
                   for c in _safe(memory.call_prefs, []) or []],
+        # what a recorded call keeps (read only: the privacy file's [calls] knobs, shown as text)
+        "call_knobs": call_knobs(privacy),
         "appearance": {"accent": ui.accent, "reduce_motion": bool(ui.reduce_motion),
                        "accents": [{"key": k, "label": str((v or {}).get("label") or k.capitalize())}
                                    for k, v in T.ACCENTS.items()]},
         "usage": yuki_usage(),
     }
+
+
+def call_knobs(privacy: dict[str, Any] | None) -> dict[str, bool]:
+    """``{"record_others", "game_voice"}``: the privacy file's ``[calls]`` knobs as the memory service reads them
+    (a key the file doesn't set takes memory's own default, :class:`yuki.memory.calls.CallConfig`). Read only: the
+    Settings text says what a recorded call keeps."""
+    table = (privacy or {}).get("calls") if isinstance((privacy or {}).get("calls"), dict) else {}
+    try:
+        from yuki.memory.calls import CallConfig
+
+        cfg = CallConfig.from_dict(table or {})
+        return {"record_others": bool(cfg.record_others), "game_voice": bool(cfg.game_voice)}
+    except Exception:
+        return {"record_others": bool(table.get("record_others", True)), "game_voice": bool(table.get("game_voice", True))}
 
 
 def yuki_usage() -> dict[str, Any] | None:

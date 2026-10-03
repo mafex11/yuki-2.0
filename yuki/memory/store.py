@@ -220,7 +220,7 @@ The weekly review (yuki.memory.review; MemoryClient.weekly_review)::
     store.reviews_without_vectors() / add_review_vectors(items, model)
     store.episodes_by_ids(ids);  store.turn_times(since, until) -> [(at, session_id)]
 
-Calls, just the user's side (yuki.memory.calls; MemoryClient.call_status / answer_call / stop_call)::
+Calls, both sides and game voice chats (yuki.memory.calls; MemoryClient.call_status / answer_call / stop_call)::
 
     store.start_call(app=, process=, via=, service=None, at=None, status="asking", consent=None, ...,
                      hold_since=None) -> int;  store.call_max_seq(id) -> int
@@ -7416,7 +7416,7 @@ class Store:
 
         return self._write(op) if items else 0
 
-    # -- calls: the user's own side (yuki.memory.calls) ------------------------
+    # -- calls and game voice chats, every track (yuki.memory.calls) -------------
 
     def _call(self, r: sqlite3.Row) -> CallRecord:
         return CallRecord(
@@ -7692,7 +7692,7 @@ class Store:
                      (thread_id, time.time(), int(call_id)))
         return int(cur.lastrowid)
 
-    # -- the call spool: the user's own speech, encrypted, until transcribed ----
+    # -- the call spool: every track's speech, encrypted, until transcribed ------
 
     @property
     def spool_dir(self) -> Path:
@@ -7988,8 +7988,9 @@ class Store:
 
     def call_side_captures(self, call_id: int) -> list[dict[str, Any]]:
         """The ``my_call_side`` captures of one call, oldest first: ``{"id", "at", "journaled", "data"}``, ``data``
-        being the decrypted capture JSON (``{"call_id", "app", "start", "end", "final", "utterances": [...]}``).
-        Empty once the captures are past the 30-day TTL."""
+        being the decrypted capture JSON (``{"call_id", "app", "kind", "start", "end", "final", "utterances": [the
+        user's lines], "lines": [every line]}``; read the lines through :meth:`call_lines`). Empty once the
+        captures are past the 30-day TTL."""
         rows = self._query(
             "SELECT c.id, c.at, c.journal_batch_id, c.delta_ciphertext FROM captures c"
             " JOIN calls k ON k.thread_id = c.thread_id WHERE k.id=? AND c.kind=? ORDER BY c.at, c.id",

@@ -70,13 +70,15 @@ Fast memory, provenance, Yuki's persona, standing requests (docs/MEMORY.md, "Fas
     memory.standing_requests() -> list[dict];  memory.cancel_standing_request(ref) -> bool
     memory.memory_diary(limit=50) -> list[dict]    # what dreaming and the persona pass changed, newest first
 
-Calls, just the user's side (the service's call worker, yuki.memory.calls)::
+Calls, both sides (the service's call worker, yuki.memory.calls; since 3 Oct 2026 the user's microphone plus
+the call app's own sound - the other people - and a game's own voice chat as a session of its own; only the
+microphone was kept from 24 Sept to 3 Oct)::
 
     memory.call_status() -> {"call": {...} | None, "recording": bool}   # wait on Local\\YukiCallReady
     memory.answer_call(call_id, "yes" | "no" | "always" | "never" | "none") -> bool
     memory.stop_call() -> int | None                     # "Stop remembering this call"
     memory.call_audio_waiting() -> dict | None           # "N calls waiting to be remembered"
-    memory.erase_call_audio() -> int                     # "Erase waiting call audio"
+    memory.erase_call_audio() -> int                     # "Erase waiting call audio" (every track)
     memory.call_prefs() -> list[dict];  memory.set_call_pref(app, "always" | "never" | None)
 
 People and routes (migration 28, yuki.memory.contacts; SQL only, no model call)::
@@ -123,9 +125,12 @@ on the click path; every text a list returns has a ``shown`` form said to the us
 
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
-    memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, times, speech, gists
-    memory.call_timeline(call, since=None, until=None) -> dict | None   # the session's blocks and dated lines
-    memory.call_transcript(call, since=None, until=None, page=1, per_page=60) -> dict | None   # exact words
+    memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, kind, times, each side's
+                                                               # speech and tracks, gists
+    memory.call_timeline(call, since=None, until=None) -> dict | None   # the session's blocks and dated lines,
+                                                               # each line with who spoke (who, app, track_kind)
+    memory.call_transcript(call, since=None, until=None, page=1, per_page=60, who="all") -> dict | None
+                                                               # the exact words of every side, labelled
     memory.recall(...)            # a fact heard on a call with a digest carries "call": "call:<id>"
 """
 
@@ -328,6 +333,83 @@ def service_running(db_path: str | Path | None = None) -> bool:
         return False
     kernel32.CloseHandle(ctypes.c_void_p(handle))
     return True
+
+
+#: ``call_transcript``'s ``who``: every line, only the user's (their microphone), or only the other people's (each
+#: app's own sound: whoever spoke on the call, a game's teammates and its own voice lines).
+TRANSCRIPT_WHO: tuple[str, ...] = ("all", "user", "others")
+
+
+def _track_of(line: dict) -> tuple[str, str, str]:
+    """Which recording a call line came from: the user's microphone, or one app's own sound."""
+    if line.get("who") == "others":
+        return ("others", str(line.get("app") or ""), str(line.get("track_kind") or ""))
+    return ("user", "", "")
+
+
+def transcript_lines(captures: list[dict], yuki_spans: Any = ()) -> list[dict]:
+    """A call's captures (``Store.call_side_captures``) -> every line of every side in time order, as
+    ``Store.call_lines`` labels them (``who`` "user" | "others", ``app``, ``track_kind``; ``heard_by`` on the user's
+    measured lines; a line from before 3 Oct 2026 is the user's), each with ``repeat`` and ``to_yuki``.
+
+    ``calldigest.prepare``'s rules, read over every side (report 61): a line stored twice (the same time, speaker and
+    words) is kept once; one whose words equal one of the few kept before it on its own track within minutes (the
+    recogniser looping on that recording's noise; another track saying the same words is no loop) is ``repeat``;
+    ``to_yuki`` ("yes" | "maybe" | "") is only ever set on the user's lines - Yuki hears only the user's microphone.
+    Identity and timings only."""
+    from yuki.memory.calldigest import REPEAT_LOOKBACK, REPEAT_WITHIN_S, _same_words
+
+    seen: set[tuple[float, str, str]] = set()
+    items: list[dict] = []
+    for cap in captures:
+        for u in Store.call_lines(cap.get("data") if isinstance(cap, dict) else None):
+            text = " ".join(str(u.get("text") or "").split())
+            try:
+                at = float(u.get("at"))
+            except (TypeError, ValueError):
+                continue
+            key = (round(at, 2), u["who"], text)
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            try:
+                end = max(at, float(u.get("end") or at))
+            except (TypeError, ValueError):
+                end = at
+            heard = u.get("heard_by")
+            items.append({"at": at, "end": end, "text": text, "lang": str(u.get("lang") or ""),
+                          "unclear": bool(u.get("unclear")), "who": u["who"], "app": u["app"],
+                          "track_kind": u["track_kind"],
+                          "heard_by": ([str(h) for h in heard] if u["who"] == "user" and isinstance(heard, list)
+                                       else None),
+                          "repeat": False, "to_yuki": ""})
+    items.sort(key=lambda x: x["at"])
+    kept: dict[tuple[str, str, str], list[dict]] = {}
+    for x in items:
+        if x["who"] == "user":
+            hits = [sure for lo, hi, sure in yuki_spans if x["end"] >= lo and x["at"] <= hi]
+            x["to_yuki"] = "yes" if any(hits) else "maybe" if hits else ""
+        mine = kept.setdefault(_track_of(x), [])
+        words = _same_words(x["text"])
+        if any(_same_words(k["text"]) == words and x["at"] - k["end"] <= REPEAT_WITHIN_S
+               for k in mine[-REPEAT_LOOKBACK:]):
+            x["repeat"] = True
+        else:
+            mine.append(x)
+    return items
+
+
+def _timeline_line(line: dict, app: str) -> dict:
+    """A digest line for the tools: every field the digest kept (read generically), its time as ISO, and who spoke
+    (``who`` "user" | "others", ``app``, ``track_kind`` "call" | "game"; report 61's contract) - a line without them
+    (every digest written before report 61's build) is the user's, on the row's app."""
+    out = dict(line)
+    out["at"] = _iso(line["at"])
+    out["nature"] = line.get("nature", "fact")
+    out["who"] = "others" if line.get("who") == "others" else "user"
+    out["app"] = str(line.get("app") or app or "")
+    out["track_kind"] = str(line.get("track_kind") or "call")
+    return out
 
 
 class MemoryClient:
@@ -2349,10 +2431,10 @@ class MemoryClient:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
 
-    # -- calls: the user's own side (yuki.memory.calls) ----------------------
+    # -- calls: both sides, each track labelled (yuki.memory.calls) ----------
 
     def call_status(self) -> dict:
-        """The call going on now, for the UI's consent card and "remembering your side" indicator.
+        """The call going on now, for the UI's consent card and recording indicator (what is kept: ``mic``, ``tracks``).
 
         ``{"call": {...} | None, "recording": bool}``; the call is
         ``{"id", "app", "status", "asking", "consent", "headphones",
@@ -2530,7 +2612,8 @@ class MemoryClient:
 
     def erase_call_audio(self) -> int:
         """Delete every piece of call audio still waiting to be transcribed (the tray's "Erase waiting call
-        audio"): the encrypted files go now, their words are never made. Returns the chunks erased. What was
+        audio"), every track: the user's microphone and each app's own sound (the other people on a call, a game's
+        voice chat). The encrypted files go now, their words are never made. Returns the chunks erased. What was
         already transcribed stays remembered."""
         rows = self.store.call_chunks()
         erased, _size = self.store.remove_call_chunks([r["id"] for r in rows], "erased")
@@ -2596,9 +2679,29 @@ class MemoryClient:
                 return span
         return None
 
-    def _session_dict(self, span: dict, rows: dict, digests: dict, waiting: dict) -> dict:
-        """One merged call for the tools: times, speech, what was recorded, digest state and gists."""
+    def _call_track_rows(self, call_ids: Any) -> list[dict]:
+        """The speech kept per call row and track, every chunk transcribed or not (content-free):
+        ``[{"call_id", "who": "user" | "others", "app", "track_kind": "call" | "game", "speech_s"}]`` -
+        :meth:`Store.track_speech`'s sums with the app and kind of each track, which it does not return. ``who``
+        "others" is an app's own sound (the other people on a call, or a game's voice chat); a chunk from before
+        3 Oct 2026 is the user's."""
+        ids = sorted({int(i) for i in call_ids})
+        if not ids:
+            return []
+        rows = self.store._query(
+            "SELECT call_id, side, coalesce(track_app, '') AS app, coalesce(track_kind, '') AS kind,"
+            " coalesce(sum(speech_s), 0) AS s FROM call_chunks"
+            f" WHERE call_id IN ({','.join('?' * len(ids))}) GROUP BY call_id, side, track_app, track_kind", ids)
+        return [{"call_id": int(r["call_id"]), "who": "others" if r["side"] == "others" else "user",
+                 "app": r["app"], "track_kind": r["kind"] or "call", "speech_s": float(r["s"] or 0.0)} for r in rows]
+
+    def _session_dict(self, span: dict, rows: dict, digests: dict, waiting: dict,
+                      tracks: list[dict] | None = None) -> dict:
+        """One merged call for the tools: times, each side's speech, what was recorded, digest state and gists.
+        ``tracks``: :meth:`_call_track_rows` of (at least) the session's rows."""
         ids = list(span["call_ids"])
+        mine = [t for t in tracks or () if t["call_id"] in ids]
+        kept = {t["call_id"] for t in mine}       # rows that kept audio of either side
         speech = 0.0
         gists, parts = [], []
         for cid in ids:
@@ -2611,7 +2714,7 @@ class MemoryClient:
                 if d.get("gist"):
                     # ``shown``: the gist said to the user (migration 33), None until written
                     gists.append({"call_id": cid, "gist": d["gist"], "shown": d.get("gist_shown")})
-            elif r.recording_started_at is None:
+            elif r.recording_started_at is None and cid not in kept:
                 state = ("not recorded (the user said no)" if r.consent in ("no", "never") else
                          "not recorded (no headphones, or stopped)" if r.consent in ("yes", "always") else
                          "not recorded (not asked or no answer)")
@@ -2626,7 +2729,15 @@ class MemoryClient:
             else:
                 state = "nothing said"
             parts.append({"call_id": cid, "start": _iso(r.detected_at), "end": _iso(r.ended_at), "state": state})
-        recorded = any(rows.get(c) is not None and rows[c].recording_started_at is not None for c in ids)
+        # the user's microphone recorded on a row; the others' side: an app's own sound kept speech (3 Oct 2026 on)
+        user_recorded = any(rows.get(c) is not None and rows[c].recording_started_at is not None for c in ids)
+        others: dict[tuple[str, str], float] = {}
+        for t in mine:
+            if t["who"] == "others":
+                key = (t["app"] or span["app"] or "", t["track_kind"])
+                others[key] = others.get(key, 0.0) + t["speech_s"]
+        app_tracks = [{"app": a, "track_kind": k, "speech_s": round(s, 1)}
+                      for (a, k), s in sorted(others.items(), key=lambda kv: -kv[1])]
         # the user's answer that let it record (or not): "always" / "never" = their standing call rule, "yes" / "no"
         # = their answer on that call's card; the first row that has one (the Activity ledger's "because")
         consent = next((rows[c].consent for c in ids if rows.get(c) is not None and getattr(rows[c], "consent", None)),
@@ -2646,7 +2757,9 @@ class MemoryClient:
             "kind": span.get("kind", "call"),   # call | game (a game's own voice chat)
             "start": _iso(span["start"]), "end": _iso(span["end"]), "ongoing": bool(span["ongoing"]),
             "seconds": round(sum(e - b for b, e in span["pieces"]), 1), "speech_s": round(speech, 1),
-            "recorded": recorded, "consent": consent,
+            "recorded": user_recorded or bool(app_tracks), "user_recorded": user_recorded,
+            "others_recorded": bool(app_tracks), "others_speech_s": round(sum(others.values()), 1),
+            "tracks": app_tracks, "consent": consent,
             "digested": [c for c in ids if (digests.get(c) or {}).get("status") == "ok"],
             "gists": gists, "rows": parts, "people": people, "where": where, "places": [p for p in places if p],
         }
@@ -2655,17 +2768,25 @@ class MemoryClient:
         """The calls and meetings overlapping ``[since, until)`` (default today), oldest first, rows of one
         continuous session merged (``yuki.memory.callspans``). Each::
 
-            {"ref": "call:16", "call_ids": [16, ..., 21], "app", "service", "start": ISO, "end": ISO,
-             "ongoing", "seconds", "speech_s" (the user's own speech), "recorded" (their side was),
+            {"ref": "call:16", "call_ids": [16, ..., 21], "app", "service", "kind": "call" | "game",
+             "start": ISO, "end": ISO, "ongoing", "seconds",
+             "speech_s" (the user's own speech), "recorded" (anything was: the user's microphone or an app's sound),
+             "user_recorded" (the user's microphone was), "others_recorded" (an app's own sound kept speech),
+             "others_speech_s" (the other people's speech kept, every app), "tracks": [{"app", "track_kind":
+             "call" | "game", "speech_s"}] (the other side's tracks: each app whose own sound was kept),
              "digested": [ids with a timeline], "gists": [{"call_id", "gist"}],
              "rows": [{"call_id", "start", "end", "state"}]}
 
-        plus meetings the timeline measured (an app in front holding the microphone or camera) that no call
-        row covers: ``{"ref": None, "app", "service", "start", "end", "seconds", "speech_s": 0, "recorded":
-        False, "transcript": False, "rows": [], ...}`` - hours only, no transcript. Nobody else's words are ever
-        stored; ``people`` (``[{"name", "how"}]``) and ``where`` (``[str]``) are who was on the call and where, as
-        the screen around it showed (the digest's reading, yuki.memory.callcontext). Content-free except the
-        gists, people and where.
+        Since 3 Oct 2026 a call keeps both sides - the user's microphone and the call app's own sound (the other
+        people, maybe several on one track) - and a game's own voice chat is a session of its own (``kind``
+        "game": its others are teammates and the game's own voice lines); a game's sound kept while a call
+        recorded is a ``game`` track of the call. Before, only the user's microphone was kept: ``others_recorded``
+        False, ``tracks`` empty. Plus meetings the timeline measured (an app in front holding the microphone or
+        camera) that no call row covers: ``{"ref": None, "app", "service", "start", "end", "seconds", "speech_s":
+        0, "recorded": False, "transcript": False, "rows": [], ...}`` - hours only, no transcript. ``people``
+        (``[{"name", "how"}]``) and ``where`` (``[str]``) are who was on the call and where, as the screen around
+        it showed (the digest's reading, yuki.memory.callcontext). Content-free except the gists, people and
+        where.
         """
         from collections import Counter
 
@@ -2678,7 +2799,8 @@ class MemoryClient:
             rows = {r.id: r for r in self.store.calls_overlapping(s - CONTEXT_S, u + CONTEXT_S)}
             digests = self.store.call_digests(i for sp in spans for i in sp["call_ids"])
             waiting = Counter(c["call_id"] for c in self.store.call_chunks(statuses=("spooled",)))
-            out = [dict(self._session_dict(sp, rows, digests, waiting), transcript=True) for sp in spans]
+            tracks = self._call_track_rows(i for sp in spans for i in sp["call_ids"])
+            out = [dict(self._session_dict(sp, rows, digests, waiting, tracks), transcript=True) for sp in spans]
         try:
             out += self._uncovered_meetings(s, u, spans)
         except Exception:
@@ -2699,16 +2821,25 @@ class MemoryClient:
                    and names & {sp.get("app"), sp.get("service")} for sp in spans):
                 continue
             out.append({"ref": None, "call_ids": [], "app": m.get("app") or m.get("label"), "service": m.get("label"),
-                        "start": _iso(m["start"]), "end": _iso(m["end"]), "ongoing": False,
-                        "seconds": m.get("seconds"), "speech_s": 0.0, "recorded": False, "transcript": False,
+                        "kind": "call", "start": _iso(m["start"]), "end": _iso(m["end"]), "ongoing": False,
+                        "seconds": m.get("seconds"), "speech_s": 0.0, "recorded": False, "user_recorded": False,
+                        "others_recorded": False, "others_speech_s": 0.0, "tracks": [], "transcript": False,
                         "digested": [], "gists": [], "rows": []})
         return out
 
     def call_timeline(self, call: Any, since=None, until=None) -> dict | None:
-        """What happened on one call (the whole merged session the row ``call`` belongs to), timeline-wise, from
-        the user's side: :meth:`calls_in`'s fields plus ``"blocks": [{"call_id", "start", "end", "topic",
-        "lines": [{"at", "text", "nature"}]}]`` in time order (ISO times), cut to ``[since, until)`` when given,
-        and ``"words_kept_until"`` (ISO: the exact transcript's 30-day TTL; None once gone). None: no such call.
+        """What happened on one call (the whole merged session the row ``call`` belongs to), timeline-wise:
+        :meth:`calls_in`'s fields plus ``"blocks": [{"call_id", "start", "end", "topic", "lines": [{"at", "text",
+        "nature", "who", "app", "track_kind", ...}]}]`` in time order (ISO times), ``"stretches"`` (the blocks
+        grouped as a written answer reads), cut to ``[since, until)`` when given, and ``"words_kept_until"`` (ISO:
+        the exact transcript's 30-day TTL; None once gone). None: no such call.
+
+        Each line says whose transcript line it rests on (report 61): ``who`` "user" (the user's own words) or
+        "others" (an app's own sound - someone on the call, or on ``track_kind`` "game" a teammate or the game's
+        own voice lines), with that track's ``app``. A digest written before report 61's build has none of them:
+        its lines are the user's (``who`` "user", the row's app, ``track_kind`` "call"). Any other field a digest
+        line carries is passed through as it is. ``others_recorded`` is also True when a line rests on the others'
+        words.
         """
         from collections import Counter
 
@@ -2720,7 +2851,8 @@ class MemoryClient:
         rows = {i: self.store.call_record(i) for i in ids}
         digests = self.store.call_digests(ids)
         waiting = Counter(c["call_id"] for c in self.store.call_chunks(statuses=("spooled",)))
-        out = self._session_dict(span, rows, digests, waiting)
+        out = self._session_dict(span, rows, digests, waiting, self._call_track_rows(ids))
+        apps = {i: (digests.get(i) or {}).get("app") or (rows[i].app if rows.get(i) is not None else "") for i in ids}
         s, u = _time_arg(since), _time_arg(until)
         blocks = []
         for i in ids:
@@ -2737,8 +2869,9 @@ class MemoryClient:
         groups = stretches(blocks)
         for b in blocks:
             b["start"], b["end"] = _iso(b["start"]), _iso(b["end"])
-            b["lines"] = [{"at": _iso(ln["at"]), "text": ln["text"], "nature": ln.get("nature", "fact")}
-                          for ln in b["lines"]]
+            b["lines"] = [_timeline_line(ln, apps.get(b["call_id"]) or span["app"]) for ln in b["lines"]]
+        if not out["others_recorded"] and any(ln["who"] == "others" for b in blocks for ln in b["lines"]):
+            out["others_recorded"] = out["recorded"] = True     # the digest rests on their lines: they were kept
         # the shape a written answer takes: stretches of the call, each with its time range, topics and moments
         out["stretches"] = [{"start": g[0]["start"], "end": g[-1]["end"],
                              "topics": list(dict.fromkeys(b["topic"] for b in g if b["topic"])),
@@ -2750,16 +2883,29 @@ class MemoryClient:
                    words_kept_until=_iso(first + 30 * 86400.0) if first else None)
         return out
 
-    def call_transcript(self, call: Any, since=None, until=None, page: int = 1, per_page: int = 60) -> dict | None:
-        """The user's exact words on one call (its merged session), as the recogniser heard them, a page at a time:
-        ``{"ref", "app", "start", "end", "since", "until", "page", "pages", "total", "loops_left_out",
-        "lines": [{"at": ISO, "call_id", "text", "lang", "unclear", "repeats"}]}``. An exact repeat of a recent
-        line (the recogniser's loop on noise) is left out and counted on the line it repeats (``repeats``);
-        ``to_yuki`` is "yes" when voice judged the line said to Yuki, "maybe" when Yuki was listening then;
-        ``unclear`` is the recogniser's own low confidence. Kept for the 30-day capture TTL. None: no such call.
-        """
-        from yuki.memory.calldigest import _same_words, prepare, yuki_spans_for
+    def call_transcript(self, call: Any, since=None, until=None, page: int = 1, per_page: int = 60,
+                        who: str = "all") -> dict | None:
+        """The exact words on one call (its merged session), every side, as the recogniser heard them, a page at a
+        time: ``{"ref", "app", "kind", "start", "end", "since", "until", "who", "page", "pages", "total",
+        "loops_left_out", "sides": {"user": n, "others": n}, "others_recorded", "lines": [{"at": ISO, "call_id",
+        "who", "app", "track_kind", "heard_by"?, "text", "lang", "unclear", "repeats", "to_yuki"}]}``.
 
+        Each line says who spoke (:func:`transcript_lines`): ``who`` "user" (the user's microphone) or "others"
+        (the ``app``'s own sound: whoever spoke on the call, maybe several people; on ``track_kind`` "game" the
+        teammates and the game's own voice lines). ``heard_by`` (the user's lines, when it was measured): the apps
+        that were taking the microphone then (``[]``: none). A line from before 3 Oct 2026 is the user's.
+        ``who`` keeps "all" lines (default), only the "user"'s or only the "others'" (``ValueError`` for anything
+        else); ``sides`` counts both in the window whatever is kept; ``others_recorded``: any of the others' sound
+        was kept on this session. An exact repeat of a recent line on its own track (the recogniser's loop on
+        noise) is left out and counted on the line it repeats (``repeats``); ``to_yuki`` (only ever on the user's
+        lines) is "yes" when voice judged the line said to Yuki, "maybe" when Yuki was listening then; ``unclear``
+        is the recogniser's own low confidence. Kept for the 30-day capture TTL. None: no such call.
+        """
+        from yuki.memory.calldigest import REPEAT_LOOKBACK, _same_words, yuki_spans_for
+
+        side = str(who or "all").strip().lower()
+        if side not in TRANSCRIPT_WHO:
+            raise ValueError(f"who must be one of {', '.join(TRANSCRIPT_WHO)}, not {who!r}")
         cid = self.call_id_of(call)
         span = self._call_session(cid) if cid is not None else None
         if span is None:
@@ -2767,30 +2913,47 @@ class MemoryClient:
         s, u = _time_arg(since), _time_arg(until)
         lines: list[dict] = []
         loops = 0
+        sides = {"user": 0, "others": 0}
+        others_seen = False
         for i in span["call_ids"]:
             captures = self.store.call_side_captures(i)
-            for utt in prepare(captures, yuki_spans_for(self.store, captures)):
-                if (s is not None and utt.at < s) or (u is not None and utt.at >= u):
+            last: dict[tuple[str, str, str], list[tuple[str, dict]]] = {}    # per track: (words, line) kept
+            for ln in transcript_lines(captures, yuki_spans_for(self.store, captures)):
+                others_seen = others_seen or ln["who"] == "others"
+                if (s is not None and ln["at"] < s) or (u is not None and ln["at"] >= u):
                     continue
-                if utt.repeat:
+                if side not in ("all", ln["who"]):      # not kept, but counted
+                    if not ln["repeat"]:
+                        sides[ln["who"]] += 1
+                    continue
+                track = _track_of(ln)
+                words = _same_words(ln["text"])
+                if ln["repeat"]:
                     loops += 1
-                    words = _same_words(utt.text)
-                    for prev in reversed(lines[-4:]):
-                        if _same_words(prev["text"]) == words:
+                    for said, prev in reversed(last.get(track, [])[-REPEAT_LOOKBACK:]):
+                        if said == words:
                             prev["repeats"] += 1
                             break
                     continue
-                lines.append({"at": utt.at, "call_id": i, "text": utt.text[:500], "lang": utt.lang,
-                              "unclear": utt.unclear, "repeats": 0, "to_yuki": utt.to_yuki})
+                sides[ln["who"]] += 1
+                out = {"at": ln["at"], "call_id": i, "who": ln["who"], "app": ln["app"],
+                       "track_kind": ln["track_kind"], "text": ln["text"][:500], "lang": ln["lang"],
+                       "unclear": ln["unclear"], "repeats": 0, "to_yuki": ln["to_yuki"]}
+                if ln["heard_by"] is not None:
+                    out["heard_by"] = ln["heard_by"]
+                lines.append(out)
+                last.setdefault(track, []).append((words, out))
         per_page = max(10, min(int(per_page or 60), 150))
         pages = max(1, -(-len(lines) // per_page))
         page = max(1, min(int(page or 1), pages))
         chunk = lines[(page - 1) * per_page: page * per_page]
         for ln in chunk:
             ln["at"] = _iso(ln["at"])
-        return {"ref": f"call:{span['call_ids'][0]}", "app": span["app"], "start": _iso(span["start"]),
-                "end": _iso(span["end"]), "since": _iso(s), "until": _iso(u), "page": page, "pages": pages,
-                "total": len(lines), "loops_left_out": loops, "lines": chunk}
+        others_recorded = others_seen or any(t["who"] == "others" for t in self._call_track_rows(span["call_ids"]))
+        return {"ref": f"call:{span['call_ids'][0]}", "app": span["app"], "kind": span.get("kind", "call"),
+                "start": _iso(span["start"]), "end": _iso(span["end"]), "since": _iso(s), "until": _iso(u),
+                "who": side, "page": page, "pages": pages, "total": len(lines), "loops_left_out": loops,
+                "sides": sides, "others_recorded": others_recorded, "lines": chunk}
 
     # -- status and control ------------------------------------------------
 

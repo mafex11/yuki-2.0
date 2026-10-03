@@ -120,7 +120,7 @@ def test_digest_reads_the_pack_before_the_words_and_stores_who_and_where(store, 
     summary = CallDigestWorker(store, client=stub, log_dir=tmp_path / "logs").digest([cid], force=True)
     assert summary["ok"] == [cid] and summary["context_chars"] > 0
     user = stub.requests[0]["messages"][0]["content"]
-    assert user.index("CONTEXT AROUND CALL") < user.index("THE USER'S UTTERANCES") < user.index("yeah do it")
+    assert user.index("CONTEXT AROUND CALL") < user.index("THE CALL'S LINES") < user.index("yeah do it")
     assert user.index("===BEGIN_UNTRUSTED_DATA_") < user.index("Priya") < user.index("===END_UNTRUSTED_DATA_")
     assert "CONTEXT AROUND THE CALL" in stub.requests[0]["system"][0]["text"]
     d = store.call_digest(cid)

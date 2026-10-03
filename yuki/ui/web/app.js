@@ -156,7 +156,7 @@
     const sh = D.shell, v = sh.voice || {};
     if (!sh.connected) return [h('i', { class: 'waitdot' }), 'Yuki isn’t running'];
     if (v.conversation && v.state && v.state !== 'off') return [h('i', { class: 'recdot' }), { listening: 'listening', hearing: 'hearing you', thinking: 'thinking', speaking: 'speaking', working: 'working on it' }[v.state] || v.state];
-    if (sh.call && sh.call.recording) return [h('i', { class: 'recdot' }), `quiet · ${sh.call.app || 'a'} call`];
+    if (sh.call && sh.call.recording) return [h('i', { class: 'recdot' }), `quiet · ${sh.call.where || (sh.call.app || 'a') + ' call'}`];
     if ((sh.runs || []).length) return [h('i', { class: 'recdot' }), 'working on it'];
     if (v.quiet_until && v.quiet_until * 1000 > Date.now()) return [h('i', { class: 'waitdot' }), `quiet until ${fmt.natTime(v.quiet_until)}`];
     if (v.wake) return [h('i', { class: 'waitdot' }), 'waiting for “Yuki”'];
@@ -164,7 +164,8 @@
   }
   const timerEl = (from, cls) => h('span', { class: 'doto ' + (cls || ''), data: { from: from }, text: fmt.clock(Date.now() / 1000 - from) });
   Y.timerEl = timerEl;
-  Y.recChip = (from) => h('span', { class: 'chip rec', title: 'Recording your side of the call' }, h('i', { class: 'recdot' }), timerEl(from));
+  /* the rec chip: its title says what is kept ("Recording · Discord + you", from Python's call_view) */
+  Y.recChip = (from, title) => h('span', { class: 'chip rec', title: title || 'Recording' }, h('i', { class: 'recdot' }), timerEl(from));
 
   function rail() {
     const home = D.pages.home, sh = D.shell;
@@ -186,7 +187,7 @@
           h('span', { class: 'kbd', text: sh.hotkey_words || 'Alt Shift' })),
         h('div', { class: 'me-row' }, h('span', { class: 'av', text: user.initial || 'Y' }),
           h('div', { class: 'who' }, user.name || 'You', h('span', { text: sh.memory_line || '' })),
-          sh.call && sh.call.recording && sh.call.started_at ? Y.recChip(sh.call.started_at) : null)));
+          sh.call && sh.call.recording && sh.call.started_at ? Y.recChip(sh.call.started_at, sh.call.line) : null)));
     el.setAttribute('aria-label', 'Yuki');
     return el;
   }

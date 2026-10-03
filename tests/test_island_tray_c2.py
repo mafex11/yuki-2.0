@@ -275,7 +275,9 @@ def test_a_call_leaves_only_a_short_notice_then_nothing(qapp, monkeypatch):
         call = _call(1)
         isl.update(call=call)
         spec = isl.window.spec
-        assert isl.state == "call-notice" and spec.compact and spec.word == "Recording your mic · Discord"
+        # a bare row (no mic / tracks): its own status, never claiming whose sound (report 61b); the real words
+        # from call_status() are in tests/test_call_ui_both_sides.py
+        assert isl.state == "call-notice" and spec.compact and spec.word == "Recording · Discord call"
         assert spec.rec and spec.halo is None
         _pump(qapp, 0.6)
         assert isl.state == "quiet-in-call" and not isl.window.isVisible() and not isl.window.halo_win.isVisible()
@@ -390,7 +392,7 @@ def test_the_hover_card_grows_on_windows_popup_and_folds_after_the_pointer(qapp)
         _pump(qapp, 0.5)
         card.tog.toggled.emit(False)                          # the Listen for "Yuki" switch
         assert voice.wake_enabled is False and card.off_text.isVisibleTo(card.content)
-        assert "Call notes still record your mic" in card.off_text.text()
+        assert "Call notes still record;" in card.off_text.text()
         card.k_open.click()
         assert opened
     finally:

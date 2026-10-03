@@ -61,9 +61,12 @@ Usage::
 
 Calls (:mod:`yuki.memory.calls`, thread ``yuki-memory-calls``): a
 communication app holding the microphone, or a meeting row in front, is a
-call; the UI is asked (``Local\\YukiCallReady``) to show a consent card, and
-only with a yes (or "always" for the app) and headphones as the output is the
-user's own speech kept - encrypted, in the spool - until the deferred
+call (a full-screen game's own voice chat is a game voice session of its own);
+the UI is asked (``Local\\YukiCallReady``) to show a consent card, and only with
+a yes (or "always" for the app) is anything kept: the call app's own sound (the
+other people; ``[calls] record_others``), a game's voice chat as its own track
+(``game_voice``), and - with headphones as the output - the user's microphone,
+each encrypted in the spool until the deferred
 transcriber (:mod:`yuki.memory.transcribe`, thread ``yuki-memory-transcribe``)
 finds the PC free and turns it into text of kind ``my_call_side`` in a
 below-normal process of its own. This process never loads a speech model or
@@ -254,7 +257,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                         help="no coach: no check-ins and no reminders (to-dos are still kept)")
     parser.add_argument("--no-review", action="store_true", help="no weekly review (scheduled or requested)")
     parser.add_argument("--no-calls", action="store_true",
-                        help="never detect calls, ask, or transcribe the user's side of one")
+                        help="never detect calls or game voice chats, ask, record or transcribe them")
     parser.add_argument("--no-visible", action="store_true",
                         help="read only the window in front (no other visible windows, popups or toasts)")
     parser.add_argument("--no-now", action="store_true",

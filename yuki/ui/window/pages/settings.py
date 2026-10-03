@@ -190,8 +190,15 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     cards.add(general, 0)
 
     # -- calls
-    calls = Panel(t, "Calls", "Yuki can remember your own side of a call: only your microphone, only with "
-                              "headphones, turned into text on this PC later. Nobody else is recorded.")
+    # what a recorded call keeps, from the privacy file's [calls] knobs (shown as text; changed in that file)
+    knobs = getattr(v, "call_knobs", None) or {}
+    both = knobs.get("record_others", True) is not False
+    game = knobs.get("game_voice", True) is not False
+    calls = Panel(t, "Calls", " ".join((
+        "Yuki can remember a call on both sides: your microphone, only with headphones on, and the call app's own "
+        "sound." if both else "Yuki can remember your side of a call: your microphone, only with headphones on.",
+        "A game's voice chat is kept as its own track, apart from your calls." if game else "",
+        "Turned into text on this PC later.")).replace("  ", " "))
     for pref in v.call_prefs:
         choice = {"always": "Always", "never": "Never"}.get(pref["decision"], "Ask")
         seg = Segmented(t, ("Always", "Ask", "Never"), choice, small=True)

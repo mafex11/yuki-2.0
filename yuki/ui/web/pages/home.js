@@ -22,8 +22,9 @@
       h('div', { class: 'big' }, h('span', { text: n.playing.title || 'Something' })), h('div', { class: 'sm', text: [n.playing.artist, n.playing.app].filter(Boolean).join(' · ') })));
     if (n.call) {
       const c = n.call;
-      tiles.push(Y.clearing('div', '', Y.label(`Call · ${c.app || ''}${c.started_at ? ' since ' + fmt.natTime(c.started_at) : ''}`, null, 'call'),
-        h('div', { class: 'big' }, c.started_at ? Y.timerEl(c.started_at) : null, h('span', { class: 'note', text: c.recording ? 'your side recording' : (c.status_words || 'not recording') })),
+      /* what is kept, in Python's words (call_view: "Recording · Discord + you"); a game's voice chat says so */
+      tiles.push(Y.clearing('div', '', Y.label(`${c.label || 'Call · ' + (c.app || '')}${c.started_at ? ' since ' + fmt.natTime(c.started_at) : ''}`, null, 'call'),
+        h('div', { class: 'big' }, c.started_at ? Y.timerEl(c.started_at) : null, h('span', { class: 'note', text: c.status_words || (c.recording ? 'recording' : 'not recording') })),
         h('div', { class: 'sm', text: c.note || '' })));
     }
     if (!tiles.length) return null;

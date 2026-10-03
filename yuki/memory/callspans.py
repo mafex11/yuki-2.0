@@ -1,6 +1,6 @@
 """Calls as the user lived them: the ``calls`` rows merged into spans, with what was in front meanwhile.
 
-Contract: ``docs/MEMORY.md`` -> "Calls: just my side" (calls in the activity output).
+Contract: ``docs/MEMORY.md`` -> "Calls: both sides" (calls in the activity output).
 
 The call worker (:mod:`yuki.memory.calls`) writes one content-free ``calls`` row
 per call it sees: an app holding the microphone, in front or not. Its rows are
@@ -208,10 +208,11 @@ def describe_call(span: dict[str, Any], *, now: float | None = None, window: boo
     """
     now = time.time() if now is None else float(now)
     app, start = span["app"], span["start"]
+    noun = "game voice chat" if span.get("kind") == "game" else "call"   # a game's own voice chat (migration 34)
     if span["ongoing"]:
-        head = f"{app} call since {_when(start, now)}, still going: {format_duration(span['seconds'])}"
+        head = f"{app} {noun} since {_when(start, now)}, still going: {format_duration(span['seconds'])}"
     else:
-        head = (f"{app} call {_when(start, now)}-{_when(span['end'], start)}: "
+        head = (f"{app} {noun} {_when(start, now)}-{_when(span['end'], start)}: "
                 f"{format_duration(span['seconds'])}")
     drops = span.get("drops") or []
     if len(drops) <= 2:   # the app let go of the microphone: muted (Meet), or left and rejoined
