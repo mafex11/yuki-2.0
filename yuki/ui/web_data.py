@@ -597,18 +597,32 @@ def call_people(people: list[Any], lookup: dict[str, str]) -> list[str]:
     return [best[k][1] if best[k][0] == 0 else f"maybe {best[k][1]}" for k in order]
 
 
+#: Calls read for provenance are kept this long (a call's place and people don't change; ``calls_in`` over days
+#: costs about half a second on a real memory, and Me is rebuilt as the journal grows).
+CALLS_CACHE_S = 600.0
+_calls_cache: dict[tuple[int, int, int], tuple[float, list[Any]]] = {}
+
+
 def call_places(memory: Any, lookup: dict[str, str] | None = None, now: float | None = None,
-                days: float = CALLS_DAYS) -> dict[int, dict[str, Any]]:
-    """call id -> ``{"label", "app", "people"}`` for the calls of the last ``days``: the place in one format
-    ("Discord, #general voice (Friends)", memory's ``place_label``; "" when the screen never showed it), the app,
-    and who was on it (:func:`call_people`). One ``calls_in`` read; ``{}`` without calls."""
+                days: float = CALLS_DAYS, since: float | None = None) -> dict[int, dict[str, Any]]:
+    """call id -> ``{"label", "app", "people"}`` for the calls since ``since`` (default: the last ``days``): the
+    place in one format ("Discord, #general voice (Friends)", memory's place label; an older digest's own words;
+    "" when the screen never showed it), the app, and who was on it (:func:`call_people`). One ``calls_in`` read,
+    kept :data:`CALLS_CACHE_S`; ``{}`` without calls."""
     now = time.time() if now is None else now
+    since = max(now - days * 86400, since if since is not None else now - days * 86400)
+    key = (id(memory), int(since // 3600), int(now // CALLS_CACHE_S))
+    hit = _calls_cache.get(key)
+    if hit is None:
+        rows = _safe(lambda: memory.calls_in(since=since, until=now, limit=400), []) or []
+        _calls_cache.clear()
+        _calls_cache[key] = hit = (now, rows)
     out: dict[int, dict[str, Any]] = {}
-    for c in _safe(lambda: memory.calls_in(since=now - days * 86400, until=now, limit=400), []) or []:
+    for c in hit[1]:
         if not isinstance(c, dict):
             continue
-        view = {"label": next((str(p) for p in c.get("places") or [] if str(p).strip()), ""),
-                "app": str(c.get("app") or ""), "people": call_people(c.get("people") or [], lookup or {})}
+        view = {"label": call_where(c, default=""), "app": str(c.get("app") or ""),
+                "people": call_people(c.get("people") or [], lookup or {})}
         for cid in c.get("call_ids") or []:
             if isinstance(cid, int):
                 out[cid] = view
@@ -727,7 +741,7 @@ def review_view(q: dict[str, Any], facts_by_ref: dict[str, dict[str, Any]]) -> d
 
 
 def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[Any],
-                  now: float | None = None) -> dict[str, Any]:
+                  now: float | None = None, lookup: dict[str, str] | None = None) -> dict[str, Any]:
     """"Maybe misheard" (memory's ``misheard()``: unanswered uncertain entries of the last week, newest first): the
     words as heard (the entry's own quote when memory kept it, else its text) and where they were heard, in the one
     format (:func:`heard_line`). An older memory: the Qt view's uncertain entries (``fallback``)."""
@@ -746,8 +760,9 @@ def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[
         quote = " ".join(str(src.get("quote") or "").split())
         cid = _call_id(m.get("call"))
         call = calls.get(cid) if cid is not None else None
-        if cid is not None and call is None:   # a call older than the window's look-back: memory's own label
-            call = {"label": m.get("heard_in") or "", "app": m.get("app") or "", "people": m.get("people") or []}
+        if cid is not None and call is None:   # memory's own label for it (its digest's place) and who was on it
+            call = {"label": m.get("heard_in") or "", "app": m.get("app") or "",
+                    "people": call_people(m.get("people") or [], lookup or {})}
         items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))), "quote": quote,
                       "prov": heard_line(str(m.get("app") or ""), call, m.get("at"),
                                          channel_known=bool(m.get("channel_known", True)), now=now)})
@@ -784,9 +799,11 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
     source, persons = people if people is not None else people_now(memory)
     lookup = name_lookup(persons)
     raw = [f for f in (_safe(memory.portrait_facts_with_evidence, []) or []) if isinstance(f, dict) and f.get("ref")]
-    any_call = any(_call_id(e.get("call")) is not None for f in raw for e in f.get("evidence") or [] if isinstance(e, dict))
+    # the calls a fact was heard on (their place and people): read only for the span those entries cover
+    heard = [t for f in raw for e in f.get("evidence") or [] if isinstance(e, dict) and _call_id(e.get("call")) is not None
+             and (t := epoch_of(e.get("at"))) is not None]
     misheard_fn = getattr(memory, "misheard", None)
-    calls = call_places(memory, lookup, now) if any_call or callable(misheard_fn) else {}
+    calls = call_places(memory, lookup, now, since=min(heard) - 6 * 3600) if heard else {}
     views = [fact_view(f, calls, now) for f in raw]
     by_ref = {str(v["ref"]): v for v in views}
     rq = getattr(memory, "review_queue", None)
@@ -820,7 +837,7 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
     total = sum(len(g["facts"]) for g in groups) + len(rules) + len(routines) + len(not_routines) + len(in_review)
     return {"source": source, "people": persons, "groups": groups, "rules": rules, "routines": routines,
             "not_routines": not_routines, "review": review, "total": total,
-            "misheard": misheard_view(memory, calls, fallback, now), "pending": pending or {},
+            "misheard": misheard_view(memory, calls, fallback, now, lookup), "pending": pending or {},
             "can": {"pin": callable(getattr(memory, "pin_fact", None)), "review": callable(rq),
                     "heard": callable(getattr(memory, "resolve_heard", None))}}
 
@@ -958,10 +975,14 @@ def call_gists(c: dict[str, Any]) -> list[str]:
     return out
 
 
-def call_where(c: dict[str, Any]) -> str:
+def call_where(c: dict[str, Any], default: str | None = None) -> str:
     """Where a call was, in the one format every row uses: "Discord, #general voice (Friends)" (memory's place
-    label), else the app."""
-    return next((str(p) for p in c.get("places") or [] if str(p).strip()), "") or str(c.get("app") or "")
+    label); a digest written before the structured place, its own words as they are; else the app."""
+    for key in ("places", "where"):
+        for p in c.get(key) or []:
+            if str(p).strip():
+                return " ".join(str(p).split())
+    return str(c.get("app") or "") if default is None else default
 
 
 def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
