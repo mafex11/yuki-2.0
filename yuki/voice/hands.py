@@ -320,7 +320,9 @@ HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
 SKILL_HAND = "run_skill"
 #: UI Automation control types (the platform's fixed vocabulary) whose click can send, delete, buy or sign out: such a
 #: click always passes Yuki's own authorization check (34-review H1/H2: a machine fact, never the control's words).
-RISKY_CLICK_ROLES = frozenset({"Button", "SplitButton", "MenuItem", "Hyperlink"})
+#: Links in a page (a video, a chat in a list) stay fast, as on the thinker's side (34-review H2): only controls that
+#: commit something - buttons and menu items - are judged.
+RISKY_CLICK_ROLES = frozenset({"Button", "SplitButton", "MenuItem"})
 
 #: The items line (v3.14): at most this many items of the window in front, each name cut to this many characters.
 ITEMS_CAP = 20
@@ -1973,10 +1975,12 @@ class Hands:
             raise _Refused("what has the keyboard is not a text field you may type in; nothing was typed", stale=True)
         facts["target"] = f'{getattr(snap, "role", "") or "field"} "{str(getattr(snap, "name", "") or "")[:60]}"'
         self._refuse_if_act_off(facts.get("app"))      # 34-review H5
-        # 34-review H1: typed words land in their work or a message box: always Yuki's own check, with their words
+        # 34-review H1/M1: the type hand never presses Enter, so plain words cannot send; a line break in them can
+        # (Enter or Ctrl+Enter sends in most chats and mail): then Yuki's own check, with their heard words
+        sends = "\r" in text or "\n" in text
         verdict = self.authorize("type_text", {"hwnd": hwnd, "text": text},
                                  {"hwnd": hwnd, "app": facts.get("app"), "title": self._title_shown(hwnd),
-                                  "element": facts["target"]}, force=True)
+                                  "element": facts["target"]}, force=sends)
         if verdict is not None and not getattr(verdict, "allowed", False):
             raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
                            held=str(getattr(verdict, "question", "") or ""))

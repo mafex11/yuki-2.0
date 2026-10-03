@@ -928,13 +928,15 @@ def test_a_click_on_a_button_and_any_typing_are_judged_with_the_heard_words_even
     name, tool_input, words, target = fake.judged[0]
     assert name == "click" and tool_input["element"] == 'Button "Restore"' and words == ["restore the pages"]
     assert target["app"] == "chrome.exe" and not desk.bubble           # allowed: clicked
-    # typing, held: nothing typed, the talker asks the check's question, nothing goes to the thinker
+    # typing with a line break (Enter / Ctrl+Enter sends in most chats), held: nothing typed, the talker asks the
+    # check's question, nothing goes to the thinker. Plain words (no line break) cannot send: the type hand never
+    # presses Enter, so they are typed without a check (review M1: a character test, not words)
     desk2 = _desk("discord_tag", front=DISCORD)
     desk2.discord_view = "general"
     hands2 = _hands(desk2, words=["message the general channel"], bridge=EscalateBridge())
     fake2 = _forced(monkeypatch, hands2, allow=False)
-    p = _run(hands2, "type", {"window": DISCORD, "text": "see you all at nine", "say_when_done": ""})
-    assert fake2.judged[0][0] == "type_text" and fake2.judged[0][1]["text"] == "see you all at nine"
+    p = _run(hands2, "type", {"window": DISCORD, "text": "see you all at nine\n", "say_when_done": ""})
+    assert fake2.judged[0][0] == "type_text" and fake2.judged[0][1]["text"] == "see you all at nine\n"
     assert "type_text" not in [c[0] for c in desk2.calls] and desk2.draft == ""
     assert "Send it to Sam?" in p.results[0]["how_to_handle_it"] and hands2.bridge.escalated == []
 
