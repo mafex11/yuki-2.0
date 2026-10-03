@@ -2901,7 +2901,7 @@ MIGRATIONS: tuple[str, ...] = (
     #   written with its shown form (the nightly review, the titles pass); cleared with it when the state changes.
     # - work_threads.closed_by / closed_at: who closed or dismissed it last (user | model | code) and when; cleared
     #   when the thread is reopened. A thread the user closed is offered to the journal as such.
-    # - work_thread_undo: the before-image of a thread a change touched (its row, the journal facts, events and
+    # - undo_images: the before-image of a thread a change touched (its row, the journal facts, events and
     #   links that pointed at it, its vector), per pass run (run_id) or per user op (run_id NULL): every close,
     #   dismiss, merge, rename and rewrite is reversible (Reopen, --undo RUN_ID).
     # - episodes.title_ciphertext / summary_ciphertext: a work session's short distinct title (a few words) and its
@@ -2913,7 +2913,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE work_threads ADD COLUMN next_ciphertext TEXT;
     ALTER TABLE work_threads ADD COLUMN closed_by TEXT;
     ALTER TABLE work_threads ADD COLUMN closed_at REAL;
-    CREATE TABLE work_thread_undo (
+    CREATE TABLE undo_images (
         id                 INTEGER PRIMARY KEY,
         run_id             INTEGER,
         work_thread_id     INTEGER NOT NULL,
@@ -2923,8 +2923,8 @@ MIGRATIONS: tuple[str, ...] = (
         before_ciphertext  TEXT NOT NULL,
         undone_at          REAL
     );
-    CREATE INDEX work_thread_undo_run ON work_thread_undo(run_id);
-    CREATE INDEX work_thread_undo_thread ON work_thread_undo(work_thread_id, at);
+    CREATE INDEX undo_images_run ON undo_images(run_id);
+    CREATE INDEX undo_images_item ON undo_images(surface, item_id, at);
     ALTER TABLE episodes ADD COLUMN title_ciphertext TEXT;
     ALTER TABLE episodes ADD COLUMN summary_ciphertext TEXT;
     ALTER TABLE correction_passes ADD COLUMN target TEXT;
@@ -9329,7 +9329,7 @@ class Store:
 
     def _snapshot_work_thread(self, conn: sqlite3.Connection, tid: int, *, run_id: int | None, action: str, by: str,
                               now: float) -> None:
-        """Keep a thread's before-image (migration 35's ``work_thread_undo``): its row, the journal facts, events and
+        """Keep a thread's before-image (migration 35's ``undo_images``): its row, the journal facts, events and
         links that point at it, and its vector, encrypted; :meth:`undo_work_threads` and :meth:`reopen_work_thread`
         put it back."""
         import base64
@@ -9348,7 +9348,7 @@ class Store:
             "vec": None if vec is None else {"model": vec["model"], "dim": vec["dim"],
                                              "blob": base64.b64encode(bytes(vec["vec_ciphertext"])).decode("ascii")},
         }
-        conn.execute("INSERT INTO work_thread_undo(run_id, work_thread_id, action, by, at, before_ciphertext)"
+        conn.execute("INSERT INTO undo_images(run_id, work_thread_id, action, by, at, before_ciphertext)"
                      " VALUES (?,?,?,?,?,?)", (run_id, int(tid), str(action), str(by), now,
                                                self.cipher.encrypt(json.dumps(before, default=str))))
 
@@ -9371,7 +9371,7 @@ class Store:
         if vec:
             conn.execute("INSERT OR REPLACE INTO work_thread_vec(work_thread_id, model, dim, vec_ciphertext)"
                          " VALUES (?,?,?,?)", (tid, vec["model"], vec["dim"], base64.b64decode(vec["blob"])))
-        conn.execute("UPDATE work_thread_undo SET undone_at=? WHERE id=?", (now, int(snap["id"])))
+        conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, int(snap["id"])))
 
     def _touched_since(self, conn: sqlite3.Connection, tid: int, at: float) -> bool:
         """The user's own work reached the thread after ``at`` (a journal or backfill event, never a pass's own)."""
@@ -9387,7 +9387,7 @@ class Store:
         now = time.time() if now is None else float(now)
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
-            snaps = conn.execute("SELECT * FROM work_thread_undo WHERE run_id=? AND undone_at IS NULL ORDER BY id DESC",
+            snaps = conn.execute("SELECT * FROM undo_images WHERE run_id=? AND undone_at IS NULL ORDER BY id DESC",
                                  (int(run_id),)).fetchall()
             restored, diverged, threads = 0, [], []
             for snap in snaps:
@@ -9417,7 +9417,7 @@ class Store:
             row = conn.execute("SELECT status FROM work_threads WHERE id=?", (int(thread_id),)).fetchone()
             if row is None or row["status"] not in ("done", "paused", "dismissed"):
                 return None
-            snap = conn.execute("SELECT * FROM work_thread_undo WHERE work_thread_id=? AND undone_at IS NULL AND"
+            snap = conn.execute("SELECT * FROM undo_images WHERE work_thread_id=? AND undone_at IS NULL AND"
                                 " action IN ('close', 'dismiss') ORDER BY id DESC LIMIT 1", (int(thread_id),)).fetchone()
             if snap is not None and not self._touched_since(conn, int(thread_id), float(snap["at"])):
                 self._restore_work_thread(conn, snap, now)
@@ -9464,7 +9464,7 @@ class Store:
         A merge or update may carry ``shown`` (the state said to the user, migration 33) and ``next`` (migration 35);
         a new state without them clears the old ones (the titles pass writes them again).
         ``by`` (``user`` | ``model`` | ``code``; default ``user`` for origin ``user``, else ``model``): who closed or
-        dismissed it. Every change keeps the thread's before-image (``work_thread_undo``, with ``run_id``), so
+        dismissed it. Every change keeps the thread's before-image (``undo_images``, with ``run_id``), so
         :meth:`undo_work_threads` (a run) and :meth:`reopen_work_thread` (one thread) take it back.
         """
         now = time.time() if now is None else float(now)
@@ -9476,10 +9476,10 @@ class Store:
                 action = ch.get("action")
                 touched = ([int(i) for i in ch.get("ids") or []] if action == "merge"
                            else [int(ch["id"])] if ch.get("id") is not None else [])
-                mark = int(conn.execute("SELECT coalesce(max(id), 0) FROM work_thread_undo").fetchone()[0])
+                mark = int(conn.execute("SELECT coalesce(max(id), 0) FROM undo_images").fetchone()[0])
 
                 def failed(why: str, ch: dict[str, Any] = ch, mark: int = mark) -> None:
-                    conn.execute("DELETE FROM work_thread_undo WHERE id > ?", (mark,))   # nothing changed: no undo
+                    conn.execute("DELETE FROM undo_images WHERE id > ?", (mark,))   # nothing changed: no undo
                     out.append({**{k: v for k, v in ch.items() if k not in ("vector",)}, "ok": False, "why": why})
 
                 for tid in touched:
