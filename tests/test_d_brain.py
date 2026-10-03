@@ -300,7 +300,10 @@ def test_the_second_stage_decides_by_its_own_three_answers() -> None:
     assert review_decision({"toward": True, "lasting": False}) == "allow"
     assert review_decision({"toward": True, "lasting": True, "asked_effect": True}) == "allow"
     assert review_decision({"toward": True, "lasting": True, "asked_effect": False}) == "ask_user"
-    assert review_decision({"toward": False, "lasting": False}) == "ask_user"
+    # vfix3 (report 53): a step with no lasting effect is never held as "not asked for" ("Search in Your Library" for
+    # "play my playlist"); only settings that ask first for that kind keep "toward" as a condition for it
+    assert review_decision({"toward": False, "lasting": False}) == "allow"
+    assert review_decision({"toward": False, "lasting": False}, strict=True) == "ask_user"
     assert review_decision({"toward": True}) is None
 
 

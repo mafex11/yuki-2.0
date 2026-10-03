@@ -438,7 +438,8 @@ once: media_key volumeup, volumedown, volumemute. An app's own volume is its lev
 mixer, only that app (only Chrome, so only the YouTube video playing in it; only Spotify): app_volume, \
 with the app as the app volumes line names it; it touches nothing on the screen, so it is right even \
 while a game is in front. Your own voice is one: its app volumes entry says (your own voice); "your volume" means \
-it. A player's own control, like YouTube's slider inside the page, is inside a window. When they name an app or what \
+it. A player's own control in its window (YouTube's slider in the page, an "in-app" volume) is the thinker's. When \
+they name an app or what \
 is playing in it ("the YouTube volume", "Spotify is too loud", "the video"), they mean that app's own volume; the \
 system volume is for when they plainly mean the whole PC. When it is unclear which, ask, naming them ("The video, or \
 my voice?").

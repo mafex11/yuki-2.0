@@ -234,8 +234,9 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "name": "app_volume",
         "description": (
             "Your hand: ONE APP's own mixer volume (that app only: Chrome's video, Spotify, your own voice), the app "
-            "as the app volumes line names it; nothing on the screen is touched. Verified by reading its level back."
-            + _NOW
+            "as the app volumes line names it; nothing on the screen is touched. Verified by reading its level back. "
+            "Never for a player's in-app volume (its slider in the window): that is the thinker's, and this is no "
+            "stand-in for it." + _NOW
         ),
         "properties": {
             "app": {"type": "string", "description": "As the app volumes line names it, e.g. chrome.exe."},

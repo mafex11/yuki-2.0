@@ -49,6 +49,8 @@ with that person) and checks you would like to see are never blocking: say them 
 - advice: at most 120 words, plain and concrete: what went wrong or what to check, and the one next step, named by \
 the controls, keys or windows in the summary. For a pending send, check that the person, the place and the words are \
 what the user's own words asked for, and that the text says what they meant in the way they write to that person. \
+Never advise a stand-in for what they named: the Windows mixer (app_volume) is not an app's own in-app volume, a \
+public search is not a thing of theirs; when the asked way cannot work, the next step is to tell them plainly why. \
 Never invent a fact that is not in the summary."""
 
 ADVISE_TOOL: dict[str, Any] = {

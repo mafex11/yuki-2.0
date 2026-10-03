@@ -583,6 +583,18 @@ def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
     return ""
 
 
+#: The label the voice bridge puts on its own note to a running request (``yuki.voice.bridge``: the app they named,
+#: the references resolved): Yuki's words, not the user's.
+VOICE_NOTE_LABEL = "(From Yuki's voice, about the request you are on)"
+
+
+def users_steers(steers: Sequence[str] | None) -> list[str]:
+    """The words the user added while a run went on, without Yuki's voice's own notes (vfix3: live 4 Oct a note that
+    only named the app was kept in practice memory as "they said while it ran", and made a run without trouble a
+    pitfall). Our own fixed label, never the words."""
+    return [s for s in steers or () if not str(s).lstrip().startswith(VOICE_NOTE_LABEL)]
+
+
 def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Sequence[str] = (),
                     at: float | None = None, stamped: bool = True) -> dict[str, list[str]]:
     """N8 (report 47): from one finished run's trace, per app, what did not work and what worked after it, as short
@@ -595,6 +607,7 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
     import collections
     from datetime import datetime as _dt
 
+    steers = users_steers(steers)
     steps = [s for s in trace or () if isinstance(s, dict) and s.get("kind") in ("action", "control")
              and s.get("tool") not in ("tasks",)]
     acted = [s for s in steps if s.get("kind") == "action"]
@@ -634,7 +647,11 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
                                f"it; read the state before acting again)")
     first_bad = min((trace.index(s) for s in bad if s in trace), default=None)
     if first_bad is not None:
-        worked = [s for s in list(trace)[first_bad + 1:] if s.get("kind") == "action" and s.get("verdict") is True]
+        # vfix3: what worked after a failed step in an app must have acted on something there (a control or its
+        # window): live 4 Oct the Windows mixer level (no window, no control) was learned as the way instead of the
+        # player's own slider the user had asked for, and every later request was steered to the mixer
+        worked = [s for s in list(trace)[first_bad + 1:] if s.get("kind") == "action" and s.get("verdict") is True
+                  and str(s.get("target") or "").strip()]
         for s in worked[:1]:
             out[s.get("app") or ""].append(f"{pre}what worked after that: {s.get('tool')}"
                                            + (f" on {s.get('target')}" if s.get("target") else ""))
@@ -658,6 +675,7 @@ def session_pitfalls(trace: Sequence[dict[str, Any]], *, outcome: str,
     single failed step the run got past stays a session lesson only). Code only."""
     import collections
 
+    steers = users_steers(steers)
     steps = [s for s in trace or () if isinstance(s, dict)]
     acted = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in steps
                                 if s.get("kind") == "action")

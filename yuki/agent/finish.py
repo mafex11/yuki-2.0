@@ -121,6 +121,14 @@ def finish_line(name: str, tool_input: dict[str, Any], *, process: str | None = 
         return "Done."
     if name == "write_clipboard":
         return "Copied."
+    if name == "set_slider":
+        # vfix3: live 4 Oct a verified in-app volume change was said as "Done."
+        where = f" in {app}" if process else ""
+        to, by = tool_input.get("to"), tool_input.get("by")
+        if isinstance(to, (int, float)) and not isinstance(to, bool):
+            return f"Set it to {int(round(float(to)))}%{where}."
+        if isinstance(by, (int, float)) and not isinstance(by, bool) and by:
+            return f"Turned it {'down' if by < 0 else 'up'}{where}."
     return "Done."
 
 
@@ -129,6 +137,11 @@ def noop_line(name: str, details: dict[str, Any] | None, *, process: str | None 
     level was already where it was asked to go, or at its end), in place of the line written before it ran ("Turned
     Spotify up."), or ``None`` for an action that did move. Fixed sentences over the measured numbers."""
     details = details if isinstance(details, dict) else {}
+    if name == "set_slider" and details.get("level_unread") and not details.get("noop"):
+        # vfix3 review F2: a shortcut whose effect showed only as the bar's look changing; the level itself was never
+        # read, so no percent and no "turned it down" is said for it
+        where = app_name(str(process)) if process else "the app"
+        return f"I pressed {where}'s own shortcut for it and the bar changed, but I can't read the new level."
     if not details.get("noop"):
         return None
     if name == "app_volume":

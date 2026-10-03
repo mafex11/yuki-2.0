@@ -973,7 +973,8 @@ def test_f7_the_slider_keys_stop_once_the_caller_has_stopped_waiting() -> None:
 
     def stopped() -> bool:
         calls["n"] += 1
-        return calls["n"] > 1                                     # the budget ran out after the first batch
+        # the budget ran out after the first batch (call 1: vfix3 review F5's look before the value is set)
+        return calls["n"] > 2
 
     ok, _summary, details = drive(s, to=90, press=s.press, sleep=lambda _s: None, settle_s=0.0, stopped=stopped)
     assert not ok and details["stopped"] and details["presses"] == KEYS_PER_BATCH and s.value == KEYS_PER_BATCH
