@@ -13,10 +13,14 @@ summaries of the user's conversations with Yuki, what happened to the threads of
 gists of the day's calls, the day's goals from the check-ins. Code gathers and checks (ids offered, sizes); the model
 decides what mattered. A day with nothing in it gets no digest and no call.
 
-When: in the portrait scheduler's night (after the threads tidy), for the completed days of the last
-:data:`NIGHT_DAYS` that have none; and lazily when the window asks for the connector line and yesterday has none
-(:meth:`MemoryClient.day_connector` writes the :data:`DAYDIGEST_FLAG` flag, the service's scheduler builds it in the
-background - never on a request's path).
+When: at the first scheduler check of each user day (the day rollover at 04:00, or the service's start), so the day
+that just ended has its digest by morning (the nightly slot at 22:00 comes before the day is over: review A1); in the
+portrait scheduler's night (after the threads tidy) for the completed days of the last :data:`NIGHT_DAYS` that have
+none; and lazily when the window asks for the connector line, or Yuki's first request of a new day reads the resume
+block, and yesterday has none (:meth:`MemoryClient.day_connector` / ``resume_context`` write the
+:data:`DAYDIGEST_FLAG` flag, the service's scheduler builds it in the background - never on a request's path). A day
+whose call fails is tried at most :data:`MAX_TRIES_PER_DAY` times per service run; a digest saved without its shown
+form is retried once for it (review A6).
 
 Run it by hand (on a copy first): ``python -m yuki.memory.daydigest --backfill --days 7 [--db PATH] [--dry-run]``.
 """
@@ -39,6 +43,8 @@ from yuki.memory.titles import SHOWN_RULES, clean_shown, natural_day, natural_ti
 DAYDIGEST_FLAG = "day_digest"
 #: The nightly pass looks back this many completed days for a missing digest.
 NIGHT_DAYS = 2
+#: A day whose digest call failed (model error, nothing usable) is tried at most this many times per service run.
+MAX_TRIES_PER_DAY = 3
 #: Sizes of what one day's request shows, and the digest's limits (plumbing).
 MAX_SUMMARIES = 8
 MAX_EVENTS = 30
@@ -253,6 +259,7 @@ class DigestResult:
     ok: bool = True
     days: list[str] = field(default_factory=list)          # written (or, dry run, would be)
     skipped: list[str] = field(default_factory=list)       # nothing in them, or already written
+    failed: list[str] = field(default_factory=list)        # a call was made and nothing usable came back
     digests: list[dict[str, Any]] = field(default_factory=list)   # dry run: what would be written
     rejected: list[str] = field(default_factory=list)
     calls: int = 0
@@ -272,8 +279,11 @@ class DayDigester:
         self.model = model or HAIKU_MODEL
 
     def missing(self, days: Sequence[str]) -> list[str]:
-        have = {d["day"] for d in self.store.day_digests(days=list(days), limit=len(days) or 1)}
-        return [d for d in days if d not in have]
+        """The days without a digest, and the days whose digest has no shown form yet and was not retried for it
+        (one retry: review A6)."""
+        have = {d["day"]: d for d in self.store.day_digests(days=list(days), limit=len(days) or 1)}
+        return [d for d in days if d not in have
+                or (not have[d].get("shown") and not (have[d].get("refs") or {}).get("shown_retried"))]
 
     def run(self, *, days: Sequence[str] | None = None, back: int = NIGHT_DAYS, redo: bool = False,
             dry_run: bool = False, now: float | None = None, reason: str = "") -> DigestResult:
@@ -287,10 +297,13 @@ class DayDigester:
         result.skipped = [d for d in wanted if d not in todo]
         if not todo:
             return result
+        # a day that already has a digest is here again only for its missing shown form: one retry (review A6)
+        old = {d["day"]: d for d in self.store.day_digests(days=list(todo), limit=len(todo))}
         worker = self.worker
         with worker._run_lock:
             stats = PortraitRunStats(kind="daydigest", model=self.model, window_until=now)
             run_id = None
+            day = None
             try:
                 for day in sorted(todo):
                     data = gather(self.store, day)
@@ -305,12 +318,20 @@ class DayDigester:
                                        stats=stats, model=self.model, forced=True)
                     digest, rejected = validate(raw, data)
                     result.rejected += [f"{day}: {r}" for r in rejected]
-                    if digest is None:
+                    retry = old.get(day) if not redo else None
+                    if digest is None or (retry is not None and digest["shown"] is None):
+                        result.failed.append(day)
+                        if retry is not None and not dry_run:   # the retry is spent: keep what was there
+                            self.store.save_day_digest(day, retry["text"], retry.get("shown"),
+                                                       {**(retry.get("refs") or {}), "shown_retried": True},
+                                                       model=self.model, cost_usd=None)
                         continue
                     refs = {"threads": sorted(data.threads), "calls": [d["call_id"] for d in data.calls],
                             "sessions": [s.session_id for s in data.summaries],
                             "commitments": [f.id for f in data.made + data.done], "open": digest["open"],
                             "exchanges": data.exchanges}
+                    if retry is not None:
+                        refs["shown_retried"] = True
                     if dry_run:
                         result.digests.append({"day": day, **digest})
                     else:
@@ -321,11 +342,14 @@ class DayDigester:
             except Exception as exc:
                 stats.outcome, stats.error = "error", f"{type(exc).__name__}: {exc}"
                 result.ok, result.error = False, stats.error
+                if day is not None and day not in result.days and day not in result.failed:
+                    result.failed.append(day)
             result.calls, result.cost_usd = stats.calls, stats.cost_usd
             if run_id is not None:
                 self.store.finish_portrait_run(run_id, stats)
             worker._log("portrait_daydigest", run_id=run_id, reason=reason, dry_run=dry_run, ok=result.ok,
-                        days=result.days, skipped=result.skipped, rejected=result.rejected, calls=result.calls,
+                        days=result.days, skipped=result.skipped, failed=result.failed, rejected=result.rejected,
+                        calls=result.calls,
                         cost_usd=round(result.cost_usd, 6), error=result.error)
         return result
 
@@ -361,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         store.close()
 
 
-__all__ = ["DAYDIGEST_FLAG", "DayDigester", "DigestResult", "day_window", "gather", "previous_days", "today"]
+__all__ = ["DAYDIGEST_FLAG", "MAX_TRIES_PER_DAY", "NIGHT_DAYS", "DayDigester", "DigestResult", "day_window", "gather", "previous_days", "today"]
 
 
 if __name__ == "__main__":

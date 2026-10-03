@@ -119,7 +119,7 @@ on the click path; every text a list returns has a ``shown`` form said to the us
     memory.review_mark("fact:N", "right" | "wrong" | "notmine" | "undo", correction_id=None) -> dict
     memory.day_connector(day=None) -> {"day", "label", "text", "memory", "open", "threads", "exchanges"} | None
     memory.chat_days(days=14) -> [{"day", "count", "first", "last"}];  memory.turns_on(day) -> [turn dict]
-    memory.people_list() / memory.contact(ref)   # "usual" is a label object, one "summary" per person
+    memory.people_list() / memory.contact(ref)   # "usual" a plain line, "usual_route" its label object, one "summary"
 
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
@@ -198,6 +198,8 @@ REVIEW_PER_DAY = 5
 REVIEW_WITHIN_DAYS = 14
 REVIEW_UNSURE = 0.6
 REVIEW_SKIP_KINDS = ("open_loop",)
+#: An Undo that came after the Wrong's correction pass started (review A3): the answer stands, the item stays gone.
+TOO_LATE_TO_UNDO = "Too late to undo: Yuki is already updating memory from your answer."
 #: "Maybe misheard" (report 38 §5): uncertain entries of the last this-many days, this many listed (newest first).
 MISHEARD_DAYS = 7
 MISHEARD_SHOWN = 8
@@ -641,8 +643,10 @@ class MemoryClient:
         """The user's answer to one "To review" fact, at once and without a model: ``right`` - reviewed and pinned
         (it stays as it is); ``wrong`` / ``notmine`` - retired now, and the correction pass queued for the ripple
         (returns its ``correction_id``); ``undo`` (within the window's Undo) - takes it back: a retired fact is
-        current again and the queued pass (``correction_id``) is cancelled while it has not started. Returns
-        ``{"ok", "ref", "verdict", "correction_id"}``, ``ok`` False with ``error`` when nothing could be done."""
+        current again and the queued pass (``correction_id``) is cancelled - only while it has not started: once it has,
+        nothing is restored and ``ok`` is False with :data:`TOO_LATE_TO_UNDO` (the window keeps the item removed).
+        Returns ``{"ok", "ref", "verdict", "correction_id", "cancelled"?}``, ``ok`` False with ``error`` when nothing
+        could be done."""
         fid = self._fact_id(ref)
         verdict = str(verdict or "").strip().lower()
         out: dict[str, Any] = {"ok": False, "ref": f"fact:{fid}" if fid else str(ref or ""), "verdict": verdict,
@@ -672,6 +676,13 @@ class MemoryClient:
                 out["correction_id"] = self._ripple(fact.subject or fact.kind, fact.text, words)
                 self.rerender_portrait()
         else:
+            # the queued ripple is taken back first: once its pass started, the answer stands (review A3: a restore
+            # with the "forget it" pass still running would be undone again by that pass)
+            if correction_id:
+                out["cancelled"] = self.store.cancel_correction(int(correction_id))
+                if not out["cancelled"]:
+                    out["error"] = TOO_LATE_TO_UNDO
+                    return out
             if fact.valid_to is None:
                 out["ok"] = self.store.mark_fact_reviewed(fid, None, pin=False if fact.origin != "user" else None,
                                                           note=f"The user took back their answer on F{fid}.")
@@ -680,8 +691,6 @@ class MemoryClient:
                     fid, None, note=f"The user took back their answer on F{fid}.")
                 if out["ok"]:
                     self.rerender_portrait()
-            if out["ok"] and correction_id:
-                out["cancelled"] = self.store.cancel_correction(int(correction_id))
         if not out["ok"] and "error" not in out:
             out["error"] = "That fact has changed since; open it again."
         return out
@@ -1460,17 +1469,31 @@ class MemoryClient:
     def _resume_from_day(self, now: float) -> str | None:
         """The resume block when the last exchange is older than the window (report 38 §9.3): the last day digest -
         the same line the user sees at the top of the new chat - and the open promises, at most
-        :data:`RESUME_FALLBACK_CHARS`; None when there is none from the last :data:`RESUME_FALLBACK_DAYS` days."""
+        :data:`RESUME_FALLBACK_CHARS`; None when there is none from the last :data:`RESUME_FALLBACK_DAYS` days.
+
+        It says which day the digest is from and never calls an older day "the last day": when yesterday had
+        activity and its digest is not written yet, it asks for it (the flag, as :meth:`day_connector` does) and says
+        that yesterday's is missing (review A1: Yuki and the page must not disagree about yesterday)."""
         from yuki.memory.daydigest import day_window, previous_days, today
 
         try:
+            asked = self._ask_day_digest(now)
+            if asked:   # say so only when they talked with Yuki yesterday (journal entries alone may make no digest)
+                y_start, y_end = day_window(previous_days(1, now)[0])
+                asked = bool(self.store.turn_times(y_start, y_end))
             found = self.store.day_digests(before=today(now), limit=1)
             if not found or found[0]["day"] < previous_days(RESUME_FALLBACK_DAYS, now)[-1]:
                 return None
             d = found[0]
             start, _end = day_window(d["day"])
-            head = (f"[The user's last day with you ({datetime.fromtimestamp(start + 6 * 3600):%A %d %B}), from "
-                    "memory's day digest; this is a new chat]")
+            when = f"{datetime.fromtimestamp(start + 6 * 3600):%A %d %B}"
+            if d["day"] == previous_days(1, now)[0]:
+                head = f"[Yesterday ({when}) with the user, from memory's day digest; this is a new chat]"
+            else:
+                head = (f"[From memory's day digest of {when}, the latest one written"
+                        + ("; the user also talked with you yesterday, whose digest is not written yet" if asked
+                           else "")
+                        + "; this is a new chat]")
             parts = [head, _clip_sentences(d["text"], 600) or ""]
             opened = [o.get("text") for o in (d.get("refs") or {}).get("open") or [] if isinstance(o, dict)]
             if opened:
@@ -2729,7 +2752,8 @@ class MemoryClient:
         """The user's Right / Wrong on a "maybe misheard" entry, at once, with no model on the click path:
         ``right`` - the entry is taken as said (its nature becomes ``fact``; nothing is reworded); ``wrong`` - it is
         retired now and the correction pass is queued for the ripple (``correction_id``); ``undo`` (the window's Undo)
-        - either is taken back, and a queued pass (``correction_id``) is cancelled while it has not started. The item
+        - either is taken back, and a queued pass (``correction_id``) is cancelled first; once that pass started, nothing
+        is taken back (``ok`` False, :data:`TOO_LATE_TO_UNDO`); an entry never answered has nothing to undo. The item
         leaves :meth:`misheard` at once (answered entries are never listed again). Returns ``{"ok", "ref", "verdict",
         "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered."""
         jid = self._journal_id(ref)
@@ -2739,6 +2763,11 @@ class MemoryClient:
         if jid is None or verdict not in ("right", "wrong", "undo"):
             out["error"] = "say right, wrong or undo for a journal entry"
             return out
+        if verdict == "undo" and correction_id:   # the ripple first: once its pass started, the answer stands (A3)
+            out["cancelled"] = self.store.cancel_correction(int(correction_id))
+            if not out["cancelled"]:
+                out["error"] = TOO_LATE_TO_UNDO
+                return out
         try:
             done = self.store.resolve_journal(jid, verdict)
         except Exception as exc:
@@ -2751,8 +2780,6 @@ class MemoryClient:
         if verdict == "wrong":
             out["correction_id"] = self._ripple(done.get("app") or "what Yuki heard", done["text"],
                                                 "That was misheard. It's wrong, forget it")
-        elif verdict == "undo" and correction_id:
-            out["cancelled"] = self.store.cancel_correction(int(correction_id))
         return out
 
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
@@ -2812,18 +2839,12 @@ class MemoryClient:
         anything in it has no digest yet, asks the service to write it (a flag; one Haiku call in the background,
         never on this path) and returns the newest older one, if any, within :data:`RESUME_FALLBACK_DAYS`.
         Read only otherwise. Never raises."""
-        from yuki.memory.daydigest import DAYDIGEST_FLAG, day_window, previous_days, today
+        from yuki.memory.daydigest import day_window, previous_days, today
 
         now = time.time() if now is None else float(now)
         try:
             if day is None:
-                yesterday = previous_days(1, now)[0]
-                if not self.store.day_digests(days=[yesterday], limit=1):
-                    start, end = day_window(yesterday)
-                    if self.store.turn_times(start, end) or self.store.journal_count(start, end):
-                        path = self._flag(DAYDIGEST_FLAG)
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+                self._ask_day_digest(now)
                 found = self.store.day_digests(before=today(now), limit=1)
             else:
                 found = self.store.day_digests(days=[str(day)], limit=1)
@@ -2844,6 +2865,26 @@ class MemoryClient:
                     "exchanges": refs.get("exchanges")}
         except Exception:
             return None
+
+    def _ask_day_digest(self, now: float) -> bool:
+        """Yesterday had exchanges or journal entries and has no digest yet: write the ``day_digest`` flag (the
+        service's scheduler builds it in the background, one Haiku call; never on this path). True when it asked.
+        Content-free reads. Never raises."""
+        from yuki.memory.daydigest import DAYDIGEST_FLAG, day_window, previous_days
+
+        try:
+            yesterday = previous_days(1, now)[0]
+            if self.store.day_digests(days=[yesterday], limit=1):
+                return False
+            start, end = day_window(yesterday)
+            if not (self.store.turn_times(start, end) or self.store.journal_count(start, end)):
+                return False
+            path = self._flag(DAYDIGEST_FLAG)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(datetime.now().astimezone().isoformat(timespec="seconds"), encoding="utf-8")
+            return True
+        except Exception:
+            return False
 
     def chat_days(self, days: int = 14, now: float | None = None) -> list[dict]:
         """The user days with exchanges in the last ``days`` (days start at 04:00), newest first: ``{"day", "count",
@@ -3264,13 +3305,16 @@ class MemoryClient:
         """The people the user talks to, as structured rows for the Yuki window's Me page (no message text is
         decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "human", "use",
         "app", "kind", "chat", "handle", "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...],
-        "usual", "usual_ref", "summary", "margin", "close", "last_contact", "rhythm"}]``, most recently in touch first;
+        "usual", "usual_route", "usual_ref", "summary", "margin", "close", "last_contact", "rhythm"}]``, most recently in
+        touch first;
         ``rhythm`` is their messages a day both ways over 14 days (``yuki.memory.contacts.rhythm``: ``days``, ``total``,
         ``known_days``, ``peak``...). ``[]`` when memory has no people index yet. Never raises.
 
-        Since migration 33 (the 3 Oct feedback): ``usual`` is a label object, never a ``route:N``
-        (:func:`yuki.memory.contacts.usual_label`: ``{"ref", "label": "Discord DM", "sub", "use", "mine", "theirs",
-        "last_at", "tone", "preferred"}`` or None; ``usual_ref`` is the bare ref); ``relation`` is the person fact's
+        Since migration 33 (the 3 Oct feedback): ``usual`` is one plain line, never a ``route:N``
+        (:func:`yuki.memory.contacts.usual_line`: "Slack DM. Code questions go on the PR.", or None) and
+        ``usual_route`` its structured form (:func:`yuki.memory.contacts.usual_label`: ``{"ref", "label": "Discord
+        DM", "sub", "use", "mine", "theirs", "last_at", "tone", "preferred"}`` or None; ``usual_ref`` is the bare
+        ref); ``relation`` is the person fact's
         short label written to the user ("Your father") when there is one; ``summary`` is the one summary per person
         (``{"ref": "fact:N", "headline", "text" (shown form, may be None), "pinned"}`` or None); a route's ``use`` is
         one sentence of what the user uses that chat for with them (None until the contacts rebuild writes it)."""
@@ -3298,7 +3342,8 @@ class MemoryClient:
                 last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),
                            default=None)
                 rows.append({"ref": c["ref"], "name": c["name"], "relation": c["relation"], "aliases": c["aliases"],
-                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "usual_ref": c["usual_ref"],
+                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "usual_route": c["usual_route"],
+                             "usual_ref": c["usual_ref"],
                              "summary": c["summary"], "margin": c["margin"],
                              "close": c["close"], "last_contact": last, "rhythm": rhythms.get(person.id)})
             rows.sort(key=lambda r: r["last_contact"] or 0, reverse=True)

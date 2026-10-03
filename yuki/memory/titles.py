@@ -427,6 +427,13 @@ _KINDS = {"work": "work", "interest": "an interest", "person": "a person in thei
           "open_loop": "an open loop (something owed)"}
 
 
+def shown_key(p: Any) -> str:
+    """The shown pass's own attempt key (review A5): a fact's label and its shown form are both ``P<id>``, and
+    ``W<id>`` is both a know-how way's summary and a thread's shown form, so failures in one pass never block the
+    other."""
+    return f"shown:{p.surface}:{p.item_id}"
+
+
 class Titler:
     """The batched labels pass, through the portrait worker's model call, log and lock."""
 
@@ -503,7 +510,7 @@ class Titler:
         out: list[ShownPending] = []
 
         def add(p: ShownPending) -> None:
-            if self._failed.get(p.ref, 0) < MAX_ATTEMPTS:
+            if self._failed.get(shown_key(p), 0) < MAX_ATTEMPTS:
                 out.append(p)
 
         facts = [f for f in store.portrait_facts(include_corrections=False) if wanted("fact", f.id)]
@@ -601,7 +608,7 @@ class Titler:
             result.rejected += rejected
             for p in batch:
                 if p.item_id not in texts.get(p.surface, {}):
-                    self._failed[p.ref] = self._failed.get(p.ref, 0) + 1
+                    self._failed[shown_key(p)] = self._failed.get(shown_key(p), 0) + 1
             for surface, rows in texts.items():
                 if dry_run:
                     by_id = {p.item_id: p for p in batch if p.surface == surface}

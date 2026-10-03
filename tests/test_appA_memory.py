@@ -372,9 +372,13 @@ def test_a_card_has_a_human_usual_line_one_summary_and_the_relation_from_the_sum
     person = contacts.Contact(id=1, key="dev", name="Dev", relation="the user's father", aliases=[], tone="short",
                               fact_ids=[fid, other], routes=[route])
     card = contacts.card(store, person, with_samples=0)
-    assert card["usual"]["label"] == "Discord DM" and card["usual"]["sub"] == "@dev"
-    assert card["usual"]["use"] == "Plans for the family trip." and card["usual"]["tone"] == "short"
-    assert "route:" not in json.dumps(card["usual"]["label"]) and card["usual_ref"] == "route:7"
+    usual = card["usual_route"]
+    assert usual["label"] == "Discord DM" and usual["sub"] == "@dev"
+    assert usual["use"] == "Plans for the family trip." and usual["tone"] == "short"
+    assert "route:" not in json.dumps(usual["label"]) and card["usual_ref"] == "route:7"
+    # a window that prints ``usual`` as it is gets a plain line, never an object (review A2)
+    assert card["usual"] == "Discord DM. Plans for the family trip."
+    assert contacts.usual_line({**usual, "use": None}) == "Discord DM \u00b7 @dev" and contacts.usual_line(None) is None
     assert card["summary"] == {"ref": f"fact:{fid}", "headline": "Your father, talks future plans with you",
                                "text": "Your father Dev talks with you about your future plans.", "pinned": False}
     assert card["relation"] == "Your father, talks future plans with you"           # never "the user's father"
@@ -390,7 +394,7 @@ def test_a_person_fact_written_after_the_link_run_still_attaches_by_name(store):
     fid = _fact(store, "person", "Mira", "Mira is the user's classmate.", summary="Your classmate")
     person = contacts.Contact(id=2, key="mira", name="Mira", relation=None, aliases=[], tone=None, fact_ids=[])
     card = contacts.card(store, person, with_samples=0)
-    assert card["summary"]["ref"] == f"fact:{fid}" and card["usual"] is None
+    assert card["summary"]["ref"] == f"fact:{fid}" and card["usual"] is None and card["usual_route"] is None
 
 
 # -- call digests ---------------------------------------------------------------------------------------------------
@@ -496,3 +500,142 @@ def test_dreaming_shows_closer_look_alikes_and_merges_a_behaviour_into_a_routine
                                     "importance": None, "journal_ids": [], "reason": "stale"}],
                                   store.portrait_facts(), set())
     assert rejected and "pinned" in rejected[0]
+
+
+# -- review fixes (report 43, "Review fixes") ------------------------------------------------------------------------
+
+
+def _scheduler(store, worker, *, clock=None, logs=None):
+    from yuki.memory.portrait import PortraitScheduler
+
+    logs = [] if logs is None else logs
+    return PortraitScheduler(store, worker, db_path=store.path, log=lambda t, **f: logs.append((t, f)),
+                             idle_fn=lambda: 1e9, clock=clock or (lambda: NOW))
+
+
+def test_the_day_that_just_ended_gets_its_digest_at_the_rollover_and_failures_back_off(store):
+    """A1: the nightly slot (22:00) comes before the user day ends (04:00), so the first check of each new day
+    writes the day that just ended. A6: a day whose call keeps failing is tried at most three times a run."""
+    from yuki.memory.daydigest import MAX_TRIES_PER_DAY, day_window, previous_days, today
+
+    yesterday = previous_days(1, NOW)[0]
+    start, end = day_window(yesterday)
+    _journal(store, "The user opened the garden planner.", at=start + 3600)
+    store.apply_work([WorkOp("starts", None, title="Garden planner", state="The user drew the beds.",
+                             at=start + 3600, seen_at=start + 3600)])
+    # 22:05 on that day: the nightly slot's pass cannot cover it yet (it is not over)
+    assert yesterday not in previous_days(2, end - 6 * 3600 + 300)
+    failing = _Worker(store, [None] * (MAX_TRIES_PER_DAY + 2))
+    sched = _scheduler(store, failing)
+    assert sched._daydigest_rollover(NOW) and not sched._daydigest_rollover(NOW + 60)   # once per user day
+    assert sched._daydigest_rollover(day_window(today(NOW))[1] + 60)                    # and again the next day
+    for _ in range(MAX_TRIES_PER_DAY + 2):
+        sched._daydigest("connector asked")
+    assert len(failing.calls) == MAX_TRIES_PER_DAY                                    # then it stops asking
+    good = _Worker(store, [{"text": "The user drew the garden beds.", "shown": "You drew the garden beds.",
+                            "open": []}])
+    sched = _scheduler(store, good)                                                    # a new service run
+    assert sched._daydigest("day rollover") == "daydigest"
+    assert [d["day"] for d in store.day_digests(days=[yesterday])] == [yesterday]
+    assert sched._daydigest("day rollover") is None and len(good.calls) == 1          # written: no more calls
+
+
+def test_a_digest_without_its_shown_form_is_retried_once(store):
+    from yuki.memory.daydigest import DayDigester, day_window, previous_days
+
+    yesterday = previous_days(1, NOW)[0]
+    start, _ = day_window(yesterday)
+    store.apply_work([WorkOp("starts", None, title="Garden planner", state="The user drew the beds.",
+                             at=start + 3600, seen_at=start + 3600)])
+    store.save_day_digest(yesterday, "The user worked on the garden planner.", None, {"exchanges": 0})
+    worker = _Worker(store, [{"text": "The user worked on the garden planner.", "shown": "", "open": []}])
+    assert DayDigester(worker).missing([yesterday]) == [yesterday]
+    r = DayDigester(worker).run(days=[yesterday], now=NOW)
+    assert r.calls == 1 and r.failed == [yesterday]
+    [d] = store.day_digests(days=[yesterday])
+    assert d["text"] == "The user worked on the garden planner." and d["refs"]["shown_retried"] is True
+    assert DayDigester(worker).missing([yesterday]) == []                              # once only
+
+
+def test_the_resume_block_never_calls_an_older_digest_the_last_day_and_asks_for_yesterdays(store):
+    from yuki.memory.daydigest import DAYDIGEST_FLAG, day_window, previous_days
+    from yuki.memory.store import flag_path
+
+    yesterday, before = previous_days(2, NOW)
+    store.save_day_digest(before, "The user planned the seed order.", "You planned the seed order.", {})
+    start, _ = day_window(yesterday)
+    client = MemoryClient(store)
+    client.log_turn("s1", 1, start + 3600, "open the garden planner", "Done.", [], "final")
+    store.flush_turns(5.0)
+    resume = client._resume_from_day(NOW)
+    assert "planned the seed order" in resume and "last day" not in resume
+    assert "talked with you yesterday, whose digest is not written yet" in resume
+    assert flag_path(store.path, DAYDIGEST_FLAG).exists()                             # the service builds it
+    store.save_day_digest(yesterday, "The user drew the beds.", "You drew the beds.", {})
+    assert MemoryClient(store)._resume_from_day(NOW).startswith("[Yesterday (")
+
+
+def test_an_undo_after_the_correction_pass_started_keeps_the_answer(store):
+    """A3: the restore depends on cancelling the queued pass; once the pass started, the item stays removed."""
+    client = MemoryClient(store)
+    fid = _fact(store, "interest", "Kites", "The user flies kites.", confidence=0.4, shown="You fly kites.")
+    wrong = client.review_mark(f"fact:{fid}", "wrong")
+    store._write(lambda c: c.execute("UPDATE correction_passes SET status='applying' WHERE correction_id=?",
+                                     (wrong["correction_id"],)))
+    undo = client.review_mark(f"fact:{fid}", "undo", correction_id=wrong["correction_id"])
+    assert not undo["ok"] and undo["cancelled"] is False and "Too late" in undo["error"]
+    assert store.portrait_fact(fid).valid_to is not None                             # still retired
+    heard = _journal(store, "Said what sounded like 'kite day'.", at=NOW - 600, nature="uncertain")
+    out = client.resolve_heard(f"journal:{heard}", "wrong")
+    store._write(lambda c: c.execute("UPDATE correction_passes SET status='applying' WHERE correction_id=?",
+                                     (out["correction_id"],)))
+    undo = client.resolve_heard(f"journal:{heard}", "undo", correction_id=out["correction_id"])
+    assert not undo["ok"] and "Too late" in undo["error"]
+    assert heard not in [i["id"] for i in client.misheard(now=NOW)["items"]]
+
+
+def test_one_answer_then_a_same_day_update_counts_once(store):
+    """A4: a later version carries reviewed_at over; the daily cap counts answers, not versions."""
+    client = MemoryClient(store)
+    ids = [_fact(store, "interest", f"Topic {n}", f"The user likes topic {n}.", confidence=0.3, importance=6,
+                 shown=f"You like topic {n}.") for n in range(3)]
+    assert client.review_mark(f"fact:{ids[0]}", "right")["ok"]
+    [(ok, new)] = store.commit_portrait_changes(None, [FactChange(
+        "UPDATE", ids[0], "interest", "Topic 0", "The user likes topic 0 a lot.", 0.9, [], NOW + 5, "model")])
+    assert ok and store.portrait_fact(new).reviewed_at is not None
+    q = client.review_queue(now=NOW + 10)
+    assert q["reviewed_today"] == 1 and q["left_today"] == 4
+
+
+def test_the_shown_pass_keeps_its_own_attempt_count(store):
+    """A5: a fact's label failing three times never blocks its shown form (both were keyed P<id>)."""
+    fid = _fact(store, "interest", "Kites", "The user flies kites.", summary=None, shown=None)
+    t = titles.Titler(_Worker(store))
+    t._failed[f"P{fid}"] = titles.MAX_ATTEMPTS
+    assert f"P{fid}" not in [p.ref for p in t.pending(only={"fact": [fid]})]
+    assert [p.ref for p in t.pending_shown(only={"fact": [fid]}, now=NOW)] == [f"P{fid}"]
+
+
+def test_an_undo_on_an_entry_never_answered_changes_nothing(store):
+    """A7: Undo on an unanswered fact entry must not turn it into a "maybe misheard" one."""
+    client = MemoryClient(store)
+    jid = _journal(store, "The user opened the garden planner.", at=NOW - 600)
+    out = client.resolve_heard(f"journal:{jid}", "undo")
+    assert not out["ok"] and store.journal_by_ids([jid])[0].nature == "fact"
+    assert client.misheard(now=NOW)["items"] == []
+
+
+def test_a_titles_run_of_shown_forms_only_is_logged(store):
+    """A8: the scheduler logs a pass that wrote only shown forms (model calls) and reports it."""
+    _fact(store, "interest", "Kites", "The user flies kites.", summary="Flies kites", shown=None)
+    logs = []
+    sched = _scheduler(store, _Worker(store), logs=logs)
+
+    class _Titler:
+        def run(self, reason=""):
+            return titles.TitlesResult(shown_pending=2, shown_written=2, calls=1, cost_usd=0.01)
+
+    sched._titler = _Titler()
+    assert sched._titles("idle") == "titles"
+    [(_, fields)] = [entry for entry in logs if entry[0] == "portrait_run"]
+    assert fields["kind"] == "titles" and fields["shown_pending"] == 2 and fields["shown_written"] == 2

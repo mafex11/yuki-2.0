@@ -3066,6 +3066,10 @@ class PortraitScheduler:
         self._titles_at = 0.0
         #: The waiting questions' re-check against memory (questions.revet): earliest next pass.
         self._revet_at = 0.0
+        #: The user day (yuki.memory.daydigest.today) whose rollover pass already ran (None: not yet in this run),
+        #: and the failed digest attempts per day in this run (review A1, A6).
+        self._digest_day: str | None = None
+        self._digest_tries: dict[str, int] = {}
 
     def _log(self, type: str, **fields: Any) -> None:
         if self._log_fn is not None:
@@ -3205,6 +3209,10 @@ class PortraitScheduler:
             return self._run(kind, reason)
         if now >= self._loop_check_at and self.worker.loop_check_pending():
             return self._check_loops(now)
+        if self._daydigest_rollover(now):
+            ran = self._daydigest("day rollover")
+            if ran:
+                return ran
         if self._daydigest_wanted():
             return self._daydigest("connector asked")
         if now >= self._titles_at:
@@ -3220,21 +3228,43 @@ class PortraitScheduler:
         except OSError:
             return False
 
+    def _daydigest_rollover(self, now: float) -> bool:
+        """True once per user day, at the first check after it began (04:00) or after the service started: the day
+        that just ended gets its digest by morning. The nightly slot (``nightly_hour``, 22:00) comes before the user
+        day ends, so it can only cover the days before (review A1). Content-free; a day already written costs one
+        indexed read and no call."""
+        from yuki.memory.daydigest import today
+
+        day = today(now)
+        if day == self._digest_day:
+            return False
+        self._digest_day = day
+        return True
+
     def _daydigest(self, kind: str) -> str | None:
         """The day digests of the last completed days that have none (:class:`yuki.memory.daydigest.DayDigester`, one
-        Haiku call a day). Logs and never raises."""
-        from yuki.memory.daydigest import DayDigester
+        Haiku call a day); a day whose call failed :data:`yuki.memory.daydigest.MAX_TRIES_PER_DAY` times in this run
+        is left alone (review A6: the connector asks again on every window request). Logs and never raises."""
+        from yuki.memory.daydigest import MAX_TRIES_PER_DAY, NIGHT_DAYS, DayDigester, previous_days
 
         if not hasattr(self.worker, "_call"):
             return None
+        now = self.clock()
+        days = [d for d in previous_days(NIGHT_DAYS, now) if self._digest_tries.get(d, 0) < MAX_TRIES_PER_DAY]
+        if not days:
+            return None
         try:
-            result = DayDigester(self.worker).run(reason=f"after the {kind} run" if kind in JOURNAL_RUN_KINDS else kind)
+            result = DayDigester(self.worker).run(days=days, now=now,
+                                                  reason=f"after the {kind} run" if kind in JOURNAL_RUN_KINDS else kind)
         except Exception as exc:
             self._log("error", where="portrait_daydigest", error=f"{type(exc).__name__}: {exc}",
                       traceback=traceback.format_exc())
             return None
+        for d in result.failed:
+            self._digest_tries[d] = self._digest_tries.get(d, 0) + 1
         self._log("portrait_run", kind="daydigest", ok=result.ok, run_id=result.run_id, days=len(result.days),
-                  calls=result.calls, cost_usd=round(result.cost_usd, 6), error=result.error)
+                  failed=len(result.failed), calls=result.calls, cost_usd=round(result.cost_usd, 6),
+                  error=result.error)
         return "daydigest" if result.calls else None
 
     def _titles(self, reason: str, *, gated: bool = True) -> str | None:
@@ -3261,12 +3291,13 @@ class PortraitScheduler:
             self._log("error", where="portrait_titles", error=f"{type(exc).__name__}: {exc}",
                       traceback=traceback.format_exc())
             return None
-        if not result.pending:
+        if not (result.pending or result.shown_pending):   # a pass of shown forms only is a run too (review A8)
             return None
         if not result.ok:
             self._titles_at = now + self.retry_after_s
         self._log("portrait_run", kind="titles", ok=result.ok, run_id=result.run_id, reason=reason,
-                  pending=result.pending, written=result.written, calls=result.calls,
+                  pending=result.pending, written=result.written, shown_pending=result.shown_pending,
+                  shown_written=result.shown_written, calls=result.calls,
                   cost_usd=round(result.cost_usd, 6), rejected=len(result.rejected), error=result.error)
         return "titles"
 

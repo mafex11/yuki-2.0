@@ -6027,8 +6027,11 @@ class Store:
         return bool(self._write(op))
 
     def review_counts(self, since: float) -> int:
-        """How many portrait facts (any version) the user reviewed since ``since`` (the queue's daily cap)."""
-        return int(self._query("SELECT count(*) FROM portrait_facts WHERE reviewed_at >= ?", (float(since),))[0][0])
+        """How many answers the user gave in the "To review" queue since ``since`` (the queue's daily cap). Counted by
+        distinct answer time: a later version of an answered fact carries its ``reviewed_at`` over, so one answer
+        followed by a same-day update is still one answer (review A4)."""
+        return int(self._query("SELECT count(DISTINCT reviewed_at) FROM portrait_facts WHERE reviewed_at >= ?",
+                               (float(since),))[0][0])
 
     def resolve_journal(self, journal_id: int, verdict: str, *, now: float | None = None) -> dict[str, Any] | None:
         """The user's verdict on a "maybe misheard" journal entry (migration 33), deterministic, no model:
@@ -6066,6 +6069,8 @@ class Store:
                     conn.execute("UPDATE journal SET superseded_at=NULL, superseded_by=NULL, reviewed_at=NULL"
                                  " WHERE id=?", (int(journal_id),))
                 else:
+                    if row["reviewed_at"] is None:
+                        return None   # never answered: nothing to take back (review A7)
                     conn.execute("UPDATE journal SET nature='uncertain', reviewed_at=NULL WHERE id=?",
                                  (int(journal_id),))
                 line = "took back the answer"

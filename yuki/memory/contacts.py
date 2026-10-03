@@ -1495,6 +1495,7 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
     # the window's other facts about them (never the summary's own fact again: report 38 §3), said to the user
     more = [{"ref": f"fact:{f.id}", "headline": f.summary, "text": f.shown or f.summary} for f in mine[1:]
             if f.shown or f.summary]
+    usual = usual_label(routes, contact.tone)
     return {"ref": contact.ref, "name": contact.name,
             # the user-facing relation is the person fact's own short label (written to the user, "Your father"),
             # else the linking call's phrase; the agent's card text keeps the memory form (relation_memory)
@@ -1503,7 +1504,10 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
             "aliases": [a["name"] for a in contact.aliases if a.get("how") != "heard"], "heard": contact.heard(),
             "tone": contact.tone, "facts": facts, "summary": summary, "facts_shown": more, "routes": routes,
             "margin": ranking.margin,
-            "close": ranking.close, "usual": usual_label(routes, contact.tone),
+            # ``usual`` stays a plain line any window can print as it is ("Slack DM. Code questions go on the PR.");
+            # the structured form is ``usual_route`` (review A2: a window that passes ``usual`` through as a string
+            # must never print an object)
+            "close": ranking.close, "usual": usual_line(usual), "usual_route": usual,
             "usual_ref": routes[0]["ref"] if routes else None, "preferred": ranking.preferred,
             "calls": calls_with(store, contact, seen=calls_seen)}
 
@@ -1533,6 +1537,20 @@ def usual_label(routes: Sequence[dict[str, Any]], tone: str | None = None) -> di
     return {"ref": r.get("ref"), "label": r.get("human") or r.get("label"), "sub": sub or None, "use": r.get("use"),
             "mine": r.get("mine"), "theirs": r.get("theirs"), "last_at": last, "tone": tone or None,
             "preferred": bool(r.get("preferred"))}
+
+
+def usual_line(usual: dict[str, Any] | None) -> str | None:
+    """The usual route as one plain line (deterministic formatting of :func:`usual_label`): the route's name, then
+    what the user uses it for when the linking call wrote it ("Slack DM. Code questions go on the PR."), else the
+    handle or chat ("Discord DM · @dev"). None without routes."""
+    if not usual or not usual.get("label"):
+        return None
+    label = " ".join(str(usual["label"]).split())
+    use = " ".join(str(usual.get("use") or "").split())
+    if use:
+        return f"{label.rstrip('.')}. {use}"
+    sub = " ".join(str(usual.get("sub") or "").split())
+    return f"{label} · {sub}" if sub else label
 
 
 def card_text(c: dict[str, Any]) -> str:
