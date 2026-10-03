@@ -34,6 +34,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWi
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
 from yuki.ui.surface import SurfaceWindow
+from yuki.ui.lattice_cards import LatticeCard
 from yuki.ui.nudges import BUSY_NOTIFICATION_STATES, NudgeWatcher, notification_state
 from yuki.ui.status import STRIP_HEIGHT, STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
@@ -56,13 +57,14 @@ HEADPHONES_NOTE = "Only with headphones, so other people's voices aren't picked 
 def consent_text(call: dict[str, Any]) -> tuple[str, str, str]:
     """``(question, detail, headphones note or "")`` for a ``call_status()["call"]``."""
     app = str(call.get("app") or "this app")
-    detail = ("Only your microphone, kept encrypted and turned into text on this PC later, "
-              "when it's free. Nobody else is recorded.")
+    # the Lattice design's words: the call, then the question with what is kept and when it becomes text
+    detail = ("Keep a private timeline of what you say? Only your mic, never theirs. I transcribe it later, "
+              "when the GPU is idle.")
     note = ""
     if call.get("headphones") is False:
         output = call.get("form_factor") or "not headphones"
         note = f"{HEADPHONES_NOTE} Your sound is on {output} now, so I'd wait for headphones."
-    return "Remember what you say in this call?", detail, note
+    return f"You’re on a {app} call." if call.get("app") else "You’re on a call.", detail, note
 
 
 def waiting_text(waiting: Any) -> str:
@@ -109,9 +111,10 @@ class CallWatcher(NudgeWatcher):
         self.arrived.emit(status if isinstance(status, dict) else {}, why)
 
 
-class CallConsentCard(SurfaceWindow):
-    """The consent card (Horizon): a live LED and "Discord started a call", the question, what is and is not
-    recorded, No and Yes, and under a rule "Never for Discord" and "Always for Discord". Never takes focus.
+class CallConsentCard(LatticeCard):
+    """The consent card in the Lattice design (top right, the design's ``.card.top``): "Call · Discord · 21:06", the
+    question in 17 px, what is and is not recorded, **Record my side** and **Not this call**, and a check
+    "Always for Discord" (checked: Record answers ``always``, Not this call answers ``never``). Never takes focus.
 
     Signals:
         answered: ``(call, answer)`` -- ``yes`` | ``no`` | ``always`` | ``never``, or ``none``
@@ -119,100 +122,52 @@ class CallConsentCard(SurfaceWindow):
     """
 
     answered = Signal(object, str)
+    corner = "top"
 
     def __init__(self) -> None:
-        super().__init__(activates=False)
+        super().__init__(icon="call")
         self.setObjectName("YukiCallConsentCard")
         self.call: dict[str, Any] | None = None
-        self.setFixedWidth(CARD_WIDTH + 2 * self.SHADOW)
-        from yuki.ui.window.theme import variable_font
-        from yuki.ui.window.widgets import Led
+        from yuki.ui import lattice as L
 
-        column = QVBoxLayout(self)
-        column.setContentsMargins(self.SHADOW + 20, self.SHADOW + 16, self.SHADOW + 20, self.SHADOW + 12)
-        column.setSpacing(6)
-        who = QHBoxLayout()
-        who.setSpacing(6)
-        self.led = Led(self.theme(), "on", 7, parent=self)
-        who.addWidget(self.led, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.title = QLabel("A call started", self)
-        self.title.setFont(variable_font(12, "Regular"))
-        who.addWidget(self.title, 1)
-        self.when = QLabel("", self)
-        self.when.setFont(variable_font(12, "Regular"))
-        who.addWidget(self.when)
-        column.addLayout(who)
-        column.addSpacing(4)
-        self.question = QLabel(self)
-        self.question.setFont(variable_font(19, "Regular", display=True))
-        self.question.setWordWrap(True)
-        column.addWidget(self.question)
-        self.detail = QLabel(self)
-        self.detail.setFont(variable_font(13.5, "Regular"))
-        self.detail.setWordWrap(True)
-        column.addWidget(self.detail)
-        self.note = QLabel(self)
-        self.note.setFont(variable_font(13, "Regular"))
-        self.note.setWordWrap(True)
-        column.addWidget(self.note)
-        for label in (self.title, self.when, self.question, self.detail, self.note):
-            label.setTextFormat(Qt.TextFormat.PlainText)
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        row1.addStretch(1)
-        self.no_button = self._button("No", primary=False)
-        self.yes_button = self._button("Yes", primary=True)
-        row1.addWidget(self.no_button)
-        row1.addWidget(self.yes_button)
-        column.addSpacing(8)
-        column.addLayout(row1)
-        column.addSpacing(8)
-        self._rule_y = 0
-        self.rule = QWidget(self)
-        self.rule.setFixedHeight(1)
-        column.addWidget(self.rule)
-        row2 = QHBoxLayout()
-        row2.setSpacing(18)
-        self.never_button = self._button("Never", primary=False, small=True)
-        self.always_button = self._button("Always", primary=False, small=True)
-        row2.addWidget(self.never_button)
-        row2.addWidget(self.always_button)
-        row2.addStretch(1)
-        column.addLayout(row2)
-        for button, answer in ((self.yes_button, "yes"), (self.no_button, "no"),
-                               (self.always_button, "always"), (self.never_button, "never")):
-            button.clicked.connect(lambda _=False, a=answer: self._answer(a))
-
+        self.title = L.Label("A call started", parent=self)   # the words of the header ("Discord started a call")
+        self.title.hide()
+        self.when = L.Label("", parent=self)
+        self.when.hide()
+        self.question = L.Para("", font=L.ui_font(17, 600), line_height=1.45, parent=self)
+        self.content.addWidget(self.question)
+        self.content.addSpacing(6)
+        self.detail = L.Para("", font=L.ui_font(14), color=L.TEXT2, line_height=1.45, parent=self)
+        self.content.addWidget(self.detail)
+        self.note_gap = QWidget(self)
+        self.note_gap.setFixedHeight(6)
+        self.content.addWidget(self.note_gap)
+        self.note = L.Para("", font=L.ui_font(13), line_height=1.45, parent=self)   # said plainly (no warning colour)
+        self.content.addWidget(self.note)
+        acts = QHBoxLayout()
+        acts.setContentsMargins(0, 14, 0, 0)
+        acts.setSpacing(6)
+        self.yes_button = L.Key("Record my side", variant="pri", size="sm", icon="rec", parent=self)
+        self.no_button = L.Key("Not this call", size="sm", parent=self)
+        self.always_button = L.Check("Always for this app", self)
+        #: Kept for older callers: "never" is Not this call with the check on.
+        self.never_button = L.Key("Never", variant="ghost", size="xs", parent=self)
+        self.never_button.hide()
+        acts.addWidget(self.yes_button)
+        acts.addWidget(self.no_button)
+        acts.addStretch(1)
+        acts.addWidget(self.always_button)
+        self.content.addLayout(acts)
+        self.yes_button.clicked.connect(lambda: self._answer("always" if self.always_button.isChecked() else "yes"))
+        self.no_button.clicked.connect(lambda: self._answer("never" if self.always_button.isChecked() else "no"))
+        self.never_button.clicked.connect(lambda: self._answer("never"))
+        self.x_button.clicked.connect(lambda: self._answer("no"))
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
         self._timeout.timeout.connect(lambda: self._answer("none"))
-        self.restyle()
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (settings changed)
-        t = self.theme()
-        self.led.t = t
-        self.led.update()
-        self.title.setStyleSheet(f"color: {self.ink_css('text_3')};")
-        self.when.setStyleSheet(f"color: {self.ink_css('text_3')};")
-        self.question.setStyleSheet(f"color: {self.ink_css('text')};")
-        self.detail.setStyleSheet(f"color: {self.ink_css('text_2')};")
-        self.note.setStyleSheet(f"color: {self.ink_css('text')};")   # said plainly (no warning colour)
-        self.rule.setStyleSheet(f"background: {self.ink_css('text_3')};")
-        self.rule.setStyleSheet(f"background: rgba({t.float_sep.red()},{t.float_sep.green()},{t.float_sep.blue()},255);")
-        self.yes_button.setStyleSheet(self.button_css("default"))
-        self.no_button.setStyleSheet(self.button_css("ghost"))
-        quiet = self.button_css("ghost").replace("padding: 0px 14px", "padding: 0px 0px")
-        for button in (self.never_button, self.always_button):
-            button.setStyleSheet(quiet)
-
-    def _button(self, text: str, *, primary: bool, small: bool = False) -> QPushButton:
-        from yuki.ui.window.theme import variable_font
-
-        button = QPushButton(text, self)
-        button.setFont(variable_font(13, "Semibold" if primary else "Regular"))
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # the card never takes the keyboard
-        return button   # styled as a pill in restyle()
+        self.update()
 
     def set_call(self, call: dict[str, Any]) -> None:
         """Fill the card for one call and size it (no showing)."""
@@ -224,30 +179,23 @@ class CallConsentCard(SurfaceWindow):
         self.title.setText(f"{app_name} started a call" if app_name else "A call started")
         moment = local_moment(call.get("detected_at"))
         self.when.setText(moment.strftime("%H:%M") if moment else "")
-        self.question.setText(question)
-        self.detail.setText(detail)
-        self.note.setText(note)
+        self.set_head("call", " · ".join(x for x in ("Call", app_name, self.when.text()) if x))
+        self.question.set_text(question)
+        self.detail.set_text(detail)
+        self.note.set_text(note)
         self.note.setVisible(bool(note))
+        self.note_gap.setVisible(bool(note))
         app = str(call.get("app") or "this app")
         self.always_button.setText(f"Always for {app}")
+        self.always_button.setChecked(False)
         self.never_button.setText(f"Never for {app}")
-        remember = bool(call.get("can_remember_choice", True))
-        self.always_button.setVisible(remember)
-        self.never_button.setVisible(remember)
-        self.rule.setVisible(remember)
-        self.layout().activate()
-        width = CARD_WIDTH + 2 * self.SHADOW
-        lay = self.layout()
-        wanted = lay.totalHeightForWidth(width) if lay.hasHeightForWidth() else lay.sizeHint().height()
-        self.setFixedHeight(max(120 + 2 * self.SHADOW, wanted))
+        self.always_button.setVisible(bool(call.get("can_remember_choice", True)))
+        self.fit_height()
         self.update()
 
-    def anchor(self, *, above: int = 0) -> QPoint:
-        screen = QGuiApplication.primaryScreen()
-        area = screen.availableGeometry() if screen else self.geometry()
-        x = area.right() - self.width() + self.SHADOW - STRIP_MARGIN
-        y = area.bottom() - self.height() + self.SHADOW - STRIP_MARGIN - above
-        return QPoint(x, y)
+    def anchor(self, *, above: int = 0) -> QPoint:  # noqa: D102 - top right of the monitor in use
+        del above
+        return LatticeCard.anchor(self)
 
     def show_call(self, call: dict[str, Any], *, above: int = 0) -> None:
         self.set_call(call)
@@ -270,6 +218,7 @@ class CallConsentCard(SurfaceWindow):
         self.fade_out()
         if call is not None:
             self.answered.emit(call, answer)
+
 
 class CallIndicator(SurfaceWindow):
     """The call pill (Horizon x Field Unit): the accent recording dot, a small grey wave, the call's running

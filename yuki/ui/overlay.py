@@ -44,7 +44,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeyEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -69,11 +68,11 @@ from yuki.ui.surface import (
     ui_font,
 )
 
-#: Width of the panel (excluding the shadow margin), in logical pixels (Horizon's ask bar: 548-560).
-PANEL_WIDTH = 560
-
-#: Padding inside the panel (sides).
-PAD = 22
+#: Width of the ask bar (the Lattice design's ``.askbar``: 780 px) and its padding (18 px in).
+PANEL_WIDTH = 780
+PAD = 18
+#: The ask bar's top, from the top of the monitor in use (the design's ``top: 64px``).
+TOP_PX = 64
 
 #: How many cards (requests, replies and nudges together) stay on screen.
 MAX_CARDS = 5
@@ -366,8 +365,193 @@ class ReplyCard(QWidget):
         painter.drawRoundedRect(rect, 8, 8)
 
 
+class ResChip(QWidget):
+    """A resolved chip (the design's ``.res``): ``who Sam`` / ``where WhatsApp``: a 30 px pill, a mono key in text-3,
+    the value in 600. (No swap key: the agent acts at once, there is no plan to change yet.)"""
+
+    def __init__(self, key: str, value: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from yuki.ui import lattice as L
+
+        self.key, self.value = key, value
+        fk, fv = L.mono_font(10.5), L.ui_font(13.5, 600)
+        from PySide6.QtGui import QFontMetricsF
+
+        w = 11 + QFontMetricsF(fk).horizontalAdvance(key) + 6 + QFontMetricsF(fv).horizontalAdvance(value) + 8 + 2
+        self.setFixedSize(int(round(w)) + 1, 30)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102
+        from PySide6.QtGui import QFontMetricsF, QPainterPath
+
+        from yuki.ui import lattice as L
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.fillPath(path, L.RAISE)
+        p.setPen(QPen(L.HAIR2, 1.0))
+        p.drawPath(path)
+        fk, fv = L.mono_font(10.5), L.ui_font(13.5, 600)
+        x = 12.0
+        p.setFont(fk)
+        p.setPen(L.TEXT3)
+        kw = QFontMetricsF(fk).horizontalAdvance(self.key)
+        p.drawText(QRectF(x, 0, kw + 1, self.height()), Qt.AlignmentFlag.AlignVCenter, self.key)
+        x += kw + 6
+        p.setFont(fv)
+        p.setPen(L.TEXT)
+        p.drawText(QRectF(x, 0, self.width() - x, self.height()), Qt.AlignmentFlag.AlignVCenter, self.value)
+        p.end()
+
+
+class IntentCard(QWidget):
+    """The Intent card inside the ask bar (the design's ``.intent``: a clearing framed by four crop marks).
+
+    * **Unsent** (an offer put words in the ask bar): "In the ask bar · not sent", that nothing is sent until Enter,
+      and Send / Clear, with where the words came from;
+    * **Resolved** (a typed request whose task frame named a person): "Resolved from memory", the request, its
+      chips (who, where) and **because** (where the frame found them, and how long ago).
+    """
+
+    send = Signal()
+    clear = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from yuki.ui import lattice as L
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(20, 18, 20, 16)
+        col.setSpacing(0)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.icon = L.Icon("key", 10, L.TEXT3, self)
+        head.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.label = L.Para("", font=L.mono_font(11), color=L.TEXT3, line_height=1.2, parent=self, max_lines=1)
+        head.addWidget(self.label, 1)
+        col.addLayout(head)
+        self.title = L.Para("", font=L.ui_font(19, 600), line_height=1.45, parent=self)
+        self.title_gap = QWidget(self)
+        self.title_gap.setFixedHeight(10)
+        col.addWidget(self.title_gap)
+        col.addWidget(self.title)
+        self.text = L.Para("", font=L.ui_font(14), color=L.TEXT2, line_height=1.45, parent=self)
+        self.text_gap = QWidget(self)
+        self.text_gap.setFixedHeight(8)
+        col.addWidget(self.text_gap)
+        col.addWidget(self.text)
+        grid = QHBoxLayout()
+        grid.setContentsMargins(0, 16, 0, 0)
+        grid.setSpacing(14)
+        self.dt = L.Para("Resolved", font=L.mono_font(11), color=L.TEXT3, line_height=24 / 11, parent=self)
+        self.dt.setFixedWidth(78)
+        grid.addWidget(self.dt, 0, Qt.AlignmentFlag.AlignTop)
+        dd = QVBoxLayout()
+        dd.setSpacing(8)
+        self.chips_row = QHBoxLayout()
+        self.chips_row.setSpacing(8)
+        self.chips_row.addStretch(1)
+        dd.addLayout(self.chips_row)
+        self.because = L.Para("", font=L.ui_font(13), color=L.TEXT2, line_height=1.45, parent=self)
+        dd.addWidget(self.because)
+        grid.addLayout(dd, 1)
+        self.grid_box = QWidget(self)
+        self.grid_box.setLayout(grid)
+        col.addWidget(self.grid_box)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(0, 18, 0, 0)
+        foot.setSpacing(8)
+        self.k_send = L.Key("Send", variant="pri", icon="up", parent=self)
+        self.k_clear = L.Key("Clear", variant="ghost", parent=self)
+        self.k_send.clicked.connect(self.send.emit)
+        self.k_clear.clicked.connect(self.clear.emit)
+        foot.addWidget(self.k_send)
+        foot.addWidget(self.k_clear)
+        foot.addStretch(1)
+        self.source = L.Para("", font=L.mono_font(11), color=L.TEXT3, line_height=1.2, parent=self, max_lines=1)
+        foot.addWidget(self.source, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.foot_box = QWidget(self)
+        self.foot_box.setLayout(foot)
+        col.addWidget(self.foot_box)
+        self._chips: list[QWidget] = []
+        self.mode = ""
+
+    def show_unsent(self, source: str = "") -> None:
+        self.mode = "unsent"
+        self.icon.name = "key"
+        self.label.set_text("In the ask bar · not sent")
+        self.title.setVisible(False)
+        self.title_gap.setVisible(False)
+        self.text.set_text("I put it here for you. Nothing is sent until you press Enter, and you can change any "
+                           "word first.")
+        self.text.setVisible(True)
+        self.text_gap.setVisible(True)
+        self.grid_box.setVisible(False)
+        self.foot_box.setVisible(True)
+        self.source.set_text(source)
+        self.source.setFixedWidth(int(self.source.natural_width()) + 2)
+        self.show()
+
+    def show_resolved(self, request: str, frame: dict[str, Any]) -> bool:
+        """The frame's first person and their usual route as chips; ``False`` when the frame named nobody."""
+        persons = [p for p in (frame or {}).get("persons") or [] if isinstance(p, dict) and p.get("name")]
+        if not persons:
+            return False
+        person = persons[0]
+        routes = [r for r in person.get("routes") or [] if isinstance(r, dict)]
+        self.mode = "resolved"
+        self.icon.name = "memory"
+        self.label.set_text("Plan · resolved from memory")
+        self.title.set_text(request)
+        self.title.setVisible(bool(request))
+        self.title_gap.setVisible(bool(request))
+        self.text.setVisible(False)
+        self.text_gap.setVisible(False)
+        for c in self._chips:
+            c.deleteLater()
+        self._chips = [ResChip("who", str(person["name"]), self)]
+        if routes and (routes[0].get("label") or routes[0].get("app")):
+            self._chips.append(ResChip("where", str(routes[0].get("label") or routes[0].get("app")), self))
+        for k, c in enumerate(self._chips):
+            self.chips_row.insertWidget(k, c)
+        mine = routes[0].get("mine") if routes else None
+        because = []
+        where = (frame or {}).get("where")
+        if where:
+            because.append(str(where))
+        if isinstance(mine, (int, float)) and mine > 0:
+            because.append(f"you sent {int(mine)} messages there")
+        self.because.set_text(("because " + ", and ".join(because)) if because else "")
+        if because:
+            self.because.set_text("because " + ", and ".join(because),
+                                  [__import__("yuki.ui.lattice", fromlist=["Span"]).Span(0, 7, color=None, weight=500)])
+        self.because.setVisible(bool(because))
+        self.grid_box.setVisible(True)
+        self.foot_box.setVisible(False)
+        self.show()
+        return True
+
+    def hasHeightForWidth(self) -> bool:  # noqa: D102
+        return True
+
+    def heightForWidth(self, w: int) -> int:  # noqa: D102
+        return self.layout().totalHeightForWidth(w)
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102 - a clearing: four crop marks, nothing else
+        from yuki.ui import lattice as L
+
+        p = QPainter(self)
+        L.paint_crop_marks(p, QRectF(self.rect()))
+        p.end()
+
+
 class Overlay(SurfaceWindow):
-    """The overlay window.
+    """The ask bar in the Lattice design (phase E9): 780 px, 64 px from the top of the monitor in use, the field colour
+    with a ``#2E3135`` border and 22 px corners. On top the input row (the face at 4 px, your words at 19 px, Speak and
+    the shortcut), then the Intent card when there is one (words an offer put here unsent; a request's resolved chips),
+    the thread (the live chat, in the design's turns), and a foot of key hints with the call's timer.
 
     Signals:
         submitted: Text the user entered. The controller decides whether that is a
@@ -378,27 +562,84 @@ class Overlay(SurfaceWindow):
         opened: The overlay came up (from hidden or fading out; not a refocus
             of an overlay already open).
         do_nudge: ``(nudge)`` -- Do it on a card with an offer in the thread.
+        speak: Speak (a voice conversation).
     """
 
+    SHADOW = 0
     submitted = Signal(str)
     dismissed = Signal()
     opened = Signal()
     do_nudge = Signal(object)
+    speak = Signal()
 
     def __init__(self) -> None:
-        super().__init__(activates=True, radius=20)
+        super().__init__(activates=True, radius=22)
         self.setObjectName("YukiOverlay")
+        from yuki.ui import lattice as L
+        from yuki.ui.dots import FaceWidget
+
         #: Thread mode (attach_thread): the live chat thread, and the stand-ins handed out for cards.
         self.thread: Any = None
         self._thread_model: Any = None
         self._proxies: list[ThreadCard] = []
+        #: The call's ``(timer, app)`` for the foot, or None (the tray gives it: the island's clock).
+        self.call_line: Any = lambda: None
 
         outer = QVBoxLayout(self)
-        # Horizon's ask bar: the thread 20 px from the top, the input 15 px under a rule edge to edge
-        outer.setContentsMargins(self.SHADOW + PAD, self.SHADOW + 18, self.SHADOW + PAD, self.SHADOW + 15)
-        outer.setSpacing(30)
-
-        # The card stack scrolls inside a capped area; the input below it never moves off screen.
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        # the input row (the design's .ab-in): 64 px, 18 px in, the face, the words, Speak, the shortcut
+        self.top_row = QWidget(self)
+        self.top_row.setMinimumHeight(64 - 1)
+        row = QHBoxLayout(self.top_row)
+        row.setContentsMargins(18, 0, 12, 0)
+        row.setSpacing(14)
+        self.face = FaceWidget(4, self.top_row, blink=True)
+        self.face.set_state("listening")
+        row.addWidget(self.face, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.input = AskInput(self.top_row)
+        self.input.setFont(L.ui_font(19))
+        self.input.setPlaceholderText("Ask Yuki")
+        self.input.submitted.connect(self._on_submit)
+        self.input.escaped.connect(self.dismiss)
+        self.input.wants_height.connect(self._on_input_height)
+        self.input.textChanged.connect(self._on_text)
+        row.addWidget(self.input, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.speak_key = L.Key("Speak", size="sm", icon="mic", parent=self.top_row)
+        self.speak_key.clicked.connect(self.speak.emit)
+        row.addWidget(self.speak_key, 0, Qt.AlignmentFlag.AlignVCenter)
+        #: The shortcut that opens the ask bar, as a key hint ("Alt Shift").
+        self.hint = L.Kbd("Alt Shift", self.top_row)
+        row.addWidget(self.hint, 0, Qt.AlignmentFlag.AlignVCenter)
+        outer.addWidget(self.top_row)
+        # the Intent card (the design's .intent: 16 px under the input, 18 px in)
+        self.intent_box = QWidget(self)
+        ib = QVBoxLayout(self.intent_box)
+        ib.setContentsMargins(18, 16, 18, 0)
+        self.intent = IntentCard(self.intent_box)
+        self.intent.send.connect(lambda: self._on_submit(self.input.toPlainText().strip())
+                                 if self.input.toPlainText().strip() else None)
+        self.intent.clear.connect(self._clear_unsent)
+        ib.addWidget(self.intent)
+        self.intent_box.setVisible(False)
+        outer.addWidget(self.intent_box)
+        # the thread (the design's .ab-thread: a label, then the turns)
+        self.thread_head = L.Para("Earlier in this thread · today", font=L.mono_font(11), color=L.TEXT3,
+                                  line_height=1.2, parent=self, max_lines=1)
+        self.thread_head.setContentsMargins(0, 0, 0, 0)
+        head_box = QWidget(self)
+        hb = QVBoxLayout(head_box)
+        hb.setContentsMargins(18, 18, 18, 4)
+        hb.addWidget(self.thread_head)
+        self.head_box = head_box
+        head_box.setVisible(False)
+        outer.addWidget(head_box)
+        self.thread_box = QWidget(self)
+        self.thread_lay = QVBoxLayout(self.thread_box)
+        self.thread_lay.setContentsMargins(18, 0, 18, 10)
+        self.thread_lay.setSpacing(0)
+        outer.addWidget(self.thread_box)
+        # the card stack (the older non-thread mode) scrolls in the same place
         self._content = QWidget()
         self._content.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._cards = QVBoxLayout(self._content)
@@ -419,44 +660,42 @@ class Overlay(SurfaceWindow):
         smooth(self._scroll)
         self._scroll.setFixedHeight(0)
         self._scroll.setVisible(False)
-        outer.addWidget(self._scroll)
-        #: Keep the newest card in view while the user has not scrolled up.
+        self.thread_lay.addWidget(self._scroll)
         self._follow = True
         self._forwarding_wheel = False
         bar = self._scroll.verticalScrollBar()
         bar.rangeChanged.connect(self._on_scroll_range)
         bar.valueChanged.connect(self._on_scroll_value)
+        # the foot (the design's .ab-foot): key hints, the call's timer on the right
+        self.foot = QWidget(self)
+        self.foot.setFixedHeight(10 + 13 + 10)
+        fr = QHBoxLayout(self.foot)
+        fr.setContentsMargins(18, 0, 18, 0)
+        fr.setSpacing(18)
+        self.foot_keys: list[tuple[Any, Any]] = []
+        for key, words in (("Enter", "go"), ("Tab", "swap a chip"), ("Esc", "close")):
+            pair = QHBoxLayout()
+            pair.setSpacing(6)
+            k = L.Kbd(key, self.foot)
+            w = L.Para(words, font=L.mono_font(11), color=L.TEXT3, line_height=1.0, parent=self.foot, max_lines=1)
+            w.setFixedSize(int(w.natural_width()) + 2, 13)
+            pair.addWidget(k, 0, Qt.AlignmentFlag.AlignVCenter)
+            pair.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
+            fr.addLayout(pair)
+            self.foot_keys.append((k, w))
+        fr.addStretch(1)
+        self.call_icon = L.Icon("rec", 11, L.TEXT3, self.foot)
+        fr.addWidget(self.call_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.call_text = L.Para("", font=L.mono_font(11), color=L.TEXT3, line_height=1.0, parent=self.foot,
+                                max_lines=1)
+        fr.addWidget(self.call_text, 0, Qt.AlignmentFlag.AlignVCenter)
+        outer.addWidget(self.foot)
+        self._call_tick = QTimer(self)
+        self._call_tick.setInterval(1000)
+        self._call_tick.timeout.connect(self._update_call)
+        self._unsent_source = ""
 
-        self.input = AskInput(self)
-        from yuki.ui.window.theme import variable_font
-
-        self.input.setFont(variable_font(18, "Light", display=True))
-        self.input.setPlaceholderText("Ask Yuki")
-        self.input.submitted.connect(self._on_submit)
-        self.input.escaped.connect(self.dismiss)
-        self.input.wants_height.connect(self._on_input_height)
-        line = QHBoxLayout()
-        line.setContentsMargins(0, 0, 0, 0)
-        line.setSpacing(12)
-        line.addWidget(self.input, 1)
-        #: The shortcut that opens the ask bar, in quiet words on the right ("Alt Shift").
-        self.hint = QLabel(self)
-        self.hint.setFont(variable_font(12, "Regular"))
-        self.hint.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        line.addWidget(self.hint, 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addLayout(line)
-
-        self._input_effect = QGraphicsOpacityEffect(self.input)
-        self._input_effect.setOpacity(1.0)
-        self.input.setGraphicsEffect(self._input_effect)
-        self._input_fade = QPropertyAnimation(self._input_effect, b"opacity", self)
-        self._input_fade.setDuration(ANIM_MS)
-        self._input_collapse = QPropertyAnimation(self.input, b"maximumHeight", self)
-        self._input_collapse.setDuration(ANIM_MS)
-        self._input_collapse.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._input_collapse.valueChanged.connect(lambda *_: self.fit())
-        self._input_collapse.valueChanged.connect(lambda *_: self.hint.setVisible(self.input.maximumHeight() > 8))
-
+        self._input_effect = None
         self.input.setMaximumHeight(self.input.preferred_height())
         self.resize(PANEL_WIDTH + 2 * self.SHADOW, self.layout().sizeHint().height())
 
@@ -469,40 +708,111 @@ class Overlay(SurfaceWindow):
         self._grace_timer.timeout.connect(self._end_focus_grace)
         self.restyle()
 
-    # -- look (Horizon's ask bar, docs/UI-window.md) ---------------------------
+    # -- look (the Lattice ask bar) -------------------------------------------------------------------------
 
     def restyle(self) -> None:  # noqa: D102 - SurfaceWindow hook (theme changed)
         if not hasattr(self, "input"):
             return
+        from yuki.ui import lattice as L
         from yuki.ui import ui_settings
         from yuki.ui.window.widgets import combo_words
 
         combo = combo_words(ui_settings.current().open_hotkey or "alt+shift")
-        self.hint.setText(combo.replace(" + ", " "))
-        self.hint.setStyleSheet(f"color: {self.ink_css('text_3')}; background: transparent;")
-        sel = self.theme().accent_soft
+        self.hint.text = combo.replace(" + ", " ")
+        self.hint.setFixedSize(L.kbd_size(self.hint.text))
+        self.hint.update()
+        live = L.live()
         self.input.setStyleSheet(
             "QPlainTextEdit { background: transparent;"
-            f" color: {self.ink_css('text')};"
-            f" selection-background-color: rgba({sel.red()},{sel.green()},{sel.blue()},{sel.alpha()});"
+            f" color: {L.css(L.TEXT)};"
+            f" selection-background-color: {L.css(live)}; selection-color: {L.css(L.live_ink())};"
             " border: none; padding: 0px; }")
         pal = self.input.palette()
-        pal.setColor(pal.ColorRole.PlaceholderText, self.ink("text_3"))   # "Ask Yuki", quiet
+        pal.setColor(pal.ColorRole.PlaceholderText, L.TEXT3)
         self.input.setPalette(pal)
         if self.thread is not None:
             self.thread.restyle()
 
     def paintEvent(self, event: object) -> None:  # noqa: D102 - Qt override
-        super().paintEvent(event)
-        shown = self.thread.isVisible() if self.thread is not None else self._scroll.isVisible()
-        if self.input.maximumHeight() <= 0 or not shown:
-            return
-        # a rule between the conversation and the input, edge to edge
+        del event
+        from PySide6.QtGui import QPainterPath
+
+        from yuki.ui import lattice as L
+
         painter = QPainter(self)
-        panel = self.panel_rect()
-        y = self.input.geometry().top() - 15
-        painter.fillRect(QRectF(panel.left() + 1, y, panel.width() - 2, 1), self.theme().float_sep)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 21.5, 21.5)
+        painter.fillPath(path, L.BG)
+        painter.setPen(QPen(L.ASKBAR_BORDER, 1.0))
+        painter.drawPath(path)
+        y = self.top_row.geometry().bottom() + 1
+        painter.fillRect(QRectF(1, y, self.width() - 2, 1), L.HAIR)    # under the input row
+        fy = self.foot.geometry().top()
+        painter.fillRect(QRectF(1, fy, self.width() - 2, 1), L.HAIR)   # over the foot
         painter.end()
+
+    def _on_text(self) -> None:
+        """Words an offer put here stay "not sent" until Enter; the face listens while the field is empty."""
+        empty = not self.input.toPlainText().strip()
+        # the design's face listens in the ask bar, and rests while an offer's words wait unsent
+        self.face.set_state("idle" if (self.intent.mode == "unsent" and not empty) else "listening")
+        if empty and self.intent.mode == "unsent":
+            self.intent.hide()
+            self.intent.mode = ""
+            self.intent_box.setVisible(False)
+            self.fit()
+
+    def show_unsent(self, source: str = "") -> None:
+        """An offer's words are in the input, unsent: the Intent card says so (Send / Clear)."""
+        self.intent.show_unsent(source)
+        self.face.set_state("idle")
+        self.intent_box.setVisible(True)
+        self.foot_keys[0][1].set_text("send")
+        self.fit()
+
+    def show_resolved(self, request: str, frame: dict[str, Any]) -> None:
+        """A request's task frame named a person: its chips (who, where, because) in the Intent card."""
+        if self.intent.show_resolved(request, frame):
+            self.intent_box.setVisible(True)
+            self.fit()
+
+    def clear_intent(self) -> None:
+        self.intent.mode = ""
+        self.intent.hide()
+        self.intent_box.setVisible(False)
+        self.foot_keys[0][1].set_text("go")
+        self.fit()
+
+    def _clear_unsent(self) -> None:
+        self.input.clear()
+        self.clear_intent()
+        self.input.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _update_call(self) -> None:
+        line = None
+        try:
+            line = self.call_line()
+        except Exception:
+            line = None
+        on = bool(line)
+        self.call_icon.setVisible(on)
+        self.call_text.setVisible(on)
+        if on:
+            timer, app = line
+            self.call_text.set_text(f"{timer} on {app}" if app else str(timer))
+            self.call_text.setFixedSize(int(self.call_text.natural_width()) + 4, 13)
+            self.foot.layout().activate()
+
+    def showEvent(self, e: object) -> None:  # noqa: D102 - the call's clock runs only while the ask bar is up
+        super().showEvent(e)
+        self._update_call()
+        self._call_tick.start()
+
+    def hideEvent(self, e: object) -> None:  # noqa: D102
+        super().hideEvent(e)
+        self._call_tick.stop()
 
     # -- thread mode (the live chat thread) ------------------------------------
 
@@ -513,14 +823,14 @@ class Overlay(SurfaceWindow):
         from yuki.ui.chatview import ChatThreadView
 
         self._thread_model = model
-        self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 8,
-                                     margins=(0, 2, 2, 2), look="overlay", parent=self)
+        self.thread = ChatThreadView(model, self.theme, max_bubble=PANEL_WIDTH - 2 * PAD - 92,
+                                     margins=(0, 0, 2, 0), look="lattice", parent=self.thread_box)
         self.thread.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.thread.content_resized.connect(self.fit)
         self.thread.reply_nudge.connect(self._on_thread_reply)
         self.thread.do_nudge.connect(self.do_nudge.emit)
         self._scroll.setVisible(False)
-        self.layout().insertWidget(0, self.thread)
+        self.thread_lay.insertWidget(0, self.thread)
         self.fit()
 
     def _on_thread_reply(self, nudge: object) -> None:
@@ -545,26 +855,24 @@ class Overlay(SurfaceWindow):
     # -- geometry ----------------------------------------------------------
 
     def anchor(self) -> QPoint:
-        """Top-left to sit at: centred horizontally, upper third of the screen."""
-        screen = QGuiApplication.primaryScreen()
+        """Top-left to sit at: centred, 64 px from the top of the monitor in use (the design's ``.askbar``)."""
+        from yuki.ui.island import active_screen
+
+        screen = active_screen() or QGuiApplication.primaryScreen()
         area = screen.availableGeometry() if screen else self.geometry()
         width = PANEL_WIDTH + 2 * self.SHADOW
         x = area.left() + (area.width() - width) // 2
-        y = area.top() + int(area.height() * 0.18) - self.SHADOW
+        y = area.top() + TOP_PX - self.SHADOW
         return QPoint(x, y)
 
     def max_cards_height(self) -> int:
-        """Tallest the card stack may be on the overlay's screen (:data:`MAX_CARDS_FRACTION`)."""
+        """Tallest the thread may be on the overlay's screen (:data:`MAX_CARDS_FRACTION`)."""
         screen = self.screen() or QGuiApplication.primaryScreen()
         area = screen.availableGeometry() if screen else self.geometry()
         return max(120, int(area.height() * MAX_CARDS_FRACTION))
 
     def fit(self) -> None:
-        """Size the card stack to its content (capped), then the window to the layout.
-
-        Keeps the top-left fixed. Past the cap the stack scrolls and the input
-        stays where it is, below it.
-        """
+        """Size the thread to its content (capped), then the window to the layout. Keeps the top-left fixed."""
         if self.thread is not None:
             content = self.thread.content_height() if self._thread_model.items else 0
             stack = min(content, self.max_cards_height())
@@ -577,10 +885,15 @@ class Overlay(SurfaceWindow):
             if self._scroll.height() != stack or self._scroll.isVisible() != (stack > 0):
                 self._scroll.setFixedHeight(stack)
                 self._scroll.setVisible(stack > 0)
+        self.head_box.setVisible(stack > 0)
+        self.thread_box.setVisible(stack > 0)
         width = PANEL_WIDTH + 2 * self.SHADOW
-        height = self.layout().sizeHint().height()
+        self.layout().activate()
+        height = self.layout().totalHeightForWidth(width) if self.layout().hasHeightForWidth() else \
+            self.layout().sizeHint().height()
         if (self.width(), self.height()) != (width, height):
             self.resize(width, height)
+        self.update()
 
     # -- scrolling ---------------------------------------------------------
 
@@ -597,7 +910,6 @@ class Overlay(SurfaceWindow):
             self._scroll.verticalScrollBar().setValue(maximum)
 
     def _on_scroll_value(self, value: int) -> None:
-        # At the bottom: follow new content; scrolled up: leave the view where the user put it.
         self._follow = value >= self._scroll.verticalScrollBar().maximum() - 2
 
     def scroll_range(self) -> tuple[int, int]:
@@ -606,8 +918,6 @@ class Overlay(SurfaceWindow):
         return bar.value(), bar.maximum()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: D102 - Qt override
-        # The wheel scrolls the stack wherever it is turned over the panel (margins,
-        # the gap above the input), not only over the cards themselves.
         area = self.thread.area if self.thread is not None else self._scroll
         shown = self.thread.isVisible() if self.thread is not None else self._scroll.isVisible()
         if shown and not self._forwarding_wheel:
@@ -615,7 +925,7 @@ class Overlay(SurfaceWindow):
             try:
                 from yuki.ui.window.widgets import smooth
 
-                smooth(area).wheel(event)   # the same smooth, eased, kinetic scroll as over the thread itself
+                smooth(area).wheel(event)
             finally:
                 self._forwarding_wheel = False
             event.accept()
@@ -624,10 +934,9 @@ class Overlay(SurfaceWindow):
 
     def _on_input_height(self, height: int) -> None:
         """Follow the input's own growth as the user types onto a new line."""
-        if self.input.maximumHeight() > 0 and self._input_collapse.state() != (
-            QPropertyAnimation.State.Running
-        ):
+        if self.input.maximumHeight() > 0:
             self.input.setMaximumHeight(height)
+            self.top_row.setMinimumHeight(max(63, height + 22))
             self.fit()
 
     # -- show / hide -------------------------------------------------------
@@ -636,14 +945,8 @@ class Overlay(SurfaceWindow):
         return self.input
 
     def open(self) -> None:
-        """Show the overlay (or just refocus it) with the input ready to type in.
-
-        The grace period is armed before anything is shown, so the activation
-        messages of the hand-over cannot reach :meth:`changeEvent` as a "user
-        clicked away". :meth:`fade_in` then shows the window and takes the
-        foreground at once (:meth:`SurfaceWindow.take_focus`), focusing the input
-        before the first animation frame.
-        """
+        """Show the overlay (or just refocus it) with the input ready to type in (the grace period is armed before
+        anything is shown, so the hand-over's activation messages never read as "clicked away")."""
         coming_up = not self.isVisible() or self.closing
         self._focus_grace = True
         self._grace_timer.start()
@@ -678,13 +981,7 @@ class Overlay(SurfaceWindow):
             self.dismiss()
 
     def _end_focus_grace(self) -> None:
-        """Close the grace window; if the hand-over did not stick, try once more.
-
-        Losing activation from here on is a real focus-out again. If the overlay
-        is showing but not active right now, the activation lost a race (for
-        example to the window behind it); take it back once, without the
-        injected-key fallback, which :meth:`open` has already spent.
-        """
+        """Close the grace window; if the hand-over did not stick, try once more (without the injected key-up)."""
         self._focus_grace = False
         if self.isVisible() and not self.closing and not self.isActiveWindow():
             self.take_focus(reason="grace_end", allow_unlock=False)
@@ -708,17 +1005,7 @@ class Overlay(SurfaceWindow):
         tone: CardTone = "reply",
         accent: QColor | None = None,
     ) -> ReplyCard:
-        """Add a card at the bottom of the stack and animate it in.
-
-        Args:
-            prompt: Dim prompt line, usually what the user asked.
-            body: Body text; empty for a card that is still waiting.
-            tone: Colour treatment.
-            accent: Bar colour for a ``context`` card.
-
-        Returns:
-            The new card, so the caller can fill it in when the answer arrives.
-        """
+        """Add a card at the bottom of the stack (thread mode: a stand-in; the thread shows the exchange)."""
         if self.thread is not None:   # the thread shows the exchange from the chat model
             self.scroll_to_latest()
             return self._proxy(tone)  # type: ignore[return-value]
@@ -739,18 +1026,7 @@ class Overlay(SurfaceWindow):
     def add_nudge_card(
         self, nudge: dict[str, Any], label: str, *, accent: QColor | None = None, at: float
     ) -> ReplyCard | None:
-        """Put one of memory's nudges in the stack, in time order, and animate it in.
-
-        Args:
-            nudge: The nudge (kept on the card as ``card.nudge``).
-            label: The small label (``Yuki, 14:32, nudge``).
-            accent: Its kind's colour.
-            at: When the user saw it (epoch s): where it goes in the stack.
-
-        Returns:
-            The card, or ``None`` when the stack is full of newer cards, so it
-            would only be trimmed away again at once.
-        """
+        """Put one of memory's nudges in the stack, in time order (``None`` when the stack is full of newer cards)."""
         existing = self.nudge_card(nudge.get("id"))
         if existing is not None:
             return existing
@@ -766,7 +1042,6 @@ class Overlay(SurfaceWindow):
             label, " ".join(str(nudge.get("text") or "").split()), tone="nudge", accent=accent,
             at=at, nudge=nudge, parent=self._content,
         )
-        # Layout index of the card it goes before (cards are the only items).
         self._cards.insertWidget(index, card)
         self._watch(card)
         card.show()
@@ -807,32 +1082,20 @@ class Overlay(SurfaceWindow):
     # -- input -------------------------------------------------------------
 
     def collapse_input(self) -> None:
-        """Fade and collapse the input away (after a submit)."""
-        self._input_fade.stop()
-        self._input_fade.setStartValue(self._input_effect.opacity())
-        self._input_fade.setEndValue(0.0)
-        self._input_fade.start()
-        self._input_collapse.stop()
-        self._input_collapse.setStartValue(self.input.maximumHeight())
-        self._input_collapse.setEndValue(0)
-        self._input_collapse.start()
+        """After a submit: the field empties at once (the words are in the thread now); it stays in place."""
+        self.input.clear()
 
     def expand_input(self) -> None:
-        """Bring a cleared, focused input back below the cards."""
+        """A cleared, focused input (an offer's words put back with :meth:`show_unsent` after this)."""
         self.input.clear()
-        self._input_fade.stop()
-        self._input_fade.setStartValue(self._input_effect.opacity())
-        self._input_fade.setEndValue(1.0)
-        self._input_fade.start()
-        self._input_collapse.stop()
-        self._input_collapse.setStartValue(self.input.maximumHeight())
-        self._input_collapse.setEndValue(self.input.preferred_height())
-        self._input_collapse.start()
+        self.clear_intent()
+        self.input.setMaximumHeight(self.input.preferred_height())
         self.input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_submit(self, text: str) -> None:
-        """Collapse the input and hand the text to the controller."""
+        """Hand the text to the controller; the field empties."""
         self.collapse_input()
+        self.clear_intent()
         self.submitted.emit(text)
 
 

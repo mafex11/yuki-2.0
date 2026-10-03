@@ -119,6 +119,8 @@ class _Tiny(QAbstractButton):
                  pill: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.t, self.glyph, self.ink, self.pill = t, glyph, ink, pill
+        #: The Lattice fold (the ask bar): the chevron as a 9 px dot icon (turned down when open), mono words.
+        self.dots = False
         self.setText(text)
         self.setFont(variable_font(12.5, "Regular"))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -144,7 +146,13 @@ class _Tiny(QAbstractButton):
             ink = QColor(self.t.faint)
         p.setPen(ink)
         x = r.left() + (13 if self.pill else 1)
-        if self.glyph:
+        if self.glyph and self.dots:
+            from yuki.ui import lattice as L
+
+            L.paint_icon(p, QRectF(x, r.center().y() - 4.5, 9, 9), "chev", ink,
+                         rotate=90.0 if self.glyph == "down" else 0.0)
+            x += 17
+        elif self.glyph:
             f = font("icon_small")
             f.setPixelSize(10 if self.glyph in ("next", "down") else 11)
             p.setFont(f)
@@ -333,9 +341,10 @@ class _Steps(QWidget):
 
     toggled = Signal()
 
-    def __init__(self, t: Theme) -> None:
+    def __init__(self, t: Theme, *, lattice: bool = False) -> None:
         super().__init__()
         self.t = t
+        self.lattice = lattice
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 2)
@@ -354,7 +363,7 @@ class _Steps(QWidget):
     def refresh(self, item: Item, now: float) -> None:
         open_ = item.expanded_now()
         self.head.glyph = "down" if open_ else "next"
-        self.head.setText(item.work_line(now))
+        self.head.setText(self._line(item, now))
         self.head.updateGeometry()
         self.head.update()
         self.rows_box.setVisible(open_)
@@ -383,8 +392,16 @@ class _Steps(QWidget):
         for r in self._rows:
             self.rows.addWidget(r)
 
+    def _line(self, item: Item, now: float) -> str:
+        """The fold's head: "worked for 12 s, 5 steps"; the Lattice ask bar's "3 steps · 7 s, 8¢"."""
+        if not self.lattice:
+            return item.work_line(now)
+        n = len(item.real_steps())
+        parts = [fmt_seconds(item.work_seconds(now))] + ([item.meta] if item.meta else [])
+        return f"{n} step{'' if n == 1 else 's'} · {', '.join(parts)}"
+
     def tick(self, item: Item, now: float) -> None:
-        self.head.setText(item.work_line(now))
+        self.head.setText(self._line(item, now))
         self.head.updateGeometry()
         times, tail = item.step_times(now)
         for r in self._rows:
@@ -435,7 +452,10 @@ class _ItemWidget(QWidget):
             lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.row.addWidget(lab, 1)
             return
-        overlay = self.look == "overlay"
+        overlay = self.look in ("overlay", "lattice")
+        if self.look == "lattice" and item.kind in ("user", "assistant"):
+            self._build_turn(item)
+            return
         if item.kind == "user":
             self.row.addStretch(1)
             self.bubble = _Bubble(t, mine=True, look=self.look)
@@ -462,10 +482,11 @@ class _ItemWidget(QWidget):
             head = QHBoxLayout()
             head.setSpacing(8)
             head.addWidget(Wave("checkin", theme=lambda: t, size=(34, 10)), 0, Qt.AlignmentFlag.AlignVCenter)
-            from yuki.ui.nudges import card_offer, card_title
+            from yuki.ui.nudges import card_offer, card_title, checkin_moment
 
             joiner = " at " if overlay else ", "
-            title = card_title(nudge) if kind == "notice" else KIND_TITLES.get(kind, "Yuki")
+            checkin = checkin_moment(nudge) is not None
+            title = card_title(nudge) if kind == "notice" or checkin else KIND_TITLES.get(kind, "Yuki")
             missed = ", missed while you were away" if nudge.get("missed") else ""
             when = _label(t, f"{title}{joiner}{_stamp(item.at)}{missed}", "micro", t.text_3,
                           wrap=False, select=False)
@@ -492,7 +513,7 @@ class _ItemWidget(QWidget):
             self.offer_result: QLabel | None = None
             #: The offer's state as this thread last heard it (``nudge_state`` ``offer:<state>``), else its outcome.
             self.offer_state: str | None = str(nudge.get("_offer_state") or nudge.get("outcome") or "") or None
-            offer = card_offer(nudge) if kind != "question" else None
+            offer = card_offer(nudge) if kind != "question" or checkin else None   # a check-in may carry one
             if offer is not None:   # what the button will and won't do, in sight before the press
                 from yuki.ui.nudges import offer_label, offer_lines
 
@@ -570,6 +591,80 @@ class _ItemWidget(QWidget):
             self.row.addStretch(1)
         self._raw = ""
 
+    def _build_turn(self, item: Item) -> None:
+        """The ask bar's Lattice look (the design's ``.turn``): a mono "who" column (82 px: "you · 21:25", "yuki")
+        and the words beside it at 14 px; Yuki's steps fold under its words; a hair rule closes each turn."""
+        from yuki.ui import lattice as L
+
+        t = self.t
+        mine = item.kind == "user"
+        self.row.setContentsMargins(0, 10, 0, 0 if mine else 10)
+        self.row.setSpacing(10)
+        who = QLabel("you · " + _stamp(item.at) if mine else "yuki")
+        who.setFont(L.mono_font(11))
+        who.setFixedWidth(82)
+        who.setStyleSheet(f"color: {css(L.TEXT3)}; background: transparent;")
+        who.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        who.setContentsMargins(0, 2, 0, 0)
+        self.row.addWidget(who, 0, Qt.AlignmentFlag.AlignTop)
+        self.who = who
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        col.setContentsMargins(0, 0, 0, 0)
+        if mine:
+            self.text = _label(t, "", "body", t.text)
+            self.text.setFont(L.ui_font(14))
+            self.meta = _label(t, "", "micro", t.text_3, wrap=False, select=False)
+            self.meta.setVisible(False)
+            col.addWidget(self.text)
+            self.row.addLayout(col, 1)
+            return
+        self.bubble = _Bubble(t, mine=False, look="overlay")
+        self.text = _label(t, "", "body", t.text, markdown=True)
+        self.text.setFont(rich_font(14))
+        self.bubble.body.addWidget(self.text)
+        foot = QHBoxLayout()
+        foot.setSpacing(12)
+        self.meta = _label(t, "", "micro", t.text_3, wrap=False, select=False)
+        self.meta.setFont(L.mono_font(11))
+        foot.addWidget(self.meta)
+        self.copy = _Tiny(t, "Copy", "copy")
+        self.copy.clicked.connect(self._copy)
+        foot.addWidget(self.copy)
+        foot.addStretch(1)
+        self.bubble.body.addLayout(foot)
+        col.addWidget(self.bubble)
+        from yuki.ui.wave import Wave
+
+        self.live = QWidget()
+        self.live.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        live_row = QHBoxLayout(self.live)
+        live_row.setContentsMargins(0, 2, 4, 2)
+        live_row.setSpacing(10)
+        self.live_spin = Wave("think", theme=lambda: t, size=(34, 10))
+        live_row.addWidget(self.live_spin, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.live_label = _label(t, "Thinking…", "caption", t.text_3, wrap=False, select=False)
+        live_row.addWidget(self.live_label, 1)
+        self.live.setVisible(False)
+        col.addWidget(self.live, 0, Qt.AlignmentFlag.AlignLeft)
+        self.steps = _Steps(t, lattice=True)
+        self.steps.toggled.connect(lambda: self.toggle.emit(self.item_id))
+        self.steps.head.setFont(L.mono_font(11.5))
+        self.steps.head.dots = True
+        self.meta.setVisible(False)   # the design's turn: no time or Copy under Yuki's words
+        self.copy.setVisible(False)
+        self._lattice_quiet = True
+        col.addSpacing(8)
+        col.addWidget(self.steps)
+        self.row.addLayout(col, 1)
+        self._raw = ""
+
+    def paintEvent(self, _e: object) -> None:  # noqa: D102 - the Lattice turn's closing hair rule
+        if self.look == "lattice" and self.kind == "assistant":
+            p = QPainter(self)
+            p.fillRect(QRectF(0, self.height() - 1, self.width(), 1), self.t.border)
+            p.end()
+
     def _fit_width(self, text: str) -> None:
         """A reply takes the width its words need, up to the bubble's widest (Qt's own guess for wrapped rich
         text is a narrow column). Only grows while it streams, so the bubble never jumps narrower."""
@@ -640,7 +735,8 @@ class _ItemWidget(QWidget):
             if text and item.source != "voice":   # typed replies are Markdown: summary, bullets, bold, code
                 from yuki.ui.markdown import to_html
 
-                self.text.setText(to_html(text, t, px=15 if self.look == "overlay" else font("body").pixelSize()))
+                px = 15 if self.look == "overlay" else 14 if self.look == "lattice" else font("body").pixelSize()
+                self.text.setText(to_html(text, t, px=px))
             else:   # spoken replies are plain words, shown as they were said
                 import html as _html
 
@@ -650,7 +746,7 @@ class _ItemWidget(QWidget):
             if self.bubble.tone != tone:
                 self.bubble.tone = tone
                 self.bubble.update()
-            if self.look == "overlay":
+            if self.look in ("overlay", "lattice"):
                 parts = [f"Spoken at {_stamp(item.at)}" if item.source == "voice" else _stamp(item.at)]
             else:
                 parts = ["Yuki", _stamp(item.at)]
@@ -661,7 +757,9 @@ class _ItemWidget(QWidget):
             if item.meta:
                 parts.append(item.meta)
             self.meta.setText(", ".join(parts))
-            if self.copy is not None:
+            if getattr(self, "_lattice_quiet", False):
+                self.meta.setVisible(False)
+            elif self.copy is not None:
                 self.copy.setVisible(bool(text))
 
     def _refresh_offer(self, item: Item, now: float) -> None:
@@ -737,7 +835,7 @@ class ChatThreadView(QWidget):
         self.inner.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.lay = QVBoxLayout(self.inner)
         self.lay.setContentsMargins(*margins)
-        self.lay.setSpacing(12 if look == "window" else 14)
+        self.lay.setSpacing(12 if look == "window" else 0 if look == "lattice" else 14)
         self.area.setWidget(self.inner)
         outer.addWidget(self.area)
         self._widgets: dict[str, _ItemWidget] = {}
