@@ -627,3 +627,54 @@ def test_format_carry_and_diff_of_a_thousand_element_read_cost_little() -> None:
     T.format_window_tree(tree)
     elapsed = time.perf_counter() - started
     assert not change.any and elapsed < 1.0
+
+
+def test_a_read_stopped_by_its_cap_does_not_make_the_rest_gone() -> None:
+    model = WindowModel(5)
+    model.carry([_el(0, "Window", "W", rid=(1,)), _el(1, "Button", "Far", 0, rid=(2,))], read=1)
+    model.carry([_el(0, "Window", "W", rid=(1,))], read=2, partial=True)
+    assert model.gone(1) is None and 1 in model.latest
+
+
+def test_the_view_after_actions_reuses_the_after_read_while_the_events_show_no_change(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.perception.events import EventHub
+
+    source = _FakeSource()
+    hub = EventHub(lambda: source)
+    try:
+        desk = _PlayerDesk(monkeypatch)
+        d = _dispatcher(desk)
+        d.events = hub
+        hub.watch(7001, wait_s=1.0)
+        text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+        d.dispatch("click", {"element": _ids(text, "Mute"), "expect_hwnd": 7001})
+        reads = desk.reads
+        view = d.window_view(7001, settle=True, changes=True, near=_ids(text, "Mute"))
+        assert desk.reads == reads and view.reads == 0 and view.settled
+        assert '"Unmute"' in view.text   # the change since the thinker's read, from the reused read
+        source.sinks[7001]("property", 30005, None)
+        reads = desk.reads
+        d.window_view(7001, settle=False)
+        assert desk.reads == reads + 1    # an event since: read again
+    finally:
+        hub.close()
+
+
+class _CutShortDesk(_PlayerDesk):
+    def get_window_tree(self, hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0) -> T.WindowTree:
+        tree = super().get_window_tree(hwnd, max_elements=max_elements, timeout_s=timeout_s)
+        if self.reads >= 2:
+            tree.elements = tree.elements[:4]
+            tree.truncated = True
+        return tree
+
+
+def test_an_after_read_cut_short_leaves_the_actions_own_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    desk = _CutShortDesk(monkeypatch)
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    out = d.dispatch("click", {"element": _ids(text, "Home"), "expect_hwnd": 7001})
+    assert "What changed" not in out.content[0]["text"]
+    assert out.payload["details"].get("screen_change") is None or out.payload["details"]["screen_change"][
+        "verified"] is None

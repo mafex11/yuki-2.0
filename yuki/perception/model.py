@@ -163,8 +163,13 @@ class WindowModel:
     #: id -> ``(role, name, last read number)`` for every id the window has had.
     seen: dict[int, tuple[str, str, int]] = field(default_factory=dict)
 
-    def carry(self, elements: list[Any], read: int) -> list[Any]:
-        """Carry ids into a new read's ``elements`` and make it the latest; returns the renumbered elements."""
+    def carry(self, elements: list[Any], read: int, *, partial: bool = False) -> list[Any]:
+        """Carry ids into a new read's ``elements`` and make it the latest; returns the renumbered elements.
+
+        ``partial``: the read stopped before the end of the window (its cap or its clock), so an element missing
+        from it is not known to be gone: the earlier read's elements it did not reach stay in :attr:`latest`.
+        """
+        previous = dict(self.latest)
         if self.latest:
             mapping, top = carry_refs(self.latest, elements, self.ceiling)
             elements = renumber(elements, mapping)
@@ -175,6 +180,9 @@ class WindowModel:
             self.lineage = {read}
         self.read = read
         self.latest = {int(fact(e, "id")): e for e in elements}
+        if partial:
+            for old_id, old in previous.items():
+                self.latest.setdefault(old_id, old)
         for element in elements:
             self.seen[int(fact(element, "id"))] = (str(fact(element, "role") or ""),
                                                    str(fact(element, "name") or "")[:80], read)

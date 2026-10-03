@@ -2299,24 +2299,28 @@ class Dispatcher:
             tree = self.backend.get_window_tree(int(hwnd), max_elements=self.max_tree_elements, timeout_s=timeout_s)
         except Exception:  # noqa: BLE001 - gone or wedged
             return None
-        if str(_field(tree, "status") or "ok") != "ok":
-            return None
+        if str(_field(tree, "status") or "ok") != "ok" or self._cut_short(tree):
+            return None   # a read the clock cut short cannot say what is gone or what changed
         elements = list(_field(tree, "elements") or [])
         if not elements or not all(isinstance(_field(e, "id"), int) for e in elements):
             return None
-        carried = self.window_model(int(hwnd)).carry(elements, self._reads)
+        carried = self.window_model(int(hwnd)).carry(elements, self._reads,
+                                                     partial=bool(_field(tree, "truncated")))
         self._note_observed(hwnd, generation, at, tree)
         return carried
 
     def _current(self, hwnd: int) -> tuple[list[Any] | None, bool]:
         """The window as it is now, for the read before an action: ``(elements, fresh)``. The model's latest
         observation when the window's events show nothing happened since it was taken; else a new read."""
-        model = self.window_model(int(hwnd))
         seen = self._observed.get(int(hwnd))
-        if model.latest and seen is not None:
+        last = self._observed_trees.get(int(hwnd))
+        if last is not None and seen is not None:
             generation = self._generation(hwnd)
             if generation is not None and seen[0] == generation:
-                return list(model.latest.values()), False
+                # the same read again, its ids carried (an identity carry: the model already holds it)
+                elements = list(_field(last, "elements") or [])
+                if elements:
+                    return self.window_model(int(hwnd)).carry(elements, self._reads), False
         # Without events a fresh read is the only way to know the window as it is now, and comparing it with the
         # thinker's read is what shows the elements that change on their own (a clock, a progress bar).
         return self._observe(hwnd), True
@@ -2441,7 +2445,8 @@ class Dispatcher:
         elements = list(_field(tree, "elements") or [])
         if not elements or not all(isinstance(_field(e, "id"), int) for e in elements):
             return tree
-        return _tree_with(tree, self.window_model(hwnd).carry(elements, self._reads))
+        return _tree_with(tree, self.window_model(hwnd).carry(elements, self._reads,
+                                                              partial=bool(_field(tree, "truncated"))))
 
     def _format_tree(self, tree: Any, within: int | None = None) -> str:
         """The backend's own text for a tree; ``within`` lists one element's part in full (a backend whose formatter
