@@ -60,6 +60,8 @@ datas += collect_data_files("yuki", includes=["ui/fonts/*.ttf", "ui/fonts/*.txt"
 # yuki.ui.webview2.loader_path() finds under webview2/ in the bundle. The loader comes from the installed pywebview
 # package (BSD, redistributable); nothing else of pywebview is bundled or imported.
 datas += [(str(ROOT / "yuki" / "ui" / "web"), "yuki/ui/web")]
+# The app icon the window loads for its taskbar button (make_icon.py copies packaging/yuki.ico there on every build).
+datas += [(str(ROOT / "yuki" / "ui" / "yuki.ico"), "yuki/ui")]
 
 
 def _webview2_loader() -> list[tuple[str, str]]:

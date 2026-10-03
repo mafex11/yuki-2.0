@@ -75,12 +75,18 @@
       h('div', { class: 'srow' }, h('span', null, 'Motion', h('small', { text: 'The field runs at 30 fps, the live figure at 15, and both sleep when nothing changes' })),
         h('span', { class: 'seg' }, h('button', { data: { do: 'motion', on: '0' }, attrs: { type: 'button', 'aria-pressed': String(!ap.reduce_motion) }, text: 'Full' }),
           h('button', { data: { do: 'motion', on: '1' }, attrs: { type: 'button', 'aria-pressed': String(!!ap.reduce_motion) }, text: 'Reduced' })))];
+    // About: the startup splash (mounted by mount() below; data-keep: a live patch never replaces it mid-play)
+    const about = [
+      h('div', { class: 'about-splash', data: { keep: '', do: 'about-replay', enter: 'about-replay' },
+        attrs: { role: 'button', tabindex: '0', title: 'Play again', 'aria-label': 'Yuki. Press to play the animation again' } }),
+      D.version ? srow('Version', D.version) : null];
     // data-k: the blocks' keys for the live patch (app.js patchInto)
     return [Y.k(Y.head('Settings', meta), 'head'),
       h('div', { class: 'set-grid', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
-          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps')),
+          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps'),
+          Y.k(Y.sec('About', null, about), 'about')),
         h('div', { class: 'col', data: { k: 'right' } },
           Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for my next start')), 'voice'),
           Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
@@ -133,5 +139,18 @@
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
   });
 
-  Y.pages.settings = { build };
+  /* About's splash: plays once when Settings opens (a still frame with reduced motion or under a full-screen app);
+     a live patch keeps the one already there; a press (or Enter) plays it again */
+  function mount(main) {
+    const el = main.querySelector('.about-splash');
+    if (!el || el.__splash || !window.PlanetSplash) return;
+    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: window.Lattice.Motion.reduced });
+  }
+  A['about-replay'] = (t) => {
+    const el = t.closest('.about-splash');
+    if (!el || !el.__splash) return;
+    if (window.Lattice.Motion.reduced) el.__splash.still(); else el.__splash.replay();
+  };
+
+  Y.pages.settings = { build, mount };
 })();

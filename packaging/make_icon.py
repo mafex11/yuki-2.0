@@ -61,10 +61,12 @@ INSTALLER_DIR = PKG / "installer"
 #: The wizard images Inno Setup chooses from by the size of its image area (it keeps 164:314 and a square; the
 #: sizes are its 100 %, 125 % and 150 % areas, before 6.6 and since): ``win`` is how many of the splash's 520 x 300
 #: layout px span the width, ``cx``/``cy`` the layout point at the centre. The large image shows the planet over the
-#: name; the small one only the planet.
+#: name; the small one (58 to 124 px square) only the planet, zoomed so its dots are a whole number of pixels apart
+#: (size -> px between dots: crisp, no moire).
 WIZARD = ((164, 314), (202, 386), (240, 459), (336, 643))
-WIZARD_SMALL = (58, 77, 97, 124)
-WIZARD_WIN, SMALL_WIN = 214.0, 118.0
+WIZARD_SMALL = {58: 2, 77: 3, 97: 3, 124: 4}
+WIZARD_WIN = 214.0
+SPLASH_PITCH = 5.2               # planet-splash.js P: the field's dot pitch in layout px
 PLANET_CENTRE = (260.0, 113.6)   # planet-splash.js: column 50, row round(57 * 0.36) of the 5.2 px field
 
 
@@ -262,8 +264,8 @@ def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) 
 
     specs = [{"file": f"wizard-{w}x{h}.bmp", "w": w, "h": h, "win": WIZARD_WIN, "cx": 260.0, "cy": 150.0}
              for w, h in WIZARD]
-    specs += [{"file": f"wizard-small-{s}.bmp", "w": s, "h": s, "win": SMALL_WIN, "cx": PLANET_CENTRE[0],
-               "cy": PLANET_CENTRE[1], "text": False} for s in WIZARD_SMALL]
+    specs += [{"file": f"wizard-small-{s}.bmp", "w": s, "h": s, "win": s * SPLASH_PITCH / px, "cx": PLANET_CENTRE[0],
+               "cy": PLANET_CENTRE[1], "text": False} for s, px in WIZARD_SMALL.items()]
     res = browser_run({"kind": "installer", "images": specs, "set": "mint"},
                       [WEB_DIR / "dots.js", WEB_DIR / "planet-splash.js"], browser)
     out_dir.mkdir(parents=True, exist_ok=True)

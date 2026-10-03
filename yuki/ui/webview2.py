@@ -453,7 +453,10 @@ class HostOptions:
     #: and shadow kept, the page's title bar answered to Windows as caption / buttons (:func:`caption_hit`).
     frameless: bool = True
     background: tuple[int, int, int] = (0x0B, 0x0B, 0x0C)
-    browser_args: str | None = None          # extra Chromium switches (``WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS``)
+    #: The app icon (``yuki/ui/yuki.ico``, every size): the window's taskbar button and Alt+Tab, each loaded at
+    #: the exact size Windows asks for at this DPI (the .ico has 16 to 64 px frames). ``None``: Windows' default.
+    icon: Path | None = None
+    browser_args: str | None = None         # extra Chromium switches (``WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS``)
     dev_tools: bool = False
     app_host: str = APP_HOST
     on_message: Callable[[Any], None] | None = None   # each JSON message the page posts (parsed)
@@ -484,6 +487,7 @@ class WebView2Host:
         self._wndproc = WNDPROC(self._proc)
         self._class = f"YukiWebView2-{os.getpid()}"
         self._brush = 0
+        self._icons: list[int] = []
         self._captures: list[tuple[Handler, Com, Callable[[bool], None] | None]] = []
         self.browser_pid: int | None = None
         self.runtime: str | None = None
@@ -747,8 +751,9 @@ class WebView2Host:
         self._brush = gdi32.CreateSolidBrush(wintypes.COLORREF(r | (g << 8) | (b << 16)))
         user32.LoadCursorW.restype = wintypes.HANDLE
         user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, c_void_p]
-        wc = WNDCLASSEXW(ctypes.sizeof(WNDCLASSEXW), CS_HREDRAW | CS_VREDRAW, self._wndproc, 0, 0, hinst, None,
-                         user32.LoadCursorW(None, c_void_p(32512)), self._brush, None, self._class, None)
+        big, small = self._load_icons()
+        wc = WNDCLASSEXW(ctypes.sizeof(WNDCLASSEXW), CS_HREDRAW | CS_VREDRAW, self._wndproc, 0, 0, hinst, big,
+                         user32.LoadCursorW(None, c_void_p(32512)), self._brush, None, self._class, small)
         user32.RegisterClassExW.argtypes = [POINTER(WNDCLASSEXW)]
         if not user32.RegisterClassExW(byref(wc)):
             raise ctypes.WinError()
@@ -782,6 +787,27 @@ class WebView2Host:
         if self.o.placement != "offscreen":
             user32.SetForegroundWindow(wintypes.HWND(self.hwnd))
         self.marks["window"] = time.time()
+
+    def _load_icons(self) -> tuple[int | None, int | None]:
+        """The app icon at the window's big and small icon sizes for the system DPI (32 / 16 px at 100 %, 40 / 20 at
+        125 %, 48 / 24 at 150 %: frames the .ico has, so nothing is rescaled). ``None`` each when there is none."""
+        path = self.o.icon
+        if path is None or not Path(path).exists():
+            return None, None
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, c_int, c_int, wintypes.UINT]
+        try:
+            dpi = user32.GetDpiForSystem()
+            metric = lambda i: user32.GetSystemMetricsForDpi(i, dpi)   # noqa: E731
+        except (AttributeError, OSError):
+            metric = user32.GetSystemMetrics
+        out: list[int | None] = []
+        for cx, cy in ((11, 12), (49, 50)):   # SM_CXICON / SM_CYICON, SM_CXSMICON / SM_CYSMICON
+            h = user32.LoadImageW(None, str(path), 1, metric(cx), metric(cy), 0x0010)   # IMAGE_ICON, LR_LOADFROMFILE
+            out.append(int(h) if h else None)
+        self._icons = [h for h in out if h]
+        return out[0], out[1]
 
     @staticmethod
     def _scaled(size: tuple[int, int]) -> tuple[int, int]:
@@ -900,6 +926,9 @@ class WebView2Host:
         if self._brush:
             ctypes.windll.gdi32.DeleteObject(wintypes.HGDIOBJ(self._brush))
             self._brush = 0
+        for h in self._icons:
+            ctypes.windll.user32.DestroyIcon(wintypes.HICON(h))
+        self._icons = []
 
     # -- WebView2 --------------------------------------------------------------------------------------
 

@@ -43,6 +43,10 @@ Compression=lzma2/max
 SolidCompression=yes
 LZMANumBlockThreads=4
 WizardStyle=modern
+; The wizard images: the startup splash's still frame (the planet over YUKI; the planet alone in the corner), drawn
+; at each size Inno Setup picks from by DPI (make_icon.py --installer-images), so they are never stretched there.
+WizardImageFile=installer\wizard-164x314.bmp,installer\wizard-202x386.bmp,installer\wizard-240x459.bmp,installer\wizard-336x643.bmp
+WizardSmallImageFile=installer\wizard-small-58.bmp,installer\wizard-small-77.bmp,installer\wizard-small-97.bmp,installer\wizard-small-124.bmp
 ; The tray holds files open: close Yuki's processes before replacing them (and we stop them ourselves too).
 CloseApplications=force
 RestartApplications=no
