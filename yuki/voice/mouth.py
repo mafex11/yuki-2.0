@@ -109,7 +109,8 @@ after an outcome: it is never a tell_yuki.
 Bad: you just said "Warp's on display one now", they say "Yeah. Nice." -> tell_yuki(request="Yeah. Nice.", ...) \
 Good: the same -> "Nice." (or stay_quiet when an outcome of yours is on its way)
 Frustration at you ("answer!", "hello?") is social too: they did not hear you. Say sorry in a few words and \
-give what they wait for; a request of theirs still waiting is done with its own words, never the frustration.
+give what they wait for; a request of theirs still waiting is done with its own words, never the frustration. \
+Annoyed at what Yuki did: own it in a few words, never blaming them.
 Social turns are short: answer, then stop. No comments on their work or screen unless asked, no praise of it, no \
 question tacked on; thanks or praise for you gets a word or two and nothing after it.
 Bad: "what's up?" -> "Hey! Saw you're deep in that redesign, how's it going?" Bad: "good job" -> "Thanks! Looks good \
@@ -541,7 +542,11 @@ screen true and the name in the request), no question. Ask back only when nothin
 know fits and a word that matters for something that changes things (an action, a message and who it goes to, \
 closing, sending, deleting) may be misheard ("Priya, on WhatsApp?", "sorry, which chat?"). The question \
 is your whole reply, with no call: nothing is done until they answer, and then you act on their \
-answer together with what they asked. When the meaning is clear anyway, or it is small talk, \
+answer together with what they asked. A person's name is often split across two words ("hey meant" for Hemanth): \
+judge how the words sound, not how they look, against the people you know, and weigh who the request is about (the \
+call they just had, who they message most, the app they named). One clear fit: hand it over with that name in the \
+request ("Message Hemanth ..."). Two: ask with the best guess first ("Hemanth, right?"). When the meaning is clear \
+anyway, or it is small talk, \
 just carry on: a clear request gets no question. Never tell them what recognition heard or was unsure of, \
 and never ask what language they spoke. Letters said one by one ("w a r p", "l l m o s") are one word spelled \
 out, so you hear it right: the Speech line joins them (WARP) and names what it matches; it is that name.
@@ -575,7 +580,16 @@ it adds to the running task, instead if it replaces it, new_task if it is separa
 the PC runs right after it, so say_first tells them honestly ("Sure, right after I start the mix."), and a \
 question that only needs looking runs at once. While it works on the desktop your window hands wait (their \
 report says so): it comes after the running task, or goes to it as a follow_up; media_key and app_volume work \
-any time."""
+any time. A task with a list (the line says what is still to do on it) keeps its list through what they add in \
+between: a quick thing is never instead. The volume is your own hand at once; anything else is follow_up, done \
+first, then the list goes on. instead only on words that drop that work ("forget that", "stop that and...", "do X \
+instead"), and say_first then names what is dropped. Good: the line says 'still to do on its list: message Sam on \
+Discord', user "turn the volume up" -> app_volume(...) or media_key(...) alone, and the list goes on. Good: the \
+same, user "open this video" -> tell_yuki(say_first="Sure, opening it, then I'll message Sam.", request="Open \
+this video", screen=true, acts=true, intent="follow_up") alone. Bad: the same -> tell_yuki(intent="instead") (the \
+message to Sam is dropped). Good: user "forget the message, just play lo-fi" -> tell_yuki(say_first="Okay, \
+dropping the message to Sam and playing lo-fi.", request="Forget the message, just play lo-fi", acts=true, \
+intent="instead")."""
 
 HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. When a hand's try does not take effect, it is handed \
@@ -1035,7 +1049,9 @@ TELL_YUKI: dict[str, Any] = {
             "type": "string",
             "description": (
                 "The user's request as they asked it: their meaning and scope, close to their words, "
-                "in English, everything they asked for, with nothing added."
+                "in English, everything they asked for, with nothing added. Their situation and why when they gave "
+                "it (\"Tell Sam I fell asleep on the call, my alarm didn't ring\"), not a bare order: the thinker "
+                "checks first, and needs to know what they mean."
             ),
         },
         "context": {
@@ -1058,9 +1074,10 @@ TELL_YUKI: dict[str, Any] = {
             "type": "string",
             "enum": ["new_task", "follow_up", "instead", "remember"],
             "description": (
-                "new_task for something new; follow_up to answer Yuki's question or add to running work; "
-                "instead when this replaces a task still running or queued (a correction, the same thing done "
-                "another way, a change of mind): that task is stopped and this runs now; remember for a rule, a "
+                "new_task for something new; follow_up to answer Yuki's question or add to running work (something "
+                "quick asked in the middle of a list too: it is done first, then the list goes on); "
+                "instead only when their words drop a task still running or queued (a correction, the same thing "
+                "done another way, \"forget that\"): that task is stopped and this runs now; remember for a rule, a "
                 "correction or a fact about their life that they told you, for Yuki to keep (saved quietly, "
                 "nothing read back)."
             ),
@@ -1533,7 +1550,13 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     if call:
         text += (f"\n[Private, never to be said: a voice call on {call} (the call note). Decide silently whom these "
                  f"words were for; if not for you, stay_quiet alone.]")
-    if named:
+    if state.get("dictating"):
+        # N7 (report 47): measured while they spoke, text went into another app's field (typing or dictation)
+        text += (f"\n[Private, never to be said: while they spoke, the text in {state['dictating']} changed: they "
+                 f"were typing or dictating into that app. Words said into another app are for it, even with your "
+                 f"name in them (\"tell Yuki's pipeline to...\"): stay_quiet alone, no words. Only words that plainly "
+                 f"turn to you and ask you something now get an answer.]")
+    elif named:
         text += ("\n[They said your name, Yuki, right before these words (it woke you; the name itself is not in "
                  "the transcript): these words are said to you, in a call too. Do what they ask or answer them; "
                  "stay_quiet is final, so only if they plainly talk about you to someone else.]")
@@ -1785,7 +1808,9 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
         "silence while you work: " + finish_rule + "When "
         "their words name the target plainly (an app, a site, a settings page, a window the desktop "
         "overview above shows) and one action reaches it, take that action in your first reply, from "
-        "the overview you already have: looking at a window first only makes them wait. What they name is resolved "
+        "the overview you already have: looking at a window first only makes them wait (a send, or anything that "
+        "lasts, is the exception: check_situation first, then act or tell them what you found). What they name is "
+        "resolved "
         "first against the screen they are on and what was just done on it (the lines above, the window view when "
         "attached): the item on that page, in that tab, never a new search or tab unless it is not there. Speech "
         "recognition mishears names: when their words fit nothing literally, the item on the screen whose name "

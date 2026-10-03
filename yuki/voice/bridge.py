@@ -118,6 +118,8 @@ class Job:
     #: Withdrawn because a newer request of the user's replaced it (tell_yuki intent ``instead``): nothing of
     #: it is ever spoken, even an outcome that raced the withdrawal.
     superseded: bool = False
+    #: N10 (report 47): the thinker's kept list for this request (its ``tasks`` call): ``[{"what", "state", "by"?}]``.
+    tasks: list[dict[str, Any]] = field(default_factory=list)
     #: Started by code, not by a tell_yuki call: a hand of the talker's did not take effect and the thinker was
     #: handed the same request (v3.9). Its items reach the mouth through ``announce``.
     escalated: bool = False
@@ -573,12 +575,16 @@ class VoiceBridge(QObject):
             else:
                 step = (f', now: "{j.step_line}"' if j.step_line and j.step_running else
                         f", now: {j.step.lower()}" if j.step else ", starting")
-                parts.append(f'{name} "{j.brief()}" running for {ago} s{step}')
+                left = _tasks_left(j.tasks)
+                parts.append(f'{name} "{j.brief()}" running for {ago} s{step}'
+                             + (f"; still to do on its list: {'; '.join(left)}" if left else ""))
         if done:
             j = done[-1]
             what = {DONE: "finished", FAILED: "failed", CANCELLED: "stopped"}.get(j.state, j.state)
             if j.superseded:
-                what = "withdrawn for a newer request"
+                left = _tasks_left(j.tasks)
+                what = "withdrawn for a newer request" + (
+                    f" (its list still had: {'; '.join(left)}; say so if they did not mean to drop it)" if left else "")
             outcome = condense(j.outcome or "", max_sentences=1, max_chars=120)[0] if j.state == DONE else ""
             parts.append(f'task {j.job_id} "{j.brief()}" {what} {round(now - (j.finished_at or now))} s ago'
                          + (f': "{outcome}"' if outcome else ""))
@@ -652,9 +658,10 @@ class VoiceBridge(QObject):
             # The talker judged that this replaces work already handed over (a correction, the same target done
             # another way, a change of mind): that work is withdrawn now and this runs next, on the worker (v3.9).
             replaced = self._replace_targets(args.get("replaces"), besides=early)
+            words = heard[-1] if heard else request   # N10: a withdrawal carries the user's own words
             for old in replaced:
                 self._drop_items(old)
-                self._gui(lambda old=old: self._withdraw(old))
+                self._gui(lambda old=old: self._withdraw(old, words=words))
             self._log("bridge", op="replace", call=params.tool_call_id, withdrawn=[j.job_id for j in replaced])
             intent = "new_task"
         if early is not None and intent == "follow_up" and self._follow_up_target(besides=early) is not None:
@@ -1595,16 +1602,24 @@ class VoiceBridge(QObject):
             how = cancel(job.job_id, by="voice") if _takes(cancel, "by") else cancel(job.job_id)
             self._log("bridge", op="cancelled", job_id=job.job_id, how=how)
 
-    def _withdraw(self, job: Job) -> None:
-        """On the GUI thread: stop a job the user's newer request replaces (queued after its ``_submit``)."""
+    def _withdraw(self, job: Job, words: str | None = None) -> None:
+        """On the GUI thread: stop a job the user's newer request replaces (queued after its ``_submit``). N10: the
+        user's words that replaced it go with it (the runtime's log and the withdrawn line), and what its kept list
+        still had is logged and stays on the thinker line, so nothing is dropped silently."""
         job.superseded = True
         job.cancel_requested = True
         if job.log is not None:
-            job.log.add("the user", "replaced it with a newer request")
+            job.log.add("the user", "replaced it with a newer request" + (f": \"{words}\"" if words else ""))
         if job.job_id is not None:
             withdraw = getattr(self.runtime, "withdraw", None)
-            how = withdraw(job.job_id) if callable(withdraw) else self.runtime.cancel(job.job_id)
-            self._log("bridge", op="withdrawn", job_id=job.job_id, how=how)
+            if callable(withdraw):
+                try:
+                    how = withdraw(job.job_id, words=words)
+                except TypeError:   # an older runtime without the words
+                    how = withdraw(job.job_id)
+            else:
+                how = self.runtime.cancel(job.job_id)
+            self._log("bridge", op="withdrawn", job_id=job.job_id, how=how, left=len(_tasks_left(job.tasks)))
 
     def _typed(self, lane: str, job_id: int, request: str) -> Job:
         """A job the bridge did not submit (typed in the overlay): tracked for progress questions."""
@@ -1681,6 +1696,11 @@ class VoiceBridge(QObject):
         if (tool_input or {}).get("action") == "close":
             self.closed_at = time.monotonic()   # v3.17: the talker gets its guidance on getting a closed tab back
         if job is None:
+            return
+        if name == "tasks" and isinstance((tool_input or {}).get("items"), list):
+            # N10: the kept list rides on the thinker line (what is left), so an interjection never loses it
+            job.tasks = [dict(i) for i in tool_input["items"] if isinstance(i, dict)][:12]
+            self._changed()
             return
         job.acting = _action_words(name, tool_input)
         step = step_of(name, tool_input)
@@ -2323,6 +2343,12 @@ def _memory_words(request: str, heard: Any) -> str | None:
         return memory_words(request, heard) or None
     except Exception:  # noqa: BLE001 - a hint for memory only
         return None
+
+
+def _tasks_left(tasks: list[dict[str, Any]] | None) -> list[str]:
+    """N10: the items of a job's kept list still to do, in order (a few words each)."""
+    return [" ".join(str(t.get("what") or "").split())[:80] for t in tasks or []
+            if isinstance(t, dict) and t.get("state") in ("todo", "doing") and str(t.get("what") or "").strip()][:6]
 
 
 def _action_words(name: str, tool_input: dict | None) -> str:

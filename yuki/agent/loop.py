@@ -42,6 +42,7 @@ from typing import Any, Iterable, Iterator
 from yuki.agent import consult as second_look
 from yuki.agent import finish as finish_gate
 from yuki.agent import frame as task_frame
+from yuki.agent import situation as situation_check
 from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.failover import FailoverClient
 from yuki.agent.judge import Authorizer, call_text as judge_call_text
@@ -62,6 +63,7 @@ from yuki.agent.memory import (
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
     ABOUT_FIELD,
+    STATES_FIELD,
     ALL_TOOL_NAMES,
     ACTION_TOOL_NAMES,
     AUTO_VIEW_TOOLS,
@@ -340,6 +342,8 @@ class _Turn:
     verdicts: list[tuple[str, bool | None, str]] = field(default_factory=list)
     #: The windows the ``done`` of this response says the present state of (``about``); ``None``: no done.
     done_about: list[int] | None = None
+    #: N3: the states the ``done`` of this response tells, each with the step it says showed it (``states``).
+    done_states: list[dict[str, Any]] = field(default_factory=list)
     #: The user answered a question in this response (``ask_user`` or a risk confirmation).
     asked: bool = False
     #: ``(tool, why)`` of actions this response ran whose own report shows the effect did not happen (revamp D, S2):
@@ -559,6 +563,9 @@ class Agent:
         self._said: deque[dict[str, Any]] = deque(maxlen=12)
         #: The task frame of the request being handled (``yuki.agent.frame``), for its log.
         self._frame: task_frame.TaskFrame | None = None
+        #: N8 (report 47): ``(at, {app: [lines]})`` of this session's troubled runs (:func:`task_frame.session_lessons`),
+        #: shown in the frame of the next requests on those apps until practice memory's post-mortem learns them.
+        self._session_lessons: deque[tuple[float, dict[str, list[str]]]] = deque(maxlen=12)
         #: The profile and rules layers of the system prompt for the request being handled
         #: (``prompt.system_blocks``), set by ``_memory_context``; ``None`` when memory had
         #: nothing (then the layer is left out).
@@ -879,7 +886,21 @@ class Agent:
             self._steer_texts.extend(texts)   # the user's own words mid-run: a post-mortem's evidence
         for text in texts:
             self._note_words(text, how="added")   # and the authorization judge's
-        return [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
+        blocks = [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
+        left = self._tasks_left()
+        if left:
+            # N10 (report 47): what they add mid-run never drops the rest of their list silently
+            blocks.append({"type": "text", "text": (
+                f"{CHECK_LABEL}: your list still has, in order: {'; '.join(left)}. What they just added comes first "
+                f"when it is quick (do it now, add it to tasks), then the list goes on; it replaces the list only "
+                f"when their words say so (\"forget that\", \"instead\"), and then mark those items dropped with "
+                f"their words and say so.")})
+        return blocks
+
+    def _tasks_left(self) -> list[str]:
+        """N10: the kept list's items still to do, in order."""
+        return [str(t.get("what") or "") for t in getattr(self, "_tasks", None) or []
+                if t.get("state") in ("todo", "doing")]
 
     def cancel(self, reason: str = CANCELLED) -> None:
         """Ask the run to stop. Safe to call from any thread, at any time.
@@ -1028,6 +1049,11 @@ class Agent:
         self._send_consulted = False
         self._close_call_consulted = False
         self._sends: list[dict[str, Any]] = []
+        #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
+        self._situation_checks: list[situation_check.CheckRecord] = []
+        #: N10: the request's kept list (``tasks``), and how often a done was held for what is still on it.
+        self._tasks: list[dict[str, Any]] = []
+        self._tasks_held = 0
         self._typed: dict[int, str] = {}
         self._files_read = False
         self._unconfirmed: list[tuple[int, int | None]] = []
@@ -1136,6 +1162,7 @@ class Agent:
                 request, reply=reply, outcome=outcome, at=started_epoch
             )
             self._record_run(request, reply=reply, outcome=outcome, at=started_epoch)
+            self._keep_lessons(outcome=outcome, at=started_epoch)
             self._record_surfaced(reply=reply, at=started_epoch)
             words = self._this_query or memory_query_of(request)
             if words:
@@ -1549,6 +1576,41 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - memory never breaks a request
             self.logger.error(f"run trace failed: {type(exc).__name__}: {exc}", exc=exc)
 
+    #: N8: how long a session lesson is shown (s): practice memory's post-mortem learns a run within minutes when its
+    #: budget allows (live 3 Oct its daily budget was spent by 19:09 and the troubled runs after it were held).
+    LESSON_TTL_S = 4 * 3600.0
+
+    def _keep_lessons(self, *, outcome: str, at: float) -> None:
+        """N8 (report 47): this run's lessons for the rest of the session (a troubled run only). Never raises."""
+        try:
+            lessons = task_frame.session_lessons(getattr(self, "_trace", None) or [], outcome=outcome,
+                                                 steers=list(getattr(self, "_steer_texts", None) or []), at=at)
+            if lessons:
+                self._session_lessons.append((time.time(), lessons))
+                self.logger.log("session_lessons", apps=sorted(lessons), lines=sum(len(v) for v in lessons.values()))
+        except Exception as exc:  # noqa: BLE001 - a lesson never breaks a request
+            self.logger.log("session_lessons", error=f"{type(exc).__name__}: {exc}"[:200])
+
+    def _lessons_for(self, overview: Any) -> list[str]:
+        """N8: the session lessons of the apps in play (an open window's app, or the app the user named), newest
+        first."""
+        now = time.time()
+        keys = {_app_key(w.get("process_name")) for w in ((overview or {}).get("windows") or [])
+                if isinstance(w, dict)} if isinstance(overview, dict) else set()
+        named = _app_key(getattr(self, "_request_app_named", None))
+        if named:
+            keys.add(named)
+        keys.discard("")
+        out: list[str] = []
+        for at, lessons in reversed(list(getattr(self, "_session_lessons", ()) or ())):
+            if now - at > self.LESSON_TTL_S:
+                continue
+            for app, lines in lessons.items():
+                key = _app_key(app)
+                if key and any(key == k or (len(k) >= 4 and (k in key or key in k)) for k in keys):
+                    out += [f"[{app}] {line}" for line in lines]
+        return out[:task_frame.MAX_LESSONS]
+
     def _note_action(self, name: str, ok: bool, summary: str) -> None:
         """Add one line to this request's actions (not for looks, done or the note)."""
         if name in _NOT_ACTIONS:
@@ -1786,6 +1848,21 @@ class Agent:
         when a ``done`` was held.
         """
         held: list[tuple[dict[str, Any], str]] = []
+        left = self._tasks_left()
+        ending = bool(turn.finished) or (bool(turn.finishing) and not turn.failed and not turn.stop_after)
+        if ending and not turn.failed and left and self._tasks_held < 2:
+            # N10 (report 47): the request does not end while its kept list still has items to do (live 3 Oct the
+            # last part of a list, a message to the user's friend, was forgotten after an interjection)
+            self._tasks_held += 1
+            self.logger.log("tasks_held", left=left, message=turn.finished[0] if turn.finished else None)
+            turn.finished.clear()
+            turn.finishing.clear()
+            held.append(({"type": "text", "text": (
+                f"{CHECK_LABEL}: the request did not end: your list still has, in order: {'; '.join(left)}. Do it "
+                f"now. Only when their own words dropped an item, mark it dropped in tasks with those words and say "
+                f"so in done; when all is done, mark it done in tasks alongside done.")},
+                "the kept list still had items to do"))
+            return held
         if not turn.finished and turn.finishing and not turn.failed and not turn.stop_after:
             _message, verified, why, tool = turn.finishing[-1]
             if verified is not True:
@@ -1818,7 +1895,30 @@ class Agent:
                 for tool, verified, why in turn.verdicts if verified is not True and not finish_gate.is_expected(why)]
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
                  f"verified result" for hwnd in (turn.done_about or []) if hwnd not in self._evidence]
+        gaps += self._state_gaps(turn.done_states)
         return gaps
+
+    def _state_gaps(self, states: list[dict[str, Any]]) -> list[str]:
+        """N3 (report 47): the states a done tells (``states``) that no step of this request showed: the step it names
+        did not run in this request, failed, or (an action) did not verify its effect; a window it names was neither
+        read nor acted on with a verified result. Facts of the run trace only, never the words."""
+        out: list[str] = []
+        trace = getattr(self, "_trace", None) or []
+        for item in states or []:
+            says = " ".join(str(item.get("says") or "").split())[:120]
+            tool = " ".join(str(item.get("seen_in") or "").split())
+            hwnd = _as_hwnd(item.get("hwnd"))
+            steps = [s for s in trace if s.get("tool") == tool and s.get("ok")
+                     and (s.get("kind") != "action" or s.get("verdict") is True or s.get("expected"))]
+            seen_window = hwnd is not None and hwnd in self._evidence   # read (the view after actions too) or verified
+            if not steps and not seen_window:
+                out.append(f"it says \"{says}\", but no {tool or 'step'} in this request showed that: you have not "
+                           f"read that")
+            elif hwnd is not None and hwnd not in self._evidence and tool in ("look_at_window", "read_page",
+                                                                              "read_tabs"):
+                out.append(f"it says \"{says}\" of window {hwnd}, which this request has not read: you have not read "
+                           f"that")
+        return out
 
     def _step_signal(self, turn: _Turn, breaker_blocks: list[dict[str, Any]]) -> str | None:
         """The measured reason this request's next model call needs judgement, or ``None`` (v3.14).
@@ -2163,6 +2263,19 @@ class Agent:
             # a read_file: review 34 M2).
             judged = self._authorize(name, tool_input, target)
             held_text = self._denial_text(judged) if judged is not None and not judged.allowed else None
+            held_why = "not run: held by Yuki's check"
+            if held_text is None:
+                # N0 (report 47): a step with a lasting effect (a send, a window closed, one declared irreversible) runs
+                # only after a situation check this request has read; otherwise the brain is sent to look first.
+                need = situation_check.consequence(name, tool_input, sends=bool(judged is not None and judged.sends))
+                checks = getattr(self, "_situation_checks", None)
+                confirmed = (name, call_signature(acting)) in getattr(self, "_confirmed", set())   # they said yes
+                if need and checks is not None and not confirmed and not situation_check.covered(
+                        checks, target.get("hwnd"), self._model_calls):
+                    held_text = situation_check.REFUSAL.format(label=CHECK_LABEL, what=need)
+                    held_why = "not run: no situation check before a step that lasts"
+                    self.logger.log("situation_gate", tool=name, what=need, checks=len(checks),
+                                    hwnd=target.get("hwnd"))
             if held_text is None:
                 # Revamp D (S3): a pending send to a person, or the request's first action on a close call, gets one
                 # second look before it runs; its verdict (the model's) can hold the call.
@@ -2184,9 +2297,8 @@ class Agent:
                 self.logger.tool_result(name, ok=False, summary=held_text,
                                         result={"held": True, "judge": judged.facts() if judged else None},
                                         elapsed_ms=judged.ms if judged else 0.0, tool_use_id=tool_id)
-                self._note_action(name, False, "not run: held by Yuki's check")
-                self._trace_step(name, tool_input, ok=False, kind="control", why="not run: held by Yuki's check",
-                                 result=held_text)
+                self._note_action(name, False, held_why)
+                self._trace_step(name, tool_input, ok=False, kind="control", why=held_why, result=held_text)
                 yield ToolResult(name, False, held_text, about=step_words)
                 turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": held_text}], is_error=True))
                 turn.stop_after = True
@@ -2209,6 +2321,10 @@ class Agent:
                 payload={"why": str(tool_input.get("why") or "")})
         elif name == "spawn_helpers" and (self.tool_names is None or name in self.tool_names):
             outcome = yield from self._run_helpers(tool_input)
+        elif name == situation_check.TOOL_NAME and (self.tool_names is None or name in self.tool_names):
+            # N0: the situation check is gathered here (the window read again, memory's recent history); a read with
+            # no side effects, so a cancel stops the wait for it
+            outcome = self._abortable(name, lambda: self._situation(tool_input))
         elif name in PERCEPTION_TOOLS:
             # A read has no side effects: a cancel or the user's correction stops the wait for it (v3.14).
             outcome = self._abortable(name, lambda: self._dispatch(name, tool_input))
@@ -2283,10 +2399,18 @@ class Agent:
         if outcome.kind == "note":
             self.context.set_note(outcome.control_input["text"])
 
+        if outcome.kind == "tasks":
+            # N10: the kept list, in the run trace and the log; a steer carries what is left, done is held for it
+            self._tasks = [dict(i) for i in outcome.control_input.get("items") or []]
+            self.logger.log("tasks", items=self._tasks, left=len(self._tasks_left()))
+            self._trace_step("tasks", {"items": self._tasks}, ok=True, kind="control", result=outcome.summary)
+
         if outcome.kind == "done":
             turn.finished.append(outcome.control_input["message"])
             about = tool_input.get(ABOUT_FIELD)
             turn.done_about = [h for h in (_as_hwnd(v) for v in about) if h] if isinstance(about, list) else []
+            states = tool_input.get(STATES_FIELD)
+            turn.done_states = [s for s in states if isinstance(s, dict)][:8] if isinstance(states, list) else []
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
@@ -2393,7 +2517,11 @@ class Agent:
                 self._mark_confirmations(target.get("hwnd"), verdict)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload, about=step_words)
         if outcome.ok and finish_line:
-            turn.finishing.append((finish_line, verdict[0] if verdict else None,
+            # N1: an action whose report says nothing moved finishes with that, never with the line written before it
+            # ran ("Turned Spotify up." at 100%)
+            moved_details = outcome.payload.get("details") if isinstance(outcome.payload, dict) else None
+            noop = finish_gate.noop_line(name, moved_details, process=target.get("app"))
+            turn.finishing.append((noop or finish_line, verdict[0] if verdict else None,
                                    verdict[1] if verdict else "", name))
 
         content = list(outcome.content) or [
@@ -2553,8 +2681,53 @@ class Agent:
         if name in MEMORY_TOOLS:
             if not self.memory.installed:
                 return unavailable_tool(name, self.tool_names or ())
-            return self.memory.run_tool(name, tool_input, request=self._request_text)
+            learned = None
+            if name == "about" and str(tool_input.get("heard_as") or "").strip():
+                learned = self._learn_heard(tool_input)
+                tool_input = {k: v for k, v in tool_input.items() if k != "heard_as"}
+            outcome = self.memory.run_tool(name, tool_input, request=self._request_text)
+            if learned:
+                outcome.summary = f"{learned} {outcome.summary}".strip()
+                outcome.content = [{"type": "text", "text": learned}, *list(outcome.content or [])]
+            return outcome
         return self.dispatcher.dispatch(name, tool_input)
+
+    def _learn_heard(self, tool_input: dict[str, Any]) -> str:
+        """N9 (report 47): keep how speech recognition heard a person's name (``about``'s ``heard_as``), confirmed or
+        corrected by the user, as that person's misheard form in memory's name aliases (the store's existing
+        ``add_alias``; memory's people index resolves it from then on, and recognition keyterms never include a heard
+        form). Only for a name memory's people index knows; the user's own words this request must hold the heard
+        form (a span of what they said, so a guess of the model's is never kept). Returns one line for the result."""
+        heard = " ".join(str(tool_input.get("heard_as") or "").split())[:60]
+        name = " ".join(str(tool_input.get("name") or "").split())[:80]
+        said = " ".join(" ".join(str(w.get("text") or "") for w in self._user_words
+                                 if isinstance(w, dict) and w.get("how") in ("typed", "heard", "added", "answer")
+                                 ).casefold().split())
+        if not heard or not name or heard.casefold() == name.casefold():
+            return ""
+        if " ".join(heard.casefold().split()) not in said:
+            return (f"Not kept as a misheard form: \"{heard}\" is not in what they said in this request (keep only the "
+                    f"words as heard).")
+        call = getattr(self.memory, "call", None)
+        if not callable(call):
+            return ""
+
+        def keep(client: Any) -> Any:
+            found = client.contact(name)
+            if not isinstance(found, dict) or not found.get("found"):
+                return None
+            return client.store.add_alias(heard, str(found.get("name") or name),
+                                          why=f"speech recognition heard it so; the user confirmed it was "
+                                              f"{found.get('name') or name} (voice, {time.strftime('%Y-%m-%d')})")
+
+        try:
+            row = call("add_alias", keep, timeout_s=2.0)
+        except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+            self.logger.log("heard_alias", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
+            return "The misheard form could not be kept (memory did not answer)."
+        self.logger.log("heard_alias", ok=bool(row), chars=len(heard))
+        return (f"Kept: \"{heard}\" is how speech recognition hears {name}; it resolves to them from now on."
+                if row else f"Not kept: memory's people index has no one called {name}.")
 
     def _skip(self, tool_use_id: str, name: str, text: str) -> dict[str, Any]:
         """Answer a tool that never ran, and record that in the transcript.
@@ -2821,7 +2994,8 @@ class Agent:
                                              payload=self._overview_payload)
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
                                      overview=self._overview_payload, practice=getattr(fetched, "practice", None),
-                                     named_app=getattr(self, "_request_app_named", None))
+                                     named_app=getattr(self, "_request_app_named", None),
+                                     lessons=self._lessons_for(self._overview_payload))
             self._frame = frame
             self._practice_shown = list(frame.playbooks)
             rest, personality = _split_personality(fetched.portrait)
@@ -3294,6 +3468,59 @@ class Agent:
                                           refresh=refresh, cancelled=self._cancelled.is_set)
         self.logger.log("send_confirmation", app=app, hwnd=hwnd, chars=len(text or ""), **result)
         return result
+
+    def _situation(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """N0 (report 47): one situation check (:mod:`yuki.agent.situation`): the target window read again with a larger
+        budget for its latest content, memory's recent history of the person or thing, the user's own recent messages in
+        that app most like what is about to be sent; the evidence fenced as data read from outside, then the question a
+        good assistant asks itself. Recorded for the gate before a consequential step (with the model call it came
+        from: only a later call has read it) and in the run trace. Never raises."""
+        started = time.perf_counter()
+        backend = getattr(self.dispatcher, "backend", None)
+        windows = {int(w["hwnd"]): w for w in (self._overview_payload or {}).get("windows") or []
+                   if isinstance(w, dict) and isinstance(w.get("hwnd"), int)} \
+            if isinstance(self._overview_payload, dict) else {}
+
+        def read_tree(hwnd: int) -> Any:
+            get = getattr(backend, "get_window_tree", None)
+            if not callable(get):
+                return None
+            from yuki.agent.tools import _plain
+
+            return _plain(get(int(hwnd), max_elements=situation_check.READ_CAP,
+                              timeout_s=situation_check.READ_TIMEOUT_S))
+
+        def process_of(hwnd: int) -> tuple[str, str]:
+            w = windows.get(int(hwnd)) or self._window_of(int(hwnd)) or {}
+            return str(w.get("process_name") or ""), str(w.get("title") or "")
+
+        installed = bool(getattr(self.memory, "installed", False))
+        fetch = getattr(self.memory, "call_method", None) if installed else None
+
+        def recall(query: str, since_epoch: float) -> str:
+            call = getattr(self.memory, "call", None)
+            if not callable(call):
+                return ""
+            from yuki.agent.memory import format_recall
+
+            since = datetime.fromtimestamp(since_epoch)
+            rows = call("situation_recall", lambda c: c.recall(query, since=since, limit=8),
+                        timeout_s=situation_check.MEMORY_TIMEOUT_S)
+            facts = [r for r in (rows or []) if isinstance(r, dict)]
+            return format_recall(facts, query=query, since=since) if facts else ""
+
+        sit = situation_check.gather(tool_input, read_tree=read_tree, process_of=process_of,
+                                     memory_call=fetch if callable(fetch) else None,
+                                     recall=recall if installed else None)
+        self._situation_checks.append(situation_check.CheckRecord(hwnd=sit.hwnd, at=time.time(), about=sit.about,
+                                                                  call=self._model_calls))
+        self.logger.log("situation_check", **sit.facts_dict(), call=self._model_calls)
+        evidence = wrap(sit.evidence_text(), source="the target window and memory (Yuki's situation check)",
+                        nonce=self._nonce)
+        text = f"{situation_check.CHECK_LABEL}: {sit.summary()}.\n{evidence}\n\n{situation_check.QUESTION}"
+        return ToolOutcome(name=situation_check.TOOL_NAME, ok=True, summary=sit.summary(),
+                           content=[{"type": "text", "text": text}], payload={"situation": sit.facts_dict()},
+                           elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
 
     def _dispatch_watching(self, name: str, tool_input: dict[str, Any]) -> Iterator[AgentEvent]:
         """Run an action whose hands may wait for the user (S7) on its own thread, saying the gate's line as a ``Say``
@@ -3814,6 +4041,14 @@ def _split_personality(portrait: str | None) -> tuple[str, str | None]:
     except Exception:  # noqa: BLE001 - no memory package: the whole page stays background
         return portrait or "", None
     return split_personality(portrait)
+
+
+def _app_key(name: Any) -> str:
+    """An app's name as a comparable key ("Spotify.exe", "spotify" -> "spotify"): plumbing."""
+    text = str(name or "").casefold().strip()
+    if text.endswith(".exe"):
+        text = text[:-4]
+    return "".join(ch for ch in text if ch.isalnum())
 
 
 def _as_hwnd(value: Any) -> int | None:

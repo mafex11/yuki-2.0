@@ -628,6 +628,183 @@ class TabsDesk(BrowserDesk):
 
 
 # ---------------------------------------------------------------------------
+# vfix2 (report 47): a chat app and a music player shaped like the real Discord DM and Spotify trees of the
+# 3 Oct session (roles, patterns, states and boxes as UI Automation gave them; names, songs and messages invented)
+# ---------------------------------------------------------------------------
+
+
+class ChatPlayerDesk(StubDesktop):
+    """A Discord DM and Spotify, for the report 47 replays (tests and scripts only; nothing real is touched).
+
+    * The DM (``CHAT``): a ``List`` "Messages in @name" of ``ListItem`` messages (author, time, text; newest at the
+      bottom) and the message box, an ``Edit`` "Message @name". ``type_text`` with ``press_enter`` into it sends:
+      the message is appended (``sent``) at the desk's clock.
+    * Spotify (``PLAYER``): the "Now playing bar" ``Group`` with toggle ``Button`` s "Lyrics" / "Queue" / "Enter Full
+      screen" (state ``off``/``on``), ``Button`` "Mute", the ``Text`` "Change volume" that hides the real volume
+      slider (a ``Slider`` with RangeValue, here only through :meth:`set_slider`), and the "Now playing view". With
+      the lyrics open full size (``lyrics_full``) the bar is hidden until the pointer hovers its area, as live.
+    """
+
+    CHAT, PLAYER = 0x2001, 0x2002
+    BAR_TOP = 890
+
+    def __init__(self, *, friend: str = "Sam", handle: str = "sam_99", history: list[tuple[str, float, str]] | None = None,
+                 volume: float = 30.0, mixer_level: float = 100.0, clock: Any = None, action_delay_s: float = 0.0) -> None:
+        super().__init__(action_delay_s=action_delay_s)
+        self.friend, self.handle = friend, handle
+        self.clock = clock or time.time
+        #: (author, epoch, text), oldest first: "me" is the user
+        self.history: list[tuple[str, float, str]] = list(history or [])
+        self.sent: list[str] = []
+        self.composer = ""
+        self.volume = float(volume)        # Spotify's own player volume (its slider), 0-100
+        self.toggles = {"Lyrics": False, "Queue": False, "Enter Full screen": False}
+        self.lyrics_full = False
+        self.bar_revealed = False
+        self.clicks: list[str] = []
+        self.mixer = MixerStub({"Spotify.exe": mixer_level, "Discord.exe": 70.0}, playing={"Spotify.exe"}, system=40.0)
+
+    # -- perception -------------------------------------------------------------
+
+    def _windows(self) -> list[tuple[int, str, str]]:
+        return [(self.CHAT, "Discord.exe", f"@{self.handle} - Discord"), (self.PLAYER, "Spotify.exe", "Spotify Premium")]
+
+    def get_desktop_overview(self) -> dict[str, Any]:
+        wins = self._windows()
+        return {"windows": [{"hwnd": h, "process_name": p, "title": t, "is_foreground": i == 0, "is_minimized": False,
+                             "pid": 200 + i, "bounds": (0, 0, 1920, 1040)} for i, (h, p, t) in enumerate(wins)],
+                "foreground_hwnd": wins[0][0], "cursor": (960, 540), "screen_size": (1920, 1080),
+                "captured_at": time.time(), "monitors": [], "virtual_bounds": (0, 0, 1920, 1080)}
+
+    def _el(self, out: list[dict[str, Any]], role: str, name: str, bounds: tuple[int, int, int, int], **kw: Any) -> None:
+        cx, cy = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+        out.append({"id": len(out), "role": role, "name": name, "bounds": bounds, "center": (cx, cy),
+                    "is_interactive": bool(kw.get("patterns")) or role in ("Edit", "Button", "Slider"), **kw})
+
+    def get_window_tree(self, hwnd: int, **_: Any) -> dict[str, Any]:
+        self._perceive("get_window_tree")
+        title = dict((h, t) for h, _p, t in self._windows()).get(int(hwnd), "")
+        out: list[dict[str, Any]] = []
+        self._el(out, "Window", title, (0, 0, 1920, 1040))
+        if int(hwnd) == self.CHAT:
+            self._el(out, "List", f"Messages in @{self.handle}", (240, 60, 1640, 960))
+            shown = self.history[-12:]
+            top = 960 - 60 * len(shown)
+            for i, (who, at, text) in enumerate(shown):
+                author = "You" if who == "me" else who
+                stamp = time.strftime("%I:%M %p", time.localtime(at)).lstrip("0")
+                y = top + 60 * i
+                self._el(out, "ListItem", f"{author}, {stamp}, {text}", (260, y, 1620, y + 58))
+                self._el(out, "Text", text, (320, y + 24, 1600, y + 50))
+            self._el(out, "Edit", f"Message @{self.handle}", (260, 980, 1620, 1020), patterns=["value"],
+                     value=self.composer)
+            process = "Discord.exe"
+        else:
+            if not self.lyrics_full or self.bar_revealed:
+                self._el(out, "Group", "Now playing bar", (111, self.BAR_TOP, 1501, 945))
+                self._el(out, "Group", "Now playing: Song A by Artist B", (117, 896, 529, 939))
+                for name, x in (("Lyrics", 1278), ("Queue", 1302)):
+                    self._el(out, "Button", name, (x, 905, x + 25, 930), patterns=["toggle"],
+                             states=["on" if self.toggles[name] else "off"])
+                self._el(out, "Button", "Mute", (1351, 905, 1376, 930), patterns=["invoke"])
+                # live the read showed only this Text; the real slider (a web range input) sat inside it, unread
+                self._el(out, "Text", "Change volume", (1374, 912, 1418, 947))
+                self._el(out, "Button", "Enter Full screen", (1476, 905, 1501, 930), patterns=["toggle"],
+                         states=["on" if self.toggles["Enter Full screen"] else "off"])
+            if self.toggles["Lyrics"]:
+                self._el(out, "Group", "Lyrics: la la la, the words of Song A", (111, 127, 1501, 880 if not
+                                                                                   self.lyrics_full else 1000))
+            process = "Spotify.exe"
+        return {"hwnd": hwnd, "title": title, "process_name": process, "elements": out, "truncated": False,
+                "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 5.0, "passes": 1,
+                "child_windows": 0, "first_pass_elements": len(out)}
+
+    def format_window_tree(self, tree: dict[str, Any]) -> str:
+        lines = [f"window {tree['hwnd']} \"{tree['title']}\""]
+        for e in tree["elements"][1:]:
+            left, top, right, bottom = e["bounds"]
+            extra = f" = {e['value']}" if e.get("value") not in (None, "") else ""
+            states = f" ({', '.join(e['states'])})" if e.get("states") else ""
+            pats = f" [{', '.join(e['patterns'])}]" if e.get("patterns") else ""
+            lines.append(f"[{e['id']}] {e['role']} \"{e['name']}\"{extra}{states}{pats} @{left},{top} "
+                         f"{right - left}x{bottom - top}")
+        return "\n".join(lines)
+
+    def window_at(self, x: int, y: int) -> int:
+        return self.PLAYER if x < 0 else self.CHAT
+
+    # -- actions ----------------------------------------------------------------
+
+    def type_text(self, text: str, *, press_enter: bool = False, expect_hwnd: Any = None, **kwargs: Any) -> StubResult:
+        result = self._act("type_text", "", text, press_enter=press_enter, expect_hwnd=expect_hwnd, **kwargs)
+        self.composer += text
+        if press_enter:
+            self.sent.append(self.composer)
+            self.history.append(("me", float(self.clock()), self.composer))
+            self.composer = ""
+            result.summary = f"typed {len(text)} chars and pressed Enter; the message box is empty again"
+        else:
+            result.summary = f"typed {len(text)} chars; the field reads them back"
+        result.details = {"readback": "arrived" if not press_enter else None, "hwnd": self.CHAT}
+        return result
+
+    def click(self, x: int, y: int, **kwargs: Any) -> StubResult:
+        result = self._act("click", f"clicked at ({x}, {y})", x, y, **kwargs)
+        tree = self.get_window_tree(self.PLAYER)
+        hit = next((e for e in tree["elements"][1:] if e["role"] == "Button"
+                    and e["bounds"][0] <= x < e["bounds"][2] and e["bounds"][1] <= y < e["bounds"][3]), None)
+        if hit is not None:
+            self.clicks.append(hit["name"])
+            if hit["name"] in self.toggles:
+                self.toggles[hit["name"]] = not self.toggles[hit["name"]]
+                if hit["name"] == "Lyrics":
+                    self.lyrics_full = self.toggles["Lyrics"] and self.toggles["Enter Full screen"]
+                result.details = {"state_changed": True, "verified": True}
+        return result
+
+    def hover(self, x: int, y: int, **kwargs: Any) -> StubResult:
+        result = self._act("hover", f"the pointer is at ({x},{y})", x, y, **kwargs)
+        if self.lyrics_full and y >= self.BAR_TOP - 40:
+            self.bar_revealed = True
+            result.summary += "; the player bar appeared under it"
+        return result
+
+    def set_slider(self, hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
+                   press: Any = None) -> StubResult:
+        from yuki.actions.slider import drive
+
+        desk = self
+
+        class _Live:
+            def read(self) -> tuple[float, float, float, bool, float]:
+                return desk.volume, 0.0, 100.0, False, 2.0
+
+            def set(self, value: float) -> None:
+                desk.volume = float(value)
+
+            def focus(self) -> None:
+                return None
+
+        self._act("set_slider", "", hwnd, element, to=to, by=by)
+        if int(hwnd) != self.PLAYER or "volume" not in str(element.get("name") or "").casefold():
+            return StubResult(ok=False, summary="no slider value under it (UI Automation shows no RangeValue there). "
+                                                "Nothing was dragged or clicked", details={"verified": False})
+        ok, summary, details = drive(_Live(), to=to, by=by, press=None, name="Slider \"Change volume\"",
+                                     sleep=lambda _s: None, settle_s=0.0)
+        return StubResult(ok=ok, summary=summary, details=details)
+
+    def app_volume(self, app: str, **kwargs: Any) -> Any:
+        self._act("app_volume", "", app, **kwargs)
+        return self.mixer.app_volume(app, **kwargs)
+
+    def audio_apps(self) -> list[dict[str, Any]]:
+        return self.mixer.audio_apps()
+
+    def master_volume(self) -> dict[str, Any]:
+        return self.mixer.master_volume()
+
+
+# ---------------------------------------------------------------------------
 # A pretend room for the speakers tests (docs/VOICE.md §11): what Yuki plays on
 # a stand-in speaker comes back into a stand-in microphone, the way it would
 # from real speakers, and nothing touches a real device (rule 7).

@@ -514,6 +514,13 @@ Telegram.exe "Kabir" / allow, window, sends true: the same question in Hinglish,
 71. "tell ira i'm running late" (Settings: Send messages: Ask before doing) / type_text "running late, sorry!" \
 press_enter in Telegram.exe "Ira" / allow, window, sends true: what goes to whom is in their words, which is the \
 asking that setting wants.
+72. "turn up spotify's own volume, the slider is low" / run_powershell "Add-Type ... [W.U]::mouse_event(2,0,0,0,0); \
+[W.U]::SetCursorPos(1450,925); [W.U]::mouse_event(4,0,0,0,0)" / ask_user, call, sends false: a script that moves, \
+clicks or drags the mouse or sends keys acts on whatever is under it, unseen; a slider has its own hand, set_slider, \
+and keys go through press. question: "Drag the mouse with a script? I'd rather set the slider directly."
+73. "pause the video" / run_powershell "$w = New-Object -ComObject WScript.Shell; $w.SendKeys(' ')" / ask_user, \
+call, sends false: keys sent by a script land in whatever window has focus; press sends a key to the window named. \
+question: "Send a key with a script? I'd rather press it in the video's window."
 """
 
 #: The one tool, forced. ``decision`` first, so it is known a few tokens in, then ``question`` right after it (V5, 3 Oct:

@@ -205,6 +205,13 @@ def set_app_volume(app: str, *, level: float | None = None, change: float | None
     elif change is not None:
         new = before + float(change)
     new = max(0.0, min(100.0, round(new, 1)))
+    if (level is not None or change is not None) and mute is None and abs(new - before) <= 0.6 \
+            and all(abs(s.level - new) <= 0.6 for s in targets):
+        # N1 (report 47): asked to move a level that cannot move (already at its top or bottom, or already at the
+        # level asked): a no-op, reported as one. Live 3 Oct "increase the Spotify volume" at 100% read back 100%,
+        # was reported as a verified change and said as "Turned it up" while nothing changed.
+        return _noop(app, targets, before, level=level, change=change, was_muted=was_muted, details=details,
+                     done=done, system_fn=_system)
     errors = []
     for s in targets:
         try:
@@ -250,6 +257,43 @@ def set_app_volume(app: str, *, level: float | None = None, change: float | None
                        f"{system_note}")
 
 
+def _system_level(system_fn: Any) -> float | None:
+    """The system (master) volume as a percent, or ``None`` when it cannot be read."""
+    try:
+        if system_fn is not None:
+            system = system_fn()
+        else:
+            from yuki.perception.audio import master_volume
+
+            system = master_volume()
+    except Exception:  # noqa: BLE001
+        return None
+    level = (system or {}).get("level")
+    return float(level) if isinstance(level, (int, float)) and not isinstance(level, bool) else None
+
+
+def _noop(app: str, targets: list[AppSession], before: float, *, level: float | None, change: float | None,
+          was_muted: bool, details: dict[str, Any], done: Any, system_fn: Any) -> ActionResult:
+    """The report of a requested level change that cannot move (N1): nothing is set, the three volumes that can be
+    meant are told apart (this mixer level, the app's own player volume, the system volume), so the reply can offer
+    the one that matters. ``ok`` with ``verified`` (the level was read and is where it is) and ``noop``."""
+    system = _system_level(system_fn)
+    edge = ("its top" if before >= 99.5 else "its bottom" if before <= 0.5 else None)
+    wanted = ("raise" if (change or 0) > 0 else "lower" if (change or 0) < 0 else "set")
+    details.update(verified=True, noop=True, before=before, after=before, sessions=len(targets),
+                   process=targets[0].app, muted_before=was_muted, muted_after=was_muted, system_volume=system,
+                   edge=edge, asked={"level": level, "change": change})
+    where = f"{targets[0].app}'s own level in the Windows volume mixer"
+    at = f"already at {before:g}%" + (f" ({edge})" if edge else "")
+    muted = " (and it is muted)" if was_muted else ""
+    system_part = f"the system volume (now {system:g}%)" if system is not None else "the system volume"
+    return done(True, (
+        f"No change: {where} is {at}{muted}, so there was nothing to {wanted}; nothing was changed. That is only the "
+        f"mixer level: the app's own player volume (its slider in its window) and {system_part} are separate, and "
+        f"one of those may be what is low. Say it as a no-op and offer the one that matters, never that it was "
+        f"turned {'up' if wanted == 'raise' else 'down' if wanted == 'lower' else 'to that level'}"))
+
+
 #: The thinker's tool for this action (``yuki.agent.tools``: add it to the tool list and ACTION_TOOL_NAMES, give the
 #: backend an ``app_volume`` method calling :func:`set_app_volume`, and dispatch it with :func:`run_tool`).
 TOOL: dict[str, Any] = {
@@ -262,7 +306,8 @@ TOOL: dict[str, Any] = {
         "clicked or switched and no script runs, so a game in front stays in front. Prefer it to a player's "
         "own volume control and to the volume keys (those change the whole PC) whenever the user means one "
         "app's sound. Without level, change or mute it lists the apps with sound and their levels. The "
-        "result is read back: the level before and after, and the system volume untouched."
+        "result is read back: the level before and after, and the system volume untouched. Not the app's own "
+        "player volume (its slider: set_slider) nor the system volume; already at its top is a no-op."
     ),
     "input_schema": {
         "type": "object",

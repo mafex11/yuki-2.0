@@ -44,11 +44,11 @@ from yuki.ui.own_window import PAGE_WORDS, PAGES as YUKI_PAGES
 #: This is bookkeeping about payload size, not a rule about behaviour.
 PERCEPTION_TOOLS: frozenset[str] = frozenset(
     {"look_at_desktop", "look_at_window", "read_page", "read_tabs", "take_screenshot", "system_facts", "memory",
-     "read_file", "fetch_url", "look_at_focus", "read_clipboard", "about"}
+     "read_file", "fetch_url", "look_at_focus", "read_clipboard", "about", "check_situation"}
 )
 
 #: Tools handled by the agent loop rather than a backend function.
-CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "say"})
+CONTROL_TOOLS: frozenset[str] = frozenset({"ask_user", "done", "note_to_self", "say", "tasks"})
 
 #: Tools only one lane is shown (the reader lane's hand-off, :mod:`yuki.agent.lanes`): never in the worker's block.
 LANE_ONLY_TOOLS: frozenset[str] = frozenset({"hand_over"})
@@ -239,7 +239,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Click an element (an id from the latest read of its window) or, when no element describes the target, "
             "x and y. A left single click on an element that supports a UI Automation pattern (invoke, toggle, "
-            "select) goes through that pattern, without the mouse or taking focus; the result says which way."
+            "select) goes through that pattern, without the mouse or taking focus; the result says which way. "
+            "x, y must be on a control of the latest read; one hidden until hovered is hovered, read, then clicked."
         ),
         "input_schema": _obj(
             {
@@ -250,6 +251,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "button": {"type": "string", "enum": ["left", "right", "middle"]},
                 "clicks": {"type": "integer", "description": "2 for a double click."},
                 "expect_hwnd": _GUARD,
+                # N4 (report 47): a toggle (a read with on/off) is clicked only toward the state they want
+                "toggle_to": {"type": "string", "enum": ["on", "off"],
+                              "description": "A toggle (on/off in the read): the state they want; read live first, "
+                                             "clicked only if not there, read back."},
             },
         ),
     },
@@ -372,7 +377,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "label": "Changing an app's volume",
         "description": (
             "One app's own volume in the Windows mixer (only Chrome, only Spotify): nothing focused or clicked, the "
-            "system volume untouched. Without level, change or mute it lists the apps with sound. Read back."
+            "system volume untouched. Without level, change or mute it lists the apps with sound. Read back. Not "
+            "the app's own player volume (its slider: set_slider)."
         ),
         "input_schema": _obj(
             {
@@ -618,6 +624,53 @@ FINISH_WORDS_SCHEMA: dict[str, Any] = {
     "description": "With finishes_with: the outcome in your words, only when its report cannot name it as they asked.",
 }
 
+# vfix2 (report 47): the situation check before a consequential action (N0, run by the agent loop) and the slider
+# hand (N2). Appended here, after the registry's own list, so the hunks of other builders' tools stay apart.
+from yuki.agent.situation import SITUATION_TOOL as _SITUATION_TOOL  # noqa: E402
+from yuki.agent.slider_tool import SLIDER_TOOL as _SLIDER_TOOL  # noqa: E402
+
+#: N10 (report 47): a request of several parts is a kept list. Live 3 Oct "open Chrome, open YouTube, scroll the
+#: recommendations, then message my best friend on Discord" lost its last part when the user said "turn the volume up"
+#: in between. The loop holds the list (``yuki.agent.loop``): what they add mid-run carries it, done is held while an
+#: item is still to do, and it is in the run trace.
+TASKS_TOOL: dict[str, Any] = {
+    "name": "tasks",
+    "label": "Keeping your list",
+    "description": (
+        "Several things asked at once: the list, done in order. Send it whole alongside your first step, and again "
+        "alongside a step that finishes, changes or adds an item. What they add mid-run goes on it (a quick one "
+        "first). Dropped only on their words (by), said aloud. done waits while an item is left."
+    ),
+    "input_schema": _obj(
+        {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "what": {"type": "string"},
+                        "state": {"type": "string", "enum": ["todo", "doing", "done", "dropped"]},
+                        "by": {"type": "string", "description": "dropped: their words, exactly."},
+                    },
+                    "required": ["what", "state"],
+                },
+            },
+        },
+        ["items"],
+    ),
+}
+#: N9 (report 47): the heard form of a name, learned as an alias when the user confirms or corrects a guess.
+ABOUT_HEARD_AS: dict[str, Any] = {
+    "type": "string",
+    "description": "Their confirmation or correction of a misheard name (\"hey meant\" was Hemanth): the words as "
+                   "heard, kept as that person's misheard form.",
+}
+
+TOOL_SCHEMAS.extend([dict(_SITUATION_TOOL), dict(_SLIDER_TOOL), TASKS_TOOL])
+for _t in TOOL_SCHEMAS:
+    if _t.get("name") == "about":
+        _t["input_schema"]["properties"]["heard_as"] = ABOUT_HEARD_AS
+
 #: Name -> schema, for validation and lookups.
 TOOLS_BY_NAME: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOL_SCHEMAS}
 
@@ -642,6 +695,7 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "app_volume",
     "window_action",
     "write_clipboard",
+    "set_slider",
 )
 
 
@@ -689,6 +743,7 @@ TOOL_TRAITS: dict[str, Traits] = {
     "app_volume": Traits(("open_apps",), "none"),
     "window_action": Traits(("open_apps",), "window"),
     "write_clipboard": Traits(("click_type",), "none"),
+    "set_slider": Traits(("click_type",), "input"),
 }
 #: Per operation, where one tool's operations differ (the fixed enum or boolean argument that names it).
 OP_TRAITS: dict[tuple[str, str], Traits] = {
@@ -897,7 +952,27 @@ ACHIEVED_SCHEMA: dict[str, Any] = {
                    "you found (\"Found when your call started\"). Never just \"Done\", never a command, path or id.",
 }
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][ACHIEVED_FIELD] = ACHIEVED_SCHEMA
-TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD]
+#: N3 (report 47): each state the done message tells, with the step of this request whose result showed it; the loop
+#: checks the step ran and showed something (never by reading the words). Live 3 Oct "Spotify's own slider is already
+#: at 100%" was said before any look at the window, then again after reading only the Windows mixer.
+STATES_FIELD = "states"
+STATES_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "says": {"type": "string"},
+            "seen_in": {"type": "string", "description": "The tool whose result in this request showed it."},
+            "hwnd": {"type": "integer", "description": "Its window, 0 for none."},
+        },
+        "required": ["says", "seen_in"],
+    },
+    "description": "Each present state your message tells (a level, on/off, open, sent, already at its top) and the "
+                   "step that showed it; unseen is not yours to tell. The mixer level (app_volume) is not an app's "
+                   "own player volume. [] for none.",
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][STATES_FIELD] = STATES_SCHEMA
+TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD]
 
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
@@ -915,13 +990,14 @@ HELPER_TOOLS: tuple[str, ...] = (
 #: ``run_powershell`` is not here: it acts on the system, not on a window. A list
 #: of names for plumbing, not a rule about what the model should do.
 AUTO_VIEW_TOOLS: frozenset[str] = frozenset(
-    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab", "hover"}
+    {"launch_app", "focus_window", "open_url", "click", "type_text", "hotkey", "press", "scroll", "tab", "hover",
+     "set_slider"}
 )
 
 #: Input actions after which the window they went to may look different from its latest read, so a click
 #: at raw x,y there is refused until it is read again (:meth:`Dispatcher._check_raw_point`). Plumbing.
 _MARKS_ACTED: frozenset[str] = frozenset(
-    {"type_text", "hotkey", "press", "scroll", "hover", "tab", "window_action"}
+    {"type_text", "hotkey", "press", "scroll", "hover", "tab", "window_action", "set_slider"}
 )
 
 #: How long a window's element count and covered area must hold still before the
@@ -1422,6 +1498,13 @@ class _LazyRealBackend:
         return importlib.import_module("yuki.actions.app_volume").set_app_volume(
             app, level=level, change=change, mute=mute)
 
+    def set_slider(self, hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
+                   press: Callable[[str, int], Any] | None = None) -> Any:
+        """:func:`yuki.actions.slider.set_slider`: a slider set by RangeValue or its own keys, read back (N2)."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.slider").set_slider(hwnd, element, to=to, by=by, press=press)
+
     def audio_apps(self) -> list[dict[str, Any]]:
         """:func:`yuki.actions.app_volume.audio_apps`: the apps with sound and their own levels, read-only."""
         import importlib
@@ -1490,7 +1573,7 @@ def default_backend() -> Backend:
 # Dispatch results
 # ---------------------------------------------------------------------------
 
-Kind = Literal["normal", "ask_user", "done", "note", "say"]
+Kind = Literal["normal", "ask_user", "done", "note", "say", "tasks"]
 
 
 @dataclass
@@ -2885,6 +2968,11 @@ class Dispatcher:
         target = None
         if not label and self.guard_raw_clicks:
             target = self._check_raw_point(x, y, tool_input)
+            self._check_point_on_control(x, y, target)
+        toggle = self._toggle_state(tool_input) if label else None
+        if toggle is not None:
+            # N4: a toggle is read live first and clicked only toward the wanted state, then read back
+            return self._click_toggle(tool_input, toggle, button=button, guard=guard, label=label, x=x, y=y)
         if label and button == "left" and self._opt_int(tool_input, "clicks", 1) == 1:
             via = self._pattern_first("click", tool_input, "click")
             if via is not None:
@@ -2906,6 +2994,97 @@ class Dispatcher:
         if outcome.ok:
             self._mark_acted(guard or target or self._pointed_window(x, y), "click")
         return outcome
+
+    def _check_point_on_control(self, x: int, y: int, target: int | None) -> None:
+        """N4 (report 47): a click at raw x,y must land on a control of the latest read of the window there. Live 3 Oct
+        the thinker clicked the coordinates of a player bar that a full-screen view had hidden: nothing of the latest
+        read was there. Bounds from the read only; a window never read (refused before this), a read with no elements
+        or a backend that cannot say which window is at the point is not checked."""
+        if not target or int(target) not in self._latest_trees:
+            return
+        number, elements = self._latest_trees[int(target)]
+        boxes = [e for e in elements.values() if isinstance(e, dict) and e.get("bounds")]
+        if not boxes:
+            return
+        for e in boxes:
+            b = e["bounds"]
+            if e.get("is_interactive") and len(b) == 4 and int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3]):
+                return
+        raise ToolError(
+            f"not clicked: nothing you can click is at ({x},{y}) in read #{number} of window {target}. A control hidden "
+            f"until the pointer comes near it (a player bar in a full-screen view) is not there yet: hover where it "
+            f"appears, read the window again, then click it by its element id from that read")
+
+    def _toggle_state(self, tool_input: dict[str, Any]) -> tuple[int, dict[str, Any], str] | None:
+        """``(hwnd, element, state)`` when the element a click names is a toggle with an on/off state in its read
+        (UI Automation's Toggle pattern, as the read lists it), else ``None``."""
+        found = self._read_element(tool_input)
+        if found is None:
+            return None
+        hwnd, element = found
+        states = [str(s) for s in element.get("states") or []]
+        if "toggle" not in (element.get("patterns") or []) or not ({"on", "off"} & set(states)):
+            return None
+        return hwnd, element, "on" if "on" in states else "off"
+
+    def _live_element(self, hwnd: int, element: dict[str, Any]) -> dict[str, Any] | None:
+        """The same control in a fresh read of its window (same role and name, the box nearest the read's), or
+        ``None`` when it is not there now. The fresh read does not replace the latest read (its ids stay valid)."""
+        try:
+            tree = _plain(self.backend.get_window_tree(int(hwnd), max_elements=self.max_tree_elements,
+                                                       timeout_s=self.tree_timeout_s))
+        except Exception:  # noqa: BLE001
+            return None
+        want = element.get("bounds") or (0, 0, 0, 0)
+        same = [e for e in (tree or {}).get("elements") or [] if isinstance(e, dict)
+                and e.get("role") == element.get("role") and e.get("name") == element.get("name") and e.get("bounds")]
+        if not same:
+            return None
+        return min(same, key=lambda e: sum(abs(int(a) - int(b)) for a, b in zip(e["bounds"], want)))
+
+    def _click_toggle(self, tool_input: dict[str, Any], toggle: tuple[int, dict[str, Any], str], *, button: str,
+                      guard: int | None, label: str, x: int, y: int) -> ToolOutcome:
+        """N4: read the toggle's live state, click only when it is not the wanted one, read it back. Live 3 Oct
+        Spotify's Lyrics toggle was clicked six times from stale reads and the lyrics view flipped open and shut."""
+        hwnd, element, read_state = toggle
+        want = tool_input.get("toggle_to")
+        if want not in ("on", "off"):
+            raise ToolError(f"not clicked: {label} is a toggle (it was {read_state} in the read): give toggle_to, on "
+                            f"or off, the state they want; it is clicked only when it is not there already")
+        live = self._live_element(hwnd, element)
+        if live is None:
+            raise ToolError(f"not clicked: {label} is not in a fresh read of its window: it may be hidden until the "
+                            f"pointer comes near it, or gone. Hover where it appears, read again, and click it from "
+                            f"that read")
+        now = "on" if "on" in (live.get("states") or []) else "off" if "off" in (live.get("states") or []) else None
+        if now == want:
+            outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just now): not "
+                                                                 f"clicked, nothing changed",
+                                  content=[{"type": "text", "text": f"{label} is already {want} (read live just "
+                                                                    f"now): not clicked, nothing changed"}],
+                                  payload={"details": {"verified": True, "noop": True, "state": now}})
+            return self._labelled(outcome, label)
+        via = self._pattern_first("click", tool_input, "click") if button == "left" else None
+        if via is None:
+            self._before_input("click")
+            via = self._from_action("click", self.backend.click(x, y, button=button, clicks=1, expect_hwnd=guard))
+        if via.ok:
+            self._mark_acted(hwnd, "click")
+        after = self._live_element(hwnd, element)
+        state = None if after is None else ("on" if "on" in (after.get("states") or []) else
+                                            "off" if "off" in (after.get("states") or []) else None)
+        verified = state == want
+        note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
+        if via.ok and not verified:
+            note += f" (wanted {want}): do not click it again from this read; read the window first"
+        via.summary += note
+        if via.content and via.content[0].get("type") == "text":
+            via.content[0]["text"] += note
+        if isinstance(via.payload, dict):
+            details = dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict) else {}
+            details.update(verified=verified, state_before=now, state_after=state, toggle_to=want)
+            via.payload = {**via.payload, "details": details}
+        return self._labelled(via, label)
 
     def _pointed_window(self, x: int, y: int) -> int | None:
         locate = getattr(self.backend, "window_at", None)
@@ -3137,6 +3316,34 @@ class Dispatcher:
         from yuki.actions.app_volume import run_tool
 
         return self._from_action("app_volume", run_tool(tool_input, set_volume=self.backend.app_volume))
+
+    def _do_set_slider(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """N2 (report 47): a slider set by its RangeValue, else its own arrow keys, read back; never dragged."""
+        _x, _y, guard, label = self._point(tool_input)
+        found = self._read_element(tool_input)
+        if found is None:
+            raise ToolError("give the slider's element id from the latest read of its window")
+        hwnd, element = found
+        to, by = tool_input.get("to"), tool_input.get("by")
+        for key, v in (("to", to), ("by", by)):
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                raise ToolError(f"'{key}' must be a number, got {v!r}")
+        if to is None and by is None:
+            raise ToolError("give to (0-100 percent of its range) or by (percent points)")
+        act = getattr(self.backend, "set_slider", None)
+        if not callable(act):
+            raise ToolError("this desktop has no slider hand")
+        press = getattr(self.backend, "press", None)
+
+        def keys(key: str, times: int) -> Any:
+            self._before_input("set_slider")
+            return press(key, times=int(times), expect_hwnd=guard or hwnd)
+
+        outcome = self._from_action("set_slider", act(hwnd, element, to=to, by=by,
+                                                      press=keys if callable(press) else None))
+        if outcome.ok:
+            self._mark_acted(hwnd, "set_slider")
+        return self._labelled(outcome, label)
 
     def _do_open_url(self, tool_input: dict[str, Any]) -> ToolOutcome:
         url = self._need_str(tool_input, "url")
@@ -3402,6 +3609,29 @@ class Dispatcher:
             control_input={"message": message},
             payload={"message": message},
         )
+
+    def _do_tasks(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """N10: the request's kept list (the loop holds it; see :data:`TASKS_TOOL`)."""
+        raw = tool_input.get("items")
+        if not isinstance(raw, list) or not raw:
+            raise ToolError("give items: the list, each with what and state (todo, doing, done or dropped)")
+        items = []
+        for item in raw[:12]:
+            if not isinstance(item, dict) or not str(item.get("what") or "").strip():
+                raise ToolError("each item needs what (a few words) and state")
+            state = str(item.get("state") or "todo")
+            if state not in ("todo", "doing", "done", "dropped"):
+                raise ToolError(f"state must be todo, doing, done or dropped, got {state!r}")
+            by = " ".join(str(item.get("by") or "").split())[:200]
+            if state == "dropped" and not by:
+                raise ToolError(f"\"{item['what']}\" is dropped only on their words: give by, their words that "
+                                f"dropped it, exactly; otherwise keep it on the list")
+            items.append({"what": " ".join(str(item["what"]).split())[:120], "state": state, **({"by": by} if by
+                                                                                               else {})})
+        left = [i["what"] for i in items if i["state"] in ("todo", "doing")]
+        text = ("Kept. Still to do, in order: " + "; ".join(left) + ".") if left else "Kept: nothing left to do."
+        return ToolOutcome(name="tasks", ok=True, summary=text, kind="tasks", control_input={"items": items},
+                           content=[{"type": "text", "text": text}], payload={"items": items})
 
     def _do_say(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = self._need_str(tool_input, "text")

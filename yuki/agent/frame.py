@@ -328,12 +328,16 @@ def named_app_line(app: str | None) -> str:
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
           chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
-          named_app: str | None = None) -> TaskFrame:
+          named_app: str | None = None, lessons: Sequence[str] = ()) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
     metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
     words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
     older memory without it still gives) and the desktop overview. Code only; never raises (a failure is an empty
-    frame with ``error``)."""
+    frame with ``error``).
+
+    ``lessons`` (N8, report 47): what went wrong in this session's troubled runs on the apps in play, written by code
+    from their traces (:func:`session_lessons`) until practice memory's post-mortem learns it; kept whole with the
+    pitfalls."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
@@ -371,6 +375,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
             # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
             # always reach the brain (the person block gives way first)
             tail = _practice_lines(frame, practice)
+        fresh = [str(x) for x in lessons or () if str(x).strip()][:MAX_LESSONS]
+        if fresh:
+            tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         else:   # an older memory: know-how lines and their "Not:" part
             proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
             if proc:
@@ -520,6 +527,10 @@ PLAYBOOK_HEAD = ("How this was done before on this PC (playbooks - your first at
                  "the screen, adapt when the screen differs, ask when it names no single default; put its id in the "
                  "playbook field of the actions that follow it):")
 PITFALL_HEAD = "Your own earlier mistakes in the apps in play (never repeat one; do what it says instead):"
+#: N8 (report 47): this session's troubled runs on the apps in play, from their traces, before memory learns them.
+LESSONS_HEAD = ("Earlier in this session on the apps in play, from your own runs (not learned yet; never repeat what "
+                "did not work, and start from what worked):")
+MAX_LESSONS = 4
 
 
 def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
@@ -567,3 +578,54 @@ def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
             return text
         (body if body else tail).pop()
     return ""
+
+
+def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Sequence[str] = (),
+                    at: float | None = None) -> dict[str, list[str]]:
+    """N8 (report 47): from one finished run's trace, per app, what did not work and what worked after it, as short
+    lines for the next requests of this session (:func:`build`'s ``lessons``), or ``{}`` for a run with no trouble.
+
+    Trouble is measured: a step that failed, was held, or whose report showed no effect (contradicted), the same
+    control acted on three times or more, a run that ended cancelled, withdrawn or failed after acting, or words the
+    user added mid-run. Each line names the tool, the control (role and name, never ids or coordinates) and how many
+    times, with the step's own why; what worked is the steps verified after the first trouble. Code only."""
+    import collections
+    from datetime import datetime as _dt
+
+    steps = [s for s in trace or () if isinstance(s, dict) and s.get("kind") in ("action", "control")
+             and s.get("tool") not in ("tasks",)]
+    acted = [s for s in steps if s.get("kind") == "action"]
+    bad = [s for s in steps if s.get("ok") is False or s.get("verdict") is False]
+    counts = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in acted)
+    repeated = [k for k, n in counts.items() if n >= 3 and k[2]]
+    ended_badly = outcome in ("cancelled", "withdrawn", "error", "failed") and bool(acted)
+    if not bad and not repeated and not ended_badly and not steers:
+        return {}
+    clock = _dt.fromtimestamp(at).strftime("%I:%M %p").lstrip("0") if at else "earlier"
+    out: dict[str, list[str]] = collections.defaultdict(list)
+    seen: set[tuple[str, Any, str]] = set()
+    for s in bad:
+        key = (s.get("app") or "", s.get("tool"), s.get("target") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        n = counts.get(key, 1)
+        why = _one(s.get("why") or s.get("result"), 120)
+        out[key[0]].append(f"{clock}: {key[1]}" + (f" on {key[2]}" if key[2] else "") + (f", {n} times" if n > 1
+                                                                                         else "") + f": {why}")
+    for key in repeated:
+        if key not in seen:
+            seen.add(key)
+            out[key[0]].append(f"{clock}: {key[1]} on {key[2]} {counts[key]} times in one run (it did not settle "
+                               f"it; read the state before acting again)")
+    first_bad = min((trace.index(s) for s in bad if s in trace), default=None)
+    if first_bad is not None:
+        worked = [s for s in list(trace)[first_bad + 1:] if s.get("kind") == "action" and s.get("verdict") is True]
+        for s in worked[:1]:
+            out[s.get("app") or ""].append(f"{clock}: what worked after that: {s.get('tool')}"
+                                           + (f" on {s.get('target')}" if s.get("target") else ""))
+    if ended_badly or steers:
+        app = next((s.get("app") for s in reversed(acted) if s.get("app")), "")
+        said = "; ".join(f"\"{_one(w, 80)}\"" for w in list(steers)[:2])
+        out[app or ""].append(f"{clock}: the run ended {outcome}" + (f"; they said while it ran: {said}" if said else ""))
+    return {k: v[:MAX_LESSONS] for k, v in out.items() if v}

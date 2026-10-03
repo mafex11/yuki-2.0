@@ -362,8 +362,8 @@ class Lane(QThread):
                 # Cancelled while it waited: it never reaches the agent, so a
                 # cancel meant for it cannot land on the next request instead.
                 if skipped == WITHDRAWN:
-                    self.runtime.withdrawn.emit(self.name, job.id,
-                                                "Withdrawn before it started: replaced by a newer request.")
+                    self.runtime.withdrawn.emit(self.name, job.id, self._withdrawn_text(
+                        job.id, "Withdrawn before it started: replaced by a newer request."))
                 else:
                     self.runtime.failed.emit(self.name, job.id, "Cancelled before it started.")
                 self.runtime.lane_done.emit(self.name, job.id, job.request, False, [])
@@ -512,7 +512,7 @@ class Lane(QThread):
                 elif self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == WITHDRAWN:
                     # Replaced by the user's newer request: a quiet end, never an error (the chat shows it
                     # cancelled; the voice says nothing of it).
-                    runtime.withdrawn.emit(self.name, job.id, event.text)
+                    runtime.withdrawn.emit(self.name, job.id, self._withdrawn_text(job.id, event.text))
                 else:
                     runtime.failed.emit(self.name, job.id, event.text)
 
@@ -521,6 +521,11 @@ class Lane(QThread):
         if self.agent.cancelled:
             return []  # stopped or withdrawn: a request the user dropped is never handed to the worker
         return refused
+
+    def _withdrawn_text(self, job_id: int, text: str) -> str:
+        """N10: the withdrawn line with the user's words that replaced it, when the runtime has them."""
+        name = getattr(self.runtime, "withdrawn_text", None)
+        return name(job_id, text) if callable(name) else text
 
     def _drain_answers(self) -> None:
         """Throw away answers left over from a cancelled request.
@@ -670,6 +675,8 @@ class AgentRuntime(QObject):
                 memory=self.memory,
             )
 
+        #: N10: the user's words that withdrew a request, until its withdrawn line goes out (:meth:`withdrawn_text`).
+        self._withdraw_words: dict[int, str] = {}
         self.worker = Lane(WORKER, worker_agent, self)
         self.front_desk = Lane(FRONT_DESK, front_desk_agent, self, blocked=front_desk_blocked)
         self.lane_done.connect(self._on_lane_done)
@@ -887,14 +894,27 @@ class AgentRuntime(QObject):
             self.cancelled.emit(int(request_id), by)
         return how
 
-    def withdraw(self, request_id: int) -> str:
+    def withdraw(self, request_id: int, words: str | None = None) -> str:
         """Withdraw one request because the user's newer request replaces it (running or queued).
 
         The same stop as :meth:`cancel` (a streaming response is dropped at once, a tool in flight
         finishes), ending with the ``withdrawn`` signal instead of ``failed``: shown as cancelled, never
         as an error, and never spoken. Returns how, as :meth:`cancel`.
+
+        N10 (report 47): ``words`` are the user's own words that replaced it ("forget that, play lo-fi"); they are
+        logged and go on the withdrawn line, so a request is never dropped without the words that dropped it (live 3 Oct
+        a list of four tasks ended "Withdrawn: replaced by the user's newer request" after "turn the volume up").
         """
+        words = " ".join(str(words or "").split())[:200] or None
+        self.ui_log.event("withdraw", id=request_id, words=words)
+        if words:
+            self._withdraw_words[request_id] = words
         return self.cancel(request_id, WITHDRAWN)
+
+    def withdrawn_text(self, request_id: int, text: str) -> str:
+        """The withdrawn line of a request, with the user's words that replaced it when they are known (N10)."""
+        words = self._withdraw_words.pop(request_id, None)
+        return f"{text} (their words: \"{words}\")" if words else text
 
     def steer(self, request_id: int, text: str) -> bool:
         """Pass something the user added to a running request (:meth:`Agent.steer`).
