@@ -601,6 +601,12 @@ class Settings:
     #: never hold Yuki back), and how long a wait lasts before its one line is said (silent before).
     input_yield_probe_s: float = 0.25
     input_yield_notify_s: float = 3.0
+    #: appTakeover (4 Oct): while the worker's request acts, the user's real keys, clicks or a big mouse movement pause
+    #: it ("You took over"); Resume or Stop on the island, their words, or typing to Yuki goes on. A pause nobody
+    #: resumes ends the request quietly after ``takeover_idle_stop_s``. The movement threshold is the user's own
+    #: setting (``ui.json`` ``takeover_move_px``).
+    takeover_pause: bool = True
+    takeover_idle_stop_s: float = 600.0
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
 

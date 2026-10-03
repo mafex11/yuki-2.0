@@ -19,6 +19,7 @@ told. Numbers, measured on the clock, never on what was typed.
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -365,6 +366,291 @@ class InputGate:
             self.sleep(self.poll_s)
 
 
-__all__ = ["INPUT_LEASE_S", "InputGate", "LeaseBusy", "WINDOW_LEASE_S", "input_held_elsewhere", "input_lease",
-           "last_input_age_s", "leased", "note_own_input", "own_input_at", "own_input_now", "own_input_span",
-           "user_input_age_s", "window_lease"]
+# ---------------------------------------------------------------------------
+# Taking over: the user's real input while a request acts (appTakeover, 4 Oct)
+# ---------------------------------------------------------------------------
+#
+# The user, 4 Oct: "when it's working and I start typing with my keyboard or I suddenly move my mouse then it should
+# think that I have taken over ... and it should stop temporarily ... not a very small vibration, a big movement,
+# because my mouse sensor is bad and sometimes vibrates on its own." While a request acts, :class:`TakeoverThread`
+# looks a few times a second (``GetLastInputInfo``, ``GetCursorPos``, and ``GetAsyncKeyState`` only when some input
+# came since the last look: no hook, nothing at all while no request acts) for a key or a mouse button going down, or
+# the cursor travelling far. Yuki's own input moments are left out (its own span, and any span that began since the
+# last look: its keys and its cursor jumps are never the user's). Numbers on the clock and in pixels only.
+
+#: How far (screen pixels) the cursor must travel within :data:`TAKEOVER_WINDOW_S` to count as the user moving the
+#: mouse, by default. A sensor that twitches by itself moves the cursor a few pixels back and forth (it never gets far
+#: from where it was); a hand reaching for something covers tens to hundreds of pixels in a fraction of a second. The
+#: user's setting (``ui.json`` ``takeover_move_px``, Settings) overrides it, within the bounds below.
+TAKEOVER_MOVE_PX = 40
+TAKEOVER_MOVE_MIN_PX = 12
+TAKEOVER_MOVE_MAX_PX = 400
+#: The window the travel is measured over (s), and how often the watch looks (s).
+TAKEOVER_WINDOW_S = 0.3
+TAKEOVER_POLL_S = 0.1
+#: The mouse buttons among :data:`_REAL_INPUT_VKS` (a button going down is a click; any other key is typing).
+_MOUSE_VKS = frozenset({1, 2, 4, 5, 6})
+
+
+def key_states(vks: tuple[int, ...] = _REAL_INPUT_VKS) -> tuple[frozenset[int], frozenset[int]] | None:
+    """``(down, tapped)``: the keys and mouse buttons held down now (``GetAsyncKeyState``'s high bit), and those pressed
+    and let go since the last look (its low bit, the key no longer down); ``None`` when Windows cannot say. Every key
+    is asked each look, so no "pressed since" bit is left over for the next one."""
+    try:
+        get = ctypes.windll.user32.GetAsyncKeyState
+        down: set[int] = set()
+        tapped: set[int] = set()
+        for vk in vks:
+            state = get(vk)
+            if state & 0x8000:
+                down.add(vk)
+            elif state & 1:
+                tapped.add(vk)
+        return frozenset(down), frozenset(tapped)
+    except Exception:  # noqa: BLE001 - not on Windows
+        return None
+
+
+#: process id -> whether it is Yuki's (this process, or a program in Yuki's own folder: the window, the memory service).
+_YUKI_PIDS: dict[int, bool] = {}
+
+
+def _pid_is_yuki(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    known = _YUKI_PIDS.get(pid)
+    if known is not None:
+        return known
+    import os
+
+    mine = pid == os.getpid()
+    if not mine:
+        try:
+            import sys
+            from pathlib import Path
+
+            import psutil
+
+            from yuki.core.paths import app_dir
+
+            exe = Path(psutil.Process(pid).exe()).resolve()
+            mine = any(exe.is_relative_to(root) for root in (app_dir().resolve(), Path(sys.prefix).resolve()))
+        except Exception:  # noqa: BLE001 - gone, or not ours to read
+            mine = False
+    if len(_YUKI_PIDS) > 512:
+        _YUKI_PIDS.clear()
+    _YUKI_PIDS[pid] = mine
+    return mine
+
+
+def _window_pid(hwnd: int) -> int:
+    try:
+        pid = ctypes.c_ulong(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(int(hwnd)), ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def yuki_has_it(kind: str, where: tuple[int, int] | None) -> bool:
+    """Whether the user's input went to Yuki itself, not the desktop: keys typed into a Yuki window in front (the ask
+    bar, the window's chat: words for Yuki), a click or the cursor on one of Yuki's windows (the island's buttons).
+    Measured on the window, never on what was typed."""
+    try:
+        user32 = ctypes.windll.user32
+        if kind == "keys":
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            hwnd = int(user32.GetForegroundWindow() or 0)
+        else:
+            if where is None:
+                return False
+            from ctypes import wintypes
+
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = ctypes.c_void_p
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            hit = user32.WindowFromPoint(wintypes.POINT(int(where[0]), int(where[1])))
+            hwnd = int(user32.GetAncestor(hit, 2) or 0) if hit else 0      # GA_ROOT
+        return bool(hwnd) and _pid_is_yuki(_window_pid(hwnd))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def takeover_move_px(value: Any = None) -> int:
+    """The travel that counts as the user moving the mouse (px): ``value`` (or the user's ``ui.json`` setting), kept
+    within :data:`TAKEOVER_MOVE_MIN_PX`..:data:`TAKEOVER_MOVE_MAX_PX`; :data:`TAKEOVER_MOVE_PX` when unset or unreadable."""
+    if value is None:
+        try:
+            from yuki.ui import ui_settings
+
+            value = getattr(ui_settings.load(), "takeover_move_px", None)
+        except Exception:  # noqa: BLE001 - no settings file: the default
+            value = None
+    try:
+        px = int(value)
+    except (TypeError, ValueError):
+        return TAKEOVER_MOVE_PX
+    return max(TAKEOVER_MOVE_MIN_PX, min(TAKEOVER_MOVE_MAX_PX, px))
+
+
+class TakeoverWatch:
+    """Whether the user took over the keyboard or mouse since the watch began: one :meth:`poll` per look.
+
+    * **keys** / **click**: a key or a mouse button went down since the last look (or was pressed and let go between
+      two looks), not held from before the watch began;
+    * **mouse**: the cursor travelled at least ``move_px`` from where it was within the last ``window_s`` seconds, and
+      it is still that far on the next look (a twitching sensor's back-and-forth, or a one-look jump that comes straight
+      back, never counts);
+    * left out: every look while one of Yuki's own input moments runs or just ended (:data:`OWN_INPUT_SLACK_S`), or
+      when one began since the previous look: its keys are consumed and not counted, and the cursor's places from
+      before are forgotten (Yuki moves the cursor itself; review vfix2 for scroll); input that went to Yuki itself
+      (:func:`yuki_has_it`).
+
+    ``GetAsyncKeyState`` is asked only when ``GetLastInputInfo`` shows new input since the last look (or around one of
+    Yuki's own moments): an idle desk costs two calls a look. Every source is a parameter (tests pass stubs).
+
+    Attributes:
+        polls: Looks so far.
+        max_travel: The farthest the cursor travelled in one window without counting (px): what jitter looked like.
+        ignored: Why input was not counted, by reason (``own``, ``yuki``).
+    """
+
+    def __init__(self, *, move_px: int = TAKEOVER_MOVE_PX, window_s: float = TAKEOVER_WINDOW_S,
+                 age: Callable[[], float | None] = last_input_age_s,
+                 keys: Callable[[], tuple[frozenset[int], frozenset[int]] | None] = key_states,
+                 cursor: Callable[[], tuple[int, int] | None] = cursor_at,
+                 span: Callable[[], tuple[float, float | None]] = own_input_span,
+                 ours: Callable[[str, tuple[int, int] | None], bool] = yuki_has_it,
+                 now: Callable[[], float] = time.monotonic) -> None:
+        self.move_px, self.window_s = float(move_px), float(window_s)
+        self.age, self.keys, self.cursor, self.span, self.ours, self.now = age, keys, cursor, span, ours, now
+        self.polls = 0
+        self.max_travel = 0.0
+        self.ignored: dict[str, int] = {}
+        self._down: frozenset[int] = frozenset()
+        self._last_input: float | None = None
+        self._prev_t: float | None = None
+        self._samples: list[tuple[float, int, int]] = []
+        self._far: tuple[int, int] | None = None   # where the cursor was when a far travel was first seen
+
+    def _own(self, t: float) -> bool:
+        """One of Yuki's own input moments runs, ended a moment ago, or began since the previous look."""
+        start, end = self.span()
+        if not start:
+            return False
+        if end is None or t <= end + OWN_INPUT_SLACK_S:
+            return True
+        return self._prev_t is not None and start >= self._prev_t - 0.05
+
+    def _skip(self, why: str) -> None:
+        self.ignored[why] = self.ignored.get(why, 0) + 1
+
+    def poll(self) -> str | None:
+        """Look once: ``"keys"``, ``"click"`` or ``"mouse"`` when the user took over now, else ``None``."""
+        t = self.now()
+        own = self._own(t)
+        seconds = self.age()
+        last = None if seconds is None or seconds == float("inf") else t - float(seconds)
+        came = last is not None and (self._last_input is None or last > self._last_input + 0.005)
+        first = self.polls == 0
+        found: str | None = None
+        if first or came or own:
+            states = self.keys()
+            if states is not None:
+                down, tapped = states
+                if own:
+                    # consumed, never counted, and never the baseline: a key Yuki holds now is let go by Yuki
+                    if (down - self._down) | (tapped - down):
+                        self._skip("own")
+                else:
+                    fresh = (down - self._down) | (tapped - down)
+                    self._down = down
+                    if fresh and not first:
+                        found = "click" if fresh & _MOUSE_VKS else "keys"
+        if last is not None:
+            self._last_input = last if self._last_input is None else max(self._last_input, last)
+        where = self.cursor()
+        if own:
+            self._samples.clear()   # the cursor's places before Yuki moved it are no measure of the user's hand
+            self._far = None
+        elif where is not None:
+            if self._far is not None:
+                if math.dist(where, self._far) >= self.move_px:
+                    found = found or "mouse"
+                self._far = None
+            if found is None:
+                self._samples = [s for s in self._samples if t - s[0] <= self.window_s]
+                travel = max((math.dist(where, (x, y)) for _t, x, y in self._samples), default=0.0)
+                if travel >= self.move_px:
+                    far = max(self._samples, key=lambda s: math.dist(where, (s[1], s[2])))
+                    self._far = (far[1], far[2])
+                else:
+                    self.max_travel = max(self.max_travel, travel)
+            self._samples.append((t, int(where[0]), int(where[1])))
+        self._prev_t = t
+        self.polls += 1
+        if found is not None and self.ours(found, where):
+            self._skip("yuki")
+            self._samples.clear()
+            self._far = None
+            return None
+        return found
+
+
+class TakeoverThread:
+    """Runs a :class:`TakeoverWatch` on its own thread while a request acts; calls ``on_takeover(kind)`` once, the
+    first time the user takes over, then ends. :meth:`stop` ends it at once (the agent stops it when the request ends
+    or is paused). ``grace_s``: how long it waits before its first look (after a resume, the hand that pressed Resume
+    is still moving away)."""
+
+    def __init__(self, on_takeover: Callable[[str], None], *, move_px: int | None = None,
+                 poll_s: float = TAKEOVER_POLL_S, grace_s: float = 0.0,
+                 watch: Callable[[], TakeoverWatch] | None = None) -> None:
+        self.on_takeover = on_takeover
+        self.move_px = takeover_move_px(move_px)
+        self.poll_s, self.grace_s = float(poll_s), float(grace_s)
+        self._make = watch or (lambda: TakeoverWatch(move_px=self.move_px))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.watch: TakeoverWatch | None = None
+        self.fired: str | None = None
+
+    def start(self) -> "TakeoverThread":
+        self._thread = threading.Thread(target=self._run, name="yuki-takeover-watch", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
+
+    def _run(self) -> None:
+        if self.grace_s > 0 and self._stop.wait(self.grace_s):
+            return
+        try:
+            self.watch = watch = self._make()   # made here: its first look (the baseline) is after the grace
+        except Exception:  # noqa: BLE001
+            return
+        while not self._stop.is_set():
+            try:
+                kind = watch.poll()
+            except Exception:  # noqa: BLE001 - a broken read never pauses anything
+                kind = None
+            if kind is not None and not self._stop.is_set():
+                self.fired = kind
+                try:
+                    self.on_takeover(kind)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            self._stop.wait(self.poll_s)
+
+
+__all__ = ["INPUT_LEASE_S", "InputGate", "LeaseBusy", "TAKEOVER_MOVE_PX", "TakeoverThread", "TakeoverWatch",
+           "WINDOW_LEASE_S", "input_held_elsewhere", "input_lease", "key_states", "last_input_age_s", "leased",
+           "note_own_input", "own_input_at", "own_input_now", "own_input_span", "takeover_move_px", "user_input_age_s",
+           "window_lease", "yuki_has_it"]

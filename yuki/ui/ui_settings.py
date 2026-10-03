@@ -40,6 +40,16 @@ class UiSettings:
     web_window: list[int] | None = None  # the HTML window's x, y, w, h (physical px) when it last closed
     web_maximized: bool = False
     island_resting: bool = True         # Settings → Island: the tiny resting pill when idle (False: nothing on screen)
+    #: appTakeover: how far (px) the mouse must move while Yuki works for Yuki to pause (you took over); see
+    #: :data:`TAKEOVER_MOVE_LABEL`. Kept within 12..400 (``yuki.actions.leases.takeover_move_px``).
+    takeover_move_px: int = 40
+
+
+#: The plain-words label and hint for ``takeover_move_px`` on the Settings page (appTakeover).
+TAKEOVER_MOVE_LABEL = "Pause when you move the mouse this far"
+TAKEOVER_MOVE_HINT = ("While Yuki works, typing, clicking or a big mouse movement pauses it so you can take over. "
+                      "Raise this if your mouse twitches on its own; lower it to pause on smaller moves.")
+TAKEOVER_MOVE_CHOICES: tuple[int, ...] = (24, 40, 64, 100, 160)
 
 
 #: The window engines a settings file may hold (``window_engine``); anything else reads as "web".
@@ -62,9 +72,14 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     web = raw.get("web_window")
     web = [int(v) for v in web][:4] if isinstance(web, list) and len(web) >= 4 and all(
         isinstance(v, (int, float)) for v in web[:4]) else None
+    try:
+        move = max(12, min(400, int(raw.get("takeover_move_px", 40))))
+    except (TypeError, ValueError):
+        move = 40
     return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last,
                       accent if accent in ACCENT_NAMES else "green", engine if engine in WINDOW_ENGINES else "web",
-                      web, bool(raw.get("web_maximized", False)), bool(raw.get("island_resting", True)))
+                      web, bool(raw.get("web_maximized", False)), bool(raw.get("island_resting", True)),
+                      takeover_move_px=move)
 
 
 def load(path: Path | None = None) -> UiSettings:

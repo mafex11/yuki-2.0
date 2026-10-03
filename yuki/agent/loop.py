@@ -96,6 +96,7 @@ from yuki.log.events import (
     ErrorEvent,
     Final,
     Partial,
+    Paused,
     Say,
     SendPending,
     SessionLogger,
@@ -165,6 +166,18 @@ CANCELLED, WITHDRAWN = "cancelled", "withdrawn"
 #: v3.14b: a request paused on a question nobody answered, set aside so its lane can go on (yuki.ui.runtime parks it,
 #: and a later answer carries it on as a new request).
 PARKED = "parked"
+
+#: appTakeover (4 Oct): a request paused because the user took over the keyboard or mouse, and nobody resumed it within
+#: ``Agent.pause_timeout_s``, ends with this line (quietly: never spoken). A stop while paused ends with it too.
+PAUSE_STOP_LINE = "Stopped. Nothing else was done."
+#: What an action the pause kept from running answers to the model.
+PAUSED_SKIP = ("Not run: the user took over the keyboard or mouse before this ran, so you were paused here. The screen "
+               "may have changed since you chose it.")
+#: After a resume, the watch for the user taking over starts again this late (s): the hand that pressed Resume is still
+#: moving away, and the screen is read again first.
+RESUME_GRACE_S = 1.5
+#: How the user took over, in plain words (the model's note and the log).
+TAKEOVER_WORDS = {"keys": "typed on the keyboard", "click": "clicked", "mouse": "moved the mouse"}
 
 
 def written_tool_call(text: str, tools: Iterable[str]) -> str | None:
@@ -540,6 +553,25 @@ class Agent:
         self._send_lock = threading.Lock()
         self._send_open: dict[str, Any] | None = None    # the send the countdown shows now (its alternatives)
         self._send_choice: tuple[str, str] | None = None
+        #: appTakeover: makes the watch for the user taking over while this request acts (``takeover(on_takeover,
+        #: grace_s=...)`` -> an object with ``start()`` / ``stop()``, ``yuki.actions.leases.TakeoverThread``); ``None``
+        #: (the default: the CLI, evals, tests, a caller's agent) never pauses. The desktop runtime's worker sets it.
+        self.takeover: Any = None
+        #: Told at once of every pause state (``on_pause(state, why, seconds)``: ``paused`` from the watch's thread the
+        #: moment the user takes over, ``resumed`` / ``ended`` from the request's thread), so the island shows it while
+        #: the request is still in a model call. Never raises into the request.
+        self.on_pause: Any = None
+        #: A pause nobody resumes ends the request after this long (s; ``Settings.takeover_idle_stop_s``).
+        self.pause_timeout_s = float(getattr(self.settings, "takeover_idle_stop_s", 600.0) or 600.0)
+        self._paused = threading.Event()
+        self._pause_wake = threading.Event()
+        self._pause_lock = threading.Lock()
+        self._pause_why = ""
+        self._pause_at = 0.0
+        self._paused_s = 0.0
+        self._pauses = 0
+        self._stopped_paused = False
+        self._watch: Any = None
         self._pending_answer: str | None = None
         self._awaiting_answer = False
         self._prewarm_thread: threading.Thread | None = None
@@ -964,6 +996,150 @@ class Agent:
         self.cancel_reason = reason if reason in (WITHDRAWN, PARKED) else CANCELLED
         self._cancelled.set()
         self._send_wake.set()   # a send countdown waiting now ends at once: nothing is sent
+        self._pause_wake.set()  # appTakeover: a paused request ends at once (nothing else is done)
+
+    # -- appTakeover: the user took over -------------------------------------------------------------------------
+
+    def pause(self, why: str = "") -> bool:
+        """The user took over the keyboard or mouse (``why``: ``keys`` | ``click`` | ``mouse``): no new action of this
+        request starts until :meth:`resume` (an action in flight finishes its own part; one waiting for the user to
+        stop typing is not sent). Safe from any thread. ``False`` when nothing is acting, it is stopping, or it is
+        already paused."""
+        with self._pause_lock:
+            if self._acting_token is None or self._cancelled.is_set() or self._paused.is_set():
+                return False
+            self._pause_why, self._pause_at = str(why or ""), time.monotonic()
+            self._pauses += 1
+            self._paused.set()
+            self._pause_wake.clear()
+        self.logger.log("takeover", state="paused", why=self._pause_why, n=self._pauses)
+        self._tell_pause("paused", self._pause_why)
+        return True
+
+    def _tell_pause(self, state: str, why: str, seconds: float = 0.0) -> None:
+        tell = self.on_pause
+        if tell is None:
+            return
+        try:
+            tell(state, why, seconds)
+        except Exception:  # noqa: BLE001 - presentation only
+            pass
+
+    def resume(self, words: str | None = None, *, by: str = "") -> bool:
+        """Go on after the user took over (``by``: who asked: the island, the run card, voice, typing). ``words``: what
+        they typed or said with it, added to the request as theirs (:meth:`steer`). The request reads the screen again
+        before its next step. Safe from any thread. ``False`` when it is not paused."""
+        with self._pause_lock:
+            if not self._paused.is_set():
+                return False
+            if words and str(words).strip():
+                self.steer(str(words))
+            self._paused.clear()
+            self._pause_wake.set()
+        self.logger.log("takeover", state="resume_asked", by=by or None, words=bool(words and str(words).strip()))
+        return True
+
+    @property
+    def paused(self) -> bool:
+        """Whether the request is paused because the user took over. Safe to read from any thread."""
+        return self._paused.is_set()
+
+    def _watch_on(self, grace_s: float = 0.0) -> None:
+        """Start watching for the user taking over (once per acting stretch; never while paused). Never raises."""
+        if self.takeover is None or self._watch is not None or self._paused.is_set() or self._cancelled.is_set():
+            return
+        try:
+            self._watch = self.takeover(self._on_takeover, grace_s=grace_s)
+            self._watch.start()
+        except Exception as exc:  # noqa: BLE001 - the request goes on without the watch
+            self._watch = None
+            self.logger.log("takeover", state="watch_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _watch_off(self) -> None:
+        watch, self._watch = self._watch, None
+        if watch is not None:
+            try:
+                watch.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_takeover(self, kind: str) -> None:
+        """The watch saw the user take over (its own thread)."""
+        self.pause(kind)
+
+    def _hold_paused(self) -> Iterator[AgentEvent]:
+        """When the user took over: say so (:class:`Paused`), wait until they resume, stop, or the limit passes, and
+        return whether it goes on (``False``: not paused, or it ended; a stop is then this request's cancel)."""
+        if not self._paused.is_set() or self._cancelled.is_set():
+            return False
+        self._watch_off()
+        why, since = self._pause_why, self._pause_at or time.monotonic()
+        yield Paused("paused", why)
+        limit = float(self.pause_timeout_s or 600.0)
+        timed_out = False
+        while self._paused.is_set() and not self._cancelled.is_set():
+            left = limit - (time.monotonic() - since)
+            if left <= 0:
+                timed_out = True
+                break
+            self._pause_wake.wait(min(0.5, left))
+        took = time.monotonic() - since
+        self._paused_s += took
+        self._waited_s += took    # the user's time, not the work's
+        if timed_out:
+            self.logger.log("takeover", state="ended", why=why, seconds=round(took, 1))
+            self._stopped_paused = True
+            self._tell_pause("ended", why, round(took, 1))
+            yield Paused("ended", why, round(took, 1))
+            self.cancel()
+            return False
+        if self._cancelled.is_set():
+            self._stopped_paused = True
+            self.logger.log("takeover", state="stopped", why=why, seconds=round(took, 1))
+            return False
+        self._paused.clear()
+        self.logger.log("takeover", state="resumed", why=why, seconds=round(took, 1))
+        self._tell_pause("resumed", why, round(took, 1))
+        yield Paused("resumed", why, round(took, 1))
+        self._watch_on(grace_s=RESUME_GRACE_S)
+        return True
+
+    def _resume_note(self, seconds: float) -> str:
+        """What the model is told when the request goes on after the user took over."""
+        how = TAKEOVER_WORDS.get(self._pause_why, "took over the keyboard or mouse")
+        return (f"{CHECK_LABEL}: while you worked the user {how}, so you were paused for {round(seconds)} s; they have "
+                f"now let you go on. They may have changed things: the screen below was read again just now. Check "
+                f"what your earlier steps left and go on from what it shows, not from what you saw before; a step "
+                f"marked not run did not happen.")
+
+    def _resume_view(self) -> tuple[int, str] | None:
+        """The window in front, read again in full as the request goes on after a pause (the user may have changed
+        it): ``(hwnd, text)`` for the next message, or ``None``. Yuki's own window in front (they typed to Yuki to go
+        on) is not read. Never raises."""
+        started = time.perf_counter()
+        try:
+            hwnd = self.dispatcher.foreground_hwnd()
+            if hwnd is None:
+                return None
+            from yuki.agent.tools import _is_own_window
+
+            if _is_own_window(hwnd):
+                self.logger.log("takeover", state="resume_view_skipped", why="Yuki's own window is in front")
+                return None
+            view = self.dispatcher.window_view(int(hwnd), settle=False)
+        except Exception as exc:  # noqa: BLE001 - the overview still goes with the note
+            self.logger.log("takeover", state="resume_view_failed", error=f"{type(exc).__name__}: {exc}")
+            return None
+        finally:
+            self._auto_view_s += time.perf_counter() - started
+        text = (f"The window in front now, read again after the pause ({view.elapsed_ms:.0f} ms): its elements are "
+                f"ready to act on.\n" + wrap(view.text, source=f"the window {hwnd} (its on-screen text)",
+                                             nonce=self._nonce))
+        self.logger.perception("resume_view", size_chars=len(text), elapsed_ms=(time.perf_counter() - started) * 1000,
+                               payload={"hwnd": hwnd, "summary": getattr(view, "summary", None)})
+        self._evidence[int(hwnd)] = "looked"
+        self._last_view_text = view.text
+        return int(hwnd), text
 
     def send_choice(self, kind: str, value: str) -> bool:
         """appPT: the user tapped a chip on the send countdown: ``kind`` ``who`` or ``where``, ``value`` one of the
@@ -1064,6 +1240,10 @@ class Agent:
         """
         self._cancelled.clear()
         self.cancel_reason = CANCELLED
+        self._watch_off()
+        self._paused.clear()
+        self._pause_wake.clear()
+        self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
         stale = self.take_steers()
         self._pending_answer = None
         self._awaiting_answer = False
@@ -1440,9 +1620,12 @@ class Agent:
         if not refresh or not published:
             self.logger.log("memory_acting", state="refresh" if refresh else "begin", token=token,
                             published=published)
+        self._watch_on()   # appTakeover: from the first action on, the user's taking over pauses the request
 
     def _acting_done(self) -> None:
         """The request ended: withdraw the marker, if one was published. Never raises."""
+        self._watch_off()
+        self._paused.clear()
         token, self._acting_token = self._acting_token, None
         if token is None:
             return
@@ -1898,6 +2081,15 @@ class Agent:
     def _drive(self) -> Iterator[AgentEvent]:
         """Round-trip with the model until it finishes, asks, or fails."""
         for step in range(1, self.settings.max_steps + 1):
+            if self._paused.is_set() and not self._cancelled.is_set():
+                # appTakeover: the user took over after the last results went in (while the screen was being read):
+                # wait for them here, then the screen is read again before the next call
+                since = self._paused_s
+                if (yield from self._hold_paused()):
+                    overview, _facts = self._capture_overview()
+                    view = self._resume_view()
+                    self.context.add_note("\n\n".join(
+                        [self._resume_note(self._paused_s - since), overview] + ([view[1]] if view else [])))
             if self._cancelled.is_set():
                 yield self._cancel_event()
                 return
@@ -2007,6 +2199,14 @@ class Agent:
                         f"wrote before that call (it was not checked), and try the usual way for what they asked "
                         f"before telling them it cannot be done.")}, reason)]
                 breaker_blocks = breaker_blocks + [note for note, _why in held]
+                resumed_after: float | None = None
+                if not turn.finished and self._paused.is_set() and not self._cancelled.is_set():
+                    # appTakeover: the user took over during this turn: wait for them; on resume the screen is read
+                    # again (the overview below, and the window in front in full) before the next call
+                    since = self._paused_s
+                    if (yield from self._hold_paused()):
+                        resumed_after = self._paused_s - since
+                        breaker_blocks = breaker_blocks + [{"type": "text", "text": self._resume_note(resumed_after)}]
                 steers = self._steer_blocks()
                 if turn.finished and steers:
                     # The user added something before the closing message went
@@ -2017,7 +2217,10 @@ class Agent:
                     )})
                     self.logger.log("steer", held_final=turn.finished[0])
                     turn.finished.clear()
-                view = None if turn.finished else self._auto_view(turn)
+                if resumed_after is not None:
+                    view = self._resume_view()
+                else:
+                    view = None if turn.finished else self._auto_view(turn)
                 overview, facts = self._capture_overview()
                 self.context.add_tool_results(
                     blocks + breaker_blocks + steers, overview, tool_names=names, self_facts=facts,
@@ -2345,6 +2548,13 @@ class Agent:
             self.context.add_note("The user moved on before that request finished: it was withdrawn in favour of "
                                   "their newer request. Do not continue it or bring it up.")
             return ErrorEvent(message)
+        if self._stopped_paused or self._paused.is_set():
+            # appTakeover: stopped while paused because the user took over (or nobody resumed it in time): plainly
+            message = PAUSE_STOP_LINE
+            self.logger.error(message)
+            self.context.add_note("The user took over and that request was stopped while paused. Do not continue it "
+                                  "or bring it up unless they ask.")
+            return ErrorEvent(message)
         message = "Cancelled by the user."
         stopped = getattr(self, "_send_stopped", None)
         if stopped is not None:
@@ -2608,6 +2818,17 @@ class Agent:
                 turn.stop_after = True
                 return
 
+        if acts and self._paused.is_set():
+            # appTakeover: the user took over: no new action starts (the request waits for them after this turn). Not a
+            # failure of the call: the loop breaker and the escalation signals leave it out.
+            turn.gated.add(tool_id)
+            turn.record(tool_id, self._skip(tool_id, name, PAUSED_SKIP))
+            self._note_action(name, False, "not run: the user took over (paused)")
+            self._trace_step(name, tool_input, ok=False, kind="control", why="paused: the user took over",
+                             result=PAUSED_SKIP)
+            yield ToolResult(name, False, PAUSED_SKIP, about=step_words)
+            turn.stop_after = True
+            return
         if acts:
             self._acting_start()
         dispatched = time.perf_counter()
@@ -2661,6 +2882,11 @@ class Agent:
             outcome.content = wrap_blocks(list(outcome.content), source=source_for(name, tool_input),
                                           nonce=self._nonce)
         abandoned = isinstance(outcome.payload, dict) and bool(outcome.payload.get("abandoned"))
+        if acts and not outcome.ok and self._paused.is_set():
+            # appTakeover: the user took over while it waited to send its input (nothing was sent): not a failure of
+            # the call for the loop breaker or the escalation signals
+            abandoned = True
+            turn.gated.add(tool_id)
         if name not in CONTROL_TOOLS and not abandoned:
             trip = self._breaker.observe(name, acting, outcome.ok, outcome.summary,
                                          perception=name in PERCEPTION_TOOLS)

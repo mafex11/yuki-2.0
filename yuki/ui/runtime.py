@@ -235,6 +235,39 @@ class Lane(QThread):
         self._parked: tuple[Job, str] | None = None
         #: How long a question may hold the lane before it is set aside (s; ``Settings.ask_park_s``).
         self.park_after_s = float(getattr(getattr(runtime, "settings", None), "ask_park_s", ASK_PARK_S))
+        #: appTakeover: the job paused because the user took over (its id), else ``None``; told by the agent at once.
+        self._paused_job: int | None = None
+        if hasattr(agent, "on_pause"):
+            agent.on_pause = self._on_pause
+
+    # -- appTakeover: the user took over -------------------------------------------------------------------
+
+    def _on_pause(self, state: str, why: str, seconds: float = 0.0) -> None:
+        """The agent's pause state changed (any thread): the island, the run card and the voice are told through
+        ``paused_changed``; a pause nobody resumed in time ends as a stop (``cancelled`` with ``by`` ``paused``)."""
+        job_id = self.current_id
+        if job_id is None:
+            return
+        with self._state:
+            self._paused_job = job_id if state == "paused" else None
+        self.runtime.paused_changed.emit(self.name, int(job_id), str(state), str(why or ""))
+        if state == "ended":
+            self.runtime.cancelled.emit(int(job_id), "paused")
+
+    def paused_job(self) -> int | None:
+        """The id of the job paused because the user took over, else ``None``."""
+        with self._state:
+            paused = self._paused_job
+        return paused if paused is not None and paused == self.current_id and getattr(self.agent, "paused", False) \
+            else None
+
+    def resume_job(self, job_id: int, words: str | None = None, *, by: str = "") -> bool:
+        """Go on with ``job_id`` after the user took over (``words``: what they typed or said with it, read as theirs
+        at its next step). ``False`` when that job is not the one paused here."""
+        if self.paused_job() != int(job_id):
+            return False
+        resume = getattr(self.agent, "resume", None)
+        return bool(resume(words, by=by)) if callable(resume) else False
 
     @property
     def allowed_tools(self) -> tuple[str, ...] | None:
@@ -299,6 +332,9 @@ class Lane(QThread):
             if hold:
                 self._early_steers.setdefault(job_id, []).append(text)
         if running and not hold:
+            if self.resume_job(job_id, text, by="words"):
+                # appTakeover: words typed or said to a request paused because the user took over: it goes on with them
+                return True
             self.agent.steer(text)
         return running or queued
 
@@ -411,6 +447,7 @@ class Lane(QThread):
                 with self._state:
                     self._current = None
                     self._begun = None
+                    self._paused_job = None
                     self._named_late.pop(job.id, None)
                     self._early_steers.pop(job.id, None)
                 self.runtime.lane_done.emit(
@@ -658,6 +695,10 @@ class AgentRuntime(QObject):
     #: appPT: ``(lane, id, send)``: the send countdown (``yuki.log.events.SendPending`` as a dict: ``state`` counting |
     #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory, window).
     send_pending = Signal(str, int, dict)
+    #: appTakeover: ``(lane, id, state, why)``: the request paused because the user took over the keyboard or mouse
+    #: (``paused``; why: keys | click | mouse), goes on (``resumed``: it read the screen again), or ended unresumed
+    #: (``ended``: a stop follows). Sent the moment it happens, from any thread (Qt queues it to the GUI thread).
+    paused_changed = Signal(str, int, str, str)
 
     def __init__(
         self,
@@ -696,6 +737,9 @@ class AgentRuntime(QObject):
             # appPT: a plain send waits this long on the island's send countdown (Stop, Esc, a chip swap); only the
             # worker sends, and only the desktop's own agent gets it (a caller's agent keeps its own setting)
             worker_agent.send_countdown_s = SEND_COUNTDOWN_S
+            if getattr(settings, "takeover_pause", True):
+                # appTakeover: the worker's request pauses when the user takes over (only the desktop's own agent)
+                worker_agent.takeover = takeover_watch
         if front_desk_agent is None:
             front_desk_blocked = front_desk_blocked or HandsBlockedBackend()
             front_desk_agent = Agent(
@@ -972,6 +1016,21 @@ class AgentRuntime(QObject):
         self.ui_log.event("steer", id=request_id, delivered=ok, text=text)
         return ok
 
+    def resume(self, request_id: int, words: str | None = None, *, by: str = "") -> bool:
+        """appTakeover: go on with a request paused because the user took over (``by``: ``island``, ``card``,
+        ``voice``, ``words``). It reads the screen again before its next step. ``False`` when it is not paused."""
+        ok = any(lane.resume_job(int(request_id), words, by=by) for lane in (self.worker, self.front_desk))
+        self.ui_log.event("takeover_resume", id=request_id, by=by or None, words=bool(words), delivered=ok)
+        return ok
+
+    def paused_id(self) -> int | None:
+        """The request paused because the user took over, if any."""
+        for lane in (self.worker, self.front_desk):
+            paused = lane.paused_job()
+            if paused is not None:
+                return paused
+        return None
+
     def steer_held(self, request_id: int) -> bool:
         """Whether words added to ``request_id`` wait for it to start (it is still queued)."""
         return any(lane.holds_steers(request_id) for lane in (self.worker, self.front_desk))
@@ -1071,6 +1130,14 @@ class AgentRuntime(QObject):
             self._user_words.pop(request_id, None)
             self._apps_named.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
+
+
+def takeover_watch(on_takeover: Any, *, grace_s: float = 0.0) -> Any:
+    """appTakeover: the worker agent's watch for the user taking over (``Agent.takeover``): polls only while a request
+    acts, no hook. The movement threshold is the user's setting, read when the watch starts."""
+    from yuki.actions.leases import TakeoverThread
+
+    return TakeoverThread(on_takeover, grace_s=grace_s)
 
 
 def frame_view(agent: Any) -> dict[str, Any] | None:
