@@ -214,7 +214,7 @@ def test_the_titles_pass_fills_every_surface_in_one_call(store):
         {"id": f"W{kid}", "label": "Pass the link as a launch argument"},
         {"id": "P99999", "label": "not an item"},
     ]}])
-    result = titles.Titler(worker).run(reason="test")
+    result = titles.Titler(worker).run(reason="test", what="labels")
     assert result.ok and result.pending == 6 and result.calls == 1 and result.written == 6
     assert any("P99999" in r for r in result.rejected)
     assert f"P{lid} [portrait fact, an open loop (something owed)] HEADING 'Varun' NEEDS a title" in worker.calls[0]["user"]
@@ -223,7 +223,7 @@ def test_the_titles_pass_fills_every_surface_in_one_call(store):
     assert not any(store.labels_missing().values())
     assert store.portrait_fact(lid).summary == "Send Varun the demo video"   # an open loop's title
     assert [r["kind"] for r in store.portrait_runs(5)] == ["titles"]
-    assert titles.Titler(worker).run(reason="again").pending == 0          # nothing left: no call
+    assert titles.Titler(worker).run(reason="again", what="labels").pending == 0   # nothing left: no call
 
 
 def test_a_label_outside_its_bounds_is_asked_for_again_then_left(store):
@@ -244,7 +244,7 @@ def test_a_label_over_its_limit_is_fixed_by_the_retry(store):
     worker = _Worker(store, [{"labels": [{"id": f"P{fid}", "label": "Plays Valorant most nights, often while on "
                                                                      "Discord voice calls"}]},
                              {"labels": [{"id": f"P{fid}", "label": "Plays Valorant most nights"}]}])
-    r = titles.Titler(worker).run()
+    r = titles.Titler(worker).run(what="labels")
     assert r.ok and r.written == 1 and r.retried == 1
     assert store.portrait_fact(fid).summary == "Plays Valorant most nights"
 

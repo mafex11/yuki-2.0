@@ -115,7 +115,8 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
-from yuki.memory.titles import SUMMARY_FIELD as TITLES_SUMMARY_FIELD, fact_label
+from yuki.memory.titles import SHOWN_FIELD as TITLES_SHOWN_FIELD, SUMMARY_FIELD as TITLES_SUMMARY_FIELD
+from yuki.memory.titles import call_lines, fact_label, fact_shown
 from yuki.memory.personality import ASPECT_TITLES, ASPECTS, PERSONALITY_HEADING, nature_mark
 from yuki.memory.brief import BRIEF_FIELD_SCHEMA, BRIEF_RENDER_RULES, brief_inputs, validate_brief
 from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema, vet_new
@@ -325,6 +326,14 @@ a single passing mention is low, repeated or explicit evidence is high. Do not s
 guesses as facts.
 - Labelled: every ADD and UPDATE carries a summary, the few words the user's app shows for the \
 fact (see its field): the gist in plain words, never the fact cut short.
+- Shown: every ADD and UPDATE also carries shown, the same fact as the user's app shows it to \
+them - said to them ("you", "your father", "your friend Kiran"), natural dates and 12-hour times \
+("on 25 September, from about 2 AM to 3:22 AM"), and for anything said on a call who was on it, or \
+"on a call with other friends" when the person the fact is about was not on that call (a journal \
+entry said on a call shows [call: ...] with where it was and who was on it). The text stays third \
+person for Yuki; only shown speaks to the user.
+- One pattern, one fact: a day that continues a pattern an existing fact describes ("continued on \
+2 Oct") is an UPDATE of that fact, never a new fact.
 - Rated: importance (1-10) on every ADD and UPDATE is how much the fact matters for Yuki \
 helping the user later, on the journal's scale: 1-2 trivia, 3-4 ordinary, 5-6 a clear signal \
 about their work, interests, people or who they are, 7-8 commitments, deadlines, plans, the \
@@ -383,7 +392,8 @@ reviewed it" - and never call it the user heads down, their longest focused stre
 own coding unless the journal shows the user's own work.
 
 Origin "user" marks facts the user stated themselves; they outrank anything inferred. \
-Change one only when journal entries dated after it show that it is no longer true. A \
+A fact marked pinned is one the user pinned to keep. Change a pinned fact only when journal \
+entries dated after it show that it is no longer true. A \
 fact of kind correction is the user's own words fixing the portrait: carry it out by \
 operating on the facts it concerns - UPDATE or INVALIDATE what it contradicts, ADD what it \
 states that no fact covers - and list the correction's id in based_on_facts of each such \
@@ -413,7 +423,7 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": [
-                        "op", "fact_id", "kind", "subject", "text", "summary", "confidence", "importance",
+                        "op", "fact_id", "kind", "subject", "text", "summary", "shown", "confidence", "importance",
                         "journal_ids", "episode_ids", "based_on_facts", "reason", "loop", "aspect",
                     ],
                     "properties": {
@@ -451,6 +461,10 @@ UPDATE_PORTRAIT_TOOL: dict[str, Any] = {
                         "summary": {
                             "anyOf": [{"type": "string"}, {"type": "null"}],
                             "description": "ADD and UPDATE: " + TITLES_SUMMARY_FIELD + " INVALIDATE and NOOP: null.",
+                        },
+                        "shown": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "description": "ADD and UPDATE: " + TITLES_SHOWN_FIELD + " INVALIDATE and NOOP: null.",
                         },
                         "confidence": {"type": "number", "description": "0 to 1."},
                         "importance": {
@@ -658,9 +672,9 @@ def withdrawn_facts(store: Any, facts: Sequence[Any]) -> set[int]:
     """The ids of the facts whose evidence was withdrawn (revamp A9): model-written facts that cite no episode and
     whose every cited journal entry was re-journaled or marked as text for or from another AI tool or a sample page
     (:meth:`Store.withdrawn_journal`). What such a fact says rests on nothing now: the card writers leave it out and
-    ``python -m yuki.memory.recheck`` retires it. The user's own facts and corrections never are."""
-    candidates = [f for f in facts if getattr(f, "origin", "model") != "user" and f.kind != CORRECTION_KIND
-                  and f.source_ids and not getattr(f, "episode_ids", None)]
+    ``python -m yuki.memory.recheck`` retires it. The user's own facts, pinned facts and corrections never are."""
+    candidates = [f for f in facts if getattr(f, "origin", "model") != "user" and not getattr(f, "pinned", False)
+                  and f.kind != CORRECTION_KIND and f.source_ids and not getattr(f, "episode_ids", None)]
     if not candidates:
         return set()
     gone = store.withdrawn_journal({i for f in candidates for i in f.source_ids})
@@ -1406,14 +1420,20 @@ class PortraitWorker:
         mark = (f" [rests on re-journaled entries {', '.join(f'J{i}' for i in redone)}: see their corrected "
                 f"versions in JOURNAL]") if redone else ""
         return (
-            f"F{f.id} [{kind}] subject={safe(f.subject, 120)!r} confidence={conf} origin={f.origin} "
+            f"F{f.id} [{kind}] subject={safe(f.subject, 120)!r} confidence={conf} origin={f.origin}"
+            f"{' pinned' if getattr(f, 'pinned', False) else ''} "
             f"since {_local(f.valid_from, '%Y-%m-%d')}: {safe(f.text, 1200)}{mark}"
         )
 
     @staticmethod
-    def _journal_line(j: JournalEntry, safe: Callable[[str | None, int], str], cap: int = 1500) -> str:
+    def _journal_line(j: JournalEntry, safe: Callable[[str | None, int], str], cap: int = 1500,
+                      calls: dict[int, str] | None = None) -> str:
+        """One journal entry as the operations see it; ``calls``: :func:`yuki.memory.titles.call_lines` of the batch
+        (who was on the call an entry was said on, and where: report 38 §2c, item 5 of the 3 Oct feedback)."""
         where = j.app + (f" / {j.host}" if j.host else "")
-        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]: "
+        call = (calls or {}).get(j.id)
+        on_call = f" [call: {safe(call, 300)}]" if call else ""
+        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]{on_call}: "
                 f"{safe(j.fact, cap)}")
 
     def _ops_message(
@@ -1438,7 +1458,8 @@ class PortraitWorker:
             + (f" [last evidence {_local(seen[f.id], '%Y-%m-%d')}]" if f.id in seen else "")
             for f in facts
         ] or ["(none yet)"]
-        journal_lines = [self._journal_line(j, safe) for j in journal]
+        calls = call_lines(self.store, journal, now)
+        journal_lines = [self._journal_line(j, safe, calls=calls) for j in journal]
         window = {
             "first": "everything in the journal so far (first portrait)",
             "weekly": "the whole last 7 days (weekly review: look for patterns across days)",
@@ -1604,7 +1625,7 @@ class PortraitWorker:
                 changes.append(FactChange(
                     "ADD", None, out.kind, out.subject, out.text, 1.0 if corrections else confidence, known, at,
                     origin, corrections, episode_ids=known_episodes, aspect=aspect, importance=importance,
-                    summary=fact_label(out.kind, item),
+                    summary=fact_label(out.kind, item), shown=fact_shown(item),
                 ))
                 continue
             target = current.get(fact_id) if fact_id is not None else None
@@ -1623,17 +1644,19 @@ class PortraitWorker:
                 continue
             # an open loop that fails the bar may be dropped on the rules alone, citing nothing, and so may
             # a fact whose journal evidence was all read again (re-journaled) and now supports nothing
-            dropping_loop = out.op == "INVALIDATE" and target.kind == LOOP_KIND and target.origin != "user"
-            dropping_redone = (out.op == "INVALIDATE" and target.origin != "user" and bool(target.source_ids)
+            # the user's pin (migration 33; before it, origin user) protects a fact from the model's rewrites: only a
+            # later correction or later evidence changes it, and it is never dropped on the rules alone
+            dropping_loop = out.op == "INVALIDATE" and target.kind == LOOP_KIND and not target.pinned
+            dropping_redone = (out.op == "INVALIDATE" and not target.pinned and bool(target.source_ids)
                                and all(i in rejournaled for i in target.source_ids) and not target.episode_ids)
             if not evidenced and not (dropping_loop or dropping_redone):
                 reject(unfit)
                 continue
-            if target.origin == "user":
+            if target.pinned:
                 newer_correction = any(current[c].valid_from > target.valid_from for c in corrections)
                 newer_evidence = latest_evidence is not None and latest_evidence > target.valid_from
                 if not (newer_correction or newer_evidence):
-                    reject("user-confirmed fact; no later evidence or correction")
+                    reject("pinned fact; no later evidence or correction")
                     continue
             if out.op == "UPDATE":
                 if not out.text:
@@ -1655,6 +1678,7 @@ class PortraitWorker:
                     1.0 if corrections else confidence, known, latest_evidence or now,
                     "user" if corrections else "model", corrections, episode_ids=known_episodes,
                     aspect=new_aspect, importance=importance, summary=fact_label(kind, item),
+                    shown=fact_shown(item),
                 ))
             else:
                 changes.append(FactChange(
@@ -2156,7 +2180,7 @@ class PortraitWorker:
 
     def _expire_loops(self, run_id: int | None, now: float, stats: PortraitRunStats) -> list[OpOutcome]:
         """Invalidate model-inferred loops with no evidence for :data:`LOOP_EXPIRE_DAYS`; rows become ``expired``."""
-        loops = [f for f in self.store.portrait_facts([LOOP_KIND]) if f.origin != "user"]
+        loops = [f for f in self.store.portrait_facts([LOOP_KIND]) if not f.pinned]
         seen = self.loop_last_seen(loops)
         old = [f for f in loops if seen[f.id] < now - LOOP_EXPIRE_DAYS * 86400.0]
         if not old:
@@ -2675,10 +2699,13 @@ class PortraitWorker:
                 line += f" UNDER REVIEW ({reasons.get(f.id, '')}; cites {', '.join(f'J{i}' for i in sorted(f.source_ids)[-AUDIT_CITED:]) or 'no entry'})"
             fact_lines.append(line)
 
+        calls = call_lines(self.store, [*evidence, *recent], now)
+
         def jline(j: JournalEntry, cap: int = 900) -> str:
             where = j.app + (f" / {j.host}" if j.host else "")
+            call = f" [call: {safe(calls[j.id], 300)}]" if j.id in calls else ""
             return (f"J{j.id} {_local(j.at)} {safe(where, 120)}{self._thread_label(j.thread_id, labels, safe)} "
-                    f"[importance {j.importance}, {_nature_label(j)}]: {safe(j.fact, cap)}")
+                    f"[importance {j.importance}, {_nature_label(j)}]{call}: {safe(j.fact, cap)}")
 
         shown = {j.id for j in evidence}
         evidence_lines = [jline(j) for j in sorted(evidence, key=lambda j: (j.at, j.id))]
@@ -3191,7 +3218,7 @@ class PortraitScheduler:
         try:
             if gated and self.idle_fn() < titles.IDLE_S:
                 return None
-            if not any(self.store.labels_missing().values()):
+            if not any(self.store.labels_missing().values()) and not any(self.store.shown_missing().values()):
                 self._titles_at = now + titles.EVERY_S
                 return None
             if self._titler is None:
