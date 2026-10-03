@@ -42,8 +42,9 @@ _TREE_SCOPE_SUBTREE = 7
 #: Ancestors climbed to match the read's element, and levels above it searched for a RangeValue element.
 MATCH_LEVELS = 4
 SEARCH_UP = 2
-#: The whole job's budget (s), and how long a set value is watched for its read-back.
-BUDGET_S = 4.0
+#: The whole job's budget (s: the keys path, up to MAX_PRESSES with a read-back after each batch and the input gate's
+#: wait before each, takes longer than one SetValue), and how long a set value is watched for its read-back.
+BUDGET_S = 8.0
 SETTLE_S = 0.4
 POLL_S = 0.05
 #: Keys: presses per batch, the most presses in all, and how close (share of the range) counts as reached.
@@ -118,7 +119,11 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
         while presses < MAX_PRESSES and abs(after - want) > close:
             need = max(1, min(KEYS_PER_BATCH, math.ceil(abs(want - after) / max(step, 1e-9))))
             before_batch = after
-            press(key, need)
+            try:
+                press(key, need)
+            except Exception as exc:  # noqa: BLE001 - the user took the keyboard, or the window left the front
+                details["keys_error"] = f"{type(exc).__name__}: {exc}"[:160]
+                break
             presses += need
             sleep(POLL_S)
             after = slider.read()[0]

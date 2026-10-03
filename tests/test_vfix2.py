@@ -128,6 +128,20 @@ class FakeSlider:
             self.value = max(self.low, min(self.high, self.value + step * times))
 
 
+def test_n2_a_read_shows_where_a_slider_stands_and_the_focus_reader_keeps_its_own_helper() -> None:
+    import inspect
+
+    from yuki.perception import tree
+
+    props = {tree._P_IS_RANGE_VALUE_AVAILABLE: True, tree._P_RANGE_VALUE_VALUE: 37.0,
+             tree._P_RANGE_VALUE_MINIMUM: 0.0, tree._P_RANGE_VALUE_MAXIMUM: 100.0,
+             tree._P_RANGE_VALUE_IS_READONLY: False}
+    assert tree._slider_value(props.get) == "37 (range 0-100)"
+    assert tree._slider_value({tree._P_IS_RANGE_VALUE_AVAILABLE: False}.get) is None
+    # the RangeValue reader never shadows the focus read's text-range helper (both lived as _range_text once)
+    assert list(inspect.signature(tree._range_text).parameters) == ["text_range", "limit"]
+
+
 def test_n2_rangevalue_sets_the_level_and_reads_it_back() -> None:
     from yuki.actions.slider import drive
 

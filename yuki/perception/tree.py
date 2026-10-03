@@ -834,7 +834,7 @@ def _set_position(get: object) -> tuple[int, int] | None:
     return None
 
 
-def _range_text(get: object) -> str | None:
+def _slider_value(get: object) -> str | None:
     """A slider's RangeValue as a read shows it ("37 (range 0-100)"), or ``None`` without one. An optional property:
     an older UI Automation, or a provider without it, reads as absent (its "not supported" sentinel is no number)."""
     try:
@@ -995,7 +995,7 @@ class _CachedWalker:
         patterns = tuple(
             label for label, property_id in _PATTERN_ORDER if _as_bool(get(property_id))
         ) + (("value",) if editable else ())
-        ranged = _range_text(get)
+        ranged = _slider_value(get)
         if ranged is not None:
             patterns += ("range",)
             if value is None:
