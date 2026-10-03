@@ -486,13 +486,15 @@ def test_a_confirmed_send_is_verified_and_an_unseen_one_is_said_plainly(tmp_path
     for captured, expect in (([{"text": "on my way"}], "Verified: memory's capture"),
                              ([], "not confirmed")):
         client = Client([
+            _response(_block("tool_use", id="t0", name="check_situation",
+                             input={"action": "send the message", "hwnd": CHROME})),  # vfix2 N0: look first
             _response(_block("tool_use", id="t1", name="type_text",
                              input={"text": "on my way", "press_enter": True, "expect_hwnd": CHROME})),
             _response(_block("tool_use", id="t2", name="done", input={"message": "Sent.", "about": []})),
         ], judge=sends)
         agent = _agent(client, tmp_path, memory=_send_memory(captured))
         _run(agent, "tell hemanth on my way")
-        result = _texts(client.brain_calls[1]["messages"][-1]["content"])
+        result = _texts(client.brain_calls[2]["messages"][-1]["content"])
         assert expect in result
         assert agent.last_summary["sends"][0]["confirmed"] is bool(captured)
 
@@ -537,6 +539,8 @@ def test_a_contradicted_action_gets_one_second_look_and_the_profile_never_change
 def test_a_pending_send_gets_a_second_look_that_can_hold_it(tmp_path: Path) -> None:
     desk = StubDesktop(action_delay_s=0)
     client = Client([
+        _response(_block("tool_use", id="t0", name="check_situation",
+                         input={"action": "send the message", "hwnd": CHROME})),  # vfix2 N0: look first
         _response(_block("tool_use", id="t1", name="type_text",
                          input={"text": "hey", "press_enter": True, "expect_hwnd": CHROME})),
         _response(_block("tool_use", id="t2", name="ask_user", input={"question": "Send Hemanth 'hey'?"})),
@@ -547,12 +551,14 @@ def test_a_pending_send_gets_a_second_look_that_can_hold_it(tmp_path: Path) -> N
     agent = _agent(client, tmp_path, backend=desk, consult=True)
     _run(agent, "message hemanth", answers=["no"])
     assert not any(c[0] == "type_text" for c in desk.calls)
-    held = _texts(client.brain_calls[1]["messages"][-1]["content"])
+    held = _texts(client.brain_calls[2]["messages"][-1]["content"])
     assert "second look" in held and "was not run" in held
     assert [c["signal"] for c in agent.last_summary["consults"]] == ["send"]
     # a wording quibble is advice, never a hold: the send runs
     desk2 = StubDesktop(action_delay_s=0)
     client2 = Client([
+        _response(_block("tool_use", id="t0", name="check_situation",
+                         input={"action": "send the message", "hwnd": CHROME})),  # vfix2 N0: look first
         _response(_block("tool_use", id="t1", name="type_text",
                          input={"text": "kab aa raha hai vc pe", "press_enter": True, "expect_hwnd": CHROME})),
         _response(_block("tool_use", id="t2", name="done", input={"message": "Sent.", "about": []})),
@@ -589,7 +595,7 @@ def test_the_schemas_got_lighter_where_tool_metadata_allows() -> None:
     assert STEP_FIELD in voice["click"]["input_schema"]["properties"]
     assert STEP_FIELD not in voice["click"]["input_schema"]["required"]    # optional now
     typed = len(json.dumps(tool_params(cacheable=False, screenshot_policy="never")))
-    assert typed < 34_000, typed                                           # was 70,190 characters
+    assert typed < 36_000, typed   # was 70,190; vfix2 (report 47): +4.1k for check_situation, set_slider, tasks, states
 
 
 def test_a_finishing_call_ends_with_a_line_written_by_code_that_the_voice_reads_as_verified(tmp_path: Path) -> None:

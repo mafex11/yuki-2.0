@@ -124,6 +124,36 @@ def finish_line(name: str, tool_input: dict[str, Any], *, process: str | None = 
     return "Done."
 
 
+def noop_line(name: str, details: dict[str, Any] | None, *, process: str | None = None) -> str | None:
+    """N1 (report 47): the finish line of an action whose own report says nothing moved (``details["noop"]``: the
+    level was already where it was asked to go, or at its end), in place of the line written before it ran ("Turned
+    Spotify up."), or ``None`` for an action that did move. Fixed sentences over the measured numbers."""
+    details = details if isinstance(details, dict) else {}
+    if not details.get("noop"):
+        return None
+    if name == "app_volume":
+        app = app_name(str(details.get("process") or process or ""))
+        before = details.get("before")
+        at = f"already at {float(before):g}%" if isinstance(before, (int, float)) else "already there"
+        change = (details.get("asked") or {}).get("change")
+        verb = "raise" if isinstance(change, (int, float)) and change > 0 else (
+            "lower" if isinstance(change, (int, float)) and change < 0 else "change")
+        if details.get("muted_before") and verb != "lower":
+            # review F5: muted in the mixer is the real reason it is quiet; unmuting is the fix to offer
+            return (f"{app} is {at} in Windows' volume mixer but muted there, so nothing changed. Want me to unmute "
+                    f"it?")
+        system = details.get("system_volume")
+        system_part = f"the system volume, at {float(system):g}%," if isinstance(system, (int, float)) else \
+            "the system volume"
+        return (f"{app} is {at} in Windows' volume mixer, so nothing changed. Its own player volume and "
+                f"{system_part} are separate. Want me to {verb} one of those?")
+    if name == "set_slider":
+        at = details.get("before_percent")
+        return f"It's already at {float(at):g}%, so nothing changed." if isinstance(at, (int, float)) else \
+            "It's already there, so nothing changed."
+    return "It was already that way, so nothing changed."
+
+
 def finish_request(tool_input: dict[str, Any]) -> tuple[bool, str | None]:
     """``(finishes, own words)`` from a call's finish fields: ``finishes_with`` true (or a string, an older habit:
     taken as the words), ``finish_words`` the brain's own wording."""
@@ -203,4 +233,4 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
 
 __all__ = ["CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
            "LEARNED_UNVERIFIABLE", "PAGE_SCROLL_UNVERIFIABLE", "UNVERIFIED", "VERIFIED", "app_name", "classify",
-           "confirm_send", "finish_line", "finish_request", "is_expected", "similar"]
+           "confirm_send", "finish_line", "finish_request", "is_expected", "noop_line", "similar"]

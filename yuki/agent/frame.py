@@ -328,12 +328,16 @@ def named_app_line(app: str | None) -> str:
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
           chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
-          named_app: str | None = None) -> TaskFrame:
+          named_app: str | None = None, lessons: Sequence[str] = (), lately: Sequence[str] = ()) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
     metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
     words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
     older memory without it still gives) and the desktop overview. Code only; never raises (a failure is an empty
-    frame with ``error``)."""
+    frame with ``error``).
+
+    ``lessons`` (N8, report 47): what went wrong in this session's troubled runs on the apps in play, written by code
+    from their traces (:func:`session_lessons`) until practice memory's post-mortem learns it; kept whole with the
+    pitfalls. ``lately`` (N9): :func:`people_lately`'s lines, for a spoken request (who a misheard name may be)."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
@@ -363,6 +367,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                                   "samples": r.get("samples") or []})
         lines = _referent_lines(frame, routes, {p["id"] for p in frame.persons})
         lines += _person_lines(frame, overview)
+        near = [str(x) for x in lately or () if str(x).strip()][:MAX_LATELY]
+        if near:   # N9: who a misheard name may be (gives way first when the frame is over its size)
+            lines += [LATELY_HEAD, *(f"- {_one(x, 200)}" for x in near)]
         named = named_app_line(named_app)
         if named:
             lines.insert(0, named)   # first, so the size limit never cuts it and it reads before any usual route
@@ -382,6 +389,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                 lines.append("What did not work before in the apps in play:")
                 lines += [f"- [{p.get('app')}] {_one(p.get('text'), 260)}" for p in pits]
             frame.pitfalls = len(pits)
+        fresh = [str(x) for x in lessons or () if str(x).strip()][:MAX_LESSONS]
+        if fresh:   # N8: this session's lessons, kept whole with the pitfalls
+            tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         # an action request (the caller's measure for the related ranking): a person named or in front, a selection
         frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"])
         frame.text = _fit(lines, chars, keep=tail)
@@ -520,6 +530,10 @@ PLAYBOOK_HEAD = ("How this was done before on this PC (playbooks - your first at
                  "the screen, adapt when the screen differs, ask when it names no single default; put its id in the "
                  "playbook field of the actions that follow it):")
 PITFALL_HEAD = "Your own earlier mistakes in the apps in play (never repeat one; do what it says instead):"
+#: N8 (report 47): this session's troubled runs on the apps in play, from their traces, before memory learns them.
+LESSONS_HEAD = ("Earlier in this session on the apps in play, from your own runs (not learned yet; never repeat what "
+                "did not work, and start from what worked):")
+MAX_LESSONS = 4
 
 
 def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
@@ -567,3 +581,169 @@ def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
             return text
         (body if body else tail).pop()
     return ""
+
+
+def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Sequence[str] = (),
+                    at: float | None = None, stamped: bool = True) -> dict[str, list[str]]:
+    """N8 (report 47): from one finished run's trace, per app, what did not work and what worked after it, as short
+    lines for the next requests of this session (:func:`build`'s ``lessons``), or ``{}`` for a run with no trouble.
+
+    Trouble is measured: a step that failed, was held, or whose report showed no effect (contradicted), the same
+    control acted on three times or more, a run that ended cancelled, withdrawn or failed after acting, or words the
+    user added mid-run. Each line names the tool, the control (role and name, never ids or coordinates) and how many
+    times, with the step's own why; what worked is the steps verified after the first trouble. Code only."""
+    import collections
+    from datetime import datetime as _dt
+
+    steps = [s for s in trace or () if isinstance(s, dict) and s.get("kind") in ("action", "control")
+             and s.get("tool") not in ("tasks",)]
+    acted = [s for s in steps if s.get("kind") == "action"]
+
+    def settled(i: int, s: dict[str, Any]) -> bool:
+        """A hold (a check's refusal: look first, the user's confirmation) that the same tool in the same app then got
+        past in this run is the loop working, no pitfall (review F8)."""
+        return s.get("kind") == "control" and any(
+            later.get("kind") == "action" and later.get("tool") == s.get("tool") and later.get("ok") is True
+            and (not s.get("app") or not later.get("app") or later.get("app") == s.get("app"))
+            for later in steps[i + 1:])
+
+    bad = [s for i, s in enumerate(steps) if (s.get("ok") is False or s.get("verdict") is False)
+           and not settled(i, s)]
+    counts = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in acted)
+    repeated = [k for k, n in counts.items() if n >= 3 and k[2]]
+    ended_badly = outcome in ("cancelled", "withdrawn", "error", "failed") and bool(acted)
+    if not bad and not repeated and not ended_badly and not steers:
+        return {}
+    clock = _dt.fromtimestamp(at).strftime("%I:%M %p").lstrip("0") if at else "earlier"
+    pre = f"{clock}: " if stamped else ""
+    out: dict[str, list[str]] = collections.defaultdict(list)
+    seen: set[tuple[str, Any, str]] = set()
+    for s in bad:
+        key = (s.get("app") or "", s.get("tool"), s.get("target") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        n = counts.get(key, 1)
+        why = _one(s.get("why") or s.get("result"), 120)
+        out[key[0]].append(f"{pre}{key[1]}" + (f" on {key[2]}" if key[2] else "") + (f", {n} times" if n > 1
+                                                                                         else "") + f": {why}")
+    for key in repeated:
+        if key not in seen:
+            seen.add(key)
+            out[key[0]].append(f"{pre}{key[1]} on {key[2]} {counts[key]} times in one run (it did not settle "
+                               f"it; read the state before acting again)")
+    first_bad = min((trace.index(s) for s in bad if s in trace), default=None)
+    if first_bad is not None:
+        worked = [s for s in list(trace)[first_bad + 1:] if s.get("kind") == "action" and s.get("verdict") is True]
+        for s in worked[:1]:
+            out[s.get("app") or ""].append(f"{pre}what worked after that: {s.get('tool')}"
+                                           + (f" on {s.get('target')}" if s.get("target") else ""))
+    if ended_badly or steers:
+        app = next((s.get("app") for s in reversed(acted) if s.get("app")), "")
+        said = "; ".join(f"\"{_one(w, 80)}\"" for w in list(steers)[:2])
+        out[app or ""].append(f"{pre}the run ended {outcome}" + (f"; they said while it ran: {said}" if said else ""))
+    return {k: v[:MAX_LESSONS] for k, v in out.items() if v}
+
+
+#: What a run kept in practice memory as a pitfall must show: it failed or was stopped (cancelled, withdrawn, an
+#: error), the user added words while it ran, or one control was acted on three times or more.
+PITFALL_OUTCOMES: tuple[str, ...] = ("cancelled", "withdrawn", "error", "failed")
+
+
+def session_pitfalls(trace: Sequence[dict[str, Any]], *, outcome: str,
+                     steers: Sequence[str] = ()) -> dict[str, dict[str, str]]:
+    """N8 (report 47, review): a failed or stopped run's lessons as practice-memory pitfalls, per app: ``{app: {"text":
+    what went wrong, "instead": what worked after it or ""}}``, from :func:`session_lessons` without the clock (they
+    outlive the session). ``{}`` for a run that did not fail, was not stopped or corrected, and repeated nothing (a
+    single failed step the run got past stays a session lesson only). Code only."""
+    import collections
+
+    steps = [s for s in trace or () if isinstance(s, dict)]
+    acted = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in steps
+                                if s.get("kind") == "action")
+    repeated = any(n >= 3 and k[2] for k, n in acted.items())
+    if not (outcome in PITFALL_OUTCOMES or steers or repeated) or not acted:
+        return {}
+    marker = "what worked after that: "
+    out: dict[str, dict[str, str]] = {}
+    for app, lines in session_lessons(trace, outcome=outcome, steers=steers, stamped=False).items():
+        if not app:
+            continue
+        worked = [line.split(marker, 1)[1] for line in lines if line.startswith(marker)]
+        rest = [line for line in lines if not line.startswith(marker)]
+        if rest:
+            out[app] = {"text": "; ".join(rest)[:500], "instead": worked[0][:200] if worked else ""}
+    return out
+
+
+#: N9: the people block of a spoken request: at most this many people, the calls of this many hours.
+MAX_LATELY = 8
+LATELY_CALL_HOURS = 48.0
+LATELY_HEAD = ("Who they deal with lately (for a name speech recognition may have misheard: first how the heard words "
+               "sound, then this and what the request is about):")
+
+
+def people_lately(people: Sequence[dict[str, Any]] | None, calls: Sequence[dict[str, Any]] | None = None, *,
+                  now: float | None = None, limit: int = MAX_LATELY) -> list[str]:
+    """N9 (report 47, review): one line per person the user deals with lately, for resolving a misheard name: their
+    relation, how long since they were last in touch, the chat they use most with them, their messages a day over the
+    last two weeks (closeness, measured) and the calls of the last :data:`LATELY_CALL_HOURS` they were on (the call
+    digest's reading of the screen around it). From memory's ``people_list`` (most recently in touch first) and
+    ``calls_in``; people only on a call come too. Deterministic formatting; never raises (``[]``)."""
+    from datetime import datetime as _dt
+
+    now = time.time() if now is None else float(now)
+    try:
+        on_calls: dict[str, list[str]] = {}
+        shown: dict[str, str] = {}
+        for c in calls or ():
+            if not isinstance(c, dict):
+                continue
+            try:
+                start = _dt.fromisoformat(str(c.get("start"))).timestamp()
+            except (TypeError, ValueError):
+                continue
+            day = "today" if _dt.fromtimestamp(start).date() == _dt.fromtimestamp(now).date() else \
+                _dt.fromtimestamp(start).strftime("%a %d %b").replace(" 0", " ")
+            when_ = f"{day}, {_dt.fromtimestamp(start).strftime('%I:%M %p').lstrip('0')}"
+            app = str(c.get("service") or c.get("app") or "a").strip()
+            for p in c.get("people") or []:
+                name = " ".join(str((p or {}).get("name") or "").split())[:60] if isinstance(p, dict) else ""
+                if name:
+                    shown.setdefault(name.casefold(), name)
+                    on_calls.setdefault(name.casefold(), []).append(f"on a {app} call with them {when_}")
+        out: list[str] = []
+        named: set[str] = set()
+        for row in people or ():
+            if not isinstance(row, dict) or not row.get("name"):
+                continue
+            name = " ".join(str(row["name"]).split())[:60]
+            bits = [name + (f" ({row['relation']})" if row.get("relation") else "")]
+            if row.get("aliases"):
+                bits.append("also heard as " + ", ".join(f"\"{a}\"" for a in list(row["aliases"])[:3]))
+            last = row.get("last_contact")
+            if isinstance(last, (int, float)) and last > 0:
+                age = now - float(last)
+                bits.append(f"last in touch {_ago(age) if age < 86400 else f'{int(age // 86400)} days ago'}")
+            usual = row.get("usual_route") if isinstance(row.get("usual_route"), dict) else None
+            label = (usual or {}).get("label") or next((r.get("label") for r in row.get("routes") or []
+                                                        if isinstance(r, dict) and r.get("label")), None)
+            if label:
+                bits.append(f"mostly {label}")
+            rhythm = row.get("rhythm") if isinstance(row.get("rhythm"), dict) else {}
+            total, days = rhythm.get("total"), rhythm.get("known_days") or len(rhythm.get("days") or []) or 14
+            if isinstance(total, (int, float)) and total > 0:
+                per_day = float(total) / max(1, int(days))
+                bits.append(f"{per_day:.0f} messages a day both ways" if per_day >= 1 else "a few messages a week"
+                            if per_day * 7 >= 1 else "rarely writes")
+            bits += on_calls.get(name.casefold(), [])[:1]
+            named.add(name.casefold())
+            out.append("; ".join(bits))
+            if len(out) >= limit:
+                break
+        for key, seen in on_calls.items():   # on a recent call, not among the people listed
+            if key not in named and len(out) < limit + 2:
+                out.append(f"{shown.get(key, key)}: {seen[0]}")
+        return out
+    except Exception:  # noqa: BLE001 - a missing block never breaks a request
+        return []

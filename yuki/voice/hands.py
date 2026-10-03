@@ -126,6 +126,13 @@ _FAILED_NOTE = (
     "with the user's request as they asked it and this report as context. If the report says why nothing "
     "more can happen (already at the end), say that and stop."
 )
+#: N1 (report 47): a level asked to move that cannot (already at its top or bottom, or already there). Live 3 Oct
+#: "increase the Spotify volume" at 100% was said as "Turned it up" twice while nothing changed.
+_NOOP_NOTE = (
+    "Nothing changed: it was already there, as the report says. Say that in a few words, never that you turned it up "
+    "or down, and offer the volume that may be the low one (the app's own player volume or the system volume, as the "
+    "report names them). No other hand and no hand-off unless they say which."
+)
 #: V6 (3 Oct): a hand whose effect cannot be read back by the nature of its target (a web page that does not report
 #: its scroll): done, nothing said, nothing handed over.
 _EXPECTED_NOTE = (
@@ -671,6 +678,10 @@ class Hands:
         #: ``{hwnd: (window title, action log version, strip, read at)}``: tabs read ahead.
         self._tabs: dict[int, tuple[str, int, Any, float]] = {}
         self._prefetching = False
+        #: N7 (report 47): the text field of another app that had the keyboard as the user started talking, and
+        #: ``{"at", "since", "app", "title", "field"}`` when its text changed while they spoke (typing or dictation).
+        self._focus_mark: dict[str, Any] | None = None
+        self.dictating: dict[str, Any] | None = None
         self._desk_ahead = False
         self._desk_ahead_at = 0.0
         #: Set when a hand that touches a window did not show its effect: the talker's window hands then
@@ -1171,6 +1182,7 @@ class Hands:
                     return
                 title = next((str(w.get("title") or "") for w in payload.get("windows") or []
                               if isinstance(w, dict) and w.get("hwnd") == front), "")
+                self._mark_focus(front, payload)   # N7: the text at the caret as they start talking
                 self._keep_tabs(front, title, read(front, budget_s=0.4))
                 with self._lock:
                     items = self.items
@@ -1354,6 +1366,9 @@ class Hands:
 
             await params.result_callback({"done": report[:700], "how_to_handle_it": _EXPECTED_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
+            return
+        if ok and facts.get("noop"):
+            await params.result_callback({"no_change": report[:700], "how_to_say_it": _NOOP_NOTE})
             return
         if name == "press_keys" and ok:
             note, key = _KEYS_NOTE, "report"
@@ -1976,9 +1991,50 @@ class Hands:
             return None
         return snap if getattr(snap, "ok", False) else None
 
+    @staticmethod
+    def _caret_text(snap: Any) -> str:
+        """The text around the caret of a focus read (the Text pattern's, else the field's value), for comparing two
+        reads of the same field. Never a password field's."""
+        if snap is None or getattr(snap, "is_password", False):
+            return ""
+        return f"{getattr(snap, 'before', '') or ''}‸{getattr(snap, 'after', '') or ''}" \
+            if getattr(snap, "text_source", "") == "text" else str(getattr(snap, "value", "") or "")
+
+    def _mark_focus(self, front: int, payload: dict[str, Any]) -> None:
+        """N7 (report 47): as the user starts talking, what has the keyboard in the window in front and the text at
+        its caret (another app's text field only, never Yuki's own window). Read on the prefetch thread."""
+        self._focus_mark = None
+        process = next((str(w.get("process_name") or "") for w in payload.get("windows") or []
+                        if isinstance(w, dict) and w.get("hwnd") == front), "")
+        if not process or process.casefold() == _own_process_name().casefold():
+            return
+        snap = self._focus(timeout_s=0.25)
+        if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+            return
+        title = next((str(w.get("title") or "") for w in payload.get("windows") or []
+                      if isinstance(w, dict) and w.get("hwnd") == front), "")
+        self._focus_mark = {"at": time.monotonic(), "front": front, "window": int(getattr(snap, "window", 0) or 0),
+                            "role": str(getattr(snap, "role", "") or ""), "name": str(getattr(snap, "name", "") or ""),
+                            "text": self._caret_text(snap), "process": process, "title": title}
+
+    def _check_dictation(self, foreground: int | None, snap: Any) -> None:
+        """N7: the same text field of another app as when they started talking, and its text at the caret changed
+        since: they were typing or dictating into that app while they spoke (``dictating``, with when it was seen).
+        Measured facts of two focus reads; whether the words were for Yuki stays the talker's judgement."""
+        mark = getattr(self, "_focus_mark", None)
+        self.dictating = None
+        if not mark or snap is None or not foreground or mark["front"] != foreground:
+            return
+        same = (str(getattr(snap, "role", "") or "") == mark["role"] and str(getattr(snap, "name", "") or "")
+                == mark["name"] and int(getattr(snap, "window", 0) or 0) == mark["window"])
+        if same and self._caret_text(snap) != mark["text"]:
+            self.dictating = {"at": time.monotonic(), "since": mark["at"], "app": mark["process"],
+                              "title": mark["title"][:80], "field": mark["name"][:60] or mark["role"]}
+
     def _focus_line(self, foreground: int | None) -> str:
         """The desktop block's focus line, only when a text field of the window in front has the keyboard (v3.14)."""
         snap = self._focus() if foreground else None
+        self._check_dictation(foreground, snap)
         if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
             return ""
         window = int(getattr(snap, "window", 0) or 0)
@@ -2142,6 +2198,9 @@ class Hands:
         result = act(app, level=level, change=change, mute=mute)
         ok, report, facts = self._report(result, "", facts)
         facts["verified"] = bool(_detail(result, "verified")) if ok else False
+        if ok and _detail(result, "noop"):
+            # N1: nothing moved (already at the level or its end): no done line, no hand-off; the talker says it
+            facts.update(noop=True, settled=True, verified=None)
         return ok, report, facts
 
     def _tab(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:

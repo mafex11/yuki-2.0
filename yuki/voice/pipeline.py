@@ -553,18 +553,21 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                    key=lambda t: difflib.SequenceMatcher(None, k, t).ratio(), default=None)
         return best if best and difflib.SequenceMatcher(None, k, best).ratio() >= NEAR_TERM_RATIO else None
 
-    flagged: set[int] = set()
-    for size in (1, 2):  # single words first; a pair only when neither of its words was named alone
+    # N9 (report 47): single words and pairs are both measured, and every near name is named, closest first:
+    # recognition splits a name across two words ("hey meant" for Hemanth), and live a single word of the pair
+    # ("niche") was named with another contact whose handle looks like it, which kept the pair from being measured.
+    scored: list[tuple[float, str, str]] = []
+    for size in (1, 2):
         for i in range(len(spoken) - size + 1):
             window = spoken[i:i + size]
             k = key(" ".join(window))
-            if (len(k) < 5 or k in terms or any(j in exact or j in flagged for j in range(i, i + size))
+            if (len(k) < 5 or k in terms or any(j in exact for j in range(i, i + size))
                     or (size == 2 and any(len(key(w)) < 3 for w in window))):
                 continue
             best = closest(k)
-            if best:
-                near.append((" ".join(window), terms[best]))
-                flagged.update(range(i, i + size))
+            if best and all(t != terms[best] for _r, _h, t in scored):
+                scored.append((difflib.SequenceMatcher(None, k, best).ratio(), " ".join(window), terms[best]))
+    near = [(h, t) for _r, h, t in sorted(scored, key=lambda s: -s[0])]
     spelled: list[tuple[str, str, str | None]] = []
     run: list[str] = []
     for w in [*spoken, ""]:
@@ -3785,6 +3788,12 @@ class Conversation:
         scrolling = self._scrolling_line()
         if scrolling:
             state["scrolling"] = scrolling   # V7: a page scrolling on by itself; the talker stops it
+        dictating = getattr(hands, "dictating", None) if hands is not None else None
+        started = getattr(self.observer, "_user_started_at", None)
+        if isinstance(dictating, dict) and started is not None and float(dictating.get("since") or 0) >= started - 1.0:
+            # N7 (report 47): another app's text field changed while they spoke this turn (typing or dictation)
+            state["dictating"] = (f"{dictating.get('app')} \"{dictating.get('title')}\" (the field "
+                                  f"{dictating.get('field')})")
         return state
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").

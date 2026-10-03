@@ -428,6 +428,8 @@ def test_reversible_or_asked_for_actions_run_without_a_card(tmp_path):
     asked_for = {**RISKY, "risk": {**RISKY["risk"], "user_asked": True}}
     client = ScriptedClient([
         _response(_block("tool_use", id="p1", name="run_powershell", input=listing)),
+        # vfix2 N0: a step that cannot be undone gets a situation check first
+        _response(_block("tool_use", id="c1", name="check_situation", input={"action": "delete report.docx"})),
         _response(_block("tool_use", id="p2", name="run_powershell", input=asked_for)),
         _response(_block("tool_use", id="d", name="done", input={"message": "Done."})),
     ])

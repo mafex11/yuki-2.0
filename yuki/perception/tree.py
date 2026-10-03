@@ -137,6 +137,13 @@ _P_HELP_TEXT = 30013
 _P_FULL_DESCRIPTION = 30159
 _P_POSITION_IN_SET = 30152
 _P_SIZE_OF_SET = 30153
+#: A slider's RangeValue (report 47, N2): whether it has one, and its value and range, so a read shows where a slider
+#: stands and the slider hand (``yuki.actions.slider``) has something to set.
+_P_IS_RANGE_VALUE_AVAILABLE = 30033
+_P_RANGE_VALUE_VALUE = 30047
+_P_RANGE_VALUE_IS_READONLY = 30048
+_P_RANGE_VALUE_MINIMUM = 30049
+_P_RANGE_VALUE_MAXIMUM = 30050
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -172,7 +179,9 @@ _CACHED_PROPERTIES = (
 
 #: Cached too when the provider knows them (added one by one: an older UIA
 #: without one simply reads it as absent).
-_OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET)
+_OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET,
+                        _P_IS_RANGE_VALUE_AVAILABLE, _P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_IS_READONLY,
+                        _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM)
 
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_CHILDREN = 2
@@ -825,6 +834,23 @@ def _set_position(get: object) -> tuple[int, int] | None:
     return None
 
 
+def _slider_value(get: object) -> str | None:
+    """A slider's RangeValue as a read shows it ("37 (range 0-100)"), or ``None`` without one. An optional property:
+    an older UI Automation, or a provider without it, reads as absent (its "not supported" sentinel is no number)."""
+    try:
+        if not _as_bool(get(_P_IS_RANGE_VALUE_AVAILABLE)):  # type: ignore[operator]
+            return None
+        value, low, high = (get(p) for p in (_P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_MINIMUM,  # type: ignore[operator]
+                                             _P_RANGE_VALUE_MAXIMUM))
+        read_only = _as_bool(get(_P_RANGE_VALUE_IS_READONLY))  # type: ignore[operator]
+    except Exception:
+        return None
+    numbers = [v for v in (value, low, high) if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if len(numbers) != 3:
+        return "slider"
+    return f"{float(value):g} (range {float(low):g}-{float(high):g}{', read-only' if read_only else ''})"
+
+
 def _states(get: object) -> tuple[str, ...]:
     """Current state from the cached SelectionItem/Toggle/ExpandCollapse values.
 
@@ -969,6 +995,11 @@ class _CachedWalker:
         patterns = tuple(
             label for label, property_id in _PATTERN_ORDER if _as_bool(get(property_id))
         ) + (("value",) if editable else ())
+        ranged = _slider_value(get)
+        if ranged is not None:
+            patterns += ("range",)
+            if value is None:
+                value = ranged
         is_interactive = enabled and (
             bool(patterns)
             or _as_bool(get(_P_IS_KEYBOARD_FOCUSABLE))
