@@ -61,9 +61,10 @@ review never writes facts). The review is then marked as given to that run.
 What may enter at all is :data:`ADMISSION_BAR` (report 50): durable, about the person, useful - never
 transient readings or metrics (quotas, usage, costs, burn rates, projections, counts, model mixes), an AI
 tool's analysis or dashboard text, or tooling telemetry; at most one lasting line from such evidence. It is in
-the operations prompt, and every run's new versions pass a **bar gate** (:meth:`PortraitWorker._bar_gate`): one
-forced call (no thinking) of the same model judges the model's own ADDs and UPDATEs (not corrections, not open
-loops) and each that fails is refused or written as its lasting line. A failed gate call lets the versions
+the operations and audit prompts, and every run's new versions (nightly and audit) pass a **bar gate**
+(:meth:`PortraitWorker._bar_gate`): one forced call (no thinking) of the same model judges the model's own ADDs and
+UPDATEs (not corrections, not open loops), with the other current facts listed, and each that fails is refused or
+written as its lasting line. A failed gate call lets the versions
 through (logged); dreaming retires failures nightly and the bar pass
 (:class:`yuki.memory.dreaming.BarPass`) sweeps the existing facts once.
 

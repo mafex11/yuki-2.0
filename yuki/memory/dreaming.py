@@ -31,7 +31,8 @@ fact judged against the bar, the failing ones retired (pinned facts reported, ne
 line (pass ``bar``), the whole pass reversible (``--undo-bar``).
 
 Run it by hand: ``python -m yuki.memory.dreaming [--db PATH] [--dry-run]``; the bar pass:
-``python -m yuki.memory.dreaming --bar [--db PATH] [--dry-run]``, taken back with ``--undo-bar RUN_ID``.
+``python -m yuki.memory.dreaming --bar [--db PATH] [--dry-run [--save FILE]]``; ``--bar --apply FILE`` writes
+exactly the decisions a dry run kept (no new judgement); taken back with ``--undo-bar RUN_ID``.
 """
 
 from __future__ import annotations
