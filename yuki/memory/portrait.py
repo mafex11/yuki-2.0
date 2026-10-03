@@ -58,6 +58,15 @@ first operations call, with the episodes they cite added to its EPISODES, and
 decides on them like on any other evidence (its own validation applies; the
 review never writes facts). The review is then marked as given to that run.
 
+What may enter at all is :data:`ADMISSION_BAR` (report 50): durable, about the person, useful - never
+transient readings or metrics (quotas, usage, costs, burn rates, projections, counts, model mixes), an AI
+tool's analysis or dashboard text, or tooling telemetry; at most one lasting line from such evidence. It is in
+the operations prompt, and every run's new versions pass a **bar gate** (:meth:`PortraitWorker._bar_gate`): one
+forced call (no thinking) of the same model judges the model's own ADDs and UPDATEs (not corrections, not open
+loops) and each that fails is refused or written as its lasting line. A failed gate call lets the versions
+through (logged); dreaming retires failures nightly and the bar pass
+(:class:`yuki.memory.dreaming.BarPass`) sweeps the existing facts once.
+
 User corrections (:meth:`Store.add_correction`, from Yuki's ``update_portrait``
 tool) are facts of kind ``correction`` with origin ``user``: the render follows
 them at once, and the next run folds them into the facts they concern (the
@@ -223,8 +232,10 @@ counts, model mixes, disk, battery or build numbers), an AI tool's analysis, adv
 text, and tooling telemetry. Such evidence can still show one lasting thing about the person - that they \
 run several accounts, that they built a tool, that they work with many agents at once: write at most \
 that one line, without the numbers, the evening or the tool's words, and only when no fact already says \
-it. Numbers are fine where they describe the person's own habits across days (a behaviour or routine \
-pattern), never where they are a tool's meters on one day.
+it. A fact that mixes lasting points (their tools, preferences, how they work) with such details fails \
+as written; rewritten to its lasting points alone, it passes. Numbers are fine where they describe the \
+person's own habits across days (a behaviour or routine pattern), never where they are a tool's meters \
+on one day.
 Worked examples (invented):
 - FAILS: "The user's harness rotates across four Claude accounts on Mac and PC. On the evening of \
 2026-08-14, with 15 parallel agents running, the four accounts' combined quota fell to 160% of 400% by \
@@ -1101,16 +1112,20 @@ journal entries it rests on (app, and whether an entry is text for or from anoth
 each fact on its own words and that evidence: what it says about the person, not how it was \
 written. Most facts pass. Never fail a fact for being about work with AI tools, about money \
 or about a tool the user built: fail it for being a tool's readings, a tool's words or one evening's \
-state. A fact that mixes a lasting point with metrics fails as written; give its lasting line.
+state. A fact that mixes lasting points with metrics fails as written; give its lasting line.
 
 Call judge_bar once, listing only the facts that fail, each with:
 - category: why it fails (the first that fits): transient_state (one evening or session), \
 usage_metrics (quotas, usage, costs, burn rates, projections, counts, model mixes), ai_tool_output (an \
 AI tool's analysis, advice, report or dashboard text), tooling_telemetry (machine or tool status), \
 not_about_user, not_useful.
-- lasting: the one lasting line about the person the fact still carries, third person ("The user ..."), \
-no numbers, dates or tool's words - only when no other listed fact already says it, and at most one \
-such line for facts resting on the same evidence; else null.
+- lasting: the fact rewritten to only what is lasting about the person - every durable point it \
+carries (their tools and preferences, how they work, who they are), one to three sentences, third \
+person ("The user ..."), without the numbers, the evening's clock times or the tool's words; a status \
+keeps when it was true ("in October 2026"), a past piece of work stays past. Null only when \
+nothing lasting is left or other listed facts already say all of it; nothing durable may be lost. Facts \
+resting on the same evidence share one lasting line: give it once. Never stretch one day into a habit \
+("tends to", "often") that the fact does not show across days.
 - shown and summary: for a lasting line, the same line as the app shows it (see the fields); else null.
 - reason: one short clause, for the diary.
 An empty list when every fact passes.

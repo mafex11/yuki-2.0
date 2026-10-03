@@ -209,6 +209,7 @@ def _facts(store):
     ])
     ids = [new for _ok, new in written]
     store.set_fact_pinned(ids[5], True)       # the user pinned the advice: never retired, reported
+    store.mark_fact_reviewed(ids[0], T0 + 10)  # answered in "To review": its lasting line does not ask again
     return j, ids
 
 
@@ -236,7 +237,7 @@ def test_the_bar_pass_retires_telemetry_keeps_durable_facts_and_pinned_ones(stor
     assert old.valid_to is not None and old.superseded_by is None and old.text == QUOTA
     [new] = [f for f in current.values() if f.text == LASTING]
     assert new.kind == "work" and sorted(new.source_ids) == sorted([j[0], j[1]]) and new.importance == 6
-    assert new.shown and new.summary
+    assert new.shown and new.summary and new.reviewed_at == T0 + 10 and not new.pinned
     # open loops and corrections are never shown to the pass
     content = client.requests[0]["messages"][0]["content"]
     assert f"F{loop} " not in content and f"F{quota} [work]" in content and f"F{advice} [work] " in content

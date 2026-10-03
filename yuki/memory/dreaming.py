@@ -623,6 +623,9 @@ class BarPass:
                 result.rejected.append(f"F{f.id}: no longer current")
                 continue
             new_ids = [w[1] for w in written[1:] if w[0] and w[1] is not None]
+            if new_ids and f.reviewed_at is not None:
+                # the user already answered this fact in "To review": its lasting line does not ask again
+                self.store.mark_fact_reviewed(new_ids[0], f.reviewed_at)
             result.retired += 1
             result.lasting += len(new_ids)
             kept = f"; kept the lasting part as F{new_ids[0]}: \"{_short(ch['lasting'], 160)}\"" if new_ids else ""
@@ -684,7 +687,9 @@ def main(argv: list[str] | None = None) -> int:
 
     store = Store.open(args.db)
     try:
-        worker = PortraitWorker(store, embedder=get_embedder(), log_dir=_log_dir(args))
+        # the bar pass needs the embedder only for the lasting lines it writes: loaded then, not before
+        worker = PortraitWorker(store, embedder=None if (args.bar or args.undo_bar is not None) else get_embedder(),
+                                log_dir=_log_dir(args))
         if args.undo_bar is not None:
             print(json.dumps(BarPass(worker).undo(args.undo_bar)))
             worker.render()
@@ -692,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.bar:
             bar = BarPass(worker).run(reason="by hand", dry_run=args.dry_run)
             if not args.dry_run and bar.lasting:
+                worker.embedder = get_embedder()
                 worker.embed_facts()
             print(json.dumps({"ok": bar.ok, "run_id": bar.run_id, "judged": bar.judged, "calls": bar.calls,
                               "retired": bar.retired, "lasting": bar.lasting, "categories": bar.categories,
