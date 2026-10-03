@@ -313,6 +313,14 @@ def test_the_playbook_page_is_practice_memorys_workflows(store):
     assert lesson["do"] == "bring it forward first" and lesson["from"].startswith("From a time I got it wrong")
     prop = next(x for x in d["proposals"] if x["ref"] == f"pb:{cand}")
     assert prop["title"] == "Videos in Firefox" and "Seen" in prop["basis"] and prop["app"] == "Firefox"
+    # more things seen once than NEW blocks: the rest stay visible in their own lists, marked tentative
+    for n in range(2):
+        P.add_playbook(store, {"kind": "procedure", "intent": f"Open the planner {n}", "body": {"steps": ["a", "b"]}},
+                       events=[{"type": "observed", "run_key": f"x{n}"}])
+    d = W.build_playbook(MemoryClient(store))
+    assert len(d["proposals"]) == W.PROPOSALS_SHOWN == 2
+    tentative = [p for p in d["procedures"] if p.get("tentative")]
+    assert len(tentative) == 1 and tentative[0]["conf_word"] == "tentative, seen once"
 
 
 def test_save_edit_and_no_map_onto_memorys_own_playbook_actions(store, tmp_path):
@@ -490,6 +498,31 @@ def test_the_pages_frame_messages_reach_the_host_on_the_ui_thread(tmp_path):
     win.on_message({"op": "window", "do": "drag"})
     win.on_message({"op": "window", "do": "maximize"})
     assert calls == [("caption", 34), ("window", "drag"), ("window", "maximize")]
+
+
+@pytest.mark.skipif(__import__("os").environ.get("YUKI_WEBVIEW2_TEST") != "1",
+                    reason="opens a real (off-screen) WebView2 window")
+def test_a_real_offscreen_window_has_the_frameless_frame_and_answers_windows_hit_test(tmp_path):
+    import ctypes
+    import os
+    import sys
+
+    metrics = tmp_path / "m.json"
+    before = ctypes.windll.user32.GetForegroundWindow()
+    proc = subprocess.run([sys.executable, "-m", "yuki.ui.web_window", "--fixture", "--offscreen", "--no-connect",
+                           "--profile", str(tmp_path / "profile"), "--metrics", str(metrics), "--exit-after", "4",
+                           "--probe-frame", "--t0", repr(time.time())], env={**os.environ, "PYTHONPATH": str(ROOT)},
+                          timeout=90)
+    assert proc.returncode == 0
+    m = json.loads(metrics.read_text(encoding="utf-8"))
+    f = m["frame"]
+    assert f["thick_frame"] and f["caption_style"] and f["maximize_box"]        # snap, resize, min/max animations
+    assert f["client_origin"][1] == 0 and f["client_origin"][0] > 0              # no title bar; side borders kept
+    p = f["points"]
+    assert p["max_button"]["nchittest"] == 9 and p["close_button"]["nchittest"] == 20 and p["min_button"]["nchittest"] == 8
+    assert p["title_bar"]["nchittest"] == 2 and p["top_edge"]["nchittest"] == 12 and p["page"]["nchittest"] == 1
+    assert p["left_border"]["nchittest"] == 10
+    assert m["took_focus"] is False and ctypes.windll.user32.GetForegroundWindow() == before
 
 
 def test_the_frame_is_built_into_the_page_without_markup_from_data():

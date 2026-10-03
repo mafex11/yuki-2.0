@@ -145,7 +145,9 @@
       if (cv.__face) return;
       // the idle face blinks as the design's does, but on the shared 1 Hz tick: two still draws a blink, no 30 fps
       // loop (field.js Tick; 32-build-E11-E14.md §7); live faces blink through the loop they already run
-      const f = new L.Face(cv, +cv.dataset.pitch || 4); f.tickBlink(); f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
+      const f = new L.Face(cv, +cv.dataset.pitch || 4);
+      if (Q.get('blink') === '0') f.idleBlink = false; else f.tickBlink();   // blink=0: the measurement baseline
+      f.set(cv.dataset.core, { n: 2, of: 5 }); cv.__face = f;
     });
   }
   function afterMain(main, nav) {

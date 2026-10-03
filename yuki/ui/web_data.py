@@ -760,6 +760,8 @@ def _top_full(v: Any) -> str:
 # -- Playbook ------------------------------------------------------------------------------------------------------
 
 
+#: NEW blocks on the Playbook page at most (the design shows one); more tentative items go to their lists.
+PROPOSALS_SHOWN = 2
 #: How each practice object came to be (``playbooks.origin``), in the words the Playbook page's side line uses.
 ORIGIN_WORDS = {"distill": "From a run that worked", "run": "From a run that worked",
                 "postmortem": "From a time I got it wrong", "user": "In your words", "taught": "You taught me",
@@ -846,16 +848,25 @@ def build_playbook(memory: Any) -> dict[str, Any]:
     available = bool(wf.get("available"))
     procs = [procedure_view(c) for c in wf.get("procedures") or [] if isinstance(c, dict)] if available else []
     lessons = [lesson_view(c) for c in wf.get("lessons") or [] if isinstance(c, dict)] if available else []
-    props = [proposal_view(c) for c in wf.get("proposals") or [] if isinstance(c, dict)] if available else []
-    know = [] if procs else [{"title": k.title, "line": k.line, "app": k.app}
-                             for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
+    # what Yuki is not sure of yet: questions first, at most PROPOSALS_SHOWN as the NEW blocks (the design shows one);
+    # the other tentative ways and lessons stay visible in their own lists, marked as seen once
+    pending = [c for c in wf.get("proposals") or [] if isinstance(c, dict)] if available else []
+    pending.sort(key=lambda c: c.get("kind") != "question")
+    props = [proposal_view(c) for c in pending[:PROPOSALS_SHOWN]]
+    for c in pending[PROPOSALS_SHOWN:]:
+        if c.get("kind") in WAY_KINDS:
+            procs.append({**procedure_view(c), "conf_word": "tentative, seen once", "tentative": True})
+        elif c.get("kind") in ("pitfall", "style"):
+            lessons.append({**lesson_view(c), "tentative": True})
+    know = [] if available else [{"title": k.title, "line": k.line, "app": k.app}
+                                 for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
     rules = [rule_json(r) for r in (_safe(memory.rules, []) or [])]
     standing = []
     for r in _safe(memory.standing_requests, []) or []:
         text = " ".join(str(r.get("quote") or r.get("condition") or "").split())
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
-    return {"proposals": props[:3], "procedures": procs, "know_how": know, "lessons": lessons, "rules": rules,
+    return {"proposals": props, "procedures": procs, "know_how": know, "lessons": lessons, "rules": rules,
             "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None}
 
 

@@ -37,7 +37,8 @@
   function lesson(l) {
     return h('div', { class: 'lesson' + (l.disabled ? ' off' : '') }, h('span', { class: 'd', text: l.dont }), l.because ? [' ', h('span', { class: 'b', text: l.because })] : null,
       l.do ? h('div', { class: 'z', text: l.do }) : null,
-      h('div', { class: 'm', text: [`used ${fmt.plural(l.used || 0, 'time')}`, l.from ? l.from.charAt(0).toLowerCase() + l.from.slice(1) : ''].filter(Boolean).join(' · ') }));
+      h('div', { class: 'm', text: [l.tentative ? 'tentative, seen once' : '', `used ${fmt.plural(l.used || 0, 'time')}`,
+        l.from ? l.from.charAt(0).toLowerCase() + l.from.slice(1) : ''].filter(Boolean).join(' · ') }));
   }
   function ruleRow(r, i) {
     return h('div', { class: 'rule', data: { fact: '', ref: r.ref, kind: r.kind === 'standing' ? 'standing' : 'rule', text: r.text } },

@@ -443,9 +443,10 @@ class HostOptions:
     #: was maximized; used for the normal placement when the rect is still on a monitor.
     rect: tuple[int, int, int, int] | None = None
     maximized: bool = False
-    #: ``normal``: a framed window, shown and brought forward (the tray let this process take the foreground);
-    #: ``offscreen``: a frameless tool window beyond the left edge of every monitor, shown without activation and
-    #: refusing activation (measurements and tests: it never takes focus and is never seen).
+    #: ``normal``: the window, shown and brought forward (the tray let this process take the foreground);
+    #: ``offscreen``: a tool window beyond the left edge of every monitor, shown without activation and refusing
+    #: activation (measurements and tests: it never takes focus and is never seen; with ``frameless`` it has the real
+    #: frame, so its hit testing can be measured; the page's window ops are refused there).
     placement: str = "normal"
     #: The Lattice frame: no Windows title bar (the page draws its own caption buttons), the system's resize borders
     #: and shadow kept, the page's title bar answered to Windows as caption / buttons (:func:`caption_hit`).

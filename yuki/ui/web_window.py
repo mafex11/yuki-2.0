@@ -27,7 +27,7 @@ One window at a time, whichever engine: the same single-instance mutex and focus
 Options for tests and measurements (all optional): ``--fixture`` (invented data, no memory, no pipe), ``--db``,
 ``--page``, ``--offscreen`` (a frameless tool window beyond every monitor that never activates), ``--profile``,
 ``--browser-args``, ``--query`` (preview knobs for the page, e.g. ``state=listening``), ``--t0``, ``--metrics``, ``--shot``, ``--exit-after``,
-``--memory-low-after``.
+``--memory-low-after``, ``--probe-frame`` (the off-screen frame: Windows' own hit test answers, 32-build-E11-E14.md §6).
 """
 
 from __future__ import annotations
