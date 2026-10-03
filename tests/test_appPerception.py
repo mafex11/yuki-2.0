@@ -788,3 +788,14 @@ def test_the_renderer_pane_under_a_scroll_point_is_no_marker_and_the_page_below_
     small = SimpleNamespace(CurrentBoundingRectangle=SimpleNamespace(left=10, top=10, right=200, bottom=60))
     assert not scrolling.window_sized(small, 5)
     assert scrolling.page_below(_Automation(), pane) is page
+
+
+def test_a_new_page_and_a_retitled_page_are_said_apart() -> None:
+    def read_of(title: str, url: str) -> list[dict[str, Any]]:
+        common = dict(bounds=(0, 0, 10, 10), center=(5, 5), states=(), is_interactive=False)
+        return [{"id": 0, "role": "Window", "name": "Arc", "parent": -1, "depth": 0, "value": None, **common},
+                {"id": 1, "role": "Document", "name": title, "parent": 0, "depth": 1, "value": url, **common}]
+    moved = diff(read_of("Home", "https://www.youtube.com/"), read_of("Clip", "https://www.youtube.com/watch?v=x"))
+    assert describe(moved)[0] == "the page is now https://www.youtube.com/watch?v=x (was https://www.youtube.com/)"
+    retitled = diff(read_of("(1) Home", "https://www.youtube.com/"), read_of("(2) Home", "https://www.youtube.com/"))
+    assert retitled.page is None and describe(retitled)[0] == 'the window\'s title is now "(2) Home"'

@@ -209,7 +209,10 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
     if before and after and fact(before[0], "depth", 0) == 0 and t0 != t1:
         change.title = (t0 or "", t1 or "")
     p0, p1 = _page(before), _page(after)
-    if p0 != p1 and (p0 or p1):
+    if p0 and p1 and p0[1] == p1[1]:
+        if p0[0] != p1[0] and change.title is None:
+            change.title = (p0[0], p1[0])   # the same address, retitled: said as the title
+    elif p0 != p1 and (p0 or p1):
         change.page = (p0[1] if p0 else "", p1[1] if p1 else "")
     change.counts = {"appeared": len(appeared), "gone": len(gone), "changed": len(change.changed),
                      "moved": len(change.moved), "ignored": change.ignored, "before": len(before),
