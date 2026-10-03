@@ -108,26 +108,39 @@ def test_migration_33_is_additive_from_32():
             s.close()
 
 
-def test_migration_33_sets_the_pin_for_user_facts_only(tmp_path):
+def test_migration_33_runs_on_a_v32_file_with_rows_and_pins_user_facts_only(tmp_path):
+    """The real migration path on a file that holds data written at version 32 (review note: the earlier test re-ran
+    only the UPDATE). Rows need the store's key, so they are written by a store, then the file is taken back to v32
+    (migration 33's columns and table dropped, user_version 32) and opened again: Store.open runs migration 33."""
     db = tmp_path / "old.db"
-    conn = sqlite3.connect(str(db), isolation_level=None)
-    for index in range(32):
-        for statement in _split_sql(MIGRATIONS[index]):
-            conn.execute(statement)
-    conn.execute("PRAGMA user_version=32")
-    conn.close()
-    # rows written by the store at version 32 need its key: write them through a store opened at 33, then reset the
-    # columns migration 33 added and run its UPDATE again, as the migration does on the real file
     s = Store.open(db)
     try:
         told = _fact(s, "work", "Acme", "The user works at Acme.", origin="user")
         seen = _fact(s, "interest", "Chess", "The user plays chess most evenings.")
-        s._write(lambda c: c.execute("UPDATE portrait_facts SET pinned=0"))
-        for statement in _split_sql(MIGRATIONS[32]):
-            if statement.lstrip().upper().startswith("UPDATE PORTRAIT_FACTS"):
-                s._write(lambda c, st=statement: c.execute(st))
+        [op] = s.apply_work([WorkOp("starts", None, title="Garden planner", state="The user drew the beds.",
+                                    at=NOW, seen_at=NOW)])
+        jid = _journal(s, "The user opened the garden planner.", at=NOW - 60)
+        cid = _call_row(s, started_at=NOW - 3600, people=["Ana"], gist="A game night with Ana.")
+    finally:
+        s.close()
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    for table, column in (("portrait_facts", "shown_ciphertext"), ("portrait_facts", "pinned"),
+                          ("portrait_facts", "reviewed_at"), ("work_threads", "shown_ciphertext"),
+                          ("call_digests", "gist_shown_ciphertext"), ("journal", "reviewed_at"),
+                          ("contact_routes", "use_ciphertext")):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute("DROP TABLE day_digests")
+    conn.execute("PRAGMA user_version=32")
+    conn.close()
+    s = Store.open(db)
+    try:
+        assert s._query("PRAGMA user_version")[0][0] == 33
         assert s.portrait_fact(told).pinned is True and s.portrait_fact(seen).pinned is False
-        assert s.portrait_fact(told).text == "The user works at Acme."     # nothing else moved
+        assert s.portrait_fact(told).text == "The user works at Acme." and s.portrait_fact(seen).shown is None
+        assert s.shown_missing()["fact"] and op.result_id in s.shown_missing()["thread"]
+        assert s.journal_by_ids([jid])[0].fact == "The user opened the garden planner."
+        assert s.call_digest(cid)["gist"] == "A game night with Ana." and s.day_digests() == []
+        assert MemoryClient(s).review_queue(now=NOW)["waiting"] == 1                  # the model fact only
     finally:
         s.close()
 
