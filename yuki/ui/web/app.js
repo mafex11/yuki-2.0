@@ -307,6 +307,7 @@
   function renderDrawer() {
     const old = $app.querySelector('.drawer');
     if (!S.chat) { if (old) old.remove(); return; }
+    stats.drawer = (stats.drawer || 0) + 1;
     const oldBody = old && old.querySelector('.body');
     const stick = !oldBody || oldBody.scrollHeight - oldBody.scrollTop - oldBody.clientHeight < 40;
     const el = Y.drawer(D, S, old);
@@ -350,6 +351,7 @@
     tickT = setTimeout(tick, need ? 1000 - (Date.now() % 1000) + 5 : 60000 - (Date.now() % 60000) + 50);
   }
   function tickSoon() { clearTimeout(tickT); tickT = setTimeout(tick, 0); }
+  Y.tickSoon = tickSoon;
 
   /* the next moment the open page changes with the clock alone (an Undo window closing, an offer running out, the
      away window moving, midnight): one timer, a patch then (42 verification, missing 4); none while hidden */
