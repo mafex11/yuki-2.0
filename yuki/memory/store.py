@@ -540,6 +540,8 @@ class JournalEntry:
     work_thread_id: int | None = None
     #: ``front`` | ``visible`` | ``popup``: the attention its source had (migration 24; older rows read ``front``).
     attention: str = "front"
+    #: When the user answered it as a "maybe misheard" entry (migration 33), or ``None``.
+    reviewed_at: float | None = None
 
 
 @dataclass
@@ -613,6 +615,8 @@ class WorkThread:
     created_at: float
     updated_at: float
     score: float | None = None
+    #: Where it stands, said to the user (migration 33); ``None`` until written or after the state changed.
+    shown: str | None = None
 
 
 @dataclass
@@ -746,6 +750,14 @@ class PortraitFact:
     #: words, model-written with the fact (an ``open_loop``: its three-to-six-word title); ``None`` until
     #: written (the titles pass fills it).
     summary: str | None = None
+    #: The fact as the app shows it, said to the user (migration 33, :data:`yuki.memory.titles.SHOWN_RULES`);
+    #: ``None`` until written.
+    shown: str | None = None
+    #: The user's pin (migration 33): protected from the model's rewrites (it changes only on a correction or
+    #: later evidence). Separate from ``origin`` ("you told me").
+    pinned: bool = False
+    #: When the user answered it in the "To review" queue (migration 33), or ``None``.
+    reviewed_at: float | None = None
 
 
 @dataclass
@@ -775,6 +787,8 @@ class FactChange:
     importance: int | None = None
     #: The new version's short line (migration 21); ``None``: the titles pass writes it later.
     summary: str | None = None
+    #: The new version as the app shows it, said to the user (migration 33); ``None``: the titles pass writes it.
+    shown: str | None = None
 
 
 @dataclass
@@ -2776,6 +2790,42 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS journal_batch_thread ON journal(batch_id, thread_id);
     CREATE INDEX IF NOT EXISTS messages_thread_seen ON messages(thread_id, first_seen);
     """,
+    # 33 (2026-10-03, the 3 Oct feedback, Builder A: docs/research/revamp-2026-10-02/38-feedback-root-causes.md §2-§9,
+    # §12, 43-build-appA-memory.md): what the app shows the user, said to them.
+    # - portrait_facts.shown_ciphertext: the fact as the app shows it - second person, natural dates, others by name
+    #   (yuki.memory.titles.SHOWN_RULES) - written by the same model call that writes the fact (or the titles pass);
+    #   the stored text stays third person for every prompt that reads it.
+    # - portrait_facts.pinned: the user's pin, its own flag (before, "pinned" was origin == 'user', which also means
+    #   "you told me", so it could not be turned off). Set for the current user-origin facts so nothing changes.
+    # - portrait_facts.reviewed_at: when the user answered it in the "To review" queue (Right / Wrong / Not mine).
+    # - work_threads.shown_ciphertext: where the thread stands, said to the user (cleared when the state changes).
+    # - call_digests.gist_shown_ciphertext: the call's gist, said to the user.
+    # - journal.reviewed_at: when the user answered a "maybe misheard" entry (Right / Wrong) - a direct op, no model.
+    # - contact_routes.use_ciphertext: one sentence, what the user uses that chat for with the person.
+    # - day_digests: one short digest per user day (days start at 04:00; yuki.memory.daydigest), the memory form
+    #   (text) and the form shown to the user (shown), with the ids it rests on; the line that connects one day's
+    #   chat to the next for the user and for Yuki (resume_context).
+    # Additive only.
+    """
+    ALTER TABLE portrait_facts ADD COLUMN shown_ciphertext TEXT;
+    ALTER TABLE portrait_facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE portrait_facts ADD COLUMN reviewed_at REAL;
+    UPDATE portrait_facts SET pinned = 1 WHERE origin = 'user' AND kind != 'correction';
+    ALTER TABLE work_threads ADD COLUMN shown_ciphertext TEXT;
+    ALTER TABLE call_digests ADD COLUMN gist_shown_ciphertext TEXT;
+    ALTER TABLE journal ADD COLUMN reviewed_at REAL;
+    ALTER TABLE contact_routes ADD COLUMN use_ciphertext TEXT;
+    CREATE TABLE day_digests (
+        day                 TEXT PRIMARY KEY,
+        text_ciphertext     TEXT NOT NULL,
+        shown_ciphertext    TEXT,
+        refs                TEXT,
+        model               TEXT,
+        cost_usd            REAL,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL
+    );
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -2807,6 +2857,16 @@ LABEL_SURFACES: dict[str, tuple[str, dict[str, str], str]] = {
     "commit": ("conversation_facts", {"title": "title_ciphertext"}, "kind = 'commitment' AND status = 'active'"),
     "todo": ("todos", {"title": "title_ciphertext"}, "status = 'open'"),
     "knowhow": ("knowhow", {"title": "title_ciphertext", "summary": "summary_ciphertext"}, "valid_to IS NULL"),
+}
+
+#: What carries a form shown to the user, said to them (migration 33, :data:`yuki.memory.titles.SHOWN_RULES`):
+#: surface -> (table, key column, shown column, which rows are current). Kept apart from :data:`LABEL_SURFACES`: a
+#: shown form is a sentence or two in the user's voice, not a short label.
+SHOWN_SURFACES: dict[str, tuple[str, str, str, str]] = {
+    "fact": ("portrait_facts", "id", "shown_ciphertext", f"valid_to IS NULL AND kind != '{CORRECTION_KIND}'"),
+    "thread": ("work_threads", "id", "shown_ciphertext",
+               "status NOT IN ('merged', 'dismissed') AND state_ciphertext IS NOT NULL"),
+    "gist": ("call_digests", "call_id", "gist_shown_ciphertext", "status = 'ok' AND gist_ciphertext IS NOT NULL"),
 }
 
 #: Open loops with their title: the summary of the ``open_loop`` portrait fact each follows (migration 21).
@@ -3643,6 +3703,7 @@ class Store:
             tainted=bool(r["tainted"]) if "tainted" in keys else False,
             work_thread_id=r["work_thread_id"] if "work_thread_id" in keys else None,
             attention=(r["attention"] or "front") if "attention" in keys else "front",
+            reviewed_at=r["reviewed_at"] if "reviewed_at" in keys else None,
         )
 
     def _source(self, stored: str | None) -> dict[str, Any] | None:
@@ -3906,6 +3967,9 @@ class Store:
             aspect=(r["aspect"] if "aspect" in r.keys() and r["aspect"] in PERSONALITY_ASPECTS else None),
             importance=(int(r["importance"]) if "importance" in r.keys() and r["importance"] is not None else None),
             summary=self._dec(r["summary_ciphertext"]) if "summary_ciphertext" in r.keys() else None,
+            shown=self._dec(r["shown_ciphertext"]) if "shown_ciphertext" in r.keys() else None,
+            pinned=bool(r["pinned"]) if "pinned" in r.keys() else (r["origin"] == "user"),
+            reviewed_at=r["reviewed_at"] if "reviewed_at" in r.keys() else None,
         )
 
     def portrait_facts(
@@ -3938,19 +4002,23 @@ class Store:
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
         source_ids: Sequence[int], confidence: float | None, origin: str, run_id: int | None, now: float,
         episode_ids: Sequence[int] = (), aspect: str | None = None, importance: int | None = None,
-        summary: str | None = None,
+        summary: str | None = None, shown: str | None = None, pinned: bool | None = None,
+        reviewed_at: float | None = None,
     ) -> int:
+        # a fact the user stated (origin user) starts pinned, as before migration 33; the user may unpin it
+        pin = (origin == "user" and kind != CORRECTION_KIND) if pinned is None else bool(pinned)
         cur = conn.execute(
             "INSERT INTO portrait_facts(kind, subject_ciphertext, text_ciphertext, valid_from, valid_to,"
             " source_ids, confidence, origin, created_at, run_id, episode_ids, aspect, importance,"
-            " summary_ciphertext) VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)",
+            " summary_ciphertext, shown_ciphertext, pinned, reviewed_at) VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 kind, self._enc(subject or ""), self.cipher.encrypt(text), float(valid_from),
                 json.dumps([int(i) for i in source_ids]), confidence, origin, now, run_id,
                 json.dumps([int(i) for i in episode_ids]) if episode_ids else None,
                 aspect if kind == "personality" and aspect in PERSONALITY_ASPECTS else None,
                 None if importance is None else min(10, max(1, int(importance))),
-                self._enc(summary) if summary else None,
+                self._enc(summary) if summary else None, self._enc(shown) if shown else None, int(pin),
+                reviewed_at,
             ),
         )
         return int(cur.lastrowid)
@@ -4022,11 +4090,15 @@ class Store:
                     importance = ch.importance
                     if importance is None and old is not None and "importance" in old.keys():
                         importance = old["importance"]   # an UPDATE that does not re-rate keeps the rating
+                    # a new version keeps the user's pin and review (migration 33): they were about this fact
+                    pinned = None if old is None else (bool(old["pinned"]) or ch.origin == "user")
+                    reviewed = None if old is None else old["reviewed_at"]
                     new_id = self._insert_fact(
                         conn, kind=ch.kind, subject=ch.subject, text=ch.text, valid_from=at,
                         source_ids=ch.source_ids, confidence=ch.confidence, origin=ch.origin,
                         run_id=run_id, now=now, episode_ids=ch.episode_ids, aspect=ch.aspect,
-                        importance=importance, summary=ch.summary,
+                        importance=importance, summary=ch.summary, shown=ch.shown, pinned=pinned,
+                        reviewed_at=reviewed,
                     )
                 if old is not None:
                     self._end_fact(conn, old["id"], at, now, new_id)
@@ -5836,6 +5908,213 @@ class Store:
 
         return int(self._write(op))
 
+    # -- what the app shows, said to the user (migration 33, yuki.memory.titles SHOWN_RULES) ------------------
+
+    def shown_missing(self, surfaces: Sequence[str] | None = None) -> dict[str, list[int]]:
+        """``{surface: ids}`` of current items still without their shown form (:data:`SHOWN_SURFACES`), oldest
+        first. Plumbing on NULL columns: nothing is decrypted."""
+        out: dict[str, list[int]] = {}
+        for surface, (table, key, col, where) in SHOWN_SURFACES.items():
+            if surfaces is not None and surface not in surfaces:
+                continue
+            out[surface] = [int(r[0]) for r in self._query(
+                f"SELECT {key} FROM {table} WHERE {where} AND {col} IS NULL ORDER BY {key}")]
+        return out
+
+    def set_shown(self, surface: str, texts: dict[int, str], *, overwrite: bool = False) -> int:
+        """Write shown forms (encrypted), ``{item id: text}`` for one surface of :data:`SHOWN_SURFACES`. Without
+        ``overwrite`` a form another writer stored meanwhile is kept. Returns how many were written."""
+        table, key, col, _where = SHOWN_SURFACES[surface]
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for item_id, text in texts.items():
+                text = " ".join(str(text or "").split())
+                if not text:
+                    continue
+                guard = "" if overwrite else f" AND {col} IS NULL"
+                n += conn.execute(f"UPDATE {table} SET {col}=? WHERE {key}=?{guard}",
+                                  (self.cipher.encrypt(text), int(item_id))).rowcount
+            return n
+
+        return int(self._write(op)) if texts else 0
+
+    def call_contexts(self, call_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """Who was on each call and where (the digest's reading of the call screen, migration 25; ``place`` is the
+        structured form since migration 33's digests): ``{call_id: {"app", "people": [{"name", "how"}], "where",
+        "place"}}``. Only the context column is decrypted; calls without one are left out."""
+        ids = sorted({int(i) for i in call_ids})
+        if not ids:
+            return {}
+        out: dict[int, dict[str, Any]] = {}
+        for r in self._query(f"SELECT call_id, app, started_at, context_ciphertext FROM call_digests WHERE call_id IN"
+                             f" ({','.join('?' * len(ids))})", ids):
+            try:
+                ctx = json.loads(self._dec(r["context_ciphertext"]) or "{}")
+            except (ValueError, TypeError):
+                ctx = {}
+            if not isinstance(ctx, dict):
+                ctx = {}
+            people = [p for p in ctx.get("people") or [] if isinstance(p, dict) and p.get("name")]
+            place = ctx.get("place") if isinstance(ctx.get("place"), dict) else None
+            out[int(r["call_id"])] = {"app": _shown(r["app"]), "people": people, "started_at": r["started_at"],
+                                      "where": " ".join(str(ctx.get("where") or "").split()), "place": place}
+        return out
+
+    def set_fact_pinned(self, fact_id: int, on: bool, *, now: float | None = None) -> bool:
+        """The user's pin on a current portrait fact (migration 33), one UPDATE and a diary line (pass ``pin``). No
+        model, no correction. False when the fact is not current."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            if conn.execute("UPDATE portrait_facts SET pinned=? WHERE id=? AND valid_to IS NULL AND kind != ?",
+                            (int(bool(on)), int(fact_id), CORRECTION_KIND)).rowcount != 1:
+                return False
+            self._insert_diary(conn, None, now, {"pass": "pin", "action": "pin" if on else "unpin",
+                                                 "fact_ids": [int(fact_id)],
+                                                 "text": f"The user {'pinned' if on else 'unpinned'} F{int(fact_id)}."})
+            return True
+
+        return bool(self._write(op))
+
+    def mark_fact_reviewed(self, fact_id: int, at: float | None, *, pin: bool | None = None,
+                           note: str | None = None) -> bool:
+        """Set (``at``) or clear (``None``) a current fact's ``reviewed_at``, optionally its pin, with a diary line
+        (pass ``review``). False when the fact is not current."""
+        now = time.time()
+
+        def op(conn: sqlite3.Connection) -> bool:
+            sets, params = ["reviewed_at=?"], [at]
+            if pin is not None:
+                sets.append("pinned=?")
+                params.append(int(bool(pin)))
+            if conn.execute(f"UPDATE portrait_facts SET {', '.join(sets)} WHERE id=? AND valid_to IS NULL",
+                            (*params, int(fact_id))).rowcount != 1:
+                return False
+            if note:
+                self._insert_diary(conn, None, now, {"pass": "review", "action": "review" if at else "undo",
+                                                     "fact_ids": [int(fact_id)], "text": note})
+            return True
+
+        return bool(self._write(op))
+
+    def restore_fact(self, fact_id: int) -> bool:
+        """Undo the user's own retirement of a fact (the review queue's Wrong, within its Undo window): the version
+        becomes current again when nothing superseded it. False otherwise."""
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT kind FROM portrait_facts WHERE id=? AND valid_to IS NOT NULL AND"
+                               " superseded_by IS NULL", (int(fact_id),)).fetchone()
+            if row is None or row["kind"] == CORRECTION_KIND:
+                return False
+            conn.execute("UPDATE portrait_facts SET valid_to=NULL, expired_at=NULL WHERE id=?", (int(fact_id),))
+            return True
+
+        return bool(self._write(op))
+
+    def review_counts(self, since: float) -> int:
+        """How many portrait facts (any version) the user reviewed since ``since`` (the queue's daily cap)."""
+        return int(self._query("SELECT count(*) FROM portrait_facts WHERE reviewed_at >= ?", (float(since),))[0][0])
+
+    def resolve_journal(self, journal_id: int, verdict: str, *, now: float | None = None) -> dict[str, Any] | None:
+        """The user's verdict on a "maybe misheard" journal entry (migration 33), deterministic, no model:
+        ``right`` - its nature becomes ``fact`` and ``reviewed_at`` is set (in place: a classification the user just
+        confirmed, nothing is reworded); ``wrong`` - it is retired now (kept, superseded by a no-model batch, like a
+        correction's retirement); ``undo`` - either is taken back (a retirement only while it is the latest state of
+        that entry). A diary line each (pass ``heard``). Returns ``{"id", "verdict", "nature", "text"}`` or ``None``
+        when the entry is not there (or already resolved the other way)."""
+        now = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            row = conn.execute("SELECT * FROM journal WHERE id=?", (int(journal_id),)).fetchone()
+            if row is None:
+                return None
+            text = self.cipher.decrypt(row["fact_ciphertext"])
+            if verdict == "right":
+                if row["superseded_at"] is not None:
+                    return None
+                conn.execute("UPDATE journal SET nature='fact', reviewed_at=? WHERE id=?", (now, int(journal_id)))
+                line = "confirmed what it heard"
+            elif verdict == "wrong":
+                if row["superseded_at"] is not None:
+                    return None
+                batch = self._insert_batch(conn, ModelCall(at=now, thread_id=row["thread_id"], model="user:heard",
+                                                           cost_usd=0.0, outcome="ok"), 0, 0)
+                conn.execute("UPDATE journal SET superseded_at=?, superseded_by=?, reviewed_at=? WHERE id=?",
+                             (now, batch, now, int(journal_id)))
+                line = "said it was misheard; retired"
+            elif verdict == "undo":
+                if row["superseded_at"] is not None:
+                    batch = conn.execute("SELECT model FROM journal_batches WHERE id=?",
+                                         (row["superseded_by"],)).fetchone()
+                    if batch is None or batch["model"] != "user:heard":
+                        return None   # superseded by something else since (a correction's rewrite): not ours to undo
+                    conn.execute("UPDATE journal SET superseded_at=NULL, superseded_by=NULL, reviewed_at=NULL"
+                                 " WHERE id=?", (int(journal_id),))
+                else:
+                    conn.execute("UPDATE journal SET nature='uncertain', reviewed_at=NULL WHERE id=?",
+                                 (int(journal_id),))
+                line = "took back the answer"
+            else:
+                raise ValueError(f"unknown verdict {verdict!r}")
+            self._insert_diary(conn, None, now, {"pass": "heard", "action": verdict, "fact_ids": [int(journal_id)],
+                                                 "text": f"The user {line} for J{int(journal_id)}."})
+            nature = "fact" if verdict == "right" else ("uncertain" if verdict == "undo" else row["nature"])
+            return {"id": int(journal_id), "verdict": verdict, "nature": nature, "text": text}
+
+        out = self._write(op)
+        self._forget_withdrawn()
+        return out
+
+    def uncertain_journal(self, since: float, *, limit: int | None = None) -> tuple[list[JournalEntry], int]:
+        """Current journal entries marked uncertain (possibly misheard) since ``since`` that the user has not answered
+        (migration 33), newest first, and how many there are in all."""
+        where = "superseded_at IS NULL AND nature = 'uncertain' AND reviewed_at IS NULL AND at >= ?"
+        total = int(self._query(f"SELECT count(*) FROM journal WHERE {where}", (float(since),))[0][0])
+        sql = f"SELECT * FROM journal WHERE {where} ORDER BY at DESC, id DESC"
+        params: list[Any] = [float(since)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [self._entry(r) for r in self._query(sql, params)], total
+
+    # -- day digests (migration 33, yuki.memory.daydigest) ----------------------------------------------------
+
+    def save_day_digest(self, day: str, text: str, shown: str | None, refs: dict[str, Any] | None, *,
+                        model: str | None = None, cost_usd: float | None = None) -> None:
+        """Store (or replace) one user day's digest, encrypted."""
+        now = time.time()
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO day_digests(day, text_ciphertext, shown_ciphertext, refs, model, cost_usd, created_at,"
+            " updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET text_ciphertext=excluded.text_ciphertext,"
+            " shown_ciphertext=excluded.shown_ciphertext, refs=excluded.refs, model=excluded.model,"
+            " cost_usd=excluded.cost_usd, updated_at=excluded.updated_at",
+            (str(day), self.cipher.encrypt(text), self._enc(shown) if shown else None,
+             json.dumps(refs or {}), model, cost_usd, now, now)))
+
+    def day_digests(self, *, days: Sequence[str] | None = None, before: str | None = None,
+                    limit: int = 7) -> list[dict[str, Any]]:
+        """Day digests, newest day first: ``{"day", "text", "shown", "refs", "created_at"}``; ``days``: these days
+        only; ``before``: days strictly before this one."""
+        sql, params = "SELECT * FROM day_digests WHERE 1=1", []
+        if days is not None:
+            if not days:
+                return []
+            sql += " AND day IN (%s)" % ",".join("?" * len(days))
+            params.extend(str(d) for d in days)
+        if before is not None:
+            sql += " AND day < ?"
+            params.append(str(before))
+        out = []
+        for r in self._query(sql + " ORDER BY day DESC LIMIT ?", [*params, int(limit)]):
+            try:
+                refs = json.loads(r["refs"] or "{}")
+            except ValueError:
+                refs = {}
+            out.append({"day": r["day"], "text": self.cipher.decrypt(r["text_ciphertext"]),
+                        "shown": self._dec(r["shown_ciphertext"]), "refs": refs if isinstance(refs, dict) else {},
+                        "created_at": r["created_at"]})
+        return out
+
     def complete_open_loop(self, loop_id: int, *, at: float | None = None) -> bool:
         """The user says an open loop is done: in one transaction the loop row becomes ``done``
         and its current portrait fact is invalidated (``valid_to`` = now, history kept).
@@ -7480,10 +7759,12 @@ class Store:
         blocks: Sequence[dict[str, Any]], started_at: float | None, ended_at: float | None, speech_s: float,
         utterances: int, kept: int, model: str | None, usage: dict[str, int] | None = None, requests: int = 0,
         cost_usd: float | None = None, latency_ms: float = 0.0, context: dict[str, Any] | None = None,
+        gist_shown: str | None = None,
     ) -> None:
         """Store a call's digest (``status`` ok, or empty when the call held nothing worth a line), encrypted;
         the cost is added to what earlier attempts cost. ``context``: who was on the call and where, as the
-        screen around it showed (:mod:`yuki.memory.callcontext`; migration 25)."""
+        screen around it showed (:mod:`yuki.memory.callcontext`; migration 25). ``gist_shown``: the gist said to
+        the user (migration 33); ``None`` leaves it for the titles pass."""
         usage = usage or {}
         now = time.time()
         ids = json.dumps(sorted(int(i) for i in capture_ids))
@@ -7503,7 +7784,9 @@ class Store:
                 " capture_ids=?, status=?, gist_ciphertext=?, blocks_ciphertext=?, model=?, requests=?,"
                 " input_tokens=?, output_tokens=?, cache_write_tokens=?, cache_read_tokens=?,"
                 " cost_usd=cost_usd+?, latency_ms=?, context_ciphertext=?, error=NULL, claimed_by=NULL,"
-                " claimed_at=NULL, updated_at=? WHERE call_id=?", (*values, now, int(call_id)))
+                " claimed_at=NULL, updated_at=?, gist_shown_ciphertext=? WHERE call_id=?",
+                (*values, now, self._enc(" ".join(gist_shown.split())) if gist_shown and gist_shown.strip() else None,
+                 int(call_id)))
             try:   # the digest's words changed: its vector (whole-memory ranking, migration 23) is made again
                 conn.execute("DELETE FROM call_digest_vec WHERE call_id=?", (int(call_id),))
             except sqlite3.OperationalError:
@@ -7548,6 +7831,7 @@ class Store:
                 "context": context if isinstance(context, dict) else {},
                 "call_id": int(r["call_id"]), "app": _shown(r["app"]), "status": r["status"],
                 "gist": self._dec(r["gist_ciphertext"]),
+                "gist_shown": self._dec(r["gist_shown_ciphertext"]) if "gist_shown_ciphertext" in r.keys() else None,
                 "blocks": blocks if isinstance(blocks, list) else [], "started_at": r["started_at"],
                 "ended_at": r["ended_at"], "speech_s": r["speech_s"], "utterances": r["utterances"], "kept": r["kept"],
                 "capture_ids": captures, "model": r["model"], "cost_usd": r["cost_usd"], "attempts": r["attempts"],
@@ -8270,7 +8554,8 @@ class Store:
             entities=self._json_list(r["entities_ciphertext"]), first_seen=float(r["first_seen"]),
             last_seen=float(r["last_seen"]), importance=r["importance"], origin=r["origin"],
             merged_into=r["merged_into"], events=int(r["events"] or 0), created_at=float(r["created_at"]),
-            updated_at=float(r["updated_at"]), score=score)
+            updated_at=float(r["updated_at"]), score=score,
+            shown=self._dec(r["shown_ciphertext"]) if "shown_ciphertext" in r.keys() else None)
 
     def work_threads(self, statuses: Sequence[str] | None = ("active", "paused"), *, since: TimeArg = None,
                      limit: int | None = None, ids: Iterable[int] | None = None) -> list[WorkThread]:
@@ -8583,13 +8868,15 @@ class Store:
                     status, touched, event = row["status"], float(row["last_seen"]), "seen"
                 if op.action == "continues" and row["status"] in ("paused", "done") and not older and not glimpsed:
                     event = "reopens"
+                # a new state makes the shown one stale (migration 33): cleared, the titles pass writes it again
                 conn.execute(
                     "UPDATE work_threads SET status=?, state_ciphertext=coalesce(?, state_ciphertext), open_ciphertext=?,"
                     " entities_ciphertext=?, first_seen=min(first_seen, ?), last_seen=max(last_seen, ?),"
-                    " importance=?, events=events+1, updated_at=? WHERE id=?",
+                    " importance=?, events=events+1, updated_at=?,"
+                    " shown_ciphertext=CASE WHEN ? THEN NULL ELSE shown_ciphertext END WHERE id=?",
                     (status, self._enc(state or None), self.cipher.encrypt(json.dumps(open_items)),
                      self.cipher.encrypt(json.dumps(entities)), min(first, touched), touched,
-                     max(rated) if rated else None, now, tid))
+                     max(rated) if rated else None, now, int(bool(state)), tid))
                 op.outcome = {"continues": "continued", "pauses": "paused", "ends": "ended"}[op.action]
                 if event == "reopens":
                     op.outcome = "reopened"
@@ -8674,6 +8961,13 @@ class Store:
             self._write(lambda conn: self._apply_work(conn, ops, batch_id=batch_id))
         return list(ops)
 
+    def _shown_args(self, ch: dict[str, Any]) -> tuple[Any, Any, int]:
+        """The three parameters of ``shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE
+        shown_ciphertext END`` for one nightly change: its shown form, else cleared when the state changed."""
+        shown = " ".join(str(ch.get("shown") or "").split())
+        enc = self.cipher.encrypt(shown) if shown else None
+        return enc, enc, int(bool(ch.get("state")))
+
     def change_work_threads(self, changes: Sequence[dict[str, Any]], *, now: float | None = None,
                             origin: str = "consolidate") -> list[dict[str, Any]]:
         """The nightly pass's validated decisions, in one transaction; returns what happened to each.
@@ -8682,6 +8976,8 @@ class Store:
         "embed_model"}`` (the others end ``merged`` into ``keep``; their facts, events and links move to it),
         ``{"action": "close", "id", "status": "paused" | "done"}``, ``{"action": "rename", "id", "title",
         "vector", "embed_model"}``, ``{"action": "update", "id", "state", "open", "vector", "embed_model"}``.
+        A merge or update may carry ``shown`` (the state said to the user, migration 33); a new state without one
+        clears the old shown form (the titles pass writes it again).
         """
         now = time.time() if now is None else float(now)
         out: list[dict[str, Any]] = []
@@ -8709,7 +9005,8 @@ class Store:
                     conn.execute(
                         "UPDATE work_threads SET title_ciphertext=?, state_ciphertext=coalesce(?, state_ciphertext),"
                         " open_ciphertext=coalesce(?, open_ciphertext), entities_ciphertext=?, status=?,"
-                        " first_seen=?, last_seen=?, events=?, importance=coalesce(?, importance), updated_at=?"
+                        " first_seen=?, last_seen=?, events=?, importance=coalesce(?, importance), updated_at=?,"
+                        " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END"
                         " WHERE id=?",
                         (self.cipher.encrypt(str(ch.get("title") or self._dec(rows[keep]["title_ciphertext"]) or "")),
                          self._enc(ch.get("state") or None),
@@ -8717,7 +9014,8 @@ class Store:
                          is not None else None,
                          self.cipher.encrypt(json.dumps(entities)), status,
                          min(r["first_seen"] for r in group), max(r["last_seen"] for r in group),
-                         sum(int(r["events"] or 0) for r in group), ch.get("importance"), now, keep))
+                         sum(int(r["events"] or 0) for r in group), ch.get("importance"), now,
+                         *self._shown_args(ch), keep))
                     conn.execute(f"UPDATE work_threads SET status='merged', merged_into=?, updated_at=? WHERE id IN ({marks})",
                                  (keep, now, *others))
                     conn.execute(f"UPDATE journal SET work_thread_id=? WHERE work_thread_id IN ({marks})", (keep, *others))
@@ -8760,10 +9058,12 @@ class Store:
                     else:
                         conn.execute(
                             "UPDATE work_threads SET state_ciphertext=coalesce(?, state_ciphertext),"
-                            " open_ciphertext=coalesce(?, open_ciphertext), updated_at=? WHERE id=?",
+                            " open_ciphertext=coalesce(?, open_ciphertext), updated_at=?,"
+                            " shown_ciphertext=CASE WHEN ? IS NOT NULL THEN ? WHEN ? THEN NULL ELSE shown_ciphertext END"
+                            " WHERE id=?",
                             (self._enc(ch.get("state") or None),
                              self.cipher.encrypt(json.dumps(list(ch["open"])[: self.WORK_OPEN_MAX]))
-                             if ch.get("open") is not None else None, now, tid))
+                             if ch.get("open") is not None else None, now, *self._shown_args(ch), tid))
                         event = "renamed" if ch.get("title") else "continues"
                     self._put_work_vec(conn, tid, ch.get("vector"), ch.get("embed_model"))
                     conn.execute("INSERT INTO work_thread_events(work_thread_id, at, action, state_ciphertext, origin,"
