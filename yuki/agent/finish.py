@@ -138,6 +138,10 @@ def noop_line(name: str, details: dict[str, Any] | None, *, process: str | None 
         change = (details.get("asked") or {}).get("change")
         verb = "raise" if isinstance(change, (int, float)) and change > 0 else (
             "lower" if isinstance(change, (int, float)) and change < 0 else "change")
+        if details.get("muted_before") and verb != "lower":
+            # review F5: muted in the mixer is the real reason it is quiet; unmuting is the fix to offer
+            return (f"{app} is {at} in Windows' volume mixer but muted there, so nothing changed. Want me to unmute "
+                    f"it?")
         system = details.get("system_volume")
         system_part = f"the system volume, at {float(system):g}%," if isinstance(system, (int, float)) else \
             "the system volume"

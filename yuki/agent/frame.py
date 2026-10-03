@@ -595,7 +595,17 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
     steps = [s for s in trace or () if isinstance(s, dict) and s.get("kind") in ("action", "control")
              and s.get("tool") not in ("tasks",)]
     acted = [s for s in steps if s.get("kind") == "action"]
-    bad = [s for s in steps if s.get("ok") is False or s.get("verdict") is False]
+
+    def settled(i: int, s: dict[str, Any]) -> bool:
+        """A hold (a check's refusal: look first, the user's confirmation) that the same tool in the same app then got
+        past in this run is the loop working, no pitfall (review F8)."""
+        return s.get("kind") == "control" and any(
+            later.get("kind") == "action" and later.get("tool") == s.get("tool") and later.get("ok") is True
+            and (not s.get("app") or not later.get("app") or later.get("app") == s.get("app"))
+            for later in steps[i + 1:])
+
+    bad = [s for i, s in enumerate(steps) if (s.get("ok") is False or s.get("verdict") is False)
+           and not settled(i, s)]
     counts = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in acted)
     repeated = [k for k, n in counts.items() if n >= 3 and k[2]]
     ended_badly = outcome in ("cancelled", "withdrawn", "error", "failed") and bool(acted)

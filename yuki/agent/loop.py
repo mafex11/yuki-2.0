@@ -2267,7 +2267,11 @@ class Agent:
             if held_text is None:
                 # N0 (report 47): a step with a lasting effect (a send, a window closed, one declared irreversible) runs
                 # only after a situation check this request has read; otherwise the brain is sent to look first.
-                need = situation_check.consequence(name, tool_input, sends=bool(judged is not None and judged.sends))
+                # a send is the judge's mark or, whatever the judge says (or with no judge), the call's own traits:
+                # text typed with Enter, a click while typed text waits (review F6)
+                sends = bool(judged is not None and judged.sends) or sends_for_certain(call_traits(
+                    name, tool_input, role=target.get("role"), typed_pending=bool(target.get("typed_pending"))))
+                need = situation_check.consequence(name, tool_input, sends=sends)
                 checks = getattr(self, "_situation_checks", None)
                 confirmed = (name, call_signature(acting)) in getattr(self, "_confirmed", set())   # they said yes
                 if need and checks is not None and not confirmed and not situation_check.covered(
@@ -2325,6 +2329,12 @@ class Agent:
             # N0: the situation check is gathered here (the window read again, memory's recent history); a read with
             # no side effects, so a cancel stops the wait for it
             outcome = self._abortable(name, lambda: self._situation(tool_input))
+            record = outcome.payload.pop("record", None) if isinstance(outcome.payload, dict) else None
+            if outcome.ok and isinstance(record, situation_check.CheckRecord):
+                # recorded here, on the loop's own thread, only for a check whose result goes back to the model: a read
+                # left behind by the user's words or a cancel never covers a later send (review F1)
+                record.call = self._model_calls
+                self._situation_checks.append(record)
         elif name in PERCEPTION_TOOLS:
             # A read has no side effects: a cancel or the user's correction stops the wait for it (v3.14).
             outcome = self._abortable(name, lambda: self._dispatch(name, tool_input))
@@ -2697,17 +2707,26 @@ class Agent:
         corrected by the user, as that person's misheard form in memory's name aliases (the store's existing
         ``add_alias``; memory's people index resolves it from then on, and recognition keyterms never include a heard
         form). Only for a name memory's people index knows; the user's own words this request must hold the heard
-        form (a span of what they said, so a guess of the model's is never kept). Returns one line for the result."""
+        form (a span of what they said, so a guess of the model's is never kept), and they must have said something
+        after it: an answer to a question, words added mid-run, or a later request (review F4: a first guess, before
+        any question or answer, is never kept; whether those words confirm it is the model's judgement, which is why
+        it passes ``heard_as`` only then). Returns one line for the result."""
         heard = " ".join(str(tool_input.get("heard_as") or "").split())[:60]
         name = " ".join(str(tool_input.get("name") or "").split())[:80]
-        said = " ".join(" ".join(str(w.get("text") or "") for w in self._user_words
-                                 if isinstance(w, dict) and w.get("how") in ("typed", "heard", "added", "answer")
-                                 ).casefold().split())
+        own = [w for w in self._user_words
+               if isinstance(w, dict) and w.get("how") in ("typed", "heard", "added", "answer")]
         if not heard or not name or heard.casefold() == name.casefold():
             return ""
-        if " ".join(heard.casefold().split()) not in said:
+        needle = " ".join(heard.casefold().split())
+        first = next((i for i, w in enumerate(own) if needle in " ".join(str(w.get("text") or "").casefold().split())),
+                     None)
+        if first is None:
             return (f"Not kept as a misheard form: \"{heard}\" is not in what they said in this request (keep only the "
                     f"words as heard).")
+        if not any(w.get("how") in ("answer", "added") or (w.get("request") or 0) > (own[first].get("request") or 0)
+                   for w in own[first + 1:]):
+            return (f"Not kept as a misheard form yet: they have not confirmed that \"{heard}\" meant {name} (pass "
+                    f"heard_as only after their answer or correction says so).")
         call = getattr(self.memory, "call", None)
         if not callable(call):
             return ""
@@ -3475,8 +3494,8 @@ class Agent:
         """N0 (report 47): one situation check (:mod:`yuki.agent.situation`): the target window read again with a larger
         budget for its latest content, memory's recent history of the person or thing, the user's own recent messages in
         that app most like what is about to be sent; the evidence fenced as data read from outside, then the question a
-        good assistant asks itself. Recorded for the gate before a consequential step (with the model call it came
-        from: only a later call has read it) and in the run trace. Never raises."""
+        good assistant asks itself. Its record (``payload["record"]``) is kept for the gate by the caller, on the loop's
+        thread, only when the result reaches the model (this may run on an abandoned reader thread). Never raises."""
         started = time.perf_counter()
         backend = getattr(self.dispatcher, "backend", None)
         windows = {int(w["hwnd"]): w for w in (self._overview_payload or {}).get("windows") or []
@@ -3514,14 +3533,14 @@ class Agent:
         sit = situation_check.gather(tool_input, read_tree=read_tree, process_of=process_of,
                                      memory_call=fetch if callable(fetch) else None,
                                      recall=recall if installed else None)
-        self._situation_checks.append(situation_check.CheckRecord(hwnd=sit.hwnd, at=time.time(), about=sit.about,
-                                                                  call=self._model_calls))
+        record = situation_check.CheckRecord(hwnd=sit.hwnd, at=time.time(), about=sit.about)
         self.logger.log("situation_check", **sit.facts_dict(), call=self._model_calls)
         evidence = wrap(sit.evidence_text(), source="the target window and memory (Yuki's situation check)",
                         nonce=self._nonce)
         text = f"{situation_check.CHECK_LABEL}: {sit.summary()}.\n{evidence}\n\n{situation_check.QUESTION}"
         return ToolOutcome(name=situation_check.TOOL_NAME, ok=True, summary=sit.summary(),
-                           content=[{"type": "text", "text": text}], payload={"situation": sit.facts_dict()},
+                           content=[{"type": "text", "text": text}],
+                           payload={"situation": sit.facts_dict(), "record": record},
                            elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
 
     def _dispatch_watching(self, name: str, tool_input: dict[str, Any]) -> Iterator[AgentEvent]:

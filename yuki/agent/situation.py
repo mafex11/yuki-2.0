@@ -104,7 +104,8 @@ QUESTION = (
     "Maya if she is free tonight, and her message 10 minutes ago says she is out of town -> \"Maya just said she's "
     "out of town tonight. Still ask?\"; they ask to close a window that holds a post they were writing -> \"That "
     "window has your unsent post. Close it anyway?\"; they ask to tell Sam they are on their way and nothing like "
-    "it is there -> send it, no question. Their yes to such a question is the go-ahead: then send it.")
+    "it is there -> send it, no question; they ask to tell Maya they are running late and the same words went to "
+    "Sam, in another chat, a few minutes ago -> send it, no question (it is not done for Maya). Their yes to such a question is the go-ahead: then send it.")
 
 #: What the loop says when a consequential step comes with no situation check in its request (or only one sent in the
 #: same response, whose result was not read before the step).
@@ -189,7 +190,7 @@ def latest_lines(payload: dict[str, Any] | None, *, limit: int = LATEST_LINES) -
     if not elements:
         return []
     root = max((_area(e.get("bounds")) for e in elements), default=0) or 1
-    rows: list[tuple[int, int, str]] = []
+    rows: list[tuple[int, int, str, str]] = []
     for e in elements:
         b = e.get("bounds")
         if not b or len(b) != 4 or _area(b) <= 0 or _area(b) > CONTAINER_SHARE * root:
@@ -257,6 +258,21 @@ class Situation:
 
     # -- what the model reads -------------------------------------------------------------------------------------
 
+    def chat_of(self, message: dict[str, Any]) -> tuple[bool | None, str]:
+        """``(same, label)``: whether a captured message of the user's went to the person's own chat (its thread is
+        one of their routes' threads in memory's people index), and words for it ("to Sam, Discord DM @sam_99", "in
+        another chat, not with Sam"); ``None`` when no person was named or found (the chat cannot be told). Review
+        F2: the same words sent to someone else are not already done for this person. Ids only, never words."""
+        person = self.person or {}
+        thread = message.get("thread")
+        if not person.get("found") or thread is None:
+            return None, "in a chat not tied to anyone named here"
+        for r in person.get("routes") or []:
+            if isinstance(r, dict) and thread in (r.get("thread_ids") or []):
+                label = r.get("label") or r.get("app") or "their chat"
+                return True, f"to {person.get('name')}, {label}"
+        return False, f"in another chat, not with {person.get('name')}"
+
     def evidence_text(self) -> str:
         """The gathered evidence (to be fenced as data read from outside by the caller)."""
         parts: list[str] = []
@@ -287,12 +303,14 @@ class Situation:
             parts.append(f"Memory has no one called \"{self.about}\" in its people index.")
         if self.own:
             rows = [f"The user's own messages captured in {self.process or 'that app'} in the last "
-                    f"{self.hours:g} h, the ones most like what you are about to do first:"]
+                    f"{self.hours:g} h, the ones most like what you are about to do first, each with the chat it "
+                    f"went to:"]
             for m in self.own[:OWN_MESSAGES]:
                 close = m.get("similarity")
                 mark = f" (similar to what you are about to send: {close:.2f})" if isinstance(close, float) \
                     and close >= SIMILAR_MARK else ""
-                rows.append(f"- {when(m.get('at'), self.now)}: \"{str(m.get('text') or '')[:LINE_CHARS]}\"{mark}")
+                rows.append(f"- {when(m.get('at'), self.now)}, {self.chat_of(m)[1]}: "
+                            f"\"{str(m.get('text') or '')[:LINE_CHARS]}\"{mark}")
             parts.append("\n".join(rows))
         if self.facts.strip():
             parts.append(f"Memory's facts of the last {self.hours:g} h near this:\n{self.facts.strip()[:FACTS_CHARS]}")
@@ -315,9 +333,12 @@ class Situation:
             bits.append(f"memory: {len(samples)} of the user's own messages to {person.get('name')}"
                         + (f", newest {when(newest, self.now)}" if newest else ""))
         if self.own:
-            best = max((m.get("similarity") or 0.0 for m in self.own), default=0.0)
+            best = max(self.own, key=lambda m: m.get("similarity") or 0.0)
+            score = float(best.get("similarity") or 0.0)
+            same = self.chat_of(best)[0]
+            where = "" if same is None else (" in this chat" if same else " in another chat")
             bits.append(f"{len(self.own)} own messages in the app in {self.hours:g} h"
-                        + (f", one {best:.2f} similar to this" if best >= SIMILAR_MARK else ""))
+                        + (f", one {score:.2f} similar to this{where}" if score >= SIMILAR_MARK else ""))
         if self.facts.strip():
             bits.append("related facts")
         return "Checked first: " + ("; ".join(bits) if bits else "nothing could be read")
@@ -431,7 +452,7 @@ def gather(tool_input: dict[str, Any], *, read_tree: Callable[[int], Any] | None
         for r in rows:
             if isinstance(r, dict) and str(r.get("text") or "").strip():
                 own.append({"text": str(r["text"]), "at": r.get("at") or r.get("first_seen"),
-                            "similarity": round(similar(action, str(r["text"])), 3)})
+                            "thread": r.get("thread"), "similarity": round(similar(action, str(r["text"])), 3)})
         own.sort(key=lambda m: (-(m["similarity"] or 0.0), -float(m.get("at") or 0)))
         sit.own = own[:OWN_MESSAGES]
     sit.ms = round((time.perf_counter() - started) * 1000, 1)

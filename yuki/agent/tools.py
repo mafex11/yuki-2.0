@@ -662,8 +662,8 @@ TASKS_TOOL: dict[str, Any] = {
 #: N9 (report 47): the heard form of a name, learned as an alias when the user confirms or corrects a guess.
 ABOUT_HEARD_AS: dict[str, Any] = {
     "type": "string",
-    "description": "Their confirmation or correction of a misheard name (\"hey meant\" was Hemanth): the words as "
-                   "heard, kept as that person's misheard form.",
+    "description": "Only after they confirmed or corrected a misheard name (\"hey meant\" was Hemanth), never on "
+                   "your own first guess: the words as heard, kept as that person's misheard form.",
 }
 
 TOOL_SCHEMAS.extend([dict(_SITUATION_TOOL), dict(_SLIDER_TOOL), TASKS_TOOL])
@@ -1499,7 +1499,7 @@ class _LazyRealBackend:
             app, level=level, change=change, mute=mute)
 
     def set_slider(self, hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
-                   press: Callable[[str, int], Any] | None = None) -> Any:
+                   press: Callable[..., Any] | None = None) -> Any:
         """:func:`yuki.actions.slider.set_slider`: a slider set by RangeValue or its own keys, read back (N2)."""
         import importlib
 
@@ -3003,12 +3003,22 @@ class Dispatcher:
         if not target or int(target) not in self._latest_trees:
             return
         number, elements = self._latest_trees[int(target)]
-        boxes = [e for e in elements.values() if isinstance(e, dict) and e.get("bounds")]
+        boxes = [e for e in elements.values() if isinstance(e, dict) and e.get("bounds") and len(e["bounds"]) == 4]
         if not boxes:
             return
+        from yuki.agent.situation import CONTAINER_SHARE
+
+        def area(b: Any) -> int:
+            return max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+
+        whole = max(area(e["bounds"]) for e in boxes) or 1
         for e in boxes:
             b = e["bounds"]
-            if e.get("is_interactive") and len(b) == 4 and int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3]):
+            # review F3: the window's root, a page's document or a pane covering much of the window takes the keyboard
+            # (so it reads as interactive) but is no control: only something smaller under the point counts
+            if area(b) > CONTAINER_SHARE * whole:
+                continue
+            if e.get("is_interactive") and int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3]):
                 return
         raise ToolError(
             f"not clicked: nothing you can click is at ({x},{y}) in read #{number} of window {target}. A control hidden "
@@ -3335,8 +3345,10 @@ class Dispatcher:
             raise ToolError("this desktop has no slider hand")
         press = getattr(self.backend, "press", None)
 
-        def keys(key: str, times: int) -> Any:
+        def keys(key: str, times: int, stopped: Callable[[], bool] | None = None) -> Any:
             self._before_input("set_slider")
+            if stopped is not None and stopped():   # review F7: the result went back while the gate waited
+                raise TimeoutError("out of time while waiting for the keyboard")
             return press(key, times=int(times), expect_hwnd=guard or hwnd)
 
         outcome = self._from_action("set_slider", act(hwnd, element, to=to, by=by,

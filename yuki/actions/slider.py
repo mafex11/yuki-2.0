@@ -26,6 +26,7 @@ Which element is the slider is fixed UI Automation facts (patterns, boxes); noth
 from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Any, Callable, Protocol
 
@@ -77,9 +78,11 @@ def target_value(value: float, low: float, high: float, *, to: float | None, by:
 
 def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
           press: Callable[[str, int], Any] | None = None, name: str = "the slider",
-          sleep: Callable[[float], None] = time.sleep, settle_s: float = SETTLE_S) -> tuple[bool, str, dict[str, Any]]:
+          sleep: Callable[[float], None] = time.sleep, settle_s: float = SETTLE_S,
+          stopped: Callable[[], bool] | None = None) -> tuple[bool, str, dict[str, Any]]:
     """Move one live slider to its target and read it back: ``(ok, summary, details)``. RangeValue.SetValue first;
-    when that cannot move it, focus and the arrow keys (``press(key, times)``) with a read-back after each batch."""
+    when that cannot move it, focus and the arrow keys (``press(key, times)``) with a read-back after each batch.
+    ``stopped()`` true (the caller stopped waiting: its result has gone back) ends the keys before the next batch."""
     details: dict[str, Any] = {"verified": False}
     value, low, high, read_only, small = slider.read()
     details.update(before=round(value, 4), minimum=low, maximum=high, before_percent=round(percent(value, low, high), 1))
@@ -117,6 +120,9 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
         close = max(step / 2.0, (high - low) * 0.005)   # within half a key step of the target: as near as keys get
         presses = 0
         while presses < MAX_PRESSES and abs(after - want) > close:
+            if stopped is not None and stopped():
+                details["stopped"] = True   # review F7: no key after the caller has given its answer
+                break
             need = max(1, min(KEYS_PER_BATCH, math.ceil(abs(want - after) / max(step, 1e-9))))
             before_batch = after
             try:
@@ -196,9 +202,10 @@ def _distance(rect: tuple[int, int, int, int] | None, want: Any) -> float:
 
 
 def set_slider(hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
-               press: Callable[[str, int], Any] | None = None) -> ActionResult:
-    """The real slider hand (see the module docstring). ``press(key, times)`` sends keys to the slider's window (the
-    caller's guarded key action); ``None``: RangeValue only."""
+               press: Callable[..., Any] | None = None) -> ActionResult:
+    """The real slider hand (see the module docstring). ``press(key, times, stopped=...)`` sends keys to the slider's
+    window (the caller's guarded key action; ``stopped()`` turns true once this has returned, after which it must not
+    press: it may have waited for the user to stop typing); ``None``: RangeValue only."""
     started = time.perf_counter()
     name = f"{element.get('role') or 'element'} \"{str(element.get('name') or '')[:60]}\""
     base: dict[str, Any] = {"hwnd": int(hwnd), "element": {"role": element.get("role"),
@@ -263,11 +270,22 @@ def set_slider(hwnd: int, element: dict[str, Any], *, to: float | None = None, b
         best = min(candidates, key=lambda c: _distance(_rect(c), element.get("bounds")))
         pattern = best.GetCurrentPattern(_PATTERN_RANGE_VALUE).QueryInterface(module.IUIAutomationRangeValuePattern)
         shared["acting"] = True
-        ok, summary, details = drive(_LiveSlider(best, pattern), to=to, by=by, press=press, name=name)
+        ok, summary, details = drive(_LiveSlider(best, pattern), to=to, by=by,
+                                     press=guarded if press is not None else None, name=name, stopped=stop.is_set)
         shared["done"] = (ok, summary, details)
+
+    stop = threading.Event()
+
+    def guarded(key: str, times: int) -> Any:
+        # review F7: the caller's key action is told when the result has already gone back (it may wait for the user
+        # to stop typing first), so no key is pressed after that
+        if stop.is_set():
+            raise TimeoutError("out of time")
+        return press(key, times, stopped=stop.is_set)
 
     pending = _Pending(job, "yuki-slider", BUDGET_S)
     shared = pending.wait()
+    stop.set()
     if shared.get("done"):
         ok, summary, details = shared["done"]
         return result(ok, summary, {**details, "via_uia": True})

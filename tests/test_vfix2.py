@@ -638,14 +638,29 @@ def test_n10_an_item_is_dropped_only_with_the_users_words() -> None:
 
 def test_n9_a_confirmed_mishearing_is_kept_as_an_alias_only_from_the_users_own_words(tmp_path: Path) -> None:
     mem = FakeMemoryClient(person={"name": "Hemanth", "aka": ["hemanth"], "relation": "best friend", "routes": []})
+    seen: dict[str, str] = {}
+
+    def after_guess(params: dict) -> SimpleNamespace:
+        seen["guess"] = _texts(params)
+        return _response(_use("ask_user", question="Hemanth, right?"))
+
+    def after_answer(params: dict) -> SimpleNamespace:
+        return _response(_use("about", 1, name="Hemanth", heard_as="hey meant"),
+                         _use("about", 2, name="Hemanth", heard_as="hair nest"))
+
+    def end(params: dict) -> SimpleNamespace:
+        seen["end"] = _texts(params)
+        return _response(_use("done", message="Got it.", about=[], states=[]))
+
     brain = Brain([
-        _response(_use("about", name="Hemanth", heard_as="hey meant")),
-        _response(_use("about", 1, name="Hemanth", heard_as="hair nest")),
-        _response(_use("done", message="Got it.", about=[], states=[])),
+        _response(_use("about", name="Hemanth", heard_as="hey meant")),   # the thinker's own first guess
+        after_guess, after_answer, end,
     ])
     agent = _agent(brain, tmp_path, ChatPlayerDesk(), memory=_memory(mem))
-    _run(agent, "yes, hey meant is Hemanth")
-    assert mem.aliases == [("hey meant", "Hemanth")]              # "hair nest" was never said: not kept
+    _run(agent, "message hey meant on discord that I'm running late", answers=["yes, Hemanth"])
+    assert "not confirmed that \"hey meant\" meant Hemanth" in seen["guess"]   # review F4: a guess is never kept
+    assert mem.aliases == [("hey meant", "Hemanth")]              # kept after their yes; "hair nest" was never said
+    assert "is not in what they said" in seen["end"]
 
 
 def test_n9_a_name_split_across_two_words_is_named_even_when_one_word_looks_like_another_contact() -> None:
