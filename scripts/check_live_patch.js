@@ -301,6 +301,46 @@ async function inPage(F) {
   factRow.querySelector('[data-do="forget-undo"]').click();   // cancelled: nothing is sent
   F.pages.me = me;
 
+  // ---- review F4: navigating between pages whose head figures share kind and size still sweeps the new one in ----
+  for (const [from, to] of [['#me', '#playbook'], ['#playbook', '#activity'], ['#activity', '#me']]) {
+    await go(from); await sleep(900);
+    const t0f = Y.field.figT0;
+    await go(to); await sleep(200);
+    let still = 0, cells = 0;
+    for (const k of Y.field.figIdx) { cells++; if (Y.field.delay[k] < 0) still++; }
+    check(`F4 ${from} -> ${to}: the new page's figure sweeps in`, Y.field.figT0 !== t0f && still === 0, `figT0 ${Y.field.figT0 === t0f ? 'kept' : 'reset'}, ${still}/${cells} cells with no sweep`);
+  }
+
+  // ---- review F5: an Undo window closing on the row you just pressed patches once, not in a loop ----
+  await go('#activity'); await sleep(600);
+  const uspan = main().querySelector('[data-until]');
+  const urow = uspan && uspan.closest('[data-row], .lrow, .srow, [data-item]');
+  if (urow) {
+    urow.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));   // held: the item you pressed
+    uspan.dataset.until = String(Date.now() / 1000 - 1);
+    const p0 = Y.patchStats.patches;
+    Y.tickSoon();
+    await sleep(1000);
+    check('F5 a closed Undo on a held row patches at most twice in a second', Y.patchStats.patches - p0 <= 2, `${Y.patchStats.patches - p0} patches`);
+  } else check('F5 an Activity row with an Undo is in the fixture', false, 'no [data-until] row');
+  await sleep(5200);   // the press hold ends: one patch then
+
+  // ---- review F6: a content morph (a draft with Copy) outlives the 4 s retire; a confirmation row does not ----
+  await go('#home'); await sleep(900);
+  const cards = main().querySelectorAll('[data-k="offers"] [data-card]');
+  const draftBox = cards[0], confBox = cards[1];
+  Y.morph(draftBox, Y.h('div', { class: 'draft' }, Y.h('p', { text: 'An invented draft to read.' }), Y.h('button', { class: 'key xs', text: 'Copy' })));
+  if (confBox) Y.morph(confBox, Y.h('div', null, Y.confirmRow('Invented confirmation', {})));
+  const homeR = clone(F.pages.home);
+  homeR.needs[0].title = 'A question pushed during a draft?';
+  await push('home', homeR);
+  await sleep(4700);
+  check('F6 a draft you are reading survives past the 4 s retire', draftBox.isConnected && draftBox.textContent.includes('An invented draft to read.'), 'draft swapped away');
+  check('F6 a confirmation row still retires after 4 s', !confBox || !main().textContent.includes('Invented confirmation'), 'confirmation still there');
+  check('F6 the rest of Home was patched meanwhile', main().textContent.includes('A question pushed during a draft?'));
+  Y.restore(draftBox);
+  F.pages.home = homeR;
+
   // ---- 21: the drawer, a streamed reply: few patches, the other turns untouched, the fold you closed stays closed ----
   await go('#home?thread=1');
   await sleep(300);

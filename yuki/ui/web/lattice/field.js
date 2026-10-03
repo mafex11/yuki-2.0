@@ -231,7 +231,7 @@
       Loop.add(this.frame);
     }
     /* The figures are rasterised again only when one changed: its kind, place, size or data (figSig). A figure
-       already on screen in the same kind and size keeps no sweep: its cells ease to their new values (a changed
+       already on screen (the same element, patched in place) in the same kind and size keeps no sweep: its cells ease to their new values (a changed
        skyline column grows, a moved figure follows) through the cur easing; only a new figure sweeps in
        (42-window-live-refresh.md R6: a redraw no longer replays the sweep). */
     rasterFigures(o) {
@@ -243,9 +243,8 @@
         found.push({ el, kind: el.dataset.figure, sig: figSig(el), i0: Math.round((r.left - o.left) / P), j0: Math.round((r.top - o.top) / P), ci: Math.floor(r.width / P), cj: Math.floor(r.height / P) });
       });
       const prev = this.figs || [];
-      const same = (a, b) => a.kind === b.kind && a.sig === b.sig && a.i0 === b.i0 && a.j0 === b.j0 && a.ci === b.ci && a.cj === b.cj;
+      const same = (a, b) => a.el === b.el && a.kind === b.kind && a.sig === b.sig && a.i0 === b.i0 && a.j0 === b.j0 && a.ci === b.ci && a.cj === b.cj;
       if (this.rasterOK && found.length === prev.length && found.every((f, n) => same(f, prev[n]))) {
-        found.forEach((f, n) => { prev[n].el = f.el; });
         return;   // nothing to raster: figT0, delays and the drawn cells stay as they are
       }
       const fig = this.fig, tone = this.figTone, delay = this.delay;
@@ -255,7 +254,8 @@
       let fresh = false;
       found.forEach((f) => {
         const el = f.el;
-        const kept = prev.some((q) => q.kind === f.kind && q.ci === f.ci && q.cj === f.cj);
+        // the same element (a patch keeps it; a navigation builds new ones, so a new page's figure always sweeps in)
+        const kept = prev.some((q) => q.el === el && q.kind === f.kind && q.ci === f.ci && q.cj === f.cj);
         if (!kept) fresh = true;
         this.figs.push(f);
         const put = (i, j, v, t, d) => {

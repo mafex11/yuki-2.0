@@ -218,13 +218,23 @@
     return el.tagName + (k ? ':' + k : '.' + el.className);
   }
   const typedIn = (el) => (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.value !== el.defaultValue;
-  function holdsHands(el, now) {
+  /* a box morphed to an action's confirmation row (Y.confirmRow / a .confirm span), not to content you read or edit */
+  function confirmMorph(el) {
+    const c = el.firstElementChild;
+    if (!c || el.children.length !== 1) return false;
+    return c.classList.contains('confirm') || (c.children.length === 1 && c.firstElementChild.classList.contains('confirm'));
+  }
+  /* `gone`: the node's item is no longer in the new data (patchChildren's leftovers) */
+  function holdsHands(el, now, gone) {
     const a = document.activeElement;
     if (FIELDS.has(el.tagName)) return el === a || typedIn(el);
     if (el.__forget || el.__leaving || el.classList.contains('editing')) return true;
-    if (el === S.pressed && now - S.touched < PRESS_MS) return true;
+    if (el === S.pressed && now - S.touched < PRESS_MS) { retireLater(PRESS_MS - (now - S.touched)); return true; }   // one patch when the hold ends
     if (Y.hasOrig(el)) {   // mid-morph: a confirmation, a draft, an edit box
       if (el.__fade || el.contains(a) || Array.from(el.querySelectorAll('input, textarea')).some(typedIn)) return true;
+      // a draft with Copy, a peek, an edit box: yours until its own Close / Cancel, or until its item leaves the data
+      if (!confirmMorph(el)) return !gone;
+      // a confirmation row: stays RETIRE_MS, then the data's own row may replace it
       if (now - (el.__morphAt || 0) < RETIRE_MS) { retireLater(RETIRE_MS - (now - (el.__morphAt || 0))); return true; }
       return false;
     }
@@ -232,7 +242,14 @@
     if (bar) { if (!el.__barAt) el.__barAt = now; if (now - el.__barAt < RETIRE_MS) { retireLater(RETIRE_MS - (now - el.__barAt)); return true; } }
     return false;
   }
-  function retireLater(ms) { if (!retireT) retireT = setTimeout(() => { retireT = 0; renderMain(); }, ms + 60); }
+  /* one timer, at the earliest moment a held node may give way */
+  let retireAt = 0;
+  function retireLater(ms) {
+    const at = performance.now() + ms + 60;
+    if (retireT && retireAt <= at) return;
+    clearTimeout(retireT); retireAt = at;
+    retireT = setTimeout(() => { retireT = 0; retireAt = 0; renderMain(); }, ms + 60);
+  }
   const tickerOwned = (el) => el.nodeType === 1 && TICKER.some((k) => k in el.dataset);
   function sameAttrs(a, b) {
     if (a.attributes.length !== b.attributes.length) return false;
@@ -286,7 +303,7 @@
     let i = 0;
     for (const c of Array.from(old.childNodes)) {
       if (placed.has(c)) { i = out.indexOf(c) + 1; continue; }
-      if (c.nodeType === 1 && ('keep' in c.dataset || holdsHands(c, now))) { out.splice(i, 0, c); placed.add(c); i++; }
+      if (c.nodeType === 1 && ('keep' in c.dataset || holdsHands(c, now, true))) { out.splice(i, 0, c); placed.add(c); i++; }
       else if (c.nodeType === 1 && Y.hasOrig(c) && !c.__leaving) { c.__leaving = true; out.splice(i, 0, c); placed.add(c); i++; Y.leave(c); }
     }
     for (let j = 0; j < out.length; j++) if (old.childNodes[j] !== out[j]) { old.insertBefore(out[j], old.childNodes[j] || null); stats.changes++; }
@@ -297,7 +314,7 @@
   /* a page's data changed: patch it in place; returns what changed */
   function renderMain() {
     const old = document.getElementById('main'); if (!old) return render(false);
-    clearTimeout(retireT); retireT = 0;
+    clearTimeout(retireT); retireT = 0; retireAt = 0;
     const t0 = performance.now();
     const figsBefore = figsOf(old).map(figSig).join('|');
     const neu = mainView();
@@ -333,6 +350,7 @@
      dots blink by the design's own CSS animation (recdot), which only exists while something is live; the host
      pauses it (html.quiet) while a full-screen app covers the window, and it stops whenever the window is hidden. */
   let tickT = 0;
+  const untilDone = new WeakSet();   // Undo spans whose window closed and were already patched for
   function tick() {
     tickT = 0;
     const now = Date.now() / 1000;
@@ -346,7 +364,8 @@
     let closed = false;
     document.querySelectorAll('#main [data-until]').forEach((el) => {
       const left = Number(el.dataset.until) - now;
-      if (left <= 0) { closed = true; return; }
+      // once per span: a held row keeps its span through the patch, and its hold's end patches it once (holdsHands)
+      if (left <= 0) { if (!untilDone.has(el)) { untilDone.add(el); closed = true; } return; }
       const v = `${Math.max(1, Math.round(left / 60))} min left`; if (el.textContent !== v) el.textContent = v;
     });
     document.querySelectorAll('[data-nowmin]').forEach((el) => {
