@@ -351,7 +351,10 @@ def test_h5_the_policy_reader_reads_the_apps_and_matches_a_windows_process(tmp_p
     ui_policy.set_app_act("Discord", False, path)
     ui_policy.set_app_act("Spotify", True, path)
     apps = reader.apps()
-    assert apps["discord"] == {"name": "Discord", "act": False} and apps["spotify"]["act"] is True
+    assert apps == {"discord": False, "spotify": True} == ui_policy.app_acts(path)   # yuki.ui.policy's own shape
+    # the voice hands read it as {name: bool(value)} (yuki.voice.hands._app_acts): a switched-off app stays off
+    assert {str(k).casefold(): bool(v) for k, v in apps.items()}["discord"] is False
+    assert reader.app_entries()["discord"] == {"name": "Discord", "act": False}
     assert reader.app_off("Discord.exe") == "Discord" and reader.app_off("discord") == "Discord"
     assert reader.app_off("Spotify.exe") is None and reader.app_off(None) is None
     # a switch stored under the name Windows gives the app matches its process through that name

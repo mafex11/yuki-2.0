@@ -131,16 +131,20 @@ def _stored_names(name: str) -> set[str]:
     return {n for n in names if n}
 
 
-def app_switched_off(app: str | None, apps: dict[str, dict[str, Any]],
+def app_switched_off(app: str | None, apps: dict[str, Any],
                      names: Callable[[str | None], set[str]] = app_names) -> str | None:
-    """The name Settings shows for ``app`` when the user switched off clicking and typing in it, else ``None``."""
-    off = [entry for entry in apps.values() if not entry.get("act", True)]
+    """The name Settings shows for ``app`` when the user switched off clicking and typing in it, else ``None``.
+    ``apps``: ``{casefolded name: allowed}`` (``yuki.ui.policy.app_acts``' shape) or ``{casefolded name: {"name",
+    "act"}}`` (:func:`clean_apps`)."""
+    off = [(str(v.get("name") or k), bool(v.get("act", True))) if isinstance(v, dict) else (str(k), bool(v))
+           for k, v in apps.items()]
+    off = [name for name, allowed in off if not allowed]
     if not off or not app:
         return None
     mine = names(app)
-    for entry in off:
-        if mine & _stored_names(str(entry["name"])):
-            return str(entry["name"])
+    for name in off:
+        if mine & _stored_names(name):
+            return name
     return None
 
 
@@ -184,8 +188,13 @@ class PolicyReader:
         with self._lock:
             return dict(self._levels)
 
-    def apps(self) -> dict[str, dict[str, Any]]:
-        """``{casefolded name: {"name", "act"}}`` (``{}`` with no file)."""
+    def apps(self) -> dict[str, bool]:
+        """``{casefolded name: allowed}``, the shape of ``yuki.ui.policy.app_acts`` (the voice hands read this) - ``{}``
+        with no file."""
+        return {k: bool(v["act"]) for k, v in self.app_entries().items()}
+
+    def app_entries(self) -> dict[str, dict[str, Any]]:
+        """``{casefolded name: {"name": as Settings shows it, "act"}}`` (``{}`` with no file)."""
         if not self._load():
             return {}
         with self._lock:
@@ -193,7 +202,7 @@ class PolicyReader:
 
     def app_off(self, app: str | None) -> str | None:
         """The name Settings shows for ``app`` when its "Act" switch is off, else ``None``."""
-        return app_switched_off(app, self.apps())
+        return app_switched_off(app, self.app_entries())
 
 
 #: A key press that acts system-wide and types nothing into the window in front (``Dispatcher.SYSTEM_KEYS``).
