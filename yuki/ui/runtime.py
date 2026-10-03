@@ -166,6 +166,9 @@ class Job:
     user_words: tuple[str, ...] | None = None
     #: The thinker's request pack built while the user spoke (``Agent.run(pack=)``, revamp D S5; voice only, worker only).
     pack: Any = None
+    #: V4: the app or route the user named for this request in their own words (``Agent.run(app_named=)``; voice: the
+    #: talker's ``app_named``); ``None``: none named.
+    app_named: str | None = None
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -173,6 +176,8 @@ def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
     if words is None:
         return None
     items = [words] if isinstance(words, str) else list(words)
+    # V4 (3 Oct): an entry given as {"how", "text"} (the voice's shape before this fix) is its text, never its repr
+    items = [w.get("text") if isinstance(w, dict) else w for w in items]
     out = tuple(str(w).strip() for w in items if str(w or "").strip())
     return out or None
 
@@ -277,6 +282,17 @@ class Lane(QThread):
         if running:
             self.agent.steer(text)
         return running
+
+    def name_app_job(self, job_id: int, app: str) -> bool:
+        """V4: the app the user named, for the running job's agent (:meth:`Agent.set_app_named`); ``False`` if that
+        job is not running here."""
+        with self._state:
+            running = self._current is not None and self._current.id == job_id
+        setter = getattr(self.agent, "set_app_named", None)
+        if running and callable(setter):
+            setter(app)
+            return True
+        return False
 
     def answer(self, text: str) -> None:
         """Hand the user's answer to a paused request."""
@@ -405,6 +421,9 @@ class Lane(QThread):
             **({"previous_query": job.previous_query} if job.previous_query else {}),
             **({"user_words": list(job.user_words)} if job.user_words else {}),
             **({"pack": job.pack} if job.pack is not None else {}),
+            # V4: the app the user named (the job's own, or one named after it was queued: AgentRuntime.name_app)
+            **({"app_named": named} if (named := job.app_named or getattr(runtime, "_apps_named", {}).get(job.id))
+               else {}),
         )
         while True:
             try:
@@ -593,6 +612,7 @@ class AgentRuntime(QObject):
         #: The memory query each front-desk request came with, kept across a hand-off to the worker.
         self._memory_queries: dict[int, str] = {}
         self._user_words: dict[int, tuple[str, ...]] = {}   # front-desk requests' heard words, kept for a hand-off
+        self._apps_named: dict[int, str] = {}   # front-desk requests' named app (V4), kept for a hand-off
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -701,6 +721,7 @@ class AgentRuntime(QObject):
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
+        app_named: str | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -730,6 +751,8 @@ class AgentRuntime(QObject):
                 it while that lane is free, even when the worker is idle, so the worker's hands stay free (revamp D,
                 30b §2, :func:`yuki.agent.lanes.route`); a reader that finds it needs hands hands it to the worker
                 as before. ``None`` / ``True``: as before.
+            app_named: The app or route the user named in their own words (V4; voice: the talker's ``app_named``):
+                kept across a front-desk hand-off and given to ``Agent.run(app_named=)``.
 
         Returns:
             ``(lane name, request id)``.
@@ -753,9 +776,12 @@ class AgentRuntime(QObject):
         words = _words_tuple(user_words)
         if words and lane is not self.worker:
             self._user_words[request_id] = words
+        named = " ".join(str(app_named or "").split()) or None
+        if named and lane is not self.worker:
+            self._apps_named[request_id] = named
         fresh = pack if (lane is self.worker and worker_idle) else None
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words, fresh))
+                                   previous_query, words, fresh, named))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -764,7 +790,8 @@ class AgentRuntime(QObject):
         return lane.name, request_id
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
-                         memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None) -> int:
+                         memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
+                         app_named: str | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -779,7 +806,8 @@ class AgentRuntime(QObject):
         request_id = next(self._ids)
         self._worker_outstanding.append(request_id)
         waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
-                                          user_words=_words_tuple(user_words)))
+                                          user_words=_words_tuple(user_words),
+                                          app_named=" ".join(str(app_named or "").split()) or None))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
         )
@@ -850,6 +878,18 @@ class AgentRuntime(QObject):
         self.ui_log.event("steer", id=request_id, delivered=ok, text=text)
         return ok
 
+    def name_app(self, request_id: int, app: str | None) -> bool:
+        """V4: the app or route the user named, for a request already submitted (a voice hand-off started before the
+        talker's call was complete). Given to its agent now when it runs, else kept for when it starts (or is handed
+        to the worker). Returns whether a running agent took it."""
+        named = " ".join(str(app or "").split()) or None
+        if not named:
+            return False
+        if any(lane.name_app_job(request_id, named) for lane in (self.worker, self.front_desk)):
+            return True
+        self._apps_named[request_id] = named
+        return False
+
     def running_ids(self) -> dict[str, int | None]:
         """``lane -> id`` of the request each lane is driving now."""
         return {lane.name: lane.current_id for lane in (self.worker, self.front_desk)}
@@ -906,17 +946,20 @@ class AgentRuntime(QObject):
         if lane_name == WORKER:
             if request_id in self._worker_outstanding:
                 self._worker_outstanding.remove(request_id)
+            self._apps_named.pop(request_id, None)
             return
         if needed_hands:
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
                                            memory_query=self._memory_queries.pop(request_id, None),
-                                           user_words=self._user_words.pop(request_id, None))
+                                           user_words=self._user_words.pop(request_id, None),
+                                           app_named=self._apps_named.pop(request_id, None))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
         else:
             self._sources.pop(request_id, None)
             self._user_words.pop(request_id, None)
+            self._apps_named.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
 
 

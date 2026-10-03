@@ -1028,7 +1028,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # v3.16, the marker channel: only text after a say marker line reaches the voice (and so the context);
             # the marker lines and any scratch are taken out of the stream here, before anything downstream sees
             # them, so every stream fact (first text, words in the reply, an early say_first) is about speech only.
-            channel = (ReplyChannel(cap_words=int(hook("reply_cap", default=0) or 0))
+            last = hook("last_line", default=None) or {}
+            channel = (ReplyChannel(cap_words=int(hook("reply_cap", default=0) or 0),
+                                    repeat_of=last.get("written"), heard=last.get("heard"))
                        if hook("channel", default="guard") == "marker" else None)
 
             async def timed() -> Any:
@@ -1358,6 +1360,7 @@ class _Turn:
     rerun_at: float | None = None        # when it was answered again (monotonic)
     gave_up: bool = False                # the rerun was silent too: the error tone said so, the window was extended
     tts_silent: int = 0                  # replies of this turn whose voice played nothing at all
+    repeat_dropped: bool = False         # V9: a reply to it was word for word the line said before, and was not said
 
     @property
     def heard(self) -> bool:
@@ -1474,6 +1477,9 @@ class TurnObserver:
         self._stretch_words = False
         #: When words last left the speaker (monotonic, 0: never).
         self.words_heard_at = 0.0
+        #: V9: the last turn whose words left the speaker: ``{"written": all it wrote, "heard": what left the speaker}``
+        #: (content, RAM only), for the speech channel's repeat guard.
+        self.last_said: dict[str, str] | None = None
 
     def cut_for_now(self) -> dict[str, str] | None:
         """The last reply they spoke over, as they heard it (v3.12), for the first user turn after it; else ``None``."""
@@ -1551,6 +1557,9 @@ class TurnObserver:
             self.turn.audible.append(words + " ")
             self.turn.audible_at = time.monotonic()
             if words.strip():
+                heard = " ".join("".join(self.turn.audible).split())
+                written = " ".join(strip_tags("".join(self.turn.reply)).split())
+                self.last_said = {"written": written if written.startswith(heard[:12]) else heard, "heard": heard}
                 self._heard_words(self.turn.audible_at)
         if self.on_chat is None:
             return
@@ -2272,6 +2281,11 @@ class _Hooks:
         """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none)."""
         return int(getattr(self.c.settings, "voice_reply_words_cap", 0) or 0)
 
+    def last_line(self) -> dict[str, str] | None:
+        """V9: Yuki's last spoken line (``{"written", "heard"}``), so a reply that repeats it word for word is not
+        said (content, RAM only); ``None`` before anything was heard."""
+        return getattr(self.c.observer, "last_said", None)
+
     def state(self) -> dict[str, Any]:
         """The measured states that bring their guidance into this call's volatile block (``mouth.volatile_block``)."""
         return self.c._prompt_state()
@@ -2602,7 +2616,7 @@ class Conversation:
         bridge.steps = self.steps
         bridge.progress_answerer = self._progress_answer
         bridge.on_remembered = self._refresh_rules
-        bridge.end_requested = lambda: asyncio.ensure_future(self._end_after_speech())
+        bridge.end_requested = lambda quick=False: asyncio.ensure_future(self._end_after_speech(quick=quick))
         # v3.9: the bridge binds each job to the user turn it answers, paces its "still on it" line by real
         # silence, and says a job's own finishing line by code when no tell_yuki call carries it.
         bridge.user_turns = lambda: self.observer.user_turns
@@ -3042,9 +3056,11 @@ class Conversation:
         lag = asyncio.create_task(self._lag_monitor())
         replies = asyncio.create_task(self._reply_watch())
         names = asyncio.create_task(self._screen_terms_loop())
+        self._scroll_hold(True)
         try:
             await runner.run()
         finally:
+            self._scroll_hold(False)
             self._cancel_route()
             self._unboost()
             self._log_audio_qos()
@@ -3662,8 +3678,10 @@ class Conversation:
         turn.gave_up = True
         self._grace_since = time.monotonic()
         self.log.event("reply_watch", op="gave_up", turn=turn.n, responses=turn.responses, marker=turn.marker,
-                       unmarked=turn.unmarked, tts_silent=turn.tts_silent, guarded=turn.guarded)
-        self._tone("error")
+                       unmarked=turn.unmarked, tts_silent=turn.tts_silent, guarded=turn.guarded,
+                       repeat=bool(getattr(turn, "repeat_dropped", False)))
+        if not getattr(turn, "repeat_dropped", False):
+            self._tone("error")   # a line kept back as a repeat was heard already: nothing went wrong (V9)
         self._activity.set()
 
     def _tone(self, kind: str) -> None:
@@ -3755,7 +3773,44 @@ class Conversation:
         held = getattr(self, "_held_more", None)
         if held and self.observer.user_turns - int(getattr(self, "_held_at_turn", 0)) <= self.HELD_TURNS:
             state["held"] = held
+        turn = self.observer.turn
+        if turn is not None and getattr(turn, "repeat_dropped", False):
+            state["repeat"] = True   # V9: the rerun is told its last reply repeated the line before
+        scrolling = self._scrolling_line()
+        if scrolling:
+            state["scrolling"] = scrolling   # V7: a page scrolling on by itself; the talker stops it
         return state
+
+    #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").
+    SCROLL_TALK_HOLD_S = 1.5
+
+    def _scroll_hold(self, live: bool) -> None:
+        """V7: while this conversation runs, a continuous scroll pauses while the user talks (and while a reply to them
+        is being written); when it ends, a scroll still running is stopped (nobody could say stop any more)."""
+        try:
+            from yuki.actions import scrolling
+        except Exception:  # noqa: BLE001
+            return
+        if live:
+            obs = self.observer
+            scrolling.set_voice_hold(lambda: bool(
+                obs.user_speaking or obs.generating
+                or time.monotonic() - float(getattr(obs, "last_user_at", 0.0) or 0.0) < self.SCROLL_TALK_HOLD_S))
+            return
+        scrolling.set_voice_hold(None)
+        report = scrolling.stop_continuous("ended", wait_s=0.0)
+        if report is not None:
+            self.log.event("hands", op="scroll_keep", stopped="ended", steps=report.get("steps"),
+                           seconds=report.get("seconds"))
+
+    def _scrolling_line(self) -> str | None:
+        """V7: what the continuous scroll is doing now (``yuki.actions.scrolling.continuous``), or ``None``."""
+        try:
+            from yuki.actions.scrolling import continuous_state
+
+            return continuous_state()
+        except Exception:  # noqa: BLE001 - a hint only
+            return None
 
     # -- v3.18: practice memory and the thinker's request pack -----------------------------------------------------
 
@@ -3807,6 +3862,8 @@ class Conversation:
             turn.marker = facts.get("marker") or turn.marker
             turn.scratch += int(facts.get("scratch_chars") or 0)
             turn.unmarked = bool(turn.unmarked or facts.get("unmarked"))
+            if facts.get("repeat_dropped"):
+                turn.repeat_dropped = True   # V9: answered again with the repeat note, never with the same line
         if facts.get("marker") is not None or facts.get("scratch_chars"):
             self.log.event("marker", session=self.session, user_turn=bool(getattr(call, "user_turn", False)),
                            turn=turn.n if turn is not None else None, **facts)
@@ -3834,8 +3891,13 @@ class Conversation:
                 end = b
         return total
 
-    async def _end_after_speech(self, max_s: float = 6.0) -> None:
-        """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on)."""
+    #: With no goodbye to say (V1: "shut up", "go away"), the conversation ends this soon after the call (s): only a
+    #: word already on its way to the speaker plays out, nothing new is said.
+    QUICK_END_S = 0.3
+
+    async def _end_after_speech(self, max_s: float = 6.0, quick: bool = False) -> None:
+        """The user asked to end the conversation: let the goodbye play, then end it (the wake word stays on).
+        ``quick`` (V1): there is no goodbye, so it ends at once."""
         started = time.monotonic()
         heard = False
         while time.monotonic() - started < max_s:
@@ -3843,7 +3905,7 @@ class Conversation:
             heard = heard or obs.bot_speaking
             if heard and not obs.bot_speaking:
                 break
-            if not heard and time.monotonic() - started > 2.0:
+            if not heard and time.monotonic() - started > (self.QUICK_END_S if quick else 2.0):
                 break  # no goodbye was spoken
             await asyncio.sleep(0.05)
         self.log.event("session", state="end_asked", session=self.session, waited_ms=round(
@@ -3936,8 +3998,9 @@ class Conversation:
             obs = self.observer
             began = time.monotonic()
             held = bool(self._held_pending(began))
+            scrolling = self._scrolling_line() is not None   # V7: open while a page scrolls on (they say stop)
             owed = (self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
-                    + int(held) + self._owed_pending())
+                    + int(held) + self._owed_pending() + int(scrolling))
             unanswered = self._unanswered() is not None
             now = time.monotonic()
             if now - began > self.STALL_MIN_S:
@@ -3958,6 +4021,8 @@ class Conversation:
                 limit = s.voice_hold_max_s if owed else self.idle_limit()
                 remaining = limit - ((now - window) - self._stalled_since(window, now))
                 wait = (1.0 if unanswered else None) if busy else max(0.05, remaining)
+            if scrolling and (wait is None or wait > 1.0):
+                wait = 1.0   # the scroll ends on its own thread with no event here: look again each second
             if not busy and not obs.owes_reply and obs.state in ("thinking", "working", "listening"):
                 # The pill says "Working on it" only while a job really runs (queued or running); a
                 # result folded in silently, a cancelled job or a stay_quiet leaves it "Listening".

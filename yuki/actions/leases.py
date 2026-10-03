@@ -197,44 +197,131 @@ def user_input_age_s(*, age: Callable[[], float | None] = last_input_age_s,
     return seconds
 
 
+#: Virtual-key codes polled for "a key or a mouse button is held down now": the mouse buttons (1, 2, 4, 5, 6) and every
+#: keyboard key (8..254) - Windows' own fixed numbering.
+_REAL_INPUT_VKS: tuple[int, ...] = (1, 2, 4, 5, 6, *range(8, 255))
+
+
+def key_or_button_down() -> bool | None:
+    """Whether a keyboard key or a mouse button is held down right now (``GetAsyncKeyState``'s high bit, polled only
+    while Yuki waits to act: no input hook), ``None`` when Windows cannot say. A moving mouse holds nothing down."""
+    try:
+        get = ctypes.windll.user32.GetAsyncKeyState
+        return any(get(vk) & 0x8000 for vk in _REAL_INPUT_VKS)
+    except Exception:  # noqa: BLE001 - not on Windows
+        return None
+
+
+def cursor_at() -> tuple[int, int] | None:
+    """Where the mouse cursor is (``GetCursorPos``), ``None`` when Windows cannot say."""
+    try:
+        from ctypes import wintypes
+
+        point = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        return int(point.x), int(point.y)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class RealInput:
+    """When the user last really used the PC: a key or a mouse button (V8, 3 Oct). ``GetLastInputInfo`` also counts
+    every mouse move (and input another machine sends through a shared mouse), so live Yuki said twice "you're using the
+    keyboard or mouse" while the user touched nothing. Polled while Yuki waits to act (no hook): an input that came
+    while the cursor stayed where it was (a key, a click, the wheel) or while a key or button was held down counts; one
+    that came with the cursor moving and nothing held down is the mouse moving, and does not. Measured facts only."""
+
+    def __init__(self, *, age: Callable[[], float | None] = user_input_age_s,
+                 held: Callable[[], bool | None] = key_or_button_down,
+                 cursor: Callable[[], tuple[int, int] | None] = cursor_at,
+                 now: Callable[[], float] = time.monotonic) -> None:
+        self.age, self.held, self.cursor, self.now = age, held, cursor, now
+        self.last_real: float | None = None   # when real input was last seen (monotonic), None: not yet
+        self._last_input: float | None = None
+        self._cursor: tuple[int, int] | None = None
+        self.polls = 0
+
+    def poll(self) -> float | None:
+        """Look once; returns :attr:`last_real`."""
+        t = self.now()
+        seconds = self.age()
+        last = None if seconds is None or seconds == float("inf") else t - seconds
+        where = self.cursor()
+        down = self.held()
+        if down:
+            self.last_real = t
+        elif last is not None and self._last_input is not None and last > self._last_input + 0.005:
+            # new input since the last look: real unless the cursor moved with it
+            if where is not None and self._cursor is not None and where == self._cursor:
+                self.last_real = max(self.last_real or 0.0, last)
+        if last is not None:
+            self._last_input = last if self._last_input is None else max(self._last_input, last)
+        self._cursor = where
+        self.polls += 1
+        return self.last_real
+
+
+#: The line said when Yuki has waited this long for the user to stop typing or clicking (V8: before, it was said at
+#: the start of every wait, mouse moves included; now the wait is silent unless it goes on).
+INPUT_WAIT_LINE = "You're typing or clicking, so I'll wait a moment before I do it."
+
+
 class InputGate:
-    """Wait for the user to stop typing or moving the mouse before global input (one notice per wait).
+    """Wait for the user to stop typing or clicking before global input; silent unless the wait goes on (V8).
 
     Args:
-        recent_s: The user's input this recent means they are using the PC now.
-        quiet_s: How long they must be still before Yuki's input goes in.
+        recent_s: Input this recent (any kind, ``GetLastInputInfo``) makes the gate look closer.
+        quiet_s: How long they must be still (no key, no click) before Yuki's input goes in.
         max_s: The longest wait; then the action is not sent.
         age: Seconds since the user's last input (:func:`user_input_age_s`; tests pass a stub).
+        probe_s: How long the gate watches recent input to tell a key or click from the mouse moving; with no real
+            input seen in that time, Yuki goes ahead.
+        notify_after_s: The one notice is said only when the wait has lasted this long (~3 s).
+        held, cursor: The key-or-button and cursor reads (:class:`RealInput`; tests pass stubs).
     """
 
     def __init__(self, *, recent_s: float = 1.0, quiet_s: float = 0.8, max_s: float = 12.0,
-                 age: Callable[[], float | None] = user_input_age_s, poll_s: float = 0.1,
-                 sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic) -> None:
+                 age: Callable[[], float | None] = user_input_age_s, poll_s: float = 0.05,
+                 sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
+                 probe_s: float = 0.25, notify_after_s: float = 3.0,
+                 held: Callable[[], bool | None] = key_or_button_down,
+                 cursor: Callable[[], tuple[int, int] | None] = cursor_at) -> None:
         self.recent_s, self.quiet_s, self.max_s = float(recent_s), float(quiet_s), float(max_s)
         self.age, self.poll_s, self.sleep, self.now = age, float(poll_s), sleep, now
+        self.probe_s, self.notify_after_s = float(probe_s), float(notify_after_s)
+        self.held, self.cursor = held, cursor
 
     def wait(self, *, notify: Callable[[str], None] | None = None,
              cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
-        """``{"waited": bool, "ok": bool, "ms", "why"?}``: ``ok`` False means the user kept going past ``max_s``
-        (or the request was cancelled): send nothing."""
+        """``{"waited": bool, "ok": bool, "ms", "why"?, "real"?}``: ``ok`` False means the user kept typing or clicking
+        past ``max_s`` (or the request was cancelled): send nothing. ``real``: whether a key or click was seen."""
         first = self.age()
         if first is None or first >= self.recent_s:
             return {"waited": False, "ok": True, "ms": 0.0}
         started = self.now()
-        if notify is not None:
-            try:
-                notify("You're using the keyboard or mouse, so I'll wait a moment before I type or click.")
-            except Exception:  # noqa: BLE001
-                pass
+        watch = RealInput(age=self.age, held=self.held, cursor=self.cursor, now=self.now)
+        notified = False
         while True:
             if cancelled is not None and cancelled():
-                return {"waited": True, "ok": False, "ms": round((self.now() - started) * 1000), "why": "cancelled"}
-            seconds = self.age()
-            if seconds is None or seconds >= self.quiet_s:
-                return {"waited": True, "ok": True, "ms": round((self.now() - started) * 1000)}
-            if self.now() - started >= self.max_s:
-                return {"waited": True, "ok": False, "ms": round((self.now() - started) * 1000),
-                        "why": f"the user kept using the keyboard or mouse for {self.max_s:g} s"}
+                return {"waited": True, "ok": False, "ms": round((self.now() - started) * 1000), "why": "cancelled",
+                        "real": watch.last_real is not None}
+            last_real = watch.poll()
+            t = self.now()
+            ms = round((t - started) * 1000)
+            if last_real is None and t - started >= self.probe_s:
+                return {"waited": ms > 0, "ok": True, "ms": ms, "real": False}   # only the mouse moved: go ahead
+            if last_real is not None and t - last_real >= self.quiet_s:
+                return {"waited": True, "ok": True, "ms": ms, "real": True}
+            if t - started >= self.max_s:
+                return {"waited": True, "ok": False, "ms": ms, "real": last_real is not None,
+                        "why": f"the user kept typing or clicking for {self.max_s:g} s"}
+            if notify is not None and not notified and t - started >= self.notify_after_s:
+                notified = True
+                try:
+                    notify(INPUT_WAIT_LINE)
+                except Exception:  # noqa: BLE001
+                    pass
             self.sleep(self.poll_s)
 
 

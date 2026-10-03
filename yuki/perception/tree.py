@@ -3531,6 +3531,7 @@ def wait_for_page(
     accept: Callable[[str], bool],
     *,
     timeout_s: float = CONTENT_WAIT_S,
+    stale: Callable[[str], bool] | None = None,
 ) -> PageWait:
     """Wait until one of ``windows()`` shows a page whose address ``accept`` takes.
 
@@ -3541,6 +3542,10 @@ def wait_for_page(
     page.  Every top-level page on screen counts, not only the main one.  A
     condition poll bounded by ``timeout_s``, on its own worker thread with its
     own COM apartment; a provider that blocks past the budget is abandoned.
+
+    ``stale`` (V11, 3 Oct): a page ``accept`` takes only loosely (``stale(url)``: deeper than the site root that was
+    asked for) does not count when it was already showing on the first look, right after the hand-off: it was there
+    before (live, a browser restored with a video page "verified" a request for the site's home page).
 
     Returns:
         A :class:`PageWait`; never raises.
@@ -3562,6 +3567,7 @@ def wait_for_page(
             )
             polls = 0
             answered = False
+            before: set[str] = set()   # loosely matching pages already showing on the first look
             while not cancel.is_set():
                 try:
                     handles = [int(h) for h in windows()]
@@ -3579,7 +3585,9 @@ def wait_for_page(
                         continue
                     answered = True
                     seen.extend(pages)
-                    hit = next((page for page in pages if accept(page.url)), None)
+                    if polls == 0 and stale is not None:
+                        before.update(page.url for page in pages if stale(page.url))
+                    hit = next((page for page in pages if accept(page.url) and page.url not in before), None)
                     if hit is not None:
                         shared["result"] = PageWait(
                             matched=hit, seen=seen, windows=handles, polls=polls + 1,

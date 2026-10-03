@@ -28,6 +28,7 @@ Plumbing only: nothing here looks at what an element is called.
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -83,10 +84,14 @@ class Outcome:
     shift_px: int | None = None
     note: str = ""
     target: dict[str, Any] = field(default_factory=dict)
+    #: V6 (3 Oct): the wheel went into a web page that takes no UI Automation scrolling, so its scrolling cannot be
+    #: watched from here: expected-unverifiable, never "did not scroll" (live the page scrolled and Yuki said it had not).
+    page: bool = False
 
     def facts(self) -> dict[str, Any]:
         return {"moved": self.moved, "how": self.how, "before": _r(self.before), "after": _r(self.after),
-                "at_end": self.at_end, "shift_px": self.shift_px, "scroller": self.target, "note": self.note}
+                "at_end": self.at_end, "shift_px": self.shift_px, "scroller": self.target, "note": self.note,
+                "page": self.page}
 
 
 def _r(value: float | None) -> float | None:
@@ -148,8 +153,27 @@ def _steps(target: Target, vertical: bool, notches: int, forward: bool) -> None:
 def wheel_at(x: int, y: int, *, send: Callable[[], None], marker: Callable[[], int | None],
              cursor: Callable[[], tuple[int, int] | None], move: Callable[[int, int], None],
              watch_s: float = WATCH_S, back_after_s: float = CURSOR_BACK_S, poll_s: float = POLL_S,
-             clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> Outcome:
-    """The wheel at (x, y) with the cursor put back after; ``marker()`` is the top edge of what was under the point."""
+             clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+             page: bool = False) -> Outcome:
+    """The wheel at (x, y) with the cursor put back after; ``marker()`` is the top edge of what was under the point.
+
+    ``page`` (V6): the point is inside a web page that takes no UI Automation scrolling. Its elements' positions are not
+    a reliable read-back there (the page itself never moves, and a browser may report its content's new positions
+    late): a marker that moved still verifies it, one that did not makes it unverifiable (``moved`` None), never "it
+    did not scroll"."""
+    out = _wheel(x, y, send=send, marker=marker, cursor=cursor, move=move, watch_s=watch_s, back_after_s=back_after_s,
+                 poll_s=poll_s, clock=clock, sleep=sleep)
+    if page and out.moved is not True:
+        out.moved, out.page = None, True
+        out.note = ("a web page here does not report its scroll position, so whether it moved could not be checked "
+                    "(expected for this kind of page, not a failure)")
+    return out
+
+
+def _wheel(x: int, y: int, *, send: Callable[[], None], marker: Callable[[], int | None],
+           cursor: Callable[[], tuple[int, int] | None], move: Callable[[int, int], None],
+           watch_s: float, back_after_s: float, poll_s: float,
+           clock: Callable[[], float], sleep: Callable[[float], None]) -> Outcome:
     before = marker()
     home = cursor()
     move(x, y)
@@ -260,13 +284,21 @@ def _area(element: Any) -> int:
         return 0
 
 
+#: The UIA role of a web page (the platform's own control type name).
+PAGE_ROLE = "Document"
+#: How deep, and through how many children per level, a marker inside a page is looked for under the point (V6).
+MARKER_DEPTH = 6
+MARKER_CHILDREN = 40
+
+
 def find_target(automation: Any, x: int, y: int, hwnd: int | None, vertical: bool,
-                deadline: float) -> tuple[_UiaTarget | None, str, Any]:
+                deadline: float, facts: dict[str, Any] | None = None) -> tuple[_UiaTarget | None, str, Any]:
     """The scrollable element for a scroll at (x, y) in ``hwnd``: ``(target, where, element at the point)``.
 
     The element under the point or its nearest scrollable ancestor (what the wheel
     would have scrolled, had it reached it); else the window's largest element that
-    scrolls on this axis. ``where`` says which.
+    scrolls on this axis. ``where`` says which. ``facts`` (V6) gets ``page``: the point is inside a web page (a
+    Document is the element there or one of its ancestors), and ``page_element``: that page.
     """
     at_point = None
     top = int(hwnd) if hwnd else _root_of(x, y)
@@ -281,6 +313,8 @@ def find_target(automation: Any, x: int, y: int, hwnd: int | None, vertical: boo
         target = _as_target(element, vertical)
         if target is not None:
             return target, "at the point", at_point
+        if facts is not None and "page_element" not in facts and _role(element) == PAGE_ROLE:
+            facts["page"], facts["page_element"] = True, element
         try:
             if top and int(element.CurrentNativeWindowHandle or 0) == top:
                 break  # the window itself: nothing above it is this window's
@@ -305,6 +339,50 @@ def find_target(automation: Any, x: int, y: int, hwnd: int | None, vertical: boo
         if target is not None:
             return target, "the window's largest scrollable area", at_point
     return None, "none", at_point
+
+
+def _contains(element: Any, x: int, y: int) -> int | None:
+    """The area of ``element``'s box when it holds the point (x, y), else ``None``."""
+    try:
+        r = element.CurrentBoundingRectangle
+    except Exception:  # noqa: BLE001
+        return None
+    if r.left <= x < r.right and r.top <= y < r.bottom:
+        return max(0, r.right - r.left) * max(0, r.bottom - r.top)
+    return None
+
+
+def marker_in_page(automation: Any, page: Any, x: int, y: int, deadline: float) -> Any:
+    """V6: an element inside the page, under the point and smaller than the page, to watch while the page scrolls (the
+    page's own box never moves); ``None`` when there is none or no time. By position and size only."""
+    whole = _contains(page, x, y)
+    if whole is None:
+        return None
+    walker = automation.ControlViewWalker
+    best, node = None, page
+    for _depth in range(MARKER_DEPTH):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            child = walker.GetFirstChildElement(node)
+        except Exception:  # noqa: BLE001
+            child = None
+        found = None
+        for _n in range(MARKER_CHILDREN):
+            if child is None or time.monotonic() >= deadline:
+                break
+            area = _contains(child, x, y)
+            if area is not None and 0 < area < whole:
+                found = child
+                break
+            try:
+                child = walker.GetNextSiblingElement(child)
+            except Exception:  # noqa: BLE001
+                child = None
+        if found is None:
+            break
+        best = node = found
+    return best
 
 
 def _marker(element: Any) -> Callable[[], int | None]:
@@ -348,7 +426,8 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
     def job(automation: Any, shared: dict) -> None:
         started = time.monotonic()
         deadline = started + budget_s * 0.4
-        target, where, at_point = find_target(automation, x, y, hwnd, vertical, deadline)
+        found: dict[str, Any] = {}
+        target, where, at_point = find_target(automation, x, y, hwnd, vertical, deadline, facts=found)
         shared["find_ms"] = round((time.monotonic() - started) * 1000, 1)
         shared["where"] = where
         if target is not None:
@@ -356,6 +435,15 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
             shared["outcome"] = scroll_pattern_target(target, vertical=vertical, notches=notches, forward=forward)
             return
         shared["stage"] = "wheel"
+        page = bool(found.get("page"))
+        watched = at_point
+        if page and at_point is not None and _role(at_point) == PAGE_ROLE:
+            # V6: the point gave the page itself, whose box never moves: watch an element inside it instead
+            inner = marker_in_page(automation, found.get("page_element") or at_point, x, y,
+                                   started + budget_s * 0.5)
+            shared["page_marker"] = inner is not None
+            watched = inner
+        shared["page"] = page
 
         def cursor() -> tuple[int, int] | None:
             try:
@@ -364,12 +452,14 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
                 return None
 
         shared["outcome"] = wheel_at(x, y, send=_wheel_sender(dy if vertical else 0, 0 if vertical else dx),
-                                     marker=_marker(at_point), cursor=cursor, move=_move)
+                                     marker=_marker(watched), cursor=cursor, move=_move, page=page)
 
     pending = _Pending(job, "yuki-scroll", budget_s)
     shared = pending.wait()
     facts = {"find_ms": shared.get("find_ms"), "where": shared.get("where"), "stage": shared.get("stage"),
              "error": shared.get("error")}
+    if "page_marker" in shared:
+        facts["page_marker"] = shared["page_marker"]
     outcome = shared.get("outcome")
     if outcome is None:
         stage = shared.get("stage")
@@ -395,8 +485,9 @@ def describe(outcome: Outcome, *, direction: str, notches: int, x: int, y: int) 
             return False, f"asked {name} to scroll {direction}, but it did not move (still {_pct(outcome.before)})"
         return True, f"asked {name} to scroll {direction}; {outcome.note or 'whether it moved is not known'}"
     if outcome.how == "wheel":
-        sent = f"sent {notches} wheel notch(es) {direction} at ({x},{y}) (nothing there takes UI Automation scrolling; " \
-               f"the cursor was put back)"
+        where = " on the web page" if outcome.page else ""
+        sent = f"sent {notches} wheel notch(es) {direction}{where} at ({x},{y}) (nothing there takes UI Automation " \
+               f"scrolling; the cursor was put back)"
         if outcome.moved:
             return True, f"{sent}; the content moved"
         if outcome.moved is False:
@@ -407,3 +498,268 @@ def describe(outcome: Outcome, *, direction: str, notches: int, x: int, y: int) 
 
 def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value:.0f}%"
+
+
+# ---------------------------------------------------------------------------
+# V7: keep scrolling until they say stop
+# ---------------------------------------------------------------------------
+#
+# Live 3 Oct "keep scrolling until I say stop" could not be done: the thinker scrolled once, tried page down, and gave
+# up. A continuous scroll is one object here, shared by the talker's keep_scrolling hand and the thinker's scroll with
+# until_stopped: it scrolls the window in steps on its own thread, pauses while the user talks (their words may be
+# "stop"), and stops when the talker calls stop, when the Stop hotkey cancels, when the user really takes over (a key or
+# a click: :class:`yuki.actions.leases.RealInput`), when the page ends, after two failed steps, or at its limits. Its
+# report says where it stopped. Measured facts only; no words are read here.
+
+#: Paces: (seconds between steps, wheel notches per step; a screenful is about 10).
+PACES: dict[str, tuple[float, int]] = {"slow": (2.6, 3), "normal": (1.7, 4), "fast": (1.0, 6)}
+#: A continuous scroll ends by itself after this many steps or this long.
+MAX_STEPS = 150
+MAX_S = 300.0
+#: Two failed steps in a row end it (the window went away, or nothing scrolls there).
+MAX_FAILURES = 2
+#: How often the loop looks at its stop, pause and take-over signals while it waits between steps (s).
+TICK_S = 0.1
+#: Why it stopped, when it stopped by itself (the rest are a stop someone asked for: voice, stop, replaced, ended).
+SELF_STOPS = ("end", "limit", "failed", "user_input", "error")
+
+
+@dataclass
+class StepResult:
+    """One step of a continuous scroll, from the scroll's own report."""
+
+    ok: bool
+    moved: bool | None = None
+    at_end: bool = False
+    percent: float | None = None
+    report: str = ""
+
+
+def step_result(result: Any) -> StepResult:
+    """A :class:`StepResult` from a scroll action's result (``yuki.actions.input.scroll``'s details)."""
+    details = getattr(result, "details", None) or {}
+    axes = [a for a in details.get("scrolls") or [] if isinstance(a, dict)]
+    first = axes[0] if axes else {}
+    after = first.get("after")
+    return StepResult(ok=bool(getattr(result, "ok", False)), moved=details.get("verified"),
+                      at_end=bool(first.get("at_end")),
+                      percent=float(after) if isinstance(after, (int, float)) and after >= 0 else None,
+                      report=str(getattr(result, "summary", "") or "")[:300])
+
+
+class ContinuousScroll:
+    """A window's page scrolled on in steps until something stops it (V7).
+
+    Args:
+        step: One step (blocking; returns a :class:`StepResult`).
+        where: The window as people say it (``Arc "YouTube"``), for its state line and report.
+        direction: ``down`` / ``up``; ``pace``: a key of :data:`PACES`.
+        hold: While it says True the scroll waits (the user is talking: their words may be "stop").
+        took_over: Says True once the user really used the keyboard or mouse buttons (they took over).
+        on_stop: Called with :meth:`report` when it stopped by itself (:data:`SELF_STOPS`), off its own thread.
+        steps_done: Steps already taken before it started (the caller's first step).
+    """
+
+    def __init__(self, step: Callable[[], StepResult], *, where: str, direction: str = "down", pace: str = "normal",
+                 hold: Callable[[], bool] | None = None, took_over: Callable[[], bool] | None = None,
+                 on_stop: Callable[[dict[str, Any]], None] | None = None, max_steps: int = MAX_STEPS,
+                 max_s: float = MAX_S, steps_done: int = 0, started_by: str = "voice",
+                 sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic) -> None:
+        self.step_fn, self.where = step, where
+        self.direction = direction if direction in ("down", "up") else "down"
+        self.pace = pace if pace in PACES else "normal"
+        self.hold, self.took_over, self.on_stop = hold, took_over, on_stop
+        self.max_steps, self.max_s, self.started_by = int(max_steps), float(max_s), started_by
+        self.sleep, self.now = sleep, now
+        self.steps = int(steps_done)
+        self.failures = 0
+        self.percent: float | None = None
+        self.last = ""
+        self.why: str | None = None
+        self.started_at = now()
+        self.stopped_at: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.why is None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="yuki-keep-scrolling", daemon=True)
+        self._thread.start()
+
+    def stop(self, why: str = "stop", wait_s: float = 2.0) -> dict[str, Any]:
+        """Stop it (``why``: voice / stop / replaced / ended); returns the report."""
+        if self.why is None:
+            self.why = why
+            self.stopped_at = self.now()
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(wait_s)
+        return self.report()
+
+    def _end(self, why: str) -> None:
+        if self.why is None:
+            self.why = why
+            self.stopped_at = self.now()
+        self._stop.set()
+
+    def _wait(self, seconds: float) -> bool:
+        """Wait between steps, looking at the signals every tick; False once it must stop."""
+        until = self.now() + seconds
+        while not self._stop.is_set():
+            if self.took_over is not None and self.took_over():
+                self._end("user_input")
+                return False
+            if self.now() >= until:
+                return True
+            self.sleep(TICK_S)
+        return False
+
+    def _run(self) -> None:
+        pace_s = PACES[self.pace][0]
+        try:
+            if not self._wait(pace_s):
+                return
+            while not self._stop.is_set():
+                if self.steps >= self.max_steps or self.now() - self.started_at >= self.max_s:
+                    self._end("limit")
+                    break
+                if self.hold is not None and self.hold():
+                    if not self._wait(TICK_S):
+                        break
+                    continue
+                result = self.step_fn()
+                if self._stop.is_set():
+                    break
+                self.steps += 1
+                self.last = result.report
+                if not result.ok:
+                    self.failures += 1
+                    if self.failures >= MAX_FAILURES:
+                        self._end("failed")
+                        break
+                else:
+                    self.failures = 0
+                    if result.percent is not None:
+                        self.percent = result.percent
+                if result.at_end:
+                    self._end("end")
+                    break
+                if not self._wait(pace_s):
+                    break
+        except Exception as exc:  # noqa: BLE001 - a broken step ends it, reported
+            self.last = f"{type(exc).__name__}: {exc}"[:200]
+            self._end("error")
+        finally:
+            if self.why is None:
+                self._end("stop")
+            if self.why in SELF_STOPS and self.on_stop is not None:
+                try:
+                    self.on_stop(self.report())
+                except Exception:  # noqa: BLE001 - the report is a courtesy
+                    pass
+            _forget(self)
+
+    def report(self) -> dict[str, Any]:
+        """Where it stopped (or is): steps, seconds, how far down when the page says, and why it stopped."""
+        end = self.stopped_at if self.stopped_at is not None else self.now()
+        return {"where": self.where, "direction": self.direction, "pace": self.pace, "steps": self.steps,
+                "seconds": round(end - self.started_at, 1),
+                "percent": None if self.percent is None else round(self.percent), "why": self.why,
+                "running": self.why is None, "last": self.last, "started_by": self.started_by}
+
+    def line(self) -> str:
+        """The state line for the talker while it runs."""
+        r = self.report()
+        far = f", about {r['percent']}% of the way" if r["percent"] is not None else ""
+        return f"{r['where']}, {r['direction']}, {r['pace']} pace, {r['steps']} steps in {r['seconds']:g} s{far}"
+
+
+def stopped_words(report: dict[str, Any] | None) -> str:
+    """The report in plain words (for a tool result or the action log): how far it went and why it stopped."""
+    if not report:
+        return "nothing was scrolling"
+    far = f", about {report['percent']}% of the way {report['direction']}" if report.get("percent") is not None else ""
+    why = {"voice": "stopped as they asked", "stop": "stopped", "replaced": "replaced by a new scroll",
+           "ended": "stopped when the conversation ended", "end": "reached the end of the page",
+           "limit": "stopped at its limit", "failed": "stopped: the page would not scroll any more",
+           "user_input": "stopped: they took over the keyboard or mouse", "error": "stopped on an error"}
+    return (f"scrolled {report.get('where')} {report.get('direction')} for {report.get('steps')} steps in "
+            f"{report.get('seconds')} s{far}; {why.get(str(report.get('why')), str(report.get('why')))}")
+
+
+_LOCK = threading.Lock()
+_RUNNING: ContinuousScroll | None = None
+_VOICE_HOLD: Callable[[], bool] | None = None
+
+
+def _forget(scroller: ContinuousScroll) -> None:
+    global _RUNNING
+    with _LOCK:
+        if _RUNNING is scroller:
+            _RUNNING = None
+
+
+def set_voice_hold(fn: Callable[[], bool] | None) -> None:
+    """The live voice conversation's "the user is talking" signal (``None`` when no conversation runs)."""
+    global _VOICE_HOLD
+    _VOICE_HOLD = fn
+
+
+def voice_hold() -> bool:
+    """Whether a continuous scroll should wait now because the user is talking."""
+    fn = _VOICE_HOLD
+    try:
+        return bool(fn()) if fn is not None else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def start_continuous(scroller: ContinuousScroll) -> dict[str, Any] | None:
+    """Start ``scroller``; a continuous scroll already running is stopped first (its report is returned)."""
+    global _RUNNING
+    with _LOCK:
+        old, _RUNNING = _RUNNING, scroller
+    report = old.stop("replaced") if old is not None and old.running else None
+    scroller.start()
+    return report
+
+
+def stop_continuous(why: str = "stop", wait_s: float = 2.0) -> dict[str, Any] | None:
+    """Stop the continuous scroll (``None`` when none runs); returns its report. ``wait_s``: how long to wait for a
+    step in progress to finish (0 on the GUI thread or the voice loop: the stop is set at once either way)."""
+    with _LOCK:
+        running = _RUNNING
+    return running.stop(why, wait_s=wait_s) if running is not None and running.running else None
+
+
+def continuous_running() -> ContinuousScroll | None:
+    with _LOCK:
+        running = _RUNNING
+    return running if running is not None and running.running else None
+
+
+def continuous_state() -> str | None:
+    """The talker's state line while a continuous scroll runs, else ``None``."""
+    running = continuous_running()
+    return running.line() if running is not None else None
+
+
+def input_watch() -> Callable[[], bool]:
+    """A "they took over" signal from now on: real keyboard or mouse-button input of the user's (never Yuki's own,
+    never the mouse merely moving; :class:`yuki.actions.leases.RealInput`)."""
+    from yuki.actions.leases import RealInput
+
+    watch = RealInput()
+    watch.poll()   # the baseline: input before now does not count
+    watch.last_real = None
+    since = time.monotonic()
+
+    def took_over() -> bool:
+        last = watch.poll()
+        return last is not None and last > since
+
+    return took_over

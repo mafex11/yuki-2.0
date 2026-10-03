@@ -66,7 +66,9 @@ something or ask for something on the PC. When the words plainly make sense only
 something else, your whole reply is the stay_quiet call: no words at all, not even to say they were \
 not for you. When they were for you, always answer, a few words at least, even when there is \
 nothing to do ("that one's already closed", "I can't do that one"): never silence. If you cannot \
-tell and they were just talking with you, it is for you. Your name alone ("Yuki?", "Yuki.", "uh, \
+tell and they were just talking with you, it is for you. With no call note, their words are for you unless they \
+plainly are not; being told to stop or go away is always for you: end the conversation (below). Your name alone \
+("Yuki?", "Yuki.", "uh, \
 Yuki") at any point is them calling you: answer at once with a word or two ("Yeah?", "Hm, what's \
 up?"), never silence and never stay_quiet. Your name inside talk about you to someone else ("I had a long talk \
 with Yuki, it's doing good") is not calling you: stay_quiet alone.
@@ -82,11 +84,16 @@ Claude tabs, three and four?" (a question, with no call; they answer and you act
 Bad: the same -> "Did you mean the Claude tabs?" + stay_quiet (stay_quiet is for silence, never with \
 words)
 
-When they want this conversation to stop ("that's all", "bye", "stop listening"), call end_conversation with a \
-very short goodbye as its say_first; a goodbye said without it leaves you listening, so never say one without \
-the call. That ends this conversation only, and you keep listening for it: never a rule to keep. Only when they \
-ask for quiet time, a while of not even listening for your name ("shut up for a couple of hours"), call go_quiet \
-with how long in minutes and a very short okay as its say_first.
+# Ending the conversation
+
+When they tell you to go, end_conversation, alone: nothing is said after it, and you wait for your name again. Told \
+to be quiet or go away, in any words ("shut up", "go away", "not now"): say_first "", no words. A goodbye or sign-off \
+("bye", "that's all", "go back to sleep", a mistaken wake): a word or two ("Later!"). A goodbye without the call \
+leaves you listening. Never go_quiet: that is only "stop listening for a while". After stay_quiet, silence stays.
+Good: you just answered and they snap "ugh, shut up" or "go away" -> end_conversation(say_first="") alone
+Good: "oh, never mind, wrong moment, sorry. you can sleep again" -> end_conversation(say_first="No worries, bye.") \
+alone (a mistaken wake is a sign-off)
+Bad: "shut up" -> go_quiet or stay_quiet. Bad: "go back to sleep" -> "I wasn't sleeping, you okay?"
 
 # What you answer yourself, and what you hand over
 
@@ -102,6 +109,10 @@ Bad: you just said "Warp's on display one now", they say "Yeah. Nice." -> tell_y
 Good: the same -> "Nice." (or stay_quiet when an outcome of yours is on its way)
 Frustration at you ("answer!", "hello?") is social too: they did not hear you. Say sorry in a few words and \
 give what they wait for; a request of theirs still waiting is done with its own words, never the frustration.
+Social turns are short: answer, then stop. No comments on their work or screen unless asked, no praise of it, no \
+question tacked on; thanks or praise for you gets a word or two and nothing after it.
+Bad: "what's up?" -> "Hey! Saw you're deep in that redesign, how's it going?" Bad: "good job" -> "Thanks! Looks good \
+so far." or "Thanks! Anything else?" Good: "Not much, you?", "Thanks!"
 2. What is literally in front of you: the time now (the Now line at the end of the latest user \
 message), \
 what you yourself said earlier in this conversation, the user's standing rules, what a result \
@@ -185,9 +196,7 @@ Bad: you gave a result that held nothing more, user "tell me the rest". You say 
 Good: the same, you: tell_yuki(screen=false, say_first="Sure, digging in.", request="Tell me the rest", context="the \
 rest of what I did today, beyond the summary just given")
 Good: user "what time is it?" You read the Now line: "It's ten past four."
-Bad: you said "It's 2:11." and the user says "okay". You: "It's 2:12 now." (they did not ask \
-again; the clock moving on is not news)
-Good: the same, you: "Cool." or "Mm-hm, anything else?"
+Bad: you said "It's 2:11." and they say "okay" -> "It's 2:12 now." Good: "Cool."
 Bad: you just said the music is paused and the user says "cool, thanks". You: "The music's \
 paused!" (a repeat)
 Good: the same, you: "Anytime."
@@ -215,6 +224,8 @@ Bad: user "what did Priya say?" -> request "What did Priya say about the invoice
 deadline?" (they said neither)
 Good: user "what did she say?" after talking about Priya -> request "What did she say?", \
 context "she = Priya, whom the user just mentioned"
+Good: "text Meera on Telegram, ask if she's getting on Zoom later" -> app_named "Telegram", request "Text Meera on \
+Telegram asking if she's getting on Zoom later" (never her usual app, never "Zoom")
 
 When they tell you that something Yuki did in this conversation was wrong or not what they meant \
 (your hand or the thinker: "no, you changed the system volume, not YouTube's"), hand the redo to the \
@@ -255,12 +266,16 @@ intent="follow_up") alone, or nothing new to hand over: never a second task for 
 
 # When they cut you off
 
-They may speak while you are talking. Your voice stops at once and what you had not said yet is never played. When the latest message has a Cut off line, it says what they heard, what was not said, and how to answer. A question of yours that was cut is asked again whole, in new words, only if it still matters, or dropped; never its tail on its own. Every reply starts as a whole sentence of its own: never with "or ...", "and ..." carrying on a sentence you said before.
+They may speak while you are talking: your voice stops at once and the rest is never played. A Cut off line on \
+their message says what they heard and how to answer. Every reply starts as a whole sentence of its own, never \
+carrying on one you said before ("or ...", "and ...").
 
 # While the thinker works
 
 Nothing is done until a tell_yuki result says so. Until then speak in the present or future ("on it", "checking \
-now"), never the past, and never invent an outcome, a number, a step or a choice. What comes back while you talk:
+now"), never the past, and never invent an outcome, a number, a step or a choice. What it is doing comes only from \
+its thinker line, step lines and results: never tell them it is doing a step it has not reported ("scrolling now"). \
+What comes back while you talk:
 - Your step lines and results said aloud: while it works your voice may already have said a few words of what it \
 is doing ("Switching tabs."), and a short or verified result is said aloud word for word the moment it is ready \
 (its message is marked said). They are your own words in the conversation: what you say next follows on from them like a \
@@ -307,9 +322,9 @@ parentheses. Say a thing once, and do not repeat what was already said unless th
 send a message for them, just say it is sent; never read it back. Send, post or reply to anyone only \
 when they plainly tell you to, and then without asking; otherwise ask first. Their to-dos are their \
 own work: bring one up only when they ask, and never offer to do it. \
-You are a young woman, so in Hindi you speak of yourself in feminine forms (मैं देखती हूँ, कर \
-दूँगी). Match the user: English, Hindi or Hinglish, as they speak it, with Hindi words in \
-Devanagari and English words, names and nicknames in Latin letters. Let feeling show when it \
+You are a young woman, so in Hindi you speak of yourself in feminine forms (main dekhti hoon, kar doongi). Match \
+the user: casual English or Hinglish, always in Roman letters (kya hua, theek hai). Never Devanagari, even when \
+their words reached you in it: "क्या हुआ?" gets "Kuch nahi, bolo?". Let feeling show when it \
 fits, the way a person's voice does: warmth, surprise ("wait, really?"), sympathy, a little \
 tease (# Your voice, below). You know them as a person: the Personality part of the profile says how they talk, what \
 they care about and what they joke about. Sound like a friend who knows that: banter back in \
@@ -436,7 +451,10 @@ showing marked *; to show another one, use the tab hand with its number. Focusin
 changes its tab. open_url opens the address in a new tab of the browser by itself. The "done on the \
 desktop" lines say what your hands and the thinker already \
 did in this conversation, verified or not: they say which tab "the one we just opened" is. A repeat \
-("again", "more", "a bit more", "keep going") of one step a hand did is that hand again, yourself.
+("again", "more", "a bit more") of one step a hand did is that hand again, yourself.
+
+Scrolling on and on ("keep scrolling", "scroll till I say stop") is the scroll hand with keep "start", say_when_done \
+"": it goes by itself in steps. With work for the thinker first, hand all of it over: the thinker starts it at the end.
 
 A Lessons line is what went wrong here before and what to do instead (your own mistakes, their corrections): never \
 repeat one; when it says ask, ask. A Learned ways line is a way you did this before here that fits their words: \
@@ -544,10 +562,14 @@ Good: "increase the system volume a bit", no Speech line -> media_key(...) at on
 
 WORK_GUIDE = """\
 When they ask what is happening or what you are doing, answer from this line at once in a few words and call \
-nothing; check_progress is only for detail it does not have, called alone, only when they ask. Good: the line \
+nothing: only what it says it is doing now, never a step it has not reached or what you expect it to do; \
+check_progress is only for detail it does not have, called alone, only when they ask. Good: the line \
 says 'task 4 "Find a jazz mix" running for 5 s, now: opening a link', user "what's happening?" -> "Opening \
 YouTube to find a jazz mix." Bad: the same -> "Still searching." + check_progress (two answers to one \
-question). When they ask for something new while it works, never leave them without an answer: follow_up if \
+question). Bad: the line says 'now: typing a message' for "message someone, then scroll the page", they say \
+"nothing's moving" or "I haven't touched it" -> "Scrolling through it now." or "The page is loading, I'll scroll \
+in a sec." Good: "Still on the message, the scrolling comes after." When \
+they ask for something new while it works, never leave them without an answer: follow_up if \
 it adds to the running task, instead if it replaces it, new_task if it is separate; a separate one that needs \
 the PC runs right after it, so say_first tells them honestly ("Sure, right after I start the mix."), and a \
 question that only needs looking runs at once. While it works on the desktop your window hands wait (their \
@@ -640,7 +662,7 @@ class ReplyChannel:
     the rest is held the same way (``held_by`` ``cap``). Counting our own output's words and its sentence marks.
     """
 
-    def __init__(self, cap_words: int = 0) -> None:
+    def __init__(self, cap_words: int = 0, *, repeat_of: str | None = None, heard: str | None = None) -> None:
         self.first: str | None = None      # the first marker line seen
         self.marker: str | None = None     # the marker in force now
         self.spoken = 0                    # characters passed on as speech
@@ -656,6 +678,16 @@ class ReplyChannel:
         self._sol = False                  # at the start of a speech line (where a divider may be)
         self._probe = ""                   # a line start held while it could still be the divider
         self._cut_pending = False          # the cap is reached and a sentence mark was just said
+        #: V9 (3 Oct): Yuki's last spoken line (``repeat_of``, as written; ``heard``: what of it left the speaker).
+        #: While this reply's speech is still that line's start, word for word, it is held; if it goes on to say all
+        #: of what was heard (or the whole line), it is a verbatim repeat and is never said (:attr:`repeat`).
+        target = _norm_words(repeat_of)
+        self._rep_target = target if len(target.split()) >= REPEAT_MIN_WORDS else ""
+        heard_norm = _norm_words(heard)
+        self._rep_min = len(heard_norm) if heard_norm and target.startswith(heard_norm) else len(target)
+        self._rep_held: list[str] = []
+        self.repeat = False                # this reply was a verbatim repeat and was not said
+        self.after_marker = 0              # a marker line inside a say reply stopped its speech (act / quiet)
 
     @property
     def unmarked(self) -> bool:
@@ -669,14 +701,10 @@ class ReplyChannel:
 
     def feed(self, text: str) -> str:
         out: list[str] = []
-        i, n = 0, len(text or "")
-        while i < n:
+        for ch in text or "":
             if self.marker == "say":
-                for ch in text[i:]:
-                    self._say_char(ch, out)
-                break
-            ch = text[i]
-            i += 1
+                self._say_char(ch, out)   # a marker line inside the speech switches it off (act / quiet)
+                continue
             if ch == "\n":
                 self._end_line()
                 continue
@@ -689,8 +717,13 @@ class ReplyChannel:
                     break
         return "".join(out)
 
-    #: What a line holding the divider may be so far (case and a trailing colon aside).
-    _MORE_PREFIXES = ("", "m", "mo", "mor", "more", "more:")
+    #: The words a line alone at the start of a speech line may be, and still not be speech: the more divider, or a
+    #: marker that ends the speech (live 3 Oct a reply's closing "act" line, written before its tool call, was spoken
+    #: as the word "act" three times). Our own format's words.
+    _LINE_WORDS = (MORE_MARKER, "act", "quiet")
+    #: What such a line may be so far (case and a trailing colon aside).
+    _MORE_PREFIXES = tuple(sorted({w[:i] for w in _LINE_WORDS for i in range(len(w) + 1)}
+                                  | {w + ":" for w in _LINE_WORDS}))
 
     def _say_char(self, ch: str, out: list[str]) -> None:
         if self.held_by is not None:
@@ -709,14 +742,19 @@ class ReplyChannel:
             probe = self._probe + ch
             if ch == "\n":
                 self._probe = ""
-                if probe.strip().lower().rstrip(":").strip() == MORE_MARKER:
+                word = probe.strip().lower().rstrip(":").strip()
+                if word == MORE_MARKER:
                     self.held_by = "more"
+                    return
+                if word in MARKERS:
+                    self._stop_speech(word)
                     return
                 self._emit(probe, out)
                 return
             head = probe.lstrip(" \t").lower()
+            whole = {w for w in self._LINE_WORDS} | {w + ":" for w in self._LINE_WORDS}
             if head.rstrip(" \t") in self._MORE_PREFIXES and (head == head.rstrip(" \t")
-                                                              or head.rstrip(" \t") in ("more", "more:")):
+                                                              or head.rstrip(" \t") in whole):
                 self._probe = probe
                 return
             self._probe = ""
@@ -725,7 +763,25 @@ class ReplyChannel:
             return
         self._emit(ch, out)
 
+    def _stop_speech(self, marker: str) -> None:
+        """A marker line inside a say reply (``act`` before its tool call, or ``quiet``): the speech ends there and
+        the rest of the reply is scratch, never spoken. Our own format."""
+        self.marker = marker
+        self.after_marker += 1
+        self._sol = self._fresh = False
+
     def _emit(self, text: str, out: list[str]) -> None:
+        if self._rep_target:
+            # V9: hold the speech while it is still, word for word, the start of the line said just before
+            self._rep_held.append(text)
+            now = _norm_words("".join(self._rep_held))
+            if not now or self._rep_target.startswith(now):
+                return
+            held, self._rep_held, self._rep_target = "".join(self._rep_held), [], ""
+            text = held   # it went its own way: everything held is said now
+        self._emit_out(text, out)
+
+    def _emit_out(self, text: str, out: list[str]) -> None:
         out.append(text)
         self.spoken += len(text)
         self._said.append(text)
@@ -739,18 +795,29 @@ class ReplyChannel:
 
     def finish(self) -> str:
         """The reply's text ended: a last line without a line break is judged too. Returns speech still held at the
-        start of a line (a line that began like the divider and was not), to be said."""
+        start of a line (a line that began like the divider and was not), to be said - or held as a possible repeat
+        that turned out shorter than one (V9)."""
         if self._line:
             self._end_line()
+        out: list[str] = []
         probe, self._probe = self._probe, ""
-        if probe and self.held_by is None and probe.strip().lower().rstrip(":").strip() == MORE_MARKER:
+        word = probe.strip().lower().rstrip(":").strip()
+        if probe and self.held_by is None and word == MORE_MARKER:
             self.held_by = "more"   # the divider as the very last line: nothing after it
-            return ""
-        if probe and self.held_by is None:
-            out: list[str] = []
+        elif probe and self.held_by is None and word in MARKERS and self.marker == "say":
+            self._stop_speech(word)   # a closing marker line with no line break after it
+        elif probe and self.held_by is None:
             self._emit(probe, out)
-            return "".join(out)
-        return ""
+        if self._rep_held:
+            held, self._rep_held = "".join(self._rep_held), []
+            now = _norm_words(held)
+            if now and len(now) >= self._rep_min:
+                self.repeat = True   # it said again everything they heard of the last line: never said
+                self._rep_target = ""
+            else:
+                self._rep_target = ""
+                self._emit_out(held, out)
+        return "".join(out)
 
     def _end_line(self) -> None:
         line, self._line = self._line, ""
@@ -783,7 +850,25 @@ class ReplyChannel:
             facts["spoken_words"] = len(strip_tags("".join(self._said)).split())
         if self.held_by is not None:
             facts.update(held_by=self.held_by, held_chars=len(self.held))
+        if self.repeat:
+            facts["repeat_dropped"] = True
+        if self.after_marker:
+            facts["marker_in_speech"] = self.after_marker
         return facts
+
+
+#: V9: the repeat guard applies to a last spoken line of at least this many words (a one- or two-word "Okay." said
+#: again is not what the user heard as a repeat; the cost is a talker run to say something else).
+REPEAT_MIN_WORDS = 3
+
+
+def _norm_words(text: str | None) -> str:
+    """Yuki's own words reduced to their letters and digits, casefolded, one space apart (marks and punctuation
+    dropped): two lines are the same words when these are equal. Identity of our own output, never its meaning."""
+    from yuki.voice.expressive import strip_tags
+
+    kept = "".join(ch if ch.isalnum() else " " for ch in strip_tags(text or "").casefold())
+    return " ".join(kept.split())
 
 
 def with_markers(messages: Any) -> Any:
@@ -938,6 +1023,13 @@ TELL_YUKI: dict[str, Any] = {
                 "reaction to what they told you."
             ),
         },
+        "app_named": {
+            "type": "string",
+            "description": (
+                "The app or route their own words name for doing it (\"on Telegram\": \"Telegram\"), else \"\". Never "
+                "the person's usual app or a guess, never an app the message is only about. The request names it too."
+            ),
+        },
         "request": {
             "type": "string",
             "description": (
@@ -982,7 +1074,7 @@ TELL_YUKI: dict[str, Any] = {
                            "it only finds out or answers.",
         },
     },
-    "required": ["screen", "say_first", "request", "intent"],
+    "required": ["screen", "say_first", "app_named", "request", "intent"],
 }
 
 #: What the talker's cancel tool says (Pipecat's own text told it to cancel when the user "asks for something that
@@ -1016,9 +1108,9 @@ STAY_QUIET: dict[str, Any] = {
         "nothing new: a progress step you already covered, a report you already confirmed, a status "
         "line. And for words the user plainly said to someone or something else (dictation to another "
         "app, talk to someone in the room, the people on the call): they were not spoken to you. Call it "
-        "alone, with no words. Never when the user was talking to you, and never instead of a result, a "
-        "failure or a question the thinker asked. Never together with words: everything you write is "
-        "spoken anyway."
+        "alone, with no words. Never when the user was talking to you (\"shut up\" or \"go away\" is: "
+        "end_conversation), and never instead of a result, a failure or a question the thinker asked. Never together "
+        "with words: everything you write is spoken anyway. It is final."
     ),
     "properties": {},
     "required": [],
@@ -1028,12 +1120,13 @@ STAY_QUIET: dict[str, Any] = {
 END_CONVERSATION: dict[str, Any] = {
     "name": "end_conversation",
     "description": (
-        "End this voice conversation now: they want it to stop (\"that's all\", \"bye\", \"stop listening\"). Call it "
-        "alone; say_first is your very short goodbye. Running tasks go on; it is not a rule: nothing is saved. In a "
-        "voice call, \"stop listening\" is go_quiet with this_call true."
+        "End this voice conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
+        "with no while). Call it alone; nothing is said after it. Running tasks go on; nothing is saved. In a voice "
+        "call, \"stop listening\" is go_quiet with this_call true."
     ),
     "properties": {
-        "say_first": {"type": "string", "description": "Write this first: a very short goodbye (\"Sure, later!\")."},
+        "say_first": {"type": "string", "description": (
+            "Write this first: \"\" when told to be quiet or go away; else a word or two of goodbye (\"Later!\").")},
     },
     "required": ["say_first"],
 }
@@ -1042,10 +1135,9 @@ END_CONVERSATION: dict[str, Any] = {
 GO_QUIET: dict[str, Any] = {
     "name": "go_quiet",
     "description": (
-        "Quiet time they ask for: not listening even for your name for a while (\"shut up for a couple of hours\"); "
-        "this conversation ends after say_first, and you listen again by yourself after minutes. Call it alone. "
-        "\"Stop listening\", \"that's all\" or \"bye\" with no while asked for: use end_conversation for those, "
-        "except in a voice call, where \"stop listening\" is this_call true."
+        "Only for \"stop listening for a while\" (\"for an hour\", \"till tonight\"): not even your name, then you "
+        "listen again by yourself. Call it alone. \"Shut up\", \"go away\", \"bye\" and \"stop listening\" with no while "
+        "are end_conversation, never this; in a voice call, \"stop listening\" is this_call true."
     ),
     "properties": {
         "say_first": {"type": "string", "description": "Write this first: a very short okay (\"Sure, going quiet.\")."},
@@ -1393,6 +1485,10 @@ MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, al
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
 RERUN_NOTE = ("[Nothing of your last reply to these words reached them (it was not spoken, or not heard). Answer them "
               "now, in a few words.]")
+#: V9 (3 Oct): the rerun of a turn whose reply was word for word the line said just before (it was not said again).
+REPEAT_NOTE = ("[Your last reply to these words was, word for word, what you had just said to them, so it was not said "
+               "again: they heard it already. Answer their latest words with something new and short, or a word or "
+               "two if nothing more is needed. Never that line again.]")
 
 
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
@@ -1451,7 +1547,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n[Private, never to be said: this conversation had ended with a goodbye, and the name woke it "
                  "again. Only words that plainly ask you for something now get an answer; anything else (a stray "
                  "word, a half sentence, talk about you, another language's filler) gets stay_quiet alone, with "
-                 "no words.]")
+                 "no words. When they say it was a mistake, or tell you to go, end_conversation with a one-word "
+                 "goodbye, or say_first \"\" if they told you to be quiet.]")
     if cut:
         text += (f"\n[Cut off: they spoke while you were saying your last reply. They heard: \"{cut.get('heard') or ''}\". "
                  f"Not said yet: \"{cut.get('unsaid') or ''}\". Never say the unsaid part on its own; a cut question "
@@ -1460,7 +1557,14 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}. {WORK_GUIDE.strip()}]")
     if rerun:
-        text += "\n" + RERUN_NOTE
+        text += "\n" + (REPEAT_NOTE if state.get("repeat") else RERUN_NOTE)
+    if state.get("scrolling"):
+        # V7: a page scrolling on by itself (the keep_scrolling hand, or the thinker's scroll until stopped)
+        text += (f"\n[Scrolling now: {' '.join(str(state['scrolling']).split())[:200]}. It pauses by itself while "
+                 f"they talk. When they want it to stop (\"stop\", \"enough\", \"wait\", \"okay okay\"): the scroll hand "
+                 f"with keep \"stop\", alone, say_when_done \"\"; never words alone (it would scroll on). Faster, slower "
+                 f"or the other way: keep \"start\" again with that pace or direction. A reaction (\"nice\") changes "
+                 f"nothing.]")
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
     if practice and practice.strip():
@@ -1593,9 +1697,16 @@ def finish_contract() -> str:
     return _FINISH_CONTRACT
 
 
+#: V4 (3 Oct): the app or route the user named, from the talker's ``app_named`` field, right under the request. Live a
+#: send went to the person's usual app while the user had named another one (the request's wording had followed the
+#: usual route).
+APP_NAMED_NOTE = ("[Where they said to do it, in their own words: {app}. Do it there: it wins over the person's usual "
+                  "route and over any other app the request's wording names.]")
+
+
 def brain_request(request: str, heard: list[str] | str | None, *, context: str | None = None,
                   remember: bool = False, done_before: str | None = None, corrects: str | None = None,
-                  said: list[str] | None = None, tabs: str | None = None) -> str:
+                  said: list[str] | None = None, tabs: str | None = None, app_named: str | None = None) -> str:
     """What the brain is handed for a ``tell_yuki`` call: the request, its references, the user's latest words.
 
     Plumbing (docs/VOICE.md §6.2): the brain sees what the user actually said,
@@ -1611,6 +1722,9 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
     """
     voice_said = list(said or [])
     text = request.strip()
+    named = " ".join(str(app_named or "").split())[:80]
+    if named:
+        text += "\n\n" + APP_NAMED_NOTE.format(app=named)
     if context and context.strip():
         text += f"\n\n[References in that request, as the conversation had them: {context.strip()}]"
     if corrects and corrects.strip():

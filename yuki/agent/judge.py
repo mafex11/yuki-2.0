@@ -308,11 +308,17 @@ when he's coming on", "send him the link", "reply to the email saying yes"): all
 not the exact text: Yuki writes it the way they write to that person, so a message in another language or script \
 (Hinglish for an English instruction), in their slang or casing, or shorter, that says the same thing is what they \
 asked. Naming only the person is not enough ("message Sam" means show a draft first), \
-and neither is Yuki's own idea, an earlier offer, a to-do or a card of Yuki's they did not send.
+and neither is Yuki's own idea, an earlier offer, a to-do or a card of Yuki's they did not send. Where it goes is part \
+of what they asked: when their words name the app or route ("on Telegram", "by email", "in the team channel"), a send \
+through any other app or place is not what they asked, however that person is usually reached: ask_user, naming both. \
+An app their message is about is not where it goes ("ask him on Telegram when he's getting on Zoom" goes on \
+Telegram). A line with the app they named may come with their words; compare the action's target app with it.
 
 The settings line says how much the user lets Yuki do on its own for each kind of action. "Ask before doing" means: \
 allow only when their words ask for this action or it is a step toward exactly what they asked; an action of Yuki's \
-own initiative of that kind, toward something they did not ask for, is ask_user. "Show me the plan" is the same, stricter: allow only what their words \
+own initiative of that kind, toward something they did not ask for, is ask_user. For sends, a plain instruction saying \
+what goes to whom (on the app they named, if any) is the asking that setting wants: allow it, never ask_user only \
+because the setting says ask. "Show me the plan" is the same, stricter: allow only what their words \
 spell out. "Do it and tell me" means: allow what serves what they asked, and still ask for anything that destroys or \
 sends what they did not ask for.
 
@@ -341,12 +347,13 @@ that close nothing and send nothing. scope call: this action only. When in doubt
 
 why: at most fifteen words. question, only with ask_user: the one short plain question Yuki will put to the user, \
 naming the action and its target in everyday words ("Close all of Chrome? You asked me to restore the pages."), \
-never mentioning this check.
+never mentioning this check. With allow, question is "". If you would put any question to them, or your why argues \
+for asking, the decision is ask_user: never allow with a doubt.
 
 When the request asks for review instead (a second, careful look at an action a quick check held back), call \
 review: what their words ask for, in a few words; whether the action is toward it; whether it can have a lasting \
 effect (step 1); and only when it can, whether their words ask for that very effect. The decision follows from \
-those answers (steps 2 and 3); write a question only when it would not be allowed.
+those answers (steps 2 and 3); write a question only when it would not be allowed, and "" when it would.
 
 Examples (their words, then the action, then the verdict):
 
@@ -494,10 +501,25 @@ sends false: a click in its sidebar to get there changes nothing lasting.
 66. "switch to the llm os one in warp" / hotkey ctrl+w in Warp.exe "Acme pull request 2781" / ask_user, call, \
 sends false: it closes the tab showing. question: "Close the Acme pull request tab? You asked to switch to the \
 LLM OS one."
+67. "text meera on telegram, ask if she's coming to the gig" / type_text "coming to the gig?" press_enter in \
+Slack.exe "Meera (DM) - Slack" / ask_user, call, sends true: they named Telegram and this sends on Slack. question: \
+"Send it to Meera on Slack? You said Telegram."
+68. "text meera on telegram, ask if she's coming to the gig" / type_text "coming to the gig tonight?" press_enter in \
+Telegram.exe "Meera" / allow, window, sends true.
+69. "message kabir on telegram, ask when he's getting on zoom" / type_text "when are you getting on zoom?" \
+press_enter in Zoom.exe "Kabir - Chat" / ask_user, call, sends true: Zoom is what the message is about; they said to \
+send it on Telegram. question: "Send it to Kabir on Zoom chat? You said Telegram."
+70. "message kabir on telegram, ask when he's getting on zoom" / type_text "zoom pe kab aayega?" press_enter in \
+Telegram.exe "Kabir" / allow, window, sends true: the same question in Hinglish, where they said.
+71. "tell ira i'm running late" (Settings: Send messages: Ask before doing) / type_text "running late, sorry!" \
+press_enter in Telegram.exe "Ira" / allow, window, sends true: what goes to whom is in their words, which is the \
+asking that setting wants.
 """
 
-#: The one tool, forced. ``decision`` first, so it is known a few tokens in, then ``sends`` (needed before a call that
-#: can reach someone runs); ``question`` last (only on ask).
+#: The one tool, forced. ``decision`` first, so it is known a few tokens in, then ``question`` right after it (V5, 3 Oct:
+#: the decision and the reasoning disagreed and nothing reconciled them; now the question is written next to the
+#: decision, "" with an allow, and an allow that comes with a question is read as ask_user), then ``sends`` (needed
+#: before a call that can reach someone runs).
 VERDICT_TOOL: dict[str, Any] = {
     "name": "verdict",
     "description": "Your verdict on the proposed action.",
@@ -505,12 +527,14 @@ VERDICT_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "decision": {"type": "string", "enum": ["allow", "ask_user"]},
+            "question": {"type": "string",
+                         "description": "With ask_user: the one short plain question for the user. With allow: \"\" "
+                                        "(any doubt you would put to them means ask_user, never allow)."},
             "sends": {"type": "boolean"},
             "scope": {"type": "string", "enum": ["call", "window"]},
             "why": {"type": "string"},
-            "question": {"type": "string"},
         },
-        "required": ["decision", "sends", "scope", "why"],
+        "required": ["decision", "question", "sends", "scope", "why"],
     },
 }
 
@@ -534,28 +558,39 @@ REVIEW_TOOL: dict[str, Any] = {
                              "description": "Only when lasting: their words ask for that very effect. A send: they "
                                             "said what goes to whom - asking, telling, tagging or replying to a named "
                                             "person with what to say is that, in any wording (\"ask him when he's "
-                                            "coming on\")."},
+                                            "coming on\") - on the app or route they named, when they named one."},
+            "question": {"type": "string",
+                         "description": "When it is not allowed: the one plain question. When it is allowed: \"\" (a "
+                                        "question here means it is not allowed)."},
             "sends": {"type": "boolean"},
             "scope": {"type": "string", "enum": ["call", "window"]},
-            "question": {"type": "string", "description": "When it is not allowed: the one plain question."},
         },
-        "required": ["asked", "toward", "lasting", "asked_effect", "sends", "scope"],
+        "required": ["asked", "toward", "lasting", "asked_effect", "question", "sends", "scope"],
     },
 }
 
 
 def review_decision(data: dict[str, Any]) -> str | None:
-    """The review's decision from its own three answers, by the fixed rule of the prompt's steps 2 and 3: a step toward
-    what they asked is allowed when it has no lasting effect, or when they asked for that effect. ``None`` when an
-    answer is missing (then the review gave no verdict)."""
+    """The review's decision from its own answers, by the fixed rule of the prompt's steps 2 and 3: a step toward what
+    they asked is allowed when it has no lasting effect, or when they asked for that effect - and never when it wrote a
+    question for the user (V5: its own doubt is an ask). ``None`` when an answer is missing (then the review gave no
+    verdict)."""
     toward, lasting, asked = data.get("toward"), data.get("lasting"), data.get("asked_effect")
     if not isinstance(toward, bool) or not isinstance(lasting, bool):
         return None
     if not toward:
         return "ask_user"
+    if _doubt(data.get("question")):
+        return "ask_user"
     if not lasting:
         return "allow"
     return "allow" if asked is True else "ask_user"
+
+
+def _doubt(question: Any) -> bool:
+    """Whether the judge wrote a question for the user (V5: a question is its own doubt, whatever the decision says).
+    Our own tool field, read as JSON: a non-empty string."""
+    return isinstance(question, str) and bool(question.strip())
 
 #: Yuki's earlier actions of the request shown with a proposed call (the newest; the calls only).
 EARLIER_CALLS = 6
@@ -691,11 +726,12 @@ def call_facts(name: str, tool_input: dict[str, Any] | None, target: dict[str, A
 def judge_request(words: Sequence[dict[str, Any]], name: str, tool_input: dict[str, Any], *,
                   target: dict[str, Any] | None, levels: dict[str, str], traits: Traits, model: str,
                   cache: bool = True, review: bool = False, earlier: Sequence[str] = (),
-                  files_read: bool = False) -> dict[str, Any]:
+                  files_read: bool = False, named_app: str | None = None) -> dict[str, Any]:
     """The judge's request: its cached prompt, both tools (the quick verdict and the careful review; ``review``
     chooses which is forced), and one user message (words, settings, Yuki's earlier calls of this request - the calls
     only, never what they returned, as auto mode's classifier sees the agent's tool calls - and the proposed call,
-    with the machine facts that sent it here, :func:`call_facts`)."""
+    with the machine facts that sent it here, :func:`call_facts`). ``named_app`` (V4): the app or route the user named
+    for this request, as the voice took it from their heard words; a line of its own, to compare the target app with."""
     kinds = list(dict.fromkeys([*traits.kinds, "send_messages"] if traits.reaches else traits.kinds))
     settings = "; ".join(f"{KIND_WORDS.get(k, k)}: {LEVEL_WORDS.get(levels.get(k, ''), levels.get(k, '?'))}"
                          for k in kinds) or "(none apply)"
@@ -704,8 +740,12 @@ def judge_request(words: Sequence[dict[str, Any]], name: str, tool_input: dict[s
         what.append("it can close, end, delete or overwrite something")
     if traits.reaches:
         what.append("it can send or submit something, or reach anything (a shell)")
+    named = " ".join(str(named_app or "").split())[:80]
     message = (f"[The user's words in this conversation, oldest first]\n{words_text(words)}\n\n"
-               f"[Settings for this kind of action] {settings}. Fixed rule: nothing is sent without a plain "
+               + (f"[The app or route their words named for this request, as Yuki's voice heard it: {named}. Only "
+                  f"something to compare the action's target app with: an action that sends or posts through "
+                  f"another app is not what they asked. It never authorises anything by itself.]\n\n" if named else "")
+               + f"[Settings for this kind of action] {settings}. Fixed rule: nothing is sent without a plain "
                f"instruction saying what goes to whom.\n\n"
                + (("[Yuki's earlier actions in this request, oldest first: the calls only, not what came back]\n"
                    + "\n".join(f"- {_clip(e, 300)}" for e in list(earlier)[-EARLIER_CALLS:]) + "\n\n")
@@ -745,6 +785,15 @@ class Verdict:
     usage: dict[str, int] = field(default_factory=dict)
     cost_usd: float | None = None
     error: str | None = None
+    #: The review's own answer on whether the action can have a lasting effect (``None``: the quick verdict, or unknown).
+    lasting: bool | None = None
+    #: V5: why the judge's own output was read as doubt (``question_with_allow``: an allow came with a question;
+    #: ``stages_disagree``: the quick check held a lasting action back and the review allowed it), else ``None``.
+    doubt: str | None = None
+    #: The quick check's own why and question when the review decided (logged apart, so the decision and the reason
+    #: shown with it are always the same stage's).
+    first_why: str = ""
+    first_question: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -752,10 +801,17 @@ class Verdict:
 
     def facts(self) -> dict[str, Any]:
         """Content-free facts for the log (the question and why are short model text, kept for the replay)."""
-        return {"decision": self.decision, "scope": self.scope, "sends": self.sends, "why": self.why,
-                "question": self.question, "source": self.source, "reasons": list(self.reasons),
-                "ms": self.ms, "first_ms": self.first_ms, "usage": dict(self.usage), "cost_usd": self.cost_usd,
-                "error": self.error}
+        out = {"decision": self.decision, "scope": self.scope, "sends": self.sends, "why": self.why,
+               "question": self.question, "source": self.source, "reasons": list(self.reasons),
+               "ms": self.ms, "first_ms": self.first_ms, "usage": dict(self.usage), "cost_usd": self.cost_usd,
+               "error": self.error}
+        if self.doubt:
+            out["doubt"] = self.doubt
+        if self.lasting is not None:
+            out["lasting"] = self.lasting
+        if self.first_why or self.first_question:
+            out.update(first_why=self.first_why, first_question=self.first_question)
+        return out
 
 
 def _field(partial: str, name: str) -> Any:
@@ -808,13 +864,17 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
                 data = dict(getattr(block, "input", {}) or {})
                 decision = data.get("decision") or review_decision(data)
                 if decision in ("allow", "ask_user"):
+                    if decision == "allow" and _doubt(data.get("question")):
+                        # V5: an allow that comes with a question for the user is the judge's own doubt: ask
+                        decision, verdict.doubt = "ask_user", "question_with_allow"
                     verdict.decision = str(decision)
                     verdict.scope = "window" if data.get("scope") == "window" else "call"
                     verdict.sends = bool(data.get("sends"))
+                    verdict.lasting = data.get("lasting") if isinstance(data.get("lasting"), bool) else None
                     verdict.why = _clip(data.get("why") or (
                         f"{data.get('asked') or ''} (toward it: {data.get('toward')}, lasting: {data.get('lasting')}, "
-                        f"asked for that: {data.get('asked_effect')})"), 240)
-                    verdict.question = _clip(data.get("question"), 240)
+                        f"asked for that: {data.get('asked_effect')})" if "asked" in data else ""), 240)
+                    verdict.question = _clip(data.get("question"), 240) if decision == "ask_user" else ""
                 else:
                     verdict.error = "no decision in the verdict"
         usage = getattr(final, "usage", None)
@@ -845,10 +905,17 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
                         {k: _field(partial, k) for k in ("toward", "lasting", "asked_effect")})
                     if decision != "allow":
                         continue
+                    # V5: an early allow needs its question field written and empty (the schema puts it before
+                    # sends); a question means doubt, so the whole verdict is read and comes out as ask_user
+                    question = _field(partial, "question")
+                    if question is None or _doubt(question):
+                        continue
                     if all(_field(partial, k) is not None for k in need):
+                        lasting = _field(partial, "lasting")
                         early = Verdict(decision="allow", sends=_field(partial, "sends") is True,
                                         scope="window" if _field(partial, "scope") == "window" else "call",
-                                        first_ms=verdict.first_ms, usage=dict(verdict.usage))
+                                        first_ms=verdict.first_ms, usage=dict(verdict.usage),
+                                        lasting=lasting if isinstance(lasting, bool) else None)
                         early.ms = round((time.perf_counter() - started) * 1000, 1)
                         box["verdict"] = early
                         returned = True
@@ -876,6 +943,31 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
     verdict = box.get("verdict") or Verdict(error="no verdict")
     verdict.ms = verdict.ms or round((time.perf_counter() - started) * 1000, 1)
     return verdict
+
+
+def combine_stages(first: Verdict, review: Verdict, traits: Traits) -> Verdict:
+    """The one verdict of a call the quick check held back and the review looked at again (V5, fail closed).
+
+    The review decides, with one exception: when it allows an action that can have a lasting effect (its own
+    ``lasting`` answer, or - when that is not known - the call's metadata says it destroys or reaches someone) that the
+    quick check held back, the two looks disagree about a lasting effect, and doubt is an ask. Live 3 Oct both sends of
+    one request came out "allow" while the reason shown argued for asking: the reason was the quick check's, the
+    decision the review's. The decision, its why and its question now always belong together: an allow carries the
+    review's why and no question; an ask carries the question of the stage that asked. Facts of the two verdicts only."""
+    lasting = review.lasting if isinstance(review.lasting, bool) else bool(traits.destroys or traits.reaches)
+    out = Verdict(decision=review.decision, scope=review.scope, sends=review.sends or first.sends, why=review.why,
+                  question=review.question if not review.allowed else "", source="review",
+                  ms=round(first.ms + review.ms, 1), first_ms=first.first_ms, usage=dict(review.usage),
+                  cost_usd=review.cost_usd, lasting=review.lasting, doubt=review.doubt,
+                  first_why=first.why, first_question=first.question)
+    if review.allowed and lasting:
+        out.decision, out.scope, out.doubt = "ask_user", "call", "stages_disagree"
+        out.why = first.why or "the quick check and the careful look disagreed about an action that lasts"
+        out.question = first.question or review.question
+    elif not review.allowed:
+        out.why = review.why or first.why
+        out.question = review.question or first.question
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -953,12 +1045,14 @@ class Authorizer:
 
     def check(self, name: str, tool_input: dict[str, Any], *, words: Sequence[dict[str, Any]],
               target: dict[str, Any] | None = None, signature: str = "",
-              earlier: Sequence[str] = (), files_read: bool = False) -> Verdict | None:
+              earlier: Sequence[str] = (), files_read: bool = False, named_app: str | None = None) -> Verdict | None:
         """The verdict for one call, or ``None`` when its metadata and the policy do not send it to the judge.
 
         ``target`` may carry the machine facts the caller read (review 34): ``role`` (the clicked element's UIA role),
         ``typed_pending`` (Yuki's typed text waits in that window); ``files_read``: a ``read_file`` ran earlier in
-        this request. A click or type in an app whose "Act" switch is off is refused outright, with no judge call."""
+        this request. ``named_app`` (V4): the app or route the user named for this request in their own words (the voice
+        talker's ``app_named``), shown to the judge to compare the action's app with; it can only make it hold. A click
+        or type in an app whose "Act" switch is off is refused outright, with no judge call."""
         target = target or {}
         traits = call_traits(name, tool_input, role=target.get("role"),
                              typed_pending=bool(target.get("typed_pending")), files_read=files_read)
@@ -994,7 +1088,7 @@ class Authorizer:
             return v
         model = str(getattr(self.settings, "judge_model", "") or "")
         params = judge_request(words, name, tool_input, target=target, levels=levels, traits=traits, model=model,
-                               earlier=earlier, files_read=files_read)
+                               earlier=earlier, files_read=files_read, named_app=named_app)
         try:
             client = self._client()
         except Exception as exc:  # noqa: BLE001 - fail closed below
@@ -1004,18 +1098,21 @@ class Authorizer:
         grantable = bool(hwnd) and not traits.destroys and not traits.reaches
         generation = self._generation
 
-        def rest(full: Verdict) -> None:
+        def rest(full: Verdict, first: Verdict | None = None) -> None:
             # The rest of an early allow, read on the judge's thread: its cost, and a window grant when it scoped one
-            # (only for the request it was asked in).
+            # (only for the request it was asked in). For the review (``first``: the quick check that held it), what
+            # counts is the two stages combined: an allow they disagree on grants and memoizes nothing (V5).
             self._cost(model, full)
+            final = combine_stages(first, full, traits) if first is not None and full.error is None else full
             with self._lock:
-                if generation == self._generation and full.error is None and full.allowed:
-                    if full.scope == "window" and grantable:
+                if generation == self._generation and final.error is None and final.allowed:
+                    if final.scope == "window" and grantable:
                         self.grants.add(int(hwnd))
                     if keep_allow:
-                        self.memo[key] = full
+                        self.memo[key] = final
             self._log("judge_rest", tool=name, scope=full.scope, sends=full.sends, why=full.why, ms=full.ms,
-                      usage=dict(full.usage), cost_usd=full.cost_usd)
+                      usage=dict(full.usage), cost_usd=full.cost_usd,
+                      **({"doubt": final.doubt} if final.doubt else {}))
 
         if client is None:
             v = Verdict(error=error or "no client")
@@ -1032,20 +1129,16 @@ class Authorizer:
             first = v
             again = decide(client, judge_request(words, name, tool_input, target=target, levels=levels,
                                                  traits=traits, model=model, review=True, earlier=earlier,
-                                                 files_read=files_read),
+                                                 files_read=files_read, named_app=named_app),
                            timeout_s=float(getattr(self.settings, "judge_timeout_s", 8.0)) + 2.0,
-                           need=("sends",) if traits.reaches else (), on_rest=rest)
+                           need=("sends",) if traits.reaches else (),
+                           on_rest=lambda full, first=first: rest(full, first))
             self.calls += 1
             if again.why or not again.allowed or again.error is not None:
                 self._cost(model, again)
             if again.error is None:
-                again.source = "review"
-                again.question = again.question or first.question
-                again.why = again.why or first.why
-                again.ms = round(first.ms + again.ms, 1)
-                again.first_ms = first.first_ms
-                again.reasons = reasons
-                v = again
+                v = combine_stages(first, again, traits)
+                v.reasons = reasons
         self.ms.append(v.ms)
         if v.error is not None:
             # Fail closed: a check that could not run is an ask, said plainly.

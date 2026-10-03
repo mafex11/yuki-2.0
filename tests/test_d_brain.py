@@ -272,8 +272,13 @@ def test_deny_counters_reset_on_an_allow_and_cap_at_twenty(tmp_path: Path) -> No
     from yuki.agent.judge import MAX_TOTAL_DENIALS, Authorizer, PolicyReader
 
     answers: list[str] = []
-    client = Client([], judge=lambda p: {"decision": answers.pop(0), "sends": False, "scope": "call", "why": "w",
-                                         "question": "q?"})
+
+    def verdict(_p: Any) -> dict[str, Any]:
+        decision = answers.pop(0)   # V5: a question goes only with ask_user (an allow with one is read as doubt)
+        return {"decision": decision, "question": "q?" if decision == "ask_user" else "", "sends": False,
+                "scope": "call", "why": "w"}
+
+    client = Client([], judge=verdict)
     auth = Authorizer(lambda: client, _settings(tmp_path), policy=PolicyReader(tmp_path / "none.json"))
     for i in range(2):
         answers += ["ask_user", "ask_user"]          # each held call goes through both stages
@@ -800,20 +805,67 @@ def test_pattern_choice_follows_the_reads_own_pattern_list() -> None:
     assert usable({"patterns": (), "is_scrollable": True}, "scroll") == "scroll"
 
 
-def test_input_waits_for_the_user_and_says_one_line(tmp_path: Path) -> None:
+def _clocked_gate(**kw: Any) -> tuple[Any, dict[str, float]]:
+    """An input gate on a pretend clock, with pretend key and cursor reads (V8: never the real keyboard in a test)."""
     from yuki.actions.leases import InputGate
 
-    ages = iter([0.2, 0.3, 0.1, 0.5, 0.9])
     clock = {"t": 0.0}
+    kw.setdefault("held", lambda: False)
+    kw.setdefault("cursor", lambda: (500, 500))
+    gate = InputGate(sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"], **kw)
+    return gate, clock
+
+
+def test_input_waits_while_they_type_and_says_nothing_under_three_seconds() -> None:
+    # V8: they type for ~1 s (a new input on every look, the cursor still), then stop: Yuki waits, silently
+    state = {"last": 0.0}
+    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.1)
+
+    def age() -> float:
+        if clock["t"] < 1.0:
+            state["last"] = clock["t"]   # still typing
+        return clock["t"] - state["last"]
+
+    gate.age = age
     said: list[str] = []
-    gate = InputGate(recent_s=1.0, quiet_s=0.8, max_s=5.0, age=lambda: next(ages), poll_s=0.1,
-                     sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"])
     result = gate.wait(notify=said.append)
-    assert result["waited"] and result["ok"] and len(said) == 1
-    busy = InputGate(recent_s=1.0, quiet_s=0.8, max_s=1.0, age=lambda: 0.1, poll_s=0.1,
-                     sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"])
-    assert not busy.wait()["ok"]
-    idle = InputGate(age=lambda: 30.0)
+    assert result["waited"] and result["ok"] and result["real"] and said == []
+    assert 1700 <= result["ms"] <= 2100
+
+
+def test_input_wait_says_one_line_only_past_three_seconds() -> None:
+    state = {"last": 0.0}
+    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.1)
+
+    def age() -> float:
+        if clock["t"] < 4.0:
+            state["last"] = clock["t"]   # typing on for 4 s
+        return clock["t"] - state["last"]
+
+    gate.age = age
+    said: list[str] = []
+    result = gate.wait(notify=said.append)
+    assert result["ok"] and len(said) == 1 and "wait a moment" in said[0]
+
+
+def test_mouse_moves_alone_never_hold_yuki_back() -> None:
+    # V8: GetLastInputInfo counts every mouse move; with the cursor moving and nothing held down it is no real input
+    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05,
+                                cursor=lambda: (int(clock["t"] * 1000), 300))
+    gate.age = lambda: 0.01   # input "just now" on every look: the mouse is moving
+    said: list[str] = []
+    result = gate.wait(notify=said.append)
+    assert result["ok"] and result["real"] is False and result["ms"] <= 300 and said == []
+
+
+def test_a_held_key_or_button_counts_as_real_input_and_a_long_one_stops_the_action() -> None:
+    gate, _clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=1.0, poll_s=0.1, held=lambda: True,
+                                 cursor=lambda: None)
+    gate.age = lambda: 0.1
+    result = gate.wait()
+    assert not result["ok"] and result["real"]
+    idle, _ = _clocked_gate()
+    idle.age = lambda: 30.0
     assert idle.wait() == {"waited": False, "ok": True, "ms": 0.0}
 
 
@@ -837,13 +889,17 @@ def test_the_dispatcher_yields_before_global_input_and_the_loop_says_it(tmp_path
     desk = StubDesktop(action_delay_s=0)
     agent = _agent(client, tmp_path, backend=desk, judge=False)
     agent.dispatcher.notices = queue.SimpleQueue()
-    agent.dispatcher.input_gate = InputGate(recent_s=1.0, quiet_s=0.8, max_s=5.0, age=lambda: next(ages, 5.0),
-                                            poll_s=0.01)
+    # (pretend key and cursor reads: a test never reads the real keyboard; the line is said at once here)
+    keys = iter([True])   # a key held down on the first look only: they were typing, then stopped
+    agent.dispatcher.input_gate = InputGate(recent_s=1.0, quiet_s=0.05, max_s=5.0, age=lambda: next(ages, 5.0),
+                                            poll_s=0.01, notify_after_s=0.0, held=lambda: next(keys, False),
+                                            cursor=lambda: (1, 1))
     events = _run(agent, "press enter")
     says = [e.text for e in events if isinstance(e, Say)]
     assert len(says) == 1 and "wait a moment" in says[0] and any(c[0] == "press" for c in desk.calls)
     # a media key acts system-wide and types nothing: no wait
-    agent.dispatcher.input_gate = InputGate(age=lambda: 0.0, max_s=0.05, poll_s=0.01)
+    agent.dispatcher.input_gate = InputGate(age=lambda: 0.0, max_s=0.05, poll_s=0.01, held=lambda: True,
+                                            cursor=lambda: (1, 1))
     out = agent.dispatcher.dispatch("press", {"key": "playpause"})
     assert out.ok
     blocked = agent.dispatcher.dispatch("press", {"key": "enter"})

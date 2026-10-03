@@ -316,6 +316,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "dy": {"type": "integer"},
                 "dx": {"type": "integer"},
                 "expect_hwnd": _GUARD,
+                "until_stopped": {"type": "boolean", "description": (
+                    "For \"keep scrolling until I say stop\": after this step it goes on scrolling by itself in steps "
+                    "(pausing while they talk) until they say stop, take over or the page ends; returns after the "
+                    "first step. Make it your last step, then done.")},
             },
         ),
     },
@@ -2995,9 +2999,9 @@ class Dispatcher:
             via = self._pattern_first("scroll", tool_input, "scroll", dy=self._opt_int(tool_input, "dy", 0),
                                       dx=self._opt_int(tool_input, "dx", 0))
             if via is not None:
-                return self._labelled(via, label)
+                return self._continue_scrolling(tool_input, self._labelled(via, label), x, y, guard)
         self._before_input("scroll")
-        return self._labelled(
+        return self._continue_scrolling(tool_input, self._labelled(
             self._from_action(
                 "scroll",
                 self.backend.scroll(
@@ -3009,7 +3013,44 @@ class Dispatcher:
                 ),
             ),
             label,
-        )
+        ), x, y, guard)
+
+    def _continue_scrolling(self, tool_input: dict[str, Any], first: ToolOutcome, x: int, y: int,
+                            guard: int | None) -> ToolOutcome:
+        """V7: ``until_stopped`` - after a first step that worked, the page goes on scrolling by itself in steps
+        (:class:`yuki.actions.scrolling.ContinuousScroll`) until Yuki's voice stops it, the user takes over, the Stop
+        hotkey cancels, or the page ends. The request ends; the scroll does not."""
+        if tool_input.get("until_stopped") is not True or not first.ok:
+            return first
+        from yuki.actions.scrolling import ContinuousScroll, input_watch, start_continuous, step_result, voice_hold
+
+        dy, dx = self._opt_int(tool_input, "dy", 0), self._opt_int(tool_input, "dx", 0)
+        if not dy and not dx:
+            return first
+        backend = self.backend
+
+        def step() -> Any:
+            return step_result(backend.scroll(x, y, dy=dy, dx=dx, expect_hwnd=guard))
+
+        where = "the window"
+        try:
+            from yuki.agent.finish import app_name
+            from yuki.perception.windows import window_info
+
+            info = window_info(int(guard)) if guard else None
+            if info is not None:
+                where = f"{app_name(info.process_name)} \"{(info.title or '')[:60]}\""
+        except Exception:  # noqa: BLE001 - a label only
+            pass
+        notches = abs(dy or dx)
+        pace = "fast" if notches >= 6 else "slow" if notches <= 3 else "normal"
+        start_continuous(ContinuousScroll(step, where=where, direction="up" if dy > 0 else "down", pace=pace,
+                                          hold=voice_hold, took_over=input_watch(), steps_done=1,
+                                          started_by="thinker"))
+        note = ("It now goes on scrolling by itself in steps until they say stop (Yuki's voice stops it), take over or "
+                "the page ends: nothing more to do for the scrolling; finish with done.")
+        return dataclasses.replace(first, summary=f"{first.summary}; {note}",
+                                   content=[*first.content, {"type": "text", "text": note}])
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:
         return self._from_action(

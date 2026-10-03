@@ -1443,10 +1443,19 @@ def _app_windows(identity: _AppIdentity, before: dict[int, int]):
     return windows
 
 
+def _past_root(requested: str, actual: str) -> bool:
+    """V11: ``actual`` matches ``requested`` only because a request for a site's root (no path) takes any page of that
+    site: the site's home page was asked for and this is some other page of it. Address parts only."""
+    want, got = _address_parts(requested), _address_parts(actual)
+    return bool(want and got and not want[3] and got[3] and _same_page(requested, actual))
+
+
 def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, int], timeout_s: float):
     """Wait (bounded) until one of the app's windows shows a page at one of
     ``targets`` (see :func:`yuki.perception.tree.wait_for_page`); ``None`` when
-    the accessibility reader cannot be loaded."""
+    the accessibility reader cannot be loaded. V11: for a site's home page, another page of that site that was already
+    showing when the address was handed over is not the page asked for (a redirect from the root to a deeper page,
+    which appears after the hand-off, still counts)."""
     try:
         from yuki.perception.tree import wait_for_page
     except Exception:
@@ -1455,6 +1464,7 @@ def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, in
         _app_windows(identity, before),
         lambda url: any(_same_page(target, url) for target in targets),
         timeout_s=timeout_s,
+        stale=lambda url: any(_past_root(target, url) for target in targets),
     )
 
 

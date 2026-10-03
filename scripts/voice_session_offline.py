@@ -16,6 +16,8 @@ Usage::
         call     in a Discord call: "Yuki, pause the music", then talk to friends. --headphones for full duplex
         call2    the same with questions the friends were asked, and Yuki addressed again mid-way
         latency  "Yuki." then "Pause the music.", twice (cold, then warm): the wake word to listening
+        endings  vfix: "shut up", "go away", "bye bye" and a mistaken wake, each after the name: every one ends the
+                 conversation at once and leaves the wake word on (clips: voice_clips.py --set vfix)
 
 Each run writes ``<out>/<scenario>-<variant>.json`` (the timeline: what was heard, said, called and
 done, the states, the session's timings) and prints a summary.
@@ -179,6 +181,16 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         box["name_end_s"] = speech_end_offset(clip("k_name"))  # "Yuki" said alone; in k_pause it ends about as soon
         if args.breath:
             box["name_end_s"] = float(manifest[args.breath]["name_end"])
+    elif scenario == "endings":
+        # vfix (report 40, V1-V3): "shut up", "go away", "bye" and a mistaken wake each end the conversation at once
+        # and leave Yuki waiting for her name (never quiet time); after "what's up?" got its answer.
+        first = prewarmed() if args.prewarm else None
+        lines = [("k_name", 1.0, first), ("e_whatsup", 0.35, None), ("e_shutup", 1.0, settled(0.8)),
+                 ("k_name", 1.0, standby_again(1.5)), ("e_whatsup", 0.35, None), ("e_goaway", 1.0, settled(0.8)),
+                 ("k_name", 1.0, standby_again(1.5)), ("e_bye", 0.35, None),
+                 ("k_name", 1.0, standby_again(1.5)), ("e_mistake", 0.35, None)]
+        script = [(clip(n), after, wait) for n, after, wait in lines]
+        names = [n for n, _a, _w in lines]
     else:
         raise SystemExit(f"unknown scenario {scenario}")
 
@@ -286,6 +298,22 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 del nxt
             rows.append(row)
         report["latency"] = rows
+    if scenario == "endings" and mic is not None:
+        rows = []
+        ends = [t - t0 for t, on in convs if not on]
+        for i, name in enumerate(names):
+            if not name.startswith("e_") or name == "e_whatsup" or i >= len(mic.lines):
+                continue
+            said_end = mic.lines[i]["started_at"] + speech_end_offset(clip(name)) - t0
+            end = next((e for e in ends if e > said_end), None)
+            upto = end if end is not None else said_end + 30
+            said = [e["text"] for e in timeline.events if e["kind"] == "yuki" and said_end < e["t"] <= upto]
+            tools = [e["name"] for e in timeline.events if e["kind"] == "mouth_tool" and said_end - 0.5 < e["t"] <= upto]
+            rows.append({"line": name, "ended": end is not None,
+                         "speech_end_to_conversation_end_ms": round((end - said_end) * 1000) if end else None,
+                         "yuki_said_after": said, "tools": tools})
+        report["endings"] = rows
+        report["quiet_after"] = bool(getattr(session, "quiet", False))
     if io_seen is not None:
         report["loop_io"] = sorted(({"event": k[0], "where": k[1], "what": k[2], "n": n} for k, n in io_seen.items()),
                                    key=lambda r: -r["n"])
@@ -354,6 +382,10 @@ def summary(report: dict[str, Any]) -> str:
             lines.append(f"{t:7.2f}  pill {s}: {d}")
     if report.get("latency"):
         lines.append("latency: " + json.dumps(report["latency"]))
+    if report.get("endings") is not None:
+        for row in report["endings"]:
+            lines.append("ending: " + json.dumps(row, ensure_ascii=False))
+        lines.append(f"quiet time after (go_quiet): {report.get('quiet_after')}")
     lines.append("session timings: " + json.dumps(report["session_timings_ms"]))
     lines.append(f"mic levels: {report['mic_levels']}")
     if report.get("loop_io") is not None:
@@ -365,7 +397,7 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency"))
+    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency", "endings"))
     ap.add_argument("--clips", type=Path, required=True, help="the folder with manifest.json of the v34 clips")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--echo", default="aec", choices=("aec", "half", "none"))

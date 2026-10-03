@@ -541,10 +541,15 @@ def test_the_prompt_is_layered_by_state_with_breakpoints_before_the_call_layer()
 
 def test_the_cached_prompt_stays_under_its_measured_size() -> None:
     """Measured 15.3k cached tokens (no call) / 15.9k (in a call) with a real profile (was 17.7k / 18.4k): a guard on
-    the characters of the static layers so the prompt does not creep back past the ~16k step unnoticed."""
+    the characters of the static layers so the prompt does not creep back past the ~18k step unnoticed.
+
+    vfix (3 Oct, V1-V12): with today's larger profile the talker measured 17.1k cached tokens (no call) / 17.7k (in a
+    call) against main's 16.6k / 17.2k, and the time to first token was the same as main's in a call (p50 1,035 vs
+    1,034 ms, 8 interleaved rounds, scripts/voice_ttft.py). A first draft at 18.4k in a call cost +300 ms: the step is
+    between the two, so this guard stays tight."""
     from yuki.voice.mouth import CALL_LAYER, HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT
 
-    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 40_500
+    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 41_800
     assert len(CALL_LAYER) <= 2_300
 
 

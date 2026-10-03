@@ -38,8 +38,8 @@ from PySide6.QtCore import QObject, Signal
 
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
-    CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE, brain_request,
-    result_payload, waiting_payload,
+    APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE,
+    brain_request, result_payload, waiting_payload,
 )
 from yuki.voice.narrator import RANKS, Item, asks, condense, ends_sentence, machine_text, sentences
 from yuki.voice.progress import JobLog, step_of
@@ -123,6 +123,8 @@ class Job:
     escalated: bool = False
     #: The talker judged it needs the PC's hands (tell_yuki ``acts``), or its own hand was tried first (v3.14b).
     acts: bool = False
+    #: V4: the app or route the user named in their own words (tell_yuki ``app_named``), else ``None``.
+    app_named: str | None = None
     #: Desktop actions of the job that succeeded (``ACTION_TOOL_NAMES``), from the runtime's tool signals.
     actions_ok: int = 0
     #: "Still on it" lines offered for it (v3.9: said only when the user has heard nothing for a while).
@@ -631,6 +633,8 @@ class VoiceBridge(QObject):
         request = str(args.get("request") or args.get("message") or "").strip()
         context = str(args.get("context") or "").strip() or None
         corrects = str(args.get("corrects") or "").strip() or None
+        # V4: the app or route the user named in their own words (the talker's structured field), else None
+        app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
         intent = str(args.get("intent") or "new_task")
         heard = heard_words(params.context, skip=self.not_heard)
         request = request or (heard[-1] if heard else "")
@@ -659,7 +663,8 @@ class VoiceBridge(QObject):
             self._log("bridge", op="early_dropped", why="follow_up", call=params.tool_call_id)
             early = None
         if early is not None:
-            await self._adopt(early, params, args, context=context, corrects=corrects, remember=remember)
+            await self._adopt(early, params, args, context=context, corrects=corrects, remember=remember,
+                              app_named=app_named)
             return
         if intent == "new_task" and not remember and not replaced:
             same = self._same_turn_job()
@@ -687,12 +692,14 @@ class VoiceBridge(QObject):
             said.append(first)
         tabs = self.tabs_for_thinker()
         text = brain_request(request, heard, context=context, remember=remember, done_before=done_before,
-                             corrects=corrects, said=said, tabs=tabs)
+                             corrects=corrects, said=said, tabs=tabs, app_named=app_named)
         await self._ack_if_silent(params, args)
         if intent == "follow_up":
             target = self._follow_up_target()
             if target is not None:
                 how = await self._follow_up(target, text)
+                if app_named and how != "restart" and target.job_id is not None:
+                    self._name_app(target, app_named)
                 self._log("bridge", op="follow_up", job_id=target.job_id, how=how, call=params.tool_call_id)
                 if how != "restart":
                     # The mouth acknowledged in the same reply: this settles the call without
@@ -708,7 +715,7 @@ class VoiceBridge(QObject):
                 text = brain_request(request, heard, context="; ".join(x for x in (
                     context, f'this adds to the request just before it ("{target.request}"), which had just '
                              f'finished{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
-                    if x), done_before=done_before, corrects=corrects, said=said, tabs=tabs)
+                    if x), done_before=done_before, corrects=corrects, said=said, tabs=tabs, app_named=app_named)
         job = self._new_job(request)
         job.acked = self._acked(params, args)
         job.acts = acts
@@ -727,12 +734,12 @@ class VoiceBridge(QObject):
         words = _memory_words(request, heard)
         reads = args.get("acts") is False and not remember   # the talker's own mark: it only finds out or answers
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words,
-                                       user_words=heard, needs_hands=False if reads else None))
+                                       user_words=heard, needs_hands=False if reads else None, app_named=app_named))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
                   request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
                   done_before_chars=len(done_before), heard_turns=len(heard), corrects_chars=len(corrects or ""),
                   said_lines=len(said), tabs_chars=len(tabs or ""), screen=screen, acts=acts,
-                  replaced=len(replaced), lane=lane)
+                  replaced=len(replaced), lane=lane, app_named=bool(app_named))
         self._changed()
         self._arm_wait(job)
         try:
@@ -1076,13 +1083,17 @@ class VoiceBridge(QObject):
             self.drop_early(call_id)
 
     async def _adopt(self, job: Job, params: Any, args: dict[str, Any], *, context: str | None,
-                     corrects: str | None, remember: bool) -> None:
+                     corrects: str | None, remember: bool, app_named: str | None = None) -> None:
         """The tell_yuki call a job was started early for is complete: it carries that job's outcome."""
         job.acked = job.acked or self._acked(params, args)
         job.acts = job.acts or args.get("acts") is True
         if remember:
             job.remember = True
         extra = []
+        if app_named:
+            # V4: the app the user named reaches the early-started thinker as a note and, for its judge, as a field
+            extra.append(APP_NAMED_NOTE.format(app=app_named))
+            self._gui(lambda: self._name_app(job, app_named))
         if context:
             extra.append(f"[References in that request, as the conversation had them: {context}]")
         if corrects:
@@ -1097,7 +1108,8 @@ class VoiceBridge(QObject):
             self._gui(lambda: self._steer(job, job.job_id, note) if job.job_id is not None
                       else job.pending_steers.append(note))
         self._log("bridge", op="adopted", job_id=job.job_id, token=job.token, call=params.tool_call_id,
-                  context_chars=len(context or ""), corrects_chars=len(corrects or ""), remember=remember)
+                  context_chars=len(context or ""), corrects_chars=len(corrects or ""), remember=remember,
+                  app_named=bool(app_named))
         await self._ack_if_silent(params, args)
         try:
             await self._relay(job, params)
@@ -1266,18 +1278,10 @@ class VoiceBridge(QObject):
             await params.result_callback({"not_quiet": "A result, a failure or a question is always said. Say what it "
                                           "says now, in a few words of your own."})
             return
-        if by_user and not self._named_refused and self.named_turn is not None and self.named_turn():
-            self._named_refused = True  # once: a second stay_quiet is the mouth's considered choice
-            # They said the name right before these words (the wake word heard it, and the name was kept out
-            # of the transcript): the words were for Yuki. Measured offline 2026-09-27, "Pause the music." cut
-            # after the name got stay_quiet 3 of 12 times. A fact about the conversation, not about the words.
-            self._log("bridge", op="quiet", refused="named")
-            await params.result_callback({"not_quiet": "They said your name right before these words: most likely "
-                                          "said to you. Reply now in a few words: do what they asked, or say "
-                                          "plainly why there is nothing to do. Never say it is done when "
-                                          "nothing was done. Only if the words plainly talk about you to someone "
-                                          "else (\"I had a long talk with Yuki\"), call stay_quiet again."})
-            return
+        # V2 (3 Oct): a stay_quiet on the user's own words is final. It used to be refused once after the name (v3.6)
+        # and once in a live exchange (v3.9); live 3 Oct "go away" got a quiet, the refusal made the talker run again,
+        # and it said it was still there. Whom the words were for is the talker's judgement (the prompt: outside a
+        # call they are for Yuki unless plainly not), and code never makes it speak after it chose silence.
         spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         held = self.held_at
         if not by_user and not spoke and held is not None and time.monotonic() - held < 20.0:
@@ -1298,22 +1302,7 @@ class VoiceBridge(QObject):
                 await params.result_callback({"ok": True, "note": "What you had held is being done now."},
                                              properties=FunctionCallResultProperties(run_llm=False))
                 return
-        turn = self.user_turns() if self.user_turns is not None else -1
         evidence = self.call_evidence() if self.call_evidence is not None else None
-        # On a call seen on the screen just now, only words said to Yuki get a reply: the mouth's stay_quiet stands.
-        # With only old evidence of a call (or none), plain instructions are for Yuki (v3.10, the user's rule).
-        sure_call = in_call and evidence != "stale"
-        if (by_user and not sure_call and not spoke and self.in_exchange is not None and self.in_exchange()
-                and turn != self._quiet_refused_turn and not self._answer_on_its_way()):
-            # They are in a live exchange with Yuki (she spoke moments ago) and this is their turn: it is almost
-            # always said to her (offline 2026-09-27 "Thanks." got silence). Refused once per turn; a second
-            # stay_quiet is the mouth's considered judgement (dictation, someone in the room). State only.
-            self._quiet_refused_turn = turn
-            self._log("bridge", op="quiet", refused="in_exchange")
-            await params.result_callback({"not_quiet": "You were just talking with them, so these words were most "
-                                          "likely for you: answer in a few words. Only if they plainly were for "
-                                          "someone or something else, call stay_quiet again."})
-            return
         # In a call, staying quiet on the user's own turn is the mouth's judgement that the words
         # were for the people on the call (logged as such; content-free).
         with_words = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else None
@@ -1335,12 +1324,19 @@ class VoiceBridge(QObject):
         from pipecat.frames.frames import FunctionCallResultProperties
 
         args = params.arguments if isinstance(params.arguments, dict) else {}
+        words = str(args.get("say_first") or "").strip()
+        spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         await self._ack_if_silent(params, args)
-        self._log("bridge", op="end_conversation")
+        # V1 (3 Oct): "shut up" / "go away" end with no goodbye at all (an empty say_first): nothing is waited for
+        quick = not words and not spoke
+        self._log("bridge", op="end_conversation", goodbye=bool(words or spoke))
         await params.result_callback({"ok": True, "note": "The conversation ends after your goodbye."},
                                      properties=FunctionCallResultProperties(run_llm=False))
         if self.end_requested is not None:
-            self.end_requested()
+            try:
+                self.end_requested(quick=quick)
+            except TypeError:   # a stand-in that takes no arguments
+                self.end_requested()
 
     async def go_quiet(self, params: Any) -> None:
         """Pipecat handler for ``go_quiet`` (v3.10): the user wants Yuki quiet for a while.
@@ -1441,7 +1437,8 @@ class VoiceBridge(QObject):
 
     def _submit(self, job: Job, text: str, origin: int | None, *, lane: str | None = None,
                 view: int | None = None, memory_query: str | None = None,
-                user_words: list[str] | None = None, needs_hands: bool | None = None) -> None:
+                user_words: list[str] | None = None, needs_hands: bool | None = None,
+                app_named: str | None = None) -> None:
         extra: dict[str, Any] = {}
         if lane:
             extra["lane"] = lane
@@ -1452,9 +1449,17 @@ class VoiceBridge(QObject):
             extra["needs_hands"] = False
         words = [" ".join(str(t).split()) for t in (user_words or []) if str(t).strip()]
         if words and self._takes_user_words():
-            # 34-review H4: what speech recognition heard, labelled as the user's own words, apart from the request
-            # (the talker's reading of them, which never authorizes a send); the judge reads these
-            extra["user_words"] = [{"how": "voice", "text": t} for t in words]
+            # 34-review H4: what speech recognition heard, apart from the request (the talker's reading of them,
+            # which never authorizes a send); the agent labels them as the user's heard words for the judge. Plain
+            # strings, the runtime's contract (V4, 3 Oct: passed as {"how", "text"} dicts, they reached the judge as
+            # Python reprs).
+            extra["user_words"] = list(words)
+        app_named = app_named or job.app_named
+        if app_named:
+            job.app_named = app_named
+            if self._takes("app_named"):
+                # V4: the app or route the user named, as a field the thinker's frame and its judge read
+                extra["app_named"] = app_named
         if view:
             extra["view_hwnd"] = view
         if memory_query:
@@ -1494,6 +1499,26 @@ class VoiceBridge(QObject):
             self._needs_hands_ok = _takes(getattr(self.runtime, "submit", None), "needs_hands")
             self._log("bridge", op="needs_hands_probe", supported=self._needs_hands_ok)
         return bool(self._needs_hands_ok)
+
+    def _takes(self, name: str) -> bool:
+        """Whether ``runtime.submit`` names the parameter ``name`` (probed once per name, never assumed)."""
+        cache = self.__dict__.setdefault("_submit_params", {})
+        if name not in cache:
+            cache[name] = _takes(getattr(self.runtime, "submit", None), name)
+            self._log("bridge", op="submit_probe", param=name, supported=cache[name])
+        return bool(cache[name])
+
+    def _name_app(self, job: Job, app: str) -> None:
+        """On the GUI thread: the app the user named, for a job already submitted (its thinker started early, or a
+        follow-up steered into it): the runtime gives it to that request's agent for its judge (V4). Probed."""
+        name = getattr(self.runtime, "name_app", None)
+        if job.job_id is None or not callable(name):
+            job.app_named = app   # given with the submit if it has not happened yet
+            return
+        try:
+            name(job.job_id, app)
+        except Exception as exc:  # noqa: BLE001 - the note in the request still says it
+            self._log("bridge_error", error=f"name_app: {type(exc).__name__}: {exc}")
 
     def _takes_user_words(self) -> bool:
         """Whether ``runtime.submit`` names a ``user_words`` parameter (34-review H4; probed once, never assumed)."""
@@ -2166,10 +2191,12 @@ class VoiceBridge(QObject):
         request = str(args.get("request") or "").strip() or (heard[-1] if heard else "")
         if not request or self._loop is None:
             return False
+        app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
         text = brain_request(request, heard, context=str(args.get("context") or "").strip() or None,
                              done_before=self.actions.text(), said=spoken_words(context),
-                             tabs=self.tabs_for_thinker())
+                             tabs=self.tabs_for_thinker(), app_named=app_named)
         job = self._new_job(request)
+        job.app_named = app_named
         job.acked = bool(str(args.get("say_first") or "").strip())
         with self._lock:
             self._unsubmitted[job.token] = job

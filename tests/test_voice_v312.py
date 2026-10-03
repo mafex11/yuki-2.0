@@ -228,7 +228,7 @@ def test_a_wake_right_after_a_goodbye_is_judged_not_taken_as_addressed() -> None
     from yuki.voice.mouth import MOUTH_PROMPT, volatile_block
 
     assert "this conversation had ended with a goodbye" in volatile_block(after_goodbye=True)["text"]   # v3.13 wording
-    assert "never say one without the call" in MOUTH_PROMPT
+    assert "A goodbye without the call leaves you listening" in MOUTH_PROMPT   # vfix V3 wording
     assert "I had a long talk" in MOUTH_PROMPT   # talk about Yuki is not calling her
 
 
@@ -342,5 +342,5 @@ def test_only_the_users_own_switch_turns_listening_off_and_turning_it_on_ends_a_
 def test_stop_listening_alone_ends_the_conversation_and_is_never_quiet_time() -> None:
     from yuki.voice.mouth import GO_QUIET, MOUTH_PROMPT
 
-    assert "you keep listening for it" in MOUTH_PROMPT
-    assert "use end_conversation for those" in GO_QUIET["description"]
+    assert "you wait for your name again" in MOUTH_PROMPT   # vfix V1 wording
+    assert "are end_conversation, never this" in GO_QUIET["description"]

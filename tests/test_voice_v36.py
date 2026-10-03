@@ -654,15 +654,15 @@ def test_yukis_own_name_is_never_a_doubtful_word_and_the_cut_first_word_is_forgi
 
 
 def test_staying_quiet_on_the_first_words_after_the_name_is_refused_once() -> None:
+    """vfix V2 (3 Oct): no longer refused. A stay_quiet on the user's words is final; the volatile block still tells
+    the talker the words after its name were said to it, and the prompt's addressee rule does the rest."""
     async def main() -> None:
         _rt, bridge = _bridge()
         bridge.user_turn = lambda: True
         bridge.named_turn = lambda: True
-        first, second = Params(), Params()
+        first = Params()
         await bridge.stay_quiet(first)
-        await bridge.stay_quiet(second)
-        assert "not_quiet" in first.results[0][0]
-        assert second.results[0][0] == {"ok": True}  # once: a second one is its considered choice
+        assert first.results[0][0] == {"ok": True}
 
     asyncio.run(main())
 

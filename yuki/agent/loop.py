@@ -230,6 +230,9 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
     own = details.get("verified")
     if isinstance(own, bool):
         return own, "its report says it was " + ("seen" if own else "not seen")
+    if name == "scroll" and details.get("unverifiable") == "page":
+        # V6: a web page that takes no UI Automation scrolling never shows its scroll from here: expected, not trouble
+        return None, finish_gate.PAGE_SCROLL_UNVERIFIABLE
     if name in ("scroll", "tab", "app_volume", "hover"):
         return None, "its report could not tell whether it took effect"
     if name == "open_url" or (name == "launch_app" and details.get("page_verified") is not None):
@@ -823,6 +826,12 @@ class Agent:
         if text:
             self._steers.put(text)
 
+    def set_app_named(self, app: str | None) -> None:
+        """V4: the app or route the user named for the request running now (a voice hand-off whose thinker started
+        before the talker's call was complete gets it this way). The authorization judge compares a send's target app
+        with it from the next call on. Safe from any thread (one attribute)."""
+        self._request_app_named = " ".join(str(app or "").split())[:80] or None
+
     def take_steers(self) -> list[str]:
         """Everything in the steering inbox, emptying it (what arrived too late for a request)."""
         out: list[str] = []
@@ -886,7 +895,7 @@ class Agent:
         view_hwnd: int | None = None, escalate: tuple[str | None, bool | None] | None = None,
         voice: bool = False, memory_query: str | None = None, previous_query: str | None = None,
         memory_apps: Iterable[str] | None = None, pack: "RequestPack | None" = None,
-        user_words: Iterable[str] | str | None = None,
+        user_words: Iterable[str] | str | None = None, app_named: str | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -941,6 +950,9 @@ class Agent:
                 reads as the user's own words, while the talker's ``request`` is shown to it as Yuki's reading, which
                 never authorises a send (review 34 H4). ``None``: the heard turns in the hand-off's own notes; a typed
                 request's own text is the user's words.
+            app_named: The app or route the user named for this request in their own words (V4, 3 Oct: the voice
+                talker's ``app_named``, taken from the heard words). It wins over the usual route: the task frame says
+                so above the person's routes, and the authorization judge compares a send's target app with it.
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -962,6 +974,8 @@ class Agent:
         self._nonce = new_nonce()
         self._confirmed = set()
         self._request_text = request
+        #: V4: the app or route the user named for this request (the voice's structured field), or None.
+        self._request_app_named = " ".join(str(app_named or "").split())[:80] or None
         self._requests += 1
         self._actions = []
         #: What this request's actions measured (v3.15 counters; the done's optional learned note is a hint for practice
@@ -2249,7 +2263,7 @@ class Agent:
             # What the action's own report verifies (v3.14): an outcome is said only on a verified effect.
             verdict = action_verdict(name, outcome)
             hwnd_acted = target.get("hwnd")
-            if (verdict[0] is None and outcome.ok and verdict[1] != EXPECTED_UNVERIFIABLE
+            if (verdict[0] is None and outcome.ok and not finish_gate.is_expected(verdict[1])
                     and target.get("control")):
                 # Revamp D (S2): a control practice memory learned never shows its effect is expected-unverifiable.
                 learned = self._learned_control(name, target)
@@ -2770,7 +2784,8 @@ class Agent:
                                              apps=apps or (), screen=screen, action=action,
                                              payload=self._overview_payload)
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
-                                     overview=self._overview_payload, practice=getattr(fetched, "practice", None))
+                                     overview=self._overview_payload, practice=getattr(fetched, "practice", None),
+                                     named_app=getattr(self, "_request_app_named", None))
             self._frame = frame
             self._practice_shown = list(frame.playbooks)
             rest, personality = _split_personality(fetched.portrait)
@@ -2986,7 +3001,9 @@ class Agent:
                 dispatcher.input_gate = InputGate(
                     recent_s=float(getattr(self.settings, "input_yield_recent_s", 1.0)),
                     quiet_s=float(getattr(self.settings, "input_yield_quiet_s", 0.8)),
-                    max_s=float(getattr(self.settings, "input_yield_max_s", 12.0)))
+                    max_s=float(getattr(self.settings, "input_yield_max_s", 12.0)),
+                    probe_s=float(getattr(self.settings, "input_yield_probe_s", 0.25)),
+                    notify_after_s=float(getattr(self.settings, "input_yield_notify_s", 3.0)))
         except Exception:  # noqa: BLE001 - the hands work without it
             pass
 
@@ -3033,6 +3050,9 @@ class Agent:
             self._note_words(head or query, how="typed")
             return
         heard = [user_words] if isinstance(user_words, str) else list(user_words or [])
+        # V4 (3 Oct): the voice passed each heard turn as {"how", "text"}; the runtime turned each into its Python repr,
+        # so the judge read "{'how': 'voice', 'text': ...}". A dict entry is taken by its text (our own shape).
+        heard = [h.get("text") if isinstance(h, dict) else h for h in heard]
         heard = [" ".join(str(h).split()) for h in heard if h and str(h).strip()]
         if not heard and VOICE_HEARD_MARK in notes:   # the hand-off's own notes carry the heard turns
             block = notes[notes.find(VOICE_HEARD_MARK):]
@@ -3061,7 +3081,10 @@ class Agent:
         element = describe(tool_input) if callable(describe) else None
         if element:
             target["element"] = f"{element.get('role') or 'element'} \"{element.get('name') or ''}\""
-            target["control"] = f"{element.get('role') or ''}|{element.get('name') or ''}"
+            # V6: a scroll's control is its role in that app (a page's name is its title, different on every page),
+            # so what practice memory learns about scrolling there is learned per app
+            target["control"] = (f"{element.get('role') or ''}|" if name == "scroll"
+                                 else f"{element.get('role') or ''}|{element.get('name') or ''}")
             target["role"] = element.get("role") or ""
         elif name == "click":
             # Review 34 H2: a click at raw coordinates is gated by the element under the point in the latest read.
@@ -3101,7 +3124,9 @@ class Agent:
                         for s in getattr(self, "_trace", []) if s.get("tool") == "read_file"]
         verdict = self.authorizer.check(name, tool_input, words=list(self._user_words), target=target,
                                         signature=call_signature(acting_input(tool_input)), earlier=earlier,
-                                        files_read=outbound)
+                                        files_read=outbound,
+                                        **({"named_app": self._request_app_named}
+                                           if getattr(self, "_request_app_named", None) else {}))
         if self.authorizer.stopped and verdict is not None and not verdict.allowed:
             self._denial_stop = self.authorizer.stopped
         return verdict

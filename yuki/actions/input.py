@@ -2726,6 +2726,10 @@ def scroll(
     details["scrolls"] = axes
     moved = [a["moved"] for a in axes]
     details["verified"] = True if all(m is True for m in moved) else (False if any(m is False for m in moved) else None)
+    if details["verified"] is None and any(a.get("page") and a.get("moved") is None for a in axes):
+        # V6 (3 Oct): a web page that takes no UI Automation scrolling cannot show its scroll from here: expected for
+        # that kind of page (the finish gate's expected-unverifiable), never "did not scroll"
+        details["unverifiable"] = "page"
     return _result(all(oks), "; ".join(parts), details, started)
 
 

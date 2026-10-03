@@ -114,7 +114,7 @@ def test_silence_stands_while_a_hand_opens_what_they_just_confirmed() -> None:
         bridge.user_turns = lambda: 5
         again = _quiet_params(bridge)
         await bridge.stay_quiet(again)
-        assert "not_quiet" in again.results[-1][0]   # nothing on its way: a live exchange still gets words
+        assert again.results[-1][0] == {"ok": True}   # vfix V2: a stay_quiet on their words is final
 
     asyncio.run(main())
 

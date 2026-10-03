@@ -597,6 +597,10 @@ class Settings:
     input_yield_recent_s: float = 1.0
     input_yield_quiet_s: float = 0.8
     input_yield_max_s: float = 12.0
+    #: V8 (3 Oct): how long recent input is watched to tell a key or click from the mouse moving (mouse moves alone
+    #: never hold Yuki back), and how long a wait lasts before its one line is said (silent before).
+    input_yield_probe_s: float = 0.25
+    input_yield_notify_s: float = 3.0
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
 

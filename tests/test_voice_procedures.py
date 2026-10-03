@@ -991,7 +991,8 @@ def test_a_hand_off_passes_what_speech_recognition_heard_apart_as_the_users_word
         return rt.submitted
 
     got = asyncio.run(main(WordsRuntime()))
-    assert got[-1][2]["user_words"] == [{"how": "voice", "text": "message sam"}]
+    # vfix V4: plain strings, the runtime's contract (as {"how", "text"} dicts they reached the judge as Python reprs)
+    assert got[-1][2]["user_words"] == ["message sam"]
     assert "user_words" not in asyncio.run(main(FakeRuntime()))[-1][2]
 
 

@@ -878,9 +878,9 @@ def test_silence_is_refused_once_when_the_user_is_waiting() -> None:
         bridge.call_mode = lambda: False
         bridge.in_exchange = lambda: True
         p = Params()
-        await bridge.stay_quiet(p)  # "Thanks." right after Yuki spoke: answered
-        assert "not_quiet" in p.results[-1][0]
-        await bridge.stay_quiet(p)  # the mouth's second, considered choice stands
+        await bridge.stay_quiet(p)  # vfix V2: a stay_quiet on the user's words is final, in an exchange too
+        assert p.results[-1][0] == {"ok": True}
+        await bridge.stay_quiet(p)
         assert p.results[-1][0] == {"ok": True}
         bridge.call_mode = lambda: True  # in a call, quiet is the mouth's judgement at once
         turns["n"] = 5

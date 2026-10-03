@@ -126,6 +126,12 @@ _FAILED_NOTE = (
     "with the user's request as they asked it and this report as context. If the report says why nothing "
     "more can happen (already at the end), say that and stop."
 )
+#: V6 (3 Oct): a hand whose effect cannot be read back by the nature of its target (a web page that does not report
+#: its scroll): done, nothing said, nothing handed over.
+_EXPECTED_NOTE = (
+    "It was done; this page does not report its scroll position, so it cannot be checked from here (normal for this "
+    "page, not a failure). Say nothing now. If they say it did not move, hand it to the thinker."
+)
 #: What the talker reads when a hand's try did not take effect and code handed it to the thinker (v3.9).
 _PASSED_NOTE = (
     "It did not take effect, so it was handed to the thinker with this report and the window already read; "
@@ -243,6 +249,9 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "window": _WINDOW,
             "direction": {"type": "string", "enum": ["up", "down"]},
             "amount": {"type": "integer", "description": "Notches (default 5; a screenful is about 10)."},
+            "keep": {"type": "string", "enum": ["start", "stop"], "description": (
+                "start: go on scrolling in steps by itself until they say stop; stop: end that.")},
+            "pace": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "With keep start."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "direction", "say_when_done"],
@@ -1337,6 +1346,14 @@ class Hands:
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _ACT_OFF_NOTE.format(
                 app=facts["act_off"])})
             return
+        if ok and facts.get("expected"):
+            # V6: done, and its effect cannot be read back by the nature of the target (a web page's scroll): no
+            # second talker run, no hand-off; they watch it happen
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            await params.result_callback({"done": report[:700], "how_to_handle_it": _EXPECTED_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         if name == "press_keys" and ok:
             note, key = _KEYS_NOTE, "report"
         elif ok:
@@ -1613,6 +1630,8 @@ class Hands:
     def _run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
         """Blocking: validate, act through the backend, verify, return ``(ok, report, facts)``."""
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
+        if name == "scroll" and args.get("keep") == "stop":
+            return self._stop_scrolling(facts)   # V7: stopping always works (while the thinker works, after trouble)
         try:
             self._guard_desk(name)
             if name != SKILL_HAND:
@@ -1717,6 +1736,8 @@ class Hands:
                 report += "; " + words
                 facts["verified"] = changed
             return ok, report, facts
+        if name == "scroll" and args.get("keep") == "start":
+            return self._keep_scrolling(args, facts)   # V7: on and on, until they say stop
         if name == "scroll":
             hwnd = self._window(args)
             direction = str(args.get("direction") or "down")
@@ -1730,6 +1751,12 @@ class Hands:
             if _detail(result, "at_end") or any(isinstance(x, dict) and x.get("at_end")
                                                 for x in (_detail(result, "scrolls") or [])):
                 facts["settled"] = True  # already at the end: nothing more can happen, nothing to hand over
+            if ok and facts["verified"] is None and _detail(result, "unverifiable") == "page":
+                # V6: a web page that does not report its scroll: expected-unverifiable, not trouble to hand over
+                from yuki.agent.finish import PAGE_SCROLL_UNVERIFIABLE
+
+                facts["expected"] = facts["settled"] = True
+                facts["why"] = PAGE_SCROLL_UNVERIFIABLE
             return ok, report, facts
         if name == "window":
             hwnd = self._window(args)
@@ -2328,6 +2355,83 @@ class Hands:
         return True, (f"the volume is now {after.get('level')}%{' (muted)' if after.get('muted') else ''} "
                       f"(was {before.get('level')}%{' muted' if before.get('muted') else ''})")
 
+    # -- V7: keep scrolling until they say stop ---------------------------------------------------------------------
+
+    #: What is said by code when a continuous scroll stopped by itself (a measured outcome of their own request; a stop
+    #: they asked for, or their taking over, is silent).
+    SCROLL_STOPPED_LINES = {"end": "That's the end of the page.", "limit": "I'll stop scrolling there.",
+                            "failed": "It's stopped scrolling."}
+
+    def _keep_scrolling(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """Start the continuous scroll (:class:`yuki.actions.scrolling.ContinuousScroll`) on a window the talker was
+        shown: the first step runs here and is the hand's report; the rest run on their own thread."""
+        from yuki.actions.scrolling import (
+            PACES, ContinuousScroll, input_watch, start_continuous, step_result, voice_hold,
+        )
+        from yuki.agent.finish import app_name
+
+        hwnd = self._window(args)
+        direction = "up" if str(args.get("direction") or "down") == "up" else "down"
+        pace = str(args.get("pace") or "normal")
+        pace = pace if pace in PACES else "normal"
+        dy = PACES[pace][1] * (1 if direction == "up" else -1)
+        lead = self._front(hwnd)
+        x, y = self._scroll_point(hwnd)
+        backend = self.backend
+
+        def step() -> Any:
+            return step_result(backend.scroll(x, y, dy=dy, expect_hwnd=hwnd))
+
+        facts["sent_at"] = time.monotonic()
+        first = step()
+        if not first.ok or (first.moved is False and not first.at_end):
+            facts["verified"] = False
+            return False, lead + first.report, facts
+        if first.at_end:
+            facts["verified"], facts["settled"] = False, True
+            return True, (f"{lead}{first.report}: already at the {'bottom' if direction == 'down' else 'top'}, "
+                          f"nothing more to scroll"), facts
+        title = self._title_shown(hwnd)
+        where = f"{app_name(self._app_at(hwnd))} \"{title[:60]}\"" if title else app_name(self._app_at(hwnd))
+        start_continuous(ContinuousScroll(step, where=where, direction=direction, pace=pace, hold=voice_hold,
+                                          took_over=input_watch(), on_stop=self._scroll_stopped, steps_done=1))
+        facts["verified"] = first.moved            # True when the page reports its position; None on a web page
+        facts["settled"] = facts["continuous"] = True   # it goes on by itself: nothing to hand over
+        if first.moved is not True:
+            facts["expected"] = True
+        return True, (f"{lead}scrolling {direction} by itself now, a step every {PACES[pace][0]:g} s "
+                      f"({first.report}); it pauses while they talk; scroll with keep stop ends it"), facts
+
+    def _stop_scrolling(self, facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """Stop the continuous scroll (V7): its report says where it stopped."""
+        from yuki.actions.scrolling import stop_continuous, stopped_words
+
+        report = stop_continuous("voice")
+        facts["verified"], facts["settled"] = True, True   # it is not scrolling now, either way
+        facts["steps"] = int(report["steps"]) if report else 0
+        return True, (stopped_words(report) if report else "nothing was scrolling, so there was nothing to stop"), facts
+
+    def _scroll_stopped(self, report: dict[str, Any]) -> None:
+        """A continuous scroll stopped by itself (its own thread): into the action log, and a short line by code when it
+        reached the end, its limit, or would not scroll any more."""
+        from yuki.actions.scrolling import stopped_words
+
+        why = str(report.get("why") or "")
+        self.actions.add("your hand", "scroll keep (stopped by itself)", stopped_words(report)[:400],
+                         ok=why != "failed", verified=None)
+        if self.log is not None:
+            self.log.event("hands", op="scroll_keep", stopped=why, steps=report.get("steps"),
+                           seconds=report.get("seconds"))
+        line = self.SCROLL_STOPPED_LINES.get(why)
+        bridge = self.bridge
+        speak = getattr(bridge, "speak", None) if bridge is not None else None
+        loop = getattr(bridge, "_loop", None) if bridge is not None else None
+        if line and callable(speak) and loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(speak(line), loop)
+            except Exception:  # noqa: BLE001 - the action log has it anyway
+                pass
+
     def _scroll_point(self, hwnd: int) -> tuple[int, int]:
         """The window's centre: its content, whatever the cursor is over (plumbing: where to look for it)."""
         with self._lock:
@@ -2377,8 +2481,8 @@ def _is_address(text: str) -> bool:
 def _what(name: str, args: dict[str, Any]) -> str:
     """One line naming a hand's action from its arguments (for the shared action log)."""
     parts = [name]
-    for key in ("skill", "window", "tab", "action", "direction", "amount", "key", "keys", "times", "url", "app", "name",
-                "level", "change", "mute", "page"):
+    for key in ("skill", "window", "tab", "action", "direction", "amount", "keep", "key", "keys", "times", "url", "app",
+                "name", "level", "change", "mute", "page"):
         if args.get(key) not in (None, "", []):
             parts.append(f"{key}={args[key]}")
     return " ".join(str(p) for p in parts)
@@ -2419,8 +2523,9 @@ def judged_call(name: str, args: dict[str, Any], *, tab_names: list[str] | None 
         return "click", {"hwnd": w, "item": args.get("item")}
     if name == "type":
         return "type_text", {"hwnd": w, "text": str(args.get("text") or "")}
-    if name == "scroll":
-        return "scroll", {"hwnd": w, "direction": args.get("direction"), "amount": args.get("amount")}
+    if name == "scroll":   # V7: keep start is the same kind of step, repeated (keep stop never reaches the check)
+        return "scroll", {"hwnd": w, "direction": args.get("direction"), "amount": args.get("amount"),
+                          **({"until_stopped": True} if args.get("keep") == "start" else {})}
     if name == "open_url":
         return "open_url", {"url": args.get("url"), **({"app": args["app"]} if args.get("app") else {})}
     if name == "open_app":

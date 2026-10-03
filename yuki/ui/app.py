@@ -390,6 +390,14 @@ class YukiUi(QObject):
                     self.strip.stopping()
             self.runtime.cancel_worker()
             self.voice.interrupt()
+            try:   # V7: a page scrolling on by itself stops too
+                from yuki.actions.scrolling import stop_continuous
+
+                stopped = stop_continuous("stop", wait_s=0.0)
+                if stopped is not None:
+                    self.ui_log.event("keep_scrolling", stopped="stop", steps=stopped.get("steps"))
+            except Exception:  # noqa: BLE001 - the cancel itself already happened
+                pass
             return
         if action == "voice":
             self.voice.toggle_conversation("hotkey")

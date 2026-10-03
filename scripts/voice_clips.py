@@ -416,6 +416,11 @@ def plan(which: str) -> list[dict]:
         for name, text in V318_CLIPS:
             items.append({"set": "v318", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": False})
+    if which in ("vfix",):
+        provider, voice = VFIX_USER
+        for name, text in VFIX_CLIPS:
+            items.append({"set": "vfix", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": name == "k_name"})
     if which in ("names",):
         for provider, voice in NAMES_VOICES:
             tag = voice.replace("aura-2-", "").replace("-en", "")[:6]
@@ -455,11 +460,21 @@ V318_CLIPS = [
 ]
 
 
+#: vfix (report 40, V1-V3): ways the user ends a conversation, for voice_session_offline.py's "endings" scenario (the
+#: real session's words stay private; these are generic).
+VFIX_USER = ("deepgram", "aura-2-apollo-en")
+VFIX_CLIPS = [
+    ("k_name", "Yuki."), ("e_whatsup", "What's up?"), ("e_shutup", "Shut up."),
+    ("e_goaway", "Go away for now, man."), ("e_bye", "Okay, bye."),
+    ("e_mistake", "Oh, never mind, wrong moment, sorry. You can go back to sleep."),
+]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "v314",
-                                                     "v318", "all"))
+                                                     "v318", "vfix", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

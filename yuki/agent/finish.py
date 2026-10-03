@@ -40,6 +40,11 @@ EXPECTED_UNVERIFIABLE = ("the field shows no text to read back (expected for thi
 #: The reason when practice memory has learned the control behaves so.
 LEARNED_UNVERIFIABLE = ("this control's report never shows the effect (learned: {n} earlier runs confirmed it worked "
                         "afterwards, none contradicted it)")
+#: V6 (3 Oct): a scroll on a web page that takes no UI Automation scrolling: the wheel went in, and the page does not
+#: report where it is (measured on each scroll: no scroll pattern, the point inside a page). Live a page scrolled and
+#: was reported as "did not scroll", and Yuki told the user so while they watched it move.
+PAGE_SCROLL_UNVERIFIABLE = ("the web page does not report its scroll position here (expected for a page in this app, "
+                            "not a failure; the wheel went in)")
 
 VERIFIED, EXPECTED, CONTRADICTED, UNVERIFIED, FAILED = "verified", "expected", "contradicted", "unverified", "failed"
 
@@ -56,7 +61,8 @@ def classify(ok: bool, verdict: bool | None, why: str) -> str:
         return VERIFIED
     if verdict is False:
         return CONTRADICTED
-    if why == EXPECTED_UNVERIFIABLE or why.startswith(LEARNED_UNVERIFIABLE.split("{")[0]):
+    if (why in (EXPECTED_UNVERIFIABLE, PAGE_SCROLL_UNVERIFIABLE)
+            or why.startswith(LEARNED_UNVERIFIABLE.split("{")[0])):
         return EXPECTED
     return UNVERIFIED
 
@@ -196,5 +202,5 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
 
 
 __all__ = ["CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
-           "LEARNED_UNVERIFIABLE", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line",
-           "finish_request", "is_expected", "similar"]
+           "LEARNED_UNVERIFIABLE", "PAGE_SCROLL_UNVERIFIABLE", "UNVERIFIED", "VERIFIED", "app_name", "classify",
+           "confirm_send", "finish_line", "finish_request", "is_expected", "similar"]

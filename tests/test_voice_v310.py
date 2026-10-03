@@ -349,6 +349,8 @@ def _quiet_params(bridge: Any) -> Any:
 
 
 def test_a_sure_call_keeps_the_talkers_silence_and_stale_evidence_refuses_it_once() -> None:
+    """vfix V2 (3 Oct): the talker's silence on the user's words is final in every case now (with stale evidence the
+    call layer's prompt makes plain instructions Yuki's; code no longer makes it speak after it chose silence)."""
     async def main() -> None:
         rt, bridge = _bridge()
         bridge.user_turn = lambda: True
@@ -364,7 +366,7 @@ def test_a_sure_call_keeps_the_talkers_silence_and_stale_evidence_refuses_it_onc
         bridge.user_turns = lambda: 6
         unsure = _quiet_params(bridge)
         await bridge.stay_quiet(unsure)
-        assert "not_quiet" in unsure.results[-1][0]   # old evidence: plain words are for Yuki
+        assert unsure.results[-1][0] == {"ok": True}   # V2: final; the stale call layer decides in the prompt
 
     asyncio.run(main())
 

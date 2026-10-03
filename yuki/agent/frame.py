@@ -315,9 +315,20 @@ def preconditions(person: dict[str, Any], overview: Any) -> list[str]:
     return [f"No {app} window is open now ({', '.join(sorted(procs))} not running or no window)."]
 
 
+def named_app_line(app: str | None) -> str:
+    """V4 (3 Oct): the line that puts the app the user named above every usual route ("" without one). A send went
+    to the person's usual app while the user had named another one."""
+    app = " ".join(str(app or "").split())[:80]
+    if not app:
+        return ""
+    return (f"The user named where to do this themselves: {app}. Use that app or route (their chat there, found by "
+            f"the name it knows them by); it wins over the usual route below, and over the request's wording.")
+
+
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
-          chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None) -> TaskFrame:
+          chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
+          named_app: str | None = None) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
     metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
     words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
@@ -352,6 +363,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                                   "samples": r.get("samples") or []})
         lines = _referent_lines(frame, routes, {p["id"] for p in frame.persons})
         lines += _person_lines(frame, overview)
+        named = named_app_line(named_app)
+        if named:
+            lines.insert(0, named)   # first, so the size limit never cuts it and it reads before any usual route
         tail: list[str] = []
         if isinstance(practice, dict):
             # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
