@@ -816,7 +816,8 @@ class TrayHoverCard(QWidget):
                 "off": "not-listening", "game": "game-quiet"}.get(info.state, info.state)
         self.face.set_state(face if info.state in TRAY_STATES else "idle",
                             (max(1, info.cur + 1), max(1, info.of)) if info.of else None)
-        self.line.set_text(info.line)
+        at = info.line.find(info.timer) if getattr(info, "timer", "") else -1
+        self.line.set_text(info.line, [L.Span(at, len(info.timer), color=L.live())] if at >= 0 else None)
         self.sub.set_text(info.sub)
         self.sub.setVisible(bool(info.sub))
         kind = info.task_kind if info.task else ""

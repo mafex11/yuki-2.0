@@ -255,6 +255,7 @@ class TrayCardInfo:
     last: str = ""
     listen: bool = True
     game: bool = False
+    timer: str = ""                   # the call's running time inside ``line`` (drawn in the live colour)
 
 
 LISTEN_OFF_TEXT = ("I can't hear you or talk. Typing still works. Call notes still record your mic; "
@@ -662,7 +663,7 @@ class TrayWatch(QObject):
         timer = self.island.call_time() if self._recording() else ""
         hot = self._hotkey()
         info = TrayCardInfo(state=state, listen=bool(getattr(self.voice, "wake_enabled", i.listening != "off")),
-                            game=state == "game")
+                            game=state == "game", timer=timer)
         last = getattr(self.island, "last_final", None)
         info.last = f"{last[0]} · {natural_when(last[2])}" if last and last[0] else "Nothing yet"
         run = i.run
@@ -703,11 +704,13 @@ class TrayWatch(QObject):
         elif state == "call-ask":
             info.line, info.sub = f"On {app} · not recording", "Waiting for your answer on the card"
         elif state == "call":
-            info.line, info.sub = f"On {app} · {timer}", "Recording only your mic"
+            info.line, info.sub = f"On {app} · {timer} · recording only your mic", ""
         elif state == "off":
             info.line = "Voice is off"
             info.sub = {"quiet": "Quiet for a while", "call_off": "Paused for this call"}.get(
                 i.listening, "I’m not listening or speaking")
+            if timer:                    # call notes still record your mic: the card keeps the call's time
+                info.sub = f"Call notes · {app} · {timer}"
         elif state == "game":
             info.line = "Quiet while you play"
             info.sub = f"On {app} · {timer} · your mic only" if timer else "Cards wait until you’re back"
