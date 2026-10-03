@@ -73,6 +73,14 @@ Calls, just the user's side (the service's call worker, yuki.memory.calls)::
     memory.erase_call_audio() -> int                     # "Erase waiting call audio"
     memory.call_prefs() -> list[dict];  memory.set_call_pref(app, "always" | "never" | None)
 
+People and routes (migration 28, yuki.memory.contacts; SQL only, no model call)::
+
+    memory.contact(ref, near=None) -> dict | None        # one person: routes ranked with counts and margin, their
+                                                          # aliases and misheard names, the user's last messages each
+    memory.people_directory() -> str                     # the compact people block (<= ~900 chars) for cached layers
+    memory.prefer_route(ref, "route:N", words) -> dict   # the user's lasting route choice, in their own words
+    memory.frame_facts(words, said=, screen=, apps=)     # what the task frame needs (yuki.agent.frame)
+
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
     memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, times, speech, gists
@@ -2484,7 +2492,7 @@ class MemoryClient:
     def related(self, query: str = "", *, previous: str | None = None, screen: Any = None, limit: int | None = None,
                 voice: bool = False, embed_wait_s: float | None = None, now: float | None = None,
                 with_recent: bool = True, session_id: str | None = None, exclude_recent_s: float | None = None,
-                diet: bool = False) -> dict:
+                diet: bool = False, action: bool = False) -> dict:
         """What the whole memory holds that bears on this moment: ranked from the user's words (and the previous
         message), what is on their screen now and their current thread of work, across every kind of memory
         (:func:`yuki.memory.related.related`). ``screen``: a live picture from the caller (a dict with ``app``,
@@ -2495,7 +2503,9 @@ class MemoryClient:
         any exchange of the last ``exclude_recent_s`` seconds (default :data:`yuki.memory.related.SELF_ECHO_S`),
         are the conversation itself, never memory (revamp 02 D2). ``diet``: the brain's relevance-gated block
         (threads on screen or near the words, recent screens of the last minutes or near the words; the agent asks
-        for it, the voice talker and the MCP tools get the whole picture)."""
+        for it, the voice talker and the MCP tools get the whole picture). ``action``: the request asks Yuki to act
+        (the caller's measure): Yuki's own past exchanges from other days weigh less
+        (:data:`yuki.memory.related.ACTION_OWN_DISCOUNT`)."""
         from yuki.memory import related as rel
 
         try:
@@ -2504,7 +2514,7 @@ class MemoryClient:
                                embed_wait_s=embed_wait_s, now=now, service=service, with_recent=with_recent,
                                session_id=session_id,
                                exclude_recent_s=rel.SELF_ECHO_S if exclude_recent_s is None else exclude_recent_s,
-                               diet=bool(diet) and bool((query or "").strip()) and not voice)
+                               diet=bool(diet) and bool((query or "").strip()) and not voice, action=bool(action))
         except Exception as exc:
             return {"items": [], "screen": None, "threads": [], "recent": [], "timing": {"error": type(exc).__name__}}
 
@@ -2635,6 +2645,257 @@ class MemoryClient:
                  "last_seen": _iso(link.last_seen), "seconds": round(secs.get(link.id, 0.0), 1), "visits": link.visits,
                  "thread": f"thread:{link.work_thread_id}" if link.work_thread_id else None, "by_yuki": link.by_yuki,
                  "score": link.score, "line": _links.describe(link, secs.get(link.id))} for link in found]
+
+    # ======================================================================================================
+    # People and routes (revamp Phase B, migration 28, yuki.memory.contacts): who the user talks to and where,
+    # the compact directory for cached prompt layers, the user's route preference, and what the task frame needs.
+    # SQL only, no model call.
+    # ======================================================================================================
+
+    def _near_thread(self, near: Any) -> int | None:
+        """A capture thread id from ``near``: an id, ``thread`` / ``capture_thread`` in a dict, or a screen dict
+        (``app``, ``title``, ``url``, ``process``, ``scope``) found as memory's thread of that window."""
+        if near is None:
+            return None
+        if isinstance(near, int) and not isinstance(near, bool):
+            return int(near)
+        if isinstance(near, dict):
+            for key in ("thread_id", "capture_thread"):
+                if isinstance(near.get(key), int):
+                    return int(near[key])
+            try:
+                return self.store.find_thread(near.get("app"), near.get("title"), near.get("url"),
+                                              process=near.get("process"), scope=near.get("scope"))
+            except Exception:
+                return None
+        return None
+
+    def contact(self, ref: Any, near: Any = None) -> dict | None:
+        """One person the user talks to, by name, alias, a misheard form the user corrected, or ``contact:N`` /
+        ``route:N``: ``{"found": True, "ref", "name", "relation", "aliases", "heard", "tone", "facts", "routes": [...],
+        "margin", "close", "usual", "preferred", "calls", "text", "others"}`` - routes most used lately first with
+        message counts both ways and the user's own last messages on each (decrypted now, for this person only);
+        ``margin``/``close`` say how clearly the first route leads (``yuki.memory.contacts.ROUTE_MARGIN``). ``near``: the
+        window in front (a capture thread id or a screen dict): its route is marked ``in_front``, and among several
+        people the one with a route there comes first. ``{"found": False, "people": [...]}`` when nobody fits;
+        ``None`` when memory cannot be read. Never raises."""
+        from yuki.memory import contacts as _c
+
+        try:
+            near_thread = self._near_thread(near)
+            found = _c.resolve(self.store, ref, near_thread=near_thread)
+            if not found:
+                return {"found": False, "ref": str(ref or ""), "people": [p.name for p in _c.people(self.store)][:20]}
+            card = _c.card(self.store, found[0], near_thread=near_thread)
+            return {"found": True, **card, "text": _c.card_text(card), "others": [p.name for p in found[1:4]]}
+        except Exception:
+            return None
+
+    def people_directory(self) -> str:
+        """The compact people block (<= ~900 characters, ``yuki.memory.contacts.directory``): each person the user
+        talks to with their relation, aliases (names speech recognition misheard too), where the user talks with them
+        most used lately first, and how the user writes to them; then the group chats the user writes in most. For
+        the cached profile layer of the typed agent, the voice thinker and the voice talker. A plain string, ``""``
+        when memory has no people index yet. Never raises."""
+        from yuki.memory import contacts as _c
+
+        try:
+            return _c.directory(self.store)
+        except Exception:
+            return ""
+
+    def prefer_route(self, ref: Any, route: Any, words: str, *, source: str = "agent") -> dict:
+        """Store the user's lasting choice of route for a person ("no, the other one", "use WhatsApp for him"), in
+        their own ``words``; ``route``: ``route:N`` as :meth:`contact` lists it. That route comes first for them from
+        now on (it survives a rebuild of the index). ``{"ok", "id", "person", "route"}`` or ``{"ok": False, "error"}``.
+        Never raises."""
+        from yuki.memory import contacts as _c
+
+        try:
+            found = _c.resolve(self.store, ref)
+            text = " ".join(str(route or "").split())
+            head, _, num = text.partition(":")
+            if not found:
+                return {"ok": False, "error": f"no person {ref!r} in memory's people index"}
+            if head.strip().lower() != "route" or not num.strip().isdigit():
+                return {"ok": False, "error": "route must be route:N as about lists it"}
+            person = found[0]
+            target = next((r for r in person.routes if r.id == int(num)), None)
+            if target is None:
+                return {"ok": False, "error": f"{text} is not one of {person.name}'s routes"}
+            out = _c.prefer_route(self.store, person, target, words, source=source)
+            return {**out, "person": person.name, "route": target.label(with_service=True)}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def frame_facts(self, words: str = "", *, said: Any = (), screen: Any = None, apps: Any = (),
+                    now: float | None = None, people_limit: int = 4) -> dict:
+        """What the task frame needs from memory, in one read (``yuki.agent.frame`` builds the referent register and
+        the frame from it; code only):
+
+        * ``named``: people whose name or alias the request's ``words`` contain;
+        * ``said``: people named earlier in this conversation (``said``: ``[{"at", "text", "who"}]``, the user's words
+          and Yuki's replies), newest first, with the words as matched and who said them;
+        * ``front``: the chat in front (``screen``: the window's app, title, url, process, scope) and the people with a
+          route in it;
+        * ``recent``: people whose chat was in front in the last minutes; ``call``: the call going on and the people
+          around it;
+        * ``routes``: for the people in play (at most ``people_limit``), their routes ranked with the margin;
+        * ``pitfalls``: what did not work before in the apps in play (know-how's "Not:" part: the app in front, the
+          ``apps`` given, the apps of the people's usual routes), newest first.
+
+        Every person comes as ``{"id", "ref", "name", "relation", "heard"}``. Never raises (missing parts are empty)."""
+        from yuki.memory import contacts as _c
+
+        started = time.perf_counter()
+        now = time.time() if now is None else float(now)
+        out: dict[str, Any] = {"named": [], "said": [], "front": None, "recent": [], "call": None, "routes": {},
+                               "pitfalls": [], "people": 0}
+
+        def lite(c: Any) -> dict[str, Any]:
+            return {"id": c.id, "ref": c.ref, "name": c.name, "relation": c.relation, "heard": c.heard()}
+
+        try:
+            everyone = _c.people(self.store)
+        except Exception:
+            everyone = []
+        out["people"] = len(everyone)
+        if not everyone:
+            out["pitfalls"] = self._pitfalls(apps, screen, [])
+            out["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return out
+        in_play: list[Any] = []
+        try:
+            for c, w in _c.named_in(self.store, words):
+                out["named"].append({**lite(c), "words": w})
+                in_play.append(c)
+        except Exception:
+            pass
+        try:
+            for item in sorted((s for s in said or [] if isinstance(s, dict)), key=lambda s: -float(s.get("at") or 0)):
+                for c, w in _c.named_in(self.store, str(item.get("text") or "")):
+                    if any(x["id"] == c.id for x in out["said"]):
+                        continue
+                    out["said"].append({**lite(c), "words": w, "at": float(item.get("at") or now),
+                                        "who": str(item.get("who") or "")})
+        except Exception:
+            pass
+        thread = self._near_thread(screen) if isinstance(screen, dict) else None
+        if thread is not None:
+            try:
+                hits = _c.contacts_of_threads(self.store, [thread]).get(thread, [])
+                place = next((r for r in _c.places(self.store) if thread in r.thread_ids), None)
+                kind = hits[0][1].kind if hits else (place.kind if place else None)
+                members = []
+                for c, r in hits:
+                    measured = _c.measure_route(self.store, r, c, now)
+                    members.append({**lite(c), "route": measured.label(with_service=True), "route_ref": measured.ref,
+                                    "last_theirs": measured.last_theirs, "theirs": measured.theirs})
+                members.sort(key=lambda m: -(m["last_theirs"] or 0.0))
+                if members or place is not None:
+                    out["front"] = {"thread_id": thread, "kind": kind, "people": members,
+                                    "chat": (place.chat if place else (hits[0][1].chat if hits else None))}
+                    for m in members[:2]:
+                        c = next((x for x in everyone if x.id == m["id"]), None)
+                        if c is not None and kind == "dm":
+                            in_play.append(c)
+            except Exception:
+                pass
+        try:
+            for item in _c.recent_chat_contacts(self.store, now=now):
+                out["recent"].append({**lite(item["contact"]), "route": item["route"].label(with_service=True),
+                                      "at": item["at"], "thread_id": item["thread_id"]})
+        except Exception:
+            pass
+        try:
+            call = _c.call_contacts(self.store, now=now)
+            if call is not None:
+                out["call"] = {"call_id": call["call_id"], "app": call["app"], "since": call["since"],
+                               "people": [{**lite(p["contact"]), "at": p["at"], "how": p["how"]}
+                                          for p in call["people"]]}
+        except Exception:
+            pass
+        for group in (out["said"][:1], out["recent"][:1]):
+            for p in group:
+                c = next((x for x in everyone if x.id == p["id"]), None)
+                if c is not None:
+                    in_play.append(c)
+        seen: set[int] = set()
+        route_apps: list[str] = []
+        place_rows: list[Any] | None = None
+        for c in in_play:
+            if c.id in seen or len(seen) >= people_limit:
+                continue
+            seen.add(c.id)
+            try:
+                ranking = _c.rank_routes(self.store, c, now=now)
+            except Exception:
+                continue
+            # the group chats on the same apps the user writes in most ("tag him in my usual channel")
+            try:
+                if place_rows is None:
+                    place_rows = [_c.measure_route(self.store, p, None, now) for p in _c.places(self.store)]
+                services = {r.service for r in ranking.routes}
+                keys = {r.key for r in ranking.routes}
+                nearby = sorted((p for p in place_rows if p.service in services and p.key not in keys and p.score > 0),
+                                key=lambda p: -p.score)[:2]
+            except Exception:
+                nearby = []
+            out["routes"][c.id] = {
+                "name": c.name, "relation": c.relation, "margin": ranking.margin, "close": ranking.close,
+                "preferred": ranking.preferred,
+                "routes": [{"ref": r.ref, "label": r.label(with_service=True), "app": r.app, "kind": r.kind,
+                            "mine": r.mine, "theirs": r.theirs, "last_mine": r.last_mine, "last_theirs": r.last_theirs,
+                            "preferred": r.preferred, "thread_ids": r.thread_ids, "service": r.service,
+                            "processes": self._route_processes(r.thread_ids),
+                            # how the app knows them there when it is not the name the user calls them (a DM's own
+                            # name, the sender name they write under): what to search for or mention
+                            "known_as": next((n for n in (r.handle, r.chat if r.kind == "dm" else None)
+                                              if n and _c.tokens(n) != _c.tokens(c.name)
+                                              and not _c.span_in(c.name, n)), None),
+                            "in_front": thread is not None and thread in r.thread_ids} for r in ranking.routes[:4]],
+                "places": [{"ref": p.ref, "label": p.label(with_service=True), "mine": p.mine} for p in nearby]}
+            if ranking.usual is not None:
+                route_apps += self._route_processes(ranking.usual.thread_ids)
+        # what did not work before in the apps in play: the usual routes' apps when a person is in play, else the
+        # window in front's (and the apps the caller names, always)
+        out["pitfalls"] = self._pitfalls(apps, None if route_apps else screen, route_apps)
+        out["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return out
+
+    def _route_processes(self, thread_ids: Any) -> list[str]:
+        ids = [int(t) for t in thread_ids or [] if isinstance(t, int)]
+        if not ids:
+            return []
+        try:
+            rows = self.store._query("SELECT DISTINCT process FROM threads WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                                     ids)
+            return [r[0] for r in rows if r[0]]
+        except Exception:
+            return []
+
+    def _pitfalls(self, apps: Any, screen: Any, route_apps: Any, limit: int = 3) -> list[dict]:
+        """What did not work before in the apps in play: the "Not:" part of their current know-how (memory's own
+        fixed format, ``remember_how``'s avoid), newest first: ``{"app", "text", "at"}``."""
+        keys: list[str] = []
+        for a in [*(apps or ()), (screen or {}).get("process") if isinstance(screen, dict) else None, *(route_apps or ())]:
+            k = app_key(a) if a else None
+            if k and k not in keys:
+                keys.append(k)
+        found = []
+        for k in keys:
+            try:
+                rows = self.store.knowhow_current(k)
+            except Exception:
+                rows = []
+            for row in rows:
+                if row.app != k or " Not: " not in (row.text or ""):
+                    continue
+                avoid = row.text.split(" Not: ", 1)[1].strip()
+                if avoid:
+                    found.append({"app": k, "text": avoid, "at": float(row.valid_from or 0.0)})
+        found.sort(key=lambda x: -x["at"])
+        return found[:limit]
 
 
 __all__ = [

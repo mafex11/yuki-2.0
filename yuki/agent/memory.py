@@ -140,6 +140,12 @@ TURN_LOG_TIMEOUT_S = 15.0
 #: How long a fetched portrait is reused in-process before it is fetched again.
 PORTRAIT_TTL_S = 300.0
 
+#: How long the people directory (``MemoryClient.people_directory``, a cached prompt layer) is reused in-process.
+PEOPLE_TTL_S = 300.0
+
+#: Bound on the task frame's memory read (``MemoryClient.frame_facts``: SQL only, a few ms on the real memory).
+FRAME_TIMEOUT_S = 0.5
+
 #: Most know-how lines attached to one request.
 KNOWHOW_LINES = 6
 
@@ -237,6 +243,9 @@ class MemoryContext:
     relevant: list[dict[str, Any]] = field(default_factory=list)
     #: Yuki's own "how Yuki talks" block (``MemoryClient.yuki_persona``), for the profile layer and the mouth.
     persona: str | None = None
+    #: The people directory (``MemoryClient.people_directory``: who the user talks to and where), for the profile
+    #: layer; ``None`` when memory has no people index.
+    people: str | None = None
     #: Wall time of the fast-memory lookup (embedding + ranking), ms.
     relevant_ms: float = 0.0
     #: What the whole memory holds for this moment (``MemoryClient.related``: the user's words, their screen,
@@ -312,6 +321,8 @@ class MemoryAccess:
         self._cache_lock = threading.Lock()
         #: ``(text, monotonic time fetched)`` of the last portrait fetched.
         self._portrait: tuple[str | None, float] | None = None
+        #: ``(text, monotonic time fetched)`` of the last people directory fetched.
+        self._people: tuple[str | None, float] | None = None
         self._installed: bool | None = None
         #: The last failure, for the tray and the logs.
         self.last_error: str | None = None
@@ -458,6 +469,39 @@ class MemoryAccess:
         with self._cache_lock:
             self._portrait = (text, time.monotonic())
         return text, "memory"
+
+    def people_directory(self, *, timeout_s: float = TRAY_TIMEOUT_S) -> str:
+        """The people directory (``MemoryClient.people_directory``: each person the user talks to with their relation,
+        aliases, routes most used lately first and how the user writes to them), reused for :data:`PEOPLE_TTL_S`.
+        A plain string, ``""`` when memory has none or cannot say (an older memory, slow, absent). Never raises."""
+        with self._cache_lock:
+            if self._people is not None and time.monotonic() - self._people[1] <= PEOPLE_TTL_S:
+                return self._people[0] or ""
+        try:
+            text = self.call_method("people_directory", timeout_s=timeout_s)
+        except MemoryUnavailable:
+            with self._cache_lock:
+                return (self._people[0] or "") if self._people is not None else ""
+        text = text.strip() if isinstance(text, str) and text.strip() else None
+        with self._cache_lock:
+            self._people = (text, time.monotonic())
+        return text or ""
+
+    def invalidate_people(self) -> None:
+        """Forget the cached directory (after the user chose a route)."""
+        with self._cache_lock:
+            self._people = None
+
+    def frame_facts(self, words: str, *, said: Any = (), screen: Any = None, apps: Any = (),
+                    timeout_s: float = FRAME_TIMEOUT_S) -> dict[str, Any] | None:
+        """``MemoryClient.frame_facts``: what the task frame needs from memory (people named, the chat in front, the
+        chats in front lately, the call, routes ranked, pitfalls), bounded; ``None`` when memory cannot say."""
+        try:
+            found = self.call_method("frame_facts", words, said=list(said or ()), screen=screen, apps=list(apps or ()),
+                                     timeout_s=timeout_s)
+        except MemoryUnavailable:
+            return None
+        return found if isinstance(found, dict) else None
 
     def warm(self, *, timeout_s: float = 30.0) -> MemoryContext:
         """Open the client, fill the portrait cache and read the resume context, off the request path (and load
@@ -683,6 +727,7 @@ class MemoryAccess:
         screen: Any = None,
         gate: bool | None = None,
         now: float | None = None,
+        action: bool = False,
     ) -> MemoryContext:
         """Portrait, know-how, standing context and (asked for) resume context. Never raises.
 
@@ -706,6 +751,9 @@ class MemoryAccess:
             gate: Attach to-dos, know-how, threads and recent screens only as far as they bear on the words
                 (revamp 02 P2). Default: on whenever there are words.
             now: The moment the whole-memory ranking is for (epoch seconds; replays and tests), ``None``: now.
+            action: The request asks Yuki to act (the caller's measure: a spoken hand-off, or a task frame that
+                resolved a person, a route or a referent): Yuki's own past exchanges from other days weigh less in
+                the whole-memory ranking (``yuki.memory.related.ACTION_OWN_DISCOUNT``).
         """
         started = time.perf_counter()
         deadline = started + timeout_s
@@ -766,7 +814,8 @@ class MemoryAccess:
                 t0 = time.perf_counter()
                 remaining = max(deadline - time.perf_counter(), 0.05)
                 found = self._related(query, previous=previous, screen=screen, gate=gate, now=now,
-                                      embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
+                                      embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining,
+                                      action=action)
                 if isinstance(found, dict):
                     result.related = found
                     result.relevant = RelatedItems(
@@ -791,6 +840,8 @@ class MemoryAccess:
                     result.persona = value.strip() if isinstance(value, str) and value.strip() else None
                 except MemoryUnavailable:
                     pass
+            if "people_directory" not in self._absent:
+                result.people = self.people_directory(timeout_s=max(deadline - time.perf_counter(), 0.05)) or None
             if resume and "resume_context" not in self._absent:
                 try:
                     result.resume = self.resume(
@@ -823,10 +874,14 @@ class MemoryAccess:
         return related_block(found, voice=True) if isinstance(found, dict) else None
 
     def _related(self, query: str, *, previous: str | None, screen: Any, gate: bool, embed_wait_s: float,
-                 timeout_s: float, voice: bool = False, now: float | None = None) -> dict[str, Any] | None:
-        """``MemoryClient.related`` with this app run's session left out of it (self-echo) and the brain's diet;
-        an older memory without those arguments is asked the old way. ``None`` when memory cannot answer."""
+                 timeout_s: float, voice: bool = False, now: float | None = None,
+                 action: bool = False) -> dict[str, Any] | None:
+        """``MemoryClient.related`` with this app run's session left out of it (self-echo), the brain's diet and an
+        action request's lower weight for Yuki's own past exchanges; an older memory without those arguments is
+        asked the old way. ``None`` when memory cannot answer."""
         extra: dict[str, Any] = {"session_id": self.session_id, "diet": bool(gate)}
+        if action:
+            extra["action"] = True
         if screen is not None:
             extra["screen"] = screen
         if voice:
@@ -841,6 +896,7 @@ class MemoryAccess:
                 return None
             extra.pop("session_id", None)
             extra.pop("diet", None)
+            extra.pop("action", None)
             try:
                 found = self.call_method("related", query, previous=previous, embed_wait_s=embed_wait_s,
                                          timeout_s=timeout_s, **extra)
@@ -1051,6 +1107,8 @@ class MemoryAccess:
                 outcome = self._before(tool_input)
             elif name == "links":
                 outcome = self._links(tool_input)
+            elif name == "about":
+                outcome = self._about(tool_input, request)
             else:
                 outcome = _fail(name, f"{name!r} is not a memory tool", {"error": "unknown_tool"})
         except _BadInput as exc:
@@ -1473,6 +1531,52 @@ class MemoryAccess:
         return ToolOutcome(name="links", ok=True, summary=f"{len(rows)} link{'' if len(rows) == 1 else 's'}",
                            content=[{"type": "text", "text": format_links(rows, query=query)}],
                            payload={"asked": asked, "links": rows})
+
+    def _about(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
+        """A person the user talks to, from memory's people index (``MemoryClient.contact``; no model call), and with
+        ``prefer_route`` the user's lasting choice of route for them (``MemoryClient.prefer_route``), only in the
+        user's own words: ``words`` must be words of this request (the quote rule the other memory writes keep)."""
+        name = _need_text(tool_input, "name")
+        route = _opt_text(tool_input, "prefer_route")
+        asked: dict[str, Any] = {"name": name, "prefer_route": route}
+        if route:
+            words = _need_text(tool_input, "words")
+            from yuki.memory.conversations import quote_in
+
+            if not quote_in(words, request or ""):
+                raise _BadInput("'words' must be the user's own words from this request, exactly as they said them")
+            try:
+                saved = self.call_method("prefer_route", name, route, words, timeout_s=TOOL_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                return _not_saved("about", exc, asked)
+            if not isinstance(saved, dict) or not saved.get("ok"):
+                why = (saved or {}).get("error") if isinstance(saved, dict) else "no answer"
+                return _fail("about", f"The choice was not kept: {why}", {**asked, "error": why})
+            self.invalidate_people()
+            return ToolOutcome(name="about", ok=True, summary=f"kept: {saved.get('route')} for {saved.get('person')}",
+                               content=[{"type": "text", "text": f"Kept as the user's choice for {saved.get('person')} "
+                                                                 f"from now on: {saved.get('route')}."}],
+                               payload={**asked, "saved": True, "id": saved.get("id")})
+        try:
+            found = self.call_method("contact", name, timeout_s=TOOL_TIMEOUT_S)
+        except MemoryUnavailable as exc:
+            return _fail("about", f"Memory's people index could not be read: {exc}", {**asked, "error": str(exc)})
+        if not isinstance(found, dict):
+            return _fail("about", "Memory's people index could not be read.", {**asked, "error": "no answer"})
+        if not found.get("found"):
+            known = ", ".join(found.get("people") or []) or "nobody yet"
+            return ToolOutcome(name="about", ok=True, summary="not in memory's people index",
+                               content=[{"type": "text", "text": f"No one called {name!r} in memory's people index. "
+                                                                 f"People it has: {known}."}],
+                               payload={**asked, "found": False})
+        text = str(found.get("text") or "")
+        if found.get("others"):
+            text += "\nOthers the name fits: " + ", ".join(found["others"]) + " (ask about them by name)."
+        return ToolOutcome(name="about", ok=True, summary=f"{found.get('name')}: {len(found.get('routes') or [])} routes",
+                           content=[{"type": "text", "text": text}],
+                           payload={**asked, "found": True, "ref": found.get("ref"),
+                                    "routes": [r.get("ref") for r in found.get("routes") or []],
+                                    "margin": found.get("margin"), "close": found.get("close")})
 
     def _correct(self, tool_input: dict[str, Any]) -> ToolOutcome:
         text = _need_text(tool_input, "text")

@@ -271,6 +271,21 @@ the natural voice of whoever the user says is speaking (the user, unless they sa
 comes from you), reported speech turned into direct speech. If the wording is \
 genuinely unclear, show the draft and ask before sending.
 
+The profile block lists the people the user talks to and where, most used lately first, and a task frame may \
+come just before their words: who "him", "her", "this" or "the other one" may be, each candidate with where it \
+comes from and how long ago, and the routes of the person the request names or points at, with how clearly the \
+usual one leads. Resolve a named or implied person from these before you ask anything; call about with their \
+name when you need the counts, the names they go by or the user's last messages to them. Send over the route \
+the user uses most with that person unless they name another, and say which in a few words. To open a route, \
+look for the chat by the name the route shows - a DM by the handle the app knows them by, which may not be the \
+name the user calls them - and for a group or channel go to that chat and mention them there. Write it the way \
+the user's own recent messages to that person read: the same language and script, casing, length and slang. \
+Ask only when the frame calls two candidates a close call and the request does not settle it, naming both. When \
+they correct you ("no, the other one", "WhatsApp, not Discord"), do it their way and keep their choice with \
+about's prefer_route, in their own words, in that same turn. For example, with Hemanth's Discord DM in front \
+and a link copied a moment ago, "message him this" means: type that link into that DM as the user would write \
+to him, send it, and say "Sent to Hemanth on Discord."
+
 Each request notes where the user was when they asked: the window in front, anything \
 playing, whether their microphone or camera was in use. If they were engaged in \
 something -- watching or listening, on a call or in a meeting, reading or working -- and \
@@ -407,14 +422,18 @@ def identity_text(names: Any) -> str | None:
     return f"The user is {clean[0]}; apps also show them as {', '.join(clean[1:])}."
 
 
-def profile_text(names: Any = None, personality: str | None = None, persona: str | None = None) -> str | None:
-    """The profile layer: identity, the portrait's Personality section and Yuki's own persona, or ``None``.
+def profile_text(names: Any = None, personality: str | None = None, persona: str | None = None,
+                 people: str | None = None) -> str | None:
+    """The profile layer: identity, the portrait's Personality section, Yuki's own persona and the people directory
+    (``MemoryClient.people_directory``: who the user talks to and where, revamp Phase B2), or ``None``.
 
     All change rarely (the names are settings; the portrait and the persona are re-written about
-    daily), so this block is cached on its own, after the frozen prompt and before the rules.
+    daily; the directory when the people index or its order changes), so this block is cached on its own, after the
+    frozen prompt and before the rules.
     """
     voice = f"{PERSONA_HEADING}\n{persona.strip()}" if persona and persona.strip() else None
-    parts = [p for p in (identity_text(names), (personality or "").strip() or None, voice) if p]
+    parts = [p for p in (identity_text(names), (personality or "").strip() or None, voice,
+                         (people or "").strip() or None) if p]
     if not parts:
         return None
     return PROFILE_LABEL + "\n" + "\n\n".join(parts) + "\n" + PROFILE_END

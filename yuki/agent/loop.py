@@ -33,11 +33,12 @@ import queue
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
+from yuki.agent import frame as task_frame
 from yuki.agent.context import KEEP_FULL_REQUESTS, ContextManager, RequestRecord
 from yuki.agent.failover import FailoverClient
 from yuki.agent.loopguard import EXEMPT as LOOP_EXEMPT, LoopBreaker, signature as call_signature
@@ -441,6 +442,12 @@ class Agent:
         #: never Yuki's hand-off envelope: ``run(memory_query=)``, else ``memory_query_of``).
         self._previous_query: str | None = None
         self._this_query: str | None = None
+        #: This conversation's exchanges as the task frame reads them for "the last person named"
+        #: (``{"at", "text", "who": "user" | "yuki"}``: the user's own words and Yuki's replies, newest last). Old
+        #: ones fade by their age in the frame (``yuki.agent.frame.SOURCES``).
+        self._said: deque[dict[str, Any]] = deque(maxlen=12)
+        #: The task frame of the request being handled (``yuki.agent.frame``), for its log.
+        self._frame: task_frame.TaskFrame | None = None
         #: The profile and rules layers of the system prompt for the request being handled
         #: (``prompt.system_blocks``), set by ``_memory_context``; ``None`` when memory had
         #: nothing (then the layer is left out).
@@ -956,6 +963,11 @@ class Agent:
             )
             if outcome == "final":
                 self._save_learned(request)
+            words = self._this_query or memory_query_of(request)
+            if words:
+                self._said.append({"at": started_epoch, "text": words, "who": "user"})
+            if reply and outcome == "final":
+                self._said.append({"at": time.time(), "text": reply, "who": "yuki"})
             self._previous_request = request
             self._previous_query = self._this_query or memory_query_of(request) or None
             self._this_query = None
@@ -2277,6 +2289,29 @@ class Agent:
                 "text": str(window.get("text") or ""), "at": window.get("read_at"), "by_yuki": bool(window.get("by_yuki")),
                 "source": "now"}
 
+    def _frame_inputs(self, words: str | None, screen: dict[str, Any] | None,
+                      apps: list[str]) -> tuple[dict[str, Any] | None, Any, dict[str, Any] | None]:
+        """What the task frame is built from: memory's ``frame_facts`` (people named in the words and earlier in
+        this conversation, the chat in front, the chats in front lately, the call, routes, pitfalls; bounded), this
+        turn's focus read (the dispatcher's, no second read) and the clipboard's metadata (a few ms; private content
+        never read). Each is ``None`` when it cannot be had; never raises."""
+        facts = None
+        fetch = getattr(self.memory, "frame_facts", None)
+        if callable(fetch):
+            try:
+                facts = fetch(words or "", said=list(self._said), screen=screen, apps=apps)
+            except Exception:
+                facts = None
+        focus = getattr(self.dispatcher, "last_focus", None)
+        clip = None
+        backend = getattr(self.dispatcher, "backend", None)
+        if backend is not None:
+            try:
+                clip = task_frame.clipboard_meta(backend)
+            except Exception:
+                clip = None
+        return (facts if isinstance(facts, dict) else None), focus, clip
+
     def _memory_context(
         self, request: str, *, first: bool = False, lean: bool = False, query: str | None = None,
         previous: str | None = None, apps: list[str] | None = None, origin_hwnd: int | None = None,
@@ -2320,18 +2355,31 @@ class Agent:
         query = query if query is not None else memory_query_of(request)
         self._profile_layer = profile_text(self.settings.user_names, None)
         self._rules_layer = None
+        self._frame = None
         try:
             screen = self._live_screen(origin_hwnd)
+            # the task frame (revamp Phase B): who and what the request may refer to, built in code from the Now
+            # board, this conversation, the focus, the clipboard and memory's people index; a request whose frame has
+            # a person, a route or a referent in play (or a spoken hand-off) is an action request, for which Yuki's
+            # own past exchanges from other days weigh less in the whole-memory ranking (follow-up 4)
+            facts, focus, clip = self._frame_inputs(query, screen, list(apps or ()))
+            frame = task_frame.build(facts, focus=focus, clip=clip, overview=self._overview_payload)
+            action = bool(self._request_voice or frame.action)
             fetched = self.memory.context(app=app, query=query, resume=first and not lean, previous=previous,
-                                          apps=apps or (), screen=screen)
+                                          apps=apps or (), screen=screen, action=action)
+            frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
+                                     overview=self._overview_payload)
+            self._frame = frame
             rest, personality = _split_personality(fetched.portrait)
             rules = standing_rules_text(fetched)
             commitments = standing_commitments_text(fetched)
-            self._profile_layer = profile_text(self.settings.user_names, personality, fetched.persona)
+            self._profile_layer = profile_text(self.settings.user_names, personality, fetched.persona,
+                                               getattr(fetched, "people", None))
             if fetched.source != "unavailable" and rules is not None:
                 self._rules_layer = rules_text(rules)
             background = replace(fetched, portrait=None if lean else ((rest or "").strip() or None),
-                                 resume=None if lean else fetched.resume)
+                                 resume=None if lean else fetched.resume,
+                                 knowhow=list(fetched.knowhow)[frame.procedures:])   # the frame shows the first
             repeated = None
             if (
                 background.portrait
@@ -2346,6 +2394,8 @@ class Agent:
             relevant = relevant_block_text(fetched.relevant)
             if relevant:
                 standing = f"{relevant}\n\n{standing}" if standing else relevant
+            if frame.text:   # the frame first: who and what, then what memory connects to it
+                standing = f"{frame.text}\n\n{standing}" if standing else frame.text
         except Exception as exc:  # memory must never break a request
             self.logger.error(f"memory context failed: {type(exc).__name__}: {exc}", exc=exc)
             self._memory_info = {
@@ -2380,6 +2430,10 @@ class Agent:
             "relevant_items": len(fetched.relevant),
             "relevant_ms": fetched.relevant_ms,
             "persona_chars": len(fetched.persona or ""),
+            "people_chars": len(getattr(fetched, "people", None) or ""),
+            "action": action,
+            "own_discounted": int((fetched.related or {}).get("own_discounted") or 0),
+            "frame": frame.info(),
             "lookup_ms": elapsed_ms,
         }
         self.logger.log(
@@ -2409,6 +2463,11 @@ class Agent:
                       for r in fetched.relevant],
             relevant_ms=fetched.relevant_ms,
             persona_chars=len(fetched.persona or ""),
+            people_chars=len(getattr(fetched, "people", None) or ""),
+            action=action,
+            own_discounted=int((fetched.related or {}).get("own_discounted") or 0),
+            frame=frame.info(),
+            frame_facts_ms=(facts or {}).get("elapsed_ms") if isinstance(facts, dict) else None,
             memory_session=getattr(self.memory, "session_id", None),
             app=app,
             error=fetched.error,
