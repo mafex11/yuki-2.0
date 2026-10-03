@@ -29,7 +29,12 @@
   Object.assign(Y, { S, D, field, B });
   Y.remeasure = () => field.remeasure();
   // the moment of your last action: a build that started before it is not drawn over what the action just showed
-  Y.act = (action, fields) => { S.actedAt = Date.now(); return B.request('act', Object.assign({ action: action }, fields || {})); };
+  // (actions that only read or open something leave the page's data alone)
+  const READS = new Set(['person', 'copy', 'askbar', 'continue']);
+  Y.act = (action, fields) => {
+    if (!READS.has(action)) S.actedAt = Date.now();
+    return B.request('act', Object.assign({ action: action }, fields || {}));
+  };
   Y.go = go;
 
   /* ================= routing ================= */
