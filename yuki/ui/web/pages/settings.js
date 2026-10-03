@@ -150,18 +150,32 @@
   A.coach = (t) => { const on = flip(t); save(t, 'coach', { enabled: on }, on ? 'Check-ins on.' : 'Check-ins off.', () => flip(t)); };
   A.questions = (t) => { const on = flip(t); save(t, 'questions', { enabled: on }, on ? 'Questions on.' : 'No more questions.', () => flip(t)); };
   /* quiet hours: the switch, then each time; the page shows what Python wrote (both times in one write) */
+  const quietKnown = (r) => typeof r.quiet_start === 'string' && typeof r.quiet_end === 'string';
+  /* the times a save leaves: Python's reply; a reply without them (the preview's canned {ok: true}, review F2) is read
+     as what you asked, worked out from the hours shown, so the switch never flips back to what it was */
+  function quietResult(r, asked) {
+    if (quietKnown(r)) return r;
+    const co = settings().coach || {}, s = co.quiet_start || '00:30', e = co.quiet_end || '08:00';
+    const last = (co.quiet_last || []).length >= 2 && co.quiet_last[0] !== co.quiet_last[1] ? co.quiet_last : ['00:30', '08:00'];
+    const [qs, qe] = asked.on === false ? [s, s] : asked.on === true ? (s !== e ? [s, e] : last) : [asked.start || s, asked.end || e];
+    return Object.assign({}, r, { quiet_start: qs, quiet_end: qe });
+  }
   function quietSaved(r) {
-    if (!r.ok) return;
     const co = settings().coach || (settings().coach = {});
     if (co.quiet_start !== co.quiet_end) co.quiet_last = [co.quiet_start, co.quiet_end];
     co.quiet_start = r.quiet_start; co.quiet_end = r.quiet_end;
     if (r.quiet_start !== r.quiet_end) co.quiet_last = [r.quiet_start, r.quiet_end];
     Y.renderMain();
   }
-  A['quiet-on'] = (t) => {
-    const on = flip(t);
-    save(t, 'quiet', { on }, (r) => (r.quiet_start !== r.quiet_end ? `Quiet from ${clockWords(r.quiet_start)} to ${clockWords(r.quiet_end)}.` : 'No quiet hours.'), () => flip(t)).then(quietSaved);
-  };
+  function quietSave(t, asked, revert) {
+    save(t, 'quiet', asked, null, revert).then((raw) => {
+      if (!raw.ok) return;
+      const r = quietResult(raw, asked);
+      Y.toast(r.quiet_start !== r.quiet_end ? `Quiet from ${clockWords(r.quiet_start)} to ${clockWords(r.quiet_end)}.` : 'No quiet hours.');
+      quietSaved(r);
+    });
+  }
+  A['quiet-on'] = (t) => { const on = flip(t); quietSave(t, { on }, () => flip(t)); };
   A.pause = (t) => { const on = t.dataset.on === '1'; save(t, 'pause', { paused: on }, on ? 'Memory paused.' : 'Remembering again.').then((r) => { if (r.ok) { settings().privacy.paused = on; Y.renderMain(); } }); };
   A.accent = (t) => { const name = t.dataset.accent; save(t, 'accent', { accent: name }).then((r) => { if (r.ok) { settings().appearance.accent = name; Y.applyAppearance(Object.assign({}, Y.D.appearance, { accent: name })); Y.render(false); } }); };
   A.motion = (t) => { const on = t.dataset.on === '1'; save(t, 'motion', { reduce: on }).then((r) => { if (r.ok) { settings().appearance.reduce_motion = on; Y.applyAppearance(Object.assign({}, Y.D.appearance, { reduce_motion: on })); Y.render(false); } }); };
@@ -179,8 +193,7 @@
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
     if (t.dataset.change === 'quiet-time') {
       const co = settings().coach || {}, was = co[t.dataset.which === 'start' ? 'quiet_start' : 'quiet_end'];
-      save(t, 'quiet', { [t.dataset.which]: t.value }, (r) => `Quiet from ${clockWords(r.quiet_start)} to ${clockWords(r.quiet_end)}.`, () => { t.value = was; })
-        .then(quietSaved);
+      quietSave(t, { [t.dataset.which]: t.value }, () => { t.value = was; });
     }
   });
 

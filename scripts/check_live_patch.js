@@ -410,11 +410,34 @@ async function inPage(F) {
     && !acts('submit').some((m) => m.text === 'also the invented other one'), JSON.stringify(acts('steer')));
   check('W9 what you added shows under the reply, with whether it was read', document.querySelector('.drawer').textContent.includes('you added “also the invented other one”')
     && document.querySelector('.drawer').textContent.includes('read at its next step'));
+  // review F1: words for a request that hasn't started wait for it; a "not running" reply while the request still shows
+  // never becomes a separate request; only one that has ended goes on as a new request
+  REPLY.steer = { ok: true, delivered: true, held: true };
+  inp().value = 'also the invented queued one'; enter(); await sleep(250);
+  check('F1 words for a request that hasn\'t started wait for its start (no new request)', document.querySelector('.drawer').textContent.includes('read when it starts')
+    && !acts('submit').some((m) => m.text === 'also the invented queued one'));
+  REPLY.steer = { ok: true, delivered: false };
+  inp().value = 'also the invented refused one'; enter(); await sleep(250);
+  check('F1 a refused addition while the request still shows goes back in the box, never a new request', !acts('submit').some((m) => m.text === 'also the invented refused one')
+    && inp().value === 'also the invented refused one', inp().value);
+  inp().value = '';
+  REPLY.steer = () => { window.__push({ kind: 'live', shell: { runs: [] } }); return { ok: true, delivered: false }; };
+  inp().value = 'also the invented ended one'; enter(); await sleep(250);
+  check('F1 an addition to a request that has ended goes on as a new request', acts('submit').some((m) => m.text === 'also the invented ended one'));
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(200);
+  REPLY.steer = { ok: true, delivered: true };
   const qItems = clone(F.chat.items); const qLast = qItems[qItems.length - 1]; qLast.question = 'Which invented folder?'; qLast.running = true;
   window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(250);
   check('W9 when it asks you something, the face says so and the box takes your answer', inRow().querySelector('canvas').dataset.core === 'needs-you' && inp().placeholder.includes('answer'), inRow().querySelector('canvas').dataset.core + ' / ' + inp().placeholder);
   inp().value = 'the invented one'; enter(); await sleep(200);
   check('W9 Enter on a question answers it (the submit path), never a steer', acts('submit').some((m) => m.text === 'the invented one') && !acts('steer').some((m) => m.text === 'the invented one'));
+  // review F3: an older request asks while a newer one runs: the box answers the one that asked
+  window.__push({ kind: 'live', shell: { runs: [...clone(runNow), { item: 'invented-newer', jobs: [job + 1], title: '“A newer invented request”', line: 'Step 1 · Another invented thing', started_at: Date.now() / 1000 - 1, step: 1 }] } });
+  await sleep(200);
+  inp().value = 'the invented older one'; enter(); await sleep(200);
+  check('F3 a question from an older request is answered while a newer one runs', acts('submit').some((m) => m.text === 'the invented older one')
+    && !acts('steer').some((m) => m.text === 'the invented older one'));
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(150);
   delete qLast.question; window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(150);
   inp().value = ''; inp().focus(); enter('Escape'); await sleep(200);
   check('W9 Esc on the empty box stops the request', acts('stop').some((m) => m.job === job));
@@ -586,6 +609,12 @@ async function inPage(F) {
   const qsel = () => Array.from(main().querySelectorAll('select[data-change="quiet-time"]'));
   check('W10 quiet hours has a switch, a from and a to time, and says what they do', !!qrow() && !!qrow().querySelector('.tog[data-do="quiet-on"]') && qsel().length === 2
     && qrow().textContent.includes('No cards') && !main().textContent.includes('Quiet hours: none'), qrow() && qrow().textContent);
+  // review F2: a reply without the times (the preview's canned {ok: true}) keeps what you set
+  qrow().querySelector('.tog').click(); await sleep(250);
+  const qOn = () => qrow().querySelector('.tog').getAttribute('aria-checked') === 'true';
+  check('F2 off with a bare reply stays off', !qOn() && qrow().textContent.includes('Off.') && qsel().every((s) => s.disabled), qrow().textContent.slice(0, 60));
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('F2 on again with a bare reply brings the hours back', qOn() && qrow().textContent.includes('From 12:30 AM to 8:00 AM'), qrow().textContent.slice(0, 60));
   REPLY.quiet = (m) => (m.on === false ? { ok: true, quiet_start: '00:30', quiet_end: '00:30' } : m.on === true ? { ok: true, quiet_start: '00:30', quiet_end: '08:00' }
     : { ok: true, quiet_start: m.start || '00:30', quiet_end: m.end || '08:00' });
   qrow().querySelector('.tog').click(); await sleep(250);

@@ -160,14 +160,19 @@
     else out.push(Y.empty(D.shell.connected ? 'Nothing said yet today. Type below, or say “Yuki”.' : 'Yuki isn’t running, so there’s no conversation to show. Start Yuki from the Start menu.'));
     return out;
   }
-  /* the request running now (the newest), its job and whether it is waiting for your answer: what the one input does */
+  /* the request the one input acts on: one that asked you something, whichever it is (the tray answers any pending
+     question; review F3: two can run at once, a long one in the worker and a quick one at the front desk), else the
+     newest; its job and whether it waits for your answer */
   function running(D) {
     const runs = D.shell.runs || [];
     if (!runs.length) return null;
-    const r = runs[runs.length - 1], job = (r.jobs || [])[0];
-    const item = (D.chat.items || []).find((i) => i.id === r.item);
-    return { job: job == null ? null : job, question: !!(item && item.question), title: r.title || '' };
+    const items = D.chat.items || [];
+    const asks = (r) => { const it = items.find((i) => i.id === r.item); return !!(it && it.question); };
+    const r = runs.slice().reverse().find(asks) || runs[runs.length - 1], job = (r.jobs || [])[0];
+    return { job: job == null ? null : job, question: asks(r), title: r.title || '' };
   }
+  /* whether request ``job`` is still in the live runs (queued or running) */
+  const stillRuns = (job) => ((Y.D.shell || {}).runs || []).some((r) => (r.jobs || []).includes(job));
   /* the face left of the input: the island's state, from the same live state the rail's face reads; needs you while a
      request waits for your answer; done for DONE_S after a request ends */
   function faceFor(D, run, fresh) {
@@ -193,7 +198,8 @@
     const steering = !!(run && run.job != null && !run.question);
     const placeholder = !connected ? 'Yuki isn’t running'
       : run && run.question ? 'Your answer, then Enter'
-        : steering ? 'Add to it, or change it' : 'Type, or say “Yuki” to speak';
+        : steering ? ((D.shell.runs || []).length > 1 && run.title ? `Add to “${run.title}”` : 'Add to it, or change it')
+          : 'Type, or say “Yuki” to speak';
     const input = h('input', { class: 'drawer-in', data: { enter: 'send', escape: 'drawer-esc', mode: run && run.question ? 'answer' : steering ? 'steer' : 'new' },
       attrs: { placeholder, 'aria-label': steering ? 'Add to the request Yuki is working on' : run && run.question ? 'Answer Yuki' : 'Message Yuki', autocomplete: 'off', disabled: !connected } });
     const btn = run && run.job != null
@@ -307,9 +313,14 @@
     Y.renderDrawer();
     Y.act('steer', { job: run.job, text }).then((r) => {
       m.wait = false;
-      if (r.ok && r.delivered) m.state = 'read at its next step';
-      else if (r.ok) {   // it finished just before: your words go on as your next message, never dropped
-        m.state = 'it had finished, so I took it as a new request';
+      if (r.ok && r.delivered) m.state = r.held ? 'it hasn’t started yet; read when it starts' : 'read at its next step';
+      else if (r.ok && stillRuns(run.job)) {
+        // the tray says it isn't running, yet it still shows here (review F1): never sent on as a separate request
+        // while the original may still run; your words go back in the box
+        m.state = 'not added: it isn’t taking additions right now';
+        if (!input.value) input.value = text;
+      } else if (r.ok) {   // it ended just before: your words go on as your next message, never dropped
+        m.state = 'it had ended, so I sent it as a new request';
         submitNew(input, text);
       } else m.state = r.error || 'not sent';
       Y.renderDrawer();

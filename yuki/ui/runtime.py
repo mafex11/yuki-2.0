@@ -226,6 +226,10 @@ class Lane(QThread):
         #: V4: the app named for the running job after it became current (:meth:`name_app_job`), given to the agent
         #: again once its run has begun, so the run's own start cannot overwrite it (review F9).
         self._named_late: dict[int, str] = {}
+        #: appWin2 review F1: words added to a job before its run's body began (still queued, or current a moment before
+        #: ``Agent.run`` empties the steering inbox), handed to the agent once it has begun; ``_begun`` is that job's id.
+        self._early_steers: dict[int, list[str]] = {}
+        self._begun: int | None = None
         #: v3.14b: the request this lane set aside while it waited for an answer that did not come, as
         #: ``(job, question)``; a later answer carries it on as a new request (:meth:`AgentRuntime.answer`).
         self._parked: tuple[Job, str] | None = None
@@ -283,12 +287,25 @@ class Lane(QThread):
         return "queued" if queued else "unknown"
 
     def steer_job(self, job_id: int, text: str) -> bool:
-        """Hand ``text`` to the running job's agent (:meth:`Agent.steer`); ``False`` if it is not running."""
+        """Hand ``text`` to the running job's agent (:meth:`Agent.steer`); ``False`` if it is neither running nor queued.
+
+        A job still waiting in this lane's queue (or current, but before its run's body began: ``Agent.run`` empties
+        the inbox as it starts) keeps the words and gets them as soon as its run begins (review F1: words added to a
+        queued request were otherwise refused, and the window sent them on as a separate request)."""
         with self._state:
             running = self._current is not None and self._current.id == job_id
-        if running:
+            queued = job_id in self._waiting and job_id not in self._skip
+            hold = (running and self._begun != job_id) or (queued and not running)
+            if hold:
+                self._early_steers.setdefault(job_id, []).append(text)
+        if running and not hold:
             self.agent.steer(text)
-        return running
+        return running or queued
+
+    def holds_steers(self, job_id: int) -> bool:
+        """Whether words added to ``job_id`` are held until its run begins (it has not started yet)."""
+        with self._state:
+            return job_id in self._early_steers
 
     def name_app_job(self, job_id: int, app: str) -> bool:
         """V4: the app the user named, for the running job's agent (:meth:`Agent.set_app_named`); ``False`` if that
@@ -362,6 +379,8 @@ class Lane(QThread):
                     self._waiting.remove(job.id)
                 skipped = self._skip.pop(job.id, None)
                 self._current = None if skipped else job
+                if skipped:   # words added while it waited go with it: you stopped (or replaced) that request
+                    self._early_steers.pop(job.id, None)
             if skipped:
                 # Cancelled while it waited: it never reaches the agent, so a
                 # cancel meant for it cannot land on the next request instead.
@@ -381,7 +400,9 @@ class Lane(QThread):
                 summary = self.agent.last_summary
                 if summary is not None:
                     self.runtime.summarized.emit(self.name, job.id, dict(summary))
-                late = self.agent.take_steers()
+                with self._state:   # held for a run that ended before its first step (review F1): never dropped
+                    late = self._early_steers.pop(job.id, [])
+                late = late + self.agent.take_steers()
                 if late:
                     # Said after the request's last step: the caller decides what
                     # to do with it (voice passes it on as a new request).
@@ -389,7 +410,9 @@ class Lane(QThread):
             finally:
                 with self._state:
                     self._current = None
+                    self._begun = None
                     self._named_late.pop(job.id, None)
+                    self._early_steers.pop(job.id, None)
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
                 )
@@ -452,9 +475,13 @@ class Lane(QThread):
                 begun = True
                 with self._state:
                     late = self._named_late.pop(job.id, None)
+                    self._begun = job.id
+                    early = self._early_steers.pop(job.id, [])
                 setter = getattr(self.agent, "set_app_named", None)
                 if late and callable(setter):
                     setter(late)
+                for text in early:   # review F1: added while it waited; read at its first step
+                    self.agent.steer(text)
 
             if isinstance(event, Partial):
                 runtime.partial.emit(self.name, job.id, event.what, event.text)
@@ -936,12 +963,18 @@ class AgentRuntime(QObject):
     def steer(self, request_id: int, text: str) -> bool:
         """Pass something the user added to a running request (:meth:`Agent.steer`).
 
+        A request still queued keeps the words and reads them at its first step (appWin2 review F1).
+
         Returns:
-            ``False`` when that request is not running (finished, or still queued).
+            ``False`` when that request is neither running nor queued (it has ended).
         """
         ok = any(lane.steer_job(request_id, text) for lane in (self.worker, self.front_desk))
         self.ui_log.event("steer", id=request_id, delivered=ok, text=text)
         return ok
+
+    def steer_held(self, request_id: int) -> bool:
+        """Whether words added to ``request_id`` wait for it to start (it is still queued)."""
+        return any(lane.holds_steers(request_id) for lane in (self.worker, self.front_desk))
 
     def send_choice(self, request_id: int, kind: str, value: str) -> bool:
         """appPT: a chip tapped on the send countdown of running request ``request_id`` (``kind`` ``who`` or

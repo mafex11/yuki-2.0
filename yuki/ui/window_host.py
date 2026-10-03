@@ -519,13 +519,20 @@ class WindowHost(QObject):
 
     def _op_steer(self, req: dict[str, Any]) -> dict[str, Any]:
         """``steer(job, text)``: something the user adds to a running request (:meth:`AgentRuntime.steer`, read at
-        the next step). ``delivered`` is false when that request is not running."""
+        the next step). ``delivered`` is false only when that request has ended; ``held`` is true when it has not
+        started yet (queued: the words wait for its first step, appWin2 review F1)."""
         job = self._job(req)
         text = str(req.get("text") or "").strip()
         if job is None or not text:
             return {"ok": False, "error": "steer needs a job and some text"}
-        delivered = bool(self._on_gui(lambda: self.ui.runtime.steer(job, text)))
-        return {"job": job, "delivered": delivered}
+
+        def run() -> tuple[bool, bool]:
+            rt = self.ui.runtime
+            ok = bool(rt.steer(job, text))
+            held = getattr(rt, "steer_held", None)
+            return ok, bool(ok and callable(held) and held(job))
+        delivered, held = self._on_gui(run)
+        return {"job": job, "delivered": delivered, "held": held}
 
     def _op_now(self, req: dict[str, Any]) -> dict[str, Any]:
         """``now``: the live task trace, from the chat thread (:class:`ChatModel`): every response still running,
