@@ -136,7 +136,7 @@ def test_memory_query_is_the_users_words_not_the_voice_envelope():
     assert memory_query_of("open my portfolio") == "open my portfolio"
     card = "[Replying to your nudge (kind: question): Was that offer real?]\nno it was a joke"
     assert memory_query_of(card).startswith("no it was a joke") and "offer real" in memory_query_of(card)
-    assert memory_words("Tag Hemanth", ["tag hey meant in a message"]) == "Tag Hemanth | tag hey meant in a message"
+    assert memory_words("Tag Hemanth", ["tag hey man in a message"]) == "Tag Hemanth | tag hey man in a message"
     assert memory_words("Tag Hemanth", ["tag hemanth"]) == "Tag Hemanth"   # the heard words add nothing new
 
 

@@ -96,8 +96,8 @@ MSG_TIME_SQL_M = ("CASE WHEN m.at >= 1000000000 AND m.at <= m.first_seen + 3600 
 #: The user's own messages weigh by recency: half after this many days (the route they use *lately*).
 ROUTE_HALF_LIFE_DAYS = 10.0
 #: The first route leads the second by less than this share of its score: a close call, both are named. Measured on
-#: the real memory of 3 Oct (24-build-B.md §3): Hemanth's Discord DM led WhatsApp by 0.9+, Elina's DM led the RES group
-#: by ~0.3 (she is reached in both).
+#: the real memory of 3 Oct (24-build-B.md §3): one friend's Discord DM led his WhatsApp chat by 0.9+, another
+#: person's DM led a group chat by ~0.3 (she is reached in both).
 ROUTE_MARGIN = 0.35
 #: Their messages count this much of a route's weight for ranking people in the directory (the user's own count 1).
 THEIRS_WEIGHT = 0.25
@@ -275,7 +275,8 @@ def gather(store: Store, *, now: float | None = None, settings_names: Sequence[s
         "SELECT t.id, t.app, t.process, t.host, t.kind, t.title_ciphertext, t.scope_ciphertext,"
         f" sum(m.is_me) AS mine, count(m.id) - sum(m.is_me) AS theirs, min({MSG_TIME_SQL_M}) AS first,"
         f" max({MSG_TIME_SQL_M}) AS last, max(m.first_seen) AS seen"
-        f" FROM threads t JOIN messages m ON m.thread_id = t.id WHERE t.merged_into IS NULL AND t.kind IN ({marks})"
+        f" FROM threads t JOIN messages m ON m.thread_id = t.id AND m.status != 'reread'"
+        f" WHERE t.merged_into IS NULL AND t.kind IN ({marks})"
         " GROUP BY t.id HAVING max(m.first_seen) >= ? ORDER BY count(m.id) DESC LIMIT ?",
         (*CHAT_KINDS, since, MAX_THREADS))
     from yuki.core.appnames import shown
@@ -296,7 +297,8 @@ def gather(store: Store, *, now: float | None = None, settings_names: Sequence[s
         ids = sorted(threads)
         marks = ",".join("?" * len(ids))
         for r in store._query(f"SELECT thread_id, sender_ciphertext, is_me, text_ciphertext, {MSG_TIME_SQL} AS t"
-                              f" FROM messages WHERE thread_id IN ({marks}) ORDER BY t DESC", ids):
+                              f" FROM messages WHERE thread_id IN ({marks}) AND status != 'reread' ORDER BY t DESC",
+                              ids):
             t = threads[int(r["thread_id"])]
             if r["is_me"]:
                 if len(t.own_lines) < OWN_LINES and r["text_ciphertext"]:
@@ -381,8 +383,8 @@ different spelling is not proof; when two names might be one person and nothing 
 and ask (questions, at most two, only when it matters: the user talks with them). For each person:
 - name: how the user names them (a person fact's subject, else how the chat shows them), exactly.
 - relation: who they are to the user, as a short phrase of two to eight words copied word for word from \
-a cited person fact ("best friend", "brother", "colleague on the Corvana team", "music collaborator"); \
-at most two such phrases joined by "; " ("Varun's wife; colleague on the Corvana team"); "" when no \
+a cited person fact ("best friend", "brother", "colleague on the Acme team", "music collaborator"); \
+at most two such phrases joined by "; " ("Varun's wife; colleague on the Acme team"); "" when no \
 fact says.
 - aliases: their other names exactly as the data shows them - handles, display names, spellings, the \
 misheard forms in ALIASES.
@@ -1237,16 +1239,40 @@ def tags_in(store: Store, route: Route, contact: Contact) -> tuple[int, float | 
     return total, last
 
 
+#: Per process: ``(db, route thread ids) -> (newest message id, the user's message times, the others')`` (review 34
+#: M11: a route's messages are read again only when a newer message arrived).
+_ROUTE_TIMES: dict[tuple[str, tuple[int, ...]], tuple[int, list[float], list[float]]] = {}
+_ROUTE_TIMES_MAX = 2000
+
+
+def _route_times(store: Store, ids: Sequence[int]) -> tuple[list[float], list[float]]:
+    """The times of the user's own and the others' messages on a route's threads (re-reads left out: review 34 M10),
+    from a per-process cache keyed by the threads' newest message id."""
+    key = (_db_key(store), tuple(int(i) for i in ids))
+    marks = ",".join("?" * len(ids))
+    newest = store._query(f"SELECT max(id) FROM messages WHERE thread_id IN ({marks})", list(ids))[0][0] or 0
+    hit = _ROUTE_TIMES.get(key)
+    if hit is not None and hit[0] == int(newest):
+        return hit[1], hit[2]
+    mine_t: list[float] = []
+    theirs_t: list[float] = []
+    for r in store._query(f"SELECT is_me, {MSG_TIME_SQL} AS t FROM messages WHERE thread_id IN ({marks})"
+                          " AND status != 'reread'", list(ids)):
+        (mine_t if r["is_me"] else theirs_t).append(float(r["t"]))
+    if len(_ROUTE_TIMES) >= _ROUTE_TIMES_MAX:
+        _ROUTE_TIMES.clear()
+    _ROUTE_TIMES[key] = (int(newest), mine_t, theirs_t)
+    return mine_t, theirs_t
+
+
 def measure_route(store: Store, route: Route, contact: Contact | None, now: float) -> Route:
-    """Fill a route's numbers from its messages (SQL aggregates; group senders from :func:`_sender_counts`)."""
+    """Fill a route's numbers from its messages (SQL aggregates; group senders from :func:`_sender_counts`). Messages
+    memory marked as a re-read (the same message again under a new time label) are not counted."""
     ids = route.thread_ids
     if not ids:
         return route
     marks = ",".join("?" * len(ids))
-    mine_t: list[float] = []
-    theirs_t: list[float] = []
-    for r in store._query(f"SELECT is_me, {MSG_TIME_SQL} AS t FROM messages WHERE thread_id IN ({marks})", list(ids)):
-        (mine_t if r["is_me"] else theirs_t).append(float(r["t"]))
+    mine_t, theirs_t = _route_times(store, ids)
     route.mine = len(mine_t)
     route.first_mine, route.last_mine = (min(mine_t), max(mine_t)) if mine_t else (None, None)
     own_weight = sum(_decay(now - t) for t in mine_t)
@@ -1387,9 +1413,11 @@ def samples(store: Store, route: Route, limit: int = STYLE_SAMPLES) -> list[dict
     return out
 
 
-def calls_with(store: Store, contact: Contact) -> dict[str, Any] | None:
-    """The user's calls the digests saw this person on: ``{"count", "last", "where"}`` or ``None``."""
-    seen = call_people_seen(store, limit=200)
+def calls_with(store: Store, contact: Contact, *, seen: dict[str, dict[str, Any]] | None = None
+               ) -> dict[str, Any] | None:
+    """The user's calls the digests saw this person on: ``{"count", "last", "where"}`` or ``None``. ``seen``: the
+    :func:`call_people_seen` of this pass (``limit=200``), read once for many people (review 34 M11)."""
+    seen = call_people_seen(store, limit=200) if seen is None else seen
     hits = [g for k, g in seen.items() if any(tokens(n) == tokens(g["name"]) for n in contact.names)]
     if not hits:
         return None
@@ -1399,8 +1427,11 @@ def calls_with(store: Store, contact: Contact) -> dict[str, Any] | None:
 
 
 def card(store: Store, contact: Contact, *, now: float | None = None, near_thread: int | None = None,
-         with_samples: int = STYLE_SAMPLES) -> dict[str, Any]:
-    """Everything memory knows about where and how the user talks with this person (no model call)."""
+         with_samples: int = STYLE_SAMPLES, calls_seen: dict[str, dict[str, Any]] | None = None,
+         person_facts: dict[int, Any] | None = None) -> dict[str, Any]:
+    """Everything memory knows about where and how the user talks with this person (no model call). A caller building
+    many cards passes what is the same for all of them, read once (review 34 M11): ``calls_seen``
+    (:func:`call_people_seen` with ``limit=200``) and ``person_facts`` (the current person facts by id)."""
     now = time.time() if now is None else float(now)
     ranking = rank_routes(store, contact, now=now)
     routes = []
@@ -1414,7 +1445,8 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
             "samples": samples(store, r, with_samples) if with_samples else []})
     facts = []
     try:
-        current = {f.id: f for f in store.portrait_facts(["person"], include_corrections=False)}
+        current = person_facts if person_facts is not None else {
+            f.id: f for f in store.portrait_facts(["person"], include_corrections=False)}
         facts = [_clean(current[f].text, 400) for f in contact.fact_ids if f in current]
     except Exception:
         pass
@@ -1422,7 +1454,7 @@ def card(store: Store, contact: Contact, *, now: float | None = None, near_threa
             "aliases": [a["name"] for a in contact.aliases if a.get("how") != "heard"], "heard": contact.heard(),
             "tone": contact.tone, "facts": facts, "routes": routes, "margin": ranking.margin, "close": ranking.close,
             "usual": routes[0]["ref"] if routes else None, "preferred": ranking.preferred,
-            "calls": calls_with(store, contact)}
+            "calls": calls_with(store, contact, seen=calls_seen)}
 
 
 def card_text(c: dict[str, Any]) -> str:
@@ -1723,9 +1755,19 @@ _SENDER_DAYS: dict[tuple[str, int], tuple[int, dict[str, dict[str, int]]]] = {}
 
 def watch_started(store: Store) -> float | None:
     """When memory first read a chat message on this PC (the earliest ``first_seen``): before it, nothing is known
-    about anyone's messages, so those days are left empty rather than counted as zero. ``None`` with no message."""
+    about anyone's messages, so those days are left empty rather than counted as zero. ``None`` with no message.
+    Cached per database once known (messages are never deleted, so it never moves; review 34 M11)."""
+    key = _db_key(store)
+    if key in _WATCH_STARTED:
+        return _WATCH_STARTED[key]
     rows = store._query("SELECT min(first_seen) FROM messages")
-    return float(rows[0][0]) if rows and rows[0][0] is not None else None
+    found = float(rows[0][0]) if rows and rows[0][0] is not None else None
+    if found is not None:
+        _WATCH_STARTED[key] = found
+    return found
+
+
+_WATCH_STARTED: dict[str, float] = {}
 
 
 def _sender_days(store: Store, thread_id: int) -> dict[str, dict[str, int]]:
@@ -1776,9 +1818,12 @@ def rhythm(store: Store, contacts: Sequence[Contact], *, now: float | None = Non
     per_thread: dict[int, dict[str, list[int]]] = {}   # thread -> day -> [mine, theirs]
     if all_dm:
         marks = ",".join("?" * len(all_dm))
+        # A message's time is never more than an hour after memory first saw it (MSG_TIME_SQL), so first_seen bounds
+        # the scan through the messages(thread_id, first_seen) index (migration 32); re-reads are not counted (M10).
         for r in store._query(f"SELECT thread_id, is_me, date(t, 'unixepoch', 'localtime') AS d, count(*) AS n FROM"
                               f" (SELECT thread_id, is_me, {MSG_TIME_SQL} AS t FROM messages WHERE thread_id IN"
-                              f" ({marks})) WHERE t >= ? GROUP BY thread_id, is_me, d", (*all_dm, start)):
+                              f" ({marks}) AND first_seen >= ? AND status != 'reread') WHERE t >= ?"
+                              " GROUP BY thread_id, is_me, d", (*all_dm, start - 3600.0, start)):
             cell = per_thread.setdefault(int(r["thread_id"]), {}).setdefault(r["d"], [0, 0])
             cell[0 if r["is_me"] else 1] += int(r["n"])
     out: dict[int, dict[str, Any]] = {}

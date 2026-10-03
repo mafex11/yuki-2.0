@@ -308,7 +308,7 @@ import numpy as np
 
 from yuki.core.appnames import shown as _shown   # stored app names as they read now ("WhatsApp.Root" -> "WhatsApp")
 from yuki.memory.crypto import FieldCipher, load_or_create_key
-from yuki.memory.secret_filter import redact_utterances
+from yuki.memory.secret_filter import redact_text, redact_utterances
 
 KEY_FILENAME = "memory.key"
 DB_FILENAME = "memory.db"
@@ -1359,7 +1359,7 @@ QUESTION_STATUSES: tuple[str, ...] = ("open", "asked", "answered", "skipped", "n
 #: existing one is the same question. Measured 2026-09-25 (multilingual MiniLM):
 #: the same question reworded 0.73-0.78 ("Bro" / "Bro (WhatsApp)", "Ravi" /
 #: "Ravi2099", two wordings of the OpenSchool one), different people and names at
-#: most 0.64 ("Ravi2099" / "Komal").
+#: most 0.64 (questions about two different people).
 QUESTION_DUPLICATE_COSINE = 0.70
 
 
@@ -3517,6 +3517,7 @@ class Store:
         if not old:
             return 0
         conn.execute("UPDATE journal_batches SET supersedes=? WHERE id=?", (json.dumps(old), batch_id))
+        self._forget_withdrawn()
         return conn.execute(
             "UPDATE journal SET superseded_at=?, superseded_by=? WHERE batch_id IN (%s) AND superseded_at IS NULL"
             % ",".join("?" * len(old)), (time.time(), batch_id, *old)).rowcount
@@ -3820,21 +3821,46 @@ class Store:
         untainted entry of the same capture thread in the batch that replaced them: on 1 Oct the demo page's
         "received a job offer from Google" was re-journaled into nothing). An entry re-journaled into corrected
         entries is not withdrawn (the portrait's audit weighs those), and an id not in the journal is unknown, not
-        withdrawn. Ids and flags only (nothing decrypted)."""
+        withdrawn. Ids and flags only (nothing decrypted).
+
+        Review 34 M9: the replacement is looked up only for superseded entries (``CASE``; SQLite would otherwise run
+        the subquery for every row) through the ``journal(batch_id, thread_id)`` index (migration 32), and each
+        entry's answer is cached on this store: a withdrawn entry stays withdrawn (taint is set once, a supersede is
+        never undone), a standing one is asked again after :data:`WITHDRAWN_RECHECK_S` or once this store
+        re-journals."""
         ids = sorted({int(i) for i in journal_ids})
         if not ids:
             return set()
-        out: set[int] = set()
-        for start in range(0, len(ids), 500):
-            chunk = ids[start:start + 500]
+        cache: dict[int, float | None] = self.__dict__.setdefault("_withdrawn_cache", {})   # id -> checked at | None
+        clock = time.monotonic()
+        out = {i for i in ids if i in cache and cache[i] is None}
+        ask = [i for i in ids if i not in out and clock - float(cache.get(i) or -1e18) >= self.WITHDRAWN_RECHECK_S]
+        for start in range(0, len(ask), 500):
+            chunk = ask[start:start + 500]
             rows = self._query(
-                "SELECT j.id, coalesce(j.tainted, 0) AS tainted, j.superseded_at, EXISTS (SELECT 1 FROM journal n"
-                " WHERE n.batch_id = j.superseded_by AND n.thread_id IS j.thread_id AND n.superseded_at IS NULL"
-                " AND coalesce(n.tainted, 0) = 0) AS replaced FROM journal j WHERE j.id IN (%s)"
-                % ",".join("?" * len(chunk)), chunk)
-            out |= {int(r["id"]) for r in rows
+                "SELECT j.id, coalesce(j.tainted, 0) AS tainted, j.superseded_at, CASE WHEN j.superseded_by IS NULL"
+                " THEN 0 ELSE EXISTS (SELECT 1 FROM journal n WHERE n.batch_id = j.superseded_by"
+                " AND n.thread_id IS j.thread_id AND n.superseded_at IS NULL AND coalesce(n.tainted, 0) = 0) END"
+                " AS replaced FROM journal j WHERE j.id IN (%s)" % ",".join("?" * len(chunk)), chunk)
+            gone = {int(r["id"]) for r in rows
                     if r["tainted"] or (r["superseded_at"] is not None and not r["replaced"])}
+            out |= gone
+            for i in chunk:   # an id not in the journal is unknown, not withdrawn: asked again later like a standing one
+                cache[i] = None if i in gone else clock
+        if len(cache) > self.WITHDRAWN_CACHE_MAX:
+            cache.clear()
         return out
+
+    #: How long a standing entry's answer is kept (seconds), and the most entries cached per store.
+    WITHDRAWN_RECHECK_S = 600.0
+    WITHDRAWN_CACHE_MAX = 200_000
+
+    def _forget_withdrawn(self) -> None:
+        """A re-journal changed what stands: the standing entries' cached answers are asked again."""
+        cache = self.__dict__.get("_withdrawn_cache")
+        if cache:
+            for key in [k for k, v in list(cache.items()) if v is not None]:
+                cache.pop(key, None)
 
     def superseded_journal(self, journal_ids: Iterable[int]) -> dict[int, int]:
         """``{journal id: the batch that replaced it}`` for those of ``journal_ids`` a re-journal superseded."""
@@ -6402,6 +6428,7 @@ class Store:
             # the fold-in (yuki.memory.checkins.fold_answers), which turns it into goals or updates of them
             if not words:
                 return None
+            words = redact_text(words)   # like add_rule and add_todo: a pasted key never reaches the fold (review 34 L20)
             conn.execute(
                 "UPDATE questions SET status='answered', answered_at=?, answer_ciphertext=?, folded_at=NULL,"
                 " updated_at=? WHERE id=?", (float(at), self.cipher.encrypt(words), now, row["id"]))
@@ -8037,7 +8064,10 @@ class Store:
                 out.append((int(old_id), new_id))
             return out
 
-        return self._write(op)
+        try:
+            return self._write(op)
+        finally:
+            self._forget_withdrawn()
 
     def supersede_episode(self, episode_id: int, text: str, *, vector: np.ndarray | None = None,
                           embed_model: str | None = None) -> int | None:
@@ -8567,24 +8597,36 @@ class Store:
             op.result_id = tid
 
     def memory_started_at(self) -> float | None:
-        """When memory began capturing (its first capture), or ``None`` before any: nothing it holds can have been seen
-        earlier. Cached once known."""
+        """When memory began capturing, or ``None`` before anything was captured: nothing it holds can have been seen
+        earlier. Taken from capture-time stamps that are never pruned (review 34 H8: captures go at 30 days, so their
+        oldest is "about a month ago", not when memory began): the first capture thread's ``first_seen``, the first
+        journal batch, and the oldest capture still kept. Never ``journal.at``, which is the content's own date (a
+        2021 message read back). Cached once known."""
         cached = getattr(self, "_memory_started", None)
         if cached is not None:
             return cached
-        try:
-            row = self._query("SELECT min(at) FROM captures")[0][0]
-        except sqlite3.OperationalError:
+        found: list[float] = []
+        for sql in ("SELECT min(first_seen) FROM threads", "SELECT min(at) FROM journal_batches",
+                    "SELECT min(at) FROM captures"):
+            try:
+                row = self._query(sql)[0][0]
+            except sqlite3.OperationalError:   # a table an old or test database does not have
+                continue
+            if row is not None:
+                found.append(float(row))
+        if not found:
             return None
-        if row is not None:
-            self._memory_started = float(row)
-        return float(row) if row is not None else None
+        self._memory_started = min(found)
+        return self._memory_started
 
-    def repair_work_thread_dates(self, *, now: float | None = None) -> list[dict[str, Any]]:
-        """Threads of work dated outside what memory can have seen, set right from their own events (measured
+    def repair_work_thread_dates(self, *, now: float | None = None, dry_run: bool = False) -> list[dict[str, Any]]:
+        """Threads of work dated where memory cannot have seen them, set right from their own events (measured
         bounds, revamp A9): a first seen before memory began (a thread "since Fri 2024-11-08", 11 months before
         memory existed) becomes its first event dated after memory began; a last seen after now (a calendar line
-        "08 Nov" read as when it was touched) becomes its last event up to now. Returns what changed."""
+        "08 Nov" read as when it was touched) becomes its last event up to now. Only those impossible or future
+        dates move: a true start inside memory's life stays, however old (review 34 H8: the floor is when memory
+        began, :meth:`memory_started_at`, never the oldest capture the 30-day prune left). Returns what changed
+        (``dry_run``: what would change; nothing is written)."""
         now = time.time() if now is None else float(now)
         floor = self.memory_started_at()
         rows = self._query("SELECT id, first_seen, last_seen, created_at FROM work_threads WHERE status != 'merged'")
@@ -8610,7 +8652,7 @@ class Store:
                 new_first = new_last
             if (new_first, new_last) != (first, last):
                 changed.append({"id": int(r["id"]), "first_seen": [first, new_first], "last_seen": [last, new_last]})
-        if changed:
+        if changed and not dry_run:
             self._write(lambda conn: conn.executemany(
                 "UPDATE work_threads SET first_seen=?, last_seen=?, updated_at=? WHERE id=?",
                 [(c["first_seen"][1], c["last_seen"][1], now, c["id"]) for c in changed]))

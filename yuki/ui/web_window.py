@@ -279,7 +279,9 @@ class WebWindow:
 
     def post_live(self) -> None:
         if self.booted:
-            self.post({"kind": "live", "shell": self.shell})
+            # a snapshot (a dict copy is one step under the GIL): other threads update the shell while this posts
+            # (review 34 L6: "dictionary changed size" killed the timer thread and lost an update)
+            self.post({"kind": "live", "shell": dict(self.shell)})
 
     # -- start ---------------------------------------------------------------------------------------------
 
@@ -429,13 +431,17 @@ class WebWindow:
 
     def _people(self) -> tuple[str, list[dict[str, Any]]]:
         """The people: the tray's ``people`` op (memory's people index) when the tray serves it, else the same index
-        through this window's own memory client, else the portrait's person facts."""
+        through this window's own memory client, else the portrait's person facts. An empty index is no index (review
+        34 M5): the portrait's people show until the nightly run builds it."""
         from yuki.ui import web_data as W
 
         if self.client is not None and "people" in self.ops:
             reply = self.request("people", wait_s=6.0, limit=60) or {}
             if reply.get("ok") and reply.get("available") and isinstance(reply.get("people"), list):
-                return "index", [W.person_from_index(p) for p in reply["people"] if isinstance(p, dict) and p.get("name")]
+                people = [W.person_from_index(p) for p in reply["people"] if isinstance(p, dict) and p.get("name")]
+                if people:
+                    return "index", people
+                return W.people_now(self.memory, use_index=False)
         return W.people_now(self.memory)
 
     def _devices(self) -> dict[str, Any] | None:
@@ -476,12 +482,27 @@ class WebWindow:
                 self.post({"kind": "quiet", "on": quiet})
                 self.event("web_quiet", on=quiet)
 
+    def window_shown(self) -> bool:
+        """Whether the window can be seen: not minimised and not hidden (Windows' own answer for its hwnd). ``True``
+        before it exists or when Windows cannot say, so nothing is skipped by mistake."""
+        host = self.host
+        hwnd = int(getattr(host, "hwnd", 0) or 0) if host is not None else 0
+        if not hwnd:
+            return True
+        try:
+            user32 = ctypes.windll.user32
+            return bool(user32.IsWindowVisible(hwnd)) and not bool(user32.IsIconic(hwnd))
+        except Exception:  # noqa: BLE001
+            return True
+
     def _timers(self) -> None:
-        """Home every minute; the pending corrections every 15 s while there are some; the pipe again while down."""
+        """Home every minute while the window can be seen (minimised or hidden it waits, and refreshes on the first
+        tick after it is shown again: review 34 M11, the People list costs a pass over memory); the pending
+        corrections every 15 s while there are some; the pipe again while down."""
         last_home, last_pending, last_connect = time.time(), 0.0, time.time()
         while not self._closing.wait(5.0):
             now = time.time()
-            if now - last_home >= HOME_REFRESH_S:
+            if now - last_home >= HOME_REFRESH_S and self.window_shown():
                 last_home = now
                 self.refresh("home")
                 self._jobs.put(("page", "shell"))

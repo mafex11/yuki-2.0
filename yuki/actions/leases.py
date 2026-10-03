@@ -28,7 +28,13 @@ from typing import Any, Callable, Iterator
 _INPUT = threading.RLock()
 #: One lease per window, made on first use.
 _WINDOWS: dict[int, threading.RLock] = {}
+#: How many hands hold or wait for each window's lease (taken under the guard before the lock is tried, given back
+#: after it is released): a window lease is forgotten only when nobody holds or waits for it.
+_WINDOW_USERS: dict[int, int] = {}
 _WINDOWS_GUARD = threading.Lock()
+#: Past this many window leases the idle ones are forgotten (at most :data:`WINDOWS_FORGET` at a time).
+WINDOWS_KEEP = 256
+WINDOWS_FORGET = 128
 #: ``(start, end)`` (``time.monotonic()``) of Yuki's latest input action; ``end`` is ``None`` while it runs. Input
 #: Windows stamped inside that span (plus :data:`OWN_INPUT_SLACK_S`) is Yuki's own.
 _own_span: tuple[float, float | None] = (0.0, 0.0)
@@ -106,18 +112,44 @@ def input_lease(hwnd: int | None = None, *, timeout_s: float = INPUT_LEASE_S) ->
 @contextmanager
 def window_lease(hwnd: int, *, timeout_s: float = WINDOW_LEASE_S) -> Iterator[None]:
     """Hold one window's lease (an action that works on that window through UI Automation)."""
+    hwnd = int(hwnd)
     with _WINDOWS_GUARD:
-        lock = _WINDOWS.setdefault(int(hwnd), threading.RLock())
-        if len(_WINDOWS) > 256:   # windows come and go: forget the ones nobody holds
-            for key in [k for k, v in _WINDOWS.items() if k != int(hwnd) and v.acquire(blocking=False)][:128]:
-                _WINDOWS[key].release()
-                _WINDOWS.pop(key, None)
-    if not lock.acquire(timeout=timeout_s):
-        raise LeaseBusy(f"another hand is acting on window {hwnd}")
+        lock = _WINDOWS.setdefault(hwnd, threading.RLock())
+        _WINDOW_USERS[hwnd] = _WINDOW_USERS.get(hwnd, 0) + 1
+        if len(_WINDOWS) > WINDOWS_KEEP:
+            _forget_idle_windows(keep=hwnd)
     try:
-        yield
+        if not lock.acquire(timeout=timeout_s):
+            raise LeaseBusy(f"another hand is acting on window {hwnd}")
+        try:
+            yield
+        finally:
+            lock.release()
     finally:
-        lock.release()
+        with _WINDOWS_GUARD:
+            left = _WINDOW_USERS.get(hwnd, 1) - 1
+            if left > 0:
+                _WINDOW_USERS[hwnd] = left
+            else:
+                _WINDOW_USERS.pop(hwnd, None)
+
+
+def _forget_idle_windows(*, keep: int) -> int:
+    """Windows come and go: forget up to :data:`WINDOWS_FORGET` window leases nobody holds or waits for (called under
+    the guard). Each candidate is tried without blocking and released at once, so no lock is ever left held; only
+    those stale keys are popped. Returns how many were forgotten."""
+    stale: list[int] = []
+    for key, lock in list(_WINDOWS.items()):
+        if len(stale) >= WINDOWS_FORGET:
+            break
+        if key == keep or _WINDOW_USERS.get(key, 0) > 0:
+            continue   # held, or about to be tried, by some hand (an RLock would let its own thread in again)
+        if lock.acquire(blocking=False):
+            lock.release()
+            stale.append(key)
+    for key in stale:
+        _WINDOWS.pop(key, None)
+    return len(stale)
 
 
 def input_held_elsewhere() -> bool:

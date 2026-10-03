@@ -80,8 +80,16 @@ def test_the_fixture_is_invented_and_covers_every_page():
     assert set(data["pages"]) == {"home", "work", "day", "me", "playbook", "activity", "settings"}
     assert data["pages"]["home"]["offers"] and data["pages"]["me"]["people"] and data["chat"]["items"]
     text = json.dumps(data, ensure_ascii=False)
-    for name in ("Hemanth", "quix", "Mafex", "Jatin", "Discord", "Eastvale", "Corvana", "Varun", "VALORANT", "Kian"):
+    for name in ("Mafex", "Jatin", "Discord", "Eastvale", "Corvana", "VALORANT", "Kian"):
         assert name not in text, name
+    # Real contacts' names are checked by digest, so the guard itself does not spell them out (review 34 H7):
+    # sha256 of the casefolded word, first 16 hex digits.
+    import hashlib
+
+    words = {"".join(ch if ch.isalnum() else " " for ch in text).casefold()}
+    words = {w for chunk in words for w in chunk.split()}
+    real = {"4a911b18f788b638", "85c13293783e9420", "f4482939d91a358c"}
+    assert not {hashlib.sha256(w.encode()).hexdigest()[:16] for w in words} & real
 
 
 def test_the_fixture_file_is_what_its_generator_writes():

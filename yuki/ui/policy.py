@@ -1,8 +1,9 @@
 """The autonomy policy: how much Yuki may do on its own, per kind of action (the Settings "autonomy dial").
 
 Stored as ``%LOCALAPPDATA%\\Yuki\\autonomy.json`` and exposed over the window's pipe (``permissions_get`` /
-``permissions_set``, :mod:`yuki.ui.window_host`). The agent reads it later (Phase E14 / stream 1c); nothing here
-decides anything at run time, it only stores what the user chose and keeps it inside the user's fixed rules.
+``permissions_set``, :mod:`yuki.ui.window_host`). The agent reads it as a file (:class:`yuki.agent.judge.PolicyReader`:
+the levels and the per-app "Act" switches); nothing here decides anything at run time, it only stores what the user
+chose and keeps it inside the user's fixed rules.
 
 Six kinds of action, four levels each (the rungs of the Lattice dial, least to most on its own):
 
@@ -147,7 +148,8 @@ def set_level(kind: str, level: str, path: Path | None = None) -> dict[str, str]
 def app_acts(path: Path | None = None) -> dict[str, bool]:
     """Per app, whether Yuki may click and type in it (Settings > App access, the "act" column): ``{app name,
     casefolded: allowed}``; an app not listed is allowed (inside the click-and-type level above). Stored under
-    ``apps`` in the same file; the agent reads it later (E14 / 1c), like the levels."""
+    ``apps`` in the same file; the agent refuses clicks, typing and keys in an app switched off
+    (:meth:`yuki.agent.judge.PolicyReader.app_off`, review 34 H5)."""
     try:
         raw = json.loads((path or policy_path()).read_text(encoding="utf-8"))
     except (OSError, ValueError):

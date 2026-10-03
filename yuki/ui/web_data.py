@@ -442,14 +442,18 @@ def contact_card(card: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def people_now(memory: Any, limit: int = 40) -> tuple[str, list[dict[str, Any]]]:
-    """(``index`` | ``portrait``, people): memory's people index when this build has it (probed), else the portrait's
-    person facts (no routes: the page says routes appear once Yuki has learned them)."""
-    people_list = getattr(memory, "people_list", None)
+def people_now(memory: Any, limit: int = 40, *, use_index: bool = True) -> tuple[str, list[dict[str, Any]]]:
+    """(``index`` | ``portrait``, people): memory's people index when this build has it (probed) and it holds someone,
+    else the portrait's person facts (no routes: the page says routes appear once Yuki has learned them). An empty
+    index (``[]``: none built yet, or memory could not read it) is no index (review 34 M5). ``use_index=False``: the
+    caller already found the index empty."""
+    people_list = getattr(memory, "people_list", None) if use_index else None
     if callable(people_list):
         rows = _safe(lambda: people_list(limit=limit), None)
-        if isinstance(rows, list):
-            return "index", [person_from_index(p) for p in rows if isinstance(p, dict) and p.get("name")]
+        people = [person_from_index(p) for p in rows if isinstance(p, dict) and p.get("name")] \
+            if isinstance(rows, list) else []
+        if people:
+            return "index", people
     from yuki.ui.window.data import portrait_item
 
     facts = [f for f in (_safe(lambda: memory.portrait_facts_with_evidence(2), []) or []) if f.get("kind") == "person"]

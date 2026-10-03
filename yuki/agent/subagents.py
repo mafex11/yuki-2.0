@@ -162,6 +162,14 @@ class Helper:
             return ToolOutcome(name=name, ok=False, summary=f"{name} is not available to helpers",
                                content=[{"type": "text", "text": f"{name} is not available: helpers only look "
                                          f"and read. Available: {', '.join(sorted(self.allowed))}."}])
+        if name == "fetch_url" and getattr(self, "_files_read", False):
+            # Review 34 M2: a helper cannot be judged or ask, and a web address can carry what a file says out; after
+            # a read_file in its task it fetches nothing (the brain can, through the judge). The tool sequence only.
+            return ToolOutcome(name=name, ok=False, summary="fetch_url is not available after read_file",
+                               content=[{"type": "text", "text": "fetch_url is not available after read_file in the "
+                                         "same task. Report what you found; Yuki can fetch the page itself."}])
+        if name == "read_file":
+            self._files_read = True
         if name in MEMORY_TOOLS:
             return self.memory.run_tool(name, tool_input, request=self.task)
         return self.dispatcher.dispatch(name, tool_input)

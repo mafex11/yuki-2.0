@@ -2925,8 +2925,15 @@ class MemoryClient:
                 rhythms = _c.rhythm(self.store, persons)
             except Exception:
                 rhythms = {}
+            # read once for every card (review 34 M11): who the call digests saw, and the current person facts
+            seen = _c.call_people_seen(self.store, limit=200) if persons else {}
+            try:
+                facts = {f.id: f for f in self.store.portrait_facts(["person"], include_corrections=False)} \
+                    if persons else {}
+            except Exception:
+                facts = None
             for person in persons:
-                c = _c.card(self.store, person, with_samples=0)
+                c = _c.card(self.store, person, with_samples=0, calls_seen=seen, person_facts=facts)
                 routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "chat", "handle", "mine", "theirs",
                                                  "last_mine", "last_theirs", "share", "preferred")} for r in c["routes"]]
                 last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),

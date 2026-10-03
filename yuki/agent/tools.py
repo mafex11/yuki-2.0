@@ -695,17 +695,72 @@ OP_TRAITS: dict[tuple[str, str], Traits] = {
 }
 
 
+#: Facts of a call's input or target that make an otherwise quiet call one that can destroy or reach someone (review
+#: 34: H2, M1, M2). Kept out of :data:`OP_TRAITS` so the tools' schemas (the ``risk`` field) do not change.
+#: ``open_url`` of anything but an http(s) address: a file or a scheme handler runs through its default program.
+LOCAL_TARGET_TRAITS = Traits(("open_apps",), "focus", destroys=True, reaches=True)
+#: A click on a control whose UIA role commits something (Send, Delete, Sign out, Approve, Buy are buttons and menu
+#: items): it can close, delete or send like a key can.
+COMMITTING_CLICK_TRAITS = Traits(("click_type", "send_messages"), "input", destroys=True, reaches=True)
+#: A click while text Yuki typed is waiting in that window: the click can send it.
+PENDING_TEXT_CLICK_TRAITS = Traits(("click_type", "send_messages"), "input", reaches=True)
+#: ``fetch_url`` after ``read_file`` in the same request: the address can carry what the file says out.
+OUTBOUND_FETCH_TRAITS = Traits((), "none", reaches=True)
+#: The UIA roles (``yuki.perception.tree`` control type names) whose click commits something. List items, tree items,
+#: tabs and links only move around or select, so they stay ungated at the default policy.
+COMMITTING_ROLES: frozenset[str] = frozenset({"Button", "MenuItem", "SplitButton"})
+#: Schemes ``open_url`` opens in a browser (anything else is a file, a folder or another program's handler).
+WEB_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def _line_break_in(text: Any) -> bool:
+    """A carriage return or line feed in typed text: typed key by key it is Enter (``\\r``) or Ctrl+Enter (``\\n``),
+    which sends in most chats and mail (review 34 M1). A character test, not words."""
+    return isinstance(text, str) and ("\r" in text or "\n" in text)
+
+
+def _web_address(url: Any) -> bool:
+    """``url`` is an http(s) address (its scheme parsed, a fixed machine format)."""
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(str(url or "").strip()).scheme.casefold() in WEB_SCHEMES
+    except ValueError:
+        return False
+
+
 def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
-    """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool)."""
+    """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool). Text with
+    a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme runs
+    something (both facts of the input itself)."""
     tool_input = tool_input or {}
     op = None
     if name in ("window_action", "tab"):
         op = str(tool_input.get("action") or "")
-    elif name == "type_text" and tool_input.get("press_enter") is True:
+    elif name == "type_text" and (tool_input.get("press_enter") is True or _line_break_in(tool_input.get("text"))):
         op = "submit"
+    elif name == "open_url" and not _web_address(tool_input.get("url")):
+        return LOCAL_TARGET_TRAITS
     if op is not None and (name, op) in OP_TRAITS:
         return OP_TRAITS[(name, op)]
     return TOOL_TRAITS.get(name, Traits())
+
+
+def call_traits(name: str, tool_input: dict[str, Any] | None = None, *, role: str | None = None,
+                typed_pending: bool = False, files_read: bool = False) -> Traits:
+    """:func:`tool_traits` plus the machine facts of the call's target the caller knows (review 34): a click on a
+    control whose UIA role (from the latest read) is in :data:`COMMITTING_ROLES`, or a click while text Yuki typed
+    waits in that window, can destroy or send; ``fetch_url`` after a ``read_file`` in the same request can carry the
+    file out. Roles, a flag and the tool sequence only, never words."""
+    traits = tool_traits(name, tool_input)
+    if name == "click":
+        if role and str(role) in COMMITTING_ROLES:
+            return COMMITTING_CLICK_TRAITS
+        if typed_pending:
+            return PENDING_TEXT_CLICK_TRAITS
+    if name == "fetch_url" and files_read:
+        return OUTBOUND_FETCH_TRAITS
+    return traits
 
 
 #: Tools some operation of which can destroy or reach someone: they carry the ``risk`` field (revamp D, 07 E1: the
@@ -2607,6 +2662,33 @@ class Dispatcher:
                 return None
             return {"role": str(element.get("role") or ""), "name": str(element.get("name") or "")[:80]}
         except Exception:  # noqa: BLE001 - a trace detail, never an error
+            return None
+
+    def pointed_element(self, tool_input: dict[str, Any]) -> dict[str, Any] | None:
+        """The role and name of the element under a click's raw ``x``, ``y`` in the latest read of its window (the
+        smallest interactive element whose bounds hold the point, else the smallest element), or ``None``: so a click
+        at a Send button's coordinates is gated like a click on its id (review 34 H2). Bounds from the read only (no
+        desktop call beyond which window is at the point); never raises."""
+        try:
+            if tool_input.get("element") is not None or tool_input.get("x") is None or tool_input.get("y") is None:
+                return None
+            x, y = int(tool_input["x"]), int(tool_input["y"])
+            hwnd = self._opt_hwnd(tool_input) or self._pointed_window(x, y) or self._latest_tree_hwnd
+            if hwnd is None or int(hwnd) not in self._latest_trees:
+                return None
+            best: tuple[bool, int, dict[str, Any]] | None = None
+            for element in self._latest_trees[int(hwnd)][1].values():
+                b = element.get("bounds") if isinstance(element, dict) else None
+                if not b or len(b) != 4 or not (int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3])):
+                    continue
+                rank = (not element.get("is_interactive"), (int(b[2]) - int(b[0])) * (int(b[3]) - int(b[1])), element)
+                if best is None or rank[:2] < best[:2]:
+                    best = rank
+            if best is None:
+                return None
+            element = best[2]
+            return {"role": str(element.get("role") or ""), "name": str(element.get("name") or "")[:80]}
+        except Exception:  # noqa: BLE001 - a gate detail, never an error
             return None
 
     def _element_target(self, tool_input: dict[str, Any]) -> tuple[int, int, int, str] | None:

@@ -44,7 +44,7 @@ def test_a_suggestion_is_accepted_by_key_and_checked_by_the_field(monkeypatch: A
     monkeypatch.setattr(inp, "_foreground_mismatch", lambda _h: None)
     monkeypatch.setattr(inp, "_read_field", lambda: after)
     before = FieldState(ok=True, value="@Hem", parts=1, parts_text="@Hem", popup=True, popup_how="controls",
-                        items=("Hemanth hemanth_q", "Harry Tran harryt"), selected=0)
+                        items=("Hemanth hemanth_q", "Hema Tran hemat"), selected=0)
     details: dict[str, Any] = {}
     phrase, state = inp._accept_suggestion(before, 8194, details)
     assert pressed == ["enter"] and details["suggestion_verified"] is True

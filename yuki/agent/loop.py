@@ -987,6 +987,7 @@ class Agent:
         self._close_call_consulted = False
         self._sends: list[dict[str, Any]] = []
         self._typed: dict[int, str] = {}
+        self._files_read = False
         self._unconfirmed: list[tuple[int, int | None]] = []
         self._last_view_text: str | None = None
         self._denial_stop: str | None = None
@@ -2106,9 +2107,10 @@ class Agent:
             return
 
         judged = None
-        if acts:
+        if acts or self._outbound_read(name):
             # Revamp D (S1): calls whose metadata can destroy or reach someone, and kinds the user's policy holds back,
-            # pass the authorization judge, which sees only the user's own words and this call.
+            # pass the authorization judge, which sees only the user's own words and this call (and a fetch_url after
+            # a read_file: review 34 M2).
             judged = self._authorize(name, tool_input, target)
             held_text = self._denial_text(judged) if judged is not None and not judged.allowed else None
             if held_text is None:
@@ -2167,6 +2169,10 @@ class Agent:
             outcome = self._dispatch(name, tool_input)
         self._tool_s += time.perf_counter() - dispatched
         self._tool_counts[name] += 1
+        if name == "read_file" or (name == "spawn_helpers" and isinstance(outcome.payload, dict) and any(
+                "read_file" in (h.get("tools") or []) for h in outcome.payload.get("helpers") or []
+                if isinstance(h, dict))):
+            self._files_read = True   # a later fetch_url is judged (review 34 M2)
         # Text written outside Yuki (pages, windows, files, command output, memory) is fenced as
         # untrusted data with this request's code (yuki.agent.untrusted).
         if name in EXTERNAL_TEXT_TOOLS and (outcome.ok or name == "run_powershell"):
@@ -3056,6 +3062,17 @@ class Agent:
         if element:
             target["element"] = f"{element.get('role') or 'element'} \"{element.get('name') or ''}\""
             target["control"] = f"{element.get('role') or ''}|{element.get('name') or ''}"
+            target["role"] = element.get("role") or ""
+        elif name == "click":
+            # Review 34 H2: a click at raw coordinates is gated by the element under the point in the latest read.
+            pointed = getattr(self.dispatcher, "pointed_element", None)
+            under = pointed(tool_input) if callable(pointed) else None
+            if under:
+                target["element"] = f"{under.get('role') or 'element'} \"{under.get('name') or ''}\" (under the point)"
+                target["role"] = under.get("role") or ""
+        if name == "click":
+            # text Yuki typed into this window and has not sent yet: a click there can send it (review 34 H2)
+            target["typed_pending"] = bool(str(getattr(self, "_typed", {}).get(int(hwnd or 0), "")).strip())
         if name == "tab":
             names = (getattr(self.dispatcher, "tab_names", {}) or {}).get(hwnd or 0) or {}
             tab = names.get(str(tool_input.get("tab") or "").strip().strip("[]"))
@@ -3064,16 +3081,27 @@ class Agent:
                 target["tab_name"] = tab
         return target
 
+    def _outbound_read(self, name: str) -> bool:
+        """A ``fetch_url`` after a ``read_file`` in this request (the brain's own or a helper's): the address could
+        carry what the file says out, so it is judged (review 34 M2). The tool sequence only."""
+        return name == "fetch_url" and bool(getattr(self, "_files_read", False))
+
     def _authorize(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> Any:
         """The judge's verdict for one action, or ``None`` when its metadata and the policy do not send it there."""
-        if self.authorizer is None or name not in ACTION_TOOL_NAMES:
+        outbound = self._outbound_read(name)
+        if self.authorizer is None or (name not in ACTION_TOOL_NAMES and not outbound):
             return None
         # Yuki's own earlier calls of this request (the calls, never what came back: auto mode's classifier sees the
         # agent's tool calls too), so a message is judged whole (a mention typed by the call before is part of it).
         earlier = [f"{s.get('tool')} {json.dumps(s.get('input') or {}, ensure_ascii=False, default=str)}"
                    for s in getattr(self, "_trace", []) if s.get("kind") == "action" and s.get("ok")]
+        if outbound:
+            # the file reads it follows (the calls only), so the judge sees what the address may carry
+            earlier += [f"{s.get('tool')} {json.dumps(s.get('input') or {}, ensure_ascii=False, default=str)}"
+                        for s in getattr(self, "_trace", []) if s.get("tool") == "read_file"]
         verdict = self.authorizer.check(name, tool_input, words=list(self._user_words), target=target,
-                                        signature=call_signature(acting_input(tool_input)), earlier=earlier)
+                                        signature=call_signature(acting_input(tool_input)), earlier=earlier,
+                                        files_read=outbound)
         if self.authorizer.stopped and verdict is not None and not verdict.allowed:
             self._denial_stop = self.authorizer.stopped
         return verdict
@@ -3083,6 +3111,9 @@ class Agent:
         if verdict.source == "policy":
             return (f"{JUDGE_LABEL}: not run: {verdict.why}. Tell them what you would do and let them say go, or do "
                     f"it themselves.")
+        if verdict.source == "app_off":
+            return (f"{JUDGE_LABEL}: not run, and it will not run: {verdict.why} Do not click, type or press keys in "
+                    f"that app in this request; tell them plainly, or do what they asked another way.")
         if verdict.source == "error":
             return (f"{JUDGE_LABEL}: not run: {verdict.why} ({verdict.error}). Ask the user one plain question before "
                     f"this step.")
