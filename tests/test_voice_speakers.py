@@ -444,6 +444,20 @@ def test_call_mode_ends_soon_after_the_last_exchange_however_much_they_talk() ->
     assert took < 1.0 + Conversation.CALL_SPEECH_GRACE_S + 0.5, took
 
 
+def test_the_watch_never_imports_the_scroll_module_to_ask_about_a_scroll(monkeypatch) -> None:
+    """The watch asks "is a page scrolling on?" on every pass: with the module never loaded no scroll can run, and
+    importing it there (pyautogui, comtypes: ~0.5 s) stalled the event loop and stretched the call-mode end."""
+    from yuki.voice.pipeline import Conversation
+
+    conv = Conversation(settings=Settings(), bridge=types.SimpleNamespace(), transport=None, memory=None,
+                        mouth_memory=None, log=None, speech_end=lambda: None, on_state=lambda *a: None, session="t")
+    monkeypatch.delitem(sys.modules, "yuki.actions.scrolling", raising=False)
+    assert conv._scrolling_line() is None and "yuki.actions.scrolling" not in sys.modules
+    monkeypatch.setitem(sys.modules, "yuki.actions.scrolling",
+                        types.SimpleNamespace(continuous_state=lambda: "Browser \"Feed\", down"))
+    assert conv._scrolling_line() == "Browser \"Feed\", down"
+
+
 def test_a_back_and_forth_earns_a_longer_quiet_window() -> None:
     from yuki.voice.pipeline import Conversation
 

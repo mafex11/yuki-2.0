@@ -31,6 +31,7 @@ import asyncio
 from collections import deque
 from pathlib import Path
 import os
+import sys
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -3819,11 +3820,17 @@ class Conversation:
                            seconds=report.get("seconds"))
 
     def _scrolling_line(self) -> str | None:
-        """V7: what the continuous scroll is doing now (``yuki.actions.scrolling.continuous``), or ``None``."""
-        try:
-            from yuki.actions.scrolling import continuous_state
+        """V7: what the continuous scroll is doing now (``yuki.actions.scrolling.continuous``), or ``None``.
 
-            return continuous_state()
+        Read from the module only when it is already loaded: a scroll can only run in this process through it, and
+        the watch asks on every pass, the first one included. Importing it there cost ~0.5 s on the event loop
+        (``yuki.actions`` pulls in pyautogui and comtypes), which the watch measured as a loop stall and added to the
+        call-mode idle: call mode ended at 5.7-5.9 s against its 5 s (1 s idle + speech grace)."""
+        scrolling = sys.modules.get("yuki.actions.scrolling")
+        if scrolling is None:
+            return None
+        try:
+            return scrolling.continuous_state()
         except Exception:  # noqa: BLE001 - a hint only
             return None
 

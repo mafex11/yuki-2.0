@@ -894,15 +894,17 @@ class Linker:
 
     def changed_since(self, since: float | None) -> bool:
         """Whether anything the index rests on changed since ``since`` (new messages or chats, person facts or
-        aliases); ``None``: there was no run yet."""
+        aliases); ``None``: there was no run yet. Every test is by when the row was *written* (``first_seen``,
+        ``created_at``, ``expired_at``): a person fact's ``valid_from``/``valid_to`` are its evidence dates, so a fact
+        the nightly audit wrote tonight from a chat of last week would otherwise look older than the last run."""
         if since is None:
             return True
         s = float(since)
         q = self.store._query
         return bool(
             q("SELECT 1 FROM messages WHERE first_seen > ? LIMIT 1", (s,))
-            or q("SELECT 1 FROM portrait_facts WHERE kind='person' AND (valid_from > ? OR coalesce(valid_to, 0) > ?)"
-                 " LIMIT 1", (s, s))
+            or q("SELECT 1 FROM portrait_facts WHERE kind='person' AND (coalesce(created_at, valid_from) > ?"
+                 " OR coalesce(expired_at, valid_to, 0) > ?) LIMIT 1", (s, s))
             or q("SELECT 1 FROM name_aliases WHERE created_at > ? OR coalesce(ended_at, 0) > ? LIMIT 1", (s, s)))
 
     def run(self, *, kind: str = "refresh", dry_run: bool = False, now: float | None = None,
