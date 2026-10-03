@@ -376,6 +376,9 @@ class WebWindow:
                 threading.Thread(target=self._media, name="yuki-web-media", daemon=True).start()
 
     def requests_csv(self) -> Path | None:
+        """The agent's request log; a test memory (its own ``ui_path``) reads the one beside it, never the user's."""
+        if self.ui_path is not None:
+            return Path(self.ui_path).parent / "requests.csv"
         try:
             from yuki.config import Settings
 
