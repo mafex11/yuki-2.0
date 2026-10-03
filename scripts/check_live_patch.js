@@ -561,6 +561,40 @@ async function inPage(F) {
     check('W8 nothing in the Calls tab overflows sideways', crs.every((r) => r.scrollWidth <= r.clientWidth + 1) && main().scrollWidth <= main().clientWidth + 1);
     withLines.querySelector('.fx-h').click(); await sleep(60);
   }
+  // ---- W7 (4 Oct): the Playbook - numbered steps per goal, app choices in plain words, lessons folded, two balanced
+  // columns under the procedures ----
+  await go('#playbook'); await sleep(500);
+  const pc = main().querySelector('.proc2');
+  check('W7 a procedure is a title and its steps numbered 1, 2, 3', !!pc && !!pc.querySelector('h4') && pc.querySelectorAll('.nsteps li').length >= 2
+    && Array.from(pc.querySelectorAll('.nsteps .n')).map((n) => n.textContent).join(',').startsWith('1,2'));
+  const lsn = Array.from(main().querySelectorAll('.lesson2'));
+  check('W7 lessons are a short title and one line, folded', lsn.length > 0 && lsn.every((l) => !l.classList.contains('open') && !!l.querySelector('.fx-h .lt')
+    && l.querySelector('.fx-h').getBoundingClientRect().height < 72), lsn.map((l) => Math.round(l.querySelector('.fx-h').getBoundingClientRect().height)).join(','));
+  if (lsn[0]) {
+    lsn[0].querySelector('.fx-h').click(); await sleep(80);
+    const ln = lsn[0].querySelector('.fx-h .ln');
+    check('W7 a lesson opens to its details, its one line not said twice', lsn[0].classList.contains('open') && !!lsn[0].querySelector('.fx-d .d') && (!ln || getComputedStyle(ln).display === 'none'));
+    lsn[0].querySelector('.fx-h').click(); await sleep(40);
+  }
+  const chTxt = Array.from(main().querySelectorAll('.choice')).map((c) => c.textContent).join(' | ');
+  check('W7 app choices say the choice plainly, never counts', chTxt.includes('usually') && !/\d+(\.\d+)?\s*(min|minutes|visits)\b/.test(chTxt), chTxt.slice(0, 160));
+  const pbCols = Array.from(main().querySelectorAll('.pb-grid > .col')).map((c) => c.getBoundingClientRect().height);
+  check('W7 the two columns under the procedures are about as tall', pbCols.length === 2 && Math.min(...pbCols) >= 0.6 * Math.max(...pbCols), pbCols.map(Math.round).join(' vs '));
+  // ---- W10 (4 Oct): Settings -> quiet hours: a switch, from-to times, what they do in plain words ----
+  await go('#settings'); await sleep(500);
+  const qrow = () => main().querySelector('[data-k="quiet"]');
+  const qsel = () => Array.from(main().querySelectorAll('select[data-change="quiet-time"]'));
+  check('W10 quiet hours has a switch, a from and a to time, and says what they do', !!qrow() && !!qrow().querySelector('.tog[data-do="quiet-on"]') && qsel().length === 2
+    && qrow().textContent.includes('No cards') && !main().textContent.includes('Quiet hours: none'), qrow() && qrow().textContent);
+  REPLY.quiet = (m) => (m.on === false ? { ok: true, quiet_start: '00:30', quiet_end: '00:30' } : m.on === true ? { ok: true, quiet_start: '00:30', quiet_end: '08:00' }
+    : { ok: true, quiet_start: m.start || '00:30', quiet_end: m.end || '08:00' });
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('W10 the switch turns them off (sent to Python) and the times wait, greyed', acts('quiet').some((m) => m.on === false) && qrow().textContent.includes('Off.')
+    && qsel().every((s) => s.disabled));
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('W10 on again brings the hours back', acts('quiet').some((m) => m.on === true) && qrow().textContent.includes('From 12:30 AM to 8:00 AM') && qsel().every((s) => !s.disabled));
+  qsel()[0].value = '23:00'; qsel()[0].dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
+  check('W10 a new start time is sent and shown in plain clock words', acts('quiet').some((m) => m.start === '23:00') && qrow().textContent.includes('From 11:00 PM to 8:00 AM'), qrow().textContent.slice(0, 80));
   return results;
 }
 
