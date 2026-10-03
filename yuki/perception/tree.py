@@ -3262,8 +3262,9 @@ def get_window_tree(
                 )
             note = (
                 "; ".join(parts)
-                + " - the rest is drawn without accessibility (video, canvas) or has "
-                "not been exposed yet; look again shortly if you expected content there"
+                # report 58: a sparse page (T3 Code's new thread) is mostly empty space, not hidden content
+                + " - the rest is empty space, drawn without accessibility (video, canvas), or not "
+                "exposed yet; look again shortly if you expected content there"
             )
     if elements and chosen.offscreen_pages:
         # Said because it changes what the reader can do: the window is on
