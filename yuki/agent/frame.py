@@ -581,7 +581,7 @@ def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
 
 
 def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Sequence[str] = (),
-                    at: float | None = None) -> dict[str, list[str]]:
+                    at: float | None = None, stamped: bool = True) -> dict[str, list[str]]:
     """N8 (report 47): from one finished run's trace, per app, what did not work and what worked after it, as short
     lines for the next requests of this session (:func:`build`'s ``lessons``), or ``{}`` for a run with no trouble.
 
@@ -612,6 +612,7 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
     if not bad and not repeated and not ended_badly and not steers:
         return {}
     clock = _dt.fromtimestamp(at).strftime("%I:%M %p").lstrip("0") if at else "earlier"
+    pre = f"{clock}: " if stamped else ""
     out: dict[str, list[str]] = collections.defaultdict(list)
     seen: set[tuple[str, Any, str]] = set()
     for s in bad:
@@ -621,21 +622,52 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
         seen.add(key)
         n = counts.get(key, 1)
         why = _one(s.get("why") or s.get("result"), 120)
-        out[key[0]].append(f"{clock}: {key[1]}" + (f" on {key[2]}" if key[2] else "") + (f", {n} times" if n > 1
+        out[key[0]].append(f"{pre}{key[1]}" + (f" on {key[2]}" if key[2] else "") + (f", {n} times" if n > 1
                                                                                          else "") + f": {why}")
     for key in repeated:
         if key not in seen:
             seen.add(key)
-            out[key[0]].append(f"{clock}: {key[1]} on {key[2]} {counts[key]} times in one run (it did not settle "
+            out[key[0]].append(f"{pre}{key[1]} on {key[2]} {counts[key]} times in one run (it did not settle "
                                f"it; read the state before acting again)")
     first_bad = min((trace.index(s) for s in bad if s in trace), default=None)
     if first_bad is not None:
         worked = [s for s in list(trace)[first_bad + 1:] if s.get("kind") == "action" and s.get("verdict") is True]
         for s in worked[:1]:
-            out[s.get("app") or ""].append(f"{clock}: what worked after that: {s.get('tool')}"
+            out[s.get("app") or ""].append(f"{pre}what worked after that: {s.get('tool')}"
                                            + (f" on {s.get('target')}" if s.get("target") else ""))
     if ended_badly or steers:
         app = next((s.get("app") for s in reversed(acted) if s.get("app")), "")
         said = "; ".join(f"\"{_one(w, 80)}\"" for w in list(steers)[:2])
-        out[app or ""].append(f"{clock}: the run ended {outcome}" + (f"; they said while it ran: {said}" if said else ""))
+        out[app or ""].append(f"{pre}the run ended {outcome}" + (f"; they said while it ran: {said}" if said else ""))
     return {k: v[:MAX_LESSONS] for k, v in out.items() if v}
+
+
+#: What a run kept in practice memory as a pitfall must show: it failed or was stopped (cancelled, withdrawn, an
+#: error), the user added words while it ran, or one control was acted on three times or more.
+PITFALL_OUTCOMES: tuple[str, ...] = ("cancelled", "withdrawn", "error", "failed")
+
+
+def session_pitfalls(trace: Sequence[dict[str, Any]], *, outcome: str,
+                     steers: Sequence[str] = ()) -> dict[str, dict[str, str]]:
+    """N8 (report 47, review): a failed or stopped run's lessons as practice-memory pitfalls, per app: ``{app: {"text":
+    what went wrong, "instead": what worked after it or ""}}``, from :func:`session_lessons` without the clock (they
+    outlive the session). ``{}`` for a run that did not fail, was not stopped or corrected, and repeated nothing (a
+    single failed step the run got past stays a session lesson only). Code only."""
+    import collections
+
+    steps = [s for s in trace or () if isinstance(s, dict)]
+    acted = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in steps
+                                if s.get("kind") == "action")
+    repeated = any(n >= 3 and k[2] for k, n in acted.items())
+    if not (outcome in PITFALL_OUTCOMES or steers or repeated) or not acted:
+        return {}
+    marker = "what worked after that: "
+    out: dict[str, dict[str, str]] = {}
+    for app, lines in session_lessons(trace, outcome=outcome, steers=steers, stamped=False).items():
+        if not app:
+            continue
+        worked = [line.split(marker, 1)[1] for line in lines if line.startswith(marker)]
+        rest = [line for line in lines if not line.startswith(marker)]
+        if rest:
+            out[app] = {"text": "; ".join(rest)[:500], "instead": worked[0][:200] if worked else ""}
+    return out

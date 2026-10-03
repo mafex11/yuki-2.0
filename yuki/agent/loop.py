@@ -1588,8 +1588,65 @@ class Agent:
             if lessons:
                 self._session_lessons.append((time.time(), lessons))
                 self.logger.log("session_lessons", apps=sorted(lessons), lines=sum(len(v) for v in lessons.values()))
+                self._keep_pitfalls(outcome=outcome, at=at, lessons=lessons)
         except Exception as exc:  # noqa: BLE001 - a lesson never breaks a request
             self.logger.log("session_lessons", error=f"{type(exc).__name__}: {exc}"[:200])
+
+    #: How long the background write of a run's pitfalls may take (s; off the request's path).
+    PITFALL_WRITE_S = 8.0
+
+    def _keep_pitfalls(self, *, outcome: str, at: float, lessons: dict[str, list[str]] | None = None) -> None:
+        """N8 (report 47, review): a failed or stopped run's pitfalls and the way that worked after them
+        (:func:`task_frame.session_pitfalls`) into practice memory, so every lane and the next session read them for that
+        app (practice memory shows a pitfall of an app in play to every request). Through the existing practice store
+        (``practice.add_playbook``, a ``pitfall`` with one ``observed`` event of this run: a tentative object the ledger
+        weighs like any other; a near-identical earlier one of Yuki's own is superseded, not piled up). No migration.
+        Practice memory's own post-mortem may refine it when its budget allows. On a daemon thread; never raises."""
+        trace = getattr(self, "_trace", None) or []
+        if not getattr(self.memory, "installed", False) or not callable(getattr(self.memory, "call", None)):
+            return
+        pits = task_frame.session_pitfalls(trace, outcome=outcome,
+                                           steers=list(getattr(self, "_steer_texts", None) or []))
+        if not pits:
+            return
+        intent = " ".join(str(self._this_query or "").split())[:120] or "a task"
+        key = f"agent:{getattr(self.memory, 'session_id', None) or ''}:{self.lane}-{self._requests}"
+        logger = self.logger
+
+        def write(client: Any) -> list[int]:
+            from yuki.memory import practice as practice_store
+
+            ids = []
+            what = practice_store._redact(intent) or "a task"   # memory's secret filter, as for every trace
+            for app, pit in pits.items():
+                embed = getattr(client, "_embed", None)
+                vec = embed(practice_store.vector_text(client.store, what)) if callable(embed) else None
+                supersedes = None
+                if vec is not None:
+                    near = practice_store.near(client.store, vec, kinds=["pitfall"], limit=4)
+                    same = [o for o in near if o.origin == "session" and practice_store.app_key(app) in o.apps
+                            and (o.score or 0.0) >= practice_store.SUPERSEDE_COSINE]
+                    supersedes = same[0].id if same else None
+                ids.append(practice_store.add_playbook(
+                    client.store, {"kind": "pitfall", "intent": what, "apps": [app], "origin": "session",
+                                   "body": {"text": pit["text"], "instead": pit["instead"] or None},
+                                   "sources": [key]},
+                    events=[{"type": "observed", "run_key": key, "refs": {"outcome": outcome}, "at": at}],
+                    vector=vec, embed_model=getattr(getattr(client, "_embedder", None), "model_name", None),
+                    supersedes=supersedes))
+            return ids
+
+        def run() -> None:
+            try:
+                ids = self.memory.call("session_pitfalls", write, timeout_s=self.PITFALL_WRITE_S)
+                logger.log("session_pitfalls", ok=True, apps=sorted(pits), ids=list(ids or []))
+                for app in pits:   # practice memory shows it now: the session copy would only repeat it
+                    if lessons is not None:
+                        lessons.pop(app, None)
+            except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+                logger.log("session_pitfalls", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
+
+        threading.Thread(target=run, name="yuki-session-pitfalls", daemon=True).start()
 
     def _lessons_for(self, overview: Any) -> list[str]:
         """N8: the session lessons of the apps in play (an open window's app, or the app the user named), newest
@@ -1605,7 +1662,7 @@ class Agent:
         for at, lessons in reversed(list(getattr(self, "_session_lessons", ()) or ())):
             if now - at > self.LESSON_TTL_S:
                 continue
-            for app, lines in lessons.items():
+            for app, lines in list(lessons.items()):   # a background write may drop an app it kept in memory
                 key = _app_key(app)
                 if key and any(key == k or (len(k) >= 4 and (k in key or key in k)) for k in keys):
                     out += [f"[{app}] {line}" for line in lines]
