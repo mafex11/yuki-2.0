@@ -185,9 +185,16 @@ class EventHub:
                 self._lock.notify_all()
             return
         with self._lock:
-            activity.token = token
-            activity.ready = True
-            self._lock.notify_all()
+            current = self._windows.get(hwnd) is activity
+            if current:
+                activity.token = token
+                activity.ready = True
+                self._lock.notify_all()
+        if not current:   # it left play while the subscription was being made: never leave one dangling
+            try:
+                source.unsubscribe(token)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _unsubscribe(self, source: Source, hwnd: int) -> None:
         with self._lock:
