@@ -72,12 +72,16 @@ from yuki.agent.tools import (
     MEMORY_TOOLS,
     PLAYBOOK_FIELD,
     RISK_FIELD,
+    STEP_ABOUT_FIELD,
     STEP_FIELD,
+    WHAT_FIELD,
     PERCEPTION_TOOLS,
     Backend,
     Dispatcher,
     ToolOutcome,
     resolve_tool_names,
+    call_traits,
+    sends_for_certain,
     tool_params,
     tool_traits,
     unavailable_tool,
@@ -188,6 +192,30 @@ def acting_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     if STEP_FIELD not in (tool_input or {}):
         return tool_input
     return {k: v for k, v in tool_input.items() if k != STEP_FIELD}
+
+
+def _acts_only(tool_input: Any) -> dict[str, Any]:
+    """A kept step's input without the brain's notes about it (``what``, ``risk``...): what the call did."""
+    from yuki.agent.loopguard import NOTE_FIELDS
+
+    return {k: v for k, v in (tool_input or {}).items() if k not in NOTE_FIELDS} if isinstance(tool_input, dict) else {}
+
+
+def _app_display(process: Any) -> str:
+    """A window's app as people know it (``Discord.exe`` -> ``Discord``; Windows' own name when it has one), from the
+    process name (``yuki.core.appnames``). ``""`` for none; never raises."""
+    text = str(process or "").strip()
+    if not text:
+        return ""
+    try:
+        from yuki.core.appnames import app_key, prettify, resolver
+
+        try:
+            return resolver().name_for_key(app_key(text), prettify(text)) or prettify(text)
+        except Exception:  # noqa: BLE001 - the tidied image name still reads
+            return prettify(text)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 #: The verdict reason of an action whose effect its report cannot show by the nature of its target, not because
@@ -1445,6 +1473,8 @@ class Agent:
             self._trace_numbers.update(n for n in numbers if n)
             acting = {k: v for k, v in acting_input(tool_input).items()
                       if k not in (RISK_FIELD, FINISHES_FIELD, FINISH_WORDS_FIELD, PLAYBOOK_FIELD)}
+            # (``what``, the brain's plain words for the step, stays in the kept input: the ledger shows it; the
+            # signature leaves it out, as every note field)
             sig = hashlib.sha1(call_signature(acting).encode("utf-8", "replace")).hexdigest()[:12]
             step = {"tool": name, "kind": kind, "app": app, "target": ", ".join(parts), "input": acting,
                     "ok": ok, "verdict": verdict, "why": why, "expected": finish_gate.is_expected(why),
@@ -2051,6 +2081,12 @@ class Agent:
         finish_line = (own_words or finish_gate.finish_line(name, tool_input, process=target.get("app"),
                                                              tab_name=target.get("tab_name"))) if finishes else None
         event_input = tool_input if finish_line is None else {**tool_input, FINISHES_FIELD: finish_line}
+        about = self._step_about(name, tool_input, target) if acts else {}
+        # the step's words travel on its result too (the brain's ``what`` and the target's names)
+        step_words = {**({WHAT_FIELD: tool_input[WHAT_FIELD]} if isinstance(tool_input.get(WHAT_FIELD), str) else {}),
+                      **({STEP_ABOUT_FIELD: about} if about else {})}
+        if about:   # the UI's step words (yuki.ui.step_words): names, never the command, text or address
+            event_input = {**event_input, STEP_ABOUT_FIELD: about}
         self.logger.tool_call(name, event_input, tool_use_id=tool_id)
         yield ToolCall(name, event_input)
 
@@ -2062,7 +2098,7 @@ class Agent:
         if self._cancelled.is_set():
             text = "Not run: the user cancelled."
             turn.record(tool_id, self._skip(tool_id, name, text))
-            yield ToolResult(name, False, text)
+            yield ToolResult(name, False, text, about=step_words)
             turn.stop_after = True
             return
 
@@ -2082,7 +2118,7 @@ class Agent:
             turn.record(tool_id, self._skip(tool_id, name, refused))
             self._note_action(name, False, refused)
             self._trace_step(name, tool_input, ok=False, why="refused before it ran", result=refused)
-            yield ToolResult(name, False, refused)
+            yield ToolResult(name, False, refused, about=step_words)
             turn.stop_after = True
             return
         if decision == "confirm":
@@ -2115,7 +2151,7 @@ class Agent:
             self._note_action(name, False, f"held for confirmation: {question} -> {answer}")
             self._trace_step(name, tool_input, ok=answer is not None, kind="ask",
                              result=f"held for the user's confirmation: \"{question}\" -> \"{answer}\"")
-            yield ToolResult(name, False, text)
+            yield ToolResult(name, False, text, about=step_words)
             turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True))
             turn.stop_after = True
             return
@@ -2151,7 +2187,7 @@ class Agent:
                 self._note_action(name, False, "not run: held by Yuki's check")
                 self._trace_step(name, tool_input, ok=False, kind="control", why="not run: held by Yuki's check",
                                  result=held_text)
-                yield ToolResult(name, False, held_text)
+                yield ToolResult(name, False, held_text, about=step_words)
                 turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": held_text}], is_error=True))
                 turn.stop_after = True
                 return
@@ -2225,7 +2261,7 @@ class Agent:
                     name, ok=False, summary=text, result={"answer": None},
                     elapsed_ms=outcome.elapsed_ms, tool_use_id=tool_id,
                 )
-                yield ToolResult(name, False, text)
+                yield ToolResult(name, False, text, about=step_words)
                 turn.record(
                     tool_id,
                     self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True),
@@ -2355,7 +2391,7 @@ class Agent:
                              outcome=outcome, control=target.get("control") if acts else None)
             if acts and verdict is not None and outcome.ok:
                 self._mark_confirmations(target.get("hwnd"), verdict)
-        yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload)
+        yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload, about=step_words)
         if outcome.ok and finish_line:
             turn.finishing.append((finish_line, verdict[0] if verdict else None,
                                    verdict[1] if verdict else "", name))
@@ -3081,6 +3117,7 @@ class Agent:
         element = describe(tool_input) if callable(describe) else None
         if element:
             target["element"] = f"{element.get('role') or 'element'} \"{element.get('name') or ''}\""
+            target["element_name"] = element.get("name") or ""
             # V6: a scroll's control is its role in that app (a page's name is its title, different on every page),
             # so what practice memory learns about scrolling there is learned per app
             target["control"] = (f"{element.get('role') or ''}|" if name == "scroll"
@@ -3092,6 +3129,7 @@ class Agent:
             under = pointed(tool_input) if callable(pointed) else None
             if under:
                 target["element"] = f"{under.get('role') or 'element'} \"{under.get('name') or ''}\" (under the point)"
+                target["element_name"] = under.get("name") or ""
                 target["role"] = under.get("role") or ""
         if name == "click":
             # text Yuki typed into this window and has not sent yet: a click there can send it (review 34 H2)
@@ -3103,6 +3141,39 @@ class Agent:
                 target["element"] = f"tab \"{tab}\""
                 target["tab_name"] = tab
         return target
+
+    def _step_about(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+        """What a person can read about an action's target, for the UI's step words (``_about`` on the ``tool_call``
+        event, revamp 38 §8c): the control's role and visible name and the tab's name from the latest read, the app's
+        name, whether the call sends or changes something for certain (its fixed traits, never words) and the brain's
+        declared effect. Never the command, typed text, address or a window or element number. Never raises."""
+        about: dict[str, Any] = {}
+        try:
+            if target.get("element_name"):
+                about["element"] = str(target["element_name"])[:80]
+            if target.get("role"):
+                about["role"] = str(target["role"])
+            if target.get("tab_name"):
+                about["tab"] = str(target["tab_name"])[:80]
+            app = _app_display(target.get("app"))
+            if app:
+                about["app"] = app
+            traits = call_traits(name, tool_input, role=target.get("role"),
+                                 typed_pending=bool(target.get("typed_pending")))
+            if sends_for_certain(traits):
+                about["sends"] = True
+            fixed = tool_traits(name, tool_input)
+            if (fixed.destroys or fixed.reaches) and fixed.needs != "input":
+                about["changes"] = True   # a shell, a close: an effect for certain (keys and clicks only may be)
+            if fixed.needs == "focus" and (fixed.destroys or fixed.reaches):
+                about["local"] = True     # open_url of a file or another program's handler
+            risk = tool_input.get(RISK_FIELD)
+            effect = " ".join(str(risk.get("effect") or "").split()) if isinstance(risk, dict) else ""
+            if effect:
+                about["effect"] = effect[:160]
+        except Exception as exc:  # noqa: BLE001 - presentation only, never in the way of the call
+            self.logger.log("step_about_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
+        return about
 
     def _outbound_read(self, name: str) -> bool:
         """A ``fetch_url`` after a ``read_file`` in this request (the brain's own or a helper's): the address could
@@ -3116,7 +3187,7 @@ class Agent:
             return None
         # Yuki's own earlier calls of this request (the calls, never what came back: auto mode's classifier sees the
         # agent's tool calls too), so a message is judged whole (a mention typed by the call before is part of it).
-        earlier = [f"{s.get('tool')} {json.dumps(s.get('input') or {}, ensure_ascii=False, default=str)}"
+        earlier = [f"{s.get('tool')} {json.dumps(_acts_only(s.get('input')), ensure_ascii=False, default=str)}"
                    for s in getattr(self, "_trace", []) if s.get("kind") == "action" and s.get("ok")]
         if outbound:
             # the file reads it follows (the calls only), so the judge sees what the address may carry

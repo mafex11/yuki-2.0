@@ -66,6 +66,7 @@ from yuki.ui.island import Island, on_call_status
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import describe_summary, describe_tool
+from yuki.ui.step_words import FAILED_TITLE, achievement, clock, label_input, return_view, took_words
 from yuki.ui.uilog import UiLog
 from yuki.ui.window_host import WindowHost
 from yuki.voice.session import VoiceSession
@@ -208,8 +209,9 @@ class YukiUi(QObject):
         self._settled: dict[int, ReplyCard | None] = {}
         #: Every run going on, shown on the strip from its start: ``{id: {"lane", "started", "steps", "line"}}``.
         self._runs: dict[int, dict] = {}
-        #: Requests the user stopped (the strip's Stop, or the cancel hotkey): they end as "Stopped", not an error.
-        self._stopped: set[int] = set()
+        #: Requests the user stopped, and by what (``strip``: Stop on the strip or the run card, ``hotkey``, ``voice``:
+        #: the voice's cancel, ``window``): they end as "Stopped", never as an error (revamp 38 §8b).
+        self._stopped: dict[int, str] = {}
         #: The strip says the stop shortcut once per session.
         self._stop_hint_shown = False
         #: An ``ask`` suggestion put in the ask bar and not sent yet (``{"nudge", "text"}``), and the requests sent
@@ -255,6 +257,12 @@ class YukiUi(QObject):
         if parked is not None:    # set aside on an unanswered question: the run is over for the strip
             parked.connect(self._on_parked)
         runtime_signals.summarized.connect(self._on_summarized)
+        finished_step = getattr(runtime_signals, "tool_finished", None)
+        if finished_step is not None:   # each step's end: the return card says what happened and what did not
+            finished_step.connect(self._on_tool_finished)
+        cancelled = getattr(runtime_signals, "cancelled", None)
+        if cancelled is not None:       # every stop, whoever asked (the voice's cancel too): a stop, not a failure
+            cancelled.connect(self._on_cancelled)
         # Moments the screen may have come free for a queued nudge.
         runtime_signals.lane_done.connect(self._on_lane_free)
         self.strip.faded_out.connect(self.nudges.try_show)
@@ -392,7 +400,7 @@ class YukiUi(QObject):
         if action == "cancel":
             running = self.runtime.running_ids().get(WORKER) if hasattr(self.runtime, "running_ids") else None
             if running is not None:
-                self._stopped.add(int(running))
+                self._stopped.setdefault(int(running), "hotkey")
                 if self.strip.run_id == int(running):
                     self.strip.stopping()
             self.runtime.cancel_worker()
@@ -533,7 +541,7 @@ class YukiUi(QObject):
             self.cards[request_id] = self.overlay.add_card(request)
         # every run shows on the strip from its first second, with its time and Stop (06 §4.4: the one real "Do it"
         # showed nothing for 9.6 s, and nothing on screen could stop it)
-        self._runs[request_id] = {"lane": lane_name, "started": time.monotonic(), "steps": 0, "line": ""}
+        self._runs[request_id] = {"lane": lane_name, "started": time.monotonic(), "steps": 0, "line": "", "calls": []}
         self._strip_run(request_id)
         setter = getattr(self.strip, "set_request", None)
         if setter is not None:   # the island's run card shows what was asked
@@ -572,8 +580,8 @@ class YukiUi(QObject):
     def _on_strip_stop(self, request_id: int) -> str:
         """Stop on the strip (or the window's run card, the ``stop`` pipe op): cancel that request (and its voice, if
         it is the voice's). Returns how (``running`` / ``queued`` / ``unknown``, :meth:`AgentRuntime.cancel`)."""
-        self._stopped.add(int(request_id))
-        how = self.runtime.cancel(int(request_id))
+        self._stopped.setdefault(int(request_id), "strip")
+        how = self.runtime.cancel(int(request_id), by="strip")
         if self.voice.owns(request_id):
             self.voice.interrupt()
         self.ui_log.event("strip_stop", id=request_id, how=how)
@@ -598,6 +606,22 @@ class YukiUi(QObject):
         if self._end_run(request_id):
             self.strip.dismiss()
 
+    def _on_cancelled(self, request_id: int, by: str) -> None:
+        """A request was stopped (:attr:`AgentRuntime.cancelled`), whoever asked: it ends as "Stopped". Who asked is
+        kept for the log: the caller's word, else the voice when the voice owns it, else the window."""
+        if not by:
+            owns = getattr(self.voice, "owns", None)
+            by = "voice" if callable(owns) and owns(request_id) else "window"
+        self._stopped.setdefault(int(request_id), by)
+
+    def _on_tool_finished(self, lane_name: str, request_id: int, name: str, ok: bool, summary: str) -> None:
+        """A step ended: the run's record of it says whether it worked (the return card's rows)."""
+        run = self._runs.get(request_id)
+        for call in reversed(run.get("calls", []) if run is not None else []):
+            if call["ok"] is None and call["name"] == name:
+                call["ok"] = bool(ok)
+                return
+
     def _on_tool_called(self, lane_name: str, request_id: int, name: str, tool_input: dict) -> None:
         """Show the step. For the worker, the first one takes the screen over."""
         line = describe_tool(name, tool_input)
@@ -605,6 +629,8 @@ class YukiUi(QObject):
         if run is not None:
             run["steps"] += 1
             run["line"] = line
+            if name != "helper":   # the step's words only (label_input: never the command, text or address)
+                run.setdefault("calls", []).append({"name": name, "input": label_input(tool_input), "ok": None})
             if self.strip.run_id != request_id:
                 self._strip_run(request_id)   # the worker's run takes the strip over another lane's, never back
         island = getattr(self, "island", None)
@@ -697,8 +723,8 @@ class YukiUi(QObject):
             self._question = None
         self._island_answered(request_id)
         run = self._runs.get(request_id)
-        stopped = request_id in self._stopped
-        self._stopped.discard(request_id)
+        stopped_by = self._stopped.pop(request_id, None)
+        stopped = stopped_by is not None
         handed = request_id in getattr(self, "_handed", set())
         getattr(self, "_handed", set()).discard(request_id)
         if stopped and tone == "error":
@@ -706,6 +732,18 @@ class YukiUi(QObject):
         outcome = "handed" if handed else "stopped" if tone == "stopped" else "failed" if tone == "error" else "done"
         self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
         shown = self._end_run(request_id)
+        # A run that acted ends on one plain line, the same on the strip, the thread and the return card: what it
+        # achieved (never the reply or a bare "Done"), or the plain reason it did not finish (never the loop's error
+        # text, which stays in the log).
+        final = text
+        if acted and outcome == "done":
+            line = achievement(list((run or {}).get("calls") or []))
+            final = line or text
+            host = getattr(self, "window_host", None)
+            if line and callable(getattr(host, "emit", None)):
+                host.emit({"type": "achieved", "job": request_id, "text": line})
+        elif acted and outcome == "failed":
+            final = FAILED_TITLE
         card = self.cards.pop(request_id, None)
         if card is not None:
             card.set_body(text, tone="error" if tone == "error" else "reply")
@@ -721,16 +759,17 @@ class YukiUi(QObject):
             # over it for a moment, then that run comes back
             other = self.strip.run_id if self.strip.run_id not in (None, request_id) else None
             self.nudges.make_way()
-            self.strip.show_final(text, tone="error" if tone == "error" else "final", outcome=outcome)
+            self.strip.show_final(final, tone="error" if tone == "error" else "final", outcome=outcome)
             self._settled[request_id] = None
             if other is not None:
                 QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=other: self._strip_run(rid)
                                   if rid in self._runs and self.strip.run_id is None else None)
-        self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text,
+        self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text, by=stopped_by,
+                          shown=final if final != text else None,
                           steps=run["steps"] if run else None,
                           wall_s=round(time.monotonic() - run["started"], 1) if run else None)
         if acted and getattr(self, "island", None) is not None:
-            self._queue_return_card(request_id, text, outcome, run)
+            self._queue_return_card(request_id, text, outcome, run, by=stopped_by)
         self.nudges.try_show()
 
     def _ask_outcome(self, request_id: int, *, stopped: bool, failed: bool) -> None:
@@ -765,9 +804,6 @@ class YukiUi(QObject):
                 from yuki.ui.status import _money
 
                 set_cost(_money(float(cost)))
-            pending = getattr(self, "_return_pending", None)
-            if pending is not None and pending.get("id") == request_id:
-                pending["cost"] = text
             return
         try:
             target.set_meta(text)
@@ -1078,20 +1114,19 @@ class YukiUi(QObject):
         cursor.movePosition(cursor.MoveOperation.End)
         self.overlay.input.setTextCursor(cursor)
 
-    def _queue_return_card(self, request_id: int, text: str, outcome: str, run: dict | None) -> None:
-        """A run that acted ended: the return card says what it changed (action steps only), with what practice
-        memory learned since the run began (a proposal), once its cost is known. Nothing to report, no card."""
-        from yuki.agent.tools import ACTION_TOOL_NAMES
-
-        model = getattr(self.window_host, "model", None)
-        item = model.item_for_job(request_id) if model is not None and hasattr(model, "item_for_job") else None
-        steps = item.real_steps() if item is not None else []
-        changed = [st.label for st in steps if st.name in ACTION_TOOL_NAMES and st.ok]
-        if not changed:
+    def _queue_return_card(self, request_id: int, text: str, outcome: str, run: dict | None, *,
+                           by: str | None = None) -> None:
+        """A run that acted ended: the return card says how it really ended (done, stopped, didn't finish, handed
+        back) and what it changed that the user cares about, in plain words (:func:`yuki.ui.step_words.return_view`:
+        effects as rows, the opening steps folded into one line, no undo of any kind), with what practice memory
+        learned since the run began. Nothing to tell beyond the strip's final word, no card."""
+        view = return_view(outcome, text, list((run or {}).get("calls") or []))
+        if not view["worth"]:
             return
-        started_wall = time.time() - (time.monotonic() - run["started"]) if run else time.time()
-        self._return_pending = {"id": request_id, "title": text, "outcome": outcome, "changed": changed[:4],
-                                "cost": "", "since": started_wall}
+        took = time.monotonic() - run["started"] if run else 0.0
+        started_wall = time.time() - took
+        self._return_pending = {"id": request_id, "view": view, "outcome": outcome, "by": by,
+                                "took": took_words(took) if run else "", "since": started_wall}
         memory = self.runtime.memory
         import threading
 
@@ -1129,10 +1164,11 @@ class YukiUi(QObject):
             self.return_card = ReturnCard()
             self.return_card.learned.connect(self._on_learned)
             self.return_card.why.connect(lambda: self.window_host.open_window("activity"))
-        self.return_card.show_run(title=str(pending["title"]), at=datetime.now().strftime("%H:%M"),
-                                  changed=list(pending["changed"]), learned=learned, cost=str(pending["cost"]))
-        self.ui_log.event("return_card", id=pending["id"], outcome=pending["outcome"], changed=len(pending["changed"]),
-                          learned=bool(learned))
+        view = pending["view"]
+        self.return_card.show_run(icon=view["icon"], head=view["head"], title=view["title"], at=clock(datetime.now()),
+                                  rows=view["rows"], more=view["more"], learned=learned, took=str(pending["took"]))
+        self.ui_log.event("return_card", id=pending["id"], outcome=pending["outcome"], by=pending.get("by"),
+                          rows=len(view["rows"]) + view["more"], learned=bool(learned))
 
     def _on_learned(self, ref: str, action: str, words: str) -> None:
         """Save / Edit / No on a Learned proposal (applied once the card went, so Undo could take it back)."""

@@ -471,7 +471,7 @@ class Lane(QThread):
                     from yuki.ui.status import describe_result
 
                     try:
-                        better = describe_result(event.name, None, event.payload)
+                        better = describe_result(event.name, getattr(event, "about", None), event.payload)
                     except Exception:   # presentation only: never in the way of the run
                         better = ""
                     if better:
@@ -580,6 +580,9 @@ class AgentRuntime(QObject):
             report's first line); also sent as ``tool_called`` / ``tool_finished`` named ``helper``.
         notice: ``(kind, text)`` -- something to tell the user once, unasked (``cost``: the day's
             model spend passed ``Settings.daily_cost_alert_usd``); the tray shows it.
+        cancelled: ``(id, by)`` -- a request was stopped (:meth:`cancel` with the plain cancel reason, running,
+            queued or parked; not a withdrawal): whoever asked, it ends as stopped, never as an error. ``by``: who
+            asked when the caller says (``strip``, ``hotkey``, ``window``, ``voice``), else ``""``.
     """
 
     started = Signal(str, int, str)
@@ -605,6 +608,7 @@ class AgentRuntime(QObject):
     #: ``(lane, job, what, text)``: the reply or the thinking written so far (``what``: reply | thinking), live
     partial = Signal(str, int, str, str)
     notice = Signal(str, str)
+    cancelled = Signal(int, str)
     #: ``(lane, id, frame)``: the request's task frame as plain data (:func:`frame_view`: who it may be about and
     #: their usual route, the playbooks shown), once, before its first step; the island's "from memory" chip.
     framed = Signal(str, int, dict)
@@ -863,8 +867,12 @@ class AgentRuntime(QObject):
         self.ui_log.event("cancel", lane=WORKER, outstanding=len(self._worker_outstanding))
         self.worker.cancel()
 
-    def cancel(self, request_id: int, reason: str = CANCELLED) -> str:
+    def cancel(self, request_id: int, reason: str = CANCELLED, *, by: str = "") -> str:
         """Cancel one request by id, running or still queued, on whichever lane has it.
+
+        A plain cancel (not a withdrawal) is a stop, whoever asked: :attr:`cancelled` says so with ``by`` (the
+        Stop on the strip or the run card, the stop hotkey, the window, the voice), so the run ends as "Stopped"
+        and never as "Cancelled by the user." in red (revamp 38 §8b: the voice's cancel was shown as a failure).
 
         Returns:
             ``running``, ``queued`` or ``unknown`` (see :meth:`Lane.cancel_job`).
@@ -874,7 +882,9 @@ class AgentRuntime(QObject):
             how = lane.cancel_job(request_id, reason)
             if how != "unknown":
                 break
-        self.ui_log.event("cancel", id=request_id, how=how, reason=reason)
+        self.ui_log.event("cancel", id=request_id, how=how, reason=reason, by=by or None)
+        if reason == CANCELLED and how != "unknown":
+            self.cancelled.emit(int(request_id), by)
         return how
 
     def withdraw(self, request_id: int) -> str:

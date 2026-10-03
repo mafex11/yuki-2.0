@@ -413,13 +413,16 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     d = W.build_activity(Mem(), requests_csv=csv_path, now=now)
     rows = {r["id"]: r for r in d["rows"]}
     launch, click, todo = (rows[f"run:agent:s:worker-3:{i}"] for i in (1, 2, 3))
-    assert launch["what"] == "Opened firefox" and launch["where"] == "Firefox" and launch["f"] == "did"
+    assert launch["what"] == "Opened Firefox" and launch["where"] == "Firefox" and launch["f"] == "did"
     assert launch["why"] == "you said “pause it and remind me to water the basil”, using how you do it"
     assert launch["chips"] == [{"kind": "memory", "text": "Restore Firefox"}] and launch["status"] == "verified"
-    assert launch["result"] == "done in 900 ms, checked on screen" and "cant_undo" not in launch
-    assert click["f"] == "failed" and click["status"] == "failed" and click["result"].startswith("failed: the window")
+    # plain words only: no timing, no raw failure text, no "can't undo" (appC1 review F5)
+    assert launch["result"] == "done, checked on screen" and "cant_undo" not in launch
+    assert click["f"] == "failed" and click["status"] == "failed" and click["result"] == "didn’t work"
     assert click["chips"] == [{"kind": "lesson", "text": "Pause the music"}] and "keeping a lesson in mind" in click["why"]
-    assert todo["what"] == "Added to your list “Water the basil”" and "undo" not in todo   # no Undo on Activity (3 Oct ask A)
+    # the to-do's own words, from memory's record of it (appC1 review F9), never from the step's input; no Undo on
+    # the Activity tab (the 3 Oct ask A)
+    assert todo["what"] == "Added to your list “Water the basil”" and "undo" not in todo
     # the steps are grouped under the request they belonged to (3 Oct ask C)
     g = next(x for x in d["groups"] if x["id"] == "run:agent:s:worker-3")
     assert g["title"] == "“pause it and remind me to water the basil”" and g["steps"] == 3 and g["said"] == "you said"

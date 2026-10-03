@@ -1228,20 +1228,6 @@ def build_playbook(memory: Any) -> dict[str, Any]:
 # -- Activity ------------------------------------------------------------------------------------------------------
 
 
-#: What an acting step did, by its tool (the agent's closed set of tool names), in the past tense.
-TOOL_DONE = {"click": "Clicked", "type_text": "Typed", "launch_app": "Opened", "open_url": "Opened",
-             "focus_window": "Brought a window forward", "window_action": "Arranged a window", "hotkey": "Pressed",
-             "press": "Pressed", "scroll": "Scrolled", "hover": "Pointed at", "tab": "Switched tabs",
-             "app_volume": "Changed an app’s volume", "run_powershell": "Ran a command",
-             "write_clipboard": "Put text on the clipboard", "todo": "Changed your list", "remember_rule": "Kept a rule",
-             "forget_rule": "Dropped a rule", "correct_memory": "Corrected what I know",
-             "watch_for": "Started keeping an eye out", "remember_how": "Kept how it’s done",
-             "answer_question": "Kept your answer"}
-#: The argument that names what the tool acted on (the agent's own argument names); the rest show their target.
-TOOL_DETAIL = {"type_text": "text", "launch_app": "query", "open_url": "url", "hotkey": "keys", "press": "key",
-               "app_volume": "app", "window_action": "action", "tab": "tab", "run_powershell": "command",
-               "write_clipboard": "text", "todo": "text", "remember_rule": "text", "forget_rule": "text",
-               "correct_memory": "text", "watch_for": "condition", "remember_how": "text", "answer_question": "answer"}
 #: Practice memory's kinds: ways of doing (shown as "using …") and lessons (shown as "lesson …").
 WAY_KINDS = ("procedure", "habit")
 #: Memory's Undo window for something Yuki added (offers: yuki.memory.offers.UNDO_WITHIN_S; to-dos alike).
@@ -1255,47 +1241,38 @@ def _clip(text: Any, n: int) -> str:
     return t if len(t) <= n else t[: n - 1].rstrip() + "…"
 
 
-#: The to-do tool's own ``action`` values, in the past tense.
-TODO_DONE = {"add": "Added to your list", "done": "Marked done on your list", "not_needed": "Took off your list",
-             "wrong": "Took off your list"}
-
-
 def step_what(step: dict[str, Any]) -> str:
-    """One acting step in plain past-tense words: the tool's verb and what it acted on (its own argument when the tool
-    has one that says so, else the control and window the trace recorded)."""
-    verb = TOOL_DONE.get(str(step.get("tool") or ""), "Did a step")
-    detail = ""
-    key = TOOL_DETAIL.get(str(step.get("tool") or ""))
-    if key:
-        try:
-            args = json.loads(step.get("input") or "{}")
-        except (TypeError, ValueError):
-            args = {}
-        if step.get("tool") == "todo" and isinstance(args, dict):
-            verb = TODO_DONE.get(str(args.get("action") or ""), verb)
-        value = args.get(key) if isinstance(args, dict) else None
-        if isinstance(value, str) and value.strip():
-            detail = f"“{_clip(value, 70)}”" if key in ("text", "condition", "answer", "command") else _clip(value, 70)
-    if not detail and step.get("target"):
-        detail = _clip(step["target"], 80)
-    return f"{verb} {detail}".strip()
+    """One acting step in plain past-tense words, from the one label function of every run surface
+    (:func:`yuki.ui.step_words.describe_step`): the brain's own words for the step when it gave them, else the
+    control's name and the app the trace kept; never the command, typed text, address or keys (revamp 38 §8c). A
+    voice hand's step (its own tool names: ``window``, ``open_app``, ``media_key``) reads as the thinker's would."""
+    from yuki.ui.step_words import ABOUT, describe_step, hand_input
+
+    try:
+        args = json.loads(step.get("input") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    args = args if isinstance(args, dict) else {}
+    about = {"element": args.get("name"), "role": args.get("role"), "app": step.get("app_name") or step.get("app")}
+    tool, words_from = hand_input(str(step.get("tool") or ""), args)
+    if tool != str(step.get("tool") or ""):
+        about.pop("element")   # a hand's "name" is the app it opened (now the query), not a control
+    return describe_step(tool, {**words_from, ABOUT: about}, done=True, limit=90)
 
 
-def step_result(step: dict[str, Any]) -> tuple[str, str]:
-    """(the result in words, its status for the glyph): checked on screen, done, ran but not shown, failed."""
-    ms = step.get("ms")
-    took = ""
-    if isinstance(ms, (int, float)) and ms > 0:
-        took = f" in {round(ms)} ms" if ms < 1000 else f" in {ms / 1000:.1f} s"
+def step_result(step: dict[str, Any], *, stopped: bool = False) -> tuple[str, str]:
+    """(the result in plain words, its status for the glyph): done and checked on screen, done, ran but not shown,
+    didn't work, or stopped before it finished (``stopped``: the run was cancelled, a structured outcome). Never the
+    tool's own result text or a timing (the user's 3 Oct feedback: plain words only); those stay in the trace."""
     if step.get("ok") is False:
-        return f"failed: {_clip(step.get('result'), 90)}" if step.get("result") else "failed", "failed"
+        return ("stopped before it finished", "stopped") if stopped else ("didn’t work", "failed")
     if step.get("verdict") is True:
-        return f"done{took}, checked on screen", "verified"
+        return "done, checked on screen", "verified"
     if step.get("verdict") is False:
         return "ran, but the screen didn’t show it", "unverified"
     if step.get("expected") or step.get("kind") == "memory":
-        return f"done{took}", "done"
-    return f"done{took}; I couldn’t check it", "unverified"
+        return "done", "done"
+    return "done; I couldn’t check it", "unverified"
 
 
 def _todo_for(step: dict[str, Any], todos: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1316,10 +1293,27 @@ def _todo_for(step: dict[str, Any], todos: list[dict[str, Any]]) -> dict[str, An
     return None
 
 
-def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+def _rule_for(step: dict[str, Any], rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The rule a ``remember_rule`` step kept: the user's rule written closest to the step, within two minutes
+    (matched by time, a structured field; never by the step's input)."""
+    at = float(step.get("at") or 0)
+    near = [(abs(since - at), r) for r in rules
+            if isinstance(r, dict) and (since := epoch_of(r.get("at"))) is not None and abs(since - at) <= 120]
+    return min(near, key=lambda p: p[0])[1] if near else None
+
+
+def _kept_words(record: dict[str, Any] | None) -> str:
+    """The words of the to-do or rule a step kept, from memory's own record, quoted ("“Water the basil”")."""
+    words = _clip((record or {}).get("text"), 80)
+    return f" “{words}”" if words else ""
+
+
+def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float,
+             rules: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """One request's rows for the ledger: each acting step (time, what, where, why: the user's words and any
-    procedure or lesson it used, result, Undo where memory can take it back), or one "Answered" row when nothing
-    acted."""
+    procedure or lesson it used, result in plain words, Undo where memory can take it back: a to-do it added), or
+    one "Answered" row when nothing acted. A to-do or rule Yuki kept says which, from memory's record of it. No
+    "can't undo" text (the user, 3 Oct: no undo talk on the run surfaces)."""
     voice = run.get("lane") == "voice" or run.get("source") == "hand"
     words = _clip(run.get("words"), 120)
     why = (f"you said “{words}”" if voice else f"you typed “{words}”") if words else (
@@ -1342,8 +1336,9 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float) -> li
                  "where": "Yuki", "cost": cost, "because": "because", "why": why, "chips": [], "result": result,
                  "status": status, "wrong_text": wrong}]
     rows = []
+    stopped = str(run.get("outcome") or "") in ("cancelled", "withdrawn", "abandoned")
     for i, s in enumerate(steps):
-        result, status = step_result(s)
+        result, status = step_result(s, stopped=stopped)
         chips = [{"kind": "memory" if c.get("kind") in WAY_KINDS else "lesson", "text": c.get("title") or ""}
                  for c in s.get("cited") or [] if c.get("title")]
         row = {"id": f"run:{run.get('key')}:{s.get('step')}", "kind": "action", "f": "failed" if status == "failed" else "did",
@@ -1354,10 +1349,11 @@ def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float) -> li
                + (", keeping a lesson in mind" if any(c["kind"] == "lesson" for c in chips) else ""),
                "chips": chips, "result": result, "status": status, "wrong_text": wrong}
         todo = _todo_for(s, todos) if s.get("tool") == "todo" else None
+        rule = _rule_for(s, rules or []) if s.get("tool") == "remember_rule" and s.get("ok") is not False else None
+        if todo is not None or rule is not None:
+            row["what"] += _kept_words(todo or rule)
         if todo is not None and row["at"] + LEDGER_UNDO_S > now:
             row["undo"] = {"todo": todo.get("id"), "until": row["at"] + LEDGER_UNDO_S, "label": "Undo"}
-        elif s.get("kind") == "action" and status != "failed":
-            row["cant_undo"] = True
         rows.append(row)
     return rows
 
@@ -1400,8 +1396,10 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
     runs = (_safe(lambda: ledger(since=since, until=now, limit=150), []) or []) if callable(ledger) else []
     todos = (_safe(lambda: memory.todos(include_done=False), []) or []) if any(
         s.get("tool") == "todo" for r in runs for s in r.get("steps") or []) else []
+    rules = (_safe(lambda: memory.rules(), []) or []) if callable(getattr(memory, "rules", None)) and any(
+        s.get("tool") == "remember_rule" for r in runs for s in r.get("steps") or []) else []
     for run in runs:
-        rows.extend(run_rows(run, todos, now))
+        rows.extend(run_rows(run, todos, now, rules))
     run_starts = sorted(float(r.get("at") or 0) for r in runs)
     lanes = {"worker": "Typed request", "front_desk": "Quick answer", "voice": "Voice"}
     for i, r in enumerate(read_request_log(requests_csv, since, limit=120) if requests_csv else []):
@@ -1414,7 +1412,7 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
                      "what": request_title(r.get("what") or ""),
                      "where": lanes.get(r.get("where") or "", (r.get("where") or "").replace("_", " ").capitalize()),
                      "cost": cost, "because": "because", "why": "you asked by voice" if voice else "you asked",
-                     "chips": [], "result": words, "status": status, "cant_undo": status == "done"})
+                     "chips": [], "result": words, "status": status})
     standing = {}
     for s in _safe(lambda: memory.standing_requests(include_ended=True), []) or []:
         if isinstance(s, dict) and s.get("ref"):

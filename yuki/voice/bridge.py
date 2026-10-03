@@ -1591,7 +1591,8 @@ class VoiceBridge(QObject):
         if job.log is not None:
             job.log.add("the user", "asked to stop")
         if job.job_id is not None:
-            how = self.runtime.cancel(job.job_id)
+            cancel = self.runtime.cancel   # a stop by the voice: recorded as such, it ends as "Stopped"
+            how = cancel(job.job_id, by="voice") if _takes(cancel, "by") else cancel(job.job_id)
             self._log("bridge", op="cancelled", job_id=job.job_id, how=how)
 
     def _withdraw(self, job: Job) -> None:

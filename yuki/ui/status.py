@@ -6,12 +6,11 @@ Every agent run (typed, spoken, anything) shows here **from its first second**
 thinking line (Horizon's dotted grey wave, drifting while it works), the current step,
 the time it has taken and the step count, and a **Stop** pill that never takes focus and
 cancels that request. The first strip of a session also says the stop shortcut once.
-The step line is the tool's own one-line ``label`` from the registry
-(:func:`yuki.agent.tools.tool_label`) plus its most telling argument, so the phrase a user
-reads is written next to the tool it describes rather than re-derived here from its
-identifier. Every tool in the registry has a label (``tests/test_no_pattern.py``); a name
-the registry does not know reads "Working". When the run ends the strip says how: the
-answer (Done), Stopped, or the error.
+The step line comes from the one label function of every run surface
+(:func:`yuki.ui.step_words.describe_step`): the brain's own plain words for the step, else
+words built from the control and app the agent named, never a command, typed text, address,
+key or id (revamp 38 §8). When the run ends the strip says how: the answer (Done), Stopped,
+or the error.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
-from yuki.agent.tools import tool_label
+from yuki.ui.step_words import _iso, app_name, clock, describe_step
 from yuki.ui.surface import ACCENT, SurfaceWindow
 from yuki.ui.wave import Wave
 
@@ -51,130 +50,49 @@ STRIP_MARGIN = 24
 FINAL_LINGER_MS = 4000
 
 
-def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit: int = 44) -> str:
-    """One line of present-tense status text for a tool call, in plain words.
+def describe_tool(name: str, tool_input: dict[str, Any] | None = None, *, limit: int = 60) -> str:
+    """One line of present-tense status text for a tool call, in plain words (``Closing Slack``, ``Clicking Done``).
 
-    The phrase is the tool's own ``label`` (``hotkey`` -> ``Pressing a shortcut``),
-    with its most descriptive argument appended when there is one
-    (``Opening an app — spotify``). Dates and date-times in the arguments (ISO, the
-    tools' fixed format) read as a person says them (``Checking your calls on 26 Sep``,
-    ``… since yesterday``); Yuki's own record ids (``call:23``) mean nothing to the
-    user and are left out (the result names the thing, :func:`describe_result`). A
-    name the registry has never heard of reads "Working". Purely presentational:
-    nothing here changes what runs.
+    The one label function of every run surface (:func:`yuki.ui.step_words.describe_step`): the call's own ``what``,
+    else words built from what the agent knows about the target (``_about``: the control's name, the app) and the
+    call's fixed machine fields. Never the command, typed text, address, keys, ids or numbers (revamp 38 §8). A
+    memory read's dates read as a person says them (``Checking your calls yesterday``). Purely presentational.
 
     Args:
         name: Tool name exactly as the model called it.
-        tool_input: The tool's arguments.
-        limit: Maximum length of the appended argument.
+        tool_input: The tool's arguments as the ``tool_call`` event carries them.
+        limit: The longest line.
 
     Returns:
         A single line, no trailing punctuation except an ellipsis.
     """
-    phrase = tool_label(name) or "Working"
-    args = tool_input or {}
-    dates = [(k, d) for k, v in args.items() if (d := _iso(v)) is not None]
-    rest = {k: v for k, v in args.items() if _iso(v) is None and not _record_id(v)}
-    detail = _detail(rest, limit=limit)
-    line = f"{phrase} — {detail}" if detail else phrase
-    when = _when_words(dates)
-    if when:
-        line = f"{line} {when}"
-    return line if (detail or when) else f"{phrase}…"
+    return describe_step(name, tool_input, limit=limit)
 
 
 def describe_result(name: str, tool_input: dict[str, Any] | None, payload: Any) -> str:
     """A better line for a finished step when its result names what it worked on, else ``""``.
 
-    A call read from memory (the result's ``call``: its app and start) reads ``Reading yesterday's 22:09
-    Discord call``. Built from the result's structured fields only."""
+    A call read from memory (the result's ``call``: its app and start) reads ``Reading yesterday's Discord call from
+    10:09 PM``. Built from the result's structured fields only."""
     del name, tool_input
     call = payload.get("call") if isinstance(payload, dict) else None
     if not isinstance(call, dict):
         return ""
-    app = str(call.get("app") or "").strip()
+    app = app_name(call.get("app"))
     start = _iso(call.get("start"))
     if not app or start is None:
         return ""
     from datetime import date
 
     days = (date.today() - start.date()).days
-    hm = start.strftime("%H:%M")
+    at = clock(start)
     if days == 0:
-        return f"Reading today's {hm} {app} call"
+        return f"Reading today's {app} call from {at}"
     if days == 1:
-        return f"Reading yesterday's {hm} {app} call"
+        return f"Reading yesterday's {app} call from {at}"
     if 1 < days < 7:
-        return f"Reading {start:%A}'s {hm} {app} call"
-    return f"Reading the {app} call of {start.day} {start:%b}, {hm}"
-
-
-def _iso(value: Any) -> Any:
-    """A date or date-time from an ISO string (the tools' fixed format), else None."""
-    from datetime import date, datetime
-
-    if not isinstance(value, str) or not value[:4].isdigit() or len(value) < 10:
-        return None
-    try:
-        return datetime.fromisoformat(value.strip())
-    except ValueError:
-        try:
-            d = date.fromisoformat(value.strip()[:10])
-            return datetime(d.year, d.month, d.day)
-        except ValueError:
-            return None
-
-
-def _record_id(value: Any) -> bool:
-    """Yuki's own record ids, ``<kind>:<number>`` (``call:23``, ``fact:7``): a fixed internal format."""
-    if not isinstance(value, str) or ":" not in value:
-        return False
-    kind, _sep, number = value.strip().partition(":")
-    return kind.isalpha() and number.isdigit()
-
-
-def _day_words(d: Any, *, time_too: bool = True) -> str:
-    from datetime import date
-
-    days = (date.today() - d.date()).days
-    day = "today" if days == 0 else "yesterday" if days == 1 else f"{d.day} {d:%b}"
-    return f"{day} {d:%H:%M}" if time_too and (d.hour, d.minute) != (0, 0) else day
-
-
-def _when_words(dates: list[tuple[str, Any]]) -> str:
-    """``on 26 Sep``, ``since yesterday``, ``from 25 Sep to today``, from the ISO dates of a call's arguments."""
-    if not dates:
-        return ""
-    if len(dates) == 1:
-        key, d = dates[0]
-        words = _day_words(d)
-        if key in ("since", "until", "before", "after"):
-            return f"{key} {words}"
-        return words if words.startswith(("today", "yesterday")) else f"on {words}"
-    (_ka, a), (_kb, b) = sorted(dates[:2], key=lambda kd: kd[1])
-    if a.date() == b.date():
-        words = _day_words(a, time_too=False)
-        return words if words in ("today", "yesterday") else f"on {words}"
-    return f"from {_day_words(a)} to {_day_words(b)}"
-
-
-def _detail(tool_input: dict[str, Any], *, limit: int) -> str:
-    """The most human-readable argument of a tool call, shortened.
-
-    Prefers text over numbers because text is what the user recognises; falls back
-    to ``key=value`` so a purely numeric call still says something.
-    """
-    for value in tool_input.values():
-        if isinstance(value, str) and value.strip():
-            return _shorten(" ".join(value.split()), limit)
-        if isinstance(value, (list, tuple)) and value and all(isinstance(v, str) for v in value):
-            return _shorten("+".join(value), limit)
-    numbers = [
-        f"{key} {value}"
-        for key, value in tool_input.items()
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    ]
-    return _shorten(", ".join(numbers[:3]), limit) if numbers else ""
+        return f"Reading {start:%A}'s {app} call from {at}"
+    return f"Reading the {app} call of {start.day} {start:%B}, {at}"
 
 
 def describe_summary(summary: dict[str, Any]) -> str:

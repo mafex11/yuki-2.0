@@ -7,8 +7,9 @@ right). It comes in as the design's ``cardin`` (520 ms, a 10 px rise, its ease) 
 an 8 px drop), never takes focus, and morphs its height in 240 ms when its contents change (a confirmation in place).
 
 The cards built on it: the offer, question, break and notice cards (:class:`yuki.ui.nudges.NudgeCard`), the call
-consent card (:class:`yuki.ui.calls.CallConsentCard`), and here the **return card** (:class:`ReturnCard`: what a run
-changed, what needs you, what Yuki learned with Save / Edit / No) and the tray's **hover card** in a game
+consent card (:class:`yuki.ui.calls.CallConsentCard`), and here the **return card** (:class:`ReturnCard`: how a run
+really ended, what it changed in plain words, what needs you, what Yuki learned with Save / Edit / No) and the tray's
+**hover card** in a game
 (:class:`TrayHoverCard`, the call's timer while the island is away).
 """
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QFontMetricsF, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 
 from yuki.ui import lattice as L
@@ -413,9 +414,12 @@ class CardFoot(QWidget):
 
 
 class ReturnCard(LatticeCard):
-    """What a run changed (the design's return card): the outcome, **Changed** (each with "can't undo from here"),
-    **Needs you**, a **Learned** proposal from practice memory with Save / Edit / No (applied when the card goes, so
-    Undo can take it back), the cost and Why. A run with nothing to report shows no card (the tray decides).
+    """How a run ended (the design's return card, revamp 38 §8b-c): the header by the real outcome ("Done", "Stopped",
+    "Didn't finish", "Handed back") and the time, one plain sentence, **Changed** (the effects the user cares about in
+    plain words, the opening steps folded into one line, "+N more"), **Needs you**, a **Learned** proposal from
+    practice memory with Save / Edit / No (applied when the card goes), and a footer of the run's time and Why.
+    No undo of any kind: no chips, no Undo keys, no "can't undo" text (the user, 3 Oct 19:10). A run with nothing to
+    tell shows no card (the tray decides, :func:`yuki.ui.step_words.return_view`).
 
     Signals:
         learned(ref, action, words): ``save`` | ``edit`` | ``forget`` for a proposal, once the card is gone.
@@ -439,6 +443,8 @@ class ReturnCard(LatticeCard):
         self.content.addWidget(self.changed_l)
         self.content.addSpacing(6)
         self.content.addLayout(self.changed_box)
+        self.more = L.Para("", font=L.ui_font(12), color=L.TEXT3, line_height=1.45, parent=self)
+        self.content.addWidget(self.more)
         self.content.addSpacing(12)
         self.content.addWidget(self.needs_l)
         self.content.addSpacing(6)
@@ -449,9 +455,10 @@ class ReturnCard(LatticeCard):
         self.content.addWidget(self.learn)
         foot = QHBoxLayout()
         foot.setContentsMargins(0, 12, 0, 0)
-        self.cost = L.Para("", font=L.mono_font(11), color=L.TEXT3, line_height=1.0, parent=self, max_lines=1)
-        self.cost.setFixedHeight(22)
-        foot.addWidget(self.cost, 1)
+        #: The run's time ("41 s"); its steps and cost are behind Why (the Activity page).
+        self.took = L.Para("", font=L.mono_font(11), color=L.TEXT3, line_height=1.0, parent=self, max_lines=1)
+        self.took.setFixedHeight(22)
+        foot.addWidget(self.took, 1)
         self.why_key = L.Key("Why", variant="ghost", size="xs", parent=self)
         self.why_key.clicked.connect(self.why.emit)
         foot.addWidget(self.why_key)
@@ -464,24 +471,39 @@ class ReturnCard(LatticeCard):
         self._linger.timeout.connect(self.close_card)
         self.faded_out.connect(self._apply)
 
-    def show_run(self, *, title: str, at: str, changed: list[str], needs: str = "", learned: dict | None = None,
-                 cost: str = "", linger_ms: int = 30_000) -> None:
-        self.set_head("check", f"Done · {at}" if at else "Done")
+    def show_run(self, *, title: str, at: str, rows: list[dict[str, str]], icon: str = "check", head: str = "Done",
+                 more: int = 0, needs: str = "", learned: dict | None = None, took: str = "",
+                 linger_ms: int = 30_000) -> None:
+        """Show a finished run (:func:`yuki.ui.step_words.return_view` gives ``icon``, ``head``, ``title``, ``rows``
+        and ``more``).
+
+        Args:
+            title: One plain sentence: the answer, or how it stopped ("Stopped before it finished. Nothing was sent.").
+            at: When it ended, as people say it ("1:28 PM").
+            rows: ``{"text", "icon"}`` per change (``check`` happened, ``dash`` did not).
+            icon, head: The header by the real outcome.
+            more: Changes that did not fit ("+2 more").
+            needs: What needs the user, if anything.
+            learned: A practice-memory proposal to Save / Edit / No.
+            took: The run's time ("41 s").
+        """
+        self.set_head(icon, f"{head} · {at}" if at else head)
         self.title.set_text(title)
         for w in self._rows:
             w.deleteLater()
         self._rows = []
-        for text in changed:
-            row = ChangedRow(text, self)
+        for r in rows:
+            row = ChangedRow(str(r.get("text") or ""), self, icon=str(r.get("icon") or "check"))
             self.changed_box.addWidget(row)
             self._rows.append(row)
-        for w in (self.changed_l,):
-            w.setVisible(bool(changed))
+        self.changed_l.setVisible(bool(rows))
+        self.more.set_text(f"+{more} more" if more > 0 else "")
+        self.more.setVisible(more > 0)
         self.needs.set_text(needs)
         self.needs_l.setVisible(bool(needs))
         self.needs.setVisible(bool(needs))
         self.learn.set_learned(learned)
-        self.cost.set_text(cost)
+        self.took.set_text(took)
         self._pending = None
         self.fit_height()
         self.fade_in(self.anchor())
@@ -512,24 +534,25 @@ class ReturnCard(LatticeCard):
 
 
 class ChangedRow(QWidget):
-    """``.chg``: what changed, and the flag "can't undo from here"."""
+    """``.chg``: one change in plain words after a small mark (``check``: it happened; ``dash``: it did not). Nothing
+    else: no undo chip, no Undo key, no "can't undo" flag."""
 
-    def __init__(self, text: str, parent: QWidget | None = None, flag: str = "can’t undo from here") -> None:
+    #: The text starts this far in (the mark and its gap).
+    INDENT = 18
+
+    def __init__(self, text: str, parent: QWidget | None = None, *, icon: str = "check") -> None:
         super().__init__(parent)
+        self.icon = L.Icon(icon, 10, L.TEXT3, self)
         self.text = L.Para(text, font=L.ui_font(13), line_height=1.45, parent=self)
-        self.flag_text = flag
         sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
-
-    def _flag_w(self) -> int:
-        return int(QFontMetricsF(L.mono_font(10.5)).horizontalAdvance(self.flag_text)) + 12 + 2
 
     def hasHeightForWidth(self) -> bool:  # noqa: D102
         return True
 
     def heightForWidth(self, w: int) -> int:  # noqa: D102
-        return max(20, self.text.heightForWidth(max(10, w - self._flag_w() - 10)))
+        return max(20, self.text.heightForWidth(max(10, w - self.INDENT)))
 
     def sizeHint(self) -> Any:  # noqa: D102
         from PySide6.QtCore import QSize
@@ -538,25 +561,15 @@ class ChangedRow(QWidget):
 
     def resizeEvent(self, e: Any) -> None:  # noqa: D102
         super().resizeEvent(e)
-        tw = max(10, self.width() - self._flag_w() - 10)
-        self.text.setGeometry(0, 0, tw, self.text.heightForWidth(tw))
-
-    def paintEvent(self, _e: Any) -> None:  # noqa: D102
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        fw = self._flag_w()
-        r = QRectF(self.width() - fw + 0.5, (self.height() - 17) / 2 + 0.5, fw - 1, 17 - 1)
-        p.setPen(QPen(L.HAIR2, 1.0))
-        p.drawRoundedRect(r, 7.5, 7.5)
-        p.setPen(L.TEXT2)
-        p.setFont(L.mono_font(10.5))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.flag_text)
-        p.end()
+        tw = max(10, self.width() - self.INDENT)
+        self.icon.move(0, 5)
+        self.text.setGeometry(self.INDENT, 0, tw, self.text.heightForWidth(tw))
 
 
 class LearnedBox(QWidget):
     """The design's ``.learned``: a raised box with "Learned", the lesson, why, and Save / Edit / No; each choice
-    morphs to a confirmation with Undo. Emits ``decided(ref, action, words)`` (``action`` "" after Undo)."""
+    morphs to a one-line confirmation (no Undo on the return card: the user, 3 Oct 19:10). Emits
+    ``decided(ref, action, words)``."""
 
     decided = Signal(str, str, str)
 
@@ -590,14 +603,11 @@ class LearnedBox(QWidget):
         self.acts = acts
         self.col.addLayout(acts)
         self.confirm = ConfirmRow(self, icon="lesson")
-        self.k_undo = L.Key("Undo", variant="ghost", size="xs")
-        self.confirm.add_key(self.k_undo)
         self.confirm.hide()
         self.col.addWidget(self.confirm)
         self.k_save.clicked.connect(lambda: self._decide("save"))
         self.k_no.clicked.connect(lambda: self._decide("forget"))
         self.k_edit.clicked.connect(self._edit)
-        self.k_undo.clicked.connect(self._undo)
         sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
@@ -639,10 +649,6 @@ class LearnedBox(QWidget):
         self.edit.setText(self.text.text())
         self.edit.show()
         self.edit.begin_typing()
-
-    def _undo(self) -> None:
-        self._show_choices(True)
-        self.decided.emit(self.ref, "", "")
 
     def hasHeightForWidth(self) -> bool:  # noqa: D102
         return True

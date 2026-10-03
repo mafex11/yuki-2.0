@@ -503,7 +503,10 @@ def test_the_activity_result_leads_with_what_changed_and_what_is_open(store):
                 NOW - 2 * 3600, events=5)
     _thread(store, "Old thread", "done long ago", [], NOW - 5 * DAY, events=2)
     jid = store.add_journal(NOW - 3 * 3600, None, "GitHub", "Merged PR #2803, the voiceover export fix", 7)
-    store._write(lambda conn: conn.execute("UPDATE journal SET milestone=1 WHERE id=?", (jid,)))
+    # written when it happened: the header only counts facts written before its ``until`` (milestones_since), and
+    # add_journal stamps created_at with the real clock, which is past this test's fixed NOW after 18:00 on 3 Oct 2026
+    store._write(lambda conn: conn.execute("UPDATE journal SET milestone=1, created_at=? WHERE id=?",
+                                           (NOW - 3 * 3600, jid)))
     header = MemoryClient(store).activity_header(since=start, until=NOW, now=NOW)
     assert [x["ref"] for x in header["threads"]] == [f"W{w}"] and header["threads"][0]["touched"] == 5
     assert header["threads"][0]["open"] == ["host the demo", "send Priya the link"]

@@ -1297,7 +1297,8 @@ class Hands:
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified)
         if self.on_step is not None:
             try:
-                self.on_step(name, _what(name, args), bool(ok and verified is not False), report[:400], ms)
+                self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified is not False),
+                             report[:400], ms)
             except Exception:  # noqa: BLE001 - the screen never breaks a hand
                 pass
         if self.log is not None:
@@ -2486,8 +2487,20 @@ def _is_address(text: str) -> bool:
         return False
 
 
+def hand_words(name: str, args: dict[str, Any], app: Any = None) -> str:
+    """A hand's step in the words every run surface uses (``yuki.ui.step_words.describe_hand``: "Closed Slack",
+    "Turned Spotify down"), for the thread and the screen; never its tool name or arguments (the user's 3 Oct
+    feedback 12 and 14). ``app``: the window's app the hand acted in, when its facts name it."""
+    from yuki.ui.step_words import describe_hand
+
+    try:
+        return describe_hand(name, args, app=app if isinstance(app, str) else None)
+    except Exception:  # noqa: BLE001 - presentation only
+        return "Did a step"
+
+
 def _what(name: str, args: dict[str, Any]) -> str:
-    """One line naming a hand's action from its arguments (for the shared action log)."""
+    """One line naming a hand's action from its arguments (for the shared action log the mouth reads; never shown)."""
     parts = [name]
     for key in ("skill", "window", "tab", "action", "direction", "amount", "keep", "key", "keys", "times", "url", "app",
                 "name", "level", "change", "mute", "page"):
