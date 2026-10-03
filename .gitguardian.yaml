@@ -1,0 +1,9 @@
+# GitGuardian / ggshield: these files hold FAKE secret-shaped strings on purpose - they are the test cases for
+# Yuki's own secret filter (yuki/memory/secretfilter.py), which hides passwords and keys before anything is stored.
+# No real secret lives in the repo (keys are environment variables only; see docs/HANDBOOK.md section 2).
+version: 2
+secret:
+  ignored_paths:
+    - "tests/secret_cases.py"
+    - "tests/secret_cases_holdout.py"
+    - "tests/test_secret_filter.py"
