@@ -700,7 +700,7 @@ class AgentRuntime(QObject):
     def submit(
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
-        user_words: "Iterable[str] | str | None" = None, pack: Any = None,
+        user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -725,13 +725,25 @@ class AgentRuntime(QObject):
                 talker's own reading of them never counts as the user's words.
             pack: A request pack the voice built while the user spoke (``Agent.build_pack``); used only when the
                 worker takes the request now (a pack read for an idle worker is stale on a queue).
+            needs_hands: The caller's own mark, never read from the words (voice: the talker's ``acts``). ``False``
+                (it only finds out or answers): the reader lane (the front desk: read tools and ``hand_over``) takes
+                it while that lane is free, even when the worker is idle, so the worker's hands stay free (revamp D,
+                30b §2, :func:`yuki.agent.lanes.route`); a reader that finds it needs hands hands it to the worker
+                as before. ``None`` / ``True``: as before.
 
         Returns:
             ``(lane name, request id)``.
         """
         request_id = next(self._ids)
         worker_idle = not self.worker_busy   # before this request counts: a pack is fresh only for an idle worker
-        lane = self.worker if (lane == WORKER or worker_idle) else self.front_desk
+        to_reader = False
+        if lane != WORKER and needs_hands is False:
+            from yuki.agent.lanes import route
+
+            reader_busy = self.front_desk.current_id is not None or bool(self.front_desk.waiting_ids())
+            to_reader = route(needs_hands=False, worker_busy=not worker_idle, reader_busy=reader_busy) == "reader"
+        lane = self.front_desk if to_reader else (
+            self.worker if (lane == WORKER or worker_idle) else self.front_desk)
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
         else:
@@ -747,6 +759,7 @@ class AgentRuntime(QObject):
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
+            **({"reader": True} if to_reader else {}),
         )
         return lane.name, request_id
 

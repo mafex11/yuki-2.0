@@ -6,7 +6,10 @@ traces, each step citing trace steps that ran and were not shown to fail). When 
 memory is sure of it (:mod:`yuki.voice.practice` offers it on the talker's "Learned ways" line), the talker can run it
 with ``run_skill`` instead of handing the request to the thinker: it writes the way's steps as structured hand steps
 (the role and name, the keys, the text from their words) in its one reply, and this module runs them through the very
-hands the talker already has (the same backend, dispatcher, guards and verdicts):
+hands the talker already has (the same backend, dispatcher, guards and verdicts). When memory keeps the way's steps
+executable (``MemoryClient.practice(detail=True)``'s ``run``, fx2: each a control by role and name, keys, an app, an
+expected state, never a window id), the line shows them as run_skill takes them and the talker's steps must be the
+way's own last steps, run as memory keeps them (:func:`fit_to_way`; only a type step's text is the talker's):
 
 * **click**: the control (role and name, as the way names it) is found in a fresh read of the window in front, a popup
   or a window of the way's app, waiting a moment for it to appear after the step before; clicked by that read's
@@ -194,6 +197,49 @@ def check_sends(args: dict[str, Any], words: list[str]) -> str | None:
     if not said(what, words):
         return f"it would send \"{what[:60]}\", which is not what they said"
     return None
+
+
+def _same_step(mine: SkillStep, way: dict[str, Any]) -> bool:
+    """Whether the talker's step is the way's stored step ``way`` (strings compared with strings: identity, or one
+    name a whole-word span of the other - "Chrome" for "Google Chrome"; keys as a set)."""
+    from yuki.memory.contacts import span_in
+
+    if mine.do != way.get("do"):
+        return False
+    if mine.do in ("click", "open_app"):
+        a, b = _words(mine.name or mine.app), _words(way.get("name"))
+        return bool(a and b) and (a.casefold() == b.casefold() or span_in(a, b) or span_in(b, a))
+    if mine.do == "keys":
+        return {k.casefold() for k in mine.keys} == {str(k).casefold() for k in way.get("keys") or []}
+    if mine.do == "open_url":
+        return _words(mine.url).casefold().rstrip("/") == _words(way.get("url")).casefold().rstrip("/")
+    if mine.do == "scroll":
+        return mine.direction == str(way.get("direction") or "down")
+    return True   # type: the text is the talker's (their words), checked by check_texts
+
+
+def fit_to_way(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillStep]:
+    """The talker's steps as the way's own executable steps (memory's ``run``, fx2): they must be the way's last steps
+    in order - the first ones may be left out when the screen is already past them (Chrome already open), none may be
+    added, changed or left out after the first one run. Each step then runs as memory keeps it: the control's role and
+    name, the keys, the app, the address and the expected words from the way; only a type step's text is the talker's.
+    Raises :class:`SkillRefused` (nothing runs; the thinker gets it) when they are not the way's steps."""
+    if not run:
+        return steps
+    start = len(run) - len(steps)
+    if start < 0 or not all(_same_step(mine, way) for mine, way in zip(steps, run[start:])):
+        raise SkillRefused("those are not the learned way's own steps (its last steps, in order, as the line gives "
+                           "them)")
+    out = []
+    for mine, way in zip(steps, run[start:]):
+        out.append(SkillStep(
+            i=mine.i, do=mine.do, role=_words(way.get("role")) or mine.role,
+            name=_words(way.get("name")) or mine.name, window=None, text=mine.text,
+            keys=[str(k).casefold() for k in way.get("keys") or []] or mine.keys,
+            direction=str(way.get("direction") or mine.direction), amount=mine.amount,
+            url=_words(way.get("url")) or mine.url, app=_words(way.get("app")) or mine.app,
+            expect=_words(way.get("expect")) or mine.expect))
+    return out
 
 
 def check_texts(steps: list[SkillStep], words: list[str], way_text: str) -> str | None:
@@ -492,7 +538,7 @@ class SkillRunner:
         """Run the way ``item`` (offered to the talker) with the talker's ``args``: ``(ok, report, facts)``.
 
         Raises :class:`SkillRefused` before any step runs when the call cannot be run as written."""
-        steps = parse_steps(args.get("steps"))
+        steps = fit_to_way(parse_steps(args.get("steps")), [s for s in item.get("run") or [] if isinstance(s, dict)])
         way_text = str(item.get("text") or "")
         why = check_sends(args, words) or check_texts(steps, words, way_text)
         if why:
@@ -623,4 +669,4 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
 
 
 __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_steps", "check_sends", "check_texts",
-           "said", "trace_steps", "SKILL_DOS"]
+           "fit_to_way", "said", "trace_steps", "SKILL_DOS"]

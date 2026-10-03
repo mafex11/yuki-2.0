@@ -542,7 +542,9 @@ def test_used_outcomes_reach_the_ledger_and_a_correction_counts_against_what_was
                                       {"id": ids["paste"], "how": "repeated"},              # a bad step in discord
                                       {"id": 777, "how": "ok"}]}])
     res = L.Learner(worker).run_once(now=NOW + 200)
-    assert res[0].written["used"] == [(ids["tag"], "user_corrected"), (ids["paste"], "ran_trouble")]
+    # corrected: what was cited and what was shown for the app the run acted in count against (fx2: never for it);
+    # the Warp procedure, shown but of an app the run never acted in, is left alone
+    assert res[0].written["used"] == [(ids["tag"], "user_corrected"), (ids["paste"], "user_corrected")]
     assert P.get(store, ids["tag"]).n_corrected == 1 and P.get(store, ids["warp"]).n_ran_ok == 0
     # an uncited procedure the run followed anyway in its app, with a bad step there, can be contradicted; one of an
     # app the run never acted in cannot
@@ -553,6 +555,66 @@ def test_used_outcomes_reach_the_ledger_and_a_correction_counts_against_what_was
                        "used": [{"id": ids["tag"], "how": "contradicted"}, {"id": ids["warp"], "how": "contradicted"}]}]
     res = L.Learner(worker).run_once(now=NOW + 600)
     assert res[0].written["used"] == [(ids["tag"], "contradicted")]
+
+
+def _slider_case(store: Store, *, injected_extra: list[int] = ()) -> tuple[int, dict[str, Any]]:
+    """29-build §3 item 5: a misleading pitfall of Chrome ("use the YouTube player's slider"), shown on a voice hand
+    run that turned Chrome's mixer volume down (verified: the wrong target, its own report could not know) when the
+    user meant Yuki's own voice; their correction 15 s later."""
+    slider = P.add_playbook(store, {"kind": "pitfall", "intent": "lower the video's volume",
+                                    "apps": ["chrome.exe"], "body": {"text": "the system keys moved everything",
+                                                                     "instead": "drag the YouTube player's slider"}},
+                            events=[{"type": "observed", "run_key": "r1", "at": NOW - DAY},
+                                    {"type": "observed", "run_key": "r2", "at": NOW - 2 * DAY}],
+                            vector=vec("lower the video's volume"), now=NOW)
+    got = P.record_hand_trace(store, session_id="S9", name="app_volume", args={"app": "chrome.exe", "change": -20},
+                              ok=True, verified=True, report="chrome.exe 80 -> 60", ms=90.0, at=NOW,
+                              app="chrome.exe", target="the mixer volume of chrome.exe (that app only)",
+                              words="Lower your volume.", request_id="voice-1-h1",
+                              injected=[slider, *injected_extra])
+    assert got["ok"]
+    store.add_turn("S9", "voice-1-h1", NOW, "Lower your volume.", "", ["app_volume"], "final")
+    store.add_turn("S9", "voice-2", NOW + 15, "No. No. No. Not my system's audio. I want you to turn your volume down.",
+                   "", [], "final")
+    lesson = {"op": "ADD", "kind": "pitfall", "intent": "lower or raise a volume", "apps": ["chrome.exe"],
+              "text": "turned Chrome's volume down; the user meant Yuki's own voice",
+              "instead": "for 'your volume' lower Yuki's own entry", "from": [1],
+              "quote": "I want you to turn your volume down"}
+    return slider, lesson
+
+
+@pytest.mark.parametrize("outcome", ["corrected", "worked_after_trouble"])
+def test_a_correction_counts_against_the_lesson_shown_never_for_it(store, outcome):
+    """fx2 regression (29-build §3 item 5): on the run the user corrected, the learner credited the shown pitfall
+    ``avoided`` (ran_ok: 0.618 -> 0.75) because the wrong step verified. A correction must count against what was
+    shown or cited, whatever the pass says about it - also when the pass labels the outcome otherwise but writes a lesson
+    on the user's own correction words."""
+    other = P.add_playbook(store, {"kind": "pitfall", "intent": "switch to a Warp tab", "apps": ["warp"],
+                                   "body": {"text": "Warp's tabs cannot be read", "instead": "read the title"}},
+                           events=[{"type": "observed", "run_key": "r3", "at": NOW - DAY}], vector=vec("warp tab"),
+                           now=NOW)
+    slider, lesson = _slider_case(store, injected_extra=[other])
+    before = P.get(store, slider).confidence
+    worker = Worker(store, [{"outcome": outcome, "cause": "Chrome's volume, not Yuki's", "operations": [lesson],
+                             "used": [{"id": slider, "how": "avoided"}, {"id": other, "how": "avoided"}]}])
+    res = L.Learner(worker).run_once(now=NOW + 120)
+    assert res[0].mode == "postmortem" and res[0].written["added"]
+    assert res[0].written["used"] == [(slider, "user_corrected")]        # the Warp lesson: no app the run acted in
+    o = P.get(store, slider)
+    types = [e.type for e in P.ledger(store, slider)]
+    assert "ran_ok" not in types and types.count("user_corrected") == 1
+    assert o.n_ran_ok == 0 and o.n_corrected == 1 and o.confidence < before
+    assert [e.type for e in P.ledger(store, other)].count("ran_ok") == 0
+
+
+def test_a_pitfall_kept_clear_of_on_a_run_nobody_corrected_still_counts_for_it(store):
+    """The other side: the same hand with no correction (the next words are a new request) keeps the old rule - a
+    pitfall of the app it acted in, kept clear of, is credited."""
+    slider, _lesson = _slider_case(store)
+    worker = Worker(store, [{"outcome": "worked", "cause": "", "operations": [],
+                             "used": [{"id": slider, "how": "avoided"}]}])
+    res = L.Learner(worker).run_once(now=NOW + 120)
+    assert res[0].written["used"] == [(slider, "ran_ok")]
 
 
 # -- the nightly miner --------------------------------------------------------------------------------------------

@@ -676,15 +676,19 @@ class MemoryAccess:
     def record_hand_trace(self, *, name: str, args: dict[str, Any] | None, ok: bool, verified: bool | None,
                           report: str, ms: float, at: float | None = None, app: str | None = None,
                           target: str | None = None, words: str | None = None, why: str | None = None,
-                          request_id: str | None = None,
+                          request_id: str | None = None, injected: list[Any] | None = None,
+                          cited: list[Any] | None = None, control: Any = None,
                           on_done: Callable[[dict[str, Any]], None] | None = None) -> bool:
         """Queue one voice hand's trace for ``MemoryClient.record_hand_trace`` (practice memory: the learners see the
-        talker's single steps too), under this app run's session. Returns at once; never raises. For the voice hands
-        (builder 3b wires it); ``False`` when memory is not installed."""
+        talker's single steps too), under this app run's session. ``injected`` / ``cited``: the playbooks shown to the
+        talker for it and those it followed; ``control``: the control it acted on (``"role|name"``). Returns at once;
+        never raises. For the voice hands (builder 3b wires it); ``False`` when memory is not installed."""
         payload = {"session_id": self.session_id, "name": name, "args": dict(args or {}), "ok": bool(ok),
                    "verified": verified, "report": str(report or ""), "ms": float(ms or 0.0),
                    "at": time.time() if at is None else float(at), "app": app, "target": target, "words": words,
                    "why": why, "request_id": request_id}
+        # fx2: only what was given, so a memory without these fields still takes the trace
+        payload.update({k: v for k, v in (("injected", injected), ("cited", cited), ("control", control)) if v})
         return self._queue_write("record_hand_trace", payload, on_done)
 
     def _queue_write(self, method: str, payload: dict[str, Any],
@@ -736,6 +740,7 @@ class MemoryAccess:
                                                timeout_s=TURN_LOG_TIMEOUT_S)
                     else:
                         kwargs = {k: turn.get(k) for k in ("at", "app", "target", "words", "why", "request_id")}
+                        kwargs.update({k: turn[k] for k in ("injected", "cited", "control") if turn.get(k)})
                         got = self.call_method("record_hand_trace", turn.get("session_id"), turn["name"],
                                                turn.get("args"), turn["ok"], turn.get("verified"), turn.get("report"),
                                                turn.get("ms"), timeout_s=TURN_LOG_TIMEOUT_S, **kwargs)
