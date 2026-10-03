@@ -267,6 +267,13 @@ def _clean(value: Any, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
 
 
+def _others_call_line(src: Any) -> bool:
+    """A call line that is not the user's: the call app's own sound or a game's voice chat (``who`` "others", our
+    own label on the line; a line stored before 3 Oct 2026 has none and is the user's)."""
+    utterance = getattr(src, "utterance", None)
+    return isinstance(utterance, dict) and utterance.get("who", "user") == "others"
+
+
 def _ints(values: Any) -> list[int]:
     out = []
     for v in values or []:
@@ -320,6 +327,10 @@ def parse_work(items: Any, offered: dict[int, WorkThread], sources: Sequence[Any
         if action == "starts" and idx and all(getattr(getattr(sources[i], "capture", None), "by_yuki", False)
                                               for i in idx):
             rejected.append("what Yuki put on screen starts no thread")
+            continue
+        if action in ("starts", "ends") and idx and all(_others_call_line(sources[i]) for i in idx):
+            # a friend's "I finished the deploy" neither starts nor ends the user's work (review 61 #5)
+            rejected.append("someone else's words on a call start or end no thread")
             continue
         attention = _attention([sources[i] for i in idx] or list(sources))
         if action == "starts" and attention != "front":

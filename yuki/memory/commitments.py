@@ -184,7 +184,9 @@ def close_joke_commitments(store: Store, *, now: float | None = None) -> list[di
                     except (TypeError, ValueError):
                         continue
                     mine = line.get("who", "user") != "others"   # digests before 3 Oct carry no who: the user's
-                    if same and mine and normalize_nature(line.get("nature")) == "humor":
+                    # a line moved onto the user's reply (calldigest.rest_on) may be a mislabelled friend's joke:
+                    # never enough to end the user's real to-do (review 61 #3a)
+                    if same and mine and not line.get("moved") and normalize_nature(line.get("nature")) == "humor":
                         hit = (c.id, at)
                         break
                 if hit:

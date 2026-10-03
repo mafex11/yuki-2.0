@@ -139,7 +139,10 @@ SPEAKERS: tuple[str, ...] = ("user", "others")
 #: moved onto the user's own nearest line within this many lines, and the reverse (report 61: the 4 Oct check put
 #: "Agreed to send the hostel link" on the friend's request in 2 of 2 runs). Plumbing on the model's own label and
 #: the lines' metadata; no words are read.
-REPOINT_SPAN = 6
+REPOINT_SPAN = 6   # kept for callers of the name; the search is by time now (REPOINT_S)
+#: How far in time the move may reach (review 61 #3: by time and by side, not by line count, so a game's callouts
+#: between a friend's request and the user's "yeah sure" never stop it).
+REPOINT_S = 60.0
 #: What kind of place a call was in (the structured ``place``, migration 33): a voice channel, a text channel's
 #: call, a meeting, a direct call; "" when the screen does not say.
 PLACE_KINDS: tuple[str, ...] = ("voice", "text", "meeting", "direct", "")
@@ -176,7 +179,7 @@ lines.
 - lines: short English lines, in order, each resting on one line of the transcript - give that \
 line's number as at, and your line gets its time from it. Most lines are about the user: what the \
 user said, asked, decided, planned, promised, explained, told, complained about or joked about, and \
-to whom when the evidence names the person ("Told Ravi the integrals would be explained after \
+to whom when the evidence names the person ("Told Tara the integrals would be explained after \
 the match"). Write about the user without their name, starting with the verb ("Asked whether...", \
 "Said the build was failing, so busy for now"); where a line has to name the user again, write "the \
 user", as the rest of memory does - never he, she, him, her, his or hers for the user (other people \
@@ -228,7 +231,7 @@ of work the user touched then, and how memory spells names; every item has its l
 up with the call's lines. Use it only to understand what was said and who was there:
 - Resolve what a line refers to when the context makes it plain at that time: "him", "you", "that \
 link", "this", "the thing on screen", "yeah do it" -> who (a name on the call screen or in its chat) and \
-what (the page, PR, document, video or game in front then). Write the resolved line ("Told Mafex to \
+what (the page, PR, document, video or game in front then). Write the resolved line ("Told Kabir to \
 share the screen again", "Said the Relay PR open on screen was ready to merge"), never a guess: when the \
 context does not settle it, keep the words as said, or make the line uncertain. With exactly one other \
 person on the call screen at that time, the OTHERS lines are that person's.
@@ -617,7 +620,8 @@ def render_request(pieces: Sequence[Piece], earlier: dict[int, str], nonce: str)
             out.append(sanitize_untrusted(earlier[p.call_id], nonce, 4_000))
         if p.context:
             out.append(f"CONTEXT AROUND CALL {p.call_id} (text on the user's screen during and just around it, "
-                       "never audio; only to understand the user's words - see CONTEXT AROUND THE CALL):")
+                       "never audio; only to understand what was said and who was there - see CONTEXT AROUND THE "
+                       "CALL):")
             out.append(sanitize_untrusted(p.context, nonce, CONTEXT_MAX_CHARS))
             out.append(f"THE CALL'S LINES, CALL {p.call_id}:")
         prev_end: float | None = None
@@ -690,9 +694,15 @@ def parse_blocks(tool_input: Any, numbered: dict[int, tuple[int, Utterance]]
             text = " ".join(str(ln.get("text") or "").split())[:LINE_MAX_CHARS]
             if not text or at not in numbered or numbered[at][0] != cid:
                 continue
-            at = rest_on(at, str(ln.get("speaker") or ""), numbered)
+            speaker = str(ln.get("speaker") or "")
+            cited = at
+            at = rest_on(at, speaker, numbered)
+            rested = numbered[at][1]
+            if rested.who == "others" and rested.track_kind == "game":
+                continue   # a game's voice chat is context only, never a timeline line of its own (review 61 #4)
             first, last = min(first, at), max(last, at)
-            lines.append((at, text, normalize_nature(ln.get("nature"))))
+            lines.append((at, text, normalize_nature(ln.get("nature")),
+                          speaker if speaker in SPEAKERS else "", at != cited))
         if lines:
             raw.append({"call_id": cid, "first": first, "last": last,
                         "topic": " ".join(str(b.get("topic") or "").split())[:80], "lines": sorted(lines)})
@@ -717,8 +727,9 @@ def parse_blocks(tool_input: Any, numbered: dict[int, tuple[int, Utterance]]
         out.append({
             "call_id": b["call_id"], "start": first_u.at, "end": max(last_u.end, first_u.at), "topic": b["topic"],
             "lines": [{"at": numbered[at][1].at, "text": text, "nature": nature, "who": numbered[at][1].who,
-                       "app": numbered[at][1].app, "track_kind": numbered[at][1].track_kind}
-                      for at, text, nature in b["lines"]],
+                       "app": numbered[at][1].app, "track_kind": numbered[at][1].track_kind,
+                       **({"speaker": speaker} if speaker else {}), **({"moved": True} if moved else {})}
+                      for at, text, nature, speaker, moved in b["lines"]],
         })
     gists: dict[int, str] = {}
     for g in data.get("calls") or []:
@@ -735,24 +746,32 @@ def parse_blocks(tool_input: Any, numbered: dict[int, tuple[int, Utterance]]
 
 
 def rest_on(at: int, speaker: str, numbered: dict[int, tuple[int, Utterance]]) -> int:
-    """The line number a digest line rests on, given whose words the model says it reports (``speaker``): a line
-    reporting the user's words that cites someone else's line moves to the user's own nearest line of the same
-    call (the next ones first: an answer follows its question), one reporting someone else's words that cites a
-    user line moves to the nearest other-side line (the earlier ones first), each within :data:`REPOINT_SPAN`
-    lines; otherwise, or with no ``speaker``, it stays. Its stored ``who`` then follows the line it rests on."""
+    """The line number a digest line rests on, given whose words the model says it reports (``speaker``).
+
+    Searched by time, among the wanted side's lines only (lines of another track in between - a game's callouts -
+    never stop the search; review 61 #3b):
+
+    - a line reporting the user's words that cites someone else's line moves only onto the user's REPLY: their
+      first own line after it, within :data:`REPOINT_S` (an answer follows its question). Never onto an earlier
+      user line, so a friend's plan the model mislabels cannot land on whatever the user said before it;
+    - a line reporting someone else's words that cites a user line moves to the nearest other-side line, the
+      earlier ones first, within :data:`REPOINT_S` (the safe direction: it stops being the user's).
+
+    Otherwise, or with no ``speaker``, it stays. The stored ``who`` follows the line it rests on; the model's own
+    ``speaker`` is stored beside it (``parse_blocks``), and a moved line is marked ``moved``."""
     if speaker not in SPEAKERS or at not in numbered:
         return at
     cid, u = numbered[at]
     if (u.who == "user") == (speaker == "user"):
         return at
     want_user = speaker == "user"
-    steps = [*range(1, REPOINT_SPAN + 1)] if want_user else [*range(-1, -REPOINT_SPAN - 1, -1)]
-    steps += [-s for s in steps]
-    for step in steps:
-        n = at + step
-        if n in numbered and numbered[n][0] == cid and (numbered[n][1].who == "user") == want_user:
-            return n
-    return at
+    same_side = sorted(n for n, (c, v) in numbered.items() if c == cid and (v.who == "user") == want_user)
+    if want_user:
+        later = [n for n in same_side if n > at and numbered[n][1].at - u.at <= REPOINT_S]
+        return later[0] if later else at
+    near = [n for n in same_side if abs(numbered[n][1].at - u.at) <= REPOINT_S]
+    near.sort(key=lambda n: (abs(numbered[n][1].at - u.at), n > at))
+    return near[0] if near else at
 
 
 def parse_people(tool_input: Any, numbered: dict[int, tuple[int, Utterance]], contexts: dict[int, str],

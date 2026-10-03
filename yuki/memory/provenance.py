@@ -99,10 +99,12 @@ def source_of(src: Any, thread: Any, sources: Sequence[Any] = (), index: int | N
             out.update(kind="call", by="the user", quote=_clip(words), where=where,
                        unclear=bool(utterance.get("unclear")))
         else:   # the call app's own sound (everyone else on the call), or a game's voice chat
+            # No verbatim quote of someone else's words: a fact's source outlives the call's 30-day words, and the
+            # fact's own sentence already says what was said (owner's decision 3 Oct 2026; privacy review 61 #4).
             game = utterance.get("track_kind") == "game"
             track = str(utterance.get("app") or app or "")
             out.update(kind="call", who="others", by="a teammate or the game" if game else "someone on the call",
-                       quote=_clip(words), where=f"{track} game voice chat" if game else where,
+                       quote=None, where=f"{track} game voice chat" if game else where,
                        unclear=bool(utterance.get("unclear")))
         if call.startswith("call:"):
             out["call"] = call

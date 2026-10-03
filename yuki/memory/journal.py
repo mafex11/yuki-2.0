@@ -110,6 +110,9 @@ EMPTY_REJOURNAL = "re-journal found no facts where the earlier run had some; the
 #: Cap for one capture's text inside a batch (MaxMi's maxNewContentChars) and
 #: the default batch size.
 MAX_BATCH_CHARS = 12_000
+#: A call part is cut at the longest silence among its last this-many lines (JournalWorker._call_parts), so a question
+#: and its answer stay in one part.
+CALL_CUT_LOOKBACK = 12
 PREVIOUS_FACTS_CHARS = 2_000
 #: How much of a page's first capture is shown as TOP OF THIS PAGE with its later deltas.
 PAGE_TOP_CHARS = 600
@@ -709,11 +712,29 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "nature", "importance", "source"],
+                    "required": ["text", "nature", "importance", "source", "user_said", "involves_user"],
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
                            ["properties"].items() if k not in ("content_date", "milestone", "other_ai",
                                                                "user_said")},
+                        "user_said": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the fact gives the user's own words or the user themself - what they "
+                                "said, agreed to, plan, think, how they are, a story or a joke of theirs: it must "
+                                "cite a THE USER line. False for what someone on the call or in the game said."
+                            ),
+                        },
+                        "involves_user": {
+                            "type": "boolean",
+                            "description": (
+                                "For a fact from an OTHERS line: true only when it involves the user - something "
+                                "asked of them, a plan they take part in, something they will need later (a date, a "
+                                "link, a place, a decision made together); false for the speaker's own private "
+                                "matters or gossip (see WHAT IS WORTH KEEPING FROM THE OTHERS). True for a fact from "
+                                "a THE USER line."
+                            ),
+                        },
                         # dated by themselves; the user's own voice is never another AI tool's text
                         "nature": {
                             "type": "string",
@@ -923,6 +944,25 @@ def users_line(src: Any) -> bool:
     return isinstance(utterance, dict) and utterance.get("who", "user") == "user"
 
 
+def said_into_game(src: Any, sources: Sequence[Any] = ()) -> bool:
+    """Whether a user's call line was said into a game's voice chat (owner's decision 4 Oct 2026: no to-dos from
+    game chat). On the line's own metadata, no words read: the microphone was recorded for a game's session with
+    no call (``track_kind`` "game"), or the apps taking the microphone then (``heard_by``, measured) were only the
+    games whose voice chat is in this batch."""
+    utterance = getattr(src, "utterance", None)
+    if not isinstance(utterance, dict) or utterance.get("who", "user") != "user":
+        return False
+    if utterance.get("track_kind") == "game":
+        return True
+    heard = utterance.get("heard_by")
+    if not isinstance(heard, list) or not heard:
+        return False
+    games = {str(u.get("app") or "") for s in sources
+             if isinstance(u := getattr(s, "utterance", None), dict)
+             and u.get("who") == "others" and u.get("track_kind") == "game"}
+    return bool(games) and all(str(h) in games for h in heard)
+
+
 def terminal_commands(cap: PendingCapture) -> list[dict[str, Any]]:
     """The commands a ``terminal`` capture carries (its delta is our own JSON, written by the store)."""
     try:
@@ -960,9 +1000,11 @@ def call_line_label(line: dict[str, Any], call_app: str, safe: Any) -> tuple[str
             names = ", ".join(safe(str(h), 40) for h in heard if str(h).strip())
             where += f", mic open to: {names or 'no app'}"
         return "THE USER SAID", where
+    # what each label means is said once, in the batch's header (build_user_message), not on every line (review 61
+    # #8: per-line explanations were most of a part's characters)
     if line.get("track_kind") == "game":
-        return "GAME VOICE SAID", f"in {app}'s voice chat: teammates or the game's own voice lines"
-    return "OTHERS SAID", f"on the {app} call: the call app's own sound, everyone else on it"
+        return "GAME VOICE SAID", f"in {app}'s voice chat"
+    return "OTHERS SAID", f"on the {app} call"
 
 
 def build_sources(
@@ -1098,11 +1140,18 @@ def build_user_message(
     elif (thread.kind or "") == CALL_SIDE_KIND:
         sides = {("user" if s.users_line else "game" if (s.utterance or {}).get("track_kind") == "game" else "others")
                  for s in sources if s.utterance is not None}
-        parts[-1] += (" (a call, transcribed on this PC: the user's microphone"
+        lines = [s.utterance for s in sources if s.utterance is not None]
+        game_only = bool(lines) and all(u.get("track_kind") == "game" for u in lines)   # a game's session, no call
+        parts[-1] += ((" (a game's voice chat while the user played, no call" if game_only else " (a call")
+                      + ", transcribed on this PC: the user's microphone"
                       + (", the call app's own sound (the other people)" if "others" in sides else "")
                       + (", a game's own voice chat" if "game" in sides else "")
                       + "; each line says who spoke" + ("" if sides - {"user"} else
-                                                         "; only the user's own lines are here") + ")")
+                                                         "; only the user's own lines are here")
+                      + ("; OTHERS SAID = the call app's own sound, everyone else on it, mixed into one track"
+                         if "others" in sides else "")
+                      + ("; GAME VOICE SAID = the game's voice chat: teammates or the game's own voice lines"
+                         if "game" in sides else "") + ")")
     else:
         if thread.scope and thread.scope != thread.url:
             label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
@@ -1169,8 +1218,8 @@ def build_user_message(
         parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}{no_input(src)}:\n    {text}")
     if context:   # a call's surroundings on screen (yuki.memory.callcontext): after the sources, never one of them
         parts += ["", "CONTEXT AROUND THE CALL (text on the user's screen during and just around it, never audio; "
-                      "NEVER a fact source - write no fact the user's own words do not carry; only to understand "
-                      "who and what their words refer to):", safe(context, CONTEXT_CHARS)]
+                      "NEVER a fact source - every fact rests on the call line it cites; only to understand who "
+                      "was there and who and what each line refers to):", safe(context, CONTEXT_CHARS)]
     if work:   # after the sources: next to FACTS ALREADY RECORDED its lines were taken for recorded facts (29 Sept A/B)
         parts += ["", work]
     data = "\n".join(parts)
@@ -1532,11 +1581,26 @@ class JournalWorker:
         parts: list[list[Source]] = []
         current: list[Source] = []
         size = 0
+
+        def cost(src: Source) -> int:   # the words plus the source line around them, as build_user_message writes it
+            u = src.utterance or {}
+            who, where = call_line_label(u, src.call_app or "", lambda s, _n: s)
+            return len(str(u.get("text") or "")) + len(who) + len(where) + 50
+
         for src in sources:
-            n = len(str((src.utterance or {}).get("text") or "")) + 100   # + the source line around the words
+            n = cost(src)
             if current and size + n > self.batch_chars:
-                parts.append(current)
-                current, size = [], 0
+                # cut at the longest silence among the last lines, not mid-exchange: a request at the end of one
+                # part and its "yeah sure" at the start of the next would never meet (review 61 #8)
+                tail = min(CALL_CUT_LOOKBACK, len(current) - 1)
+                cut = len(current)
+                if tail > 0:
+                    gaps = [(float(current[i].at) - float(current[i - 1].at), i)
+                            for i in range(len(current) - tail, len(current))]
+                    cut = max(gaps)[1]
+                parts.append(current[:cut])
+                current = current[cut:]
+                size = sum(cost(s) for s in current)
             current.append(src)
             size += n
         if current:
@@ -1751,6 +1815,9 @@ class JournalWorker:
                 continue
             if not users_line(sources[index]):
                 rejected.append("cites someone else's line, not the user's words")
+                continue
+            if said_into_game(sources[index], sources):
+                rejected.append("said in a game's voice chat: no to-do")
                 continue
             nature = normalize_nature(item.get("nature") or "fact")
             if nature != "fact" or index in unserious:
@@ -2037,6 +2104,27 @@ class JournalWorker:
                 out.add(c.id)
         return out
 
+    @staticmethod
+    def _others_fact_dropped(src: Source, item: dict[str, Any], nature: str) -> bool:
+        """Whether a fact citing a call line that is not the user's is thrown away (structural, on the line's own
+        ``who`` / ``track_kind`` and the model's labels; owner's decision 3 Oct 2026, both sides recorded):
+
+        - a GAME VOICE line (teammates, the game's own voice lines) is context only - never a fact source;
+        - a fact about the user themself (nature trait, story or humor) never rests on someone else's words;
+        - a fact the model says does not involve the user (``involves_user`` false: the speaker's own private
+          matters, gossip) is not kept.
+
+        ``user_said`` on such a line is caught before this, by the WHOSE WORDS check (its source is not by the
+        user). A line from before 3 Oct 2026 has no ``who`` and is the user's: never dropped here."""
+        utterance = getattr(src, "utterance", None)
+        if not isinstance(utterance, dict) or utterance.get("who", "user") != "others":
+            return False
+        if utterance.get("track_kind") == "game":
+            return True
+        if nature in ("trait", "story", "humor"):
+            return True
+        return item.get("involves_user") is False
+
     def _parse_facts(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
                      tool: str = "record_facts", indexes: list[int] | None = None,
                      not_users_words: list[int] | None = None) -> list[NewFact]:
@@ -2080,6 +2168,10 @@ class JournalWorker:
             source = source_of(sources[index], thread, sources, index)
             to_people = item.get("user_said") in (True, USER_SAID[1])   # True: a boolean answer
             if to_people and source.get("by") != "the user" and not source.get("by_yuki"):
+                if not_users_words is not None:
+                    not_users_words.append(index + 1)
+                continue
+            if self._others_fact_dropped(sources[index], item, nature):
                 if not_users_words is not None:
                     not_users_words.append(index + 1)
                 continue
