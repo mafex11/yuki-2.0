@@ -583,8 +583,7 @@ class MemoryClient:
         out = {"ok": ok, "ref": f"fact:{fid}", "pinned": bool(on) if ok else None}
         if not ok:
             out["error"] = "That fact has changed since; open it again."
-        else:
-            self.rerender_portrait()   # the page marks pinned facts (debounced; no model on this path)
+        # no re-render: the pin changes no word of the page Yuki reads (a render is a model call)
         return out
 
     def _ripple(self, subject: str, memory_had: str, words: str) -> int | None:
