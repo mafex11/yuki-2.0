@@ -430,7 +430,7 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     assert {launch["group"], click["group"], todo["group"]} == {"run:agent:s:worker-3"}
     answered = rows["run:agent:s:worker-4"]
     assert answered["what"] == "Answered “what's on today”" and answered["why"] == "you typed “what's on today”"
-    reqs = [r for r in d["rows"] if r["kind"] == "request" and r["id"][1:].isdigit()]   # request log rows
+    reqs = [r for r in d["rows"] if r["kind"] == "request" and r["id"].startswith("req:")]   # request log rows
     assert [r["what"] for r in reqs] == ["“open my budget”"]          # the traced request is not listed twice
     assert rows["c41"]["why"] == "rule: “Tell me when the forum thread gets a reply.”"
     assert rows["c42"]["why"] == "you stopped mid-way"
