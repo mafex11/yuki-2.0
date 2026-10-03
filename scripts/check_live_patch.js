@@ -392,6 +392,45 @@ async function inPage(F) {
   check('21 the drawer input keeps focus and its text', document.activeElement === steer && steer.value === 'a half-written message');
   check('21 a fold you closed stays closed', !fold || (fold.isConnected && !fold.open));
 
+  // ---- W9 (4 Oct): ONE input. While a request runs, Enter steers it (an answer when it asked you something), the
+  // send button is Stop, Esc on the empty box stops; idle, Enter sends a new request; the face shows the live state ----
+  const inp = () => document.querySelector('.drawer .drawer-in');
+  const inRow = () => document.querySelector('.drawer .inp');
+  const enter = (k) => inp().dispatchEvent(new KeyboardEvent('keydown', { key: k || 'Enter', bubbles: true }));
+  const job = (last.jobs || [])[0] || 31;
+  const runNow = [{ item: last.id, jobs: [job], title: '“An invented request”', line: 'Step 1 · Doing an invented thing', started_at: Date.now() / 1000 - 5, step: 1 }];
+  window.__push({ kind: 'live', shell: { runs: runNow } }); await sleep(200);
+  check('W9 no separate steer box, run box or second Stop', !document.querySelector('.drawer .runbar, .drawer .steer-in') && document.querySelectorAll('.drawer [data-do="stop"]').length === 1);
+  check('W9 the button right of the input is Stop while a request runs', !!inRow().querySelector('button[data-do="stop"]') && !inRow().querySelector('[data-do="send"]'));
+  check('W9 the face left of the input shows working', inRow().firstElementChild.tagName === 'CANVAS' && inRow().querySelector('canvas').dataset.core === 'working', inRow().querySelector('canvas').dataset.core);
+  REPLY.steer = { ok: true, delivered: true };
+  inp().focus(); inp().value = 'also the invented other one'; enter();
+  await sleep(250);
+  check('W9 Enter while it runs steers that request (no new request)', acts('steer').some((m) => m.text === 'also the invented other one' && m.job === job)
+    && !acts('submit').some((m) => m.text === 'also the invented other one'), JSON.stringify(acts('steer')));
+  check('W9 what you added shows under the reply, with whether it was read', document.querySelector('.drawer').textContent.includes('you added “also the invented other one”')
+    && document.querySelector('.drawer').textContent.includes('read at its next step'));
+  const qItems = clone(F.chat.items); const qLast = qItems[qItems.length - 1]; qLast.question = 'Which invented folder?'; qLast.running = true;
+  window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(250);
+  check('W9 when it asks you something, the face says so and the box takes your answer', inRow().querySelector('canvas').dataset.core === 'needs-you' && inp().placeholder.includes('answer'), inRow().querySelector('canvas').dataset.core + ' / ' + inp().placeholder);
+  inp().value = 'the invented one'; enter(); await sleep(200);
+  check('W9 Enter on a question answers it (the submit path), never a steer', acts('submit').some((m) => m.text === 'the invented one') && !acts('steer').some((m) => m.text === 'the invented one'));
+  delete qLast.question; window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(150);
+  inp().value = ''; inp().focus(); enter('Escape'); await sleep(200);
+  check('W9 Esc on the empty box stops the request', acts('stop').some((m) => m.job === job));
+  check('W9 Esc stopping it leaves the thread open', !!document.querySelector('.drawer'));
+  window.__push({ kind: 'live', shell: { runs: [] } }); await sleep(200);
+  check('W9 when it ends, the button is Send and the face shows done', !!inRow().querySelector('button[data-do="send"]') && !inRow().querySelector('[data-do="stop"]')
+    && inRow().querySelector('canvas').dataset.core === 'done-flash', inRow().querySelector('canvas').dataset.core);
+  inp().focus(); inp().value = 'an invented new request'; enter(); await sleep(200);
+  check('W9 idle, Enter sends a new request', acts('submit').some((m) => m.text === 'an invented new request') && inp().value === '');
+  await sleep(3200);
+  check('W9 the done face goes back to the resting one after 3 s', inRow().querySelector('canvas').dataset.core !== 'done-flash', inRow().querySelector('canvas').dataset.core);
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(150);
+  check('W9 a new run brings Stop back', !!inRow().querySelector('button[data-do="stop"]'));
+  window.__push({ kind: 'live', shell: { runs: [] } }); await sleep(150);
+  window.__push({ kind: 'chat', reset: true, items: clone(F.chat.items), connected: true }); await sleep(150);
+
   // ---- the 3 Oct design (report 45): the drawer's days ----
   await go('#home');
   await go('#home?thread=1');

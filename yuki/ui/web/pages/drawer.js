@@ -2,9 +2,12 @@
    top of today, the line I remember about your last day (memory's day digest, said to you) with Still on it / Done
    when something was left open; earlier days fold to one line each and open on a click (their exchanges are read
    from memory then). Each reply's steps fold under it in plain verbs (open while it runs, closed when done; your
-   choice sticks), a time only for steps of a second or more; Stop and a steer box while a request runs; the input.
-   The live thread is the tray's ChatModel (Python keeps a replica and sends each change as JSON). The drawer opens at
-   the latest turn. */
+   choice sticks), a time only for steps of a second or more. ONE input (the 4 Oct item W9): idle, Enter sends a new
+   request; while a request runs, what you send steers it (the run card's steer path: read at its next step) or, when
+   it asked you something, answers it; the send button turns into Stop while it runs (Esc on the empty input stops
+   too); the face left of the input shows what Yuki is doing (the island's states: listening, hearing, thinking,
+   working, speaking, needs you, done). The live thread is the tray's ChatModel (Python keeps a replica and sends each
+   change as JSON). The drawer opens at the latest turn. */
 (function () {
   'use strict';
   const Y = window.Yk, { h, ic, key, fmt } = Y;
@@ -12,7 +15,8 @@
   const DAY_START_H = 4;              // a user day starts at 04:00 (memory's own day: checkins.user_day)
   const THREAD_DAYS_S = 600;          // the days and the connector are read again at most this often while open
   const UNDO_S = 5;
-  const T = { at: 0, busy: false, data: null, turns: {}, loading: new Set(), answered: {} };
+  const DONE_S = 3;                   // the done face after a request ends (the island's done pill: 3 s)
+  const T = { at: 0, busy: false, data: null, turns: {}, loading: new Set(), answered: {}, runs: 0, doneUntil: 0, doneT: 0 };
 
   /* the user day of an epoch: 'YYYY-MM-DD' of (local time - 4 h) */
   function dayKey(epoch) {
@@ -59,9 +63,14 @@
       h('summary', null, ic('chev'), [it.work_line, it.meta].filter(Boolean).join(' · ')), h('div', { class: 'fold-in' }, steps.map(stepRow))) : null;
     const text = it.text || '';
     const liveLine = it.running && !text ? h('div', { class: 'live-line' }, h('i', { class: 'recdot' }), it.question ? 'Waiting for your answer' : (it.thinking || 'Thinking…')) : null;
+    // what you added to it from the input while it ran, with whether it reached it
+    const jobs = it.jobs || [];
+    const added = steers.filter((m) => jobs.includes(m.job));
+    const addedEl = added.length ? h('div', { class: 'steer-msgs' }, added.map((m) => h('div', { class: 'msg' }, h('span', { text: `you added “${m.text}”` }),
+      h('span', { class: 's' + (m.wait ? ' wait' : ''), text: m.state })))) : null;
     return h('div', { class: 'y', data: { k: it.id } }, h('span', { class: 'who', text: 'yuki' }),
       text ? h('span', { class: 'tx' + (it.status === 'failed' ? ' failed' : it.status === 'interrupted' ? ' dim' : ''), text }) : h('span', { class: 'tx dim', text: it.question || '' }),
-      liveLine, fold, !steps.length && it.meta && !it.running ? h('div', { class: 'meta', text: it.meta }) : null,
+      liveLine, addedEl, fold, !steps.length && it.meta && !it.running ? h('div', { class: 'meta', text: it.meta }) : null,
       it.status === 'interrupted' ? h('div', { class: 'meta', text: 'interrupted' }) : null);
   }
   /* each turn and each message is keyed by its item's id, so a redraw while a reply streams patches only the turn
@@ -151,16 +160,47 @@
     else out.push(Y.empty(D.shell.connected ? 'Nothing said yet today. Type below, or say “Yuki”.' : 'Yuki isn’t running, so there’s no conversation to show. Start Yuki from the Start menu.'));
     return out;
   }
-  function runbar(D) {
+  /* the request running now (the newest), its job and whether it is waiting for your answer: what the one input does */
+  function running(D) {
     const runs = D.shell.runs || [];
     if (!runs.length) return null;
     const r = runs[runs.length - 1], job = (r.jobs || [])[0];
-    const mine = steers.filter((m) => m.job === job);
-    return h('div', { class: 'runbar' },
-      h('div', null, h('div', { class: 'tt', text: r.title || 'Working on your request' }), h('div', { class: 'sub', text: r.line || 'Thinking…' })),
-      job != null ? key('Stop', { cls: 'stop sm', icon: 'stop', data: { do: 'stop', job }, title: 'Alt+Shift+X' }) : h('span'),
-      job != null ? h('label', { class: 'steer' }, h('input', { class: 'steer-in', data: { enter: 'steer', job }, attrs: { placeholder: 'Steer: “also…” or “no, the other one”', 'aria-label': 'Steer the request', autocomplete: 'off' } }), h('span', { class: 'kbd', text: 'Enter' })) : null,
-      mine.length ? h('div', { class: 'steer-msgs' }, mine.map((m) => h('div', { class: 'msg' }, h('span', { text: `“${m.text}”` }), h('span', { class: 's ' + (m.state.startsWith('sent') ? '' : 'wait'), text: m.state })))) : null);
+    const item = (D.chat.items || []).find((i) => i.id === r.item);
+    return { job: job == null ? null : job, question: !!(item && item.question), title: r.title || '' };
+  }
+  /* the face left of the input: the island's state, from the same live state the rail's face reads; needs you while a
+     request waits for your answer; done for DONE_S after a request ends */
+  function faceFor(D, run, fresh) {
+    const n = (D.shell.runs || []).length;
+    if (fresh) T.runs = n;                     // the drawer just opened: nothing ended in front of you
+    if (T.runs && !n && D.shell.connected) {   // a request just ended: the done face, then back to what is live
+      T.doneUntil = Date.now() + DONE_S * 1000;
+      clearTimeout(T.doneT);
+      T.doneT = setTimeout(() => { T.doneT = 0; if (Y.S.chat) Y.renderDrawer(); }, DONE_S * 1000 + 30);
+    }
+    if (n) T.doneUntil = 0;
+    T.runs = n;
+    const f = Y.faceState ? Y.faceState() : 'idle';
+    if (run && run.question && !['listening', 'hearing', 'speaking'].includes(f)) return 'needs-you';
+    if ((f === 'idle' || f === 'quiet-in-call') && Date.now() < T.doneUntil) return 'done-flash';
+    return f;
+  }
+  const FACE_WORDS = { listening: 'Listening', hearing: 'Hearing you', thinking: 'Thinking', working: 'Working', speaking: 'Speaking',
+    'needs-you': 'Waiting for your answer', 'done-flash': 'Done', 'quiet-in-call': 'Quiet in a call', idle: 'Ready' };
+  /* the one input: its face, the field and the button (send, or Stop while a request runs) */
+  function inputRow(D, run, face) {
+    const connected = !!D.shell.connected;
+    const steering = !!(run && run.job != null && !run.question);
+    const placeholder = !connected ? 'Yuki isn’t running'
+      : run && run.question ? 'Your answer, then Enter'
+        : steering ? 'Add to it, or change it' : 'Type, or say “Yuki” to speak';
+    const input = h('input', { class: 'drawer-in', data: { enter: 'send', escape: 'drawer-esc', mode: run && run.question ? 'answer' : steering ? 'steer' : 'new' },
+      attrs: { placeholder, 'aria-label': steering ? 'Add to the request Yuki is working on' : run && run.question ? 'Answer Yuki' : 'Message Yuki', autocomplete: 'off', disabled: !connected } });
+    const btn = run && run.job != null
+      ? key('Stop', { cls: 'stop sm', icon: 'stop', data: { do: 'stop', job: run.job }, title: 'Stop it (Esc on an empty box, or Alt+Shift+X)', aria: { label: 'Stop the request' } })
+      : key('Send', { cls: 'sm send', data: { do: 'send' }, disabled: !connected, title: 'Enter', aria: { label: 'Send' } });
+    return { input, row: h('label', { class: 'inp', data: { face: face } },
+      h('canvas', { data: { core: face, pitch: 3 }, attrs: { role: 'img', 'aria-label': FACE_WORDS[face] || 'Yuki', title: FACE_WORDS[face] || '' } }), input, btn) };
   }
 
   /* the days and the connector, read when the drawer opens (a read: nothing is sent), again after a while or a new day */
@@ -181,16 +221,25 @@
     const focused = old && document.activeElement && old.contains(document.activeElement) ? document.activeElement.className : '';
     wantDays();
     const bodyEl = h('div', { class: 'body' }, body(D, S));
-    const input = h('input', { class: 'drawer-in', data: { enter: 'submit' }, attrs: { placeholder: D.shell.connected ? 'Type, or say “Yuki” to speak' : 'Yuki isn’t running', 'aria-label': 'Message Yuki', autocomplete: 'off', disabled: !D.shell.connected } });
+    const run = running(D), face = faceFor(D, run, !old);
+    const { input, row } = inputRow(D, run, face);
     input.value = draft || S.draft || ''; S.draft = '';
+    const stopping = run && run.job != null;
     const el = h('aside', { class: 'drawer', data: { clear: '' }, aria: { label: 'Thread' } },
       h('div', { class: 'dh' }, h('b', { text: 'Thread' }), h('span', { class: 'r' }, h('span', { class: 'label', text: 'a new chat every day' }),
         h('a', { class: 'key xs ghost', attrs: { href: '#' + S.page + (S.sub ? '/' + S.sub : ''), 'aria-label': 'Close' } }, ic('x')))),
-      bodyEl, runbar(D),
-      h('label', { class: 'inp' }, h('canvas', { data: { core: 'idle', pitch: 3 } }), input, h('span', { class: 'kbd', text: 'Enter' })),
-      h('div', { class: 'foot-hint' }, h('span', { text: 'Esc closes' }), h('span', { text: 'Alt Shift X stops' })));
+      bodyEl, row,
+      h('div', { class: 'foot-hint' }, stopping
+        ? [h('span', { text: run.question ? 'Enter answers' : 'Enter adds to it' }), h('span', { text: 'Esc on an empty box stops' })]
+        : [h('span', { text: 'Enter sends' }), h('span', { text: 'Esc closes' })]));
     // the drawer opens at the latest turn; while you read further up, new turns don't pull you down
     requestAnimationFrame(() => {
+      // a focused or typed-in box is kept through the patch (app.js holdsHands): it takes the new placeholder
+      const live = document.querySelector('.drawer .drawer-in');
+      if (live && live !== input) {
+        live.placeholder = input.placeholder; live.disabled = input.disabled;
+        live.setAttribute('aria-label', input.getAttribute('aria-label')); live.dataset.mode = input.dataset.mode;
+      }
       if (stick) bodyEl.scrollTop = bodyEl.scrollHeight; else if (oldBody) bodyEl.scrollTop = oldBody.scrollTop;
       if (focused) { const f = el.querySelector('.' + focused.split(' ')[0]); if (f) f.focus(); }
     });
@@ -241,19 +290,36 @@
     Y.restore(box);
   };
 
-  Y.actions.submit = (t) => {
-    const text = t.value.trim(); if (!text) return;
-    t.value = '';
-    Y.act('submit', { text }).then((r) => { if (!r.ok) { t.value = text; Y.toast(r.error || 'Yuki isn’t running, so it can’t answer yet.', true); } });
-  };
-  Y.actions.steer = (t) => {
-    const text = t.value.trim(), job = Number(t.dataset.job); if (!text) return;
-    t.value = '';
-    const m = { job, text, state: 'added, not yet read' }; steers.push(m);
+  /* the one input's Enter: a new request when nothing runs; while one runs, an answer when it asked you something,
+     else your words steer it (read at its next step). What it does is decided now, from the live state, never from
+     what the box showed when it was drawn (a focused box is kept through a redraw). */
+  function submitNew(input, text) {
+    Y.act('submit', { text }).then((r) => { if (!r.ok) { if (!input.value) input.value = text; Y.toast(r.error || 'Yuki isn’t running, so it can’t answer yet.', true); } });
+  }
+  Y.actions.send = (t) => {
+    const input = t.classList.contains('drawer-in') ? t : (t.closest('.drawer') || document).querySelector('.drawer-in');
+    if (!input) return;
+    const text = input.value.trim(); if (!text) { input.focus(); return; }
+    input.value = '';
+    const run = running(Y.D);
+    if (!run || run.job == null || run.question) { submitNew(input, text); return; }
+    const m = { job: run.job, text, state: 'added, not read yet', wait: true }; steers.push(m);
     Y.renderDrawer();
-    Y.act('steer', { job, text }).then((r) => {
-      m.state = r.ok && r.delivered ? 'sent · read at its next step' : r.ok ? 'it had already finished' : (r.error || 'not sent');
+    Y.act('steer', { job: run.job, text }).then((r) => {
+      m.wait = false;
+      if (r.ok && r.delivered) m.state = 'read at its next step';
+      else if (r.ok) {   // it finished just before: your words go on as your next message, never dropped
+        m.state = 'it had finished, so I took it as a new request';
+        submitNew(input, text);
+      } else m.state = r.error || 'not sent';
       Y.renderDrawer();
     });
+  };
+  /* Esc in the input: on an empty box, Stop while a request runs, else close the thread */
+  Y.actions['drawer-esc'] = (t) => {
+    if (t.value) return;
+    const run = running(Y.D);
+    if (run && run.job != null) { const s = (t.closest('.drawer') || document).querySelector('[data-do="stop"]'); if (s) s.click(); return; }
+    Y.go(Y.S.page, Y.S.sub, { chat: false });
   };
 })();

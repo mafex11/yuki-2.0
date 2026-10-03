@@ -771,21 +771,19 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .fold .st.run .ic, .fold .st.run .ms { color: var(--live); }
 .fold .st.bad { color: var(--text); }
 .fold .st small { display: block; color: var(--text-3); font-size: 11.5px; }
-.drawer .inp { cursor: text; margin: 0 14px 10px; display: flex; align-items: center; gap: 10px; min-height: 46px; border: 1px solid var(--hair-2); border-radius: 14px; padding: 0 8px 0 14px; color: var(--text-3); font-size: 14px; }
+.drawer .inp { cursor: text; margin: 0 14px 10px; display: flex; align-items: center; gap: 10px; min-height: 46px; border: 1px solid var(--hair-2); border-radius: 14px; padding: 0 8px 0 12px; color: var(--text-3); font-size: 14px; }
 .drawer .inp:focus-within { border-color: rgba(111,235,196,.55); }
 .drawer .inp canvas { flex: none; }
+.drawer .inp .key { flex: none; cursor: pointer; }
+.drawer .inp .key.send { color: var(--text-2); }
+.drawer .inp .key.send:not(:disabled):hover { color: var(--text); }
 .drawer-in { flex: 1; min-width: 0; border: 0; background: transparent; outline: 0; color: var(--text); font: inherit; padding: 12px 0; }
 .drawer-in::placeholder { color: var(--text-3); }
-.drawer .runbar { margin: 0 14px 10px; padding: 10px 12px; border: 1px solid var(--hair-2); border-radius: 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
-.drawer .runbar .tt { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.drawer .runbar .sub { font: 500 11px/1.4 var(--f-mono); color: var(--text-3); }
-.drawer .runbar .steer { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; height: 34px; border: 1px solid var(--hair-2); border-radius: 10px; padding: 0 8px 0 10px; }
-.drawer .runbar .steer:focus-within { border-color: rgba(111,235,196,.55); }
-.steer-in { flex: 1; min-width: 0; border: 0; background: transparent; outline: 0; color: var(--text); font-size: 13px; }
-.steer-in::placeholder { color: var(--text-3); }
-.steer-msgs { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; }
-.steer-msgs .msg { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; }
-.steer-msgs .s { font: 500 11px/1.6 var(--f-mono); color: var(--text-3); white-space: nowrap; }
+/* what you added to a running request from the input, under its reply (the 4 Oct item W9) */
+.turn .steer-msgs { grid-column: 2; display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.steer-msgs .msg { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12.5px; color: var(--text-2); }
+.steer-msgs .msg > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.steer-msgs .s { font: 500 11px/1.6 var(--f-mono); color: var(--text-3); text-align: right; }
 .steer-msgs .s.wait { color: var(--live); }
 .drawer .foot-hint { margin: 0 16px 12px; font: 500 10.5px/1.3 var(--f-mono); color: var(--text-3); display: flex; gap: 12px; }
 
