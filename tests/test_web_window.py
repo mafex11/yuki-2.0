@@ -710,7 +710,7 @@ def test_activity_is_the_ledger_with_why_result_undo_and_calls(tmp_path):
     d = web_data.build_activity(_Memory(), requests_csv=_csv(tmp_path))
     by = {r["what"]: r for r in d["rows"]}
     assert by["“pause it”"]["status"] == "failed" and by["“open my budget”"]["result"] == "done"
-    assert by["“open my budget”"]["because"] == "because" and by["“open my budget”"]["cant_undo"] is True
+    assert by["“open my budget”"]["because"] == "because" and "cant_undo" not in by["“open my budget”"]   # no undo talk
     card = by["Order seed trays."]
     assert card["undo"]["card"] == "39" and card["result"] == "done" and card["where"] == "Card · Your work"
     assert d["seen"] == [{"app": "VS Code", "min": 40.0, "visits": 9}]               # under 30 s: left out

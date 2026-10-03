@@ -192,9 +192,9 @@ def test_step_labels_are_plain_words():
     assert describe_tool("calls", {"since": yesterday, "until": yesterday}) == "Checking your calls yesterday"
     assert describe_tool("calls", {"since": "2026-01-05"}) == "Checking your calls since 5 Jan"
     assert "call:23" not in describe_tool("call_timeline", {"call": "call:23"})   # a record id means nothing
-    assert describe_tool("launch_app", {"name": "spotify"}).endswith("spotify")
+    assert describe_tool("launch_app", {"query": "spotify"}) == "Opening Spotify"   # the app it takes by name
     better = describe_result("call_timeline", None, {"call": {"app": "Discord", "start": f"{yesterday}T22:09:00"}})
-    assert better == "Reading yesterday's 22:09 Discord call"
+    assert better == "Reading yesterday's Discord call from 10:09 PM"   # a time in a sentence: 12-hour
     assert describe_result("calls", None, {"calls": []}) == ""
     m = ChatModel()   # the result's better line replaces the step's
     m.apply({"type": "user", "text": "x", "job": 4, "at": 1.0})

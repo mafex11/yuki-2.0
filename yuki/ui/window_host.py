@@ -220,7 +220,12 @@ class WindowHost(QObject):
         self.emit({"type": "tool_finished", "job": job, "name": name, "ok": bool(ok), "summary": summary})
 
     def _on_helper_step(self, lane: str, job: int, helper: int, state: str, text: str, ok: bool) -> None:
-        """A read-only helper of a request: a "Helper N" step (and its tools) in the response's fold."""
+        """A read-only helper of a request: a "Helper N" step (and its tools) in the response's fold. A helper's tool
+        use is sent as its words only (``Reading the page``), never the tool's name or its result summary."""
+        if state == "tool":
+            from yuki.ui.status import describe_tool
+
+            text = describe_tool(str(text or "").partition(": ")[0].strip(), {}, limit=60)
         self.emit({"type": "helper_step", "job": job, "helper": int(helper), "state": state, "text": text,
                    "ok": bool(ok)})
 
@@ -250,11 +255,15 @@ class WindowHost(QObject):
             self.emit({"type": "voice_reply", "turn": turn, "text": ev.get("text") or "",
                        "final": bool(ev.get("final")), "interrupted": bool(ev.get("interrupted"))})
         elif kind == "hand_step":
+            from yuki.ui.step_words import describe_hand
+
             self._hands += 1
             name = str(ev.get("name") or "hand")
+            # the hand's words come from the one label function (the hands pass yuki.voice.hands.hand_words); a hand
+            # with none gets its kind's words, never its tool name or arguments
+            label = " ".join(str(ev.get("args") or "").split()) or describe_hand(name, {})
             self.emit({"type": "voice_hand", "turn": turn, "call": f"{turn}:{self._hands}", "name": name,
-                       "label": str(ev.get("args") or name.replace("_", " ")), "phase": "end",
-                       "ok": bool(ev.get("ok")), "result": ev.get("result") or "", "ms": ev.get("ms")})
+                       "label": label, "phase": "end", "ok": bool(ev.get("ok")), "ms": ev.get("ms")})
         elif kind == "job_event":
             job = ev.get("job_id")
             if ev.get("state") == "submitted" and isinstance(job, int):
@@ -380,7 +389,7 @@ class WindowHost(QObject):
             return {}
         if op == "cancel":
             job = req.get("job")
-            self._on_gui(lambda: ui.runtime.cancel(int(job)) if isinstance(job, int) else ui.runtime.cancel_worker())
+            self._on_gui(lambda: self._cancel_from_window(job))
             return {}
         if op == "voice_set":
             def apply() -> dict[str, Any]:
@@ -477,6 +486,21 @@ class WindowHost(QObject):
             return self._memory().call_method(name, *args, timeout_s=MEMORY_WAIT_S, **kwargs)
         except Exception as exc:   # MemoryUnavailable, a timeout, or the method raised
             raise RuntimeError(f"memory: {exc}") from exc
+
+    def _cancel_from_window(self, job: Any) -> str:
+        """The window's ``cancel`` op (the native window's Stop sends it with no job): the request it names, else the
+        one the worker is running, cancelled as a stop by the window (``runtime.cancel(..., by="window")``: it ends as
+        "Stopped", never as "Cancelled by the user." in red). Nothing running: the worker's cancel, as before."""
+        from yuki.ui.runtime import WORKER   # the tray's process has the runtime loaded already
+
+        rt = self.ui.runtime
+        if not isinstance(job, int):
+            running = getattr(rt, "running_ids", None)
+            job = (running() or {}).get(WORKER) if callable(running) else None
+        if isinstance(job, int):
+            return str(rt.cancel(int(job), by="window") or "unknown")
+        rt.cancel_worker()
+        return "worker"
 
     def _op_stop(self, req: dict[str, Any]) -> dict[str, Any]:
         """``stop(job)``: the run card's Stop, the same path as the strip's Stop (marks it stopped so it reads
