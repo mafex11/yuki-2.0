@@ -383,6 +383,12 @@ class VoiceSession(QObject):
         if self.in_conversation:
             return False
         started = heard_at if heard_at is not None else time.monotonic()
+        if name_end and wake_at is not None and name_end < wake_at - WAKE_PREROLL_S:
+            # The spotter's token clock drifted on a long open stream: it put the name's end seconds before the
+            # batch that heard it (live 4 Oct: 7-39 s, while the listener was 10 ms behind the mic). Replaying from
+            # there fed that much old audio to speech recognition before the request. Use the batch instead.
+            self.log.event("wake", state="name_end_ignored", drift_ms=round((wake_at - name_end) * 1000))
+            name_end = None
         if name_end:
             listen_from = name_end
         else:
