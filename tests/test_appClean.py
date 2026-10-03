@@ -234,6 +234,23 @@ def test_reshapes_are_checked_never_more_steps_or_new_numbers(store):
     assert C.check(mixed, items, []).merge == []                             # a way never merges with a pitfall
 
 
+def test_between_two_ways_of_equal_standing_the_models_choice_stays(store):
+    """Both rest on the user's Save and neither ran since: the wanted one (the model's keep) stays even though the
+    other has more evidence; a way that worked more often would win."""
+    saved = [{"type": "taught", "refs": {"via": "playbook page"}}, {"type": "user_saved"}]
+    a = _way(store, "Drag the volume slider", ["Drag the Volume slider right"], saved)
+    b = _way(store, "Adjust the volume safely", [], saved + [{"type": "observed_day"}, {"type": "observed_day",
+                                                                                        "at": NOW + 86400}],
+             kind="habit", origin="miner", text="close the panel first, then drag")
+    items = {it.obj.id: it for it in C.gather(store, P.live(store))}
+    got = C.check({"merge": [{"keep": a, "drop": [b], "why": "same job"}], "retire": [], "reshape": []}, items, [])
+    assert got.merge == [{"id": b, "into": a, "why": "same job"}]
+    P.add_events(store, [{"playbook_id": b, "type": "ran_ok", "run_key": "r-ok", "at": NOW + 10}])
+    items = {it.obj.id: it for it in C.gather(store, P.live(store))}
+    got = C.check({"merge": [{"keep": a, "drop": [b], "why": "same job"}], "retire": [], "reshape": []}, items, [])
+    assert got.merge == [{"id": a, "into": b, "why": "same job"}]
+
+
 def test_the_daily_cap_retires_the_weakest_pitfalls_and_can_be_taken_back(store):
     ids = seed(store)
     p = ids["pits"]

@@ -62,6 +62,14 @@ Public API::
     workflows(store, *, now=None) -> dict;  workflow_edit(store, ref, action, words="", *, now=None) -> dict
     learned_way(kind, events) -> bool;  verified_run(store, key) -> bool;  judged_ok(store, key) -> bool | None;  corrected_by_quote(store, key) -> bool
     stamp_successes(store, *, run_keys=None, ok=None, dry_run=False) -> [(id, run_key)]
+    provenance(store, obj) -> (verdict, why);  pitfall_overflow(store, pitfalls, cap=) -> [id]   # appClean
+    retire_cleaned(store, items, *, run_key) -> [id];  cap_pitfalls(store, *, cap=, dry_run=False) -> [id]
+
+**Cleaning what is saved** (appClean, 4 Oct): :mod:`yuki.memory.practice_clean` re-judges every saved object - a way
+stays only on the user's word, a success or what the user does (:func:`provenance`, code), near-duplicates merge into
+the one that worked, kept procedures become a title and numbered steps - and pitfalls are capped per app
+(:data:`PITFALLS_PER_APP`, also daily: :func:`cap_pitfalls`). Each change is a ``cleaned`` ledger event under
+``clean:<run>`` and can be taken back.
 """
 
 from __future__ import annotations
@@ -1760,5 +1768,6 @@ __all__ = [
     "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
     "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
     "LEARNED_EVENT_NAME", "signal_learned",
-    "stamp_successes",
+    "stamp_successes", "provenance", "provenance_rank", "pitfall_rank", "pitfall_overflow", "retire_cleaned",
+    "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX",
 ]
