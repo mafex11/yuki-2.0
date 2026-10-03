@@ -344,6 +344,10 @@ class VoiceBridge(QObject):
         self.more_held: Callable[[], tuple[str, bool] | None] | None = None
         #: When the thinker last closed a tab or window (monotonic), for the talker's guidance (v3.17).
         self.closed_at: float | None = None
+        #: ``() -> dict | None``: the thinker's request pack, from what the conversation read while the user talked
+        #: (v3.18, 07 §6 E2); passed with a hand-off only when the runtime and the agent take one (probed once).
+        self.pack_source: Callable[[], dict[str, Any] | None] | None = None
+        self._pack_ok: bool | None = None
         #: When a call of the mouth's was held until the user answers (doubtful words; monotonic), set by the
         #: conversation: the run that report starts owes them words (a question, or the call again), never silence.
         self.held_at: float | None = None
@@ -419,6 +423,7 @@ class VoiceBridge(QObject):
             self.held_at = None
             self.held_call = None
             self.ledger = None
+            self.pack_source = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -1434,6 +1439,15 @@ class VoiceBridge(QObject):
             # 22 §4 (v3.17): memory is searched with the user's own words (``memory_words``), passed explicitly, so it
             # never depends on the hand-off's format.
             extra["memory_query"] = memory_query
+        if self.pack_source is not None and self._pack_supported():
+            # v3.18 (07 §6 E2): what the thinker's first call needs, read while the user talked, handed over with the
+            # request so it is not read again (only when the runtime and the agent take a pack)
+            try:
+                pack = self.pack_source()
+            except Exception:  # noqa: BLE001 - the agent reads what it needs itself
+                pack = None
+            if pack:
+                extra["pack"] = pack
         try:
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
         except TypeError:
@@ -1441,6 +1455,10 @@ class VoiceBridge(QObject):
                 raise
             extra.pop("memory_query")   # a stand-in runtime without the argument: the agent takes them from the text
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
+        if "pack" in extra:
+            self._log("bridge", op="pack", token=job.token, keys=len(extra["pack"]),
+                      practice=bool(extra["pack"].get("practice")), age_s=(extra["pack"].get("overview") or {}).get(
+                          "age_s"))
         with self._lock:
             self._unsubmitted.pop(job.token, None)
             job.job_id, job.lane = job_id, lane
@@ -1451,6 +1469,17 @@ class VoiceBridge(QObject):
         self._log("bridge", op="submitted", token=job.token, job_id=job_id, lane=lane)
         self._changed()
         self._job_event(job, "submitted", job.request)
+
+    def _pack_supported(self) -> bool:
+        """Whether the thinker takes a request pack (v3.18): ``runtime.submit`` names a ``pack`` parameter and the
+        worker's ``Agent.run`` does too (builder 1c-1 adds it; probed once, never assumed)."""
+        if self._pack_ok is None:
+            self._pack_ok = _takes(getattr(self.runtime, "submit", None), "pack")
+            agent = getattr(getattr(self.runtime, "worker", None), "agent", None)
+            if self._pack_ok and agent is not None:
+                self._pack_ok = _takes(getattr(agent, "run", None), "pack")
+            self._log("bridge", op="pack_probe", supported=self._pack_ok)
+        return bool(self._pack_ok)
 
     def _steer(self, job: Job, job_id: int, text: str) -> None:
         if not self.runtime.steer(job_id, text):
@@ -2016,7 +2045,7 @@ class VoiceBridge(QObject):
             self._arm_wait(job, self._wait_again_s)   # the next one, after as much silence again
 
     async def escalate(self, params: Any, name: str, args: dict[str, Any], report: str,
-                       acked: bool = False) -> bool:
+                       acked: bool = False, context: str | None = None) -> bool:
         """A hand of the talker's did not take effect: hand the same request to the thinker now, by code (v3.9).
 
         Live 2026-09-27 14:18 the talker narrated every failed try ("The stop key didn't take. Let me pause it
@@ -2024,12 +2053,16 @@ class VoiceBridge(QObject):
         Now the thinker gets the user's words with the hand's report and the window in front already read, and
         the user hears one outcome (and one "still on it" only if it takes a while). Returns whether a job was
         started (``False`` with no conversation loop or no runtime).
+
+        ``context`` (v3.18): what to tell the thinker instead of the one-step note: a learned way the talker ran that
+        stopped at a step (what was done, where it deviated, the way's steps), so it carries on and never redoes them.
         """
         if self._loop is None:
             return False
         heard = heard_words(params.context, skip=self.not_heard)
         request = heard[-1] if heard else _action_words(name, args)
-        context = f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}"
+        context = (" ".join(str(context).split())[:1200] if context else
+                   f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}")
         said = spoken_words(params.context)
         text = brain_request(request, heard, context=context, done_before=self.actions.text(), said=said,
                              tabs=self.tabs_for_thinker())
@@ -2160,6 +2193,18 @@ class VoiceBridge(QObject):
                 await deliver(not self_spoken, False)
             if kind in ("done", "failed"):
                 return
+
+
+def _takes(fn: Any, name: str) -> bool:
+    """Whether ``fn`` names a parameter ``name`` (a catch-all ``**kwargs`` is not enough: it may drop it unread)."""
+    if not callable(fn):
+        return False
+    try:
+        import inspect
+
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _memory_words(request: str, heard: Any) -> str | None:

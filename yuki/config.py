@@ -375,6 +375,15 @@ class Settings:
         voice_qos: While a conversation is live, the process is opted out of Windows' power throttling and the voice
             loop, the speaker's writer and the microphone's callback threads too (v3.17, D7).
         voice_mmcss: Those threads also join the MMCSS "Audio" task (Windows' scheduler for audio threads).
+        voice_practice: The talker gets practice memory's lines for the user's words (v3.18): the Lessons line (the
+            top pitfalls and habits of the apps in play, at most ``voice_lessons_chars``) and the Learned ways line.
+        voice_skills: The talker may run a learned way as its hand (``run_skill``, v3.18), step by step, each step
+            checked, handed to the thinker at the first deviation; only ways above both floors are offered.
+        voice_skill_min_cosine: A way is offered as a skill only this near the words (measured, 29-build §2.1).
+        voice_skill_min_confidence: ... and only this sure (memory's computed confidence; above one source's 0.667).
+        voice_lessons_chars: The Lessons line's size in the talker's volatile block.
+        voice_hand_traces: Every talker hand (and learned-way run) is kept as a run trace in practice memory so the
+            learners see the hands too (v3.18; written off the voice loop).
     """
 
     model: str = DEFAULT_MODEL
@@ -511,6 +520,13 @@ class Settings:
     voice_reply_words_cap: int = 45
     voice_qos: bool = True
     voice_mmcss: bool = True
+    # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md)
+    voice_practice: bool = True
+    voice_skills: bool = True
+    voice_skill_min_cosine: float = 0.56
+    voice_skill_min_confidence: float = 0.70
+    voice_lessons_chars: int = 400
+    voice_hand_traces: bool = True
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --
     #: Model failover (yuki.agent.failover): per model id, the targets tried after it keeps failing
     #: (throttled, 5xx, overloaded, timed out, unreachable, model or profile not found), in order:
