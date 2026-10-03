@@ -738,6 +738,12 @@ class YukiUi(QObject):
             return
         if target is None:
             self.strip.set_meta(text)
+            set_cost = getattr(self.strip, "set_cost", None)
+            cost = summary.get("cost_usd")
+            if set_cost is not None and isinstance(cost, (int, float)):
+                from yuki.ui.status import _money
+
+                set_cost(_money(float(cost)))
             pending = getattr(self, "_return_pending", None)
             if pending is not None and pending.get("id") == request_id:
                 pending["cost"] = text

@@ -123,6 +123,8 @@ class FinalInfo:
     outcome: str = "done"
     meta: str = ""
     run: RunInfo | None = None
+    ended: float = 0.0                       # time.monotonic() when it ended (the run card's time)
+    cost: str = ""                           # the run's cost, once the summary came ("33¢")
 
 
 @dataclass
@@ -313,8 +315,12 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
 
 
 def _final_sub(f: FinalInfo) -> str:
-    return {"done": "done", "stopped": "stopped by you", "failed": "it didn't finish",
-            "handed": "you have the controls"}.get(f.outcome, "")
+    """The end word's sub line (the design's run card heads: "Nothing was sent · 0:44", "You have the controls")."""
+    word = {"done": "Done", "stopped": "Stopped by you", "failed": "It didn't finish",
+            "handed": "You have the controls"}.get(f.outcome, "")
+    if f.run is not None and f.ended:
+        return f"{word} · {elapsed(f.ended - f.run.started)}"
+    return word
 
 
 def caption_spans(words: list[tuple[str, float | None]], threshold: float) -> tuple[str, list[L.Span]]:
@@ -1531,7 +1537,7 @@ class Island(QObject):
         steps = self._steps(run)
         done = sum(1 for s in steps if s["kind"] == "done")
         count = f"{done}/{run.of}" if run.of else str(done if mode != "live" else max(done, run.steps))
-        cost = ("so far" if mode == "live" else (final.meta if final and final.meta else "total"))
+        cost = "so far" if mode == "live" else (f"{final.cost} total" if final and final.cost else "total")
         asked = _clean(run.request)
         title = asked
         touch = _touching(run.frame)
@@ -1572,7 +1578,9 @@ class Island(QObject):
         out: list[dict[str, Any]] = []
         for k, st in enumerate(shown, 1):
             verb, _sep, obj = str(st.label or st.name or "").partition(" — ")
-            if st.running:
+            if st.running and self.inputs.run is None:   # the run is over: a step still open was stopped there
+                kind, ms = "cancelled", "stopped"
+            elif st.running:
                 kind, ms = "running", "now"
             elif st.ok is False:
                 kind, ms = "failed", "failed"
@@ -1836,7 +1844,7 @@ class IslandStrip(QObject):
         ended = getattr(self, "_ended", None)
         kind = outcome or ("failed" if tone == "error" else "done")
         isl = self.island
-        isl.update(final=FinalInfo(text, kind, "", ended), transient="")
+        isl.update(final=FinalInfo(text, kind, "", ended, ended=time.monotonic()), transient="")
         isl._final_timer.start(DONE_MS)
         self._ended = None
         self._changed(was)
@@ -1845,6 +1853,12 @@ class IslandStrip(QObject):
         final = self.island.inputs.final
         if final is not None:
             self.island.update(final=replace(final, meta=text))
+
+    def set_cost(self, cost: str) -> None:
+        """The finished run's cost (the run card's "33¢ total")."""
+        final = self.island.inputs.final
+        if final is not None and cost:
+            self.island.update(final=replace(final, cost=cost))
 
     def dismiss(self) -> None:
         was = self.isVisible()

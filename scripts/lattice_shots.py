@@ -431,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mock", type=Path, default=Path(os.environ.get("TEMP", ".")) / "yuki-2c" / "mock")
     ap.add_argument("--out", type=Path, default=Path(os.environ.get("TEMP", ".")) / "yuki-2c" / "qt")
     ap.add_argument("--only", default="")
+    ap.add_argument("--design", type=Path, default=ROOT.parent.parent.parent / "docs" / "ui-mockups" / "revamp-2026-10"
+                    / "3-lattice", help="the Lattice design folder (gitignored; for frames the capture did not make)")
     ap.add_argument("--t", type=float, default=2.0)
     ap.add_argument("--transitions", action="store_true", help="the state changes, frame by frame, next to the mock's")
     args = ap.parse_args(argv)
@@ -510,6 +512,28 @@ def main(argv: list[str] | None = None) -> int:
         score = side_by_side(crops / f"{mock_name}-{ms}.png", img, args.out / f"sbs-{name}.png")
         results.append((name, score))
         card.close()
+    if not args.only or "hover" in args.only:
+        # the tray's hover card in a game (the mock's call story at 6.2 s), on the game backdrop
+        from PySide6.QtCore import Qt as _Qt
+
+        from yuki.ui.lattice_cards import TrayHoverCard
+
+        hc = TrayHoverCard()
+        hc.setAttribute(_Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        hc.set_card(what="Quiet while you play Hollow Peak", call="Discord call, your side", timer="47:31")
+        hc.show()
+        img = composite(args.mock / "backdrop-game.png", "card",
+                        [(_grab(hc), VIEW_W - 116 - hc.width(), VIEW_H - 58 - hc.height(), 1.0)])
+        img.save(str(args.out / "tray-hover.png"))
+        story = args.design / "shots" / "story" / "desktop-story-call-t-6.2-hold-1.png"
+        mock_crop = args.out / "_mock-tray-hover.png"
+        if story.exists():
+            from PySide6.QtGui import QImage
+
+            x0, y0, x1, y1 = BOXES["card"]
+            QImage(str(story)).copy(x0, y0, x1 - x0, y1 - y0).save(str(mock_crop))
+        results.append(("tray-hover", side_by_side(mock_crop, img, args.out / "sbs-tray-hover.png")))
+        hc.close()
     for name, ov in askbar_shots(args.t):
         if args.only and args.only not in name:
             continue

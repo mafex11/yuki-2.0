@@ -79,6 +79,7 @@ class LatticeCard(SurfaceWindow):
         head.addWidget(self.x_button, 0, Qt.AlignmentFlag.AlignVCenter)
         col.addLayout(head)
         col.addSpacing(12)                           # the header row is 26 px (its close key); then 12
+        self._head_gap = col.itemAt(col.count() - 1).spacerItem()
         self.content = QVBoxLayout()
         self.content.setContentsMargins(0, 0, 0, 0)
         self.content.setSpacing(0)
@@ -672,14 +673,14 @@ class TrayHoverCard(LatticeCard):
         self.setFixedWidth(292)
         self.layout().setContentsMargins(17, 15, 17, 15)
         self.x_button.hide()
+        self._head_gap.changeSize(0, 8)              # no close key: the label's own line, then 8 px (.trayhover .tt)
         self.tt = L.Para("", font=L.ui_font(14, 600), line_height=1.45, parent=self)
-        self.content.addSpacing(8 - 7)
         self.content.addWidget(self.tt)
         row = QHBoxLayout()
         row.setContentsMargins(0, 10, 0, 0)
         self.row_text = L.Para("", font=L.ui_font(13), color=L.TEXT2, line_height=1.45, parent=self, max_lines=1)
         row.addWidget(self.row_text, 1, Qt.AlignmentFlag.AlignVCenter)
-        self.timer = L.Para("", font=L.doto_font(22, 800, 0.05), color=L.live(), line_height=1.2, parent=self,
+        self.timer = L.Para("", font=L.doto_font(22, 800, 0.05), color=L.live(), line_height=1.45, parent=self,
                             max_lines=1)
         row.addWidget(self.timer, 0, Qt.AlignmentFlag.AlignVCenter)
         self.content.addLayout(row)
