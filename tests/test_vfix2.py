@@ -447,7 +447,9 @@ def test_n0_small_reversible_steps_need_no_check_and_a_window_close_does() -> No
         == "cannot be undone (deletes the folder)"
     checks = [CheckRecord(hwnd=CHAT, at=NOW, call=2)]
     assert covered(checks, CHAT, 3) and not covered(checks, CHAT, 2) and not covered(checks, PLAYER, 3)
-    assert covered([CheckRecord(hwnd=None, at=NOW, call=1)], PLAYER, 2)
+    # a check that named no window read memory only: it covers a command or a file, never a step in a window
+    assert covered([CheckRecord(hwnd=None, at=NOW, call=1)], None, 2)
+    assert not covered([CheckRecord(hwnd=None, at=NOW, call=1)], PLAYER, 2)
 
 
 # ---------------------------------------------------------------------------

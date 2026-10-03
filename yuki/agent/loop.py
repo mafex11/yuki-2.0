@@ -2276,7 +2276,9 @@ class Agent:
                 confirmed = (name, call_signature(acting)) in getattr(self, "_confirmed", set())   # they said yes
                 if need and checks is not None and not confirmed and not situation_check.covered(
                         checks, target.get("hwnd"), self._model_calls):
-                    held_text = situation_check.REFUSAL.format(label=CHECK_LABEL, what=need)
+                    read_before = [c for c in checks if c.call < self._model_calls]
+                    held_text = (situation_check.REFUSAL_OTHER if read_before else situation_check.REFUSAL).format(
+                        label=CHECK_LABEL, what=need)
                     held_why = "not run: no situation check before a step that lasts"
                     self.logger.log("situation_gate", tool=name, what=need, checks=len(checks),
                                     hwnd=target.get("hwnd"))

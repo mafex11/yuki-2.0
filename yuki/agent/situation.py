@@ -115,6 +115,11 @@ REFUSAL = (
     "question for the user: call check_situation now, alone (action: what you are about to do with its content; "
     "hwnd: the window it happens in; about: the person or thing), then decide from what it shows: act at once when "
     "nothing turns up, or ask them when something does.")
+#: The same, when this request's checks read another window or none (memory only): the target itself was not read.
+REFUSAL_OTHER = (
+    "{label}: not run: this step {what} in a window your check did not read (a check with no window reads memory "
+    "only). This is your own look, not a question for the user: call check_situation now, alone, with hwnd: the "
+    "window it happens in, then act at once when nothing turns up, or ask them when something does.")
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +162,15 @@ class CheckRecord:
 def covered(checks: Sequence[CheckRecord], hwnd: int | None, call: int | None = None) -> bool:
     """Whether a check made in this request covers a step on ``hwnd`` made in model call ``call``: one whose result the
     model had seen when it wrote the step (made in an earlier call: a check sent in the same response as the send ran
-    first but was never read), and that read that window, or named no window, or any such check when the step's window
-    is unknown."""
+    first but was never read), and that read that window; any such check when the step's window is unknown (a command,
+    a file). A check that named no window read only memory, so it does not cover a step in a window: the chat itself
+    was never read (review: memory alone misses what is on the screen now)."""
     seen = [c for c in checks if call is None or c.call < call]
     if not seen:
         return False
     if hwnd is None:
         return True
-    return any(c.hwnd is None or c.hwnd == hwnd for c in seen)
+    return any(c.hwnd == hwnd for c in seen)
 
 
 # ---------------------------------------------------------------------------
@@ -459,5 +465,5 @@ def gather(tool_input: dict[str, Any], *, read_tree: Callable[[int], Any] | None
     return sit
 
 
-__all__ = ["CHECK_LABEL", "CheckRecord", "QUESTION", "REFUSAL", "SITUATION_TOOL", "Situation", "TOOL_NAME",
-           "consequence", "covered", "gather", "latest_lines", "when"]
+__all__ = ["CHECK_LABEL", "CheckRecord", "QUESTION", "REFUSAL", "REFUSAL_OTHER", "SITUATION_TOOL", "Situation",
+           "TOOL_NAME", "consequence", "covered", "gather", "latest_lines", "when"]
