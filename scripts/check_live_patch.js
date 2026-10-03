@@ -153,8 +153,13 @@ async function inPage(F) {
   // the drawer's days (read once when it first opens): yesterday's connector line and an earlier day
   REPLY.thread_days = { ok: true, connector: { day: '2026-10-02', day_at: Date.now() / 1000 - 86400, label: 'Yesterday',
     text: 'Yesterday you finished the invented screen.', open: ['Write the invented timer'] },
-  days: [{ day: '2026-09-30', count: 2, first_at: Date.now() / 1000 - 3 * 86400, last_at: Date.now() / 1000 - 3 * 86400 + 600 }] };
-  REPLY.chat_day = { ok: true, turns: [{ id: 't1', at: Date.now() / 1000 - 3 * 86400, user: 'an invented question', reply: 'An invented answer.' }] };
+  days: [{ day: '2026-09-30', count: 2, first_at: Date.now() / 1000 - 3 * 86400, last_at: Date.now() / 1000 - 3 * 86400 + 600 },
+    { day: '2026-10-01', count: 5, first_at: Date.now() / 1000 - 2 * 86400, last_at: Date.now() / 1000 - 2 * 86400 + 3600 }] };
+  const twoDaysAgo = Date.now() / 1000 - 2 * 86400;
+  REPLY.chat_day = (m) => (m.day === '2026-10-01'
+    ? { ok: true, turns: [{ id: 't49', at: twoDaysAgo + 60, user: 'an earlier invented question', reply: 'An earlier invented answer.' },
+      { id: 't50', at: twoDaysAgo + 3000, user: 'the live invented question', reply: 'The live invented answer.' }] }
+    : { ok: true, turns: [{ id: 't1', at: Date.now() / 1000 - 3 * 86400, user: 'an invented question', reply: 'An invented answer.' }] });
 
   // ---- boot, then the first fresh data (17: drawn at once, not 6-9 s later) ----
   // nothing live (no run, no call): the idle page, so a no-op can be told from the live figure's own frames
@@ -411,6 +416,24 @@ async function inPage(F) {
     const fresh = document.querySelector('details.dayfold[data-mem="2026-09-30"]');
     check('15 opening an earlier day reads it from memory and shows it', acts('chat_day').some((m) => m.day === '2026-09-30') && !!fresh && fresh.textContent.includes('An invented answer.'));
   }
+  // review F6: a day the window holds only the last turn of (the newest session started then) folds to memory's
+  // count, and opening it reads memory's day and merges it with the live turn (by turn id, shown once)
+  Y.D.chat.items = [{ id: 'm:50:u', kind: 'user', at: twoDaysAgo + 3000, text: 'the live invented question', source: 'history' },
+    { id: 'm:50:a', kind: 'assistant', at: twoDaysAgo + 3000, text: 'The live invented answer.', source: 'history', status: 'done', steps: [] },
+    ...(Y.D.chat.items || [])];
+  Y.renderDrawer(); await sleep(150);
+  const part = document.querySelector('details.dayfold[data-mem="2026-10-01"]');
+  check('15 a day partly in the window folds to memory’s count', !!part && part.querySelector('summary em').textContent.includes('5 chats'), part && part.querySelector('summary em').textContent);
+  if (part) {
+    part.open = true; part.dispatchEvent(new Event('toggle'));
+    await sleep(400);
+    const merged = document.querySelector('details.dayfold[data-mem="2026-10-01"]');
+    const txt = merged ? merged.textContent : '';
+    check('15 opening it reads memory’s day and shows each turn once', acts('chat_day').some((m) => m.day === '2026-10-01')
+      && txt.includes('An earlier invented answer.') && txt.split('The live invented answer.').length === 2, txt.slice(0, 200));
+    merged.open = false; merged.dispatchEvent(new Event('toggle'));
+  }
+  Y.D.chat.items = Y.D.chat.items.filter((i) => !String(i.id).startsWith('m:50:')); Y.renderDrawer();
   const ms = dr ? Array.from(dr.querySelectorAll('.fold .ms')).map((e) => e.textContent).filter(Boolean) : [];
   check('14 no step shows milliseconds or a sub-second time', ms.every((t) => !/ms|\d\.\d/.test(t)), ms.join(' | '));
   await go('#home');

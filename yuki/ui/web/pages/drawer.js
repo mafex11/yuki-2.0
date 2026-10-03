@@ -82,6 +82,22 @@
     h('div', { class: 'u' }, h('span', { class: 'who two' }, 'you', t.at ? [h('br'), fmt.natTime(t.at)] : null), h('span', { class: 'tx', text: t.user || '' })),
     t.reply ? h('div', { class: 'y' }, h('span', { class: 'who', text: 'yuki' }), h('span', { class: 'tx', text: t.reply })) : null));
 
+  /* the turns memory read for a day that the live items don't already show (merged by turn id: a live item from
+     memory is "m:<turn id>:u"; live items from the session log carry no turn id, so the earlier turns are the ones
+     before the first live one) */
+  function earlierTurns(loaded, live) {
+    const ids = new Set(live.map((i) => String(i.id || '').split(':')).filter((p) => p[0] === 'm' && p.length === 3).map((p) => 't' + p[1]));
+    const firstLive = Math.min(...live.map((i) => i.at || Infinity));
+    return loaded.filter((t) => !ids.has(t.id) && (ids.size || !t.at || t.at < firstLive - 1));
+  }
+  /* an earlier day needs memory's own turns when nothing live is from it, or memory has more of it than the window */
+  function needsMemoryDay(k) {
+    const live = (Y.D.chat.items || []).filter((i) => i.at && dayKey(i.at) === k);
+    if (!live.length) return true;
+    const mem = ((T.data || {}).days || []).find((d) => (d.first_at ? dayKey(d.first_at) : d.day) === k);
+    return !!mem && mem.count > live.filter((i) => i.kind === 'user').length;
+  }
+
   /* the line I remember about your last day, with its answer kept for the day */
   function connector(c) {
     const ans = T.answered[c.day];
@@ -114,11 +130,18 @@
     keys.forEach((k) => {
       if (k === today) return;
       const live = byDay.get(k), mem = days.get(k), loaded = T.turns[k];
-      const count = live ? live.filter((i) => i.kind === 'user').length : (mem ? mem.count : 0);
+      const liveCount = live ? live.filter((i) => i.kind === 'user').length : 0;
+      // the window holds only the newest session's last turns: when memory has more of that day, its count wins and
+      // its turns are read on open, merged with the live ones (review F6)
+      const count = Math.max(liveCount, mem ? mem.count : 0);
       if (!count && !live) return;
-      const first = live ? (live.find((i) => i.at) || {}).at : mem && mem.first_at, lastAt = live ? (live.slice().reverse().find((i) => i.at) || {}).at : mem && mem.last_at;
+      const first = mem && mem.first_at && (!live || count > liveCount) ? mem.first_at : live ? (live.find((i) => i.at) || {}).at : mem && mem.first_at;
+      const lastAt = live ? (live.slice().reverse().find((i) => i.at) || {}).at : mem && mem.last_at;
       const sum = conn && connKey === k ? conn.text : first ? `from ${fmt.natTime(first)} to ${fmt.natTime(lastAt || first)}` : '';
-      const kids = live ? turns(live, S) : loaded ? memoryTurns(loaded) : h('div', { class: 'label', text: T.loading.has(k) ? 'Reading that day…' : 'Open to read that day.' });
+      const waiting = h('div', { class: 'label', text: T.loading.has(k) ? 'Reading that day…' : 'Open to read that day.' });
+      const kids = !live ? (loaded ? memoryTurns(loaded) : waiting)
+        : count <= liveCount ? turns(live, S)
+          : [loaded ? memoryTurns(earlierTurns(loaded, live)) : waiting, ...turns(live, S)];
       out.push(dayFold(k, mem ? mem.day : k, dayLabel(k), count, sum, kids, S.open.has('day:' + k)));
     });
     const todayItems = byDay.get(today) || [];
@@ -180,7 +203,7 @@
     if (d.matches('details.dayfold')) {
       const k = d.dataset.day; if (!k) return;
       Y.S.open.delete('day:' + k); if (d.open) Y.S.open.add('day:' + k);
-      if (d.open && !T.turns[k] && !T.loading.has(k) && !(Y.D.chat.items || []).some((i) => i.at && dayKey(i.at) === k)) {
+      if (d.open && !T.turns[k] && !T.loading.has(k) && needsMemoryDay(k)) {
         T.loading.add(k); Y.renderDrawer();
         Y.act('chat_day', { day: d.dataset.mem || k }).then((r) => { T.loading.delete(k); T.turns[k] = r && r.ok !== false ? (r.turns || []) : []; Y.renderDrawer(); });
       }
