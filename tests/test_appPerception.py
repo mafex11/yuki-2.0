@@ -741,3 +741,50 @@ def test_an_effect_outside_the_window_is_never_called_nothing_changed(monkeypatc
     out = d.dispatch("click", {"element": _ids(text, "Home"), "expect_hwnd": 7001})
     assert "nothing changed inside this window itself" in out.content[0]["text"]
     assert action_verdict("click", out)[0] is True
+
+
+def test_an_empty_content_window_is_asked_once_as_an_accessibility_client_would(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    class _Oleacc:
+        def AccessibleObjectFromWindow(self, hwnd: Any, objid: Any, iid: Any, out: Any) -> int:
+            calls.append(int(hwnd.value))
+            return 0
+
+    monkeypatch.setattr(T, "ctypes_oleacc", lambda: _Oleacc())
+    monkeypatch.setattr(T, "_window_rect", lambda h: {901: (0, 0, 1000, 800), 902: (0, 0, 20, 20)}.get(h))
+    monkeypatch.setattr(T, "_woken", {})
+    view = (0, 0, 1000, 800)
+    assert T._wake_accessibility([901, 902], view) == 1      # the small child is not a content window
+    assert T._wake_accessibility([901, 902], view) == 0      # asked once per ten minutes
+    assert calls == [901]
+
+
+def test_the_renderer_pane_under_a_scroll_point_is_no_marker_and_the_page_below_it_is_found(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import win32gui
+
+    from yuki.actions import scrolling
+
+    monkeypatch.setattr(win32gui, "GetWindowRect", lambda h: (0, 0, 1000, 1000))
+    page = SimpleNamespace(CurrentControlType=50030)
+
+    class _Pane:
+        CurrentBoundingRectangle = SimpleNamespace(left=0, top=0, right=1000, bottom=980)
+        CurrentControlType = 50033
+
+        def FindFirst(self, scope: int, condition: Any) -> Any:
+            return page if condition == ("prop", 30003, 50030) else None
+
+    class _Automation:
+        def CreatePropertyCondition(self, pid: int, value: Any) -> tuple:
+            return ("prop", pid, value)
+
+    pane = _Pane()
+    assert scrolling.window_sized(pane, 5)
+    small = SimpleNamespace(CurrentBoundingRectangle=SimpleNamespace(left=10, top=10, right=200, bottom=60))
+    assert not scrolling.window_sized(small, 5)
+    assert scrolling.page_below(_Automation(), pane) is page
