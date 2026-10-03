@@ -2714,7 +2714,9 @@ class MemoryClient:
             for d in dicts:
                 ctx = calls.get(int(str(d["call"])[5:])) if d.get("call") and str(d["call"])[5:].isdigit() else None
                 label = place_label(ctx.get("place"), ctx.get("where") or "") if ctx else ""
-                channel = bool(ctx and ((ctx.get("place") or {}).get("channel") or ctx.get("where")))
+                # a channel is known when the digest's place names one, or its free text says more than the app
+                channel = bool(ctx and ((ctx.get("place") or {}).get("channel") or (
+                    label and label.casefold() != str(ctx.get("app") or "").casefold())))
                 items.append({**d, "ref": f"journal:{d['id']}",
                               "heard_in": label or d.get("where") or d.get("app") or "",
                               "channel_known": channel,

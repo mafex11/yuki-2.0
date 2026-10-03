@@ -108,8 +108,8 @@ SHOWN_RULES = (
     "the item states it (\"your father\", \"your friend Kiran\"). Dates as people say them: \"on 25 September\", "
     "\"on Thursday 1 October\", with the year only when it is not the current year - never 2026-09-25, never "
     "\"yesterday\" or \"last week\" (the text is kept and read on later days). Times as people say them, 12-hour, "
-    "every one with AM or PM: \"from about 2 AM to 3:22 AM\", \"around 10:30 AM\" - never 02:00, 21:00 or a bare "
-    "10:30. People who did something are named or called \"your friends\", never only \"they\" (\"your friends chose "
+    "every one with AM or PM: \"from about 2 AM to 3:22 AM\", \"around 10:30 AM\", \"asked at 4:17 PM\" - never "
+    "02:00, 16:17, 19:00-21:00 or a bare 10:30. People who did something are named or called \"your friends\", never only \"they\" (\"your friends chose "
     "...\", not \"they chose ...\"). Something said on a call says who was "
     "on it (\"on a Discord call with Ana and Sam\", \"in #general voice\") and, when the person the item is about was "
     "not on that call, \"on a call with other friends\" - it must never read as if the call was with them. Keep every "
@@ -133,8 +133,9 @@ SHOWN_EXAMPLES = (
     "- Thread \"The user merged the replies fix; the demo video for Priya is still to send.\" -> \"You merged the "
     "replies fix; the demo video for Priya is still to send.\""
 )
-#: A shown form is kept when it is non-empty, not cut off and at most this long (plumbing, nothing matched).
-SHOWN_MAX_CHARS = 900
+#: A shown form is kept when it is non-empty, not cut off and at most this long (plumbing, nothing matched): as long
+#: as the longest facts (1,626 characters on the 3 Oct copy), which the app opens on click under their headline.
+SHOWN_MAX_CHARS = 1_800
 SHOWN_FIELD = ("The fact as the user's app shows it to them, from the text you wrote: " + SHOWN_RULES
                + " For example \"On 25 September, from about 2 AM to 3:22 AM, you prepared a maths chapter to go "
                "over with your friend Kiran.\"")
@@ -218,7 +219,11 @@ the shown form, changing only the voice, the dates and times and what the rules 
 A line may come with CALLS: who was on the calls the item rests on, and where (the app, the server and \
 the voice channel) - use them to say who a call was with, and "other friends" when the person the item \
 is about was not on it. A call gist comes with WHO WAS ON IT and the call's timeline topics: "they" in a \
-gist means the people on the call unless the gist names someone else.
+gist means the people on the call unless the gist names someone else. The app shows a gist on the call's \
+row, next to its date, time, place and who was on it, so a shown gist never repeats those: it says only \
+what happened ("A heated game where your friends chose killing people for fun, which shocked you."). In \
+a gist, never write "they" for the people on the call, even after naming them: write "your friends" or \
+their names again.
 
 {SHOWN_EXAMPLES}
 
@@ -243,8 +248,8 @@ WRITE_SHOWN_TOOL: dict[str, Any] = {
 }
 #: Shown forms per call (they are sentences, so fewer than labels), characters of each item's text.
 SHOWN_BATCH_ITEMS = 25
-SHOWN_ITEM_CHARS = 900
-SHOWN_MAX_TOKENS = 6_000
+SHOWN_ITEM_CHARS = 1_800
+SHOWN_MAX_TOKENS = 8_000
 SHOWN_LETTERS = {"fact": "P", "thread": "W", "gist": "G"}
 
 
@@ -526,9 +531,9 @@ class Titler:
             ctx = d.get("context") or {}
             people = [str(p.get("name")) for p in ctx.get("people") or [] if p.get("name")]
             topics = [str(b.get("topic") or "") for b in d.get("blocks") or [] if b.get("topic")][:8]
-            where = place_label(ctx.get("place"), ctx.get("where") or "") or f"{d.get('app') or 'a'} call"
-            context = (f"WHO WAS ON IT: {', '.join(people) if people else 'not recorded'}; WHERE: {where}; WHEN: "
-                       f"{natural_day(d.get('started_at'), now)}, {natural_time(d.get('started_at'))}"
+            # who was on it (to say who "they" are) and the topics; never when or where: the call's row shows them,
+            # and a gist given them repeats them (measured on the 3 Oct copy: 37 of 37 gists began with the date)
+            context = (f"WHO WAS ON IT: {', '.join(people) if people else 'not recorded'}"
                        + (f"; TOPICS: {'; '.join(topics)}" if topics else ""))
             add(ShownPending(f"G{cid}", "gist", cid, "the gist of one of their calls, at most 25 words; the app shows "
                              "it on the call's row beside its date, time and place, so it leaves those out",

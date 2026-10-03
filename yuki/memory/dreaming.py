@@ -278,7 +278,7 @@ class Dreamer:
                     action == "rate" and all(current[i].kind != CORRECTION_KIND for i in ids)):
                 no("open loops and corrections are not dreaming's (they are only rated)")
                 continue
-            if any(current[i].pinned for i in ids):
+            if action != "rate" and any(current[i].pinned for i in ids):   # rating changes no word of it
                 no("a pinned fact (the user's pin)")
                 continue
             if any(i in touched for i in ids):
