@@ -18,6 +18,17 @@ What happens when it opens (E4):
    data is built by :mod:`yuki.ui.web_data` (Home first, then the others one at a time) and replaces the snapshot's.
 4. On close the pages are written back to the snapshot.
 
+**Live refresh** (docs/research/revamp-2026-10-02/42-window-live-refresh.md, 44-build-appL-live-refresh.md): the page
+open in the window follows memory by events, not timers. The tray forwards memory's named events (cards, the call
+status) and its own (a request's end, the agent's memory tools by name, voice state) over the pipe; each is a closed
+topic that marks the pages showing it (:data:`TOPIC_PAGES`). Only the open page is built, after a short quiet
+(:data:`DEBOUNCE_S`: a burst builds once), and only while the window can be seen; data equal to what the page has is
+never sent again (:func:`page_hash`). Pages with no event are checked by memory's change stamps (a few indexed reads)
+on a slow fallback (:data:`FALLBACK_S`), and rebuilt at the next moment they change by the clock alone
+(:func:`next_boundary`). Minimised, hidden or behind a full-screen app nothing is built or posted; one catch-up when
+it can be seen again. The page patches only what changed (``app.js`` ``patchInto``). Every refresh is logged
+content-free (:meth:`WebWindow.log`).
+
 Nothing here reads what a message says to decide anything; every button is a closed action name with machine fields
 (ids, kinds), turned into a memory call, a settings write or a pipe op.
 
@@ -89,9 +100,6 @@ TOPIC_PAGES: dict[str, tuple[str, ...]] = {
     "portrait": ("me", "home"),
     "people": ("me", "home"),
     "voice": ("settings",),                          # the tray's voice, devices or hotkeys changed
-    "settings": ("settings",),                       # one of Settings' own controls was used
-    "media": ("home",),
-    "memory_state": ("shell", "settings"),           # memory paused or resumed
 }
 #: After these, the pages may have changed (a run can move a thread or teach a procedure): their change stamps are
 #: read, and the page is built only if one moved.
