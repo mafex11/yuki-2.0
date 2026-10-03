@@ -565,6 +565,27 @@ def test_post_mortems_have_their_own_budget_and_hitting_a_limit_is_logged_once(s
     assert [r.mode for r in out] == ["postmortem", "postmortem"] and len(worker.calls) == 3
 
 
+def test_a_run_held_as_a_distill_is_post_mortemed_once_a_late_correction_arrives(store):
+    """Review appFix-R1: a run held on the spent shared pool is not stuck there when a correction written after it was
+    held makes it a post-mortem, which has its own pool. Without a change it is not decided again."""
+    store._write(lambda c: c.execute("INSERT INTO portrait_runs(at, kind, model, outcome, cost_usd) VALUES"
+                                     " (?, 'practice_distill', 'x', 'ok', 0.2)", (NOW + 100,)))   # shared pool spent
+    P.record_run(store, tag_run())
+    store.add_turn("S1", "worker-1", NOW, "tag Hemanth in my usual channel and ask when he's coming on", "Tagged him.",
+                   ["hotkey ctrl+k"], "final")
+    worker = Worker(store, [])
+    learner = L.Learner(worker)
+    [res] = learner.run_once(now=NOW + 200)                         # due by time, no follow-up yet: a distill
+    assert res.mode == "distill" and res.skipped == "budget" and not worker.calls
+    assert learner.run_once(now=NOW + 260) == []                    # nothing changed: not decided again
+    # the user's correction, said 20 s after the run, is written only now (its own turn took a while)
+    store.add_turn("S1", "worker-2", NOW + 60, "no, tag Hemanth in the other channel, not that one", "", [], "final")
+    worker.answers = [{"outcome": "corrected", "operations": [], "used": []}]
+    [res] = learner.run_once(now=NOW + 300)
+    assert res.mode == "postmortem" and res.skipped is None and len(worker.calls) == 1
+    assert L.spent_today(store, NOW + 300, "postmortem")[1] == 1
+
+
 def test_used_outcomes_reach_the_ledger_and_a_correction_counts_against_what_was_followed(store):
     ids = _seed(store)
     run = tag_run(injected=[ids["tag"], ids["warp"], ids["paste"]],
