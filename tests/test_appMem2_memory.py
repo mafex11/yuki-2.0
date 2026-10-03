@@ -8,7 +8,6 @@ Offline: temp databases, invented people and scripted model answers; no network,
 
 from __future__ import annotations
 
-import json
 import tempfile
 import threading
 import time
@@ -159,9 +158,9 @@ def test_w1bc_the_nightly_pass_closes_superseded_threads_writes_cards_and_is_und
     assert dry.ok and dry.run_id is None
     assert decision_counts(dry.decisions) == {"close_done": 1, "dismiss": 1, "present": 1}
     assert any("card W" in r for r in dry.rejected)                      # no card for a thread it closes
-    worker = dry_worker = _Worker(store)
-    message = Consolidator(_Worker(store, [_consolidate_answer(old, new)])).message(
-        store.work_threads(("active",)), *Consolidator(dry_worker).signals(store.work_threads(("active",))), NOW)
+    tidy = Consolidator(_Worker(store))
+    active = store.work_threads(("active",))
+    message = tidy.message(active, *tidy.signals(active), NOW)
     assert "RECENT ACTIVITY" in message and "Seed-swap uploads" in message   # what the user moved on to
     assert store.work_thread(old).status == "active"                      # the dry run wrote nothing
     path = save_plan(store, dry.decisions, Path(store.path).parent / "plan.json")

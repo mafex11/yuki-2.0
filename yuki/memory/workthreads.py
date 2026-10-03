@@ -1664,7 +1664,8 @@ def main(argv: list[str] | None = None) -> int:
             from yuki.memory.embed import get_embedder
             from yuki.memory.portrait import PortraitWorker
 
-            worker = PortraitWorker(store, embedder=get_embedder(), log_dir=log_dir)
+            # a dry run writes no vectors and asks nothing: no embedder loaded for it
+            worker = PortraitWorker(store, embedder=None if args.dry_run else get_embedder(), log_dir=log_dir)
             # after a backfill every thread is new: the tidy may change many more than a night's few
             big = args.backfill or args.all_changes
             plan = load_plan(store, args.apply) if args.apply else None
