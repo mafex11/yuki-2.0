@@ -57,6 +57,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from yuki.config import MODEL_ALIASES
+from yuki.memory.episodes import SESSION_SUMMARY_FIELD, SESSION_TITLE_FIELD, session_summary, session_title
 from yuki.memory.journal import sanitize_untrusted
 from yuki.memory.store import CORRECTION_KIND, FactChange, ModelCall, PortraitRunStats
 from yuki.memory.titles import SHOWN_RULES, SUMMARY_FIELD, TITLE_FIELD, clean as clean_label, clean_shown
@@ -135,21 +136,30 @@ is wrong. Yuki is their personal assistant on their Windows PC. You get the CORR
 WORDS in it (only these say what is wrong and what is right), what it FIXES, names already corrected, \
 later corrections (newer words of the user win over this one), and CANDIDATES found by similarity and \
 by the names in it. Each candidate has an id whose letter says what it is:
-J a journal fact (a dated fact memory recorded), P a portrait fact (the user's profile), C a \
-conversation item (a rule, a preference, Yuki's commitment or the user's to-do from a chat or a call), \
-T a to-do the user added, E an episode (a narrative of what the user was doing), Q a question waiting \
+J a journal fact (a dated fact memory recorded), P a portrait fact (the user's profile; a person fact is \
+that person's summary), C a conversation item (a rule, a preference, Yuki's commitment or the user's to-do \
+from a chat or a call), T a to-do the user added, E an episode (a narrative of one of the user's work \
+sessions), W a thread of work (its subject is its title, its text where it stands), Q a question waiting \
 for the user, Y a line of how Yuki talks.
+
+When a TARGET is given, it is the item the user was looking at when they said this: their words are \
+about it first ("he's my cousin, not a classmate", "that was last week", "that's not a project"), so \
+judge it first and fix it whenever their words contradict it; other candidates only when they carry \
+the same wrong thing.
 
 A candidate is wrong only when it states something the user's words contradict: the name they said \
 is wrong, an owner, relationship, source or status they denied, a claim they called wrong. For each \
 such candidate return an edit:
 - rewrite: the complete corrected text with the contradicted part changed to what the user said and \
 every other word, date, number and detail kept as it was, in the item's own style and person (third \
-person, "the user"). For P and Q also give the corrected subject; else "". For a P, a commitment C \
-or a T also give its label: the few words the user's app shows for the corrected item (see the field). \
-For a P also give shown: the corrected fact as the user's app shows it, said to them (see the field).
+person, "the user"). For P and Q also give the corrected subject; for a W the corrected title when \
+the title itself is wrong; else "". For a P, a commitment C or a T also give its label: the few words \
+the user's app shows for the corrected item (see the field); for an E its label is the session's \
+corrected title (a few words). For a P also give shown: the corrected fact as the user's app shows it, \
+said to them (see the field); for an E shown is the session's corrected summary said to them (one or \
+two short sentences).
 - retire: only when the user's words say the item itself is wrong or to forget it, and no corrected \
-version of it would be true. Never retire an E.
+version of it would be true; for a W, when they say it is no piece of work. Never retire an E.
 Leave every other candidate out. Being about the same person or topic does not make an item wrong. \
 Never add the correction's new information to an item that does not contradict it, never change who \
 did what unless the user's words say who, never touch wording the correction is not about (a pronoun or \
@@ -181,19 +191,21 @@ JUDGE_TOOL: dict[str, Any] = {
                 "label": {"type": "string", "description": (
                     "A rewrite of a P, a commitment C or a T: the corrected item's short label for the user's app, "
                     "from its corrected text. P: " + SUMMARY_FIELD + " A commitment C or a T: " + TITLE_FIELD
-                    + " Else \"\".")},
+                    + " An E: the work session's corrected title, " + SESSION_TITLE_FIELD + " Else \"\".")},
                 "shown": {"type": "string", "description": (
                     "A rewrite of a P: the corrected fact as the user's app shows it to them, from its corrected "
-                    "text. " + SHOWN_RULES + " Else \"\".")},
+                    "text. " + SHOWN_RULES + " A rewrite of an E: the work session's corrected summary, "
+                    + SESSION_SUMMARY_FIELD + " Else \"\".")},
                 "reason": {"type": "string", "description": "A few words: what was wrong in it."},
             }}}},
     },
 }
 
-#: Surfaces where an item can be retired (an episode is a narrative: it is only ever reworded).
-RETIRABLE = {"J", "P", "C", "T", "Q", "Y"}
+#: Surfaces where an item can be retired (an episode is a narrative: it is only ever reworded; a thread retired is
+#: dismissed: no piece of work).
+RETIRABLE = {"J", "P", "C", "T", "Q", "Y", "W"}
 SURFACE_NAMES = {"J": "journal", "P": "portrait", "C": "conversation", "T": "todo", "E": "episode",
-                 "Q": "question", "Y": "persona"}
+                 "Q": "question", "Y": "persona", "W": "thread"}
 
 
 @dataclass
@@ -244,6 +256,59 @@ def own_words(text: str) -> str | None:
 
 def _day(at: float | None) -> str:
     return datetime.fromtimestamp(at).strftime("%a %d %b %H:%M") if at else "undated"
+
+
+def thread_candidate(t: Any) -> "Candidate":
+    """A thread of work as a candidate: its title as the subject, where it stands as the text."""
+    return Candidate(f"W{t.id}", "W", int(t.id), t.state or t.shown or "", t.title,
+                     f"thread of work ({t.status}, last touched {_day(t.last_seen)})", t)
+
+
+def target_candidate(store: Any, target: str | None) -> "Candidate | None":
+    """The item a correction was made on (``correction_passes.target``, migration 35) as a candidate, when it is still
+    current: ``W12`` a thread, ``E40`` an episode (a newer version followed), ``P7`` a portrait fact, ``J300`` a journal
+    fact, ``C5`` a conversation item. ``None`` otherwise."""
+    ref = str(target or "").strip()
+    if len(ref) < 2 or not ref[1:].isdigit():
+        return None
+    letter, n = ref[0].upper(), int(ref[1:])
+    try:
+        if letter == "W":
+            tid = store.resolve_work_thread(n)
+            t = store.work_thread(tid) if tid is not None else None
+            return thread_candidate(t) if t is not None and t.status not in ("merged", "dismissed") else None
+        if letter == "E":
+            for _ in range(16):   # an open window's episode is rewritten hourly: the newest version of it
+                rows = store.episodes_by_ids([n])
+                if not rows:
+                    return None
+                if rows[0].superseded_by is None:
+                    e = rows[0]
+                    return Candidate(f"E{e.id}", "E", e.id, e.text, label=f"episode, {_day(e.started_at)}", obj=e)
+                n = int(rows[0].superseded_by)
+            return None
+        if letter == "P":
+            f = store.portrait_fact(n)
+            if f is None or f.valid_to is not None or f.kind == CORRECTION_KIND:
+                return None
+            return Candidate(f"P{f.id}", "P", f.id, f.text, f.subject,
+                             f"portrait fact ({f.kind}{', the user told Yuki' if f.origin == 'user' else ''})", f)
+        if letter == "J":
+            rows = store.journal_by_ids([n])
+            if not rows:
+                return None
+            j = rows[0]
+            return Candidate(f"J{j.id}", "J", j.id, j.fact, label=f"journal fact, {_day(j.at)}, {j.app}", obj=j)
+        if letter == "C":
+            f = next((f for f in store.conversation_facts(("rule", "preference", "commitment", "feedback", "resource"))
+                      if f.id == n), None)
+            if f is None:
+                return None
+            whose = {"yuki": ", Yuki's own", "user": ", the user's to-do"}.get(f.owner or "", "")
+            return Candidate(f"C{f.id}", "C", f.id, f.text, f.subject, f"{f.kind}{whose}", f)
+    except Exception:
+        return None
+    return None
 
 
 def _span_of(part: str, text: str) -> bool:
@@ -343,6 +408,9 @@ class CorrectionApplier:
             small.append(Candidate(f"Q{q.id}", "Q", q.id, q.question, q.subject, f"question ({q.status})", q))
         for p in store.persona_items():
             small.append(Candidate(f"Y{p['id']}", "Y", int(p["id"]), p["text"], label="how Yuki talks", obj=p))
+        for t in store.work_threads(("active", "paused", "done")):
+            if t.state:
+                small.append(thread_candidate(t))
         for c in small:
             if has_term(f"{c.subject} {c.text}"):
                 add(c)
@@ -361,7 +429,7 @@ class CorrectionApplier:
         return out
 
     def _judge(self, correction: Any, fixes: str, cands: Sequence[Candidate], run_id: int | None,
-               stats: PortraitRunStats) -> list[Any]:
+               stats: PortraitRunStats, target: Candidate | None = None) -> list[Any]:
         nonce = str(uuid.uuid4()).upper()
 
         def safe(v: Any, cap: int) -> str:
@@ -378,7 +446,8 @@ class CorrectionApplier:
                 f"CORRECTION ({_day(correction.valid_from)}): {safe(correction.text, 3000)}\n"
                 f"THE USER'S OWN WORDS: {safe(words, 1000) if words else 'the whole correction'}\n"
                 f"FIXES: {safe(fixes, 600)}\n"
-                f"NAMES ALREADY CORRECTED:\n" + ("\n".join(aliases) or "(none)")
+                + (f"TARGET: {target.ref} (the item the user was looking at)\n" if target is not None else "")
+                + "NAMES ALREADY CORRECTED:\n" + ("\n".join(aliases) or "(none)")
                 + "\nLATER CORRECTIONS (the user's newer words win):\n" + ("\n".join(later) or "(none)")
                 + "\n\nCANDIDATES:\n" + "\n".join(lines)
                 + f"\n===END_UNTRUSTED_DATA_{nonce}===\n\nCall apply_correction once.")
@@ -537,8 +606,24 @@ class CorrectionApplier:
                 record(e, new_id, new_id is not None)
         for e in [e for e in edits if e["cand"].surface == "E"]:
             new_id = store.supersede_episode(e["cand"].item_id, e["text"], vector=vec_of.get(e["cand"].ref),
-                                             embed_model=model)
+                                             embed_model=model, title=session_title(e.get("label")),
+                                             summary=session_summary(e.get("shown")))
             record(e, new_id, new_id is not None)
+        for e in [e for e in edits if e["cand"].surface == "W"]:
+            t = e["cand"].obj
+            if e["op"] == "retire":
+                change = {"action": "dismiss", "id": t.id, "reason": note}
+            else:
+                # the new state clears the card's words and next step: the titles pass right after this pass writes
+                # them again from it (yuki.memory.portrait: _titles after a correction)
+                change = {"action": "update", "id": t.id, "state": e["text"], "reason": note,
+                          **({"title": e["subject"]} if e["subject"] and e["subject"] != t.title else {})}
+            try:
+                [oc] = store.change_work_threads([change], now=now, origin="correct", run_id=run_id, by="user")
+                record(e, t.id if oc.get("ok") else None, bool(oc.get("ok")))
+            except Exception as exc:
+                record(e, None, False)
+                e["reason"] += f" (failed: {type(exc).__name__})"
         for e in [e for e in edits if e["cand"].surface == "Q"]:
             q = e["cand"].obj
             new_id = store.supersede_question(q.id, e["subject"] or q.subject, e["text"] or "", q.evidence,
@@ -594,11 +679,15 @@ class CorrectionApplier:
                 terms = [" ".join(str(t).split()) for t in (seen.get("search_terms") or []) if str(t).strip()]
                 result.terms = list(dict.fromkeys(terms))[:MAX_TERMS]
                 cands = self.candidates(correction, result.fixes, result.terms)
+                # the item the user corrected in their own words (migration 35) is always judged, first
+                target = target_candidate(store, store.correction_target(correction.id))
+                if target is not None:
+                    cands = [target, *[c for c in cands if c.ref != target.ref]][:max(MAX_CANDIDATES, 1)]
                 result.candidates = len(cands)
                 result.aliases = self._aliases(seen.get("aliases"), correction, cands)
                 edits: list[dict[str, Any]] = []
-                if cands and (seen.get("elsewhere") or result.aliases):
-                    raw = self._judge(correction, result.fixes, cands, run_id, stats)
+                if cands and (seen.get("elsewhere") or result.aliases or target is not None):
+                    raw = self._judge(correction, result.fixes, cands, run_id, stats, target)
                     edits, result.rejected = self.validate(raw, cands)
                 if dry_run:
                     result.changes = [{"surface": SURFACE_NAMES[e["cand"].surface], "ref": e["cand"].ref, "op": e["op"],
@@ -606,6 +695,14 @@ class CorrectionApplier:
                     result.aliases = self.confirmed_aliases(result.aliases, [dict(c, ok=True) for c in result.changes])
                 else:
                     result.changes = self._apply(correction, edits, run_id, stats, now)
+                    if target is not None and target.surface == "J":
+                        # the entry the user corrected themselves is settled: its new version is no "maybe misheard"
+                        for c in result.changes:
+                            if c["ref"] == target.ref and c["ok"] and c["op"] == "rewrite" and c["new_id"]:
+                                try:
+                                    store.resolve_journal(int(c["new_id"]), "right", now=now)
+                                except Exception:
+                                    pass
                     result.aliases = self.confirmed_aliases(result.aliases, result.changes)
                     for a in result.aliases:
                         store.add_alias(a["heard"], a["name"], why=a["why"], correction_id=correction.id, at=now)
