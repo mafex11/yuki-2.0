@@ -1,5 +1,5 @@
-"""v3.15: a long or troubled job ends with what it learned, kept as the app's know-how and handed to the next
-request in that app; and Yuki can open its own window. Fake model client, stub desk, a temp memory database."""
+"""v3.15 (updated for Phase C): a long job is traced for practice memory and its done goes out at once (no held done
+asking for a learned note); and Yuki can open its own window. Fake model client, stub desk, a temp memory database."""
 
 from __future__ import annotations
 
@@ -85,13 +85,17 @@ def _texts(params: dict) -> str:
     return "\n".join(out)
 
 
-def test_a_long_job_ends_with_a_learned_note_kept_for_its_app_and_given_to_the_next_request(tmp_path: Path) -> None:
+def test_a_long_job_is_traced_for_practice_memory_and_its_done_goes_out_at_once(tmp_path: Path) -> None:
+    """Phase C replaced v3.15's held done (an extra model call per long job, asking the brain for a learned note):
+    the done goes out at once, and the run's own trace - every step with its app, target and verdict - is kept for
+    practice memory's distiller; the optional learned note rides along as a hint, never as know-how."""
+    from yuki.memory import practice as P
+
     learned = "In Discord, open the channel with Ctrl+K, type @ and the name, accept the suggestion with Tab."
     keys = [["ctrl", "k"], ["enter"], ["tab"]]
     client = FakeClient([
         *[_response(_block("tool_use", id=f"t{i}", name="hotkey", input={"keys": k})) for i, k in enumerate(keys)],
-        _response(_block("tool_use", id="d1", name="done", input={"message": "Sent it.", "about": []})),
-        _response(_block("tool_use", id="d2", name="done", input={"message": "Sent it.", "about": [],
+        _response(_block("tool_use", id="d1", name="done", input={"message": "Sent it.", "about": [],
                                                                  "learned": learned})),
     ])
     memory, store_client = _memory(tmp_path)
@@ -99,20 +103,20 @@ def test_a_long_job_ends_with_a_learned_note_kept_for_its_app_and_given_to_the_n
     events = list(agent.run("message Hemanth in after-hours", effort="low", thinking=False,
                             escalate=("medium", True), voice=True, lean=True))
     assert isinstance(events[-1], Final) and events[-1].text == "Sent it."
-    assert len(client.calls) == 5
-    # The third action's result says the note is due; the done without it is sent back once, not as an error,
-    # and nothing escalates for it (the last call is still the fast pass).
-    assert "fill done's learned" in _texts(client.calls[3])
-    assert "Not sent yet" in _texts(client.calls[4])
-    assert client.calls[4]["thinking"] == {"type": "disabled"} and agent.last_summary["escalated"] is None
-    agent._learn_thread.join(10)
-    assert any(learned in line and line.startswith("[discord]") for line in store_client.knowhow(app="Discord.exe"))
-
-    # The next spoken request with Discord in front gets it in its memory block, before its first model call.
-    nxt = FakeClient([_response(_block("tool_use", id="n1", name="done", input={"message": "Sent.", "about": []}))])
-    list(_agent(nxt, tmp_path, memory).run("tag Rohan and ask when he's free", effort="low", thinking=False,
-                                           voice=True, lean=True))
-    assert learned in _texts(nxt.calls[0])
+    assert len(client.calls) == 4   # no held done: three actions and the done
+    assert not any("fill done's learned" in _texts(c) or "Not sent yet" in _texts(c) for c in client.calls)
+    assert memory.flush_turns(10)
+    store = store_client.store
+    runs = P.pending_runs(store)
+    assert len(runs) == 1
+    head = runs[0]
+    assert head.signals["actions"] == 3 and head.note["learned"] == learned and head.outcome == "final"
+    assert head.words == "message Hemanth in after-hours" and head.calls == 4
+    steps = P.run_steps(store, head.run_key)
+    assert [s.tool for s in steps] == ["hotkey", "hotkey", "hotkey"]
+    assert all(s.app == "discord" and s.verdict is True for s in steps)
+    assert DISCORD in head.signals["numbers"] and not any(str(DISCORD) in (s.target or "") for s in steps)
+    assert not store.knowhow_current()   # nothing written as know-how by the brain's own note
 
 
 def test_a_short_clean_job_needs_no_note(tmp_path: Path) -> None:

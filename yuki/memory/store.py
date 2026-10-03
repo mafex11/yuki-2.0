@@ -238,13 +238,22 @@ People and routes (migration 28, yuki.memory.contacts reads and writes them thro
     and the user's lasting route choice; derived (rebuilt by ``python -m yuki.memory.contacts --rebuild``), no counts
     stored (computed from ``messages`` when read)
 
+Practice memory (migration 29, yuki.memory.practice / yuki.memory.practice_learn read and write them through the
+store's own helpers)::
+
+    runs (the structured trace of agent requests and voice hands, one row per step, 30-day TTL with the captures),
+    playbooks + playbook_vec (procedures, habits, pitfalls, style notes; derived columns computed from the ledger),
+    playbook_events (the evidence ledger: observed, ran_ok, taught, ran_trouble, user_corrected, contradicted,
+    injected, cited, ...); written only by the practice pipeline (MemoryClient.record_run / record_hand_trace /
+    workflow_edit and the service's practice worker), never by hand
+
 Status::
 
     store.activity_today(since) -> dict       # captures, facts, last capture, cost (journal + portrait + episodes + conversations + nudges)
 
 Maintenance and reporting::
 
-    store.prune(older_than_days: float = 30) -> int     # captures deleted
+    store.prune(older_than_days: float = 30) -> int     # captures deleted (run traces past the TTL go too)
     store.health_summary(since=None, until=None) -> dict
     store.batch_summary(since=None, until=None) -> dict
     store.db_size_bytes() -> int
@@ -2473,6 +2482,108 @@ MIGRATIONS: tuple[str, ...] = (
         ended_at            REAL
     );
     CREATE INDEX contact_prefs_name ON contact_prefs(name_key, ended_at);
+    """,
+    # 29 (2026-10-03, revamp Phase C "practice memory", docs/research/revamp-2026-10-02/27-build-C.md;
+    # yuki.memory.practice, yuki.memory.practice_learn): how this user does things on this PC, learned from Yuki's own
+    # runs and from what memory already observes, and never a mistake twice.
+    # - runs: the structured trace of every agent request and voice hand, kept for the learners (30-day TTL, pruned
+    #   with the captures; text secret-filtered then encrypted). One row per step: step 0 is the request itself (the
+    #   user's words, the outcome, wall time, model calls, the request's cost, the measured signals, the playbooks shown
+    #   and cited, and where learning stands); steps 1.. are its tool calls in order (tool, the target app as app_key,
+    #   the control's role and name and the window's title - never a window number as meaning -, an input summary, the
+    #   verdict and why, result facts up to ~300 characters, duration, the share of its model call's cost).
+    # - playbooks: the practice objects, four kinds (procedure | habit | pitfall | style): intent (a few plain words)
+    #   + vector, scope (apps as app_keys in clear like threads.process, entities encrypted), body (steps, default,
+    #   text), avoid, the family a lesson generalises to; derived columns (counts, last evidence/use, confidence, state)
+    #   computed from the ledger by code, never written by a model; bi-temporal valid_from/valid_to/superseded_by.
+    # - playbook_vec: the intent vectors (encrypted float32, like knowhow_vec).
+    # - playbook_events: the evidence ledger (observed, observed_day, ran_ok, taught, ran_trouble, user_corrected,
+    #   contradicted, injected, cited, superseded, retired_by, user_*), each with its weight and the run it came from.
+    # Additive only; the know-how rows stay (the practice pipeline converts them, python -m yuki.memory.practice_learn
+    # --intake).
+    """
+    CREATE TABLE runs (
+        id                 INTEGER PRIMARY KEY,
+        run_key            TEXT NOT NULL,
+        session_id         TEXT,
+        request_id         TEXT,
+        source             TEXT NOT NULL,
+        lane               TEXT,
+        step               INTEGER NOT NULL,
+        at                 REAL NOT NULL,
+        ended_at           REAL,
+        tool               TEXT NOT NULL,
+        kind               TEXT,
+        app                TEXT,
+        target_ciphertext  TEXT,
+        input_ciphertext   TEXT,
+        ok                 INTEGER,
+        verdict            INTEGER,
+        why_ciphertext     TEXT,
+        result_ciphertext  TEXT,
+        ms                 REAL,
+        cost_usd           REAL,
+        calls              INTEGER,
+        outcome            TEXT,
+        signals            TEXT,
+        playbooks          TEXT,
+        note_ciphertext    TEXT,
+        learn              TEXT,
+        learn_at           REAL,
+        learn_note         TEXT
+    );
+    CREATE INDEX runs_key ON runs(run_key, step);
+    CREATE INDEX runs_learn ON runs(learn, at);
+    CREATE INDEX runs_at ON runs(at);
+    CREATE INDEX runs_session ON runs(session_id, at);
+    CREATE TABLE playbooks (
+        id                  INTEGER PRIMARY KEY,
+        kind                TEXT NOT NULL,
+        intent_ciphertext   TEXT NOT NULL,
+        apps                TEXT,
+        entities_ciphertext TEXT,
+        body_ciphertext     TEXT NOT NULL,
+        avoid_ciphertext    TEXT,
+        family_ciphertext   TEXT,
+        origin              TEXT NOT NULL,
+        sources_ciphertext  TEXT,
+        n_observed          INTEGER NOT NULL DEFAULT 0,
+        n_days              INTEGER NOT NULL DEFAULT 0,
+        n_ran_ok            INTEGER NOT NULL DEFAULT 0,
+        n_ran_trouble       INTEGER NOT NULL DEFAULT 0,
+        n_corrected         INTEGER NOT NULL DEFAULT 0,
+        n_used              INTEGER NOT NULL DEFAULT 0,
+        last_evidence_at    REAL,
+        last_used_at        REAL,
+        last_verified_at    REAL,
+        confidence          REAL,
+        state               TEXT NOT NULL DEFAULT 'candidate',
+        disabled_at         REAL,
+        valid_from          REAL NOT NULL,
+        valid_to            REAL,
+        superseded_by       INTEGER,
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL
+    );
+    CREATE INDEX playbooks_live ON playbooks(valid_to, kind);
+    CREATE TABLE playbook_vec (
+        playbook_id     INTEGER PRIMARY KEY REFERENCES playbooks(id),
+        model           TEXT NOT NULL,
+        dim             INTEGER NOT NULL,
+        vec_ciphertext  BLOB NOT NULL
+    );
+    CREATE TABLE playbook_events (
+        id              INTEGER PRIMARY KEY,
+        at              REAL NOT NULL,
+        playbook_id     INTEGER NOT NULL REFERENCES playbooks(id),
+        type            TEXT NOT NULL,
+        weight          REAL NOT NULL DEFAULT 0,
+        run_key         TEXT,
+        day             TEXT,
+        refs_ciphertext TEXT
+    );
+    CREATE INDEX playbook_events_pb ON playbook_events(playbook_id, at);
+    CREATE INDEX playbook_events_run ON playbook_events(run_key);
     """,
 )
 
@@ -7474,6 +7585,9 @@ class Store:
                 "DELETE FROM thread_latest WHERE thread_id IN (SELECT id FROM threads WHERE last_seen < ?)",
                 (cutoff,),
             )
+            # run traces (migration 29) share the captures' TTL: a 30-day buffer for the learners, not an archive
+            # (what they learned stays in the playbooks and their ledger)
+            conn.execute("DELETE FROM runs WHERE at < ?", (cutoff,))
             return int(deleted)
 
         return self._write(op)

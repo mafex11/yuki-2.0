@@ -27,6 +27,7 @@ Two things keep the number and length of rounds down:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -63,6 +64,7 @@ from yuki.agent.tools import (
     CONTROL_TOOLS,
     FINISHES_FIELD,
     MEMORY_TOOLS,
+    PLAYBOOK_FIELD,
     RISK_FIELD,
     STEP_FIELD,
     PERCEPTION_TOOLS,
@@ -114,8 +116,11 @@ _NOT_ACTIONS: frozenset[str] = PERCEPTION_TOOLS | {"done", "note_to_self", "say"
 
 #: Longest one-line action summary kept for memory and the collapsed request.
 _ACTION_LINE_CHARS = 160
-#: A request with this many actions ends with a learned note in its done (v3.15, ``Agent._learn_due``).
+#: A request with this many actions, or trouble then a success, is what practice memory's distiller learns from
+#: (``yuki.memory.practice_learn.DISTILL_AFTER_ACTIONS``; here only for the content-free ``_learning`` counters).
 LEARN_AFTER_ACTIONS = 3
+#: Steps one request's run trace keeps (practice memory, Phase C): far more than any real request takes.
+TRACE_STEPS = 80
 
 #: How the loop breaker's rethink note reaches the model (:mod:`yuki.agent.loopguard`).
 BREAKER_LABEL = "[Yuki's loop breaker, not the user]"
@@ -756,6 +761,8 @@ class Agent:
         if not texts:
             return []
         self.logger.log("steer", texts=texts, count=len(texts))
+        if isinstance(getattr(self, "_steer_texts", None), list):
+            self._steer_texts.extend(texts)   # the user's own words mid-run: a post-mortem's evidence
         return [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
 
     def cancel(self, reason: str = CANCELLED) -> None:
@@ -868,9 +875,19 @@ class Agent:
         self._request_text = request
         self._requests += 1
         self._actions = []
-        #: What this request's actions measured for its learned note (v3.15, :meth:`_learn_due`).
+        #: What this request's actions measured (v3.15 counters; the done's optional learned note is a hint for practice
+        #: memory's distiller, which reads the run trace).
         self._learning: dict[str, Any] = {"actions": 0, "trouble_at": None, "told": False, "asked": False,
                                           "saved": False, "targets": Counter(), "note": None, "worked_at": None}
+        #: This request's run trace (practice memory, Phase C: ``yuki.memory.practice.record_run``): one dict per tool
+        #: call - tool, target app and control, input, verdict and why, result, duration, the model call it came from
+        #: (its cost is shared out when the request ends) - plus the window ids, element ids and coordinates it
+        #: touched (never meaning: no lesson may carry them), the words the user added mid-run, the playbooks shown.
+        self._trace: list[dict[str, Any]] = []
+        self._trace_numbers: set[int] = set()
+        self._call_costs: dict[int, float] = {}
+        self._steer_texts: list[str] = []
+        self._practice_shown: list[int] = []
         self._reset_accounting()
         self.last_summary = None
         started_at = datetime.now()
@@ -961,8 +978,7 @@ class Agent:
             self._log_turn(
                 request, reply=reply, outcome=outcome, at=started_epoch
             )
-            if outcome == "final":
-                self._save_learned(request)
+            self._record_run(request, reply=reply, outcome=outcome, at=started_epoch)
             words = self._this_query or memory_query_of(request)
             if words:
                 self._said.append({"at": started_epoch, "text": words, "who": "user"})
@@ -989,8 +1005,8 @@ class Agent:
         #: What the memory block of this request carried (``request_summary``).
         self._memory_info: dict[str, Any] = {}
 
-    def _account_response(self, model: str, usage: Any) -> None:
-        """Fold one real (non-warm-up) response into this request's totals.
+    def _account_response(self, model: str, usage: Any) -> float | None:
+        """Fold one real (non-warm-up) response into this request's totals; returns its cost (``None``: unpriced).
 
         Priced per call with the model that call actually used, so a model
         switch that lands mid-request is still costed correctly.
@@ -1005,6 +1021,7 @@ class Agent:
             self._unpriced.add(model)
         else:
             self._cost_usd += cost
+        return cost
 
     def _summarize(
         self, request: str, *, outcome: str, started_at: datetime, model: str, effort: str
@@ -1201,41 +1218,107 @@ class Agent:
         trouble = learning["trouble_at"]
         return learning["actions"] >= LEARN_AFTER_ACTIONS or (trouble is not None and learning["worked_at"] > trouble)
 
-    def _save_learned(self, request: str) -> None:
-        """After the reply is out: the done's learned note, kept as know-how for the app it acted in, through
-        memory's remember_how (the same path as the tool), on a thread of its own. Only when it was due."""
-        learning = getattr(self, "_learning", None)
-        note = learning.get("note") if learning else None
-        if not note:
-            return
-        if not self._learn_due():
-            self.logger.log("learned_note", saved=False, why="not due", chars=len(note))
-            return
-        app = None
-        windows = {w.get("hwnd"): w for w in ((self._overview_payload or {}).get("windows") or [])
-                   if isinstance(w, dict)} if isinstance(self._overview_payload, dict) else {}
-        for hwnd, _n in learning["targets"].most_common():
-            name = str((windows.get(hwnd) or {}).get("process_name") or "").strip()
-            if name:
-                app = name
-                break
-        app = app or _foreground_app(self._overview_payload)
-        memory, logger = self.memory, self.logger
-        tool_input = {"text": note, **({"app": app} if app else {})}
+    def _window_of(self, hwnd: int | None) -> dict[str, Any] | None:
+        """The desktop overview's entry for ``hwnd`` (process name, title), or ``None``."""
+        if hwnd is None or not isinstance(self._overview_payload, dict):
+            return None
+        return next((w for w in self._overview_payload.get("windows") or []
+                     if isinstance(w, dict) and w.get("hwnd") == hwnd), None)
 
-        def save() -> None:
-            try:
-                outcome = memory.run_tool("remember_how", tool_input, request=request)
-                logger.log("learned_note", saved=bool(outcome.ok), app=app, chars=len(note),
-                           actions=learning["actions"], trouble=learning["trouble_at"] is not None)
-            except Exception as exc:  # noqa: BLE001 - memory never breaks a request
-                logger.log("learned_note", saved=False, app=app, error=f"{type(exc).__name__}: {exc}")
-
-        if not getattr(memory, "installed", False):
-            self.logger.log("learned_note", saved=False, why="no memory", chars=len(note))
+    def _trace_step(self, name: str, tool_input: dict[str, Any], *, ok: bool | None, verdict: bool | None = None,
+                    why: str = "", result: str = "", ms: float = 0.0, outcome: ToolOutcome | None = None,
+                    kind: str | None = None) -> None:
+        """One step of this request's run trace (practice memory, Phase C): the tool, the app it acted in and the
+        control's role and name and the window's title (never a window number as meaning: the ids and coordinates it
+        touched go to the run's numbers), its input, the verdict and why, what it reported, how long it took and the
+        model call it came from. Plumbing; never raises, never changes what the request does."""
+        trace = getattr(self, "_trace", None)
+        if trace is None or len(trace) >= TRACE_STEPS:
             return
-        self._learn_thread = threading.Thread(target=save, name="yuki-learned-note", daemon=True)
-        self._learn_thread.start()
+        try:
+            payload = outcome.payload if outcome is not None and isinstance(outcome.payload, dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            if kind is None:
+                kind = ("action" if name in ACTION_TOOL_NAMES else "memory" if name in MEMORY_TOOLS
+                        else "ask" if name == "ask_user" else "read" if name in PERCEPTION_TOOLS else "control")
+            hwnd = (_view_target(name, tool_input, details)[0] if kind == "action"
+                    else _as_hwnd(tool_input.get("hwnd")))
+            window = self._window_of(hwnd)
+            app = str((window or {}).get("process_name") or "") or None
+            if app is None and kind == "action":
+                app = _foreground_app(self._overview_payload)
+            parts = []
+            describe = getattr(self.dispatcher, "element_info", None)
+            element = describe(tool_input) if callable(describe) else None
+            if element:
+                parts.append(f"{element.get('role') or 'element'} \"{element.get('name') or ''}\"")
+            if window and window.get("title"):
+                parts.append(f"window \"{str(window['title'])[:80]}\"")
+            numbers = [hwnd] if hwnd else []
+            for key in ("hwnd", "expect_hwnd", "element", "read", "x", "y"):
+                v = tool_input.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    numbers.append(int(v))
+            for key in ("hwnd", "foreground_hwnd"):
+                v = details.get(key)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    numbers.append(v)
+            self._trace_numbers.update(n for n in numbers if n)
+            acting = {k: v for k, v in acting_input(tool_input).items()
+                      if k not in (RISK_FIELD, FINISHES_FIELD, PLAYBOOK_FIELD)}
+            sig = hashlib.sha1(call_signature(acting).encode("utf-8", "replace")).hexdigest()[:12]
+            trace.append({"tool": name, "kind": kind, "app": app, "target": ", ".join(parts), "input": acting,
+                          "ok": ok, "verdict": verdict, "why": why, "expected": why == EXPECTED_UNVERIFIABLE,
+                          "result": " ".join(str(result or "").split())[:400], "ms": round(float(ms or 0.0), 1),
+                          "call": self._model_calls, "sig": sig, "playbook": tool_input.get(PLAYBOOK_FIELD),
+                          "at": time.time()})
+        except Exception as exc:  # noqa: BLE001 - the trace never breaks a request
+            self.logger.log("trace_step_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
+
+    def _record_run(self, request: str, *, reply: str, outcome: str, at: float) -> None:
+        """After the reply is out: this request's run trace to memory's background writer (practice memory, Phase C;
+        ``MemoryClient.record_run``), with each step's share of its model call's cost, the words the user added
+        mid-run, the playbooks the frame showed, the loop breaker's trips and the done's optional learned note (a hint
+        for the distiller, never evidence). Returns at once; never raises."""
+        trace = getattr(self, "_trace", None)
+        record = getattr(self.memory, "record_run", None)
+        if trace is None or not callable(record) or not getattr(self.memory, "installed", False):
+            return
+        try:
+            per_call = Counter(s.get("call") for s in trace)
+            steps = []
+            for s in trace:
+                cost = self._call_costs.get(s.get("call"))
+                share = per_call.get(s.get("call")) or 0
+                steps.append({**{k: v for k, v in s.items() if k != "call"},
+                              "cost_usd": round(cost / share, 6) if cost is not None and share else None})
+            numbers = set(self._trace_numbers)
+            if isinstance(self._overview_payload, dict):   # every window number on screen is never meaning either
+                numbers.update(int(w["hwnd"]) for w in self._overview_payload.get("windows") or []
+                               if isinstance(w, dict) and isinstance(w.get("hwnd"), int))
+            learning = getattr(self, "_learning", None) or {}
+            run = {
+                "source": "agent", "session_id": getattr(self.memory, "session_id", None),
+                "request_id": f"{self.lane}-{self._requests}", "lane": "voice" if self._request_voice else self.lane,
+                "at": at, "ended_at": time.time(), "words": self._this_query or memory_query_of(request),
+                "reply": reply, "outcome": outcome, "steps": steps,
+                "cost_usd": None if self._unpriced else round(self._cost_usd, 6), "model_calls": self._model_calls,
+                "wall_s": round(time.monotonic() - self._request_started, 2), "note": learning.get("note"),
+                "steers": list(self._steer_texts), "breaker": len(self._breaker.trips),
+                "numbers": sorted(numbers), "injected": list(self._practice_shown),
+                "app": _foreground_app(self._overview_payload),
+            }
+            logger = self.logger
+
+            def done(report: dict[str, Any]) -> None:
+                logger.log("run_trace_logged", **{k: v for k, v in report.items() if k != "result"},
+                           learn=(report.get("result") or {}).get("learn"))
+
+            queued = record(run, on_done=done)
+            self.logger.log("run_trace_queued", queued=queued, steps=len(steps), injected=run["injected"],
+                            cited=sorted({str(s.get("playbook")) for s in steps if s.get("playbook")}))
+        except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+            self.logger.error(f"run trace failed: {type(exc).__name__}: {exc}", exc=exc)
 
     def _note_action(self, name: str, ok: bool, summary: str) -> None:
         """Add one line to this request's actions (not for looks, done or the note)."""
@@ -1733,25 +1816,8 @@ class Agent:
             turn.stop_after = True
             return
 
-        if name == "done" and not str(tool_input.get("learned") or "").strip() and self._learn_due():
-            learning = self._learning
-            if not learning["asked"]:
-                # A long or troubled job ends with what it learned (v3.15; live 30 Sept a Discord message took 8 steps,
-                # $0.54, and nothing was kept for next time). Asked once, from the job's own record; not an error, so
-                # nothing escalates for it.
-                learning["asked"] = True
-                text = (f"Not sent yet: this request took {learning['actions']} actions"
-                        + (", and one did not work or was not verified before it worked"
-                           if learning["trouble_at"] is not None else "")
-                        + ". Call done again with the same message and fill learned: the fastest way to do this in "
-                        "this app next time, from what you saw work, and what not to do again.")
-                self.logger.log("learned_asked", actions=learning["actions"],
-                                trouble=learning["trouble_at"] is not None)
-                self.logger.tool_result(name, ok=False, summary=text, result={"held": "learned"}, elapsed_ms=0.0,
-                                        tool_use_id=tool_id)
-                turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": text}]))
-                return
-
+        # (v3.15 held a long job's done once to ask for a learned note: a whole extra model call per long job. Phase C
+        # learns from the run trace instead - the distiller reads the steps themselves - so done goes out at once.)
         self.logger.tool_call(name, tool_input, tool_use_id=tool_id)
         yield ToolCall(name, tool_input)
 
@@ -1782,6 +1848,7 @@ class Agent:
         if refused is not None:
             turn.record(tool_id, self._skip(tool_id, name, refused))
             self._note_action(name, False, refused)
+            self._trace_step(name, tool_input, ok=False, why="refused before it ran", result=refused)
             yield ToolResult(name, False, refused)
             turn.stop_after = True
             return
@@ -1812,6 +1879,8 @@ class Agent:
             self.logger.tool_result(name, ok=False, summary=text, result={"held": True, "answer": answer},
                                     elapsed_ms=0.0, tool_use_id=tool_id)
             self._note_action(name, False, f"held for confirmation: {question} -> {answer}")
+            self._trace_step(name, tool_input, ok=answer is not None, kind="ask",
+                             result=f"held for the user's confirmation: \"{question}\" -> \"{answer}\"")
             yield ToolResult(name, False, text)
             turn.record(tool_id, self._result_block(tool_id, [{"type": "text", "text": text}], is_error=True))
             turn.stop_after = True
@@ -1861,6 +1930,9 @@ class Agent:
             self._awaiting_answer = False
             answer = self._pending_answer
             self._pending_answer = None
+            self._trace_step(name, tool_input, ok=answer is not None, kind="ask",
+                             result=f"asked \"{question}\" -> " + (f"\"{answer}\"" if answer is not None
+                                                                     else "no answer"))
             if answer is None:
                 text = "The user did not answer."
                 self._note_action("asked the user", False, f"{question} (no answer)")
@@ -1957,6 +2029,10 @@ class Agent:
 
         self._log_outcome(outcome, tool_use_id=tool_id)
         self._note_action(name, outcome.ok, outcome.summary)
+        if name not in CONTROL_TOOLS:
+            self._trace_step(name, tool_input, ok=outcome.ok, verdict=verdict[0] if verdict else None,
+                             why=verdict[1] if verdict else "", result=outcome.summary, ms=outcome.elapsed_ms,
+                             outcome=outcome)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload)
         finishing = tool_input.get(FINISHES_FIELD) if name in ACTION_TOOL_NAMES else None
         if outcome.ok and isinstance(finishing, str) and finishing.strip():
@@ -1974,13 +2050,6 @@ class Agent:
             content.append({"type": "text", "text": (
                 f"\n(Verified from its own report: {verdict[1]}.)" if verdict[0] is True else
                 f"\n(Not verified: {verdict[1]}. What happened is only what the window shows now.)")})
-        learning = getattr(self, "_learning", None)
-        if verdict is not None and learning is not None and not learning["told"] and self._learn_due():
-            learning["told"] = True   # once, so the closing done carries it in the same call
-            content.append({"type": "text", "text": (
-                f"\n(This request has taken {learning['actions']} actions"
-                + (", one of them did not work first" if learning["trouble_at"] is not None else "")
-                + ": finish with done, not finishes_with, and fill done's learned: the fastest way next time.)")})
         turn.record(tool_id, self._result_block(tool_id, content, is_error=not outcome.ok))
 
         if not outcome.ok or outcome.kind == "done":
@@ -2365,11 +2434,17 @@ class Agent:
             facts, focus, clip = self._frame_inputs(query, screen, list(apps or ()))
             frame = task_frame.build(facts, focus=focus, clip=clip, overview=self._overview_payload)
             action = bool(self._request_voice or frame.action)
+            # the apps in play for practice memory: the open windows (with the apps the words name, found by memory,
+            # and the caller's), not only the window in front
+            open_apps = sorted({str(w.get("process_name")) for w in (self._overview_payload or {}).get("windows") or []
+                                if isinstance(w, dict) and w.get("process_name")}) if isinstance(
+                self._overview_payload, dict) else []
             fetched = self.memory.context(app=app, query=query, resume=first and not lean, previous=previous,
-                                          apps=apps or (), screen=screen, action=action)
+                                          apps=apps or (), screen=screen, action=action, open_apps=open_apps)
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
-                                     overview=self._overview_payload)
+                                     overview=self._overview_payload, practice=getattr(fetched, "practice", None))
             self._frame = frame
+            self._practice_shown = list(frame.playbooks)
             rest, personality = _split_personality(fetched.portrait)
             rules = standing_rules_text(fetched)
             commitments = standing_commitments_text(fetched)
@@ -2434,6 +2509,7 @@ class Agent:
             "action": action,
             "own_discounted": int((fetched.related or {}).get("own_discounted") or 0),
             "frame": frame.info(),
+            "practice": _practice_info(getattr(fetched, "practice", None)),
             "lookup_ms": elapsed_ms,
         }
         self.logger.log(
@@ -2467,6 +2543,7 @@ class Agent:
             action=action,
             own_discounted=int((fetched.related or {}).get("own_discounted") or 0),
             frame=frame.info(),
+            practice=_practice_info(getattr(fetched, "practice", None)),
             frame_facts_ms=(facts or {}).get("elapsed_ms") if isinstance(facts, dict) else None,
             memory_session=getattr(self.memory, "session_id", None),
             app=app,
@@ -2693,7 +2770,9 @@ class Agent:
         used_model = self._used_model(params["model"])
         if used_model != params["model"]:
             self.logger.log("model_used", requested=params["model"], used=used_model)
-        self._account_response(used_model, getattr(response, "usage", None))
+        cost = self._account_response(used_model, getattr(response, "usage", None))
+        if cost is not None and isinstance(getattr(self, "_call_costs", None), dict):
+            self._call_costs[self._model_calls] = cost   # shared out over this call's steps in the run trace
         # The request went through, so its cache entry exists: the next prune
         # measures "before the breakpoint" against this one.
         self.context.commit_breakpoint()
@@ -2900,6 +2979,16 @@ class Agent:
         )
         self._evidence[hwnd] = "looked"   # the next call sees it read after the actions (v3.14)
         return (hwnd, text, True) if changes else (hwnd, text)
+
+
+def _practice_info(practice: Any) -> dict[str, Any] | None:
+    """Content-free facts of what practice memory gave a request (ids, cosines, the apps in play, how long it took)."""
+    if not isinstance(practice, dict):
+        return None
+    return {"ways": [(w.get("id"), w.get("cosine")) for w in practice.get("ways") or [] if isinstance(w, dict)],
+            "pitfalls": [(p.get("id"), p.get("cosine")) for p in practice.get("pitfalls") or [] if isinstance(p, dict)],
+            "apps": list(practice.get("apps") or []), "named": list(practice.get("named") or []),
+            "measured": practice.get("measured"), "ms": practice.get("ms")}
 
 
 def _split_personality(portrait: str | None) -> tuple[str, str | None]:

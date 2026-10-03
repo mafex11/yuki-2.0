@@ -81,6 +81,14 @@ People and routes (migration 28, yuki.memory.contacts; SQL only, no model call):
     memory.prefer_route(ref, "route:N", words) -> dict   # the user's lasting route choice, in their own words
     memory.frame_facts(words, said=, screen=, apps=)     # what the task frame needs (yuki.agent.frame)
 
+Practice memory (migration 29, yuki.memory.practice; learned by the service's practice worker, yuki.memory.practice_learn)::
+
+    memory.record_run(run) -> dict                       # one agent request's step trace (the agent loop writes it)
+    memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=) -> dict
+    memory.practice(words, apps=, open_apps=) -> dict    # procedures / habits and pitfalls for the apps in play
+    memory.workflows() -> dict                           # the window's Playbook page
+    memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
+
 What happened on calls and meetings (timeline digests written by the service, yuki.memory.calldigest)::
 
     memory.calls_in(since=None, until=None) -> list[dict]      # merged sessions: app, times, speech, gists
@@ -2885,6 +2893,77 @@ class MemoryClient:
         out["pitfalls"] = self._pitfalls(apps, None if route_apps else screen, route_apps)
         out["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
         return out
+
+    # -- practice memory (migration 29, yuki.memory.practice; no model call here) -----------------------------------
+
+    def record_run(self, run: dict) -> dict:
+        """Keep one agent request's structured trace (``yuki.memory.practice.record_run``: one row per step, text
+        secret-filtered and encrypted, 30-day TTL) and log the playbooks it was shown and cited. The memory service's
+        practice worker learns from it once its follow-up window has passed. Never raises."""
+        from yuki.memory import practice as _p
+
+        return _p.record_run(self.store, run)
+
+    def record_hand_trace(self, session_id: str | None, name: str, args: dict | None, ok: bool, verified: bool | None,
+                          report: str, ms: float, *, at: float | None = None, app: str | None = None,
+                          target: str | None = None, words: str | None = None, why: str | None = None,
+                          request_id: str | None = None) -> dict:
+        """Keep one voice hand (the talker's instant single step) as a run of one action, so the learners see the hands
+        too: ``name`` and ``args`` as the hand got them (window ids, element ids and coordinates are kept apart, never
+        as meaning), ``ok`` / ``verified`` / ``report`` / ``ms`` as it measured, ``app`` the process it acted in,
+        ``target`` the control's role and name, ``words`` what the user said for it. Fast (one small write); never
+        raises."""
+        from yuki.memory import practice as _p
+
+        return _p.record_hand_trace(self.store, session_id=session_id, name=name, args=args, ok=ok, verified=verified,
+                                    report=report, ms=ms, at=at, app=app, target=target, words=words, why=why,
+                                    request_id=request_id)
+
+    def practice(self, words: str = "", *, apps: Any = (), open_apps: Any = (), embed_wait_s: float | None = None,
+                 now: float | None = None) -> dict:
+        """What practice memory holds for one request (``yuki.memory.practice.relevant``): ``{"ways": [procedures, then
+        a habit or style note], "pitfalls": [...], "apps": [the apps in play], "named": [apps named in the words],
+        "measured": bool, "ms"}``. The apps in play are the apps named in ``words`` (whole words of an app name memory
+        has stored), ``apps`` (the caller's: apps the request names) and ``open_apps`` (the open windows' process
+        names) - not the window in front alone. Ways clear a similarity floor to the words (the same vector as the
+        related memories); pitfalls of an app in play always come. Never raises (empty lists)."""
+        from yuki.memory import practice as _p
+
+        started = time.perf_counter()
+        try:
+            text = " ".join(str(words or "").split())
+            known = [str(a) for a in (*(open_apps or ()), *(apps or ())) if a]
+            # the intent is matched without the app names (the apps are matched by scope): the words' own vector when
+            # they name no app, else one more embedding of what is left (~20 ms on the service's pipe)
+            intent = _p.intent_words(self.store, text, known) if text else ""
+            vec = self._embed(intent or text, embed_wait_s) if text else None
+            named = _p.apps_named(self.store, text, known)
+            out = _p.relevant(self.store, query_vec=vec, apps_in_play=[*named, *known], now=now)
+            out["named"] = named
+            out["measured"] = vec is not None
+        except Exception as exc:
+            out = {"ways": [], "pitfalls": [], "apps": [], "named": [], "measured": False,
+                   "error": f"{type(exc).__name__}: {exc}"}
+        out["ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return out
+
+    def workflows(self) -> dict:
+        """The Yuki window's Playbook page (``yuki.memory.practice.workflows``): ``{"available", "procedures",
+        "lessons", "proposals", "workflows", "learning"}`` - what Yuki learned to do on this PC, the lessons from its
+        mistakes and what it is not sure of yet (tentative objects, teach-back questions), each with its uses, last use,
+        confidence and state. Never raises."""
+        from yuki.memory import practice as _p
+
+        return _p.workflows(self.store)
+
+    def workflow_edit(self, ref: Any, action: str, words: str = "") -> dict:
+        """The user's say over one Playbook item (``yuki.memory.practice.workflow_edit``): ``save`` (it is right),
+        ``edit`` (in their words: the practice worker re-distills it), ``disable`` / ``enable``, ``forget``; a
+        ``question:N`` is answered with ``save`` and the words. Always through the ledger, never a hand edit. Never
+        raises."""
+        from yuki.memory import practice as _p
+
+        return _p.workflow_edit(self.store, ref, action, words)
 
     def _route_processes(self, thread_ids: Any) -> list[str]:
         ids = [int(t) for t in thread_ids or [] if isinstance(t, int)]
