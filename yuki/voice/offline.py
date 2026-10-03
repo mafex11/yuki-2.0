@@ -664,8 +664,17 @@ class ChatPlayerDesk(StubDesktop):
         self.clicks: list[str] = []
         #: N6: the user's own playlists in the sidebar, and which one plays (``None``: whatever played before)
         self.playlists = ["Gym Mix", "J-Pop Nights", "Focus Lofi"]
+        #: vfix3: who made each playlist, as the library row says it ("you" unless given: a mix the app made)
+        self.playlist_owners: dict[str, str] = {}
         self.playing: str | None = None
         self.mixer = MixerStub({"Spotify.exe": mixer_level, "Discord.exe": 70.0}, playing={"Spotify.exe"}, system=40.0)
+        #: vfix3: the live shape - the real volume slider is a web range input hidden under the "Change volume"
+        #: label, named like it, with an empty box; UI Automation's point lookup answers with the whole pane, so it is
+        #: found only by searching the window. ``slider_exposed`` False: nothing exposes the level at all.
+        self.slider_exposed = True
+        #: The stand-in app's own shortcuts for its volume (keys -> points), unknown to Yuki: empty unless a test
+        #: gives some.
+        self.volume_keys: dict[tuple[str, ...], float] = {}
 
     # -- perception -------------------------------------------------------------
 
@@ -698,6 +707,8 @@ class ChatPlayerDesk(StubDesktop):
 
     def get_desktop_overview(self) -> dict[str, Any]:
         wins = self._windows()
+        front = int(getattr(self, "front", 0) or 0)
+        wins.sort(key=lambda w: w[0] != front)   # vfix3: the window put in front is the foreground one (stable sort)
         return {"windows": [{"hwnd": h, "process_name": p, "title": t, "is_foreground": i == 0, "is_minimized": False,
                              "pid": 200 + i, "bounds": (0, 0, 1920, 1040)} for i, (h, p, t) in enumerate(wins)],
                 "foreground_hwnd": wins[0][0], "cursor": (960, 540), "screen_size": (1920, 1080),
@@ -736,7 +747,8 @@ class ChatPlayerDesk(StubDesktop):
             self._el(out, "Group", "Your Library", (111, 120, 430, 860))
             for i, name in enumerate(self.playlists):
                 y = 220 + 56 * i
-                self._el(out, "Button", f"{name} Playlist • you", (117, y, 425, y + 50), patterns=["invoke"])
+                self._el(out, "Button", f"{name} Playlist • {self.playlist_owners.get(name, 'you')}",
+                         (117, y, 425, y + 50), patterns=["invoke"])
                 self._el(out, "Button", f"Play {name}", (123, y + 6, 160, y + 44), patterns=["invoke"])
             if not self.lyrics_full or self.bar_revealed:
                 self._el(out, "Group", "Now playing bar", (111, self.BAR_TOP, 1501, 945))
@@ -745,7 +757,8 @@ class ChatPlayerDesk(StubDesktop):
                 for name, x in (("Lyrics", 1278), ("Queue", 1302)):
                     self._el(out, "Button", name, (x, 905, x + 25, 930), patterns=["toggle"],
                              states=["on" if self.toggles[name] else "off"])
-                self._el(out, "Button", "Mute", (1351, 905, 1376, 930), patterns=["invoke"])
+                self._el(out, "Button", "Mute", (1351, 905, 1376, 930), patterns=["invoke"],
+                         description=self.volume_word())
                 # live the read showed only this Text; the real slider (a web range input) sat inside it, unread
                 self._el(out, "Text", "Change volume", (1374, 912, 1418, 947))
                 self._el(out, "Button", "Enter Full screen", (1476, 905, 1501, 930), patterns=["toggle"],
@@ -820,28 +833,46 @@ class ChatPlayerDesk(StubDesktop):
             result.summary += "; the player bar appeared under it"
         return result
 
+    def volume_word(self) -> str:
+        """What the live Mute button's description says of the level ("Volume medium")."""
+        return "Volume muted" if self.volume <= 0 else "Volume low" if self.volume < 34 else \
+            "Volume medium" if self.volume < 67 else "Volume high"
+
+    def hotkey(self, *keys: str, **kwargs: Any) -> StubResult:
+        result = self._act("hotkey", f"pressed {'+'.join(keys)}", *keys, **kwargs)
+        delta = self.volume_keys.get(tuple(k.casefold() for k in keys))
+        if delta is not None and int(getattr(self, "front", 0) or self.PLAYER) == self.PLAYER:
+            self.volume = max(0.0, min(100.0, self.volume + float(delta)))
+        return result
+
+    def press(self, key: str, *, times: int = 1, **kwargs: Any) -> StubResult:
+        result = self._act("press", f"pressed {key}" + (f" x{times}" if times > 1 else ""), key, times=times,
+                           **kwargs)
+        if getattr(self, "slider_focused", False) and key.casefold() in ("right", "left", "up", "down"):
+            step = 10.0 if key.casefold() in ("right", "up") else -10.0   # a web range input's step (0.1 of 0-1)
+            self.volume = max(0.0, min(100.0, self.volume + step * int(times)))
+        return result
+
+    def slider_tree(self) -> "PlayerTree":
+        """The player window's live tree as the slider hand searches it (:class:`PlayerTree`)."""
+        return PlayerTree(self)
+
     def set_slider(self, hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
-                   press: Any = None) -> StubResult:
-        from yuki.actions.slider import drive
+                   press: Any = None, hover: Any = None, hotkey: Any = None, keys: Any = None) -> StubResult:
+        """The real slider hand (:func:`yuki.actions.slider.run`) on :class:`PlayerTree`, the live shape."""
+        from yuki.actions.slider import run
 
-        desk = self
-
-        class _Live:
-            def read(self) -> tuple[float, float, float, bool, float]:
-                return desk.volume, 0.0, 100.0, False, 2.0
-
-            def set(self, value: float) -> None:
-                desk.volume = float(value)
-
-            def focus(self) -> None:
-                return None
-
-        self._act("set_slider", "", hwnd, element, to=to, by=by)
-        if int(hwnd) != self.PLAYER or "volume" not in str(element.get("name") or "").casefold():
-            return StubResult(ok=False, summary="no slider value under it (UI Automation shows no RangeValue there). "
+        self._act("set_slider", "", hwnd, element, to=to, by=by, keys=keys)
+        if int(hwnd) != self.PLAYER:
+            return StubResult(ok=False, summary="nothing in this window exposes a slider's level to UI Automation. "
                                                 "Nothing was dragged or clicked", details={"verified": False})
-        ok, summary, details = drive(_Live(), to=to, by=by, press=None, name="Slider \"Change volume\"",
-                                     sleep=lambda _s: None, settle_s=0.0)
+
+        def plain(fn: Any) -> Any:   # the dispatcher's guarded actions take stopped=; the hand calls them without
+            return None if fn is None else (lambda *a: fn(*a, stopped=lambda: False))
+
+        ok, summary, details = run(self.slider_tree(), element, to=to, by=by, press=plain(press),
+                                   hotkey=plain(hotkey), keys=keys, hover=plain(hover), sleep=lambda _s: None,
+                                   settle_s=0.0, hold_s=0.0, reveal_s=0.0, wait_s=0.0)
         return StubResult(ok=ok, summary=summary, details=details)
 
     def app_volume(self, app: str, **kwargs: Any) -> Any:
@@ -853,6 +884,74 @@ class ChatPlayerDesk(StubDesktop):
 
     def master_volume(self) -> dict[str, Any]:
         return self.mixer.master_volume()
+
+
+class PlayerTree:
+    """:class:`ChatPlayerDesk`'s player window as UI Automation's tree search sees it (:class:`yuki.actions.slider.
+    Tree`), shaped like the live Spotify read of 4 Oct: the "Now playing bar" ``Group`` holds ``Button`` "Mute" (its
+    description "Volume medium") and ``Text`` "Change volume"; the real sliders are web range inputs hidden next to
+    their labels, named like them ("Change volume", "Change progress"), with empty boxes, and they exist only while
+    the bar does (the full-size lyrics view hides it until the pointer is over it). The volume input is 0-1 in steps of
+    0.1, as a web range input of the player's. Tests and replays only."""
+
+    def __init__(self, desk: ChatPlayerDesk) -> None:
+        self.desk = desk
+
+    def _bar_shown(self) -> bool:
+        return not self.desk.lyrics_full or self.desk.bar_revealed
+
+    def _read(self) -> list[dict[str, Any]]:
+        return self.desk.get_window_tree(self.desk.PLAYER)["elements"]
+
+    def ranges(self, scope: Any = None) -> list[Any]:
+        from yuki.actions.slider import Node
+
+        if not self._bar_shown() or not self.desk.slider_exposed:
+            return []
+        hidden = [Node("Slider", "Change progress", None, "progress"), Node("Slider", "Change volume", None, "volume")]
+        if scope is None or scope.ref == "bar":
+            return hidden
+        return []   # the inputs sit beside their labels, not inside them
+
+    def named(self, role: str, name: str) -> list[Any]:
+        from yuki.actions.slider import Node
+
+        return [Node(e["role"], e["name"], tuple(e["bounds"]), e["id"]) for e in self._read()
+                if e["role"] == role and e["name"] == name]
+
+    def parent(self, node: Any) -> Any:
+        from yuki.actions.slider import Node
+
+        bar = next((e for e in self._read() if e["role"] == "Group" and e["name"] == "Now playing bar"), None)
+        if bar is None or node.ref in ("bar", None):
+            return None
+        return Node("Group", "Now playing bar", tuple(bar["bounds"]), "bar")
+
+    def slider(self, node: Any) -> Any:
+        desk = self.desk
+
+        class _Live:
+            def read(self) -> tuple[float, float, float, bool, float]:
+                if node.ref == "progress":
+                    return 65.0, 0.0, 219.0, False, 5.0
+                return round(desk.volume / 100.0, 4), 0.0, 1.0, False, 0.1
+
+            def set(self, value: float) -> None:
+                if node.ref == "volume":
+                    desk.volume = max(0.0, min(100.0, float(value) * 100.0))
+
+            def focus(self) -> None:
+                desk.slider_focused = node.ref == "volume"
+
+        return _Live()
+
+    def shown(self, node: Any) -> list[tuple[str, Any]]:
+        out = []
+        for e in self._read():
+            if e["role"] in ("Button", "Text") and e["bounds"][1] >= self.desk.BAR_TOP:
+                out.append((f"{e['role']} \"{e['name']}\"" + (f": {e['description']}" if e.get("description") else ""),
+                            tuple(e["bounds"])))
+        return out
 
 
 # ---------------------------------------------------------------------------

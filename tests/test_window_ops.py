@@ -239,10 +239,13 @@ def test_stop_goes_through_the_strips_stop_and_steer_reaches_the_runtime(qapp, t
     assert ui.stopped == [31]
     assert host._handle({"op": "stop"})["ok"] is False            # a job is required: never "stop everything"
     assert host._handle({"op": "stop", "job": True})["ok"] is False
-    assert host._handle({"op": "steer", "job": 31, "text": "  the other Riya  "}) == {"job": 31, "delivered": True}
+    assert host._handle({"op": "steer", "job": 31, "text": "  the other Riya  "}) == {"job": 31, "delivered": True, "held": False}
     assert ui.runtime.steered == [(31, "the other Riya")]
-    assert host._handle({"op": "steer", "job": 99, "text": "x"}) == {"job": 99, "delivered": False}
+    assert host._handle({"op": "steer", "job": 99, "text": "x"}) == {"job": 99, "delivered": False, "held": False}
     assert host._handle({"op": "steer", "job": 31, "text": "  "})["ok"] is False
+    # appWin2 review F1: a request still queued keeps the words for its start, and the window is told so
+    ui.runtime.steer_held = lambda job: job == 31
+    assert host._handle({"op": "steer", "job": 31, "text": "also the April ones"}) == {"job": 31, "delivered": True, "held": True}
 
 
 def test_the_windows_cancel_stops_the_workers_run_as_a_stop_by_the_window(qapp, tmp_path):

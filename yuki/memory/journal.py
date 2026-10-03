@@ -74,6 +74,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.titles import TITLE_FIELD as _TITLE_FIELD, clean as _clean_label
 from yuki.memory.embed import Embedder, get_embedder
+from yuki.memory import misheard as _misheard
 from yuki.memory import workthreads as _work
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
 from yuki.memory.provenance import source_of
@@ -579,6 +580,8 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
             .replace("{questions}", guidance))
     # the user's threads of work (migration 23): kept by this same call, no call of their own
     text = f"{text}\n\n{_work.WORK_GUIDANCE}"
+    if call_side:   # what recognition misheard, with the guess; facts in English (the feedback round 3, W5-W6)
+        text = f"{text}\n\n{_misheard.MISHEARD_GUIDANCE}"
     if requests and not call_side:
         text = f"{text}\n\n{REQUEST_GUIDANCE}"
     return (f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}\n\n{CALL_SPEAKERS_GUIDANCE}\n\n{CALL_CONTEXT_GUIDANCE}"
@@ -815,6 +818,7 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
     },
 }
 RECORD_CALL_SIDE_TOOL["input_schema"]["required"] = ["facts", "commitments", "questions", "work"]
+_misheard.extend_call_side_tool(RECORD_CALL_SIDE_TOOL)   # heard / meant: what recognition misheard (W6)
 
 
 #: At most this many standing-request cards in 24 hours, whatever the model matches (plumbing).
@@ -2166,6 +2170,7 @@ class JournalWorker:
             if not 0 <= index < len(sources):
                 index = len(sources) - 1
             source = source_of(sources[index], thread, sources, index)
+            source.update(_misheard.source_fields(item, nature))   # heard words and the guess (call side, W6)
             to_people = item.get("user_said") in (True, USER_SAID[1])   # True: a boolean answer
             if to_people and source.get("by") != "the user" and not source.get("by_yuki"):
                 if not_users_words is not None:

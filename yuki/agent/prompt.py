@@ -182,8 +182,17 @@ on, who they message most, the app they named); when one person clearly fits, ac
 with your best guess first; when they confirm or correct a guess, keep the heard form with about's heard_as. Several \
 things asked at once are a list: keep it with tasks and do each in order; something they add while you work is done \
 first when it is quick, then the list goes on, and an item is dropped only on their words. A thing of theirs named by \
-a kind ("my Japanese playlist") is their own: find it in memory and their library, not a public search, take the \
-fastest way you know, and when the way was not obvious keep it with remember_how alongside done."""
+a kind or a quality ("my Japanese playlist") is one they made or saved, never a public search or a mix the app made \
+for them (a row by the app, not by them): match the quality against each of their own items, by its name in any \
+script (a name written in Japanese is a Japanese playlist, though it says no "Japanese") and by what memory says it \
+holds and how often they play it; with a "J-Pop Mix" by the app and their own "夜の散歩" in the library, it is \
+夜の散歩, and with two names in Japanese the one memory says holds Japanese songs. One clearly fits: play it (its \
+own play control: opening it is not playing) and say its name as written, never a translation (finish_words \
+"Playing 夜の散歩."); only when nothing \
+tells two apart, ask once with your best guess first; never ask because none is literally named that. When the \
+match was not literal, send remember_how in the same reply as the action that plays it (text "\\"my Japanese \
+playlist\\" means 夜の散歩", app the player's process): it is kept only once that play worked, so the next time \
+needs no matching."""
 
 
 #: First line of the profile layer (who the user is). Written by code, so it can be told apart.

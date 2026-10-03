@@ -358,6 +358,9 @@ class _Turn:
     gated: set[str] = field(default_factory=set)
     #: ``(tool, verdict, why)`` of every action this response ran (v3.14: the escalation signals).
     verdicts: list[tuple[str, bool | None, str]] = field(default_factory=list)
+    #: vfix3 review F6: this response carries an action, so a ``remember_how`` in it describes a step not yet seen to
+    #: work: it is held and kept only when the request ends well (:meth:`Agent._keep_held_how`).
+    acting_reply: bool = False
     #: The windows the ``done`` of this response says the present state of (``about``); ``None``: no done.
     done_about: list[int] | None = None
     #: N3: the states the ``done`` of this response tells, each with the step it says showed it (``states``).
@@ -1090,6 +1093,8 @@ class Agent:
         self._trace_numbers: set[int] = set()
         self._call_costs: dict[int, float] = {}
         self._steer_texts: list[str] = []
+        #: vfix3 review F6: know-how sent with the action it describes, kept when the request ends well.
+        self._held_how: list[dict[str, Any]] = []
         self._practice_shown: list[int] = []
         # Revamp D: the judge's per-request state, the consults taken, the sends and their confirmation, the text
         # typed into each window (an Enter later sends it), the trace steps an independent confirmation may still back,
@@ -1221,6 +1226,7 @@ class Agent:
             )
             self._record_run(request, reply=reply, outcome=outcome, at=started_epoch)
             self._keep_lessons(outcome=outcome, at=started_epoch)
+            self._keep_held_how(outcome=outcome)
             self._record_surfaced(reply=reply, at=started_epoch)
             words = self._this_query or memory_query_of(request)
             if words:
@@ -1651,6 +1657,56 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - a lesson never breaks a request
             self.logger.log("session_lessons", error=f"{type(exc).__name__}: {exc}"[:200])
 
+    def _hold_how(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """vfix3 review F6: ``remember_how`` sent in the same response as the action it describes ("'my Japanese
+        playlist' means <name>" with the play click) is held, not saved: what it says is learned only after it worked
+        (:meth:`_keep_held_how`). Its text and app are checked now, so a bad call still fails at once."""
+        text = " ".join(str(tool_input.get("text") or "").split())
+        if not text:
+            return ToolOutcome(name="remember_how", ok=False, summary="give the know-how as text",
+                               content=[{"type": "text", "text": "Not saved: give the know-how as text."}])
+        self._held_how.append({"input": dict(tool_input), "call": self._model_calls,
+                               "steers": len(task_frame.users_steers(self._steer_texts))})
+        return ToolOutcome(name="remember_how", ok=True, summary="held until the step it describes has worked",
+                           content=[{"type": "text", "text": "Held: it is kept once this request ends with that step "
+                                                             "done, and dropped if it fails or they correct you."}],
+                           payload={"held": True})
+
+    def _keep_held_how(self, *, outcome: str) -> None:
+        """At the end of a request: the know-how :meth:`_hold_how` held is kept when the request ended with its
+        answer (``final``), every action from the response that sent it on succeeded with no contradicted effect,
+        and the user added no words after it (a correction); else dropped. Learned after one success, by the run's
+        own facts (outcome, ok, verdicts). Saved on a background thread; never raises."""
+        held, self._held_how = list(getattr(self, "_held_how", None) or []), []
+        if not held:
+            return
+        trace = list(getattr(self, "_trace", None) or [])
+        steers = len(task_frame.users_steers(getattr(self, "_steer_texts", None) or []))
+        keep: list[dict[str, Any]] = []
+        for h in held:
+            steps = [s for s in trace if s.get("kind") == "action" and int(s.get("call") or 0) >= h["call"]]
+            why = ("the request did not end with its answer" if outcome != "final" else
+                   "no action ran after it" if not steps else
+                   "a step after it failed or did not have its effect"
+                   if any(not s.get("ok") or s.get("verdict") is False for s in steps) else
+                   "they added words after it" if steers > h["steers"] else "")
+            self.logger.log("held_how", kept=not why, why=why or "it worked", app=h["input"].get("app"))
+            if not why:
+                keep.append(h["input"])
+        if not keep or not getattr(self.memory, "installed", False):
+            return
+        memory, request, logger = self.memory, self._request_text, self.logger
+
+        def save() -> None:
+            for tool_input in keep:
+                try:
+                    out = memory.run_tool("remember_how", tool_input, request=request)
+                    logger.log("held_how_saved", ok=bool(out.ok), summary=str(out.summary)[:120])
+                except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+                    logger.log("held_how_saved", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
+
+        threading.Thread(target=save, name="yuki-held-how", daemon=True).start()
+
     def _keep_slider_way(self, *, outcome: str, at: float) -> None:
         """N2 (report 47, review): after one success, the way a slider of that app was moved (which control of the read
         holds it, set by its value or its own keys and read back) as a practice procedure for that app, so the next
@@ -1665,10 +1721,18 @@ class Agent:
                 control = str(s.get("target") or "").split(", window ", 1)[0].strip()
                 if not control or control.startswith("window "):
                     continue
+                keys = (s.get("input") or {}).get("keys") if isinstance(s.get("input"), dict) else None
+                # vfix3: a shortcut is kept only when this very step verified it moved the level (its report:
+                # "pressed the app's own shortcut ..."); a shortcut that did nothing here is not a way
+                shortcut = ("+".join(str(k) for k in keys)[:30]
+                            if isinstance(keys, list) and keys and "pressed the app's own shortcut" in str(
+                                s.get("result") or "") else "")
+                how = (f"with keys {shortcut} (its own shortcut, verified: the level moved)" if shortcut else
+                       "with to (percent) or by (points); it reads the value back")
                 objects[str(s["app"])] = {"kind": "procedure", "body": {"steps": [   # each step at most 160 chars
                     "Read the window",
-                    f"set_slider on {control[:70]} with to (percent) or by (points); it reads the value back",
-                    "Never drag the slider or script the mouse"]}}
+                    f"set_slider on {control[:60]} {how}",
+                    "Never drag the slider or script the mouse; the mixer is another control"]}}
         if objects:
             self._write_practice(objects, origin="slider", outcome=outcome, at=at)
 
@@ -2328,10 +2392,14 @@ class Agent:
             so skipped tools get an error block explaining they never ran.
         """
         order = [str(getattr(b, "id", "")) for b in tool_uses]
-        work = [b for b in tool_uses if str(getattr(b, "name", "")) != "done"]
+        work = [b for b in tool_uses if str(getattr(b, "name", "")) not in ("done", "remember_how")]
+        # vfix3 review F6: know-how written in the same response as the action it describes runs after that action
+        # (and is held until the request ends well); done stays last
+        learning = [b for b in tool_uses if str(getattr(b, "name", "")) == "remember_how"]
         closing = [b for b in tool_uses if str(getattr(b, "name", "")) == "done"]
+        turn.acting_reply = any(str(getattr(b, "name", "")) in ACTION_TOOL_NAMES for b in tool_uses)
 
-        for block in work + closing:
+        for block in work + learning + closing:
             tool_id = str(getattr(block, "id", ""))
             if tool_id in turn.handled:
                 continue
@@ -2555,6 +2623,9 @@ class Agent:
                 "type": "text", "text": "Queued: the task lane takes it the moment you finish. Say in one line that it "
                                         "comes right after what is running, then call done."}],
                 payload={"why": str(tool_input.get("why") or "")})
+        elif (name == "remember_how" and turn.acting_reply and getattr(self.memory, "installed", False)
+              and (self.tool_names is None or name in self.tool_names)):
+            outcome = self._hold_how(tool_input)
         elif name == "spawn_helpers" and (self.tool_names is None or name in self.tool_names):
             outcome = yield from self._run_helpers(tool_input)
         elif name == situation_check.TOOL_NAME and (self.tool_names is None or name in self.tool_names):
@@ -2662,7 +2733,8 @@ class Agent:
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
-        if name == "remember_how" and outcome.ok and hasattr(self, "_learning"):
+        if (name == "remember_how" and outcome.ok and hasattr(self, "_learning")
+                and not (isinstance(outcome.payload, dict) and outcome.payload.get("held"))):
             self._learning["saved"] = True   # it already kept what it learned
 
         verdict: tuple[bool | None, str] | None = None
@@ -2805,8 +2877,8 @@ class Agent:
         ``done`` never counts as earlier: it is evaluated last anyway.
         """
         name = str(getattr(block, "name", ""))
-        if name in _DEFERRED_TOOLS or name == "spawn_helpers":
-            return False
+        if name in _DEFERRED_TOOLS or name in ("spawn_helpers", "remember_how"):
+            return False   # remember_how: vfix3 review F6, it waits for the response's actions (_run_tools)
         if self._risk_check(name, dict(getattr(block, "input", {}) or {}))[0] != "run":
             return False   # a confirmation or a refusal waits for the end of the stream
         if turn.stop_after or turn.failed or self._cancelled.is_set():

@@ -55,21 +55,35 @@
       h('span', { class: 'mono', text: `${Math.round(a.min)} min` }), h('span', { class: 'mono', text: fmt.plural(a.visits || 0, 'visit') }))),
     h('div', { class: 'label', css: { marginTop: '14px' }, text: 'Counts only. I keep no screen content in this view.' })] : Y.empty('Nothing seen yet today.'), null, 'apps-seen');
   }
-  /* a call: when, where (one format: "Discord, #general voice (Friends)"), who (each friend once), how long;
-     opened, what was said, said to you */
+  /* a call (the 4 Oct item W8: the layout only; the words and fields are Python's, yuki/ui/web_data + call_words):
+     a row of three columns - when (day and time over "to …" and how long), where and who, how many lines - and,
+     opened, what was said as a timeline under the where column, with the status line and how long you spoke. A
+     line may be a sentence or {at, who, text} (a timed line from one side of the call); both lay out the same way. */
+  function callLine(g) {
+    if (g && typeof g === 'object') {
+      return h('li', { class: 'cl' + (g.at ? ' timed' : '') }, g.at ? h('span', { class: 'cl-t', text: fmt.natTime(g.at) }) : null,
+        h('span', { class: 'cl-x' }, g.who ? h('b', { class: 'cl-w', text: g.who }) : null, g.text || ''));
+    }
+    return h('li', { class: 'cl' }, h('span', { class: 'cl-x', text: String(g == null ? '' : g) }));
+  }
   function callRow(c) {
+    const people = c.people || [];
     const head = [h('span', { class: 'tm' }, h('b', { text: `${fmt.dayRule(c.start_at)}, ${fmt.natTime(c.start_at)}` }),
-      `${c.live ? 'live' : c.end_at ? 'to ' + fmt.natTime(c.end_at) : ''} · ${fmt.dur(c.min || 0)}`),
-    h('span', { class: 'wh' }, h('span', { class: 'w1' }, c.where || c.app || 'Call', c.live && c.start_at ? Y.recChip(c.start_at) : null),
-      h('span', { class: 'w2', text: (c.people || []).length ? 'with ' + c.people.join(', ') : 'who was on it: not known yet' }))];
+      h('span', { class: 'tm2', text: [c.live ? 'live' : c.end_at ? 'to ' + fmt.natTime(c.end_at) : '', fmt.dur(c.min || 0)].filter(Boolean).join(' · ') })),
+    h('span', { class: 'wh' }, h('span', { class: 'w1' }, h('span', { class: 'cw', text: c.where || c.app || 'Call' }), c.live && c.start_at ? Y.recChip(c.start_at) : null),
+      h('span', { class: 'w2', text: people.length ? 'with ' + people.join(', ') : 'who was on it: not known yet' }))];
     const gists = c.gists || [];
-    const body = [gists.length ? h('ul', { class: 'gists' }, gists.map((g) => h('li', { text: g }))) : h('div', { class: 'pend', text: c.status || (c.recorded ? 'Waiting to be turned into text.' : 'Not recorded.') }),
-      c.spoke_min != null ? h('div', { class: 't3 gnote', text: `you spoke ${Math.round(c.spoke_min)} min` }) : null];
-    return Y.fold(`call:${c.start_at}:${c.app || ''}`, head, h('span', { class: 'mono', text: gists.length ? fmt.plural(gists.length, 'line') : '' }), body, { cls: 'callrow' });
+    const status = gists.length ? '' : (c.status || (c.recorded ? 'Waiting to be turned into text.' : 'Not recorded.'));
+    const body = h('div', { class: 'call-d' },
+      gists.length ? h('ol', { class: 'call-tl' }, gists.map(callLine)) : null,
+      status ? h('div', { class: 'pend', text: status }) : null,
+      c.spoke_min != null ? h('div', { class: 'call-m' }, h('span', { text: `you spoke ${Math.round(c.spoke_min)} min` })) : null);
+    const meta = h('span', { class: 'mono', text: gists.length ? fmt.plural(gists.length, 'line') : '' });
+    return Y.fold(`call:${c.start_at}:${c.app || ''}`, head, meta, body, { cls: 'callrow' + (c.live ? ' live' : '') + (c.recorded === false ? ' unrec' : '') });
   }
   function calls(d) {
     const C = d.calls || [];
-    return Y.sec('Calls', C.length, C.length ? C.map(callRow) : Y.empty('No calls this week.'), Y.rightLabel('click one for what was said'));
+    return Y.sec('Calls', C.length, C.length ? h('div', { class: 'calls' }, C.map(callRow)) : Y.empty('No calls this week.'), Y.rightLabel('click one for what was said'), 'calls-sec');
   }
 
   function build(d, S) {

@@ -98,6 +98,14 @@ KNOWHOW_SUMMARY_FIELD = (
     + LABEL_RULES
 )
 
+#: Everything memory shows the user is in English (the user's feedback round 3, W5): written so at the source by the
+#: same model call, never translated at render time.
+ENGLISH_RULE = (
+    "Always in English, whatever language the item or its quotes are in: words someone said or wrote in Hindi, "
+    "Hinglish or any other language are given in English (\"you said you're exhausted\", not the Hindi words), never "
+    "in Devanagari or another script; a name stays the name, in Latin letters; a title in another script is given in "
+    "English or in Latin letters (\"your Japanese playlist named 'Yoru no Drive'\")."
+)
 #: The shared rule for every text the app shows the user from memory (migration 33; report 38 §2d): memory keeps its
 #: own third-person form for the prompts that read it, and the same model call writes this one next to it.
 SHOWN_RULES = (
@@ -117,8 +125,8 @@ SHOWN_RULES = (
     "gives it), never \"you said\". A game's voice chat is with teammates, usually strangers: \"your teammates\", "
     "never \"your friends\". Keep every "
     "name, number and specific the item states and add nothing it does not state; a joke stays a joke and a story a "
-    "story; the user's own quoted words stay as they said them. One or two plain sentences; no internal names, "
-    "ids, codes or file paths (say what they mean)."
+    "story; the user's own quoted words keep what they said. One or two plain sentences; no internal names, "
+    "ids, codes or file paths (say what they mean). " + ENGLISH_RULE
 )
 #: Worked examples of :data:`SHOWN_RULES` (invented people), memory's form -> the form shown.
 SHOWN_EXAMPLES = (
@@ -159,6 +167,21 @@ GIST_SHOWN_FIELD = ("The gist as the user's app shows it to them, at most 25 wor
                     + " For example \"A heated game where your friends chose killing people for fun, which shocked "
                     "you.\"")
 THREAD_SHOWN_FIELD = ("Where it stands, as the user's app shows it to them: " + SHOWN_RULES)
+#: A thread's card (the user's feedback round 3, W1c): what they were doing and where it stands, and the next step.
+THREAD_PRESENT_FIELD = (
+    "What the user was doing on this thread and where it stands, said to them in one or two short sentences (about 40 "
+    "words at most), the real work from its states and facts - never \"you worked on this\" or \"pick up where you left "
+    "off\". Second person, natural dates, in English, no ids, tool names or file paths (\"You were wiring the seed-swap "
+    "form to the new server on 2 October; saving works, but photo uploads still fail.\")."
+)
+THREAD_NEXT_FIELD = (
+    "The concrete next step to continue the thread, said to the user in one short sentence starting with what to do, "
+    "from its open items and latest state (\"Fix the photo upload, then send Priya the test link.\"); in English, no "
+    "ids, tool names or file paths; \"\" when it only waits on someone else."
+)
+#: Most characters of a thread card's shown form and of its next step (plumbing: longer is asked for again).
+THREAD_PRESENT_MAX_CHARS = 400
+THREAD_NEXT_MAX_CHARS = 220
 
 
 def clean_shown(text: Any) -> str | None:
@@ -242,6 +265,11 @@ row, next to its date, time, place and who was on it, so a shown gist never repe
 what happened ("A heated game where your friends chose killing people for fun, which shocked you."). In \
 a gist, never write "they" for the people on the call, even after naming them: write "your friends" or \
 their names again.
+A thread of work (a W line) is the card the user picks it up from: its shown form says what they were \
+doing and where it stands, in one or two short sentences (about 40 words at most), from its state, open \
+items and earlier states - the real work, never "you worked on this" - and it also gets next: the concrete \
+next step to continue it, one short sentence starting with what to do ("Fix the photo upload, then send \
+Priya the test link."), or "" when it only waits on someone else. Every other line's next is "".
 
 {SHOWN_EXAMPLES}
 
@@ -257,10 +285,11 @@ WRITE_SHOWN_TOOL: dict[str, Any] = {
         "additionalProperties": False,
         "required": ["items"],
         "properties": {"items": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False, "required": ["id", "shown"],
+            "type": "object", "additionalProperties": False, "required": ["id", "shown", "next"],
             "properties": {
                 "id": {"type": "string", "description": "The line's id as shown (P12, W3, G56)."},
                 "shown": {"type": "string", "description": "The item said to the user, by the rules."},
+                "next": {"type": "string", "description": "W lines only: " + THREAD_NEXT_FIELD + " Else \"\"."},
             }}}},
     },
 }
@@ -544,9 +573,18 @@ class Titler:
         for t in store.work_threads(statuses):
             if not t.state or not wanted("thread", t.id):
                 continue
+            # its card (W1c): the open items and the states before this one say what the user was doing
+            earlier = []
+            try:
+                earlier = [e["state"] for e in store.work_thread_events(t.id, limit=6)
+                           if e.get("state") and e["state"] != t.state][-2:]
+            except Exception:
+                pass
+            context = "; ".join(x for x in (("OPEN: " + " | ".join(t.open_items[:3])) if t.open_items else "",
+                                            ("EARLIER: " + " | ".join(earlier)) if earlier else "") if x)
             add(ShownPending(f"W{t.id}", "thread", t.id,
-                             f"where a thread of their work stands ({t.status}, last touched "
-                             f"{natural_day(t.last_seen, now)})", t.state, t.title, "", t.state))
+                             f"a thread of their work, its card ({t.status}, last touched "
+                             f"{natural_day(t.last_seen, now)})", t.state, t.title, context, t.state))
         ids = store.shown_missing(["gist"]).get("gist", []) if not redo else [
             int(r[0]) for r in store._query("SELECT call_id FROM call_digests WHERE status='ok' AND"
                                             " gist_ciphertext IS NOT NULL ORDER BY call_id")]
@@ -614,10 +652,15 @@ class Titler:
                 continue
             seen.add(ref)
             text = clean_shown(item.get("shown"))
+            if text is not None and p.surface == "thread" and len(text) > THREAD_PRESENT_MAX_CHARS:
+                text = None   # a thread's card is one or two short sentences (asked for again)
             if text is None:
                 rejected.append(f"{ref}: an empty, cut or overlong shown form")
                 continue
             out.setdefault(p.surface, {})[p.item_id] = text
+            nxt = clean_shown(item.get("next")) if p.surface == "thread" else None
+            if nxt is not None and len(nxt) <= THREAD_NEXT_MAX_CHARS:
+                out.setdefault("thread_next", {})[p.item_id] = nxt
         rejected += [f"{p.ref}: left out" for p in batch if p.ref not in seen]
         return out, rejected
 
@@ -633,6 +676,12 @@ class Titler:
             for p in batch:
                 if p.item_id not in texts.get(p.surface, {}):
                     self._failed[shown_key(p)] = self._failed.get(shown_key(p), 0) + 1
+            nexts = texts.pop("thread_next", {})
+            if nexts:   # a thread's next step (migration 35), written with its card
+                if dry_run:
+                    result.shown += [{"ref": f"W{i}", "next": t} for i, t in nexts.items()]
+                else:
+                    self.store.set_thread_next(nexts, overwrite=True)
             for surface, rows in texts.items():
                 if dry_run:
                     by_id = {p.item_id: p for p in batch if p.surface == surface}

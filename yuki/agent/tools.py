@@ -378,7 +378,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "One app's own volume in the Windows mixer (only Chrome, only Spotify): nothing focused or clicked, the "
             "system volume untouched. Without level, change or mute it lists the apps with sound. Read back. Not "
-            "the app's own player volume (its slider: set_slider)."
+            "the app's own player volume (its slider: set_slider), never a stand-in for it."
         ),
         "input_schema": _obj(
             {
@@ -480,8 +480,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "remember_how",
         "label": "Saving how it's done",
-        "description": "Keep a way of doing something on this PC that the user tells you, in their words (your own "
-                       "jobs teach Yuki by themselves).",
+        "description": "Keep a way of doing something on this PC that the user tells you, or which thing of theirs "
+                       "their words meant when it was not literal (other jobs teach Yuki by themselves).",
         "input_schema": _obj(
             {"app": {"type": "string", "description": "The process name it applies to, if one."},
              "text": {"type": "string"}},
@@ -801,6 +801,10 @@ def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
         op = "submit"
     elif name == "open_url" and not _web_address(tool_input.get("url")):
         return LOCAL_TARGET_TRAITS
+    elif name == "set_slider" and tool_input.get("keys"):
+        # vfix3 review F1: the shortcut set_slider presses is a key combination like any hotkey (alt+f4 closes, enter
+        # sends), so it is judged as one: the hotkey tool's own traits (the same object: keys by their tool alone)
+        return TOOL_TRAITS["hotkey"]
     if op is not None and (name, op) in OP_TRAITS:
         return OP_TRAITS[(name, op)]
     return TOOL_TRAITS.get(name, Traits())
@@ -1520,11 +1524,13 @@ class _LazyRealBackend:
             app, level=level, change=change, mute=mute)
 
     def set_slider(self, hwnd: int, element: dict[str, Any], *, to: float | None = None, by: float | None = None,
-                   press: Callable[..., Any] | None = None) -> Any:
-        """:func:`yuki.actions.slider.set_slider`: a slider set by RangeValue or its own keys, read back (N2)."""
+                   press: Callable[..., Any] | None = None, **reveal_and_keys: Any) -> Any:
+        """:func:`yuki.actions.slider.set_slider`: a slider set by RangeValue or its own keys, read back (N2); vfix3:
+        ``hover``, ``hotkey`` and ``keys`` (a bar shown by the pointer, a learned shortcut read back)."""
         import importlib
 
-        return importlib.import_module("yuki.actions.slider").set_slider(hwnd, element, to=to, by=by, press=press)
+        return importlib.import_module("yuki.actions.slider").set_slider(hwnd, element, to=to, by=by, press=press,
+                                                                        **reveal_and_keys)
 
     def audio_apps(self) -> list[dict[str, Any]]:
         """:func:`yuki.actions.app_volume.audio_apps`: the apps with sound and their own levels, read-only."""
@@ -3361,19 +3367,45 @@ class Dispatcher:
                 raise ToolError(f"'{key}' must be a number, got {v!r}")
         if to is None and by is None:
             raise ToolError("give to (0-100 percent of its range) or by (percent points)")
+        shortcut = tool_input.get("keys")
+        if shortcut is not None and (not isinstance(shortcut, list) or not shortcut
+                                     or not all(isinstance(k, str) and k.strip() for k in shortcut)):
+            raise ToolError(f"'keys' must be a list of key names (the app's own shortcut), got {shortcut!r}")
         act = getattr(self.backend, "set_slider", None)
         if not callable(act):
             raise ToolError("this desktop has no slider hand")
         press = getattr(self.backend, "press", None)
+        hotkey = getattr(self.backend, "hotkey", None)
+        hover = getattr(self.backend, "hover", None)
 
-        def keys(key: str, times: int, stopped: Callable[[], bool] | None = None) -> Any:
+        def waited(stopped: Callable[[], bool] | None) -> None:
             self._before_input("set_slider")
             if stopped is not None and stopped():   # review F7: the result went back while the gate waited
                 raise TimeoutError("out of time while waiting for the keyboard")
+
+        def keys(key: str, times: int, stopped: Callable[[], bool] | None = None) -> Any:
+            waited(stopped)
             return press(key, times=int(times), expect_hwnd=guard or hwnd)
 
-        outcome = self._from_action("set_slider", act(hwnd, element, to=to, by=by,
-                                                      press=keys if callable(press) else None))
+        def combo(names: list[str], stopped: Callable[[], bool] | None = None) -> Any:
+            waited(stopped)
+            return hotkey(*names, expect_hwnd=guard or hwnd)
+
+        def point(x: int, y: int, stopped: Callable[[], bool] | None = None) -> Any:
+            # vfix3: a player bar hidden until the pointer is over it (no click)
+            waited(stopped)
+            return hover(int(x), int(y), expect_hwnd=guard or hwnd, label="the slider's bar")
+
+        extra: dict[str, Any] = {}
+        if callable(hover):
+            extra["hover"] = point
+        if shortcut and callable(hotkey):
+            extra.update(hotkey=combo, keys=[k.strip() for k in shortcut])
+        try:
+            report = act(hwnd, element, to=to, by=by, press=keys if callable(press) else None, **extra)
+        except TypeError:   # an older slider hand (a test desk's) without the reveal and shortcut
+            report = act(hwnd, element, to=to, by=by, press=keys if callable(press) else None)
+        outcome = self._from_action("set_slider", report)
         if outcome.ok:
             self._mark_acted(hwnd, "set_slider")
         return self._labelled(outcome, label)

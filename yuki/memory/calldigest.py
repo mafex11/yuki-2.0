@@ -191,7 +191,7 @@ link?" write "Someone on the call asked the user for the hostel link" (or "Mira 
 evidence names her), never "Asked for the hostel link" - that reads as the user asking. When the user \
 answers, one line resting on the user's own line [6] can carry both ("Agreed to send the hostel link a \
 friend asked for, after dinner"). Translate Hindi, Hinglish, Devanagari and any other language into plain English; \
-quote a few words only when the exact words matter. Several lines on one point make one line; aim \
+quote a few words, translated into English, only when the exact words matter. Several lines on one point make one line; aim \
 for about one line for each minute or two of real talk, more when a lot happens, none for filler. \
 Keep names, numbers, times and places exactly as said. Banter and swearing among friends: say what \
 it was (trash-talked a friend, teased someone about their crush) without repeating slurs.

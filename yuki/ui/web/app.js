@@ -139,6 +139,7 @@
     if (sh.call && sh.call.recording) return 'quiet-in-call';
     return 'idle';
   }
+  Y.faceState = faceState;   // the thread input's face reads the same state (pages/drawer.js)
   /* the step the running request is on, for the face's and the field's working figures: no total (there is no plan,
      appPT: "Working · step 2", never "of N"; review F5) */
   function stepNow() {

@@ -680,6 +680,77 @@ class MemoryClient:
         except Exception:
             return None
 
+    #: What :meth:`correct_item` takes: the ref prefixes the lists give -> the correction target's letter.
+    _CORRECT_KINDS = {"fact": "P", "f": "P", "p": "P", "thread": "W", "w": "W", "episode": "E", "e": "E",
+                      "session": "E", "journal": "J", "j": "J", "heard": "J"}
+
+    def correct_item(self, ref: Any, words: str) -> dict:
+        """Correct one item from the user's own short words about what is wrong (the feedback round 3, W3): a portrait
+        fact or a person's summary (``fact:N``), a thread of work (``thread:N``), a work session (``episode:N``) or a
+        journal entry such as a "maybe misheard" one (``journal:N``); ``words`` is what they said ("he's my cousin, not
+        a classmate", "that was last week"). Returns at once: the correction is recorded in the Me page's fixed
+        format with the item as its target, and the service is woken to run the correction pass, which rewrites the
+        item (and anything else carrying the same wrong thing) a moment later - bi-temporally, the old version kept,
+        a diary line each; the user never edits text by hand. Poll :meth:`correction_status` with ``correction_id``
+        (``updating`` -> ``done``); Undo before the pass starts: ``cancel_correction(correction_id)``. Returns ``{"ok",
+        "ref", "correction_id", "state": "updating"}``, ``ok`` False with ``error`` (plain words). Never raises."""
+        text = " ".join(str(words or "").split())
+        raw = str(ref or "").strip().strip("[]")
+        head, _, tail = raw.partition(":")
+        letter = self._CORRECT_KINDS.get(head.lower()) if tail else self._CORRECT_KINDS.get(raw[:1].lower())
+        num = tail if tail else raw[1:]
+        out: dict[str, Any] = {"ok": False, "ref": raw, "correction_id": None, "state": None}
+        if letter is None or not num.isdigit():
+            out["error"] = "That can't be corrected here."
+            return out
+        if not text:
+            out["error"] = "Say what's wrong in a few words."
+            return out
+        from yuki.memory.corrections import target_candidate
+
+        try:
+            cand = target_candidate(self.store, f"{letter}{int(num)}")
+        except Exception:
+            cand = None
+        if cand is None:
+            out["error"] = "That has changed since; open it again."
+            return out
+        obj = cand.obj
+        if letter == "W":
+            subject, had = obj.title, " ".join(str(obj.shown or obj.state or "").split())
+        elif letter == "E":
+            subject = f"a work session on {datetime.fromtimestamp(obj.started_at):%A %d %B}"
+            had = " ".join(str(obj.summary or obj.text or "").split())
+        elif letter == "P":
+            subject, had = obj.subject or obj.kind, " ".join(str(obj.shown or obj.text or "").split())
+        else:
+            src = obj.source if isinstance(getattr(obj, "source", None), dict) else {}
+            subject = "what Yuki heard" if src.get("heard") else (obj.app or "a journal entry")
+            had = obj.fact + (f' (heard "{src["heard"]}", Yuki guessed "{src.get("meant")}")'
+                              if src.get("heard") and src.get("meant") else "")
+        correction = (f'About "{" ".join(str(subject or "this").split())}" (memory had: "{had}"), '
+                      f'the user said in their own words: "{text}"')
+        try:
+            cid = self.store.add_correction(secret_filter.redact_text(correction), target=cand.ref)
+        except Exception as exc:
+            out["error"] = f"memory: {type(exc).__name__}"
+            return out
+        self.rerender_portrait()   # wakes the service: its scheduler runs queued corrections before anything else
+        prefix = {"P": "fact", "W": "thread", "E": "episode", "J": "journal"}[letter]
+        out.update(ok=True, ref=f"{prefix}:{cand.item_id}", correction_id=cid, state="updating")
+        return out
+
+    def cancel_correction(self, ref: Any) -> dict:
+        """The Undo of :meth:`correct_item` (or any queued correction) before its pass starts: the correction ends and
+        its pass is skipped. ``{"ok", "id", "error"?}``; once the pass started, ``ok`` False with
+        :data:`TOO_LATE_TO_UNDO`."""
+        try:
+            cid = int(str(ref).strip().strip("[]").split(":")[-1].lstrip("F"))
+        except ValueError:
+            return {"ok": False, "id": ref, "error": "not a correction"}
+        ok = bool(self.store.cancel_correction(cid))
+        return {"ok": ok, "id": cid} if ok else {"ok": False, "id": cid, "error": TOO_LATE_TO_UNDO}
+
     def review_queue(self, now: float | None = None) -> dict:
         """The day's "To review" queue (report 38 §12.3, the mock's design): current facts Yuki wrote that the user
         has not answered or pinned, written in the last :data:`REVIEW_WITHIN_DAYS` days, ranked by importance x
@@ -1867,13 +1938,18 @@ class MemoryClient:
         """Episodes overlapping ``[since, until)`` (default today), oldest first.
 
         Each: ``{"start": ISO, "end": ISO, "text": str, "final": bool (False while
-        its window is still open and may be rewritten), "totals": dict}``.
+        its window is still open and may be rewritten), "totals": dict}``, and since migration 35 (the feedback
+        round 3, W2) ``"id"``, ``"ref"`` (``episode:N``, what :meth:`correct_item` takes), ``"title"`` (a few words,
+        distinct; None until written) and ``"summary"`` (one or two short sentences said to the user; None until
+        written). ``text`` is memory's own narrative (third person, with times): the app shows title and summary,
+        and the time per app as data from the timeline.
         """
         s, u = self._window(since, until)
         rows = self.store.episodes_between(s, u)[-max(1, int(limit)):]
         return [
             {"start": _iso(e.started_at), "end": _iso(e.ended_at), "text": e.text, "final": e.final,
-             "totals": (e.aggregates or {}).get("totals") or {}}
+             "totals": (e.aggregates or {}).get("totals") or {}, "id": e.id, "ref": f"episode:{e.id}",
+             "title": getattr(e, "title", None), "summary": getattr(e, "summary", None)}
             for e in rows
         ]
 
@@ -2973,13 +3049,24 @@ class MemoryClient:
         Each is :meth:`_journal_dict` plus ``ref`` (``journal:N``, what :meth:`resolve_heard` takes), ``heard_in`` (a
         label: the voice channel for an entry said on a call when the digest saw it, "Discord, #general voice
         (Friends)"; else the call app or the window's app), ``channel_known`` and ``people`` (who the call screen showed
-        on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises."""
+        on that call). Returns ``{"items", "total"}``. Read only, no model. Never raises.
+
+        Since the feedback round 3 (W6, :mod:`yuki.memory.misheard`) only real mishearings are listed: entries whose
+        provenance holds the words as heard and Yuki's guess. Each item also has ``heard`` ("sea ra", Latin
+        letters), ``guess`` ("Ciara"), ``why`` (who or what makes it fit, English), ``guess_is_name`` and ``shown``
+        (the entry said to the user in English, or None: show ``text`` then). The raw transcript (``source.quote``)
+        is provenance, never for showing."""
+        from yuki.memory.misheard import is_listed
         from yuki.memory.titles import place_label
 
         now = time.time() if now is None else float(now)
         try:
-            entries, total = self.store.uncertain_journal(now - float(days) * 86400.0, limit=max(0, int(limit)))
-            dicts = [self._journal_dict(j) for j in entries]
+            entries, _all = self.store.uncertain_journal(now - float(days) * 86400.0)
+            entries = [j for j in entries if is_listed(j.source)]
+            total = len(entries)
+            dicts = [{**self._journal_dict(j), "heard": j.source.get("heard"), "guess": j.source.get("meant"),
+                      "why": j.source.get("meant_why") or None, "guess_is_name": bool(j.source.get("meant_name")),
+                      "shown": j.source.get("shown") or None} for j in entries[: max(0, int(limit))]]
             calls = {}
             ids = {int(d["call"][5:]) for d in dicts if str(d.get("call") or "").startswith("call:")
                    and str(d["call"])[5:].isdigit()}
@@ -3008,14 +3095,34 @@ class MemoryClient:
         - either is taken back, and a queued pass (``correction_id``) is cancelled first; once that pass started, nothing
         is taken back (``ok`` False, :data:`TOO_LATE_TO_UNDO`); an entry never answered has nothing to undo. The item
         leaves :meth:`misheard` at once (answered entries are never listed again). Returns ``{"ok", "ref", "verdict",
-        "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered."""
+        "nature", "correction_id"}``; ``ok`` False with ``error`` when the entry is gone or already answered.
+
+        With Yuki's guess (the feedback round 3, W6): ``guess_right`` means the GUESS is right - the entry leaves the
+        list at once but stays uncertain (``nature`` stays ``uncertain``, never used as a fact) while the correction
+        pass, queued with the user's words "It was 'Ciara', not 'sea ra'" and the entry as its target, rewrites it
+        (the new version is settled as a fact and the name alias learned once the rewrite carries it;
+        ``correction_id``; Undo cancels it while it waits). ``right`` keeps its meaning (taken as said, as heard;
+        ``as_heard`` is the same); ``wrong`` retires it; a correction in the user's own words goes through
+        :meth:`correct_item`. ``guess_right`` on an entry with no guess is ``right``."""
         jid = self._journal_id(ref)
         verdict = str(verdict or "").strip().lower()
         out: dict[str, Any] = {"ok": False, "ref": f"journal:{jid}" if jid else str(ref or ""), "verdict": verdict,
                                "nature": None, "correction_id": None}
-        if jid is None or verdict not in ("right", "wrong", "undo"):
-            out["error"] = "say right, wrong or undo for a journal entry"
+        if jid is None or verdict not in ("right", "as_heard", "guess_right", "wrong", "undo"):
+            out["error"] = "say right, guess_right, wrong or undo for a journal entry"
             return out
+        guess: dict[str, Any] | None = None
+        if verdict == "guess_right":
+            from yuki.memory.misheard import is_listed
+
+            rows = self.store.journal_by_ids([jid])
+            if rows and is_listed(rows[0].source):
+                guess = rows[0].source
+                verdict = "pending"
+            else:
+                verdict = "right"
+        if verdict == "as_heard":
+            verdict = "right"
         if verdict == "undo" and correction_id:   # the ripple first: once its pass started, the answer stands (A3)
             out["cancelled"] = self.store.cancel_correction(int(correction_id))
             if not out["cancelled"]:
@@ -3033,6 +3140,16 @@ class MemoryClient:
         if verdict == "wrong":
             out["correction_id"] = self._ripple(done.get("app") or "what Yuki heard", done["text"],
                                                 "That was misheard. It's wrong, forget it")
+        elif guess is not None:
+            from yuki.memory.misheard import right_words
+
+            try:
+                text = (f'About "what Yuki heard" (memory had: "{" ".join(done["text"].split())}"), '
+                        f'the user said in their own words: "{right_words(guess)}"')
+                out["correction_id"] = self.store.add_correction(secret_filter.redact_text(text), target=f"J{jid}")
+                self.rerender_portrait()   # wakes the service for the pass
+            except Exception:
+                pass
         return out
 
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
@@ -3382,7 +3499,10 @@ class MemoryClient:
         return {"ref": f"thread:{t.id}", "id": t.id, "title": t.title, "status": t.status, "state": t.state,
                 "open": list(t.open_items), "involves": list(t.entities), "first_seen": _iso(t.first_seen),
                 "last_seen": _iso(t.last_seen), "events": t.events, "importance": t.importance,
-                "line": thread_line(t), "shown": getattr(t, "shown", None)}
+                "line": thread_line(t), "shown": getattr(t, "shown", None),
+                # migration 35 (the feedback round 3, W1): the next step said to the user, and who closed it
+                "next": getattr(t, "next", None), "closed_by": getattr(t, "closed_by", None),
+                "closed_at": _iso(getattr(t, "closed_at", None))}
 
     @staticmethod
     def thread_id_of(ref: Any) -> int | None:
@@ -3464,6 +3584,41 @@ class MemoryClient:
             "links": [{"url": link.url, "title": link.title, "line": _links.describe(link, secs.get(link.id))}
                       for link in d["links"]],
         }
+
+    def close_thread(self, ref: Any, how: str) -> dict:
+        """The user's own close of a thread of work (the feedback round 3, W1a), at once, no model: ``how`` = ``done``
+        (finished), ``dismiss`` (not a piece of work: it stops being a thread, its facts stay) or ``reopen`` (either
+        taken back exactly: the window's Undo and its Reopen). Returns ``{"ok", "ref", "status", "how"}``; ``ok`` False
+        with ``error`` (plain words) when nothing could be done. Never raises."""
+        from yuki.memory.workthreads import close_thread
+
+        tid = self.thread_id_of(ref)
+        if tid is None:
+            return {"ok": False, "ref": str(ref or ""), "status": None, "how": str(how or ""), "error": "not a thread"}
+        try:
+            return close_thread(self.store, tid, how)
+        except Exception as exc:
+            return {"ok": False, "ref": f"thread:{tid}", "status": None, "how": str(how or ""),
+                    "error": f"memory: {type(exc).__name__}"}
+
+    def thread_continue(self, ref: Any) -> dict | None:
+        """What a thread's Continue shows and does (the feedback round 3, W1d): ``{"ref", "title", "status", "shown"
+        (what you were doing and where it stands, said to you; None until written), "next" (the concrete next step;
+        None until written or when it only waits on someone), "open", "last_at", "last_label" ("Saturday 3 October"),
+        "places": [{"kind": "page" | "window", "app", "title", "url" (pages), "last_at"}] (the windows and pages worth
+        bringing back, newest first, at most 5), "ask" (the request to hand Yuki to continue it)}``. ``None`` for an
+        unknown thread (merged ones followed). Read only, no model."""
+        from yuki.memory.workthreads import continue_context
+
+        tid = self.thread_id_of(ref)
+        tid = self.store.resolve_work_thread(tid) if tid is not None else None
+        t = self.store.work_thread(tid) if tid is not None else None
+        if t is None:
+            return None
+        try:
+            return continue_context(self.store, t)
+        except Exception:
+            return None
 
     def before(self, at: Any = None, event: str = "break", minutes: float = 90.0) -> dict:
         """What the user was doing before a moment: the break nearest ``at`` (or, with no ``at``, the latest
