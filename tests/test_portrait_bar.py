@@ -251,9 +251,153 @@ def test_the_bar_pass_retires_telemetry_keeps_durable_facts_and_pinned_ones(stor
 
     # reversible: the whole pass taken back
     undone = BarPass(worker).undo(result.run_id)
-    assert undone == {"restored": 2, "ended": 1}
+    assert undone == {"restored": 2, "ended": 1, "diverged": []}
     current = {f.id: f for f in store.portrait_facts()}
     assert quota in current and mix in current and new.id not in current
+
+
+def test_undo_leaves_a_retirement_whose_lasting_line_changed_since(store):
+    """Review A2-5: a lasting line updated after the pass is not ended, and its retired fact is not restored beside
+    it (that would say the same thing twice); the rest of the pass is taken back, and the gap reported."""
+    from yuki.memory.dreaming import BarPass
+
+    _j, ids = _facts(store)
+    quota, mix = ids[0], ids[1]
+    worker, _client = worker_with(store, {"judge_bar": _verdicts(ids), **RENDER})
+    result = BarPass(worker).run(now=T0 + 7200)
+    [new] = [f for f in store.portrait_facts() if f.text == LASTING]
+    [(ok, newer)] = store.commit_portrait_changes(None, [FactChange(
+        "UPDATE", new.id, "work", new.subject, LASTING + " They switch between them when one runs low.", 0.8,
+        new.source_ids, T0 + 8000)])
+    assert ok
+    undone = BarPass(worker).undo(result.run_id)
+    assert undone == {"restored": 1, "ended": 0, "diverged": [quota]}
+    current = {f.id for f in store.portrait_facts()}
+    assert newer in current and quota not in current and mix in current
+    assert "left as they are" in store.changelog(pass_="bar")[0]["text"]
+
+
+def test_a_saved_dry_run_is_applied_exactly_with_no_new_judgement(store, tmp_path):
+    """Review A2-6: the dry run's decisions are kept (encrypted) and --apply writes exactly those; a fact changed
+    since is skipped, and the judge is not called again."""
+    from yuki.memory.dreaming import BarPass, load_plan, save_plan
+
+    _j, ids = _facts(store)
+    quota, mix = ids[0], ids[1]
+    worker, client = worker_with(store, {"judge_bar": _verdicts(ids), **RENDER})
+    dry = BarPass(worker).run(now=T0 + 7200, dry_run=True)
+    path = save_plan(store, dry.decisions, tmp_path / "plan.json")
+    raw = path.read_text(encoding="utf-8")
+    assert "Claude accounts" not in raw and "enc:v1:" in raw          # the facts' words are not in the clear
+    plan = load_plan(store, path)
+    assert [d["id"] for d in plan] == [quota, mix] and plan[0]["lasting"] == LASTING and plan[0]["shown"]
+    # the token-mix fact changed since the dry run: not written from the plan
+    [(_ok, mix2)] = store.commit_portrait_changes(None, [FactChange("UPDATE", mix, "work", "token mix", MIX + " Again.",
+                                                                    0.6, [], T0 + 7300)])
+    judged = client.tools_called().count("judge_bar")
+    result = BarPass(worker).run(now=T0 + 7400, plan=plan)
+    assert result.ok, result.error
+    assert client.tools_called().count("judge_bar") == judged          # no new judgement
+    assert result.retired == 1 and result.lasting == 1 and any(f"F{mix}" in r for r in result.rejected)
+    current = {f.id: f for f in store.portrait_facts()}
+    assert quota not in current and mix2 in current
+    assert [f for f in current.values() if f.text == LASTING][0].shown == plan[0]["shown"]
+    with pytest.raises(ValueError):
+        (tmp_path / "other.json").write_text('{"kind": "something else"}', encoding="utf-8")
+        load_plan(store, tmp_path / "other.json")
+
+
+# -- review fixes: the audit's operations, the gate's view of the portrait, dreaming's lasting lines -----------
+
+
+def test_the_audit_prompt_holds_the_bar_and_its_operations_go_through_the_gate(store):
+    """Review A2-2: the portrait audit's ADDs and UPDATEs meet the bar like a nightly run's."""
+    from yuki.memory.portrait import AUDIT_SYSTEM_PROMPT, ADMISSION_BAR, RunResult
+    from yuki.memory.store import PortraitRunStats
+
+    assert ADMISSION_BAR in AUDIT_SYSTEM_PROMPT
+    j = store.add_journal(T0, None, "Coding tool", "The usage panel showed the accounts' quota.", 5)
+    [(_ok, mira)] = store.commit_portrait_changes(None, [FactChange("ADD", None, "person", "Mira",
+                                                                    "Mira talks with the user.", 0.6, [j], T0)])
+
+    def op(**kw):
+        return {"op": "ADD", "fact_id": None, "kind": "work", "subject": "Claude", "text": QUOTA, "confidence": 0.7,
+                "journal_ids": [j], "episode_ids": [], "based_on_facts": [], "reason": "x", "loop": None,
+                "aspect": None, "finding": 1, "relationship": None, **kw}
+
+    answer = {"findings": [{"finding": "relationship", "fact_ids": [mira], "journal_ids": [j], "decision": "resolve",
+                            "reasoning": "x"}],
+              "operations": [op(), op(op="UPDATE", fact_id=mira, kind="person", subject="Mira", text=SISTER)],
+              "questions": []}
+    worker, client = worker_with(store, {"judge_bar": [{"failing": [fail("N1", "usage_metrics")]}]})
+    result = RunResult(None, "audit", True)
+    stats = PortraitRunStats(kind="audit", model=worker.model)
+    facts = store.portrait_facts()
+    applied = worker._apply_audit(None, 1, answer, facts, store.journal_between(), T0 + 3600, result, stats,
+                                  under=1, excerpts=0)
+    assert applied == 1 and client.tools_called() == ["judge_bar"]
+    assert [f.text for f in store.portrait_facts()] == [SISTER]
+    assert result.operations[0].status == "rejected: fails the admission bar (usage_metrics)"
+    assert stats.ops_rejected == 1 and stats.ops_update == 1
+
+
+def test_the_bar_gate_sees_the_portrait_so_a_lasting_line_is_not_written_twice(store):
+    """Review A2-4: the gate lists the current facts (not the ones this run updates) for the judge not to judge."""
+    from yuki.memory.store import PortraitRunStats
+
+    j = store.add_journal(T0, None, "Coding tool", "The usage panel showed the accounts' quota.", 5)
+    written = store.commit_portrait_changes(None, [
+        FactChange("ADD", None, "work", "Claude accounts", LASTING, 0.8, [j], T0),
+        FactChange("ADD", None, "person", "Mira", "Mira talks with the user.", 0.6, [j], T0)])
+    have, mira = [new for _ok, new in written]
+    ops = _ops(j)[:1] + [{**_ops(j)[1], "op": "UPDATE", "fact_id": mira}]
+    worker, client = worker_with(store, {"judge_bar": [{"failing": [fail("N1", "usage_metrics", None,
+                                                                          "the lasting part is already a fact")]}]})
+    facts = store.portrait_facts()
+    journal = store.journal_between()
+    changes, outcomes = worker._validate(ops, facts, journal, T0 + 3600)
+    kept = worker._bar_gate(None, changes, outcomes, journal, PortraitRunStats(kind="nightly", model=worker.model),
+                            facts=facts)
+    assert [c.text for c in kept] == [SISTER]
+    content = client.requests[-1]["messages"][0]["content"]
+    other = content.split("OTHER FACTS", 1)[1]
+    assert f"F{have} [work]" in other and f"F{mira} " not in other     # the updated fact is judged, not listed
+
+
+def test_dreaming_keeps_the_lasting_part_of_a_fact_that_fails_the_bar(store):
+    """Review A2-1: a bar retirement with durable points left goes on as those points (an UPDATE, history kept,
+    citations, review and pin carried); one with nothing left ends; a lasting line said twice is written once."""
+    from yuki.memory.dreaming import Dreamer, dream_system_prompt
+
+    assert "nothing durable may be lost" in dream_system_prompt()
+    j = [store.add_journal(T0 + i, None, "Coding tool", f"reading {i}", 5) for i in range(3)]
+    written = store.commit_portrait_changes(None, [
+        FactChange("ADD", None, "work", "Claude accounts", QUOTA, 0.8, [j[0], j[1]], T0, importance=6),
+        FactChange("ADD", None, "work", "token mix", MIX, 0.6, [j[2]], T0),
+        FactChange("ADD", None, "work", "accounts again", QUOTA + " Again.", 0.6, [j[2]], T0),
+        FactChange("ADD", None, "person", "Mira", SISTER, 0.9, [j[2]], T0),
+    ])
+    quota, mix, again, sister = [new for _ok, new in written]
+    store.mark_fact_reviewed(quota, T0 + 10)
+
+    def retire(fid, text):
+        return {"action": "retire", "fact_ids": [fid], "keep_id": None, "text": text, "importance": None,
+                "journal_ids": [], "reason": "fails the admission bar: a tool's readings"}
+
+    worker, _client = worker_with(store, {"dream": [{"decisions": [retire(quota, LASTING), retire(mix, ""),
+                                                                   retire(again, LASTING)]}], **RENDER})
+    result = Dreamer(worker, max_retire_fraction=1.0).run(now=T0 + 3600)
+    assert result.ok and result.applied == 3, (result.error, result.rejected)
+    current = {f.id: f for f in store.portrait_facts()}
+    assert set(current) & {quota, mix, again} == set() and sister in current
+    old = store.portrait_fact(quota)
+    assert old.valid_to is not None and old.text == QUOTA          # kept as history
+    [new] = [f for f in current.values() if f.text == LASTING]
+    assert old.superseded_by == new.id and sorted(new.source_ids) == sorted([j[0], j[1]])
+    assert new.importance == 6 and new.reviewed_at == T0 + 10
+    assert store.portrait_fact(mix).superseded_by is None and store.portrait_fact(again).superseded_by is None
+    lines = {tuple(d["fact_ids"]): d for d in store.changelog(pass_="dream")}
+    assert lines[(quota,)]["new_fact_ids"] == [new.id] and "lasting part" in lines[(quota,)]["text"]
 
 
 def test_a_dry_bar_pass_writes_nothing(store):

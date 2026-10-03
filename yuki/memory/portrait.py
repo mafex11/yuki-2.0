@@ -1005,6 +1005,11 @@ question). Origin "user" facts and corrections are the user's own words: change 
 evidence dated after it. Never record passwords, codes, account numbers or other secrets \
 that an excerpt may show.
 
+""" + ADMISSION_BAR + """
+Every ADD and UPDATE must meet the admission bar; a new version that fails it is refused. Never \
+write or refresh a fact from a tool's readings (newer quota, usage, cost or count figures from \
+RECENT JOURNAL): at most its one lasting line, when no fact says it yet.
+
 Questions: neutral and third person with no guess inside ("Whose student account was open \
 in the browser on <date>?", "Who is <name> to the user?"), about what the \
 evidence cannot settle and Yuki would otherwise get wrong: whose something is, who a person \
@@ -1184,6 +1189,18 @@ def bar_item_line(ref: str, *, kind: str, subject: str, text: str, pinned: bool,
     for j in list(evidence)[-3:]:
         lines.append(f"    J{j.id} {_local(j.at, '%Y-%m-%d')} {safe(j.app, 60)} [{_nature_label(j)}]: {safe(j.fact, 260)}")
     return lines
+
+
+def bar_other_facts(facts: Sequence[Any], skip: set[int | None],
+                    safe: Callable[[str | None, int], str]) -> list[str]:
+    """The portrait's other facts as the bar judge sees them, by summary, not to be judged: only for what a lasting
+    line would repeat (open loops and corrections are left out, and the ids in ``skip``)."""
+    others = [f"F{f.id} [{f.kind}] {safe(f.summary or f.text, 160)}" for f in facts
+              if f.id not in skip and f.kind not in (LOOP_KIND, CORRECTION_KIND)]
+    if not others:
+        return []
+    return ["", "OTHER FACTS (already in the portrait; not to judge here - only for what a lasting line would "
+                "repeat):", *others]
 
 
 def parse_bar_verdicts(tool_input: dict[str, Any], refs: Sequence[str]) -> tuple[list[BarVerdict], list[str]]:
@@ -1893,11 +1910,15 @@ class PortraitWorker:
         return parse_bar_verdicts(tool_input, refs)
 
     def _bar_gate(self, run_id: int | None, changes: list[FactChange], outcomes: Sequence[OpOutcome],
-                  journal: Sequence[JournalEntry], stats: PortraitRunStats) -> list[FactChange]:
+                  journal: Sequence[JournalEntry], stats: PortraitRunStats, *,
+                  facts: Sequence[PortraitFact] = ()) -> list[FactChange]:
         """The admission bar on a run's new versions, judged by a second model call (one forced call, no thinking):
         an ADD or UPDATE that fails is refused (its outcome ``rejected: fails the admission bar (<category>)``), or
         written as the one lasting line the judge gives instead. Only the model's own versions are judged: the
-        user's corrections and open loops (their own bar) pass through. Returns the changes to commit, in order.
+        user's corrections and open loops (their own bar) pass through. ``facts``, the portrait's current facts, are
+        listed by summary for the judge not to judge (as in the bar pass): a lasting line one of them already says is
+        refused rather than written twice; the facts this run updates or ends are left out of that list. Returns the
+        changes to commit, in order.
         Never raises: when the call fails the changes go through as they were (dreaming and the bar pass still
         judge the facts later), and the failure is logged."""
         applied = [o for o in outcomes if o.status == "applied"]
@@ -1920,6 +1941,7 @@ class PortraitWorker:
             evidence = sorted((by_id[i] for i in c.source_ids if i in by_id), key=lambda j: j.at)
             lines += bar_item_line(f"N{n}", kind=c.kind, subject=c.subject, text=c.text, pinned=False,
                                    evidence=evidence, safe=safe)
+        lines += bar_other_facts(facts, {c.fact_id for c in changes if c.op in ("UPDATE", "INVALIDATE")}, safe)
         try:
             verdicts, bad = self.judge_bar(lines, [f"N{n}" for n, _o, _c in judged], run_id=run_id, stats=stats,
                                            purpose="bar_gate", nonce=nonce, forced=True)
@@ -2111,7 +2133,7 @@ class PortraitWorker:
                 if items is None:
                     raise _ModelError("update_portrait input has no operations list")
                 changes, outcomes = self._validate(items, facts, chunk, now, part_episodes)
-                changes = self._bar_gate(run_id, changes, outcomes, chunk, stats)
+                changes = self._bar_gate(run_id, changes, outcomes, chunk, stats, facts=facts)
                 self._record_questions(run_id, _as_list(tool_input.get("questions")), facts, chunk, now)
                 written = iter(self.store.commit_portrait_changes(
                     run_id, changes, until_journal_id=max((j.id for j in chunk), default=None)
@@ -3173,6 +3195,9 @@ class PortraitWorker:
                                               None, [], [], str(op.get("reason") or ""), status=refused[n]))
                 else:
                     outcomes.append(next(kept_outcomes))
+        # the admission bar on the audit's own new versions too (report 50 review, A2-2): the refused ones above
+        # are not "applied", so the applied outcomes still pair 1:1 with the changes
+        changes = self._bar_gate(run_id, changes, outcomes, shown, stats, facts=facts)
         written = iter(self.store.commit_portrait_changes(run_id, changes))
         applied = 0
         for out in outcomes:

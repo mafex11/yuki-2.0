@@ -101,7 +101,11 @@ pattern or a lasting trait) and is marked idle {stale_days} days or more is stal
 something only because it is old if it is durable (who a person is, a lasting taste or trait).
 - retire, too: a fact that fails the admission bar below (one evening's state, a tool's readings or \
 metrics, an AI tool's analysis or dashboard text, tooling telemetry), whatever its age; say which way it fails \
-in reason.
+in reason. When such a fact also carries durable points about the person (their tools and preferences, how they \
+work, who they are) that no other fact says, give text: the fact rewritten to only those points (every durable \
+point it carries, one to three sentences, without the numbers, the evening's clock times or the tool's words), \
+and the fact goes on as that. text "" only when nothing lasting is left or another fact already says it; \
+nothing durable may be lost. A retirement for staleness has text "".
 - promote / demote: move the importance of a fact that clearly matters more (it keeps coming \
 back, it is a deadline, a commitment, someone close) or less (trivia, a one-off) than its rating.
 - rate: every fact that is unrated gets its importance (this is not a change to the portrait and \
@@ -139,7 +143,10 @@ DREAM_TOOL: dict[str, Any] = {
                                      "description": "n of each fact F<n>: merge 2+, the others exactly one."},
                         "keep_id": {"anyOf": [{"type": "integer"}, {"type": "null"}],
                                     "description": "merge: n of the fact that carries the merged text; else null."},
-                        "text": {"type": "string", "description": "merge: the merged fact; else \"\"."},
+                        "text": {"type": "string",
+                                 "description": "merge: the merged fact; retire of a fact that fails the admission "
+                                                "bar: its lasting part, or \"\" when nothing lasting is left; else "
+                                                "\"\"."},
                         "importance": {"anyOf": [{"type": "integer", "enum": list(range(1, 11))}, {"type": "null"}],
                                        "description": "merge, promote, demote, rate: the new importance; retire: null."},
                         "journal_ids": {"type": "array", "items": {"type": "integer"},
@@ -278,6 +285,7 @@ class Dreamer:
         ratings: list[dict[str, Any]] = []
         rejected: list[str] = []
         touched: set[int] = set()
+        lastings: set[str] = {""}
         retired = 0
         for item in items:
             if not isinstance(item, dict):
@@ -336,7 +344,13 @@ class Dreamer:
                     no(f"over tonight's cap of {retire_cap} retirements")
                     continue
                 retired += 1
-                changes.append({"action": "retire", "ids": ids, "cites": cites, "reason": reason})
+                # a fact that fails the admission bar but carries durable points goes on as those points alone
+                lasting = " ".join(str(item.get("text") or "").split())
+                if lasting.casefold() in lastings:   # one lasting line said twice: the first fact carries it
+                    lasting = ""
+                lastings.add(lasting.casefold())
+                changes.append({"action": "retire", "ids": ids, "cites": cites, "reason": reason,
+                                **({"lasting": lasting} if lasting else {})})
             elif action in ("promote", "demote"):
                 old = current[ids[0]].importance
                 if len(ids) != 1 or imp is None or (old is not None and (imp > old) != (action == "promote")) \
@@ -391,8 +405,8 @@ class Dreamer:
                 result.ok, result.error = False, stats.error
             result.cost_usd = stats.cost_usd
             if run_id is not None:
-                stats.ops_update = sum(c["action"] == "merge" for c in result.decisions)
-                stats.ops_invalidate = sum(c["action"] == "retire" for c in result.decisions)
+                stats.ops_update = sum(c["action"] == "merge" or bool(c.get("lasting")) for c in result.decisions)
+                stats.ops_invalidate = sum(c["action"] == "retire" and not c.get("lasting") for c in result.decisions)
                 stats.ops_rejected = len(result.rejected)
                 self.store.finish_portrait_run(run_id, stats)
             worker._log("portrait_dream", run_id=run_id, reason=reason, dry_run=dry_run, ok=result.ok,
@@ -430,6 +444,21 @@ class Dreamer:
                               "cites": sources,
                               "text": f"Merged {others} ({keep.kind}) into F{new_id}: \"{_short(ch['text'], 160)}\" - "
                                       f"{ch['reason']}; kept all {len(sources)} citations."})
+            elif ch["action"] == "retire" and ch.get("lasting"):
+                # failed the admission bar with durable points left: the fact goes on as its lasting part (an UPDATE:
+                # the old version kept as history, the new one keeps its citations, pin and review)
+                f = current[ids[0]]
+                written = self.store.commit_portrait_changes(run_id, [FactChange(
+                    "UPDATE", f.id, f.kind, f.subject, ch["lasting"], f.confidence, list(f.source_ids), now,
+                    f.origin, episode_ids=list(f.episode_ids), aspect=f.aspect, importance=f.importance)])
+                if not written or not written[0][0]:
+                    result.rejected.append(f"retire {ids}: target no longer current")
+                    continue
+                new_id = written[0][1]
+                diary.append({"pass": "dream", "action": "retire", "fact_ids": ids, "new_fact_ids": [new_id],
+                              "cites": ch["cites"],
+                              "text": f"Retired F{f.id} ({f.kind}) \"{_short(f.text)}\" - {ch['reason']}; kept the "
+                                      f"lasting part as F{new_id}: \"{_short(ch['lasting'], 160)}\"."})
             elif ch["action"] == "retire":
                 f = current[ids[0]]
                 written = self.store.commit_portrait_changes(
@@ -506,8 +535,13 @@ class BarPass:
     def eligible(self) -> list[PortraitFact]:
         return [f for f in self.store.portrait_facts() if f.kind not in UNTOUCHED_KINDS]
 
-    def run(self, *, now: float | None = None, dry_run: bool = False, reason: str = "") -> BarResult:
-        from yuki.memory.portrait import bar_item_line
+    def run(self, *, now: float | None = None, dry_run: bool = False, reason: str = "",
+            plan: Sequence[dict[str, Any]] | None = None) -> BarResult:
+        """Judge every eligible fact and retire the failing ones (``dry_run``: decide, write nothing). ``plan``: the
+        decisions of an earlier dry run (:attr:`BarResult.decisions`, as :func:`save_plan` keeps them) applied as
+        they are, with no new judgement: what was reviewed is what is written. Its facts must still be current
+        (a fact changed since is skipped, reported in ``rejected``); pinned facts and the cap hold as always."""
+        from yuki.memory.portrait import BAR_CATEGORIES, BarVerdict, bar_item_line, bar_other_facts
 
         now = time.time() if now is None else float(now)
         worker = self.worker
@@ -520,7 +554,16 @@ class BarPass:
             try:
                 cited = self.store.journal_entries({i for f in facts for i in f.source_ids})
                 verdicts = []
-                for chunk in self._chunks(facts, cited):
+                if plan is not None:
+                    for d in plan:
+                        if d.get("category") not in BAR_CATEGORIES or not isinstance(d.get("id"), int) \
+                                or d["id"] not in current:
+                            result.rejected.append(f"F{d.get('id')}: no longer current, or not a bar decision")
+                            continue
+                        verdicts.append(BarVerdict(f"F{int(d['id'])}", d["category"], str(d.get("reason") or ""),
+                                                   d.get("lasting") or None, d.get("shown") or None,
+                                                   d.get("summary") or None))
+                for chunk in ([] if plan is not None else self._chunks(facts, cited)):
                     nonce = str(uuid.uuid4()).upper()
 
                     def safe(v: Any, cap: int) -> str:
@@ -532,12 +575,7 @@ class BarPass:
                         kind = f"{f.kind}: {f.aspect}" if f.aspect else f.kind
                         lines += bar_item_line(f"F{f.id}", kind=kind, subject=f.subject, text=f.text,
                                                pinned=f.pinned, evidence=evidence, safe=safe)
-                    inside = {f.id for f in chunk}
-                    others = [f"F{f.id} [{f.kind}] {safe(f.summary or _short(f.text, 120), 160)}"
-                              for f in facts if f.id not in inside]
-                    if others:
-                        lines += ["", "OTHER FACTS (already in the portrait; not to judge here - only for what a "
-                                      "lasting line would repeat):", *others]
+                    lines += bar_other_facts(facts, {f.id for f in chunk}, safe)
                     got, bad = worker.judge_bar(lines, [f"F{f.id}" for f in chunk], run_id=run_id, stats=stats,
                                                 purpose="bar_pass", nonce=nonce, effort="low",
                                                 max_tokens=BAR_MAX_TOKENS)
@@ -605,7 +643,8 @@ class BarPass:
                             "lasting": lasting, "shown": v.shown if lasting else None,
                             "summary": v.summary if lasting else None})
             result.categories[v.category] = result.categories.get(v.category, 0) + 1
-        result.decisions = [{k: c[k] for k in ("id", "kind", "category", "reason", "lasting")} for c in changes]
+        result.decisions = [{k: c[k] for k in ("id", "kind", "category", "reason", "lasting", "shown", "summary")}
+                            for c in changes]
         return changes
 
     def _apply(self, run_id: int | None, changes: Sequence[dict[str, Any]], current: dict[int, PortraitFact],
@@ -635,31 +674,76 @@ class BarPass:
         if diary:
             self.store.add_diary(run_id, diary, now=now)
 
-    def undo(self, run_id: int, *, now: float | None = None) -> dict[str, int]:
-        """Take one bar pass back: every fact it retired is current again and the lasting lines it wrote end. Logged,
-        with one diary line (pass ``bar``, action ``undo``)."""
+    def undo(self, run_id: int, *, now: float | None = None) -> dict[str, Any]:
+        """Take one bar pass back: every fact it retired is current again and the lasting lines it wrote end. A
+        retirement whose lasting line changed since (a newer version, merged, ended) is left as it is and reported
+        in ``diverged`` (the retired fact ids). Logged, with one diary line (pass ``bar``, action ``undo``)."""
         now = time.time() if now is None else float(now)
         lines = [d for d in self.store.changelog(pass_=BAR_PASS, limit=100_000)
                  if d["run_id"] == int(run_id) and d["action"] == "retire"]
         restored = ended = 0
+        diverged: list[int] = []
         with self.worker._run_lock:
             for d in lines:
-                for new_id in d["new_fact_ids"]:
-                    f = self.store.portrait_fact(new_id)
-                    if f is not None and f.valid_to is None:
-                        ok = self.store.commit_portrait_changes(
-                            None, [FactChange("INVALIDATE", f.id, f.kind, f.subject, "", None, [], now)])
-                        ended += bool(ok and ok[0][0])
+                news = [self.store.portrait_fact(i) for i in d["new_fact_ids"]]
+                if any(f is None or f.valid_to is not None for f in news):
+                    # its lasting line was changed since (a newer version, merged, or retired by someone): ending
+                    # the newer one could take other facts' words with it, and restoring the old fact beside it
+                    # would say the same thing twice - left as it is, and reported
+                    diverged += list(d["fact_ids"])
+                    continue
+                for f in news:
+                    ok = self.store.commit_portrait_changes(
+                        None, [FactChange("INVALIDATE", f.id, f.kind, f.subject, "", None, [], now)])
+                    ended += bool(ok and ok[0][0])
                 for old in d["fact_ids"]:
                     restored += bool(self.store.restore_fact(old))
             if lines:
+                left = (f"; {len(diverged)} left as they are, their lasting lines changed since"
+                        if diverged else "")
                 self.store.add_diary(None, [{"pass": BAR_PASS, "action": "undo",
-                                             "fact_ids": [i for d in lines for i in d["fact_ids"]],
+                                             "fact_ids": [i for d in lines for i in d["fact_ids"] if i not in diverged],
                                              "text": f"Took back the admission-bar pass of run {int(run_id)}: "
-                                                     f"{restored} facts restored, {ended} lasting lines ended."}],
+                                                     f"{restored} facts restored, {ended} lasting lines ended{left}."}],
                                      now=now)
-        self.worker._log("portrait_bar_undo", run_id=int(run_id), restored=restored, ended=ended)
-        return {"restored": restored, "ended": ended}
+        self.worker._log("portrait_bar_undo", run_id=int(run_id), restored=restored, ended=ended, diverged=diverged)
+        return {"restored": restored, "ended": ended, "diverged": diverged}
+
+
+#: A saved bar plan's marker (``--bar --dry-run`` writes one, ``--bar --apply`` reads it).
+BAR_PLAN_KIND = "yuki-bar-plan"
+
+
+def save_plan(store: Any, decisions: Sequence[dict[str, Any]], path: Any, *, now: float | None = None) -> Any:
+    """Keep a dry run's decisions for :meth:`BarPass.run` (``plan``): one JSON file, the decisions encrypted with
+    the memory's key (they quote facts). Returns the path."""
+    from pathlib import Path
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"kind": BAR_PLAN_KIND, "made_at": time.time() if now is None else float(now),
+                                "count": len(decisions),
+                                "decisions_ciphertext": store.cipher.encrypt(json.dumps(list(decisions),
+                                                                                        ensure_ascii=False))}),
+                    encoding="utf-8")
+    return path
+
+
+def load_plan(store: Any, path: Any) -> list[dict[str, Any]]:
+    """The decisions :func:`save_plan` kept (raises when the file is not a bar plan or not of this memory's key)."""
+    from pathlib import Path
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("kind") != BAR_PLAN_KIND:
+        raise ValueError(f"{path} is not a saved bar plan")
+    return [d for d in json.loads(store.cipher.decrypt(data["decisions_ciphertext"])) if isinstance(d, dict)]
+
+
+def _default_plan_path() -> Any:
+    import tempfile
+    from pathlib import Path
+
+    return Path(tempfile.gettempdir()) / f"yuki-bar-plan-{datetime.now():%Y%m%d-%H%M%S}.json"
 
 
 def _log_dir(args: Any) -> Any:
@@ -678,6 +762,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="decide and validate, write nothing")
     parser.add_argument("--bar", action="store_true",
                         help="the admission-bar pass instead: retire the facts that fail the portrait's bar")
+    parser.add_argument("--save", default=None, metavar="FILE",
+                        help="--bar --dry-run: where to keep its decisions (default: a file in the temp folder)")
+    parser.add_argument("--apply", default=None, metavar="FILE",
+                        help="--bar: write exactly the decisions a dry run kept in FILE, with no new judgement")
     parser.add_argument("--undo-bar", type=int, default=None, metavar="RUN_ID",
                         help="take back the admission-bar pass of this portrait run")
     args = parser.parse_args(argv)
@@ -695,7 +783,14 @@ def main(argv: list[str] | None = None) -> int:
             worker.render()
             return 0
         if args.bar:
-            bar = BarPass(worker).run(reason="by hand", dry_run=args.dry_run)
+            if args.apply and args.dry_run:
+                parser.error("--apply writes the saved plan; leave out --dry-run")
+            plan = load_plan(store, args.apply) if args.apply else None
+            bar = BarPass(worker).run(reason="by hand" if plan is None else "saved plan", dry_run=args.dry_run,
+                                      plan=plan)
+            saved = None
+            if args.dry_run and bar.ok:
+                saved = str(save_plan(store, bar.decisions, args.save or _default_plan_path()))
             if not args.dry_run and bar.lasting:
                 worker.embedder = get_embedder()
                 worker.embed_facts()
@@ -703,7 +798,8 @@ def main(argv: list[str] | None = None) -> int:
                               "retired": bar.retired, "lasting": bar.lasting, "categories": bar.categories,
                               "would_retire": len(bar.decisions), "pinned_failing": bar.pinned,
                               "rejected": bar.rejected, "cost_usd": round(bar.cost_usd, 4), "error": bar.error,
-                              "decisions": bar.decisions if args.dry_run else None}, ensure_ascii=False, indent=1))
+                              "plan_saved": saved, "decisions": bar.decisions if args.dry_run else None},
+                             ensure_ascii=False, indent=1))
             return 0 if bar.ok else 1
         worker.embed_facts()
         result = Dreamer(worker).run(reason="by hand", dry_run=args.dry_run)
