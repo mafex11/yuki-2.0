@@ -1659,7 +1659,8 @@ class ConversationWorker:
 
     def sort_owners(self, *, dry_run: bool = False) -> list[dict[str, Any]]:
         """Open commitments written before owners existed: whose each is (Yuki's or the user's own to-do), and
-        whether its words were said to Yuki at all. A plan the user said on a call is theirs by construction;
+        whether its words were said to Yuki at all. A plan the user said on a call is theirs by construction (the
+        journal keeps a call commitment only when its quote is in one of the user's own lines, report 61);
         the rest get one small Haiku call. One that was not said to Yuki (dictation into another program, talk
         to someone else) ends as a wrong capture. Logged; never raises. Returns what it decided."""
         try:

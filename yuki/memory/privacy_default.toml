@@ -451,7 +451,7 @@ defer_vram_min_free_running_mb = 300
 spool_max_age_days = 7
 spool_max_mb = 500
 # How the deferred worker turns speech into text (measured 2026-09-25 on synthetic
-# speech and noise; docs/MEMORY.md "Calls: just my side").  Each chunk's language
+# speech and noise; docs/MEMORY.md "Calls: both sides").  Each chunk's language
 # is detected first and the chunk decoded once, beam stt_beam_size, never
 # conditioned on the previous chunk's text.  Whisper retries a decode hotter
 # (stt_temperatures) when its text compresses too well (a loop) or its average

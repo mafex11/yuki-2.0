@@ -209,7 +209,7 @@ class CallConfig:
     chunk_min_s: float = 6.0
     chunk_max_s: float = 25.0
     pause_s: float = 0.7
-    # -- speech to text in the deferred worker (the stt_* keys; docs/MEMORY.md "Calls: just my side") --
+    # -- speech to text in the deferred worker (the stt_* keys; docs/MEMORY.md "Calls: both sides") --
     stt_beam_size: int = 5
     #: Whisper's temperature fallback: a decode that fails the thresholds below is retried hotter.
     stt_temperatures: tuple[float, ...] = (0.0, 0.4, 0.8)

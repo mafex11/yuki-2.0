@@ -9,11 +9,13 @@ message (sender, "the user" for the user's own, its own time, NEW or HISTORY -
 see :meth:`yuki.memory.store.Store.add_conversation`), one per terminal command
 (``terminal`` captures written by :mod:`yuki.memory.warp`: command line, folder,
 branch, exit code, start time - never output; the prompt asks for sequences to
-be summarised, never listed, and never a secret), one per utterance of the
-user in a call (``my_call_side`` captures written by :mod:`yuki.memory.calls`:
-only the user's own microphone; its batch also returns the user's own
-commitments, kept as conversation-memory commitments of origin ``call`` when
-their quote is the user's words) and one per page capture.
+be summarised, never listed, and never a secret), one per line of a call
+(``my_call_side`` captures written by :mod:`yuki.memory.calls`, read through
+:meth:`~yuki.memory.store.Store.call_lines`: the user's microphone and, since
+3 Oct 2026, the call app's own sound and a game's voice chat, each line
+labelled with who spoke; its batch also returns the user's own commitments,
+kept as conversation-memory commitments of origin ``call`` only when their
+quote is the user's words in one of the user's own lines) and one per page capture.
 Each fact cites its source and is dated by it (a message's own time, never the
 moment an old message was re-read), embedded locally
 (:mod:`yuki.memory.embed`) and written together with the batch's accounting and
@@ -64,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 
 from yuki.config import Settings
@@ -108,6 +110,9 @@ EMPTY_REJOURNAL = "re-journal found no facts where the earlier run had some; the
 #: Cap for one capture's text inside a batch (MaxMi's maxNewContentChars) and
 #: the default batch size.
 MAX_BATCH_CHARS = 12_000
+#: A call part is cut at the longest silence among its last this-many lines (JournalWorker._call_parts), so a question
+#: and its answer stay in one part.
+CALL_CUT_LOOKBACK = 12
 PREVIOUS_FACTS_CHARS = 2_000
 #: How much of a page's first capture is shown as TOP OF THIS PAGE with its later deltas.
 PAGE_TOP_CHARS = 600
@@ -170,12 +175,13 @@ they ran: the command line, the folder it ran in, the git branch, the exit code 
 succeeded, anything else = it failed; "not recorded" = unknown) and when it started. A \
 command marked "run by Warp's AI agent" was not typed by the user. The output of \
 commands is never given.
-- WHAT THE USER SAID in a call (Zoom, Discord, Google Meet ...), one source per utterance, \
-dated by when it was said. Only the user's own microphone was transcribed, on their PC and \
-with their consent; the other people in the call were never recorded and nothing they said \
-is given. The words are an automatic transcript: expect misheard words, missing punctuation, \
-Hindi-English mixing, and Hindi, Kannada, Tamil or Telugu in their own script or \
-transliterated into another one.
+- CALL LINES: what was said on a call (Zoom, Discord, Google Meet ...) or in a game's voice \
+chat, one source per line, dated by when it was said, each labelled with who spoke: THE USER \
+SAID (the user's own microphone), OTHERS SAID (the call app's own sound: the other people on \
+the call) or GAME VOICE SAID (a game's own sound: teammates and the game's spoken lines). It was \
+recorded and transcribed on the user's PC with their consent. The words are an automatic \
+transcript: expect misheard words, missing punctuation, Hindi-English mixing, and Hindi, \
+Kannada, Tamil or Telugu in their own script or transliterated into another one.
 
 Sources marked BY YUKI were put on screen by Yuki itself, the assistant, while it carried out \
 a request the user gave it (the request is quoted). Record them as Yuki's doing at the user's \
@@ -195,15 +201,14 @@ that appeared ("A Gmail notification at 14:05 showed a new mail from Stripe abou
 never as something the user did or saw. Either can still hold a fact worth keeping (a message someone \
 sent, a date, a result); only the user's attention to it is unknown.
 
-For WHAT THE USER SAID, record what the user said, decided, planned, promised or asked \
+For CALL LINES, record what the user said, decided, planned, promised or asked \
 for, and what it reveals about their work, people and plans - and about them as a person: how \
 they talk, what they care about, the stories they tell, what they joke about - naming the call's \
 app: "In a Zoom call, the user said they would send Varun the updated deck on 2026-09-25." \
-Summarise; do not transcribe. Never infer or record what anyone else in the call said, asked, decided or \
-felt, who they were, or what the call was about beyond the user's own words: an utterance \
-that answers someone is recorded only as what the user said. An utterance too garbled to \
-understand is skipped, never guessed at. Write the facts in English, keeping names in their \
-original form. Decisions and plans the user stated are importance 6-8.
+From the other people's lines record only what WHO SPOKE ON A CALL (given with every call) allows, \
+always saying who said it. Summarise; do not transcribe. A line too garbled to understand is \
+skipped, never guessed at. Write the facts in English, keeping names in their original form. \
+Decisions and plans the user stated are importance 6-8.
 
 For COMMANDS, summarise; do not transcribe. Write one fact per coherent piece of work: a \
 sequence of related commands becomes one fact that says what the user was doing, in which \
@@ -307,14 +312,15 @@ def user_identity(names: Sequence[str]) -> str:
     return f"The user is {clean[0]}, who also appears as {', '.join(clean[1:])}, {also}."
 
 
-#: Appended to the system prompt of a call's own side only (``record_call_side`` batches).
+#: Appended to the system prompt of a call batch only (``record_call_side``; the call digest reads it too).
 CALL_TRANSCRIPT_GUIDANCE = """\
-THE CALL TRANSCRIPT IS NOISY. It comes from a speech recogniser (Whisper) run on the user's \
-microphone alone, and it makes predictable mistakes:
-- On breathing, keyboard and mouse clicks, game sounds or near-silence it invents short phrases, \
-often the same few words over several utterances in a row, or a stock phrase ("Thank you for \
-watching"). A short phrase that keeps coming back, or a fragment that fits nothing around it, is \
-noise: skip it.
+THE CALL TRANSCRIPT IS NOISY. It comes from a speech recogniser (Whisper) run on each side of the \
+call on its own - the user's microphone, the call app's sound, a game's sound - and it makes \
+predictable mistakes:
+- On breathing, keyboard and mouse clicks, game sounds (gunfire, footsteps, music) or near-silence \
+it invents short phrases, often the same few words over several utterances in a row, or a stock \
+phrase ("Thank you for watching"). A short phrase that keeps coming back, or a fragment that fits \
+nothing around it, is noise: skip it.
 - It mishears words: names, English words inside Hindi sentences (often written phonetically in \
 Devanagari - "क्लॉड" may be "Claude"), and above all it swaps a word for a commoner one that \
 sounds alike ("praises" heard as "prices", "Claude" as "cloud", "deck" as "debt"). Read each \
@@ -334,8 +340,8 @@ keeping, and a fact whose sense you follow but whose words you are unsure of is 
 uncertain. Take a commitment only from words that are clear; never from an UNCLEAR utterance or \
 a guess at what was meant.
 
-IT IS TALK AMONG FRIENDS, heard from one side - and it shows who the user is better than any \
-screen does. People joke, exaggerate, tease, boast, play along, talk hypothetically and give \
+IT IS TALK AMONG FRIENDS - and it shows who the user is better than any screen does. People \
+joke, exaggerate, tease, boast, play along, talk hypothetically and give \
 advice. Keep all of it, each for what it is: a joke or a boast ("I need a rich spouse so I never \
 have to work", "I have unlimited accounts") is humor - record the bit as a bit, so Yuki can joke \
 back about it one day, never as a fact about their life; when you cannot tell whether they meant \
@@ -346,14 +352,80 @@ necessarily their own setup, unless they say so. Numbers, dates and durations (s
 they have known someone, amounts) must be in the words of the utterance you cite: never work one \
 out, and never join words from different utterances into a number or a relationship the user did \
 not state in one go ("my newest friends since I moved to Eastvale" says nothing about how many \
-years); a number heard once that nothing around it confirms is uncertain. A short answer on its \
-own ("2 years I guess", "yeah, Friday") answers a question you cannot hear: what it refers to is \
-unknown, so never attach it to the user's next sentence; at most it is uncertain. The other side is not \
-in the transcript: never assume what they said or who they are beyond what the user's own words \
-make plain."""
+years); a number heard once that nothing around it confirms is uncertain. A short answer \
+("2 years I guess", "yeah, Friday") answers something: read the other people's lines just before \
+it - "how long have you known them?" then "2 years I guess" says what the two years are. When no \
+line before it holds the question (their sound was not recorded, or was too garbled), what it \
+refers to is unknown: never attach it to the user's next sentence; at most it is uncertain. Never \
+assume what anyone said beyond their own lines."""
 
 
-#: Appended for a call's own side after the transcript guidance: the context pack around the call
+#: Appended to a call batch after the transcript guidance (and read by the call digest): who spoke on which track,
+#: and whose words a plan or a promise is (owner's decision 3 Oct 2026: both sides are recorded, a game's voice chat
+#: is its own track). Model judgement with worked examples (invented names), never a word list.
+CALL_SPEAKERS_GUIDANCE = """\
+WHO SPOKE ON A CALL. Every line is labelled with who spoke:
+- THE USER: the user's own microphone. Only these lines are the user's words.
+- OTHERS (on <app>): the call app's own sound - everyone else on the call, mixed into one track. \
+It may be one person or several; the recogniser does not tell voices apart, and a friend's stream \
+or a video played into the call comes through it too.
+- GAME VOICE (on <game>): a game's own voice chat - teammates, usually strangers matched for that \
+game, and the game's own spoken lines (agents, the announcer: "Spike planted", "Enemy spotted", \
+"Round won").
+A user line may say "mic open to: ...": the apps taking the user's microphone at that moment, i.e. \
+who could hear it. An app can keep the microphone open while the user is muted in it, so it is a \
+hint, not proof; "mic open to: no app" means no app took the microphone, so nobody on the call or \
+in the game heard that line. Calls before 3 Oct 2026 hold only THE USER's lines.
+
+ATTRIBUTION IS ABSOLUTE. A plan, promise, opinion, question or fact is the user's only when a THE \
+USER line says it. What OTHERS or GAME VOICE lines say is theirs: never write it as the user's, \
+never as the user's commitment, never as a fact about the user's life unless the user's own lines \
+confirm it. Worked examples:
+- OTHERS: "I'll send you the photos tomorrow" -> someone on the call said they would send the user \
+the photos the next day. Their plan, never the user's to-do.
+- OTHERS: "can you send me the link to the hostel?", then THE USER: "yeah sure, after dinner" -> the \
+user agreed to send the hostel link after dinner: the user's commitment, quoted from the user's own \
+line ("yeah sure, after dinner"), its text saying what was asked ("Send the hostel link that someone \
+on the call asked for, after dinner").
+- OTHERS: "who's booking the cab?", then THE USER: "I'll do it" -> the user said they would book the cab.
+- OTHERS: "we're meeting at six at the station" and nothing from the user about it -> what the user \
+may need later (where and when they meet), never something the user said or agreed to.
+- OTHERS: "Kabir is picking you up at 7", then THE USER: "perfect" -> information the user needs (Kabir \
+will pick the user up at 7): a fact, not a to-do. Acknowledging someone else's plan ("perfect", "okay", \
+"got it") is never a promise of the user's; only words where the user takes something on are.
+
+WHO THE OTHERS ARE. Everyone else on one app is one track, so a line does not say which person \
+spoke. Name a speaker only when the evidence settles it: the context's call screen shows exactly one \
+other person on the call at that time, the line names its speaker ("it's Kabir, can you hear me?"), \
+or the user answers that person by name right then (OTHERS: "are you coming Saturday?", THE USER: \
+"yes Tara, I'll be there"). Otherwise write "someone on the call" or "a friend on the call" - in a \
+game, "a teammate". Never pick a name because the user mentions it elsewhere in the call.
+
+GAMES. While the user plays, their lines go two ways. They are said to the teammates when timing \
+and content fit the game: a reply right after a GAME VOICE line, a callout ("one B long", "rotate", \
+"I'm low"), a cheer or a complaint about a round, with the microphone open to the game. They are \
+said to the friends on the call when they fit that talk: an answer to an OTHERS line, the subject \
+the call was on. Read timing, content and "mic open to" together - it may name both apps when both \
+keep the microphone open. Worked example: GAME VOICE: "two on A, rotate!", THE USER: "rotating, \
+watch heaven" -> a callout to teammates, game talk; OTHERS: "did you finish the slides?", THE USER: \
+"yeah, sending them tonight" -> said to the friends: the user will send the slides tonight. Never \
+read a reply to teammates as talk with the friends, or the reverse. Teammates are strangers in a \
+match: never record facts about them as people the user knows, never keep their names, never ask \
+about them, and never take the game's own voice lines for anything anyone said. Game talk is \
+context, kept light: at most one fact for a match (which game, how it went), never its callouts one \
+by one or quoted, and anything the user said that matters beyond the game.
+
+WHAT IS WORTH KEEPING FROM THE OTHERS: what they asked the user, plans that involve the user (a \
+time, a place, who does what), and information the user will need later (a date, a link, an \
+address, a decision made together). Not their own private matters - their health, relationships, \
+money, family - or gossip, as facts about them, unless it involves the user; family matters stay \
+out. Worked example: OTHERS: "my sister is going through a really bad breakup", THE USER: "oh no, \
+that's rough" -> no fact about the sister or the breakup, not even inside a fact about the user's \
+reply. A fact from their line says who said it, as the evidence allows ("Someone on the Discord call \
+said the trek starts at 6 am on 2026-10-11."; "Kabir said ..." only when WHO THE OTHERS ARE names him)."""
+
+
+#: Appended to a call batch after the speakers guidance: the context pack around the call
 #: (:mod:`yuki.memory.callcontext`, 2026-10-01 "use what's around the call").
 CALL_CONTEXT_GUIDANCE = """\
 CONTEXT AROUND THE CALL. After the sources may come a CONTEXT AROUND THE CALL block: text Yuki read on \
@@ -361,28 +433,31 @@ the user's screen during and just around the call - never audio - with local tim
 windows (voice channel, participants or tiles, the call's chat, captions), the other windows the user \
 had open or shared, links, chats just before and after, the threads of work touched then, and how \
 memory spells names. It is NEVER a fact source (those screens are journaled from their own captures): \
-every fact must be carried by what the user said in the utterance it cites; never record what was on \
-screen as such - a page or product viewed, a notification or mail that arrived, a setting, a number an \
-app showed. Use the context only to understand what the user said. Where it makes plain who or what the user's \
-words refer to at that time, write the fact with it - "In a Discord call with Rohan, the user said they \
+every fact must be carried by the call line it cites; never record what was on screen as such - a page \
+or product viewed, a notification or mail that arrived, a setting, a number an app showed. Use the \
+context only to understand what was said and who was there. Where it makes plain who or what a line \
+refers to at that time, write the fact with it - "In a Discord call with Rohan, the user said they \
 would send him the relay PR that was open on screen" instead of "said they would send him that" - and \
 name the call's people and place (server, channel, meeting) as the screen shows them, spelled as \
-memory spells them. When it does not settle who or what, keep the user's words as said: never guess. \
-The user's words stay the user's; what anyone else said aloud is never known, and what someone wrote \
-on screen (the call's chat, captions) may appear only as on-screen text ("Rohan had written 'push it' \
-in the call chat"). A commitment's text may name the person or thing resolved this way; its quote \
-stays the user's exact words."""
+memory spells them. It also tells you how many others were on the call: with exactly one other person \
+shown there, the OTHERS lines are that person's. When it does not settle who or what, keep the words \
+as said: never guess. Each line's words stay its speaker's, and what someone wrote on screen (the \
+call's chat, captions) may appear only as on-screen text ("Rohan had written 'push it' in the call \
+chat"). A commitment's text may name the person or thing resolved this way; its quote stays the \
+user's exact words."""
 
 
-#: A call's own side asks only about names the user said (:data:`RECORD_CALL_SIDE_TOOL` ``questions``).
+#: A call batch asks only about names the user said (:data:`RECORD_CALL_SIDE_TOOL` ``questions``).
 CALL_QUESTION_GUIDANCE = """\
-ASK ABOUT NAMES, NEVER GUESS. Never state a relationship, a meaning or an owner the user's words \
-do not say. When the user names someone or something in the call that WHAT MEMORY ALREADY KNOWS \
+ASK ABOUT NAMES, NEVER GUESS. Never state a relationship, a meaning or an owner the words do not \
+say. When the user names someone or something in a THE USER line that WHAT MEMORY ALREADY KNOWS \
 does not cover - a person they are with, talk to or talk about, a name their plans or work use - \
 and knowing it would change how Yuki understands them, put it in questions ("Who is <name> to the \
-user?"), citing the utterance. Only a name clear enough that you would write it in a fact; never \
-about what anyone else said, who the others in the call are beyond the name the user used, or what \
-the call was about. At most two; most calls need none."""
+user?"), citing the user's own line it rests on. Only a name clear enough that you would write it in \
+a fact, and only one the user's own words take part in (they name the person, or agree to that \
+person's plan: "yeah I'll be there" to "are you coming to Tara's birthday?"); never a game teammate, \
+never a name someone else only mentioned in passing, never who the others in the call are beyond \
+that, or what the call was about. At most two; most calls need none."""
 
 
 #: Text the user typed into, or read from, another AI tool (migration 17, ``journal.tainted``): the model
@@ -490,9 +565,10 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
     """:data:`SYSTEM_PROMPT` with the user's identity and the shared guidance filled in.
 
     ``questions``: include the ask-don't-guess guidance (the ``record_facts`` batches).
-    ``call_side``: add :data:`CALL_TRANSCRIPT_GUIDANCE` (how to read a noisy transcript); a
-    call's own side asks only about names the user said (:data:`CALL_QUESTION_GUIDANCE`):
-    nothing is inferred about the others in it.
+    ``call_side``: add :data:`CALL_TRANSCRIPT_GUIDANCE` (how to read a noisy transcript),
+    :data:`CALL_SPEAKERS_GUIDANCE` (who spoke, whose words a plan is, games) and
+    :data:`CALL_CONTEXT_GUIDANCE`; a call batch asks only about names the user said
+    (:data:`CALL_QUESTION_GUIDANCE`).
     """
     guidance = (CALL_QUESTION_GUIDANCE if call_side else QUESTION_GUIDANCE if questions else
                 "Never state a relationship, a meaning or an owner the sources do not say in words.")
@@ -505,7 +581,8 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
     text = f"{text}\n\n{_work.WORK_GUIDANCE}"
     if requests and not call_side:
         text = f"{text}\n\n{REQUEST_GUIDANCE}"
-    return f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}\n\n{CALL_CONTEXT_GUIDANCE}" if call_side else text
+    return (f"{text}\n\n{CALL_TRANSCRIPT_GUIDANCE}\n\n{CALL_SPEAKERS_GUIDANCE}\n\n{CALL_CONTEXT_GUIDANCE}"
+            if call_side else text)
 
 
 #: ``record_facts`` ``user_said``: whose words a fact gives as the user's (WHOSE WORDS). Words to a person or
@@ -615,12 +692,14 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
 }
 RECORD_FACTS_TOOL["input_schema"]["required"] = ["facts", "questions", "work"]
 
-#: The tool for a call's user side: journal facts plus the user's own commitments (to-dos).
+#: The tool for a call batch: journal facts plus the user's own commitments (to-dos). The name is from the time only
+#: the user's microphone was recorded; it stays (stored logs and tests carry it).
 RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
     "name": "record_call_side",
     "description": (
-        "Record the journal facts and the user's own commitments from what the user said in the call. "
-        "Call exactly once; pass empty lists when nothing is worth remembering."
+        "Record the journal facts from the call's lines (see WHO SPOKE ON A CALL) and the user's own commitments, "
+        "which come only from THE USER's lines. Call exactly once; pass empty lists when nothing is worth "
+        "remembering."
     ),
     "strict": True,
     "input_schema": {
@@ -633,11 +712,29 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "nature", "importance", "source"],
+                    "required": ["text", "nature", "importance", "source", "user_said", "involves_user"],
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
                            ["properties"].items() if k not in ("content_date", "milestone", "other_ai",
                                                                "user_said")},
+                        "user_said": {
+                            "type": "boolean",
+                            "description": (
+                                "True when the fact gives the user's own words or the user themself - what they "
+                                "said, agreed to, plan, think, how they are, a story or a joke of theirs: it must "
+                                "cite a THE USER line. False for what someone on the call or in the game said."
+                            ),
+                        },
+                        "involves_user": {
+                            "type": "boolean",
+                            "description": (
+                                "For a fact from an OTHERS line: true only when it involves the user - something "
+                                "asked of them, a plan they take part in, something they will need later (a date, a "
+                                "link, a place, a decision made together); false for the speaker's own private "
+                                "matters or gossip (see WHAT IS WORTH KEEPING FROM THE OTHERS). True for a fact from "
+                                "a THE USER line."
+                            ),
+                        },
                         # dated by themselves; the user's own voice is never another AI tool's text
                         "nature": {
                             "type": "string",
@@ -656,12 +753,18 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "type": "array",
                 "description": (
                     "Things the user said THEY will do later (\"I'll send the deck tomorrow\", \"let me check "
-                    "and get back to you by Friday\"), and plans they made with someone for a day or a date - a call, "
+                    "and get back to you by Friday\"), what they agreed to do when someone on the call asked (OTHERS: "
+                    "\"can you send me the link?\", THE USER: \"yeah sure\" -> send that person the link; the text "
+                    "says what was asked), and plans they made with someone for a day or a date - a call, "
                     "a meeting, a start - which they take part in (\"come on the call Sunday, we'll do the setup\" -> "
                     "a setup call with that person on that Sunday; \"we start on the 12th\" -> starting it with them "
-                    "on the 12th): each with its due date resolved against the CALENDAR, the call's own dates. Not "
-                    "what anyone else will do alone, not what was already done, and never a joke, a tease, a boast or "
-                    "anything said in jest (its nature below)."
+                    "on the 12th): each with its due date resolved against the CALENDAR, the call's own dates. One "
+                    "commitment per thing the user takes on: details someone else gave (a pickup time, a place) go "
+                    "into its text, never into a second commitment. Only "
+                    "from THE USER's lines. Never what someone else said they will do (OTHERS: \"I'll send it "
+                    "tomorrow\" is their plan), never a teammate's callout, not what anyone else will do alone, not "
+                    "what was already done, and never a joke, a tease, a boast or anything said in jest (its nature "
+                    "below)."
                 ),
                 "items": {
                     "type": "object",
@@ -687,13 +790,15 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                         },
                         "quote": {
                             "type": "string",
-                            "description": "The user's exact words for it, copied character for character from the source.",
+                            "description": "The user's exact words for it, copied character for character from that "
+                                           "THE USER line (for an agreed request, the words agreeing to it).",
                         },
                         "due": {
                             "type": "string",
                             "description": "\"YYYY-MM-DD HH:MM\" or \"YYYY-MM-DD\" when a time or day was said; else \"\".",
                         },
-                        "source": {"type": "integer", "description": "Number of the utterance the quote is from."},
+                        "source": {"type": "integer", "description": "Number of the THE USER line the quote is from "
+                                                                     "(never an OTHERS or GAME VOICE line)."},
                         "subject": {"type": "string", "description": "Short label (\"deck for Varun\")."},
                         "title": {"type": "string", "description": _TITLE_FIELD},
                     },
@@ -701,7 +806,8 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
             },
             "questions": {
                 "type": "array",
-                "description": "Names the user said that memory cannot place (see ASK ABOUT NAMES); usually empty.",
+                "description": "Names the user said in their own lines that memory cannot place (see ASK ABOUT "
+                               "NAMES); usually empty.",
                 "items": question_item_schema("source", SCREEN_QUESTION_KINDS),
             },
             "work": _work.work_property(call_side=True),
@@ -766,7 +872,8 @@ MESSAGE_KINDS = ("conversation", "email")
 TERMINAL_KIND = "terminal"
 #: Capture kind of lists (inbox views, folders): one source per row.
 LIST_KIND = "list"
-#: Capture kind of the user's own side of a call (yuki.memory.calls, Store.add_call_side): one source per utterance.
+#: Capture kind of a call's transcript (yuki.memory.calls, Store.add_call_side): one source per line, every side.
+#: The name is from the time only the user's microphone was recorded (store.CALL_SIDE_KIND).
 CALL_SIDE_KIND = "my_call_side"
 
 #: The date the extractor put in front of a list row that shows one
@@ -819,9 +926,41 @@ class Source:
     item: str | None = None
     #: The row showed its own date (``at`` is that date, not the capture time).
     item_dated: bool = False
-    #: One utterance of the user in a call (``Store.add_call_side``: at, end, text, lang) and the call's app.
+    #: One line of a call (:meth:`Store.call_lines`: at, end, text, lang, ``who`` user | others, ``app``,
+    #: ``track_kind`` call | game, ``heard_by`` on the user's lines) and the call's app (the capture's).
     utterance: dict[str, Any] | None = None
     call_app: str | None = None
+
+    @property
+    def users_line(self) -> bool:
+        """A call line from the user's own microphone (:func:`users_line`)."""
+        return users_line(self)
+
+
+def users_line(src: Any) -> bool:
+    """Whether a source is a call line from the user's own microphone (a line stored before 3 Oct 2026 has no
+    ``who``: the user's). False for everything that is not a call line. Metadata only, no words read."""
+    utterance = getattr(src, "utterance", None)
+    return isinstance(utterance, dict) and utterance.get("who", "user") == "user"
+
+
+def said_into_game(src: Any, sources: Sequence[Any] = ()) -> bool:
+    """Whether a user's call line was said into a game's voice chat (owner's decision 4 Oct 2026: no to-dos from
+    game chat). On the line's own metadata, no words read: the microphone was recorded for a game's session with
+    no call (``track_kind`` "game"), or the apps taking the microphone then (``heard_by``, measured) were only the
+    games whose voice chat is in this batch."""
+    utterance = getattr(src, "utterance", None)
+    if not isinstance(utterance, dict) or utterance.get("who", "user") != "user":
+        return False
+    if utterance.get("track_kind") == "game":
+        return True
+    heard = utterance.get("heard_by")
+    if not isinstance(heard, list) or not heard:
+        return False
+    games = {str(u.get("app") or "") for s in sources
+             if isinstance(u := getattr(s, "utterance", None), dict)
+             and u.get("who") == "others" and u.get("track_kind") == "game"}
+    return bool(games) and all(str(h) in games for h in heard)
 
 
 def terminal_commands(cap: PendingCapture) -> list[dict[str, Any]]:
@@ -835,15 +974,37 @@ def terminal_commands(cap: PendingCapture) -> list[dict[str, Any]]:
 
 
 def call_utterances(cap: PendingCapture) -> tuple[str, list[dict[str, Any]]]:
-    """``(app, utterances)`` of a ``my_call_side`` capture (its delta is our own JSON, written by the store)."""
+    """``(app, lines)`` of a ``my_call_side`` capture (its delta is our own JSON, written by the store): every
+    line of every track in time order, each with ``who``, ``app`` and ``track_kind``
+    (:meth:`Store.call_lines`; a capture from before 3 Oct 2026 reads as the user's own lines)."""
     try:
         data = json.loads(cap.delta or "{}")
     except ValueError:
         return "", []
     if not isinstance(data, dict):
         return "", []
-    items = [u for u in (data.get("utterances") or []) if isinstance(u, dict) and str(u.get("text") or "").strip()]
-    return str(data.get("app") or ""), items
+    return str(data.get("app") or ""), Store.call_lines(data)
+
+
+def call_line_label(line: dict[str, Any], call_app: str, safe: Any) -> tuple[str, str]:
+    """``(who, where)`` of one call line for a journal source: ``("THE USER SAID", "in the Discord call, mic open
+    to: Discord")``, ``("OTHERS SAID", "on the Discord call: the call app's own sound, everyone else on it")``,
+    ``("GAME VOICE SAID", "in VALORANT's voice chat: teammates or the game's own voice lines")``. Our own labels on
+    the line's metadata (who, app, track kind, heard_by), nothing read from the words."""
+    app = safe(str(line.get("app") or call_app or ""), 80) or "the call"
+    if line.get("who", "user") != "others":
+        # the user's microphone belongs to the voice session's row: a call, else a game's voice chat
+        where = f"in {app}'s voice chat, during the game" if line.get("track_kind") == "game" else f"in the {app} call"
+        heard = line.get("heard_by")
+        if isinstance(heard, list):
+            names = ", ".join(safe(str(h), 40) for h in heard if str(h).strip())
+            where += f", mic open to: {names or 'no app'}"
+        return "THE USER SAID", where
+    # what each label means is said once, in the batch's header (build_user_message), not on every line (review 61
+    # #8: per-line explanations were most of a part's characters)
+    if line.get("track_kind") == "game":
+        return "GAME VOICE SAID", f"in {app}'s voice chat"
+    return "OTHERS SAID", f"on the {app} call"
 
 
 def build_sources(
@@ -977,7 +1138,20 @@ def build_user_message(
         parts[-1] += " (terminal)"
         parts.append(f"folder: {safe(thread.title, 300)}")
     elif (thread.kind or "") == CALL_SIDE_KIND:
-        parts[-1] += " (a call: only the user's own microphone was transcribed; nobody else's words are here)"
+        sides = {("user" if s.users_line else "game" if (s.utterance or {}).get("track_kind") == "game" else "others")
+                 for s in sources if s.utterance is not None}
+        lines = [s.utterance for s in sources if s.utterance is not None]
+        game_only = bool(lines) and all(u.get("track_kind") == "game" for u in lines)   # a game's session, no call
+        parts[-1] += ((" (a game's voice chat while the user played, no call" if game_only else " (a call")
+                      + ", transcribed on this PC: the user's microphone"
+                      + (", the call app's own sound (the other people)" if "others" in sides else "")
+                      + (", a game's own voice chat" if "game" in sides else "")
+                      + "; each line says who spoke" + ("" if sides - {"user"} else
+                                                         "; only the user's own lines are here")
+                      + ("; OTHERS SAID = the call app's own sound, everyone else on it, mixed into one track"
+                         if "others" in sides else "")
+                      + ("; GAME VOICE SAID = the game's voice chat: teammates or the game's own voice lines"
+                         if "game" in sides else "") + ")")
     else:
         if thread.scope and thread.scope != thread.url:
             label = "conversation" if (thread.kind or "") in MESSAGE_KINDS else "thread"
@@ -1002,9 +1176,10 @@ def build_user_message(
         if src.utterance is not None:
             lang = safe(str(src.utterance.get("lang") or ""), 8)
             said = safe(str(src.utterance.get("text") or ""), 2_000).replace("\n", " ")
-            where = f"in the {safe(src.call_app or thread.app, 80)} call" + (f", transcribed as '{lang}'" if lang else "")
+            who, where = call_line_label(src.utterance, src.call_app or thread.app or "", safe)
+            where += f", transcribed as '{lang}'" if lang else ""
             unclear = " UNCLEAR" if src.utterance.get("unclear") else ""
-            parts.append(f"[{number}] THE USER SAID {_local(src.at)} ({where}){unclear}: \"{said}\"")
+            parts.append(f"[{number}] {who} {_local(src.at)} ({where}){unclear}: \"{said}\"")
             continue
         c = src.command
         if c is not None:
@@ -1043,8 +1218,8 @@ def build_user_message(
         parts.append(f"[{number}] {mark} MESSAGE {when} from {safe(_sender(m), 160)}{by_yuki(src)}{no_input(src)}:\n    {text}")
     if context:   # a call's surroundings on screen (yuki.memory.callcontext): after the sources, never one of them
         parts += ["", "CONTEXT AROUND THE CALL (text on the user's screen during and just around it, never audio; "
-                      "NEVER a fact source - write no fact the user's own words do not carry; only to understand "
-                      "who and what their words refer to):", safe(context, CONTEXT_CHARS)]
+                      "NEVER a fact source - every fact rests on the call line it cites; only to understand who "
+                      "was there and who and what each line refers to):", safe(context, CONTEXT_CHARS)]
     if work:   # after the sources: next to FACTS ALREADY RECORDED its lines were taken for recorded facts (29 Sept A/B)
         parts += ["", work]
     data = "\n".join(parts)
@@ -1395,7 +1570,8 @@ class JournalWorker:
                                call.latency_ms, call.error)
 
     def _call_parts(self, sources: Sequence[Source]) -> list[list[Source]]:
-        """A call's utterances cut, in order, into runs of about ``batch_chars`` characters: one model call each.
+        """A call's lines (every side) cut, in order, into runs of about ``batch_chars`` characters: one model call
+        each.
 
         A call is one capture (all its words, written when its last chunk is
         transcribed), so a 30-minute call is ~60k characters; sent whole it is one
@@ -1405,11 +1581,26 @@ class JournalWorker:
         parts: list[list[Source]] = []
         current: list[Source] = []
         size = 0
+
+        def cost(src: Source) -> int:   # the words plus the source line around them, as build_user_message writes it
+            u = src.utterance or {}
+            who, where = call_line_label(u, src.call_app or "", lambda s, _n: s)
+            return len(str(u.get("text") or "")) + len(who) + len(where) + 50
+
         for src in sources:
-            n = len(str((src.utterance or {}).get("text") or "")) + 100   # + the source line around the words
+            n = cost(src)
             if current and size + n > self.batch_chars:
-                parts.append(current)
-                current, size = [], 0
+                # cut at the longest silence among the last lines, not mid-exchange: a request at the end of one
+                # part and its "yeah sure" at the start of the next would never meet (review 61 #8)
+                tail = min(CALL_CUT_LOOKBACK, len(current) - 1)
+                cut = len(current)
+                if tail > 0:
+                    gaps = [(float(current[i].at) - float(current[i - 1].at), i)
+                            for i in range(len(current) - tail, len(current))]
+                    cut = max(gaps)[1]
+                parts.append(current[:cut])
+                current = current[cut:]
+                size = sum(cost(s) for s in current)
             current.append(src)
             size += n
         if current:
@@ -1418,12 +1609,14 @@ class JournalWorker:
 
     def _journal_call_side(self, thread: ThreadInfo, captures: list[PendingCapture],
                            previous: list[JournalEntry], *, supersedes: Sequence[int] = ()) -> BatchResult:
-        """A call's own side: ``record_call_side`` over each part of the call (:meth:`_call_parts`), then all its
-        facts and the user's quote-checked commitments in one transaction with the captures' checkpoint.
+        """A call: ``record_call_side`` over each part of the call (:meth:`_call_parts`; every side's lines, each
+        labelled with who spoke), then all its facts and the user's quote-checked commitments in one transaction
+        with the captures' checkpoint.
 
         The facts and to-dos of the earlier parts are shown to the later ones as
         already recorded. Any part failing fails the batch (nothing is written; it
-        is retried whole, like any batch).
+        is retried whole, like any batch). A commitment or a question must cite one of
+        the user's own lines (:meth:`_parse_commitments`, :meth:`_users_questions`).
         """
         thread_id = thread.id
         capture_ids = [c.id for c in captures]
@@ -1478,7 +1671,9 @@ class JournalWorker:
                 part_sources: list[int] = []
                 offset = len(facts)
                 facts += self._parse_facts(response, thread, part, tool=tool["name"], indexes=part_sources)
-                for q in self._parse_questions(response, thread, part, part_sources, tool=tool["name"]):
+                # a call asks only about names the user said: a question citing someone else's line is dropped
+                for q in self._parse_questions(response, thread, part, part_sources, tool=tool["name"],
+                                               keep=lambda i, part=part: part[i].users_line):
                     q.fact_indexes = [offset + i for i in q.fact_indexes]
                     questions.append(q)
                 ops, why = self.parse_work(response, tool["name"], offered, thread, part, part_sources)
@@ -1518,6 +1713,7 @@ class JournalWorker:
                 parts=len(parts), usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
                 stop_reason=call.stop_reason, facts=len(facts), embed_error=embed_error,
                 utterances=len(sources), unclear=sum(1 for s in sources if (s.utterance or {}).get("unclear")),
+                users_lines=sum(1 for s in sources if s.users_line),
                 context_chars=[len(c) for c in contexts] or None,
                 commitments=len(commitment_ids), commitments_rejected=rejected, known_chars=len(known),
                 questions=[{"id": qid, "outcome": outcome, "kind": q.kind, "importance": q.importance}
@@ -1578,10 +1774,12 @@ class JournalWorker:
     ) -> tuple[list[ConversationChange], list[str]]:
         """The user's own commitments from a call, as conversation-memory commitments (origin ``call``).
 
-        The quote rule of conversation memory applies: the quote must be a span
-        of the cited utterance (after normalising case, whitespace and quote
-        marks); otherwise the commitment is rejected (its reason is logged,
-        never its words). Dated by that utterance; ``due`` becomes ``due_at``.
+        The quote rule of conversation memory applies, against the user's own lines only: the cited source
+        must be a line of the user's microphone (``who`` "user"; a friend's "I'll send it tomorrow" on the
+        call's own sound is their plan, never the user's to-do - rejected structurally, whatever the model
+        wrote), and the quote must be a span of it (after normalising case, whitespace and quote marks);
+        otherwise the commitment is rejected (its reason is logged, never its words). Dated by that line;
+        ``due`` becomes ``due_at``.
         """
         from yuki.memory.conversations import parse_due, quote_in
 
@@ -1615,6 +1813,12 @@ class JournalWorker:
             if not 0 <= index < len(sources) or sources[index].utterance is None:
                 rejected.append("cites no utterance")
                 continue
+            if not users_line(sources[index]):
+                rejected.append("cites someone else's line, not the user's words")
+                continue
+            if said_into_game(sources[index], sources):
+                rejected.append("said in a game's voice chat: no to-do")
+                continue
             nature = normalize_nature(item.get("nature") or "fact")
             if nature != "fact" or index in unserious:
                 rejected.append(f"said as {nature if nature != 'fact' else 'a joke or possibly misheard'}: no to-do")
@@ -1634,13 +1838,16 @@ class JournalWorker:
         return out, rejected
 
     def _parse_questions(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
-                         fact_sources: Sequence[int], tool: str = "record_facts") -> list[NewQuestion]:
+                         fact_sources: Sequence[int], tool: str = "record_facts",
+                         keep: Callable[[int], bool] | None = None) -> list[NewQuestion]:
         """Questions for the user from the ``record_facts`` call, dated by the source they cite.
 
         Each carries the indexes of the batch's facts from the same source, whose journal
         ids become its evidence ids in the batch's transaction. A question citing a
         source put on screen by Yuki is kept too: what Yuki showed can still hold a
-        name the user uses.
+        name the user uses. ``keep``: which cited source indexes may carry a question (a call
+        batch: only the user's own lines - never a name a friend or a teammate said); with it, a
+        question citing no valid source is dropped instead of dated by the last one.
         """
         items = (self._tool_block(response, tool).input or {}).get("questions") or []
         out: list[NewQuestion] = []
@@ -1650,9 +1857,13 @@ class JournalWorker:
             try:
                 index = int(item.get("source")) - 1
             except (TypeError, ValueError):
-                index = len(sources) - 1
+                index = -1 if keep is not None else len(sources) - 1
             if not 0 <= index < len(sources):
+                if keep is not None:
+                    continue
                 index = len(sources) - 1
+            if keep is not None and not keep(index):
+                continue
             q = question_from_item(item, at=sources[index].at, origin="journal",
                                    fact_indexes=[i for i, s in enumerate(fact_sources) if s == index])
             if q is not None:
@@ -1893,6 +2104,27 @@ class JournalWorker:
                 out.add(c.id)
         return out
 
+    @staticmethod
+    def _others_fact_dropped(src: Source, item: dict[str, Any], nature: str) -> bool:
+        """Whether a fact citing a call line that is not the user's is thrown away (structural, on the line's own
+        ``who`` / ``track_kind`` and the model's labels; owner's decision 3 Oct 2026, both sides recorded):
+
+        - a GAME VOICE line (teammates, the game's own voice lines) is context only - never a fact source;
+        - a fact about the user themself (nature trait, story or humor) never rests on someone else's words;
+        - a fact the model says does not involve the user (``involves_user`` false: the speaker's own private
+          matters, gossip) is not kept.
+
+        ``user_said`` on such a line is caught before this, by the WHOSE WORDS check (its source is not by the
+        user). A line from before 3 Oct 2026 has no ``who`` and is the user's: never dropped here."""
+        utterance = getattr(src, "utterance", None)
+        if not isinstance(utterance, dict) or utterance.get("who", "user") != "others":
+            return False
+        if utterance.get("track_kind") == "game":
+            return True
+        if nature in ("trait", "story", "humor"):
+            return True
+        return item.get("involves_user") is False
+
     def _parse_facts(self, response: Any, thread: ThreadInfo, sources: Sequence[Source],
                      tool: str = "record_facts", indexes: list[int] | None = None,
                      not_users_words: list[int] | None = None) -> list[NewFact]:
@@ -1936,6 +2168,10 @@ class JournalWorker:
             source = source_of(sources[index], thread, sources, index)
             to_people = item.get("user_said") in (True, USER_SAID[1])   # True: a boolean answer
             if to_people and source.get("by") != "the user" and not source.get("by_yuki"):
+                if not_users_words is not None:
+                    not_users_words.append(index + 1)
+                continue
+            if self._others_fact_dropped(sources[index], item, nature):
                 if not_users_words is not None:
                     not_users_words.append(index + 1)
                 continue

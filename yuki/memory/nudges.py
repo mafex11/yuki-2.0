@@ -32,7 +32,8 @@ checks every nudge's evidence ids against the request, like the to-do mentions):
   shown on a return.
 * ``reminder`` - a to-do or Yuki's commitment at its due time (no budget, never late
   more than ``reminder_late_max_h``); a vague item gets none (``suppressed:vague``).
-* ``confirm`` - a plan the user said out loud on a call that has a day: never scheduled
+* ``confirm`` - a plan the user said out loud on a call that has a day (their own words: the journal keeps a
+  call commitment only when its quote is in one of the user's own lines, never the others'): never scheduled
   on its own, Yuki asks once whether they want a reminder (while its moment is at least
   ``confirm_lead_min`` ahead); a yes reaches the agent, which adds the to-do.
 * questions (:mod:`yuki.memory.questions`) - at most one per ``question_gap_min`` of the
@@ -375,10 +376,12 @@ WHO THE USER IS: in the block after this one.
 The ITEM line says what kind of item it is:
 - a to-do the user added, or something you promised to do for them: one short sentence saying \
 what is due and when ("now", "at 15:00", "today", "since yesterday 15:00").
-- the user's own words on a call - a plan of theirs, usually said to a friend, not a promise of \
-yours and not an order: nothing is scheduled yet. Ask, in one short sentence, whether it is \
-still on and whether they want a reminder, saying when it would be due ("You told Elina you'd \
-sort her Claude setup this afternoon, still on? Want a reminder?"). Never tell them to do it.
+- the user's own words on a call - a plan of theirs, or something they agreed to when someone on \
+the call asked them, usually said to a friend; not a promise of yours and not an order: nothing is \
+scheduled yet. Ask, in one short sentence, whether it is still on and whether they want a reminder, \
+saying when it would be due ("You told Elina you'd sort her Claude setup this afternoon, still on? \
+Want a reminder?"). Never tell them to do it, and never present what someone else on the call said \
+they would do as the user's.
 Follow every one of their RULES, in the last block of this prompt (their nickname, their tone). \
 Say only what the item says; never add a task, a detail or a deadline it does not give. No \
 preamble, no emojis unless their rules ask.
