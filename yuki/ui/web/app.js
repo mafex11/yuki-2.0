@@ -251,7 +251,11 @@
     if (holdsHands(old, now)) { stats.held++; return old; }
     if (Y.hasOrig(old)) { stats.swapped++; return neu; }                      // a retired confirmation: the data's own row
     if (tickerOwned(old) && sameAttrs(old, neu)) return old;                   // the ticker's text is newer
-    if (old.tagName === 'CANVAS') return old.__face && old.dataset.core === neu.dataset.core ? old : neu;
+    if (old.tagName === 'CANVAS') {   // a face: the one already drawing changes its expression, never a new one
+      if (!old.__face) return neu;
+      if (old.dataset.core !== neu.dataset.core) { old.dataset.core = neu.dataset.core; old.__face.set(neu.dataset.core, { n: 2, of: 5 }); }
+      return old;
+    }
     if (old.tagName === 'DETAILS' && neu.tagName === 'DETAILS') neu.open = old.open;   // your fold stays as you left it
     if (old.isEqualNode(neu) && sameFigures(old, neu)) { stats.kept++; return old; }
     if (FIELDS.has(old.tagName)) { stats.swapped++; return neu; }
@@ -476,6 +480,10 @@
     const same = raw === D.raw[m.page];
     D.source[m.page] = m.source || 'memory'; D.stamp[m.page] = Date.now();
     if (same) return;                                   // the same data again: nothing to draw (42 §6.3)
+    if (m.page === 'me' && D.pages.me) {   // a person whose data moved: their dossier details are read again
+      const was = new Map((D.pages.me.people || []).map((p) => [p.ref, JSON.stringify(p)]));
+      (m.data.people || []).forEach((p) => { if (was.has(p.ref) && was.get(p.ref) !== JSON.stringify(p)) { delete D.detail[p.ref]; delete D.detail['?' + p.ref]; } });
+    }
     D.pages[m.page] = m.data; D.raw[m.page] = raw;
     if (m.page === 'home') { D.shell.needs = (m.data.needs || []).length; renderRail(); }
     if (m.page !== openKey()) return;

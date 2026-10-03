@@ -939,18 +939,27 @@ def test_a_forwarded_call_status_patches_rail_and_home_without_reading_memory(tm
     live = _Live(tmp_path, monkeypatch, memory=_NoCallRead(), real_build=True)
     win, host = live.win, live.host
     try:
+        win.mark("home", "want", urgent=True)                                # Home on screen (read from memory once)
+        live.settle(0.6)
+        assert live.built == ["home"]
+        _NoCallRead.reads = 0
         status = {"call": {"id": 9, "app": "Signal", "status": "recording", "session_started_at": "2026-10-03T10:00:00"},
                   "recording": True, "waiting": {"calls": 1, "minutes": 30.0}}
         win._on_tray_event({"ev": "call", "status": status})
         assert host.kinds("live")[-1]["shell"]["call"]["recording"] is True   # the rail's chip, at once
-        live.settle(0.6)
+        live.settle(0.3)
         home = live.data("home")[-1]["data"]
         assert home["now"]["call"]["app"] == "Signal" and [r["kind"] for r in home["running"]] == ["call", "waiting"]
-        assert _NoCallRead.reads == 0
-        n = len(host.kinds("live"))
+        assert _NoCallRead.reads == 0 and live.built == ["home"]              # patched from the status: no build, no read
+        assert {"day", "activity"} <= set(win.dirty)                          # pages with call rows: built when opened
+        n, m = len(host.kinds("live")), len(live.data("home"))
         win._on_tray_event({"ev": "call", "status": status})                  # the same status: nothing new to draw
         live.settle()
-        assert len(host.kinds("live")) == n
+        assert len(host.kinds("live")) == n and len(live.data("home")) == m
+        # a build later uses the forwarded status too (no call read)
+        win.mark("home", "action", urgent=True)
+        live.settle(0.6)
+        assert live.built == ["home", "home"] and _NoCallRead.reads == 0
     finally:
         live.close()
 

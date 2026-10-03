@@ -81,7 +81,7 @@ AGAIN_S = 5.0
 #: rail (always on screen).
 TOPIC_PAGES: dict[str, tuple[str, ...]] = {
     "cards": ("shell", "home", "activity"),          # a card or question arrived, or memory has a reaction to one
-    "call": ("home", "day", "activity"),             # the tray's forwarded call status (the rail is patched from it)
+    "call": ("day", "activity"),                     # the tray's forwarded call status (rail and Home: patched)
     "request_end": ("home", "activity"),             # a request finished, failed or was replaced (the request log)
     "rules": ("me", "playbook"),
     "todos": ("home", "activity"),
@@ -509,6 +509,9 @@ class WebWindow:
             if kind == "media":   # what is playing, put on the Home it was read for, in turn with the builds
                 self._apply_media(job[2])
                 continue
+            if kind == "call":    # the tray's call status on Home: a payload patch, no memory read
+                self._apply_call(job[2])
+                continue
             with self._lock:
                 self._queued.discard(("check:" if kind == "check" else "") + name)
             if self.memory is None or self._closing.is_set():
@@ -661,6 +664,22 @@ class WebWindow:
             self.log("web_page", page="home", reason="media", topic="media", ms=0,
                      result="posted" if posted else "unchanged")
 
+    def _apply_call(self, status: dict[str, Any]) -> None:
+        from yuki.ui.web_data import call_view, home_call
+
+        with self._lock:
+            home = self.pages.get("home")
+        if not isinstance(home, dict):
+            return
+        now_call, running = home_call(call_view(status), status.get("waiting"))
+        patched = dict(home)
+        patched["now"] = {**(home.get("now") or {}), "call": now_call}
+        patched["running"] = running
+        t = time.time()
+        posted = self.send_page("home", patched, built_at=t)
+        self.log("web_page", page="home", reason="call", topic="call", ms=round((time.time() - t) * 1000),
+                 result="posted" if posted else "unchanged")
+
     # -- what changed, and when the open page is built (42 §6.2) ---------------------------------------------------
 
     def mark(self, name: str, reason: str, *, urgent: bool = False, check: bool = False,
@@ -746,6 +765,10 @@ class WebWindow:
                     self._schedule(name, now, True)
             if self._fallback_at <= now:
                 self.maybe.setdefault(self.open_page, set()).add("fallback")
+                self._schedule(self.open_page, now, True)
+            if self._clock_at.get(self.open_page, float("inf")) <= now:   # a time boundary passed while hidden
+                self._clock_at[self.open_page] = float("inf")
+                self.dirty.setdefault(self.open_page, set()).add("clock")
                 self._schedule(self.open_page, now, True)
             self._cv.notify()
         if self.want_connect and self.client is None and self.cipher is not None:
@@ -984,6 +1007,7 @@ class WebWindow:
         if call != self.shell.get("call"):
             self.shell["call"] = call
             self.post_live()
+        self._jobs.put(("call", "home", status, ()))   # Home's call tile and rows, patched in turn with the builds
         self.topic("call")
 
     def on_memory_topic(self, topic: str) -> None:

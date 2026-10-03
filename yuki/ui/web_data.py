@@ -272,6 +272,27 @@ def request_row_words(r: dict[str, Any]) -> tuple[str, str]:
     return words, ", ".join(bits)
 
 
+def home_call(call: dict[str, Any] | None, waiting: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Home's call tile and its Running rows (the call being remembered, the transcripts waiting) from
+    :func:`call_view` and the waiting audio; also how the window patches Home from the tray's forwarded status."""
+    now_call = None
+    if call and (call.get("recording") or call.get("status") in ("asking", "waiting_headphones")):
+        note = "Only your mic. Turned into text when the PC is free. Cards are held." if call.get("recording") else ""
+        now_call = {**call, "note": note}
+    running: list[dict[str, Any]] = []
+    if call and call.get("recording"):
+        running.append({"kind": "call", "live": True, "recording": True, "started_at": call.get("started_at"),
+                        "title": f"Remembering your side of the {call.get('app') or ''} call".replace("  ", " "),
+                        "detail": "Only your mic. Turned into text later, when the PC is free."})
+    waiting = waiting or {}
+    if int(waiting.get("calls") or 0):
+        n = int(waiting["calls"])
+        running.append({"kind": "waiting", "live": False, "title": f"{n} call{'s' if n != 1 else ''} waiting to be turned into text",
+                        "detail": f"{dur_words(float(waiting.get('minutes') or 0) * 60)} in all. Done when the PC is free.",
+                        "meta": "waiting"})
+    return now_call, running
+
+
 def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
                now: float | None = None, people: list[dict[str, Any]] | None = None,
                call_status: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -283,22 +304,10 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
     now = time.time() if now is None else now
     since = since if since is not None else now - AWAY_HOURS * 3600
     call = call_view(call_status) if call_status is not None else call_now(memory)
-    now_strip = {"front": front_now(memory, now), "playing": None, "call": None}
-    if call and (call.get("recording") or call.get("status") in ("asking", "waiting_headphones")):
-        note = "Only your mic. Turned into text when the PC is free. Cards are held." if call.get("recording") else ""
-        now_strip["call"] = {**call, "note": note}
-    needs = [question_item(q) for q in (_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])]
-    running: list[dict[str, Any]] = []
-    if call and call.get("recording"):
-        running.append({"kind": "call", "live": True, "recording": True, "started_at": call.get("started_at"),
-                        "title": f"Remembering your side of the {call.get('app') or ''} call".replace("  ", " "),
-                        "detail": "Only your mic. Turned into text later, when the PC is free."})
     waiting = (call_status.get("waiting") if call_status is not None else _safe(memory.call_audio_waiting, {})) or {}
-    if int(waiting.get("calls") or 0):
-        n = int(waiting["calls"])
-        running.append({"kind": "waiting", "live": False, "title": f"{n} call{'s' if n != 1 else ''} waiting to be turned into text",
-                        "detail": f"{dur_words(float(waiting.get('minutes') or 0) * 60)} in all. Done when the PC is free.",
-                        "meta": "waiting"})
+    now_call, running = home_call(call, waiting)
+    now_strip = {"front": front_now(memory, now), "playing": None, "call": now_call}
+    needs = [question_item(q) for q in (_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])]
     cards = _safe(lambda: memory.recent_nudges(hours=24 * INBOX_DAYS), []) or []
     cards = sorted(cards, key=lambda n: epoch_of(n.get("shown_at")) or epoch_of(n.get("at")) or 0, reverse=True)
     offers = [offer_card(n, now) for n in cards if card_offer(n) is not None and offer_open(n, now)][:INBOX_MAX]
