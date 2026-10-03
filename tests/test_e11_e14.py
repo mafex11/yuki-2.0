@@ -325,7 +325,7 @@ def test_the_playbook_page_is_practice_memorys_workflows(store):
                        events=[{"type": "observed", "run_key": f"x{n}"}, {"type": "succeeded", "run_key": f"x{n}"}])
     d = W.build_playbook(MemoryClient(store))
     assert len(d["proposals"]) == W.PROPOSALS_SHOWN == 2
-    tentative = [p for p in d["procedures"] if p.get("tentative")]
+    tentative = [p for p in d["procedures"] + d["choices"] if p.get("tentative")]   # a habit is an app choice (appWin2 W7)
     assert len(tentative) == 1 and tentative[0]["conf_word"] == "tentative, seen once"
 
 

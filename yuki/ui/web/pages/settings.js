@@ -13,6 +13,33 @@
     return sel;
   }
 
+  /* Quiet hours (the 4 Oct item W10): a switch, the from-to times (every half hour, said as clock times), and what
+     they do in plain words. The privacy file keeps "HH:MM"; an equal from and to is none, as memory reads it. */
+  const QUIET_SAY = 'No cards from me in these hours: no check-ins, questions or offers. Reminders you set and things you asked me to tell you still come, and I still answer when you talk to me.';
+  function clockWords(hhmm) {
+    const [hh, mm] = String(hhmm).split(':').map(Number);
+    if (!(hh >= 0 && hh < 24 && mm >= 0 && mm < 60)) return String(hhmm || '');
+    return `${hh % 12 || 12}:${fmt.pad(mm)} ${hh < 12 ? 'AM' : 'PM'}`;
+  }
+  function timePick(value, which, label, disabled) {
+    const opts = [];
+    for (let m = 0; m < 24 * 60; m += 30) opts.push(`${fmt.pad(Math.floor(m / 60))}:${fmt.pad(m % 60)}`);
+    if (value && !opts.includes(value)) { opts.push(value); opts.sort(); }   // a time set elsewhere stays shown as it is
+    const sel = pick(opts.map((v) => [v, clockWords(v)]), value, { change: 'quiet-time', which }, label);
+    sel.disabled = !!disabled;
+    return sel;
+  }
+  function quietRows(co) {
+    const start = co.quiet_start || '00:30', end = co.quiet_end || '08:00', on = start !== end;
+    const last = (co.quiet_last || []).length >= 2 && co.quiet_last[0] !== co.quiet_last[1] ? co.quiet_last : ['00:30', '08:00'];
+    const [from, to] = on ? [start, end] : last;
+    return [
+      h('div', { class: 'srow quiet-h', data: { k: 'quiet' } }, h('span', null, 'Quiet hours', h('small', { class: 'quiet-say', text: on ? `From ${clockWords(from)} to ${clockWords(to)}, every day. ${QUIET_SAY}` : `Off. ${QUIET_SAY}` })),
+        h('span', { class: 'ctl' }, tog(on, { do: 'quiet-on' }, 'Quiet hours'))),
+      h('div', { class: 'srow quiet-t' + (on ? '' : ' off'), data: { k: 'quiet-times' } }, h('span', { class: 'quiet-range' },
+        h('span', { class: 't3', text: 'From' }), timePick(from, 'start', 'Quiet hours start', !on), h('span', { class: 't3', text: 'to' }), timePick(to, 'end', 'Quiet hours end', !on)))];
+  }
+
   function dialSentence(A) {
     const by = (lv) => A.kinds.filter((k) => k.level === lv).map((k) => k.words.toLowerCase());
     const free = by('do_and_tell'), ask = by('ask');
@@ -58,7 +85,7 @@
       srow('Offers on cards', tog((d.offers || {}).enabled, { do: 'offers' }, 'Offers on cards'), 'A named button that does one small thing, with Undo where it can. Off: cards only talk.'),
       srow('Check-ins', tog(co.enabled, { do: 'coach' }, 'Check-ins')),
       srow('Questions', tog(co.questions, { do: 'questions' }, 'Questions'), 'When I’m not sure I heard or read something right'),
-      srow('Quiet hours', co.quiet_start && co.quiet_start !== co.quiet_end ? `${co.quiet_start}–${co.quiet_end}` : 'none')];
+      ...quietRows(co)];
     const privacy = [
       h('div', { class: 'srow', data: { pause: '' } }, h('span', null, pr.paused ? 'Memory is paused' : 'Remember what I do', h('small', { class: 'pause-say', text: pr.paused ? 'I’m not looking at anything. Calls you said yes to still record your side.' : 'I see the window in front, never private windows or blocked apps' })),
         h('span', { class: 'ctl' }, pr.paused ? key('Resume', { cls: 'xs pri', data: { do: 'pause', on: '0' } }) : key('Pause', { cls: 'xs', data: { do: 'pause', on: '1' } }))),
@@ -122,6 +149,33 @@
   A.offers = (t) => { const on = flip(t); save(t, 'offers', { enabled: on }, on ? 'Offers on. Cards can carry one named button.' : 'Offers off. Cards only talk now.', () => flip(t)); };
   A.coach = (t) => { const on = flip(t); save(t, 'coach', { enabled: on }, on ? 'Check-ins on.' : 'Check-ins off.', () => flip(t)); };
   A.questions = (t) => { const on = flip(t); save(t, 'questions', { enabled: on }, on ? 'Questions on.' : 'No more questions.', () => flip(t)); };
+  /* quiet hours: the switch, then each time; the page shows what Python wrote (both times in one write) */
+  const quietKnown = (r) => typeof r.quiet_start === 'string' && typeof r.quiet_end === 'string';
+  /* the times a save leaves: Python's reply; a reply without them (the preview's canned {ok: true}, review F2) is read
+     as what you asked, worked out from the hours shown, so the switch never flips back to what it was */
+  function quietResult(r, asked) {
+    if (quietKnown(r)) return r;
+    const co = settings().coach || {}, s = co.quiet_start || '00:30', e = co.quiet_end || '08:00';
+    const last = (co.quiet_last || []).length >= 2 && co.quiet_last[0] !== co.quiet_last[1] ? co.quiet_last : ['00:30', '08:00'];
+    const [qs, qe] = asked.on === false ? [s, s] : asked.on === true ? (s !== e ? [s, e] : last) : [asked.start || s, asked.end || e];
+    return Object.assign({}, r, { quiet_start: qs, quiet_end: qe });
+  }
+  function quietSaved(r) {
+    const co = settings().coach || (settings().coach = {});
+    if (co.quiet_start !== co.quiet_end) co.quiet_last = [co.quiet_start, co.quiet_end];
+    co.quiet_start = r.quiet_start; co.quiet_end = r.quiet_end;
+    if (r.quiet_start !== r.quiet_end) co.quiet_last = [r.quiet_start, r.quiet_end];
+    Y.renderMain();
+  }
+  function quietSave(t, asked, revert) {
+    save(t, 'quiet', asked, null, revert).then((raw) => {
+      if (!raw.ok) return;
+      const r = quietResult(raw, asked);
+      Y.toast(r.quiet_start !== r.quiet_end ? `Quiet from ${clockWords(r.quiet_start)} to ${clockWords(r.quiet_end)}.` : 'No quiet hours.');
+      quietSaved(r);
+    });
+  }
+  A['quiet-on'] = (t) => { const on = flip(t); quietSave(t, { on }, () => flip(t)); };
   A.pause = (t) => { const on = t.dataset.on === '1'; save(t, 'pause', { paused: on }, on ? 'Memory paused.' : 'Remembering again.').then((r) => { if (r.ok) { settings().privacy.paused = on; Y.renderMain(); } }); };
   A.accent = (t) => { const name = t.dataset.accent; save(t, 'accent', { accent: name }).then((r) => { if (r.ok) { settings().appearance.accent = name; Y.applyAppearance(Object.assign({}, Y.D.appearance, { accent: name })); Y.render(false); } }); };
   A.motion = (t) => { const on = t.dataset.on === '1'; save(t, 'motion', { reduce: on }).then((r) => { if (r.ok) { settings().appearance.reduce_motion = on; Y.applyAppearance(Object.assign({}, Y.D.appearance, { reduce_motion: on })); Y.render(false); } }); };
@@ -137,6 +191,10 @@
     if (t.dataset.change === 'voice-mic') save(t, 'voice', { mic: v }, `Microphone: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-speaker') save(t, 'voice', { speaker: v }, `Speaker: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
+    if (t.dataset.change === 'quiet-time') {
+      const co = settings().coach || {}, was = co[t.dataset.which === 'start' ? 'quiet_start' : 'quiet_end'];
+      quietSave(t, { [t.dataset.which]: t.value }, () => { t.value = was; });
+    }
   });
 
   /* About's splash: plays once per opening of Settings, when it first comes into view (it is the page's last block,

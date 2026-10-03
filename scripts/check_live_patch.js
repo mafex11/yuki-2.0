@@ -392,6 +392,68 @@ async function inPage(F) {
   check('21 the drawer input keeps focus and its text', document.activeElement === steer && steer.value === 'a half-written message');
   check('21 a fold you closed stays closed', !fold || (fold.isConnected && !fold.open));
 
+  // ---- W9 (4 Oct): ONE input. While a request runs, Enter steers it (an answer when it asked you something), the
+  // send button is Stop, Esc on the empty box stops; idle, Enter sends a new request; the face shows the live state ----
+  const inp = () => document.querySelector('.drawer .drawer-in');
+  const inRow = () => document.querySelector('.drawer .inp');
+  const enter = (k) => inp().dispatchEvent(new KeyboardEvent('keydown', { key: k || 'Enter', bubbles: true }));
+  const job = (last.jobs || [])[0] || 31;
+  const runNow = [{ item: last.id, jobs: [job], title: '“An invented request”', line: 'Step 1 · Doing an invented thing', started_at: Date.now() / 1000 - 5, step: 1 }];
+  window.__push({ kind: 'live', shell: { runs: runNow } }); await sleep(200);
+  check('W9 no separate steer box, run box or second Stop', !document.querySelector('.drawer .runbar, .drawer .steer-in') && document.querySelectorAll('.drawer [data-do="stop"]').length === 1);
+  check('W9 the button right of the input is Stop while a request runs', !!inRow().querySelector('button[data-do="stop"]') && !inRow().querySelector('[data-do="send"]'));
+  check('W9 the face left of the input shows working', inRow().firstElementChild.tagName === 'CANVAS' && inRow().querySelector('canvas').dataset.core === 'working', inRow().querySelector('canvas').dataset.core);
+  REPLY.steer = { ok: true, delivered: true };
+  inp().focus(); inp().value = 'also the invented other one'; enter();
+  await sleep(250);
+  check('W9 Enter while it runs steers that request (no new request)', acts('steer').some((m) => m.text === 'also the invented other one' && m.job === job)
+    && !acts('submit').some((m) => m.text === 'also the invented other one'), JSON.stringify(acts('steer')));
+  check('W9 what you added shows under the reply, with whether it was read', document.querySelector('.drawer').textContent.includes('you added “also the invented other one”')
+    && document.querySelector('.drawer').textContent.includes('read at its next step'));
+  // review F1: words for a request that hasn't started wait for it; a "not running" reply while the request still shows
+  // never becomes a separate request; only one that has ended goes on as a new request
+  REPLY.steer = { ok: true, delivered: true, held: true };
+  inp().value = 'also the invented queued one'; enter(); await sleep(250);
+  check('F1 words for a request that hasn\'t started wait for its start (no new request)', document.querySelector('.drawer').textContent.includes('read when it starts')
+    && !acts('submit').some((m) => m.text === 'also the invented queued one'));
+  REPLY.steer = { ok: true, delivered: false };
+  inp().value = 'also the invented refused one'; enter(); await sleep(250);
+  check('F1 a refused addition while the request still shows goes back in the box, never a new request', !acts('submit').some((m) => m.text === 'also the invented refused one')
+    && inp().value === 'also the invented refused one', inp().value);
+  inp().value = '';
+  REPLY.steer = () => { window.__push({ kind: 'live', shell: { runs: [] } }); return { ok: true, delivered: false }; };
+  inp().value = 'also the invented ended one'; enter(); await sleep(250);
+  check('F1 an addition to a request that has ended goes on as a new request', acts('submit').some((m) => m.text === 'also the invented ended one'));
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(200);
+  REPLY.steer = { ok: true, delivered: true };
+  const qItems = clone(F.chat.items); const qLast = qItems[qItems.length - 1]; qLast.question = 'Which invented folder?'; qLast.running = true;
+  window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(250);
+  check('W9 when it asks you something, the face says so and the box takes your answer', inRow().querySelector('canvas').dataset.core === 'needs-you' && inp().placeholder.includes('answer'), inRow().querySelector('canvas').dataset.core + ' / ' + inp().placeholder);
+  inp().value = 'the invented one'; enter(); await sleep(200);
+  check('W9 Enter on a question answers it (the submit path), never a steer', acts('submit').some((m) => m.text === 'the invented one') && !acts('steer').some((m) => m.text === 'the invented one'));
+  // review F3: an older request asks while a newer one runs: the box answers the one that asked
+  window.__push({ kind: 'live', shell: { runs: [...clone(runNow), { item: 'invented-newer', jobs: [job + 1], title: '“A newer invented request”', line: 'Step 1 · Another invented thing', started_at: Date.now() / 1000 - 1, step: 1 }] } });
+  await sleep(200);
+  inp().value = 'the invented older one'; enter(); await sleep(200);
+  check('F3 a question from an older request is answered while a newer one runs', acts('submit').some((m) => m.text === 'the invented older one')
+    && !acts('steer').some((m) => m.text === 'the invented older one'));
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(150);
+  delete qLast.question; window.__push({ kind: 'chat', what: 'changed', item: qLast }); await sleep(150);
+  inp().value = ''; inp().focus(); enter('Escape'); await sleep(200);
+  check('W9 Esc on the empty box stops the request', acts('stop').some((m) => m.job === job));
+  check('W9 Esc stopping it leaves the thread open', !!document.querySelector('.drawer'));
+  window.__push({ kind: 'live', shell: { runs: [] } }); await sleep(200);
+  check('W9 when it ends, the button is Send and the face shows done', !!inRow().querySelector('button[data-do="send"]') && !inRow().querySelector('[data-do="stop"]')
+    && inRow().querySelector('canvas').dataset.core === 'done-flash', inRow().querySelector('canvas').dataset.core);
+  inp().focus(); inp().value = 'an invented new request'; enter(); await sleep(200);
+  check('W9 idle, Enter sends a new request', acts('submit').some((m) => m.text === 'an invented new request') && inp().value === '');
+  await sleep(3200);
+  check('W9 the done face goes back to the resting one after 3 s', inRow().querySelector('canvas').dataset.core !== 'done-flash', inRow().querySelector('canvas').dataset.core);
+  window.__push({ kind: 'live', shell: { runs: clone(runNow) } }); await sleep(150);
+  check('W9 a new run brings Stop back', !!inRow().querySelector('button[data-do="stop"]'));
+  window.__push({ kind: 'live', shell: { runs: [] } }); await sleep(150);
+  window.__push({ kind: 'chat', reset: true, items: clone(F.chat.items), connected: true }); await sleep(150);
+
   // ---- the 3 Oct design (report 45): the drawer's days ----
   await go('#home');
   await go('#home?thread=1');
@@ -506,6 +568,62 @@ async function inPage(F) {
     g.querySelector('.fx-h').click(); await sleep(80);
     check('C a group opens to its steps in plain words', g.classList.contains('open') && g.querySelector('.lstep .w1').textContent.length > 0);
   }
+  // ---- W8 (4 Oct): the Calls tab lays out cleanly: when | where and who | lines; opened, the timeline sits under
+  // the where column; nothing squeezed or overflowing ----
+  await go('#activity/calls'); await sleep(500);
+  const crs = Array.from(main().querySelectorAll('.callrow'));
+  const wOf = (el) => el.getBoundingClientRect().width;
+  check('W8 every call row spans the section, its where-and-who column wide', crs.length > 0 && crs.every((r) => wOf(r.querySelector('.fx-h')) >= wOf(r) - 4 && wOf(r.querySelector('.wh')) > 300),
+    crs.map((r) => `${Math.round(wOf(r.querySelector('.fx-h')))}/${Math.round(wOf(r))}/${Math.round(wOf(r.querySelector('.wh')))}`).join(' '));
+  const withLines = crs.find((r) => r.querySelector('.fx-meta .mono') && r.querySelector('.fx-meta .mono').textContent);
+  if (withLines) {
+    withLines.querySelector('.fx-h').click(); await sleep(120);
+    const tl = withLines.querySelector('.call-tl'), wh = withLines.querySelector('.wh');
+    check('W8 an opened call shows what was said as a timeline under the where column', !!tl && tl.querySelectorAll('li').length >= 1
+      && Math.abs(tl.getBoundingClientRect().left - wh.getBoundingClientRect().left) <= 2, tl ? `${tl.getBoundingClientRect().left} vs ${wh.getBoundingClientRect().left}` : 'no timeline');
+    check('W8 nothing in the Calls tab overflows sideways', crs.every((r) => r.scrollWidth <= r.clientWidth + 1) && main().scrollWidth <= main().clientWidth + 1);
+    withLines.querySelector('.fx-h').click(); await sleep(60);
+  }
+  // ---- W7 (4 Oct): the Playbook - numbered steps per goal, app choices in plain words, lessons folded, two balanced
+  // columns under the procedures ----
+  await go('#playbook'); await sleep(500);
+  const pc = main().querySelector('.proc2');
+  check('W7 a procedure is a title and its steps numbered 1, 2, 3', !!pc && !!pc.querySelector('h4') && pc.querySelectorAll('.nsteps li').length >= 2
+    && Array.from(pc.querySelectorAll('.nsteps .n')).map((n) => n.textContent).join(',').startsWith('1,2'));
+  const lsn = Array.from(main().querySelectorAll('.lesson2'));
+  check('W7 lessons are a short title and one line, folded', lsn.length > 0 && lsn.every((l) => !l.classList.contains('open') && !!l.querySelector('.fx-h .lt')
+    && l.querySelector('.fx-h').getBoundingClientRect().height < 72), lsn.map((l) => Math.round(l.querySelector('.fx-h').getBoundingClientRect().height)).join(','));
+  if (lsn[0]) {
+    lsn[0].querySelector('.fx-h').click(); await sleep(80);
+    const ln = lsn[0].querySelector('.fx-h .ln');
+    check('W7 a lesson opens to its details, its one line not said twice', lsn[0].classList.contains('open') && !!lsn[0].querySelector('.fx-d .d') && (!ln || getComputedStyle(ln).display === 'none'));
+    lsn[0].querySelector('.fx-h').click(); await sleep(40);
+  }
+  const chTxt = Array.from(main().querySelectorAll('.choice')).map((c) => c.textContent).join(' | ');
+  check('W7 app choices say the choice plainly, never counts', chTxt.includes('usually') && !/\d+(\.\d+)?\s*(min|minutes|visits)\b/.test(chTxt), chTxt.slice(0, 160));
+  const pbCols = Array.from(main().querySelectorAll('.pb-grid > .col')).map((c) => c.getBoundingClientRect().height);
+  check('W7 the two columns under the procedures are about as tall', pbCols.length === 2 && Math.min(...pbCols) >= 0.6 * Math.max(...pbCols), pbCols.map(Math.round).join(' vs '));
+  // ---- W10 (4 Oct): Settings -> quiet hours: a switch, from-to times, what they do in plain words ----
+  await go('#settings'); await sleep(500);
+  const qrow = () => main().querySelector('[data-k="quiet"]');
+  const qsel = () => Array.from(main().querySelectorAll('select[data-change="quiet-time"]'));
+  check('W10 quiet hours has a switch, a from and a to time, and says what they do', !!qrow() && !!qrow().querySelector('.tog[data-do="quiet-on"]') && qsel().length === 2
+    && qrow().textContent.includes('No cards') && !main().textContent.includes('Quiet hours: none'), qrow() && qrow().textContent);
+  // review F2: a reply without the times (the preview's canned {ok: true}) keeps what you set
+  qrow().querySelector('.tog').click(); await sleep(250);
+  const qOn = () => qrow().querySelector('.tog').getAttribute('aria-checked') === 'true';
+  check('F2 off with a bare reply stays off', !qOn() && qrow().textContent.includes('Off.') && qsel().every((s) => s.disabled), qrow().textContent.slice(0, 60));
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('F2 on again with a bare reply brings the hours back', qOn() && qrow().textContent.includes('From 12:30 AM to 8:00 AM'), qrow().textContent.slice(0, 60));
+  REPLY.quiet = (m) => (m.on === false ? { ok: true, quiet_start: '00:30', quiet_end: '00:30' } : m.on === true ? { ok: true, quiet_start: '00:30', quiet_end: '08:00' }
+    : { ok: true, quiet_start: m.start || '00:30', quiet_end: m.end || '08:00' });
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('W10 the switch turns them off (sent to Python) and the times wait, greyed', acts('quiet').some((m) => m.on === false) && qrow().textContent.includes('Off.')
+    && qsel().every((s) => s.disabled));
+  qrow().querySelector('.tog').click(); await sleep(250);
+  check('W10 on again brings the hours back', acts('quiet').some((m) => m.on === true) && qrow().textContent.includes('From 12:30 AM to 8:00 AM') && qsel().every((s) => !s.disabled));
+  qsel()[0].value = '23:00'; qsel()[0].dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
+  check('W10 a new start time is sent and shown in plain clock words', acts('quiet').some((m) => m.start === '23:00') && qrow().textContent.includes('From 11:00 PM to 8:00 AM'), qrow().textContent.slice(0, 80));
   return results;
 }
 
